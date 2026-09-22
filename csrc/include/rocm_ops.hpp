@@ -1532,9 +1532,27 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));
 
-#define PA_MQA_LOGITS_MXFP4_GFX1250_PYBIND               \
-    m.def("pa_mqa_logits_mxfp4_gfx1250_fwd_sched",       \
-          &pa_mqa_logits_mxfp4_gfx1250_fwd_sched,        \
+#define PA_MQA_LOGITS_MXFP4_PYBIND                       \
+    m.def("pa_mqa_logits_mxfp4_build_tiles",             \
+          &pa_mqa_logits_mxfp4_build_tiles,              \
+          py::arg("cu_seq_q"),                           \
+          py::arg("cu_tiles"),                           \
+          py::arg("total_q"),                            \
+          py::arg("max_tiles"),                          \
+          py::arg("q_per_block"));                       \
+    m.def("pa_mqa_logits_mxfp4_build_sched",             \
+          &pa_mqa_logits_mxfp4_build_sched,              \
+          py::arg("cu_tiles"),                           \
+          py::arg("local_starts"),                       \
+          py::arg("local_ends"),                         \
+          py::arg("row_to_batch"),                       \
+          py::arg("cta_info"),                           \
+          py::arg("num_tiles"),                          \
+          py::arg("num_ctas"),                           \
+          py::arg("cta_resident"),                       \
+          py::arg("block_k"));                           \
+    m.def("pa_mqa_logits_mxfp4_fwd_sched",               \
+          &pa_mqa_logits_mxfp4_fwd_sched,                \
           py::arg("q"),                                  \
           py::arg("q_scale"),                            \
           py::arg("kv_cache"),                           \
@@ -1551,52 +1569,7 @@ namespace py = pybind11;
           py::arg("kv_block_size"),                      \
           py::arg("max_seq_len"),                        \
           py::arg("q_per_block"),                        \
-          py::arg("block_k"));                           \
-    m.def("pa_mqa_logits_mxfp4_gfx1250_build_tiles",     \
-          &pa_mqa_logits_mxfp4_gfx1250_build_tiles,      \
-          py::arg("cu_seq_q"),                           \
-          py::arg("cu_tiles"),                           \
-          py::arg("total_q"),                            \
-          py::arg("max_tiles"),                          \
-          py::arg("q_per_block"));                       \
-    m.def("pa_mqa_logits_mxfp4_gfx1250_build_sched",     \
-          &pa_mqa_logits_mxfp4_gfx1250_build_sched,      \
-          py::arg("cu_tiles"),                           \
-          py::arg("local_starts"),                       \
-          py::arg("local_ends"),                         \
-          py::arg("row_to_batch"),                       \
-          py::arg("cta_info"),                           \
-          py::arg("num_tiles"),                          \
-          py::arg("num_ctas"),                           \
-          py::arg("cta_resident"),                       \
           py::arg("block_k"));
-
-#define PA_MQA_LOGITS_MXFP4_PYBIND               \
-    m.def("pa_mqa_logits_mxfp4_build_sched",     \
-          &pa_mqa_logits_mxfp4_build_sched,      \
-          py::arg("local_starts"),               \
-          py::arg("local_ends"),                 \
-          py::arg("row_to_batch"),               \
-          py::arg("cta_info"),                   \
-          py::arg("num_rows"),                   \
-          py::arg("num_ctas"),                   \
-          py::arg("block_k"),                    \
-          py::arg("cta_target"));                \
-    m.def("pa_mqa_logits_mxfp4_fwd_sched",       \
-          &pa_mqa_logits_mxfp4_fwd_sched,        \
-          py::arg("q"),                          \
-          py::arg("q_scale"),                    \
-          py::arg("kv_cache"),                   \
-          py::arg("kv_scale"),                   \
-          py::arg("block_tables"),               \
-          py::arg("weights"),                    \
-          py::arg("cta_info"),                   \
-          py::arg("out"),                        \
-          py::arg("num_ctas"),                   \
-          py::arg("weight_scale"),               \
-          py::arg("block_k"),                    \
-          py::arg("kv_block_size"),              \
-          py::arg("max_seq_len"));               \
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \

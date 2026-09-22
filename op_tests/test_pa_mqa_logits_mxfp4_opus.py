@@ -8,11 +8,14 @@ prefill regimes (fresh, and chunked at PR #5332's shapes so the two PRs are comp
 an MTP decode sweep -- as markdown for a reader and as one-line JSON records for a benchmark
 driver.
 
-Every launch goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``, the arch dispatcher, rather
-than an arch arm directly -- so the path under test is the path a caller gets, layout check
-included, and ONE file covers every target the op is built for. ``SUPPORTED_GFX`` below is that
-list; it is gfx1250 alone today and gains gfx950 when #5332 folds its implementation into the
-same dispatcher.
+Every launch goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``, the ONE module both arches
+build into, so the path under test is the path a caller gets, layout check included. This file
+runs on BOTH targets: it builds the NATURAL (3-D) scale/cache layouts on gfx1250 and the
+MFMA-permuted (4-D) ones on gfx950 (``_is_permuted`` / ``_scale_to_opus`` below), while the
+dequantized reference reads the natural E8M0 either way. The kernel INSTANCES differ per arch --
+gfx1250 packs up to four query rows per tile, gfx950 runs one and names its instances by KV tile
+width -- and ``_variants()`` returns the right set. The two tile-cut probes
+(``assert_qshare_windows``, ``check_row_id_bound``) are gfx1250-only and gate on ``q_per_block``.
 
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py             # the full default sweep
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py -b 1 2      # a quick subset
@@ -72,9 +75,10 @@ from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
 dev = "cuda"
 
-# Every target the dispatcher is built for. gfx950 joins when #5332 folds its implementation in;
-# the arms below need no change for that, since nothing here names an arch.
-SUPPORTED_GFX = ["gfx1250"]
+# BOTH targets of the one module. build_inputs picks the layout per arch (`_is_permuted`); the
+# dispatcher checks it. The perf/correctness code never names an arch -- only the layout builder
+# and the two gfx1250-only tile-cut probes do, and those gate on `q_per_block`.
+SUPPORTED_GFX = ["gfx1250", "gfx950"]
 
 HEADS = 64
 HEAD_DIM = 128
@@ -82,6 +86,14 @@ KV_BLOCK_SIZE = 64  # page size
 SCALE_BLOCK = 32  # E8M0 block
 WEIGHT_SCALE = 1.5
 BLOCKS_ROW = HEAD_DIM // SCALE_BLOCK  # 4 natural E8M0 blocks per row
+
+# gfx950 MFMA-permuted scale geometry, used only when `_is_permuted()`. A lane's 4 E8M0 bytes
+# land in one aligned dword indexed [.., g(K_CHUNKS), m(MFMA_N), byte]; the shuffle is a pure
+# permutation of the natural array, so the reference (which reads the natural E8M0) is unmoved.
+MFMA_N = 32
+K_TILES = HEAD_DIM // 64      # 2  (MFMA_K = 64)
+K_CHUNKS = 64 // SCALE_BLOCK  # 2  (32-K chunks per k-tile)
+SCALE_BYTES = 4              # K_TILES * n_tiles per lane dword
 
 CSA_RATIO = 4  # ATOM's compression ratio: row n sees floor((pos + 1) / 4)
 
@@ -181,15 +193,38 @@ def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
     return (vals * scale.unsqueeze(-1)).reshape(*prefix, d)
 
 
-# ── input builders: every buffer NATURAL ──────────────────────────────────────
+# ── per-arch scale/cache layout ───────────────────────────────────────────────
+@functools.cache
+def _is_permuted() -> bool:
+    """True on gfx950 (MFMA-permuted 4-D scales + 4-chunk kv_cache), False on gfx1250 (natural
+    3-D). Lazy for the same reason as ``_variants``: the arch probe inits HIP at import, which
+    ``main()``'s gate is meant to run before."""
+    return get_gfx() == "gfx950"
+
+
+def _scale_to_opus(e8_nat, rows_per_group):
+    """``[rows, 4]`` natural E8M0 -> ``[rows/rpg, K_CHUNKS, MFMA_N, SCALE_BYTES]``, gfx950's
+    layout. ``rows_per_group`` is ``MFMA_N * n_tiles``: 64 heads per query row for q_scale, 64
+    page tokens per block for kv_scale. A pure permutation -- no byte dropped or duplicated."""
+    n_tiles = rows_per_group // MFMA_N
+    groups = e8_nat.shape[0] // rows_per_group
+    return (
+        e8_nat.reshape(groups, n_tiles, MFMA_N, K_TILES, K_CHUNKS)
+        .permute(0, 4, 2, 3, 1)  # [group, g, m, kt, tile]
+        .reshape(groups, K_CHUNKS, MFMA_N, SCALE_BYTES)
+        .contiguous()
+    )
+
+
+# ── input builders: NATURAL on gfx1250, MFMA-permuted on gfx950 ────────────────
 @dataclass
 class Inputs:
     q_packed: torch.Tensor  # [T, H, D/2]            natural
-    q_scale: torch.Tensor  # [T, H, 4]               natural
+    q_scale: torch.Tensor  # [T, H, 4] nat / [T, 2, 32, 4] permuted
     q_dq: torch.Tensor  # [T, H, D]  dequantized, for the reference
     weights: torch.Tensor  # [T, H] bf16             natural
-    kv_cache: torch.Tensor  # [num_blocks, PAGE, D/2] natural
-    kv_scale: torch.Tensor  # [num_blocks, PAGE, 4]   natural
+    kv_cache: torch.Tensor  # [nb, PAGE, D/2] nat / [nb, 4, PAGE, 16] permuted
+    kv_scale: torch.Tensor  # [nb, PAGE, 4] nat / [nb, 2, 32, 4] permuted
     kv_dq: torch.Tensor  # [bs, t_max, D] dequantized
     block_tables: torch.Tensor
     max_seq_len: int
@@ -221,12 +256,24 @@ def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
     t_max = mbps * KV_BLOCK_SIZE
     num_blocks = bs * mbps
 
-    # --- KV. The two "layouts" are reshapes: natural is what the kernel reads. ---
+    permuted = _is_permuted()
+
+    # --- KV. The reference always reads the NATURAL (kv_packed, kv_e8); the kernel reads the
+    # arch's own scale/cache layout, both pure reshapes/permutations of the same bytes. ---
     kv_packed = fill_nibbles(bs * t_max, data_init, gen)
     kv_e8 = fill_exponents((bs * t_max, BLOCKS_ROW), scale_init, gen)
     kv_dq = fp4_dequant(kv_packed, kv_e8).reshape(bs, t_max, HEAD_DIM)
-    kv_cache = kv_packed.reshape(num_blocks, KV_BLOCK_SIZE, HEAD_DIM // 2).contiguous()
-    kv_scale = kv_e8.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW).contiguous()
+    if permuted:
+        # gfx950: kv_cache[blk, b, o, :] holds K[token o][32b:32b+32]'s 16 packed bytes.
+        kv_cache = (
+            kv_packed.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW, HEAD_DIM // 2 // BLOCKS_ROW)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        kv_scale = _scale_to_opus(kv_e8, KV_BLOCK_SIZE)
+    else:
+        kv_cache = kv_packed.reshape(num_blocks, KV_BLOCK_SIZE, HEAD_DIM // 2).contiguous()
+        kv_scale = kv_e8.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW).contiguous()
     block_tables = torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(
         bs, mbps
     )
@@ -236,7 +283,11 @@ def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
     q_e8 = fill_exponents((total_tokens * HEADS, BLOCKS_ROW), scale_init, gen)
     q_dq = fp4_dequant(q_packed_flat, q_e8).reshape(total_tokens, HEADS, HEAD_DIM)
     q_packed = q_packed_flat.reshape(total_tokens, HEADS, HEAD_DIM // 2).contiguous()
-    q_scale = q_e8.reshape(total_tokens, HEADS, BLOCKS_ROW).contiguous()
+    q_scale = (
+        _scale_to_opus(q_e8, HEADS)
+        if permuted
+        else q_e8.reshape(total_tokens, HEADS, BLOCKS_ROW).contiguous()
+    )
     weights = fill(
         (total_tokens, HEADS), data_init, gen, dtype=torch.bfloat16, device=dev
     )
@@ -358,6 +409,15 @@ def _qpb_max():
     return max((v.q_per_block for v in _variants()), default=4)
 
 
+def _resolve_variant(name):
+    """The perf decode sweep names gfx1250 instances. On an arch that did not compile that name
+    -- gfx950, whose instances are ``mfma_kv64`` / ``mfma_kv256`` -- fall back to its default
+    (``None``), so one shape list drives both targets without naming an arch."""
+    if name is None:
+        return None
+    return name if name in {v.name for v in _variants()} else None
+
+
 def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends, q_per_block):
     """Check the one condition the schedule takes on faith: within a tile the window rule is
     NON-DECREASING, so the union is the first row's start and the LAST row's end -- two loads
@@ -411,10 +471,11 @@ def run_one(inp, qlens, rb, ls, le, label, seed, variant, check_windows=True):
     plan = pa_mqa_logits_mxfp4_plan(
         cu, le, buffers=buffers, total_q=total_q, local_starts=ls, row_to_batch=rb
     )
-    if check_windows:
+    if check_windows and plan.variant.q_per_block > 1:
         # The condition the kernel cannot check. Host-side and synchronising, so it runs in the
         # correctness path only -- and it is worth running, because breaking it DEADLOCKS the
-        # CTA rather than returning a wrong answer.
+        # CTA rather than returning a wrong answer. Only a tile WIDER than one row can violate it,
+        # so it is moot at q_per_block == 1 (gfx950, and gfx1250's one-row instance).
         assert_qshare_windows(
             plan.cu_tiles, plan.num_tiles, ls, le, plan.variant.q_per_block
         )
@@ -610,11 +671,19 @@ def run_corner(data_init, scale_init, seed):
             "no compiled kernel instances to run the corner suite on; an empty sweep reports "
             "`pass` having tested nothing"
         )
+    # `check_row_id_bound` walks the gfx1250 cu_seq_q -> cu_tiles -> row_id overrun path and its
+    # tile straddle -- a gfx1250-only guarantee. gfx950 cuts one row per tile and its callers
+    # build cu_seq_q from the same qlens as q, so that path is never taken; skip it there.
+    row_id = (
+        []
+        if _is_permuted()
+        else [check_row_id_bound(data_init, scale_init, seed + 70, v) for v in variants]
+    )
     return [
         check_prefill(w, seed + case_seed, label, data_init, scale_init, v)
         for v in variants
         for w, case_seed, label in cases
-    ] + [check_row_id_bound(data_init, scale_init, seed + 70, v) for v in variants]
+    ] + row_id
 
 
 SPREAD_PROBE_ROWS = 4096
@@ -655,6 +724,108 @@ def correctness_blindness(data_init, scale_init):
             "b_scale_sel would read an exponent that happens to be right"
         )
     return None
+
+
+# ── NaN E8M0 scale propagation ────────────────────────────────────────────────
+def poison_kv_rows(kv_scale, block_tables, row_in_seq):
+    """A copy of ``kv_scale`` with KV row ``row_in_seq`` of EVERY batch set to 0xFF (E8M0 NaN).
+
+    Every batch, because the block tables differ per batch and poisoning only batch 0's would
+    leave the others as an untested control. Poisoned by MARKING in the NATURAL layout and pushing
+    the mark through the arch's own permutation (``_scale_to_opus`` on gfx950, identity on
+    gfx1250), rather than by computing where those bytes land -- the permutation is the thing
+    under test's own ABI, so rederiving it here would let the test and the kernel agree on a wrong
+    offset.
+    """
+    nb = block_tables.numel()  # one entry per (batch, page)
+    mark = torch.zeros(nb * KV_BLOCK_SIZE, BLOCKS_ROW, dtype=torch.uint8, device=dev)
+    blk = block_tables[:, row_in_seq // KV_BLOCK_SIZE].long()
+    mark[blk * KV_BLOCK_SIZE + row_in_seq % KV_BLOCK_SIZE] = 1
+    out = kv_scale.clone()
+    if _is_permuted():
+        out[_scale_to_opus(mark, KV_BLOCK_SIZE) != 0] = 0xFF
+    else:
+        out[mark.reshape(out.shape) != 0] = 0xFF
+    return out
+
+
+def check_nan_scale(entry, bs, next_n, ends, seed, variant, label, kv_row=0):
+    """A NaN E8M0 scale must reach the logits of every row that attends its KV row, and nowhere
+    else. E8M0 0xFF is NaN and an E2M1 nibble cannot encode one, so a NaN scale is the only way a
+    non-finite value enters this kernel -- and the relu decides whether it comes out again. The
+    kernel promises the IEEE ``maximum`` that PROPAGATES it (not a NaN-swallowing select), and
+    only under ``-fno-finite-math-only``. Asserted as an exact SET, so NaN smeared too far fails.
+    """
+    total_q = bs * next_n
+    assert len(ends) == total_q
+    inp = build_inputs(bs, max(max(ends), 1), total_q, seed, "norm", "auto")
+
+    def t(v):
+        return torch.tensor(v, dtype=torch.int32, device=dev)
+
+    rb = t([b for b in range(bs) for _ in range(next_n)])
+    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
+    le = t(list(ends))
+    cu = t([0] + list(itertools.accumulate([next_n] * bs)))
+    kvs = poison_kv_rows(inp.kv_scale, inp.block_tables, kv_row)
+
+    # `entry` is which TABLE this is: prefill hands the builder the window starts, decode leaves
+    # them None. Both are zero here so the schedules coincide -- what differs is the builder's
+    # `local_starts` branch, which reads the array instead of assuming 0.
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, bs, variant=variant)
+    plan = pa_mqa_logits_mxfp4_plan(
+        cu,
+        le,
+        buffers=buffers,
+        total_q=total_q,
+        local_starts=ls if entry == "prefill" else None,
+        row_to_batch=rb,
+    )
+    out = pa_mqa_logits_mxfp4(
+        inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
+        inp.weights, plan, inp.max_seq_len,
+        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    col = torch.arange(out.shape[1], device=dev).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    want = inside & (col == kv_row)
+    got = inside & ~torch.isfinite(out)
+    exact = bool(torch.equal(want, got))
+    oob = oob_is_neginf(out, ls, le)
+    return {
+        "case": label, "entry": entry, "variant": plan.variant.name, "rows": total_q,
+        "max_win": int(le.max()), "expect nan": int(want.sum()), "got nan": int(got.sum()),
+        "exact set": exact, "oob -inf": oob, "pass": exact and oob,
+    }  # fmt: skip
+
+
+def run_nan_scale(seed):
+    """:func:`check_nan_scale` over both entry points and every compiled instance.
+
+    Separate from :func:`run_corner` because its pass condition is the opposite one: these cases
+    REQUIRE non-finite in-window cells, so ``window_is_written`` -- which every corner case asserts
+    -- is deliberately false here.
+    """
+    oks = []
+    for v in _variants():
+        # Ragged windows, all containing KV row 0.
+        oks.append(check_nan_scale("prefill", 2, 3, [50, 120, 200, 40, 100, 180],
+                                   seed + 80, v, "prefill, nan at kv row 0"))  # fmt: skip
+        # A window that EXCLUDES the poisoned row -- the control that says the NaN is not smeared.
+        oks.append(check_nan_scale("prefill", 1, 4, [0, 1, 2, 3],
+                                   seed + 81, v, "prefill, nan at kv row 2", kv_row=2))  # fmt: skip
+        # Decode, where a window spans several KV splits and only one holds the row.
+        oks.append(check_nan_scale("decode", 2, 4,
+                                   [200, 201, 202, 203, v.block_k * 2 + 1] + [130] * 3,
+                                   seed + 82, v, "decode, nan at kv row 0"))  # fmt: skip
+    df = pd.DataFrame(oks)
+    aiter.logger.info(
+        "MXFP4 MQA logits NaN E8M0 scale propagation, %d/%d pass (markdown):\n%s",
+        int(df["pass"].sum()), len(df), df.to_markdown(index=False),
+    )  # fmt: skip
+    return bool(df["pass"].all())
 
 
 # ── perf ──────────────────────────────────────────────────────────────────────
@@ -869,6 +1040,7 @@ def test_decode(mtp, seqs, n_long, variant, data_init, scale_init, seed):
     ``variant`` is the kernel instance, or ``None`` for the op's own default. It is a per-shape
     CHOICE made by the driver and never inferred here -- see ``decode_shapes``.
     """
+    variant = _resolve_variant(variant)  # gfx1250 names; the arch default elsewhere
     n_short = seqs - n_long
     ctxs = [DECODE_WIN_LONG] * n_long + [DECODE_WIN_SHORT] * n_short
     qlens = [mtp] * seqs
@@ -1025,6 +1197,11 @@ def main():
         summarize("pa_mqa_logits_mxfp4 corner (not judged)", not_judged)
     if corner:
         summarize("pa_mqa_logits_mxfp4 corner", corner)
+
+    # NaN E8M0 propagation: its own pass condition (REQUIRES non-finite in-window cells), and its
+    # own random data -- independent of the init-pair sweep above.
+    if not args.no_verify:
+        ok = run_nan_scale(args.seed) and ok
 
     summarize(
         "pa_mqa_logits_mxfp4 prefill causal",
