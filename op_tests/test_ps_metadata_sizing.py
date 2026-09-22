@@ -78,22 +78,11 @@ def test_unset_total_qlen_keeps_the_legacy_sizes(
 ):
     max_qlen = 8 * qlen_granularity + 3
     info = _info(batch_size, num_head_k, max_qlen, qlen_granularity)
-    assert info[:6] == _legacy_info(batch_size, num_head_k, max_qlen, qlen_granularity)
+    assert info == _legacy_info(batch_size, num_head_k, max_qlen, qlen_granularity)
     assert (
         _info(batch_size, num_head_k, max_qlen, qlen_granularity, total_qlen=None)
         == info
     )
-
-
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("qlen_granularity", QLEN_GRANULARITIES)
-def test_partial_rows_match_the_partial_map_layout(batch_size, qlen_granularity):
-    max_qlen = 5 * qlen_granularity
-    for total_qlen in (None, batch_size * max_qlen // 3 + 1):
-        *_, (num_partials, _), partial_rows = _info(
-            batch_size, 1, max_qlen, qlen_granularity, total_qlen=total_qlen
-        )
-        assert partial_rows == num_partials * qlen_granularity
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -111,7 +100,6 @@ def test_budget_never_grows_the_buffers(batch_size, qlen_granularity, divisor):
     )
     for got, ref in zip(bounded[2:6], unbounded[2:6]):
         assert got[0] <= ref[0]
-    assert bounded[6] <= unbounded[6]
     # a single request is still allowed to be max_qlen long under any budget
     assert bounded[4][0] >= math.ceil(max_qlen / qlen_granularity)
 
@@ -133,7 +121,6 @@ def _generate(qlens, qlen_granularity, is_causal, need_lse):
         (reduce_indptr_size, reduce_indptr_type),
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
-        partial_rows,
     ) = _info(
         batch_size,
         1,
@@ -182,6 +169,7 @@ def _generate(qlens, qlen_granularity, is_causal, need_lse):
         need_lse=need_lse,
     )
 
+    partial_rows = reduce_partial_map_size * qlen_granularity
     used_partials = reduce_indptr.cpu()[-1].item()
     assert used_partials <= reduce_partial_map_size
     assert work_indptr.cpu()[-1].item() <= work_info_size[0]

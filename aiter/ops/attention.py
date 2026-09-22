@@ -1023,11 +1023,10 @@ def get_ps_metadata_info_v1(
         3. Shape of work_info followed by its scalar type.
         4. Shape of reduce_indptr followed by its scalar type.
         5. Shape of reduce_final_map followed by its scalar type.
-        6. Shape of reduce_partial_map followed by its scalar type.
-        7. Number of rows of the partial logits/attn_lse pool that
-           reduce_partial_map indexes into, i.e. the leading dimension of the
-           (rows, num_head_q, v_head_dim) partial output and the (rows,
-           num_head_q) partial lse that get_ps_metadata_v1 addresses.
+        6. Shape of reduce_partial_map followed by its scalar type. Its entries
+           index a partial pool of reduce_partial_map_size * qlen_granularity
+           rows, so allocate the partial logits as (rows, num_head_q,
+           v_head_dim) and the partial lse as (rows, num_head_q).
     """
 
     device = torch.cuda.current_device()
@@ -1060,7 +1059,6 @@ def get_ps_metadata_info_v1(
         (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
         ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
         (max_partials, torch.int32),  # reduce_partial_map
-        max_partials * qlen_granularity,  # partial logits/attn_lse rows
     )
 
 
