@@ -22,11 +22,15 @@ def resolve_route_input_row(packed, tokens, topk):
     )
 
 
+def _input_row_resolver_for(config):
+    if config.sorted_input:
+        return None
+    topk = config.shape.topk
+    return lambda packed, tokens: resolve_route_input_row(packed, tokens, topk)
+
+
 def compile_megakernel_producer(config: MegakernelConfig, composition):
     shape = config.shape
-
-    def input_row_resolver(packed, tokens):
-        return resolve_route_input_row(packed, tokens, shape.topk)
 
     return compile_gemm2_a4w4_port(
         BM=config.tile_m,
@@ -52,7 +56,7 @@ def compile_megakernel_producer(config: MegakernelConfig, composition):
         _reduce_store_cache_modifier=(
             _ROUTE_STORE_CACHE_MODIFIER if config.producer_mode == "routes" else None
         ),
-        _input_row_resolver=input_row_resolver,
+        _input_row_resolver=_input_row_resolver_for(config),
     )
 
 
@@ -60,9 +64,6 @@ def compile_window_producer(config: WindowConfig, window: int, composition):
     shape = config.shape
     n_start = window * config.window
     n_end = n_start + config.window
-
-    def input_row_resolver(packed, tokens):
-        return resolve_route_input_row(packed, tokens, shape.topk)
 
     return compile_gemm2_a4w4_port(
         BM=config.tile_m,
@@ -84,6 +85,6 @@ def compile_window_producer(config: WindowConfig, window: int, composition):
         out_dtype="fp8",
         enable_bias=False,
         _composition=composition,
-        _input_row_resolver=input_row_resolver,
+        _input_row_resolver=_input_row_resolver_for(config),
         _output_n_range=(n_start, n_end),
     )

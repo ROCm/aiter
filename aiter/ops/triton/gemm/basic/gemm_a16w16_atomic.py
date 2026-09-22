@@ -55,7 +55,7 @@ def gemm_a16w16_atomic_(
         y (torch.Tensor): Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
+        "GEMM_A16W16_ATOMIC: x.shape=%s, w.shape=%s ", tuple(x.shape), tuple(w.shape)
     )
 
     w = w.T

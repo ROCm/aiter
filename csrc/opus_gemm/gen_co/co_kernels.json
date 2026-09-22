@@ -7870,6 +7870,80 @@
         1,
         4
       ]
+    },
+    {
+      "kid": 21316,
+      "tag": "a16w16_4wave_wlr_co",
+      "block_size": 128,
+      "tile": [
+        256,
+        256,
+        64
+      ],
+      "num_slots": 4,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        4,
+        1
+      ]
+    },
+    {
+      "kid": 21317,
+      "tag": "a16w16_4wave_wlr_co",
+      "block_size": 128,
+      "tile": [
+        256,
+        256,
+        64
+      ],
+      "num_slots": 4,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
     }
   ]
 }

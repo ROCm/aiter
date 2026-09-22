@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 PREPROCESS_AUTOTUNE_KEYS = [
     "max_seqlen_q",
@@ -760,10 +761,28 @@ def get_bwd_configs(mode: AutotuneMode):
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
-    preprocess_autotune_configs,
-    causal_autotune_configs,
-    noncausal_autotune_configs,
+    _bwd_preprocess_cfgs,
+    _bwd_causal_cfgs,
+    _bwd_noncausal_cfgs,
 ) = get_bwd_configs(AUTOTUNE)
+preprocess_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_preprocess_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+causal_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_causal_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+noncausal_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_noncausal_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
 
 
 @triton.jit

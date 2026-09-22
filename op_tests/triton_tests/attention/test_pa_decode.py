@@ -7,10 +7,8 @@ import pytest
 import torch
 import triton.language as tl
 
-from aiter import pertoken_quant
+from aiter import logger, pertoken_quant
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
-
-DEBUG_MODE = False
 
 
 def paged_attention_decode_ref(
@@ -348,26 +346,38 @@ def test_paged_attn_per_token_quant(
         alibi_slopes=None,
     )
 
-    if DEBUG_MODE:
-        print(
-            f"B={B} H_Q={H_Q}, H_KV={H_KV} D={D}, KV_BLK_SZ={KV_BLK_SZ}, SEQ_LEN={SEQ_LEN}, NUM_BLK={NUM_BLK}"
-        )
-        print(f"query={query}")
-        print(
-            f"key_cache_tri.shape={key_cache_tri.shape} key_cache_tri={key_cache_tri}"
-        )
-        print(f"k_scale.shape={k_scale.shape} k_scale={k_scale}")
-        print(
-            f"key_cache_tri_quant.shape={key_cache_tri_quant.shape} key_cache_tri_quant={key_cache_tri_quant}"
-        )
-        print(f"v_scale.shape={v_scale.shape} v_scale={v_scale}")
-        print(
-            f"value_cache_tri.shape={value_cache_tri.shape} value_cache_tri={value_cache_tri}"
-        )
-        print(
-            f"value_cache_tri_quant.shape={value_cache_tri_quant.shape} value_cache_tri_quant={value_cache_tri_quant}"
-        )
-        print(f"triton_output={triton_output}")
+    logger.debug(
+        "B=%d H_Q=%d, H_KV=%d D=%d, KV_BLK_SZ=%d, SEQ_LEN=%d, NUM_BLK=%d",
+        B,
+        H_Q,
+        H_KV,
+        D,
+        KV_BLK_SZ,
+        SEQ_LEN,
+        NUM_BLK,
+    )
+    logger.debug("query=%s", query)
+    logger.debug(
+        "key_cache_tri.shape=%s key_cache_tri=%s", key_cache_tri.shape, key_cache_tri
+    )
+    logger.debug("k_scale.shape=%s k_scale=%s", k_scale.shape, k_scale)
+    logger.debug(
+        "key_cache_tri_quant.shape=%s key_cache_tri_quant=%s",
+        key_cache_tri_quant.shape,
+        key_cache_tri_quant,
+    )
+    logger.debug("v_scale.shape=%s v_scale=%s", v_scale.shape, v_scale)
+    logger.debug(
+        "value_cache_tri.shape=%s value_cache_tri=%s",
+        value_cache_tri.shape,
+        value_cache_tri,
+    )
+    logger.debug(
+        "value_cache_tri_quant.shape=%s value_cache_tri_quant=%s",
+        value_cache_tri_quant.shape,
+        value_cache_tri_quant,
+    )
+    logger.debug("triton_output=%s", triton_output)
     # torch doesn't have support for fp8 data type, so we convert here
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = query.to(tl_to_torch_dtype[compute_type])
@@ -379,7 +389,6 @@ def test_paged_attn_per_token_quant(
     paged_attention_decode_ref(
         torch_output, query, key_cache, value_cache, block_tables, context_lens
     )
-    if DEBUG_MODE:
-        print(f"torch_output={torch_output}")
+    logger.debug("torch_output=%s", torch_output)
 
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)

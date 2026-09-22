@@ -2,12 +2,15 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
+#include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
+
+AITER_CTYPES_ERROR_DEF
 
 // Debug instrumentation (host prints + post-launch sync/error checks + raw
 // buffer dumps) for the gfx1250 gfx1250 MLA dispatch is compiled ONLY when
@@ -645,9 +648,10 @@ static void mla_decode_gfx1250_dispatch(
 #endif
 }
 
-AITER_C_ITFS
-void mla_decode_stage1_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_stage1_asm_fwd,
+    (aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
     aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
     aiter_tensor_t* qo_indptr,            //   [batch_size+1]
     aiter_tensor_t* kv_indptr,            //   [batch_size+1]
@@ -674,7 +678,8 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
     int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, stream))
 {    
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
@@ -977,7 +982,12 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
+        && gqa_ratio == 96){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 96;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
@@ -1091,9 +1101,10 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
-AITER_C_ITFS
-void mla_prefill_ps_asm_fwd(
-    aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_ps_asm_fwd,
+    (aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
     aiter_tensor_t* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
     aiter_tensor_t* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
     aiter_tensor_t* qo_indptr,            //   [batch_size+1], int
@@ -1110,7 +1121,8 @@ void mla_prefill_ps_asm_fwd(
     aiter_tensor_t* q_scale,              //   fp32, scalar (nullable)
     aiter_tensor_t* k_scale,              //   fp32, scalar (nullable)
     aiter_tensor_t* v_scale,              //   fp32, scalar (nullable)
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, K, V, qo_indptr, kv_indptr, kv_page_indices, work_indptr, work_info_set, max_seqlen_q, softmax_scale, is_causal, splitData, splitLse, output, q_scale, k_scale, v_scale, stream))
 {
     int num_q_tokens  = Q->size(0);
     int num_head_q    = Q->size(1);
@@ -1208,9 +1220,10 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
-AITER_C_ITFS
-void mla_prefill_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_asm_fwd,
+    (aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
     aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
     aiter_tensor_t* qo_indptr,            //   [batch_size+1]
     aiter_tensor_t* kv_indptr,            //   [batch_size+1]
@@ -1220,7 +1233,8 @@ void mla_prefill_asm_fwd(
     float softmax_scale,
     aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
     aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, max_seqlen_q, softmax_scale, splitData, splitLse, stream))
 {
     int sub_Q           = 128;
     int batch           = kv_indptr->size(0) - 1;

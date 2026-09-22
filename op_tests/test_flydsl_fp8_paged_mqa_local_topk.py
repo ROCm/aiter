@@ -20,7 +20,7 @@ from aiter.ops.flydsl.split_topk_merge import (
     alloc_split_topk_merge_workspace,
     split_topk_merge,
 )
-from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.test_common import benchmark, checkAllclose, run_perftest

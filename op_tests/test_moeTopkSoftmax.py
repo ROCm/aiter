@@ -754,6 +754,87 @@ df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
 
+# Register-resident path: G=1 and E on the EPL whitelist. Token list is kept
+# small so CI time stays bounded. Odd stride (rowVec2=false) is one extra case.
+reg_tokens = [1, 128]
+df = []
+for token in reg_tokens:
+    for expert, topk, dtype in (
+        (128, 4, dtypes.bf16),
+        (128, 32, dtypes.fp32),
+        (2048, 32, dtypes.bf16),
+    ):
+        ret = test_biased_grouped_topk(
+            token,
+            expert,
+            1,
+            topk,
+            1,
+            True,
+            dtype,
+            num_iters=args.iters,
+            num_warmup=args.warmup,
+        )
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_biased_grouped_topk summary (markdown):\n%s", df_md
+)
+
+# Odd row stride: host launches rowVec2=false. token>1 is required — row 0 is
+# still 2-element aligned even when stride_gating is odd.
+odd_token, odd_expert, odd_topk = 128, 128, 8
+backing = torch.randn((odd_token, odd_expert + 1), dtype=dtypes.bf16)
+gating_odd = backing[:, :odd_expert]
+assert gating_odd.stride(0) % 2 == 1
+ret = test_biased_grouped_topk(
+    odd_token,
+    odd_expert,
+    1,
+    odd_topk,
+    1,
+    True,
+    dtypes.bf16,
+    gating_output=gating_odd,
+    num_iters=args.iters,
+    num_warmup=args.warmup,
+)
+df = pd.DataFrame([ret])
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_biased_grouped_topk_odd_stride summary (markdown):\n%s",
+    df_md,
+)
+
+df = []
+for token in reg_tokens:
+    ret = test_grouped_topk(
+        token,
+        128,
+        1,
+        8,
+        1,
+        True,
+        dtypes.bf16,
+        scoring_func="softmax",
+    )
+    df.append(ret)
+    ret = test_grouped_topk(
+        token,
+        256,
+        1,
+        8,
+        1,
+        True,
+        dtypes.bf16,
+        scoring_func="sigmoid",
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moeTopkSoftmax_reg_grouped_topk summary (markdown):\n%s", df_md)
+
 # Test shared expert sigmoid scoring
 aiter.logger.info("\n" + "=" * 70)
 aiter.logger.info("Testing topk_softmax with shared expert sigmoid scoring")

@@ -92,7 +92,6 @@ def _attn_fwd_inner(
     seqlen_q,
     dropout_p,
     sd_mask_ptrs,
-    dropout_mask_ptrs,
     philox_seed,
     philox_ptrs,
     block_min,
@@ -225,14 +224,19 @@ def _attn_fwd_inner(
                 philox_seed, philox_ptrs
             )  # TODO: use tl.randint for better performance
             dropout_mask = rng_output > dropout_p
-            tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
 
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
+            # Keep both uses of the dropout predicate close together. This works
+            # around an SGPR split/spill bug that corrupts a loop-carried buffer
+            # descriptor on gfx950.
+            p_kept = tl.where(dropout_mask, p, 0.0)
+
+            if RETURN_SCORES:
+                # return scores with negative values for dropped vals
+                sd_mask = tl.where(dropout_mask, p, -p)
+                tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
 
             # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
+            p = p_kept
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             tl.store(sd_mask_ptrs, p, mask=p_mask)
@@ -268,7 +272,6 @@ def _attn_fwd_inner(
             sd_mask_ptrs += BLOCK_N * stride_sn
 
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += BLOCK_N * stride_sn
             philox_ptrs += BLOCK_N * stride_sn
 
     return acc, l_i, m_i
@@ -306,7 +309,6 @@ def _attn_fwd(
     out_ptr: torch.Tensor,
     alibi_slopes_ptr: torch.Tensor,
     s_dmask_ptr: torch.Tensor,
-    dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
     sink_ptr: torch.Tensor,
     stride_qz_in,
@@ -662,14 +664,7 @@ def _attn_fwd(
         s_dmask_ptrs = None
 
     # dropout
-    if dropout_mask_ptr is not None:
-        dropout_mask_offs = (
-            off_z * stride_sd_z
-            + off_q_head * stride_sd_h
-            + offs_m[:, None] * stride_sd_m
-            + offs_n[None, :] * stride_sd_n
-        )
-        dropout_mask_ptrs = dropout_mask_ptr + dropout_mask_offs
+    if ENABLE_DROPOUT:
         philox_ptrs = (
             philox_offset_base
             + off_z * stride_sd_z
@@ -678,7 +673,6 @@ def _attn_fwd(
             + offs_n[None, :] * stride_sd_n
         )
     else:
-        dropout_mask_ptrs = None
         philox_ptrs = None
 
     if ENABLE_SINK:
@@ -752,7 +746,6 @@ def _attn_fwd(
         if RETURN_SCORES:
             s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
             philox_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
@@ -775,7 +768,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             s_dmask_ptrs,
-            dropout_mask_ptrs,
             philox_seed,
             philox_ptrs,
             block_min,
@@ -822,7 +814,7 @@ def _attn_fwd(
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
+            philox_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -840,7 +832,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             s_dmask_ptrs,
-            dropout_mask_ptrs,
             philox_seed,
             philox_ptrs,
             block_min,
@@ -955,7 +946,7 @@ def _get_config(
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
-    # TODO: pe + dropout is not tuned
+    # TODO: pe + dropout is not tuned on every arch.
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
         return fwd_cfg["pe_dropout_or_fp32"]
     elif has_pe and "pe" in fwd_cfg:

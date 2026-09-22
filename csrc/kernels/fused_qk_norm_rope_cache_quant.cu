@@ -99,6 +99,15 @@ using mrope_utils::vec_t;
 // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
 static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
 
+// Per-wave LDS scratch the coarse Q path uses to gather a head's e8m0 scale run
+// into the one lane that carries it, so the inline scale rides in the same store
+// as the fp8 payload instead of a second, partial write to the same 128B sector
+// of the row. 32B per wave covers every supported group size: the run is one
+// duplicated pair per nope group, 14 bytes at Q_GROUP_SIZE=64 and 28 at 32, and
+// the slot is rewritten every head. Reserved by the launcher and addressed in the
+// kernel, so the two must agree -- it sits immediately after the Q-head TDM ring.
+static constexpr size_t kQScaleGatherBytes = 32;
+
 // HW-native fp8 e4m3 element dtype, selected by the compile target (same idiom as
 // quant_kernels.cu): gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn
 // (max_pos=448). Used as the MX dtype tag for the e8m0 block-scale helpers. Keyed on the
@@ -4759,9 +4768,12 @@ namespace aiter {
           for (int i = 0; i < vec_size_i; i++) {
             float my_val   = k_normed[i];
             float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-            float rot = is_x_half
-                            ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
-                            : (my_val * pe_cos[i] + pair_val * pe_sin[i]);
+            // Explicit fma for the same reason as the GPT-J branch below: under
+            // SWA this is stored twice, and a rematerialised copy that contracts
+            // the other product differs by one f32 ulp.
+            const float pv = pair_val * pe_sin[i];
+            float rot = is_x_half ? __builtin_fmaf(my_val, pe_cos[i], -pv)
+                                  : __builtin_fmaf(my_val, pe_cos[i], pv);
             const rope_t rot_s = static_cast<rope_t>(rot);
             k_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
             if constexpr (HAS_SWA) {
@@ -4777,8 +4789,22 @@ namespace aiter {
             float fky = k_normed[i + 1];
             float f32_cos = pe_cos[i >> 1];
             float f32_sin = pe_sin[i >> 1];
-            const rope_t r0 = static_cast<rope_t>(fkx * f32_cos - fky * f32_sin);
-            const rope_t r1 = static_cast<rope_t>(fky * f32_cos + fkx * f32_sin);
+            // Under SWA these two values are each stored to two destinations, and
+            // the pool and the main output were observed to disagree by one bf16
+            // code on exactly one element of 131072 at T=1024 H=16 and H=32. The
+            // f32 result there is -0.4736328125, which is the exact tie between
+            // bf16 0xbef2 and 0xbef3, so anything that perturbs it by one f32 ulp
+            // before the convert flips one destination and not the other.
+            //
+            // Spelling the fma explicitly was NOT enough on its own -- the values
+            // did not move -- so the empty asm is what actually pins it: it makes
+            // each result a value the compiler has to materialise once and forbids
+            // recomputing it for the second store. Costs no instruction.
+            float rot0 = __builtin_fmaf(fkx, f32_cos, -(fky * f32_sin));
+            float rot1 = __builtin_fmaf(fky, f32_cos, fkx * f32_sin);
+            asm("" : "+v"(rot0), "+v"(rot1));
+            const rope_t r0 = static_cast<rope_t>(rot0);
+            const rope_t r1 = static_cast<rope_t>(rot1);
             k_out_rope[pe_local_tid * vec_size_i + i]     = r0;
             k_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
             if constexpr (HAS_SWA) {
@@ -4796,7 +4822,8 @@ namespace aiter {
               bool is_neox,
               // --- compile-time layout/quant options ---
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0>
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0,
+              bool MERGE_Q_SCALE = false>
     __device__ void fuse_qk_norm_rope_group_quant_cache_kernel_impl(
         const scalar_t* __restrict__ q,       // [num_tokens, num_heads, head_dim]
         const scalar_t* __restrict__ kv,      // [num_tokens, (k_num_heads,) head_dim]
@@ -4972,6 +4999,43 @@ namespace aiter {
       static_assert(Q_REDUCE >= 1 && Q_REDUCE <= 64 && (Q_REDUCE & (Q_REDUCE - 1)) == 0,
                     "Q_REDUCE (Q_GROUP_SIZE/vec_size_i) must be a power of 2 in [1,64]");
 
+      // ---- Inline e8m0 run carried by the payload store (see the store below) ----
+      // Distinct group ids among the nope lanes -- NOT head_size/Q_GROUP_SIZE: the
+      // run only covers [0, nope_dim), and nope_dim need not be a multiple of the
+      // group size (448 against 128 is not), so the last group is partial and still
+      // owns one pair.
+      constexpr int32_t kNopeGroups =
+          (static_cast<int32_t>(nope_vec) + Q_REDUCE - 1) / Q_REDUCE;
+      constexpr int32_t kScaleRunBytes = 2 * kNopeGroups;
+      // Slots of the payload store the run spans, hence the carrier lanes:
+      // nope_vec .. nope_vec + kScaleCarrierSlots - 1, the first PE lanes.
+      constexpr int32_t kScaleCarrierSlots =
+          (kScaleRunBytes + vec_size_o - 1) / vec_size_o;
+      // Only where the run starts exactly on a store slot, the carrier lanes exist,
+      // and the LDS scratch the launcher reserved is big enough. That scratch lives
+      // in the coarse kernel's dynamic LDS, which only the TDM build allocates, so
+      // this is off wherever the ring is off.
+      constexpr bool kMergeQScaleStoreOk =
+#if defined(__gfx1250__)
+          Q_TDM_DEPTH > 0 && (nope_dim % vec_size_o) == 0
+          && (static_cast<int32_t>(nope_vec) + kScaleCarrierSlots) <= WARP_SIZE
+          && static_cast<size_t>(kScaleCarrierSlots) * vec_size_o <= kQScaleGatherBytes;
+#else
+          false;
+#endif
+      // ...and only on the tier the trade actually pays on, which is why
+      // MERGE_Q_SCALE is a template parameter and not a runtime flag. Merging
+      // replaces a store with an LDS round trip per head: a win once the store
+      // path sets the time (-3.9% at T=16384 H=128, the xlarge tier) and a loss
+      // while per-head latency does (+6% at T=512, where one generation of waves
+      // covers the whole launch and the saved store was never the limit).
+      //
+      // Selecting between them at RUNTIME costs the small shapes ~6% even with the
+      // branch never taken, because both forms are then present in the one kernel
+      // and T=512 is short enough to pay for the code it does not run. Choosing
+      // host-side gives each tier an instantiation carrying only its own store.
+      constexpr bool merge_q_scale_store = kMergeQScaleStoreOk && MERGE_Q_SCALE;
+
       // q_weight is loaded once per Q head (same across all heads since the weight is shared).
       // We could hoist this out of the head loop, but the cost is negligible (1 load / 16B / thread).
       opus_vec_i vec_q_weight;
@@ -4980,16 +5044,9 @@ namespace aiter {
       }
 
       // ORDER MATTERS: the q descriptor and the TDM prologue are issued BEFORE
-      // the cos/sin gather, so their setup covers the gather's latency.
-      //
-      // ATT at T=512 H=128 found the single worst stall in the kernel here: the
-      // two `global_load_b128` of cos/sin were followed immediately by
-      // `s_wait_loadcnt 0x1` and then a `v_lshlrev_b32` consuming the result --
-      // 9898 cycles over 8 hits, 1237 cycles stalled per wave, 99.9% of that
-      // instruction's latency. cos/sin is indexed by positions[token], so it is a
-      // scattered read with poor cache hit rate, and nothing was scheduled between
-      // issue and use. Neither the descriptor build nor the TDM prologue depends on
-      // cos/sin, so moving them up gives the gather something to hide behind.
+      // the cos/sin gather, so their setup covers the gather's latency. cos/sin is
+      // indexed by positions[token], so it is a scattered read with a poor hit
+      // rate, and neither the descriptor build nor the TDM prologue depends on it.
       // Build the q buffer descriptor ONCE per wave (base = this token's q row); load each
       // head via a uniform per-head scalar offset (soffset) instead of rebuilding the SRD
       // (the make_gmem readfirstlane/saveexec pattern) for every head.
@@ -4999,18 +5056,18 @@ namespace aiter {
 
       // ---- Optional TDM prefetch ring over the Q-head loop (gfx1250) ----
       //
-      // The loop below is strictly serial: load head k -> wave_reduce (a full-wave
-      // barrier) -> norm/rope/quant/store -> load head k+1. Nothing overlaps, so
-      // MLP is 1, which is what ATT shows as s_wait_loadcnt = 57.9% of the wave at
-      // T=16384 (78 waves sampled) against FETCH_SIZE = 1.089x ideal -- traffic is
-      // already at the floor, the latency simply is not hidden.
+      // Without the ring the loop is strictly serial: load head k -> wave_reduce (a
+      // full-wave barrier) -> norm/rope/quant/store -> load head k+1. Nothing
+      // overlaps, so the traffic sits at the floor while the latency is not hidden.
       //
-      // The comment this replaces recorded that a vLLM-style 2-deep register
-      // prefetch measured neutral on MI355, because the extra live vec_q_next cost
-      // VGPR/occupancy. That objection does not apply to TDM: tensor_load_to_lds is
-      // a scalar instruction and its in-flight data sits in LDS, not VGPRs, so the
-      // register pressure is nearly unchanged.
+      // A vLLM-style 2-deep REGISTER prefetch measured neutral, because the extra
+      // live vec_q_next costs VGPR/occupancy. That objection does not apply to TDM:
+      // tensor_load_to_lds is a scalar instruction and its in-flight data sits in
+      // LDS, not VGPRs, so the register pressure is nearly unchanged.
       [[maybe_unused]] __UINTPTR_TYPE__ q_lds_addr = 0;
+      // Per-wave scratch for the e8m0 scale gather, immediately after the TDM
+      // ring. Sized and reserved by the launcher (kQScaleGatherBytes).
+      [[maybe_unused]] uint16_t* q_scale_lds = nullptr;
 #if defined(__gfx1250__)
       extern __shared__ char fqk_coarse_lds[];
       if constexpr (Q_TDM_DEPTH > 0) {
@@ -5018,6 +5075,13 @@ namespace aiter {
         q_lds_addr = reinterpret_cast<__UINTPTR_TYPE__>(fqk_coarse_lds)
                    + static_cast<__UINTPTR_TYPE__>(wave_in_blk * Q_TDM_DEPTH * head_size)
                      * sizeof(scalar_t);
+        if constexpr (MERGE_Q_SCALE) {
+          q_scale_lds = reinterpret_cast<uint16_t*>(
+              fqk_coarse_lds
+              + static_cast<size_t>(TOKENS_PER_BLOCK) * Q_TDM_DEPTH * head_size
+                * sizeof(scalar_t)
+              + static_cast<size_t>(wave_in_blk) * kQScaleGatherBytes);
+        }
       }
       using QTdmWin = opus::tdm<scalar_t, opus::seq<head_size, 1>>;
       // ONE window for the whole head loop, walked with move(), instead of a fresh
@@ -5030,8 +5094,8 @@ namespace aiter {
       //
       //  - extent[1] = the wave's head count, so the hardware clamps the tail: once
       //    origin[1] passes the last head, dim1_clamped saturates to 0 and the
-      //    refill still ISSUES -- which is all s_wait_tensorcnt<DEPTH-1> counts --
-      //    but fetches nothing. That replaces the old `h = min(head, q_head_end-1)`
+      //    refill still ISSUES -- which is all the tensorcnt wait counts -- but
+      //    fetches nothing. That replaces the old `h = min(head, q_head_end-1)`
       //    clamp and is strictly safer: the old form re-read the last head, this one
       //    touches no memory.
       //  - the row pitch is q_stride_1 rather than head_size. They are equal for a
@@ -5113,48 +5177,49 @@ namespace aiter {
       // modulo: LLVM cannot prove the dividend non-negative, so it emits the
       // sign-correction dance for what is a counter.
       int32_t q_slot = 0;
+      // Slot whose refill is still owed, deferred by one head (see the refill site
+      // below). -1 only on the first iteration, where nothing has been read yet.
+      [[maybe_unused]] int32_t q_refill_slot = -1;
       const bool is_nope_thr = (tid < nope_vec);  // nope-first
       const int32_t pe_store_off = (tid - pe_tid_start) * vec_size_i;
       const bool pe_is_x_half = ((tid - pe_tid_start) < (pe_dim / vec_size_i / 2));
 
       for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
         opus_vec_i vec_q;
+        // Ring slot this head reads. Carried out of the block below so the refill
+        // site, which runs after the reduce, can hand it to the next head.
+        [[maybe_unused]] int32_t q_read_slot = 0;
 #if defined(__gfx1250__)
         if constexpr (Q_TDM_DEPTH > 0) {
           const int32_t slot = q_slot;
-          // Wait only for THIS head's tile; the other Q_TDM_DEPTH-1 stay in flight
-          // across this head's reduce -> rope -> quant -> store chain.
-          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
-          // ring's N is Q_TDM_DEPTH-1. This MUST cover every depth the dispatch can
-          // pick: a depth that falls through to a smaller N drains the whole ring
-          // and silently turns the prefetch off. It did -- the old switch stopped
-          // at case 3, so any DEPTH > 4 emitted s_wait_tensorcnt<0> (wait for ALL)
-          // and measured 17.9% slower at DEPTH=6, which was misread as an LDS /
-          // occupancy cost rather than a lost pipeline.
-          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
-          // ring's N is Q_TDM_DEPTH-1, and every depth the dispatch can pick MUST
-          // have a case. The old switch stopped at case 3, so any DEPTH > 4 fell
-          // through to s_wait_tensorcnt<0> -- wait for ALL -- which turns the
-          // prefetch off entirely. That is why DEPTH=6 measured 17.9% slower; it
-          // was misread as an LDS/occupancy cost. ISA confirms it: the DEPTH=6
-          // build emits s_wait_tensorcnt 0x0 where DEPTH=2 emits 0x1.
+          q_read_slot = slot;
+          // Wait only for THIS head's tile; the rest stay in flight across this
+          // head's reduce -> rope -> quant -> store chain.
           //
-          // The hardware ceiling is 3 tensor ops in flight per wave (opus.hpp:2953),
-          // so depth above 3 only parks the prologue. Range is [2,3]: depth 1 races
-          // the refill against the ds_read of the slot it overwrites (508a86ac).
-          static_assert(Q_TDM_DEPTH >= 2 && Q_TDM_DEPTH <= 3,
-                        "Q_TDM_DEPTH must be 2 or 3: 1 is a data race (508a86ac), "
-                        "and the hardware allows only 3 tensor ops in flight/wave.");
-          switch (Q_TDM_DEPTH - 1) {
-            case 2:  opus::s_wait_tensorcnt<2>(); break;
-            default: opus::s_wait_tensorcnt<1>(); break;
-          }
+          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding". The
+          // threshold is DEPTH-2, not DEPTH-1, because the refill is deferred by
+          // one head: at the wait point one slot is still owed its issue, so one
+          // fewer tile is in flight than the ring is deep. Getting this wrong is
+          // silent -- too small a threshold drains the whole ring and turns the
+          // prefetch off rather than failing. That is what a stale switch did
+          // once, emitting s_wait_tensorcnt<0> and measuring 17.9% slower at
+          // DEPTH=6, which was misread as an LDS/occupancy cost.
+          //
+          // DEPTH is 3 exactly. The hardware allows 3 tensor ops in flight per
+          // wave (opus.hpp:2953), so the prologue's 3 issues are the ceiling; and
+          // the deferred refill costs one tile of lead, so DEPTH=2 would leave
+          // DEPTH-2 = 0 -- a full drain every head. DEPTH=3 deferred and DEPTH=2
+          // immediate carry the SAME two heads of lead; the difference is only
+          // that this one needs no explicit s_wait_dscnt (see the refill site).
+          static_assert(Q_TDM_DEPTH == 3,
+                        "the deferred-refill ring needs Q_TDM_DEPTH == 3: 2 leaves "
+                        "no tile in flight at the wait, and the hardware allows "
+                        "only 3 tensor ops in flight per wave.");
+          opus::s_wait_tensorcnt<Q_TDM_DEPTH - 2>();
           vec_q = *reinterpret_cast<const OPUS_LDS_ADDR opus_vec_i*>(
               q_lds_addr
               + static_cast<__UINTPTR_TYPE__>((slot * head_size) + tid * vec_size_i)
                 * sizeof(scalar_t));
-          // Refill this slot with the head Q_TDM_DEPTH ahead.
-          q_tdm_issue(slot);
           q_slot = (slot + 1 == Q_TDM_DEPTH) ? 0 : (slot + 1);
         } else
 #endif
@@ -5196,6 +5261,36 @@ namespace aiter {
         const float sum_sq = acc2.x + acc2.y;
         const float amax_raw = fmaxf(amax2.x, amax2.y);
         (void)amax_raw;
+
+#if defined(__gfx1250__)
+        if constexpr (Q_TDM_DEPTH > 0) {
+          // Refill the slot the PREVIOUS head read, not the one just read.
+          //
+          // tensorcnt orders TDM loads against each other, not against this wave's
+          // DS reads, and tensor_load_to_lds is executed asynchronously by the TDM
+          // engine -- so refilling the slot just read races the ds_read of it, and
+          // instruction order alone does not settle it. Waiting for the read with
+          // an explicit s_wait_dscnt closes the race but drains the whole DS
+          // pipeline every head, which measured +2.1% at T=4096 H=32 (the shapes
+          // that gain nothing elsewhere, so it showed up undiluted).
+          //
+          // Deferring by one head closes it for free instead: the slot being
+          // refilled was read a full head ago, and the sum_sq loop above has since
+          // consumed vec_q -- which the compiler already guards with the
+          // s_wait_dscnt that read needs anyway. So by the time this issues, the
+          // read has provably retired and there is nothing extra to pay. The cost
+          // is one more ring slot of LDS, since holding the same two heads of lead
+          // with a deferred issue needs DEPTH=3 (see the wait above).
+          //
+          // Correctness does NOT depend on where this lands. The scheduler does in
+          // fact hoist the issue back up next to this head's ds_read, but the slot
+          // it refills belongs to the PREVIOUS head, whose read retired before this
+          // iteration could start. Deferring is what closes the race; position
+          // only costs overlap.
+          if (q_refill_slot >= 0) q_tdm_issue(q_refill_slot);
+          q_refill_slot = q_read_slot;
+        }
+#endif
 
         auto sum_func = [](float a, float b) { return a + b; };
         float total_sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(sum_sq, sum_func);
@@ -5280,18 +5375,81 @@ namespace aiter {
             work[i] = v;
           }
           query_t* q_out_head = q_out + q_out_off;
-          if (is_nope_thr) {
-            {
-              const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
-              auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
-              const uint16_t scale_pair =
-                  static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
-              *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
+          const uint16_t scale_pair =
+              static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
+          auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
+          if constexpr (merge_q_scale_store) {
+            // ONE store per head instead of two.
+            //
+            // The row is nope fp8 in [0, nope_dim) plus the duplicated e8m0 run in
+            // [nope_dim, nope_dim + 2*kNopeGroups). Written as two stores those are
+            // a full b128 per nope lane and a separate b16, and the b16 lands in the
+            // SAME 128B sector as the payload's last lanes -- a second partial write
+            // to a sector already being written, which measured at 7.1% of the
+            // kernel for 14 bytes of data. Cutting the lane count on that store to
+            // one per group changed nothing, so the cost is the store itself, not
+            // its lanes.
+            //
+            // Scale carrier lanes gather the run into the payload store. The
+            // remaining slots carry zeros so one ordinary vector store covers
+            // the allocated output row, including padding. For D=512 and G=64
+            // this writes 512 bytes instead of 464, improving sector coverage.
+            // RoPE output is computed independently from work below.
+            //
+            // The gather goes through LDS rather than a lane permute: the run needs
+            // kNopeGroups values from kNopeGroups different source lanes, which is
+            // one ds_store_b16 plus one ds_load_b128 here against ~7 permutes plus
+            // the packing. LDS ops from one wave are ordered, so the carrier lane
+            // sees this head's run, and the slot is rewritten every head.
+            if (is_nope_thr && (tid % Q_REDUCE) == 0)
+              q_scale_lds[tid / Q_REDUCE] = scale_pair;
+            // The carrier slots are vec_size_o bytes each and the run is only
+            // kScaleRunBytes of that, so define the tail: those bytes are pad in
+            // the row and must not be stored uninitialised.
+            constexpr int32_t kCarrierPairs = kScaleCarrierSlots * vec_size_o / 2;
+            if (tid == 0) {
+              #pragma unroll
+              for (int i = kNopeGroups; i < kCarrierPairs; i++) q_scale_lds[i] = 0;
             }
-            // work already carries rstd*inv_scale, so the fp8 cast is the whole store.
-            opus_vec_q vec_out = opus::cast<query_t>(work);
-            auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
-            q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+            __builtin_amdgcn_wave_barrier();
+            // Zero the unused output slots so the payload store covers the row.
+            opus_vec_q vec_out{};
+            if (is_nope_thr) {
+              // work already carries rstd*inv_scale, so the fp8 cast is the store.
+              vec_out = opus::cast<query_t>(work);
+            } else if (tid < nope_vec + kScaleCarrierSlots) {
+              // The scale carriers gather their slots; the remaining PE lanes
+              // retain zeros for output padding, independently of RoPE work.
+              const int32_t k = static_cast<int32_t>(tid) - nope_vec;
+              // memcpy, not a reinterpret_cast load. The publishes above are
+              // uint16_t and this pickup is vec_size_o bytes wide, so a typed load
+              // lets alias analysis decide the two do not overlap and reorder them
+              // -- including hoisting the NEXT head's publish above this head's
+              // pickup. That reproduced as one wrong e8m0 byte in 29,360,128 at
+              // Q_GROUP_SIZE=32, where the run spans two carrier slots. Going
+              // through char keeps the dependency visible while still lowering to
+              // one ds_read of the slot width. `volatile` also orders it, but it
+              // serialises against the TDM ring's LDS traffic and measured 1.6x
+              // slower than the two-store form it was meant to beat.
+              __builtin_memcpy(&vec_out,
+                               reinterpret_cast<const char*>(
+                                   q_scale_lds + k * (vec_size_o / 2)),
+                               sizeof(vec_out));
+            }
+            __builtin_amdgcn_wave_barrier();
+            if (tid < head_size / vec_size_i)
+              q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+          } else {
+            if (is_nope_thr) {
+              {
+                const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
+                auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
+                *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
+              }
+              // work already carries rstd*inv_scale, so the fp8 cast is the store.
+              opus_vec_q vec_out = opus::cast<query_t>(work);
+              q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+            }
           }
           if (is_pe_thread) {
             // Rope straight into the bf16 store rather than back into `work`. The
@@ -5654,8 +5812,11 @@ namespace aiter {
             for (int i = 0; i < vec_size_i; i++) {
               float my_val = k_normed[i];
               float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-              float rot = is_x_half ? (my_val * kc[i] - pair_val * ks[i])
-                                    : (my_val * kc[i] + pair_val * ks[i]);
+              // Explicit fma: vrot feeds two stores under SWA, and a
+              // rematerialised copy is free to contract the other product.
+              const float pv = pair_val * ks[i];
+              float rot = is_x_half ? __builtin_fmaf(my_val, kc[i], -pv)
+                                    : __builtin_fmaf(my_val, kc[i], pv);
               vrot[i] = static_cast<scalar_t>(rot);
             }
             *reinterpret_cast<opus_vec_i*>(&k_out_rope[pe_local_tid * vec_size_i]) = vrot;
@@ -5679,8 +5840,12 @@ namespace aiter {
               float fky = k_normed[i + 1];
               const float f32_cos = kc[i >> 1];
               const float f32_sin = ks[i >> 1];
-              vrot[i]     = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
-              vrot[i + 1] = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
+              // Explicit fma: vrot feeds two stores under SWA, and a
+              // rematerialised copy is free to contract the other product.
+              vrot[i] =
+                  static_cast<scalar_t>(__builtin_fmaf(fkx, f32_cos, -(fky * f32_sin)));
+              vrot[i + 1] =
+                  static_cast<scalar_t>(__builtin_fmaf(fky, f32_cos, fkx * f32_sin));
             }
             *reinterpret_cast<opus_vec_i*>(&k_out_rope[pe_local_tid * vec_size_i]) = vrot;
             // k_out_rope is safe to vectorise: its row stride is the kernel's own
@@ -5905,7 +6070,8 @@ namespace aiter {
     // TOKENS_PER_BLOCK=1: single-wave (decode/small prefill), TOKENS_PER_BLOCK>1: multi-wave
     template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt,
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0>
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0,
+              bool MERGE_Q_SCALE = false>
     __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
     // PARAMETER ORDER IS PERFORMANCE-CRITICAL, do not regroup for readability.
     //
@@ -5913,12 +6079,8 @@ namespace aiter {
     // (128 B, kernarg 0x000..0x07f) into user SGPRs; anything past that costs a
     // real s_load. With the 12 pointers first, MlaKernelParams started at 0x064
     // and only its first 7 ints fit -- num_heads (0x0a0), max_position (0x0a4)
-    // and the SWA strides (0x0c4, 0x0d4) all fell outside.
-    //
-    // ATT at T=512 H=128 measured the cost: s_load_b96 @0xd4 = 2045 cycles and
-    // s_load_b128 @0xc4 = 903 cycles, 2948 of the kernel's 3132 scalar-load
-    // cycles in two instructions -- against 25 cycles total when every field the
-    // per-head path needs sits inside the preload window.
+    // and the SWA strides (0x0c4, 0x0d4) all fell outside, so the per-head path
+    // paid a real s_load for them.
     //
     // Putting the struct first moves every int field into the preload window.
     // The pointers move out, but each is dereferenced through an SRD built once,
@@ -5952,7 +6114,8 @@ namespace aiter {
     ) {
       #define DISPATCH_NEOX(NEOX) \
         fuse_qk_norm_rope_group_quant_cache_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, \
-            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK, Q_TDM_DEPTH>( \
+            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK, Q_TDM_DEPTH, \
+            MERGE_Q_SCALE>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
             cos_cache, sin_cache, eps, params, \
             swa_nope, swa_rope, swa_block_tables, swa_dest_row, batch_id_per_token)
@@ -5967,7 +6130,8 @@ namespace aiter {
 // Unified macro for the coarse fused QK norm + RoPE + group quant + cache kernel.
 // Requires in scope at the call site:
 //   template args  head_dim_val, tokens_per_block_val, q_group_size_val,
-//                  q_scale_fp32_val, has_q_weight_val, q_tdm_depth_val
+//                  q_scale_fp32_val, has_q_weight_val, q_tdm_depth_val,
+//                  merge_q_scale_val
 //   launch config  grid, block, coarse_lds_bytes, stream
 //   kernel args    mla_params, eps, is_neox, and the tensors q, kv, k_rope_buff,
 //                  k_weight, k_nope_scale_buff, q_nope_scale_buff, positions,
@@ -5980,7 +6144,7 @@ namespace aiter {
 #define CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_norm_rope_group_quant_cache_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, \
                  q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val, \
-                 q_tdm_depth_val> \
+                 q_tdm_depth_val, merge_q_scale_val> \
                <<<grid, block, coarse_lds_bytes, stream>>>(                                                             \
                  mla_params,                                                                             \
                  static_cast<float>(eps),                                                                \
@@ -6289,12 +6453,12 @@ void fused_qk_norm_rope_group_quant(
   constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG   = 8;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_XLRG  = 16;
   // Depth of the Q-head TDM prefetch ring in the coarse kernel (0 = off).
-  // Not a build-time knob: 1 is a data race (the refill overwrites the slot the
-  // consumer is still reading, see 508a86ac) and the hardware allows only 3 tensor
-  // ops in flight per wave, so the range is [2,3] and 3 measured neutral against 2
-  // both before and after the ring stopped re-reading the last head. The kernel's
-  // static_assert enforces the range.
-  constexpr int kCoarseQTdmDepth = 2;
+  // Not a build-time knob: the kernel defers each refill by one head so the slot
+  // it overwrites was read a head ago (which is what removes the explicit
+  // s_wait_dscnt), and holding the same two heads of lead that way costs one extra
+  // slot. 2 would leave nothing in flight at the wait; above 3 the hardware only
+  // allows 3 tensor ops per wave. The kernel's static_assert pins it.
+  constexpr int kCoarseQTdmDepth = 3;
   // ---------------------------------------------------------------------------
   // Heads per wave for the two prefill tiers. 16 at xlarge is the point of the
   // coarse path: one cos/sin gather, one descriptor build and one kernarg read
@@ -6448,17 +6612,25 @@ void fused_qk_norm_rope_group_quant(
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
     constexpr bool q_scale_fp32_val  = decltype(scale_fp32_tag)::value;
     constexpr bool has_q_weight_val  = decltype(has_qw_tag)::value;
-    auto launch_coarse = [&](auto tokens_per_block_tag, auto q_tdm_depth_tag) {
+    auto launch_coarse = [&](auto tokens_per_block_tag, auto q_tdm_depth_tag,
+                             auto merge_q_scale_tag) {
       constexpr int tokens_per_block_val = decltype(tokens_per_block_tag)::value;
       constexpr int q_tdm_depth_val      = decltype(q_tdm_depth_tag)::value;
+      constexpr bool merge_q_scale_val   = decltype(merge_q_scale_tag)::value;
       // Element size must track scalar_t, not a fixed 2 bytes. The kernel indexes
       // the ring as `wave_in_blk * Q_TDM_DEPTH * head_size * sizeof(scalar_t)`,
       // and the dispatch below instantiates scalar_t = float when kv is fp32, so a
       // hard-coded uint16_t under-allocates by 2x and puts the last wave's slots
       // outside the allocation. scalar_t is KV_T, which comes from kv.dtype().
+      // The per-wave e8m0 gather scratch sits right after the ring, so it is only
+      // reserved for the instantiation that uses it. The kernel derives the same
+      // offset, so the two must stay in step.
       const size_t coarse_lds_bytes =
           static_cast<size_t>(tokens_per_block_val) * q_tdm_depth_val
-          * head_dim_val * kv.element_size();
+              * head_dim_val * kv.element_size()
+          + (merge_q_scale_val
+                 ? static_cast<size_t>(tokens_per_block_val) * kQScaleGatherBytes
+                 : 0);
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val,
                 1 + num_q_waves);
       dim3 block(tokens_per_block_val * warp_size);
@@ -6466,13 +6638,21 @@ void fused_qk_norm_rope_group_quant(
           kv.dtype(), kv_cache_dtype, q_out_type,
           CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
     };
-    auto launch_coarse_for_arch = [&](auto tokens_per_block_tag) {
+    // merge_scale: carry the Q e8m0 run in the payload store instead of issuing a
+    // second, partial write to the same sector. Compile-time, not a runtime flag:
+    // the two store forms cannot share one instantiation without the small shapes
+    // paying ~6% for code they never run (see MERGE_Q_SCALE in the kernel). Only
+    // the xlarge tier takes it -- below that, per-head latency rather than the
+    // store path sets the time and the LDS round trip it costs is a loss.
+    auto launch_coarse_for_arch = [&](auto tokens_per_block_tag, auto merge_scale_tag) {
       if (has_tdm) {
         launch_coarse(
             tokens_per_block_tag,
-            std::integral_constant<int, kCoarseQTdmDepth>{});
+            std::integral_constant<int, kCoarseQTdmDepth>{},
+            merge_scale_tag);
       } else {
-        launch_coarse(tokens_per_block_tag, std::integral_constant<int, 0>{});
+        launch_coarse(tokens_per_block_tag, std::integral_constant<int, 0>{},
+                      std::false_type{});
       }
     };
     if (use_finegrained) {
@@ -6483,13 +6663,10 @@ void fused_qk_norm_rope_group_quant(
       // ceil((num_heads+1)/HPB) * num_tokens workgroups instead of
       // (num_heads+1) * num_tokens. At H=32 that is 9 blocks/token instead of 33.
       //
-      // Why this is the decode lever: ATT at T=256 puts 4046 cyc/wave (~2 us) in
-      // wave execution against an 8.05 us kernel, and all 8448 waves fit resident
-      // at once -- so roughly two thirds of the kernel is dispatch ramp and drain,
-      // not work. inverse_rope_group_quant measured the same 2/3 split at s=512
-      // with this same one-wave-block shape (ramp 33% / steady 33% / drain 35%).
-      // Per-wave savings can only reach the other third; the workgroup count can
-      // reach this one.
+      // Why this is the decode lever: at T=256 every wave of the launch fits
+      // resident at once, so roughly two thirds of the kernel is dispatch ramp and
+      // drain rather than work. Per-wave savings can only reach the other third;
+      // the workgroup count can reach this one.
       //
       // MEASURED on gfx1250 at H=32, paired: HPB=4 is no gain at T=64 or T=256
       // (both CIs cross zero) against a coarse-path control. So packing does NOT
@@ -6531,7 +6708,7 @@ void fused_qk_norm_rope_group_quant(
       // wave count itself halves. Both cut parallelism, and the decode tier is
       // already demand-limited. This is the same failure as raising
       // HEADS_PER_BLOCK: "fewer, bigger waves" is the wrong direction where the
-      // is starved, whatever the ramp/drain share of the ATT trace suggests.
+      // machine is starved, whatever the ramp/drain share suggests.
       //
       // Left at 1. Still worth trying at the XLARGE prefill tier, which also uses
       // the FG kernel but runs far more waves/SIMD, where the occupancy argument
@@ -6550,10 +6727,13 @@ void fused_qk_norm_rope_group_quant(
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_FINEGRAINED);
     } else if (use_decode_path) {
-      launch_coarse_for_arch(std::integral_constant<int, 1>{});
+      launch_coarse_for_arch(std::integral_constant<int, 1>{}, std::false_type{});
+    } else if (use_xlarge_prefill) {
+      launch_coarse_for_arch(
+          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{}, std::true_type{});
     } else {
       launch_coarse_for_arch(
-          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{});
+          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{}, std::false_type{});
     }
   };
 

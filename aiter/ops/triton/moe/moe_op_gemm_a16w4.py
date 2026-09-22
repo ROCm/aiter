@@ -272,7 +272,12 @@ def moe_gemm_a16w4(
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
     _LOGGER.info(
-        f"MOE_GEMM_A16W4: x={x.shape} w={w.shape} w_scales={w_scales.shape} swizzle_mx_scale={swizzle_mx_scale} backend={backend}"
+        "MOE_GEMM_A16W4: x=%s w=%s w_scales=%s swizzle_mx_scale=%s backend=%s",
+        x.shape,
+        w.shape,
+        w_scales.shape,
+        swizzle_mx_scale,
+        backend,
     )
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"

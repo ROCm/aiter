@@ -379,7 +379,9 @@ def _seg_occupancy_class(num_segs: int) -> int:
 
 
 @triton.autotune(
-    configs=_K2_CONFIGS,
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN", _K2_CONFIGS, default_config=_K2_FALLBACK_CONFIG
+    ),
     # HAS_V / COMPUTE_OUTPUT are in the key because the three passes below have
     # very different per-iteration cost and must not share a tuned config, and
     # NUM_SEGS_CLASS is there for the same reason -- without it the segmented

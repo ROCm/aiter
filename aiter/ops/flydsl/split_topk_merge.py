@@ -8,7 +8,7 @@ from functools import cache
 import torch
 
 from .kernels.tensor_shim import _run_compiled
-from .kernels.topk_per_row_decode import (
+from .kernels.topk.topk_per_row_decode import (
     _STATE_SIZE,
     build_topk_per_row_decode_module,
 )

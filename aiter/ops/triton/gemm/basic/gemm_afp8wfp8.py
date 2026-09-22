@@ -345,8 +345,10 @@ def gemm_afp8wfp8_preshuffle(
             num_ctas == 1 or kernel_type == "bandwidth_bound"
         ), f"CGA multicast is only wired into bandwidth_bound, got '{kernel_type}'"
         _LOGGER.info(
-            f"GEMM_AFP8WFP8 PRESHUFFLE [gluon/gfx1250]: x={tuple(x.shape)} "
-            f"w={tuple(w_view.shape)} kernel={kernel_type}"
+            "GEMM_AFP8WFP8 PRESHUFFLE [gluon/gfx1250]: x=%s w=%s kernel=%s",
+            tuple(x.shape),
+            tuple(w_view.shape),
+            kernel_type,
         )
 
         # Shape-derived clamp, not a tuning default: the pipeline computes

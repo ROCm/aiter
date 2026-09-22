@@ -88,6 +88,9 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    _fused_splitk_ok,
+    check_persistent_n_tiles,
+    cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
@@ -101,6 +104,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
@@ -618,6 +622,9 @@ def _compile_mxfp8_128_wmma_to_cache(
     split_k: int,
     cluster_m: int,
     cluster_n: int,
+    a_preshuffle: bool = False,
+    persistent_n_tiles: int = 1,
+    fused_splitk: bool = True,
     **kwargs,
 ):
     del kwargs
@@ -666,12 +673,42 @@ def _compile_mxfp8_128_wmma_to_cache(
             cluster_n,
             True,
         )
-        launch = (
-            launch_gemm_a8w8_256x256
-            if is_compute_wmma_kernel_name(kernel_name)
-            else launch_gemm_a8w8
+        compute_bound = is_compute_wmma_kernel_name(kernel_name)
+        launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
+        check_persistent_n_tiles(
+            persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
         )
-        launch(*launch_args, SCALE_BLOCK_SIZE, split_k)
+        for variant_cm in cluster_m_fallback_values(
+            cluster_m, cluster_n, compute_bound
+        ):
+            variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
+            if compute_bound:
+                fused = fused_splitk and _fused_splitk_ok(
+                    tile_m, variant_cm, cluster_n, split_k, True
+                )
+                row_bounded = bool(m % tile_m)
+                cb_args = variant_args[:12] + (_ptr_view_safe(out),) + variant_args[12:]
+                bounds = (False, True) if fused else (row_bounded,)
+                for bounded_m in bounds:
+                    launch(
+                        *cb_args,
+                        SCALE_BLOCK_SIZE,
+                        split_k,
+                        a_preshuffle,
+                        persistent_n_tiles,
+                        fused,
+                        bounded_m,
+                    )
+            else:
+                launch(
+                    *variant_args,
+                    SCALE_BLOCK_SIZE,
+                    split_k,
+                    False,
+                    0,
+                    1,
+                    a_preshuffle,
+                )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
                 _ptr_view_safe(out),

@@ -50,6 +50,10 @@ def run_torch_moe_sorting(
     m, topk = topk_ids.shape
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    # The GEMM consumers describe this allocation as max_num_m_blocks full
+    # blocks. Keep the reference capacity block-aligned so the sorting test also
+    # enforces that descriptor/allocation contract.
+    max_num_tokens_padded = max_num_m_blocks * block_size
     init_val = topk << 24 | m
     sorted_ids = torch.full(
         (max_num_tokens_padded,), init_val, dtype=dtypes.i32, device=device
@@ -98,6 +102,7 @@ def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
     max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
     max_num_m_blocks = (max_num_tokens_padded + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    max_num_tokens_padded = max_num_m_blocks * BLOCK_SIZE_M
     elem_bytes = torch.empty((), dtype=dtype).element_size()
     nbytes = (
         token * topk * 4
@@ -126,6 +131,19 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
         _moe_buf,
     ) = out
 
+    assert sorted_ids_b.shape == sorted_ids_a.shape, (
+        "sorted_ids capacity must cover every full GEMM block: "
+        f"expected {sorted_ids_a.shape}, got {sorted_ids_b.shape}"
+    )
+    assert sorted_weights_b.shape == sorted_weights_a.shape, (
+        "sorted_weights capacity must match sorted_ids: "
+        f"expected {sorted_weights_a.shape}, got {sorted_weights_b.shape}"
+    )
+    assert sorted_expert_ids_b.shape == sorted_expert_ids_a.shape, (
+        "sorted_expert_ids capacity mismatch: "
+        f"expected {sorted_expert_ids_a.shape}, got {sorted_expert_ids_b.shape}"
+    )
+
     errs = {}
     errs["num_tokens_post_padded"] = checkAllclose(
         num_tokens_post_padded_a,
@@ -152,6 +170,54 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
         msg="sorted_expert_ids",
     )
     return errs
+
+
+def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
+    """Cover the production MXFP4 auxiliary-sort route with a small OOB case.
+
+    At block size 32, the old formula allocated 1054 rows while GEMM described
+    1056 rows.
+    """
+    token, E, topk = 7, 32, 5
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        token,
+        model_dim,
+        E,
+        topk,
+        dtype,
+        has_expert_mask=False,
+        padding_extra=0,
+    )
+    for block_size in (16, 32, 64, 128):
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+            block_size,
+            output_aux=fm.AUX_SORT_OPUS,
+        )
+
+        errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
+        bad = {name: err for name, err in errs.items() if err}
+        mismatch = f"Opus auxiliary sort mismatch at block_size={block_size}: {bad}"
+        assert not bad, mismatch
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            _,
+            _,
+            aux_m_indices,
+            aux_reverse_sorted,
+        ) = out
+        expected_capacity = sorted_expert_ids.numel() * block_size
+        assert sorted_ids.numel() == expected_capacity
+        assert sorted_weights.numel() == expected_capacity
+        assert aux_m_indices.numel() == expected_capacity
+        assert aux_reverse_sorted.numel() == topk_ids.numel()
 
 
 def _build_moe_sorting_inputs(
@@ -185,6 +251,25 @@ def _build_moe_sorting_inputs(
     return topk_ids, topk_weights, expert_mask, num_local_tokens
 
 
+def _apply_routing_case(topk_ids, topk_weights, routing_case):
+    token, topk = topk_weights.shape
+    if routing_case == "all-empty":
+        topk_ids[:token].fill_(-1)
+        topk_weights.zero_()
+    elif routing_case == "mixed":
+        invalid = (
+            torch.arange(token * topk, device=topk_ids.device, dtype=torch.int64).view(
+                token, topk
+            )
+            % 2
+            == 1
+        )
+        topk_ids[:token].masked_fill_(invalid, -1)
+        topk_weights.masked_fill_(invalid, 0)
+    elif routing_case != "valid":
+        raise ValueError(f"unknown routing case: {routing_case}")
+
+
 @benchmark()
 def test_moe_sorting(
     dtype,
@@ -197,6 +282,7 @@ def test_moe_sorting(
     padding_extra=0,
     dispatch_policy=0,
     accumulate=True,
+    routing_case="valid",
 ):
     """accumulate=False (with has_expert_mask=False) makes moe_sorting allocate
     a (0,0) moe_buf placeholder instead of the full [M, model_dim] buffer --
@@ -213,6 +299,7 @@ def test_moe_sorting(
         has_expert_mask,
         padding_extra,
     )
+    _apply_routing_case(topk_ids, topk_weights, routing_case)
 
     ref = run_torch_moe_sorting(
         topk_ids,
@@ -265,7 +352,7 @@ def test_moe_sorting(
         )
 
     flops, nbytes = _moe_sorting_roofline(token, topk, E, model_dim, dtype)
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx(), "routing case": routing_case}
     failures = {}
 
     for name, fn in candidates.items():
@@ -290,7 +377,8 @@ def test_moe_sorting(
         raise AssertionError(
             f"moe_sorting mismatch vs CPU reference at token={token}, E={E}, "
             f"topk={topk}, has_expert_mask={has_expert_mask}, "
-            f"padding_extra={padding_extra}, dispatch_policy={dispatch_policy}: "
+            f"padding_extra={padding_extra}, dispatch_policy={dispatch_policy}, "
+            f"routing_case={routing_case}: "
             f"{failures}"
         )
     return ret
@@ -303,6 +391,7 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     E,
     topk,
     has_expert_mask=False,
+    routing_case="valid",
 ):
     """Capture moe_sorting (FlyDSL backend) under a real torch.cuda.graph(),
     then replay with a DIFFERENT num_local_tokens tensor value than was
@@ -327,6 +416,7 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
         has_expert_mask,
         padding_extra,
     )
+    _apply_routing_case(topk_ids, topk_weights, routing_case)
     assert isinstance(num_local_tokens, torch.Tensor)
 
     def run():
@@ -381,7 +471,85 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     assert not bad, (
         f"moe_sorting cuda-graph replay mismatch (captured token={capture_tokens}, "
         f"replayed token={replay_tokens}, E={E}, topk={topk}, "
-        f"has_expert_mask={has_expert_mask}): {bad}"
+        f"has_expert_mask={has_expert_mask}, routing_case={routing_case}): {bad}"
+    )
+
+
+def test_moe_sorting_invalid_topk_ids():
+    """Exercise every invalid-ID sorting path against the torch reference."""
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("moe_sorting unsupported on %s; skipping", get_gfx())
+        return
+
+    dtype = dtypes.bf16
+    model_dim = 4096
+    E = 256
+    topk = 6
+
+    direct_cases = (
+        # Automatic large-token Opus path; P0_v1 is guarded by #4839.
+        ("opus", 16384, 0, False),
+        # Remaining single-kernel mesh and local-expert-mask accesses.
+        ("opus", 8, 1, False),
+        ("opus", 8, 1, True),
+        # Forced large-token multi-phase regression (P0_v1 -> P1 -> P23).
+        ("opus", 2048, 2, False),
+        # FlyDSL LDS oneshot and HBM multiphase mesh stores.
+        ("flydsl", 8, 0, False),
+        ("flydsl", 2048, 0, False),
+    )
+
+    for backend, token, dispatch_policy, has_expert_mask in direct_cases:
+        for routing_case in ("all-empty", "mixed"):
+            topk_ids, topk_weights, expert_mask, _ = _build_moe_sorting_inputs(
+                token,
+                model_dim,
+                E,
+                topk,
+                dtype,
+                has_expert_mask,
+                padding_extra=0,
+            )
+            _apply_routing_case(topk_ids, topk_weights, routing_case)
+            ref = run_torch_moe_sorting(
+                topk_ids,
+                topk_weights,
+                E,
+                BLOCK_SIZE_M,
+                expert_mask,
+            )
+
+            set_moe_sorting_backend(backend)
+            out = moe_sorting(
+                topk_ids,
+                topk_weights,
+                E,
+                model_dim,
+                dtype,
+                BLOCK_SIZE_M,
+                expert_mask,
+                None,
+                dispatch_policy,
+                accumulate=True,
+            )
+            torch.cuda.synchronize()
+            errs = _compare_moe_sorting_outputs(ref, out, topk, token)
+            bad = {name: value for name, value in errs.items() if value}
+            assert not bad, (
+                f"{backend} moe_sorting mismatch for token={token}, "
+                f"dispatch_policy={dispatch_policy}, "
+                f"has_expert_mask={has_expert_mask}, "
+                f"routing_case={routing_case}: {bad}"
+            )
+
+    test_moe_sorting_flydsl_cuda_graph_capture(
+        dtype,
+        token=2048,
+        model_dim=model_dim,
+        E=E,
+        topk=topk,
+        has_expert_mask=True,
+        routing_case="mixed",
     )
 
 
@@ -483,6 +651,27 @@ def test_moe_sorting_decode_graph_perf(
     return ret
 
 
+def run_invalid_routing_regressions(dtype, model_dim, inter_dim):
+    rows = []
+    for routing_case in ("all-empty", "mixed"):
+        rows.append(
+            test_moe_sorting(
+                dtype,
+                token=2048,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                E=256,
+                topk=6,
+                has_expert_mask=False,
+                padding_extra=0,
+                dispatch_policy=0,
+                accumulate=True,
+                routing_case=routing_case,
+            )
+        )
+    return rows
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("moe_sorting unsupported on %s; skipping", get_gfx())
@@ -574,6 +763,16 @@ def main():
         "isolates moe_buf-zeroing cost from mesh-scan work).\n    e.g.: -accum f",
     )
     parser.add_argument(
+        "-rc",
+        "--routing_case",
+        choices=["valid", "all-empty", "mixed"],
+        nargs="*",
+        default=None,
+        help="Routing inputs, including invalid -1 sentinel coverage.\n"
+        "    e.g.: -rc all-empty mixed\n"
+        "    default: valid matrix plus focused all-empty/mixed regressions",
+    )
+    parser.add_argument(
         "-dg",
         "--decode_graph",
         type=int,
@@ -591,20 +790,24 @@ def main():
         parser.error("-e/--expert and -t/--topk must have the same length")
 
     model_configs = list(zip(args.expert, args.topk))
+    routing_cases = args.routing_case if args.routing_case is not None else ["valid"]
 
     for dtype in args.dtype:
+        test_moe_sorting_opus_aux_capacity(dtype, args.model_dim)
         df = []
         for (
             padding_extra,
             expert_mask,
             dispatch_policy,
             accumulate,
+            routing_case,
             m,
         ) in itertools.product(
             args.padding,
             args.expert_mask,
             args.dispatch_policy,
             args.accumulate,
+            routing_cases,
             args.m,
         ):
             for E, topk in model_configs:
@@ -620,8 +823,17 @@ def main():
                         padding_extra=padding_extra,
                         dispatch_policy=dispatch_policy,
                         accumulate=accumulate,
+                        routing_case=routing_case,
                     )
                 )
+        if args.routing_case is None:
+            df.extend(
+                run_invalid_routing_regressions(
+                    dtype,
+                    args.model_dim,
+                    args.inter_dim,
+                )
+            )
         df = pd.DataFrame(df)
         aiter.logger.info(
             "moe_sorting summary (markdown):\n%s", df.to_markdown(index=False)

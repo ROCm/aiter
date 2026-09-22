@@ -107,8 +107,38 @@ def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name="BlockPerC
 # These instances are used for generating the kernel code and tuning.
 kernels_list_942 = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+    # Keep IDs 0 and 1 stable: existing tuned configurations may refer to them.
     0:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
     1:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    # Neighbor seeds: tile shapes already selected by GFX942 CK-Tile
+    # a8w8-bpreshuffle tables. In particular, narrow-N/K=512 tiles cover
+    # decode and wide-N/K=128 tiles cover the compute-heavy M range.
+    # N_Tile=192 violates the unshuffled B-scale window layout; the
+    # 128x256x128 and 64x256x256 neighbors are omitted because they fail the
+    # compile-time feasibility gate for this unshuffled blockscale operation.
+    2:   TileKernelInstance(    16,      64,      512,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    3:   TileKernelInstance(    32,      64,      512,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    4:   TileKernelInstance(    64,     256,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    5:   TileKernelInstance(    48,     128,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    6:   TileKernelInstance(    16,      64,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    7:   TileKernelInstance(    64,     128,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    8:   TileKernelInstance(    64,     128,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    9:   TileKernelInstance(    48,      64,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    # MIRROR candidates: computational tile shapes from the CK legacy list
+    # that competes on the same blockscale operation. These close the geometry
+    # gap without treating BlockPerCu launch variants as distinct mappings.
+   10:   TileKernelInstance(   128,      64,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   11:   TileKernelInstance(    64,      64,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   12:   TileKernelInstance(    32,     256,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   13:   TileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   14:   TileKernelInstance(    32,      64,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   15:   TileKernelInstance(    32,     128,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   16:   TileKernelInstance(    32,      64,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   17:   TileKernelInstance(    64,      64,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    # Wave-map twins for the compute-heavy CK shapes. GFX942 remains at four
+    # waves and K_Warp_Tile=64; eight-wave/K_Warp_Tile=128 is unsupported.
+   18:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+   19:   TileKernelInstance(    64,     128,      128,     2,        2,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
 }
 
 kernels_list_95x = {

@@ -54,8 +54,11 @@ def moe_gemm_per_token(
         Output tensor ``[total_tokens, N]``.
     """
     _LOGGER.info(
-        f"MOE_GEMM_PER_TOKEN: lhs={tuple(lhs.shape)} rhs={tuple(rhs.shape)} "
-        f"x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "MOE_GEMM_PER_TOKEN: lhs=%s rhs=%s x_scale=%s w_scale=%s",
+        tuple(lhs.shape),
+        tuple(rhs.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     total_tokens = lhs.shape[0]

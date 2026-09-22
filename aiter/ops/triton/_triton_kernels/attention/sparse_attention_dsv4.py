@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # =====================================================================
 # Utility
@@ -275,7 +276,7 @@ _sparse_attn_prefill_kernel_repr = make_kernel_repr(
 
 
 @triton.autotune(
-    configs=_get_prefill_autotune_configs(),
+    configs=autotune_configs("SPARSE_ATTENTION_DSV4", _get_prefill_autotune_configs()),
     key=["num_heads", "head_dim", "HAS_ATTN_SINK"],
     prune_configs_by={"early_config_prune": _prefill_prune_configs},
 )
