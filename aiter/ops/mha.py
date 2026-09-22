@@ -4137,7 +4137,7 @@ def flash_attn_varlen_func(
             raise ValueError("tuned flydsl backend rejected this MHA call")
 
     if tuned_backend in ("triton", "gluon") or (
-        tuned_backend is None and not ENABLE_CK
+        not ENABLE_CK and tuned_backend in (None, "ck")
     ):
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
