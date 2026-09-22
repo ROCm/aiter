@@ -228,6 +228,32 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 q,
                 k,
                 v,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse"),
+            id="bf16",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                native_fp8_format(),
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse"),
+            id="bf16fp8",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
                 native_fp8_format(),
                 native_fp8_format(),
                 native_fp8_format(),
@@ -362,31 +388,6 @@ def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
     _assert_sparse_matches_dense(sparse, dense)
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.parametrize(
-    "v_format",
-    [
-        pytest.param(AttentionFormat.BF16, id="bf16"),
-        pytest.param(native_fp8_format(), id="bf16fp8"),
-    ],
-)
-def test_mha_v4_sparse_dense_only_formats_reject_block_mask(v_format):
-    q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(
-        (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
-    )
-    with pytest.raises(NotImplementedError, match="does not have a BF16 manifest row"):
-        mha_v4(
-            q,
-            q,
-            q,
-            AttentionFormat.BF16,
-            AttentionFormat.BF16,
-            v_format,
-            block_mask=mask,
-        )
-
-
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 validation")
 @pytest.mark.skipif(
     not _mha_v4_mxfp6_sparse_co_available(),
@@ -454,6 +455,22 @@ def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [
+        pytest.param(
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
+            ),
+            id="bf16",
+        ),
+        pytest.param(
+            AttentionFormat.BF16,
+            native_fp8_format(),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
+            ),
+            id="bf16fp8",
+        ),
         pytest.param(
             native_fp8_format(),
             native_fp8_format(),

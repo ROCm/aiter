@@ -12,13 +12,13 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Per-batch key lengths on dense via `seqlens_k`; sorted sparse rejects it.
 - No backward, dropout, RNG state, LSE, causal, or Q-side varlen support yet.
 
-Supported recipes. Every quantized recipe is available in both dense and sorted-sparse mode with
-the same V packing and scale modes; only the BF16 rows are dense-only (for now).
+Supported recipes. Every recipe is available in both dense and sorted-sparse mode with the same
+V packing and scale modes.
 
 | Q/K | V | Modes |
 |---|---|---|
-| BF16 | BF16 | dense |
-| BF16 | FP8 | dense |
+| BF16 | BF16 | dense, sparse |
+| BF16 | FP8 | dense, sparse |
 | INT8 | FP8 | dense, sparse |
 | MXFP8 | FP8 | dense, sparse |
 | FP8 | FP8 | dense, sparse |

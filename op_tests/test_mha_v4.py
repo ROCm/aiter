@@ -240,26 +240,30 @@ def test_mha_v4_resolves_raw_recipe(q_format, v_format, sparse, kind, v_pack):
 
 
 @pytest.mark.parametrize(
-    ("q_format", "v_format", "message"),
+    ("v_format", "kind"),
     [
         (
             AttentionFormat.BF16,
-            AttentionFormat.BF16,
-            "does not have a BF16 manifest row",
+            _RawRecipeKind.BF16,
+        ),
+        (
+            native_fp8_format(),
+            _RawRecipeKind.BF16_FP8,
         ),
     ],
 )
-def test_mha_v4_rejects_unavailable_sparse_recipe(q_format, v_format, message):
-    with pytest.raises(NotImplementedError, match=message):
-        _resolve_raw_recipe(
-            q_format,
-            q_format,
-            v_format,
-            None,
-            None,
-            None,
-            sparse=True,
-        )
+def test_mha_v4_resolves_bf16_sparse_recipe(v_format, kind):
+    recipe = _resolve_raw_recipe(
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
+        v_format,
+        None,
+        None,
+        None,
+        sparse=True,
+    )
+    assert recipe.kind == kind
+    assert recipe.v_pack == AttentionPack.DEFAULT
 
 
 @pytest.mark.parametrize("sparse", [False, True])

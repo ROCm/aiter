@@ -409,10 +409,6 @@ def _resolve_raw_recipe(
     )
 
     if q_format == AttentionFormat.BF16:
-        if sparse:
-            raise NotImplementedError(
-                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
-            )
         kind = (
             _RawRecipeKind.BF16
             if v_format == AttentionFormat.BF16
@@ -879,10 +875,6 @@ def mha_v4_packed(
     if lut is None:
         _mha_v4_fwd_launch(*launch_args, seqlens_k)
     else:
-        if q_format == AttentionFormat.BF16:
-            raise NotImplementedError(
-                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
-            )
         kv_tile = mha_v4_kv_tile()
         if k.shape[1] % kv_tile != 0:
             raise ValueError(
