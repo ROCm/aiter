@@ -150,8 +150,8 @@ def _radix_pass(pass_idx: int) -> _RadixPass:
     )
 
 
-def _f32_to_ord(val, *, nan_to_bottom: bool = False):
-    return f32_to_ordered_i32(val, nan_to_bottom=nan_to_bottom)
+def _f32_to_ord(val):
+    return f32_to_ordered_i32(val)
 
 
 def _row_length(row, row_ends, width, next_n):
@@ -253,7 +253,6 @@ def build_topk_per_row_decode_module(
     block_threads: int = _BLOCK_THREADS,
     split_width: int | None = None,
     payload_indices: bool = False,
-    nan_to_bottom: bool = False,
     combine_histograms: bool = False,
     use_split_counts: bool = False,
     precomputed_first_pass: bool = False,
@@ -295,10 +294,8 @@ def build_topk_per_row_decode_module(
     split_vectors = 0 if split_width is None else split_width // _VEC
     output_steps = (k + block_threads - 1) // block_threads
 
-    # The merge path wants NaN at the bottom of the order rather than the top,
-    # so the pad it writes for absent split slots never outranks a real score.
     def ordered_key(val):
-        return _f32_to_ord(val, nan_to_bottom=nan_to_bottom)
+        return _f32_to_ord(val)
 
     # Every value that shapes a kernel body, including the two module constants:
     # they are constants only by default, and a build that varies one must not
@@ -312,7 +309,6 @@ def build_topk_per_row_decode_module(
         blk=block_threads,
         sw=split_width,
         pi=payload_indices,
-        nb=nan_to_bottom,
         ch=combine_histograms,
         sc=use_split_counts,
         pf=precomputed_first_pass,

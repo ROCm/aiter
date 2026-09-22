@@ -23,7 +23,6 @@ NUM_RADIX_PASSES = (KEY_BITS + RADIX_BITS - 1) // RADIX_BITS
 FINAL_RADIX_BITS = KEY_BITS - (NUM_RADIX_PASSES - 1) * RADIX_BITS
 RADIX_SIGN_BIT = 1 << (RADIX_BITS - 1)
 NUM_HIST_BINS = 1 << RADIX_BITS
-INT32_MIN = -(1 << 31)
 
 _DPP_ROW_SHR_1 = 0x111
 _DPP_ROW_SHR_2 = 0x112
@@ -54,18 +53,10 @@ def make_streaming_topk_storage(
     return StreamingTopKStorage
 
 
-def f32_to_ordered_i32(value, *, nan_to_bottom: bool = True):
-    """Map float32 to signed-order int32 with an explicit NaN convention."""
+def f32_to_ordered_i32(value):
+    """Map float32 bits to signed-order int32."""
     bits = value.bitcast(fx.Int32)
-    ordered = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
-    abs_bits = bits & fx.Int32(0x7FFFFFFF)
-    is_nan = arith.cmpi(
-        arith.CmpIPredicate.ugt,
-        abs_bits,
-        fx.Int32(0x7F800000),
-    )
-    nan_key = fx.Int32(INT32_MIN if nan_to_bottom else 0x7FFFFFFF)
-    return arith.select(is_nan, nan_key, ordered)
+    return bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
 
 
 def radix_pass_bits(pass_index):

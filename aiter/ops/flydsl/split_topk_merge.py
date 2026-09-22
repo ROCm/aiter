@@ -61,7 +61,6 @@ def clear_split_topk_merge_workspace_cache() -> None:
 def _build_split_topk_merge(k: int, splits: int, precomputed_first_pass: bool):
     # One chunk per split, and `split_width` tells the chunk that its slice of
     # the row is a bag of `k` slots whose live prefix is `candidate_counts`.
-    # NaN sinks to the bottom so a NaN scale can never displace a real score.
     return build_topk_per_row_decode_module(
         k,
         stable=False,
@@ -71,7 +70,6 @@ def _build_split_topk_merge(k: int, splits: int, precomputed_first_pass: bool):
         block_threads=_BLOCK_THREADS,
         split_width=k,
         payload_indices=True,
-        nan_to_bottom=True,
         combine_histograms=True,
         use_split_counts=True,
         precomputed_first_pass=precomputed_first_pass,

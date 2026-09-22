@@ -291,7 +291,6 @@ def flydsl_fp8_paged_mqa_local_topk(
     larger than ``block_tables.shape[1] * page_size`` are clamped to that table
     span. Block-table entries outside ``[0, num_pages)`` are not scored (they
     contribute ``-inf``); the kernel will not index the KV cache with those ids.
-    Negative or NaN ``k_scales`` contribute zero.
 
     If ``workspace`` is set and ``num_splits > 1``, Stage A fills that pair's
     pass-0 histogram for ``split_topk_merge(..., precomputed_first_pass=True)``.

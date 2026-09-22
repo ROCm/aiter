@@ -291,6 +291,24 @@ def compile_fp8_paged_mqa_local_topk(
         histogram = storage.histogram.peek().view(fx.make_layout(NUM_HIST_BINS, 1))
         scan = storage.scan.peek().view(fx.make_layout(WAVES + 1, 1))
         state = storage.state.peek().view(fx.make_layout(_STATE_SIZE, 1))
+        histogram_owner = fx.make_layout(
+            (
+                (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS,
+                BLOCK_THREADS,
+            ),
+            (BLOCK_THREADS, 1),
+        )
+        pool_owner = fx.make_layout(
+            (pool_steps, BLOCK_THREADS),
+            (BLOCK_THREADS, 1),
+        )
+        output_owner = fx.make_layout(
+            (output_steps, BLOCK_THREADS),
+            (BLOCK_THREADS, 1),
+        )
+
+        def _thread_slot(step, owner):
+            return fx.Int32(fx.get_scalar(fx.crd2idx((fx.Int32(step), tid), owner)))
 
         table_span = max_pages * page_size_i32
         valid_len = _imin(fx.Int32(lengths[row]), table_span)
@@ -339,7 +357,7 @@ def compile_fp8_paged_mqa_local_topk(
                 for hist_step in range_constexpr(
                     (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
                 ):
-                    histogram[hist_step * BLOCK_THREADS + tid] = 0
+                    histogram[_thread_slot(hist_step, histogram_owner)] = 0
                 rocdl.s_waitcnt(lgkmcnt=0)
                 gpu.barrier()
                 score_prefix = state[_SCORE_PREFIX]
@@ -347,7 +365,7 @@ def compile_fp8_paged_mqa_local_topk(
                 xor_value = RADIX_SIGN_BIT if radix_pass == 0 else 0
 
                 for step in range_constexpr(pool_steps):
-                    pool_pos = fx.Int32(step * BLOCK_THREADS) + tid
+                    pool_pos = _thread_slot(step, pool_owner)
                     live = pool_pos < pool_count
                     safe_pos = live.select(pool_pos, fx.Int32(0))
                     score_ord = f32_to_ordered_i32(pool_values[safe_pos])
@@ -391,7 +409,7 @@ def compile_fp8_paged_mqa_local_topk(
             write_cursor = fx.Int32(0)
             equal_seen = fx.Int32(0)
             for step in range_constexpr(pool_steps):
-                pool_pos = fx.Int32(step * BLOCK_THREADS) + tid
+                pool_pos = _thread_slot(step, pool_owner)
                 live = pool_pos < pool_count
                 safe_pos = live.select(pool_pos, fx.Int32(0))
                 value = pool_values[safe_pos]
@@ -519,12 +537,8 @@ def compile_fp8_paged_mqa_local_topk(
                         total = total + activated * weight
                 total = total + total.shuffle_xor(16, WAVE_SIZE)
                 total = total + total.shuffle_xor(32, WAVE_SIZE)
-                # `scale` is per position: it is the same for all DREG heads in a
-                # lane and across both shuffle_xor lane groups, so it factors out
-                # of the ReLU sum. Clamping it to >= 0 keeps that exact, since a
-                # negative or NaN scale must score 0 (previously supplied by
-                # maximumf on each scaled product).
-                total = total * scale.maximumf(fx.Float32(0.0))
+                # The per-position scale is shared by every contributing head.
+                total = total * scale
                 total = page_oks[ni].select(total, fx.Float32(float("-inf")))
 
                 is_writer = (lane_div_16 == 0) & (logical < split_end)
@@ -657,7 +671,7 @@ def compile_fp8_paged_mqa_local_topk(
             for hist_step in range_constexpr(
                 (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
             ):
-                histogram[hist_step * BLOCK_THREADS + tid] = 0
+                histogram[_thread_slot(hist_step, histogram_owner)] = 0
             if split == 0 and tid == 0:
                 merge_state_row[_MERGE_PREFIX] = 0
                 merge_state_row[_MERGE_MASK] = 0
@@ -672,7 +686,7 @@ def compile_fp8_paged_mqa_local_topk(
             gpu.barrier()
 
         for step in range_constexpr(output_steps):
-            slot = fx.Int32(step * BLOCK_THREADS) + tid
+            slot = _thread_slot(step, output_owner)
             if slot < fx.Int32(topk):
                 live = slot < retained
                 safe_slot = live.select(slot, fx.Int32(0))
@@ -712,7 +726,7 @@ def compile_fp8_paged_mqa_local_topk(
             for hist_step in range_constexpr(
                 (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
             ):
-                hist_bin = hist_step * BLOCK_THREADS + tid
+                hist_bin = _thread_slot(hist_step, histogram_owner)
                 count = histogram[hist_bin]
                 if count != 0:
                     atomic_add_i32(

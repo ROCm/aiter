@@ -128,6 +128,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_mla_ltx.py]=22
     FILE_TIMES[op_tests/test_sample.py]=22
     FILE_TIMES[op_tests/test_mla_prefill_ps.py]=21
+    FILE_TIMES[op_tests/test_flydsl_fp8_paged_mqa_local_topk.py]=19
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_group_quant.py]=18
     FILE_TIMES[op_tests/test_moe_tkw1.py]=18
     FILE_TIMES[op_tests/test_fused_qk_norm.py]=16
