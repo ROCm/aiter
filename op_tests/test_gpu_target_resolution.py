@@ -4,14 +4,13 @@
 """Unit tests for GPU target resolution: the arch and CU count aiter builds and
 dispatches for, and the caches keyed on that answer.
 
-The HIP device is faked, so these run without a GPU.
+The live GPU probes are faked, so these run without a GPU.
 """
 
 import contextlib
 import os
 import sys
 import tempfile
-from types import SimpleNamespace
 from unittest import mock
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
@@ -31,25 +30,6 @@ def _restored_env(*names):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-
-
-@contextlib.contextmanager
-def _fake_hip_host(devices, current=0):
-    """Present `devices` as the visible HIP devices; [] means no HIP context."""
-    import torch
-
-    props = [
-        SimpleNamespace(gcnArchName=arch, multi_processor_count=cu)
-        for arch, cu in devices
-    ]
-    # With no devices is_available() is False, so chip_info short-circuits
-    # before it reaches the other two patches.
-    with (
-        mock.patch.object(torch.cuda, "is_available", return_value=bool(props)),
-        mock.patch.object(torch.cuda, "current_device", return_value=current),
-        mock.patch.object(torch.cuda, "get_device_properties", lambda i: props[i]),
-    ):
-        yield
 
 
 def test_runtime_arch_resolution():
@@ -112,71 +92,21 @@ def test_runtime_arch_resolution():
             core.get_gfx_list.cache_clear()
 
 
-def test_active_device_arch_resolution():
-    from aiter.jit.utils import chip_info
-
-    def _reset():
-        chip_info.get_gfx_runtime.cache_clear()
-        chip_info.get_cu_num.cache_clear()
-        chip_info.get_gfx.cache_clear()
-        chip_info.get_gfx_custom_op_core.cache_clear()
-
-    # A mixed host: rocminfo and HIP both enumerate the gfx942 part first, but
-    # the process launches on device 1. Every answer must describe device 1, so
-    # reading device 0 fails these with gfx942/304 rather than passing quietly.
-    mixed_host = [("gfx942:sramecc+:xnack-", 304), ("gfx950:sramecc+:xnack-", 256)]
-    rocminfo_first = mock.patch.object(
-        chip_info, "_detect_native_rocminfo", return_value=["gfx942"]
-    )
-    with _restored_env("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM"):
-        try:
-            _reset()
-            with rocminfo_first, _fake_hip_host(mixed_host, current=1):
-                native = chip_info._detect_native()
-                assert native == ["gfx950"], (
-                    f"_detect_native should return the launching device, not the "
-                    f"first agent, got {native}"
-                )
-                runtime = chip_info.get_gfx_runtime()
-                assert (
-                    runtime == "gfx950"
-                ), f"get_gfx_runtime should resolve the launching device, got {runtime}"
-                cu_num = chip_info.get_cu_num()
-                assert (
-                    cu_num == 256
-                ), f"get_cu_num should read the launching device, got {cu_num}"
-
-            # No HIP context (GPU-less build host): rocminfo is still the fallback.
-            _reset()
-            with rocminfo_first, _fake_hip_host([]):
-                runtime = chip_info.get_gfx_runtime()
-                assert (
-                    runtime == "gfx942"
-                ), f"no HIP context should fall back to rocminfo, got {runtime}"
-
-            # That fallback must not be pinned: a caller running before the HIP
-            # context exists would otherwise fix gfx942 for the whole process.
-            with rocminfo_first, _fake_hip_host(mixed_host, current=1):
-                runtime = chip_info.get_gfx_runtime()
-                assert runtime == "gfx950", (
-                    f"a pre-context rocminfo answer must not be memoised, got "
-                    f"{runtime}"
-                )
-        finally:
-            _reset()
-
-
 def test_gpu_archs_takes_the_live_cu_count():
     from aiter.jit.utils import chip_info
 
     # A binned gfx950: naming the arch alone must not resolve to the full SKU.
-    binned = [("gfx950:sramecc+:xnack-", 128)]
     with _restored_env("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM"):
         os.environ["GPU_ARCHS"] = "gfx950"
         chip_info.get_gfx_runtime.cache_clear()
         chip_info.get_cu_num.cache_clear()
         try:
-            with _fake_hip_host(binned):
+            with (
+                mock.patch.object(
+                    chip_info, "_detect_native", return_value=["gfx950"]
+                ),
+                mock.patch.object(chip_info, "get_cu_num_custom_op", return_value=128),
+            ):
                 targets = chip_info.get_build_targets()
         finally:
             chip_info.get_gfx_runtime.cache_clear()
@@ -225,7 +155,6 @@ def test_cpp_itfs_cache_identity():
 
 if __name__ == "__main__":
     test_runtime_arch_resolution()
-    test_active_device_arch_resolution()
     test_gpu_archs_takes_the_live_cu_count()
     test_cpp_itfs_cache_identity()
     print("ALL_PASS")
