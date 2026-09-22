@@ -2,6 +2,7 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+from functools import lru_cache
 
 import torch
 import triton
@@ -20,6 +21,14 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+@lru_cache(maxsize=1)
+def _warn_gluon_fallback_once():
+    _LOGGER.warning(
+        "Gluon was explicitly requested for moe_gemm_a16w4 but is not supported "
+        "on this GPU; using Triton."
+    )
 
 
 def _is_gluon_available():
@@ -252,7 +261,8 @@ def moe_gemm_a16w4(
         if _is_gluon_available():
             backend = "gluon"
         else:
-            _LOGGER.warning("GLUON backend not available. Using TRITON backend!!!")
+            if backend == "gluon":
+                _warn_gluon_fallback_once()
             backend = "triton"
 
     backend = backend.lower()
@@ -262,7 +272,12 @@ def moe_gemm_a16w4(
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
     _LOGGER.info(
-        f"MOE_GEMM_A16W4: x={x.shape} w={w.shape} w_scales={w_scales.shape} swizzle_mx_scale={swizzle_mx_scale} backend={backend}"
+        "MOE_GEMM_A16W4: x=%s w=%s w_scales=%s swizzle_mx_scale=%s backend=%s",
+        x.shape,
+        w.shape,
+        w_scales.shape,
+        swizzle_mx_scale,
+        backend,
     )
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"

@@ -103,6 +103,7 @@ def compile_flydsl_fhmoe_stage2(
     enable_bias: bool = False,
     xcd_swizzle: int = 0,
     shared_expert_id: int = -1,
+    use_global_a: bool = True,
 ):
     """Compile the heterogeneous stage2 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm2
@@ -126,6 +127,7 @@ def compile_flydsl_fhmoe_stage2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=use_global_a,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
@@ -211,6 +213,7 @@ def _s2_args_fhmoe(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -243,6 +246,7 @@ def _s2_args_fhmoe(
         ptr_arg(num_valid_ids),
         ptr_arg(kernel_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,

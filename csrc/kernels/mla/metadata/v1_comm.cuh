@@ -96,6 +96,9 @@ struct MlaMetadataV1KernelParameter
     // KV trim (batch_tail) so each work spans the full local kv; the kernel masks
     // on GLOBAL positions instead.
     bool is_cp_round_robin;
+    // XCDs the part exposes; 1 disables the XCD grouping below. Workgroup -> XCD is round-robin.
+    int32_t num_xcd;
+    bool xcd_lane_works;
     int32_t fixed_over_head_num_blocks;
     int32_t tail_done_threshold;
 };
