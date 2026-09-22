@@ -258,7 +258,7 @@ def test_indexer_edges(mode):
         def candidate():
             return flydsl_fp8_paged_mqa_local_topk(
                 case.q,
-                case.kv,
+                _preshuffle_kv(case.kv),
                 case.scales,
                 case.weights,
                 case.lengths,
@@ -287,7 +287,7 @@ def test_indexer_edges(mode):
         def candidate():
             return flydsl_fp8_paged_mqa_local_topk(
                 case.q,
-                case.kv,
+                _preshuffle_kv(case.kv),
                 case.scales,
                 case.weights,
                 case.lengths,

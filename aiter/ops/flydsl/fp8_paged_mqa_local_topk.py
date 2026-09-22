@@ -140,7 +140,7 @@ def _prepare_stage_a(
     *,
     k,
     num_splits,
-    preshuffled,
+    preshuffled=True,
     require_page64=False,
 ):
     for name, tensor in (
@@ -183,10 +183,8 @@ def _prepare_stage_a(
         raise ValueError(
             f"gfx950 requires torch.float8_e4m3fn q_fp8, got {q_fp8.dtype}"
         )
-    if not isinstance(preshuffled, bool):
-        raise TypeError(f"preshuffled must be bool, got {type(preshuffled).__name__}")
-    if packed and not preshuffled:
-        raise ValueError("packed kv_cache requires preshuffled=True")
+    if preshuffled is not True:
+        raise ValueError("kv_cache must use shuffle_weight(..., layout=(16, 16))")
 
     rows = q_fp8.shape[0]
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
@@ -212,7 +210,7 @@ def _prepare_stage_a(
         raise ValueError(f"k must be one of {SUPPORTED_K}, got {k}")
     if require_page64 and page_size != 64:
         raise ValueError(f"this specialization requires page_size 64, got {page_size}")
-    if preshuffled and page_size % 16:
+    if page_size % 16:
         raise ValueError(
             f"preshuffled kv_cache requires page_size divisible by 16, got {page_size}"
         )
@@ -277,15 +275,15 @@ def flydsl_fp8_paged_mqa_local_topk(
     *,
     k=2048,
     num_splits=None,
-    preshuffled=False,
+    preshuffled=True,
     workspace=None,
 ):
     """Compute exact H32D128 FP8 scores and retain local TopK per history split.
 
     Live candidates are emitted unordered. Positions are logical history positions.
-    Set ``preshuffled=True`` when ``kv_cache`` uses
-    ``shuffle_weight(..., layout=(16,16))`` within each page. This experimental
-    API never allocates a full-width logits tensor.
+    ``kv_cache`` must use ``shuffle_weight(..., layout=(16,16))`` within each
+    page (packed or split). This experimental API never allocates a full-width
+    logits tensor.
 
     ``q_fp8`` is ``[B,1,32,128]``: one decode query per request. Row lengths
     larger than ``block_tables.shape[1] * page_size`` are clamped to that table
@@ -327,7 +325,6 @@ def flydsl_fp8_paged_mqa_local_topk(
             launch.candidate_counts,
             topk=launch.k,
             num_splits=launch.num_splits,
-            preshuffled=preshuffled,
             arch=launch.arch,
             stream=launch.stream,
             packed=launch.packed,
@@ -359,8 +356,8 @@ def flydsl_fp8_paged_mqa_topk(
 ):
     """Compute exact TopK through compact split-local candidate bags.
 
-    Packed pages require ``k_scales=None``. This compact specialization requires
-    ``preshuffled=True``. Lengths and block-table ids follow
+    Packed pages require ``k_scales=None``. K pages must be preshuffled with
+    ``shuffle_weight(..., layout=(16,16))``. Lengths and block-table ids follow
     the same safety contract as ``flydsl_fp8_paged_mqa_local_topk``.
 
     Serving / CUDA-graph caller
@@ -389,7 +386,7 @@ def flydsl_fp8_paged_mqa_topk(
     Two-kernel form (caller owns the ``[rows, S, k]`` bags too)::
 
         bags = flydsl_fp8_paged_mqa_local_topk(
-            ..., workspace=workspace, preshuffled=True,
+            ..., workspace=workspace,
         )
         split_topk_merge(
             *bags, k=k, precomputed_first_pass=True, workspace=workspace,
@@ -398,8 +395,6 @@ def flydsl_fp8_paged_mqa_topk(
 
     ``num_splits == 1`` has no merge and rejects ``workspace``.
     """
-    if preshuffled is not True:
-        raise ValueError("flydsl_fp8_paged_mqa_topk requires preshuffled=True")
     launch = _prepare_stage_a(
         q_fp8,
         kv_cache,
@@ -439,7 +434,6 @@ def flydsl_fp8_paged_mqa_topk(
             launch.candidate_counts,
             topk=launch.k,
             num_splits=launch.num_splits,
-            preshuffled=preshuffled,
             arch=launch.arch,
             stream=launch.stream,
             packed=launch.packed,

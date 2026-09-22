@@ -50,14 +50,12 @@ def fp8_paged_mqa_local_topk_kernel_name(
     *,
     topk: int,
     arch: str,
-    preshuffled: bool,
     packed: bool,
     prepare_merge: bool,
 ) -> str:
-    layout_name = "preshuffled" if preshuffled else "rowmajor"
     packed_tag = "_packed" if packed else ""
     return (
-        f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
+        f"fp8_paged_mqa_local_topk_h32d128_k{topk}_preshuffled{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
         f"pm{int(prepare_merge)}_ptr64_scan3_n1_{arch}"
     )
@@ -118,14 +116,6 @@ def _ptr_load_i32x4(i32_ptr, offset_i64):
     )
 
 
-def _ptr_load_fp8x32(i32_ptr, byte_base_i64, lane_div_16):
-    """Load one lane's contiguous K32 fragment through a 64-bit global pointer."""
-    off = (byte_base_i64 >> fx.Int64(2)) + fx.Int64(lane_div_16) * fx.Int64(8)
-    lo = _ptr_load_i32x4(i32_ptr, off)
-    hi = _ptr_load_i32x4(i32_ptr, off + fx.Int64(4))
-    return _concat_i32x4(lo, hi)
-
-
 def _ptr_load_preshuffled_fp8x32(
     i32_ptr,
     page_i32,
@@ -152,12 +142,15 @@ def compile_fp8_paged_mqa_local_topk(
     *,
     topk: int,
     arch: str,
-    preshuffled: bool,
     page_size: int,
     prepare_merge: bool = False,
     packed: bool = False,
 ):
-    """Compile an H32D128 Stage-A specialization."""
+    """Compile an H32D128 Stage-A specialization.
+
+    K pages must use ``shuffle_weight(..., layout=(16, 16))``. Packed and split
+    scale storage are both valid; row-major K is not.
+    """
     if topk not in SUPPORTED_K:
         raise ValueError(f"topk must be one of {SUPPORTED_K}, got {topk}")
     if arch != "gfx950":
@@ -177,7 +170,6 @@ def compile_fp8_paged_mqa_local_topk(
     kernel_name = fp8_paged_mqa_local_topk_kernel_name(
         topk=topk,
         arch=arch,
-        preshuffled=preshuffled,
         packed=packed,
         prepare_merge=prepare_merge,
     )
@@ -205,23 +197,13 @@ def compile_fp8_paged_mqa_local_topk(
         def _page_i32(physical_page):
             return fx.Int64(physical_page) * fx.Int64(block_i32)
 
-    if preshuffled:
-
-        def _load_k(kv_i32_ptr, page_i32, token_in_page, lane):
-            return _ptr_load_preshuffled_fp8x32(
-                kv_i32_ptr,
-                page_i32,
-                token_in_page,
-                lane,
-            )
-
-    else:
-
-        def _load_k(kv_i32_ptr, page_i32, token_in_page, lane):
-            byte_base = (page_i32 << fx.Int64(2)) + fx.Int64(token_in_page) * fx.Int64(
-                HEAD_DIM
-            )
-            return _ptr_load_fp8x32(kv_i32_ptr, byte_base, lane)
+    def _load_k(kv_i32_ptr, page_i32, token_in_page, lane):
+        return _ptr_load_preshuffled_fp8x32(
+            kv_i32_ptr,
+            page_i32,
+            token_in_page,
+            lane,
+        )
 
     if packed:
 
@@ -799,7 +781,6 @@ def launch_fp8_paged_mqa_local_topk(
     *,
     topk,
     num_splits,
-    preshuffled,
     arch,
     stream,
     prepare_merge=False,
@@ -816,7 +797,6 @@ def launch_fp8_paged_mqa_local_topk(
     launcher = compile_fp8_paged_mqa_local_topk(
         topk=topk,
         arch=arch,
-        preshuffled=preshuffled,
         page_size=page_size,
         prepare_merge=prepare_merge,
         packed=packed,
