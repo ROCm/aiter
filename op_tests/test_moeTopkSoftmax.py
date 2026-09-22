@@ -381,10 +381,7 @@ def test_biased_grouped_topk_stable(
     topk,
     dtype,
     pattern,
-    num_iters=2,
-    num_warmup=1,
 ):
-    torch.manual_seed(20260921 + expert + topk)
     gating = torch.randn((token, expert), dtype=dtype)
     bias = (torch.randn(expert) * 0.05).to(dtype)
     if pattern == "all_equal":
@@ -394,28 +391,24 @@ def test_biased_grouped_topk_stable(
         gating.fill_(-4)
         gating[:, -16:] = 0
         bias.zero_()
-    elif pattern == "all_nan":
-        gating.fill_(torch.nan)
-        bias.zero_()
-    elif pattern == "all_neg_inf_selection":
-        gating.zero_()
-        bias.fill_(-torch.inf)
-
-    def run(w, ids):
-        aiter.biased_grouped_topk_hip(gating, bias, w, ids, 1, 1, True, 2.5)
-        return w, ids
 
     w = torch.empty((token, topk), dtype=dtypes.fp32)
     ids = torch.empty((token, topk), dtype=dtypes.i32)
     _, us = run_perftest(
-        lambda: run(w, ids),
-        num_iters=num_iters,
-        num_warmup=num_warmup,
+        aiter.biased_grouped_topk_hip,
+        gating,
+        bias,
+        w,
+        ids,
+        1,
+        1,
+        True,
+        2.5,
     )
 
     repeat_w = torch.empty_like(w)
     repeat_i = torch.empty_like(ids)
-    run(repeat_w, repeat_i)
+    aiter.biased_grouped_topk_hip(gating, bias, repeat_w, repeat_i, 1, 1, True, 2.5)
 
     ids_sorted, perm = ids.sort(dim=-1)
     repeat_i_sorted, repeat_perm = repeat_i.sort(dim=-1)
@@ -428,15 +421,7 @@ def test_biased_grouped_topk_stable(
         equal_nan=True,
     )
 
-    ops = token * expert
-    nbytes = token * expert * gating.element_size() + expert * bias.element_size()
-    return {
-        "gfx": get_gfx(),
-        "register us": us,
-        "register TFLOPS": ops / us / 1e6,
-        "register TB/s": nbytes / us / 1e6,
-        "register err": 0,
-    }
+    return {"err": 0, "us": us}
 
 
 @benchmark()
