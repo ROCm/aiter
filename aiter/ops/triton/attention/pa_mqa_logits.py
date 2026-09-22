@@ -501,9 +501,18 @@ def deepgemm_fp8_paged_mqa_logits(
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
     if Preshuffle:
-        assert (
-            KVBlockSize % 16 == 0
-        ), f"Preshuffle mode only supports KVBlockSize aligned to 16. Got KVBlockSize={KVBlockSize}"
+        # The shuffled layout feeds the 16-token MFMA B tile directly, so a page
+        # either holds whole tiles or divides one. A page shorter than the tile
+        # must be shuffled in groups of its own length --
+        # `shuffle_weight(kv, layout=(KVBlockSize, 16))` -- and the kernel then
+        # assembles the tile from 16 // KVBlockSize pages.
+        assert KVBlockSize % 16 == 0 or 16 % KVBlockSize == 0, (
+            "Preshuffle needs the KV page to be a multiple of the 16-token MFMA "
+            f"tile or to divide it. Got KVBlockSize={KVBlockSize}."
+        )
+        assert not (
+            KVBlockSize < 16 and get_gfx() == "gfx1250"
+        ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     num_block = kv_cache.shape[0]
