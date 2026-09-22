@@ -294,10 +294,10 @@ def _stream_small_reject_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Select ``BLOCK_K`` columns by rejecting the bottom one or two.
+    """Select ``BLOCK_K`` columns by rejecting a small bottom tail.
 
     The generic stream selector orders fp32 keys descending and columns
-    ascending.  Here the same order is expressed as a signed key so a pair of
+    ascending.  Here the same order is expressed as a signed key so repeated
     reductions can find the complement: smaller key is worse and, among equal
     keys, the larger column is worse.  NaNs collapse above +inf and signed zero
     collapses to +0, matching the stream key transform exactly.
@@ -316,25 +316,47 @@ def _stream_small_reject_kernel(
     is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
     key = tl.where(is_nan | ~live, 0x7FFFFFFF, key)
 
-    worst_key0 = tl.min(key, axis=0)
-    reject0 = tl.max(tl.where(live & (key == worst_key0), col, -1), axis=0)
-    reject_lo = reject0
-    reject_hi = reject0
-    if REJECTS == 2:
-        key1 = tl.where(col == reject0, 0x7FFFFFFF, key)
-        worst_key1 = tl.min(key1, axis=0)
-        reject1 = tl.max(
-            tl.where(live & (col != reject0) & (key1 == worst_key1), col, -1),
-            axis=0,
-        )
-        reject_lo = tl.minimum(reject0, reject1)
-        reject_hi = tl.maximum(reject0, reject1)
+    if REJECTS <= 2:
+        # Keep the two hottest shapes byte-for-byte equivalent to the original
+        # specialization: no rejection mask and no prefix scan.
+        worst_key0 = tl.min(key, axis=0)
+        reject0 = tl.max(tl.where(live & (key == worst_key0), col, -1), axis=0)
+        reject_lo = reject0
+        reject_hi = reject0
+        if REJECTS == 2:
+            key1 = tl.where(col == reject0, 0x7FFFFFFF, key)
+            worst_key1 = tl.min(key1, axis=0)
+            reject1 = tl.max(
+                tl.where(live & (col != reject0) & (key1 == worst_key1), col, -1),
+                axis=0,
+            )
+            reject_lo = tl.minimum(reject0, reject1)
+            reject_hi = tl.maximum(reject0, reject1)
+        slot = tl.arange(0, BLOCK_K)
+        out_col = tl.where(slot >= reject_lo, slot + 1, slot)
+        if REJECTS == 2:
+            out_col = tl.where(out_col >= reject_hi, out_col + 1, out_col)
+        tl.store(idx_ptr + row * idx_stride0 + slot, out_col)
+    else:
+        rejected = col < 0
+        for _ in tl.static_range(0, REJECTS):
+            remaining_key = tl.where(rejected, 0x7FFFFFFF, key)
+            worst_key = tl.min(remaining_key, axis=0)
+            reject = tl.max(
+                tl.where(live & ~rejected & (remaining_key == worst_key), col, -1),
+                axis=0,
+            )
+            rejected |= col == reject
 
-    slot = tl.arange(0, BLOCK_K)
-    out_col = tl.where(slot >= reject_lo, slot + 1, slot)
-    if REJECTS == 2:
-        out_col = tl.where(out_col >= reject_hi, out_col + 1, out_col)
-    tl.store(idx_ptr + row * idx_stride0 + slot, out_col)
+        # Compact the complement in ascending-column order.  Exactly BLOCK_K
+        # live columns remain, so every output slot is written once.
+        keep = live & ~rejected
+        slot = tl.cumsum(keep.to(tl.int32), axis=0) - 1
+        tl.store(
+            idx_ptr + row * idx_stride0 + slot,
+            col,
+            mask=keep,
+        )
 
 
 @lru_cache(maxsize=256)
@@ -948,19 +970,25 @@ def _dispatch(
     elif backend == "stream":
         wave = wave_size_of(input.device.index)
         rejects = input.shape[1] - topk
+        small_reject = (
+            0 < rejects <= 4
+            or (rows >= 1024 and rejects <= 7)
+            or (rows >= 4096 and rejects <= 8)
+        )
         if (
             not ragged
             and get_gfx_runtime() == "gfx950"
             and topk == 2048
-            and rejects in (1, 2)
+            and small_reject
         ):
-            # A dense row with k+1/k+2 columns is a reject-one/reject-two
-            # problem, not a general selection problem.  Reduce the bottom
-            # pair(s) and emit their complement directly; this preserves the
-            # stream backend's (value desc, column asc) selected set while
-            # avoiding its three radix passes and candidate-buffer traffic.
-            # Keep gfx942 on the generic path until this geometry is measured
-            # and validated there as well.
+            # A dense row with a small N-K tail is a reject-r problem, not a
+            # general selection problem.  Reduce the bottom tail and emit its
+            # complement directly; this preserves the stream backend's
+            # (value desc, column asc) selected set while avoiding its three
+            # radix passes and candidate-buffer traffic.  Keep gfx942 on the
+            # generic path until this geometry is measured there as well.  The
+            # row-dependent r limits retain at least a 1.10x win over generic
+            # stream in the seed-0 MI355X ABBA crossover sweep.
             _stream_small_reject_kernel[(rows,)](
                 input,
                 idx,
