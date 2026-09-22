@@ -17,6 +17,7 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
+    _k_mean,
     _RawRecipeKind,
     _resolve_raw_recipe,
     mha_v4,
@@ -545,9 +546,9 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     v = torch.randn_like(q)
     fp8_format = native_fp8_format()
 
-    # mha_v4 smooths K before quantizing; packed callers pass the mean themselves.
+    # mha_v4 smooths K before quantizing; packed callers pass the same mean themselves.
     q_quantized, q_descale = quantize_fp8_rotated(q)
-    k_quantized, k_descale = quantize_fp8_rotated(k, k.float().mean(dim=1).contiguous())
+    k_quantized, k_descale = quantize_fp8_rotated(k, _k_mean(k, _RawRecipeKind.FP8))
     v_quantized, v_descale = quantize_fp8(v)
     expected = mha_v4_packed(
         q_quantized,

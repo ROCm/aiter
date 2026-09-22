@@ -189,6 +189,11 @@ _MHA_V4_Q_TILE = 256
 # find_config(..., mode=1).
 _MHA_V4_SPARSE_MODE = 1
 
+# Shared-K component, relative to a typical K row, above which removing it improves quantization.
+# Measured crossover: gains stay within noise to 0.6 and reach 1.16x by 0.85. See _k_mean.
+_K_SMOOTH_MIN_COMMON = 0.7
+_K_SMOOTH_SAMPLE_ROWS = 2048
+
 
 def native_fp8_format() -> AttentionFormat:
     """Return the FP8 E4M3 encoding native to the active GPU architecture."""
@@ -1023,14 +1028,31 @@ def _launch_mxfp6_fake(
 
 
 def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
-    """Per-(batch, head, channel) token mean of K, or None for recipes that keep K in BF16.
+    """A per-(batch, head, channel) constant to remove from K, or None if it would not pay.
 
     Softmax is shift-invariant in a component shared by every key, but quantization noise is not,
-    so removing it is free accuracy. Recipes that never quantize K have nothing to gain.
+    so once that component dominates, removing it is a large win: measured 3.5x on FP8 and 5.1x on
+    MXFP4 at the extreme. Recipes that never quantize K have nothing to gain.
+
+    Shift-invariance holds for *any* constant vector, not just the exact mean, so this estimates it
+    from a strided sample. That keeps the cost independent of sequence length -- a full reduction
+    over K is what made centering too expensive to keep before -- and a few thousand rows estimate
+    the shared component to well under the accuracy it is worth removing.
+
+    It is also not a win at every magnitude. The subtraction takes energy out of K's RMS but not
+    out of its outliers, so a per-tensor scale (set by amax) gets relatively coarser. Below a
+    common mode of ~0.7 that costs more than the shared component does, and real traces sit at
+    0.3-0.5, so the gate leaves them untouched.
     """
     if kind in (_RawRecipeKind.BF16, _RawRecipeKind.BF16_FP8):
         return None
-    return k.float().mean(dim=1).contiguous()
+    stride = max(1, k.shape[1] // _K_SMOOTH_SAMPLE_ROWS)
+    sample = k[:, ::stride].float()
+    mean = sample.mean(dim=1)
+    # Compared squared to keep the whole gate to a handful of tiny kernels; it is launch-bound.
+    row_sq = sample.pow(2).sum(dim=-1).mean(dim=1)
+    gate = mean.pow(2).sum(dim=-1) > _K_SMOOTH_MIN_COMMON**2 * row_sq
+    return (mean * gate.unsqueeze(-1)).contiguous()
 
 
 def _validate_mha_v4_raw_inputs(
