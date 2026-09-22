@@ -27,10 +27,9 @@ MIN_DYNAMIC_BATCH = 4
 # this is the most performant page size
 IDEAL_PAGE_SIZE = 64
 
-# The preshuffled cache's e8m0 byte order. 1 is what ships: one MFMA tile per
-# group with the scale axis innermost, read as one wide run. 0 is the narrow
-# order, kept only so a gather can be measured against a cache it was not
-# written for.
+# e8m0 byte order. 1 ships: one MFMA tile per group, read as one wide run.
+# 0 is the narrow order, kept so a gather can be measured against a cache it
+# was not written for.
 SCALE_MODE_WIDE = 1
 
 # DeepSeek-V4.1's two-level indexer groups the context in 8-token candidate
@@ -275,12 +274,10 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
         # vectorizer pairs the adds into v_pk_add_f32, which has no abs modifier.
         relu_add=cfg["fold_asm"],
         min_tiles_per_split=4,
-        # The balance term's cap on a workgroup's tiles. Decode wants it loose:
-        # one row block per sequence leaves the occupancy term in charge, and
-        # at a long context 64 splits past what occupancy asked for, which
-        # costs 8-10% at 128K-365K. Above one query row the row blocks already
-        # fill the machine, the occupancy term is small, and the same value
-        # halves the split count and costs 1-14%.
+        # Cap on a workgroup's tiles. Loose at decode, where occupancy is in
+        # charge and 64 over-splits by 8-10% at 128K-365K; tight above one query
+        # row, where the row blocks already fill the machine and 128 would halve
+        # the split count for 1-14%.
         max_tiles_per_split=128 if next_n == 1 else 64)
     return cfg
 
@@ -518,10 +515,9 @@ def paged_mxfp4_mqa_logits(
     if preshuffle:
         cache_format(num_heads, head_size, page_size)  # validates the geometry
 
-    # The fused stage-A reduce, as three values of one knob rather than two
-    # flags with a forbidden corner: 0 off, 1 the maxima beside the logits,
-    # 2 the maxima instead of them. The shape checks that need BLOCK_KV are
-    # below; what is resolved here is whether a logits tensor exists at all.
+    # One knob rather than two flags with a forbidden corner: 0 off, 1 maxima
+    # beside the logits, 2 instead of them. What is settled here is only whether
+    # a logits tensor exists; the BLOCK_KV shape checks are below.
     bscore_on = 0 if block_scores is None else (2 if block_scores_only else 1)
     assert not pin_newest or bscore_on, "pin_newest writes a block score"
     if block_scores_only:
@@ -557,11 +553,10 @@ def paged_mxfp4_mqa_logits(
             f"max_model_len {max_model_len} exceeds what a buffer store can "
             "address")
 
-    # A candidate gather. `gather` is what build_gather returns: two int32
-    # [B*next_n, blocks] tensors of already-resolved offsets -- page address
-    # plus the block's own offset inside its page. The kernel adds one of those
-    # per column and nothing else; there is no block-table read on this path.
-    # The walk length is the row's valid slot count, which arrives as cu_ends.
+    # `gather` is what build_gather returns: two int32 [B*next_n, blocks]
+    # tensors of resolved offsets, page address plus in-page offset. The kernel
+    # adds one per column and reads no block table. cu_ends is the walk length,
+    # in slots.
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:
@@ -578,29 +573,16 @@ def paged_mxfp4_mqa_logits(
     cfg = select_config(num_heads, head_size, next_n, page_size, preshuffle,
                         clean_logits)
     if gather_on:
-        # One query row per workgroup: above one row the walk is over the
-        # rows' union and each row's store column comes from a per-block slot,
-        # none of which the candidate addressing carries.
+        # One query row per workgroup: above one row the walk is the rows'
+        # union and each store column comes from a per-block slot, neither of
+        # which the candidate addressing carries.
         #
-        # The dense walk's two pipeline knobs invert here, both for the same
-        # reason: BLOCK_M is 1 rather than 3, and the candidate list carries
-        # the whole page address.
-        #
-        # DEPTH keeps only its split-page term, and only below 64 heads. The
-        # wide-decode term pays the dense walk because a second tile in flight
-        # covers the block-table read, and the gather does no such read -- so
-        # there it only costs registers, and at 64 heads it costs enough of
-        # them to push the scale load back to bytes. Pinning it to 1 at 64
-        # heads is 1.01-1.06x on its own and 1.19-1.29x once that spill is
-        # counted. A page wider than the tile is the one place a second tile
-        # still pays, 1.03x at decode concurrency 128, measured rather than
-        # explained by the candidate addressing.
-        #
-        # UNROLL goes the other way on a wide chunk: one query row leaves the
-        # registers the dense path at BLOCK_M = 3 does not have, and four
-        # tiles of loads in flight is worth 1.03-1.06x with no spill. Decode
-        # keeps what the dense rule gave it -- the walk is short enough there
-        # that the peeled remainder costs more than the extra loads buy.
+        # Both pipeline knobs invert here. DEPTH pays the dense walk by covering
+        # its block-table read, and the gather has none -- so it only costs
+        # registers, 1.01-1.06x at 64 heads and 1.19-1.29x once the scale spill
+        # it causes is counted; it survives only on a split page. UNROLL goes
+        # the other way: BLOCK_M = 1 leaves the registers the dense path at 3
+        # does not have, worth 1.03-1.06x on a wide chunk.
         split_page = page_size > cfg["block_kv"]
         cfg = dict(cfg, block_m=1, row_blocks=next_n,
                    depth=2 if (next_n == 1 and split_page and num_heads <= 32)
@@ -657,12 +639,9 @@ def paged_mxfp4_mqa_logits(
     cfg["kv_reread"] = 1 if row_blocks > 1 else 0
 
     num_kv_splits = cfg["num_kv_splits"]
-    # A gather launch does not build one. Every row walks the same
-    # ceil(slots / BLOCK_KV) tiles, so there is no spread for a slice plan to
-    # even out, and the build costs about half a launch. A dynamic=1 set for the
-    # step must not drag a consumer layer in. An explicit schedule is still
-    # honoured, and build_schedule takes the same gather flag so its tile count
-    # comes out of the slot counts.
+    # A gather launch does not build one: every row walks the same tile count,
+    # so there is nothing for a slice plan to even out and the build costs half
+    # a launch. An explicit schedule is still honoured.
     if schedule is None and dynamic and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
                                   page_size, preshuffle, cu_ends=cu_ends)

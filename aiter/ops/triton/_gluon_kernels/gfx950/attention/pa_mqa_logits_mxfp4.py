@@ -300,13 +300,9 @@ class Config:
         self.FOLD_ASM = gl.constexpr(FOLD_ASM)
         self.RELU_ADD = gl.constexpr(RELU_ADD)
         self.PRESHUFFLE = gl.constexpr(PRESHUFFLE)
-        # The preshuffled cache's e8m0 byte order. 1 groups one MFMA tile with
-        # the scale axis innermost, which is what lets a whole tile be read as
-        # one wide run; 0 puts the token axis innermost, one buffer_load_ubyte
-        # per group. Both are gatherable at any granularity up to N_PER_TILE --
-        # they differ in load width, not in whether a candidate block's bytes
-        # are addressable -- so which one a shared cache is written in is a
-        # question about the dense reader, not about the gather.
+        # e8m0 byte order. 1 reads a whole MFMA tile as one wide run, 0 costs a
+        # buffer_load_ubyte per group. Both are gatherable at any granularity up
+        # to N_PER_TILE, so the choice is the dense reader's, not the gather's.
         self.SCALE_MODE = gl.constexpr(SCALE_MODE)
         self.USE_BUFFER_LOAD = gl.constexpr(USE_BUFFER_LOAD)
         self.RELAXED_STORE = gl.constexpr(RELAXED_STORE)
@@ -316,16 +312,12 @@ class Config:
         self.GATHER = gl.constexpr(GATHER)
         self.GATHER_BLOCK = gl.constexpr(GATHER_BLOCK)
         self.GATHER_PIPE = gl.constexpr(GATHER_PIPE)
-        # Emit a per-row maximum over every BSCORE_BLOCK columns, so the
-        # two-level indexer's block scores cost a reduce in the walk instead of
-        # a second pass over the logits it just wrote. Three modes of one knob:
+        # A per-row max over every BSCORE_BLOCK columns, so the indexer's block
+        # scores cost a reduce in the walk rather than a second pass:
         #   0  off
-        #   1  the maxima beside the logits, for a layer that needs both
-        #   2  the maxima instead of the logits -- pass 1 of the two-pass
-        #      producer, which ranks them into a candidate pool and then
-        #      gathers its own top-k out of that pool, so the [rows, ctx] fp32
-        #      logits tensor is never allocated and never written
-        # 2 changes no value 1 writes; it only drops the store.
+        #   1  maxima beside the logits
+        #   2  maxima instead of them, so no [rows, ctx] fp32 tensor exists
+        # 2 writes the same values as 1; it only drops the logits store.
         self.BSCORE = gl.constexpr(BSCORE)
         self.STORE_LOGITS = gl.constexpr(BSCORE != 2)
         self.BSCORE_BLOCK = gl.constexpr(BSCORE_BLOCK)
@@ -466,11 +458,10 @@ class KVState:
                            layout=gl.SliceLayout(1, val_layout))[:, None]
         offs_n = gl.arange(0, cfg.BLOCK_KV,
                            layout=gl.SliceLayout(0, val_layout))[None, :]
-        # Both byte maps are separable -- A(d) + B(n) -- and a candidate block
-        # never straddles a shuffle group, so B(t0 + c) = B(t0) + c * stride for
-        # c < GATHER_BLOCK. Only the `c` term is loop invariant and lives here;
-        # B(t0) plus the page address arrives per tile as one runtime vector,
-        # which is the whole of the addressing change.
+        # Both byte maps are separable and a block never straddles a shuffle
+        # group, so B(t0 + c) = B(t0) + c * stride. Only the `c` term is loop
+        # invariant and lives here; B(t0) and the page arrive per tile as one
+        # runtime vector, which is the whole of the addressing change.
         if cfg.GATHER:
             offs_n = offs_n % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
@@ -515,12 +506,9 @@ class KVState:
         # GATHER_BLOCK divides BLOCK_KV, so this is (tile_pos + cols) // GB.
         blk = gl.minimum(tile_pos // self.cfg.GATHER_BLOCK
                          + cols // self.cfg.GATHER_BLOCK, self.last_blk)
-        # A buffer load rather than a pointer load, and not for the reason
-        # USE_BUFFER_LOAD exists: the row base is scalar and folds into the
-        # descriptor, so the per-column term stays i32 and the tile costs one
-        # shift instead of a 64-bit shift-add and a sign extend per stream.
-        # The list is one row of at most max_model_len / GATHER_BLOCK int32,
-        # so it is under the record count whatever the cache is.
+        # Buffer, not pointer: the row base is scalar and folds into the
+        # descriptor, so the per-column term stays i32 -- one shift a tile
+        # instead of a 64-bit shift-add and a sign extend per stream.
         return gl.amd.cdna4.buffer_load(ptr=base_ptr, offsets=blk)
 
     @gluon.jit
@@ -611,19 +599,11 @@ class KVState:
         loaded straight into the distribution the scaled MFMA wants.
         """
         if self.cfg.GATHER:
-            # A per-column page, so there is no single tile base to bump: the
-            # whole address goes in the offsets, i32 under buffer_load.
-            #
-            # The `* U` is the same move the value stream makes with
-            # D_PER_TILE: the list is stored in units of it so the multiply
-            # hands the divisibility back. Without it the tile's 2-byte scale
-            # runs lose their alignment at the load and the vectorizer splits
-            # each into two buffer_load_ubyte. The page stride is
-            # PAGE_SIZE * NUM_SCALES and the in-page term is
-            # (t0 % N_PER_TILE) * tok_stride + (t0 // N_PER_TILE) * N_PER_TILE
-            # * NUM_SCALES with t0 a multiple of GATHER_BLOCK, so both are even
-            # when the block and the group count are; gather_s_unit() on the
-            # host is the same two lines and must stay in step with this one.
+            # A per-column page, so the whole address goes in the offsets.
+            # `* U` is the value stream's D_PER_TILE move: the list is stored in
+            # units of U so the multiply hands the 2-byte alignment back, and
+            # without it each scale run splits into two buffer_load_ubyte.
+            # gather_s_unit() picks the same U and must stay in step.
             U: gl.constexpr = 2 if (self.cfg.GATHER_BLOCK % 2 == 0
                                     and self.cfg.NUM_SCALES % 2 == 0) else 1
             if self.cfg.USE_BUFFER_LOAD:
@@ -728,11 +708,10 @@ class RegLoader:
     def values(self, tile_pos, page, gtok):
         cfg: gl.constexpr = self.st.cfg
         if cfg.GATHER:
-            # `* D_PER_TILE` is not arithmetic for its own sake: an offset that
-            # arrives from memory carries no provable alignment, and without one
-            # Triton refuses to vectorise the load and emits one
-            # buffer_load_ubyte per byte. Storing the list in D_PER_TILE units
-            # and multiplying by the constant hands the divisibility back.
+            # An offset arriving from memory carries no provable alignment, and
+            # Triton then emits one buffer_load_ubyte per byte. Storing the list
+            # in D_PER_TILE units and multiplying back hands the divisibility
+            # over.
             if cfg.USE_BUFFER_LOAD:
                 return gl.amd.cdna4.buffer_load(
                     ptr=self.st.KV_ptr,
@@ -979,14 +958,10 @@ class Program:
         # clean_logits off. The union bound stays; it is what keeps the store
         # inside this row and this split.
         #
-        # A block max has to *see* the causal boundary as -inf, where the store
-        # predicate merely drops the column, or it picks up a lane past the
-        # row's end. MASKED says this tile can cross one. At BLOCK_M == 1 only
-        # a peeled tile can: tile_hi is ceil(row_hi / BLOCK_KV), so tile
-        # tile_hi - 1 is the only one that straddles and the pipeline always
-        # peels it. Above one row the bounds differ per row and any tile can
-        # cross, so the select is not peelable there -- but it is already
-        # unconditional unless RELAXED_STORE dropped it.
+        # A block max must *see* the boundary as -inf, where the store predicate
+        # only drops the column. MASKED marks a tile that can cross one: at
+        # BLOCK_M == 1 that is the peeled tail alone, and above one row the
+        # select is unconditional anyway unless RELAXED_STORE dropped it.
         cfg: gl.constexpr = self.cfg
         col = gl.arange(0, cfg.BLOCK_KV, layout=gl.SliceLayout(0, cfg.mfma_layout))
         pos = tile_pos + col
@@ -1269,11 +1244,9 @@ def _pa_mqa_logits_mxfp4_kernel(
     qs_base = batch_id.to(gl.int64) * stride_qs_b + n0.to(gl.int64) * stride_qs_n
     w_row = batch_id.to(gl.int64) * next_n + n0
 
-    # Loaded beside the Q rows: BLOCK_M scalar loads, nothing per KV tile. It
-    # replaces the built-in rule and may also exceed it. Needed when the boundary
-    # is not one key per row -- a compressed cache, or a context-parallel shard.
-    # Under GATHER the same number counts the row's valid candidate slots: the
-    # coordinate space changes, the bound's role does not.
+    # BLOCK_M scalar loads beside the Q rows, nothing per KV tile. Replaces the
+    # built-in rule and may exceed it, for a compressed cache or a CP shard.
+    # Under GATHER it counts valid candidate slots instead of keys.
     mfma_qs, q_scales, w_blocks, ends = (), (), (), ()
     for r in gl.static_range(0, BLOCK_M):
         q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + r * stride_q_n),
@@ -1346,25 +1319,13 @@ def _pa_mqa_logits_mxfp4_kernel(
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
 
     if PIN_NEWEST:
-        # The block holding the row's newest key is a candidate whatever it
-        # scored. Out here rather than in the reduce: it is one element per row,
-        # and a compare per block per tile would pay for it in the steady loop.
-        #
-        # Only the workgroup whose tiles cover that key writes the pin, and that
-        # is the same one whose reduce wrote that block -- so no other workgroup
-        # can land on it afterwards. `ends[r]` and not `row_hi[r]`, because
-        # row_hi is already min'd with this split's share and every split would
-        # then read its own last block as the boundary.
-        #
-        # Inside that workgroup the warps still race. Above one warp the loop's
-        # block_max stores are spread across them and nothing orders them
-        # against this one: Gluon emits barriers for LDS dependencies, not for
-        # two warps writing the same global address. Without the barrier a
-        # warp still in the loop overwrites the pin -- measured, a different
-        # subset of rows each run. One s_barrier, once, outside the loop.
+        # The row's newest block is a candidate whatever it scored. Out here
+        # because it is one element per row. Written by the workgroup covering
+        # that key -- the one whose reduce wrote it -- and keyed on `ends[r]`,
+        # not `row_hi[r]`, or every split claims its own last block. Its warps
+        # still race, and Gluon barriers LDS, not two warps on one address.
         gl.barrier()
-        # One thread, not one element of a replicated tensor: the store is a
-        # single dword and the layout has to say so.
+        # One thread, not one element of a replicated tensor.
         NT: gl.constexpr = NUM_WARPS * WARP_SIZE
         lay: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1], threads_per_warp=[WARP_SIZE],

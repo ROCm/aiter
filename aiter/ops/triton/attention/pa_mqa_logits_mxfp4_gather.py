@@ -2,30 +2,21 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Host side of the candidate gather for the paged MXFP4 MQA-logits kernel.
 
-The kernel's addressing change is one broadcast add, and this is what makes it
-one. Both stored byte maps are separable -- A(d) + B(n) for the values,
-As(s) + Bs(n) for the scales -- and a candidate block of GATHER_BLOCK tokens
-never straddles a shuffle group, so for a block starting at in-page token `t0`
-
-    preshuffled:  B(t0 + c) = B(t0) + c * K_WIDTH     Bs(t0 + c) = Bs(t0) + c * s_hi
-    token major:  B(t0 + c) = B(t0) + c * head_bytes  Bs(t0 + c) = Bs(t0) + c * n_sc
-
-for c < GATHER_BLOCK. The `c` term is loop invariant and stays in the offsets
-tensor the kernel builds once. Everything else -- the page address and B(t0) --
-is per block and is resolved here into a single int32 per candidate block per
-stream, so the walk carries no `block -> position -> block table -> page` chain.
-
-Two streams, because the value and scale regions have different byte maps.
+Both stored byte maps are separable and a candidate block never straddles a
+shuffle group, so B(t0 + c) = B(t0) + c * stride for c < GATHER_BLOCK. The `c`
+term is loop invariant and lives in the kernel; everything per block -- the page
+address and B(t0) -- is resolved here into one int32 per block per stream, which
+is why the walk carries no block -> position -> table -> page chain. Two streams,
+because values and scales have different maps.
 
 The block-to-byte map is not linear in the block index. At page 64, head_size
-128, preshuffled, the eight 8-token blocks of a page start at
+128, preshuffled, a page's eight 8-token blocks start at
 
     0, 128, 256, 384, 2048, 2176, 2304, 2432
 
 because the shuffle group is 32 tokens. Multiplying a block index by a stride
-produces plausible garbage that no tolerance check catches, which is why the
-gate on this path is bit-identity against the contiguous kernel rather than a
-tolerance.
+gives plausible garbage no tolerance check catches, which is why this path is
+gated on bit-identity against the contiguous kernel.
 """
 
 import torch
@@ -93,13 +84,10 @@ def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
         bn = t0 * head_bytes
         bs = t0 * num_scales
 
-    # The value offset is stored in K_WIDTH units, not bytes. It is always a
-    # whole number of them -- the page stride is 16-byte aligned (asserted in
-    # the launcher) and every `bn` above is a multiple of 16 -- and the kernel
-    # multiplies it back. That multiply is not arithmetic for its own sake: an
-    # offset arriving from memory carries no provable alignment, and without
-    # one Triton refuses to vectorise the KV load and emits one
-    # buffer_load_ubyte per byte instead of buffer_load_dwordx4.
+    # Stored in K_WIDTH units, not bytes, and multiplied back in the kernel:
+    # an offset arriving from memory carries no provable alignment, and without
+    # one Triton emits a buffer_load_ubyte per byte. Always whole -- the page
+    # stride is 16-byte aligned and every `bn` is a multiple of 16.
     voff = pid * kv_stride + bn
     soff = pid * kvs_stride + bs
     s_unit = gather_s_unit(block, num_scales)
