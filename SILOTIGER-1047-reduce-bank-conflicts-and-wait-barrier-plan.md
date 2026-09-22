@@ -504,6 +504,17 @@ The parent plan remains the full K2 list.
   `+4096/+4104`); the opcode does not transfer to our single-region
   `[BLOCK_N, D]` tile. Keep the 128-bit V publish. Re-open only together
   with AMD's V geometry, not as an opcode match.
+- Folding the live/phys/page_off translate join into an existing
+  barrier without redundant per-thread `indices`/`page_table` loads.
+  Tile 0 publishes with the m/l init barrier; each later tile publishes
+  after softmax (once `live_lds` has been read) and rides the P/alpha
+  barrier. The dedicated post-translate `s_barrier` dropped 7→6
+  decode / 6→5 prefill; VGPR stayed 92 / 257. Correct (`err=0`).
+  Width-2051 `L=512` medians `14.71 / 17.42 / 415.63` us versus
+  back-to-back HEAD `14.88 / 17.54 / 410.42` at `M=1/8/512`: decode
+  flat-to-slightly-faster, prefill +1.3%. Extra prologue/next-tile
+  `ds_write_b32` moved work onto the remaining join. Keep the
+  dedicated translate barrier and cooperative LDS rows.
 - Extending the existing prefill QK one-read-ahead pipeline across all
   four N subtiles. Two correct K-major schedules were measured:
   (1) issue four current-round K32 LDS reads before four independent
