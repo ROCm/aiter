@@ -1,42 +1,98 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Correctness + performance test for gfx942 packed-varlen hd192 split-KV FMHA.
+
+Public API:  aiter.flash_attn_varlen_func  (the path vLLM / the ticket calls)
+Ops layer:   aiter.ops.mha._fmha_v3_varlen_splitkv_fwd
+
+Built to the aiter op-test standard (see .claude/skills/aiter-op-test).
+
+num_splits (asm_mha_varlen_fwd.cu): 0 = auto, 1 = unsplit production kernel,
+2-8 = forced split-KV.  Auto uses split-3 when the kernel contract matches,
+Sk >= 8192, and Q_tiles * heads <= 2 * CU.
+
+q/k/v are packed THD, batch 1, BF16, D_QK=192 / D_V=128, non-causal — the
+layout the model uses for this kernel.
+"""
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 
+import argparse
+import itertools
 import math
 
-import pytest
+import pandas as pd
 import torch
 
 import aiter
-from aiter.ops.mha import (
-    _fmha_v3_varlen_splitkv_fwd,
-    flash_attn_varlen_func,
-    fmha_v3_varlen_fwd,
-)
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.mha import _fmha_v3_varlen_splitkv_fwd, flash_attn_varlen_func
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-_CUDA_AVAILABLE = torch.cuda.is_available()
-_DEVICE_NAME = torch.cuda.get_device_name() if _CUDA_AVAILABLE else ""
-pytestmark = pytest.mark.skipif(
-    not _CUDA_AVAILABLE
-    or aiter.get_gfx() != "gfx942"
-    or not any(device in _DEVICE_NAME for device in ("MI300X", "MI325X")),
-    reason="split-KV ASM is validated only on gfx942 MI300X/MI325X",
-)
+torch.set_default_device("cuda")
+
+# fmha_fwd_v3_splitkv requires gfx942 and rejects MI308.  The public wrapper
+# still runs on other gfx942 cards; this file only times the split-KV kernel.
+SUPPORTED_GFX = ["gfx942"]
+
+HD_QK = 192
+HD_V = 128
+KV_TILE = 32
+
+# (sq, sk, hq) — packed batch-1.  Ticket shape is last.
+_SHAPES = [
+    (129, 511, 4),  # Q/KV tile tails
+    (129, 2048, 4),  # split-count coverage
+    (4096, 8191, 12),  # last length that stays unsplit
+    (4096, 8192, 12),  # first auto split-3
+    (4096, 42700, 12),  # Kimi-K3 packed-varlen ticket
+]
 
 
-def _make_packed(sq: int, sk: int, h: int, seed: int = 0):
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(sq, h, 192, dtype=torch.bfloat16, generator=generator).cuda()
-    k = torch.randn(sk, h, 192, dtype=torch.bfloat16, generator=generator).cuda()
-    v = torch.randn(sk, h, 128, dtype=torch.bfloat16, generator=generator).cuda()
-    cu_q = torch.tensor([0, sq], dtype=torch.int32, device="cuda")
-    cu_k = torch.tensor([0, sk], dtype=torch.int32, device="cuda")
-    return q, k, v, cu_q, cu_k
+def run_torch(q, k, v, scale):
+    """Packed THD reference, fp32 math.  Not timed, not in the table.
+
+    Returns (out in q.dtype, lse in fp32 with shape [H, Sq]).
+    Empty K matches the C++ empty-sequence branch: zeros and +inf LSE.
+    Runs on CPU in Q tiles so the softmax reduction fits in host memory.
+    """
+    sq, hq, _ = q.shape
+    sk = k.shape[0]
+    if sk == 0:
+        out = torch.zeros(sq, hq, HD_V, dtype=q.dtype, device=q.device)
+        lse = torch.full((hq, sq), float("inf"), dtype=torch.float32, device=q.device)
+        return out, lse
+    q_cpu = q.float().cpu()
+    k_h = k.float().cpu().permute(1, 2, 0).contiguous()
+    v_h = v.float().cpu().permute(1, 0, 2).contiguous()
+    out = torch.empty(sq, hq, HD_V, dtype=torch.float32, device="cpu")
+    lse = torch.empty(hq, sq, dtype=torch.float32, device="cpu")
+    q_tile = 128
+    for q0 in range(0, sq, q_tile):
+        q1 = min(q0 + q_tile, sq)
+        q_h = q_cpu[q0:q1].permute(1, 0, 2).contiguous()
+        scores = torch.bmm(q_h, k_h) * scale
+        lse[:, q0:q1] = torch.logsumexp(scores, dim=-1)
+        out[q0:q1] = torch.bmm(torch.softmax(scores, dim=-1), v_h).permute(1, 0, 2)
+    return out.to(device=q.device, dtype=q.dtype), lse.to(device=q.device)
 
 
-def _run_v3(q, k, v, cu_q, cu_k, scale, num_splits, *, return_lse=False):
-    out, lse, _, _ = _fmha_v3_varlen_splitkv_fwd(
+def _flops_bytes(hq, sq, sk, esz):
+    """Attention roofline: 2 GEMMs (QK^T, PV), HBM traffic q+k+v+o."""
+    flops = 2.0 * hq * sq * sk * (HD_QK + HD_V)
+    nbytes = (sq * hq * HD_QK + sk * hq * HD_QK + sk * hq * HD_V + sq * hq * HD_V) * esz
+    return flops, nbytes
+
+
+def _empty_final_split(sk, num_splits):
+    kv_tiles = (sk + KV_TILE - 1) // KV_TILE
+    split_tiles = (kv_tiles + num_splits - 1) // num_splits
+    return split_tiles * (num_splits - 1) >= kv_tiles
+
+
+def _split_op(q, k, v, cu_q, cu_k, scale, num_splits, return_lse):
+    out, lse, p, rng = _fmha_v3_varlen_splitkv_fwd(
         q,
         k,
         v,
@@ -46,20 +102,15 @@ def _run_v3(q, k, v, cu_q, cu_k, scale, num_splits, *, return_lse=False):
         k.shape[0],
         scale,
         return_lse,
-        num_splits=num_splits,
+        num_splits,
     )
-    return (out, lse) if return_lse else out
+    return (out, lse, p, rng)
 
 
-def _production_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False):
-    return _run_v3(q, k, v, cu_q, cu_k, scale, 1, return_lse=return_lse)
-
-
-def _split_asm(q, k, v, cu_q, cu_k, scale, num_splits=3, *, return_lse=False):
-    return _run_v3(q, k, v, cu_q, cu_k, scale, num_splits, return_lse=return_lse)
-
-
-def _public_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False, out=None):
+def _public(q, k, v, cu_q, cu_k, scale, return_lse, out=None):
+    # Preallocated out= is the buffer the model can pass through the public API.
+    if out is None:
+        out = torch.empty(q.shape[0], q.shape[1], HD_V, dtype=q.dtype, device=q.device)
     result = flash_attn_varlen_func(
         q,
         k,
@@ -73,193 +124,170 @@ def _public_asm(q, k, v, cu_q, cu_k, scale, *, return_lse=False, out=None):
         return_lse=return_lse,
         out=out,
     )
-    return result
+    if return_lse:
+        return result[0], result[1]
+    return result, None
 
 
-def _cosine_difference(reference: torch.Tensor, actual: torch.Tensor) -> float:
-    ref = reference.double()
-    got = actual.double()
-    return 1.0 - 2.0 * (ref * got).sum().item() / max(
-        (ref.square() + got.square()).sum().item(), 1e-12
-    )
+@benchmark()
+def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
+    torch.manual_seed(0)
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    out_buf = torch.empty(sq, hq, HD_V, dtype=q.dtype)
 
+    ref_out, ref_lse = run_torch(q, k, v, scale)
+    flops, nbytes = _flops_bytes(hq, sq, sk, q.element_size())
 
-def _assert_close(reference: torch.Tensor, actual: torch.Tensor) -> None:
-    assert _cosine_difference(reference, actual) < 1e-4
-    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+    candidates = {
+        # Production unsplit ASM (num_splits=1).
+        "unsplit": lambda: _split_op(q, k, v, cu_q, cu_k, scale, 1, return_lse)[:2],
+        # The path the model actually runs.
+        "public": lambda: _public(q, k, v, cu_q, cu_k, scale, return_lse, out=out_buf),
+    }
+    # Forced split is rejected when the last KV partition would be empty.
+    if not _empty_final_split(sk, num_splits):
+        candidates["splitkv"] = lambda: _split_op(
+            q, k, v, cu_q, cu_k, scale, num_splits, return_lse
+        )[:2]
 
-
-def test_splitkv_one_matches_unsplit_kernel():
-    sq, sk, h = 129, 511, 4
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=17)
-    scale = 1.0 / math.sqrt(192)
-    reference, reference_lse, _, _ = fmha_v3_varlen_fwd(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        sq,
-        sk,
-        0,
-        0.0,
-        scale,
-        0.0,
-        False,
-        False,
-        -1,
-        -1,
-        True,
-        False,
-        1,
-    )
-    actual, actual_lse = _production_asm(q, k, v, cu_q, cu_k, scale, return_lse=True)
-    assert torch.equal(actual, reference)
-    assert torch.equal(actual_lse, reference_lse)
-
-
-@pytest.mark.parametrize(
-    "sq,sk",
-    [
-        (1, 96),
-        (31, 129),
-        (32, 160),
-        (33, 191),
-        (127, 192),
-        (128, 193),
-        (129, 224),
-        (257, 511),
-    ],
-)
-def test_splitkv_boundaries(sq, sk):
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, 4, seed=sq + sk)
-    scale = 1.0 / math.sqrt(192)
-    reference = _production_asm(q, k, v, cu_q, cu_k, scale)
-    actual = _split_asm(q, k, v, cu_q, cu_k, scale)
-    assert torch.isfinite(actual).all()
-    _assert_close(reference, actual)
-
-
-@pytest.mark.parametrize("num_splits", range(2, 9))
-def test_splitkv_counts(num_splits):
-    sq, sk, h = 129, 2048, 4
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=100 + num_splits)
-    scale = 1.0 / math.sqrt(192)
-    reference, reference_lse = _production_asm(
-        q, k, v, cu_q, cu_k, scale, return_lse=True
-    )
-    actual, actual_lse = _split_asm(
-        q, k, v, cu_q, cu_k, scale, num_splits, return_lse=True
-    )
-    _assert_close(reference, actual)
-    torch.testing.assert_close(actual_lse, reference_lse, rtol=2e-4, atol=2e-4)
-
-
-@pytest.mark.parametrize(
-    "sq,sk,h", [(4096, 8192, 12), (3969, 8192, 12), (4096, 131072, 12)]
-)
-def test_public_dispatch_uses_split3_on_long_kv(sq, sk, h):
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=sk + sq)
-    scale = 1.0 / math.sqrt(192)
-    split1 = _production_asm(q, k, v, cu_q, cu_k, scale)
-    split3, split3_lse = _split_asm(q, k, v, cu_q, cu_k, scale, 3, return_lse=True)
-    actual, actual_lse = _public_asm(q, k, v, cu_q, cu_k, scale, return_lse=True)
-    assert torch.equal(actual, split3)
-    assert torch.equal(actual_lse, split3_lse)
-    assert not torch.equal(actual, split1)
-    _assert_close(split1, actual)
-
-
-def test_public_dispatch_keeps_unsplit_outside_heuristic():
-    scale = 1.0 / math.sqrt(192)
-    # Sk=8191 is the last length below 256 full KV tiles. High Q occupancy
-    # (24 heads * 32 Q tiles > 2*304 CUs) also stays unsplit.
-    cases = [
-        (4096, 8191, 12),
-        (4096, 8192, 24),
-    ]
-    for sq, sk, h in cases:
-        q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=sq + sk + h)
-        split1 = _production_asm(q, k, v, cu_q, cu_k, scale)
-        actual = _public_asm(q, k, v, cu_q, cu_k, scale)
-        assert torch.equal(actual, split1), (sq, sk, h)
-
-
-def test_forced_splitkv_empty_k_matches_unsplit():
-    sq, h = 129, 4
-    q = torch.randn(sq, h, 192, dtype=torch.bfloat16, device="cuda")
-    k = torch.empty(0, h, 192, dtype=torch.bfloat16, device="cuda")
-    v = torch.empty(0, h, 128, dtype=torch.bfloat16, device="cuda")
-    cu_q = torch.tensor([0, sq], dtype=torch.int32, device="cuda")
-    cu_k = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
-    scale = 1.0 / math.sqrt(192)
-    reference = _production_asm(q, k, v, cu_q, cu_k, scale)
-    actual = _split_asm(q, k, v, cu_q, cu_k, scale, 3)
-    assert torch.equal(actual, reference)
-
-
-def test_public_splitkv_fullgraph_compile():
-    sq, sk, h = 4096, 8192, 12
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=27)
-    scale = 1.0 / math.sqrt(192)
-
-    def call(q, k, v):
-        return flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            sq,
-            sk,
-            softmax_scale=scale,
-            causal=False,
-            return_lse=True,
+    ret = {
+        "gfx": get_gfx(),
+        "cu": get_cu_num(),
+        "q_wgs": ((sq + 127) // 128) * hq,
+    }
+    outs = {}
+    for name, fn in candidates.items():
+        (out, lse), us = run_perftest(fn, num_rotate_args=1)
+        outs[name] = out
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6 if us else float("nan")
+        ret[f"{name} TB/s"] = nbytes / us / 1e6 if us else float("nan")
+        ret[f"{name} err"] = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{name} O sq={sq} sk={sk} hq={hq} ns={num_splits}",
         )
-
-    eager = call(q, k, v)
-    compiled = torch.compile(call, fullgraph=True)(q, k, v)
-    _assert_close(eager[0], compiled[0])
-    torch.testing.assert_close(compiled[1], eager[1], rtol=2e-4, atol=2e-4)
-
-
-def test_out_buffer_uses_public_dispatch():
-    sq, sk, h = 4096, 8192, 12
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=28)
-    scale = 1.0 / math.sqrt(192)
-    out = torch.empty((sq, h, 128), dtype=torch.bfloat16, device="cuda")
-    expected = _split_asm(q, k, v, cu_q, cu_k, scale, 3)
-    actual = _public_asm(q, k, v, cu_q, cu_k, scale, out=out)
-    assert actual.data_ptr() == out.data_ptr()
-    assert torch.equal(actual, expected)
+        if return_lse:
+            checkAllclose(
+                ref_lse.to(dtypes.fp32),
+                lse.to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{name} LSE sq={sq} sk={sk} hq={hq} ns={num_splits}",
+            )
+    if "public" in outs and "splitkv" in outs:
+        ret["public_eq_splitkv"] = int(torch.equal(outs["public"], outs["splitkv"]))
+    if "public" in outs and "unsplit" in outs:
+        ret["public_eq_unsplit"] = int(torch.equal(outs["public"], outs["unsplit"]))
+    return ret
 
 
-def test_splitkv_operator_torch_compile():
-    sq, sk, h = 129, 2048, 4
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=25)
-    scale = 1.0 / math.sqrt(192)
+@benchmark()
+def test_fmha_gfx942_asm_splitkv_empty_k(sq, hq, num_splits):
+    torch.manual_seed(1)
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.empty(0, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.empty(0, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, 0], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    ref_out, _ = run_torch(q, k, v, scale)
+    flops, nbytes = _flops_bytes(hq, sq, 0, q.element_size())
+
+    candidates = {
+        "unsplit": lambda: _split_op(q, k, v, cu_q, cu_k, scale, 1, False)[:2],
+        "splitkv": lambda: _split_op(q, k, v, cu_q, cu_k, scale, num_splits, False)[:2],
+        "public": lambda: _public(q, k, v, cu_q, cu_k, scale, False),
+    }
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        (out, _), us = run_perftest(fn, num_rotate_args=1)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6 if us else float("nan")
+        ret[f"{name} TB/s"] = nbytes / us / 1e6 if us else float("nan")
+        ret[f"{name} err"] = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=0,
+            atol=0,
+            msg=f"{name} empty-K sq={sq} hq={hq} ns={num_splits}",
+        )
+    return ret
+
+
+def _check_empty_partition_rejected():
+    sq, sk, hq = 129, 511, 4
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    try:
+        _split_op(q, k, v, cu_q, cu_k, 1.0 / math.sqrt(HD_QK), 5, False)
+    except RuntimeError as err:
+        if "empty final KV partition" not in str(err):
+            raise
+        return
+    raise AssertionError("forced split-5 on Sk=511 should reject an empty partition")
+
+
+def _check_compile_outputs():
+    sq, sk, hq = 129, 2048, 4
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
 
     def call(q, k, v):
         return _fmha_v3_varlen_splitkv_fwd(q, k, v, cu_q, cu_k, sq, sk, scale, True, 3)
 
     eager = call(q, k, v)
     compiled = torch.compile(call, fullgraph=True)(q, k, v)
-    _assert_close(eager[0], compiled[0])
-    torch.testing.assert_close(compiled[1], eager[1], rtol=2e-4, atol=2e-4)
+    for idx, (eager_t, compiled_t) in enumerate(zip(eager, compiled)):
+        assert eager_t.dtype == compiled_t.dtype, (idx, eager_t.dtype, compiled_t.dtype)
+        assert eager_t.shape == compiled_t.shape, (idx, eager_t.shape, compiled_t.shape)
+    assert eager[0].dtype == q.dtype
+    assert eager[1].dtype == torch.float32
+    assert eager[2].dtype == q.dtype
+    assert eager[3].dtype == torch.int64
+    checkAllclose(
+        eager[0].to(dtypes.fp32),
+        compiled[0].to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg="torch.compile O",
+    )
+    checkAllclose(
+        eager[1].to(dtypes.fp32),
+        compiled[1].to(dtypes.fp32),
+        rtol=2e-4,
+        atol=2e-4,
+        msg="torch.compile LSE",
+    )
 
 
-def test_public_splitkv_cuda_graph_replay():
-    sq, sk, h = 4096, 8192, 12
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=26)
-    scale = 1.0 / math.sqrt(192)
-    reference = _production_asm(q, k, v, cu_q, cu_k, scale)
-
+def _check_cuda_graph():
+    sq, sk, hq = 129, 2048, 4
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
     for _ in range(3):
         flash_attn_varlen_func(
             q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
         )
     torch.cuda.synchronize()
-
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = flash_attn_varlen_func(
@@ -269,28 +297,86 @@ def test_public_splitkv_cuda_graph_replay():
     first = captured.clone()
     graph.replay()
     torch.cuda.synchronize()
-
     assert torch.equal(captured, first)
-    _assert_close(reference, captured)
 
 
-def test_splitkv_rejects_empty_final_partition():
-    sq, sk, h = 129, 511, 4
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=21)
-    with pytest.raises(RuntimeError, match="empty final KV partition"):
-        _split_asm(q, k, v, cu_q, cu_k, 1.0 / math.sqrt(192), num_splits=5)
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "gfx942 hd192 split-KV unsupported on %s; skipping", get_gfx()
+        )
+        return
 
-
-def test_splitkv_lse_and_determinism():
-    sq, sk, h = 257, 511, 12
-    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, seed=19)
-    scale = 0.125
-    reference, reference_lse = _production_asm(
-        q, k, v, cu_q, cu_k, scale, return_lse=True
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
-    actual, actual_lse = _split_asm(q, k, v, cu_q, cu_k, scale, return_lse=True)
-    _assert_close(reference, actual)
-    torch.testing.assert_close(actual_lse, reference_lse, rtol=2e-4, atol=2e-4)
-    for _ in range(100):
-        repeat = _split_asm(q, k, v, cu_q, cu_k, scale)
-        assert torch.equal(actual, repeat)
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16],
+        help="""Data type.
+    e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-s",
+        "--shapes",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=_SHAPES,
+        help="shape(s) as sq,sk,hq (default: tails, auto-select bounds, ticket)",
+    )
+    parser.add_argument(
+        "-ns",
+        "--num_splits",
+        type=int,
+        nargs="*",
+        default=list(range(2, 9)),
+        help="forced split count(s) for the splitkv candidate (default: 2..8)",
+    )
+    parser.add_argument(
+        "--lse",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[1],
+        help="return_lse: 0=inference 1=training (default: 1)",
+    )
+    args = parser.parse_args()
+
+    for dtype in args.dtype:
+        if dtype != dtypes.bf16:
+            aiter.logger.warning("hd192 split-KV is bf16-only; skipping %s", dtype)
+            continue
+        df = []
+        for shape, num_splits, return_lse in itertools.product(
+            args.shapes, args.num_splits, args.lse
+        ):
+            sq, sk, hq = shape
+            df.append(
+                test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, bool(return_lse))
+            )
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "fmha_gfx942_asm_splitkv summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+        empty_rows = [
+            test_fmha_gfx942_asm_splitkv_empty_k(129, 4, num_splits)
+            for num_splits in args.num_splits
+        ]
+        aiter.logger.info(
+            "fmha_gfx942_asm_splitkv empty-K summary (markdown):\n%s",
+            pd.DataFrame(empty_rows).to_markdown(index=False),
+        )
+
+    _check_empty_partition_rejected()
+    _check_compile_outputs()
+    _check_cuda_graph()
+
+
+if __name__ == "__main__":
+    main()

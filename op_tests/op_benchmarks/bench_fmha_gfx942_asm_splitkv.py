@@ -85,12 +85,17 @@ def main():
     run = lambda num_splits: production_asm(q, k, v, cu_q, cu_k, scale, num_splits)
     reference = run(1)
     actual = run(args.splits)
-    cosine_difference = 1.0 - 2.0 * (
-        reference.double() * actual.double()
-    ).sum().item() / (
-        reference.double().square().sum().item() + actual.double().square().sum().item()
+    if not torch.isfinite(reference).all() or not torch.isfinite(actual).all():
+        raise RuntimeError("correctness gate failed: kernel produced non-finite output")
+    denom = (reference.double().square().sum() + actual.double().square().sum()).item()
+    if not math.isfinite(denom) or denom <= 0.0:
+        raise RuntimeError(
+            f"correctness gate failed: cosine denominator is not finite and positive ({denom})"
+        )
+    cosine_difference = (
+        1.0 - 2.0 * (reference.double() * actual.double()).sum().item() / denom
     )
-    if cosine_difference >= 1e-4:
+    if not math.isfinite(cosine_difference) or cosine_difference >= 1e-4:
         raise RuntimeError(
             f"correctness gate failed: cosine difference={cosine_difference}"
         )
