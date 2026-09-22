@@ -51,7 +51,7 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
-    use_k16=False,
+    is_gfx942=False,
 ):
     _kMChunks = BM // 16
     M_REPS = BM // 8
@@ -82,7 +82,7 @@ def _atomic_bf16_epilog(
     # gfx950+ has buffer_atomic_pk_add_bf16. gfx942 only has the global packed
     # form; emitting the buffer op there is LLVM "Cannot select BUFFER_ATOMIC_FADD
     # v2bf16" (same fork as moe_gemm_2stage / mxfp4_gemm2).
-    if const_expr(not use_k16):
+    if const_expr(not is_gfx942):
         atomic_bf16x2 = fx.make_copy_atom(
             fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
         )
@@ -134,7 +134,7 @@ def _atomic_bf16_epilog(
                     [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
                 ).to(fx.BFloat16)
                 out_off = row_base_addr + fx.Int32(s * 64)
-                if const_expr(use_k16):
+                if const_expr(is_gfx942):
                     out_ptr = _gep1(out_base, out_off * fx.Int32(2))
                     llvm.AtomicRMWOp(
                         llvm.AtomicBinOp.fadd,
@@ -280,7 +280,7 @@ def _gemm2_body_a16w4(
     NE,
     b_cache_mod=2,
     w_dtype="fp4",
-    use_k16=False,
+    rocm_arch="",
     use_reduce=False,
     topk=1,
 ):
@@ -289,6 +289,7 @@ def _gemm2_body_a16w4(
     A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
     """
+    _is_gfx942 = str(rocm_arch).startswith("gfx942")
     elem_bytes = 2
     KH_TILE_BYTES = TILE_K * elem_bytes
     LDS_STRIDE = TILE_K
@@ -326,7 +327,7 @@ def _gemm2_body_a16w4(
         TILE_K=TILE_K,
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
-        use_k16=use_k16,
+        rocm_arch=rocm_arch,
     )
 
     # ---- A path (shared with gemm1, see utils.make_a_loader) -------------------
@@ -349,7 +350,7 @@ def _gemm2_body_a16w4(
         a_load_threads=256,
         row_base_dwords=lambda row_local: (m_row + row_local) * fx.Int32(c_k_div4),
         dma_cache_mod=b_cache_mod,
-        dma_via_vgpr=use_k16,
+        dma_via_vgpr=_is_gfx942,
     )
 
     # ---- N-column addressing (W2 cols of model_dim; wave owns _n_per_wave) ------
@@ -370,14 +371,14 @@ def _gemm2_body_a16w4(
         for ni in range_constexpr(num_acc_n):
             accm[mi][ni].store(zero4)
 
-    # Arch-gate: gfx950 K=32 (one MFMA/K-step); gfx942 (use_k16) splits each v8bf16 into
+    # Arch-gate: gfx950 K=32 (one MFMA/K-step); gfx942 splits each v8bf16 into
     # two v4bf16 halves -> TWO 16x16x16 MFMAs into the same acc (no 16x16x32 on gfx942).
-    if const_expr(use_k16):
+    if const_expr(_is_gfx942):
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
     else:
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
 
-    _mma = functools.partial(_mma_bf16, mma_atom, use_k16)
+    _mma = functools.partial(_mma_bf16, mma_atom, _is_gfx942)
 
     for kt in range_constexpr(K_TILES_TOTAL):
         base_k = fx.Int32(kt * TILE_K)
@@ -431,7 +432,7 @@ def _gemm2_body_a16w4(
             BM,
             N_OUT,
             TILE_N,
-            use_k16,
+            _is_gfx942,
         )
 
 
@@ -462,7 +463,7 @@ def compile_gemm2_a16w4_port(
     waves_per_eu=None,
     w_dtype="fp4",
     persist=False,
-    use_k16,
+    rocm_arch,
     epilog="atomic",
     topk=1,
 ):
@@ -487,7 +488,6 @@ def compile_gemm2_a16w4_port(
     _topk = int(topk) if _use_reduce else 1
     if _use_reduce and _topk < 1:
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
-    _use_k16 = use_k16
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert (
@@ -597,7 +597,7 @@ def compile_gemm2_a16w4_port(
                 NE=NE,
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
-                use_k16=_use_k16,
+                rocm_arch=rocm_arch,
                 use_reduce=_use_reduce,
                 topk=_topk,
             )
