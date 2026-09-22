@@ -341,6 +341,18 @@ def build_qsa_k2_family_a_module(
             page_off_i = page_off_lds[col]
             live = live_lds[col] != zero
 
+            v_frags = []
+            if const_expr(decode_tr_pv):
+                v_row = fx.logical_divide(
+                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
+                )
+                for gr in range_constexpr(gather_rounds):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_frag = fx.make_fragment_like(v_src)
+                    fx.copy(g_copy, v_src, v_frag)
+                    v_frags.append(v_frag)
+
             k_row = fx.logical_divide(
                 fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
             )
@@ -373,13 +385,13 @@ def build_qsa_k2_family_a_module(
             else:
                 gpu.barrier()
 
-            if const_expr(use_k32):
-                v_row = fx.logical_divide(
+            if const_expr(use_k32) and const_expr(not decode_tr_pv):
+                v_row_pf = fx.logical_divide(
                     fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
                 )
                 for gr in range_constexpr(gather_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
-                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_src = fx.slice(v_row_pf, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(g_copy, v_src, v_frag)
                     v_vec = fx.Vector(fx.memref_load_vec(v_frag))
@@ -399,9 +411,6 @@ def build_qsa_k2_family_a_module(
                     v_store_frag = fx.make_fragment_like(v_dst)
                     fx.memref_store_vec(v_vec, v_store_frag)
                     fx.copy(lds_copy, v_store_frag, v_dst)
-            if const_expr(token_major_v):
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
-                fx.rocdl.s_barrier()
 
             # QK: waves partition D, then wave 0 reduces their C fragments.
             for ng in range_constexpr(n_subtiles):
@@ -426,7 +435,27 @@ def build_qsa_k2_family_a_module(
                     c_lds[ng, wave, lane, i] = acc4[i]
             gpu.barrier()
 
-            if const_expr(not use_k32):
+            if const_expr(decode_tr_pv):
+                for gr in range_constexpr(gather_rounds):
+                    v_vec = fx.Vector(fx.memref_load_vec(v_frags[gr]))
+                    v_vec = fx.Vector.from_elements(
+                        [
+                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
+                            for i in range_constexpr(vec)
+                        ],
+                        BFloat16,
+                    )
+                    v_tile = fx.make_view(
+                        fx.get_iter(v_lds) + Int32(gr * gather_span),
+                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    )
+                    v_dst = kv_store.partition_D(v_tile)
+                    v_store_frag = fx.make_fragment_like(v_dst)
+                    fx.memref_store_vec(v_vec, v_store_frag)
+                    fx.copy(lds_copy, v_store_frag, v_dst)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_barrier()
+            elif const_expr(not use_k32):
                 v_row = fx.logical_divide(
                     fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
                 )
