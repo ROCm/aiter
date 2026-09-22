@@ -776,15 +776,22 @@ def _decode_backend(
     num_rows: int,
     k: int,
     indices_only: bool,
+    adaptive_width: int | None,
 ) -> str:
     """Which of the four decode kernels is fastest for this shape.
+
+    The two tables read different lengths and must keep doing so. The adaptive
+    bands read `adaptive_width`, the caller's bound, because that kernel is
+    configured from it; `None` means no bound was stated and declines them. The
+    chunked bands read the physical `width` they were fitted on, so a bound
+    never moves a call between the two kernels upstream already ships.
 
     Both entry points ask this one function rather than deciding again further
     down, which is what keeps them from disagreeing.
     """
-    if indices_only:  # the adaptive kernel does not emit values
+    if indices_only and adaptive_width is not None:  # adaptive emits no values
         per_k = _ADAPTIVE_BANDS.get((arch, cu_count), {}).get(stable, {})
-        if _in_row_bands(per_k.get(k, ()), width, num_rows):
+        if _in_row_bands(per_k.get(k, ()), adaptive_width, num_rows):
             return BACKEND_ADAPTIVE
     if (
         arch in _FLYDSL_TOPK_DECODE_GATES
@@ -802,7 +809,7 @@ def _decode_cu_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def decode_adaptive_width(width: int, max_row_len: int | None) -> int:
+def decode_adaptive_width(width: int, max_row_len: int) -> int:
     """The row length the adaptive path should be gated and configured on.
 
     A decode buffer is allocated once at the model's maximum context, so its
@@ -815,10 +822,17 @@ def decode_adaptive_width(width: int, max_row_len: int | None) -> int:
     how a band admits a shape that then runs the wrong kernel for it.
 
     `max_row_len` is a **guarantee, not a hint** -- see `top_k_per_row_decode`.
-    `None` means the caller does not know, and the physical width stands.
+    It is required here: `None` reaching this function is a bug, because the gate
+    declines the adaptive path outright when the caller states no bound (see
+    `decode_backend_for_call`). Configuring from the physical width instead --
+    what a `None` fallback would do -- was measured to send 157 of 366 admitted
+    MI308X shapes backwards, so it is not offered.
     """
     if max_row_len is None:
-        return width
+        raise ValueError(
+            "max_row_len is required to configure the adaptive path; the gate "
+            "declines when it is None, so this path should be unreachable"
+        )
     if max_row_len < 1:
         raise ValueError(f"max_row_len must be positive, got {max_row_len}")
     return min(width, max_row_len)
@@ -850,14 +864,20 @@ def decode_backend_for_call(
         return BACKEND_UPSTREAM
 
     arch = get_gfx()
+    width = logits.shape[1]
     backend = _decode_backend(
         arch,
         _decode_cu_count(logits.device.index),
         stable,
-        decode_adaptive_width(logits.shape[1], max_row_len),
+        width,
         num_rows,
         k,
         values is None,
+        # No bound means the host cannot size the adaptive config, and the only
+        # value it could fall back to -- the physical width -- ships a measured
+        # regression (157 of 366 admitted MI308X shapes). Decline it; the chunked
+        # bands above still see the width, so the call lands where it does today.
+        None if max_row_len is None else decode_adaptive_width(width, max_row_len),
     )
     if backend == BACKEND_UPSTREAM:
         return BACKEND_UPSTREAM
@@ -934,17 +954,22 @@ def top_k_per_row_decode(
     candidate and a consumer that ranks these scores needs no extra mask.
 
     `max_row_len` is an upper bound on every entry of `seqLens`, for callers
-    whose `logits` is a context-sized buffer that decode only partly fills.
-    Without it the host has to assume every row is as long as the buffer is
-    wide, which costs up to 1.21x median and 1.91x p90 on a 1M buffer -- the
-    wide buffer itself is free, but the config built for it is not.
+    whose `logits` is a context-sized buffer that decode only partly fills. It
+    is what opts a call into the adaptive path: the host picks the kernel from
+    it, and configuring from the physical width instead costs up to 1.21x median
+    and 1.91x p90 on a 1M buffer. `None` means the caller states no bound, and
+    the gate then **declines the adaptive path only**, leaving the call on the
+    kernel it runs without this argument. A serving stack
+    that assembles the batch already knows this value (it is `max(seqLens)`), so
+    passing it is one argument, not new bookkeeping.
 
     **It is a guarantee, not a hint.** Some of what it selects is compiled in,
     so a bound below the longest live row does not merely give up performance,
     it launches a kernel that cannot read those rows to the end and returns
     wrong indices. It cannot be checked here: `seqLens` is device-resident and
     reading it would sync, which this path may be inside a graph capture for.
-    Pass `None`, which is always correct, rather than an estimate."""
+    Pass `None` rather than an estimate; `None` declines, an estimate can be
+    wrong."""
     backend = decode_backend_for_call(
         logits,
         next_n,

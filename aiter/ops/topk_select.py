@@ -552,12 +552,13 @@ def topk_select(
             keeping the small-k selector that ``tie='low'`` has to give up. Costs
             up to 1.9x where ``plain`` would have won.
         max_row_len: an upper bound on every entry of ``end``, for an ``input``
-            sized to a maximum context that a given call only partly fills.
-            Purely a performance hint to the decode backend, which otherwise has
-            to size its launch for the full width and pays up to 1.21x median on
-            a 1M buffer. It does not change any result, and it does not affect
-            which backend is chosen -- ``topk_select_backend`` was fitted on the
-            physical width and still reads it.
+            sized to a maximum context that a given call only partly fills. It
+            opts a call into the adaptive decode kernel, which is then sized
+            from the live length rather than from the buffer -- worth up to
+            1.21x median on a 1M buffer. ``None`` declines that one kernel and
+            moves nothing else: the outer selector (``topk_select_backend``)
+            and the other decode kernels read the physical width either way.
+            It never changes a result.
 
             **A guarantee, not a hint**: part of what it selects is compiled in,
             so a value below the longest live row returns wrong indices rather

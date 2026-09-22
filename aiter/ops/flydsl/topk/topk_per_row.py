@@ -494,10 +494,6 @@ def flydsl_top_k_per_row_decode(
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
 
-    from aiter.ops.topk import decode_adaptive_width
-
-    cfg_width = decode_adaptive_width(width, max_row_len)
-
     if backend is None:
         from aiter.ops.topk import decode_backend_for_call
 
@@ -516,6 +512,13 @@ def flydsl_top_k_per_row_decode(
         )
 
     if backend == _BACKEND_ADAPTIVE:
+        # Only the adaptive path takes a host-side config, and it is reached only
+        # when the gate admitted the call, which needs `max_row_len`. So the
+        # width is computed here, not before the gate: `decode_adaptive_width`
+        # requires a bound and a `None` reaching it is a bug, not a fallback.
+        from aiter.ops.topk import decode_adaptive_width
+
+        cfg_width = decode_adaptive_width(width, max_row_len)
         _run_adaptive(
             logits,
             next_n,

@@ -116,7 +116,9 @@ def one_band(monkeypatch):
 def test_the_band_decides_and_a_miss_falls_through(
     one_band, width, rows, k, stable, indices_only, expected
 ):
-    got = topk._decode_backend("gfx942", 80, stable, width, rows, k, indices_only)
+    got = topk._decode_backend(
+        "gfx942", 80, stable, width, rows, k, indices_only, width
+    )
     assert got == expected
 
 
@@ -130,7 +132,7 @@ def test_an_unmeasured_cu_count_is_not_guessed_at(one_band):
     measured = {cu for arch, cu in topk._ADAPTIVE_BANDS if arch == "gfx942"}
     unmeasured = next(cu for cu in range(1, 1024) if cu not in measured)
     assert (
-        topk._decode_backend("gfx942", unmeasured, True, 8_192, 8, 1024, True)
+        topk._decode_backend("gfx942", unmeasured, True, 8_192, 8, 1024, True, 8_192)
         != topk.BACKEND_ADAPTIVE
     )
 
@@ -271,7 +273,8 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
     torch.manual_seed(0)
     bad = []
     for width, rows, k, stable in cells:
-        want = topk._decode_backend(arch, cu_count, stable, width, rows, k, True)
+        # Every row is as long as the buffer here, so the bound is the width.
+        want = topk._decode_backend(arch, cu_count, stable, width, rows, k, True, width)
         # float32: the FlyDSL decode path takes no other dtype.
         logits = torch.randn(rows, width, dtype=torch.float32, device="cuda")
         seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
@@ -289,6 +292,7 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
             k,
             stable,
             None,
+            max_row_len=width,
         )
         aiter.top_k_per_row_decode(
             logits,
@@ -300,6 +304,7 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
             logits.stride(1),
             k=k,
             stable=stable,
+            max_row_len=width,
         )
         # `_run_adaptive` and the port both go on to call `_run_compiled`, so
         # the first name recorded is the one that was dispatched to.
@@ -336,7 +341,6 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
 @pytest.mark.parametrize(
     "width,bound,expected",
     [
-        (1 << 20, None, 1 << 20),  # said nothing: the buffer stands
         (1 << 20, 8_192, 8_192),  # said less than it holds
         (8_192, 1 << 20, 8_192),  # said more: the buffer still bounds it
         (8_192, 8_192, 8_192),
@@ -348,10 +352,12 @@ def test_the_bound_is_the_shorter_of_what_is_held_and_what_is_promised(
     assert topk.decode_adaptive_width(width, bound) == expected
 
 
-@pytest.mark.parametrize("bad", [0, -1])
+@pytest.mark.parametrize("bad", [0, -1, None])
 def test_a_bound_no_row_could_have_is_refused(bad):
-    """Zero is the plausible mistake -- an empty batch, a length not yet
-    filled in -- and it would otherwise configure for a row of nothing."""
+    """Zero is the plausible mistake -- an empty batch, a length not yet filled
+    in -- and it would otherwise configure for a row of nothing. `None` is
+    refused rather than read as the buffer: the gate declines before it gets
+    here, so a `None` arriving is a caller that skipped the gate."""
     with pytest.raises(ValueError, match="max_row_len"):
         topk.decode_adaptive_width(1 << 20, bad)
 
@@ -360,10 +366,38 @@ def test_the_gate_reads_the_bound_not_the_buffer(one_band):
     """The band is 8192..20000 wide. A 1M buffer is outside it and a 1M buffer
     carrying 8192 is inside it, and those are the same tensor."""
     args = ("gfx942", 80, True, 1 << 20, 8, 1024, True)
-    assert topk._decode_backend(*args) != topk.BACKEND_ADAPTIVE
+    assert topk._decode_backend(*args, 1 << 20) != topk.BACKEND_ADAPTIVE
+    assert topk._decode_backend(*args, 8_192) == topk.BACKEND_ADAPTIVE
 
-    bounded = args[:3] + (topk.decode_adaptive_width(1 << 20, 8_192),) + args[4:]
-    assert topk._decode_backend(*bounded) == topk.BACKEND_ADAPTIVE
+
+def test_no_bound_declines_the_adaptive_kernel_and_only_that_one(one_band):
+    """What `None` costs, and what it must not cost.
+
+    It gives up the adaptive kernel, because the host cannot size that launch
+    without a length. It must leave every other decode kernel where it is: the
+    chunked bands are read at the physical width with or without a bound, and
+    routing that shape to the one-block kernel instead measured 0.09x on a 1M
+    buffer at k=4096.
+    """
+    adaptive = ("gfx942", 80, True, 8_192, 8, 1024, True)
+    assert topk._decode_backend(*adaptive, 8_192) == topk.BACKEND_ADAPTIVE
+    assert topk._decode_backend(*adaptive, None) == topk.BACKEND_CHUNKED
+
+    # A shape no adaptive band claims, so the bound cannot be what decides it.
+    chunked = ("gfx942", 80, True, 8_192, 1, 1024, True)
+    assert topk._decode_backend(*chunked, 8_192) == topk.BACKEND_CHUNKED
+    assert topk._decode_backend(*chunked, None) == topk.BACKEND_CHUNKED
+
+
+def test_a_bound_does_not_move_the_chunked_bands(one_band):
+    """The chunked kernel reads the whole buffer, so its bands were fitted on
+    the physical width and a bound must not re-ask them at the live length. On
+    a 1M buffer holding 4096, doing so admitted the chunked kernel where the
+    one-block kernel was 14x faster.
+    """
+    padded = ("gfx942", 80, True, 1 << 20, 64, 2048, True)
+    assert topk._decode_backend(*padded, None) == topk.BACKEND_UPSTREAM
+    assert topk._decode_backend(*padded, 4_096) == topk.BACKEND_UPSTREAM
 
 
 def test_the_bound_is_what_moves_the_config_off_the_padded_launch():
@@ -409,7 +443,7 @@ def test_a_bound_call_selects_what_an_unbound_one_does(monkeypatch):
     cells = [
         (w, rows, k, stable)
         for w, rows, k, stable in _band_edge_cells(arch, cu_count)
-        if topk._decode_backend(arch, cu_count, stable, w, rows, k, True)
+        if topk._decode_backend(arch, cu_count, stable, w, rows, k, True, w)
         == topk.BACKEND_ADAPTIVE
         and rows * w * 4 <= _MAX_ELEMENTS
         and w >= 4 * k  # leave room for a ragged length that still holds k
