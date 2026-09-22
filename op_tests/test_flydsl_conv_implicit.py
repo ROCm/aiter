@@ -798,9 +798,9 @@ def main():
         nargs="*",
         default=["480x832", "368x544"],
         help="Wan clip HxW, multiples of 8. 480x832 is what the integration report "
-        "benchmarks, 368x544 what its 8-GPU training run actually feeds the VAE and "
-        "the resolution wan21_vae_bf16_tuned_conv3d.csv holds; any other size runs the "
-        "same shapes on the heuristic tile.",
+        "benchmarks and 368x544 what its 8-GPU training run feeds the VAE; "
+        "wan21_vae_bf16_tuned_conv3d.csv holds both. Any other size runs the same "
+        "shapes on the heuristic tile.",
     )
     p.add_argument(
         "--wan-frames",
@@ -814,10 +814,9 @@ def main():
         "--qwen-res",
         nargs="*",
         default=["1024x1024", "1328x1328"],
-        help="Qwen-Image HxW, multiples of 8. 1024x1024 is the resolution "
-        "qwenimage_vae_bf16_tuned_conv3d.csv holds; any other legal size (1328x1328, "
-        "1664x928, ...) runs the same 16 shapes at different extents on the heuristic "
-        "tile.",
+        help="Qwen-Image HxW, multiples of 8. qwenimage_vae_bf16_tuned_conv3d.csv "
+        "holds both defaults; any other legal size (1664x928, ...) runs the same 16 "
+        "shapes at different extents on the heuristic tile.",
     )
     args = p.parse_args()
     _FAILED.clear()

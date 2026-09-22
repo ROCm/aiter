@@ -39,8 +39,14 @@ and ``C/groups`` is where this kernel's performance comes from -- so a
 resolution, frame count or bias flag outside the table still JITs.
 
 On, the input's spatial extents are read at runtime and one artifact serves
-every resolution of the same layer, so a row covers sizes the table never
-listed. The flag is part of the compile key, which is why ``_resolve_dyn_hw``
+every resolution of the same layer. That is not the same as covering sizes the
+table never listed: the tuned lookup is still an exact match on the full shape,
+so an unlisted resolution misses it, takes ``_pick_tile``/``_pick_wgm``
+instead, and asks for a launch config that *is* in the compile key -- a
+different artifact from the one a listed resolution of the same layer built.
+Each resolution the tables are meant to serve therefore needs its own rows.
+What the flag buys is that those rows collapse onto one artifact rather than
+one each. The flag is part of the compile key, which is why ``_resolve_dyn_hw``
 derives it here through the same ``_dyn_hw_ok`` the dispatch uses, and why
 the summary prints it: a build and a run that disagree miss each other
 silently rather than failing. Shapes the dynamic path cannot express (past
