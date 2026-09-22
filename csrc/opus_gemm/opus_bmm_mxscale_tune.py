@@ -502,6 +502,13 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             help="comma list of K (default 4096)",
         )
         self.parser.add_argument(
+            "--groupSize",
+            type=_intlist,
+            default=None,
+            help="only tune kids with these quantisation block sizes "
+            "(e.g. 32); default is every group in the policy",
+        )
+        self.parser.add_argument(
             "--apply",
             action="store_true",
             default=False,
@@ -721,7 +728,10 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             for kid in _TUNE_POLICY:
                 # Per kid, not per shape: the block size is the kid's, and each
                 # block size deserves its own winning row.
-                info_keys = (gfx, b, m, n, k, _kid_group(kid))
+                group = _kid_group(kid)
+                if args.groupSize and group not in args.groupSize:
+                    continue
+                info_keys = (gfx, b, m, n, k, group)
                 for sk in _applicable(kid, b, m, n, k):
                     info = (info_keys, kid, sk, "")
                     task.append(
