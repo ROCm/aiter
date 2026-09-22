@@ -351,16 +351,28 @@ def test_csr_inputs_must_be_contiguous():
     assert torch.equal(strided_indptr, indptr)
     with pytest.raises(ValueError, match="contiguous"):
         paged_attention_output_gate_group_fp8_quant(
-            q, kc, vc, strided_indptr, indices, gate,
-            scale=1.0, quant_dtype=dtype,
+            q,
+            kc,
+            vc,
+            strided_indptr,
+            indices,
+            gate,
+            scale=1.0,
+            quant_dtype=dtype,
         )
 
     strided_indices = torch.stack([indices, indices], dim=1).flatten()[::2]
     assert not strided_indices.is_contiguous()
     with pytest.raises(ValueError, match="contiguous"):
         paged_attention_output_gate_group_fp8_quant(
-            q, kc, vc, indptr, strided_indices, gate,
-            scale=1.0, quant_dtype=dtype,
+            q,
+            kc,
+            vc,
+            indptr,
+            strided_indices,
+            gate,
+            scale=1.0,
+            quant_dtype=dtype,
         )
 
 
