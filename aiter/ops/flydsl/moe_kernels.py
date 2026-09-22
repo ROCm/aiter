@@ -3533,9 +3533,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 token_grid,
                 stream=torch.cuda.current_stream(),
             )
-            rows_to_tokens = torch.full(
-                (n_rows,), -1, dtype=torch.int32, device=device
-            )
+            rows_to_tokens = torch.full((n_rows,), -1, dtype=torch.int32, device=device)
             invert_grid = (numel + 255) // 256
             _get_compiled_invert_route_rows(source_topk)(
                 ptr_arg(topids_to_rows_i32),
@@ -3597,9 +3595,11 @@ def flydsl_moe_fused_quant_preshuffle(
             and n_rows * Pb < 0x80000000
             and n_rows * Ws < 0x80000000
         ):
-            producer_mode = os.environ.get(
-                "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER", "rowgroup"
-            ).strip().lower()
+            producer_mode = (
+                os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER", "rowgroup")
+                .strip()
+                .lower()
+            )
             if producer_mode not in ("rowgroup", "three_kernel"):
                 raise ValueError(
                     "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER must be "
@@ -3682,15 +3682,9 @@ def flydsl_moe_fused_quant_preshuffle(
                     return out_payload, out_scale
 
             use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
-            route_payload = torch.empty(
-                (numel, Pb), dtype=torch.uint8, device=device
-            )
-            route_scale = torch.empty(
-                (numel, Ws), dtype=torch.uint8, device=device
-            )
-            rows_to_routes = torch.full(
-                (n_rows,), -1, dtype=torch.int32, device=device
-            )
+            route_payload = torch.empty((numel, Pb), dtype=torch.uint8, device=device)
+            route_scale = torch.empty((numel, Ws), dtype=torch.uint8, device=device)
+            rows_to_routes = torch.full((n_rows,), -1, dtype=torch.int32, device=device)
             launch_compact = _get_compiled_fused_quant_preshuffle_route_ksplit(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,

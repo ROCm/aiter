@@ -83,10 +83,9 @@ def _select_gemm1_num_waves_per_tensor_tdm(default: int) -> int:
             "AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
         ) from exc
     if num_waves not in (1, 2, 4):
-        raise ValueError(
-            "AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
-        )
+        raise ValueError("AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM must be 1, 2, or 4")
     return num_waves
+
 
 def _select_gemm2_num_waves_per_tensor_tdm(default: int) -> int:
     """Select a GEMM2-only TDM owner count without changing GEMM1."""
@@ -100,10 +99,9 @@ def _select_gemm2_num_waves_per_tensor_tdm(default: int) -> int:
             "AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
         ) from exc
     if num_waves not in (1, 2, 4):
-        raise ValueError(
-            "AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
-        )
+        raise ValueError("AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM must be 1, 2, or 4")
     return num_waves
+
 
 def _select_gemm2_output_split_wm(default: int = 3) -> int:
     """Select the first GEMM2 output-TDM slice in logical WM rows."""
@@ -121,6 +119,7 @@ def _select_gemm2_output_split_wm(default: int = 3) -> int:
         )
     return split_wm
 
+
 def _select_epilogue_batch_wn(default: int) -> int:
     """Selects the target GEMM1 SiLU epilogue batch width."""
     try:
@@ -135,11 +134,13 @@ def _select_epilogue_batch_wn(default: int) -> int:
         raise ValueError("AITER_FLYDSL_GEMM1_EPILOGUE_BATCH_WN must be 1, 2, 4, or 8")
     return batch_wn
 
+
 def _select_schedule_hints(default: int) -> int:
     value = os.environ.get("AITER_FLYDSL_GEMM1_SCHEDULE_HINTS", str(default)).strip()
     if value not in ("0", "1"):
         raise ValueError("AITER_FLYDSL_GEMM1_SCHEDULE_HINTS must be 0 or 1")
     return int(value)
+
 
 def _select_relax_cluster_wrap_dscnt(default: int) -> int:
     value = os.environ.get(
@@ -149,11 +150,13 @@ def _select_relax_cluster_wrap_dscnt(default: int) -> int:
         raise ValueError("AITER_FLYDSL_GEMM1_RELAX_CLUSTER_WRAP_DSCNT must be 0 or 1")
     return int(value)
 
+
 def _select_binary_int(name: str, default: int) -> int:
     value = os.environ.get(name, str(default)).strip()
     if value not in ("0", "1"):
         raise ValueError(f"{name} must be 0 or 1")
     return int(value)
+
 
 def _select_positive_int(name: str, default: int) -> int:
     try:
@@ -164,6 +167,7 @@ def _select_positive_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be a positive integer")
     return value
 
+
 def _select_tristate(name: str, default: int = -1) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
@@ -172,6 +176,7 @@ def _select_tristate(name: str, default: int = -1) -> int:
     if value not in (-1, 0, 1):
         raise ValueError(f"{name} must be -1, 0, or 1")
     return value
+
 
 def _select_wmma_reuse(default: int = 0) -> int:
     try:
@@ -230,11 +235,7 @@ def supports_gfx1250_a_preshuffle(
         waves_per_tensor_tdm = _select_gemm1_num_waves_per_tensor_tdm(
             waves_per_tensor_tdm
         )
-        return (
-            K == 7168
-            and N in (4096, 6144)
-            and waves_per_tensor_tdm in (1, 2, 4)
-        )
+        return K == 7168 and N in (4096, 6144) and waves_per_tensor_tdm in (1, 2, 4)
     if stage1_act == 0 and N == 7168 and K in (2048, 3072):
         waves_per_tensor_tdm = _select_gemm2_num_waves_per_tensor_tdm(
             waves_per_tensor_tdm
@@ -455,16 +456,22 @@ def flydsl_grouped_gemm_a8w4_masked(
                 )
             ),
             _select_relax_cluster_wrap_dscnt(1 if target_fp4_prefill else 0),
-            _select_binary_int("AITER_FLYDSL_GEMM1_DIRECT_SCALES", 0)
-            if target_fp4_prefill
-            else 0,
-            _select_binary_int("AITER_FLYDSL_GEMM1_TRANSITIVE_CLUSTER_SYNC", 0)
-            if target_fp4_prefill
-            else 0,
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_DIRECT_SCALES", 0)
+                if target_fp4_prefill
+                else 0
+            ),
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_TRANSITIVE_CLUSTER_SYNC", 0)
+                if target_fp4_prefill
+                else 0
+            ),
             _select_binary_int("AITER_FLYDSL_GEMM1_TDM_EARLY_TIMEOUT", 1),
-            _select_binary_int("AITER_FLYDSL_GEMM1_M_MAJOR_SWIZZLE", 0)
-            if target_fp4_prefill
-            else 0,
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_M_MAJOR_SWIZZLE", 0)
+                if target_fp4_prefill
+                else 0
+            ),
             (
                 _select_positive_int("AITER_FLYDSL_GEMM1_MMA_GROUP", 4)
                 if target_fp4_prefill
@@ -480,15 +487,21 @@ def flydsl_grouped_gemm_a8w4_masked(
                 if target_fp4_prefill
                 else -1
             ),
-            _select_binary_int("AITER_FLYDSL_GEMM1_SILU_POLY9", 0)
-            if stage1_act == 1
-            else 0,
-            _select_binary_int("AITER_FLYDSL_GEMM1_SILU_HARD", 0)
-            if stage1_act == 1
-            else 0,
-            _select_binary_int("AITER_FLYDSL_GEMM1_SILU_RELU", 0)
-            if stage1_act == 1
-            else 0,
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_SILU_POLY9", 0)
+                if stage1_act == 1
+                else 0
+            ),
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_SILU_HARD", 0)
+                if stage1_act == 1
+                else 0
+            ),
+            (
+                _select_binary_int("AITER_FLYDSL_GEMM1_SILU_RELU", 0)
+                if stage1_act == 1
+                else 0
+            ),
             _select_wmma_reuse() if target_fp4_prefill else 0,
             _select_binary_int("AITER_FLYDSL_GEMM1_DELAY_ACC_ZERO", 0),
             (

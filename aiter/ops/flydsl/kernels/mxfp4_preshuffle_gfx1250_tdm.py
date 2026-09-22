@@ -1688,6 +1688,7 @@ AITER_FLYDSL_GEMM1_LSR_DROP_SOLUTION = bool(
     int(os.environ.get("AITER_FLYDSL_GEMM1_LSR_DROP_SOLUTION", "0"))
 )
 
+
 def vgpr_keepalive(*raw_vals):
     """Pin arbitrary VGPR *data* values live to this program point.
 
@@ -1718,6 +1719,7 @@ def vgpr_keepalive(*raw_vals):
         is_align_stack=False,
     )
 
+
 def fused_silu_poly9_elem(g, u, *, limit_f32, neg_limit_f32):
     """Fast SiLU approximation for the opt-in GEMM1 tuning path.
 
@@ -1740,25 +1742,18 @@ def fused_silu_poly9_elem(g, u, *, limit_f32, neg_limit_f32):
         )
     )
     p = _fx.Float32(
-        llvm_dialect.intr_fma(
-            _raw(x2), _raw(p), _raw(_fx.Float32(0.0007638517363))
-        )
+        llvm_dialect.intr_fma(_raw(x2), _raw(p), _raw(_fx.Float32(0.0007638517363)))
     )
     p = _fx.Float32(
-        llvm_dialect.intr_fma(
-            _raw(x2), _raw(p), _raw(_fx.Float32(-0.01575167826))
-        )
+        llvm_dialect.intr_fma(_raw(x2), _raw(p), _raw(_fx.Float32(-0.01575167826)))
     )
     p = _fx.Float32(
-        llvm_dialect.intr_fma(
-            _raw(x2), _raw(p), _raw(_fx.Float32(0.2435485293))
-        )
+        llvm_dialect.intr_fma(_raw(x2), _raw(p), _raw(_fx.Float32(0.2435485293)))
     )
-    sig = _fx.Float32(
-        llvm_dialect.intr_fma(_raw(x), _raw(p), _raw(_fx.Float32(0.5)))
-    )
+    sig = _fx.Float32(llvm_dialect.intr_fma(_raw(x), _raw(p), _raw(_fx.Float32(0.5))))
     sig = fclamp_f32(sig, _fx.Float32(0.0), _fx.Float32(1.0))
     return gate * sig * up
+
 
 def batched_silu_hard(pairs, *, limit_f32, neg_limit_f32, range_constexpr):
     """Low-cost hard-sigmoid SiLU approximation used only by an opt-in path."""
@@ -1772,12 +1767,11 @@ def batched_silu_hard(pairs, *, limit_f32, neg_limit_f32, range_constexpr):
     for i in range_constexpr(len(pairs)):
         gate = fmin_f32(pairs[i][0], limit_f32)
         up = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
-        sig = _fx.Float32(
-            llvm_dialect.intr_fma(_raw(gate), _raw(slope), _raw(half))
-        )
+        sig = _fx.Float32(llvm_dialect.intr_fma(_raw(gate), _raw(slope), _raw(half)))
         sig = fclamp_f32(sig, zero, one)
         results.append(gate * sig * up)
     return results
+
 
 def batched_silu_relu(pairs, *, limit_f32, neg_limit_f32, range_constexpr):
     """ReLU-gate approximation used only by an opt-in performance experiment."""
@@ -1790,6 +1784,7 @@ def batched_silu_relu(pairs, *, limit_f32, neg_limit_f32, range_constexpr):
         up = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
         results.append(gate * up)
     return results
+
 
 @flyc.jit
 def launch_gemm_a8w4_tdm_optimized(
@@ -2107,9 +2102,7 @@ def launch_gemm_a8w4_tdm_optimized(
         if schedule_hints and (mma_group != 4 or fence_cover_mma != 8)
         else ""
     )
-    _xdl_arb = (
-        f"_xdl{disable_xdl_arb_stall}" if disable_xdl_arb_stall >= 0 else ""
-    )
+    _xdl_arb = f"_xdl{disable_xdl_arb_stall}" if disable_xdl_arb_stall >= 0 else ""
     _silu_approx = "_silu_poly9" if silu_poly9 else ""
     if silu_hard:
         _silu_approx = "_silu_hard"
@@ -2258,9 +2251,7 @@ def launch_gemm_a8w4_tdm_optimized(
             prev_expert = (expert > 0).select(expert - 1, 0)
             # The fixed-step bisect can return E+1 for capacity-tail tiles.
             # Those WGs skip compute, but this descriptor setup runs first.
-            prev_expert = (prev_expert < n_experts).select(
-                prev_expert, n_experts - 1
-            )
+            prev_expert = (prev_expert < n_experts).select(prev_expert, n_experts - 1)
             first_m = (expert > 0).select(
                 (tile_map[prev_expert] + tile_m - 1) // tile_m, 0
             )
@@ -2270,15 +2261,13 @@ def launch_gemm_a8w4_tdm_optimized(
             for mi in range_constexpr(cluster_m):
                 peer_m = cluster_first_m + mi
                 same_expert = (peer_m >= first_m) & (peer_m < end_m)
-                column_mask = column_mask | same_expert.select(
-                    1 << (mi * cluster_n), 0
-                )
+                column_mask = column_mask | same_expert.select(1 << (mi * cluster_n), 0)
             # A cluster containing sentinel tiles cannot use a cluster barrier.
             # Its live rows use the existing independent 1-D A-only protocol.
             b_mcast_mask = full_cluster.select(column_mask << local_n, 0)
 
         def cluster_sync(drain_lds=True):
-            if const_expr(cluster_m > 1):
+            if const_expr(cluster_m > 1):  # noqa: SIM102 - preserve DSL staging
                 if full_cluster:
                     if const_expr(transitive_cluster_sync):
                         if const_expr(drain_lds):
@@ -2548,23 +2537,19 @@ def launch_gemm_a8w4_tdm_optimized(
                 split_i = j.split_inner and len(j.waves) > 1
                 if const_expr(len(j.waves) > 1):
                     if const_expr(split_i):
-                        assert j.inner % len(j.waves) == 0, (
-                            "TDM inner extent must divide owners"
-                        )
+                        assert (
+                            j.inner % len(j.waves) == 0
+                        ), "TDM inner extent must divide owners"
                     else:
-                        assert j.outer % len(j.waves) == 0, (
-                            "TDM outer extent must divide owners"
-                        )
+                        assert (
+                            j.outer % len(j.waves) == 0
+                        ), "TDM outer extent must divide owners"
                 seg = j.outer if split_i else j.outer // len(j.waves)
                 inner_seg = j.inner // len(j.waves) if split_i else j.inner
                 wave_outer_off = (
-                    0
-                    if split_i or len(j.waves) == 1
-                    else (wave - j.waves[0]) * seg
+                    0 if split_i or len(j.waves) == 1 else (wave - j.waves[0]) * seg
                 )
-                wave_inner_off = (
-                    (wave - j.waves[0]) * inner_seg if split_i else 0
-                )
+                wave_inner_off = (wave - j.waves[0]) * inner_seg if split_i else 0
                 gt = global_view(
                     j.g_base,
                     j.g_off
@@ -2575,9 +2560,7 @@ def launch_gemm_a8w4_tdm_optimized(
                 )
                 ext = None if j.oob is None else j.oob - wave_outer_off
                 pad_kw = (
-                    {"pad_interval": j.pad[0], "pad_amount": j.pad[1]}
-                    if j.pad
-                    else {}
+                    {"pad_interval": j.pad[0], "pad_amount": j.pad[1]} if j.pad else {}
                 )
                 atom = fx.rocdl.make_tdm_atom(
                     gt,
@@ -2622,7 +2605,9 @@ def launch_gemm_a8w4_tdm_optimized(
             for g in range_constexpr(len(job_waves)):
                 if owns(job_waves[g]):
                     fn([j for j in jobs if j.waves == job_waves[g]])
-            if const_expr(4 * num_waves_per_tensor_tdm < num_waves):
+            if const_expr(  # noqa: SIM102 - preserve DSL staging
+                4 * num_waves_per_tensor_tdm < num_waves
+            ):
                 if wave >= 4 * num_waves_per_tensor_tdm:
                     fn([])
 
@@ -2783,9 +2768,7 @@ def launch_gemm_a8w4_tdm_optimized(
                                 # unchanged across adjacent row boundaries.
                                 reuseA=bool(wmma_reuse in (1, 2) and wn_raw > 0),
                                 reuseB=bool(
-                                    wmma_reuse in (1, 3)
-                                    and wm > 0
-                                    and wn_raw == 0
+                                    wmma_reuse in (1, 3) and wm > 0 and wn_raw == 0
                                 ),
                             )
                         )
@@ -2855,12 +2838,10 @@ def launch_gemm_a8w4_tdm_optimized(
                 ]
             else:
                 sb_v = [
-                    load_sb(lds_addr.sb, sn, ksl)
-                    for sn in range_constexpr(sb_pairs)
+                    load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
                 ]
                 sa_v = [
-                    load_sa(lds_addr.sa, sm, ksl)
-                    for sm in range_constexpr(sa_pairs)
+                    load_sa(lds_addr.sa, sm, ksl) for sm in range_constexpr(sa_pairs)
                 ]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
@@ -3068,7 +3049,9 @@ def launch_gemm_a8w4_tdm_optimized(
                         )
                         workgroup_barrier()
                         issue(s, kt + num_buffers, my_jobs)
-                        if const_expr(cluster_m > 1):
+                        if const_expr(  # noqa: SIM102 - preserve DSL staging
+                            cluster_m > 1
+                        ):
                             if (kt + 1) % num_buffers == 0:
                                 cluster_sync(drain_lds=not relax_cluster_wrap_dscnt)
 
@@ -3140,7 +3123,9 @@ def launch_gemm_a8w4_tdm_optimized(
                             my_tdm_per,
                             current_kt=kt,
                         )
-                        if const_expr(cluster_m > 1):
+                        if const_expr(  # noqa: SIM102 - preserve DSL staging
+                            cluster_m > 1
+                        ):
                             if (kt + 1) % num_buffers == 0:
                                 cluster_sync(drain_lds=not relax_cluster_wrap_dscnt)
 
@@ -3236,10 +3221,9 @@ def launch_gemm_a8w4_tdm_optimized(
                         out_stride = c_stride
                         out_col_off = c_inner_off
                     c_iter = fx.get_iter(arg_c)
-                    c_off_rt = (
-                        (c_outer_off + fx.Int64(row_start)) * fx.Int64(out_stride)
-                        + out_col_off
-                    )
+                    c_off_rt = (c_outer_off + fx.Int64(row_start)) * fx.Int64(
+                        out_stride
+                    ) + out_col_off
                     gt_half = global_view(
                         c_iter,
                         c_off_rt,
@@ -3500,14 +3484,10 @@ def launch_gemm_a8w4_tdm_optimized(
                             ]
                             if pin:
                                 vgpr_keepalive(*pin)
-                    if const_expr(
-                        overlap_output_store and wm + 1 == OUTPUT_SPLIT_WM
-                    ):
+                    if const_expr(overlap_output_store and wm + 1 == OUTPUT_SPLIT_WM):
                         issue_output_slice(0, OUTPUT_SPLIT_WM)
             if const_expr(overlap_output_store):
-                issue_output_slice(
-                    OUTPUT_SPLIT_WM, wmma_m_rep - OUTPUT_SPLIT_WM
-                )
+                issue_output_slice(OUTPUT_SPLIT_WM, wmma_m_rep - OUTPUT_SPLIT_WM)
             # -- Shared LDS -> TDM store to global --
             # dscnt-only barrier: the TDM store reads LDS, not the e8m0 scales
             # still in flight, so their storecnt wait moves past the store below.
@@ -3534,9 +3514,7 @@ def launch_gemm_a8w4_tdm_optimized(
                     c_iter = fx.get_iter(arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                 if const_expr(STORE_PAD == 0):
-                    gtC = global_view(
-                        c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
-                    )
+                    gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
                     atomC = make_tdm_store(gtC, mn_oob, out_stride)
                     src = lds_view(
                         fx.recast_iter(oc_store, base_ptr),

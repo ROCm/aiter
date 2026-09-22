@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -81,7 +79,7 @@ SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
 # User-facing TB/s applies the requested binary/decimal conversion:
 # 1.024**4 = 2**40 / 10**12.
-TBPS_DIVISOR = 1.024 ** 4
+TBPS_DIVISOR = 1.024**4
 _ACT_BY_NAME = {
     "silu": ActivationType.Silu,
     "swiglu": ActivationType.Swiglu,
@@ -95,8 +93,8 @@ _STAGE1_ACT_ID = {
 
 
 def _bytes_per_microsecond_to_tbps(
-    bytes_count: int | float,
-    time_us: int | float,
+    bytes_count: float,
+    time_us: float,
 ) -> float:
     return bytes_count / time_us / 1e6 / TBPS_DIVISOR
 
@@ -123,9 +121,7 @@ _TDM_KERNEL_RE = re.compile(
     r"(?:_prefetch)?"
     r"(?:_wpt\d+)?"
 )
-_MOE_GEMM1_ASM_SYMBOL = (
-    "moe_gemm1_mxfp4_ABpreShuffle_256x256_4x4_batch_ps_act1"
-)
+_MOE_GEMM1_ASM_SYMBOL = "moe_gemm1_mxfp4_ABpreShuffle_256x256_4x4_batch_ps_act1"
 
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
@@ -258,14 +254,22 @@ def _format_effective_stage_metrics(
     stage: dict[str, int | float | str],
 ) -> tuple[str, ...]:
     return (
-        f"{stage['executed_flops']:,} FLOP \u2192 "
-        f"{stage['executed_tflops']:,.1f} TFLOP/s",
-        f"{stage['effective_read_bytes']:,} B \u2192 "
-        f"{stage['effective_read_tbps']:.3f} TB/s",
-        f"{stage['output_write_bytes']:,} B ({stage['output_kind']}) \u2192 "
-        f"{stage['output_write_tbps']:.3f} TB/s",
-        f"{stage['effective_read_write_bytes']:,} B \u2192 "
-        f"{stage['effective_read_write_tbps']:.3f} TB/s",
+        (
+            f"{stage['executed_flops']:,} FLOP \u2192 "
+            f"{stage['executed_tflops']:,.1f} TFLOP/s"
+        ),
+        (
+            f"{stage['effective_read_bytes']:,} B \u2192 "
+            f"{stage['effective_read_tbps']:.3f} TB/s"
+        ),
+        (
+            f"{stage['output_write_bytes']:,} B ({stage['output_kind']}) \u2192 "
+            f"{stage['output_write_tbps']:.3f} TB/s"
+        ),
+        (
+            f"{stage['effective_read_write_bytes']:,} B \u2192 "
+            f"{stage['effective_read_write_tbps']:.3f} TB/s"
+        ),
     )
 
 
@@ -596,12 +600,10 @@ def test_profiled_grouped_gemm_timing_extraction_fixture():
             return self.records
 
     a8_gemm1 = (
-        "void aiter::a8w4_tdm_fp8_t16x256x256_w1x4_b2_"
-        "K7168_e384_act1_bias(...)"
+        "void aiter::a8w4_tdm_fp8_t16x256x256_w1x4_b2_" "K7168_e384_act1_bias(...)"
     )
     a8_gemm2 = (
-        "__mangled_prefix_a8w4_tdm_fp8_t16x512x128_w1x4_b2_"
-        "K768_e384_bias_wpt1.extra"
+        "__mangled_prefix_a8w4_tdm_fp8_t16x512x128_w1x4_b2_" "K768_e384_bias_wpt1.extra"
     )
     a8_records = [
         {"name": a8_gemm1, "device_time_avg": 496.191},
@@ -770,8 +772,7 @@ def test_profiled_grouped_gemm_timing_extraction_fixture():
 
     a4_records = [
         {
-            "name": "aiter::a8w4_tdm_fp4_t64x256x256_w1x4_b2_"
-            "K7168_e96_act1",
+            "name": "aiter::a8w4_tdm_fp4_t64x256x256_w1x4_b2_" "K7168_e96_act1",
             "device_time_avg": 144.7,
         },
         {
@@ -1134,10 +1135,8 @@ def _run_grouped_via_fused_moe(
             )
             # Build/import happens here, before _call exists and before any
             # run_perftest warmup or profiler iteration.
-            pipeline_injection = (
-                moe_cpp_backend.prepare_pipeline_gemm1_injection(
-                    torch_module=torch,
-                )
+            pipeline_injection = moe_cpp_backend.prepare_pipeline_gemm1_injection(
+                torch_module=torch,
             )
 
     K = model_dim
@@ -1232,7 +1231,6 @@ def _run_grouped_via_fused_moe(
 
     kernel_us = None
     trace_df = None
-    cpp_adapter = None
     with pipeline_injection as cpp_adapter:
         torch.cuda.synchronize()
         if kernel_bench:
@@ -1324,14 +1322,7 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
-    raw = (
-        tensor.detach()
-        .contiguous()
-        .view(torch.uint8)
-        .cpu()
-        .numpy()
-        .tobytes()
-    )
+    raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(raw).hexdigest()
 
 
