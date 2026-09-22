@@ -567,9 +567,22 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                            + (size_t)batch_id * kargs.stride_sfa_batch
                            + (size_t)row * kargs.stride_sfa + sf_start,
                            sfa_bytes);
+    // Bounded like g_sfa, and it has to be. The scale ring's padding lanes read
+    // past the live groups on purpose, and the comment justifying that said the
+    // reads "return zero through the buffer's num_records bound" -- true of
+    // g_sfa, which carries sfa_bytes, and not of this buffer, which carried no
+    // bound at all. Unbounded they fault: that is the GPU coredump the tune
+    // sweep died on, and it stayed hidden because whether a padding lane lands
+    // inside the allocation depends on the shape -- N=256, which the correctness
+    // check uses, happens to be safe where N=1024 is not.
+    const unsigned int sfb_groups_avail =
+        (unsigned int)(ceil_div(kargs.n, T::GROUP_N) - col / T::GROUP_N);
+    const unsigned int sfb_bytes =
+        sfb_groups_avail * (unsigned int)kargs.stride_sfb * sizeof(D_SF);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                            + (size_t)batch_id * kargs.stride_sfb_batch
-                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start);
+                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start,
+                           sfb_bytes);
 
     int role = ((wave_id & 1) ^ ((wgid >> 8) & 1));
 
