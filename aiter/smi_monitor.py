@@ -20,6 +20,15 @@ Usage (explicit start/stop):
     run_workload()
     mon.stop()
     samples = mon.samples
+
+Automatic benchmark plots:
+    AITER_SMI_MONITOR=1 AITER_SMI_PLOT=1 python3 op_tests/test_...py
+
+Plotting copies emitted results into a fresh run directory under
+``AITER_SMI_PLOT_DIR`` (default: ``./smi_plots``) and renders one report at
+normal process exit. Existing stdout / ``AITER_SMI_OUTPUT_PATH`` output is
+preserved. Matplotlib is optional and loaded only in the plotting subprocess.
+Long-lived callers can explicitly call ``flush_smi_plots()`` after a workload.
 """
 
 from __future__ import annotations
@@ -509,6 +518,24 @@ def emit_smi_result(result: dict) -> None:
             output.write(line + "\n")
     else:
         print(line, flush=True)
+
+    if os.environ.get("AITER_SMI_PLOT", "0") == "1":
+        from aiter.smi_plotting import record_smi_result
+
+        record_smi_result(line)
+
+
+def flush_smi_plots():
+    """Finish this process's pending plot report, if any, and return its path.
+
+    Normal interpreter exit does this automatically. Call explicitly in
+    long-lived processes or multiprocessing workers that bypass atexit.
+    Subsequent emissions start a fresh report. Plotting errors are reported
+    on stderr without changing benchmark results or raising an exception.
+    """
+    from aiter.smi_plotting import flush_smi_plots as flush
+
+    return flush()
 
 
 def replay_with_smi(
