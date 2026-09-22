@@ -426,11 +426,16 @@ def pa_decode_sparse(
     # the reduce masks their stale partial-buffer slots).
     # print(f"{kv_indices.shape[0]=}")
     if kv_splits is None:
-        max_kv_len = kv_indices.shape[0]
-        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
+        # PER TOKEN: the split is per token, so the ceiling is the tile count
+        # ONE token has. kv_indices.shape[0] is every token's indices together,
+        # so the ceiling never bound and splits were made with no work in them
+        # -- and a dead split still costs the reduce a slab row.
+        avg_kv_len = max(1, kv_indices.shape[0] // max(1, T))
+        max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
-        kv_splits = triton.next_power_of_2(kv_splits)
+        # DOWN to a power of two: rounding up puts back what the ceiling removed.
+        kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
 
     if use_gluon:
         _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
@@ -544,6 +549,7 @@ def pa_decode_sparse(
         attn_sink,
         kv_indptr,
         kv_indptr,
+        kv_indices,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -566,6 +572,7 @@ def pa_decode_sparse(
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
         HAS_EXTRA=False,
+        MAIN_IS_RUN=False,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -1044,11 +1051,16 @@ def _pa_decode_sparse_v4_2buff(
     USE_EXP2 = True
 
     if kv_splits is None:
-        max_kv_len = kv_indices.shape[0]
-        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
+        # PER TOKEN: the split is per token, so the ceiling is the tile count
+        # ONE token has. kv_indices.shape[0] is every token's indices together,
+        # so the ceiling never bound and splits were made with no work in them
+        # -- and a dead split still costs the reduce a slab row.
+        avg_kv_len = max(1, kv_indices.shape[0] // max(1, T))
+        max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
-        kv_splits = triton.next_power_of_2(kv_splits)
+        # DOWN to a power of two: rounding up puts back what the ceiling removed.
+        kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
 
     _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
     _lds_cap = max(1, _lds_budget // (block_d * 4))
@@ -1145,6 +1157,7 @@ def _pa_decode_sparse_v4_2buff(
         attn_sink,
         kv_indptr,
         kv_indptr,
+        kv_indices,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -1167,6 +1180,7 @@ def _pa_decode_sparse_v4_2buff(
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
         HAS_EXTRA=False,
+        MAIN_IS_RUN=False,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -1202,18 +1216,26 @@ def _v4_cache_geometry(cache: torch.Tensor, name: str):
             f"{name} rows must be packed: expected stride (.., "
             f"{rec}, 1), got {tuple(cache.stride())}"
         )
-    # gcd(bs*584, 576) = 64 and gcd(bs*584, 8) = 8 make the descriptors'
-    # row indices integral; both need block_size divisible by 8.
-    if block_size % 8:
-        raise RuntimeError(
-            f"{name} block_size must be a multiple of 8 for the unit-strided "
-            f"descriptors, got {block_size}"
-        )
+    # The descriptors count rows in 64-byte (data) and 8-byte (scale) units, so
+    # the BLOCK STRIDE has to be a multiple of both. block_size itself is
+    # unconstrained: DSV4-Pro's HCA layers page the compressed cache 2 tokens to
+    # a block, and that addresses fine as long as the stride lands right.
+    #
+    # For a contiguous cache the stride IS block_size*584, and since 584 = 8*73
+    # with 73 odd, this is the block_size % 8 it used to ask for -- so nothing
+    # is loosened there, only for a strided view.
     blk_stride = cache.stride(0)
     if blk_stride % _V4_DATA_UNIT or blk_stride % _V4_SC_UNIT:
         raise RuntimeError(
             f"{name} block stride {blk_stride} B must be a multiple of "
             f"{_V4_DATA_UNIT} and {_V4_SC_UNIT} for the unit-strided descriptors"
+            + (
+                f" (the cache is contiguous at block_size={block_size}, so the "
+                f"stride is block_size*{_V4_REC_BYTES}; a contiguous cache needs "
+                f"block_size % 8 == 0)"
+                if blk_stride == block_size * _V4_REC_BYTES
+                else ""
+            )
         )
     total_bytes = (nb - 1) * blk_stride + block_size * _V4_REC_BYTES
     return (
@@ -1247,6 +1269,8 @@ def _pa_decode_sparse_v4(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    block_k: int | None = None,
+    main_is_run: bool = False,
 ):
     """gfx1250 driver for the DSv4 unified paged cache (vLLM ``fp8_ds_mla``).
 
@@ -1391,7 +1415,7 @@ def _pa_decode_sparse_v4(
     h_padded = n_head_blocks * block_h
     block_d = D
 
-    block_k = 16
+    block_k_default = 16
     waves_per_eu = 1
     if block_h == 128:
         # A 64-row KV tile: now that the Q operand is streamed from LDS one K
@@ -1399,7 +1423,7 @@ def _pa_decode_sparse_v4(
         # overflows the register file, and the fatter iteration amortises the
         # accumulator rescale and the barriers over twice the work -- 64.4us vs
         # 69.9us at kv_len=384, T=512, H=128.
-        block_k = 64
+        block_k_default = 64
         attn_num_warps = 8
         max_num_wg = 256
         # The bf16 path asks for 2 waves/EU here; the dequant pushes this
@@ -1415,6 +1439,21 @@ def _pa_decode_sparse_v4(
     else:
         attn_num_warps = 1
         max_num_wg = 1024
+    block_k = block_k_default if block_k is None else int(block_k)
+    if main_is_run:
+        # The caller promises main_indices is one ascending run per token. The
+        # tiling is then aligned to the global slot space, which only keeps a
+        # tile inside one page while BLOCK_K divides the page.
+        if has_extra:
+            raise RuntimeError(
+                "main_is_run is single-stream for now; the top-k stream still "
+                "needs the gather path"
+            )
+        if main_block_size % block_k:
+            raise RuntimeError(
+                f"main_is_run needs block_k ({block_k}) to divide the cache's "
+                f"block_size ({main_block_size}), or a tile straddles two pages"
+            )
     if ctas_h > 1:
         # block_h is the CLUSTER tile: each CTA owns block_h // ctas_h heads,
         # and warps follow the per-CTA tile (16 heads -> 1 warp). The per-CTA
@@ -1439,13 +1478,22 @@ def _pa_decode_sparse_v4(
     USE_EXP2 = True
 
     if kv_splits is None:
-        max_kv_len = main_indices.shape[0]
+        # PER TOKEN, not the total: the split is per token, so the ceiling is
+        # the tile count ONE token has. Splitting past it only makes segments
+        # that return immediately, and those still cost the reduce a slab row
+        # each. This previously read main_indices.shape[0] -- every token's
+        # indices together -- so the ceiling never bound and the workgroup term
+        # below won: 32 splits on a token with 9 tiles.
+        total_idx = main_indices.shape[0]
         if has_extra:
-            max_kv_len += extra_indices.shape[0]
-        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
+            total_idx += extra_indices.shape[0]
+        avg_kv_len = max(1, total_idx // max(1, T))
+        max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
-        kv_splits = triton.next_power_of_2(kv_splits)
+        # DOWN to a power of two, not up: KV_SPLITS is a constexpr tile extent,
+        # and rounding up puts back the dead segments the ceiling just removed.
+        kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
 
     _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
     _lds_cap = max(1, _lds_budget // (block_d * 4))
@@ -1537,6 +1585,7 @@ def _pa_decode_sparse_v4(
         MAIN_CONTIG_BLOCKS=main_contig_blocks,
         EXTRA_CONTIG_BLOCKS=extra_contig_blocks,
         HAS_EXTRA=has_extra,
+        MAIN_IS_RUN=bool(main_is_run),
         num_warps=attn_num_warps,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -1558,6 +1607,7 @@ def _pa_decode_sparse_v4(
         attn_sink,
         main_indptr,
         extra_indptr,
+        main_indices,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -1580,6 +1630,7 @@ def _pa_decode_sparse_v4(
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
         HAS_EXTRA=has_extra,
+        MAIN_IS_RUN=bool(main_is_run),
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
