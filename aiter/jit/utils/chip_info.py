@@ -52,7 +52,10 @@ def get_gpu_model(device_id: int = 0) -> str:
         import torch
 
         return normalize_gpu_model(torch.cuda.get_device_name(int(device_id)))
-    except Exception:  # noqa: BLE001 - callers must fail closed to "unknown"
+    except Exception as error:  # noqa: BLE001 - callers fail closed to "unknown"
+        # "unknown" becomes part of the tuning key, so every tuned row silently
+        # stops matching; without this the cause is invisible.
+        logger.debug("GPU model detection failed, keying as unknown: %s", error)
         return "unknown"
 
 
