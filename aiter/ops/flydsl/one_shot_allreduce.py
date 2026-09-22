@@ -107,7 +107,6 @@ class OneShotAllReduce:
         block: int | None = None,
         max_bytes: int | None = None,
         link: str | None = None,
-        probe: str = "full",
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
         skip_self: bool | None = None,
     ):
@@ -169,7 +168,6 @@ class OneShotAllReduce:
             if max_bytes is None
             else int(max_bytes)
         )
-        self.probe = probe
         self.spin_sleep = int(spin_sleep)
 
         # ``skip_self``: None means "whatever the rung says".
@@ -220,7 +218,6 @@ class OneShotAllReduce:
                     inbox_memory=resolved_inbox,
                     fanout=key[2],
                     block=key[3],
-                    probe=probe,
                     spin_sleep=int(spin_sleep),
                     skip_self=key[4],
                     rank=self.rank,
@@ -385,13 +382,6 @@ class OneShotAllReduce:
         return int(nbytes) <= self.max_bytes
 
     def allreduce(self, inp, out, stream=None):
-        if self.probe != "full":
-            raise RuntimeError(
-                f"OneShotAllReduce was built with probe={self.probe!r}, a "
-                "measurement-only variant that does not move the payload and "
-                "computes a wrong answer. Use compile_and_launch()/_launch() "
-                "to time it."
-            )
         live_bytes = self._check_payload(inp, out)
         if not self.is_beneficial(live_bytes):
             raise ValueError(

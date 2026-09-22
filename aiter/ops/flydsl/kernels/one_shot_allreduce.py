@@ -33,7 +33,7 @@ from flydsl.expr.typing import (
 from . import buffer_ops
 
 # The fused epilogue and the row-to-workgroup geometry are shared with the
-# quantized schedules; see quick_allreduce_fusions.
+# quantized schedules.
 from .quick_allreduce_fusions import (
     ATOM_ELEMS,
     FUSIONS,
@@ -246,16 +246,13 @@ def fused_oneshot_ladder(world_size: int, link: str = "pcie"):
 
 
 def fused_block(hidden: int, atoms: int) -> int:
-    """Threads per block for a fused build, or raise saying why *hidden* is out.
+    """Threads per block for a fused build, or raise saying why hidden dim
+    cannot covered.
 
     One block covers one whole token row -- ``BLOCK * atoms * 8 == hidden`` --
     because the RMSNorm reduction spans the row and a row split across two
-    blocks could only be joined with a grid-wide barrier.
+    blocks could only be joined with a grid-wide barrier."""
 
-    This schedule carries no codec, so the only alignment a block owes is whole
-    waves for the reduction's shuffles. The quantized schedules need a stricter
-    one; see ``quick_allreduce_fusions.quick_reduce_row_block``.
-    """
     return row_block(hidden, per_thread=ATOM_ELEMS * int(atoms), align=WAVE)
 
 
@@ -301,9 +298,7 @@ PARITIES = 2
 # 64 B handshake sector at the tail of each wire slot, as 16 i32 copies of the
 # colour -- one ``dwordx4`` from each of 4 lanes.
 FLAG_I32 = 16
-# Read our own inbox with the caches bypassed: a peer wrote these lines
-# microseconds ago and an L1 hit here is a stale hit. Same reasoning as the
-# ring kernel's ``_RECV_POLICY``.
+# Read our own inbox with the caches bypassed (avoids reading stale values).
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
@@ -316,13 +311,6 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # so spreading across links sooner can start more of them in parallel.
 FANOUT_ORDERS = ("peer", "atom")
 DEFAULT_FANOUT = "peer"
-
-# Measurement-only build variants. "sync" keeps the colour loop, the flag
-# publish and the flag wait but touches no payload, so it times the floor this
-# schedule cannot go below: launch path + one flag round trip + rank-arrival
-# skew. It computes a wrong answer by construction and must never be dispatched
-# to; ``OneShotAllReduce`` refuses to run a probe build through ``allreduce``.
-PROBE_MODES = ("full", "sync")
 
 # ``s_sleep`` interval for the flag spin, 0 to spin flat out.
 DEFAULT_SPIN_SLEEP = 0
@@ -357,7 +345,6 @@ def make_one_shot_allreduce_kernel(
     grid: int,
     inbox_memory: str = "uncached",
     fanout: str = DEFAULT_FANOUT,
-    probe: str = "full",
     spin_sleep: int = DEFAULT_SPIN_SLEEP,
     skip_self: bool = False,
     rank: int | None = None,
@@ -391,8 +378,6 @@ def make_one_shot_allreduce_kernel(
         )
     if fanout not in FANOUT_ORDERS:
         raise ValueError(f"fanout must be one of {FANOUT_ORDERS}, got {fanout!r}")
-    if probe not in PROBE_MODES:
-        raise ValueError(f"probe must be one of {PROBE_MODES}, got {probe!r}")
     if not 0 <= int(spin_sleep) <= 0xFFFF:
         raise ValueError(f"spin_sleep must fit s_sleep's imm16, got {spin_sleep!r}")
     if grid < 1:
@@ -856,26 +841,19 @@ def make_one_shot_allreduce_kernel(
         for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
             tile = bid + i * n_blocks
             parity = color & fx.Int32(1)
-            # ``probe`` is a trace-time constant, so only one arm is emitted.
-            # "sync" is measurement-only: the handshake with no payload
-            # touched, so the wall time is the launch path plus the flag round
-            # trip plus rank-arrival skew. Nothing this schedule does to the
-            # data movement can go below it. Output is garbage.
-            if const_expr(probe == "full"):
-                my_atoms = _load_tile(tile)
-                # Issued before the handshake on purpose: the residual is plain
-                # HBM with no dependence on any peer, so this load retires
-                # during the flag spin instead of after it.
-                if const_expr(fused):
-                    x_atoms = _load_rows(res_in_buf, tile)
-                _fanout(parity, my_atoms)
+            my_atoms = _load_tile(tile)
+            # Issued before the handshake on purpose: the residual is plain
+            # HBM with no dependence on any peer, so this load retires
+            # during the flag spin instead of after it.
+            if const_expr(fused):
+                x_atoms = _load_rows(res_in_buf, tile)
+            _fanout(parity, my_atoms)
             _publish(parity, color)
             _wait(parity, color)
-            if const_expr(probe == "full"):
-                if const_expr(fused):
-                    _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms)
-                else:
-                    _store_tile(tile, _reduce(parity, my_atoms))
+            if const_expr(fused):
+                _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms)
+            else:
+                _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -933,8 +911,6 @@ def make_one_shot_allreduce_kernel(
         tag += f"_rms_h{hidden}"
         if padded:
             tag += f"p{h_pad}"
-    if probe != "full":
-        tag += f"_{probe}"
     if spin_sleep:
         tag += f"_sl{spin_sleep}"
     if skip_self:
@@ -965,7 +941,6 @@ def make_one_shot_allreduce_kernel(
         "world_size": world_size,
         "inbox_memory": inbox_memory,
         "fanout": fanout,
-        "probe": probe,
         "spin_sleep": spin_sleep,
         "skip_self": skip_self,
         "grid": grid,
