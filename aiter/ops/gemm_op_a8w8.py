@@ -803,8 +803,21 @@ def _blockscale_triton(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype,
+    *,
+    group32: bool = False,
 ) -> Tensor:
-    """Run the triton kernel on CK's inputs: row-major x_scale, (N, K) weight, JIT per arch."""
+    """Run Triton on unshuffled weights with the selected scale format."""
+    if group32:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+            gemm_a8w8_blockscale_group32,
+        )
+
+        assert WQ.ndim == w_scale.ndim == 2, "Expected matrix weights and scales"
+        group_n = 32 if w_scale.shape[0] == -(-WQ.shape[0] // 32) else 1
+        return gemm_a8w8_blockscale_group32(
+            XQ, WQ, x_scale, w_scale, dtype=dtype, weight_group_rows=group_n
+        )
+
     from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as _gemm_a8w8_blockscale_triton,
     )
@@ -837,89 +850,89 @@ def gemm_a8w8_blockscale(
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
 ) -> torch.Tensor:
-    """Blockscaled A8W8 GEMM with the existing 128x128 or native group32 format.
+    """Blockscaled A8W8 GEMM with configuration-first backend dispatch.
 
-    E8M0 scales with K/32 activation groups select the gfx950 Triton backend.
-    Its weights are unshuffled and use compact 32x32 or 1x32 scales. Other
-    operands retain the existing 128x128 backend dispatch.
+    Native E8M0 group32 operands use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
+    FP32 128x128 scales use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE. Both tables are
+    queried through get_CKGEMM_config before choosing a fallback. Group32
+    currently supports libtype="triton", also its default on a config miss.
+    Triton tile and split-K parameters come from its own tuning tables.
     """
-    # Native group32 scales identify a different quantization contract from
-    # the 128x128 CK/ASM inputs. Keep them compact and in E8M0 throughout.
-    if (
+    is_group32 = (
         x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
         and x_scale.ndim == 2
         and XQ.ndim == 2
         and x_scale.shape[1] == XQ.shape[1] // 32
-    ):
-        assert not isBpreshuffled, "Group32 FP8 GEMM requires native weights"
-        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
-            gemm_a8w8_blockscale_group32,
-        )
-
-        # A single scale row is shared by up to 32 weight rows, or one row
-        # per output channel. The backend validates the complete scale grid.
-        assert WQ.ndim == w_scale.ndim == 2, "Expected matrix weights and scales"
-        group_n = 32 if w_scale.shape[0] == -(-WQ.shape[0] // 32) else 1
-        return gemm_a8w8_blockscale_group32(
-            XQ, WQ, x_scale, w_scale, dtype=dtype, weight_group_rows=group_n
-        )
-
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    )
+    assert dtype in (dtypes.bf16, dtypes.fp16) or (
+        is_group32 and dtype == dtypes.fp32
+    ), f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if isBpreshuffled:
+        assert not is_group32, "Group32 FP8 GEMM requires native weights"
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+            Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
-    else:
-        if not _hip_blockscale_supported():
-            return _blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
-        config = get_CKGEMM_config(
-            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
-        )
-        if config is not None:
-            libtype = config["libtype"]
-            splitK = int(config.get("splitK", 0))
-            kernelName = str(config.get("kernelName", ""))
-            if libtype == "ck":
-                return gemm_a8w8_blockscale_ck(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    Y,
-                    splitK=splitK,
-                    kernelName=kernelName,
-                )
-            elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    Y,
-                    splitK=splitK,
-                    kernelName=kernelName,
-                )
-            else:
-                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-        min_m = _BLOCKSCALE_TRITON_FALLBACK_MIN_M.get(get_gfx())
-        if min_m is not None and m >= min_m:
-            return _blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
-        try:
-            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "
-                f"{dtype=}, config={config}: {e}"
-            ) from e
+
+    tuned_file = (
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE
+        if is_group32
+        else AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    )
+    config = get_CKGEMM_config(m, n, k, tuned_file)
+    if config is not None:
+        libtype = config["libtype"]
+        if libtype == "triton":
+            return _blockscale_triton(
+                XQ, WQ, x_scale, w_scale, dtype, group32=is_group32
+            )
+        # CK/CKTile currently consume FP32 128x128 scales. A misconfigured
+        # group32 row must fail instead of reinterpreting its E8M0 bytes.
+        assert not is_group32, f"Unsupported libtype {libtype} for group32 GEMM"
+        splitK = int(config.get("splitK", 0))
+        kernelName = str(config.get("kernelName", ""))
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+        if libtype == "ck":
+            return gemm_a8w8_blockscale_ck(
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                splitK=splitK,
+                kernelName=kernelName,
+            )
+        elif libtype == "cktile":
+            return gemm_a8w8_blockscale_cktile(
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                splitK=splitK,
+                kernelName=kernelName,
+            )
+        else:
+            assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+
+    if is_group32 or not _hip_blockscale_supported():
+        return _blockscale_triton(XQ, WQ, x_scale, w_scale, dtype, group32=is_group32)
+    min_m = _BLOCKSCALE_TRITON_FALLBACK_MIN_M.get(get_gfx())
+    if min_m is not None and m >= min_m:
+        return _blockscale_triton(XQ, WQ, x_scale, w_scale, dtype)
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    try:
+        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "
+            f"{dtype=}, config={config}: {e}"
+        ) from e
 
 
 def flatmm_a8w8_blockscale_ASM(

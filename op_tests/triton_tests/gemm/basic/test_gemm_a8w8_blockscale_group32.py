@@ -9,6 +9,7 @@ if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
     gemm_a8w8_blockscale_group32,
@@ -183,7 +184,12 @@ def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
     "m,n,k", [(0, 65, 64), (3, 2053, 1280), (66, 8193, 576), (512, 4096, 1280)]
 )
 @pytest.mark.parametrize("group_n", [1, 32])
-def test_public_group32_dispatch(m, n, k, group_n):
+@pytest.mark.parametrize("configured", [False, True])
+def test_public_group32_dispatch(m, n, k, group_n, configured, monkeypatch):
+    if configured:
+        monkeypatch.setattr(
+            gemm_op_a8w8, "get_CKGEMM_config", lambda *args: {"libtype": "triton"}
+        )
     x, w, xs, ws = _operands(m, n, k)
     if group_n == 1:
         ws = ws.repeat_interleave(32, 0)[:n].contiguous()
@@ -245,3 +251,22 @@ def test_public_group32_compile_dynamic_rows():
         torch.testing.assert_close(
             compiled(x, w, xs, ws), forward(x, w, xs, ws), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_public_group32_graph_replay(configured, monkeypatch):
+    if configured:
+        monkeypatch.setattr(
+            gemm_op_a8w8, "get_CKGEMM_config", lambda *args: {"libtype": "triton"}
+        )
+    x, w, xs, ws = _operands(3, 4096, 1280)
+    gemm_a8w8_blockscale(x, w, xs, ws)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gemm_a8w8_blockscale(x, w, xs, ws)
+    x.copy_((x.float() * 0.5).to(x.dtype))
+    xs.view(torch.uint8).add_(1)
+    graph.replay()
+    expected = gemm_a8w8_blockscale_group32(x, w, xs, ws)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
