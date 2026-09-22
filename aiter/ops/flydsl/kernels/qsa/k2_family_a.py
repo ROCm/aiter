@@ -382,6 +382,8 @@ def build_qsa_k2_family_a_module(
         gpu.barrier()
 
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
+        init_acc.append(fx.Vector.filled(4, float("-inf"), Float32))
+        init_acc.append(fx.Vector.filled(4, 0.0, Float32))
         n_tiles = tile_end - tile_start
         start = fx.Int64(0)
         stop = fx.Int64(n_tiles)
@@ -573,52 +575,60 @@ def build_qsa_k2_family_a_module(
                     fx.memref_store_vec(v_vec, v_store_frag)
                     fx.copy(lds_copy, v_store_frag, v_dst)
 
-            # Softmax load-sums packed C into registers (the 16x4 fragment).
-            if wave == zero:
-                h0 = lane_kg * Int32(4)
-                heads = [h0 + Int32(i) for i in range_constexpr(4)]
-                tile_max = [_neg_inf() for _ in range_constexpr(4)]
-                scores = []
-                score_lives = []
-                for ng in range_constexpr(n_subtiles):
-                    n = Int32(ng * 16) + lane_m
-                    score_live = live_lds[n] != zero
-                    score_lives.append(score_live)
-                    acc_sum = load_c_acc(ng, zero)
-                    for w in range_constexpr(1, num_waves):
-                        acc_sum = acc_sum + load_c_acc(ng, Int32(w))
-                    sc = []
-                    for i in range_constexpr(4):
-                        score = acc_sum[i] * softmax_scale_log2
-                        score = score_live.select(score, _neg_inf())
-                        sc.append(score)
-                        tile_max[i] = tile_max[i].maximumf(score)
-                    scores.append(sc)
-                m_prev = [m_lds[heads[i]] for i in range_constexpr(4)]
-                l_prev = [l_lds[heads[i]] for i in range_constexpr(4)]
-                if const_expr(use_k32):
-                    tile_max = _token_row_reduce_max_n(tile_max)
-                else:
-                    tile_max = _shuffle_reduce_max_n(tile_max)
-                m_new = [m_prev[i].maximumf(tile_max[i]) for i in range_constexpr(4)]
-                alpha = [_exp2(m_prev[i] - m_new[i]) for i in range_constexpr(4)]
-                p_sum = [Float32(0.0) for _ in range_constexpr(4)]
-                for ng in range_constexpr(n_subtiles):
-                    n = Int32(ng * 16) + lane_m
-                    for i in range_constexpr(4):
-                        p = score_lives[ng].select(
-                            _exp2(scores[ng][i] - m_new[i]), Float32(0.0)
-                        )
+            # Softmax load-sums packed C into registers. m/l ride the tile
+            # loop (one definition path, no if-rebind). P/alpha still go
+            # through LDS for PV.
+            m4 = fx.Vector(state[out_chunks])
+            l4 = fx.Vector(state[out_chunks + 1])
+            h0 = lane_kg * Int32(4)
+            heads = [h0 + Int32(i) for i in range_constexpr(4)]
+            tile_max = [_neg_inf() for _ in range_constexpr(4)]
+            scores = []
+            score_lives = []
+            for ng in range_constexpr(n_subtiles):
+                n = Int32(ng * 16) + lane_m
+                score_live = live_lds[n] != zero
+                score_lives.append(score_live)
+                acc_sum = load_c_acc(ng, zero)
+                for w in range_constexpr(1, num_waves):
+                    acc_sum = acc_sum + load_c_acc(ng, Int32(w))
+                sc = []
+                for i in range_constexpr(4):
+                    score = acc_sum[i] * softmax_scale_log2
+                    score = score_live.select(score, _neg_inf())
+                    sc.append(score)
+                    tile_max[i] = tile_max[i].maximumf(score)
+                scores.append(sc)
+            m_prev = [m4[i] for i in range_constexpr(4)]
+            l_prev = [l4[i] for i in range_constexpr(4)]
+            if const_expr(use_k32):
+                tile_max = _token_row_reduce_max_n(tile_max)
+            else:
+                tile_max = _shuffle_reduce_max_n(tile_max)
+            m_new = [m_prev[i].maximumf(tile_max[i]) for i in range_constexpr(4)]
+            alpha = [_exp2(m_prev[i] - m_new[i]) for i in range_constexpr(4)]
+            p_sum = [Float32(0.0) for _ in range_constexpr(4)]
+            for ng in range_constexpr(n_subtiles):
+                n = Int32(ng * 16) + lane_m
+                for i in range_constexpr(4):
+                    p = score_lives[ng].select(
+                        _exp2(scores[ng][i] - m_new[i]), Float32(0.0)
+                    )
+                    p_sum[i] = p_sum[i] + p
+                    if wave == zero:
                         p_lds[heads[i], n] = p.to(BFloat16)
-                        p_sum[i] = p_sum[i] + p
-                if const_expr(use_k32):
-                    p_sum = _token_row_reduce_sum_n(p_sum)
-                else:
-                    p_sum = _shuffle_reduce_sum_n(p_sum)
+            if const_expr(use_k32):
+                p_sum = _token_row_reduce_sum_n(p_sum)
+            else:
+                p_sum = _shuffle_reduce_sum_n(p_sum)
+            l_new = [l_prev[i] * alpha[i] + p_sum[i] for i in range_constexpr(4)]
+            m4_out = fx.Vector.from_elements(m_new, Float32)
+            l4_out = fx.Vector.from_elements(l_new, Float32)
+            if wave == zero:
                 if lane_m == zero:
                     for i in range_constexpr(4):
                         m_lds[heads[i]] = m_new[i]
-                        l_lds[heads[i]] = l_prev[i] * alpha[i] + p_sum[i]
+                        l_lds[heads[i]] = l_new[i]
                         alpha_lds[heads[i]] = alpha[i]
             gpu.barrier()
 
@@ -679,7 +689,7 @@ def build_qsa_k2_family_a_module(
                         v_vec = v_ops[ng]
                     acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
-            results = yield next_acc
+            results = yield next_acc + [m4_out, l4_out]
 
         m_final = storage.m.view(fx.make_layout(_HEAD_PAD, 1))
         l_final = storage.l.view(fx.make_layout(_HEAD_PAD, 1))
