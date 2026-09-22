@@ -92,9 +92,9 @@ BLOCKS_ROW = HEAD_DIM // SCALE_BLOCK  # 4 natural E8M0 blocks per row
 # land in one aligned dword indexed [.., g(K_CHUNKS), m(MFMA_N), byte]; the shuffle is a pure
 # permutation of the natural array, so the reference (which reads the natural E8M0) is unmoved.
 MFMA_N = 32
-K_TILES = HEAD_DIM // 64      # 2  (MFMA_K = 64)
+K_TILES = HEAD_DIM // 64  # 2  (MFMA_K = 64)
 K_CHUNKS = 64 // SCALE_BLOCK  # 2  (32-K chunks per k-tile)
-SCALE_BYTES = 4              # K_TILES * n_tiles per lane dword
+SCALE_BYTES = 4  # K_TILES * n_tiles per lane dword
 
 CSA_RATIO = 4  # ATOM's compression ratio: row n sees floor((pos + 1) / 4)
 
@@ -206,7 +206,8 @@ def _is_permuted() -> bool:
 def _scale_to_opus(e8_nat, rows_per_group):
     """``[rows, 4]`` natural E8M0 -> ``[rows/rpg, K_CHUNKS, MFMA_N, SCALE_BYTES]``, gfx950's
     layout. ``rows_per_group`` is ``MFMA_N * n_tiles``: 64 heads per query row for q_scale, 64
-    page tokens per block for kv_scale. A pure permutation -- no byte dropped or duplicated."""
+    page tokens per block for kv_scale. A pure permutation -- no byte dropped or duplicated.
+    """
     n_tiles = rows_per_group // MFMA_N
     groups = e8_nat.shape[0] // rows_per_group
     return (
@@ -267,13 +268,17 @@ def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
     if permuted:
         # gfx950: kv_cache[blk, b, o, :] holds K[token o][32b:32b+32]'s 16 packed bytes.
         kv_cache = (
-            kv_packed.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW, HEAD_DIM // 2 // BLOCKS_ROW)
+            kv_packed.reshape(
+                num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW, HEAD_DIM // 2 // BLOCKS_ROW
+            )
             .permute(0, 2, 1, 3)
             .contiguous()
         )
         kv_scale = _scale_to_opus(kv_e8, KV_BLOCK_SIZE)
     else:
-        kv_cache = kv_packed.reshape(num_blocks, KV_BLOCK_SIZE, HEAD_DIM // 2).contiguous()
+        kv_cache = kv_packed.reshape(
+            num_blocks, KV_BLOCK_SIZE, HEAD_DIM // 2
+        ).contiguous()
         kv_scale = kv_e8.reshape(num_blocks, KV_BLOCK_SIZE, BLOCKS_ROW).contiguous()
     block_tables = torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(
         bs, mbps
