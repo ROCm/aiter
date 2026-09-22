@@ -150,3 +150,36 @@ def resolve_config_dir(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
     return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
+
+
+_COND_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)_(leq|lt|geq|gt|eq)$")
+_COND_OPS = {
+    "leq": lambda value, bound: value <= bound,
+    "lt": lambda value, bound: value < bound,
+    "geq": lambda value, bound: value >= bound,
+    "gt": lambda value, bound: value > bound,
+    "eq": lambda value, bound: value == bound,
+}
+
+
+def select_tuned_config(tuned: dict, **variables) -> dict:
+    """Resolve a launch config from a JSON rule-tree instead of a hardcoded
+    if/else chain.
+
+    ``tuned`` is ``{"default": {...}, "rules": [{"if": {"<var>_<op>": <bound>,
+    ...}, "set": {...}}, ...]}``. Each rule fires when all its conditions
+    hold against ``variables`` (``<op>`` is one of leq/lt/geq/gt/eq); rules
+    are applied in list order and merged via ``dict.update``, so a JSON
+    author expresses a boundary walk by listing rules smallest-bound-first.
+    Returns a fresh, mutable dict.
+    """
+    config = dict(tuned["default"])
+    for rule in tuned.get("rules", ()):
+        conditions = rule.get("if", {})
+        if all(
+            _COND_OPS[match.group(2)](variables[match.group(1)], bound)
+            for cond_key, bound in conditions.items()
+            for match in [_COND_RE.fullmatch(cond_key)]
+        ):
+            config.update(rule["set"])
+    return config

@@ -22,8 +22,12 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_tuned_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.quant_config_utils import get_quant_config
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
@@ -47,33 +51,46 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
-def _mxfp8_gfx1250_block_config(M: int, K: int) -> tuple[int, int, int, int]:
+def _mxfp4_gfx1250_config(M: int, N: int) -> dict:
     """
-    Tuned (BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER, NUM_BUFFERS) for
-    dynamic_mxfp8_quant's M > 32 gfx1250 path, bucketed by M ({<=512, <=4096,
-    >4096}) x K ({<=1024, <=3072, >3072}). Values come from
-    configs/gfx1250/gluon/quant/quant_mxfp8/DEFAULT.json, tuned by a benchmark
-    sweep. BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS >= 4 required by
-    scaled_downcast, see _mxfp8_quant_op). NUM_BUFFERS defaults to 2
-    (double-buffered/prefetching loads+stores); some buckets pin it to 1
-    (no prefetch, fully synchronous per-tile) -- empirically found to be both
-    faster and required for correctness there, see repo notes.
+    Tuned launch config for dynamic_mxfp4_quant's gfx1250 gluon path, resolved
+    from configs/gfx1250/gluon/quant/quant_mxfp4/DEFAULT.json's default+rules
+    tree (see config_utils.select_tuned_config), tuned by a benchmark sweep.
+    BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived, not tunable via JSON, at the
+    M <= 32 and N <= 1024 edges (BLOCK_SIZE_N must stay a multiple of 32).
     """
-    m_key = (
-        "M_LEQ_512" if M <= 512 else "M_GT_512_LEQ_4096" if M <= 4096 else "M_GT_4096"
-    )
-    k_key = (
-        "K_LEQ_1024"
-        if K <= 1024
-        else "K_GT_1024_LEQ_3072" if K <= 3072 else "K_GT_3072"
-    )
-    cfg = get_quant_config("QUANT-MXFP8", f"{m_key}_{k_key}")
-    return (
-        cfg["BLOCK_SIZE_M"],
-        cfg["BLOCK_SIZE_N"],
-        cfg["NUM_ITER"],
-        cfg.get("NUM_BUFFERS", 2),
-    )
+    cfg_dir = resolve_config_dir("quant", "QUANT-MXFP4", backend="gluon")
+    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    cfg = select_tuned_config(tuned, M=M, N=N)
+    if M <= 32:
+        cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
+        cfg["BLOCK_SIZE_N"] = 4096 // cfg["BLOCK_SIZE_M"]
+    if N <= 1024:
+        cfg["BLOCK_SIZE_N"] = max(32, min(128, triton.next_power_of_2(N)))
+        cfg["BLOCK_SIZE_M"] = min(32, triton.next_power_of_2(M))
+    return cfg
+
+
+def _mxfp8_gfx1250_config(M: int, K: int) -> dict:
+    """
+    Tuned launch config for dynamic_mxfp8_quant's gfx1250 gluon path, resolved
+    from configs/gfx1250/gluon/quant/quant_mxfp8/DEFAULT.json's default+rules
+    tree (see config_utils.select_tuned_config), tuned by a benchmark sweep.
+    BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived, not tunable via JSON, when
+    M <= 32: BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS >= 4 required by
+    scaled_downcast, see _mxfp8_quant_op) and is capped at 512 to avoid
+    overflowing the TDM descriptor's pad-interval field (see repo notes).
+    NUM_BUFFERS defaults to 2 (double-buffered/prefetching loads+stores);
+    some rules pin it to 1 (no prefetch, fully synchronous per-tile) --
+    empirically found to be both faster and required for correctness there.
+    """
+    cfg_dir = resolve_config_dir("quant", "QUANT-MXFP8", backend="gluon")
+    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    cfg = select_tuned_config(tuned, M=M, K=K)
+    if M <= 32:
+        cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
+        cfg["BLOCK_SIZE_N"] = min(4096 // cfg["BLOCK_SIZE_M"], 512)
+    return cfg
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -311,33 +328,12 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
-    # for large N values
-    if M <= 32:
-        NUM_ITER = 1
-        BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
-        NUM_WARPS = 4
-        NUM_STAGES = 1
-    else:
-        NUM_ITER = 2
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
-        NUM_WARPS = 4
-        NUM_STAGES = 2
-
-        if N <= 16384:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 256
-
-    # for small N values
-    if N <= 1024:
-        NUM_ITER = 1
-        NUM_STAGES = 1
-        NUM_WARPS = 4
-        BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
-        # BLOCK_SIZE_N needs to be multiple of 32
-        BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
+    cfg = _mxfp4_gfx1250_config(M, N)
+    NUM_ITER = cfg["NUM_ITER"]
+    BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+    BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+    NUM_WARPS = cfg["NUM_WARPS"]
+    NUM_STAGES = cfg["NUM_STAGES"]
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
@@ -441,20 +437,13 @@ def dynamic_mxfp8_quant(
         and x2d.dtype in (torch.bfloat16, torch.float16)
         and quant_dtype == torch.float8_e4m3fn
     ):
-        if M <= 32:
-            NUM_ITER = 1
-            BLOCK_SIZE_M = triton.next_power_of_2(M)
-            # Capped at 512: larger overflows the TDM descriptor's pad-interval field (see repo notes).
-            BLOCK_SIZE_N = min(4096 // BLOCK_SIZE_M, 512)
-            NUM_WARPS = 4
-            NUM_STAGES = 1
-            NUM_BUFFERS = 2
-        else:
-            NUM_WARPS = 4
-            NUM_STAGES = 2
-            BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER, NUM_BUFFERS = (
-                _mxfp8_gfx1250_block_config(M, K)
-            )
+        cfg = _mxfp8_gfx1250_config(M, K)
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+        NUM_STAGES = cfg["NUM_STAGES"]
+        NUM_BUFFERS = cfg["NUM_BUFFERS"]
 
         grid = (
             triton.cdiv(M, BLOCK_SIZE_M),
