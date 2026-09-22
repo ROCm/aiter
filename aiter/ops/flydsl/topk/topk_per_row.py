@@ -477,8 +477,9 @@ def flydsl_top_k_per_row_decode(
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
-    `backend` is the gate's answer; None asks the gate, so a caller arriving
-    here directly cannot be routed to a kernel the gate would not have picked.
+    `backend` is the gate's answer and None asks the gate, which is what admits
+    the adaptive kernel. An `upstream` answer still runs the chunked pair here,
+    because this host owns no other kernel to fall back to.
 
     `max_row_len` bounds `seq_lens` from the host, and is a guarantee rather
     than a hint -- `aiter.ops.topk.top_k_per_row_decode` documents what it
