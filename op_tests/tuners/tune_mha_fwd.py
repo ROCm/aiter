@@ -38,7 +38,7 @@ from aiter.ops.mha import (
     mha_varlen_fwd,
 )
 from aiter.ops.mha_fwd_policy import (
-    _as_bool,
+    as_bool,
     MHA_FWD_CANDIDATE_FIELDS,
     MHA_FWD_HARDWARE_KEY_FIELDS,
     MHA_FWD_INDIFFERENCE_DELTA,
@@ -552,7 +552,7 @@ class MhaFwdTuner(TunerCommon):
             "is_grad",
         ]
         frame = frame.assign(
-            **{field: frame[field].map(_as_bool).astype(int) for field in BOOL_FIELDS}
+            **{field: frame[field].map(as_bool).astype(int) for field in BOOL_FIELDS}
         )
         if frame[unsupported].astype(bool).any(axis=None):
             raise ValueError(
