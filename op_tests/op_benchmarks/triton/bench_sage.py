@@ -294,7 +294,12 @@ def _generate_transformer_qkv(
     d_head_v: int,
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Realistic LLM activations: RMS-norm + per-channel log-normal scales + shared low-rank Q/K component + V outlier dims/tokens. Returns fp32 q/k/v.
+    # Realistic LLM activations: RMS-norm + per-channel log-normal scales + a Q/K term shared per
+    # token + V outlier dims/tokens. Returns fp32 q/k/v.
+    #
+    # The shared term correlates q_i with k_i at the same index, which shows up as self-affinity
+    # (diagonal logit 1.41 against 0.00 off it), not as a component shared across tokens: the
+    # token-common mode here stays near 0.02, where dumped video models run 0.13-0.42.
     q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
     k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
     v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
@@ -338,6 +343,99 @@ def _generate_transformer_qkv(
     return q, k, v
 
 
+# Calibrated against dumped Wan, HunyuanVideo 1.5 and Flux2 attention. Those three agree closely
+# despite different architectures and sequence lengths, which is what makes them a target worth
+# fitting: shared components of 0.37-0.57 (Q), 0.37-0.47 (K) and 0.31-0.36 (V), cancellation
+# 2.4-2.8, logit spread 2.0-2.6, amax/RMS near 7 on Q/K, and V carrying outlier channels and
+# tokens on top (amax/RMS 8.8-25.2, peak token norm 2.9-9.1x the mean).
+_DIFFUSION_RHO_Q = 0.45
+_DIFFUSION_RHO_K = 0.40
+_DIFFUSION_RHO_V = 0.34
+_DIFFUSION_CHANNEL_SIGMA = 0.16
+_DIFFUSION_LOGIT_STD = 2.2
+_DIFFUSION_V_OUTLIER_DIM_GAIN = 2.0
+_DIFFUSION_V_OUTLIER_TOKEN_GAIN = 4.0
+
+
+def _coherent_rows(batch, heads, seq, dim, rho, sigma, device):
+    """Rows sharing a per-head direction, so the token-common mode is `rho` by construction.
+
+    The per-channel scale then spreads channel magnitudes, which is what lifts amax above the RMS
+    even though each channel on its own stays near-Gaussian, as the dumps do.
+    """
+    shared = torch.randn((1, heads, 1, dim), device=device, dtype=torch.float32)
+    shared *= math.sqrt(dim) / shared.norm(dim=-1, keepdim=True)
+    noise = torch.randn((batch, heads, seq, dim), device=device, dtype=torch.float32)
+    rows = rho * shared + math.sqrt(1.0 - rho * rho) * noise
+    channel_scale = (
+        torch.randn((1, heads, 1, dim), device=device, dtype=torch.float32)
+        .mul(sigma)
+        .exp()
+    )
+    return rows * channel_scale
+
+
+def _generate_diffusion_qkv(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Diffusion-transformer activations. Returns fp32 q/k/v.
+
+    The defining difference from LLM activations is that Q, K and V all carry a large component
+    shared across tokens. For V that is what holds cancellation near 2.6 rather than the 8-40 that
+    iid V produces, because averaging many keys cancels the noise and leaves the shared part.
+    """
+    q = _coherent_rows(
+        batch, hq, sq, d_head, _DIFFUSION_RHO_Q, _DIFFUSION_CHANNEL_SIGMA, device
+    )
+    k = _coherent_rows(
+        batch, hk, sk, d_head, _DIFFUSION_RHO_K, _DIFFUSION_CHANNEL_SIGMA, device
+    )
+    v = _coherent_rows(
+        batch, hk, sk, d_head_v, _DIFFUSION_RHO_V, _DIFFUSION_CHANNEL_SIGMA, device
+    )
+
+    outlier_dims = torch.randperm(d_head_v, device=device)[: max(1, d_head_v // 16)]
+    v[..., outlier_dims] *= _DIFFUSION_V_OUTLIER_DIM_GAIN
+    outlier_tokens = torch.randperm(sk, device=device)[: max(1, sk // 256)]
+    v[:, :, outlier_tokens, :] *= _DIFFUSION_V_OUTLIER_TOKEN_GAIN
+
+    # Scaling Q moves the logit spread, and so the diffuseness, without touching any of the
+    # common modes, which are ratios.
+    probe = torch.arange(0, sq, max(1, sq // 64), device=device)[:64]
+    measured = ((q[0, 0, probe] @ k[0, 0].T) * (d_head**-0.5)).std(-1).median()
+    q *= _DIFFUSION_LOGIT_STD / measured.clamp_min(1e-9)
+    return q, k, v
+
+
+_NAMED_DISTRIBUTIONS = (
+    "zero",
+    "normal",
+    "diffusion",
+    "padded",
+    "transformer",
+    "sink",
+    "underflow",
+    "latepeak",
+    "maxstair",
+    "kcommon",
+)
+
+
+def _input_distribution(value: str) -> str:
+    if value in _NAMED_DISTRIBUTIONS or value.startswith("dump:"):
+        return value
+    raise argparse.ArgumentTypeError(
+        f"invalid choice: {value!r} (choose from {', '.join(_NAMED_DISTRIBUTIONS)}, or dump:PATH)"
+    )
+
+
 def generate_test_tensors(
     batch: int,
     hq: int,
@@ -351,6 +449,40 @@ def generate_test_tensors(
     distribution: str,
     hadamard_rotate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # "dump:<path>": replay Q/K/V captured from a real model. Every synthetic distribution here
+    # is far easier to quantize than a real trace: matching a trace's common modes, diffuseness,
+    # cancellation, logit spread and amax/RMS still leaves it roughly 10x too optimistic at the
+    # same sequence length, so whatever drives real error is not any of those. Replaying the
+    # capture sidesteps having to know what it is.
+    if distribution.startswith("dump:"):
+        sample = torch.load(
+            distribution[len("dump:") :], map_location=device, weights_only=False
+        )
+        # Captures are BSHD; the bench works in BHSD.
+        q, k, v = (
+            sample[name].transpose(1, 2)
+            for name in ("query_bshd", "key_bshd", "value_bshd")
+        )
+        have = (
+            q.shape[0],
+            q.shape[1],
+            k.shape[1],
+            q.shape[2],
+            k.shape[2],
+            q.shape[3],
+            v.shape[3],
+        )
+        want = (batch, hq, hk, sq, sk, d_head, d_head_v)
+        if any(h < w for h, w in zip(have, want)):
+            raise ValueError(
+                f"dump is {have} (batch, hq, hk, sq, sk, d, dv) and cannot cover the "
+                f"requested {want}; ask for a shape it contains"
+            )
+        q = q[:batch, :hq, :sq, :d_head]
+        k = k[:batch, :hk, :sk, :d_head]
+        v = v[:batch, :hk, :sk, :d_head_v]
+        return tuple(t.contiguous().to(dtype) for t in (q, k, v))
+
     # "zero": all-zero Q/K/V for degenerate-input and quantization smoke tests.
     if distribution == "zero":
         q = torch.zeros((batch, hq, sq, d_head), device=device, dtype=dtype)
@@ -551,71 +683,49 @@ def generate_test_tensors(
         )
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
-    if distribution in ("clustered", "kcommon"):
-        # Coherent-attention regime. The shipped distributions are all far more diffuse and far
-        # more self-cancelling than measured model traces (n_eff 125-3050 and cancel 11-55 here,
-        # against 21-173 and 1.3-3.3 on real fixtures), so the quantized rows are never exercised
-        # where real workloads actually live. Tokens are drawn from clusters: a query scores its
-        # own cluster highly, which sets n_eff, and V carries a shared per-cluster component, which
-        # keeps the output coherent and cancellation low.
-        #
-        # "kcommon" additionally gives K a large shared direction. Softmax is shift-invariant, so a
-        # component common to every key changes no output, but per-tensor Q/K quantization noise
-        # scales with the magnitude of q.k rather than with its spread across keys. It is therefore
-        # invisible to n_eff, cancellation and logit spread while multiplying the quantized-row
-        # error, and it is the one axis no other distribution here covers.
-        # Tokens are drawn from clusters: a query scores its own cluster highly, which sets
-        # n_eff, and V carries a shared per-cluster component, which keeps the output coherent
-        # and cancellation low.
-        clusters = max(8, sk // 16)
-        rho = 0.8  # share of a Q/K row explained by its centroid
-        struct = 0.55  # shared share of a V row; lower cancels more
-        target_logit_std = 1.2
-        k_common = 16.0 if distribution == "kcommon" else 0.0
-
-        group = max(1, hq // hk)
-        a, b = math.sqrt(rho), math.sqrt(1.0 - rho)
-        centroids = torch.randn(
-            (hk, clusters, d_head), device=device, dtype=torch.float32
+    if distribution == "kcommon":
+        # Diffusion activations plus a large direction shared by every key. Softmax is
+        # shift-invariant in such a component, so it changes no output, but per-tensor Q/K
+        # quantization noise scales with the magnitude of q.k rather than with its spread across
+        # keys. It is invisible to n_eff, cancellation and logit spread while multiplying
+        # quantized-row error, and it is the one axis no other distribution here covers. Real
+        # models reach 0.47; this pushes far past that to stress the MHA v4 K-smoothing gate.
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
         )
-        v_centroids = torch.randn(
-            (hk, clusters, d_head_v), device=device, dtype=torch.float32
-        )
-        assign_q = torch.randint(0, clusters, (sq,), device=device)
-        assign_k = torch.randint(0, clusters, (sk,), device=device)
-
-        q = torch.empty((batch, hq, sq, d_head), device=device, dtype=torch.float32)
-        k = torch.empty((batch, hk, sk, d_head), device=device, dtype=torch.float32)
-        v = torch.empty((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
-        for h in range(hk):
-            k[:, h] = a * centroids[h][assign_k] + b * torch.randn(
-                (batch, sk, d_head), device=device, dtype=torch.float32
-            )
-            v[:, h] = struct * v_centroids[h][assign_k] + math.sqrt(
-                1.0 - struct * struct
-            ) * torch.randn((batch, sk, d_head_v), device=device, dtype=torch.float32)
-        for h in range(hq):
-            q[:, h] = a * centroids[h // group][assign_q] + b * torch.randn(
-                (batch, sq, d_head), device=device, dtype=torch.float32
-            )
-
-        # Hold the logit spread fixed so the cluster knobs move diffuseness alone.
-        probe = torch.arange(0, sq, max(1, sq // 64), device=device)[:64]
-        measured = ((q[0, 0, probe] @ k[0, 0].T) * (d_head**-0.5)).std(-1).median()
-        q *= target_logit_std / measured.clamp_min(1e-9)
-
-        if k_common:
-            direction = torch.randn((hk, d_head), device=device, dtype=torch.float32)
-            direction /= direction.norm(dim=-1, keepdim=True)
-            k += k_common * k.norm(dim=-1).mean() * direction[None, :, None, :]
-
+        direction = torch.randn((hk, d_head), device=device, dtype=torch.float32)
+        direction /= direction.norm(dim=-1, keepdim=True)
+        k += 16.0 * k.norm(dim=-1).mean() * direction[None, :, None, :]
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
-    if distribution != "transformer":
+    if distribution == "padded":
+        # Ulysses-style head padding. Models whose head count does not divide the sequence-parallel
+        # degree are padded up with empty heads, so a shard can hold (batch, head) slices that are
+        # entirely zero in Q, K and V. Z-Image does exactly this: rank 7 of its captures has 4 of 8
+        # heads empty. That is not a corner case, and it found a NaN in the per-channel FP8 V
+        # quantizer, which divides by a zero amax, that no other distribution here reaches.
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        q[:, hq - max(1, hq // 4) :] = 0
+        empty_kv = max(1, hk // 4)
+        k[:, hk - empty_kv :] = 0
+        v[:, hk - empty_kv :] = 0
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "transformer":
+        # LLM activations. Kept as its own distribution rather than folded into "diffusion":
+        # MHA v4 runs LLM workloads too, and the two look nothing alike, the token-common mode
+        # staying near 0.02 here against 0.31-0.57 measured on diffusion models.
+        q, k, v = _generate_transformer_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution != "diffusion":
         raise ValueError(f"Unsupported input distribution: {distribution}")
 
-    # "transformer": realistic LLM activation statistics (see _generate_transformer_qkv).
-    q, k, v = _generate_transformer_qkv(batch, hq, hk, sq, sk, d_head, d_head_v, device)
+    q, k, v = _generate_diffusion_qkv(batch, hq, hk, sq, sk, d_head, d_head_v, device)
     return q.to(dtype), k.to(dtype), v.to(dtype)
 
 
@@ -1538,7 +1648,13 @@ def compute_accuracy_metrics(
 
 
 def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
-    if args.input_distribution in ("transformer", "sink"):
+    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
+    if args.input_distribution in (
+        "transformer",
+        "sink",
+        "diffusion",
+        "kcommon",
+    ) or str(args.input_distribution).startswith("dump:"):
         return 2.0
     return 0.5
 
@@ -2291,28 +2407,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--causal", action="store_true", help="Enable causal attention")
     parser.add_argument(
         "--input-distribution",
-        type=str,
-        default="transformer",
-        choices=[
-            "zero",
-            "normal",
-            "transformer",
-            "sink",
-            "underflow",
-            "latepeak",
-            "maxstair",
-            "clustered",
-            "kcommon",
-        ],
+        type=_input_distribution,
+        default="diffusion",
+        metavar="{zero,normal,diffusion,padded,transformer,sink,underflow,latepeak,maxstair,kcommon,dump:PATH}",
         help=(
-            "Distribution used for generated Q/K/V tensors. 'zero' sets all Q/K/V values "
-            "to zero; 'sink' is a realistic "
-            "StreamingLLM attention sink pattern; 'underflow'/'latepeak' are "
-            "adversarial fp8 tile-skip / frozen-max rollback regression tripwires; "
-            "'maxstair' raises the max every KV tile and triggers rollback for alternating "
-            "query-row groups; 'clustered' is the coherent low-cancellation regime real "
-            "traces occupy, which the others miss; 'kcommon' adds the shared K direction "
-            "that inflates quantization noise without changing any softmax statistic."
+            "Distribution used for generated Q/K/V tensors. 'diffusion' (default) is calibrated "
+            "to dumped Wan, HunyuanVideo 1.5 and Flux2 attention; 'transformer' is the LLM "
+            "activation model, which differs mainly in carrying almost no token-common "
+            "component; 'padded' is diffusion with empty Ulysses-padding heads, which real "
+            "sharded models produce and which no other distribution covers; 'zero' "
+            "sets all Q/K/V values to zero; 'sink' is a realistic StreamingLLM attention sink "
+            "pattern; 'underflow'/'latepeak' are adversarial fp8 tile-skip / frozen-max rollback "
+            "regression tripwires; 'maxstair' raises the max every KV tile and triggers rollback "
+            "for alternating query-row groups; 'kcommon' adds a shared K direction far past what "
+            "real models reach, which inflates quantization noise without changing any softmax "
+            "statistic; 'dump:PATH' replays Q/K/V captured from a real model, which no synthetic "
+            "distribution here reproduces the quantization error of."
         ),
     )
     parser.add_argument(
