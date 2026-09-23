@@ -737,6 +737,34 @@ def launch_gemm_a8w4_tdm(
                 return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
             return load_half(wn)
 
+        A_LDS_PARTS = 2 if a_is_fp4 else 4
+        B_LDS_PARTS = 4 if a_is_fp4 else 2
+
+        def load_a_part(base, wm, ksl, part):
+            off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP + 32 * part
+            return Vec(lds_load_b128(base, fx.Int32(off)))
+
+        def assemble_a_parts(parts, wm):
+            first = wm * A_LDS_PARTS
+            lo = parts[first].shuffle(parts[first + 1], list(range(8)))
+            if const_expr(a_is_fp4):
+                return lo
+            hi = parts[first + 2].shuffle(parts[first + 3], list(range(8)))
+            return lo.shuffle(hi, list(range(16)))
+
+        def load_b_part(base, wn, ksl, part):
+            half = wn * 2 + part // 2 if a_is_fp4 else wn
+            off = half * B_LDS_ROW + ksl * 1024 + (part % 2) * 512
+            return Vec(lds_load_b128(base, fx.Int32(off)))
+
+        def assemble_b_parts(parts, wn):
+            first = wn * B_LDS_PARTS
+            lo = parts[first].shuffle(parts[first + 1], list(range(8)))
+            if const_expr(a_is_fp4):
+                hi = parts[first + 2].shuffle(parts[first + 3], list(range(8)))
+                return lo.shuffle(hi, list(range(16)))
+            return lo
+
         def load_sa(base, sm, ksl):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
             return lds_load_b32(base, fx.Int32(off))[0]
@@ -815,16 +843,16 @@ def launch_gemm_a8w4_tdm(
                 )
             )
 
-        def mma_rows(wm_list, act, wt, sa_k, sb_k):
+        def mma_rows(wm_list, act, wt, sa_k, sb_k, column_major):
             for outer in range_constexpr(
-                wmma_n_rep if WMMA_COLUMN_MAJOR else len(wm_list)
+                wmma_n_rep if column_major else len(wm_list)
             ):
                 for inner in range_constexpr(
-                    len(wm_list) if WMMA_COLUMN_MAJOR else wmma_n_rep
+                    len(wm_list) if column_major else wmma_n_rep
                 ):
-                    i = inner if WMMA_COLUMN_MAJOR else outer
+                    i = inner if column_major else outer
                     wm = wm_list[i]
-                    wn_raw = outer if WMMA_COLUMN_MAJOR else inner
+                    wn_raw = outer if column_major else inner
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
                     scale_a = sb_k[wn if a_is_fp4 else wn // 2]
@@ -931,10 +959,8 @@ def launch_gemm_a8w4_tdm(
                     slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
             else:
                 # Planar LDS keeps all A stages and all B stages in disjoint
-                # contiguous regions. Alternate their reads so neither the
-                # instruction stream nor a scheduler group concentrates on one
-                # LDS segment. All bounds are compile-time, so this emits no
-                # runtime branch even when the A/B repetition counts differ.
+                # contiguous regions. Alternate scale reads; schedule operand
+                # reads below according to the wave's WMMA traversal order.
                 sa_v = []
                 sb_v = []
                 for i in range_constexpr(max(sa_pairs, sb_pairs)):
@@ -944,11 +970,59 @@ def launch_gemm_a8w4_tdm(
                         sb_v.append(load_sb(lds_addr.sb, i, ksl))
                 slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
-                for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
-                    if const_expr(i < wmma_m_rep):
-                        slot.a[i].store(load_a(lds_addr.a, i, ksl))
-                    if const_expr(i < wmma_n_rep):
-                        slot.b[i].store(load_b(lds_addr.b, i, ksl))
+                a_parts, b_parts = [], []
+                a_part_count = wmma_m_rep * A_LDS_PARTS
+                b_part_count = wmma_n_rep * B_LDS_PARTS
+                if const_expr(interleave_ab == 1):
+                    # Even SIMD: make the complete B0 operand available first,
+                    # then load every A operand before the remaining B operands.
+                    for part in range_constexpr(B_LDS_PARTS):
+                        b_parts.append(load_b_part(lds_addr.b, 0, ksl, part))
+                    for i in range_constexpr(a_part_count):
+                        a_parts.append(
+                            load_a_part(
+                                lds_addr.a,
+                                i // A_LDS_PARTS,
+                                ksl,
+                                i % A_LDS_PARTS,
+                            )
+                        )
+                    for i in range_constexpr(B_LDS_PARTS, b_part_count):
+                        b_parts.append(
+                            load_b_part(
+                                lds_addr.b,
+                                i // B_LDS_PARTS,
+                                ksl,
+                                i % B_LDS_PARTS,
+                            )
+                        )
+                else:
+                    # Odd SIMD: make the complete A0 operand available first,
+                    # then load every B operand before the remaining A operands.
+                    for part in range_constexpr(A_LDS_PARTS):
+                        a_parts.append(load_a_part(lds_addr.a, 0, ksl, part))
+                    for i in range_constexpr(b_part_count):
+                        b_parts.append(
+                            load_b_part(
+                                lds_addr.b,
+                                i // B_LDS_PARTS,
+                                ksl,
+                                i % B_LDS_PARTS,
+                            )
+                        )
+                    for i in range_constexpr(A_LDS_PARTS, a_part_count):
+                        a_parts.append(
+                            load_a_part(
+                                lds_addr.a,
+                                i // A_LDS_PARTS,
+                                ksl,
+                                i % A_LDS_PARTS,
+                            )
+                        )
+                for wm in range_constexpr(wmma_m_rep):
+                    slot.a[wm].store(assemble_a_parts(a_parts, wm))
+                for wn in range_constexpr(wmma_n_rep):
+                    slot.b[wn].store(assemble_b_parts(b_parts, wn))
 
         def k_step(
             cur_rmem,
@@ -957,6 +1031,7 @@ def launch_gemm_a8w4_tdm(
             num_outstanding_tdm=None,
             issue_fn=None,
             fence_fn=None,
+            interleave_ab=False,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
@@ -994,12 +1069,51 @@ def launch_gemm_a8w4_tdm(
                         has_side_effects=False,
                     )
                 )
-            if const_expr(WMMA_COLUMN_MAJOR):
-                mma_rows(list(range(wmma_m_rep)), cur_rmem.a, cur_rmem.b, sa_k, sb_k)
+            if const_expr(interleave_ab == 1):
+                mma_rows(
+                    list(range(wmma_m_rep)),
+                    cur_rmem.a,
+                    cur_rmem.b,
+                    sa_k,
+                    sb_k,
+                    True,
+                )
+            elif const_expr(interleave_ab == 2):
+                mma_rows(
+                    list(range(wmma_m_rep)),
+                    cur_rmem.a,
+                    cur_rmem.b,
+                    sa_k,
+                    sb_k,
+                    False,
+                )
+            elif const_expr(WMMA_COLUMN_MAJOR):
+                mma_rows(
+                    list(range(wmma_m_rep)),
+                    cur_rmem.a,
+                    cur_rmem.b,
+                    sa_k,
+                    sb_k,
+                    True,
+                )
             else:
-                mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
+                mma_rows(
+                    FRONT,
+                    cur_rmem.a[:front_wm],
+                    cur_rmem.b,
+                    sa_k,
+                    sb_k,
+                    False,
+                )
                 if const_expr(len(BACK) > 0):
-                    mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
+                    mma_rows(
+                        BACK,
+                        cur_rmem.a[front_wm:],
+                        cur_rmem.b,
+                        sa_k,
+                        sb_k,
+                        False,
+                    )
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -1133,6 +1247,7 @@ def launch_gemm_a8w4_tdm(
                         else None
                     ),
                     fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
+                    interleave_ab=interleave_ab,
                 )
                 # One region per k128: sched_group_barrier only partitions
                 # within a region, and only sched_barrier delimits one.
@@ -1385,9 +1500,15 @@ def launch_gemm_a8w4_tdm(
 
                 return profile_prologue_end
 
-            # This is a compile-time selection. The interleaved version has one
-            # mainloop body and no wave-parity branch.
-            prologue_end = run_mainloop(bool(WAVE_LDS_ORDER))
+            if const_expr(WAVE_LDS_ORDER):
+                # Dispatch once outside the K loops. Each branch gets a fully
+                # specialized load and WMMA traversal with no inner parity test.
+                if wave % 2 == 0:
+                    prologue_end = run_mainloop(1)
+                else:
+                    prologue_end = run_mainloop(2)
+            else:
+                prologue_end = run_mainloop(0)
 
             if const_expr(need_cycle_analysis):
                 mainloop_end = read_shader_cycles()
