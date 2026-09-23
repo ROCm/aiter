@@ -53,6 +53,7 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
     ),
+    "flydsl_mxfp8_gemm": (".gemm_mxfp8", "flydsl_mxfp8_gemm"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -121,6 +122,7 @@ __all__ = [
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
+    "flydsl_mxfp8_gemm",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
     "flydsl_pa_mqa_logits_fp4_varqlen",
