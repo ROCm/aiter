@@ -103,6 +103,8 @@ def build_qsa_k2_family_a_module(
     decode_tr_pv = token_major_v
 
     def make_k_lds_view(k_arr, offset, shape):
+        # gfx950 XOR on stride D. Prefill V overlay reuses this map;
+        # decode V stays unswizzled 64-bit stores.
         if use_k32:
             layout = fx.make_composed_layout(
                 fx.static(fx.SwizzleType.get(3, 3, 3)),
@@ -184,8 +186,6 @@ def build_qsa_k2_family_a_module(
             fx.make_layout((1, vec), (vec, 1)),
         )
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
-        # Same 8-wide thread map as kv_store; the 64-bit atom emits two
-        # ds_write_b64 per thread (AMD decode V).
         v64_store = fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
         q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
@@ -423,9 +423,10 @@ def build_qsa_k2_family_a_module(
                         ],
                         BFloat16,
                     )
-                    v_tile = fx.make_view(
-                        fx.get_iter(v_lds) + Int32(gr * gather_span),
-                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    v_tile = make_k_lds_view(
+                        k_arr,
+                        Int32(gr * gather_span),
+                        (block_n, gather_span),
                     )
                     v_dst = kv_store.partition_D(v_tile)
                     v_store_frag = fx.make_fragment_like(v_dst)
@@ -528,10 +529,22 @@ def build_qsa_k2_family_a_module(
                     n0 = Int32(ng * 16) + lane_kg * Int32(4)
                     if const_expr(use_k32):
                         d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
-                        sB = fx.make_view(
-                            fx.get_iter(v_lds) + Int32(ng * 16) * Int32(_D) + d_base,
-                            fx.make_layout((16, 16), (1, _D)),
-                        )
+                        if const_expr(decode_tr_pv):
+                            sB = fx.make_view(
+                                fx.get_iter(v_lds)
+                                + Int32(ng * 16) * Int32(_D)
+                                + d_base,
+                                fx.make_layout((16, 16), (1, _D)),
+                            )
+                        else:
+                            sB = fx.make_view(
+                                k_arr.ptr,
+                                fx.make_composed_layout(
+                                    fx.static(fx.SwizzleType.get(3, 3, 3)),
+                                    Int32(ng * 16) * Int32(_D) + d_base,
+                                    fx.make_layout((16, 16), (1, _D)),
+                                ),
+                            )
                         b_src = pv_b_copy.partition_S(sB)
                         b_frag = fx.make_fragment_like(b_src)
                         fx.copy(pv_b_atom, b_src, b_frag)
