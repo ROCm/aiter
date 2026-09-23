@@ -1336,9 +1336,10 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     context_lens_ptr, row_ends_ptr, query_start_loc_ptr, sched_ptr, batch, next_n,
     num_ctas, num_units,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
-    ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_ROW_ENDS: tl.constexpr,
+    ALIGN_W: tl.constexpr, BLOCK_S: tl.constexpr, HAS_ROW_ENDS: tl.constexpr,
     GATHER: tl.constexpr, VARLEN: tl.constexpr, ALIGN_B: tl.constexpr,
-    MAX_TILES: tl.constexpr,
+    MAX_TILES: tl.constexpr, MAX_SLICES: tl.constexpr, N_TILES: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
     # A "unit" is one (sequence, row block) pair; a "slot" is one workgroup of
     # the launch. The job is to give every slot a slice of some unit's KV walk,
@@ -1408,6 +1409,11 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # past residency. The host sizes num_ctas so the extra slices fit.
     if MAX_TILES > 0:
         tiles_per_slice = tl.minimum(tiles_per_slice, MAX_TILES)
+    # A floor as well, so no unit can own more than MAX_SLICES slices and the
+    # write below stays a fixed shape. It binds only when one unit's walk
+    # dwarfs the rest, and it bounds that unit at the same tiles-per-workgroup
+    # the cap above is there to hold.
+    tiles_per_slice = tl.maximum(tiles_per_slice, tl.cdiv(N_TILES, MAX_SLICES))
 
     # Step 3: lay each unit's slices end to end over the slots, so unit i owns
     # slots [first_slot_i, first_slot_i + n_slices_i).
@@ -1415,34 +1421,34 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     first_slot = tl.cumsum(n_slices) - n_slices      # exclusive prefix sum
     slots_used = tl.sum(n_slices)
 
-    # Step 4: Calculate ownership.
-    slot = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
-    owner_unit = tl.sum(
-        ((first_slot + n_slices)[None, :] <= slot[:, None]).to(tl.int32), axis=1)
-    owner_unit = tl.minimum(owner_unit, ALIGN_W - 1)
-
-    is_owner_unit = unit[None, :] == owner_unit[:, None]
-    owner_first_slot = tl.sum(tl.where(is_owner_unit, first_slot[None, :], 0), axis=1)
-    owner_slices = tl.sum(tl.where(is_owner_unit, n_slices[None, :], 0), axis=1)
-
-    # Step 5: name the slice and write the descriptor.
-    slice_idx = slot - owner_first_slot
-    # A slot past the last slice owns nothing
-    idle = (slot >= slots_used) | (slice_idx >= owner_slices)
-    owner_unit = tl.where(idle, 0, owner_unit)
-    # Which slice of how many
-    slice_idx = tl.where(idle, 1, slice_idx)
-    num_slices = tl.where(idle, 1, tl.maximum(owner_slices, 1))
-    # save the schedule, ownership info and slide indices and num slices
-    in_range = slot < num_ctas
-    base = sched_ptr + slot * 4
+    # Step 4: write the descriptors. A unit knows where its slices start, so
+    # there is no owner to search for: one program takes a band of slice
+    # indices and every unit writes the slices it has in that band. Slots past
+    # slots_used keep the zeroed descriptor, which the walk reads as no work.
+    sl = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
+    slot = first_slot[None, :] + sl[:, None]
+    live_slice = (sl[:, None] < n_slices[None, :]) & (slot < num_ctas)
     if VARLEN:
-        own_seq = tl.sum(tl.where(is_owner_unit, seq[None, :], 0), axis=1)
-        own_blk = tl.sum(tl.where(is_owner_unit, row_blk[None, :], 0), axis=1)
+        own_seq, own_blk = seq, row_blk
     else:
-        own_seq = owner_unit // ROW_BLOCKS
-        own_blk = owner_unit % ROW_BLOCKS
-    tl.store(base + 0, own_seq, mask=in_range)
-    tl.store(base + 1, own_blk, mask=in_range)
-    tl.store(base + 2, slice_idx, mask=in_range)
-    tl.store(base + 3, num_slices, mask=in_range)
+        own_seq, own_blk = unit // ROW_BLOCKS, unit % ROW_BLOCKS
+    shape: tl.constexpr = (BLOCK_S, ALIGN_W)
+    base = sched_ptr + slot * 4
+    tl.store(base + 0, tl.broadcast_to(own_seq[None, :], shape), mask=live_slice)
+    tl.store(base + 1, tl.broadcast_to(own_blk[None, :], shape), mask=live_slice)
+    tl.store(base + 2, tl.broadcast_to(sl[:, None], shape), mask=live_slice)
+    tl.store(base + 3, tl.broadcast_to(n_slices[None, :], shape), mask=live_slice)
+
+    # Step 5: the grid is num_ctas, so a slot past the last slice launches too
+    # and has to read as no work. The walk returns on num_slices <= slice_idx,
+    # so both have to be cleared -- a stale negative slice_idx would pass that
+    # test and send the workgroup on with a garbage batch id. num_ctas is sized
+    # to hold the slices, so this is usually empty and the loop does not run.
+    t = slots_used + tl.program_id(0) * BLOCK_T
+    while t < num_ctas:
+        idx = t + tl.arange(0, BLOCK_T)
+        keep = idx < num_ctas
+        zero = tl.zeros([BLOCK_T], tl.int32)
+        tl.store(sched_ptr + idx * 4 + 2, zero, mask=keep)
+        tl.store(sched_ptr + idx * 4 + 3, zero, mask=keep)
+        t += tl.num_programs(0) * BLOCK_T

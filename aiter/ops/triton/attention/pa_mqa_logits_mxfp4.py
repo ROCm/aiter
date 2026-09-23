@@ -372,14 +372,20 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     # Slots enough to keep a slice under the cap the static grid uses, which
     # is what its _kv_splits by_balance term does. Without max_model_len the
     # walk length is unknown here, so the slice stays uncapped as before.
-    num_ctas, max_tiles = target_wgs, 0
-    if max_model_len:
-        cap = plan["max_tiles_per_split"]
-        n_tiles = max(1, (max_model_len + block_kv - 1) // block_kv)
-        slots = work * ((n_tiles + cap - 1) // cap)
-        num_ctas = max(target_wgs, min(slots, SCHED_SLOT_CAP))
-        room = max(num_ctas - work, 1)
-        max_tiles = max(cap, (n_tiles * work + room - 1) // room)
+    assert max_model_len, "build_schedule sizes its slices from max_model_len"
+    cap = plan["max_tiles_per_split"]
+    n_tiles = max(1, (max_model_len + block_kv - 1) // block_kv)
+    per_unit = (n_tiles + cap - 1) // cap
+    slots = work * per_unit
+    num_ctas = max(target_wgs, min(slots, SCHED_SLOT_CAP))
+    room = max(num_ctas - work, 1)
+    max_tiles = max(cap, (n_tiles * work + room - 1) // room)
+    # The bound on slices per unit, which fixes the write's shape. It has to
+    # clear what an even split actually gives, num_ctas // work, or the floor
+    # it implies would cut the slice count and with it the parallelism; above
+    # that it only reins in a unit whose walk dwarfs the rest.
+    even = (num_ctas + work - 1) // work
+    max_slices = 1 << (max(per_unit, even) - 1).bit_length()
     align_w = max(16, 1 << (work - 1).bit_length())
     align_b = max(16, 1 << (batch - 1).bit_length())
     # The varlen search is one ALIGN_W x ALIGN_B predicate matrix per program
@@ -388,12 +394,10 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     if out is None or out.numel() < num_ctas * 4:
         out = torch.empty(num_ctas * 4, dtype=torch.int32,
                           device=context_lens.device)
-    # Slots one scheduler program describes. Every program redoes the unit
-    # reductions, so this trades that redundancy against the BLOCK_P x ALIGN_W
-    # ownership matrix: 16 is 1.4-4.7x over 4 on the wide grids and flat on the
-    # narrow ones, 32 is worse again.
-    SCHED_BLOCK_P = 16
-    _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(num_ctas, SCHED_BLOCK_P),)](
+    # Slice indices one program writes. The grid follows the slices a unit can
+    # own, not the slot count, which is what keeps the redone reductions cheap.
+    SCHED_BLOCK_S = 4
+    _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(max_slices, SCHED_BLOCK_S),)](
         context_lens,
         row_ends,
         query_start_loc,
@@ -406,12 +410,15 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         BLOCK_KV=block_kv,
         ROW_BLOCKS=row_blocks,
         ALIGN_W=align_w,
-        BLOCK_P=SCHED_BLOCK_P,
+        BLOCK_S=SCHED_BLOCK_S,
         HAS_ROW_ENDS=1 if row_ends is not None else 0,
         GATHER=int(gather),
         VARLEN=1 if varlen else 0,
         ALIGN_B=align_b,
         MAX_TILES=max_tiles,
+        MAX_SLICES=max_slices,
+        N_TILES=n_tiles,
+        BLOCK_T=256,
         num_warps=4,
     )
     # The launcher takes the grid from the length, so the length is the contract

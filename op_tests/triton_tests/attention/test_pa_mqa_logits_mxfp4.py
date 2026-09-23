@@ -8,7 +8,7 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (cache_format,
                                             preshuffle_cache,
                                             unshuffle_scales, unshuffle_values)
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
-    build_candidate_gather)
+    build_candidate_gather, build_schedule)
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import build_gather
 
 SCALE_GROUP = 32
@@ -877,5 +877,28 @@ def test_varlen(shape, num_heads, page_size, plan_n):
             q4[lo:lo + r][None].contiguous(), q4s[lo:lo + r][None].contiguous(),
             args[0], w[lo:lo + r].contiguous(), args[1][b:b + 1],
             args[2][b:b + 1].contiguous(), args[3])
+    torch.cuda.synchronize()
+    assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
+
+
+@pytest.mark.parametrize("shape", [(32, 1, [8192]), (128, 1, [4096]),
+                                   (32, 6, [8192])],
+                         ids=lambda s: f"b{s[0]}_n{s[1]}")
+def test_schedule_idle_slots(shape):
+    """Slots past the last slice launch too. Their descriptor arrives stale, so
+    the walk has to read it as no work -- a negative slice_idx would pass the
+    num_slices <= slice_idx guard and run with a garbage batch id."""
+    batch, next_n, ctx_lens = shape
+    st = _make_case(batch, next_n, 32, 128, ctx_lens * batch, 64)
+    mml = st["mml"]
+    ref = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
+                                 st["cl"], st["block_table"], mml)
+    dirty = torch.full((1 << 19,), -12345, dtype=torch.int32, device=st["dev"])
+    sched = build_schedule(st["cl"], next_n, 32, 128, 64, 1, out=dirty,
+                           max_model_len=mml)
+    d = sched.view(-1, 4)
+    assert (d[:, 3] <= d[:, 2]).any(), "shape has no idle slots to test"
+    got = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
+                                 st["cl"], st["block_table"], mml, schedule=sched)
     torch.cuda.synchronize()
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
