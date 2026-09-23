@@ -42,7 +42,6 @@ def run_case(
     strided_caches: bool,
     gemma_norm: bool,
     return_kv: bool,
-    match_hip: bool,
     seed: int,
     warmup: int,
     iters: int,
@@ -193,7 +192,6 @@ def run_case(
     _, flydsl_us = run_perftest(
         flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
         *op_args,
-        match_hip=match_hip,
         num_iters=iters,
         num_warmup=warmup,
         use_cuda_event=True,
@@ -204,7 +202,7 @@ def run_case(
         f"cache={cache_dtype} page={page_size} interleaved={interleaved} "
         f"slots={slot_pattern} strided_pos={strided_positions} "
         f"strided_cache={strided_caches} "
-        f"gemma={gemma_norm} return_kv={return_kv} match_hip={match_hip}"
+        f"gemma={gemma_norm} return_kv={return_kv}"
     )
     print(f"[case] {label}")
 
@@ -288,7 +286,6 @@ def main() -> None:
     )
     parser.add_argument("--gemma-norm", type=_str_to_bool, nargs="+", default=[False])
     parser.add_argument("--return-kv", type=_str_to_bool, nargs="+", default=[False])
-    parser.add_argument("--match-hip", type=_str_to_bool, nargs="+", default=[True])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iters", type=int, default=1)
@@ -308,7 +305,6 @@ def main() -> None:
         args.strided_caches,
         args.gemma_norm,
         args.return_kv,
-        args.match_hip,
     )
     case_count = 0
     for case_count, case in enumerate(sweep, start=1):
@@ -325,7 +321,6 @@ def main() -> None:
             strided_caches,
             gemma_norm,
             return_kv,
-            match_hip,
         ) = case
         run_case(
             num_tokens=num_tokens,
@@ -340,7 +335,6 @@ def main() -> None:
             strided_caches=strided_caches,
             gemma_norm=gemma_norm,
             return_kv=return_kv,
-            match_hip=match_hip,
             seed=args.seed,
             warmup=args.warmup,
             iters=args.iters,
