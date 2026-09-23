@@ -9,6 +9,8 @@ import functools
 
 import torch
 
+from aiter.utility.graph_alloc import persistent_alloc
+
 _compile_gemm_a16w16 = None
 _run_compiled = None
 _ptr_arg = None
@@ -83,7 +85,8 @@ _SPLIT_K_MAX_TILES = 4096
 
 @functools.cache
 def _split_k_counters(device, stream):
-    return torch.zeros(_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device)
+    with persistent_alloc(torch.device(device)):
+        return torch.zeros(_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device)
 
 
 def gemm_a16w16(

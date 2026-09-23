@@ -40,19 +40,19 @@ import triton.language as tl
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
-from aiter.ops.flydsl.kernels.topk_per_row_radix_stream import (
+from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
     build_topk_per_row_radix_stream_module,
     topk_per_row_radix_stream_block_threads,
     topk_per_row_radix_stream_lds_plan,
     topk_per_row_radix_stream_serves,
 )
-from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
-from aiter.ops.flydsl.topk_per_row_argmax import (
+from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.flydsl.topk.topk_per_row_argmax import (
     ARGMAX_DTYPES,
     topk_per_row_argmax,
     topk_per_row_argmax_serves,
 )
-from aiter.ops.flydsl.topk_per_row_small_k import (
+from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k,
     topk_per_row_small_k_serves,
 )
