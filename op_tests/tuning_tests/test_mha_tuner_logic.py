@@ -517,121 +517,69 @@ class TestMhaWinnerPromotion(unittest.TestCase):
 
 
 class TestMhaPublicDispatch(unittest.TestCase):
-    def test_csv_asm_plan_forces_the_split_count(self):
-        # The split count rides the full entry point, so the caller's out=,
-        # mask and padding reach the kernel alongside it.
+    def _varlen_forward(self, entry="fmha_v3_varlen_fwd", gfx="gfx942", **overrides):
+        """Dispatch once with ``entry`` mocked, and hand back that mock.
+
+        Thirteen of the arguments are positional and none of them vary here,
+        so spelling them out per test buried the one field each test is about.
+        """
+
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
-        sentinel = (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-        )
+        call = {
+            "cu_seqlens_q_padded": None,
+            "cu_seqlens_k_padded": None,
+            "causal": False,
+            **overrides,
+        }
         with (
-            mock.patch.object(mha, "get_gfx", return_value="gfx942"),
-            mock.patch.object(mha, "fmha_v3_varlen_fwd", return_value=sentinel) as asm,
+            mock.patch.object(mha, "get_gfx", return_value=gfx),
+            mock.patch.object(
+                mha, entry, return_value=tuple(torch.empty(1) for _ in range(4))
+            ) as backend,
         ):
-            mha._flash_attn_varlen_forward(
+            result = mha._flash_attn_varlen_forward(
                 q,
                 k,
                 v,
                 cu_q,
                 cu_k,
-                None,
-                None,
+                call.pop("cu_seqlens_q_padded"),
+                call.pop("cu_seqlens_k_padded"),
                 8,
                 16,
                 0,
                 0.0,
                 0.125,
-                False,
-                num_splits=3,
-                selected_backend="asm_v3",
+                call.pop("causal"),
+                **call,
             )
-        asm.assert_called_once()
+        backend.assert_called_once()
+        return backend, result
+
+    def test_csv_asm_plan_forces_the_split_count(self):
+        # The split count rides the full entry point, so the caller's out=,
+        # mask and padding reach the kernel alongside it.
+        asm, _ = self._varlen_forward(num_splits=3, selected_backend="asm_v3")
         self.assertEqual(asm.call_args.args[-1], 3)
 
     def test_a_split_count_the_kernel_cannot_serve_falls_back_to_auto(self):
         # Forcing a split the contract rejects is a TORCH_CHECK in C++, and a
         # tuned row is a hint: hand those calls back to auto-select instead.
-        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
-        sentinel = (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-        )
-        for name, kwargs in (
+        for name, override in (
             ("causal", {"causal": True}),
-            ("cu_seqlens_q_padded", {"cu_seqlens_q_padded": cu_q}),
+            ("cu_seqlens_q_padded", {"cu_seqlens_q_padded": torch.zeros(2)}),
             ("how_v3_bf16_cvt", {"how_v3_bf16_cvt": 0}),
         ):
             with self.subTest(argument=name):
-                with (
-                    mock.patch.object(mha, "get_gfx", return_value="gfx942"),
-                    mock.patch.object(
-                        mha, "fmha_v3_varlen_fwd", return_value=sentinel
-                    ) as asm,
-                ):
-                    call = {
-                        "cu_seqlens_q_padded": None,
-                        "cu_seqlens_k_padded": None,
-                        "causal": False,
-                        **kwargs,
-                    }
-                    mha._flash_attn_varlen_forward(
-                        q,
-                        k,
-                        v,
-                        cu_q,
-                        cu_k,
-                        call.pop("cu_seqlens_q_padded"),
-                        call.pop("cu_seqlens_k_padded"),
-                        8,
-                        16,
-                        0,
-                        0.0,
-                        0.125,
-                        call.pop("causal"),
-                        num_splits=3,
-                        selected_backend="asm_v3",
-                        **call,
-                    )
-                asm.assert_called_once()
+                asm, _ = self._varlen_forward(
+                    num_splits=3, selected_backend="asm_v3", **override
+                )
                 self.assertEqual(
                     asm.call_args.args[-1], 0, "auto-select must reach the kernel"
                 )
 
     def test_no_plan_uses_public_asm_auto_select(self):
-        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
-        sentinel = (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-        )
-        with (
-            mock.patch.object(mha, "get_gfx", return_value="gfx942"),
-            mock.patch.object(mha, "fmha_v3_varlen_fwd", return_value=sentinel) as auto,
-        ):
-            mha._flash_attn_varlen_forward(
-                q,
-                k,
-                v,
-                cu_q,
-                cu_k,
-                None,
-                None,
-                8,
-                16,
-                0,
-                0.0,
-                0.125,
-                False,
-                num_splits=0,
-                selected_backend=None,
-            )
-        auto.assert_called_once()
+        auto, _ = self._varlen_forward(num_splits=0, selected_backend=None)
         self.assertEqual(auto.call_args.args[-1], 0)
 
     def test_flash_attn_varlen_func_routes_csv_backends(self):
@@ -688,31 +636,10 @@ class TestMhaPublicDispatch(unittest.TestCase):
         # The lookup key takes the running arch while the asm gate takes the
         # built one, so a tuned asm_v3 row can reach a call no asm kernel can
         # serve. Failing the call would be worse than ignoring the row.
-        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
-        with (
-            mock.patch.object(mha, "get_gfx", return_value="gfx1201"),
-            mock.patch.object(
-                mha, "mha_varlen_fwd", return_value=("ck", None, None, None)
-            ) as ck,
-        ):
-            out, *_ = mha._flash_attn_varlen_forward(
-                q,
-                k,
-                v,
-                cu_q,
-                cu_k,
-                None,
-                None,
-                8,
-                16,
-                0,
-                0.0,
-                0.125,
-                False,
-                selected_backend="asm_v3",
-            )
-        self.assertEqual(out, "ck")
-        ck.assert_called_once()
+        ck, result = self._varlen_forward(
+            entry="mha_varlen_fwd", gfx="gfx1201", selected_backend="asm_v3"
+        )
+        self.assertIs(result[0], ck.return_value[0])
 
     def test_triton_public_varlen_reads_csv_tiles_when_config_is_none(self):
         from aiter.ops.triton.attention import mha as triton_mha

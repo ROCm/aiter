@@ -353,17 +353,17 @@ class TestUnusableMeasurements(unittest.TestCase):
         self.assertEqual(result.winner, "fast")
         self.assertNotIn("slow", result.survivors)
 
-    def test_a_zero_latency_cannot_win(self):
-        """Zero is a broken reading, not a fast one, and the leader's
+    def test_a_latency_that_is_not_positive_and_finite_cannot_win(self):
+        """These are broken readings, not fast ones, and the leader's
         estimate divides the tolerance and every reported gap."""
-        result = self._race_with("slow", lambda count: [0.0] * count)
-        states = {v.label: v.state for v in result.verdicts}
-        self.assertEqual(states["slow"], "crashed")
-        self.assertEqual(result.winner, "fast")
-
-    def test_a_negative_latency_cannot_win(self):
-        result = self._race_with("slow", lambda count: [-1.0] * count)
-        self.assertEqual(result.winner, "fast")
+        for reading in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(reading=reading):
+                result = self._race_with(
+                    "slow", lambda count, value=reading: [value] * count
+                )
+                states = {v.label: v.state for v in result.verdicts}
+                self.assertEqual(states["slow"], "crashed")
+                self.assertEqual(result.winner, "fast")
 
     def test_a_field_that_cannot_be_timed_at_all_fails_loudly(self):
         entrants = [RaceEntrant(label) for label in self.TRUTH]

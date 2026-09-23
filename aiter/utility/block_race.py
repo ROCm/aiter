@@ -46,15 +46,12 @@ __all__ = [
     "Verdict",
     "critical_t",
     "cuda_event_timer",
-    "indistinguishable_set",
     "measure_blocks",
-    "position_effect",
     "race",
     "rank",
     "regularized_incomplete_beta",
     "select_winner",
     "student_t_sf",
-    "wilcoxon_floor",
 ]
 
 
@@ -576,84 +573,6 @@ def rank(samples: dict[str, Samples]) -> list[tuple[str, float]]:
         ((label, sample.estimate) for label, sample in samples.items()),
         key=lambda item: item[1],
     )
-
-
-def position_effect(samples: dict[str, Samples]) -> list[tuple[int, float, int]]:
-    """Latency by position within a block, relative to each candidate's median.
-
-    A switching cost inside the timed calls shows up as early positions
-    running slow. Normalizing per candidate lets fast and slow ones pool.
-    """
-    by_position: dict[int, list[float]] = {}
-    for sample in samples.values():
-        reference = sample.estimate
-        if not math.isfinite(reference) or reference <= 0:
-            continue
-        for block in sample.blocks:
-            for position, latency in enumerate(block):
-                by_position.setdefault(position, []).append(latency / reference)
-    return [
-        (position, statistics.median(values), len(values))
-        for position, values in sorted(by_position.items())
-    ]
-
-
-def wilcoxon_floor(blocks: int) -> float:
-    """Smallest one-sided p a signed-rank test can return with this many pairs.
-
-    Worth printing rather than discovering: at four blocks the floor is
-    0.0625, so nothing can clear alpha=0.05 and every candidate survives no
-    matter how slow. That is a powerless test, not a tie.
-    """
-    return 0.5**blocks if blocks > 0 else 1.0
-
-
-def indistinguishable_set(samples: dict[str, Samples], alpha: float = 0.05):
-    """Candidates that cannot be separated from the fastest.
-
-    Picking the single fastest point estimate is biased, because the maximum
-    of noisy estimates is optimistic. The set that survives a paired test
-    against the leader is what the measurement supports, leaving the choice
-    within it to a policy that can prefer the incumbent.
-    """
-    ordered = rank(samples)
-    best_label = ordered[0][0]
-    best_blocks = samples[best_label].block_medians
-
-    raw = []
-    for label, _ in ordered[1:]:
-        blocks = samples[label].block_medians
-        paired = min(len(best_blocks), len(blocks))
-        if paired < 3:
-            raw.append((label, 1.0))
-            continue
-        differences = [blocks[i] - best_blocks[i] for i in range(paired)]
-        if all(d == 0 for d in differences):
-            raw.append((label, 1.0))
-            continue
-        # A paired t on the block differences rather than a signed-rank test,
-        # whose smallest attainable p depends only on the block count (see
-        # wilcoxon_floor). These values are already medians of many calls, so
-        # approximate normality is a weak assumption here.
-        spread = statistics.stdev(differences) / math.sqrt(len(differences))
-        if spread <= 0.0:
-            raw.append((label, 0.0))
-            continue
-        statistic = statistics.mean(differences) / spread
-        raw.append((label, student_t_sf(statistic, len(differences) - 1)))
-
-    # Holm-Bonferroni: the leader is compared against every other candidate, so
-    # without correction the chance of wrongly excluding one grows with the
-    # size of the catalogue.
-    raw.sort(key=lambda item: item[1])
-    total = len(raw)
-    survivors = [best_label]
-    for index, (label, p_value) in enumerate(raw):
-        if p_value > alpha / (total - index):
-            # Holm stops at the first failure; everything from here on stays.
-            survivors.extend(other for other, _ in raw[index:])
-            break
-    return survivors
 
 
 def _beta_continued_fraction(a: float, b: float, x: float) -> float:

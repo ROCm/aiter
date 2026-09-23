@@ -465,15 +465,20 @@ class TestFailedGroupResults(unittest.TestCase):
 
     GROUP = (("cand-a", "args"), ("cand-b", "args"), ("cand-c", "args"))
 
-    def _results(self, progress, **kwargs):
+    def _results(self, tasks=None, shape_grouped=True, progress=None, **kwargs):
         tuner = importlib.import_module("aiter.utility.mp_tuner")
         return tuner._failed_group_results(
-            list(self.GROUP), True, progress, False, "task_7", **kwargs
+            list(self.GROUP) if tasks is None else tasks,
+            shape_grouped,
+            progress or {},
+            kwargs.pop("return_status", False),
+            "task_7",
+            **kwargs,
         )
 
     def test_measured_candidates_survive_the_fault(self):
         measured = {"cand-a": ("cand-a", 12.5, 0.0)}
-        results, to_publish = self._results(measured)
+        results, to_publish = self._results(progress=measured)
         self.assertEqual(results[0], measured["cand-a"])
         self.assertEqual([info for info, *_ in results], ["cand-a", "cand-b", "cand-c"])
         self.assertEqual([us for _, us, *_ in results[1:]], [float("inf")] * 2)
@@ -481,32 +486,25 @@ class TestFailedGroupResults(unittest.TestCase):
         self.assertEqual(to_publish, [results[1]])
 
     def test_without_progress_the_whole_group_fails(self):
-        results, to_publish = self._results({})
+        results, to_publish = self._results()
         self.assertEqual([us for _, us, *_ in results], [float("inf")] * 3)
+        self.assertEqual(results[0][1:], (float("inf"), 1.0))
         self.assertEqual(to_publish, [results[0]])
 
     def test_status_and_detail_reach_the_typed_results(self):
-        results, _ = self._results({}, status="timeout", detail="exceeded 60s")
-        self.assertEqual(results[0][1:], (float("inf"), 1.0))
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
-        typed, _ = tuner._failed_group_results(
-            list(self.GROUP), True, {}, True, "task_7", "timeout", "exceeded 60s"
+        typed, _ = self._results(
+            return_status=True, status="timeout", detail="exceeded 60s"
         )
         self.assertEqual(typed[0][3:], ("timeout", "exceeded 60s"))
 
-    def test_ungrouped_task_yields_one_result(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
-        results, to_publish = tuner._failed_group_results(
-            ("lonely", "args"), False, {}, False, "task_3"
-        )
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0][0], "lonely")
+    def test_an_ungrouped_task_yields_one_result(self):
+        results, to_publish = self._results(("lonely", "args"), shape_grouped=False)
+        self.assertEqual([info for info, *_ in results], ["lonely"])
         self.assertEqual(to_publish, results)
 
-    def test_empty_task_falls_back_to_the_index_name(self):
-        tuner = importlib.import_module("aiter.utility.mp_tuner")
-        results, _ = tuner._failed_group_results([()], True, {}, False, "task_9")
-        self.assertEqual(results[0][0], "task_9")
+    def test_an_empty_task_falls_back_to_the_index_name(self):
+        results, _ = self._results([()])
+        self.assertEqual(results[0][0], "task_7")
 
 
 if __name__ == "__main__":
