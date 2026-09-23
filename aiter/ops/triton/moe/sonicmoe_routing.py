@@ -6,15 +6,15 @@ import math
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.bitmatrix import (
-    _bitmatrix_metadata_compute_stage1,
-    _bitmatrix_metadata_compute_stage2,
+from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix_sonicmoe import (
+    _sonicmoe_bitmatrix_metadata_compute_stage1,
+    _sonicmoe_bitmatrix_metadata_compute_stage2,
 )
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.routing import (
-    _compute_col_partial_sum_kernel,
-    _general_compute_col_partial_sum_kernel,
-    _general_metadata_compute_stage2,
-    _token_offset_searchsorted_kernel,
+from aiter.ops.triton._triton_kernels.moe.moe_routing.routing_sonicmoe import (
+    _sonicmoe_compute_col_partial_sum_kernel,
+    _sonicmoe_general_compute_col_partial_sum_kernel,
+    _sonicmoe_general_metadata_compute_stage2,
+    _sonicmoe_token_offset_searchsorted_kernel,
 )
 from aiter.ops.triton.utils.sonicmoe_config_utils import get_sonicmoe_kernel_config
 
@@ -49,7 +49,7 @@ def TC_topk_router_metadata_triton(
 
     # Transposed storage avoids cross-CTA histogram writes.
     col_partial_sum_trans = torch.empty(E, n_tiles, dtype=torch.int32, device=device)
-    _compute_col_partial_sum_kernel[(n_tiles,)](
+    _sonicmoe_compute_col_partial_sum_kernel[(n_tiles,)](
         topk_router_indices,
         col_partial_sum_trans,
         T,
@@ -64,7 +64,7 @@ def TC_topk_router_metadata_triton(
     expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
     col_partial_sum = col_partial_sum_trans.T  # [n_tiles, E]
 
-    _bitmatrix_metadata_compute_stage1[(E + 2,)](
+    _sonicmoe_bitmatrix_metadata_compute_stage1[(E + 2,)](
         expert_frequency,
         expert_frequency_offset,
         E,
@@ -75,7 +75,7 @@ def TC_topk_router_metadata_triton(
         BLOCK_N=E_POW2,
     )
 
-    _bitmatrix_metadata_compute_stage2[(n_tiles,)](
+    _sonicmoe_bitmatrix_metadata_compute_stage2[(n_tiles,)](
         s_scatter_idx,
         s_reverse_scatter_idx,
         x_gather_idx,
@@ -121,7 +121,7 @@ def general_routing_router_metadata_triton(
     n_tiles = triton.cdiv(TK, BLOCK_SIZE)
 
     col_partial_sum_trans = torch.empty(E, n_tiles, dtype=torch.int32, device=device)
-    _general_compute_col_partial_sum_kernel[(n_tiles,)](
+    _sonicmoe_general_compute_col_partial_sum_kernel[(n_tiles,)](
         selected_E,
         col_partial_sum_trans,
         TK,
@@ -134,7 +134,7 @@ def general_routing_router_metadata_triton(
     expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
     col_partial_sum = col_partial_sum_trans.T  # [n_tiles, E], strides (1, n_tiles)
 
-    _bitmatrix_metadata_compute_stage1[(E + 2,)](
+    _sonicmoe_bitmatrix_metadata_compute_stage1[(E + 2,)](
         expert_frequency,
         expert_frequency_offset,
         E,
@@ -145,7 +145,7 @@ def general_routing_router_metadata_triton(
         BLOCK_N=E_POW2,
     )
 
-    _general_metadata_compute_stage2[(n_tiles,)](
+    _sonicmoe_general_metadata_compute_stage2[(n_tiles,)](
         s_scatter_idx,
         s_reverse_scatter_idx,
         x_gather_idx,
@@ -161,7 +161,7 @@ def general_routing_router_metadata_triton(
     N_ITERS = max(1, math.ceil(math.log2(TK + 1)))
     TOKEN_BLOCK = config["TOKEN_SEARCH_BLOCK"]
     n_token_blocks = triton.cdiv(T + 1, TOKEN_BLOCK)
-    _token_offset_searchsorted_kernel[(n_token_blocks,)](
+    _sonicmoe_token_offset_searchsorted_kernel[(n_token_blocks,)](
         sorted_selected_T,
         num_activated_expert_per_token_offset,
         T,

@@ -23,7 +23,7 @@ _token_offset_searchsorted_repr = make_kernel_repr(
 
 
 @triton.jit(repr=_col_partial_sum_repr)
-def _compute_col_partial_sum_kernel(
+def _sonicmoe_compute_col_partial_sum_kernel(
     topk_indices_ptr,
     partial_sum_ptr,
     T,
@@ -69,7 +69,7 @@ def _compute_col_partial_sum_kernel(
 
 
 @triton.jit(repr=_general_col_partial_sum_repr)
-def _general_compute_col_partial_sum_kernel(
+def _sonicmoe_general_compute_col_partial_sum_kernel(
     selected_E_ptr,
     partial_sum_ptr,  # [E, n_tiles], column-major per tile
     TK,
@@ -101,7 +101,7 @@ def _general_compute_col_partial_sum_kernel(
 
 
 @triton.jit(repr=_general_metadata_stage2_repr)
-def _general_metadata_compute_stage2(
+def _sonicmoe_general_metadata_compute_stage2(
     s_scatter_idx_ptr,
     s_reverse_scatter_idx_ptr,
     x_gather_idx_ptr,
@@ -147,7 +147,7 @@ def _general_metadata_compute_stage2(
 
 
 @triton.jit(repr=_token_offset_searchsorted_repr)
-def _token_offset_searchsorted_kernel(
+def _sonicmoe_token_offset_searchsorted_kernel(
     sorted_T_ptr,  # [TK] int32, sorted ascending
     offset_ptr,  # [T+1] int32, output
     T,  # number of tokens

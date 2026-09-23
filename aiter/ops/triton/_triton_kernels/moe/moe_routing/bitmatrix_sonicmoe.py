@@ -16,7 +16,7 @@ _bitmatrix_stage2_repr = make_kernel_repr(
 
 
 @triton.jit(repr=_bitmatrix_stage1_repr)
-def _bitmatrix_metadata_compute_stage1(
+def _sonicmoe_bitmatrix_metadata_compute_stage1(
     expert_freq_ptr,
     expert_freq_offs_ptr,
     E: tl.constexpr,
@@ -53,7 +53,7 @@ def _bitmatrix_metadata_compute_stage1(
 
 
 @triton.jit(repr=_bitmatrix_stage2_repr)
-def _bitmatrix_metadata_compute_stage2(
+def _sonicmoe_bitmatrix_metadata_compute_stage2(
     s_scatter_idx_ptr,
     s_reverse_scatter_idx_ptr,
     x_gather_idx_ptr,
