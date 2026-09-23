@@ -1721,11 +1721,16 @@ def _process_segment(
 
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
-    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "NUM_SPLITS", "MAIN_FMT", "ROPE_SEPARATE"],
+    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
 )
 
 
-@gluon.jit(repr=_sparse_mla_repr)
+# Split counts follow the batch, so they (and the stride they scale) stay out of the
+# compile key.
+@gluon.jit(
+    repr=_sparse_mla_repr,
+    do_not_specialize=["pm_stride0", "num_splits", "main_num_splits"],
+)
 def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
     # R = ROPE_DIM, nnz = total gathered tokens in a segment's index list.
@@ -1744,12 +1749,12 @@ def _sparse_mla(
     extra_indices_ptr,  # [nnz_extra] int32
     extra_indptr_ptr,  # [C + 1] int32
     attn_sink_ptr,  # [H] f32, HAS_SINK only
-    out_ptr,  # [C, H, S] bf16, written when NUM_SPLITS == 1
-    # Split-K partials, written instead of out_ptr when NUM_SPLITS > 1 (unused
-    # placeholders otherwise).
-    part_m_ptr,  # [C, NUM_SPLITS, H] f32 row max, base-2 domain
-    part_l_ptr,  # [C, NUM_SPLITS, H] f32 row sum
-    part_acc_ptr,  # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
+    out_ptr,  # [C, H, S] bf16, written without SPLIT_K
+    # Split-K partials, one slot per launched split program (P >= num_splits),
+    # written instead of out_ptr with SPLIT_K (unused placeholders otherwise).
+    part_m_ptr,  # [C, P, H] f32 row max, base-2 domain
+    part_l_ptr,  # [C, P, H] f32 row sum
+    part_acc_ptr,  # [C, P, H, S] bf16 or f32, un-normalized
     # f32 side-channel per segment: scalar k_scale ("fp8_scalar") or f32 cache view
     # ("fp8_dsv32_mla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
@@ -1764,9 +1769,9 @@ def _sparse_mla(
     extra_cs0,
     main_num_rows,
     extra_num_rows,
-    pm_stride0: gl.constexpr,
+    pm_stride0,
     pm_stride_s: gl.constexpr,
-    pa_stride0: gl.constexpr,
+    pa_stride0,
     pa_stride_s: gl.constexpr,
     pa_stride_h: gl.constexpr,
     num_heads: gl.constexpr,
@@ -1783,7 +1788,8 @@ def _sparse_mla(
     ROPE_SEPARATE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    NUM_SPLITS: gl.constexpr,
+    num_splits,
+    SPLIT_K: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows,
     # 1 = columns); >= the tile's extent means one shot.
@@ -1793,10 +1799,10 @@ def _sparse_mla(
     UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
     Q_CACHE: gl.constexpr,
-    # MAIN_SPLITS <= NUM_SPLITS: splitting the SWA window past its tile count
+    # main_num_splits <= num_splits: splitting the SWA window past its tile count
     # only manufactures masked partial tiles, so main stops early and extra
     # keeps all programs (surplus ones get an empty main range).
-    MAIN_SPLITS: gl.constexpr,
+    main_num_splits,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
     ADAPTIVE_SPLITS: gl.constexpr,
     DEQ: gl.constexpr,  # see Fmt.DEQ
@@ -1826,8 +1832,8 @@ def _sparse_mla(
     KV_LDS_PAD: gl.constexpr = 0,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
-    extra (top-k). NUM_SPLITS==1 writes the output directly; otherwise stores
-    un-normalized partials for the reduce kernel."""
+    extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
+    stores un-normalized partials for the reduce kernel."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
@@ -2075,12 +2081,13 @@ def _sparse_mla(
     # ragged batch the surplus programs would each gather a mostly-masked tile
     # and write a full partial. Recompute from this query's own lengths and let
     # those programs write a neutral partial (m = -inf) and leave. The reduce
-    # skips them, so their part_acc never has to be written.
+    # skips them, so their part_acc never has to be written. Programs past
+    # num_splits, which pad the launch, leave the same way.
     if ADAPTIVE_SPLITS:
         m_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
         e_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
         work_splits = gl.minimum(
-            gl.maximum(gl.maximum(m_tiles, e_tiles), 1), NUM_SPLITS
+            gl.maximum(gl.maximum(m_tiles, e_tiles), 1), num_splits
         )
         main_splits = gl.minimum(gl.maximum(m_tiles, 1), work_splits)
         if split_id >= work_splits:
@@ -2105,9 +2112,12 @@ def _sparse_mla(
                 mask=head_mask_pv,
             )
             return
+    elif SPLIT_K:
+        work_splits = num_splits
+        main_splits = main_num_splits
     else:
-        work_splits = NUM_SPLITS
-        main_splits = MAIN_SPLITS
+        work_splits = 1
+        main_splits = 1
 
     # main (SWA) segment
     main_seg = Seg(
@@ -2199,7 +2209,7 @@ def _sparse_mla(
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))
     l_pv = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.pv_layout))
 
-    if NUM_SPLITS == 1:
+    if not SPLIT_K:
         if HAS_SINK:
             # m_pv is in the base-2 exponent domain; lift the sink into it.
             sink = (

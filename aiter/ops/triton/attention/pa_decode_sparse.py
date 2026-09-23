@@ -56,6 +56,9 @@ _FP8_DTYPE = get_fp8_e4m3_dtype()
 # only signal, and decode is slower with it, so this sits above decode batch sizes.
 _PREFILL_MIN_ROWS = 2048
 
+# Split-K cap
+_MAX_SPLITS = 64
+
 
 def _check_out(out, q, dtype):
     """Caller-supplied output buffer, or a fresh one. Writing the caller's buffer
@@ -446,7 +449,7 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
 
 def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
     """Split-K count for the gfx950 gluon kernel: fill the machine, but never
-    split a segment finer than one BLOCK_K tile.
+    split a segment finer than one BLOCK_K tile or past _MAX_SPLITS.
     """
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
@@ -457,7 +460,14 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     if base_wg >= num_sms:
         # Already at least one workgroup per CU without splitting
         return max(1, min(cta_cap, tiles // 4))
-    return max(1, min(cta_cap, tiles))
+    return max(1, min(cta_cap, tiles, _MAX_SPLITS))
+
+
+def _launch_splits(num_splits):
+    """Split programs to launch: past 2, rounded up to a multiple of 4, so the
+    reduce (unrolled over the launched count) compiles for few counts. The extra
+    programs exit early with empty partials."""
+    return num_splits if num_splits <= 2 else -(-num_splits // 4) * 4
 
 
 def _pa_decode_sparse_gfx950_gluon(
@@ -595,16 +605,18 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
+    # skip_reduce hands the partials to the caller, so only our own reduce pads.
+    grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
 
     if num_splits > 1:
         part_m = torch.empty(
-            (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
+            (num_queries, grid_splits, num_heads), dtype=torch.float32, device=q.device
         )
         part_l = torch.empty_like(part_m)
         # bf16 partials halve both the split-K HBM traffic (~31% of the kernel's
         # bytes)
         part_acc = torch.empty(
-            (num_queries, num_splits, num_heads, head_dim),
+            (num_queries, grid_splits, num_heads, head_dim),
             dtype=torch.float32 if skip_reduce else torch.bfloat16,
             device=q.device,
         )
@@ -664,7 +676,7 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
-    grid = (num_queries, num_splits, heads_blocks)
+    grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
         cache,
@@ -712,7 +724,8 @@ def _pa_decode_sparse_gfx950_gluon(
         ROPE_SEPARATE=False,
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
-        NUM_SPLITS=num_splits,
+        num_splits=num_splits,
+        SPLIT_K=num_splits > 1,
         HEAD_ALIGNED=HEAD_ALIGNED,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
@@ -723,7 +736,7 @@ def _pa_decode_sparse_gfx950_gluon(
         # masked copy would be a second gather+dequant+MFMA body, and its register
         # demand spills the tile loop.
         UNI_TILE=True,
-        MAIN_SPLITS=main_splits,
+        main_num_splits=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
         DEQ=deq,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
@@ -759,7 +772,7 @@ def _pa_decode_sparse_gfx950_gluon(
         HAS_SINK=has_sink,
         HEAD_SIZE=head_dim,
         BLOCK_M=1,
-        NUM_SPLITS=num_splits,
+        NUM_SPLITS=grid_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=adaptive_splits,
         num_warps=1,

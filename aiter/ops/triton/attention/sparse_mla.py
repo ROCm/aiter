@@ -14,6 +14,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
+    _launch_splits,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
@@ -559,16 +560,18 @@ def sparse_mla_fwd(
         num_splits = max(1, int(kv_splits))
     else:
         num_splits = _mla_num_splits(num_queries, heads_blocks, avg_topk, block_k)
+    # skip_reduce hands the partials to the caller, so only our own reduce pads.
+    grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
 
     if num_splits > 1:
         part_m = torch.empty(
-            (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
+            (num_queries, grid_splits, num_heads), dtype=torch.float32, device=q.device
         )
         part_l = torch.empty_like(part_m)
         # bf16 partials halve the split-K HBM traffic; skip_reduce hands the
         # partials back to the caller and keeps f32.
         part_acc = torch.empty(
-            (num_queries, num_splits, num_heads, kv_lora_rank),
+            (num_queries, grid_splits, num_heads, kv_lora_rank),
             dtype=torch.float32 if skip_reduce else torch.bfloat16,
             device=q.device,
         )
@@ -604,7 +607,7 @@ def sparse_mla_fwd(
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
-    grid = (num_queries, num_splits, heads_blocks)
+    grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
         cache,
@@ -650,7 +653,8 @@ def sparse_mla_fwd(
         ROPE_SEPARATE=qk_rope_head_dim > 0,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
-        NUM_SPLITS=num_splits,
+        num_splits=num_splits,
+        SPLIT_K=num_splits > 1,
         HEAD_ALIGNED=head_aligned,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
@@ -658,7 +662,7 @@ def sparse_mla_fwd(
         UNI_TILE=True,
         GRID_ORDER="qsh",
         Q_CACHE=q_cache,
-        MAIN_SPLITS=num_splits,
+        main_num_splits=num_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
         DEQ="none",
         MAIN_USE_BUFFER_LOAD=use_buffer_load,
@@ -702,7 +706,7 @@ def sparse_mla_fwd(
         HAS_SINK=has_sink,
         HEAD_SIZE=kv_lora_rank,
         BLOCK_M=1,
-        NUM_SPLITS=num_splits,
+        NUM_SPLITS=grid_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=num_splits > 1,
         lse_ptr=lse,
