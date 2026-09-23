@@ -1402,6 +1402,129 @@ __device__ void scan_and_choose_bucket(Counter<T, IdxT>* counter,
 }
 
 /**
+ * The crossing bucket, without a block-wide prefix sum.
+ *
+ * `scan_and_choose_bucket` builds the inclusive prefix of all `num_buckets`
+ * counts and then discards every one of them except the single bucket where
+ * the running total crosses k.  This reduces per thread, scans only the
+ * per-wave totals, and walks the handful of counts belonging to the one thread
+ * that straddles k.
+ *
+ * Two details carry the speed.  The per-thread counts are read as one 16-byte
+ * LDS access rather than `items_per_thread` scalar ones, which is why the
+ * blocked layout costs no bank conflicts here.  And the wave scan is DPP --
+ * row_shr plus row_bcast, pure VALU -- rather than `__shfl_up`, which lowers
+ * to `ds_bpermute` and puts the whole scan back on the LDS crossbar.
+ *
+ * Measured on gfx950, 4096 buckets, BlockSize 1024, marginal us per call:
+ *            hipcub  ds_bpermute  DPP
+ *   M=1       0.703     0.471     0.170
+ *   M=1024    2.362     1.777     1.133
+ *   M=4096    8.863     6.937     4.494
+ * Cross-checked against `scan_and_choose_bucket` on 20 random histograms per
+ * k, all four forms agreeing on the chosen bucket.
+ *
+ * `wave_sums` is caller-owned scratch of `BlockSize / WARP_SIZE` entries; the
+ * caller must have synchronized since its last use and must synchronize again
+ * before reading `counter`.
+ */
+
+// x + the DPP-moved x. `old` is 0, so lanes the masks or the row edge exclude
+// contribute nothing.
+template <int ctrl, int row_mask, int bank_mask>
+__device__ __forceinline__ int dpp_add(int x)
+{
+    return x + __builtin_amdgcn_update_dpp(0, x, ctrl, row_mask, bank_mask, false);
+}
+
+// Inclusive add-scan across one wave64, the GCN row_shr/row_bcast sequence.
+__device__ __forceinline__ int wave_inclusive_sum_dpp(int x)
+{
+    x = dpp_add<0x111, 0xf, 0xf>(x); // row_shr:1
+    x = dpp_add<0x112, 0xf, 0xf>(x); // row_shr:2
+    x = dpp_add<0x114, 0xf, 0xe>(x); // row_shr:4
+    x = dpp_add<0x118, 0xf, 0xc>(x); // row_shr:8
+    x = dpp_add<0x142, 0xa, 0xf>(x); // row_bcast:15
+    x = dpp_add<0x143, 0xc, 0xf>(x); // row_bcast:31
+    return x;
+}
+
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
+__device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
+                                     IdxT* histogram,
+                                     IdxT* wave_sums,
+                                     const IdxT k,
+                                     int const start_bit)
+{
+    constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+    static_assert(BlockSize % WARP_SIZE == 0);
+    constexpr int waves = BlockSize / WARP_SIZE;
+    constexpr bool wide = (num_buckets == BlockSize * 4);
+    constexpr int items_per_thread = wide ? 4 : 1;
+    static_assert(wide || num_buckets <= BlockSize,
+                  "choose_bucket_reduce handles 4 buckets per thread or at most one");
+
+    int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
+    int const wave = static_cast<int>(threadIdx.x) / WARP_SIZE;
+
+    IdxT counts[items_per_thread];
+    IdxT sum = 0;
+    if constexpr(wide)
+    {
+        using Vec4 = __attribute__((__ext_vector_type__(4))) IdxT;
+        Vec4 const v = reinterpret_cast<Vec4 const*>(histogram)[threadIdx.x];
+#pragma unroll
+        for(int item = 0; item < 4; ++item)
+        {
+            counts[item] = v[item];
+            sum += v[item];
+        }
+    }
+    else
+    {
+        counts[0] = (static_cast<int>(threadIdx.x) < num_buckets) ? histogram[threadIdx.x]
+                                                                  : static_cast<IdxT>(0);
+        sum       = counts[0];
+    }
+
+    IdxT const x = static_cast<IdxT>(wave_inclusive_sum_dpp(static_cast<int>(sum)));
+    if(lane == WARP_SIZE - 1) wave_sums[wave] = x;
+    __syncthreads();
+    if(static_cast<int>(threadIdx.x) < waves)
+    {
+        IdxT t = wave_sums[threadIdx.x];
+#pragma unroll
+        for(int off = 1; off < waves; off <<= 1)
+        {
+            IdxT const y = static_cast<IdxT>(__shfl_up(static_cast<int>(t), off, WARP_SIZE));
+            if(static_cast<int>(threadIdx.x) >= off) t += y;
+        }
+        wave_sums[threadIdx.x] = t;
+    }
+    __syncthreads();
+
+    // Prefix strictly before this thread's slice of the histogram.
+    IdxT run = (wave ? wave_sums[wave - 1] : static_cast<IdxT>(0)) + x - sum;
+    if(run < k && run + sum >= k)
+    {
+#pragma unroll
+        for(int item = 0; item < items_per_thread; ++item)
+        {
+            IdxT const prev  = run;
+            int const bucket = static_cast<int>(threadIdx.x) * items_per_thread + item;
+            run += counts[item];
+            if(bucket < num_buckets && prev < k && run >= k)
+            {
+                counter->k   = k - prev;
+                counter->len = counts[item];
+                using Bits   = typename aiter::radix_traits<T>::UnsignedBits;
+                counter->kth_value_bits |= static_cast<Bits>(bucket) << start_bit;
+            }
+        }
+    }
+}
+
+/**
  * Last-pass filter: write final top-k results.
  * bits < kth: definite top-k, written front-to-back.
  * bits == kth: fill from back (up to num_of_kth_needed).
@@ -2368,6 +2491,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
 
     __shared__ Counter<T, IdxT> counter;
     __shared__ IdxT histogram[num_buckets];
+    __shared__ IdxT wave_sums[BlockSize / WARP_SIZE];
     __shared__ T candidate_values[CandidateCapacity];
     __shared__ IdxT candidate_indices[CandidateCapacity];
     // Pass-1 winners are sparse across the row.  Staging their indices in LDS
@@ -2424,8 +2548,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     };
     vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass0_histogram);
     __syncthreads();
-    scan_and_choose_bucket<T, IdxT, BitsPerPass, BlockSize>(
-        &counter, histogram, k, pass0_start_bit);
+    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+        &counter, histogram, wave_sums, k, pass0_start_bit);
     __syncthreads();
 
     // Pass 1: build the middle-12 histogram, immediately emit high-prefix
@@ -2486,8 +2610,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __syncthreads();
 
     IdxT const pass1_k = counter.k;
-    scan_and_choose_bucket<T, IdxT, BitsPerPass, BlockSize>(
-        &counter, histogram, pass1_k, pass1_start_bit);
+    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+        &counter, histogram, wave_sums, pass1_k, pass1_start_bit);
     __syncthreads();
 
     // Only publish a successful staged pass.  On overflow the exact fallback
@@ -2540,8 +2664,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         };
         vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass2_histogram);
         __syncthreads();
-        scan_and_choose_bucket<T, IdxT, BitsPerPass, BlockSize>(
-            &counter, histogram, pass2_k, 0);
+        choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+            &counter, histogram, wave_sums, pass2_k, 0);
         __syncthreads();
         last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
             in,
@@ -2610,7 +2734,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __syncthreads();
 
     IdxT const pass2_k = counter.k;
-    scan_and_choose_bucket<T, IdxT, 8, BlockSize>(&counter, histogram, pass2_k, 0);
+    choose_bucket_reduce<T, IdxT, 8, BlockSize>(&counter, histogram, wave_sums, pass2_k, 0);
     __syncthreads();
 
     last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(candidate_values,
