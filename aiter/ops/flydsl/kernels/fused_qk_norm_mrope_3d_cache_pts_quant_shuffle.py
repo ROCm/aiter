@@ -161,7 +161,6 @@ def _build_q_kernel(
     eps: float,
     is_interleaved: bool,
     gemma_norm: bool,
-    match_hip: bool,
     waves_per_block: int,
     head_iters: int,
 ):
@@ -183,10 +182,7 @@ def _build_q_kernel(
     N_HEAD_BLOCKS = _ceil_div(H_Q, HEADS_PER_BLOCK)
     NEEDS_HEAD_GUARD = N_HEAD_BLOCKS * HEADS_PER_BLOCK != H_Q
 
-    kname = (
-        f"qk_norm_mrope_q_D{D}_H{H_Q}_w{waves_per_block}h{head_iters}"
-        f"{'_bf16_truncate' if match_hip else '_f32'}_flydsl"
-    )
+    kname = f"qk_norm_mrope_q_D{D}_H{H_Q}_w{waves_per_block}h{head_iters}_flydsl"
 
     @flyc.kernel(name=kname, known_block_size=[Q_THREADS, 1, 1])
     def kernel(
@@ -279,15 +275,8 @@ def _build_q_kernel(
             for p in range_constexpr(PAIRS_PER_LANE):
                 x0 = is_low.select(own[p], peer[PAIRS_PER_LANE + p])
                 x1 = is_low.select(peer[p], own[PAIRS_PER_LANE + p])
-                if const_expr(match_hip):
-                    # Match the production bf16 RMSNorm materialization before
-                    # applying RoPE in fp32.
-                    xn0 = (x0 * rstd * w0s[p]).to(fx.BFloat16).to(fx.Float32)
-                    xn1 = (x1 * rstd * w1s[p]).to(fx.BFloat16).to(fx.Float32)
-                else:
-                    xn0 = x0 * rstd * w0s[p]
-                    xn1 = x1 * rstd * w1s[p]
-
+                xn0 = x0 * rstd * w0s[p]
+                xn1 = x1 * rstd * w1s[p]
                 o0 = xn0 * cos_vs[p] - xn1 * sin_vs[p]
                 o1 = xn1 * cos_vs[p] + xn0 * sin_vs[p]
                 q_out[tok, head, cols[p]] = o0.to(fx.BFloat16)
@@ -359,7 +348,6 @@ def _build_kv_kernel(
     emit_flat_kv: bool,
     is_interleaved: bool,
     gemma_norm: bool,
-    match_hip: bool,
     cache_is_fp8: bool,
     k_cache_block_stride: int,
     v_cache_block_stride: int,
@@ -402,7 +390,6 @@ def _build_kv_kernel(
     ]
     if emit_flat_kv:
         _name_parts.append("kvout")
-    _name_parts.append("bf16_truncate" if match_hip else "f32")
     _name_parts.append("flydsl")
     kname = "_".join(_name_parts)
 
@@ -612,14 +599,9 @@ def _build_kv_kernel(
                         if const_expr(gemma_norm):
                             w0 = w0 + 1.0
                             w1 = w1 + 1.0
-                        if const_expr(match_hip):
-                            # Production materializes the weighted RMSNorm
-                            # result as bf16 before RoPE.
-                            xn0 = (k0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
-                            xn1 = (k1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
-                        else:
-                            xn0 = k0 * rstd * w0
-                            xn1 = k1 * rstd * w1
+
+                        xn0 = k0 * rstd * w0
+                        xn1 = k1 * rstd * w1
 
                         cos_v, sin_v = mrope_cos_sin(
                             col,
@@ -803,7 +785,6 @@ def _compile_q(
     eps,
     is_interleaved,
     gemma_norm,
-    match_hip,
     waves_per_block,
     head_iters,
 ):
@@ -814,7 +795,6 @@ def _compile_q(
         eps=eps,
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
-        match_hip=match_hip,
         waves_per_block=waves_per_block,
         head_iters=head_iters,
     )
@@ -833,7 +813,6 @@ def _compile_kv(
     emit_flat_kv,
     is_interleaved,
     gemma_norm,
-    match_hip,
     cache_is_fp8,
     k_cache_block_stride,
     v_cache_block_stride,
@@ -849,7 +828,6 @@ def _compile_kv(
         emit_flat_kv=emit_flat_kv,
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
-        match_hip=match_hip,
         cache_is_fp8=cache_is_fp8,
         k_cache_block_stride=k_cache_block_stride,
         v_cache_block_stride=v_cache_block_stride,
@@ -885,7 +863,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     x: int,
     rotary_dim: int = 0,
     gemma_norm: bool = False,
-    match_hip: bool = True,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008
 ) -> None:
     """FlyDSL drop-in for ``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``.
@@ -925,8 +902,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         x: Innermost shuffle run: 16 for FP8 or 8 for bf16.
         rotary_dim: Must be ``0`` or ``head_size``; partial rotary is unsupported.
         gemma_norm: Use Gemma's ``1 + weight`` RMSNorm convention.
-        match_hip: Round normalized values to bf16 before RoPE to match HIP;
-            otherwise retain fp32 intermediates.
         stream: Launch stream; defaults to the current stream.
     """
     if not is_neox_style:
@@ -1101,7 +1076,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         eps=eps,
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
-        match_hip=match_hip,
         waves_per_block=q_waves_per_block,
         head_iters=q_head_iters,
     )
@@ -1169,7 +1143,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         emit_flat_kv=return_kv,
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
-        match_hip=match_hip,
         cache_is_fp8=cache_is_fp8,
         k_cache_block_stride=k_cache_block_stride,
         v_cache_block_stride=v_cache_block_stride,
