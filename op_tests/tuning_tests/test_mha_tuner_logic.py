@@ -364,6 +364,58 @@ class TestMhaTunedPolicy(unittest.TestCase):
         self.assertIn(self._kimi_key(), table)
         self.assertNotIn(self._kimi_key("mi300x"), table)
 
+    def test_each_compiled_shape_looks_itself_up(self):
+        """The table read is constant-folded, so the key must not be.
+
+        `assume_constant_result` evaluates its function once and freezes the
+        answer into the graph. Applied to the whole lookup, the first traced
+        shape's row was reused for every later shape once dynamo made the
+        sizes dynamic, which is a wrong kernel rather than a slow one.
+        """
+        rows = [
+            {**_problem_row(), "backend": "asm_v3", "backend_config": ""},
+            {**_problem_row(), "backend": "asm_v3", "backend_config": ""},
+        ]
+        rows[0].update(total_k=8192, max_seqlen_k=8192, num_splits=2)
+        rows[1].update(total_k=16384, max_seqlen_k=16384, num_splits=5)
+        resolved = []
+
+        def call(q, k, v, max_seqlen_k):
+            plan = mha._get_mha_fwd_tuned_plan(
+                **{**self._key_args(), "q": q, "k": k, "v": v},
+                max_seqlen_k=max_seqlen_k,
+            )
+            resolved.append(None if plan is None else plan["num_splits"])
+            return q.sum()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tuned_mha_fwd.csv")
+            with open(path, "w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=MHA_FWD_RUNTIME_CSV_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            with (
+                mock.patch.dict(os.environ, {"AITER_CONFIG_MHA_FWD": path}),
+                mock.patch.object(mha, "get_gfx", return_value="gfx942"),
+                mock.patch.object(
+                    mha,
+                    "get_tuning_hardware",
+                    return_value={
+                        "gfx": "gfx942",
+                        "gpu_model": "mi325x",
+                        "cu_num": 304,
+                    },
+                ),
+            ):
+                torch._dynamo.reset()
+                compiled = torch.compile(call, dynamic=True)
+                for max_seqlen_k in (8192, 16384):
+                    q = torch.empty((4096, 12, 192), dtype=torch.bfloat16)
+                    k = torch.empty((max_seqlen_k, 12, 192), dtype=torch.bfloat16)
+                    v = torch.empty((max_seqlen_k, 12, 128), dtype=torch.bfloat16)
+                    compiled(q, k, v, max_seqlen_k)
+        self.assertEqual(resolved, [2, 5])
+
     def test_runtime_csv_has_no_measurement_columns(self):
         config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
         with config.open(encoding="utf-8", newline="") as file:

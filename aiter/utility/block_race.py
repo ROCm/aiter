@@ -105,7 +105,8 @@ class Samples:
 @dataclass
 class Verdict:
     label: str
-    # "leader", "within_delta", "protected_behind", "eliminated", "undecided"
+    # "leader", "within_delta", "protected_behind", "eliminated", "undecided",
+    # "crashed"
     state: str
     estimate: float
     relative_gap: float
@@ -247,6 +248,18 @@ def measure_blocks(
     return samples
 
 
+def _usable_latencies(measured: Sequence[float]) -> bool:
+    """Reject a block that cannot be compared or divided by.
+
+    A zero or negative reading is a broken measurement, not a fast one, and
+    the leader's estimate is a denominator throughout the race.
+    """
+
+    return bool(measured) and all(
+        math.isfinite(value) and value > 0.0 for value in measured
+    )
+
+
 def _lower_bound(differences: Sequence[float], per_decision: float) -> float:
     """Lower confidence bound on the mean paired difference."""
     spread = statistics.stdev(differences) / math.sqrt(len(differences))
@@ -299,6 +312,9 @@ def race(
     active = [entrant.label for entrant in entrants]
     eliminated: dict[str, tuple[int, float]] = {}
     behind: dict[str, float] = {}
+    # A candidate that faults or times as zero leaves the field rather than
+    # taking the race down with it, and rather than winning on a bad number.
+    crashed: dict[str, str] = {}
 
     replay = list(journal.records()) if (journal is not None and resume) else []
     replayed = 0
@@ -349,10 +365,29 @@ def race(
         else:
             latencies = {}
             for entrant in order:
-                measured = time_calls(entrant, block_calls)
+                try:
+                    measured = time_calls(entrant, block_calls)
+                except Exception as error:  # noqa: BLE001 - a fault is a verdict
+                    crashed[entrant.label] = f"{type(error).__name__}: {error}"
+                    continue
+                if not _usable_latencies(measured):
+                    crashed[entrant.label] = (
+                        "timer returned a latency that is not positive and finite"
+                    )
+                    continue
                 samples[entrant.label].blocks.append(measured)
                 latencies[entrant.label] = measured
                 calls_spent += len(measured)
+            for label, reason in crashed.items():
+                if label in active:
+                    active.remove(label)
+                    if verbose:
+                        report(f"  {label} left the race: {reason}")
+            if not active:
+                raise RuntimeError(
+                    "every entrant failed to time: "
+                    + "; ".join(f"{k} ({v})" for k, v in crashed.items())
+                )
             if journal is not None:
                 journal.append(
                     {
@@ -471,6 +506,18 @@ def race(
                 len(samples[label].blocks),
                 samples[label].relative_spread,
                 f"dropped after block {block}",
+            )
+        )
+    for label, reason in crashed.items():
+        verdicts.append(
+            Verdict(
+                label,
+                "crashed",
+                float("inf"),
+                float("inf"),
+                len(samples[label].blocks),
+                samples[label].relative_spread,
+                reason,
             )
         )
 

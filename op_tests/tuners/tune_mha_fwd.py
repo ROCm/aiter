@@ -1107,9 +1107,7 @@ class MhaFwdTuner(TunerCommon):
         fingerprint = json.dumps(
             {
                 "key": list(map(str, key)),
-                "candidates": sorted(
-                    entrant.payload.identity for entrant in entrants
-                ),
+                "candidates": sorted(entrant.payload.identity for entrant in entrants),
                 "protected": sorted(
                     entrant.label for entrant in entrants if entrant.protected
                 ),
@@ -1315,7 +1313,7 @@ class MhaFwdTuner(TunerCommon):
                     info,
                     float(outcome.samples[verdict.label].estimate),
                     float(err_ratio),
-                    "ok",
+                    "crash" if verdict.state == "crashed" else "ok",
                     verdict.note,
                 )
             )
