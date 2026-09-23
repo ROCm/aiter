@@ -1491,7 +1491,7 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(has_bias):
                         acc = acc + Vec(
                             fx.ptr_load(
-                                bias_map + expert * i32_n + col_rel,
+                                bias_map + expert * i32_n + blk_n + col_rel,
                                 result_type=T.vec(8, out_elem),
                             )
                         ).to(fx.Float32)
