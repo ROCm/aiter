@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -17,12 +18,16 @@ from unittest import mock
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 import torch
 
+from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import normalize_gpu_model
 from aiter.ops import mha
 from aiter.ops.mha_fwd_policy import (
+    MHA_FWD_CONFIG_ENV,
+    MHA_FWD_CONFIG_PROPERTY,
     MHA_FWD_RUNTIME_CSV_FIELDS,
     MHA_FWD_TILE_CONFIG_BACKENDS,
     MHA_FWD_TILE_CONFIG_KEYS,
+    MHA_FWD_TUNED_CSV,
     MhaFwdCandidate,
     MhaFwdPlan,
     MhaFwdProblem,
@@ -448,6 +453,25 @@ class TestMhaTunedPolicy(unittest.TestCase):
                             mha._load_mha_fwd_tuning_table(path)
 
 
+class TestFamilyIdentity(unittest.TestCase):
+    def test_the_config_property_names_a_real_aiter_config(self):
+        """The tuning-test tables resolve the table through this name; a
+        misspelled one silently falls back to a filename glob."""
+        self.assertTrue(hasattr(AITER_CONFIGS, MHA_FWD_CONFIG_PROPERTY))
+        # The resolver caches on its arguments, not on the environment, so a
+        # lookup here would pin the path for every later test in the process.
+        clear = type(AITER_CONFIGS).get_config_file.cache_clear
+        clear()
+        self.addCleanup(clear)
+        environment = {k: v for k, v in os.environ.items() if k != MHA_FWD_CONFIG_ENV}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            path = getattr(AITER_CONFIGS, MHA_FWD_CONFIG_PROPERTY)
+        self.assertEqual(os.path.basename(path), MHA_FWD_TUNED_CSV)
+        self.assertEqual(
+            _TUNER.MhaFwdTuner.ARG_DEFAULTS["config_env_name"], MHA_FWD_CONFIG_ENV
+        )
+
+
 class TestMhaWinnerPromotion(unittest.TestCase):
     def _result(self, backend, us, err_ratio=0.0, num_splits=0, config=""):
         problem = MhaFwdProblem.from_mapping(_problem_row())
@@ -486,6 +510,25 @@ class TestMhaWinnerPromotion(unittest.TestCase):
             args,
         )
         self.assertEqual(list(winners["backend"]), ["ck"])
+
+    def test_a_retained_shape_is_finished_without_writing_a_row(self):
+        """Nothing beating auto-select is a result, not a gap: the run must
+        neither publish a row nor report the shape as untuned."""
+        tuner = _TUNER.MhaFwdTuner()
+        key = MhaFwdProblem.from_mapping(_problem_row()).key()
+        tuner._autoselect_by_key = {
+            key: {"identity": ("asm_v3", 0, ""), "latency_us": 1.0}
+        }
+        winners = tuner.post_process(
+            [self._result("triton", 1.5, config='{"BLOCK_M":64}')],
+            argparse.Namespace(profile_file="", errRatio=0.0),
+        )
+        self.assertTrue(winners.empty)
+        self.assertEqual(list(tuner.success["status"]), ["retained"])
+        tuner.untunedf = _TUNER.pd.DataFrame([_problem_row()])
+        tuner.tune_start_time = time.time()
+        tuner.tune_summary("Finished")
+        self.assertEqual(tuner._outcomes()[0]["outcome"], "retained")
 
     def test_runtime_csv_keeps_backend_config_and_drops_metrics(self):
         tuner = _TUNER.MhaFwdTuner()
@@ -828,16 +871,14 @@ class TestMhaCheckpointJournal(unittest.TestCase):
     def test_selection_trace_is_append_only_json(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "proof.jsonl")
-            with mock.patch.dict(
-                os.environ, {"AITER_MHA_FWD_SELECTION_PROOF_FILE": path}
-            ):
+            with mock.patch.dict(os.environ, {"AITER_SELECTION_PROOF_FILE": path}):
                 mha._record_mha_fwd_selection("asm_v3", 3)
                 mha._record_mha_fwd_selection("ck", 0)
             with open(path, encoding="utf-8") as file:
                 rows = [json.loads(line) for line in file]
         self.assertEqual(
-            [(row["backend"], row["num_splits"]) for row in rows],
-            [("asm_v3", 3), ("ck", 0)],
+            [(row["family"], row["backend"], row["num_splits"]) for row in rows],
+            [("mha_fwd", "asm_v3", 3), ("mha_fwd", "ck", 0)],
         )
 
     def test_runtime_and_evidence_are_written_separately(self):

@@ -37,6 +37,7 @@ from ..utility import dtypes
 from .mha_fwd_policy import (
     HD192_SPLITKV_MIN_SPLITS,
     MHA_FWD_BACKENDS,
+    MHA_FWD_FAMILY,
     MHA_FWD_RUNTIME_CSV_FIELDS,
     MHA_FWD_TUNING_KEY_FIELDS,
     MhaFwdPlan,
@@ -262,7 +263,7 @@ def _record_mha_fwd_selection(
 ) -> None:
     """Append the actual public-path selection when a proof file is requested."""
 
-    path = os.getenv("AITER_MHA_FWD_SELECTION_PROOF_FILE", "").strip()
+    path = os.getenv("AITER_SELECTION_PROOF_FILE", "").strip()
     if not path:
         return
     config_json = (
@@ -276,6 +277,7 @@ def _record_mha_fwd_selection(
     _MHA_FWD_RECORDED_SELECTIONS.add(identity)
     payload = json.dumps(
         {
+            "family": MHA_FWD_FAMILY,
             "backend": backend,
             "num_splits": int(num_splits),
             "backend_config": config_json,
