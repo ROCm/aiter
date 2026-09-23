@@ -610,6 +610,28 @@ _bmm_pipeline_local = {
     152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
     158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
 }
+# MX twin for the pipeline family. This family is where the large-M wins live --
+# at g8/m32768 8158 measures 2122 TFLOPS and 8150 1493, against 1158 for the best
+# flatmm kid -- so with no twin here every large-M 32 shape fell back to the
+# flatmm 9325 and lost about half. The block size itself is not what costs that:
+# the same kernel at 32 gives up only ~13% (8325 1158 -> 9325 1004).
+#
+# 150 (no preload) comes first on purpose. The PRELOAD_SF_LDS variant's B-scale
+# panel is sized one byte per thread, and GROUP_N=32 multiplies that by 16, so
+# 158's twin needs the panel rebalanced as a separate step; 150 needs only the
+# lane-addressed scale the traits already describe.
+#
+# 150's twin is kept even though it loses to the flatmm 9325: at GROUP_N=32 the
+# half-tile spans four B scale groups, and those are rows of the scale matrix
+# rather than neighbouring bytes, so its steady-state B fetch is four loads where
+# the 128 kid needs one. Staging that panel in LDS is exactly what 158 does, so
+# the twin that wins is 9158 and 9150 is the substrate it is built on.
+_bmm_pipeline_local.update({
+    150 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(GROUP_N=32, GROUP_K=32),
+    158 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
+        preload_sf_lds=True, GROUP_N=32, GROUP_K=32
+    ),
+})
 _bmm_mouter_local = {
     131: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
     144: _a8w8_mxscale_bmm_spec(

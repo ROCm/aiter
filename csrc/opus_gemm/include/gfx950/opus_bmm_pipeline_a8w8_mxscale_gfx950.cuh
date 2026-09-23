@@ -22,8 +22,16 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
         // DSV4 scale is 128-block. The gfx950 scaled MFMA consumes 32-block
         // E8M0 scale bytes; replicate one checkpoint byte across all four
         // subblocks in the packed scale word to preserve 128-block semantics.
-        static_assert(T::B_K == T::GROUP_K, "e8m0 path assumes one K scale block per B_K");
-        static_assert(T::HALF_B_N == T::GROUP_N, "e8m0 path assumes one B scale per half-tile");
+        // One scale byte per lane per MFMA, at either block size. At GROUP_K=128
+        // that is the whole K extent; at 32 the lane owns exactly one of the
+        // four blocks and the other three belong to the other lane quarters, so
+        // the register tile is the same width and only the address differs.
+        static_assert(T::SF_LANE_SCALES_PER_BK == T::E_K,
+                      "e8m0 path assumes one scale byte per lane per MFMA K extent");
+        // The half-tile may span several B scale groups (GROUP_N=32 gives four);
+        // rep_n_per_scale below maps each N subtile to its group.
+        static_assert(T::HALF_B_N % T::GROUP_N == 0,
+                      "e8m0 path assumes the half-tile spans whole B scale groups");
         if constexpr (T::E_M == 1) {
             const int scale_a = pack_e8m0x4(v_sfa[0]);
             const int scale_b = pack_e8m0x4(v_sfb[0]);
@@ -67,6 +75,40 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
     } else {
         typename Mma::vtype_c v_mma = mma(v_a, v_b, 0, 0);
         scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa, v_sfb, v_c);
+    }
+}
+
+// Fetch this lane's B scale bytes for one half-tile.
+//
+// At GROUP_N=128 the half-tile is exactly one scale group and GROUP_K=128 puts
+// the whole K extent in one block, so this stays the single unqualified load the
+// call sites used to hold verbatim -- same instruction, same address.
+//
+// At GROUP_N=32 the half-tile spans HALF_B_N/GROUP_N groups, and those are rows
+// of the scale matrix rather than neighbouring bytes, so they are stride_sfb
+// apart and need one load each. The lane's own K block is added here rather than
+// folded into g_sfb's base so the buffer keeps the bound it was built with.
+template<typename T, typename VSFB, typename Mem>
+__attribute__((always_inline)) OPUS_D VSFB
+load_sfb_lane_groups(Mem& mem, int row_base, int stride_sfb, int lane_k) {
+    constexpr int NG  = T::HALF_B_N / T::GROUP_N;
+    constexpr int SPK = T::SF_LANE_SCALES_PER_BK;
+    if constexpr (NG == 1 && T::SF_PER_MFMA_K == 1) {
+        (void)stride_sfb;
+        (void)lane_k;
+        return load(mem, row_base);
+    } else {
+        VSFB v{};
+        opus::static_for<NG>([&](auto ng_c) {
+            constexpr int ng = decltype(ng_c)::value;
+            opus::static_for<SPK>([&](auto ik_c) {
+                constexpr int ik = decltype(ik_c)::value;
+                v[ng * SPK + ik] = load<1>(
+                    mem,
+                    row_base + ng * stride_sfb + ik * T::SF_PER_MFMA_K + lane_k)[0];
+            });
+        });
+        return v;
     }
 }
 
@@ -157,6 +199,9 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
 
     auto u_sfa = make_layout_sfa<T>(lane_id, wave_id_m, kargs.stride_sfa);
+    // The A scale carries this inside u_sfa; the B scale is loaded without a
+    // layout, so it needs the lane's block index explicitly. Zero at GROUP_K=128.
+    const int sfb_lane_k = sf_lane_k_block_scale<T>(lane_id);
 
     constexpr int smem_a_byte = T::smem_m_rep * (T::smem_linear_wave + T::smem_padding) * sizeof(D_A);
     __shared__ char smem_a[smem_a_byte * 4];
@@ -190,8 +235,12 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     clear(v_c[1][0]);
     clear(v_c[1][1]);
 
-    using vtype_sfa = vector_t<D_SF, T::E_M * (T::B_K / T::GROUP_K)>;
-    using vtype_sfb = vector_t<D_SF, (T::HALF_B_N / T::GROUP_N) * (T::B_K / T::GROUP_K)>;
+    // Sized per lane. At GROUP_K=32 the tile holds four K blocks but a lane owns
+    // one of them, so these stay the width they are at 128 and the extra blocks
+    // cost registers on no one.
+    using vtype_sfa = vector_t<D_SF, T::E_M * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb =
+        vector_t<D_SF, (T::HALF_B_N / T::GROUP_N) * T::SF_LANE_SCALES_PER_BK>;
     vtype_sfa v_sfa[2][2];
     vtype_sfb v_sfb[2][2];
 
@@ -262,10 +311,16 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     };
     auto load_sfb = [&](int half_tile_n, int tile_k) {
         if constexpr (PRELOAD_SFB_LDS) {
+            // Same gather as the global path, with the panel's compact row
+            // length in place of stride_sfb: the half-tile's N-groups are rows
+            // here too, so at GROUP_N=32 they are sfb_k_scales apart rather than
+            // neighbouring bytes. At 128 there is one row and one block and this
+            // is the single byte read it has always been.
             auto s = make_smem(s_sfb_ptr + sfb_lds_offset(half_tile_n, tile_k));
-            return load<SFB_NG_PER_HALF * SFB_SPK>(s, 0);
+            return load_sfb_lane_groups<T, vtype_sfb>(s, 0, sfb_k_scales, sfb_lane_k);
         } else {
-            return load(g_sfb, sfb_offset(half_tile_n, tile_k));
+            return load_sfb_lane_groups<T, vtype_sfb>(
+                g_sfb, sfb_offset(half_tile_n, tile_k), kargs.stride_sfb, sfb_lane_k);
         }
     };
     // A preloaded panel is read from LDS and issues no vm ops, so it must drop out
@@ -292,18 +347,31 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // under one byte per thread, so one predicated load covers it and the value can
     // sit in a register across the A fill.
     using sfb_reg_t = decltype(load<1>(g_sfb, 0));
-    sfb_reg_t sfb_val{};
-    bool sfb_take = false;
+    // One byte per thread covers the panel at GROUP_N=128 (128 bytes for 512
+    // threads). GROUP_N=32 gives four times the rows and GROUP_K=32 four times
+    // the scales per K tile, so the panel is 16x larger and takes a few passes.
+    // The count is compile-time, so at 128 this is one pass and the same single
+    // predicated load it was; only the 32 twins spend the extra registers.
+    constexpr int SFB_PANEL_MAX = SFB_ROWS * SFB_K_TILES_MAX * SFB_SPK;
+    constexpr int SFB_FILL_ITERS =
+        PRELOAD_SFB_LDS ? ((SFB_PANEL_MAX + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE) : 1;
+    sfb_reg_t sfb_val[SFB_FILL_ITERS];
+    bool sfb_take[SFB_FILL_ITERS] = {};
     if constexpr (PRELOAD_SFB_LDS) {
-        static_assert(SFB_ROWS * SFB_K_TILES_MAX * SFB_SPK <= T::BLOCK_SIZE,
-                      "B-scale panel must fit one byte per thread");
         const int tid = opus::thread_id_x();
-        sfb_take = tid < SFB_ROWS * sfb_k_scales;
-        if (sfb_take) {
-            const int ng = tid / sfb_k_scales;
-            const int ks = tid - ng * sfb_k_scales;
-            sfb_val = load<1>(g_sfb, ng * kargs.stride_sfb + ks);
-        }
+        const int sfb_total = SFB_ROWS * sfb_k_scales;
+        // Every pass is issued before any is stored, so all of them are in
+        // flight across the A panel fill below rather than one per round trip.
+        opus::static_for<SFB_FILL_ITERS>([&](auto it_c) {
+            constexpr int it = decltype(it_c)::value;
+            const int idx = tid + it * T::BLOCK_SIZE;
+            sfb_take[it] = idx < sfb_total;
+            if (sfb_take[it]) {
+                const int ng = idx / sfb_k_scales;
+                const int ks = idx - ng * sfb_k_scales;
+                sfb_val[it] = load<1>(g_sfb, ng * kargs.stride_sfb + ks);
+            }
+        });
     }
 
     // kid157: one-shot cooperative fill of the A-scale panel into LDS, published by
@@ -331,9 +399,13 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
 
     // Land the B scale fetched above; its latency is already spent by now.
     if constexpr (PRELOAD_SFB_LDS) {
-        if (sfb_take) {
-            make_smem(s_sfb_ptr).template store<1>(sfb_val, opus::thread_id_x());
-        }
+        opus::static_for<SFB_FILL_ITERS>([&](auto it_c) {
+            constexpr int it = decltype(it_c)::value;
+            if (sfb_take[it]) {
+                make_smem(s_sfb_ptr).template store<1>(
+                    sfb_val[it], opus::thread_id_x() + it * T::BLOCK_SIZE);
+            }
+        });
     }
 
     // One barrier for both panels: draining after each fill in turn cost two full
@@ -652,12 +724,22 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a8w8_scale_k1024_l
 // per-K-tile SFA/SFB global buffer_loads are removed from the vmcnt gate entirely.
 // Supports any K<=8192 (K%B_K==0); LDS panels sized for the compile-time upper
 // bound, packed K-tile count resolved at runtime.
+//
+// The A panel is carried only when the quantisation block spans the whole MFMA
+// K extent (SF_PER_MFMA_K==1, i.e. GROUP_K==128 here). At GROUP_K=32 one K-tile
+// holds B_K/GROUP_K scale bytes per row instead of one, so the same panel would
+// be SFA_ROWS(256) * 64 tiles * 4 = 64 KiB and no longer fits beside the A/B
+// smem tiles at 1 WG/CU; shrinking SFA_K_MAX to buy it back would exclude the
+// K=4096 shapes this kid exists for. B keeps its panel either way -- it is the
+// one that pays, since at GROUP_N=32 the four N-groups are separate rows and
+// the steady-state SFB fetch is four uncoalesceable loads inside the vmcnt gate.
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
 void gemm_a8w8_scale_preload_sf_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    gemm_a8w8_scale_kernel_impl<Traits, false, true, true>(kargs);
+    gemm_a8w8_scale_kernel_impl<Traits, false,
+                                (Traits::SF_PER_MFMA_K == 1), true>(kargs);
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }
@@ -717,6 +799,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
 
     auto u_sfa = make_layout_sfa<T>(lane_id, wave_id_m, kargs.stride_sfa);
+    // The A scale carries this inside u_sfa; the B scale is loaded without a
+    // layout, so it needs the lane's block index explicitly. Zero at GROUP_K=128.
+    const int sfb_lane_k = sf_lane_k_block_scale<T>(lane_id);
 
     constexpr int smem_a_byte = T::smem_m_rep * (T::smem_linear_wave + T::smem_padding) * sizeof(D_A);
     __shared__ char smem_a[smem_a_byte * 4];
@@ -750,8 +835,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     clear(v_c[1][0]);
     clear(v_c[1][1]);
 
-    using vtype_sfa = vector_t<D_SF, T::E_M * (T::B_K / T::GROUP_K)>;
-    using vtype_sfb = vector_t<D_SF, (T::HALF_B_N / T::GROUP_N) * (T::B_K / T::GROUP_K)>;
+    // Sized per lane. At GROUP_K=32 the tile holds four K blocks but a lane owns
+    // one of them, so these stay the width they are at 128 and the extra blocks
+    // cost registers on no one.
+    using vtype_sfa = vector_t<D_SF, T::E_M * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb =
+        vector_t<D_SF, (T::HALF_B_N / T::GROUP_N) * T::SF_LANE_SCALES_PER_BK>;
     vtype_sfa v_sfa[2][2];
     vtype_sfb v_sfb[2][2];
 
@@ -772,11 +861,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
 
     // Prologue
     v_sfa[tic][0] = load(g_sfa, u_sfa, sfa_offset(0, 0));
-    v_sfb[tic][0] = load(g_sfb, sfb_offset(0, 0));
+    v_sfb[tic][0] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(0, 0), kargs.stride_sfb, sfb_lane_k);
     async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0));
     async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0));
     v_sfa[tic][1] = load(g_sfa, u_sfa, sfa_offset(1, 0));
-    v_sfb[tic][1] = load(g_sfb, sfb_offset(1, 0));
+    v_sfb[tic][1] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(1, 0), kargs.stride_sfb, sfb_lane_k);
     async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
     async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
 
@@ -786,7 +875,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     __builtin_amdgcn_s_barrier();
 
     v_sfa[toc][0] = load(g_sfa, u_sfa, sfa_offset(0, 1));
-    v_sfb[toc][0] = load(g_sfb, sfb_offset(0, 1));
+    v_sfb[toc][0] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(0, 1), kargs.stride_sfb, sfb_lane_k);
     async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1));
     async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1));
     async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, 1));
@@ -800,7 +889,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     // Main loop
     for(int tile = 0; tile < loops - 2; tile += 2) {
         // First tile
-        v_sfb[toc][1] = load(g_sfb, sfb_offset(1, tile + 1));
+        v_sfb[toc][1] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(1, tile + 1), kargs.stride_sfb, sfb_lane_k);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 1));
         s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
@@ -833,7 +922,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfb[tic][0] = load(g_sfb, sfb_offset(0, tile + 2));
+        v_sfb[tic][0] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(0, tile + 2), kargs.stride_sfb, sfb_lane_k);
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2));
         __builtin_amdgcn_s_barrier();
@@ -866,7 +955,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         __builtin_amdgcn_sched_barrier(0);
 
         // Second tile
-        v_sfb[tic][1] = load(g_sfb, sfb_offset(1, tile + 2));
+        v_sfb[tic][1] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(1, tile + 2), kargs.stride_sfb, sfb_lane_k);
         v_b = load<T::VEC_B>(s_b[toc][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2));
         s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
@@ -899,7 +988,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfb[toc][0] = load(g_sfb, sfb_offset(0, tile + 3));
+        v_sfb[toc][0] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(0, tile + 3), kargs.stride_sfb, sfb_lane_k);
         v_b = load<T::VEC_B>(s_b[toc][1], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3));
         __builtin_amdgcn_s_barrier();
@@ -936,7 +1025,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     {
         int tile = loops - 2;
 
-        v_sfb[toc][1] = load(g_sfb, sfb_offset(1, tile + 1));
+        v_sfb[toc][1] = load_sfb_lane_groups<T, vtype_sfb>(g_sfb, sfb_offset(1, tile + 1), kargs.stride_sfb, sfb_lane_k);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 1));
         __builtin_amdgcn_s_barrier();

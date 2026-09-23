@@ -68,6 +68,33 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
 
     static_assert(VEC_A == 16 / sizeof(D_A));
+
+    // MX blocks inside one MFMA's K extent, and why GROUP_K=32 costs this family
+    // no extra scale register: a 16x16x128 fragment hands each lane
+    // W_M*W_K/warp_size == 32 elements, exactly one MX block, so the lane
+    // supplies its own scale byte. The SF_PER_MFMA_K blocks of one MFMA are told
+    // apart by lane_id / W_M in the scale *address*, not by a wider register
+    // tile -- the same scheme the flatmm split-K traits below already use.
+    // At GROUP_K=128 SF_PER_MFMA_K is 1, the lane term is a literal 0 and
+    // SF_LANE_SCALES_PER_BK == B_K/GROUP_K, so the 128 path keeps the register
+    // count and the address it always had.
+    static_assert(W_K % GROUP_K == 0, "an MFMA K extent must hold whole scale blocks");
+    static constexpr int SF_PER_MFMA_K = W_K / GROUP_K;
+    static constexpr int SF_LANE_K_QUARTERS = opus::get_warp_size() / W_M;
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
+    static_assert(SF_LANE_K_QUARTERS % SF_PER_MFMA_K == 0,
+                  "lane quarters must divide evenly among an MFMA's scale blocks");
+#endif
+    // Clamped so the wave32 host pass (where this is never used, and where the
+    // quarters count is half) cannot make it zero and turn the divide below
+    // into a compile-time division by zero.
+    static constexpr int SF_LANE_K_DIV =
+        SF_LANE_K_QUARTERS >= SF_PER_MFMA_K ? SF_LANE_K_QUARTERS / SF_PER_MFMA_K : 1;
+    // Scale bytes one lane actually holds per K tile: the tile's blocks divided
+    // by the ones the lanes cover between them.
+    static constexpr int SF_LANE_SCALES_PER_BK = (B_K / GROUP_K) / SF_PER_MFMA_K;
+    static_assert(SF_LANE_SCALES_PER_BK >= 1);
+
     static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
     static constexpr int smem_sub = smem_linear_wave / B_K;
     static constexpr int smem_m_rep = HALF_B_M / smem_sub;
@@ -78,8 +105,13 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     static constexpr int b_buffer_load_insts = HALF_B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
-    static constexpr int sfa_buffer_load_insts = E_M * (B_K / GROUP_K);
-    static constexpr int sfb_buffer_load_insts = (HALF_B_N / GROUP_N) * (B_K / GROUP_K);
+    // Counted per lane, not per tile: at GROUP_K=32 the tile's extra K blocks are
+    // covered by the other lane quarters, not by extra loads on this one. These
+    // feed the steady-state vmcnt thresholds, so over-counting them would retire
+    // a wait early and release the barrier with A/B still in flight.
+    static constexpr int sfa_buffer_load_insts = E_M * SF_LANE_SCALES_PER_BK;
+    static constexpr int sfb_buffer_load_insts =
+        (HALF_B_N / GROUP_N) * SF_LANE_SCALES_PER_BK;
 };
 
 struct opus_gemm_scale_kargs_gfx950 {
