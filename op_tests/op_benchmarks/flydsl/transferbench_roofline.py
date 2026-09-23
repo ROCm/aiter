@@ -90,9 +90,9 @@ a warning rather than an exception.
 
 Standalone, to see what would be run and to check the parser::
 
-    python3 op_tests/multigpu_tests/transferbench_roofline.py --dry-run -t 4
-    python3 op_tests/multigpu_tests/transferbench_roofline.py --self-test
-    python3 op_tests/multigpu_tests/transferbench_roofline.py -t 4 -b 114688
+    python3 op_tests/op_benchmarks/flydsl/transferbench_roofline.py --dry-run -t 4
+    python3 op_tests/op_benchmarks/flydsl/transferbench_roofline.py --self-test
+    python3 op_tests/op_benchmarks/flydsl/transferbench_roofline.py -t 4 -b 114688
 """
 
 import logging
@@ -767,10 +767,8 @@ def main() -> None:
 
     binary = find_binary(args.bin)
     if binary is None:
-        # Self-skip rather than exit non-zero. CI runs `python3 <file>` over
-        # every .py under multigpu_tests/ (.github/scripts/aiter_test.sh), so a
-        # hard failure here would fail the whole multi-GPU job on every runner
-        # that lacks an optional third-party binary.
+        # Warn and return rather than exit non-zero: TransferBench is an
+        # optional third-party binary, and its absence is not an error.
         logger.warning(
             "TransferBench not found; nothing to do. Build it from "
             "https://github.com/ROCm/TransferBench and set $TRANSFERBENCH "

@@ -111,45 +111,44 @@ production gates leave on the table.
 Examples::
 
     # default sweep: TP4 only, DSv4 shapes plus every dispatch boundary
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py
 
     # also cover the 1stage-only TP2 case, decode shapes only
-    HIP_VISIBLE_DEVICES=6,7 python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
+    HIP_VISIBLE_DEVICES=6,7 python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py \
         -tp 2 -s 1,7168 8,7168
 
     # just the two kernels we ship, against RCCL
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py -c cdr rccl
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py -c cdr rccl
 
     # "what is the fastest thing I could actually ship?" -- the summary table's
     # `fastest collective` column, restricted to candidates clearing 25 dB SQNR
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py --min-sqnr 25
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py --min-sqnr 25
 
     # fp16, where the fp8-quantized custom AR becomes available
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py -d fp16
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py -d fp16
 
     # add the fabric ceiling: how much of what TransferBench can move in the
     # same pattern is each candidate actually getting? Needs the TransferBench
     # binary -- see transferbench_roofline.py.
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py --roofline
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py --roofline
 
     # save a report to diff against after a kernel change
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py -o /tmp/ar_before.md
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py -o /tmp/ar_before.md
     #   ... change the kernel, rebuild, then -o /tmp/ar_after.md and diff the two.
 
-    # dispatch-threshold sweep: a byte ladder too long for a command line, and
-    # a CSV of the raw numbers to fit against. The default shape list jumps
-    # 168 KiB -> 1.75 MiB -> 14 MiB and both family crossovers hide in those
-    # gaps -- pinned fly_1stage* rows survive across the whole ladder by
-    # default (see _FLY1S_DEFAULT_CEILING); AITER_BENCH_FLY1S_MAX_KB would
-    # only be needed to narrow the window instead. See
-    # op_tests/multigpu_tests/shapes/README.md.
-    python3 op_tests/multigpu_tests/bench_comm_allreduce.py -tp 4 \
+    # dispatch-threshold sweep: a byte ladder too long for a command line
+    # (an M,K CSV, see load_shapes_csv), plus a CSV of the raw numbers. The
+    # default shape list jumps 168 KiB -> 1.75 MiB -> 14 MiB and both family
+    # crossovers hide in those gaps -- pinned fly_1stage* rows survive across
+    # the whole ladder by default (see _FLY1S_DEFAULT_CEILING);
+    # AITER_BENCH_FLY1S_MAX_KB would only be needed to narrow the window.
+    python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py -tp 4 \
         -c fly_int4 fly_int4_ring fly_1stage fly_1stage_b256_a4_g64 \
-        --shape-csv op_tests/multigpu_tests/shapes/ar_sweep_a_small.csv \
-        -o /tmp/ar_a_small_tp4.md --output-csv /tmp/ar_a_small_tp4.csv
+        --shape-csv /path/to/sweep.csv \
+        -o /tmp/ar_sweep_tp4.md --output-csv /tmp/ar_sweep_tp4.csv
 
     # profiling entrypoint: few iters, per-rank chrome trace
-    HIP_VISIBLE_DEVICES=6,7 python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
+    HIP_VISIBLE_DEVICES=6,7 python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py \
         -tp 2 -s 8,7168 --iters 20 --profile
 
     # under rocprofv3. Do NOT pass -o: ranks are separate processes and a fixed
@@ -157,7 +156,7 @@ Examples::
     # Omitting it gives <pid>_kernel_trace.csv per rank.
     HIP_VISIBLE_DEVICES=4,5,6,7 rocprofv3 --kernel-trace -d /tmp/arprof \
         --output-format csv -- \
-        python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
+        python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py \
             -tp 4 -s 8,7168 12,7168 --iters 20 --warmup 2
     # then filter Kernel_Name for cross_device_reduce_{1,2}stage.
 
@@ -171,12 +170,12 @@ Examples::
     ARGS="-c fly_int4 --shape 1024,7168 --warmup 20 --iters 50"
     for r in 1 2 3; do
         HIP_VISIBLE_DEVICES=0,1,2,3 python3 \
-            op_tests/multigpu_tests/bench_comm_allreduce.py \
+            op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py \
             $ARGS --rank $r --init-method $INIT --repeat 4 &
     done
     HIP_VISIBLE_DEVICES=0,1,2,3 rocprofv3 -i pmc_recipe.txt -f csv -d /tmp/arpmc \
         -o pass0_%pid% -- \
-        python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
+        python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py \
             $ARGS --rank 0 --init-method $INIT
     # Keep the JIT cache on (do not set FLYDSL_RUNTIME_ENABLE_CACHE=0): every
     # pass must launch the identical kernel set or the join has nothing to
@@ -565,19 +564,20 @@ class Candidate:
             self.skip_self,
         )
 
+
 _FLY1S_GRID = (
     # block, atoms, grid_cap, fanout   tile
-    (64, 1, 64, "peer"),    # 1 KiB
-    (64, 1, 256, "peer"),   # 1 KiB
+    (64, 1, 64, "peer"),  # 1 KiB
+    (64, 1, 256, "peer"),  # 1 KiB
     (128, 1, 128, "peer"),  # 2 KiB
-    (256, 1, 64, "peer"),   # 4 KiB
+    (256, 1, 64, "peer"),  # 4 KiB
     (256, 1, 128, "peer"),  # 4 KiB
-    (128, 2, 64, "peer"),   # 4 KiB
-    (64, 4, 64, "peer"),    # 4 KiB
-    (256, 2, 64, "peer"),   # 8 KiB
-    (256, 2, 64, "atom"),   # 8 KiB
-    (256, 4, 64, "peer"),   # 16 KiB
-    (256, 4, 64, "atom"),   # 16 KiB
+    (128, 2, 64, "peer"),  # 4 KiB
+    (64, 4, 64, "peer"),  # 4 KiB
+    (256, 2, 64, "peer"),  # 8 KiB
+    (256, 2, 64, "atom"),  # 8 KiB
+    (256, 4, 64, "peer"),  # 16 KiB
+    (256, 4, 64, "atom"),  # 16 KiB
     (256, 4, 128, "peer"),  # 16 KiB
 )
 
@@ -596,7 +596,7 @@ def _fly1s_grid_rows():
                 Candidate(
                     key,
                     "fly1s",
-                    40.0, # min acceptable SQNR value 
+                    40.0,  # min acceptable SQNR value
                     True,
                     atoms=atoms,
                     grid_cap=cap,
@@ -732,10 +732,9 @@ CANDIDATES = (
     # `_FLY_ACCURACY_ENV`), standing in for AITER_QUICK_REDUCE_QUANTIZATION --
     # with the quick-reduce slot closed this row's window is capped at
     # oneshot_max_exact and the mesh/ring rungs are never reached at all.
-    # The acceptance test for the whole heuristic -- it must stay within ~10%
-    # of the best pinned row at every shape, which is what
-    # `fit_allreduce_policy.py --audit-auto` checks (run with --fly-accuracy
-    # fast to exercise the full three-family policy). Its accuracy floor has
+    # The acceptance test for the whole heuristic: it should stay within ~10%
+    # of the best pinned row at every shape (run with --fly-accuracy fast to
+    # exercise the full three-family policy). Its accuracy floor has
     # to be the *quantized* one even in fast mode even though it is bit-exact
     # at decode sizes: one row spans both accuracy classes because the
     # schedule changes underneath it, which is exactly the thing being tested.
@@ -2144,7 +2143,10 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
     # Only worth a separate column when the sweep actually mixes accuracy
     # classes; with -c cdr rccl every candidate is exact and it would duplicate.
     want_exact = any(
-        not _exact_here(r, k) for _, r in df.iterrows() for k in live if pd.notna(r.get(f"{k} us"))
+        not _exact_here(r, k)
+        for _, r in df.iterrows()
+        for k in live
+        if pd.notna(r.get(f"{k} us"))
     )
 
     def _pick(row, pool, floor):
@@ -2508,7 +2510,7 @@ def main():
         default=None,
         help="read (tokens, hidden) pairs from a CSV with M,K columns instead\n"
         "of -s/--shape. For the dispatch sweeps, whose ~50 sizes per world size\n"
-        "do not fit on a command line; see op_tests/multigpu_tests/shapes/.",
+        "do not fit on a command line.",
     )
     parser.add_argument(
         "-d",
