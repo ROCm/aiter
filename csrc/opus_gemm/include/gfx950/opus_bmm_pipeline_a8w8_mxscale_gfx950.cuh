@@ -385,7 +385,16 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // bodies. Zero is the conservative choice: every wait stays at least as
     // strict as the non-ring pipeline's, which can only make a burst body
     // retire its own fetches early -- they are one dword each.
-    constexpr int SFA_RING_VM    = SFA_RING_OK ? 1 : 0;
+    // Zero, not one. A burst issues SFA_RING_BURST/2 loads on one body in
+    // every SFA_RING_BURST/2, so the other bodies have no ring load in flight
+    // at all and any positive slack there is an unconditional loosening of a
+    // gate that guards A/B data a consumer is about to ds_read. The barriers
+    // around those reads order the waves; they do not stand in for the VM
+    // completion the gate exists to wait for. Passing tests only show the
+    // latency happened to be covered. Zero keeps every wait at least as strict
+    // as the non-ring pipeline's, which can at worst make a burst body retire
+    // its own fetches early.
+    constexpr int SFA_RING_VM    = 0;
     constexpr int SFA_RING_COLS  = SFA_RING_TILES * SFA_SPK;
     static_assert(!SFA_RING_OK || (SFA_RING_AHEAD >= 4 &&
                                    SFA_RING_BURST >= 2 &&
