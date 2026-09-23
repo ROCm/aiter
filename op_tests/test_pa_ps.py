@@ -439,7 +439,14 @@ def test_pa_ps(
     profile_ps: bool = False,
     quant_type: QuantType = QuantType.per_Token,
     test_case=None,
+    metadata_planner: str = "legacy",
 ) -> dict:
+    if metadata_planner not in ("legacy", "tile"):
+        raise ValueError("metadata_planner must be legacy or tile")
+    if metadata_planner == "tile" and block_size != 16:
+        raise ValueError("tile planning requires page16 to match the PA_PS ASM kernels")
+    if metadata_planner == "tile" and load_metadata:
+        raise ValueError("tile planning cannot be combined with loaded metadata")
     ret = {}
     seed = 0
     device = "cuda:0"
@@ -596,6 +603,48 @@ def test_pa_ps(
             meta = torch.from_numpy(array).reshape(shape)
             torch.set_printoptions(threshold=999999, linewidth=120)
             print(f"==>load {name} from {file_name}:\n{meta}")
+    elif metadata_planner == "tile":
+        from aiter.ops.triton.attention.pa_ps_metadata import plan_pa_ps_metadata
+
+        plan = plan_pa_ps_metadata(
+            qo_indptr,
+            kv_indptr,
+            seq_lens_kv,
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
+            max_qlen=int(max_qlen),
+            block_size=block_size,
+        )
+        work_metadata_ptrs = plan.work_metadata_ptrs
+        work_indptr = plan.work_indptr
+        work_info = plan.work_info
+        reduce_indptr = plan.reduce_indptr
+        reduce_final_map = plan.reduce_final_map
+        reduce_partial_map = plan.reduce_partial_map
+        metadata_map.update(
+            work_indptr=work_indptr,
+            work_info=work_info,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+        )
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        plan_pa_ps_metadata(
+            qo_indptr,
+            kv_indptr,
+            seq_lens_kv,
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
+            max_qlen=int(max_qlen),
+            block_size=block_size,
+            plan=plan,
+        )
+        end_event.record()
+        end_event.synchronize()
+        us_metadata = start_event.elapsed_time(end_event) * 1000
     else:
         # warmup for get_pa_metadata_v1
         aiter.get_pa_metadata_v1(
@@ -822,7 +871,7 @@ def test_pa_ps(
         ret["us_asm_fp8"] = us_aiter_asm
         ret["err fp8"] = err
 
-    if test_case is not None:
+    if test_case is not None or metadata_planner == "tile":
         assert torch.isfinite(out_ref).all(), "Non-finite reference output"
         assert torch.isfinite(
             output
@@ -922,6 +971,25 @@ parser.add_argument(
     --dump_metadata # True""",
 )
 parser.add_argument(
+    "--metadata-planner",
+    choices=["legacy", "tile"],
+    default="legacy",
+    help="PA_PS metadata policy; tile uses the opt-in page16 Triton planner with the existing ASM ABI.",
+)
+parser.add_argument(
+    "--mask",
+    type=int,
+    choices=[0, 1],
+    default=None,
+    help="Restrict the accuracy matrix to one mask; omit to retain the existing matrix.",
+)
+parser.add_argument(
+    "--kv-dtype",
+    choices=["fp8", "int8", "noquant"],
+    default=None,
+    help="Restrict KV dtype; omit to retain the existing accuracy matrix.",
+)
+parser.add_argument(
     "--profile",
     action="store_true",
     help="""Enable performance profiling. Default: False (single run).
@@ -957,7 +1025,7 @@ for dtype in args.dtype:
     for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
         args.num_heads, args.qlen, args.ctx_len, args.batch_size, args.block_size
     ):
-        test_cases = [None]
+        test_cases = [None] if args.mask is None else [(aiter.dtypes.fp8, args.mask)]
         if block_size == 16:
             if (
                 dtype not in (torch.bfloat16, torch.float16)
@@ -975,8 +1043,22 @@ for dtype in args.dtype:
             test_cases = [
                 (kv_dtype, mask)
                 for kv_dtype in kv_dtypes
-                for mask in ([0, 1] if qlen > 2 else [1])
+                for mask in (
+                    [args.mask] if args.mask is not None else ([0, 1] if qlen > 2 else [1])
+                )
             ]
+        if args.kv_dtype is not None:
+            selected_kv_dtype = {
+                "fp8": aiter.dtypes.fp8,
+                "int8": torch.int8,
+                "noquant": dtype,
+            }[args.kv_dtype]
+            if block_size == 16:
+                test_cases = [case for case in test_cases if case[0] == selected_kv_dtype]
+                if not test_cases:
+                    raise ValueError("The selected KV dtype is not supported by this test geometry")
+            else:
+                test_cases = [(selected_kv_dtype, 1 if args.mask is None else args.mask)]
         for test_case in test_cases:
             ret = test_pa_ps(
                 ctx_len,
@@ -992,6 +1074,7 @@ for dtype in args.dtype:
                 args.profile,
                 getattr(QuantType, args.quant_type),
                 test_case=test_case,
+                metadata_planner=args.metadata_planner,
             )
             df.append(ret)
     df = pd.DataFrame(df)
