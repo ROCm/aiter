@@ -211,8 +211,8 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
         num_blocks = (max_model_len + blocksize - 1) // blocksize
 
         assert (
-            not args.kv_preshuffle or blocksize % 16 == 0 or 16 % blocksize == 0
-        ), f"Preshuffle needs a page that is a multiple of the 16-token MFMA tile or divides it; got {blocksize}."
+            not args.kv_preshuffle or blocksize % 16 == 0 or blocksize == 8
+        ), f"Preshuffle needs a page that is a multiple of the 16-token MFMA tile, or 8; got {blocksize}."
 
         var_ratio = 0.5
         # varctx gluon kernel only exists on the preshuffle path; passing a
@@ -316,8 +316,8 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
 
                 split_kv_cache = kv_cache_fp8.view(-1, blocksize * kv_index_dim)
                 # A page shorter than the 16-token MFMA tile is shuffled in
-                # groups of its own length; the kernel reads the tile from
-                # 16 // blocksize pages.
+                # groups of its own length; the kernel then assembles one tile
+                # from two pages.
                 split_kv_cache_data = shuffle_weight(
                     split_kv_cache[..., : kv_block_Size * index_dim]
                     .contiguous()
@@ -510,8 +510,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="KVCache page size in tokens. Preshuffle needs a multiple of the "
-        "16-token MFMA tile or a page that divides it. Default: 16 with "
-        "--kv_preshuffle, 1 without.",
+        "16-token MFMA tile, or 8. Default: 16 with --kv_preshuffle, 1 without.",
     )
     parser.add_argument(
         "--no-varctx",
