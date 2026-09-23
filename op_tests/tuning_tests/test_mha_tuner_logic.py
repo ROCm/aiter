@@ -331,10 +331,7 @@ class TestMhaTunedPolicy(unittest.TestCase):
 
     def test_measurement_rows_are_rejected_as_runtime_artifacts(self):
         fields = [
-            *mha.MHA_FWD_TUNING_KEY_FIELDS,
-            "backend",
-            "num_splits",
-            "backend_config",
+            *MHA_FWD_RUNTIME_CSV_FIELDS,
             "status",
         ]
         values = {field: "0" for field in fields}
@@ -416,14 +413,39 @@ class TestMhaTunedPolicy(unittest.TestCase):
                     compiled(q, k, v, max_seqlen_k)
         self.assertEqual(resolved, [2, 5])
 
-    def test_runtime_csv_has_no_measurement_columns(self):
+    def test_runtime_csv_carries_the_latency_but_not_the_rest_of_the_evidence(self):
+        # us rides along the way it does in the tuned GEMM CSVs, so a reviewer
+        # can sanity-check a row. status, errRatio and the raw samples belong
+        # to the tuning run and stay in their own file.
         config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
         with config.open(encoding="utf-8", newline="") as file:
             fields = tuple(csv.DictReader(file).fieldnames or ())
         self.assertEqual(fields, MHA_FWD_RUNTIME_CSV_FIELDS)
-        self.assertIn("backend_config", fields)
-        self.assertNotIn("us", fields)
-        self.assertNotIn("status", fields)
+        self.assertIn("us", fields)
+        for evidence in ("status", "errRatio", "detail", "samples_us", "tflops"):
+            self.assertNotIn(evidence, fields)
+
+    def test_a_latency_that_is_not_a_latency_is_rejected(self):
+        # A row is hand-editable, and a nonsense us means it did not come out
+        # of a tuning run. A blank stays legal: pinning a backend by hand is.
+        for us, valid in (("", True), ("134.5", True), ("0", False), ("fast", False)):
+            with self.subTest(us=us):
+                row = {**_problem_row(), "backend": "asm_v3", "num_splits": 1}
+                row.update(backend_config="", us=us)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, "tuned_mha_fwd.csv")
+                    with open(path, "w", encoding="utf-8", newline="") as file:
+                        writer = csv.DictWriter(
+                            file, fieldnames=MHA_FWD_RUNTIME_CSV_FIELDS
+                        )
+                        writer.writeheader()
+                        writer.writerow(row)
+                    if valid:
+                        plan = next(iter(mha._load_mha_fwd_tuning_table(path).values()))
+                        self.assertEqual(plan["us"], float(us) if us else None)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "invalid us"):
+                            mha._load_mha_fwd_tuning_table(path)
 
 
 class TestMhaWinnerPromotion(unittest.TestCase):
@@ -510,10 +532,11 @@ class TestMhaWinnerPromotion(unittest.TestCase):
                 fields = tuple(reader.fieldnames or ())
                 written = next(reader)
         self.assertEqual(fields, MHA_FWD_RUNTIME_CSV_FIELDS)
-        self.assertNotIn("us", fields)
         self.assertNotIn("status", fields)
         self.assertEqual(written["backend"], "triton")
         self.assertEqual(written["backend_config"], config)
+        # The winner's own latency, carried through to the row it justifies.
+        self.assertEqual(float(written["us"]), 1.5)
 
 
 class TestMhaPublicDispatch(unittest.TestCase):
