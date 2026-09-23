@@ -28,7 +28,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_device_name, get_gfx
 from aiter.ops.mha import flash_attn_varlen_func, fmha_v3_varlen_fwd
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -179,7 +179,7 @@ def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6 if us else float("nan")
         ret[f"{name} TB/s"] = nbytes / us / 1e6 if us else float("nan")
-        ret[f"{name} err"] = checkAllclose(
+        ret[f"{name} err"] = assertAllclose(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
             rtol=2e-2,
@@ -187,7 +187,7 @@ def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
             msg=f"{name} O sq={sq} sk={sk} hq={hq} ns={num_splits}",
         )
         if return_lse:
-            checkAllclose(
+            assertAllclose(
                 ref_lse.to(dtypes.fp32),
                 lse.to(dtypes.fp32),
                 rtol=2e-2,
@@ -238,7 +238,7 @@ def test_fmha_gfx942_asm_splitkv_empty_k(sq, hq, num_splits):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6 if us else float("nan")
         ret[f"{name} TB/s"] = nbytes / us / 1e6 if us else float("nan")
-        ret[f"{name} err"] = checkAllclose(
+        ret[f"{name} err"] = assertAllclose(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
             rtol=0,
@@ -305,14 +305,14 @@ def _check_compile_outputs():
     assert eager[1].dtype == torch.float32
     assert eager[2].dtype == q.dtype
     assert eager[3].dtype == torch.int64
-    checkAllclose(
+    assertAllclose(
         eager[0].to(dtypes.fp32),
         compiled[0].to(dtypes.fp32),
         rtol=2e-2,
         atol=2e-2,
         msg="torch.compile O",
     )
-    checkAllclose(
+    assertAllclose(
         eager[1].to(dtypes.fp32),
         compiled[1].to(dtypes.fp32),
         rtol=2e-4,
@@ -322,7 +322,8 @@ def _check_compile_outputs():
 
 
 def _check_cuda_graph():
-    sq, sk, hq = 129, 2048, 4
+    # sk=8192 is the first auto-select length; this captures split producer + combine.
+    sq, sk, hq = 129, 8192, 4
     q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
     k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
     v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
@@ -360,7 +361,7 @@ def _check_forced_split_writes_out():
     assert result[0].data_ptr() == sentinel, "forced split must write the caller out="
     assert torch.equal(result[0], out)
     ref_out, _ = run_torch(q, k, v, scale)
-    checkAllclose(
+    assertAllclose(
         ref_out.to(dtypes.fp32),
         out.to(dtypes.fp32),
         rtol=2e-2,
@@ -384,6 +385,26 @@ def _check_forced_split_causal_rejected():
             raise
         return
     raise AssertionError("forced split with causal=True should raise")
+
+
+def _check_non_lse():
+    sq, sk, hq = 129, 2048, 4
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    ref_out, _ = run_torch(q, k, v, scale)
+    out, lse, _, _ = _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False)
+    assert lse.numel() == 0
+    assertAllclose(
+        ref_out.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg="forced split return_lse=False",
+    )
 
 
 def main():
@@ -463,6 +484,7 @@ def main():
     _check_empty_partition_rejected()
     _check_forced_split_writes_out()
     _check_forced_split_causal_rejected()
+    _check_non_lse()
     _check_compile_outputs()
     _check_cuda_graph()
 
