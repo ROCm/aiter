@@ -49,7 +49,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import LOG2E, create_llvm_ptr
@@ -90,6 +90,13 @@ WMMA_N = 16  # kv rows per WMMA tile (the S^T=K@Q^T output's n_block-direction a
 WMMA_K = 32  # WMMA contraction depth (bf16 v_wmma_f32_16x16x32); d-tile width
 WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
 BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
+# 1 => BLOCK_M 128 ("m16x8"), 2 => BLOCK_M 256. Chosen per call by _pick_num_q_tiles.
+NUM_Q_TILES_CHOICES = (1, 2)
+NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
+
+
+def _block_m(num_q_tiles_per_wave):
+    return WMMA_M * num_q_tiles_per_wave * NUM_WAVES
 
 
 class WarpType(IntEnum):
@@ -316,22 +323,22 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     return fx.Float32(llvm_dialect.load(T.f32, gptr))
 
 
-def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
+def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
     """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
     indices: ``(kv_head, q_head_idx, seq_idx)``, the latter two length-R lists (one per
-    q-WMMA-tile this wave owns, R = WMMA_ROW_PER_WAVE).
+    q-WMMA-tile this wave owns, R = num_q_tiles_per_wave).
 
     block_id y is the kv_head; block_id x tiles that head's ``(seq, q_head_in_group)``
     plane, with ``q_head_in_group`` the fast axis so the ``% / //`` use the small (often
     power-of-two) ``gqa_ratio``. The R tiles a wave owns are contiguous.
     """
     kv_head = fx.Int32(gpu.block_id("y"))
-    warp_row0 = fx.Int32(gpu.block_id("x")) * BLOCK_M + warp_idx * (
-        WMMA_ROW_PER_WAVE * WMMA_M
-    )
+    warp_row0 = fx.Int32(gpu.block_id("x")) * _block_m(
+        num_q_tiles_per_wave
+    ) + warp_idx * (num_q_tiles_per_wave * WMMA_M)
     q_head_idx = []
     seq_idx = []
-    for qt in range(WMMA_ROW_PER_WAVE):
+    for qt in range(num_q_tiles_per_wave):
         row_idx = warp_row0 + qt * WMMA_M + lane_idx % WMMA_M
         q_head_idx.append(kv_head * gqa_ratio + row_idx % gqa_ratio)
         seq_idx.append(row_idx // gqa_ratio)
@@ -537,7 +544,7 @@ def _softmax(
 ):
     """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
 
-    Every ``*_list`` argument and return is length R (= WMMA_ROW_PER_WAVE). The R rows are
+    Every ``*_list`` argument and return is length R (= num_q_tiles_per_wave). The R rows are
     independent (each owns its S, running m/d and mask bounds) but share the tile's K/V,
     so processing them together lets ``_tree_reduce_multi`` interleave their max/sum trees
     and dual-issue the combines, hiding each other's permlanex16 latency. ``s_list`` is
@@ -859,6 +866,7 @@ def _core_attention(
     return_lse,
     has_sink,  # compile-time: fold a per-head sink logit into the softmax denom
     gqa_ratio,  # compile-time GQA group size = nheads_q // nheads_kv
+    num_q_tiles_per_wave,  # compile-time q-WMMA tiles per wave; BLOCK_M = 16*this*8
     ptr_O,
     ptr_Q,
     ptr_K,
@@ -902,8 +910,11 @@ def _core_attention(
     once per compile-time value; the two instantiations differ only in their main-loop
     phase ordering (LO drives the K load, HI shadows it).
     """
+    BLOCK_M = _block_m(num_q_tiles_per_wave)
     lane_idx = _lane_id()
-    kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
+    kv_head, q_head_idx, seq_idx = _packed_tile_indices(
+        gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave
+    )
 
     # softmax_scale*LOG2E, folded into Q by the loader's bf16 multiply.
     _q_scale = softmax_scale * fx.Float32(LOG2E)
@@ -916,7 +927,7 @@ def _core_attention(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
-            q_tiles_per_wave=WMMA_ROW_PER_WAVE,
+            q_tiles_per_wave=num_q_tiles_per_wave,
             elem_dtype=elem_dtype,
         )
         k_mgr = KManager16bV2(
@@ -933,7 +944,7 @@ def _core_attention(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
-            q_tiles_per_wave=WMMA_ROW_PER_WAVE,
+            q_tiles_per_wave=num_q_tiles_per_wave,
             elem_dtype=elem_dtype,
         )
         k_mgr = KManager16bV1(
@@ -1194,7 +1205,7 @@ def _core_attention(
     # Without a sink the first tile's corr zeroes the d seed, so d=1 would equal d=0 --
     # the no-sink path keeps d=0 to stay byte-for-byte.
     d_tiles = v_hdim // WMMA_M
-    R = WMMA_ROW_PER_WAVE
+    R = num_q_tiles_per_wave
     NKV = n_block // WMMA_N
     # Per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}, P_0 .. P_{NKV-1}]. P is the
     # software pipeline -- body u's PV consumes the P body u-1's softmax produced. The HI
@@ -1756,6 +1767,7 @@ def _zero_fill_attention(
     *,
     v_hdim,
     gqa_ratio,
+    num_q_tiles_per_wave,
     return_lse,
     has_sink,
     ptr_sink,
@@ -1773,6 +1785,7 @@ def _zero_fill_attention(
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
     this WG's valid query rows and LSE=-inf -- or LSE=sink[head] with a sink, exp(sink)
     being the only surviving term. Flat coalesced b128 write, no WMMA layout."""
+    BLOCK_M = _block_m(num_q_tiles_per_wave)
     tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
     kv_head = fx.Int32(gpu.block_id("y"))
     row0 = fx.Int32(gpu.block_id("x")) * fx.Int32(BLOCK_M)
@@ -1805,7 +1818,7 @@ def _zero_fill_attention(
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
+        prow = row0 + tid  # one LSE per packed row, one row per thread
         seq = prow // g
         head = kv_head * g + prow % g
         if has_sink:
@@ -1815,6 +1828,10 @@ def _zero_fill_attention(
             lse_val = fx.Float32(float("-inf"))
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
         off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+        if BLOCK_M < BLOCK_SIZE:
+            off_masked = (tid < fx.Int32(BLOCK_M)).select(
+                off_masked, fx.Int32(0x7FFFFFFF)
+            )
         buffer_ops.buffer_store(
             lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
         )
@@ -1871,6 +1888,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     return_lse: bool = False,
     has_sink: bool = False,
     gqa_ratio: int = 1,
+    num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
     """Build the m32x8 device kernel for a given layout ("thd" varlen or "bshd" batched)
     plus config; every parameter here is compile-time and baked into the trace.
@@ -1887,6 +1905,9 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     ), f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
     ELEM_DTYPE = _DTYPE_MAP[dtype_str]
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
+    assert (
+        num_q_tiles_per_wave in NUM_Q_TILES_CHOICES
+    ), f"num_q_tiles_per_wave must be in {NUM_Q_TILES_CHOICES}, got {num_q_tiles_per_wave}"
     if n_block is None:
         n_block = pick_n_block(qk_hdim, v_hdim, ELEM_DTYPE)
     assert (
@@ -1901,6 +1922,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     RET_LSE = bool(return_lse)
     HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
+    NUM_Q_TILES = int(num_q_tiles_per_wave)
 
     if layout == "thd":
 
@@ -1962,6 +1984,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     "return_lse": RET_LSE,
                     "has_sink": HAS_SINK,
                     "gqa_ratio": GQA_RATIO,
+                    "num_q_tiles_per_wave": NUM_Q_TILES,
                     "ptr_O": ptr_O,
                     "ptr_Q": ptr_Q,
                     "ptr_K": ptr_K,
@@ -2007,6 +2030,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 _zero_fill_attention(
                     v_hdim=V_HDIM,
                     gqa_ratio=GQA_RATIO,
+                    num_q_tiles_per_wave=NUM_Q_TILES,
                     return_lse=RET_LSE,
                     has_sink=HAS_SINK,
                     ptr_sink=ptr_sink,
@@ -2070,6 +2094,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "return_lse": RET_LSE,
             "has_sink": HAS_SINK,
             "gqa_ratio": GQA_RATIO,
+            "num_q_tiles_per_wave": NUM_Q_TILES,
             "ptr_O": ptr_O,
             "ptr_Q": ptr_Q,
             "ptr_K": ptr_K,
@@ -2123,6 +2148,22 @@ _launch_fns = (
 )  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
 
 
+def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio):
+    """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise.
+
+    The kernel is LDS-bound to one workgroup per CU, and halving BLOCK_M doubles KV
+    traffic, so a smaller tile only pays while the bigger one leaves CUs idle.
+    """
+    rows = int(max_seqlen_q) * int(gqa_ratio)
+    per_tile = int(num_kv_heads) * int(batch)
+    resident = get_cu_num() * NUM_WGS_PER_CU
+    for num_tiles in sorted(NUM_Q_TILES_CHOICES):
+        block_m = _block_m(num_tiles)
+        if ((rows + block_m - 1) // block_m) * per_tile <= resident:
+            return num_tiles
+    return max(NUM_Q_TILES_CHOICES)
+
+
 def _ensure_thd_kernel(
     mask_left: bool,
     mask_right: bool,
@@ -2132,6 +2173,7 @@ def _ensure_thd_kernel(
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
     dtype_str: str = DEFAULT_DTYPE,
+    num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
     key = (
         "thd",
@@ -2143,6 +2185,7 @@ def _ensure_thd_kernel(
         int(qk_hdim),
         int(v_hdim),
         str(dtype_str),
+        int(num_q_tiles_per_wave),
     )
     if key in _launch_fns:
         return
@@ -2156,7 +2199,9 @@ def _ensure_thd_kernel(
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
         dtype_str=dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
+    block_m = _block_m(num_q_tiles_per_wave)
 
     @flyc.jit
     def _launch(
@@ -2190,7 +2235,7 @@ def _ensure_thd_kernel(
         # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
         #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
         grid_x = fx.Index(
-            fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M))
+            fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(block_m))
         )
         grid_y = fx.Index(num_heads_kv)
         grid_z = fx.Index(batch_size)
@@ -2243,6 +2288,7 @@ def _ensure_bshd_kernel(
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
     dtype_str: str = DEFAULT_DTYPE,
+    num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
 ):
     key = (
         "bshd",
@@ -2254,6 +2300,7 @@ def _ensure_bshd_kernel(
         int(qk_hdim),
         int(v_hdim),
         str(dtype_str),
+        int(num_q_tiles_per_wave),
     )
     if key in _launch_fns:
         return
@@ -2267,7 +2314,9 @@ def _ensure_bshd_kernel(
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
         dtype_str=dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
+    block_m = _block_m(num_q_tiles_per_wave)
 
     @flyc.jit
     def _launch(
@@ -2300,7 +2349,7 @@ def _ensure_bshd_kernel(
         # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
         #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
         grid_x = fx.Index(
-            fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M))
+            fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(block_m))
         )
         grid_y = fx.Index(num_heads_kv)
         grid_z = fx.Index(batch_size)
@@ -2358,6 +2407,7 @@ def flash_attn_varlen_m32x8(
     return_lse=False,
     sink=None,
     lse=None,
+    num_q_tiles_per_wave=None,
 ):
     """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
 
@@ -2443,6 +2493,10 @@ def flash_attn_varlen_m32x8(
     stride_v_head = v.stride(1)
     stride_o_head = out.stride(1)
 
+    if num_q_tiles_per_wave is None:
+        num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, max_seqlen_q, gqa)
+    num_q_tiles_per_wave = int(num_q_tiles_per_wave)
+
     _ensure_thd_kernel(
         mask_left,
         mask_right,
@@ -2452,6 +2506,7 @@ def flash_attn_varlen_m32x8(
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
         dtype_str=dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
 
     _run_compiled(
@@ -2466,6 +2521,7 @@ def flash_attn_varlen_m32x8(
                 qk_hdim,
                 v_hdim,
                 dtype_str,
+                num_q_tiles_per_wave,
             )
         ],
         out,
@@ -2512,6 +2568,7 @@ def flash_attn_batch_m32x8(
     return_lse=False,
     sink=None,
     lse=None,
+    num_q_tiles_per_wave=None,
 ):
     """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
 
@@ -2612,6 +2669,10 @@ def flash_attn_batch_m32x8(
     stride_v_head = v.stride(2)
     stride_o_head = out.stride(2)
 
+    if num_q_tiles_per_wave is None:
+        num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, seq_len_q, gqa)
+    num_q_tiles_per_wave = int(num_q_tiles_per_wave)
+
     _ensure_bshd_kernel(
         mask_left,
         mask_right,
@@ -2621,6 +2682,7 @@ def flash_attn_batch_m32x8(
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
         dtype_str=dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
     )
 
     _run_compiled(
@@ -2635,6 +2697,7 @@ def flash_attn_batch_m32x8(
                 qk_hdim,
                 v_hdim,
                 dtype_str,
+                num_q_tiles_per_wave,
             )
         ],
         out,
