@@ -291,12 +291,9 @@ def flydsl_fhmoe_stage1(
     shared_w1: torch.Tensor,
     shared_w1_scale: torch.Tensor,
     shared_expert_id: int,
+    compile_context=None,
 ):
     """Run stage1 with MXFP4 routed experts and one FP8 shared expert."""
-    compile_kernel = functools.partial(
-        compile_flydsl_fhmoe_stage1,
-        shared_expert_id=shared_expert_id,
-    )
     build_mx_args = functools.partial(
         _s1_args_fhmoe,
         shared_w=shared_w1.view(-1),
@@ -335,8 +332,9 @@ def flydsl_fhmoe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
-        _compile_kernel=compile_kernel,
         _build_mx_args=build_mx_args,
+        _compile_context=compile_context,
+        _compile_metadata={"shared_expert_id": shared_expert_id},
     )
 
 
@@ -375,12 +373,9 @@ def flydsl_fhmoe_stage2(
     shared_w2: torch.Tensor,
     shared_w2_scale: torch.Tensor,
     shared_expert_id: int,
+    compile_context=None,
 ) -> torch.Tensor:
     """Run stage2 with MXFP4 routed experts and one FP8 shared expert."""
-    compile_kernel = functools.partial(
-        compile_flydsl_fhmoe_stage2,
-        shared_expert_id=shared_expert_id,
-    )
     build_mx_args = functools.partial(
         _s2_args_fhmoe,
         shared_w=shared_w2.view(-1),
@@ -417,6 +412,7 @@ def flydsl_fhmoe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
-        _compile_kernel=compile_kernel,
         _build_mx_args=build_mx_args,
+        _compile_context=compile_context,
+        _compile_metadata={"shared_expert_id": shared_expert_id},
     )

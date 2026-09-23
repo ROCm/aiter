@@ -5,18 +5,20 @@
 
 from __future__ import annotations
 
-import enum
 import json
 import multiprocessing
 import os
 import shutil
 import tempfile
 import time
+import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
+
+from .spec import DEFAULT_AOT_SPEC_REGISTRY, AotSpec, register_default_specs
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64
@@ -25,27 +27,15 @@ _DEFAULT_MEM_PER_WORKER_GB = 2.0
 _MAX_ERRORS_IN_MSG = 10
 
 
-class OpKind(enum.Enum):
-    """FlyDSL AOT kernel categories -- enum so typos at call sites become
-    construction errors instead of silently routing to the wrong code path."""
-
-    MOE = "moe"
-    MXFP4_MOE = "mxfp4_moe"
-    GEMM = "gemm"
-    GROUPED_MOE = "grouped_moe"
-    CHUNK_GDN_H = "chunk_gdn_h"
-    MEGA_MOE = "mega_moe"
-
-
 @dataclass(frozen=True)
 class JobLabel:
     """Diagnostic label attached to a submitted future."""
 
-    kind: OpKind
+    spec_name: str
     kernel_name: str
 
     def __str__(self) -> str:
-        return f"{self.kind.name} {self.kernel_name}"
+        return f"{self.spec_name} {self.kernel_name}"
 
 
 _CU_NUM_TO_ARCH = {
@@ -131,53 +121,31 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
-    if kind is OpKind.MEGA_MOE:
-        from .mega_moe import default_jobs
+def _compile_aot_job(spec: AotSpec, job: dict[str, Any]) -> dict[str, Any]:
+    """Resolve and compile one declarative AOT job inside a fresh worker."""
 
-        return default_jobs()
-    if kind is OpKind.MOE:
-        from .moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GEMM:
-        from .gemm import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
-
-
-def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    if kind is OpKind.MEGA_MOE:
-        from .mega_moe import compile_one_config
-    elif kind is OpKind.MOE:
-        from .moe import compile_one_config
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import compile_one_config
-    elif kind is OpKind.GEMM:
-        from .gemm import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import compile_one_config
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import compile_one_config
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return compile_one_config
+    return spec.compile(job)
 
 
 def _run_one_to_file(
-    worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
+    worker: Callable[..., dict[str, Any]],
+    kwargs: dict[str, Any],
+    label: Any,
+    out_path: str,
 ) -> None:
-    result = worker(**kwargs)
+    try:
+        result = worker(**kwargs)
+    except Exception as error:  # noqa: BLE001
+        # A normal Python/compiler failure is deterministic and must not be
+        # mistaken for an OOM/segfault and retried.  Truly abnormal exits never
+        # reach this handler and are still retried by the parent.
+        traceback.print_exc()
+        kernel_name = label.kernel_name if isinstance(label, JobLabel) else str(label)
+        result = {
+            "kernel_name": kernel_name,
+            "compile_time": None,
+            "error": f"{type(error).__name__}: {error}",
+        }
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f)
@@ -260,8 +228,10 @@ def _run_file_pool(
     kernel_timeout: float,
     max_retries: int,
     result_dir: str,
+    *,
+    start_method: str,
 ) -> list[dict[str, Any] | None]:
-    ctx = multiprocessing.get_context("fork")
+    ctx = multiprocessing.get_context(start_method)
     n = len(specs)
     results: list[dict[str, Any] | None] = [None] * n
     attempts = [0] * n
@@ -276,13 +246,16 @@ def _run_file_pool(
     def launch() -> None:
         while queue and len(running) < max_workers:
             idx = queue.pop()
-            worker, kwargs, _label = specs[idx]
+            worker, kwargs, label = specs[idx]
             out_path = os.path.join(result_dir, f"k{idx}.json")
             try:
                 os.remove(out_path)  # clear any stale file from a prior attempt
             except OSError:
                 pass
-            proc = ctx.Process(target=_run_one_to_file, args=(worker, kwargs, out_path))
+            proc = ctx.Process(
+                target=_run_one_to_file,
+                args=(worker, kwargs, label, out_path),
+            )
             proc.start()
             deadline = (
                 (time.monotonic() + kernel_timeout) if kernel_timeout > 0 else None
@@ -321,6 +294,7 @@ def _run_file_pool(
             # writing its result. Transient -> retry (terminal once retries run
             # out, leaving results[idx]=None).
             retry_or_drop(idx, f"worker crashed (exitcode={proc.exitcode})")
+            proc.close()
             return
         # Clean exit (exitcode 0): deterministic, never retried.
         result: dict[str, Any] | None = None
@@ -336,6 +310,7 @@ def _run_file_pool(
             result = {"kernel_name": name, "compile_time": None}
         results[idx] = result
         note_done()
+        proc.close()
 
     try:
         launch()
@@ -360,6 +335,7 @@ def _run_file_pool(
                         proc.kill()
                         proc.join()
                         running.pop(proc)
+                        proc.close()
                         retry_or_drop(
                             idx,
                             f"exceeded per-kernel timeout ({kernel_timeout:.0f}s); killed",
@@ -373,6 +349,8 @@ def _run_file_pool(
             try:
                 if proc.is_alive():
                     proc.kill()
+                proc.join()
+                proc.close()
             except Exception:  # noqa: BLE001,S110
                 pass
 
@@ -399,9 +377,15 @@ def run_jobs_parallel(
     result_dir = tempfile.mkdtemp(prefix="aot_results_")
     try:
         specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
-        raw = _run_file_pool(
-            specs, max_workers, get_kernel_timeout(), get_max_retries(), result_dir
-        )
+        with override_env("AITER_AOT_IMPORT", "1"):
+            raw = _run_file_pool(
+                specs,
+                max_workers,
+                get_kernel_timeout(),
+                get_max_retries(),
+                result_dir,
+                start_method=get_start_method(),
+            )
     finally:
         shutil.rmtree(result_dir, ignore_errors=True)
     out: list[dict[str, Any]] = []
@@ -415,86 +399,125 @@ def run_jobs_parallel(
     return out
 
 
-def run_aot(cache_dir: str) -> None:
+def get_start_method() -> str:
+    """Return the configured multiprocessing start method.
+
+    ``spawn`` is the safe default for compiler/GPU state.  ``fork`` remains an
+    opt-in escape hatch for environments where process startup dominates.
+    """
+
+    method = os.environ.get("AITER_FLYDSL_AOT_START_METHOD", "spawn")
+    available = multiprocessing.get_all_start_methods()
+    if method not in available:
+        raise ValueError(
+            "AITER_FLYDSL_AOT_START_METHOD must be one of "
+            f"{available}, got {method!r}"
+        )
+    return method
+
+
+def run_aot(cache_dir: str, *, specs: tuple[AotSpec, ...] | None = None) -> None:
     os.makedirs(cache_dir, exist_ok=True)
-    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
+    if specs is None:
+        register_default_specs()
+        specs = DEFAULT_AOT_SPEC_REGISTRY.get_all_specs()
 
-    all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
-    for kind in OpKind:
-        for job in _collect_aot_jobs_for(kind):
-            all_jobs.append((kind, job))
+    with (
+        override_env("AITER_AOT_IMPORT", "1"),
+        override_env("FLYDSL_RUNTIME_CACHE_DIR", cache_dir),
+    ):
+        all_jobs: list[tuple[AotSpec, dict[str, Any]]] = []
+        for spec in specs:
+            all_jobs.extend((spec, job) for job in spec.collect_jobs())
 
-    if not all_jobs:
-        print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
-        return
+        if not all_jobs:
+            print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
+            return
 
-    max_workers = get_max_workers(len(all_jobs))
+        max_workers = get_max_workers(len(all_jobs))
 
-    # Per-child result files live here -- recreated fresh so stale results
-    # from a previous (e.g. crashed) build can never be mistaken for this
-    # run's output.
-    result_dir = os.path.join(cache_dir, ".aot_results")
-    shutil.rmtree(result_dir, ignore_errors=True)
-    os.makedirs(result_dir, exist_ok=True)
-
-    print(
-        f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes (cache: {cache_dir})"
-    )
-
-    # One uniform task per kernel: worker = the kind's compile_one_config.
-    specs = [
-        (
-            _compile_one_config_for(kind),
-            job,
-            JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?"))),
-        )
-        for kind, job in all_jobs
-    ]
-
-    try:
-        raw = _run_file_pool(
-            specs,
-            max_workers,
-            get_kernel_timeout(),
-            get_max_retries(),
-            result_dir,
-        )
-
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
-        for (kind, _job), result, spec in zip(all_jobs, raw, specs):
-            label = spec[2]
-            if result is not None and result.get("compile_time") is not None:
-                ok_by_kind[kind] += 1
-            elif result is None:
-                # Died (crash/OOM) or timed out, even after retries.
-                fail_by_kind[kind] += 1
-                errors.append(f"FlyDSL {label} worker died or timed out")
-            else:
-                # Clean exit but no kernel (deterministic compile error).
-                fail_by_kind[kind] += 1
-                errors.append(f"FlyDSL {label} produced no kernel")
-
-        for kind in OpKind:
-            print(
-                f"[aiter] FlyDSL {kind.name} AOT: "
-                f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
-            )
-        if errors:
-            seen: set[str] = set()
-            unique_errors = [e for e in errors if not (e in seen or seen.add(e))]
-            head = unique_errors[:_MAX_ERRORS_IN_MSG]
-            suffix = ""
-            if len(unique_errors) > _MAX_ERRORS_IN_MSG:
-                suffix = (
-                    f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
-                )
-            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
-            raise AssertionError(
-                f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
-            )
-    finally:
+        # Per-child result files live here -- recreated fresh so stale results
+        # from a previous (e.g. crashed) build can never be mistaken for this
+        # run's output.
+        result_dir = os.path.join(cache_dir, ".aot_results")
         shutil.rmtree(result_dir, ignore_errors=True)
+        os.makedirs(result_dir, exist_ok=True)
+
+        spec_names = "+".join(spec.name for spec in specs)
+        start_method = get_start_method()
+        print(
+            f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels ({spec_names}), "
+            f"{max_workers} {start_method} worker processes (cache: {cache_dir})"
+        )
+
+        # Every worker receives a small importable spec plus plain job metadata;
+        # operator modules and FlyDSL are imported only in that fresh process.
+        worker_specs = [
+            (
+                _compile_aot_job,
+                {"spec": spec, "job": job},
+                JobLabel(
+                    spec_name=spec.name,
+                    kernel_name=str(job.get("kernel_name", "?")),
+                ),
+            )
+            for spec, job in all_jobs
+        ]
+
+        try:
+            raw = _run_file_pool(
+                worker_specs,
+                max_workers,
+                get_kernel_timeout(),
+                get_max_retries(),
+                result_dir,
+                start_method=start_method,
+            )
+
+            ok_by_spec = {spec.name: 0 for spec in specs}
+            fail_by_spec = {spec.name: 0 for spec in specs}
+            errors: list[str] = []
+            for (aot_spec, _job), result, worker_spec in zip(
+                all_jobs, raw, worker_specs
+            ):
+                label = worker_spec[2]
+                if result is not None and result.get("compile_time") is not None:
+                    ok_by_spec[aot_spec.name] += 1
+                elif result is None:
+                    # Died (crash/OOM) or timed out, even after retries.
+                    fail_by_spec[aot_spec.name] += 1
+                    errors.append(f"FlyDSL {label} worker died or timed out")
+                else:
+                    # Clean exit but no kernel (deterministic compile error).
+                    fail_by_spec[aot_spec.name] += 1
+                    detail = result.get("error")
+                    suffix = f": {detail}" if detail else ""
+                    errors.append(f"FlyDSL {label} produced no kernel{suffix}")
+
+            for spec in specs:
+                print(
+                    f"[aiter] FlyDSL {spec.name} AOT: "
+                    f"compiled {ok_by_spec[spec.name]} ok, "
+                    f"{fail_by_spec[spec.name]} failed"
+                )
+            if errors:
+                seen: set[str] = set()
+                unique_errors = [
+                    error for error in errors if not (error in seen or seen.add(error))
+                ]
+                head = unique_errors[:_MAX_ERRORS_IN_MSG]
+                suffix = ""
+                if len(unique_errors) > _MAX_ERRORS_IN_MSG:
+                    suffix = (
+                        f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
+                    )
+                tally = ", ".join(
+                    f"{spec.name}: {fail_by_spec[spec.name]} failed" for spec in specs
+                )
+                raise AssertionError(
+                    f"[aiter] FlyDSL AOT failures ({tally}): "
+                    + "; ".join(head)
+                    + suffix
+                )
+        finally:
+            shutil.rmtree(result_dir, ignore_errors=True)

@@ -393,19 +393,20 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import run_aot
-
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            run_aot(flydsl_cache_dir)
-        finally:
-            if _prev_aot_import is None:
-                os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+        # --- FlyDSL AOT pre-compilation (before CK) ---
+        # Run the declarative AOT registry out of process.  Besides keeping the
+        # setuptools process free of FlyDSL/compiler state, this makes it safe
+        # for the AOT driver to use fresh ``spawn`` workers.
+        flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+        subprocess.check_call(
+            [
+                sys.executable,
+                os.path.join(this_dir, "scripts", "build_flydsl_aot.py"),
+                "--cache-dir",
+                flydsl_cache_dir,
+            ],
+            cwd=this_dir,
+        )
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:

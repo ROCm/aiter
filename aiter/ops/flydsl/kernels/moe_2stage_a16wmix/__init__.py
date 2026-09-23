@@ -73,6 +73,7 @@ def flydsl_a16w4_gemm1(
     w_dtype="fp4",
     w_layout="standard",
     stream=None,
+    _compile_exe=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
@@ -124,23 +125,25 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 requires D_INTER % TILE_N({TILE_N}) == 0, got D_INTER={D_INTER}"
         )
 
-    launch = compile_gemm1_a16w4_port(
-        BM=BM,
-        D_HIDDEN=D_HIDDEN,
-        D_INTER=D_INTER,
-        NE=NE,
-        TOPK=topk,
-        TILE_N=TILE_N,
-        TILE_K=TILE_K,
-        act=act,
-        b_cache_mod=b_cache_mod,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=waves_per_eu,
-        w_dtype=w_dtype,
-        w_layout=w_layout,
-        k_wave=k_wave,
-        use_k16="gfx95" not in str(get_rocm_arch()),
-    )
+    launch = _compile_exe
+    if launch is None:
+        launch = compile_gemm1_a16w4_port(
+            BM=BM,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            NE=NE,
+            TOPK=topk,
+            TILE_N=TILE_N,
+            TILE_K=TILE_K,
+            act=act,
+            b_cache_mod=b_cache_mod,
+            xcd_swizzle=xcd_swizzle,
+            waves_per_eu=waves_per_eu,
+            w_dtype=w_dtype,
+            w_layout=w_layout,
+            k_wave=k_wave,
+            use_k16="gfx95" not in str(get_rocm_arch()),
+        )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
     # SiTUv2 beta/linear_beta + swiglu_limit -> runtime f32 scalars (host precomputes
@@ -200,6 +203,7 @@ def flydsl_a16w4_gemm2(
     persist=None,
     epilog="atomic",
     stream=None,
+    _compile_exe=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
     D_INTER] intermediate; scatters routing-weighted bf16 into ``flat_out``.
@@ -234,22 +238,24 @@ def flydsl_a16w4_gemm2(
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
     # opt-in building block.
     _persist = False if persist is None else bool(persist)
-    launch = compile_gemm2_a16w4_port(
-        BM=BM,
-        NE=NE,
-        N_OUT=D_HIDDEN,
-        D_INTER=D_INTER,
-        TILE_N=TILE_N,
-        TILE_K=TILE_K,
-        b_cache_mod=_b_cache_mod,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=waves_per_eu,
-        w_dtype=w_dtype,
-        persist=_persist,
-        use_k16="gfx95" not in str(get_rocm_arch()),
-        epilog=epilog,
-        topk=topk,
-    )
+    launch = _compile_exe
+    if launch is None:
+        launch = compile_gemm2_a16w4_port(
+            BM=BM,
+            NE=NE,
+            N_OUT=D_HIDDEN,
+            D_INTER=D_INTER,
+            TILE_N=TILE_N,
+            TILE_K=TILE_K,
+            b_cache_mod=_b_cache_mod,
+            xcd_swizzle=xcd_swizzle,
+            waves_per_eu=waves_per_eu,
+            w_dtype=w_dtype,
+            persist=_persist,
+            use_k16="gfx95" not in str(get_rocm_arch()),
+            epilog=epilog,
+            topk=topk,
+        )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist
     )

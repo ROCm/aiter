@@ -373,6 +373,12 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         )
 
 
+def get_aot_jobs():
+    """Return the default jobs registered with the unified AOT driver."""
+
+    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+
+
 def compile_one_config(**job):
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode

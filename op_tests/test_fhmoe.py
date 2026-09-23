@@ -1296,10 +1296,10 @@ def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch)
 
     forwarded = {}
 
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
+    def precompile(job):
+        forwarded["job"] = job
 
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
+    monkeypatch.setattr(aot_moe, "compile_moe_job", precompile)
     aot_fhmoe.precompile_fhmoe_to_cache(
         experts=385,
         shared_expert_id=384,
@@ -1310,42 +1310,8 @@ def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch)
         topk=7,
     )
 
-    assert forwarded["inter_dim"] == 384
-    assert forwarded["_aot_backend"].shared_expert_id == 384
-
-
-def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.ops.flydsl import fhmoe as ops_fhmoe
-
-    tensor = torch.empty(0)
-    forwarded = {}
-
-    monkeypatch.setattr(aot_fhmoe, "_shared_weight", lambda *_: tensor)
-    monkeypatch.setattr(aot_fhmoe, "_shared_scale", lambda *_: tensor)
-
-    def build_args(*args, **kwargs):
-        forwarded.update(kwargs)
-        return args
-
-    monkeypatch.setattr(ops_fhmoe, "_s1_args_fhmoe", build_args)
-
-    result = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=8).build_stage1_args(
-        *((tensor,) * 10),
-        1,
-        2,
-        3,
-        4,
-        "cpu",
-        swiglu_limit=10.0,
-        pass_swiglu_limit=False,
-    )
-
-    assert result
-    assert forwarded["swiglu_limit"] == 10.0
-    assert forwarded["pass_swiglu_limit"] is False
+    assert forwarded["job"]["inter_dim"] == 384
+    assert forwarded["job"]["shared_expert_id"] == 384
 
 
 @pytest.mark.parametrize(

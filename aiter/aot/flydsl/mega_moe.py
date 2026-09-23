@@ -399,6 +399,12 @@ def _compile_stage2(
         )
 
 
+def get_aot_jobs():
+    """Return the default jobs registered with the unified AOT driver."""
+
+    return default_jobs()
+
+
 def compile_one_config(**job):
     result = {**job, "compile_time": None}
     started = time.time()

@@ -302,6 +302,12 @@ def _format_shape_str(job: dict) -> str:
     )
 
 
+def get_aot_jobs():
+    """Return the default jobs registered with the unified AOT driver."""
+
+    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+
+
 def compile_one_config(*, cu_num: int = 0, **kwargs) -> dict:
     """Compile one opt configuration and save it to cache."""
     aot_arch = cu_num_to_arch(cu_num, default=CHUNK_GDN_H_AOT_ARCH_DEFAULT)

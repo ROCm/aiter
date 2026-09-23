@@ -1,18 +1,29 @@
 # FlyDSL AOT Pre-compilation & Tests
 
 This directory holds the **AOT (Ahead-Of-Time) pre-compilation entry points** for
-FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter's
-tuned CSV configs and compiles them into the cache up front, so that at runtime
-the JIT path hits the cache instead of compiling again.
+FlyDSL kernels. Each operator module owns its job discovery and compile entry;
+`spec.py` registers those entries declaratively and the shared build driver
+compiles them into FlyDSL's native cache. This follows FlashInfer's CuteDSL
+`JitSpec` split: orchestration knows about specs, while the DSL owns artifact
+identity, persistence, and loading.
 
-| Module | OpKind | Description |
+MoE goes one step further and uses the same immutable `CompileRequest` objects
+for runtime JIT resolution and AOT compilation. A request contains only builder
+arguments that affect compilation, an explicit ROCm target, and the launch ABI.
+Runtime-only routing metadata is consumed while selecting the request but is not
+added to the builder cache key. This currently covers the standard mixed path,
+a16w4/a16wi4, FHMoE, Stage2 reduction, and CK-Tile Stage1 epilogues.
+
+| Module | Spec | Description |
 | --- | --- | --- |
-| `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
-| `gemm.py` | `GEMM` | GEMM kernels |
-| `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
-| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
-| `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
+| `moe.py` | `moe` | MoE / Mixed-MoE kernels (stage1 + stage2) |
+| `mxfp4_moe.py` | `mxfp4_moe` | MXFP4 MoE kernels |
+| `gemm.py` | `gemm` | GEMM kernels |
+| `grouped_moe.py` | `grouped_moe` | gfx1250 grouped MoE GEMM kernels |
+| `chunk_gdn_h.py` | `chunk_gdn_h` | chunk-gdn-h opt (K5) kernels |
+| `mega_moe.py` | `mega_moe` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `spec.py` | — | Lazy `AotSpec` definitions and the ordered registry |
+| `common.py` | — | Shared job collection and crash/timeout-aware worker pool |
 
 ---
 
@@ -30,6 +41,21 @@ directory of your checkout).
 ---
 
 ## 1. Run AOT pre-compilation (compile smoke test)
+
+Build every registered family through the same entry point used by
+`PREBUILD_KERNELS` wheel builds:
+
+```bash
+python scripts/build_flydsl_aot.py \
+  --cache-dir /path/to/flydsl-cache
+
+# Inspect the registry without importing every kernel module.
+python scripts/build_flydsl_aot.py --list-specs
+```
+
+The driver starts fresh `spawn` workers. This avoids inheriting initialized
+compiler or GPU state from setuptools and makes adding an operator family a
+single `AotSpec` registration plus the module's `get_aot_jobs()` function.
 
 The most direct "test" is to run each module as a `python -m` entry point and
 confirm every kernel compiles. Each module prints `Compiled: N ok, M failed` at
@@ -72,12 +98,13 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `AITER_AOT_IMPORT` | Set to `1` so `import aiter` only loads the lightweight JIT core and skips the full top-level op namespace — faster and avoids heavy import side effects during AOT compilation (this is what `setup.py` sets while pre-compiling). | `0` |
+| `AITER_AOT_IMPORT` | Internal lightweight-import gate. The unified build script sets it before importing `aiter`; callers do not need to manage it. | `0` |
 | `FLYDSL_RUNTIME_CACHE_DIR` | Cache directory | `~/.flydsl/cache` |
 | `AITER_FLYDSL_AOT_WORKERS` | Max concurrent worker processes. Set explicitly to honor it verbatim (bypasses the memory cap below); `0`/negative clamps to 1. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
 | `AITER_FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Only applies when `AITER_FLYDSL_AOT_WORKERS` is **not** set; `0` disables the cap. | `2.0` |
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
+| `AITER_FLYDSL_AOT_START_METHOD` | Multiprocessing start method. `spawn` prevents inherited compiler/GPU state; `fork` remains an explicit compatibility escape hatch on platforms that provide it. | `spawn` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 

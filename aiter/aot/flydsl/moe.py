@@ -27,33 +27,25 @@ import csv
 import os
 import sys
 import time
+from collections.abc import Mapping
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
-    compile_only_env,
     cu_num_to_arch,
     job_identity,
-    override_env,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
+from aiter.ops.flydsl.aot_backend import compile_aot, create_compile_context
+from aiter.ops.flydsl.compile_request import RocmTarget
 from aiter.ops.flydsl.moe_kernels import (
-    _get_compiled_silu_fused,
-    _run_compiled,
-    _s1_args_fp4,
-    _s1_args_std,
-    _s2_args_fp4,
-    _s2_args_std,
-    compile_flydsl_moe_stage1,
-    compile_flydsl_moe_stage2,
+    _S2_LEGACY_FP8_PITCH_ALIGN,
+    _S2_LEGACY_FP8_SCALE_BLK,
     get_flydsl_kernel_params,
-    requires_flydsl_stage2_global_a,
     requires_flydsl_stage2_reduce,
     resolve_flydsl_grid_y_persist_m,
     resolve_flydsl_stage1_tile_n,
     resolve_flydsl_stage2_tile_k,
-    runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
@@ -168,7 +160,13 @@ def parse_csv(csv_path: str):
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
-                for enable_bias in enable_bias_options:
+                family_bias_options = (
+                    [False]
+                    if params["a_dtype"] == "bf16"
+                    and params["b_dtype"] in ("fp4", "int4")
+                    else enable_bias_options
+                )
+                for enable_bias in family_bias_options:
                     job = {
                         "kernel_name": name,
                         "model_dim": model_dim,
@@ -208,804 +206,220 @@ def parse_csv(csv_path: str):
     return jobs
 
 
-def _precompile_to_cache(
-    stage: int,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    a_dtype: str = "fp4",
-    b_dtype: str = "fp4",
-    out_dtype: str = "bf16",
-    act: str = "silu",
-    doweight_stage1: bool = False,
-    # Must match the runtime default of ``compile_mixed_moe_gemm2`` /
-    # ``compile_mixed_moe_gemm1`` (``Optional[int] = None``). A scalar default
-    # (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with
-    # the runtime-side tuple for any legacy kernel that does not explicitly
-    # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
-    # production-variant ``_persist_async_w4_cumul3`` does), causing
-    # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
-    waves_per_eu: int | None = None,
-    k_batch: int = 1,
-    b_nt: int = 2,
-    gate_mode: str = "separated",
-    mode: str = "atomic",
-    persist=None,
-    sort_block_m: int = 0,
-    cu_num: int = 0,
-    token_num: int = 0,
-    block_m: int = 0,
-    a_scale_one: bool = False,
-    xcd_swizzle: int = 0,
-    enable_bias: bool = False,
-    stage1_fuse_quant=None,
-    k_wave: int = 1,
-    v2_output_layout: bool = False,
-    # Stage2-only kernel tuning knobs (registered by the production-variant
-    # entries in `get_flydsl_stage2_kernels`). Forwarded into
-    # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
-    use_async_copy: bool = False,
-    cu_num_mul: int = 1,
-    _aot_backend=None,
-    **kwargs,
-):
-    """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
-    with dummy GPU tensors and ``COMPILE_ONLY=1``.
+def get_aot_jobs():
+    """Return the default jobs registered with the unified AOT driver."""
 
-    Builds dummy inputs that exactly mirror the tensor shapes that
-    ``fused_moe_2stages`` would pass into ``flydsl_moe_stage1`` /
-    ``flydsl_moe_stage2`` for a given ``(token_num, model_dim, inter_dim, E,
-    topk, a_dtype, b_dtype, ...)`` combination, then dispatches into the same
-    runtime entry points used by the fused-MoE op.  ``COMPILE_ONLY=1`` causes
-    the executor to compile and persist the artifact without launching a
-    kernel.  This guarantees that the cache key written here equals the cache
-    key the runtime will look up at inference time.
-    """
-    import torch
+    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
 
-    dev = torch.device("cpu")
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
-    tokens = token_num if token_num > 0 else tile_m
-    E = experts
-    _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
-    _block_m_for_sort = block_m if block_m > 0 else _sort_block_m
 
-    max_num_tokens_padded = tokens * topk + E * _block_m_for_sort - topk
-    max_num_m_blocks = (
-        max_num_tokens_padded + _block_m_for_sort - 1
-    ) // _block_m_for_sort
+def _job_target(aot_arch: str, cu_num: int) -> RocmTarget:
+    """Resolve one explicit AOT target without querying a live device."""
 
-    def _storage_dtype(dtype: str):
-        if dtype in ("fp4", "fp8"):
-            return torch.uint8
-        if dtype in ("fp16", "f16"):
-            return torch.float16
-        if dtype == "bf16":
-            return torch.bfloat16
-        return torch.int8
-
-    def _alloc(shape, dtype):
-        # Cache key only depends on shape+dtype+strides — values don't matter.
-        return torch.zeros(shape, device=dev, dtype=dtype)
-
-    def _user_a_shape():
-        # User-level activation shape: (token_num, model_dim) in storage dtype.
-        if a_dtype == "fp4":
-            return (tokens, model_dim // 2)
-        return (tokens, model_dim)
-
-    def _user_w1_shape():
-        # User-level w1 shape: (E, 2*inter_dim, model_dim) in storage dtype.
-        if b_dtype == "fp4":
-            return (E, 2 * inter_dim, model_dim // 2)
-        return (E, 2 * inter_dim, model_dim)
-
-    def _user_w2_shape():
-        # User-level w2 shape: (E, model_dim, inter_dim) in storage dtype.
-        if b_dtype == "fp4":
-            return (E, model_dim, inter_dim // 2)
-        return (E, model_dim, inter_dim)
-
-    def _make_routing():
-        sorted_token_ids = torch.zeros(
-            max_num_tokens_padded, device=dev, dtype=torch.int32
+    resolved_cu = int(cu_num)
+    if resolved_cu <= 0:
+        configured = os.environ.get("CU_NUM")
+        resolved_cu = int(configured) if configured else 0
+    if resolved_cu <= 0 and aot_arch == MOE_AOT_ARCH_DEFAULT:
+        resolved_cu = 256
+    if resolved_cu <= 0:
+        raise ValueError(
+            f"cu_num must be explicit for AOT target {aot_arch!r}; "
+            "set it in the CSV or CU_NUM"
         )
-        sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
-        num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
-        return sorted_token_ids, sorted_expert_ids, num_valid_ids
-
-    def _make_sorted_weights(doweight: bool):
-        if doweight:
-            return torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
-        return None
-
-    def _make_a1_scale():
-        """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
-        if not use_mx_gemm:
-            return None
-        if a_dtype == "fp8":
-            if a_scale_one:
-                # fused_moe_2stages: metadata.fuse_quant == "fp8"
-                return torch.empty(0, dtype=torch.uint8, device=dev)
-            # fused_moe_2stages line 1501
-            return torch.ones(
-                [max_num_tokens_padded, model_dim // 32],
-                dtype=torch.uint8,
-                device=dev,
-            )
-        if a_dtype == "bf16":
-            return torch.ones(
-                [max_num_tokens_padded, model_dim // 32],
-                dtype=torch.uint8,
-                device=dev,
-            )
-        if a_dtype == "fp4":
-            # fused_dynamic_mxfp4_quant_moe_sort or mxfp4_moe_sort_fwd:
-            # output shape is ((sorted_ids+31)//32*32, (cols+31)//32) in fp8_e8m0.
-            rows = (max_num_tokens_padded + 31) // 32 * 32
-            cols = (model_dim + 31) // 32
-            return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
-        return None
-
-    def _make_a2_scale_for_stage2():
-        """Stage2 a2_scale construction per fused_moe_2stages.
-
-        When upstream stage1 fuses fp4/fp8 quant (``stage1_fuse_quant`` set),
-        stage2 receives stage1's ``out_scale_sorted`` buffer directly -- that
-        buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
-        its own input and the resulting sorted scale uses 32-row alignment.
-        """
-        if not use_mx_gemm:
-            return None
-        if stage1_fuse_quant in ("fp4", "fp8"):
-            # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
-            #   sorted_size = max(sorted_token_ids.shape[0],
-            #                     sorted_expert_ids.shape[0] * sort_block_m)
-            #   padded_rows = (sorted_size + 255) // 256 * 256
-            #   padded_cols = (inter_dim // 32 + 7) // 8 * 8
-            _sorted_size = max(
-                max_num_tokens_padded,
-                max_num_m_blocks * tile_m,
-            )
-            _padded_rows = (_sorted_size + 255) // 256 * 256
-            _padded_cols = ((inter_dim // 32) + 7) // 8 * 8
-            return torch.zeros(
-                _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
-            )
-        if a_dtype == "fp8":
-            if act == "silu":
-                # fused_moe_2stages uses fused_quant_fp8_sort for this path.
-                rows = (max_num_tokens_padded + 31) // 32 * 32
-                cols = (inter_dim + 31) // 32
-                return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
-
-            # Otherwise fused_moe_2stages reuses a1_scale for stage2.
-            return torch.ones(
-                [max_num_tokens_padded, model_dim // 32],
-                dtype=torch.uint8,
-                device=dev,
-            )
-        if a_dtype == "fp4":
-            # fused_dynamic_mxfp4_quant_moe_sort / mxfp4_moe_sort_fwd path:
-            # 32-row alignment.
-            rows = (max_num_tokens_padded + 31) // 32 * 32
-            cols = (inter_dim + 31) // 32
-            return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
-        if a_dtype == "bf16":
-            return None
-        return None
-
-    def _make_w_scale(scale_storage_numel: int):
-        # mxfp4 e8m0 scale -- viewed as uint8 by _view_safe before kernel launch.
-        return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
-
-    def _make_a_user(a_dtype_user_shape):
-        return _alloc(a_dtype_user_shape, _storage_dtype(a_dtype))
-
-    _cu_num_str = str(cu_num) if cu_num > 0 else None
-    with compile_only_env(), override_env("CU_NUM", _cu_num_str):
-        from aiter.jit.utils.chip_info import get_cu_num
-
-        get_cu_num.cache_clear()
-
-        sorted_token_ids, sorted_expert_ids, num_valid_ids = _make_routing()
-
-        if stage == 1:
-            if b_dtype == "fp4" and a_dtype in ("bf16", "fp8"):
-                tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
-
-            a = _make_a_user(_user_a_shape())
-            w1_shape = _user_w1_shape()
-            w1 = _alloc(w1_shape, _storage_dtype(b_dtype))
-
-            _need_fp4 = out_dtype == "fp4"
-            _need_fp8 = out_dtype == "fp8"
-            _fuse_any_quant = _need_fp4 or _need_fp8
-            _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
-            _is_splitk = k_batch > 1
-            _splitk_fp4 = _is_splitk and _need_fp4
-            _gui_sk = gate_mode == "interleave" and _is_splitk
-            _gui_sk_fused = _gui_sk and _fuse_any_quant
-            _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
-            _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
-            _gemm_out_torch_dtype = (
-                torch.bfloat16 if _gemm_out_dtype == "bf16" else torch.float16
-            )
-
-            if _is_splitk:
-                tmp_out = torch.zeros(
-                    (tokens, topk, inter_dim * 2),
-                    dtype=_gemm_out_torch_dtype,
-                    device=dev,
-                )
-                out = (
-                    torch.zeros(
-                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
-                    )
-                    if _need_fp4
-                    else (
-                        torch.zeros(
-                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
-                        )
-                        if _need_fp8
-                        else torch.empty(
-                            (tokens, topk, inter_dim),
-                            device=dev,
-                            dtype=_gemm_out_torch_dtype,
-                        )
-                    )
-                )
-            else:
-                tmp_out = None
-                if _v2_output_layout:
-                    _sorted_rows = max(
-                        sorted_token_ids.shape[0],
-                        sorted_expert_ids.shape[0] * tile_m,
-                    )
-                    out = (
-                        torch.empty(
-                            (_sorted_rows, inter_dim // 2),
-                            device=dev,
-                            dtype=torch.uint8,
-                        )
-                        if _need_fp4
-                        else torch.empty(
-                            (_sorted_rows, inter_dim),
-                            device=dev,
-                            dtype=torch.uint8,
-                        )
-                    )
-                else:
-                    out = (
-                        torch.empty(
-                            (tokens, topk, inter_dim // 2),
-                            device=dev,
-                            dtype=torch.uint8,
-                        )
-                        if _need_fp4
-                        else (
-                            torch.empty(
-                                (tokens, topk, inter_dim),
-                                device=dev,
-                                dtype=torch.uint8,
-                            )
-                            if _need_fp8
-                            else torch.empty(
-                                (tokens, topk, inter_dim),
-                                device=dev,
-                                dtype=_gemm_out_torch_dtype,
-                            )
-                        )
-                    )
-
-            a1_scale = _make_a1_scale()
-            # w1_scale: per-32 group along K dimension. Storage size in bytes.
-            if use_mx_gemm:
-                w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
-            else:
-                w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-
-            sw = _make_sorted_weights(doweight_stage1)
-            bias = (
-                torch.zeros(E * inter_dim * 2, device=dev, dtype=torch.float32)
-                if enable_bias
-                else None
-            )
-
-            flat_a_scale = (
-                a1_scale.view(-1)
-                if a1_scale is not None
-                else torch.empty(0, device=dev)
-            )
-            flat_w_scale = (
-                w1_scale.view(-1)
-                if w1_scale is not None
-                else torch.empty(0, device=dev)
-            )
-            sw_arg = (
-                sw
-                if sw is not None
-                else torch.empty(0, device=dev, dtype=torch.float32)
-            )
-            _grid_y = min(max_num_m_blocks, tokens * topk)
-            _kernel_out = tmp_out if _is_splitk else out
-            kernel_bias = None if _is_splitk else bias
-            _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
-            _k_in = model_dim
-
-            scale_cols = inter_dim // 32
-            sorted_size = max(max_num_tokens_padded, max_num_m_blocks * tile_m)
-            padded_rows = (sorted_size + 255) // 256 * 256
-            padded_cols = (scale_cols + 7) // 8 * 8
-            out_scale_sorted_flat = (
-                torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
-                if (_fuse_any_quant or _splitk_fp4 or _gui_sk_fused)
-                else torch.empty(0, dtype=torch.uint8, device=dev)
-            )
-
-            if use_mx_gemm:
-                build_stage1_args = (
-                    _s1_args_fp4
-                    if _aot_backend is None
-                    else _aot_backend.build_stage1_args
-                )
-                args = build_stage1_args(
-                    _kernel_out.view(-1),
-                    a.view(-1),
-                    w1.view(-1),
-                    flat_a_scale,
-                    flat_w_scale,
-                    sorted_token_ids,
-                    sorted_expert_ids,
-                    sw_arg,
-                    num_valid_ids,
-                    out_scale_sorted_flat.view(-1),
-                    tokens,
-                    _n_in,
-                    _k_in,
-                    _grid_y,
-                    dev,
-                    bias=(
-                        kernel_bias.view(-1)
-                        if kernel_bias is not None
-                        else torch.empty(0, device=dev)
-                    ),
-                    stream=0,
-                    swiglu_limit=runtime_swiglu_limit(None, act),
-                    pass_swiglu_limit=not (a_dtype == "bf16" and b_dtype == "fp4"),
-                )
-            else:
-                args = _s1_args_std(
-                    _kernel_out.view(-1),
-                    a.view(-1),
-                    w1.view(-1),
-                    flat_a_scale,
-                    flat_w_scale,
-                    sorted_token_ids,
-                    sorted_expert_ids,
-                    sw_arg,
-                    num_valid_ids,
-                    tokens,
-                    _n_in,
-                    _k_in,
-                    _grid_y,
-                    stream=0,
-                )
-
-            compile_stage1 = (
-                compile_flydsl_moe_stage1
-                if _aot_backend is None
-                else _aot_backend.compile_stage1
-            )
-            exe = compile_stage1(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage1=(sw is not None),
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=_gemm_out_dtype,
-                act=act,
-                use_async_copy=True,
-                k_batch=k_batch,
-                waves_per_eu=waves_per_eu,
-                b_nt=b_nt,
-                gate_mode=gate_mode,
-                enable_bias=(kernel_bias is not None),
-                a_scale_one=a_scale_one,
-                xcd_swizzle=xcd_swizzle,
-                k_wave=k_wave,
-                v2_output_layout=_v2_output_layout,
-            )
-            _run_compiled(exe, args)
-
-            if _gui_sk_fused or _gui_sk or _splitk_fp4:
-                if _gui_sk_fused:
-                    quant_mode = "fp4" if _need_fp4 else "fp8"
-                    gui_layout = True
-                elif _gui_sk:
-                    quant_mode = "none"
-                    gui_layout = True
-                else:
-                    quant_mode = "fp4"
-                    gui_layout = False
-                silu_fused = _get_compiled_silu_fused(
-                    inter_dim,
-                    topk,
-                    quant_mode,
-                    gui_layout=gui_layout,
-                    act=act,
-                    enable_bias=False,
-                )
-                _run_compiled(
-                    silu_fused,
-                    (
-                        _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                        _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                        _ptr_view_safe(out_scale_sorted_flat),
-                        _ptr_view_safe(sorted_token_ids),
-                        _ptr_view_safe(num_valid_ids),
-                        _ptr_view_safe(sorted_token_ids.view(-1)),
-                        _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
-                        tokens,
-                        sorted_token_ids.shape[0],
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.0,
-                        runtime_swiglu_limit(None, act),
-                        0,
-                    ),
-                )
-
-        elif stage == 2:
-            # Match flydsl_moe_stage2 runtime dispatch: tuned tables may name a
-            # tile_k that does not divide this shape (for example 256 for
-            # inter_dim=384), in which case runtime compiles the legal fallback.
-            tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
-
-            if a_dtype == "fp4":
-                a_shape = (tokens, topk, inter_dim // 2)
-            else:
-                a_shape = (tokens, topk, inter_dim)
-            a = _alloc(a_shape, _storage_dtype(a_dtype))
-            w2_shape = _user_w2_shape()
-            w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
-
-            a2_scale = _make_a2_scale_for_stage2()
-            if use_mx_gemm:
-                w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
-            else:
-                w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-
-            sw = _make_sorted_weights(not doweight_stage1)
-            bias = (
-                torch.zeros(E * model_dim, device=dev, dtype=torch.float32)
-                if enable_bias
-                else None
-            )
-
-            torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-            accumulate = mode != "reduce" and not requires_flydsl_stage2_reduce(
-                tokens, model_dim, 2
-            )
-            out = torch.zeros((tokens, model_dim), dtype=torch_out_dtype, device=dev)
-            target = out
-            if not accumulate:
-                target = torch.empty(
-                    (tokens * topk * model_dim,),
-                    device=dev,
-                    dtype=torch_out_dtype,
-                )
-
-            flat_a_scale = (
-                a2_scale.view(-1)
-                if a2_scale is not None
-                else torch.empty(0, device=dev)
-            )
-            flat_w_scale = (
-                w2_scale.view(-1)
-                if w2_scale is not None
-                else torch.empty(0, device=dev)
-            )
-            sw_arg = (
-                sw
-                if sw is not None
-                else torch.empty(
-                    sorted_token_ids.shape, dtype=torch.float32, device=dev
-                )
-            )
-
-            _sbm = sort_block_m if sort_block_m > 0 else tile_m
-            if _sbm == tile_m:
-                m_blocks = min(sorted_expert_ids.shape[0], tokens * topk)
-            else:
-                total_sorted = sorted_expert_ids.shape[0] * _sbm
-                m_blocks = (total_sorted + tile_m - 1) // tile_m
-            if persist is True:
-                _persist_m = -1
-            elif persist is False:
-                _persist_m = 4 if m_blocks > 256 else 1
-            else:
-                _persist_m = -1 if m_blocks > 256 else 1
-            if a_dtype == "fp8":
-                _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
-
-            _n_in = model_dim
-            _k_in = inter_dim
-
-            if use_mx_gemm:
-                build_stage2_args = (
-                    _s2_args_fp4
-                    if _aot_backend is None
-                    else _aot_backend.build_stage2_args
-                )
-                args = build_stage2_args(
-                    target,
-                    a,
-                    w2,
-                    flat_a_scale,
-                    flat_w_scale,
-                    sorted_token_ids,
-                    sorted_expert_ids,
-                    sw_arg,
-                    num_valid_ids,
-                    tokens,
-                    tokens * topk,
-                    _n_in,
-                    _k_in,
-                    m_blocks,
-                    dev,
-                    bias=bias,
-                    stream=0,
-                )
-            else:
-                args = _s2_args_std(
-                    target,
-                    a,
-                    w2,
-                    flat_a_scale,
-                    flat_w_scale,
-                    sorted_token_ids,
-                    sorted_expert_ids,
-                    sw_arg,
-                    num_valid_ids,
-                    tokens,
-                    _n_in,
-                    _k_in,
-                    m_blocks,
-                    stream=0,
-                )
-
-            compile_stage2 = (
-                compile_flydsl_moe_stage2
-                if _aot_backend is None
-                else _aot_backend.compile_stage2
-            )
-            exe = compile_stage2(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage2=(sw is not None),
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=out_dtype,
-                accumulate=accumulate,
-                persist_m=_persist_m,
-                sort_block_m=sort_block_m,
-                waves_per_eu=waves_per_eu,
-                use_async_copy=use_async_copy,
-                use_global_a=requires_flydsl_stage2_global_a(a),
-                cu_num_mul=cu_num_mul,
-                b_nt=b_nt,
-                xcd_swizzle=xcd_swizzle,
-                enable_bias=enable_bias,
-            )
-            _run_compiled(exe, args)
-
-            # Reduce mode (accumulate=False) runs a separate topk reduction
-            # kernel inside the runtime stage2 wrapper. Precompile it via the
-            # same shared helper the runtime uses so the cache key matches.
-            # Single-GPU path uses use_mask=False (plain); EP/masked reduction
-            # is a multi-GPU path (separately gated) and not covered here.
-            if not accumulate:
-                from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
-
-                _run_moe_reduction(
-                    target,
-                    out,
-                    tokens,
-                    topk,
-                    model_dim,
-                    expert_mask=None,
-                    topk_ids=None,
-                    stream=0,
-                )
+    return RocmTarget(aot_arch, resolved_cu)
 
 
-def _precompile_a16w4_to_cache(
-    *,
-    stage: int,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    act: str = "silu",
-    b_nt: int = 2,
-    xcd_swizzle: int = 0,
-    k_wave: int = 1,
-    waves_per_eu: int | None = None,
-    b_dtype: str = "fp4",
-    **kwargs,
-):
-    """AOT for the folded a16w-mix port (moe_2stage_a16wmix): a16w4 / a16wi4.
+def _positive_job_int(cfg: dict, name: str) -> int:
+    value = cfg[name]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
 
-    The port launch ABI (raw fx.Int64 device pointers) differs from the generic MX
-    gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
-    builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
-    the fused-MoE op uses, under ``COMPILE_ONLY=1`` -- the cache key then matches
-    runtime by construction (``waves_per_eu`` follows runtime, ``persist=False``,
-    ``w_layout="standard"``, g2 tile downgrade are all applied inside the
-    launcher).  The compiled artifact is keyed only on the kernel's constexpr
-    params (shapes/tiles/topk/act), never on the launch pointers, grid, or
-    ``n_tokens``, so a single 1-elem real placeholder covers every buffer (real,
-    not fake, because the launcher calls ``.data_ptr()``; COMPILE_ONLY guarantees
-    it is never dereferenced).
-    """
-    import torch
 
-    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
-        flydsl_a16w4_gemm1,
-        flydsl_a16w4_gemm2,
+def _runtime_token_num(cfg: dict) -> int:
+    value = cfg.get("token_num", 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"token_num must be an integer, got {value!r}")
+    if value < 0:
+        raise ValueError(f"token_num must be non-negative, got {value!r}")
+    return value if value > 0 else _positive_job_int(cfg, "tile_m")
+
+
+def _routing_capacity(cfg: dict) -> tuple[int, int]:
+    """Mirror the runtime sorter's padded row and block capacities."""
+
+    tokens = _runtime_token_num(cfg)
+    topk = _positive_job_int(cfg, "topk")
+    experts = _positive_job_int(cfg, "experts")
+    tile_m = _positive_job_int(cfg, "tile_m")
+    block_m = cfg.get("block_m", 0)
+    if isinstance(block_m, bool) or not isinstance(block_m, int) or block_m < 0:
+        raise ValueError(f"block_m must be a non-negative integer, got {block_m!r}")
+    sort_block_m = block_m
+    if sort_block_m <= 0:
+        configured = cfg.get("sort_block_m", 0)
+        if isinstance(configured, bool) or not isinstance(configured, int):
+            raise TypeError(f"sort_block_m must be an integer, got {configured!r}")
+        sort_block_m = configured or tile_m
+    if sort_block_m <= 0:
+        raise ValueError(
+            f"sort_block_m must resolve to a positive integer, got {sort_block_m!r}"
+        )
+    padded_rows = tokens * topk + experts * sort_block_m - topk
+    routing_blocks = (padded_rows + sort_block_m - 1) // sort_block_m
+    return padded_rows, routing_blocks
+
+
+def _stage1_requests(cfg: dict, context):
+    """Create the same Stage1 requests the runtime path resolves."""
+
+    from aiter.ops.flydsl.moe_compile_requests import stage1_compile_requests
+
+    cfg = dict(cfg)
+    token_num = _runtime_token_num(cfg)
+    cfg["token_num"] = token_num
+    a_dtype = cfg["a_dtype"]
+    b_dtype = cfg["b_dtype"]
+    if a_dtype == "fp8" and b_dtype == "fp4":
+        cfg["tile_n"] = resolve_flydsl_stage1_tile_n(cfg["inter_dim"], cfg["tile_n"])
+    padded_rows, routing_blocks = _routing_capacity(cfg)
+    dense_blocks = min(
+        token_num * int(cfg["topk"]) * int(cfg["tile_m"]),
+        padded_rows,
+    ) // int(cfg["tile_m"])
+    grid_y = min(dense_blocks, routing_blocks)
+    cfg["persist_m"] = resolve_flydsl_grid_y_persist_m(
+        grid_y, int(cfg.get("persist_m", 0) or 0)
+    )
+    return stage1_compile_requests(
+        cfg,
+        context.target,
+        registry=context.registry,
     )
 
-    z = torch.zeros(1, dtype=torch.int32, device="cpu")
-    common = {
-        "sorted_expert_ids": z,
-        "cumsum_tensor": z,
-        "NE": experts,
-        "D_HIDDEN": model_dim,
-        "D_INTER": inter_dim,
-        "topk": topk,
-        "tile_m": tile_m,
-        "b_nt": b_nt,
-        "xcd_swizzle": xcd_swizzle,
-        "stream": 0,
-    }
-    with compile_only_env():
-        if stage == 1:
-            flydsl_a16w4_gemm1(
-                a_bf16=z,
-                w1_u8=z,
-                w1_scale_u8=z,
-                m_indices=z,
-                inter_sorted_bf16=z,
-                n_tokens=1,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                k_wave=k_wave,
-                waves_per_eu=None if waves_per_eu == 1 else waves_per_eu,
-                act=("situv2" if act in ("situv2", "situ") else act),
-                w_dtype=b_dtype,
-                w_layout="standard",
-                **common,
-            )
-        else:
-            # Mirror the runtime stage2 g2 tile downgrade (moe_kernels
-            # _flydsl_moe_stage2_impl a16w4 branch).
-            g2_tile_n = (
-                tile_n
-                if model_dim % tile_n == 0
-                else (256 if model_dim % 256 == 0 else 128)
-            )
-            g2_tile_k = (
-                tile_k
-                if inter_dim % tile_k == 0
-                else (128 if inter_dim % 128 == 0 else 64)
-            )
-            flydsl_a16w4_gemm2(
-                inter_sorted_bf16=z,
-                w2_u8=z,
-                w2_scale_u8=z,
-                sorted_token_ids=z,
-                sorted_weights=z,
-                flat_out=z,
-                M_logical=1,
-                max_sorted=1,
-                tile_n=g2_tile_n,
-                tile_k=g2_tile_k,
-                w_dtype=b_dtype,
-                epilog=(
-                    "reduce"
-                    if b_dtype == "int4" and kwargs.get("mode") == "reduce"
-                    else "atomic"
-                ),
-                **common,
-            )
 
+def _stage2_requests(cfg: dict, context):
+    """Create the same Stage2 GEMM/reduction requests as runtime."""
 
-def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
-    """Precompile the CK-Tile split-K post-activation epilogue kernel.
-
-    cktile_moe_stage1 with split_k>1 emits a workspace of interleaved gate/up
-    output and then runs a FlyDSL epilogue to apply the activation:
-      silu  -> flydsl_silu_and_mul_interleaved (silu_and_mul_fq with
-               quant_mode="none", gui_layout=True)
-      swiglu -> flydsl_swiglu_and_mul_interleaved (swiglu_and_mul)
-    Dispatch through the same runtime builders so the cache key matches; the
-    key depends only on inter_dim (swiglu) / (inter_dim, topk) (silu), and the
-    row/token dims are dynamic, so dummy buffers suffice.
-    """
-    import torch
-
-    from aiter.ops.flydsl.moe_kernels import (
-        _get_compiled_silu_fused,
-        _get_compiled_swiglu,
-        _run_compiled,
+    from aiter.ops.flydsl.moe_compile_requests import (
+        Stage2RuntimeMetadata,
+        stage2_compile_requests,
     )
 
-    dev = torch.device("cpu")
-    rows = 256
+    cfg = dict(cfg)
+    token_num = _runtime_token_num(cfg)
+    cfg["token_num"] = token_num
+    a_dtype = cfg["a_dtype"]
+    b_dtype = cfg["b_dtype"]
+    is_a16w_mix = a_dtype == "bf16" and b_dtype in ("fp4", "int4")
+    if not is_a16w_mix:
+        cfg["tile_k"] = resolve_flydsl_stage2_tile_k(cfg["inter_dim"], cfg["tile_k"])
+    cfg["doweight_stage2"] = not bool(cfg["doweight_stage1"])
+    requested_mode = cfg.get("mode", "atomic")
+    mode = (
+        "reduce"
+        if requested_mode == "reduce"
+        or requires_flydsl_stage2_reduce(token_num, cfg["model_dim"], 2)
+        else "atomic"
+    )
+    if is_a16w_mix and b_dtype != "int4":
+        # The current a16w4 port only has an atomic epilogue; this is also what
+        # the runtime wrapper selects for bf16 x fp4.
+        mode = "atomic"
+    accumulate = mode != "reduce"
+    _, routing_blocks = _routing_capacity(cfg)
+    storage_bytes = {
+        "fp4": token_num * int(cfg["topk"]) * int(cfg["inter_dim"]) // 2,
+        "fp8": token_num * int(cfg["topk"]) * int(cfg["inter_dim"]),
+        "bf16": token_num * int(cfg["topk"]) * int(cfg["inter_dim"]) * 2,
+    }[a_dtype]
+    cfg["use_global_a"] = storage_bytes >= (1 << 32)
+    fp8_intermediate = (
+        not accumulate
+        and not is_a16w_mix
+        and b_dtype in ("fp4", "fp8")
+        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
+    reduction_input_dtype = (
+        "fp8"
+        if fp8_intermediate
+        else {"fp16": "f16", "half": "f16"}.get(cfg["out_dtype"], cfg["out_dtype"])
+    )
+    runtime_metadata = Stage2RuntimeMetadata(
+        mode=mode,
+        accumulate=accumulate,
+        return_per_slot=False,
+        persist=cfg.get("persist"),
+        token_num=token_num,
+        routing_block_count=routing_blocks,
+        dtype_str=reduction_input_dtype,
+        use_mask=False,
+        topk_ids_available=False,
+        num_experts=0,
+        fp8_intermediate=fp8_intermediate,
+        out_dtype_str={"fp16": "f16", "half": "f16"}.get(
+            cfg["out_dtype"], cfg["out_dtype"]
+        ),
+        use_weight=False,
+        scale_blk=_S2_LEGACY_FP8_SCALE_BLK if fp8_intermediate else None,
+        pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN if fp8_intermediate else None,
+    )
+    return stage2_compile_requests(
+        cfg,
+        runtime_metadata,
+        context.target,
+        registry=context.registry,
+    )
 
-    # COMPILE_ONLY=1 makes the executor compile + persist the artifact without
-    # launching the kernel; without it _run_compiled would dispatch on the
-    # (absent) GPU under fake tensors and fault.
-    with compile_only_env():
-        if act == "swiglu":
-            exe = _get_compiled_swiglu(inter_dim)
-            x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
-            out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
-            # swiglu_and_mul_kernel takes fx.Pointer args -> pass pointer views
-            # (matches flydsl_swiglu_and_mul_interleaved), not raw tensors.
-            # trailing 0 = stream: null/default (compile-only, never launched)
-            _run_compiled(exe, (_ptr_view_safe(x), _ptr_view_safe(out), rows, 0))
-            return
 
-        exe = _get_compiled_silu_fused(
-            inter_dim, topk, quant_mode="none", gui_layout=True, act=act
-        )
-        x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
-        out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
-        empty_scale = torch.empty(0, dtype=torch.uint8, device=dev)
-        empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
-        empty_f32 = torch.empty(0, dtype=torch.float32, device=dev)
-        sorted_token_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
-        num_valid_ids = torch.zeros(2, dtype=torch.int32, device=dev)
-        _run_compiled(
-            exe,
-            (
-                _ptr_view_safe(x),
-                _ptr_view_safe(out),
-                _ptr_view_safe(empty_scale),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(empty_i32),
-                _ptr_view_safe(empty_f32),
-                rows,
-                sorted_token_ids.shape[0],
-                1.0,  # situ_beta
-                1.0,  # 1 / situ_beta
-                1.0,  # situ_linear_beta
-                1.0,  # 1 / situ_linear_beta
-                float("inf"),  # swiglu_limit (unused for silu)
-                0,  # stream: null/default (compile-only, kernel is never launched)
-            ),
-        )
+def _epilogue_requests(cfg: dict, context):
+    from aiter.ops.flydsl.moe_compile_requests import (
+        cktile_epilogue_compile_requests,
+    )
+
+    return cktile_epilogue_compile_requests(
+        {
+            **cfg,
+            "split_k": 2,
+            "post_activation_layout": "interleaved",
+            "enable_bias": False,
+        },
+        context.target,
+        registry=context.registry,
+    )
+
+
+def build_moe_compile_requests(cfg: Mapping[str, object], context):
+    """Build every compile request for one normalized MoE AOT job."""
+
+    if not isinstance(cfg, Mapping):
+        raise TypeError(f"cfg must be a mapping, got {type(cfg).__name__}")
+    stage = cfg["stage"]
+    if isinstance(stage, bool) or stage not in (1, 2, "epilogue"):
+        raise ValueError(f"unsupported MoE AOT stage: {stage!r}")
+    if stage == 1:
+        return _stage1_requests(cfg, context)
+    if stage == 2:
+        return _stage2_requests(cfg, context)
+    return _epilogue_requests(cfg, context)
+
+
+def compile_moe_job(job: Mapping[str, object]):
+    """Compile one normalized MoE job and return its generated artifacts."""
+
+    if not isinstance(job, Mapping):
+        raise TypeError(f"job must be a mapping, got {type(job).__name__}")
+    cfg = dict(job)
+    stage = cfg.get("stage")
+    if stage in (1, 2):
+        cfg["token_num"] = _runtime_token_num(cfg)
+    cu_num = cfg.get("cu_num", 0)
+    if isinstance(cu_num, bool) or not isinstance(cu_num, int):
+        raise TypeError(f"cu_num must be an integer, got {cu_num!r}")
+    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
+    context = create_compile_context(_job_target(aot_arch, cu_num))
+    requests = build_moe_compile_requests(cfg, context)
+    return tuple(compile_aot(request, context=context) for request in requests)
 
 
 def compile_one_config(
@@ -1017,15 +431,10 @@ def compile_one_config(
     cu_num: int = 0,
     **kwargs,
 ) -> dict:
-    """Compile one MoE kernel configuration and save to cache.
-
-    Uses COMPILE_ONLY=1 with dummy tensors to trigger MLIR compilation and
-    pkl cache write without depending on HIP ops or executing on GPU.
-
-    Returns a dict with timing info.
-    """
+    """Compile one MoE configuration through the shared runtime request path."""
+    stage = kwargs.pop("stage")
     aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
-    is_epilogue = kwargs.get("stage") == "epilogue"
+    is_epilogue = stage == "epilogue"
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
         if is_epilogue
@@ -1042,62 +451,27 @@ def compile_one_config(
         "compile_arch": aot_arch,
     }
 
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    # The folded a16w-mix port (a16w4 fp4 / a16wi4 int4) takes raw .data_ptr() device
-    # pointers, which FakeTensors don't have; drive its dedicated precompile with
-    # real (COMPILE_ONLY) tensors outside FakeTensorMode.
-    is_a16w_port = (
-        not is_epilogue
-        and kwargs.get("shared_expert_id", -1) < 0
-        and kwargs.get("a_dtype") == "bf16"
-        and kwargs.get("b_dtype") in ("fp4", "int4")
-    )
+    cfg = {
+        "kernel_name": kernel_name,
+        "stage": stage,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "cu_num": cu_num,
+        **kwargs,
+    }
 
     t0 = time.time()
     try:
-        if is_a16w_port:
-            with override_env("FLYDSL_GPU_ARCH", aot_arch):
-                _precompile_a16w4_to_cache(
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                    experts=experts,
-                    topk=topk,
-                    cu_num=cu_num,
-                    **kwargs,
-                )
-        else:
-            with (
-                override_env("FLYDSL_GPU_ARCH", aot_arch),
-                FakeTensorMode(),
-            ):
-                if is_epilogue:
-                    _precompile_epilogue_to_cache(
-                        act=kwargs.get("act", "silu"),
-                        inter_dim=inter_dim,
-                        topk=topk,
-                    )
-                else:
-                    shared_expert_id = kwargs.pop("shared_expert_id", -1)
-                    if shared_expert_id >= 0:
-                        from aiter.aot.flydsl.fhmoe import (
-                            precompile_fhmoe_to_cache,
-                        )
-
-                        precompile = precompile_fhmoe_to_cache
-                        kwargs["shared_expert_id"] = shared_expert_id
-                    else:
-                        precompile = _precompile_to_cache
-                    precompile(
-                        model_dim=model_dim,
-                        inter_dim=inter_dim,
-                        experts=experts,
-                        topk=topk,
-                        cu_num=cu_num,
-                        **kwargs,
-                    )
+        artifacts = compile_moe_job(cfg)
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
+        result["compile_requests"] = len(artifacts)
+        print(
+            f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  "
+            f"arch={aot_arch} requests={len(artifacts)}"
+        )
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 

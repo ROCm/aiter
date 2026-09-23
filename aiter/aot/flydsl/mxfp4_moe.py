@@ -433,6 +433,12 @@ def _compile_v2_stage2(job):
         )
 
 
+def get_aot_jobs():
+    """Return the default jobs registered with the unified AOT driver."""
+
+    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+
+
 def compile_one_config(**job):
     stage = job["stage"]
     shape_str = (

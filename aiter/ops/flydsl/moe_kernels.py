@@ -6,6 +6,7 @@
 import functools
 import os
 import re
+from collections.abc import Mapping
 
 import torch
 
@@ -611,6 +612,135 @@ def _register_all_configs():
 _register_all_configs()
 
 
+def _resolve_compile_request(request, compile_context):
+    """Resolve a shared runtime/AOT request to its runtime launcher."""
+
+    artifact = compile_context.backend.resolve_aot(
+        request,
+        context=compile_context,
+    )
+    return getattr(artifact, "launcher", artifact)
+
+
+def _merge_compile_metadata(base: dict, extra) -> dict:
+    """Add family-specific compile metadata without overriding core fields."""
+
+    if extra is None:
+        return base
+    if not isinstance(extra, Mapping):
+        raise TypeError(
+            f"extra compile metadata must be a mapping, got {type(extra).__name__}"
+        )
+    conflicts = set(base).intersection(extra)
+    if conflicts:
+        raise ValueError(
+            "extra compile metadata cannot override runtime-derived fields: "
+            f"{sorted(conflicts)!r}"
+        )
+    return {**base, **extra}
+
+
+def compile_flydsl_moe_stage1_a16w_mix(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    act: str = "silu",
+    waves_per_eu: int | None = None,
+    b_nt: int = 0,
+    xcd_swizzle: int = 0,
+    k_wave: int = 1,
+):
+    """Compile the bf16×fp4/int4 Stage1 family with its exact constexpr set."""
+
+    if a_dtype != "bf16" or b_dtype not in ("fp4", "int4"):
+        raise ValueError(
+            "a16w-mix Stage1 requires bf16 activations and fp4/int4 weights, "
+            f"got a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
+        )
+    if out_dtype != "bf16":
+        raise ValueError(f"a16w-mix Stage1 requires bf16 output, got {out_dtype!r}")
+    from flydsl.runtime.device import get_rocm_arch
+
+    from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
+
+    return compile_gemm1_a16w4_port(
+        BM=tile_m,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        NE=experts,
+        TOPK=topk,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        act=act,
+        b_cache_mod=b_nt,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        w_dtype=b_dtype,
+        w_layout="standard",
+        k_wave=k_wave,
+        use_k16="gfx95" not in str(get_rocm_arch()),
+    )
+
+
+def compile_flydsl_moe_stage2_a16w_mix(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    persist_m: int = 1,
+    waves_per_eu: int | None = None,
+    b_nt: int = 0,
+    xcd_swizzle: int = 0,
+    mode: str = "atomic",
+):
+    """Compile the bf16×fp4/int4 Stage2 family with its exact constexpr set."""
+
+    if a_dtype != "bf16" or b_dtype not in ("fp4", "int4"):
+        raise ValueError(
+            "a16w-mix Stage2 requires bf16 activations and fp4/int4 weights, "
+            f"got a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
+        )
+    if out_dtype != "bf16":
+        raise ValueError(f"a16w-mix Stage2 requires bf16 output, got {out_dtype!r}")
+    if mode == "reduce" and b_dtype != "int4":
+        raise ValueError("a16w4 Stage2 supports only the atomic epilogue")
+    if mode not in ("atomic", "reduce"):
+        raise ValueError(f"unsupported a16w-mix Stage2 mode: {mode!r}")
+    from flydsl.runtime.device import get_rocm_arch
+
+    from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
+
+    return compile_gemm2_a16w4_port(
+        BM=tile_m,
+        NE=experts,
+        N_OUT=model_dim,
+        D_INTER=inter_dim,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        xcd_swizzle=xcd_swizzle,
+        b_cache_mod=b_nt,
+        waves_per_eu=waves_per_eu,
+        w_dtype=b_dtype,
+        persist=persist_m == -1,
+        use_k16="gfx95" not in str(get_rocm_arch()),
+        epilog="reduce" if mode == "reduce" else "atomic",
+        topk=topk,
+    )
+
+
 def compile_flydsl_moe_stage1(
     model_dim: int,
     inter_dim: int,
@@ -646,27 +776,22 @@ def compile_flydsl_moe_stage1(
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
-        from flydsl.runtime.device import get_rocm_arch
-
-        from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
-
-        return compile_gemm1_a16w4_port(
-            BM=tile_m,
-            D_HIDDEN=model_dim,
-            D_INTER=inter_dim,
-            NE=experts,
-            TOPK=topk,
-            TILE_N=tile_n,
-            TILE_K=tile_k,
+        return compile_flydsl_moe_stage1_a16w_mix(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
             act=act,
-            b_cache_mod=b_nt,
-            xcd_swizzle=xcd_swizzle,
             waves_per_eu=waves_per_eu,
-            w_dtype=b_dtype,
-            w_layout="standard",
+            b_nt=b_nt,
+            xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -735,25 +860,22 @@ def compile_flydsl_moe_stage2(
     # (moe_2stage_a16wmix); its gate_up=False W2+scale layout matches the standard
     # shuffle_weight/e8m0 (a16wi4: pack_int8_to_packed_int4(shuffle_weight) + bf16 scale).
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
-        from flydsl.runtime.device import get_rocm_arch
-
-        from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
-
-        return compile_gemm2_a16w4_port(
-            BM=tile_m,
-            NE=experts,
-            N_OUT=model_dim,
-            D_INTER=inter_dim,
-            TILE_N=tile_n,
-            TILE_K=tile_k,
-            xcd_swizzle=xcd_swizzle,
-            b_cache_mod=b_nt,
-            waves_per_eu=waves_per_eu,
-            w_dtype=b_dtype,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
-            epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
+        return compile_flydsl_moe_stage2_a16w_mix(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
             topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            persist_m=persist_m,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
+            xcd_swizzle=xcd_swizzle,
+            mode=mode,
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
@@ -1019,6 +1141,7 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    _compile_exe=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1084,17 +1207,19 @@ def _run_moe_reduction(
         stream = torch.cuda.current_stream()
     # expert_mask is sized by the global expert count (!= w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
-    reduce_exe = compile_moe_reduction(
-        topk=topk,
-        model_dim=model_dim,
-        dtype_str=_reduce_dtype_str,
-        use_mask=use_mask,
-        num_experts=num_experts,
-        out_dtype_str=out_dtype_str,
-        use_weight=use_weight,
-        scale_blk=fp8_scale_blk if is_fp8 else None,
-        pitch_align=fp8_pitch_align if is_fp8 else None,
-    )
+    reduce_exe = _compile_exe
+    if reduce_exe is None:
+        reduce_exe = compile_moe_reduction(
+            topk=topk,
+            model_dim=model_dim,
+            dtype_str=_reduce_dtype_str,
+            use_mask=use_mask,
+            num_experts=num_experts,
+            out_dtype_str=out_dtype_str,
+            use_weight=use_weight,
+            scale_blk=fp8_scale_blk if is_fp8 else None,
+            pitch_align=fp8_pitch_align if is_fp8 else None,
+        )
     _run_compiled(
         reduce_exe,
         (
@@ -1339,6 +1464,8 @@ def _get_compiled_swiglu(inter_dim: int):
 def flydsl_swiglu_and_mul_interleaved(
     input: torch.Tensor,
     out: torch.Tensor,
+    *,
+    compile_context=None,
 ) -> None:
     """Fused swiglu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1347,7 +1474,27 @@ def flydsl_swiglu_and_mul_interleaved(
     """
     inter_dim = out.shape[-1]
     num_rows = input.shape[0]
-    _swiglu_fn = _get_compiled_swiglu(inter_dim)
+    if compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        compile_context = create_runtime_compile_context(input.device)
+    from .moe_compile_requests import cktile_epilogue_compile_requests
+
+    requests = cktile_epilogue_compile_requests(
+        {
+            "inter_dim": inter_dim,
+            "topk": 1,
+            "split_k": 2,
+            "act": "swiglu",
+            "post_activation_layout": "interleaved",
+            "enable_bias": False,
+        },
+        compile_context.target,
+        registry=compile_context.registry,
+    )
+    if len(requests) != 1:
+        raise RuntimeError("CK-Tile SwiGLU epilogue must emit one compile request")
+    _swiglu_fn = _resolve_compile_request(requests[0], compile_context)
     _run_compiled(
         _swiglu_fn,
         (
@@ -1368,6 +1515,8 @@ def flydsl_silu_and_mul_interleaved(
     topk: int,
     quant_mode: str = "none",
     gui_layout: bool = True,
+    *,
+    compile_context=None,
 ) -> None:
     """Fused silu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1376,13 +1525,31 @@ def flydsl_silu_and_mul_interleaved(
     """
     inter_dim = out.shape[-1]
     num_sorted_rows = sorted_token_ids.shape[0]
-    _silu_fn = _get_compiled_silu_fused(
-        inter_dim,
-        topk,
-        quant_mode=quant_mode,
-        gui_layout=gui_layout,
-        act="silu",
+    if quant_mode != "none" or not gui_layout:
+        raise ValueError(
+            "CK-Tile Stage1 epilogue requires quant_mode='none' and " "gui_layout=True"
+        )
+    if compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        compile_context = create_runtime_compile_context(input.device)
+    from .moe_compile_requests import cktile_epilogue_compile_requests
+
+    requests = cktile_epilogue_compile_requests(
+        {
+            "inter_dim": inter_dim,
+            "topk": topk,
+            "split_k": 2,
+            "act": "silu",
+            "post_activation_layout": "interleaved",
+            "enable_bias": False,
+        },
+        compile_context.target,
+        registry=compile_context.registry,
     )
+    if len(requests) != 1:
+        raise RuntimeError("CK-Tile SiLU epilogue must emit one compile request")
+    _silu_fn = _resolve_compile_request(requests[0], compile_context)
     empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
     empty_i32 = torch.empty(0, dtype=torch.int32, device=out.device)
     empty_f32 = torch.empty(0, dtype=torch.float32, device=out.device)
@@ -1448,8 +1615,9 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
-    _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
+    _compile_context=None,
+    _compile_metadata=None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1467,8 +1635,8 @@ def _flydsl_moe_stage1_impl(
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
 
-    `_compile_kernel` and `_build_mx_args` are injectable so the heterogeneous
-    shared-expert path can reuse this launcher with its own kernel builders.
+    `_build_mx_args` is injectable so the heterogeneous shared-expert path can
+    reuse this launcher with its expanded launch ABI.
 
     Returns:
         Basic:                      out
@@ -1516,10 +1684,53 @@ def _flydsl_moe_stage1_impl(
     if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
-        _act = "situv2" if act in ("situv2", "situ") else act
         sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
         _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
         inter_sorted = _alloc(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
+        if _compile_context is None:
+            from .aot_backend import create_runtime_compile_context
+
+            _compile_context = create_runtime_compile_context(a.device)
+        from .moe_compile_requests import stage1_compile_requests
+
+        compile_metadata = _merge_compile_metadata(
+            {
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "experts": E,
+                "topk": topk,
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "doweight_stage1": sorted_weights is not None,
+                "a_dtype": a_dtype,
+                "b_dtype": b_dtype,
+                "out_dtype": out_dtype,
+                "act": act,
+                "persist_m": max(int(persist_m), 1),
+                "use_async_copy": use_async_copy,
+                "k_batch": k_batch,
+                "waves_per_eu": _g1_waves_per_eu,
+                "b_nt": b_nt,
+                "gate_mode": gate_mode,
+                "model_dim_pad": model_dim_pad,
+                "inter_dim_pad": inter_dim_pad,
+                "enable_bias": bias is not None,
+                "a_scale_one": a_scale_one,
+                "xcd_swizzle": xcd_swizzle,
+                "k_wave": k_wave,
+            },
+            _compile_metadata,
+        )
+        compile_requests = stage1_compile_requests(
+            compile_metadata,
+            _compile_context.target,
+            registry=_compile_context.registry,
+        )
+        if len(compile_requests) != 1:
+            raise RuntimeError("a16w-mix Stage1 must emit one compile request")
+        primary_request = compile_requests[0]
+        primary_kwargs = primary_request.as_kwargs()
         flydsl_a16w4_gemm1(
             a_bf16=a.to(torch.bfloat16).contiguous(),
             w1_u8=w1.view(torch.uint8).contiguous(),
@@ -1533,27 +1744,28 @@ def _flydsl_moe_stage1_impl(
             m_indices=sorted_token_ids.to(torch.int32).contiguous(),
             inter_sorted_bf16=inter_sorted,
             n_tokens=token_num,
-            NE=E,
-            D_HIDDEN=model_dim,
-            D_INTER=inter_dim,
-            topk=topk,
-            tile_m=int(tile_m),
-            tile_n=tile_n,
-            tile_k=tile_k,
-            k_wave=k_wave,
+            NE=primary_kwargs["experts"],
+            D_HIDDEN=primary_kwargs["model_dim"],
+            D_INTER=primary_kwargs["inter_dim"],
+            topk=primary_kwargs["topk"],
+            tile_m=primary_kwargs["tile_m"],
+            tile_n=primary_kwargs["tile_n"],
+            tile_k=primary_kwargs["tile_k"],
+            k_wave=primary_kwargs["k_wave"],
             # Forwarded so the port's k_batch != 1 guard actually fires: the port has
             # no grid split-K, and dropping the request here would silently run a
             # non-split-K kernel under a name whose tuned timing assumed one.
             k_batch=k_batch,
-            b_nt=b_nt,
-            xcd_swizzle=xcd_swizzle,
-            waves_per_eu=_g1_waves_per_eu,
-            act=_act,
+            b_nt=primary_kwargs["b_nt"],
+            xcd_swizzle=primary_kwargs["xcd_swizzle"],
+            waves_per_eu=primary_kwargs["waves_per_eu"],
+            act=primary_kwargs["act"],
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
-            w_dtype=b_dtype,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, primary_kwargs["act"]),
+            w_dtype=primary_kwargs["b_dtype"],
             w_layout="standard",
+            _compile_exe=_resolve_compile_request(primary_request, _compile_context),
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -1731,7 +1943,26 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
-    exe = _compile_kernel(**compile_kwargs)
+    if _compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        _compile_context = create_runtime_compile_context(a.device)
+    request_metadata = _merge_compile_metadata(
+        {
+            **compile_kwargs,
+            "out_dtype": out_dtype,
+            "enable_bias": bias is not None,
+        },
+        _compile_metadata,
+    )
+    from .moe_compile_requests import stage1_compile_requests
+
+    compile_requests = stage1_compile_requests(
+        request_metadata,
+        _compile_context.target,
+        registry=_compile_context.registry,
+    )
+    exe = _resolve_compile_request(compile_requests[0], _compile_context)
     _run_compiled(exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
@@ -1754,72 +1985,15 @@ def _flydsl_moe_stage1_impl(
             else torch.empty(0, device=sorted_token_ids.device, dtype=torch.float32)
         )
     )
-    if _gui_sk_fused:
-        _quant_mode = "fp4" if _need_fp4 else "fp8"
-        _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            _quant_mode,
-            gui_layout=True,
-            act=act,
-            enable_bias=use_splitk_bias,
+    uses_fq_request = _gui_sk_fused or _gui_sk or _splitk_fp4
+    expected_request_count = 2 if uses_fq_request else 1
+    if len(compile_requests) != expected_request_count:
+        raise RuntimeError(
+            f"Stage1 expected {expected_request_count} compile requests, "
+            f"got {len(compile_requests)}"
         )
-        _run_compiled(
-            _silu_fused_k,
-            (
-                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
-                ptr_arg(out.view(-1).view(torch.uint8)),
-                ptr_arg(out_scale_sorted_flat),
-                ptr_arg(sorted_token_ids),
-                ptr_arg(num_valid_ids),
-                ptr_arg(topk_ids_arg),
-                ptr_arg(bias_arg),
-                token_num,
-                num_sorted_rows,
-                _situ_beta_val,
-                1.0 / _situ_beta_val,
-                _situ_linear_beta_val,
-                1.0 / _situ_linear_beta_val,
-                _swiglu_limit_val,
-                torch.cuda.current_stream(),
-            ),
-        )
-    elif _gui_sk:
-        _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            "none",
-            gui_layout=True,
-            act=act,
-            enable_bias=use_splitk_bias,
-        )
-        _run_compiled(
-            _silu_fused_k,
-            (
-                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
-                ptr_arg(out.view(-1).view(torch.uint8)),
-                ptr_arg(out_scale_sorted_flat),
-                ptr_arg(sorted_token_ids),
-                ptr_arg(num_valid_ids),
-                ptr_arg(topk_ids_arg),
-                ptr_arg(bias_arg),
-                token_num,
-                num_sorted_rows,
-                _situ_beta_val,
-                1.0 / _situ_beta_val,
-                _situ_linear_beta_val,
-                1.0 / _situ_linear_beta_val,
-                _swiglu_limit_val,
-                torch.cuda.current_stream(),
-            ),
-        )
-    elif _splitk_fp4:
-        _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            act=act,
-            enable_bias=use_splitk_bias,
-        )
+    if uses_fq_request:
+        _silu_fused_k = _resolve_compile_request(compile_requests[1], _compile_context)
         _run_compiled(
             _silu_fused_k,
             (
@@ -1863,7 +2037,6 @@ def _flydsl_moe_stage1_impl(
                     -1, inter_dim * 2
                 )
             silu_and_mul(post_out, post_input)
-
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
 
@@ -1912,6 +2085,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    compile_context=None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1969,6 +2143,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        _compile_context=compile_context,
     )
 
 
@@ -2004,8 +2179,9 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
-    _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
+    _compile_context=None,
+    _compile_metadata=None,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
@@ -2051,6 +2227,72 @@ def _flydsl_moe_stage2_impl(
             )
             if expert_mask is not None:
                 gemm2_out.zero_()
+        if _compile_context is None:
+            from .aot_backend import create_runtime_compile_context
+
+            _compile_context = create_runtime_compile_context(inter_states.device)
+        use_mask = _epilog == "reduce" and expert_mask is not None
+        if use_mask and topk_ids is None:
+            raise ValueError(
+                "topk_ids is required when expert_mask is provided for reduce mode"
+            )
+        compile_metadata = _merge_compile_metadata(
+            {
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "experts": E,
+                "topk": topk,
+                "tile_m": tile_m,
+                "tile_n": g2_tile_n,
+                "tile_k": g2_tile_k,
+                "doweight_stage2": sorted_weights is not None,
+                "a_dtype": a_dtype,
+                "b_dtype": b_dtype,
+                "out_dtype": out_dtype,
+                "sort_block_m": sort_block_m,
+                "waves_per_eu": waves_per_eu,
+                "use_async_copy": use_async_copy,
+                "use_global_a": True,
+                "cu_num_mul": cu_num_mul,
+                "b_nt": b_nt,
+                "model_dim_pad": model_dim_pad,
+                "inter_dim_pad": inter_dim_pad,
+                "xcd_swizzle": xcd_swizzle,
+                "enable_bias": bias is not None,
+            },
+            _compile_metadata,
+        )
+        from .moe_compile_requests import (
+            Stage2RuntimeMetadata,
+            stage2_compile_requests,
+        )
+
+        runtime_metadata = Stage2RuntimeMetadata(
+            mode=_epilog,
+            accumulate=_epilog != "reduce",
+            return_per_slot=False,
+            persist=persist,
+            token_num=M_logical,
+            routing_block_count=int(sorted_expert_ids.shape[0]),
+            dtype_str={"fp16": "f16", "half": "f16"}.get(out_dtype, out_dtype),
+            use_mask=use_mask,
+            topk_ids_available=use_mask,
+            num_experts=int(expert_mask.numel()) if use_mask else 0,
+            fp8_intermediate=False,
+            out_dtype_str={"fp16": "f16", "half": "f16"}.get(out_dtype, out_dtype),
+            use_weight=False,
+            scale_blk=None,
+            pitch_align=None,
+        )
+
+        compile_requests = stage2_compile_requests(
+            compile_metadata,
+            runtime_metadata,
+            _compile_context.target,
+            registry=_compile_context.registry,
+        )
+        primary_request = compile_requests[0]
+        primary_kwargs = primary_request.as_kwargs()
         flydsl_a16w4_gemm2(
             inter_sorted_bf16=inter_states,
             w2_u8=w2.view(torch.uint8).contiguous(),
@@ -2066,20 +2308,26 @@ def _flydsl_moe_stage2_impl(
             flat_out=gemm2_out.view(-1),
             M_logical=M_logical,
             max_sorted=max_sorted,
-            NE=E,
-            D_HIDDEN=model_dim,
-            D_INTER=inter_dim,
-            topk=topk,
-            tile_m=int(tile_m),
-            tile_n=g2_tile_n,
-            tile_k=g2_tile_k,
-            b_nt=b_nt,
-            waves_per_eu=waves_per_eu,
-            xcd_swizzle=xcd_swizzle,
-            w_dtype=b_dtype,
-            epilog=_epilog,
+            NE=primary_kwargs["experts"],
+            D_HIDDEN=primary_kwargs["model_dim"],
+            D_INTER=primary_kwargs["inter_dim"],
+            topk=primary_kwargs["topk"],
+            tile_m=primary_kwargs["tile_m"],
+            tile_n=primary_kwargs["tile_n"],
+            tile_k=primary_kwargs["tile_k"],
+            b_nt=primary_kwargs["b_nt"],
+            waves_per_eu=primary_kwargs["waves_per_eu"],
+            xcd_swizzle=primary_kwargs["xcd_swizzle"],
+            w_dtype=primary_kwargs["b_dtype"],
+            epilog=primary_kwargs["mode"],
+            persist=primary_kwargs["persist_m"] == -1,
+            _compile_exe=_resolve_compile_request(primary_request, _compile_context),
         )
         if _epilog == "reduce":
+            if len(compile_requests) != 2:
+                raise RuntimeError(
+                    "a16w-mix Stage2 reduce path must emit two compile requests"
+                )
             _run_moe_reduction(
                 gemm2_out,
                 out,
@@ -2088,6 +2336,13 @@ def _flydsl_moe_stage2_impl(
                 model_dim,
                 expert_mask,
                 topk_ids,
+                _compile_exe=_resolve_compile_request(
+                    compile_requests[1], _compile_context
+                ),
+            )
+        elif len(compile_requests) != 1:
+            raise RuntimeError(
+                "a16w-mix Stage2 atomic path emitted extra compile requests"
             )
         return out
 
@@ -2120,6 +2375,91 @@ def _flydsl_moe_stage2_impl(
         inter_dim = inter_dim * 2
 
     tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
+
+    use_mask = mode == "reduce" and not return_per_slot and expert_mask is not None
+    if use_mask and topk_ids is None:
+        raise ValueError(
+            "topk_ids is required when expert_mask is provided for reduce mode"
+        )
+    routing_block_count = int(sorted_expert_ids.shape[0])
+    topk_ids_available = use_mask and topk_ids is not None
+    num_experts = int(expert_mask.numel()) if use_mask else 0
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    _s2_fp8_inter = (
+        (not accumulate)
+        and (not return_per_slot)
+        and use_mx_gemm
+        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
+    compile_metadata = _merge_compile_metadata(
+        {
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "experts": E,
+            "topk": topk,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "doweight_stage2": sorted_weights is not None,
+            "a_dtype": a_dtype,
+            "b_dtype": b_dtype,
+            "out_dtype": out_dtype,
+            "sort_block_m": sort_block_m,
+            "waves_per_eu": waves_per_eu,
+            "use_async_copy": use_async_copy,
+            "use_global_a": requires_flydsl_stage2_global_a(inter_states),
+            "cu_num_mul": cu_num_mul,
+            "b_nt": b_nt,
+            "model_dim_pad": model_dim_pad,
+            "inter_dim_pad": inter_dim_pad,
+            "xcd_swizzle": xcd_swizzle,
+            "enable_bias": bias is not None,
+        },
+        _compile_metadata,
+    )
+    from .moe_compile_requests import Stage2RuntimeMetadata
+
+    runtime_metadata = Stage2RuntimeMetadata(
+        mode=mode,
+        accumulate=accumulate,
+        return_per_slot=return_per_slot,
+        persist=persist,
+        token_num=token_num,
+        routing_block_count=routing_block_count,
+        dtype_str=(
+            "fp8"
+            if _s2_fp8_inter
+            else {"fp16": "f16", "half": "f16"}.get(out_dtype, out_dtype)
+        ),
+        use_mask=use_mask,
+        topk_ids_available=topk_ids_available,
+        num_experts=num_experts,
+        fp8_intermediate=_s2_fp8_inter,
+        out_dtype_str={"fp16": "f16", "half": "f16"}.get(out_dtype, out_dtype),
+        use_weight=False,
+        scale_blk=_S2_LEGACY_FP8_SCALE_BLK if _s2_fp8_inter else None,
+        pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN if _s2_fp8_inter else None,
+    )
+    from .moe_compile_decisions import resolve_stage2_compile_decision
+
+    compile_decision = resolve_stage2_compile_decision(
+        compile_metadata,
+        mode=mode,
+        accumulate=accumulate,
+        return_per_slot=return_per_slot,
+        persist=persist,
+        token_num=token_num,
+        routing_block_count=routing_block_count,
+        dtype_str=runtime_metadata.dtype_str,
+        use_mask=use_mask,
+        topk_ids_available=topk_ids_available,
+        num_experts=num_experts,
+        fp8_intermediate=_s2_fp8_inter,
+    )
+    accumulate = compile_decision.accumulate
+    m_blocks = compile_decision.m_blocks
+    _persist_m = compile_decision.persist_m
+    _s2_gemm_out_dtype = compile_decision.gemm_out_dtype
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
@@ -2157,38 +2497,12 @@ def _flydsl_moe_stage2_impl(
         else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
     )
 
-    _sbm = sort_block_m if sort_block_m > 0 else tile_m
-    if _sbm == tile_m:
-        m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
-    else:
-        total_sorted = sorted_expert_ids.shape[0] * _sbm
-        m_blocks = (total_sorted + tile_m - 1) // tile_m
-    if persist is True:
-        _persist_m = -1
-    elif persist is False:
-        _persist_m = 4 if m_blocks > 256 else 1
-    else:
-        _persist_m = -1 if m_blocks > 256 else 1
-
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
-        _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
-
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = model_dim
     _k_in = inter_dim
 
     target = out
-    _s2_fp8_inter = (
-        (not accumulate)
-        and (not return_per_slot)
-        and use_mx_gemm
-        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    )
-    _s2_gemm_out_dtype = "fp8" if _s2_fp8_inter else out_dtype
 
     if not accumulate:
         if return_per_slot:
@@ -2250,40 +2564,27 @@ def _flydsl_moe_stage2_impl(
             m_blocks,
         )
 
-    exe = _compile_kernel(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage2=(sorted_weights is not None),
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=_s2_gemm_out_dtype,
-        accumulate=accumulate,
-        persist_m=_persist_m,
-        sort_block_m=sort_block_m,
-        waves_per_eu=waves_per_eu,
-        use_async_copy=use_async_copy,
-        use_global_a=requires_flydsl_stage2_global_a(inter_states),
-        cu_num_mul=cu_num_mul,
-        b_nt=b_nt,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        xcd_swizzle=xcd_swizzle,
-        enable_bias=(bias is not None),
+    if _compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        _compile_context = create_runtime_compile_context(inter_states.device)
+    from .moe_compile_requests import stage2_compile_requests
+
+    compile_requests = stage2_compile_requests(
+        compile_metadata,
+        runtime_metadata,
+        _compile_context.target,
+        decision=compile_decision,
+        registry=_compile_context.registry,
     )
+    exe = _resolve_compile_request(compile_requests[0], _compile_context)
     _run_compiled(exe, args)
 
-    if not accumulate:
-        use_mask = expert_mask is not None
-        if use_mask and topk_ids is None:
-            raise ValueError(
-                "topk_ids is required when expert_mask is provided for reduce mode"
-            )
     if not accumulate and not return_per_slot:
+        if len(compile_requests) != 2:
+            raise RuntimeError(
+                "Stage2 reduction path must emit exactly two compile requests"
+            )
         _run_moe_reduction(
             target,
             out,
@@ -2295,7 +2596,12 @@ def _flydsl_moe_stage2_impl(
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+            _compile_exe=_resolve_compile_request(
+                compile_requests[1], _compile_context
+            ),
         )
+    elif len(compile_requests) != 1:
+        raise RuntimeError("Stage2 non-reduction path emitted extra compile requests")
     return out
 
 
@@ -2331,6 +2637,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    compile_context=None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2384,6 +2691,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        _compile_context=compile_context,
     )
 
 

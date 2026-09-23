@@ -798,6 +798,12 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
 
 
+def get_aot_jobs():
+    """Return the default jobs registered with the unified AOT driver."""
+
+    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+
+
 def compile_one_config(
     kernel_name: str,
     kind: str,
