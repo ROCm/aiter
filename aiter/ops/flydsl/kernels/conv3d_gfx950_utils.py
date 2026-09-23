@@ -932,6 +932,31 @@ def make_output_scatter_plan(param, geom, cfg, grid):
     ), f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
 
     need_chk = row_chk or n_tail
+    # A tail is masked by routing the store to the OOB sentinel, which needs a
+    # buffer descriptor to land in. Split-K accumulates through atomics and
+    # BIG_OUT addresses y flat, so neither has one, and ``OutputScatter.store``
+    # would have to branch on a runtime predicate it cannot evaluate at trace
+    # time. ``_resolve_splitk`` never auto-splits a shape with a tail (it wants
+    # npq % tile_m == 0 and kg % tile_n == 0 first), so this is only reachable
+    # through an explicit ``splitk=`` or a hand-written tuned row -- named here
+    # rather than left to fail inside the trace with no shape to point at.
+    assert not need_chk or not (use_splitk or big_out), (
+        f"{'split-K' if use_splitk else 'BIG_OUT'} cannot mask a tile tail, and this "
+        "launch has one: "
+        + "; ".join(
+            m
+            for m in (
+                (
+                    f"npq={npq} is not a multiple of tile_m={cfg.tile_m}"
+                    if row_chk
+                    else ""
+                ),
+                f"kg={kg} is not a multiple of tile_n={cfg.tile_n}" if n_tail else "",
+            )
+            if m
+        )
+        + ". Use a tile that divides the problem, or drop the split."
+    )
     return OutputScatterPlan(
         k=k,
         kg=kg,
