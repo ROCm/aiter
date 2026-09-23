@@ -247,11 +247,15 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
         pivot = mn & ((start == 0) ? 0u : (0xFFFFFFFFu << (32 - 8 * start)));
     }
 
-    int ek = K;
+    // prefix_skip can move the first executed pass off 0, and the caller only
+    // counted digits for pass 0. When it moves, the prefill is for the wrong
+    // byte and s_hist has to be cleared like any other call.
+    const bool use_prefill = hist_prefilled && start == 0;
+    int ek                 = K;
 #if SELECT_CLEAR_ON_READ
     // Zeroed once here; from then on the scan re-zeroes each bucket as it reads
     // it, so the per-pass clear loop and its barrier are gone.
-    if(!hist_prefilled)
+    if(!use_prefill)
     {
         for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
             s_hist[i] = 0;
@@ -265,7 +269,7 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
         const bool filter = (p > 0);
         // Pass `start` reads a histogram the caller already filled, so this
         // scan of s_keys and the wait that ends it are paid for.
-        const bool skip_hist = hist_prefilled && p == start;
+        const bool skip_hist = use_prefill && p == start;
         if(!skip_hist)
         {
 #if !SELECT_CLEAR_ON_READ

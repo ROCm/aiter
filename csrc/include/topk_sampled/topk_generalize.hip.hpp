@@ -616,6 +616,20 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     // shows four separate load sites already, and c is about 2867 against a
     // 1024-thread block, so there are three iterations and nothing left to
     // overlap. The wait is the latency of the read itself.
+    // Count pass 0's digits while the candidates are being read, the same trade
+    // phase_a's sampler takes. Pass 1 of phase_c's select is the expensive one --
+    // the only unfiltered scan of all c keys, measured at 4.38us against 1.62 /
+    // 1.16 / 1.12 for passes 2, 3 and 4 at m=512 n=131072 -- and the keys are
+    // already in registers here.
+#ifndef PC_FOLD
+#define PC_FOLD 1
+#endif
+#if PC_FOLD
+    const int fold_rep = threadIdx.x & (HIST_REP - 1);
+    for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
+        s_hist[i] = 0u;
+    __syncthreads();
+#endif
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
 #if NT_CAND
@@ -626,17 +640,48 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
 #else
         uint64_t p = base[i];
 #endif
-        s_keys_ext[i] = fp32_to_sortable_bits((uint32_t)(p >> 32));
+        const uint32_t kk = fp32_to_sortable_bits((uint32_t)(p >> 32));
+        s_keys_ext[i]     = kk;
         if(!keys_only)
             s_idx[i] = (int)(uint32_t)p;
+#if PC_FOLD
+        // radix_shift(0) is 24, so pass 0's digit is the top byte.
+        atomicAdd(&s_hist[(kk >> 24) * HIST_REP + fold_rep], 1u);
+#endif
     }
 #endif
     __syncthreads();
 
     uint32_t pivot;
     int eq_needed;
-    block_select_lds(
-        s_keys_ext, c, k_out, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses, true);
+    // Prices phase_c the way ABLATE_PA prices phase_a: the candidate read, the LDS
+    // fill and the gather all stay, only block_select_lds goes. The gather then
+    // works off a pivot that selects nothing in particular, so the results are
+    // WRONG -- this exists to say how much of phase_c is the select.
+#ifndef ABLATE_PC
+#define ABLATE_PC 0
+#endif
+#if ABLATE_PC
+    // Block-UNIFORM and below every key, so block_gather_topk finds its k_out
+    // immediately instead of spinning: a per-thread pivot made it loop and the
+    // measurement came back at 330-937us, which was the spin, not the select.
+    pivot     = 0u;
+    eq_needed = 0;
+    (void)npasses;
+#else
+    block_select_lds(s_keys_ext,
+                     c,
+                     k_out,
+                     s_hist,
+                     s_red,
+                     s_scan,
+                     s_mm,
+                     pivot,
+                     eq_needed,
+                     npasses,
+                     true,
+                     PC_FOLD != 0);
+#endif
 
     if(threadIdx.x == 0)
     {
