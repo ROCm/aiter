@@ -109,7 +109,16 @@ def _assert_conv3d_result(
         rtol, atol = dynamic_conv_tolerances(dtype, K_red)
     y32 = y.float()
     ref32 = ref.float()
-    torch.testing.assert_close(y32, ref32, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        y32,
+        ref32,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda msg: (
+            f"Conv3D result mismatch: dtype={dtype}, K_red={K_red}, "
+            f"is_winograd={is_winograd}\n\n{msg}"
+        ),
+    )
 
     if is_winograd:
         error = (y32 - ref32).abs()
@@ -297,7 +306,16 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
     y = conv3d(x, w, stride=1, padding=0, dilation=1, layout=layout)
     ref = F.conv3d(x.float(), w.float())
     rtol, atol = dynamic_conv_tolerances(torch.float16, 32)
-    torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        y.float(),
+        ref,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda msg: (
+            f"Scalar-parameter Conv3D mismatch: layout={layout}, "
+            f"input_strides={x.stride()}\n\n{msg}"
+        ),
+    )
     assert y.dtype == torch.float16, f"expected float16 output, got {y.dtype}"
     if layout == "ndhwc":
         assert y.is_contiguous(memory_format=torch.channels_last_3d), (
@@ -333,7 +351,16 @@ def test_ncdhw_to_cblocked_mapping_and_zero_padding():
     assert packed.is_contiguous(), (
         f"packed strides are not contiguous: {packed.stride()}"
     )
-    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        packed,
+        expected,
+        rtol=0,
+        atol=0,
+        msg=lambda msg: (
+            f"NCDHW-to-cblocked mapping mismatch: C={C}, block_c={block_c}, "
+            f"C_pad={C_pad}\n\n{msg}"
+        ),
+    )
     assert torch.count_nonzero(packed[:, -1, ..., C % block_c :]) == 0, (
         "channel-padding region contains nonzero values"
     )
@@ -355,7 +382,14 @@ def test_oidhw_to_kmajor_prepack_mapping_and_zero_padding():
     assert packed.is_contiguous(), (
         f"packed strides are not contiguous: {packed.stride()}"
     )
-    torch.testing.assert_close(packed[:, :K_red], w.reshape(K_out, K_red))
+    torch.testing.assert_close(
+        packed[:, :K_red],
+        w.reshape(K_out, K_red),
+        msg=lambda msg: (
+            f"OIDHW-to-K-major mapping mismatch: K_red={K_red}, "
+            f"block_k={block_k}, K_pad={K_pad}\n\n{msg}"
+        ),
+    )
     assert torch.count_nonzero(packed[:, K_red:]) == 0, (
         "K-padding region contains nonzero values"
     )
@@ -377,7 +411,14 @@ def test_oidhw_to_3x3x3_prepack_mapping_and_zero_padding():
     assert packed.is_contiguous(), (
         f"packed strides are not contiguous: {packed.stride()}"
     )
-    torch.testing.assert_close(packed[:, :, :C], expected)
+    torch.testing.assert_close(
+        packed[:, :, :C],
+        expected,
+        msg=lambda msg: (
+            f"OIDHW-to-3x3x3 mapping mismatch: C={C}, block_c={block_c}, "
+            f"C_pad={C_pad}\n\n{msg}"
+        ),
+    )
     assert torch.count_nonzero(packed[:, :, C:]) == 0, (
         "channel-padding region contains nonzero values"
     )
@@ -403,7 +444,11 @@ def test_weight_prepack_cache_reuses_and_invalidates(monkeypatch):
     assert refreshed_pad == first_pad, (
         f"refreshed padding {refreshed_pad} != original {first_pad}"
     )
-    torch.testing.assert_close(refreshed[:, :3], w.reshape(1, 3))
+    torch.testing.assert_close(
+        refreshed[:, :3],
+        w.reshape(1, 3),
+        msg=lambda msg: f"refreshed weight pack contains stale data\n\n{msg}",
+    )
     assert torch.count_nonzero(refreshed[:, 3:]) == 0, (
         "refreshed K-padding region contains nonzero values"
     )
@@ -496,7 +541,16 @@ def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeyp
     y = conv3d_general(x, w, bias, padding=(0, 1, 1), block_k=64)
     reference = F.conv3d(x.float(), w.float(), bias.float(), padding=(0, 1, 1))
     rtol, atol = dynamic_conv_tolerances(torch.float16, 54)
-    torch.testing.assert_close(y.float(), reference, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        y.float(),
+        reference,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda msg: (
+            "general Conv3D tail masking mismatch: K_red=54, block_k=64\n\n"
+            f"{msg}"
+        ),
+    )
     assert y.dtype == torch.float16, f"expected float16 output, got {y.dtype}"
 
 
