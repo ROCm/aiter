@@ -333,11 +333,22 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     constexpr int SFB_ROWS        = 2 * SFB_NG_PER_HALF;      // N-groups in B_N tile
     constexpr int SFB_LDS_BYTES =
         PRELOAD_SFB_LDS ? (SFB_ROWS * SFB_K_TILES_MAX * SFB_SPK * (int)sizeof(D_SF)) : 1;
-    __shared__ char smem_sfb[SFB_LDS_BYTES];
+    // The panel is ours to lay out, so when a half-tile owns several N-groups it
+    // is stored N-group-minor: the NG bytes a lane wants for one scale column
+    // land next to each other and come back in one ds_read_b32 instead of NG
+    // ds_read_u8. At GROUP_N=128 there is one group per half tile, the
+    // transpose would be the identity, and the kid keeps the exact addressing
+    // it was tuned at.
+    constexpr bool SFB_NG_MINOR = PRELOAD_SFB_LDS && (SFB_NG_PER_HALF > 1);
+    __shared__ __align__(16) char smem_sfb[SFB_LDS_BYTES];
     D_SF* s_sfb_ptr = reinterpret_cast<D_SF*>(smem_sfb);
     const int sfb_k_scales = PRELOAD_SFB_LDS ? ((kargs.k / T::B_K) * SFB_SPK) : 1;
     auto sfb_lds_offset = [&](int half_tile_n, int tile_k) {
-        return half_tile_n * SFB_NG_PER_HALF * sfb_k_scales + tile_k * SFB_SPK;
+        if constexpr (SFB_NG_MINOR) {
+            return tile_k * SFB_SPK * SFB_ROWS + half_tile_n * SFB_NG_PER_HALF;
+        } else {
+            return half_tile_n * SFB_NG_PER_HALF * sfb_k_scales + tile_k * SFB_SPK;
+        }
     };
     auto load_sfb = [&](int half_tile_n, int tile_k) {
         if constexpr (PRELOAD_SFB_LDS) {
@@ -347,7 +358,22 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
             // neighbouring bytes. At 128 there is one row and one block and this
             // is the single byte read it has always been.
             auto s = make_smem(s_sfb_ptr + sfb_lds_offset(half_tile_n, tile_k));
-            return load_sfb_lane_groups<T, vtype_sfb>(s, 0, sfb_k_scales, sfb_lane_k);
+            if constexpr (SFB_NG_MINOR) {
+                // One ds_read per scale column, N-groups riding along in it.
+                vtype_sfb v{};
+                opus::static_for<T::SF_LANE_SCALES_PER_BK>([&](auto ik_c) {
+                    constexpr int ik = decltype(ik_c)::value;
+                    auto g = load<SFB_NG_PER_HALF>(
+                        s, (ik * T::SF_PER_MFMA_K + sfb_lane_k) * SFB_ROWS);
+                    opus::static_for<SFB_NG_PER_HALF>([&](auto ng_c) {
+                        constexpr int ng = decltype(ng_c)::value;
+                        v[ng * T::SF_LANE_SCALES_PER_BK + ik] = g[ng];
+                    });
+                });
+                return v;
+            } else {
+                return load_sfb_lane_groups<T, vtype_sfb>(s, 0, sfb_k_scales, sfb_lane_k);
+            }
         } else {
             return load_sfb_lane_groups<T, vtype_sfb>(
                 g_sfb, sfb_offset(half_tile_n, tile_k), kargs.stride_sfb, sfb_lane_k);
@@ -421,6 +447,11 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         const int cols = SFA_SLIDING
             ? (sfa_k_scales - col0 < SFA_SCALES_MAX ? sfa_k_scales - col0 : SFA_SCALES_MAX)
             : sfa_k_scales;
+        // Cutting the flat index on the panel's compile-time width instead of
+        // the window's would trade the runtime divisor for a reciprocal-free
+        // one, but it also walks the columns a short last window does not own:
+        // measured, that costs more than the division saves (1891 -> 1793
+        // TFLOPS at b8/m32768/k4096), so the runtime divisor stays.
         const int sfa_total = SFA_ROWS * cols;
         auto fill = [&](auto vec_c) {
             constexpr int VEC = decltype(vec_c)::value;
@@ -448,8 +479,13 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         opus::static_for<SFB_FILL_ITERS>([&](auto it_c) {
             constexpr int it = decltype(it_c)::value;
             if (sfb_take[it]) {
-                make_smem(s_sfb_ptr).template store<1>(
-                    sfb_val[it], opus::thread_id_x() + it * T::BLOCK_SIZE);
+                const int idx = opus::thread_id_x() + it * T::BLOCK_SIZE;
+                int dst = idx;
+                if constexpr (SFB_NG_MINOR) {
+                    const int ng = idx / sfb_k_scales;
+                    dst = (idx - ng * sfb_k_scales) * SFB_ROWS + ng;
+                }
+                make_smem(s_sfb_ptr).template store<1>(sfb_val[it], dst);
             }
         });
     }
