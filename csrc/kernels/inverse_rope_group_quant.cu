@@ -58,25 +58,16 @@
 
 namespace aiter {
 
-// get_gpu_arch() re-queries the driver on every call (hipGetDeviceCount plus
-// hipGetDeviceProperties), which is real host time beside a 10 us kernel. The
-// device cannot change under a process, so resolve it once.
-static inline const std::string& cached_gpu_arch()
-{
-    static const std::string arch = get_gpu_arch();
-    return arch;
-}
-
 // Runtime mirror of the layout gates above: the device image only carries the
 // layout its family consumes, so the host has to refuse the other one here
 // rather than let the launch fail with a bare "invalid device function".
 static inline bool is_cdna_arch()
 {
-    return cached_gpu_arch().rfind("gfx9", 0) == 0;
+    return get_gpu_arch().rfind("gfx9", 0) == 0;
 }
 
 // The tensor engine the payload staging below rides on is gfx1250-only.
-static inline bool has_tdm_arch() { return cached_gpu_arch() == "gfx1250"; }
+static inline bool has_tdm_arch() { return get_gpu_arch() == "gfx1250"; }
 
 static constexpr float kAbsmaxFloor = 1e-8f;
 
@@ -673,7 +664,7 @@ __global__ void inverse_rope_group_quant_kernel(
         constexpr int kWaveTileElems = kSlotsPerWave * GROUP_SIZE;
 
         // Row in the pointer: the window addresses within one row, so the
-        // 2 GiB descriptor limit ROW_BASED exists for cannot bite.
+        // 2 GiB descriptor limit that ROW_BASED guards against cannot bite.
         const scalar_t* row_ptr = o + row_elem_base;
         const opus::u32_t lds_base =
             static_cast<opus::u32_t>(
