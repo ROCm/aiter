@@ -189,10 +189,6 @@ def _mxfp4_pack_op(
     max_normal: tl.constexpr = 6
     min_normal: tl.constexpr = 1
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE).to(tl.float32)
-    # Calculate scale
-    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-    bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
 
     # MXFP4 E2M1 values are encoded as sign, two exponent bits and one
     # mantissa bit. Adjacent logical columns share one output byte.
