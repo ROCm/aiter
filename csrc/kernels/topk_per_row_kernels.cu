@@ -3011,7 +3011,10 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         IdxT const winner_count = counter.out_cnt;
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < winner_count; i += BlockSize)
         {
-            out_idx[i] = winner_indices[i];
+            // Non-temporal: this is the kernel's final output and is never
+            // read back, so it should not allocate against a last-level cache
+            // that the row still occupies.
+            __builtin_nontemporal_store(winner_indices[i], out_idx + i);
         }
     }
 
