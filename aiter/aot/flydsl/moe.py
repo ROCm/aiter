@@ -235,6 +235,7 @@ def _precompile_to_cache(
     gate_mode: str = "separated",
     mode: str = "atomic",
     persist=None,
+    persist_m: int = 0,
     sort_block_m: int = 0,
     cu_num: int = 0,
     token_num: int = 0,
@@ -244,6 +245,7 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
@@ -532,6 +534,11 @@ def _precompile_to_cache(
                 else torch.empty(0, device=dev, dtype=torch.float32)
             )
             _grid_y = min(max_num_m_blocks, tokens * topk)
+            _persist_m = (
+                int(persist_m)
+                if int(persist_m) < 0
+                else resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+            )
             _kernel_out = tmp_out if _is_splitk else out
             kernel_bias = None if _is_splitk else bias
             _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
@@ -601,31 +608,37 @@ def _precompile_to_cache(
                 if _aot_backend is None
                 else _aot_backend.compile_stage1
             )
-            exe = compile_stage1(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage1=(sw is not None),
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=_gemm_out_dtype,
-                act=act,
-                use_async_copy=True,
-                k_batch=k_batch,
-                waves_per_eu=waves_per_eu,
-                b_nt=b_nt,
-                gate_mode=gate_mode,
-                enable_bias=(kernel_bias is not None),
-                a_scale_one=a_scale_one,
-                xcd_swizzle=xcd_swizzle,
-                k_wave=k_wave,
-                v2_output_layout=_v2_output_layout,
-            )
+            compile_kwargs = {
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "experts": E,
+                "topk": topk,
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "doweight_stage1": sw is not None,
+                "a_dtype": a_dtype,
+                "b_dtype": b_dtype,
+                "out_dtype": _gemm_out_dtype,
+                "act": act,
+                "persist_m": _persist_m,
+                "use_async_copy": True,
+                "k_batch": k_batch,
+                "waves_per_eu": waves_per_eu,
+                "b_nt": b_nt,
+                "gate_mode": gate_mode,
+                "enable_bias": kernel_bias is not None,
+                "a_scale_one": a_scale_one,
+                "xcd_swizzle": xcd_swizzle,
+                "k_wave": k_wave,
+                "pipeline_phases": pipeline_phases,
+                "v2_output_layout": _v2_output_layout,
+            }
+            exe = compile_stage1(**compile_kwargs)
             _run_compiled(exe, args)
+            if _persist_m == -2:
+                overflow_exe = compile_stage1(**{**compile_kwargs, "persist_m": -3})
+                _run_compiled(overflow_exe, args)
 
             if _gui_sk_fused or _gui_sk or _splitk_fp4:
                 if _gui_sk_fused:
@@ -736,7 +749,7 @@ def _precompile_to_cache(
                 _persist_m = 4 if m_blocks > 256 else 1
             else:
                 _persist_m = -1 if m_blocks > 256 else 1
-            if a_dtype == "fp8":
+            if a_dtype == "fp8" and persist is not True:
                 _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
             _n_in = model_dim

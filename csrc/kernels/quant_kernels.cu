@@ -660,6 +660,76 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
 }
 
+// Device-row-count specialization used by graph-padded MXFP8 MoE inputs.
+// The ordinary launcher sizes its grid from the static allocation, so a MiMo
+// EP buffer with M=131072 still launches hundreds of thousands of workgroups
+// when only a few thousand received rows are live. One thread owns one 1x32
+// group here and advances through the device-reported live prefix with a
+// persistent grid, preserving the same E8M0 quantization and output layout.
+template <typename DTYPE_I, int block_size = 256>
+__global__ void __launch_bounds__(block_size)
+dynamic_per_group_scaled_quant_mxfp8_rows_kernel(opus::fp8_t* __restrict__ out,
+                                                  float* __restrict__ scale,
+                                                  DTYPE_I const* __restrict__ input,
+                                                  int32_t ori_cols,
+                                                  int32_t ori_row_stride,
+                                                  int64_t oob_size,
+                                                  int32_t const* __restrict__ num_rows,
+                                                  int32_t num_rows_factor)
+{
+    constexpr int32_t group_size       = 32;
+    constexpr int32_t thread_data_size = 32;
+    using vec_i                        = opus::vector_t<DTYPE_I, thread_data_size>;
+
+    const int64_t rows = static_cast<int64_t>(*num_rows) * num_rows_factor;
+    const int32_t scale_n = ori_cols / group_size;
+    const int64_t total_groups = rows * scale_n;
+    const int64_t group_stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+    auto* scale_u8 = reinterpret_cast<uint8_t*>(scale);
+    auto* out_ptr  = reinterpret_cast<opus::fp8_t*>(out);
+    auto buffer_o  = opus::make_gmem<opus::fp8_t>(out_ptr, oob_size);
+
+    for(int64_t group_id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        group_id < total_groups;
+        group_id += group_stride)
+    {
+        const int64_t row = group_id / scale_n;
+        const int32_t col_group = static_cast<int32_t>(group_id % scale_n);
+        const int64_t input_offset = row * ori_row_stride + col_group * group_size;
+
+        const vec_i thread_data = *reinterpret_cast<vec_i const*>(input + input_offset);
+        float abs_max = 1e-10f;
+#pragma unroll
+        for(int j = 0; j < thread_data_size; ++j)
+        {
+            abs_max = max(abs_max, abs(static_cast<float>(thread_data[j])));
+        }
+
+#if defined(__gfx942__)
+        constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+        constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3;
+#endif
+        const float row_scale =
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(
+                abs_max);
+        scale_u8[group_id] =
+            (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111;
+
+        const float inv_scale = 1.0f / row_scale;
+        store_vector<opus::fp8_t,
+                     DTYPE_I,
+                     thread_data_size,
+                     RT,
+                     false,
+                     WARP_SIZE,
+                     1,
+                     opus::fp8_t>(
+            buffer_o, thread_data, group_id * group_size, inv_scale);
+    }
+}
+
 __global__ void initializeScale(float *d_data, int size, float value)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1451,6 +1521,34 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+                    if constexpr(ee && !ss && _GS == 32 &&
+                                 std::is_same_v<out_t, opus::fp8_t>)
+                    {
+                        if(num_rows_ptr != nullptr && rows >= 8192)
+                        {
+                            constexpr int persistent_block = 256;
+                            const int max_grid = get_device_cu_num() * 2;
+                            const int static_grid =
+                                (num_group + persistent_block - 1) / persistent_block;
+                            const int persistent_grid =
+                                static_grid < max_grid ? static_grid : max_grid;
+                            aiter::dynamic_per_group_scaled_quant_mxfp8_rows_kernel<
+                                input_dtype,
+                                persistent_block><<<persistent_grid,
+                                                    persistent_block,
+                                                    0,
+                                                    stream>>>(
+                                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                                reinterpret_cast<float*>(scales.data_ptr()),
+                                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                                cols,
+                                row_stride,
+                                oob_size,
+                                num_rows_ptr,
+                                num_rows_factor);
+                            return;
+                        }
+                    }
                     // Opt in only on the measured d01 configuration. Other gfx1250
                     // machines already run this workload faster with the default path.
                     if constexpr(std::is_same_v<input_dtype, opus::bf16_t> &&
@@ -2847,7 +2945,8 @@ __global__ void mxfp4_moe_sort_kernel(
     AITER_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
     int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
     int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
-    int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
+    int persistent_blocks = num_cu * blocks_per_cu;                                    \
+    int num_tg = num_blocks < persistent_blocks ? num_blocks : persistent_blocks;       \
     dim3 const grid(num_tg);                                                            \
     /* The coalesced-store perf gate is computed inside the kernel from        */       \
     /* num_blocks + scaleN_pad (no extra launch arg / signature change).       */       \
@@ -2908,7 +3007,6 @@ void mxfp4_moe_sort_hip(
 )
 {
     const int num_cu = get_num_cu_func();
-    const bool persistent_mode = false;
     int topk = scale.numel() / ((cols + 31) / 32 * token_num);
 
     HipDeviceGuard device_guard(scale.device_id);

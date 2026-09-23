@@ -289,6 +289,43 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+                                        if (
+                                            a_dtype == "fp8"
+                                            and is_fp4_b
+                                            and tm == 64
+                                            and tn == 128
+                                            and tk == 256
+                                            and wpe == 3
+                                            and kb == 1
+                                            and bnt == 2
+                                            and not go
+                                            and xcd == 0
+                                            and kw == 1
+                                            and out_dtype == "bf16"
+                                        ):
+                                            kernels[name + "_persist"] = {
+                                                **kernels[name],
+                                                "persist_m": -1,
+                                            }
+                                        if (
+                                            a_dtype == "fp8"
+                                            and is_fp4_b
+                                            and tm == 128
+                                            and tn == 256
+                                            and tk == 256
+                                            and wpe == 1
+                                            and kb == 1
+                                            and bnt == 0
+                                            and not go
+                                            and xcd == 0
+                                            and kw == 1
+                                            and out_dtype == "bf16"
+                                        ):
+                                            kernels[name + "_persist_split_ph8"] = {
+                                                **kernels[name],
+                                                "persist_m": -2,
+                                                "pipeline_phases": 8,
+                                            }
     return kernels
 
 
@@ -636,6 +673,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
@@ -697,6 +735,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
+            pipeline_phases=pipeline_phases,
             v2_output_layout=v2_output_layout,
         )
     else:
@@ -1449,6 +1488,7 @@ def _flydsl_moe_stage1_impl(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
@@ -1625,7 +1665,11 @@ def _flydsl_moe_stage1_impl(
     )
     _grid_y = min(_dense_blks, _all_blks)
 
-    _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+    _persist_m = (
+        int(persist_m)
+        if int(persist_m) < 0
+        else resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+    )
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
@@ -1729,12 +1773,20 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        "pipeline_phases": pipeline_phases,
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
+    if _persist_m == -2:
+        # The CU-sized primary launch handles one tile per worker without a
+        # runtime loop. A small second launch preserves correctness for skewed
+        # routing that produces more valid tiles than the primary can cover.
+        overflow_compile_kwargs = {**compile_kwargs, "persist_m": -3}
+        overflow_exe = _compile_kernel(**overflow_compile_kwargs)
+        _run_compiled(overflow_exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
     use_splitk_bias = _is_splitk and bias is not None
@@ -1913,6 +1965,7 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
@@ -1970,6 +2023,7 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
+        pipeline_phases=pipeline_phases,
         v2_output_layout=v2_output_layout,
     )
 
@@ -2172,8 +2226,9 @@ def _flydsl_moe_stage2_impl(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+    if a_dtype == "fp8" and persist is not True:
+        # FP8 defaults to non-persistent scheduling, so cap grid.y via persist_m.
+        # Preserve an explicit persistent request selected by a tuned config.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:

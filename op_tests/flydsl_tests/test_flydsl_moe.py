@@ -198,6 +198,276 @@ def test_pick_flydsl_stage2_tile_k():
     assert resolve_flydsl_stage2_tile_k(512, 128) == 128
 
 
+def test_mimo_split_persistent_stage1_kernel_registration():
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    split_params = get_flydsl_kernel_params(
+        "flydsl_moe1_afp8_wfp4_bf16_t128x256x256_bnt0_gui_persist_split_ph8_fp8"
+    )
+    assert split_params is not None
+    assert split_params["tile_m"] == 128
+    assert split_params["tile_n"] == 256
+    assert split_params["tile_k"] == 256
+    assert split_params["out_dtype"] == "fp8"
+    assert split_params["persist_m"] == -2
+    assert split_params["pipeline_phases"] == 8
+
+
+@pytest.mark.parametrize(
+    ("token", "local_experts", "block_m", "kernel_name1", "kernel_name2"),
+    [
+        pytest.param(
+            token,
+            24,
+            32,
+            "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w2_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_atomic_persist",
+            id=f"ep16-m{token}",
+        )
+        for token in (256, 512, 1024, 2048)
+    ]
+    + [
+        pytest.param(
+            4096,
+            24,
+            64,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic_persist",
+            id="ep16-m4096",
+        )
+    ]
+    + [
+        pytest.param(
+            token,
+            local_experts,
+            64,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_gui_persist_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic_persist",
+            id=f"ep{384 // local_experts}-m{token}",
+        )
+        for local_experts in (24, 48)
+        for token in (8192, 16384)
+    ]
+    + [
+        pytest.param(
+            131072,
+            local_experts,
+            128,
+            "flydsl_moe1_afp8_wfp4_bf16_t128x256x256_bnt0_gui_persist_split_ph8_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic_persist_sbm128",
+            id=f"ep{384 // local_experts}-m131072",
+        )
+        for local_experts in (24, 48)
+    ],
+)
+def test_mimo_tuned_config_selection(
+    token, local_experts, block_m, kernel_name1, kernel_name2
+):
+    from aiter.fused_moe import get_2stage_cfgs
+
+    get_2stage_cfgs.cache_clear()
+    metadata = get_2stage_cfgs(
+        token=token,
+        model_dim=6144,
+        inter_dim=2048,
+        expert=local_experts,
+        # Current EP sorting carries one fake expert in addition to routed top-k 8.
+        topk=9,
+        dtype=torch.bfloat16,
+        q_dtype_a=dtypes.fp8,
+        q_dtype_w=dtypes.fp4x2,
+        q_type=QuantType.per_1x32,
+        use_g1u1=True,
+        activation=ActivationType.Silu,
+        doweight_stage1=False,
+        hidden_pad=0,
+        intermediate_pad=0,
+        is_shuffled=True,
+        gate_mode="interleave",
+        is_ep=True,
+    )
+
+    assert metadata.block_m == block_m
+    assert metadata.stage1.keywords["kernelName"] == kernel_name1
+    assert metadata.stage2.keywords["kernelName"] == kernel_name2
+
+
+@pytest.mark.parametrize(
+    ("token", "block_m", "tile_n"),
+    [
+        pytest.param(128, 32, 128, id="bm32-bn128"),
+        pytest.param(128, 128, 256, id="bm128-bn256"),
+        pytest.param(32768, 128, 256, id="bm128-bn256-overflow"),
+    ],
+)
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage1_a8w4_persistent_matches_nonpersistent(token, block_m, tile_n):
+    """Persistent stage 1 must cover exactly the device-reported valid routes."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    model_dim, inter_dim, E, topk = 512, 256, 8, 2
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=37
+    )
+    kwargs = {
+        "a": data["a_q"],
+        "w1": data["w1_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": tile_n,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "fp8",
+        "act": "silu",
+        "w1_scale": data["w1_scale_shuf"],
+        "a1_scale": data["a_scale_sort"],
+        "gate_mode": "interleave",
+        "use_async_copy": True,
+    }
+
+    normal, normal_scale = flydsl_moe_stage1(persist_m=1, **kwargs)
+    persistent, persistent_scale = flydsl_moe_stage1(persist_m=-1, **kwargs)
+    split_persistent, split_persistent_scale = flydsl_moe_stage1(
+        persist_m=-2, pipeline_phases=8, **kwargs
+    )
+    torch.cuda.synchronize()
+
+    num_sorted = int(data["num_valid_ids"][0].item())
+    sorted_ids = data["sorted_ids"][:num_sorted].to(torch.int64)
+    token_ids = sorted_ids & 0xFFFFFF
+    slot_ids = sorted_ids >> 24
+    valid = (
+        (token_ids < token)
+        & (slot_ids < topk)
+        & (data["sorted_weights"][:num_sorted] != 0)
+    )
+    route_ids = token_ids[valid] * topk + slot_ids[valid]
+
+    normal_routes = normal.view(-1, inter_dim)[route_ids]
+    persistent_routes = persistent.view(-1, inter_dim)[route_ids]
+    split_persistent_routes = split_persistent.view(-1, inter_dim)[route_ids]
+    torch.testing.assert_close(persistent_routes, normal_routes, atol=0, rtol=0)
+    torch.testing.assert_close(split_persistent_routes, normal_routes, atol=0, rtol=0)
+
+    stage2_kwargs = {
+        "w2": data["w2_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 128,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "mode": "atomic",
+        "w2_scale": data["w2_scale_shuf"],
+        "sorted_weights": data["sorted_weights"],
+    }
+    normal_out = flydsl_moe_stage2(
+        inter_states=normal, a2_scale=normal_scale, **stage2_kwargs
+    )
+    persistent_out = flydsl_moe_stage2(
+        inter_states=persistent, a2_scale=persistent_scale, **stage2_kwargs
+    )
+    split_persistent_out = flydsl_moe_stage2(
+        inter_states=split_persistent,
+        a2_scale=split_persistent_scale,
+        **stage2_kwargs,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(persistent_out, normal_out, atol=1.0, rtol=0.05)
+    torch.testing.assert_close(split_persistent_out, normal_out, atol=1.0, rtol=0.05)
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_persistent_matches_reference():
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 128, 512, 256, 8, 2, 64
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=103
+    )
+    out = flydsl_moe_stage2(
+        inter_states=data["a2_q"],
+        w2=data["w2_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=topk,
+        tile_m=64,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="atomic",
+        w2_scale=data["w2_scale_shuf"],
+        a2_scale=data["a2_scale_sort"],
+        sorted_weights=data["sorted_weights"],
+        persist=True,
+    )
+    torch.cuda.synchronize()
+    _check_close(data["ref_stage2"], out, "stage2_a8w4_persistent")
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_persistent_graph_replay():
+    """Persistent stage 2 must support graph replay with a reused output."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=29
+    )
+    out = torch.zeros(token, model_dim, dtype=torch.bfloat16, device="cuda")
+    kwargs = {
+        "inter_states": data["a2_q"],
+        "w2": data["w2_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "out": out,
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 128,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "mode": "atomic",
+        "w2_scale": data["w2_scale_shuf"],
+        "a2_scale": data["a2_scale_sort"],
+        "sorted_weights": data["sorted_weights"],
+        "persist": True,
+    }
+
+    out.zero_()
+    flydsl_moe_stage2(**kwargs)
+    torch.cuda.synchronize()
+    expected = out.clone()
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        out.zero_()
+        flydsl_moe_stage2(**kwargs)
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out.zero_()
+        flydsl_moe_stage2(**kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected, atol=1.0, rtol=0.05)
+
+
 @pytest.mark.parametrize(
     "inter_dim,seed",
     [

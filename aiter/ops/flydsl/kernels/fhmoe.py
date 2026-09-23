@@ -41,6 +41,7 @@ def compile_mixed_fhmoe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
     shared_expert_id: int,
 ):
@@ -76,6 +77,7 @@ def compile_mixed_fhmoe_gemm1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        pipeline_phases=pipeline_phases,
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
     )
