@@ -429,3 +429,12 @@ not repeated unless an overlay retry is proposed.
   `M=512` **−0.7%** (need ≤ **224.00**). Decode did not regress. Kernel
   restored. Do not retry this single-buffer interleave. Ping-pong B
   dests are a different experiment.
+- Prefill K on the same blocked `p(n,d)` map as V (`write2st64` stores
+  + `ds_read2_b64` QK A; decode stays XOR K). Oracle passed. Prefill
+  ISA (`tickets/1047/tmp/k2_k_on_vmap_isa/`): **32**
+  `ds_write2st64_b64`, **32** `ds_read2_b64`, **0** `ds_write_b128`,
+  **0** `v_bitop3`. Keep-gate vs write2st64 HEAD **30.79 / 27.02 /
+  230.93** µs: FlyDSL **26.79 / 26.33 / 233.94**; AMD same session
+  **43.76 / 42.70 / 212.36**. `M=512` **+1.3%**. Decode did not
+  regress. Kernel restored. Do not retry mapping QK K onto V’s
+  pair-store (XOR K stores stay).

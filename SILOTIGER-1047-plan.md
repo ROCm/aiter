@@ -983,6 +983,15 @@ went **25.66 / 26.01 / 229.34** (``M=512 −0.7%``, keep-gate 3% /
 211.96**. Kernel restored. Ping-pong B dest VGPRs are a different
 experiment.
 
+**Do not retry** overlay prefill K on V’s blocked ``p(n,d)`` map
+(``ds_write2st64_b64`` K stores + ``ds_read2_b64`` QK A; decode XOR K
+unchanged). GPU 6 / gfx950 stayed exact; prefill ISA had **32**
+``write2st64``, **32** ``ds_read2_b64``, **0** ``ds_write_b128``, **0**
+``v_bitop3``. Width-2051 ``L=512`` vs write2st64 HEAD **30.79 / 27.02 /
+230.93** µs went **26.79 / 26.33 / 233.94** (``M=512 +1.3%``). Decode
+did not regress. Same-session AMD **43.76 / 42.70 / 212.36**. Kernel
+restored. XOR K stores stay.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
