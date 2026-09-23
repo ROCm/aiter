@@ -22,7 +22,7 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPORTS = HERE / "reports"
-REPO = os.environ.get("AITER_BOT_REPO", "ROCm/aiter")
+REPO = os.environ.get("AITER_BOT_REPO") or os.environ.get("GITHUB_REPOSITORY", "ROCm/aiter")
 BOT = os.environ.get("AITER_BOT_NAME", "aiter-bot")
 
 
