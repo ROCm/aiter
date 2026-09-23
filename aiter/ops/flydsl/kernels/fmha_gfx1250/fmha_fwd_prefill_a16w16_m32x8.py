@@ -93,10 +93,19 @@ BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
 # 1 => BLOCK_M 128 ("m16x8"), 2 => BLOCK_M 256. Chosen per call by _pick_num_q_tiles.
 NUM_Q_TILES_CHOICES = (1, 2)
 NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
+# Causal work grows with the M index, so dispatch the heavy tiles first.
+REVERSE_M_ORDER = True
 
 
 def _block_m(num_q_tiles_per_wave):
     return WMMA_M * num_q_tiles_per_wave * NUM_WAVES
+
+
+def _m_tile_idx():
+    x = fx.Int32(gpu.block_id("x"))
+    if REVERSE_M_ORDER:
+        x = fx.Int32(gpu.grid_dim.x) - fx.Int32(1) - x
+    return x
 
 
 class WarpType(IntEnum):
@@ -333,7 +342,7 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
     power-of-two) ``gqa_ratio``. The R tiles a wave owns are contiguous.
     """
     kv_head = fx.Int32(gpu.block_id("y"))
-    warp_row0 = fx.Int32(gpu.block_id("x")) * _block_m(
+    warp_row0 = _m_tile_idx() * _block_m(
         num_q_tiles_per_wave
     ) + warp_idx * (num_q_tiles_per_wave * WMMA_M)
     q_head_idx = []
@@ -1040,7 +1049,7 @@ def _core_attention(
         q_start=q_start,
         q_len=q_len,
         kv_head=kv_head,
-        block_x=fx.Int32(gpu.block_id("x")),
+        block_x=_m_tile_idx(),
         warp_idx=warp_idx,
         lane_idx=lane_idx,
         ptr_lds_warp=q_lds_warp,
@@ -1052,7 +1061,7 @@ def _core_attention(
     # mask_right clips kv_len_wg to the WG's max query's attend-limit so no tile runs
     # fully past the band; mask_left moves start_tile past whole tiles before the WG's
     # min query's band start.
-    block_x = fx.Int32(gpu.block_id("x"))
+    block_x = _m_tile_idx()
     causal_off = kv_len - q_len
     if mask_right:
         wg_max_seq = (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(
@@ -1788,7 +1797,7 @@ def _zero_fill_attention(
     BLOCK_M = _block_m(num_q_tiles_per_wave)
     tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
     kv_head = fx.Int32(gpu.block_id("y"))
-    row0 = fx.Int32(gpu.block_id("x")) * fx.Int32(BLOCK_M)
+    row0 = _m_tile_idx() * fx.Int32(BLOCK_M)
     g = fx.Int32(gqa_ratio)
     _CH = 8  # bf16 per b128 store
     cpr = v_hdim // _CH  # b128 chunks per O row
