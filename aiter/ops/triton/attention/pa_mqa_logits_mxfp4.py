@@ -182,6 +182,11 @@ def plan_block_m(num_heads: int, next_n: int) -> int:
         return 3 if num_heads <= 32 else 1
     if 2 <= next_n <= SPEC_ROWS:
         return _spec_block_m(next_n, num_heads)
+    if num_heads <= 32 and next_n > SPEC_ROWS:
+        # A prefill chunk under the wide-chunk plan still has rows to fill the
+        # M dimension: 2 costs 1.17x of the per-shape best over 32K-344K and
+        # up to 1.56x. 4 only starves the grid below ~64 rows.
+        return 3 if next_n < 64 else 4
     if num_heads > 32 and next_n >= 2:
         return min(2, next_n)
     return 1 if next_n < 2 else min(2, next_n)
