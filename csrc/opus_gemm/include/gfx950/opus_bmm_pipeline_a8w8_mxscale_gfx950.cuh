@@ -357,8 +357,48 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     constexpr int SFA_TILES_RESIDENT = SFA_SCALES_MAX / SFA_SPK;
     constexpr bool SFA_SLIDING =
         PRELOAD_SFA_LDS && (SFA_TILES_RESIDENT < (SFA_K_MAX / T::B_K));
+    // Ring variant of the sliding panel: instead of refilling a whole window
+    // from the main loop (which drains vmcnt to 0 and with it the A/B
+    // prefetches), keep SFA_RING_TILES K-tiles in a power-of-two ring and fetch
+    // one tile pair SFA_RING_AHEAD tiles ahead, direct global->LDS. The panel is
+    // K-tile-major so a tile's LDS destination is one flat lane-contiguous run
+    // (slot*SFA_TILE_BYTES + tid*SFA_SPK), which is what buffer_load_lds needs.
+    constexpr bool SFA_RING_OK = SFA_SLIDING &&
+        (T::BLOCK_SIZE % SFA_ROWS == 0) && (T::BLOCK_SIZE / SFA_ROWS == 2);
+    // The ring is exactly the panel the non-ring path would have used, so a K
+    // that fits that panel (loops <= SFA_RING_TILES) takes the prologue fill
+    // and nothing else -- same residency as the sliding window, but filled
+    // direct-to-LDS instead of load + ds_write. Not a power of two, so the slot
+    // index is a modulo; tile_k is uniform, so it lands in SALU.
+    constexpr int SFA_RING_TILES = SFA_TILES_RESIDENT;
+    constexpr int SFA_RING_AHEAD = 16;
+    // How many K-tiles one burst refills. A fetch shares the single in-order
+    // vmcnt queue with the A/B prefetches, so issuing one every body puts a
+    // slow LDS-writing node in that queue on every iteration; measured at
+    // GROUP_K=32 that raised the A/B buffer_load stall 46% and more than ate
+    // the ds_read saving. Bursting SFA_RING_BURST tiles at once leaves
+    // (BURST/2 - 1) of every BURST/2 bodies with a queue as clean as the
+    // non-ring pipeline's.
+    constexpr int SFA_RING_BURST = 8;
+    // A burst puts SFA_RING_BURST/2 extra loads in the queue on one body in
+    // every SFA_RING_BURST/2, so no single compile-time slack is right for all
+    // bodies. Zero is the conservative choice: every wait stays at least as
+    // strict as the non-ring pipeline's, which can only make a burst body
+    // retire its own fetches early -- they are one dword each.
+    constexpr int SFA_RING_VM    = SFA_RING_OK ? 1 : 0;
+    constexpr int SFA_RING_COLS  = SFA_RING_TILES * SFA_SPK;
+    static_assert(!SFA_RING_OK || (SFA_RING_AHEAD >= 4 &&
+                                   SFA_RING_BURST >= 2 &&
+                                   (SFA_RING_BURST & (SFA_RING_BURST - 1)) == 0 &&
+                                   SFA_RING_AHEAD % SFA_RING_BURST == 0 &&
+                                   SFA_RING_TILES % 2 == 0 &&
+                                   (SFA_RING_TILES - SFA_RING_AHEAD) % SFA_RING_BURST == 0 &&
+                                   SFA_RING_AHEAD + SFA_RING_BURST <= SFA_RING_TILES),
+                  "ring must stay ahead of the body's tile+3 reads and not wrap onto them");
+    constexpr int SFA_PANEL_COLS = SFA_RING_OK ? SFA_RING_COLS : SFA_SCALES_MAX;
+    constexpr int SFA_TILE_BYTES = SFA_ROWS * SFA_SPK;
     constexpr int SFA_LDS_BYTES =
-        PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_SCALES_MAX * (int)sizeof(D_SF)) : 1;
+        PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_PANEL_COLS * (int)sizeof(D_SF)) : 1;
     // 16B-aligned so the panel fill below can land ds_write_b128; a bare char
     // array is only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) char smem_sfa[SFA_LDS_BYTES];
@@ -370,11 +410,19 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     const int sfa_lds_stride = SFA_SLIDING ? SFA_SCALES_MAX : sfa_k_scales;
     // First K-tile resident in the panel; stays 0 unless the window slides.
     int sfa_base_tile = 0;
-    auto u_sfa_lds = make_layout_sfa<T>(lane_id, wave_id_m, sfa_lds_stride);
+    // In ring mode the M-row stride inside a tile is just SFA_SPK: the tile is
+    // contiguous, so make_layout_sfa is reused with that as its row stride.
+    const int sfa_row_stride = SFA_RING_OK ? SFA_SPK : sfa_lds_stride;
+    auto u_sfa_lds = make_layout_sfa<T>(lane_id, wave_id_m, sfa_row_stride);
     auto sfa_lds_offset = [&](int half_tile_m, int tile_k) {
-        const int local_k = SFA_SLIDING ? (tile_k - sfa_base_tile) : tile_k;
-        return half_tile_m * (T::HALF_B_M / T::GROUP_M) * sfa_lds_stride +
-               local_k * SFA_SPK;
+        if constexpr (SFA_RING_OK) {
+            return (tile_k % SFA_RING_TILES) * SFA_TILE_BYTES +
+                   half_tile_m * (T::HALF_B_M / T::GROUP_M) * SFA_SPK;
+        } else {
+            const int local_k = SFA_SLIDING ? (tile_k - sfa_base_tile) : tile_k;
+            return half_tile_m * (T::HALF_B_M / T::GROUP_M) * sfa_lds_stride +
+                   local_k * SFA_SPK;
+        }
     };
     auto load_sfa = [&](int half_tile_m, int tile_k) {
         if constexpr (PRELOAD_SFA_LDS) {
@@ -572,7 +620,33 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         }
     };
 
-    if constexpr (PRELOAD_SFA_LDS) {
+    // One dword per thread covers two K-tiles exactly: BLOCK_SIZE * SFA_SPK ==
+    // 2 * SFA_TILE_BYTES. tile0 is always even and SFA_RING_TILES is even, so a
+    // pair never straddles the ring's wrap.
+    const int sfa_ring_row = (int)(opus::thread_id_x() % SFA_ROWS);
+    const int sfa_ring_sub = (int)(opus::thread_id_x() / SFA_ROWS);
+    auto sfa_ring_fetch = [&](int tile0) {
+        if constexpr (SFA_RING_OK) {
+            const int slot0 = tile0 % SFA_RING_TILES;
+            g_sfa.template async_load<SFA_SPK>(
+                s_sfa_ptr + slot0 * SFA_TILE_BYTES +
+                    (int)opus::thread_id_x() * SFA_SPK,
+                sfa_ring_row * kargs.stride_sfa + (tile0 + sfa_ring_sub) * SFA_SPK);
+        }
+    };
+
+    if constexpr (SFA_RING_OK) {
+        // Fill the whole ring, not just SFA_RING_AHEAD of it. A K short enough
+        // to fit (loops <= SFA_RING_TILES, i.e. K <= 2048 at GROUP_K=32) then
+        // never takes an in-loop burst at all, which is what the non-ring
+        // pipeline does for a K that fits its panel -- those shapes must not
+        // pay for a mechanism they do not need.
+        opus::static_for<SFA_RING_TILES / 2>([&](auto i_c) {
+            constexpr int i = decltype(i_c)::value;
+            if (2 * i < loops) sfa_ring_fetch(2 * i);
+        });
+        s_waitcnt_vmcnt(0_I);
+    } else if constexpr (PRELOAD_SFA_LDS) {
         sfa_fill_window(0, opus::bool_constant<false>{});
     }
 
@@ -630,7 +704,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
 
     if (wave_id_n == 1) __builtin_amdgcn_s_barrier();
 
-    s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFA_VM + SFB_VM>{});
+    s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFA_VM + SFB_VM + SFA_RING_VM>{});
     __builtin_amdgcn_s_barrier();
 
     v_sfa[toc][0] = load_sfa(0, 1);
@@ -639,7 +713,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1));
     async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, 1));
 
-    s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + SFA_VM + SFB_VM>{});
+    s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + SFA_VM + SFB_VM + SFA_RING_VM>{});
     __builtin_amdgcn_s_barrier();
 
     v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
@@ -651,7 +725,26 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         // first of them if the far end has walked off the resident window. The
         // new base is tile+1 rather than tile+3 so a window always starts on the
         // first tile of a body, and no body can straddle two windows.
-        if constexpr (SFA_SLIDING) {
+        if constexpr (SFA_RING_OK) {
+            // Bodies step two tiles, so this fires once every SFA_RING_BURST/2
+            // of them. The refilled slots are AHEAD..AHEAD+BURST-1 ahead of the
+            // body's own tile, and the body only reads tile+1..tile+3, so with
+            // AHEAD >= 4 no body ever refills a slot it is reading.
+            // The prologue filled tiles 0..SFA_RING_TILES-1, so the first
+            // burst is the one that fetches SFA_RING_TILES: a burst at body
+            // `tile` covers tile+AHEAD .. tile+AHEAD+BURST-1, so it must first
+            // fire at tile == SFA_RING_TILES - AHEAD, not at AHEAD. Those two
+            // coincide only when the ring is exactly twice the lookahead. The
+            // loops guard keeps a K that fits the ring off this path entirely.
+            if (tile >= SFA_RING_TILES - SFA_RING_AHEAD &&
+                (tile & (SFA_RING_BURST - 1)) == 0 &&
+                tile + SFA_RING_AHEAD < loops) {
+                opus::static_for<SFA_RING_BURST / 2>([&](auto i_c) {
+                    constexpr int i = decltype(i_c)::value;
+                    sfa_ring_fetch(tile + SFA_RING_AHEAD + 2 * i);
+                });
+            }
+        } else if constexpr (SFA_SLIDING) {
             if (tile + 3 >= sfa_base_tile + SFA_TILES_RESIDENT) sfa_slide(tile + 1);
         }
         // First tile
@@ -711,7 +804,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
             2 * T::a_buffer_load_insts +
             T::b_buffer_load_insts +
             2 * SFA_VM +
-            SFB_VM>{});
+            SFB_VM + SFA_RING_VM>{});
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
@@ -779,7 +872,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         v_sfa[toc][0] = load_sfa(0, tile + 3);
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 3));
-        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * SFA_VM + SFB_VM>{});
+        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * SFA_VM + SFB_VM + SFA_RING_VM>{});
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
@@ -821,7 +914,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_sched_barrier(0);
 
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFB_VM + 2 * SFA_VM>{});
+        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFB_VM + 2 * SFA_VM + SFA_RING_VM>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -839,7 +932,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     {
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + SFB_VM + SFA_VM>{});
+        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + SFB_VM + SFA_VM + SFA_RING_VM>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
