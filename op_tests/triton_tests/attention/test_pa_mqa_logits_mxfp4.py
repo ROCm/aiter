@@ -801,3 +801,41 @@ def test_gather_offsets_i64(num_heads, block):
             cu_ends=cu, candidate_block_size=block))
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
+
+
+def test_gather_span_window():
+    """A pool between 2 and 4 GiB: the i32 list still reaches, but the buffer
+    path would not -- it multiplies the list back to bytes in i32."""
+    rows, block, K, page_size = 4, 8, 64, 64
+    page_bytes = page_size * (64 + 4)
+    st = _make_case(1, rows, 32, 128, [2048], page_size,
+                    page_offset=2 ** 31 // page_bytes + 512)
+    g = torch.Generator(device=st["dev"]).manual_seed(13)
+    ids = torch.rand(rows, st["ctx"][0] // block, generator=g,
+                     device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
+    ends = row_ends(st["ctx"], rows, None)
+    bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
+
+    out = []
+    for width in (None, torch.int64):
+        meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], 32, 128,
+                                          block, offsets=width)
+        out.append(paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], K * block, use_gather=True, candidates=meta,
+            cu_ends=cu, candidate_block_size=block))
+    torch.cuda.synchronize()
+    assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
+
+
+def test_gather_rejects_short_offsets():
+    """Pinning i32 on a cache it cannot reach is an assert, not a truncation."""
+    rows, block, K = 2, 8, 32
+    # meta: the guard reads the cache's shape and strides, never its bytes
+    cache = torch.empty(2_000_000, 64, 1, 68, dtype=torch.uint8, device="meta")
+    ids = torch.zeros(rows, K, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), 512, dtype=torch.int32, device="cuda")
+    bt = torch.zeros(rows, 16, dtype=torch.int32, device="cuda")
+    with pytest.raises(AssertionError, match="do not reach"):
+        build_candidate_gather(ids, ends, bt, cache, 32, 128, block,
+                               offsets=torch.int32)

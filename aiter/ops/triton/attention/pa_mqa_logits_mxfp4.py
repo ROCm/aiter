@@ -313,8 +313,11 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
     s_lo = 64 // n_per_tile
     dev = candidates.device
     s_unit = gather_s_unit(block, num_scales)
+    fits = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride, s_unit)
     if offsets is None:
-        offsets = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride, s_unit)
+        offsets = fits
+    assert offsets == torch.int64 or fits == torch.int32, (
+        "i32 offsets do not reach this cache; pass offsets=torch.int64")
     pos = torch.empty((rows, k), dtype=torch.int64, device=dev)
     cu = torch.empty((rows,), dtype=torch.int32, device=dev)
     voff = torch.empty((rows, k), dtype=offsets, device=dev)
@@ -630,8 +633,11 @@ def paged_mxfp4_mqa_logits(
         assert block_kv % gather_block == 0 and page_size % gather_block == 0
         assert gather_block <= n_per_tile, (
             "a candidate block must sit inside one shuffle group")
-        # The whole address is in the list here, so its width decides.
-        use_buffer_load = gather["voff"].dtype == torch.int32
+        # Two limits, not one. The list reaches 2**31 of its own unit, but the
+        # buffer path multiplies it back to bytes in i32, so it caps at 2 GiB.
+        use_buffer_load = (gather["voff"].dtype == torch.int32 and
+                           num_pages * max(kv_page_stride, kvs_page_stride)
+                           < 2 ** 31)
 
     # The two that need the batch, which select_config does not see.
     cfg["num_kv_splits"] = _kv_splits(
