@@ -36,7 +36,6 @@ from .kernels.fmha_gfx1201.flash_attn_func_fp8 import (
     build_flash_attn_func_module as build_flash_attn_fp8_func_module,
 )
 from .kernels.fmha_gfx1201.flash_attn_func_fp8 import get_flash_attn_fp8_lds_bytes
-from .kernels.fmha_gfx1201.quantization import flydsl_fp8_quant
 from .kernels.fmha_gfx1201.stream_readiness import register_ready, wait_ready
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8,
@@ -48,7 +47,6 @@ __all__ = [
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
-    "flydsl_fp8_quant",
 ]
 
 _FP8_DTYPES = (torch.float8_e4m3fn,)
