@@ -1360,11 +1360,10 @@ def _pa_mqa_logits_mxfp4_kernel(
 @triton.jit
 def _pa_mqa_logits_mxfp4_sched_kernel(
     context_lens_ptr, row_ends_ptr, query_start_loc_ptr, sched_ptr, batch, next_n,
-    num_ctas, num_units,
+    num_ctas, num_units, max_tiles,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
     ALIGN_W: tl.constexpr, BLOCK_S: tl.constexpr, HAS_ROW_ENDS: tl.constexpr,
     GATHER: tl.constexpr, VARLEN: tl.constexpr, ALIGN_B: tl.constexpr,
-    MAX_TILES: tl.constexpr, MAX_SLICES: tl.constexpr, N_TILES: tl.constexpr,
     SLICE_ROOM: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
@@ -1434,8 +1433,7 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # caps a workgroup at max_tiles_per_split through _kv_splits and ends up
     # with far more, shorter workgroups, which this kernel keeps gaining from
     # past residency. The host sizes num_ctas so the extra slices fit.
-    if MAX_TILES > 0:
-        tiles_per_slice = tl.minimum(tiles_per_slice, MAX_TILES)
+    tiles_per_slice = tl.minimum(tiles_per_slice, max_tiles)
     # Bound one unit's slices so the write below stays a few bands. Measured
     # against its average share of the slots, not max_model_len, which on a
     # spread of lengths sits well above what the balance wants.
@@ -1458,7 +1456,7 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     else:
         own_seq, own_blk = unit // ROW_BLOCKS, unit % ROW_BLOCKS
     shape: tl.constexpr = (BLOCK_S, ALIGN_W)
-    # The band strides, so MAX_SLICES sizes the grid rather than bounding what
+    # The band strides, so the grid sizes the write rather than bounding what
     # a unit may own.
     widest = tl.max(n_slices)
     sl0 = tl.program_id(0) * BLOCK_S
