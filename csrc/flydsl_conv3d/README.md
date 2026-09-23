@@ -8,16 +8,20 @@ at runtime. A shape with no tuned row of its own borrows the nearest usable
 tuned resolution of the same layer, and falls back to the heuristic tile ladder
 when there is not one, so tuning is an optimization rather than a prerequisite.
 
-One layout only: rows are tuned NCDHW in and out, and an NDHWC-output call
-reuses that tile even though `out_ndhwc` is a compile-time parameter that
-changes the epilogue (it gives up the vectorised store). Measured rather than
-assumed -- re-sweeping the full candidate set of 8 Qwen-Image rows under
-`output_layout="NDHWC"` on gfx950 left the tuned tile the winner on 5 of them
-and within 0.2% on a 6th. It drifts only where the GEMM's K axis is tiny and
-the epilogue is most of the kernel: `3->96` (K=27) came out 4.0% off the
-NDHWC-best and `16->384` (K=144) 8.3%, the latter 19.8us against 18.3us. That
-is why there is one row per shape rather than one per layout; a layout column
-would double every table for those two cases.
+One layout only: rows are tuned NDHWC in and out, the layout the VAEs run end
+to end, and an NCDHW call reuses that tile even though `out_ndhwc` is a
+compile-time parameter that changes the epilogue (only the NCDHW one takes the
+vectorised store), and on top pays a pre-transpose no tile choice affects.
+What reusing an NDHWC-tuned tile costs an NCDHW caller has not been measured.
+The one cross-layout sweep ran the other way, while the tables were still tuned
+NCDHW: re-sweeping 8 Qwen-Image rows under `output_layout="NDHWC"` on gfx950
+left the NCDHW-tuned tile the winner on 5 of them and within 0.2% on a 6th,
+with `3->96` (K=27) 4.0% off and `16->384` (K=144) 8.3%. The NDHWC retune then
+changed the tile on 44 of the 76 rows, but it was also the first run over the
+2- and 3-wave tiles `conv3d_policy` had just been widened to, so that count
+does not separate layout from candidate set. One row per shape rather than one
+per layout until an NCDHW caller shows it needs its own; a layout column would
+double every table.
 
 Single backend, unlike the GEMM tuners: there is no asm/CK/triton alternative
 for this kernel, so there is no `--libtype` flag and no `gemm_tuner.py`-style
@@ -93,12 +97,13 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
     |-------|----------|----------------------|-----------|----------|----------|----------|----------|-------|----------|------|--------------|-------------|----------|------|
     |gfx950 |256       |...                   |flydsl     |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
 
-   `us`, `tflops` and `bw` are end-to-end: the entry point runs the
-   NCDHW->NDHWC pre-transpose and the weight repack before the kernel, and the
-   tuner times it the way the model calls it. That is a constant per shape, so
-   the ranking is unaffected, but the three columns are a floor rather than a
-   kernel figure and are not comparable with another implementation's
-   kernel-only numbers.
+   `us`, `tflops` and `bw` are end-to-end, timed NDHWC in and out, so there is
+   no layout transpose in them. The entry point still runs the weight repack
+   before the kernel, and where C/groups is not a multiple of 8 a channel pad
+   that copies the whole input on every call -- the `C=3` input conv of both
+   VAEs. That is a constant per shape, so the ranking is unaffected, but the
+   three columns are a floor rather than a kernel figure and are not
+   comparable with another implementation's kernel-only numbers.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE

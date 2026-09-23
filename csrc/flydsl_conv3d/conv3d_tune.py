@@ -408,9 +408,11 @@ class Conv3dTuner(TunerCommon):
         """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse).
 
         Both are derived from an end-to-end time. NDHWC in and out leaves no
-        layout transpose in it; what is left outside the kernel is the weight
-        repack, which run_perftest's rotated copies redo once per copy at a
-        microsecond or two. Close to kernel figures, then, but a floor on them.
+        layout transpose in it, but the entry point still runs two steps outside
+        the kernel: the weight repack, which run_perftest's rotated copies redo
+        once per copy at a microsecond or two, and, where C/groups is not a
+        multiple of LDG_VEC, a channel pad that copies the whole input on every
+        call -- the C=3 input conv of both VAEs. A floor on kernel figures, then.
         """
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
@@ -544,7 +546,10 @@ class Conv3dTuner(TunerCommon):
         torch.cuda.empty_cache()
 
     def run_config(self, args):
-        """Benchmark the production entry point (no explicit tile) per shape, NDHWC in and out."""
+        """Benchmark the production entry point (no explicit tile) per shape.
+
+        NDHWC in and out, the layout every candidate is timed in.
+        """
         from aiter.test_common import run_perftest
 
         self._clear_op_caches()
@@ -579,7 +584,8 @@ class Conv3dTuner(TunerCommon):
                         out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
                 ok = torch.allclose(out, ref, rtol=RTOL, atol=ATOL)
-                # e2e only: run_perftest includes the weight repack.
+                # e2e only: run_perftest includes the weight repack and, where
+                # C/groups is not a multiple of LDG_VEC, the channel pad.
                 results.append(
                     {
                         "shape": shape,
