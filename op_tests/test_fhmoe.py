@@ -1290,62 +1290,20 @@ def test_fhmoe_aot_manifest_covers_native_i384():
     }
 
 
-def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+def test_fhmoe_aot_compiles_through_the_runtime_wrappers():
+    from aiter import fhmoe as fhmoe_ops
     from aiter.aot.flydsl import moe as aot_moe
 
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=385,
-        shared_expert_id=384,
-        cu_num=256,
-        stage=2,
-        model_dim=7168,
-        inter_dim=384,
-        topk=7,
-    )
-
-    assert forwarded["inter_dim"] == 384
-    assert forwarded["_aot_backend"].shared_expert_id == 384
-
-
-def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.ops.flydsl import fhmoe as ops_fhmoe
-
-    tensor = torch.empty(0)
-    forwarded = {}
-
-    monkeypatch.setattr(aot_fhmoe, "_shared_weight", lambda *_: tensor)
-    monkeypatch.setattr(aot_fhmoe, "_shared_scale", lambda *_: tensor)
-
-    def build_args(*args, **kwargs):
-        forwarded.update(kwargs)
-        return args
-
-    monkeypatch.setattr(ops_fhmoe, "_s1_args_fhmoe", build_args)
-
-    result = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=8).build_stage1_args(
-        *((tensor,) * 10),
-        1,
-        2,
-        3,
-        4,
-        "cpu",
-        swiglu_limit=10.0,
-        pass_swiglu_limit=False,
-    )
-
-    assert result
-    assert forwarded["swiglu_limit"] == 10.0
-    assert forwarded["pass_swiglu_limit"] is False
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    for job in aot_moe.parse_csv(str(config_path))[:2]:
+        func, kwargs = aot_moe._stage_call(job, job["token_num"])
+        assert func is (
+            fhmoe_ops._flydsl_fhmoe_stage1_wrapper
+            if job["stage"] == 1
+            else fhmoe_ops._flydsl_fhmoe_stage2_wrapper
+        )
+        assert kwargs["shared_expert_id"] == 384
+        assert kwargs["w1" if job["stage"] == 1 else "w2"].shape[1] in (768, 7168)
 
 
 @pytest.mark.parametrize(

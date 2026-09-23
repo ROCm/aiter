@@ -7,7 +7,7 @@ the JIT path hits the cache instead of compiling again.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
-| `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
+| `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2), compiled by calling the runtime `fused_moe` stage wrappers |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
