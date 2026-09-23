@@ -52,6 +52,10 @@ _LOGGER = AiterTritonLogger()
 _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = get_fp8_e4m3_dtype()
 
+# Launches of at least this many rows get the prefill config. Row count is the
+# only signal, and decode is slower with it, so this sits above decode batch sizes.
+_PREFILL_MIN_ROWS = 2048
+
 
 def _check_out(out, q, dtype):
     """Caller-supplied output buffer, or a fresh one. Writing the caller's buffer
@@ -622,6 +626,18 @@ def _pa_decode_sparse_gfx950_gluon(
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, BLOCK_K // 4) if chunk_axis == 0 else min(128, head_dim)
 
+    prefill_kw = {}
+    if num_queries >= _PREFILL_MIN_ROWS:
+        # Prefill rows re-read each other's KV rows, so cache the gather instead of .cg.
+        prefill_kw["GATHER_CACHE"] = ""
+        if main_fmt == extra_fmt == "fp8_dsv4_mla":
+            prefill_kw.update(
+                IDX_PREFETCH=True,
+                SLOT_U32=max(s0, s1) < (1 << 24),
+                KV_LDS_PAD=16,
+            )
+            nope_chunk = max(1, BLOCK_K // 8)
+
     waves_per_eu = 2
     one_wg_per_cu = (
         use_buffer_load and num_queries * heads_blocks * num_splits <= get_num_sms()
@@ -716,6 +732,7 @@ def _pa_decode_sparse_gfx950_gluon(
         HAS_INVALID=has_invalid,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        **prefill_kw,
     )
 
     if num_splits == 1:

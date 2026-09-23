@@ -12,6 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
+    _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -667,6 +668,8 @@ def sparse_mla_fwd(
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         GATHER_CACHE="",
+        # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout
+        KV_LDS_PAD=16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots else 0,
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
         lse_ptr=lse,
