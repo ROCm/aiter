@@ -40,6 +40,7 @@ convention.
 - [x] 3. Reuse gather `live` for softmax (optional; after a keep)
 - [x] 4. Drop leftover `v_perm` on the pack path (optional; after 1)
 - [x] 4a. Match live AMD's prefill K/QK 128-bit XOR map (kept)
+- [x] 4b. Denser prefill V `write2st64` immediates (kept)
 - [ ] 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 
 ## Locked decisions
@@ -424,6 +425,39 @@ Conflict is now **0.60×** live AMD (10560/wave), wait-LDS **0.87×**
 (9264/wave), and busy **0.92×** (7522/wave). Prefill ATT
 (`tickets/1047/tmp/k2_amd_kmap_att/`) puts `ds_write*` at **4.0%** of
 stall vs AMD **6.1%**; `s_waitcnt` remains the largest FlyDSL family.
+
+### 4b. Denser prefill V `write2st64` immediates
+
+Kept (2026-09-23). Prefill V still stores 16× `ds_write2st64_b64`, but
+one base VGPR carries the token map and each gather round is an
+immediate pair `offset0:gr` / `offset1:gr+16` (512 B / 8192 B st64
+units). That is the live AMD pattern of reused addr VGPRs plus an
+offset lattice, not a new LDS permutation. Decode is unchanged.
+
+**ISA** (`tickets/1047/tmp/k2_st64_imm_isa/`). All 16 stores use
+**v100**: `offset1:16`, then `offset0:1 offset1:17`, through
+`offset0:15 offset1:31`.
+
+**Correctness.** Focused decode and prefill oracle tests: **2 passed**.
+
+**Prefill keep-gate** (`CACHE=0`, GPU 6, five-run median) vs the K-map
+keeper **179.56 µs**: **159.41 µs** (**−11.2%**), passing the 3% gate
+(≤174.17 µs). Decode medians **20.02 / 19.99** µs, flat. Same-week
+live AMD prefill is **202.80 / 211.55** µs.
+
+**PMC** (`tickets/1047/tmp/k2_st64_imm_pmc/`) vs the K-map keeper, per
+wave:
+
+| | K map | st64 imm | Δ |
+|--|--:|--:|--:|
+| busy | 6903 | 6036 | **−12.6%** |
+| conflict | 6336 | 6336 | 0 |
+| wait-LDS | 8055 | 9253 | +14.8% |
+| MFMA | 2112 | 2112 | 0 |
+| VALU | 14708 | 14713 | 0 |
+| VMEM | 1162 | 1162 | 0 |
+
+Conflict is unchanged (same V map). Busy tracks the wall-clock keep.
 
 ### 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 

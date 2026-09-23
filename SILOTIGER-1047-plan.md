@@ -984,6 +984,15 @@ conflict **31680→6336**, wait-LDS **16543→8055**, busy **8405→6903**;
 MFMA/VMEM are unchanged. Keep the kernel diff; full map and ATT evidence
 are in ``SILOTIGER-1047-optimize-overlay-split-plan.md``.
 
+**Retained:** overlay prefill V ``write2st64`` now reuses one addr VGPR
+and an immediate offset lattice (``offset0:gr`` / ``offset1:gr+16``)
+instead of 16 computed addresses with only ``offset1:16``. Prefill ISA
+has 16 stores on ``v100``. Focused oracle passed. Same-session
+width-2051 ``L=512`` prefill improved **179.56→159.41 µs** (−11.2%).
+PMC/wave vs the K-map keeper: busy **6903→6036**, wait-LDS
+**8055→9253**, conflict unchanged **6336**. Keep the kernel diff;
+details are in ``SILOTIGER-1047-optimize-overlay-split-plan.md``.
+
 **Do not retry** overlay prefill software-pipeline of
 ``ds_read_b64_tr_b16`` ahead of the current PV MFMA on a **single** B
 fragment (issue next tr16, then ``pv_mfma`` of ``v_cur``). GPU 6 /
