@@ -85,10 +85,12 @@ def compile_pa_decode_ps_reduce(
     query_group_size: int | None = None,
     bounded_plan_logits: bool = False,
     vectorize_plan_logits: bool = False,
+    compact_plan: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
-    D128/NP>64 shares weights in LDS; other shapes stay register-only.
+    D128/NP>64 shares weights in LDS unless ``compact_plan`` selects
+    a two-wave CTA. Other shapes stay register-only.
     Sinks are per-head zero-value logits: include them in the shared maximum
     for stability and add their denominator mass once after summing KV.
     ``query_group_size`` is None for runtime GQA, or a matching positive value.
@@ -119,6 +121,10 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(
             "vectorize_plan_logits requires bounded planned D=128 bf16/f16 logits"
         )
+    if compact_plan and (
+        not use_work_plan or head_size != 128 or max_context_partition_num <= 64
+    ):
+        raise ValueError("compact_plan requires a planned D128 reducer with NP>64")
     static_query_group_size = query_group_size
     planned_elements_per_thread = 2 if vectorize_plan_logits else 1
 
@@ -137,8 +143,9 @@ def compile_pa_decode_ps_reduce(
         offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
 
-    # D128 splits partition ranges across wave pairs, one wave per 64 outputs.
-    use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
+    use_parallel_lds = (
+        head_size == 128 and max_context_partition_num > warp_size and not compact_plan
+    )
     parallel_groups = 1
     if use_parallel_lds:
         parallel_groups = 2 if max_context_partition_num <= 96 else 8
@@ -381,6 +388,142 @@ def compile_pa_decode_ps_reduce(
                 # Preserve increasing-part order and separate multiply/add rounding.
                 planned_acc = planned_acc + planned_part_logits * planned_weight
             return planned_acc
+
+        def _reduce_striped():
+            # Lane l owns l + 64*k; reduce locally, then broadcast each weight.
+            partitions_per_lane = (
+                max_context_partition_num + warp_size - 1
+            ) // warp_size
+            part_sums = []
+            part_maxes = []
+            lane_max = neg_inf
+            for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                chunk_base = chunk_idx * warp_size
+                chunk_size = min(warp_size, max_context_partition_num - chunk_base)
+                part_idx = lane + fx.Int32(chunk_base)
+                if fx.const_expr(chunk_size == warp_size and not use_work_plan):
+                    stats_offset = (
+                        stats_seq_offset
+                        + kv_head_idx * stride_exp_sums_head
+                        + part_idx * stride_exp_sums_part
+                        + eqgs_idx
+                    )
+                    part_sum = fx.Float32(exp_sums[stats_offset])
+                    part_max = fx.Float32(max_logits[stats_offset])
+                else:
+                    lane_in_range = (lane < fx.Int32(chunk_size)) & (
+                        part_idx < c_part_num
+                    )
+                    stats_offset = (
+                        stats_seq_offset
+                        + kv_head_idx * stride_exp_sums_head
+                        + part_idx * stride_exp_sums_part
+                        + eqgs_idx
+                    )
+                    part_sum = zero_f
+                    part_max = neg_inf
+                    if lane_in_range:
+                        part_sum = fx.Float32(exp_sums[stats_offset])
+                        part_max = fx.Float32(max_logits[stats_offset])
+                part_sums.append(part_sum)
+                part_maxes.append(part_max)
+                lane_max = lane_max.maximumf(part_max)
+
+            global_max = _wave_reduce_max(lane_max)
+            if fx.const_expr(use_sinks):
+                sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
+                global_max = global_max.maximumf(sink_value)
+            safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
+            scaled_sums = []
+            lane_exp_sum = zero_f
+            for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                part_max = part_maxes[chunk_idx]
+                if fx.const_expr(use_work_plan):
+                    part_scale = zero_f
+                    if part_max > neg_inf:
+                        part_scale = fx.exp2(
+                            (part_max - safe_global_max) * c_log2e,
+                            fastmath="fast",
+                        )
+                else:
+                    part_scale = (part_max > neg_inf).select(
+                        fx.exp2(
+                            (part_max - safe_global_max) * c_log2e,
+                            fastmath="fast",
+                        ),
+                        zero_f,
+                    )
+                scaled_sum = part_sums[chunk_idx] * part_scale
+                scaled_sums.append(scaled_sum)
+                lane_exp_sum = lane_exp_sum + scaled_sum
+
+            global_exp_sum = _wave_reduce_sum(lane_exp_sum)
+            if fx.const_expr(use_sinks):
+                sink_scale = _sink_exp(sink_value, safe_global_max)
+                global_exp_sum = global_exp_sum + sink_scale
+            safe_global_exp_sum = (global_exp_sum > zero_f).select(
+                global_exp_sum, one_f
+            )
+            striped_inv_exp_sum = fx.Float32(rcp_f32(safe_global_exp_sum))
+
+            acc = zero_f
+            for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                chunk_base = chunk_idx * warp_size
+                chunk_size = min(warp_size, max_context_partition_num - chunk_base)
+                if fx.const_expr(use_work_plan):
+                    # Initialize per unrolled chunk so the dynamic-if rewriter
+                    # cannot reuse a stale value.
+                    weight_local_i32 = zero_f.bitcast(fx.Int32)
+                    if fx.Int32(chunk_base) < c_part_num:
+                        weight_local_i32 = (
+                            scaled_sums[chunk_idx] * striped_inv_exp_sum
+                        ).bitcast(fx.Int32)
+                        for part_lane in fx.range_constexpr(chunk_size):
+                            part_idx = chunk_base + part_lane
+                            c_part_idx = fx.Int32(part_idx)
+                            if c_part_idx < c_part_num:
+                                weight_i32 = fx.Int32(
+                                    fx.rocdl.ds_bpermute(
+                                        T.i32,
+                                        fx.Int32(part_lane) * c_four,
+                                        weight_local_i32,
+                                    )
+                                )
+                                weight = weight_i32.bitcast(fx.Float32)
+                                logits_offset = (
+                                    logits_seq_offset
+                                    + kv_head_idx * stride_logits_head
+                                    + c_part_idx * stride_logits_part
+                                    + eqgs_idx * stride_logits_group
+                                    + tid
+                                )
+                                part_logits = fx.Float32(logits[logits_offset])
+                                acc = acc + part_logits * weight
+                else:
+                    weight_local_i32 = (
+                        scaled_sums[chunk_idx] * striped_inv_exp_sum
+                    ).bitcast(fx.Int32)
+                    for part_lane in fx.range_constexpr(chunk_size):
+                        part_idx = chunk_base + part_lane
+                        c_part_idx = fx.Int32(part_idx)
+                        weight_i32 = fx.Int32(
+                            fx.rocdl.ds_bpermute(
+                                T.i32,
+                                fx.Int32(part_lane) * c_four,
+                                weight_local_i32,
+                            )
+                        )
+                        weight = weight_i32.bitcast(fx.Float32)
+                        logits_offset = (
+                            logits_seq_offset
+                            + kv_head_idx * stride_logits_head
+                            + c_part_idx * stride_logits_part
+                            + eqgs_idx * stride_logits_group
+                            + tid
+                        )
+                        part_logits = fx.Float32(logits[logits_offset])
+                        acc = acc + part_logits * weight
+            return acc
 
         if fx.const_expr(use_parallel_lds):
             # Worker 0 publishes weights to LDS. All threads, including inactive
@@ -650,139 +793,16 @@ def compile_pa_decode_ps_reduce(
                     part_logits = fx.Float32(logits[logits_offset])
                     acc = acc + part_logits * weight
         else:
-            # Lane l owns l + 64*k; reduce locally, then broadcast each weight.
-            partitions_per_lane = (
-                max_context_partition_num + warp_size - 1
-            ) // warp_size
-            part_sums = []
-            part_maxes = []
-            lane_max = neg_inf
-            for chunk_idx in fx.range_constexpr(partitions_per_lane):
-                chunk_base = chunk_idx * warp_size
-                chunk_size = min(warp_size, max_context_partition_num - chunk_base)
-                part_idx = lane + fx.Int32(chunk_base)
-                if fx.const_expr(chunk_size == warp_size and not use_work_plan):
-                    stats_offset = (
-                        stats_seq_offset
-                        + kv_head_idx * stride_exp_sums_head
-                        + part_idx * stride_exp_sums_part
-                        + eqgs_idx
-                    )
-                    part_sum = fx.Float32(exp_sums[stats_offset])
-                    part_max = fx.Float32(max_logits[stats_offset])
-                else:
-                    lane_in_range = (lane < fx.Int32(chunk_size)) & (
-                        part_idx < c_part_num
-                    )
-                    stats_offset = (
-                        stats_seq_offset
-                        + kv_head_idx * stride_exp_sums_head
-                        + part_idx * stride_exp_sums_part
-                        + eqgs_idx
-                    )
-                    part_sum = zero_f
-                    part_max = neg_inf
-                    if lane_in_range:
-                        part_sum = fx.Float32(exp_sums[stats_offset])
-                        part_max = fx.Float32(max_logits[stats_offset])
-                part_sums.append(part_sum)
-                part_maxes.append(part_max)
-                lane_max = lane_max.maximumf(part_max)
-
-            global_max = _wave_reduce_max(lane_max)
-            if fx.const_expr(use_sinks):
-                sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
-                global_max = global_max.maximumf(sink_value)
-            safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
-            scaled_sums = []
-            lane_exp_sum = zero_f
-            for chunk_idx in fx.range_constexpr(partitions_per_lane):
-                part_max = part_maxes[chunk_idx]
-                if fx.const_expr(use_work_plan):
-                    part_scale = zero_f
-                    if part_max > neg_inf:
-                        part_scale = fx.exp2(
-                            (part_max - safe_global_max) * c_log2e,
-                            fastmath="fast",
-                        )
-                else:
-                    part_scale = (part_max > neg_inf).select(
-                        fx.exp2(
-                            (part_max - safe_global_max) * c_log2e,
-                            fastmath="fast",
-                        ),
-                        zero_f,
-                    )
-                scaled_sum = part_sums[chunk_idx] * part_scale
-                scaled_sums.append(scaled_sum)
-                lane_exp_sum = lane_exp_sum + scaled_sum
-
-            global_exp_sum = _wave_reduce_sum(lane_exp_sum)
-            if fx.const_expr(use_sinks):
-                sink_scale = _sink_exp(sink_value, safe_global_max)
-                global_exp_sum = global_exp_sum + sink_scale
-            safe_global_exp_sum = (global_exp_sum > zero_f).select(
-                global_exp_sum, one_f
-            )
-            striped_inv_exp_sum = fx.Float32(rcp_f32(safe_global_exp_sum))
-
             acc = zero_f
-            for chunk_idx in fx.range_constexpr(partitions_per_lane):
-                chunk_base = chunk_idx * warp_size
-                chunk_size = min(warp_size, max_context_partition_num - chunk_base)
-                if fx.const_expr(use_work_plan):
-                    # Initialize per unrolled chunk so the dynamic-if rewriter
-                    # cannot reuse a stale value.
-                    weight_local_i32 = zero_f.bitcast(fx.Int32)
-                    if fx.Int32(chunk_base) < c_part_num:
-                        weight_local_i32 = (
-                            scaled_sums[chunk_idx] * striped_inv_exp_sum
-                        ).bitcast(fx.Int32)
-                        for part_lane in fx.range_constexpr(chunk_size):
-                            part_idx = chunk_base + part_lane
-                            c_part_idx = fx.Int32(part_idx)
-                            if c_part_idx < c_part_num:
-                                weight_i32 = fx.Int32(
-                                    fx.rocdl.ds_bpermute(
-                                        T.i32,
-                                        fx.Int32(part_lane) * c_four,
-                                        weight_local_i32,
-                                    )
-                                )
-                                weight = weight_i32.bitcast(fx.Float32)
-                                logits_offset = (
-                                    logits_seq_offset
-                                    + kv_head_idx * stride_logits_head
-                                    + c_part_idx * stride_logits_part
-                                    + eqgs_idx * stride_logits_group
-                                    + tid
-                                )
-                                part_logits = fx.Float32(logits[logits_offset])
-                                acc = acc + part_logits * weight
+            if fx.const_expr(compact_plan) and c_part_num <= fx.Int32(32):
+                if c_part_num <= c_four:
+                    acc = _reduce_planned_wave(4, (2, 1))
+                elif c_part_num <= fx.Int32(8):
+                    acc = _reduce_planned_wave(8, (4, 2, 1))
                 else:
-                    weight_local_i32 = (
-                        scaled_sums[chunk_idx] * striped_inv_exp_sum
-                    ).bitcast(fx.Int32)
-                    for part_lane in fx.range_constexpr(chunk_size):
-                        part_idx = chunk_base + part_lane
-                        c_part_idx = fx.Int32(part_idx)
-                        weight_i32 = fx.Int32(
-                            fx.rocdl.ds_bpermute(
-                                T.i32,
-                                fx.Int32(part_lane) * c_four,
-                                weight_local_i32,
-                            )
-                        )
-                        weight = weight_i32.bitcast(fx.Float32)
-                        logits_offset = (
-                            logits_seq_offset
-                            + kv_head_idx * stride_logits_head
-                            + c_part_idx * stride_logits_part
-                            + eqgs_idx * stride_logits_group
-                            + tid
-                        )
-                        part_logits = fx.Float32(logits[logits_offset])
-                        acc = acc + part_logits * weight
+                    acc = _reduce_planned_wave(32, (16, 8, 4, 2, 1))
+            else:
+                acc = _reduce_striped()
 
         if fx.const_expr(static_query_group_size is not None):
             query_idx = udiv_const(eqgs_idx, static_query_group_size)

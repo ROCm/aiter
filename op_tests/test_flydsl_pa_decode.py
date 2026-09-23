@@ -92,6 +92,7 @@ class DecodeCase:
     max_partitions: int | None = None
     workgroup_budget: int | None = None
     sparse: bool = True
+    cache_address_boundary: int = 0
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
@@ -237,6 +238,14 @@ def _make_inputs(case, planned=False):
         2 * torch.randperm(num_pages) + 1 if case.sparse else torch.arange(num_pages)
     )
     physical_pages = 2 * num_pages + 1 if case.sparse else num_pages
+    if case.cache_address_boundary:
+        # Straddle a byte-address boundary with only a few live FP8 pages.
+        assert case.sparse
+        assert case.cache_address_boundary in (2**31, 2**32)
+        page_bias = case.cache_address_boundary // (kv_heads * page * dim) - num_pages
+        assert page_bias > 0
+        selected += page_bias
+        physical_pages += page_bias
 
     def scatter(tensor):
         if not case.sparse:
@@ -625,6 +634,28 @@ CASES = [
     ),
     _case("fused-wide", parts=8, query_splits=1, wide_kv_addressing=True),
     _case(
+        "fused-wide-actual-2gib",
+        parts=2,
+        lengths=(0, 1, 257, 1027),
+        query_splits=1,
+        cache_address_boundary=2**31,
+    ),
+    _case(
+        "fused-wide-actual-4gib",
+        parts=2,
+        lengths=(0, 1, 257, 1027),
+        query_splits=1,
+        cache_address_boundary=2**32,
+    ),
+    _case(
+        "fused-wide-actual-2gib-window",
+        parts=2,
+        window=1023,
+        lengths=(0, 1, 257, 1283),
+        query_splits=1,
+        cache_address_boundary=2**31,
+    ),
+    _case(
         "fused-hkv2-window",
         (4, 2, 16, 128),
         (128, 0, 1),
@@ -635,6 +666,68 @@ CASES = [
         wide_kv_addressing=False,
     ),
     _case("mtp2-query-split", (2, 1, 16, 128), parts=3, lengths=(257, 259)),
+    *_cases(
+        "shape lengths workgroup_budget",
+        [
+            ("b4-ql2-budget512", (2, 1, 16, 128), (0, 1, 1025, 4096), 512),
+            ("b1-budget512", (4, 1, 16, 128), (4096,), 512),
+            ("b4-budget256", (4, 1, 16, 128), (0, 1, 1025, 4096), 256),
+            ("b4-budget512", (4, 1, 16, 128), (0, 1, 1025, 4096), 512),
+        ],
+        prefix="selector-mqa-",
+        parts=None,
+    ),
+    *_cases(
+        "shape query_splits",
+        [
+            (f"hkv{heads}-g{group}-qs{splits}", (4, heads, group, 128), splits)
+            for heads, group in ((4, 16), (8, 8))
+            for splits in (1, 2, 4)
+        ],
+        prefix="selector-",
+        parts=None,
+        lengths=(0, 1, 1025, 4096),
+        workgroup_budget=512,
+        sink=FP32,
+    ),
+    *_cases(
+        "lengths workgroup_budget",
+        [
+            ("b1-budget512", (4096,), 512),
+            ("b4-budget256", (10924, 21846, 32768, 2), 256),
+        ],
+        prefix="selector-hkv4-g16-ql2-",
+        shape=(2, 4, 16, 128),
+        parts=None,
+    ),
+    _case(
+        "selector-hkv8-g8-b4-budget128",
+        (4, 8, 8, 128),
+        parts=None,
+        lengths=(10925, 21846, 32768, 4),
+        workgroup_budget=128,
+    ),
+    *_cases(
+        "shape window",
+        [
+            ("hkv4-g16-auto", (4, 4, 16, 128), 0),
+            ("hkv8-g8-auto", (4, 8, 8, 128), 0),
+            ("hkv4-g16-window-auto", (4, 4, 16, 128), 1024),
+            ("hkv8-g8-window-auto", (4, 8, 8, 128), 1024),
+        ],
+        prefix="selector-",
+        parts=None,
+        lengths=(4096,),
+        workgroup_budget=512,
+    ),
+    *_cases(
+        "cache",
+        [("page16", (16, 1, 1)), ("plain-v", (128, 0, 1))],
+        prefix="selector-mqa-",
+        parts=None,
+        lengths=(4096,),
+        workgroup_budget=512,
+    ),
     *_cases(
         "cache parts window lengths workgroup_budget",
         [
@@ -868,6 +961,14 @@ CASES = [
         lengths=(1, 3, 257, 258, 514, 515, 0, 0),
         workgroup_budget=32,
     ),
+    _case(
+        "reduce-compact-shortcount-refresh",
+        parts=65,
+        workgroup_budget=160,
+        sink=FP32,
+        lengths=(0, 1, 1025, 2049, 8193),
+        active_partition_maxima=(33, 32, 0, 33),
+    ),
     # Preserve the native CU cap while hitting the smaller window task bound.
     # At the just-over-boundary windows, shortening by seven crosses a tile
     # boundary and increases the active count; captured refresh must allow it.
@@ -1004,10 +1105,15 @@ def test_pa_decode(case, planned, monkeypatch):
         for name in ("query_splits", "wide_kv_addressing")
         if getattr(case, name) is not None
     }
-    if overrides:
+    if overrides or case.cache_address_boundary:
         build_tile = module.compile_pa_decode_tile
 
         def compile_tile(**kwargs):
+            if case.cache_address_boundary:
+                cache_extent = max(args[2].numel(), args[3].numel())
+                assert cache_extent > case.cache_address_boundary
+                assert kwargs["wide_kv_addressing"]
+                assert kwargs["kv_buffer_u32"] == (cache_extent < 2**32)
             return build_tile(**{**kwargs, **overrides})
 
         monkeypatch.setattr(module, "compile_pa_decode_tile", compile_tile)
@@ -1021,13 +1127,20 @@ def test_pa_decode(case, planned, monkeypatch):
     reducer_caps = []
     if plan is not None and case.active_partition_maxima is not None:
         build_reduce = module.compile_pa_decode_ps_reduce
-        expected_reducer_cap = min(
-            plan.max_partitions, max(case.active_partition_maxima)
-        )
+        expected_reducer_cap = plan.max_partitions
+        if case.sliding_window > 0:
+            expected_reducer_cap = min(
+                expected_reducer_cap, max(case.active_partition_maxima)
+            )
 
         def compile_reduce(**kwargs):
             assert kwargs["use_work_plan"]
             assert kwargs["max_context_partition_num"] == expected_reducer_cap
+            assert kwargs["compact_plan"] == (
+                case.head_dim == 128
+                and expected_reducer_cap > 64
+                and plan.capacity <= 32 * len(case.lengths)
+            )
             reducer_caps.append(kwargs["max_context_partition_num"])
             return build_reduce(**kwargs)
 
@@ -1046,6 +1159,9 @@ def test_pa_decode(case, planned, monkeypatch):
             assert (output[:, torch.isposinf(sinks)] == 0).all()
         if plan is not None:
             active = _assert_plan(plan, context.cpu().tolist())
+            if case.cache_address_boundary and active:
+                spans = plan.work_info[:active, 2] - plan.work_info[:active, 1]
+                assert spans.max().item() > 1
             if case.active_partition_maxima is not None:
                 expected = min(case.active_partition_maxima[phase], plan.max_partitions)
                 assert plan.reduce_info[:, 1].max().item() == expected

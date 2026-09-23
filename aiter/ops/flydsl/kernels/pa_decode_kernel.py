@@ -66,9 +66,11 @@ def compile_pa_decode_tile(
     query_length: int = 1,
     trans_v: bool = True,
     wide_kv_addressing: bool = False,
+    kv_buffer_u32: bool = False,
     query_splits: int | None = None,
     use_work_plan: bool = False,
     work_capacity: int | None = None,
+    max_context_length: int | None = None,
     sliding_window: int = 0,
     use_sinks: bool = False,
     sink_dtype_str: str = "f32",
@@ -77,6 +79,8 @@ def compile_pa_decode_tile(
 
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
+    ``max_context_length`` bounds dense planned work for scheduling only; it does not
+    change the launch capacity, scratch layout, or single-tile guarantee.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
     M-tiles. Partial output stays unsplit for the shared reducer.
 
@@ -95,8 +99,9 @@ def compile_pa_decode_tile(
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
-    unwritten tail of the last owned page finite. ``wide_kv_addressing`` uses
-    i64 offsets when a cache reaches 2 GiB and the i32 page product would wrap.
+    unwritten tail of the last owned page finite. ``wide_kv_addressing`` protects
+    offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
+    and permits unsigned buffer offsets instead of i64.
     """
     if sliding_window > 0 and not use_work_plan:
         raise ValueError("positive sliding_window requires work_plan")
@@ -114,6 +119,13 @@ def compile_pa_decode_tile(
     if use_work_plan:
         if work_capacity is not None:
             split_workgroups = work_capacity * num_kv_heads
+        if sliding_window == 0 and max_context_length is not None:
+            context_tiles = (
+                max_context_length + KV_COMPUTE_BLOCK - 1
+            ) // KV_COMPUTE_BLOCK
+            split_workgroups = min(
+                split_workgroups, num_seqs * num_kv_heads * context_tiles
+            )
         if sliding_window > 0:
             # Bound the unaligned MTP window union, excluding padding CTAs.
             window_tiles = (
@@ -137,19 +149,39 @@ def compile_pa_decode_tile(
             if single_tile_plan and query_length == 4 and block_size == 128 and trans_v
             else query_length
         )
-        query_splits = (
-            query_length
-            if TUNED_PER_TOKEN
-            and num_kv_heads == 1
+        query_splits = 1
+        if (
+            TUNED_PER_TOKEN
+            and (num_kv_heads == 1 or (use_work_plan and sliding_window == 0))
             and query_length in (2, 4)
             and query_group_size == 16
             and split_weight * split_workgroups <= 2 * num_compute_units
-            else 1
-        )
+        ):
+            query_splits = query_length
+        elif (
+            TUNED_PER_TOKEN
+            and use_work_plan
+            and sliding_window == 0
+            and query_length == 4
+            and query_group_size == 8
+            and block_size == 128
+            and trans_v
+            and 2 * split_workgroups <= num_compute_units
+        ):
+            query_splits = 2
     assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
     assert query_length % query_splits == 0, "query_splits must divide query_length"
     QUERIES_PER_CTA = query_length // query_splits
     TOTAL_ROWS = query_length * query_group_size
+    CTA_ROWS = QUERIES_PER_CTA * query_group_size
+    M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
+    WIDE_FP8_MFMA = (
+        TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
+    )
+    MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
+    BUFFER_KV = (
+        kv_buffer_u32 and MTP4_FUSED and wide_kv_addressing and block_size == 128
+    )
 
     # Prefetch single-M-tile queries; large multi-tile grids favor fewer registers.
     PER_TOKEN_M1 = (
@@ -195,6 +227,7 @@ def compile_pa_decode_tile(
         query_length,
         trans_v,
         wide_kv_addressing,
+        BUFFER_KV,
         prefetch_v,
         query_splits,
         use_work_plan,
@@ -239,9 +272,6 @@ def compile_pa_decode_tile(
     assert (
         head_dim % 64 == 0
     ), f"pa_decode_tile only supports head_dim that's a multiple of 64, got {head_dim}"
-    # Query rows flatten as (MTP, GQA).
-    CTA_ROWS = QUERIES_PER_CTA * query_group_size
-    M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
     ROWS_PADDED = M_TILES * MFMA_MNK
     # Avoid repeated BF16 max packing/unpacking.
     Q_ABSMAX_F32 = sliding_window > 0 and TUNED_PER_TOKEN
@@ -259,14 +289,11 @@ def compile_pa_decode_tile(
         TUNED_SCALAR and IS_BF16 and query_length == 1 and query_group_size in (8, 16)
     )
     # K128 consumes four K32 packs without changing cache/LDS layouts.
-    WIDE_FP8_MFMA = (
-        TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
-    )
     MFMA_K = 128 if WIDE_FP8_MFMA else FP8_PACK_K
     PACKS_PER_MFMA = MFMA_K // FP8_PACK_K
-    MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
-    # Wide page128 addresses make carrying V across QK too register-heavy.
-    MTP4_PREFETCH_V = MTP4_FUSED and (block_size == 16 or not wide_kv_addressing)
+    MTP4_PREFETCH_V = MTP4_FUSED and (
+        block_size == 16 or not wide_kv_addressing or BUFFER_KV
+    )
     TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
     PAGE16_VPIPE = prefetch_v and block_size == 16
     REUSE_KV_PAGES = PER_TOKEN_M1
@@ -462,13 +489,24 @@ def compile_pa_decode_tile(
         if const_expr(DIRECT_SINKS):
             sink_token = fx.recast_iter(SINK_DTYPE, sinks_ptr)
 
-        # K/V use raw UniversalCopy so their optional i64 offsets remain intact.
         def _make_raw_flat_loader(tensor_ptr, elem_ty, reg_width, extent):
-            copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
+            # Stream dense KV; retain cache locality for sliding windows.
+            copy_op = (
+                fx.rocdl.BufferCopy128b(
+                    cache_modifier=2 if const_expr(sliding_window == 0) else 0
+                )
+                if const_expr(BUFFER_KV)
+                else fx.UniversalCopy128b()
+            )
+            copy_atom = fx.make_copy_atom(copy_op, elem_ty)
             reg = fx.make_rmem_tensor(fx.make_layout(reg_width, 1), elem_ty)
-            flat = fx.Tensor(
-                fx.make_view(
-                    fx.recast_iter(elem_ty, tensor_ptr), fx.make_layout(extent, 1)
+            flat = (
+                ptr_buf_tensor(tensor_ptr, elem_ty)
+                if const_expr(BUFFER_KV)
+                else fx.Tensor(
+                    fx.make_view(
+                        fx.recast_iter(elem_ty, tensor_ptr), fx.make_layout(extent, 1)
+                    )
                 )
             )
             tiled = fx.logical_divide(flat, fx.make_layout(1, 1))
@@ -483,6 +521,8 @@ def compile_pa_decode_tile(
         _v_load_fp8x16 = _make_raw_flat_loader(value_cache_ptr, FP8, 16, KV_EXTENT)
 
         def _kv_addr(phys, page_elems, rest):
+            if const_expr(BUFFER_KV):
+                return fx.Uint32(phys) * fx.Uint32(page_elems) + fx.Uint32(rest)
             # Widen before the page product reaches 2^31 FP8 elements.
             if const_expr(wide_kv_addressing):
                 return fx.Int64(phys) * fx.Int64(page_elems) + fx.Int64(rest)
@@ -1379,6 +1419,11 @@ def compile_pa_decode_tile(
                                 warp,
                                 ls,
                             )
+                    if const_expr(not MTP4_PREFETCH_V and trans_v):
+                        # Overlap current V with next K and the P barrier.
+                        v_vh_shared = [
+                            _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
+                        ]
                     if const_expr(not single_tile_plan) and tt1 < part_end:
                         # Saved scores are dead; next K can overlap the P barrier/PV.
                         k_next = _k_ops_from_phys(_k_page_read_warp())
@@ -1386,11 +1431,6 @@ def compile_pa_decode_tile(
 
                     gpu.barrier()
 
-                    if const_expr(not MTP4_PREFETCH_V and trans_v):
-                        # Delay transposed V until saved score registers are dead.
-                        v_vh_shared = [
-                            _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
-                        ]
                     v_next_chunks = []
                     for m in range_constexpr(M_TILES):
                         p_base = sP_off + m * MFMA_MNK * SP_ROW_BYTES
