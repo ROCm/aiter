@@ -341,14 +341,10 @@ def families_reachable(policy: FamilyPolicy) -> tuple[str, ...]:
     # Mesh is reachable when its window is non-empty: either mesh_max is None
     # (unbounded) or mesh_max > oneshot_max. Also needs to be reachable above
     # min_bytes -- but if oneshot_max >= min_bytes that is already guaranteed.
-    mesh_reachable = policy.mesh_max is None or policy.mesh_max > policy.oneshot_max
-    if mesh_reachable:
+    if policy.mesh_max is None or policy.mesh_max > policy.oneshot_max:
         out.append("mesh")
-    # Ring is reachable when the mesh window is finite and non-empty (ring
-    # starts above mesh_max) AND the ring window itself is non-empty: either
-    # ring_max is None (unbounded) or ring_max > mesh_max.
-    if mesh_reachable and policy.mesh_max is not None and (
-        policy.ring_max is None or policy.ring_max > policy.mesh_max
-    ):
-        out.append("ring")
+    if policy.mesh_max is not None:
+        ring_floor = max(policy.oneshot_max, policy.mesh_max)
+        if policy.ring_max is None or policy.ring_max > ring_floor:
+            out.append("ring")
     return tuple(out)

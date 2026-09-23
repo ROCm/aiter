@@ -130,6 +130,81 @@ def test_pick_family_is_monotone(ws):
     assert set(P.families_reachable(p)) == {"oneshot", "mesh", "ring"}
 
 
+def _accepted_sizes(p):
+    """Payload sizes a dispatcher on *p* accepts: powers of two plus each
+    ceiling and one byte past it, inside ``[min_bytes, max_bytes]``."""
+    hi = p.max_bytes if p.max_bytes is not None else 1 << 31
+    edges = {p.oneshot_max, p.mesh_max or 0, p.ring_max or 0, p.min_bytes}
+    sizes = {1 << k for k in range(4, 32)}
+    sizes |= {e + d for e in edges for d in (0, 1)}
+    return sorted(n for n in sizes if max(1, p.min_bytes) <= n <= hi)
+
+
+_RESOLVERS = {"plain": P.resolve, "fused": P.resolve_fused}
+
+
+@pytest.mark.parametrize("table", sorted(_RESOLVERS))
+@pytest.mark.parametrize("mode", P.ACCURACY_MODES)
+@pytest.mark.parametrize("cell", CELLS)
+def test_every_picked_family_is_reachable(cell, mode, table):
+    """Whatever ``pick_family`` names for an accepted payload has an engine.
+
+    The dispatchers build engines only for ``families_reachable`` and decline a
+    payload whose family has none. A family ``pick_family`` can return but
+    ``families_reachable`` omits is therefore a silent hole in the dispatch
+    range -- how the fused PCIe TP2 ring (empty mesh window) went missing.
+    """
+    p = _RESOLVERS[table](cell[0], cell[1], mode=mode)
+    reachable = P.families_reachable(p)
+    for n in _accepted_sizes(p):
+        assert P.pick_family(n, p) in reachable, (table, cell, mode, n, reachable)
+
+
+def test_empty_mesh_window_goes_straight_to_ring():
+    """``mesh_max == oneshot_max`` closes the mesh window, not the ring's."""
+    p = P.FamilyPolicy(
+        oneshot_max=768 << 10, oneshot_max_exact=768 << 10, mesh_max=768 << 10
+    )
+    assert P.families_reachable(p) == ("oneshot", "ring")
+    assert P.pick_family(768 << 10, p) == "oneshot"
+    assert P.pick_family((768 << 10) + 1, p) == "ring"
+
+
+def test_families_reachable_window_edges():
+    """Each family is judged on its own window, whatever the others do."""
+    mib = 1 << 20
+
+    def fams(**kw):
+        kw.setdefault("oneshot_max_exact", kw["oneshot_max"])
+        return P.families_reachable(P.FamilyPolicy(**kw))
+
+    # All three windows open.
+    assert fams(oneshot_max=mib, mesh_max=2 * mib) == ("oneshot", "mesh", "ring")
+    # Ring capped exactly at the mesh ceiling: empty ring window.
+    assert fams(oneshot_max=mib, mesh_max=2 * mib, ring_max=2 * mib) == (
+        "oneshot",
+        "mesh",
+    )
+    # Ring capped above an empty mesh window: ring still reachable.
+    assert fams(oneshot_max=mib, mesh_max=mib, ring_max=2 * mib) == (
+        "oneshot",
+        "ring",
+    )
+    # Unbounded mesh: nothing above it, so no ring.
+    assert fams(oneshot_max=mib, mesh_max=None) == ("oneshot", "mesh")
+    # Exact mode's disabled sentinels.
+    assert fams(oneshot_max=mib, mesh_max=0, ring_max=0) == ("oneshot",)
+
+
+def test_fused_pcie_tp2_reaches_the_ring():
+    """The shipped fused PCIe TP2 cell has no mesh window; above the one-shot
+    it must dispatch to a ring engine that actually gets built."""
+    p = P.resolve_fused("pcie", 2, mode="fast")
+    assert p.mesh_max == p.oneshot_max
+    assert P.families_reachable(p) == ("oneshot", "ring")
+    assert P.pick_family(p.oneshot_max + 1, p) == "ring"
+
+
 @pytest.mark.parametrize("ws", WORLDS)
 def test_ladders_are_well_formed(ws):
     """Every ladder starts at 0, ascends, and names values its kernel accepts.
