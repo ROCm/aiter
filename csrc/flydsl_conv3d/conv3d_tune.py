@@ -97,7 +97,10 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
 
 
 def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
-    # Pass splitk so the CSV column is what ran, matching AOT.
+    # splitk is pinned rather than re-derived by the dispatch, so the CSV column
+    # is the value that was timed and AOT compiles the artifact the runtime asks
+    # for. NCDHW in and out, so the timing includes the pre-transpose the model
+    # also pays; see Conv3dTuner.calculate.
     return flydsl_conv_implicit(
         x, weight, bias=bias, tile=tile, wgm=wgm, splitk=splitk, **params
     )
@@ -262,6 +265,14 @@ class Conv3dTuner(TunerCommon):
         tasks = []
         for tile_m, tile_n, wave_m, wave_n, wgm in configs:
             tile = (tile_m, tile_n, wave_m, wave_n)
+            # splitK is derived, not swept. A split only buys occupancy where
+            # the M/N grid alone cannot fill the device, and measured against
+            # the heuristic's own 3/4*CU bar that is 1 of the 76 shipped rows --
+            # the rest would spend tuning time confirming splitK=1 while paying
+            # an fp32 staging buffer and an atomic reduce to do it. It is still
+            # pinned rather than re-derived at dispatch, so the column records
+            # the value that ran and AOT compiles the artifact the runtime asks
+            # for.
             sk = _resolve_splitk(
                 None, m_gemm, crs, k, torch.cuda.current_device(), tile, groups
             )
@@ -334,7 +345,15 @@ class Conv3dTuner(TunerCommon):
         return kernel_id if isinstance(kernel_id, str) else str(kernel_id)
 
     def calculate(self, results, bpes=(2, 2, 2)):
-        """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse)."""
+        """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse).
+
+        Both are derived from an end-to-end time, so both are diluted by the
+        NCDHW->NDHWC pre-transpose and the weight repack the entry point runs
+        before the kernel -- a constant per shape, which leaves the ranking
+        alone but makes these two columns a floor rather than a kernel figure.
+        Do not compare them against another implementation's kernel-only
+        numbers.
+        """
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
             return 0, 0

@@ -4,9 +4,20 @@ Offline tile tuner for `flydsl_conv_implicit`, the implicit-GEMM convolution. It
 reads shapes from an untuned CSV, sweeps the launch configs
 `aiter/ops/flydsl/conv3d_policy.py` enumerates for each one, and writes the
 winner to a checked-in tuned CSV that `conv_kernels._lookup_tuned_tile` reads
-at runtime. A shape with no tuned row of its own borrows the nearest tuned
-resolution of the same layer, and falls back to the heuristic tile ladder when
-there is not one, so tuning is an optimization rather than a prerequisite.
+at runtime. A shape with no tuned row of its own borrows the nearest usable
+tuned resolution of the same layer, and falls back to the heuristic tile ladder
+when there is not one, so tuning is an optimization rather than a prerequisite.
+
+One layout only: rows are tuned NCDHW in and out, and an NDHWC-output call
+reuses that tile even though `out_ndhwc` is a compile-time parameter that
+changes the epilogue (it gives up the vectorised store). Measured rather than
+assumed -- re-sweeping the full candidate set of 8 Qwen-Image rows under
+`output_layout="NDHWC"` on gfx950 left the tuned tile the winner on 5 of them
+and within 0.2% on a 6th. It drifts only where the GEMM's K axis is tiny and
+the epilogue is most of the kernel: `3->96` (K=27) came out 4.0% off the
+NDHWC-best and `16->384` (K=144) 8.3%, the latter 19.8us against 18.3us. That
+is why there is one row per shape rather than one per layout; a layout column
+would double every table for those two cases.
 
 Single backend, unlike the GEMM tuners: there is no asm/CK/triton alternative
 for this kernel, so there is no `--libtype` flag and no `gemm_tuner.py`-style
@@ -39,8 +50,19 @@ python3 setup.py develop
    480×832.
 
    Unlisted resolutions borrow the nearest same-layer tuned tile (npq within
-   4x), then fall back to `_pick_tile`. `AITER_CONV3D_DYN_HW` (on by default)
-   shares one *artifact* across resolutions of a layer; tile is still per row.
+   4x, and only while that tile still fills the device at the npq being
+   served), then fall back to `_pick_tile`. `AITER_CONV3D_DYN_HW` (on by
+   default) shares one *artifact* across resolutions of a layer; tile is still
+   per row.
+
+   Borrowing is a fallback, not a substitute for a row. Measured on gfx950 over
+   93 off-table resolutions of the two VAEs: with the fills-device bar in place
+   it runs 2.6% faster than the heuristic on the Qwen-Image layers and 3.6%
+   faster on the Wan2.1 ones, worst case 1.22x slower. Without that bar the
+   same sweep was a 1.5% net *loss* on Qwen-Image with a worst case of 2.02x,
+   all of it on layers whose M had shrunk enough that the borrowed tile no
+   longer filled the device. The residual cases are not separable by npq
+   distance, so tune a resolution that matters rather than leaving it to this.
 
    Pass `-i` and `-o` explicitly. The defaults are the canonical pair, which
    ships header-only, so a run without them finds no shapes and exits rather
@@ -70,6 +92,30 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
     |**gfx**|**cu_num**|*(the 20 key columns)*|**libtype**|**tile_m**|**tile_n**|**wave_m**|**wave_n**|**wgm**|**splitK**|**us**|**kernelName**|**err_ratio**|**tflops**|**bw**|
     |-------|----------|----------------------|-----------|----------|----------|----------|----------|-------|----------|------|--------------|-------------|----------|------|
     |gfx950 |256       |...                   |flydsl     |96        |96        |2         |3         |1      |1         |137.3024|conv3d_implicit_t96x96_w2x3_g1|0.0|39.59|1512.16|
+
+   `us`, `tflops` and `bw` are end-to-end: the entry point runs the
+   NCDHW->NDHWC pre-transpose and the weight repack before the kernel, and the
+   tuner times it the way the model calls it. That is a constant per shape, so
+   the ranking is unaffected, but the three columns are a floor rather than a
+   kernel figure and are not comparable with another implementation's
+   kernel-only numbers.
+
+   `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
+   tuner pins that value so the column records what ran. Every row of both VAE
+   tables is `splitK=1`, and structurally so rather than by default -- a split
+   only buys occupancy where the M/N grid alone cannot fill the device, and 75
+   of the 76 rows are already at or above the heuristic's own 3/4*CU block bar,
+   where a split can do nothing but add an fp32 staging buffer and an atomic
+   reduce. The exception is Wan's `conv_out` at 368x544 (98 blocks), which
+   `_resolve_splitk` declines on `npq < 4096`.
+
+   Note that split-K cannot currently be combined with a tile that leaves a
+   tail: the masked element is dropped by routing the store to the OOB
+   sentinel, which needs a buffer descriptor, and the split-K atomic has none.
+   `make_output_scatter_plan` asserts on it. The heuristic cannot reach that
+   combination (it requires `npq % tile_m == 0` and `kg % tile_n == 0` before
+   splitting), so it is only reachable through an explicit `splitk=` or a
+   hand-written row.
 
    `libtype` names the implementation the rest of the row configures, as it does
    in the GEMM tables. It is a result rather than part of the key: where a tuner
