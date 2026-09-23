@@ -476,7 +476,7 @@ OPUS_D inline void epilogue_store_workspace_sc0nt(
     Mma& mma, GC& g_c, const Kargs& kargs,
     VC& v_c, int wave_id_m, int wave_id_n, int lane_id)
 {
-    using D_C = typename T::D_C;
+    using D_WS = typename T::D_WS;
     using D_ACC = typename T::D_ACC;
 
     auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
@@ -488,16 +488,16 @@ OPUS_D inline void epilogue_store_workspace_sc0nt(
         return half_m * T::HALF_B_M * kargs.stride_ws + half_n * T::HALF_B_N;
     };
 
-    if constexpr (std::is_same_v<D_C, D_ACC>) {
+    if constexpr (std::is_same_v<D_WS, D_ACC>) {
         opus::store<T::VEC_C>(g_c, v_c[0][0], u_gc, ws_offset(0, 0), opus::number<3>{});
         opus::store<T::VEC_C>(g_c, v_c[0][1], u_gc, ws_offset(0, 1), opus::number<3>{});
         opus::store<T::VEC_C>(g_c, v_c[1][0], u_gc, ws_offset(1, 0), opus::number<3>{});
         opus::store<T::VEC_C>(g_c, v_c[1][1], u_gc, ws_offset(1, 1), opus::number<3>{});
     } else {
-        auto c00 = opus::cast<D_C>(v_c[0][0]);
-        auto c01 = opus::cast<D_C>(v_c[0][1]);
-        auto c10 = opus::cast<D_C>(v_c[1][0]);
-        auto c11 = opus::cast<D_C>(v_c[1][1]);
+        auto c00 = opus::cast<D_WS>(v_c[0][0]);
+        auto c01 = opus::cast<D_WS>(v_c[0][1]);
+        auto c10 = opus::cast<D_WS>(v_c[1][0]);
+        auto c11 = opus::cast<D_WS>(v_c[1][1]);
         opus::store<T::VEC_C>(g_c, c00, u_gc, ws_offset(0, 0), opus::number<3>{});
         opus::store<T::VEC_C>(g_c, c01, u_gc, ws_offset(0, 1), opus::number<3>{});
         opus::store<T::VEC_C>(g_c, c10, u_gc, ws_offset(1, 0), opus::number<3>{});

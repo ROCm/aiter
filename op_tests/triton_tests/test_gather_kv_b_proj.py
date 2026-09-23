@@ -6,7 +6,7 @@ import random
 import pytest
 import torch
 
-from aiter import dtypes
+from aiter import dtypes, logger
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.utils._triton import arch_info
@@ -358,10 +358,17 @@ def test_gather_kv_b_proj(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(">>> Performance gather_kv_b_proj:")
-        print(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        logger.info(">>> Performance gather_kv_b_proj:")
+        logger.info(
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -502,10 +509,17 @@ def test_gather_kv_b_proj_per_row_scale(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(">>> Performance gather_kv_b_proj_per_row_scale:")
-        print(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        logger.info(">>> Performance gather_kv_b_proj_per_row_scale:")
+        logger.info(
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -659,12 +673,18 @@ def test_gather_kv_b_proj_bf16_weight(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(">>> Performance gather_kv_b_proj_bf16_weight:")
-        print(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
-            f"kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}, "
-            f"scale_mode {scale_mode}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        logger.info(">>> Performance gather_kv_b_proj_bf16_weight:")
+        logger.info(
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d, scale_mode %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            scale_mode,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -1164,11 +1184,15 @@ def test_gather_kv_b_proj_shuffled_kv(
             weight_preshuffle=weight_preshuffle,
             shuffled_kv_cache=True,
         )
-        print(
-            f">>> Performance gather_kv_b_proj_shuffled_kv ({scale_mode}):\n"
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
-            f"kv_length {avg_kv_length}, ktype {k_buffer_type}\n"
-            f">>>       elapsed={elapsed_us:.2f}us"
+        logger.info(
+            ">>> Performance gather_kv_b_proj_shuffled_kv (%s):\n>>>   batch %d, block_size %d, tp_k_head_num %d, kv_length %d, ktype %s\n>>>       elapsed=%.2fus",
+            scale_mode,
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            avg_kv_length,
+            k_buffer_type,
+            elapsed_us,
         )
 
 
