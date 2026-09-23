@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Typed problem, candidate, result, and CSV contracts for MHA forward tuning."""
+"""The MHA forward family contract, shared by the runtime reader, the tuner and
+the tuning tests.
+
+It holds four kinds of fact, in this order: the family's identity, the row
+schema, the candidate space and its legality, and the measurement and
+promotion values the tuner applies.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +20,20 @@ from typing import Any, Literal
 
 from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
 
-# The family's identity, stated once for the tuner and the tuning-test tables.
+# ---------------------------------------------------------------------------
+# Family identity, stated once for the tuner and the tuning-test tables.
+# ---------------------------------------------------------------------------
+
 MHA_FWD_FAMILY = "mha_fwd"
 MHA_FWD_TUNER_SCRIPT = "op_tests/tuners/tune_mha_fwd.py"
 MHA_FWD_CONFIG_ENV = "AITER_CONFIG_MHA_FWD"
 MHA_FWD_CONFIG_PROPERTY = "AITER_CONFIG_MHA_FWD_FILE"
 MHA_FWD_TUNED_CSV = "tuned_mha_fwd.csv"
 MHA_FWD_UNTUNED_CSV = "untuned_mha_fwd.csv"
+
+# ---------------------------------------------------------------------------
+# Row schema: the key, the candidate and the CSV row, and their typed forms.
+# ---------------------------------------------------------------------------
 
 MHA_FWD_PROBLEM_KEY_FIELDS = (
     "mode",
@@ -76,22 +89,6 @@ MHA_FWD_RUNTIME_CSV_FIELDS = (
     *MHA_FWD_RUNTIME_EVIDENCE_FIELDS,
 )
 MhaFwdBackend = Literal["asm_v3", "ck", "flydsl", "gluon", "opus", "triton"]
-MHA_FWD_BACKENDS = frozenset({"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"})
-MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
-MHA_FWD_TILE_CONFIG_KEYS = {
-    "triton": frozenset(
-        {
-            "BLOCK_M",
-            "BLOCK_N",
-            "PRELOAD_V",
-            "num_warps",
-            "waves_per_eu",
-            "num_stages",
-            "num_ctas",
-        }
-    ),
-    "gluon": frozenset({"BLOCK_M", "BLOCK_N", "num_warps", "waves_per_eu"}),
-}
 
 
 def csv_scalar(value: Any) -> str:
@@ -318,6 +315,28 @@ class MhaFwdPlan:
                 )
 
 
+# ---------------------------------------------------------------------------
+# Candidate space and legality: which backends and configurations exist, and
+# which of them may serve a given problem on a given architecture.
+# ---------------------------------------------------------------------------
+
+MHA_FWD_BACKENDS = frozenset({"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"})
+MHA_FWD_TILE_CONFIG_BACKENDS = frozenset({"gluon", "triton"})
+MHA_FWD_TILE_CONFIG_KEYS = {
+    "triton": frozenset(
+        {
+            "BLOCK_M",
+            "BLOCK_N",
+            "PRELOAD_V",
+            "num_warps",
+            "waves_per_eu",
+            "num_stages",
+            "num_ctas",
+        }
+    ),
+    "gluon": frozenset({"BLOCK_M", "BLOCK_N", "num_warps", "waves_per_eu"}),
+}
+
 # Below this the C++ selector leaves the KV loop unsplit, so the split-KV
 # kernel's constraints do not apply. Mirrors kFmhaHd192SplitKvMinSplits in
 # csrc/include/mha_fwd.h.
@@ -393,24 +412,6 @@ def validate_mha_fwd_backend_arch(backend: str, gfx: str) -> None:
     }
     if gfx not in supported[backend]:
         raise ValueError(f"MHA backend {backend!r} does not support {gfx!r}")
-
-
-# Multiples of the combined standard error a winner must clear before it
-# displaces the configuration already in use. Two is the conventional ~95%
-# two-sample separation; the point is that the bar is stated once and is
-# visible in the evidence rather than implied by whichever candidate sorted
-# first.
-MHA_FWD_SIGNIFICANCE_SIGMA = 2.0
-
-# The indifference zone the race uses, as a fraction of the leader's latency.
-# This is a reproducibility threshold rather than a taste parameter: an
-# unchanged configuration moves by roughly this much between sessions on this
-# hardware, so resolving differences below it would be resolving differences
-# that do not survive to the next run. Under the race strategy it is also the
-# bar a challenger must clear to displace the incumbent, because a shrinking
-# standard-error test and a fixed indifference zone disagree about what a tie
-# is, and running both would let one promote what the other called settled.
-MHA_FWD_INDIFFERENCE_DELTA = 0.02
 
 
 def enumerate_mha_fwd_candidates(
@@ -501,6 +502,58 @@ def mha_fwd_candidate_id(problem: MhaFwdProblem, candidate: MhaFwdCandidate) -> 
         separators=(",", ":"),
     )
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Measurement and promotion: what counts as correct, how candidates are
+# measured, and what a challenger must beat. The tuner's command-line defaults
+# are read from here.
+# ---------------------------------------------------------------------------
+
+# Choices that depend on this family's numerics and problem sizes.
+# errRatio is the fraction of output elements outside these tolerances, and
+# none may be.
+MHA_FWD_ERROR_METRIC = "allclose_mismatch_fraction"
+MHA_FWD_ERROR_RTOL = 2e-2
+MHA_FWD_ERROR_ATOL = 2e-2
+MHA_FWD_MAX_ERROR_RATIO = 0.0
+MHA_FWD_TASK_TIMEOUT_S = 7200
+
+# Nothing in the justification of the values below is about attention. They
+# are measurement and promotion policy that other families need unchanged,
+# and they are candidates for a central tuning-policy module.
+
+# Multiples of the combined standard error a winner must clear before it
+# displaces the configuration already in use. Two is the conventional ~95%
+# two-sample separation; the point is that the bar is stated once and is
+# visible in the evidence rather than implied by whichever candidate sorted
+# first.
+MHA_FWD_SIGNIFICANCE_SIGMA = 2.0
+
+# The indifference zone the race uses, as a fraction of the leader's latency.
+# This is a reproducibility threshold rather than a taste parameter: an
+# unchanged configuration moves by roughly this much between sessions on this
+# hardware, so resolving differences below it would be resolving differences
+# that do not survive to the next run. Under the race strategy it is also the
+# bar a challenger must clear to displace the incumbent, because a shrinking
+# standard-error test and a fixed indifference zone disagree about what a tie
+# is, and running both would let one promote what the other called settled.
+MHA_FWD_INDIFFERENCE_DELTA = 0.02
+
+# The fastest candidates per shape after the first pass, re-measured over
+# this many fresh-worker rounds before the median decides.
+MHA_FWD_FINALISTS = 8
+MHA_FWD_FINALIST_ROUNDS = 3
+
+# The race's error budget, timed calls per candidate per block, and the block
+# counts before elimination may start and at which the race stops uncertified.
+MHA_FWD_RACE_ALPHA = 0.05
+MHA_FWD_RACE_BLOCK_CALLS = 10
+MHA_FWD_RACE_MIN_BLOCKS = 3
+MHA_FWD_RACE_MAX_BLOCKS = 30
+
+# Seeds --candidate-sample and the race's block order, so a run is repeatable.
+MHA_FWD_SAMPLE_SEED = 20240917
 
 
 def as_bool(value: Any) -> bool:
