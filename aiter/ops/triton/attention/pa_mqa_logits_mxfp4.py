@@ -705,8 +705,11 @@ def paged_mxfp4_mqa_logits(
                            < 2 ** 31)
 
     # The two that need the batch, which select_config does not see.
+    # Varlen's grid is one unit per row block plus a spare per sequence, not
+    # batch x row_blocks, so the split count has to be sized from that.
+    split_q = (1, total_rows // block_m + batch) if varlen else (batch, row_blocks)
     cfg["num_kv_splits"] = _kv_splits(
-        batch, row_blocks, max_model_len, block_kv, target_wgs,
+        *split_q, max_model_len, block_kv, target_wgs,
         cfg["min_tiles_per_split"], cfg["max_tiles_per_split"])
     # More than one row block per sequence means the second re-reads the same
     # pages, so the lines are worth keeping in L1
@@ -714,20 +717,21 @@ def paged_mxfp4_mqa_logits(
 
     num_kv_splits = cfg["num_kv_splits"]
     # A gather launch does not build one
-    if schedule is None and (dynamic or varlen) and not gather_on:
+    if schedule is None and dynamic and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
                                   page_size, preshuffle, row_ends=row_ends,
                                   query_start_loc=query_start_loc, total_rows=total_rows,
                                   max_model_len=max_model_len)
     use_dynamic = schedule is not None
-    assert not varlen or use_dynamic, (
-        "varlen needs the dynamic schedule and this shape does not get one "
-        f"(batch {batch} under {MIN_DYNAMIC_BATCH}, or the work does not fit); "
-        "group the rows by count and launch per group instead")
     if use_dynamic:
         schedule = _check_schedule(schedule, context_lens.device)
         # schedule length is the grid
         grid = (schedule.numel() // 4, 1, 1)
+    elif varlen:
+        # One unit per row block plus a spare per sequence, which is what the
+        # kernel's search over query_start_loc covers; the spares exit there.
+        grid = (total_rows // block_m + batch, 1, num_kv_splits)
+        schedule = context_lens
     else:
         grid = (row_blocks, batch, num_kv_splits)
         # Placeholder ptr
@@ -752,6 +756,7 @@ def paged_mxfp4_mqa_logits(
         block_scores_ptr=block_scores if bscore_on else None,
         logits_ptr=logits,
         next_n=next_n,
+        batch=batch,
         num_kv_splits=num_kv_splits,
         stride_q_b=0 if varlen else q.stride(0),
         stride_q_n=q.stride(0) if varlen else q.stride(1),

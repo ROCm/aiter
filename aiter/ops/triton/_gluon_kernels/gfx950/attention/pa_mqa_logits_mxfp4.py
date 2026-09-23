@@ -1123,6 +1123,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     logits_ptr,        # fp32  [B * NEXT_N, max_model_len]; None under
                        # BSCORE == 2, which writes no logits at all
     next_n: gl.int32,
+    batch: gl.int32,
     num_kv_splits: gl.int32,
     stride_q_b: gl.int32, stride_q_n: gl.int32,
     stride_qs_b: gl.int32, stride_qs_n: gl.int32,
@@ -1208,6 +1209,27 @@ def _pa_mqa_logits_mxfp4_kernel(
         split_id: gl.int32 = 0
         if num_slices <= slice_idx:
             return
+    elif VARLEN:
+        # No rectangle to take the grid from when the rows are ragged, so the
+        # unit space is query_start_loc[s] // BLOCK_M + s the way aiter's
+        # unified attention does it: monotone, so a binary search takes a flat
+        # id back to its sequence, and the spare unit per sequence -- which
+        # absorbs a partial last block -- falls out past the row count below.
+        unit = gl.program_id(0)
+        lo: gl.int32 = 0
+        hi = batch
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if gl.load(query_start_loc_ptr + mid) // BLOCK_M + mid <= unit:
+                lo = mid + 1
+            else:
+                hi = mid
+        batch_id = lo - 1
+        row_block = unit - (gl.load(query_start_loc_ptr + batch_id) // BLOCK_M
+                            + batch_id)
+        split_id = gl.program_id(2)
+        slice_idx: gl.int32 = 0
+        num_slices: gl.int32 = 0
     else:
         # Longest first keeps the grid's tail short.
         row_block = gl.num_programs(0) - 1 - gl.program_id(0)
@@ -1223,6 +1245,10 @@ def _pa_mqa_logits_mxfp4_kernel(
     if VARLEN:
         q_start = gl.load(query_start_loc_ptr + batch_id)
         rows = gl.load(query_start_loc_ptr + batch_id + 1) - q_start
+        if not DYNAMIC:
+            # the spare unit, and any the bound over-provisioned
+            if row_block * BLOCK_M >= rows:
+                return
     else:
         q_start = batch_id * next_n
         rows = next_n

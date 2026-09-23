@@ -853,8 +853,10 @@ VARLEN_SHAPES = [
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("page_size", [64, 128])
-@pytest.mark.parametrize("plan_n", [None, 6])
-def test_varlen(shape, num_heads, page_size, plan_n):
+# (next_n to plan from, dynamic): the last covers the schedule path,
+# the others the binary search over query_start_loc
+@pytest.mark.parametrize("plan_n,dyn", [(None, 0), (6, 0), (None, 1)])
+def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     """Packed rows match one uniform launch per sequence, exactly."""
     _, rows, ctx_lens = shape
     hs, dev, batch, total = 128, "cuda", len(rows), sum(rows)
@@ -869,7 +871,8 @@ def test_varlen(shape, num_heads, page_size, plan_n):
     args = (st["cache"], st["cl"], st["block_table"], st["mml"])
 
     got = paged_mxfp4_mqa_logits(q4, q4s, args[0], w, *args[1:],
-                                 query_start_loc=cu, next_n=plan_n)
+                                 query_start_loc=cu, next_n=plan_n,
+                                 dynamic=dyn)
     ref = torch.full_like(got, float("-inf"))
     for b, r in enumerate(rows):
         lo = int(cu[b])
