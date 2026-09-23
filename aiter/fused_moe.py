@@ -3472,6 +3472,11 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
+    if activation == ActivationType.Relu2 and use_g1u1:
+        raise NotImplementedError(
+            "ActivationType.Relu2 is gate-only (non-gated) and does not "
+            "support use_g1u1=True; pass use_g1u1=False."
+        )
     if (
         activation == ActivationType.Relu2
         and not use_g1u1
