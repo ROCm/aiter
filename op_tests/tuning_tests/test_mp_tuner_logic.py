@@ -13,6 +13,7 @@ Run: python3 -m unittest op_tests.tuning_tests.test_mp_tuner_logic -v
 
 import importlib
 import multiprocessing as mp
+import pickle
 import time
 import unittest
 import warnings
@@ -392,6 +393,19 @@ class TestShapeGroupedContract(unittest.TestCase):
             ValueError, "declares 2 kernels but contains 1 tasks"
         ):
             tuner.work_group({}, False, 0.0, (2, (None,)), [("only-task",)])
+
+
+class TestMpTunerTask(unittest.TestCase):
+
+    def test_a_named_task_is_the_tuple_work_group_unpacks(self):
+        """Its defaults have to be what work_group assumes for a tuple that
+        stops after ref, or naming the fields would change the comparison."""
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        task = tuner.MpTunerTask(*range(10))
+        self.assertIsInstance(task, tuple)
+        self.assertEqual(tuple(task[:10]), tuple(range(10)))
+        self.assertEqual(tuple(task[10:]), (1e-2, 1e-2, None, None, None))
+        self.assertEqual(pickle.loads(pickle.dumps(task)), task)
 
 
 class TestWorkerErrorRatio(unittest.TestCase):
