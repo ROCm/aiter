@@ -672,7 +672,12 @@ def dyn_shape_values(param, geom, grid):
 
 
 def unit_divisors(param, geom):
-    """Which of (d, wo, hw_o, dhw) are 1. Layer-level, not resolution."""
+    """Which of (d, wo, hw_o, dhw) are 1, and so keep the folded divisor.
+
+    These follow the resolution, not only the layer: one layer run at D=1 and
+    at D>1 compiles to two artifacts, which is why they are part of
+    ``_dyn_hw_closure_key``.
+    """
     return (param.d == 1, geom.wo == 1, geom.hw_o == 1, geom.dhw == 1)
 
 
