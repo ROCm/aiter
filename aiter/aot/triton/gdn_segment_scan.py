@@ -19,6 +19,15 @@ this warms the Triton cache via ``JITFunction.warmup``.
 
 Coverage resolves through the same merged tuned table as the FlyDSL K5 AOT
 (``AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE``) so the two track each other.
+
+That default only reaches as far as the tuning does, and the kernels
+specialise on ``H // Hg``. The shipped tables cover a ratio of 2
+(``qwen3_5_35b``) and 4 (``qwen3_5_397b``), so a model at any other ratio
+gets nothing from them -- Qwen3.8 is 128 value heads to 16 key heads, which
+is a ratio of 8 at every TP degree, and a CSV-driven run compiles artifacts
+its server will never ask for. Pass ``--heads`` to compile the deployed
+split, and read the shape line the header prints before trusting a cache.
+
 Only ``H``/``Hg``/``dtype`` are read from a row, because nothing else these
 kernels specialise on is a tuned dimension: snapshot and state dtype, the
 indexed state pool, the final-state write and the incoming state of the replay
@@ -40,7 +49,8 @@ Two differences from the FlyDSL AOT are worth knowing:
 Usage:
     python -m aiter.aot.triton.gdn_segment_scan
     python -m aiter.aot.triton.gdn_segment_scan --csv /path/to/tuned.csv
-    python -m aiter.aot.triton.gdn_segment_scan --heads 16:8
+    # Qwen3.8 (128 value / 16 key heads) at TP8:
+    python -m aiter.aot.triton.gdn_segment_scan --heads 16:2
 
 Environment variables:
     TRITON_CACHE_DIR  Cache directory (default: ~/.triton/cache)
@@ -60,7 +70,7 @@ from typing import Any
 import torch
 from triton.runtime.jit import MockTensor
 
-from aiter.aot.flydsl.common import collect_aot_jobs
+from aiter.aot.flydsl.common import collect_aot_jobs, dedupe_jobs
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.gdn_segment_scan import (
     _gdn_segment_kernel,
@@ -334,7 +344,10 @@ def main():
         type=_parse_heads,
         nargs="+",
         default=None,
-        help="Restrict to these H:HG pairs when building a smaller custom image",
+        help="Compile exactly these H:HG pairs instead of the CSV shapes.\n"
+        "Needed whenever the deployed model's head split is not in the\n"
+        "tuned tables: they currently cover H//Hg of 2 and 4 only, so a\n"
+        "model at any other ratio gets no coverage from the CSVs at all.",
     )
     args = parser.parse_args()
 
@@ -344,18 +357,26 @@ def main():
             print(f"Error: CSV file not found: {csv_path}")
             sys.exit(1)
 
-    jobs = collect_aot_jobs(csv_paths, parse_csv)
     if args.heads:
-        wanted = set(args.heads)
-        wanted_h = {H for H, _ in wanted}
+        # Injected, not filtered. The CSVs are a tuning artifact and only
+        # describe the models that have been tuned, so filtering them can
+        # never produce a shape they do not already contain -- which is the
+        # case that matters, because an untuned model is exactly the one
+        # whose kernels are still on the JIT path.
+        dtypes = sorted({row["dtype"] for p in csv_paths for row in _shape_rows(p)})
+        jobs = dedupe_jobs(
+            [
+                job
+                for (H, HG), dtype in itertools.product(
+                    dict.fromkeys(args.heads), dtypes or [_BF16]
+                )
+                for job in _launches_for_shape(H, HG, dtype)
+            ]
+        )
+    else:
+        jobs = collect_aot_jobs(csv_paths, parse_csv)
 
-        def keep(job: dict[str, Any]) -> bool:
-            # Scan jobs carry no HG, so they match on head count alone.
-            if "HG" not in job:
-                return job["H"] in wanted_h
-            return (job["H"], job["HG"]) in wanted
-
-        jobs = [j for j in jobs if keep(j)]
+    shapes = sorted({(j["H"], j["HG"]) for j in jobs if "HG" in j})
 
     cache_dir = os.path.expanduser(
         os.environ.get("TRITON_CACHE_DIR", "~/.triton/cache")
@@ -366,9 +387,24 @@ def main():
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
+    print(f"  Source:       {'--heads' if args.heads else 'CSV shapes'}")
+    # Printed because the failure this guards against is silent: a cache full
+    # of the wrong head split looks exactly like a cache that works, right up
+    # until the server JITs anyway.
+    print(
+        "  Shapes:       "
+        + (", ".join(f"H={H} Hg={HG}" for H, HG in shapes) or "(none)")
+    )
     print(f"  Total jobs:   {len(jobs)}")
     print(f"  Cache dir:    {cache_dir}")
     print("=" * 72)
+
+    if not jobs:
+        print(
+            "\nNo shapes to compile. The tuned CSVs cover no K=V=128 row, so "
+            "pass the deployed model's head split with --heads H:HG."
+        )
+        sys.exit(1)
 
     total_t0 = time.time()
     print(f"\n--- Compiling {len(jobs)} kernels ---")
