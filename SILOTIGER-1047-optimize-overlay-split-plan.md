@@ -34,7 +34,7 @@ convention.
 
 ## Progress
 
-- [ ] 0. Overlay PMC (MFMA/conflict/VMEM per wave vs AMD)
+- [x] 0. Overlay PMC (MFMA/conflict/VMEM per wave vs AMD)
 - [ ] 1. Prefill V overlay store map
 - [ ] 2. Prefill packed K32 PV (`cvt_pk`); decode MFMA unchanged
 - [ ] 3. Reuse gather `live` for softmax (optional; after a keep)
@@ -142,8 +142,9 @@ phases 1–4 is not a reason to restore C/P LDS.
 - **PMC pass that fits hardware:** `SQ_WAVES SQ_BUSY_CYCLES
   SQ_WAIT_INST_LDS SQ_LDS_BANK_CONFLICT SQ_INSTS_VALU SQ_INSTS_MFMA
   SQ_INSTS_VMEM SQ_INSTS_SALU`. Adding `SQ_INSTS_LDS` to that group is
-  error 38. Report **per wave**. Overlay prefill MFMA/wave is unknown
-  until phase 0; do not assume the old port’s 1.00× AMD.
+  error 38. Report **per wave**. Overlay prefill MFMA/wave is **1.33×**
+  AMD (2112 vs 1584 = 64/48 static). Decode MFMA/wave is 2.00× only
+  because AMD launches 2× waves; totals match.
 - **rocprof under JIT:** fill FlyDSL cache then
   `FLYDSL_RUNTIME_ENABLE_CACHE=1` for ATT/PMC; keep-gate benches stay
   `CACHE=0`.
@@ -174,11 +175,43 @@ latency (AMD stores 9.4%). Prefill buffer-load hits **8512 vs 25376**.
 No overlay PMC yet; the port-era “MFMA/wave = 1.00×” table does not
 apply.
 
-- [ ] PMC per-wave FlyDSL vs AMD at `M=1` and `M=512` (same counter
+- [x] PMC per-wave FlyDSL vs AMD at `M=1` and `M=512` (same counter
       group as the campaign lock).
-- [ ] **Done when:** a table of busy / conflict / wait-LDS / MFMA / VALU
+- [x] **Done when:** a table of busy / conflict / wait-LDS / MFMA / VALU
       / VMEM per wave is pasted here and is the comparison point for
       later phases.
+
+Measured 2026-09-23 on GPU 6 / gfx950. Last split dispatch. Traces:
+`tickets/1047/tmp/k2_overlay_pmc/`. rocprof LDS on the overlay kernel is
+**8192 / 32768** (decode / prefill). AMD CSV `LDS_Block_Size` is 0
+(Triton under-report; ATT still 8960 / 33280).
+
+| | decode `M=1` FlyDSL | decode `M=1` AMD | ratio | prefill `M=512` FlyDSL | prefill `M=512` AMD | ratio |
+|--|--:|--:|--:|--:|--:|--:|
+| grid / waves | 16384 / 256 | 32768 / 512 | 0.50× waves | 131072 / 2048 | 131072 / 2048 | 1.00× |
+| WG / LDS / VGPR | 256 / 8192 / 100 | 256 / 0 / 108 | | 128 / 32768 / 100 | 128 / 0 / 120 | |
+| busy / wave | 3877 | 869 | **4.46×** | 11995 | 7522 | **1.59×** |
+| conflict / wave | 1258 | 81 | **15.6×** | 69696 | 10560 | **6.60×** |
+| wait-LDS / wave | 109 | 50 | **2.19×** | 24544 | 9264 | **2.65×** |
+| MFMA / wave | 48.4 | 24.2 | 2.00× | 2112 | 1584 | **1.33×** |
+| VALU / wave | 1203 | 641 | 1.88× | 33343 | 30554 | 1.09× |
+| VMEM / wave | 81 | 39 | 2.07× | 2218 | 3180 | **0.70×** |
+| SALU / wave | 212 | 109 | 1.94× | 2598 | 3646 | 0.71× |
+
+Decode **total** MFMA is identical (**12384**). The 2.00× MFMA/wave (and
+~2× VALU/VMEM/SALU) is AMD’s extra-split grid (DNR), not extra math per
+token. Decode busy **total** is still **2.23×** AMD (993k vs 445k), so
+the per-wave 4.46× is half occupancy artifact and half longer waves.
+Conflict/wave **15.6×** is the leftover decode bank cost on the overlay
+tile.
+
+Prefill grids match. Busy **1.59×** matches the ~1.57× wall / ATT span.
+MFMA/wave **1.33×** is exactly **64 / 48** static K32 (phase 2). Conflict
+**6.60×** and wait-LDS **2.65×** are the phase-1 store-map target. VMEM
+**0.70×** is fewer outstanding loads (DNR to hoist before K-publish).
+
+**This table is the comparison point for later phases.** Do not treat
+decode MFMA 2.00×/wave as a reason to add splits or drop overlay QK.
 
 ### 1. Prefill V overlay store map
 
