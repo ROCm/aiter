@@ -7254,7 +7254,11 @@ class FhmoeTuner(FmoeTuner):
         )
         return routed + shared
 
-    def _fhmoe_tune_tasks(self, untunedf):
+    def _fhmoe_tune_tasks(self, untunedf, args):
+        measure_kwargs = {
+            "num_warmup": int(args.warmup),
+            "num_iters": int(args.iters),
+        }
         tasks = []
         in_datas = []
         for _, row in untunedf.iterrows():
@@ -7275,7 +7279,7 @@ class FhmoeTuner(FmoeTuner):
                         (shape,),
                         FhmoeTuner._run_fhmoe_mp,
                         (list(self._FHMOE_MP_DATA_KEYS), shape, kn1, kn2, block_m),
-                        {},
+                        measure_kwargs,
                         FhmoeTuner.run_torch_fhmoe,
                         (list(self._FHMOE_REF_DATA_KEYS), shape),
                         {},
@@ -7394,7 +7398,7 @@ class FhmoeTuner(FmoeTuner):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
-        tasks, in_datas = self._fhmoe_tune_tasks(untunedf)
+        tasks, in_datas = self._fhmoe_tune_tasks(untunedf, args)
         if not tasks:
             return []
         return mp_tuner(
