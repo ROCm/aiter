@@ -37,7 +37,7 @@ convention.
 - [x] 0. Overlay PMC (MFMA/conflict/VMEM per wave vs AMD)
 - [x] 1. Prefill V overlay store map
 - [x] 2. Prefill packed K32 PV (`cvt_pk`); decode MFMA unchanged (miss; DNR)
-- [ ] 3. Reuse gather `live` for softmax (optional; after a keep)
+- [x] 3. Reuse gather `live` for softmax (optional; after a keep)
 - [x] 4. Drop leftover `v_perm` on the pack path (optional; after 1)
 - [ ] 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 
@@ -316,9 +316,33 @@ owner differs). No new LDS. Do not retry per-thread translate.
 
 Skip unless phase 1 or 2 kept. Likely small.
 
-- [ ] Skip unless a prior overlay keep landed.
-- [ ] Focused pytest; keep-gate.
-- [ ] **Done when:** kept, reverted and DNR, or explicitly skipped.
+- [x] Skip unless a prior overlay keep landed.
+- [x] Focused pytest; keep-gate.
+- [x] **Done when:** kept, reverted and DNR, or explicitly skipped.
+
+Kept (2026-09-23). Softmax `score_live` is `shuffle_idx` of gather
+`live` for column `n` (lane `n` owns `tid % BLOCK_N`). No
+`indices`/`page_table` re-walk. Oracle **2 passed**. Prefill
+`v_cndmask_b32` **295 → 264**; `ds_bpermute` **8 → 24**.
+
+**Keep-gate** vs phase 4 **20.38 / 20.29 / 250.57** µs: FlyDSL
+**20.47 / 20.30 / 236.93**. `M=512` **−5.4%**. Decode median flat
+(one noisy 30.87 µs run).
+
+**PMC** (`tickets/1047/tmp/k2_phase3_live_pmc/`) vs phase 4, per wave:
+
+| | decode p4 | decode p3 | prefill p4 | prefill p3 |
+|--|--:|--:|--:|--:|
+| VGPR | 128 | 108 | 124 | 124 |
+| busy | 3458 | 3425 | 9568 | 8889 |
+| conflict | 1258 | 1258 | 44352 | 44352 |
+| wait-LDS | 330 | 346 | 16127 | 27726 |
+| MFMA | 48.4 | 48.4 | 2112 | 2112 |
+| VALU | 1009 | 815 | 20805 | 15012 |
+| VMEM | 81 | 49 | 2218 | 1162 |
+
+Prefill VALU **−28%**, VMEM **−48%** (dropped softmax table walks).
+Conflict unchanged. Wait-LDS rose again; wall clock still keeps.
 
 ### 4. Drop leftover `v_perm` on the pack path (optional; after 1)
 
