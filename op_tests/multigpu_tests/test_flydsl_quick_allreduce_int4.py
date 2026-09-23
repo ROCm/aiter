@@ -108,7 +108,7 @@ SHAPES_PER_WORLD_SIZE = {
     2: [(512, 5120), (9216, 4096)],
 }
 
-# (tp, algorithm, tokens, hidden) captured into a CUDA graph. 
+# (tp, algorithm, tokens, hidden) captured into a CUDA graph.
 GRAPH_CASES = ((8, "ring", 512, 5120),)
 
 # (tp, algorithm, tokens, hidden, fill).
@@ -432,10 +432,11 @@ def _run_rank(
                         eng.allreduce(src, dst)
                         return dst
 
-                # use_cuda_event is mandatory here: run_perftest's default
-                # timer wraps the iterations in torch.profiler, which collects
-                # no device rows inside a spawn worker and then fails reducing
-                # its empty trace. cuda.Event timing is unaffected.
+                # cuda.Event timing, not run_perftest's default profiler timer:
+                # `import aiter` creates a GPU context in the parent, and on
+                # some ROCm/torch builds a child spawned after that records no
+                # GPU events in torch.profiler, so the default timer fails
+                # reducing an empty trace.
                 _, us = run_perftest(fn, use_cuda_event=True)
                 row["us"] = float(us)
             rows.append(row)
@@ -866,6 +867,7 @@ def main():
 if __name__ == "__main__":
     freeze_support()
     from time import perf_counter
+
     start = perf_counter()
     main()
     end = perf_counter()

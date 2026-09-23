@@ -833,7 +833,7 @@ class QuickAllReduceInt4:
             return
 
     def variant(self, nbytes: int) -> str:
-        """Identity of the binary an *nbytes* payload would actually run. """
+        """Identity of the binary an *nbytes* payload would actually run."""
         live_bytes = int(nbytes)
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         eng = self._by_st[self._pick_st(num_tiles, live_bytes)]
