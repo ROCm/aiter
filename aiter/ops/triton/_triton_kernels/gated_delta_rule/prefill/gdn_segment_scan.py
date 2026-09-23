@@ -42,7 +42,7 @@ _gdn_segment_scan_kernel_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_gdn_segment_kernel_repr)
+@triton.jit(repr=_gdn_segment_kernel_repr, do_not_specialize=["T_FLAT"])
 def _gdn_segment_kernel(
     k,
     u,

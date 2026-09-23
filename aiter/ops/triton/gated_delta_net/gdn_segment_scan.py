@@ -61,8 +61,17 @@ def _build_segments(
         seq_seg_offsets.append(len(chunk_base))
         global_chunk += n_chunks
         global_token += length
+    # Pad the rows to a multiple of four int32 so every descriptor pointer is
+    # 16-byte aligned. Triton specialises pointer arguments on that alignment,
+    # so an unpadded stride silently compiles a second variant of the kernel
+    # whenever the segment count is not a multiple of four -- chosen by batch
+    # shape, at the cost of a recompile. The grid never reaches the padding.
+    pad = [0] * (triton.cdiv(len(chunk_base), 4) * 4 - len(chunk_base))
     desc = torch.tensor(
-        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last],
+        [
+            row + pad
+            for row in (chunk_base, nchunks, tok_base, tok_end, seq_id, is_last)
+        ],
         dtype=torch.int32,
         device=device,
     )
