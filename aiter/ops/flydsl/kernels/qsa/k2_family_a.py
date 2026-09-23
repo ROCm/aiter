@@ -455,18 +455,9 @@ def build_qsa_k2_family_a_module(
                 lives = []
                 for i in range_constexpr(4):
                     n = Int32(ng * 16) + lane_kg * Int32(4) + Int32(i)
-                    col_i_n = base + n
-                    in_col_n = col_i_n < col_end
-                    safe_col_n = in_col_n.select(col_i_n, col_start)
-                    tok_n = indices[row, safe_col_n]
-                    token_live_n = valid_req & in_col_n & (tok_n >= zero)
-                    safe_tok_n = (tok_n >= zero).select(tok_n, zero)
-                    logical_page_n = _idiv(safe_tok_n, page)
-                    table_live_n = logical_page_n < table_width
-                    safe_logical_page_n = table_live_n.select(logical_page_n, zero)
-                    phys_n = page_table[safe_req, safe_logical_page_n]
-                    phys_live_n = (phys_n >= zero) & (phys_n < n_cache_blocks)
-                    score_live = token_live_n & table_live_n & phys_live_n
+                    score_live = (
+                        gpu.shuffle_idx(live.select(one, zero), n, Int32(64)) != zero
+                    )
                     score = qk_accs[ng][i] * softmax_scale_log2
                     score = score_live.select(score, _neg_inf())
                     sc.append(score)
