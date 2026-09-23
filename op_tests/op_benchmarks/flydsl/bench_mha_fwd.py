@@ -9,7 +9,8 @@ the same public interface (``flash_attn_func`` / ``flash_attn_varlen_func`` in
 times the kernel and reports latency / TFLOPS / TB-s.
 
 The m32x8 kernel (``fmha_fwd_prefill_a16w16_m32x8.py``, dispatched as ``*_m32x8``) serves the
-D_qk in {128,192,256} / D_v=128 bf16 path, gated behind ``AITER_ENABLE_EXPERIMENTAL=1``.
+D_qk/D_v in {128/128, 192/128, 256/128, 64/64} bf16 path, gated behind
+``AITER_ENABLE_EXPERIMENTAL=1``.
 Without that env var the public wrappers fall through to CK, so this harness asserts
 the gate is on and spies on the dispatch entry to fail loudly on a silent fallthrough.
 
@@ -100,7 +101,7 @@ def _verify_dispatch(layout):
     assert calls["n"] > 0, (
         f"m32x8 kernel ({name}) never dispatched for layout={layout}; the call fell "
         f"through to CK. Run with AITER_ENABLE_EXPERIMENTAL=1 and a supported hdim "
-        f"(128/128, 192/128 or 256/128)."
+        f"(128/128, 192/128, 256/128 or 64/64)."
     )
 
 
@@ -278,7 +279,7 @@ def run_perf(case, warmup, repeat, fix_init=None):
 
 # ============================================================================
 # Predefined cases — seqlen spans tiny..2^17, with odd (non-power-of-two) lengths
-# sprinkled in. Every base shape below is replayed at D_qk in {128, 192, 256} (D_v=128).
+# sprinkled in. Every base shape below is replayed at each (D_qk, D_v) pair.
 # ============================================================================
 
 _BASE_CASES = [
@@ -374,6 +375,15 @@ _BASE_CASES = [
         "causal": True,
         "desc": "16k square, causal, multi-batch (Hq==Hkv)",
     },
+    {
+        "layout": "thd",
+        "B": 4,
+        "sq": 65536,
+        "sk": 65536,
+        "Hq": 8,
+        "causal": True,
+        "desc": "64k square, causal, multi-batch (Hq==Hkv)",
+    },
     # --- bshd (batch) ---
     {
         "layout": "bshd",
@@ -440,9 +450,14 @@ _BASE_CASES = [
     },
 ]
 
-# Replay every base shape at D_qk in {128, 192, 256} (D_v=128), D_qk set explicitly on each.
-# Case ids: 128 block = [0, N), 192 = [N, 2N), 256 = [2N, 3N) where N = len(_BASE_CASES).
-CASES = [dict(_c, d_qk=_dqk, d_v=128) for _dqk in (128, 192, 256) for _c in _BASE_CASES]
+# Replay every base shape at each supported (D_qk, D_v) pair, set explicitly on each.
+# New pairs are APPENDED so existing case ids never shift: with N = len(_BASE_CASES),
+# 128/128 = [0, N), 192/128 = [N, 2N), 256/128 = [2N, 3N), 64/64 = [3N, 4N).
+# 64/64 is the GPT-OSS-120b geometry (head_dim 64 for Q, K and V).
+_HDIM_PAIRS = ((128, 128), (192, 128), (256, 128), (64, 64))
+CASES = [
+    dict(_c, d_qk=_dqk, d_v=_dv) for _dqk, _dv in _HDIM_PAIRS for _c in _BASE_CASES
+]
 for _i, _c in enumerate(CASES):
     _c["id"] = _i
 

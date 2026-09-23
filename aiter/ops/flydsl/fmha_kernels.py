@@ -379,11 +379,17 @@ def flydsl_flash_attn_varlen_func(
     # features (bias, alibi, dropout, paging, return_attn_probs) fall through to
     # CK/Triton instead of being silently dropped.
     #
-    # Routing (D_v=128, bf16, gfx1250): our m32x8 kernel is the DEFAULT for qk_hdim 128 and 192.
-    # qk_hdim==256 routes to us only under AITER_ENABLE_EXPERIMENTAL=1 (else CK).
+    # Routing (bf16, gfx1250): the m32x8 kernel serves 128/128, 192/128 and 64/64.
+    # 256/128 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK). This reports what the kernel
+    # can do; which backend actually wins a shape is arbitrated in aiter/ops/mha.py.
     qk_hdim = q.shape[-1]
     exp = is_experimental_enabled()
-    _use_fdsl_wave8_fmha = qk_hdim in (128, 192) or (qk_hdim == 256 and exp)
+    _v_hdim = v.shape[-1]
+    _use_fdsl_wave8_fmha = (
+        (qk_hdim in (128, 192) and _v_hdim == 128)
+        or (qk_hdim == 256 and _v_hdim == 128 and exp)
+        or (qk_hdim == 64 and _v_hdim == 64)
+    )
     # sink must be a valid [nheads_q] fp32 tensor; heads must divide;
     # window_size[2] (sink_size) is unsupported (reject so it is never silently dropped).
     _nq, _nkv = q.shape[-2], k.shape[-2]
@@ -393,7 +399,6 @@ def flydsl_flash_attn_varlen_func(
     supported = (
         get_gfx() == "gfx1250"
         and _use_fdsl_wave8_fmha
-        and v.shape[-1] == 128
         and k.shape[-1] == qk_hdim
         and q.dtype in (torch.bfloat16, torch.float16)
         and k.dtype == q.dtype
@@ -411,11 +416,11 @@ def flydsl_flash_attn_varlen_func(
     if not supported:
         return None
 
-    # gfx1250 — varlen THD, D_v=128, bf16
+    # gfx1250 — varlen THD, bf16/fp16
     if out is None:
         out = torch.empty_like(q[:, :, : v.shape[-1]])
 
-    # Clean-DSL 8-wave prefill kernel (m32x8), D_qk in {128,192,256}, D_v=128.
+    # Clean-DSL 8-wave prefill kernel (m32x8), D_qk/D_v per the routing above.
     return flash_attn_varlen_m32x8(
         q,
         k,
@@ -499,9 +504,15 @@ def flydsl_flash_attn_batch_func(
             return_lse=return_lse,
         )
 
-    # BSHD routes to the m32x8 kernel. D_v=128. D_qk 128/192 are
-    # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
+    # BSHD routes to the m32x8 kernel on the same hdim policy as the THD router above.
     qk_hdim = q.shape[-1]
+    exp = is_experimental_enabled()
+    _v_hdim = v.shape[-1]
+    _use_fdsl_wave8_fmha = (
+        (qk_hdim in (128, 192) and _v_hdim == 128)
+        or (qk_hdim == 256 and _v_hdim == 128 and exp)
+        or (qk_hdim == 64 and _v_hdim == 64)
+    )
     # Head count (BSHD [B,S,H,D]) and sink must satisfy the kernel's asserts, else validate
     # up front so an unsupported request returns None instead of tripping a kernel assert.
     _nq, _nkv = q.shape[-2], k.shape[-2]
@@ -511,8 +522,7 @@ def flydsl_flash_attn_batch_func(
     supported = (
         get_gfx() == "gfx1250"
         and q.dim() == 4
-        and (qk_hdim in (128, 192) or (qk_hdim == 256 and is_experimental_enabled()))
-        and v.shape[-1] == 128
+        and _use_fdsl_wave8_fmha
         and k.shape[-1] == qk_hdim
         and q.dtype in (torch.bfloat16, torch.float16)
         and k.dtype == q.dtype

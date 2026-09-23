@@ -19,8 +19,9 @@ Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
 
 Scope — v1 (this file is intentionally config-agnostic in its name):
-  - ``qk_hdim in {128, 192, 256}`` (D_qk), ``v_hdim == 128`` (D_v); ``n_block`` is picked
-    by ``pick_n_block`` (128 at qk_hdim 128/192, 64 at 256)
+  - ``qk_hdim in {64, 128, 192, 256}`` (D_qk), ``v_hdim in {64, 128}`` (D_v); they are
+    independent. ``n_block`` is picked by ``pick_n_block`` (128 at qk_hdim <= 128,
+    64 at 192/256)
   - dtype: bf16 for Q/K/V/O
   - grouped-query attention (GQA): ``gqa = nheads_q // nheads_k``
   - causal and non-causal
@@ -113,7 +114,8 @@ DEFAULT_V_HDIM = 128
 DEFAULT_DTYPE = "bf16"
 _DTYPE_MAP = {"bf16": fx.BFloat16, "fp16": fx.Float16}
 _TORCH_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
-SUPPORTED_QK_HDIM = (128, 192, 256)
+SUPPORTED_QK_HDIM = (64, 128, 192, 256)
+SUPPORTED_V_HDIM = (64, 128)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
@@ -2170,10 +2172,10 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     to shift/and when it is a power of two.
     """
     assert layout in ("thd", "bshd"), f"layout must be thd|bshd, got {layout!r}"
-    # qk_hdim in {128,192,256} (D_qk, WMMA_K multiple); v_hdim fixed at 128 (D_v).
+    # qk_hdim (D_qk) is a WMMA_K multiple; v_hdim (D_v) a WMMA_M multiple. Independent.
     assert (
-        qk_hdim in SUPPORTED_QK_HDIM and v_hdim == 128
-    ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} with v_hdim==128, got {qk_hdim}/{v_hdim}"
+        qk_hdim in SUPPORTED_QK_HDIM and v_hdim in SUPPORTED_V_HDIM
+    ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} x v_hdim in {SUPPORTED_V_HDIM}, got {qk_hdim}/{v_hdim}"
     assert (
         dtype_str in _DTYPE_MAP
     ), f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
@@ -2430,6 +2432,7 @@ def _ensure_thd_kernel(
     has_sink: bool,
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
+    v_hdim: int = DEFAULT_V_HDIM,
     dtype_str: str = DEFAULT_DTYPE,
 ):
     key = (
@@ -2440,6 +2443,7 @@ def _ensure_thd_kernel(
         bool(has_sink),
         int(gqa_ratio),
         int(qk_hdim),
+        int(v_hdim),
         str(dtype_str),
     )
     if key in _launch_fns:
@@ -2447,6 +2451,7 @@ def _ensure_thd_kernel(
     kernel = build_fmha_fwd_prefill_a16w16_m32x8(
         layout="thd",
         qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
         mask_left=mask_left,
         mask_right=mask_right,
         return_lse=return_lse,
@@ -2538,6 +2543,7 @@ def _ensure_bshd_kernel(
     has_sink: bool,
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
+    v_hdim: int = DEFAULT_V_HDIM,
     dtype_str: str = DEFAULT_DTYPE,
 ):
     key = (
@@ -2548,6 +2554,7 @@ def _ensure_bshd_kernel(
         bool(has_sink),
         int(gqa_ratio),
         int(qk_hdim),
+        int(v_hdim),
         str(dtype_str),
     )
     if key in _launch_fns:
@@ -2555,6 +2562,7 @@ def _ensure_bshd_kernel(
     kernel = build_fmha_fwd_prefill_a16w16_m32x8(
         layout="bshd",
         qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
         mask_left=mask_left,
         mask_right=mask_right,
         return_lse=return_lse,
@@ -2653,7 +2661,7 @@ def flash_attn_varlen_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — varlen THD, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
+    """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
 
     ``window_size`` (optional): ``(left, right)`` sliding-window bounds. ``-1`` =
     infinite on that side; ``(-1, -1)`` = full attention. ``causal`` forces
@@ -2677,7 +2685,10 @@ def flash_attn_varlen_m32x8(
     assert (
         qk_hdim in SUPPORTED_QK_HDIM
     ), f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
-    assert v.shape[-1] == 128, f"Expected v_hdim=128, got {v.shape[-1]}"
+    v_hdim = v.shape[-1]
+    assert (
+        v_hdim in SUPPORTED_V_HDIM
+    ), f"Expected v_hdim in {SUPPORTED_V_HDIM}, got {v_hdim}"
 
     total_q_tokens = q.shape[0]
     batch = cu_seqlens_q.shape[0] - 1
@@ -2712,7 +2723,7 @@ def flash_attn_varlen_m32x8(
 
     if out is None:
         out = torch.empty(
-            (total_q_tokens, nheads_q, 128), dtype=q.dtype, device=q.device
+            (total_q_tokens, nheads_q, v_hdim), dtype=q.dtype, device=q.device
         )
     if return_lse:
         if lse is None:
@@ -2748,6 +2759,7 @@ def flash_attn_varlen_m32x8(
         has_sink,
         gqa,
         qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
         dtype_str=dtype_str,
     )
 
@@ -2761,6 +2773,7 @@ def flash_attn_varlen_m32x8(
                 has_sink,
                 gqa,
                 qk_hdim,
+                v_hdim,
                 dtype_str,
             )
         ],
@@ -2809,7 +2822,7 @@ def flash_attn_batch_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
+    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no
     cu_seqlens), so there is nothing transient to bake into a CUDA graph.
@@ -2836,7 +2849,10 @@ def flash_attn_batch_m32x8(
     assert (
         qk_hdim in SUPPORTED_QK_HDIM
     ), f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
-    assert v.shape[-1] == 128, f"Expected v_hdim=128, got {v.shape[-1]}"
+    v_hdim = v.shape[-1]
+    assert (
+        v_hdim in SUPPORTED_V_HDIM
+    ), f"Expected v_hdim in {SUPPORTED_V_HDIM}, got {v_hdim}"
 
     batch, seq_len_q, nheads_q, _ = q.shape
     seq_len_k = k.shape[1]
@@ -2870,7 +2886,7 @@ def flash_attn_batch_m32x8(
 
     if out is None:
         out = torch.empty(
-            (batch, seq_len_q, nheads_q, 128), dtype=q.dtype, device=q.device
+            (batch, seq_len_q, nheads_q, v_hdim), dtype=q.dtype, device=q.device
         )
     if return_lse:
         if lse is None:
@@ -2923,6 +2939,7 @@ def flash_attn_batch_m32x8(
         has_sink,
         gqa,
         qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
         dtype_str=dtype_str,
     )
 
@@ -2936,6 +2953,7 @@ def flash_attn_batch_m32x8(
                 has_sink,
                 gqa,
                 qk_hdim,
+                v_hdim,
                 dtype_str,
             )
         ],
