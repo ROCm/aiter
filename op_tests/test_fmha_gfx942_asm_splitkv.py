@@ -91,6 +91,24 @@ def _empty_final_split(sk, num_splits):
     return split_tiles * (num_splits - 1) >= kv_tiles
 
 
+def _inputs(sq, sk, hq):
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = (
+        torch.empty(0, hq, HD_QK, dtype=dtypes.bf16)
+        if sk == 0
+        else torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    )
+    v = (
+        torch.empty(0, hq, HD_V, dtype=dtypes.bf16)
+        if sk == 0
+        else torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    )
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    return q, k, v, cu_q, cu_k, scale
+
+
 def _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, return_lse, out=None, causal=False):
     """Full fmha_v3_varlen_fwd entry: caller args reach the impl, including out=."""
     if out is None:
@@ -249,14 +267,9 @@ def test_fmha_gfx942_asm_splitkv_empty_k(sq, hq, num_splits):
 
 
 def _check_empty_partition_rejected():
-    sq, sk, hq = 129, 511, 4
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
-    cu_q = torch.tensor([0, sq], dtype=torch.int32)
-    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 511, 4)
     try:
-        _v3_fwd(q, k, v, cu_q, cu_k, 1.0 / math.sqrt(HD_QK), 5, False)
+        _v3_fwd(q, k, v, cu_q, cu_k, scale, 5, False)
     except RuntimeError as err:
         if "empty final KV partition" not in str(err):
             raise
@@ -265,13 +278,8 @@ def _check_empty_partition_rejected():
 
 
 def _check_compile_outputs():
-    sq, sk, hq = 129, 2048, 4
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
-    cu_q = torch.tensor([0, sq], dtype=torch.int32)
-    cu_k = torch.tensor([0, sk], dtype=torch.int32)
-    scale = 1.0 / math.sqrt(HD_QK)
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 2048, 4)
+    sq, sk = q.shape[0], k.shape[0]
 
     def call(q, k, v):
         return fmha_v3_varlen_fwd(
@@ -323,13 +331,8 @@ def _check_compile_outputs():
 
 def _check_cuda_graph():
     # sk=8192 is the first auto-select length; this captures split producer + combine.
-    sq, sk, hq = 129, 8192, 4
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
-    cu_q = torch.tensor([0, sq], dtype=torch.int32)
-    cu_k = torch.tensor([0, sk], dtype=torch.int32)
-    scale = 1.0 / math.sqrt(HD_QK)
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 8192, 4)
+    sq, sk = q.shape[0], k.shape[0]
     for _ in range(3):
         flash_attn_varlen_func(
             q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, causal=False
@@ -348,14 +351,8 @@ def _check_cuda_graph():
 
 
 def _check_forced_split_writes_out():
-    sq, sk, hq = 129, 2048, 4
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
-    cu_q = torch.tensor([0, sq], dtype=torch.int32)
-    cu_k = torch.tensor([0, sk], dtype=torch.int32)
-    scale = 1.0 / math.sqrt(HD_QK)
-    out = torch.empty(sq, hq, HD_V, dtype=q.dtype)
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 2048, 4)
+    out = torch.empty(q.shape[0], q.shape[1], HD_V, dtype=q.dtype)
     sentinel = out.data_ptr()
     result = _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False, out=out)
     assert result[0].data_ptr() == sentinel, "forced split must write the caller out="
@@ -371,13 +368,7 @@ def _check_forced_split_writes_out():
 
 
 def _check_forced_split_causal_rejected():
-    sq, sk, hq = 129, 2048, 4
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
-    cu_q = torch.tensor([0, sq], dtype=torch.int32)
-    cu_k = torch.tensor([0, sk], dtype=torch.int32)
-    scale = 1.0 / math.sqrt(HD_QK)
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 2048, 4)
     try:
         _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False, causal=True)
     except RuntimeError as err:
@@ -388,13 +379,7 @@ def _check_forced_split_causal_rejected():
 
 
 def _check_non_lse():
-    sq, sk, hq = 129, 2048, 4
-    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
-    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
-    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
-    cu_q = torch.tensor([0, sq], dtype=torch.int32)
-    cu_k = torch.tensor([0, sk], dtype=torch.int32)
-    scale = 1.0 / math.sqrt(HD_QK)
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 2048, 4)
     ref_out, _ = run_torch(q, k, v, scale)
     out, lse, _, _ = _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False)
     assert lse.numel() == 0
