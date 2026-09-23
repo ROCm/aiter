@@ -1435,11 +1435,6 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # past residency. The host sizes num_ctas so the extra slices fit.
     if MAX_TILES > 0:
         tiles_per_slice = tl.minimum(tiles_per_slice, MAX_TILES)
-    # A floor as well, so no unit can own more than MAX_SLICES slices and the
-    # write below stays a fixed shape. It binds only when one unit's walk
-    # dwarfs the rest, and it bounds that unit at the same tiles-per-workgroup
-    # the cap above is there to hold.
-    tiles_per_slice = tl.maximum(tiles_per_slice, tl.cdiv(N_TILES, MAX_SLICES))
 
     # Step 3: lay each unit's slices end to end over the slots, so unit i owns
     # slots [first_slot_i, first_slot_i + n_slices_i).
@@ -1451,19 +1446,25 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # there is no owner to search for: one program takes a band of slice
     # indices and every unit writes the slices it has in that band. Slots past
     # slots_used keep the zeroed descriptor, which the walk reads as no work.
-    sl = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
-    slot = first_slot[None, :] + sl[:, None]
-    live_slice = (sl[:, None] < n_slices[None, :]) & (slot < num_ctas)
     if VARLEN:
         own_seq, own_blk = seq, row_blk
     else:
         own_seq, own_blk = unit // ROW_BLOCKS, unit % ROW_BLOCKS
     shape: tl.constexpr = (BLOCK_S, ALIGN_W)
-    base = sched_ptr + slot * 4
-    tl.store(base + 0, tl.broadcast_to(own_seq[None, :], shape), mask=live_slice)
-    tl.store(base + 1, tl.broadcast_to(own_blk[None, :], shape), mask=live_slice)
-    tl.store(base + 2, tl.broadcast_to(sl[:, None], shape), mask=live_slice)
-    tl.store(base + 3, tl.broadcast_to(n_slices[None, :], shape), mask=live_slice)
+    # The band strides, so MAX_SLICES sizes the grid rather than bounding what
+    # a unit may own.
+    widest = tl.max(n_slices)
+    sl0 = tl.program_id(0) * BLOCK_S
+    while sl0 < widest:
+        sl = sl0 + tl.arange(0, BLOCK_S)
+        slot = first_slot[None, :] + sl[:, None]
+        live_slice = (sl[:, None] < n_slices[None, :]) & (slot < num_ctas)
+        base = sched_ptr + slot * 4
+        tl.store(base + 0, tl.broadcast_to(own_seq[None, :], shape), mask=live_slice)
+        tl.store(base + 1, tl.broadcast_to(own_blk[None, :], shape), mask=live_slice)
+        tl.store(base + 2, tl.broadcast_to(sl[:, None], shape), mask=live_slice)
+        tl.store(base + 3, tl.broadcast_to(n_slices[None, :], shape), mask=live_slice)
+        sl0 += tl.num_programs(0) * BLOCK_S
 
     # Step 5: the grid is num_ctas, so a slot past the last slice launches too
     # and has to read as no work. The walk returns on num_slices <= slice_idx,
