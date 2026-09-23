@@ -663,6 +663,18 @@ def launch_gemm_a8w4_tdm(
                 if owns(job_waves[g]):
                     fn([j for j in jobs if j.waves == job_waves[g]])
 
+        def next_stage_ready_fence(outstanding):
+            """Make the next TDM-filled stage visible without draining LDS reads.
+
+            TDM uses a spare LDS stage, so outstanding reads from the current
+            stage do not alias its writes. A raw split workgroup barrier retains
+            the required cross-wave TDM visibility without the generic GPU
+            barrier's conservative ``s_wait_dscnt 0``.
+            """
+            tdm_ops.tensor_wait(outstanding)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
@@ -1038,7 +1050,7 @@ def launch_gemm_a8w4_tdm(
             if const_expr(fence_fn is not None):
                 fence_fn()
             elif const_expr(num_outstanding_tdm is not None):
-                pipeline_fence(outstanding=num_outstanding_tdm)
+                next_stage_ready_fence(num_outstanding_tdm)
             if const_expr(issue_fn is not None):
                 issue_fn()
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
@@ -1360,9 +1372,11 @@ def launch_gemm_a8w4_tdm(
                             interleave_ab=interleave_ab,
                         )
                 else:
-                    # Mid-compute prefetch: better for prefill. PRE is both the tiles
-                    # resident before the loop and the issue lead; the carry adds one.
-                    PRE = num_buffers if next_stage_on else num_buffers - 1
+                    # Mid-compute prefetch: better for prefill. Keep one physical LDS
+                    # stage free so TDM can reuse it at the tile boundary, after the
+                    # preceding tile's LDS reads have naturally drained. The
+                    # cross-tile LDS-to-register carry remains enabled independently.
+                    PRE = num_buffers - 1
                     for i in range_constexpr(PRE):
                         issue(i, i)
                     n_steady = K_TILES - PRE
@@ -1381,7 +1395,18 @@ def launch_gemm_a8w4_tdm(
                         for kt in range(n_steady):
                             s = kt % num_buffers
                             buf = s
-                            if const_expr(not next_stage_on):
+                            if const_expr(next_stage_on):
+                                # The previous tile's carry fence released this stage.
+                                # Issue here, rather than before its final WMMA, while
+                                # retaining the next tile's KSL0 register preload.
+                                rocdl.sched_barrier(0)
+                                issue(
+                                    (kt + PRE) % num_buffers,
+                                    kt + PRE,
+                                    my_jobs,
+                                )
+                                rocdl.sched_barrier(0)
+                            else:
                                 pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
                                 rocdl.sched_barrier(0)
                                 issue(
@@ -1397,14 +1422,14 @@ def launch_gemm_a8w4_tdm(
                             )
                             compute_ktile(
                                 buf,
-                                kt + PRE if const_expr(next_stage_on) else None,
+                                None,
                                 next_stage_on,
                                 next_stage_buf,
                                 my_jobs,
-                                # At the fence, before this tile's issue: kt+PRE tiles
-                                # are out and everything through kt+1 must have landed.
+                                # At the carry fence, kt+PRE is already in flight and
+                                # everything through kt+1 must have landed.
                                 (
-                                    TDM_PER * (num_buffers - 2)
+                                    TDM_PER * (PRE - 1)
                                     if const_expr(next_stage_on)
                                     else None
                                 ),
@@ -1421,9 +1446,9 @@ def launch_gemm_a8w4_tdm(
                             # stays in a runtime loop.
                             for fence_j in range_constexpr(PRE - 1):
                                 if j == fence_j:
-                                    pipeline_fence(
+                                    next_stage_ready_fence(
                                         outstanding=TDM_PER
-                                        * max(0, num_buffers - 2 - fence_j)
+                                        * max(0, PRE - 2 - fence_j)
                                     )
 
                         if const_expr(next_stage_on):
@@ -1491,7 +1516,7 @@ def launch_gemm_a8w4_tdm(
                                 next_stage_buf,
                                 None,
                                 (
-                                    TDM_PER * max(0, num_buffers - 2 - j)
+                                    TDM_PER * max(0, PRE - 2 - j)
                                     if const_expr(has_next)
                                     else None
                                 ),
