@@ -1,0 +1,42 @@
+# aiter-review-bot trigger allowlist — only the GitHub logins here may use @aiter-bot review.
+# One login per line (case-insensitive). '#' starts a comment. Edit this file (a maintainer
+# commit) to change who is allowed — version-controlled and auditable. Reviews run on a shared
+# box; keep it curated.
+#
+# Contents: the aiter review roster (team.yml) + everyone who has reviewed a recent merged aiter
+# PR (incl. external collaborators). Bots excluded. Add/remove a login to grant/revoke access.
+valarLip
+gyohuangxin
+amd-ruitang3
+yifehuan
+yzhou103
+junhaha666
+zufayu
+fangche123
+Bernard-Liu
+binding7012
+brunomazzottiamd
+coderfeli
+damien-lejeune
+Dewei-Wang-sh
+fsx950223
+gbyu-amd
+JiaoliangYu
+JohnQinAMD
+k50112113
+karverma-amd
+MHYangAMD
+mjkvaak-amd
+msaffari-amd
+nidal567
+ruanjm
+samremes
+shengnxu
+simondanielsson
+vgokhale
+vpietila-amd
+XiaobingSuper
+xiaofei-zheng
+xytpai
+yanboshao
+ZhangLirong-amd

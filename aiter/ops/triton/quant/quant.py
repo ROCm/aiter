@@ -9,6 +9,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
     gluon_dynamic_mxfp8_quant_kernel_gfx1250,
 )
 from aiter.ops.triton._triton_kernels.quant.quant import (
+    _dynamic_mxfp4_quant_blockscale_kernel,
     _dynamic_mxfp4_quant_kernel,
     _dynamic_mxfp8_quant_kernel,
     _dynamic_mxfp8_quant_n32k4_mbn_kernel,
@@ -35,6 +36,7 @@ __all__ = [
     "_mxfp8_quant_op",
     "_nvfp4_quant_op",
     "dynamic_mxfp4_quant",
+    "dynamic_mxfp4_quant_blockscale",
     "dynamic_mxfp8_quant",
     "dynamic_mxfp8_quant_n32k4_mbn",
     "dynamic_nvfp4_quant",
@@ -390,6 +392,67 @@ def dynamic_mxfp4_quant(
             waves_per_eu=0,
         )
     return (x_fp4, blockscale_e8m0)
+
+
+def dynamic_mxfp4_quant_blockscale(
+    x: torch.Tensor, scaling_mode: str = "even"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize contiguous 2-D input with one MXFP4 scale per 32x32 tile.
+
+    Adjacent logical columns are packed into the low and high nibbles of each
+    output byte. The packed payload is row-major with shape ``(M, N // 2)``;
+    the raw E8M0 scale grid has shape ``(M // 32, N // 32)``.
+
+    Args:
+        x: Contiguous tensor with shape ``(M, N)`` and dtype ``bfloat16``
+            or ``float32``. Both dimensions must be positive multiples of 32.
+        scaling_mode: MX scale rounding mode. Only ``"even"`` is supported.
+
+    Returns:
+        A tuple of ``(x_fp4, blockscale_e8m0)``. Both tensors have dtype
+        ``uint8`` and use canonical row-major layouts.
+    """
+    _LOGGER.info("DYNAMIC_MXFP4_QUANT_BLOCKSCALE: x=%s", tuple(x.shape))
+    if x.dim() != 2:
+        raise ValueError(f"x must be 2-D, got {x.dim()}-D")
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"x must have dtype torch.bfloat16 or torch.float32, got {x.dtype}"
+        )
+    if not x.is_contiguous():
+        raise ValueError("x must be contiguous")
+    if scaling_mode != "even":
+        raise ValueError(f"scaling_mode must be 'even', got {scaling_mode!r}")
+
+    M, N = x.shape
+    block_size = 32
+    if M == 0 or N == 0:
+        raise ValueError(f"x dimensions must be non-zero, got {tuple(x.shape)}")
+    if M % block_size != 0 or N % block_size != 0:
+        raise ValueError(
+            f"x shape must be divisible by 32 in both dimensions, got {tuple(x.shape)}"
+        )
+
+    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    blockscale_e8m0 = torch.empty(
+        (M // block_size, N // block_size),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+
+    # Each program owns one fixed 32x32 scale tile.
+    grid = (M // block_size, N // block_size)
+    _dynamic_mxfp4_quant_blockscale_kernel[grid](
+        x,
+        x_fp4,
+        blockscale_e8m0,
+        *x.stride(),
+        *x_fp4.stride(),
+        *blockscale_e8m0.stride(),
+        BLOCK_SIZE=block_size,
+    )
+
+    return x_fp4, blockscale_e8m0
 
 
 def dynamic_mxfp8_quant(
