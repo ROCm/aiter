@@ -38,7 +38,7 @@ convention.
 - [x] 1. Prefill V overlay store map
 - [x] 2. Prefill packed K32 PV (`cvt_pk`); decode MFMA unchanged (miss; DNR)
 - [ ] 3. Reuse gather `live` for softmax (optional; after a keep)
-- [ ] 4. Drop leftover `v_perm` on the pack path (optional; after 1)
+- [x] 4. Drop leftover `v_perm` on the pack path (optional; after 1)
 - [ ] 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 
 ## Locked decisions
@@ -329,8 +329,31 @@ logical V map.
 
 Do not start here.
 
-- [ ] Skip unless phase 1 kept and ATT still ranks `v_perm`.
-- [ ] **Done when:** kept, reverted and DNR, or explicitly skipped.
+- [x] Skip unless phase 1 kept and ATT still ranks `v_perm`.
+- [x] **Done when:** kept, reverted and DNR, or explicitly skipped.
+
+Kept (2026-09-23). `live.select` on the 8-wide gather vector replaces
+per-element `to(f32)` / `from_elements` pack on K and V LDS stores
+(decode 64-bit V and gfx942 V included). XOR V map unchanged. Oracle
+**2 passed**. Prefill ISA `v_perm_b32` **168 → 40**; decode **50 → 34**.
+
+**Keep-gate** vs phase 1 **20.14 / 20.18 / 261.54** µs: FlyDSL
+**20.38 / 20.29 / 250.57**. `M=512` **−4.2%**. Decode wrapper flat
+within noise.
+
+**PMC** (`tickets/1047/tmp/k2_phase4_noperm_pmc/`) vs phase 1, per wave:
+
+| | decode p1 | decode p4 | prefill p1 | prefill p4 |
+|--|--:|--:|--:|--:|
+| VGPR | 100 | 128 | 124 | 124 |
+| busy | 3916 | 3458 | 9808 | 9568 |
+| conflict | 1258 | 1258 | 44352 | 44352 |
+| wait-LDS | 110 | 330 | 9781 | 16127 |
+| MFMA | 48.4 | 48.4 | 2112 | 2112 |
+| VALU | 1203 | 1009 | 33510 | 20805 |
+
+Prefill VALU **−38%**. Conflict unchanged; wait-LDS rose (decode VGPR
+128). Wall clock still keeps on `M=512`.
 
 ### 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 
