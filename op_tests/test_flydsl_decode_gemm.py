@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness tests for the public BF16 decode GEMM operation.
+"""Runtime correctness checks and perf sweep for the public BF16 decode GEMM.
 
-Pytest collects the validity cases below (no timing). ``python3`` this file
-to run a small ``@benchmark`` / ``run_perftest`` sweep with a markdown table.
+``python3`` this file: it runs the validity checks first, then a
+``@benchmark`` / ``run_perftest`` sweep ending in a markdown table. aiter
+op_tests are plain scripts -- there is no pytest here, and the checks are
+called from ``main()`` so a single invocation covers both.
 """
 
 from __future__ import annotations
@@ -12,16 +14,11 @@ from __future__ import annotations
 import argparse
 
 import pandas as pd
-import pytest
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-pytest.importorskip("flydsl")
-
 from aiter.ops.flydsl.gemm_kernels import (
     ActivationSource,
     BlockMfmaDecodeConfig,
@@ -30,16 +27,12 @@ from aiter.ops.flydsl.gemm_kernels import (
     WaveDecodeConfig,
     gemm_decode_bf16,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 ATOL = 0.125
 RTOL = 0.01
-
-pytestmark = pytest.mark.skipif(
-    ARCH not in SUPPORTED_ARCHS,
-    reason="BF16 decode GEMM requires gfx942 or gfx950",
-)
 
 
 def _inputs(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -79,8 +72,21 @@ def _assert_output(
     output: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
-    assert torch.isfinite(output).all()
-    torch.testing.assert_close(output, reference, atol=ATOL, rtol=RTOL)
+    assert torch.isfinite(output).all(), "decode GEMM produced non-finite values"
+    # checkAllclose reports and returns the mismatching fraction; it never
+    # raises. That is right for the sweep below, where the number becomes an
+    # `err` column, but these are validity gates: without the assert a broken
+    # kernel would log an error and still exit 0, leaving CI green.
+    err = checkAllclose(
+        reference.to(dtypes.fp32),
+        output.to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="gemm_decode_bf16 output",
+    )
+    assert (
+        err == 0
+    ), f"gemm_decode_bf16 mismatched the reference on {err:.2%} of elements"
 
 
 def _block_config(
@@ -141,7 +147,7 @@ def _run_config(
     _assert_output(output, _reference(a, b, bias))
 
 
-def test_wave_public_path_no_bias() -> None:
+def check_wave_no_bias() -> None:
     m, n, k = 1, 64, 128
     a, b = _inputs(m, n, k)
     output = _output(m, n)
@@ -151,7 +157,7 @@ def test_wave_public_path_no_bias() -> None:
     _assert_output(output, _reference(a, b))
 
 
-def test_wave_public_path_bias_and_odd_n_and_k_tails() -> None:
+def check_wave_bias_and_odd_tails() -> None:
     m, n, k = 5, 65, 257
     a, b = _inputs(m, n, k)
     bias = _bias(n)
@@ -168,7 +174,7 @@ def test_wave_public_path_bias_and_odd_n_and_k_tails() -> None:
     _assert_output(output, _reference(a, b, bias))
 
 
-def test_block_mfma_global() -> None:
+def check_block_mfma_global() -> None:
     _run_config(
         3,
         65,
@@ -178,7 +184,7 @@ def test_block_mfma_global() -> None:
     )
 
 
-def test_block_mfma_full_lds_k_padding_and_n_boundary() -> None:
+def check_block_mfma_lds_k_padding() -> None:
     _run_config(
         5,
         17,
@@ -187,7 +193,7 @@ def test_block_mfma_full_lds_k_padding_and_n_boundary() -> None:
     )
 
 
-def test_block_mfma_persistent_n_multiple_turns_and_partial_group() -> None:
+def check_block_mfma_persistent_n() -> None:
     _run_config(
         3,
         5001,
@@ -232,26 +238,21 @@ def test_gemm_decode(m, n, k, dtype):
     return ret
 
 
-# Binding starts with test_*; pytest must not collect or time this sweep.
-test_gemm_decode.__test__ = False
-
-
 CORRECTNESS_CASES = (
-    test_wave_public_path_no_bias,
-    test_wave_public_path_bias_and_odd_n_and_k_tails,
-    test_block_mfma_global,
-    test_block_mfma_full_lds_k_padding_and_n_boundary,
-    test_block_mfma_persistent_n_multiple_turns_and_partial_group,
+    check_wave_no_bias,
+    check_wave_bias_and_odd_tails,
+    check_block_mfma_global,
+    check_block_mfma_lds_k_padding,
+    check_block_mfma_persistent_n,
 )
 
 
 def _run_correctness_cases() -> None:
-    """Run the pytest cases as part of the plain `python3 <file>` invocation.
+    """Run every validity case before the timed sweep.
 
-    CI runs op_tests files as scripts, so anything reachable only through
-    pytest never executes there. Rather than teach the CI runner about this
-    file, the sweep in main() calls the cases directly -- they take no
-    arguments and no fixtures, so the two entry points stay equivalent.
+    CI runs op_tests files as scripts, so the checks have to be reachable from
+    `main()` -- there is no collector that would find them otherwise. They take
+    no arguments, so calling them in order is the whole mechanism.
     """
     for case in CORRECTNESS_CASES:
         aiter.logger.info("running %s", case.__name__)
