@@ -133,8 +133,8 @@ Run these commands from the AITER repository root.
 ### Tests
 
 Numerical Conv2D and Conv3D tests are CI-collected and skip at module level on
-unsupported GPU architectures. The Conv3D configuration and benchmark/CLI
-tests do not launch kernels.
+unsupported GPU architectures. The Conv3D configuration tests do not launch
+kernels.
 
 ```bash
 python -m pytest op_tests/triton_tests/conv/                       # all Conv1D/2D/3D tests
@@ -150,15 +150,15 @@ The Conv2D tests are parametrized over `(dtype, layout, method)`. Every kernel i
 NHWC is single-dispatch (only `conv2d_nhwc`), so each NHWC test runs once
 per dtype.
 
-The complete Conv3D suite contains numerical/routing, installed-config, and
-benchmark/CLI tests. Run it with:
+The complete Conv3D suite contains numerical, routing, prepack, cache,
+validation, and installed-configuration tests. Run it with:
 
 ```bash
 python -m pytest op_tests/triton_tests/conv/test_conv3d.py
 ```
 
-This file covers numerical, prepack, cache, validation, routing,
-installed-configuration, model-database, reporting, and CLI behavior.
+Benchmark execution and its command-line interface are provided separately by
+`op_tests/op_benchmarks/triton/bench_conv3d.py`.
 
 ### Benchmark
 
@@ -296,7 +296,7 @@ aiter/ops/triton/configs/<arch>/triton/conv/
 
 op_tests/triton_tests/conv/           Pytest correctness and integration tests
   test_conv2d.py                      Conv2D correctness and routing
-  test_conv3d.py                      Conv3D correctness, routing, config, and CLI
+  test_conv3d.py                      Conv3D correctness, routing, and config
   _helpers.py                         TestSuite, registry, shape generators
 
 op_tests/op_benchmarks/triton/
