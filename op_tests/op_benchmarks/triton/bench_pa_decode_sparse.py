@@ -487,7 +487,8 @@ def _make_fn(provider, inp, T, H, D):
             }
         fn = lambda: _pa_decode_sparse_v4(
             qp, unified, ind, iptr, sink, scale,
-            q_rope=qr, has_invalid=False, block_k=inp.get("block_k"), **kw,
+            q_rope=qr, has_invalid=False, block_k=inp.get("block_k"),
+            main_is_window=inp.get("main_is_window", False), **kw,
         )
         kv_row = HEAD_DIM * 1 + ROPE_DIM * 2
         keys = n_idx + (x["n_idx"] if x is not None else 0)
@@ -531,10 +532,11 @@ def _device_ms(fn, provider, iters=50):
 
 def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep,
              profile_dir=None, page=DEFAULT_PAGE, block_k=None, timer="wall",
-             extra_len=0, extra_page=DEFAULT_PAGE):
+             extra_len=0, extra_page=DEFAULT_PAGE, main_is_window=False):
     inp = build_inputs(T, H, D, kv_len, var_len=var_len, page=page,
                        extra_len=extra_len, extra_page=extra_page)
     inp["block_k"] = block_k
+    inp["main_is_window"] = main_is_window
     made = _make_fn(provider, inp, T, H, D)
     if made is None:
         return float("nan")
@@ -638,6 +640,7 @@ def run_benchmark(args):
             f"-{args.timer}"
             f"{f'-x{args.extra_len}' if args.extra_len else ''}"
             f"{f'-k{args.block_k}' if args.block_k else ''}"
+            f"{'-window' if args.main_is_window else ''}"
             f"{'-cudagraph' if args.cudagraph else ''}"
             f"{'-varlen' if args.var_len else ''}"
         ),
@@ -662,6 +665,7 @@ def run_benchmark(args):
             args.timer,
             extra_len,
             args.extra_page,
+            args.main_is_window,
         )
 
     _bench.run(save_path="." if args.o else None, print_data=True)
@@ -737,6 +741,14 @@ def parse_args(argv=None):
         "32-row tile is often better, because async_load costs one TDM "
         "instruction whatever the tile while an int32 gather costs "
         "ceil(BLOCK_K/8).",
+    )
+    p.add_argument(
+        "--main-is-window",
+        action="store_true",
+        help="Attend the MAIN stream as a sliding window: read each page's "
+        "first slot and async_load the tile, instead of async_gather over a "
+        "slot vector. Only v4_a8w8 supports it, and it requires --block-k to "
+        "divide --page. Off by default, which is the driver's default.",
     )
     p.add_argument(
         "--var_len",

@@ -2143,8 +2143,20 @@ def _v4_gather_tile(
         # requiring the window to be aligned. Address that page as a plain 2-D
         # tensor: one async_load against the ceil(BLOCK_K/8) TDM instructions an
         # int32 async_gather costs.
-        blk_bytes = (slot0 // MAIN_BLOCK_SIZE) * main_blk_units_data * DATA_UNIT
-        pos = slot0 % MAIN_BLOCK_SIZE
+        # Clamp into the cache before the slot becomes a BASE POINTER. The
+        # descriptor's shape bounds `pos` within the page, but the base is
+        # computed, not bounded -- an out-of-range slot would aim it past the
+        # allocation and read whatever follows. A fully-masked tile still feeds
+        # the P@V matmul, where 0 * NaN = NaN, so those bytes reach the output
+        # even though the column mask is right.
+        n_pages = main_rows_data // main_blk_units_data
+        safe_slot0 = gl.minimum(
+            gl.maximum(slot0, 0), n_pages * MAIN_BLOCK_SIZE - 1
+        )
+        blk_bytes = (
+            (safe_slot0 // MAIN_BLOCK_SIZE) * main_blk_units_data * DATA_UNIT
+        )
+        pos = safe_slot0 % MAIN_BLOCK_SIZE
         chunk_kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=main_e4m3_ptr + blk_bytes,
             shape=[MAIN_BLOCK_SIZE, NOPE_DIM],
@@ -2269,9 +2281,11 @@ def _v4_window_slot0(
     """
     q = (t_pos // PAGE) * PAGE - off0
     # q is negative on page 0 only, where the span starts before the window.
-    # It is also clamped to the array: a program whose tile range lies wholly
-    # past the window still runs one fully-masked tile, and that tile must not
-    # read off the end to find a base it will never use.
+    # The clamp below keeps the INDEX inside the block table. It does NOT bound
+    # the slot this returns: for a tile past the window `off` lands on the
+    # window's last slot, which is not a page base, and `+ t_pos % PAGE` can
+    # then carry the slot past the cache. _v4_gather_tile clamps the slot
+    # itself before using it as a base pointer -- see the note there.
     off = gl.minimum(gl.maximum(q, 0), gl.maximum(n_idx - 1, 0))
     base = gl.load(indices_ptr + base_off + off) - gl.maximum(-q, 0)
     return base + t_pos % PAGE

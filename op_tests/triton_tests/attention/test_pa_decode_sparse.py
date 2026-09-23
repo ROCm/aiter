@@ -3,6 +3,8 @@
 
 # from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 import triton
@@ -720,10 +722,10 @@ def test_pa_decode_sparse_fp8_uniform_vs_reference(T, H, D, kv_len, var_len):
     )
 
 
-def make_packed_cache(num_tokens, D, dtype):
+def make_packed_cache(num_tokens, D, dtype, page_size=256):
     device = "cuda"
     rope = 64  # DSv4 RoPE dim, stored bf16
-    block = 256  # packed cache page size
+    block = page_size  # packed cache page size; vLLM allocates 64
     nope = D - rope  # NoPE dim, stored fp8 e4m3 OCP
     nb = triton.cdiv(num_tokens, block)
     if dtype == "bf16":
@@ -814,15 +816,16 @@ def two_loop_reference(
     )
 
 
-@pytest.mark.parametrize("T", [1, 32, 128])
-@pytest.mark.parametrize("H", [16])
+@pytest.mark.parametrize("T", [1, 32, 64, 128])
+@pytest.mark.parametrize("H", [16, 32, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("main_len", [128])
 @pytest.mark.parametrize("extra_len", [8, 256])
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("strided_cache", [False, True])
+@pytest.mark.parametrize("page_size", [64, 256])
 def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
-                                    strided_cache):
+                                    strided_cache, page_size):
     """SWA (main) + top-k (extra) attended in one pass, on gfx950 and gfx1250.
 
     Both backends read the SAME cache -- ``[nb, block, 584]`` uint8, 448 B fp8
@@ -866,7 +869,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
     softmax_scale = float(D) ** -0.5
 
     # main = contiguous SWA window per query
-    main_cache, main_deq = make_packed_cache(T * main_len, D, dtype)
+    main_cache, main_deq = make_packed_cache(T * main_len, D, dtype, page_size)
     query_base = (torch.arange(T, device=device) * main_len)[:, None]
     main_idx = (
         (query_base + torch.arange(main_len, device=device)).to(torch.int32).reshape(-1)
@@ -876,7 +879,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
     )
     # extra = scattered top-k over a pool
     extra_pool = T * extra_len
-    extra_cache, extra_deq = make_packed_cache(extra_pool, D, dtype)
+    extra_cache, extra_deq = make_packed_cache(extra_pool, D, dtype, page_size)
     if strided_cache:
         extra_cache, extra_deq = widen_to_int32_overflow(extra_cache, extra_deq)
     extra_idx = torch.randint(
@@ -897,6 +900,21 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
         kwargs["has_invalid"] = False
     else:
         q_in, q_ref = q, q
+    # ATT A/B hook. main_is_window puts the SWA stream on async_load instead of
+    # async_gather, and lives on _pa_decode_sparse_v4 -- the public wrapper does
+    # not forward it. Setting MAIN_IS_WINDOW to 0 or 1 sends BOTH arms down that
+    # same entry point, so the two captures differ in one constexpr and nothing
+    # else. Unset, this is the ordinary public call.
+    # The main cache here is paged 256 and main_idx is contiguous, so the window
+    # contract holds.
+    _decode = pa_decode_sparse
+    _win = os.environ.get("MAIN_IS_WINDOW")
+    if _win is not None:
+        from aiter.ops.triton.attention.pa_decode_sparse import (
+            _pa_decode_sparse_v4 as _decode,
+        )
+
+        kwargs["main_is_window"] = _win == "1"
 
     ref = two_loop_reference(
         q_ref,
@@ -909,7 +927,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
         attn_sink,
         softmax_scale,
     )
-    out = pa_decode_sparse(
+    out = _decode(
         q_in,
         main_cache,
         main_idx,
