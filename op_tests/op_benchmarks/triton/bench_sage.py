@@ -1499,7 +1499,7 @@ def make_kernel_runner(
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
             if is_f4f4:
                 return _production_quantize_f4f4(
-                    quant_q, quant_k, v_bshd, softmax_scale, fp6_p=True
+                    quant_q, quant_k, v_bshd, softmax_scale
                 )
             return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
