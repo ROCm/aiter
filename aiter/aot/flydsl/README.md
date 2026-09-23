@@ -12,6 +12,7 @@ the JIT path hits the cache instead of compiling again.
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, opt-in per head shape via `AITER_FLYDSL_AOT_FMHA_FP8` |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -54,6 +55,19 @@ python -m aiter.aot.flydsl.mega_moe
 
 # Restrict the deployment profiles when building a smaller custom image.
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
+```
+
+The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
+factor per call, so a serving process JIT-compiles each new combination on the
+request path. `fmha_fp8` enumerates every combination the wrapper's heuristics
+can reach for a head shape (`H:Hkv:D:Dv[@layout]`, layout `varlen_cross` by
+default). It compiles nothing unless a shape is given, so `setup.py` only builds
+it when `AITER_FLYDSL_AOT_FMHA_FP8` is set.
+
+```bash
+# Kimi-K3 MLA prefill at TP8: 12 heads, qk 192, v 128 -> 92 kernels
+python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+AITER_FLYDSL_AOT_FMHA_FP8="12:12:192:128" python setup.py develop
 ```
 
 MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
