@@ -961,6 +961,17 @@ stayed exact; prefill ISA was 48 K32 (0 K16 PV) and PMC MFMA/wave
 Conflict/wave stayed 44352. Keep K16 PV gemm and scalar/register P
 ``.to(BFloat16)``.
 
+**Retained:** overlay prefill V now uses a specialized blocked
+permutation with direct ``ds_write2st64_b64 offset1:16`` and direct
+``LDSReadTrans16_64b`` lane sources. The earlier nested tiled-copy
+inverse was wrong (``err≈0.985``), while scalar inverse reads were
+correct but slow. The complete path passed decode and prefill oracle;
+same-session ``M=512`` improved **247.92→229.50 µs** (−7.4%), with
+conflict/wave **44352→31680**, wait-LDS/wave **27725→16543**, and
+busy/wave **8889→8405**. Keep the experimental kernel diff; details and
+the physical address formula are in
+``SILOTIGER-1047-optimize-overlay-split-plan.md``.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

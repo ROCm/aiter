@@ -396,3 +396,25 @@ not repeated unless an overlay retry is proposed.
 - Prefill packed K32 PV (`v_cvt_pk_bf16_f32` + `MFMA 16×16×32` so
   static MFMA 64→48). ISA and MFMA/wave matched AMD; `M=512` only
   **−0.9%** vs phase-1 XOR. Kernel restored.
+- The first AMD-like pair-store attempt was incomplete, not a DNR.
+  Rank-matched destination layout compiled to `ds_write2_b64`, and its
+  nested tiled-MMA `partition_S` was not the inverse of the store
+  partition (`err≈0.985`). Scalar inverse reads proved the permutation
+  but regressed `M=512` to **374.88 µs**.
+
+  **Retained replacement (2026-09-23).** The complete prefill V path
+  directly emits **16× `ds_write2st64_b64 offset1:16`** and directly
+  invokes `LDSReadTrans16_64b` with its per-lane source address
+  (**32× `ds_read_b64_tr_b16`**). Its specialized blocked permutation is
+  `p(n,d) = (d&3) + 4*(n&31) + 128*(d>>3) + 4096*((d>>2)&1)
+  + 8192*(n>>5)`: low token bits spread stores over LDS banks, while
+  dimension bit 2 selects the 8192-byte `st64` pair region.
+
+  Decode and prefill oracle tests passed. Same-session `M=512` median
+  **247.92 → 229.50 µs** (**−7.4%**); the earlier campaign baseline
+  **236.93 → 229.50 µs** is **−3.1%**, meeting the keep-gate. PMC per
+  wave vs phase-3 XOR: conflict **44352 → 31680** (**−28.6%**),
+  wait-LDS **27725 → 16543** (**−40.3%**), busy **8889 → 8405**
+  (**−5.4%**); MFMA and VMEM are unchanged. Conflict is still **3.0×**
+  AMD (10560), but this reproduces the material Triton lowering:
+  bank-spread addressing, `write2st64`, and transposed LDS reads.
