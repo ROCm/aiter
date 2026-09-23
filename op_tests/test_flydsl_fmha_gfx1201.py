@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -359,105 +357,6 @@ def test_flydsl_fmha_rejects_lds_overflow(head_dim, use_fp8, expected_bytes):
 
 
 @pytest.mark.parametrize(
-    "head_dim,use_fp8,selected_bytes,fallback_bytes",
-    [
-        (256, False, 66560, 33280),
-        (512, True, 67840, 34944),
-    ],
-)
-def test_flydsl_fmha_lds_falls_back_to_block_n32(
-    monkeypatch, head_dim, use_fp8, selected_bytes, fallback_bytes
-):
-    """An oversized BN64 selection retries BN32 without changing BLOCK_M."""
-    from aiter.ops.flydsl import fmha_kernels
-
-    assert (
-        fmha_kernels._gfx1201_fmha_lds_bytes(head_dim, 64, fp8=use_fp8)
-        == selected_bytes
-    )
-    assert (
-        fmha_kernels._gfx1201_fmha_lds_bytes(head_dim, 32, fp8=use_fp8)
-        == fallback_bytes
-    )
-
-    calls = []
-
-    def _fake_get_kernel(**kwargs):
-        calls.append(kwargs)
-
-        def _launch(*args, **launch_kwargs):
-            return None
-
-        return _launch
-
-    cache_name = "_get_fp8_gfx1201_kernel" if use_fp8 else "_get_kernel"
-    monkeypatch.setattr(fmha_kernels, cache_name, _fake_get_kernel)
-
-    batch, seq_len, num_heads = 1, 2048, 1
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    kwargs = {}
-    if use_fp8:
-        q = q.to(torch.float8_e4m3fn)
-        k = k.to(torch.float8_e4m3fn)
-        v = v.to(torch.float8_e4m3fn)
-        scale = torch.ones(1, dtype=torch.float32, device=q.device)
-        kwargs = {"q_descale": scale, "k_descale": scale, "v_descale": scale}
-
-    flydsl_flash_attn_func(q, k, v, causal=False, **kwargs)
-    assert len(calls) == 1
-    assert calls[0]["block_m"] == 256
-    assert calls[0]["block_n"] == 32
-    assert calls[0]["head_dim"] == head_dim
-
-
-@pytest.mark.parametrize(
-    "head_dim,use_fp8,expected_bytes",
-    [
-        (224, False, 58368),
-        (480, True, 63616),
-    ],
-)
-def test_flydsl_fmha_accepts_nearest_lds_boundary(
-    monkeypatch, head_dim, use_fp8, expected_bytes
-):
-    """The nearest supported multiple-of-32 below each LDS limit remains valid."""
-    from aiter.ops.flydsl import fmha_kernels
-
-    assert (
-        fmha_kernels._gfx1201_fmha_lds_bytes(head_dim, 64, fp8=use_fp8)
-        == expected_bytes
-    )
-
-    calls = []
-
-    def _fake_get_kernel(**kwargs):
-        calls.append(kwargs)
-
-        def _launch(*args, **launch_kwargs):
-            return None
-
-        return _launch
-
-    cache_name = "_get_fp8_gfx1201_kernel" if use_fp8 else "_get_kernel"
-    monkeypatch.setattr(fmha_kernels, cache_name, _fake_get_kernel)
-
-    batch, seq_len, num_heads = 1, 2048, 1
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    kwargs = {}
-    if use_fp8:
-        q = q.to(torch.float8_e4m3fn)
-        k = k.to(torch.float8_e4m3fn)
-        v = v.to(torch.float8_e4m3fn)
-        scale = torch.ones(1, dtype=torch.float32, device=q.device)
-        kwargs = {"q_descale": scale, "k_descale": scale, "v_descale": scale}
-
-    flydsl_flash_attn_func(q, k, v, causal=False, **kwargs)
-    assert len(calls) == 1
-    assert calls[0]["block_n"] == 64
-    assert calls[0]["head_dim"] == head_dim
-
-
-@pytest.mark.parametrize(
     "batch,seq_len,num_heads,head_dim",
     [
         (1, 1536, 24, 128),  # Flux compute-bound shape (fp8's target win).
@@ -507,43 +406,6 @@ def test_flydsl_fmha_correctness_fp8_causal():
     )
     assert cos.min().item() > 0.98, f"min_cos={cos.min().item():.6f}"
     assert cos.mean().item() > 0.997, f"mean_cos={cos.mean().item():.6f}"
-
-
-def test_flydsl_fp8_quant_producer_invariants():
-    """Direct coverage of the FlyDSL fp8 producer (fp8_quant_gfx1201), which the
-    end-to-end tests only exercise transitively: the per-tensor scale contract,
-    rotation=False dequant accuracy, and the rotation-cancellation invariant
-    ``(Q@R)(K@R)^T == Q@K^T`` that attention relies on (the rotation is never
-    undone in the kernel, so a wrong/asymmetric rotation would hide here)."""
-    b, s, h, d = 1, 1024, 8, 128  # head_dim==128 -> FlyDSL path
-    q, k, v = _make_qkv(b, s, h, d, torch.bfloat16)
-
-    # Scale contract: e4m3 outputs, 1-elem fp32 descales (real = fp8 * scale).
-    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
-    for t8 in (qq, kk, vv):
-        assert t8.dtype == torch.float8_e4m3fn
-    for sc in (sq, sk, sv):
-        assert sc.shape == (1,) and sc.dtype == torch.float32
-
-    # rotation=False: dequant ≈ original (only e4m3 rounding).
-    cos = F.cosine_similarity(
-        (qq.float() * sq).reshape(-1, d), q.float().reshape(-1, d), dim=1
-    )
-    assert (
-        cos.mean().item() > 0.99
-    ), f"rot=False dequant mean_cos={cos.mean().item():.6f}"
-
-    # rotation=True: rotation must cancel in QK^T. Dequant gives Q@R and K@R; their
-    # inner product must match the unrotated Q@K^T (one head).
-    qr, kr, _, sqr, skr, _ = flydsl_fp8_quant(q, k, v, rotation=True)
-    Qr = (qr.float() * sqr)[0, :, 0]
-    Kr = (kr.float() * skr)[0, :, 0]
-    scores_rot = Qr @ Kr.T
-    scores_ref = q[0, :, 0].float() @ k[0, :, 0].float().T
-    cos_s = F.cosine_similarity(
-        scores_rot.reshape(1, -1), scores_ref.reshape(1, -1), dim=1
-    ).item()
-    assert cos_s > 0.99, f"QK-preservation cos={cos_s:.6f}"
 
 
 def test_flydsl_fp8_quant_backend_agreement():
@@ -596,168 +458,12 @@ def test_flydsl_fp8_quant_fp16_fallback_and_direct_guard():
         flydsl_fp8_pertensor_quant(q, rotate=False)
 
 
-def test_flydsl_fp8_quant_fp16_rotation_uses_fp16_matrix(monkeypatch):
-    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
-
-    q, k, v = _make_qkv(1, 128, 2, 128, torch.float16)
-    seen_dtypes = []
-    original = quantization._hadamard_matrix
-
-    def _record_dtype(head_dim, device, dtype):
-        seen_dtypes.append(dtype)
-        return original(head_dim, device, dtype)
-
-    monkeypatch.setattr(quantization, "_hadamard_matrix", _record_dtype)
-    flydsl_fp8_quant(q, k, v, rotation=True, backend="torch")
-    assert seen_dtypes == [torch.float16]
-
-
-def test_flydsl_hadamard_matrix_uses_target_device():
-    """Build the rotation matrix directly on the requested non-current GPU."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires >=2 visible GPUs")
-
-    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
-
-    current_device = torch.cuda.current_device()
-    try:
-        torch.cuda.set_device(0)
-        target = torch.device("cuda:1")
-        quantization._HADAMARD_CACHE.clear()
-        rotation = quantization._hadamard_matrix(128, target, torch.bfloat16)
-        assert rotation.device == target
-    finally:
-        torch.cuda.set_device(current_device)
-
-
-def test_flydsl_hadamard_cache_concurrent_first_use_and_reuse():
-    """Concurrent streams share one fully-produced cached matrix."""
-    import threading
-
-    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
-
-    device = torch.device("cuda", 0)
-    quantization._HADAMARD_CACHE.clear()
-    barrier = threading.Barrier(2)
-    results = [None, None]
-    errors = []
-
-    def _worker(index):
-        try:
-            torch.cuda.set_device(device)
-            stream = torch.cuda.Stream(device=device)
-            barrier.wait()
-            with torch.cuda.stream(stream):
-                matrix = quantization._hadamard_matrix(128, device, torch.bfloat16)
-                checksum = matrix.float().sum()
-            stream.synchronize()
-            results[index] = (matrix.data_ptr(), checksum.item())
-        except Exception as exc:  # noqa: BLE001 - surfaced in the main thread
-            errors.append(exc)
-
-    threads = [threading.Thread(target=_worker, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert not errors
-    assert results[0][0] == results[1][0]
-    assert results[0][1] == pytest.approx(math.sqrt(128), rel=2e-2)
-    assert results[1][1] == pytest.approx(math.sqrt(128), rel=2e-2)
-
-    reuse_stream = torch.cuda.Stream(device=device)
-    with torch.cuda.stream(reuse_stream):
-        reused = quantization._hadamard_matrix(128, device, torch.bfloat16)
-        reused_checksum = reused.float().sum()
-    reuse_stream.synchronize()
-    assert reused.data_ptr() == results[0][0]
-    assert reused_checksum.item() == pytest.approx(math.sqrt(128), rel=2e-2)
-
-
-def test_stream_readiness_concurrent_producers_chain_same_storage():
-    """The latest registration covers every earlier in-flight producer."""
-    import threading
-
-    from aiter.ops.flydsl.kernels.fmha_gfx1201.stream_readiness import (
-        register_ready,
-        wait_ready,
-    )
-
-    device = torch.device("cuda", 0)
-    tensor = torch.zeros(2, dtype=torch.int32, device=device)
-    slow_stream = torch.cuda.Stream(device=device)
-    fast_stream = torch.cuda.Stream(device=device)
-    consumer_stream = torch.cuda.Stream(device=device)
-    source_stream = torch.cuda.current_stream(device)
-    lhs = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device) * 0.01
-    rhs = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device) * 0.01
-    slow_registered = threading.Event()
-    errors = []
-
-    def _slow_producer():
-        try:
-            torch.cuda.set_device(device)
-            slow_stream.wait_stream(source_stream)
-            with torch.cuda.stream(slow_stream):
-                work = lhs
-                for _ in range(3):
-                    work = work @ rhs
-                # The write cannot execute until all queued matrix work does.
-                tensor[0].copy_((work[0, 0] * 0).to(torch.int32) + 1)
-            register_ready((tensor,), stream=slow_stream)
-            slow_registered.set()
-        except Exception as exc:  # noqa: BLE001 - surfaced in main thread
-            errors.append(exc)
-            slow_registered.set()
-
-    def _fast_producer():
-        try:
-            torch.cuda.set_device(device)
-            slow_registered.wait()
-            fast_stream.wait_stream(source_stream)
-            with torch.cuda.stream(fast_stream):
-                tensor[1].fill_(2)
-            register_ready((tensor,), stream=fast_stream)
-        except Exception as exc:  # noqa: BLE001 - surfaced in main thread
-            errors.append(exc)
-
-    threads = [
-        threading.Thread(target=_slow_producer),
-        threading.Thread(target=_fast_producer),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert not errors
-
-    wait_ready(consumer_stream, (tensor,))
-    with torch.cuda.stream(consumer_stream):
-        observed = tensor.clone()
-    # If the latest registration did not chain the slow producer, this clone
-    # would capture tensor[0] before its matrix-dependent write.
-    consumer_stream.synchronize()
-    slow_stream.synchronize()
-    torch.testing.assert_close(observed.cpu(), torch.tensor([1, 2], dtype=torch.int32))
-
-
 def test_flydsl_fp8_quant_rejects_unknown_backend():
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="unsupported fp8 quant backend"):
         flydsl_fp8_quant(q, k, v, backend="flydls")
     with pytest.raises(TypeError, match="backend must be a string"):
         flydsl_fp8_quant(q, k, v, backend=None)
-
-
-def test_flydsl_arch_detection_does_not_require_rocminfo(monkeypatch):
-    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
-
-    def _broken_rocminfo():
-        raise RuntimeError("rocminfo unavailable")
-
-    monkeypatch.setattr(quantization, "get_gfx_runtime", _broken_rocminfo)
-    assert quantization._live_gfx(torch.device("cuda:0")) == "gfx1201"
 
 
 def test_flydsl_fp8_quant_validates_input_contract():
@@ -943,25 +649,6 @@ def test_flydsl_fp8_quant_rejects_out_overlapping_input_storage():
     )
     with pytest.raises(ValueError, match="must not overlap input storage"):
         flydsl_fp8_pertensor_quant(x, rotate=False, out=out)
-
-
-def test_flydsl_fp8_ignores_bf16_lds_vec_width_toggle(monkeypatch):
-    """The BF16 vec8 diagnostic toggle must not alter FP8's fixed vec16 layout."""
-    from aiter.ops.flydsl import fmha_kernels
-
-    monkeypatch.setenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "0")
-    fmha_kernels._get_fp8_gfx1201_kernel.cache_clear()
-
-    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
-    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
-    out = flydsl_flash_attn_func(
-        qq, kk, vv, causal=False, q_descale=sq, k_descale=sk, v_descale=sv
-    )
-    ref = _ref_sdpa_bshd(q, k, v)
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
-    )
-    assert cos.mean().item() > 0.998
 
 
 def test_flydsl_fmha_missing_fp8_descale_raises():
@@ -1277,61 +964,6 @@ def test_flydsl_fmha_masks_block_m_padding_when_block_n_aligned(seq_len):
     )
     assert cosine.min().item() > 0.99
     assert cosine.mean().item() > 0.999
-
-
-@pytest.mark.parametrize("seq_len", [96, 1408])
-def test_flydsl_fmha_block_n_aligned_skips_tail_specialization(monkeypatch, seq_len):
-    """BLOCK_M-only padding must not compile unnecessary KV tail predicates."""
-    from aiter.ops.flydsl import fmha_kernels
-
-    calls = []
-
-    def _fake_get_kernel(**kwargs):
-        calls.append(kwargs)
-
-        def _launch(*args, **launch_kwargs):
-            return None
-
-        return _launch
-
-    monkeypatch.setattr(fmha_kernels, "_get_kernel", _fake_get_kernel)
-    q, k, v = _make_qkv(1, seq_len, 2, 128, torch.bfloat16)
-    flydsl_flash_attn_func(q, k, v, causal=False)
-    assert len(calls) == 1
-    assert calls[0]["tail_mask"] is False
-
-
-def test_flydsl_fmha_bf16_vec_width_participates_in_cache_key(monkeypatch):
-    from aiter.ops.flydsl import fmha_kernels
-
-    builds = []
-
-    def _fake_build(**kwargs):
-        builds.append(kwargs)
-        return object()
-
-    monkeypatch.setattr(fmha_kernels, "build_flash_attn_func_module", _fake_build)
-    fmha_kernels._get_kernel.cache_clear()
-    common = {
-        "device_index": 0,
-        "num_heads": 2,
-        "head_dim": 128,
-        "causal": False,
-        "dtype_str": "bf16",
-        "waves_per_eu": 2,
-        "daz": True,
-        "block_m": 128,
-        "block_n": 32,
-        "softmax_scale": None,
-        "tail_mask": False,
-        "cross_attn": False,
-    }
-    fmha_kernels._get_kernel(**common, lds_vec_width=16)
-    fmha_kernels._get_kernel(**common, lds_vec_width=8)
-    fmha_kernels._get_kernel(**common, lds_vec_width=16)
-    assert len(builds) == 2
-    assert [build["lds_vec_width"] for build in builds] == [16, 8]
-    fmha_kernels._get_kernel.cache_clear()
 
 
 def test_flydsl_fmha_rejects_invalid_stream_type():

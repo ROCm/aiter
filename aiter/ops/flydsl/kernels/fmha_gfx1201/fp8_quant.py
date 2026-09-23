@@ -25,8 +25,8 @@ is orthonormal, so applying it to both Q and K leaves ``Q K^T`` unchanged -- it
 cancels in attention and the consumer never needs the matrix; it only spreads
 intra-row outliers so the global e4m3 scale clamps less.
 
-MVP fast path: ``head_dim == 128`` (VEC=4). Callers fall back (Triton/torch) for
-other head_dims.
+The native fast path supports ``head_dim == 128`` (VEC=4). Callers fall back
+(Triton/torch) for other head_dims.
 """
 
 # NOTE: do NOT add `from __future__ import annotations` (see qk_norm_rope_quant
@@ -85,7 +85,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
     D = head_dim
     VEC = D // BLOCK_THREADS
     assert D % BLOCK_THREADS == 0, f"head_dim {D} must be a multiple of {BLOCK_THREADS}"
-    assert VEC == 4, f"MVP supports head_dim=128 (VEC=4) only, got VEC={VEC}"
+    assert VEC == 4, f"native path supports head_dim=128 (VEC=4) only, got VEC={VEC}"
     assert (D & (D - 1)) == 0, f"head_dim {D} must be a power of 2 for WHT"
 
     LOG2D = int(math.log2(D))
