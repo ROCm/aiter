@@ -20,11 +20,6 @@ on:
         required: false
         type: string
         default: "/data/models2/DeepSeek-V4-Pro"
-      glm_5_2_fp8_model_path:
-        description: "GLM-5.2-FP8 model path visible on Spur nodes"
-        required: false
-        type: string
-        default: "/data/models2/GLM-5.2-FP8"
       run_glm_5_2_fp8:
         description: "Run GLM-5.2-FP8 1P1D TP-only case"
         required: false
@@ -32,6 +27,11 @@ on:
         type: boolean
       run_minimax_m3_fp8_2p1d_tp8:
         description: "Run MiniMax-M3-MXFP8 2P+1D TP8, DPA-TP8, and DPA-TP8-EAGLE3 ATOMesh nightly cases"
+        required: false
+        default: false
+        type: boolean
+      run_ds_v4_2p1d_tp8:
+        description: "Run DeepSeek-V4-Pro 2P+1D TP8 / DPA / MTP ATOMesh nightly cases"
         required: false
         default: false
         type: boolean
@@ -83,6 +83,10 @@ env:
   MINIMAX_OSL_DEFAULT: "1024"
   MINIMAX_CONC_LIST_DEFAULT: "16"
   MINIMAX_EVAL_CONC_LIST_DEFAULT: "128"
+  DSV4_2P1D_ISL_LIST_DEFAULT: "8192"
+  DSV4_2P1D_OSL_DEFAULT: "1024"
+  DSV4_2P1D_CONC_LIST_DEFAULT: "16"
+  DSV4_2P1D_EVAL_CONC_LIST_DEFAULT: "128"
   ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
   ATOMESH_SLURM_ACCOUNT: ""
   ATOMESH_SLURM_PARTITION: ""
@@ -127,6 +131,7 @@ jobs:
           # targeted DeepSeek-only debugging.
           run_glm = bool_input("run_glm_5_2_fp8", True)
           run_minimax = bool_input("run_minimax_m3_fp8_2p1d_tp8", False)
+          run_dsv4_2p1d = bool_input("run_ds_v4_2p1d_tp8", False)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
@@ -136,7 +141,7 @@ jobs:
           )
           print(
               "ATOMESH_MODEL_PATH_GLM_5_2_FP8="
-              + value("glm_5_2_fp8_model_path", "ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT")
+              + os.environ["ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT"]
           )
           print(f"RUN_GLM_5_2_FP8={str(run_glm).lower()}")
           print(
@@ -144,6 +149,7 @@ jobs:
               + os.environ["ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8_DEFAULT"]
           )
           print(f"RUN_MINIMAX_M3_FP8_2P1D_TP8={str(run_minimax).lower()}")
+          print(f"RUN_DS_V4_2P1D_TP8={str(run_dsv4_2p1d).lower()}")
           print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
           print(
               "ATOMESH_SHARED_WORKSPACE_ROOT="
@@ -165,6 +171,10 @@ jobs:
           print(f"MINIMAX_OSL={os.environ['MINIMAX_OSL_DEFAULT']}")
           print(f"MINIMAX_CONC_LIST={os.environ['MINIMAX_CONC_LIST_DEFAULT']}")
           print(f"MINIMAX_EVAL_CONC_LIST={os.environ['MINIMAX_EVAL_CONC_LIST_DEFAULT']}")
+          print(f"DSV4_2P1D_ISL_LIST={os.environ['DSV4_2P1D_ISL_LIST_DEFAULT']}")
+          print(f"DSV4_2P1D_OSL={os.environ['DSV4_2P1D_OSL_DEFAULT']}")
+          print(f"DSV4_2P1D_CONC_LIST={os.environ['DSV4_2P1D_CONC_LIST_DEFAULT']}")
+          print(f"DSV4_2P1D_EVAL_CONC_LIST={os.environ['DSV4_2P1D_EVAL_CONC_LIST_DEFAULT']}")
           PY
 
       - name: Checkout ATOM source
@@ -457,6 +467,25 @@ jobs:
                           "run_eval": True,
                       }
                   )
+          if os.environ.get("RUN_DS_V4_2P1D_TP8", "false") == "true":
+              for case, topology in (
+                  ("ds-v4-2p1d-tp8", "2p1d"),
+                  ("ds-v4-2p1d-dpa-tp8", "2p1d_dpa"),
+                  ("ds-v4-2p1d-tp8-mtp3", "2p1d_mtp3"),
+                  ("ds-v4-2p1d-dpa-tp8-mtp1", "2p1d_dpa_mtp1"),
+              ):
+                  requested.append(
+                      {
+                          "model": "DeepSeek-V4-Pro",
+                          "case": case,
+                          "topology": topology,
+                          "isl": os.environ["DSV4_2P1D_ISL_LIST"],
+                          "osl": os.environ["DSV4_2P1D_OSL"],
+                          "conc": os.environ["DSV4_2P1D_CONC_LIST"],
+                          "eval_conc": os.environ["DSV4_2P1D_EVAL_CONC_LIST"],
+                          "run_eval": True,
+                      }
+                  )
 
           node_pool = [
               node.strip()
@@ -497,7 +526,8 @@ jobs:
               cell["runner"]["slurm_account"] = ""
               cell["runner"]["slurm_partition"] = ""
               cell["runner"]["log_root"] = os.environ["ATOMESH_LOG_ROOT"]
-              if cfg["model"] == "DeepSeek-V4-Pro":
+              # 1P1D DeepSeek smoke strips --enable-tbo; keep it for 2P1D DPA/MTP.
+              if cfg["model"] == "DeepSeek-V4-Pro" and cfg["topology"] == "1p1d":
                   for role in ("prefill", "decode"):
                       service_role = cell.setdefault("service", {}).setdefault(role, {})
                       extra_args = service_role.get("extra_args", "")
