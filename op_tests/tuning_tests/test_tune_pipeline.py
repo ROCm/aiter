@@ -9,6 +9,7 @@ Runs each tuner on small shapes, verifies CSV output, and tests
 
 import csv
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -648,6 +649,74 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_gdn_k5_opt_mp1(self):
         self._run_one("gdn_k5_opt", mp=1)
+
+    def test_mha_fwd_mp1(self):
+        """Measure, gate, publish and prove one shape in a fresh process.
+
+        Not _run_one: a shape where nothing beats auto-select correctly writes
+        no row, so the check is that every shape reached an answer and every
+        row written was proven, not that there is a row per shape. The field
+        is one sampled Triton tile plus the defaults and incumbent the tuner
+        always adds, to keep it within a few minutes.
+        """
+        from aiter.ops.mha_fwd_policy import (
+            MHA_FWD_PROBLEM_KEY_FIELDS,
+            MHA_FWD_TUNER_SCRIPT,
+        )
+
+        shape = {
+            **dict.fromkeys(MHA_FWD_PROBLEM_KEY_FIELDS, 0),
+            "mode": "varlen",
+            "batch": 2,
+            "total_q": 512,
+            "total_k": 512,
+            "max_seqlen_q": 256,
+            "max_seqlen_k": 256,
+            "nhead_q": 8,
+            "nhead_k": 8,
+            "hdim_q": 128,
+            "hdim_v": 128,
+            "dtype": "bfloat16",
+            "window_left": -1,
+            "window_right": -1,
+            "dropout_p": 0.0,
+            "logits_soft_cap": 0.0,
+            "how_v3_bf16_cvt": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(
+                untuned,
+                MHA_FWD_PROBLEM_KEY_FIELDS,
+                [[shape[field] for field in MHA_FWD_PROBLEM_KEY_FIELDS]],
+            )
+            result = _run_tuner(
+                MHA_FWD_TUNER_SCRIPT,
+                untuned,
+                tuned,
+                extra_args=[
+                    "--backends",
+                    "triton",
+                    "--candidate-sample",
+                    "1",
+                    "--finalist-rounds",
+                    "1",
+                ],
+                timeout=900,
+                mp=1,
+            )
+            if result.returncode != 0:
+                print(f"\n=== mha_fwd STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== mha_fwd STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, "mha_fwd tuner failed")
+            with open(f"{tuned}.evidence.json", encoding="utf-8") as file:
+                evidence = json.load(file)
+        outcomes = [entry["outcome"] for entry in evidence["outcomes"]]
+        self.assertEqual(len(outcomes), 1, evidence["outcomes"])
+        self.assertIn(outcomes[0], ("published", "retained"), evidence["outcomes"])
+        for proof in evidence["selection_proofs"]:
+            self.assertEqual(proof["status"], "verified", proof)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
