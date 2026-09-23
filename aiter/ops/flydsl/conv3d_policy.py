@@ -57,9 +57,21 @@ BASELINE_TILES = (
 # config is slower than anything it could win on tile shape.
 MAX_N_ACC = 32
 
-# Two-wave workgroups exist in the legal space but have too little to overlap
-# global latency with; only the later ``_RELAXATIONS`` steps let them in.
-MIN_WAVES = 4
+# Small workgroups were assumed to have too little in flight to overlap global
+# latency, and this floor sat at 4. Measuring both VAE tables against the
+# unpruned legal space -- every is_legal_tile config, 75 of the 76 shapes timed
+# on gfx950 -- showed the assumption costs more than it saves. The floor is what
+# hid the fastest config for 26 of the 29 shapes the pruned sweep lost, and the
+# winners it hid are 2- and 3-wave tiles: worst case 6.85% (C=96 482x834 K=96,
+# where (192,96,3,1) wins), 1.28% across the two VAEs weighted by kernel time.
+#
+# At 2 that weighted loss drops to 0.18% and no shape is off by more than 2.60%,
+# for 17% more candidates (100.0 -> 116.9 per shape over the 76). Nearly all of
+# that widening lands on kg=96, which is where the losses were: kg=3 and kg=32
+# are unchanged, since _RELAXATIONS already had to drop the floor for them.
+# Going below 2 is pointless -- it adds 6 candidates in total and moves no
+# winner, because a legal tile needs two waves before TILE_N can reach 96.
+MIN_WAVES = 2
 MAX_WAVES = 16
 
 
