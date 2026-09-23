@@ -402,6 +402,8 @@ class MhaFwdTuner(TunerCommon):
         self._selection_proofs: list[dict[str, Any]] = []
         self._incumbents_by_key: dict[tuple, set[tuple[str, str]]] = {}
         self._autoselect_by_key: dict[tuple, dict[str, Any] | None] = {}
+        self._incumbent_probe_by_key: dict[tuple, dict[str, Any] | None] = {}
+        self._published_by_key: dict[tuple, tuple[str, int, str]] = {}
         self._promotions: list[dict[str, Any]] = []
         self._race_reports: list[dict[str, Any]] = []
         self._race_winner_by_key: dict[tuple, tuple] = {}
@@ -767,6 +769,7 @@ class MhaFwdTuner(TunerCommon):
         all_infos = []
         task_by_info = {}
         plans = []
+        self._published_by_key = self._load_published_table(args)
         for row_index, row in untunedf.iterrows():
             problem = MhaFwdProblem.from_mapping(
                 {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
@@ -789,9 +792,11 @@ class MhaFwdTuner(TunerCommon):
             # on the same GPU, is what lets the run tell an improvement from a
             # reordering of noise. Without it the comparison is against a
             # number from another session.
-            selection = self._resolve_autoselect(row)
-            self._autoselect_by_key[key] = selection
-            incumbents = self._incumbent_candidates(selection)
+            autoselect = self._resolve_autoselect(row)
+            self._autoselect_by_key[key] = autoselect
+            incumbent = self._resolve_incumbent(row, args, key, autoselect)
+            self._incumbent_probe_by_key[key] = incumbent
+            incumbents = self._incumbent_candidates(incumbent)
             known = {candidate.identity for candidate in candidates}
             for extra in (*self._shipped_tile_candidates(row), *incumbents):
                 if extra.identity not in known:
@@ -1553,7 +1558,7 @@ class MhaFwdTuner(TunerCommon):
         return fastest
 
     def _gate_against_autoselect(self, key, fastest):
-        """Gate a winner against a dispatch choice the catalogue cannot name.
+        """Gate a winner against an incumbent that was probed but not measured.
 
         asm_v3 leaves its split count to C++, which reports 0, and 0 is not a
         legal candidate split, so the shipped configuration cannot be entered
@@ -1561,11 +1566,14 @@ class MhaFwdTuner(TunerCommon):
         latency carries no round spread, so the bar is the fixed indifference
         delta rather than a standard-error separation.
 
-        Returning None leaves the shape out of the published table, which is
-        what retaining this incumbent means: no row is how the shape reaches
-        auto-select in the first place.
+        Returning None leaves the table as it stands. For a shape with no row
+        that means auto-select, which is how it reaches auto-select in the
+        first place; for a shape being re-tuned it means the published row
+        survives, which is what retaining that incumbent means.
         """
-        selection = self._autoselect_by_key.get(key)
+        selection = self._incumbent_probe_by_key.get(
+            key
+        ) or self._autoselect_by_key.get(key)
         latency = None if selection is None else selection.get("latency_us")
         if not latency or float(latency) <= 0:
             fastest["detail"] = "incumbent not measured; improvement unverified"
@@ -1578,18 +1586,25 @@ class MhaFwdTuner(TunerCommon):
         margin = (latency - float(fastest["us"])) / latency
         args = getattr(self, "_args", None)
         noise = float(getattr(args, "delta", MHA_FWD_INDIFFERENCE_DELTA))
+        retuning = key in self._published_by_key
+        bar = "the published row" if retuning else "auto-select"
         if margin <= noise:
             print(
-                f"leaving {key} on auto-select: {backend} at {latency:.1f} us "
+                f"leaving {key} on {bar}: {backend} at {latency:.1f} us "
                 f"was not beaten by {noise:.2%}",
                 flush=True,
             )
             self._record_promotion(
-                key, fastest, baseline, margin, noise, "autoselect_retained"
+                key,
+                fastest,
+                baseline,
+                margin,
+                noise,
+                "incumbent_retained" if retuning else "autoselect_retained",
             )
             return None
         fastest["detail"] = (
-            f"beat auto-select {backend} by {margin:.2%} against {noise:.2%} spread"
+            f"beat {bar} {backend} by {margin:.2%} against {noise:.2%} spread"
         )
         self._record_promotion(key, fastest, baseline, margin, noise, "promoted")
         return fastest
@@ -1715,7 +1730,9 @@ class MhaFwdTuner(TunerCommon):
 
         The probe runs the public operator in a fresh process against an empty
         tuned table, so both the identity and the latency come from the path a
-        caller on this branch would take today.
+        caller on this branch would take today. This is the floor a row has to
+        clear to be worth publishing at all, which is a separate question from
+        which candidate is fastest.
         """
         descriptor, empty_table = tempfile.mkstemp(
             prefix="mha-autoselect-", suffix=".csv"
@@ -1733,6 +1750,47 @@ class MhaFwdTuner(TunerCommon):
                 proof.get("stderr", "").strip().splitlines()[-1:] or "no detail",
             )
             return None
+        return self._selection_from_proof(proof)
+
+    def _resolve_incumbent(self, row, args, key, autoselect) -> dict[str, Any] | None:
+        """What dispatch resolves for this shape with the table as it ships.
+
+        For a shape with no row that is auto-select, already probed above, and
+        probing again would spend a second process on the same answer. For a
+        shape being re-tuned it is the published row, and that row is what a
+        challenger has to beat: gating a re-tune against auto-select instead
+        lets anything inside the noise of the published row replace it, which
+        is the churn the incumbent gate exists to prevent.
+        """
+        if key not in self._published_by_key:
+            return autoselect
+        proof = self._run_fresh_probe(row, args.tune_file)
+        if proof["status"] != "verified":
+            logger.warning(
+                "the published row for this shape did not resolve (%s); "
+                "gating against auto-select instead",
+                proof.get("stderr", "").strip().splitlines()[-1:] or "no detail",
+            )
+            return autoselect
+        selection = self._selection_from_proof(proof)
+        if selection is None:
+            return autoselect
+        published = self._published_by_key[key]
+        if selection["identity"] != published:
+            # Dispatch declining to honor a row is a fallback, not a failure,
+            # so what actually ran is the incumbent rather than what the table
+            # asked for.
+            logger.warning(
+                "the published row %r is not what dispatch ran (%r); gating "
+                "against what ran",
+                published,
+                selection["identity"],
+            )
+        return selection
+
+    @staticmethod
+    def _selection_from_proof(proof) -> dict[str, Any] | None:
+        """The candidate identity and latency a verified probe observed."""
         observed = proof["observed"]
         backend = observed.get("backend")
         if backend not in MHA_FWD_BACKENDS:
@@ -1745,6 +1803,49 @@ class MhaFwdTuner(TunerCommon):
             ),
             "latency_us": proof.get("latency_us"),
         }
+
+    def _load_published_table(self, args) -> dict[tuple, tuple[str, int, str]]:
+        """The rows the tuned table already ships, keyed the way the sweep is.
+
+        A key that is already in the table is being re-tuned rather than tuned,
+        and that distinction decides both what the incumbent is and whether a
+        shape that no longer earns a row can be left alone or has to lose it.
+        """
+        path = getattr(args, "tune_file", "")
+        if not path or not os.path.exists(path):
+            return {}
+        frame = pd.read_csv(path)
+        if frame.empty:
+            return {}
+        missing = [
+            column
+            for column in MHA_FWD_RUNTIME_CSV_FIELDS
+            if column not in frame.columns
+        ]
+        if missing:
+            raise ValueError(f"{path} is missing MHA runtime columns: {missing}")
+        published = {}
+        for line, row in enumerate(frame.to_dict("records"), start=2):
+            # Keyed through the problem rather than the raw cells: the sweep
+            # keys on normalized spelling, and a table written as bf16 or
+            # GFX950 would otherwise miss the shape it describes.
+            try:
+                key = MhaFwdProblem.from_mapping(row).key()
+            except (KeyError, TypeError, ValueError) as error:
+                logger.warning(
+                    "%s:%d does not parse as a problem (%s); the shape it "
+                    "names will be gated against auto-select",
+                    path,
+                    line,
+                    error,
+                )
+                continue
+            published[key] = (
+                str(row["backend"]),
+                int(row["num_splits"]),
+                "" if pd.isna(row["backend_config"]) else str(row["backend_config"]),
+            )
+        return published
 
     def _shipped_tile_candidates(self, row) -> list[MhaFwdCandidate]:
         """The tile dicts the dict-config kernels resolve for this shape today.
