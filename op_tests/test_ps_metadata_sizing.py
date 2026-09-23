@@ -51,6 +51,11 @@ def _info(batch_size, num_head_k, max_qlen, qlen_granularity, total_qlen=None):
     )
 
 
+def _rows(info_entry):
+    shape = info_entry[0]
+    return shape[0] if isinstance(shape, tuple) else shape
+
+
 def _legacy_info(batch_size, num_head_k, max_qlen, qlen_granularity):
     """The sizes get_ps_metadata_info_v1 returned before total_qlen existed."""
     cu_num = torch.cuda.get_device_properties(
@@ -99,9 +104,9 @@ def test_budget_never_grows_the_buffers(batch_size, qlen_granularity, divisor):
         total_qlen=max(batch_size * max_qlen // divisor, 1),
     )
     for got, ref in zip(bounded[2:6], unbounded[2:6]):
-        assert got[0] <= ref[0]
+        assert _rows(got) <= _rows(ref)
     # a single request is still allowed to be max_qlen long under any budget
-    assert bounded[4][0] >= math.ceil(max_qlen / qlen_granularity)
+    assert _rows(bounded[4]) >= math.ceil(max_qlen / qlen_granularity)
 
 
 @pytest.mark.parametrize("total_qlen", [0, -1])
