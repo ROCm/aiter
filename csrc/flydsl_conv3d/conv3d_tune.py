@@ -7,6 +7,11 @@ Reads an untuned CSV, sweeps ``conv3d_policy`` configs, writes winners to a
 per-model tuned CSV. One backend (``libtype=flydsl``), explicit tile columns
 (not solidx). Pass ``-i``/``-o``; the canonical pair is header-only.
 
+Every candidate is timed NDHWC in and NDHWC out, the layout the VAEs run end
+to end, so the tables are tuned for that call. The table has no layout column:
+an NCDHW caller gets the same row, picked for the NDHWC-output kernel, and
+pays a pre-transpose on top that no tile choice affects.
+
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
         -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
         -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
@@ -69,6 +74,9 @@ RUN_CONFIG_REPS = 3
 # keeps err_ratio at ~0 for every correct candidate.
 RTOL = ATOL = 2e-2
 
+# The layout both sides of every timed call use; see the module docstring.
+LAYOUT = "NDHWC"
+
 
 # Taken from the kernel rather than restated: this is what decides npq, and a
 # tuner that sized the GEMM by its own copy would report the wrong M and hand
@@ -90,7 +98,7 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(seed)
-    x = torch.randn((n, c, d, h, w), device=device, dtype=dtypes.bf16)
+    x = torch.randn((n, d, h, w, c), device=device, dtype=dtypes.bf16)
     weight = torch.randn((k, c // groups, kt, kh, kw), device=device, dtype=dtypes.bf16)
     bias = torch.randn((k,), device=device, dtype=dtypes.fp32) if has_bias else None
     return {"x": x, "weight": weight, "bias": bias}
@@ -99,16 +107,30 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
 def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk):
     # splitk is pinned rather than re-derived by the dispatch, so the CSV column
     # is the value that was timed and AOT compiles the artifact the runtime asks
-    # for. NCDHW in and out, so the timing includes the pre-transpose the model
-    # also pays; see Conv3dTuner.calculate.
+    # for.
     return flydsl_conv_implicit(
-        x, weight, bias=bias, tile=tile, wgm=wgm, splitk=splitk, **params
+        x,
+        weight,
+        bias=bias,
+        tile=tile,
+        wgm=wgm,
+        splitk=splitk,
+        input_layout=LAYOUT,
+        output_layout=LAYOUT,
+        **params,
     )
 
 
 def conv3d_ref(x, weight, bias, params):
+    """``F.conv3d`` on an NDHWC ``x``, returned NDHWC and contiguous.
+
+    Contiguous and in the candidate's own shape: mp_tuner reshapes a result
+    whose shape differs from the reference by a flat view, which would compare
+    an NDHWC output against NCDHW memory without failing.
+    """
     ref_bias = bias.to(x.dtype) if bias is not None else None
-    return F.conv3d(x, weight, bias=ref_bias, **params)
+    y = F.conv3d(x.permute(0, 4, 1, 2, 3).contiguous(), weight, bias=ref_bias, **params)
+    return y.permute(0, 2, 3, 4, 1).contiguous()
 
 
 def _shape_key(row):
@@ -385,12 +407,10 @@ class Conv3dTuner(TunerCommon):
     def calculate(self, results, bpes=(2, 2, 2)):
         """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse).
 
-        Both are derived from an end-to-end time, so both are diluted by the
-        NCDHW->NDHWC pre-transpose and the weight repack the entry point runs
-        before the kernel -- a constant per shape, which leaves the ranking
-        alone but makes these two columns a floor rather than a kernel figure.
-        Do not compare them against another implementation's kernel-only
-        numbers.
+        Both are derived from an end-to-end time. NDHWC in and out leaves no
+        layout transpose in it; what is left outside the kernel is the weight
+        repack, which run_perftest's rotated copies redo once per copy at a
+        microsecond or two. Close to kernel figures, then, but a floor on them.
         """
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
@@ -524,7 +544,7 @@ class Conv3dTuner(TunerCommon):
         torch.cuda.empty_cache()
 
     def run_config(self, args):
-        """Benchmark the production entry point (no explicit tile) per shape."""
+        """Benchmark the production entry point (no explicit tile) per shape, NDHWC in and out."""
         from aiter.test_common import run_perftest
 
         self._clear_op_caches()
@@ -551,13 +571,15 @@ class Conv3dTuner(TunerCommon):
                         data["x"],
                         data["weight"],
                         bias=data["bias"],
+                        input_layout=LAYOUT,
+                        output_layout=LAYOUT,
                         **params,
                     )
                     if us_i < us:
                         out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
                 ok = torch.allclose(out, ref, rtol=RTOL, atol=ATOL)
-                # e2e only: run_perftest includes transpose and weight repack.
+                # e2e only: run_perftest includes the weight repack.
                 results.append(
                     {
                         "shape": shape,
