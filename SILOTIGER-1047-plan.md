@@ -1002,7 +1002,16 @@ unchanged). GPU 6 / gfx950 stayed exact; prefill ISA had **32**
 ``v_bitop3``. Width-2051 ``L=512`` vs write2st64 HEAD **30.79 / 27.02 /
 230.93** µs went **26.79 / 26.33 / 233.94** (``M=512 +1.3%``). Decode
 did not regress. Same-session AMD **43.76 / 42.70 / 212.36**. Kernel
-restored. XOR K stores stay.
+  restored. XOR K stores stay.
+
+**Do not retry** overlay prefill QK ``lgkmcnt(1)`` by giving FlyDSL
+distinct A rmem dests (ping-pong, gemm-from-frag, or bursting all
+eight ``ds_read_b128`` before MFMA). GPU 6 / gfx950 stayed exact;
+prefill ISA still reused ``v[84:87]`` and waited ``lgkmcnt(0)`` on
+later K32. Width-2051 ``L=512`` vs same-session K-map HEAD **179.56**
+µs went **19.95 / 20.10 / 179.56** (``M=512 0.0%``, keep-gate 3% /
+≤174.17). Decode did not regress. Kernel restored. Inline-asm dest
+constraints are a different experiment.
 
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.

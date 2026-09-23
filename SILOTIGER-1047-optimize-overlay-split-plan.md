@@ -484,3 +484,14 @@ not repeated unless an overlay retry is proposed.
   **43.76 / 42.70 / 212.36**. `M=512` **+1.3%**. Decode did not
   regress. Kernel restored. Do not retry mapping QK K onto V’s
   pair-store (XOR K stores stay).
+- Prefill QK `lgkmcnt(1)` via distinct A dests in FlyDSL (two-fragment
+  ping-pong, gemm-from-frag, all-ng live dests, and an 8-read burst
+  before MFMA). Oracle **2 passed**. Prefill ISA
+  (`tickets/1047/tmp/k2_qk_pong_isa/`) still has **5** `ds_read_b128`
+  dests (`v[68:71]`…`v[84:87]`) and `s_waitcnt lgkmcnt(0)` before later
+  K32; `promote-regmem-to-vectorssa` plus LLVM reuse one A dest.
+  Same-session keep-gate vs K-map HEAD **179.56** µs: FlyDSL **19.95 /
+  20.10 / 179.56** (`M=512` **0.0%**, need ≤ **174.17**). Decode
+  median flat. Kernel restored. Do not retry pinning QK A dests
+  through rmem/gemm authoring. Inline-asm dest constraints are a
+  different experiment.
