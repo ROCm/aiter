@@ -672,7 +672,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     # passed to shuffle_weight. A page shorter than the 16-token MFMA tile can
     # only be shuffled in groups of its own length, so the tile is then read
     # from 16 // KVBlockSize pages -- which the per-lane page index already does.
-    ShuffleRows: gl.constexpr = KVBlockSize if KVBlockSize < 16 else 16
+    ShuffleRows: gl.constexpr = min(KVBlockSize, 16)
 
     # DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
@@ -1505,7 +1505,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     # passed to shuffle_weight. A page shorter than the 16-token MFMA tile can
     # only be shuffled in groups of its own length, so the tile is then read
     # from 16 // KVBlockSize pages -- which the per-lane page index already does.
-    ShuffleRows: gl.constexpr = KVBlockSize if KVBlockSize < 16 else 16
+    ShuffleRows: gl.constexpr = min(KVBlockSize, 16)
 
     # DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
