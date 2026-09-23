@@ -261,16 +261,12 @@ def launch_gemm_a8w4_tdm(
     # interleaved across 16 M rows.
     #
     # row_major_ascale instead takes a plain (row, k128) global buffer, so a
-    # producer writes each row's scales contiguously. Keep the global pitch but
-    # land each LDS row at an odd-dword stride: the old even SA_KDW/AS_FULL_KDW
-    # stride made the 16 row lanes alias in pairs on gfx1250's LDS banks.
+    # producer writes each row's scales contiguously, and moves the 16-row
+    # interleave into the per-lane ds_read below (lane == M row, stride
+    # SA_KDW dwords -> a 2-way bank conflict on one b32 read per operand).
     SA_KDW = AS_KSTEPS  # scale dwords per row per k-tile (tile_k // 128)
-    SA_LDS_KDW = SA_KDW + (1 if row_major_ascale and SA_KDW % 2 == 0 else 0)
-    AS_FULL_LDS_KDW = AS_FULL_KDW + (
-        1 if row_major_ascale and AS_FULL_KDW % 2 == 0 else 0
-    )
     STAGE_SA = (
-        ceildiv(tile_m * SA_LDS_KDW * 4, 16) * 16
+        ceildiv(tile_m * SA_KDW * 4, 16) * 16
         if row_major_ascale
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
@@ -308,11 +304,7 @@ def launch_gemm_a8w4_tdm(
         else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     )
     AS_FULL_OFF = num_buffers * PITCH
-    AS_FULL_B = (
-        ceildiv(tile_m * AS_FULL_LDS_KDW * 4, 128) * 128
-        if row_major_ascale
-        else ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
-    )
+    AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -661,7 +653,7 @@ def launch_gemm_a8w4_tdm(
                 tile_m,
                 on_i32=True,
                 lds_off=AS_FULL_OFF // 4,
-                lds_row=AS_FULL_LDS_KDW,
+                lds_row=AS_FULL_KDW,
                 k_adv=0,
                 wv=waves[2],
                 target_jobs=as_prologue_jobs,
@@ -678,7 +670,7 @@ def launch_gemm_a8w4_tdm(
                 tile_m,
                 on_i32=True,
                 lds_off=SA_OFF // 4,
-                lds_row=SA_LDS_KDW,
+                lds_row=SA_KDW,
                 k_adv=SA_KDW * 4,
                 wv=waves[2],
             )
@@ -787,7 +779,7 @@ def launch_gemm_a8w4_tdm(
         sa_lane = lane16 if wmma_m_rep == 1 else lane
         SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
         lds_sa_lane_off = (
-            SA_OFF + (wave_m * warp_tile_m + sa_lane) * SA_LDS_KDW * 4
+            SA_OFF + (wave_m * warp_tile_m + sa_lane) * SA_KDW * 4
             if row_major_ascale
             else SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * 4
         )
@@ -852,10 +844,10 @@ def launch_gemm_a8w4_tdm(
             if const_expr(row_major_ascale and tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
                 row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
-                off = (row * AS_FULL_LDS_KDW + kt * SA_KDW + ksl) * 4
+                off = (row * AS_FULL_KDW + kt * SA_KDW + ksl) * 4
                 return lds_load_b32(as_base, fx.Int32(off))[0]
             if const_expr(row_major_ascale):
-                off = (sm * SA_ROWS_PER_LOAD * SA_LDS_KDW + ksl) * 4
+                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
                 return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
             if const_expr(tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
