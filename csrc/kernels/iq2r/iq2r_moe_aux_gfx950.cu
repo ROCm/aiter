@@ -33,6 +33,8 @@ constexpr int kGptOssTopK    = 4;
 constexpr int kFusedSortTokens = 16;
 constexpr int kFusedSortRoutes = kFusedSortTokens * kGptOssTopK;
 constexpr int kFusedSortThreads = 512;
+constexpr int kParallelSortBlocks = 16;
+constexpr int kParallelSortMinRoutes = 2048;
 constexpr float kSwigluAlpha = 1.702f;
 constexpr float kSwigluLimit = 7.0f;
 constexpr float kUpOffset    = 1.0f;
@@ -273,6 +275,150 @@ __global__ __launch_bounds__(kThreads) void iq2r_route_sort_tasks_kernel(
             ++task;
         }
         task_count[0] = task <= task_capacity ? task : -1;
+    }
+}
+
+// Large-prefill sorter. The original one-CTA implementation serializes every
+// routed row through one shared histogram and one shared cursor table. Split
+// the route range across 16 CTAs, then convert the per-CTA histograms into
+// disjoint global output ranges. The final scatter still uses only shared
+// atomics, but each hot expert is now distributed across all CTAs.
+__global__ __launch_bounds__(kThreads) void iq2r_route_histogram_split_kernel(
+    const int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ block_offsets,
+    int routes,
+    int expert_count)
+{
+    __shared__ int counts[kMaxExperts + 1];
+    const int thread = static_cast<int>(threadIdx.x);
+    const int block = static_cast<int>(blockIdx.x);
+    const int buckets = expert_count + 1;
+
+    for(int bucket = thread; bucket < buckets; bucket += blockDim.x)
+        counts[bucket] = 0;
+    __syncthreads();
+
+    const int route_begin = routes * block / kParallelSortBlocks;
+    const int route_end = routes * (block + 1) / kParallelSortBlocks;
+    for(int route = route_begin + thread; route < route_end; route += blockDim.x)
+    {
+        const int expert = expert_ids[route];
+        const int bucket = expert >= 0 && expert < expert_count ? expert
+                                                                : expert_count;
+        atomicAdd(counts + bucket, 1);
+    }
+    __syncthreads();
+
+    for(int bucket = thread; bucket < buckets; bucket += blockDim.x)
+        block_offsets[block * buckets + bucket] = counts[bucket];
+}
+
+__global__ __launch_bounds__(kThreads) void iq2r_route_prefix_tasks_split_kernel(
+    int32_t* __restrict__ block_offsets,
+    int32_t* __restrict__ tasks,
+    int32_t* __restrict__ task_count,
+    int expert_count,
+    int task_capacity,
+    int task_rows)
+{
+    __shared__ int bucket_counts[kMaxExperts + 1];
+    __shared__ int route_offsets[kMaxExperts + 2];
+    __shared__ int task_offsets[kMaxExperts + 2];
+    const int thread = static_cast<int>(threadIdx.x);
+    const int buckets = expert_count + 1;
+
+    if(thread < buckets)
+    {
+        int count = 0;
+#pragma unroll
+        for(int block = 0; block < kParallelSortBlocks; ++block)
+            count += block_offsets[block * buckets + thread];
+        bucket_counts[thread] = count;
+    }
+    __syncthreads();
+
+    if(thread == 0)
+    {
+        route_offsets[0] = 0;
+        task_offsets[0] = 0;
+        for(int bucket = 0; bucket < buckets; ++bucket)
+        {
+            const int count = bucket_counts[bucket];
+            route_offsets[bucket + 1] = route_offsets[bucket] + count;
+            task_offsets[bucket + 1] =
+                task_offsets[bucket] + (count + task_rows - 1) / task_rows;
+        }
+        const int task_total = task_offsets[buckets];
+        task_count[0] = task_total <= task_capacity ? task_total : -1;
+    }
+    __syncthreads();
+
+    if(thread < buckets)
+    {
+        int block_begin = route_offsets[thread];
+#pragma unroll
+        for(int block = 0; block < kParallelSortBlocks; ++block)
+        {
+            const int index = block * buckets + thread;
+            const int count = block_offsets[index];
+            block_offsets[index] = block_begin;
+            block_begin += count;
+        }
+    }
+
+    const int task_total = task_offsets[buckets];
+    for(int task = thread; task < task_total; task += blockDim.x)
+    {
+        int low = 0;
+        int high = buckets;
+        while(low + 1 < high)
+        {
+            const int mid = (low + high) / 2;
+            if(task_offsets[mid] <= task)
+                low = mid;
+            else
+                high = mid;
+        }
+        const int bucket = low;
+        const int local_task = task - task_offsets[bucket];
+        const int local = local_task * task_rows;
+        const int count = bucket_counts[bucket];
+        tasks[task * kTaskColumns] = route_offsets[bucket] + local;
+        tasks[task * kTaskColumns + 1] = min(task_rows, count - local);
+        tasks[task * kTaskColumns + 2] =
+            bucket < expert_count ? bucket : -1;
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void iq2r_route_scatter_split_kernel(
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ block_offsets,
+    int32_t* __restrict__ sorted_expert_ids,
+    int32_t* __restrict__ gather_indices,
+    int32_t* __restrict__ scatter_indices,
+    int routes,
+    int expert_count)
+{
+    __shared__ int cursors[kMaxExperts + 1];
+    const int thread = static_cast<int>(threadIdx.x);
+    const int block = static_cast<int>(blockIdx.x);
+    const int buckets = expert_count + 1;
+
+    for(int bucket = thread; bucket < buckets; bucket += blockDim.x)
+        cursors[bucket] = block_offsets[block * buckets + bucket];
+    __syncthreads();
+
+    const int route_begin = routes * block / kParallelSortBlocks;
+    const int route_end = routes * (block + 1) / kParallelSortBlocks;
+    for(int route = route_begin + thread; route < route_end; route += blockDim.x)
+    {
+        const int expert = expert_ids[route];
+        const int bucket = expert >= 0 && expert < expert_count ? expert
+                                                                : expert_count;
+        const int sorted_route = atomicAdd(cursors + bucket, 1);
+        sorted_expert_ids[sorted_route] = expert;
+        gather_indices[sorted_route] = route;
+        scatter_indices[route] = sorted_route;
     }
 }
 
@@ -1050,6 +1196,65 @@ __global__ void iq2r_route_reduce_indexed_kernel(
     }
 }
 
+// GPT-OSS top-4 reduction. One CTA owns one token so the permutation and
+// routing weights are fetched once, then reused across the whole hidden row.
+// Eight adjacent BF16 columns are handled per thread to keep route/output
+// accesses coalesced and eliminate the generic kernel's per-element div/mod
+// and repeated index loads.
+constexpr int kRouteReduceVector = 8;
+
+__global__ __launch_bounds__(kThreads)
+void iq2r_route_reduce_indexed_top4_kernel(
+    const __hip_bfloat16* __restrict__ route_output,
+    const float* __restrict__ route_weights,
+    const int32_t* __restrict__ scatter_indices,
+    __hip_bfloat16* __restrict__ output,
+    int tokens,
+    int hidden)
+{
+    __shared__ int32_t sorted_routes[kGptOssTopK];
+    __shared__ float weights[kGptOssTopK];
+
+    const int token = static_cast<int>(blockIdx.x);
+    const int thread = static_cast<int>(threadIdx.x);
+    if(token >= tokens)
+        return;
+    if(thread < kGptOssTopK)
+    {
+        const int route = token * kGptOssTopK + thread;
+        sorted_routes[thread] = scatter_indices[route];
+        weights[thread] = route_weights[route];
+    }
+    __syncthreads();
+
+    using bf16x8 = opus::vector_t<opus::bf16_t, kRouteReduceVector>;
+    for(int column = thread * kRouteReduceVector; column < hidden;
+        column += kThreads * kRouteReduceVector)
+    {
+        float values[kRouteReduceVector] = {};
+#pragma unroll
+        for(int route = 0; route < kGptOssTopK; ++route)
+        {
+            const bf16x8 packed = *reinterpret_cast<const bf16x8*>(
+                route_output +
+                static_cast<int64_t>(sorted_routes[route]) * hidden + column);
+#pragma unroll
+            for(int item = 0; item < kRouteReduceVector; ++item)
+                values[item] = fmaf(
+                    static_cast<float>(packed[item]), weights[route], values[item]);
+        }
+
+        bf16x8 packed_output;
+#pragma unroll
+        for(int item = 0; item < kRouteReduceVector; ++item)
+            packed_output[item] = __builtin_bit_cast(
+                opus::bf16_t, __float2bfloat16(values[item]));
+        *reinterpret_cast<bf16x8*>(
+            output + static_cast<int64_t>(token) * hidden + column) =
+            packed_output;
+    }
+}
+
 template <int BlockSize, int ItemsPerThread>
 __global__ __launch_bounds__(BlockSize)
 void iq2r_route_reduce_add_rmsnorm_indexed_kernel(
@@ -1135,6 +1340,7 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                                aiter_tensor_t& sorted_expert_ids,
                                aiter_tensor_t& gather_indices,
                                aiter_tensor_t& scatter_indices,
+                               aiter_tensor_t& sort_workspace,
                                aiter_tensor_t& tasks,
                                aiter_tensor_t& task_count,
                                int64_t expert_count,
@@ -1142,18 +1348,20 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
 {
     AITER_CHECK(expert_ids.is_gpu() && sorted_expert_ids.is_gpu() &&
                     gather_indices.is_gpu() && scatter_indices.is_gpu() &&
-                    tasks.is_gpu() && task_count.is_gpu(),
+                    sort_workspace.is_gpu() && tasks.is_gpu() && task_count.is_gpu(),
                 "IQ2R route sorting requires GPU tensors");
     const int device = expert_ids.device_id;
     AITER_CHECK(sorted_expert_ids.device_id == device &&
                     gather_indices.device_id == device &&
-                    scatter_indices.device_id == device && tasks.device_id == device &&
+                    scatter_indices.device_id == device &&
+                    sort_workspace.device_id == device && tasks.device_id == device &&
                     task_count.device_id == device,
                 "IQ2R route sorting tensors must share a GPU");
     AITER_CHECK(expert_ids.dtype() == AITER_DTYPE_i32 &&
                     sorted_expert_ids.dtype() == AITER_DTYPE_i32 &&
                     gather_indices.dtype() == AITER_DTYPE_i32 &&
                     scatter_indices.dtype() == AITER_DTYPE_i32 &&
+                    sort_workspace.dtype() == AITER_DTYPE_i32 &&
                     tasks.dtype() == AITER_DTYPE_i32 &&
                     task_count.dtype() == AITER_DTYPE_i32,
                 "IQ2R route sorting tensors must be int32");
@@ -1162,12 +1370,16 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                     sorted_expert_ids.numel() == expert_ids.numel() &&
                     gather_indices.numel() == expert_ids.numel() &&
                     scatter_indices.numel() == expert_ids.numel() &&
+                    sort_workspace.dim() == 1 &&
+                    sort_workspace.numel() >=
+                        kParallelSortBlocks * (expert_count + 1) &&
                     tasks.dim() == 2 && tasks.size(1) == kTaskColumns &&
                     task_count.dim() == 1 && task_count.size(0) == 1,
                 "IQ2R route sorting shape mismatch");
     AITER_CHECK(expert_ids.is_contiguous() && sorted_expert_ids.is_contiguous() &&
                     gather_indices.is_contiguous() && scatter_indices.is_contiguous() &&
-                    tasks.is_contiguous() && task_count.is_contiguous(),
+                    sort_workspace.is_contiguous() && tasks.is_contiguous() &&
+                    task_count.is_contiguous(),
                 "IQ2R route sorting tensors must be contiguous");
     AITER_CHECK(expert_count > 0 && expert_count <= kMaxExperts,
                 "IQ2R supports at most 128 experts");
@@ -1198,7 +1410,7 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                            static_cast<int>(expert_count),
                            static_cast<int>(tasks.size(0)),
                            static_cast<int>(task_rows));
-    else
+    else if(routes < kParallelSortMinRoutes)
         hipLaunchKernelGGL(iq2r_route_sort_tasks_kernel,
                            dim3(1),
                            dim3(kThreads),
@@ -1214,6 +1426,42 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                            static_cast<int>(expert_count),
                            static_cast<int>(tasks.size(0)),
                            static_cast<int>(task_rows));
+    else
+    {
+        auto* workspace = static_cast<int32_t*>(sort_workspace.data_ptr());
+        hipLaunchKernelGGL(iq2r_route_histogram_split_kernel,
+                           dim3(kParallelSortBlocks),
+                           dim3(kThreads),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const int32_t*>(expert_ids.data_ptr()),
+                           workspace,
+                           static_cast<int>(routes),
+                           static_cast<int>(expert_count));
+        hipLaunchKernelGGL(iq2r_route_prefix_tasks_split_kernel,
+                           dim3(1),
+                           dim3(kThreads),
+                           0,
+                           getCurrentHIPStream(),
+                           workspace,
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           static_cast<int>(expert_count),
+                           static_cast<int>(tasks.size(0)),
+                           static_cast<int>(task_rows));
+        hipLaunchKernelGGL(iq2r_route_scatter_split_kernel,
+                           dim3(kParallelSortBlocks),
+                           dim3(kThreads),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const int32_t*>(expert_ids.data_ptr()),
+                           workspace,
+                           static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+                           static_cast<int32_t*>(gather_indices.data_ptr()),
+                           static_cast<int32_t*>(scatter_indices.data_ptr()),
+                           static_cast<int>(routes),
+                           static_cast<int>(expert_count));
+    }
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -1309,6 +1557,64 @@ void iq2r_route_gather_quant_out(const aiter_tensor_t& input,
                        static_cast<int>(topk),
                        scale_m_blocks,
                        tiled_scales);
+    HIP_CALL_LAUNCH(hipGetLastError());
+}
+
+void iq2r_route_gather_quant_broadcast_out(
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& scatter_indices,
+    aiter_tensor_t& output,
+    aiter_tensor_t& scales,
+    int64_t topk)
+{
+    AITER_CHECK(input.is_gpu() && scatter_indices.is_gpu() && output.is_gpu() &&
+                    scales.is_gpu(),
+                "IQ2R broadcast gather/quant requires GPU tensors");
+    const int device = input.device_id;
+    AITER_CHECK(scatter_indices.device_id == device && output.device_id == device &&
+                    scales.device_id == device,
+                "IQ2R broadcast gather/quant tensors must share a GPU");
+    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 &&
+                    scatter_indices.dtype() == AITER_DTYPE_i32 &&
+                    output.dtype() == AITER_DTYPE_fp8 &&
+                    scales.dtype() == AITER_DTYPE_u8,
+                "IQ2R broadcast gather/quant dtype mismatch");
+    const int64_t groups_per_row = input.size(1) / kQuantGroup;
+    AITER_CHECK(input.dim() == 2 && scatter_indices.dim() == 1 &&
+                    topk == kGptOssTopK &&
+                    scatter_indices.numel() == input.size(0) * topk &&
+                    input.size(1) % kQuantGroup == 0 && groups_per_row > 0 &&
+                    groups_per_row <= kDirectQuantThreads && output.dim() == 2 &&
+                    output.size(0) == scatter_indices.numel() &&
+                    output.size(1) == input.size(1) &&
+                    iq2r_valid_scale_shape(
+                        scales, output.size(0), groups_per_row),
+                "IQ2R broadcast gather/quant shape mismatch");
+    AITER_CHECK(input.stride(1) == 1 && input.stride(0) >= input.size(1) &&
+                    scatter_indices.is_contiguous() && output.is_contiguous() &&
+                    scales.is_contiguous(),
+                "IQ2R broadcast gather/quant input must have contiguous columns "
+                "and non-overlapping rows; outputs must be contiguous");
+
+    const bool tiled_scales = scales.dim() == 4;
+    const int routes = static_cast<int>(scatter_indices.numel());
+    const int scale_m_blocks = (routes + 15) / 16;
+    hipLaunchKernelGGL(
+        iq2r_route_gather_quant_broadcast_kernel,
+        dim3(static_cast<uint32_t>(input.size(0))),
+        dim3(kDirectQuantThreads),
+        0,
+        getCurrentHIPStream(),
+        static_cast<const opus::bf16_t*>(input.data_ptr()),
+        static_cast<const int32_t*>(scatter_indices.data_ptr()),
+        static_cast<opus::fp8_t*>(output.data_ptr()),
+        static_cast<uint8_t*>(scales.data_ptr()),
+        static_cast<int>(input.size(0)),
+        static_cast<int>(input.size(1)),
+        static_cast<int>(input.stride(0)),
+        static_cast<int>(groups_per_row),
+        scale_m_blocks,
+        tiled_scales);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -1851,18 +2157,33 @@ void iq2r_route_reduce_indexed_out(const aiter_tensor_t& route_output,
                     scatter_indices.is_contiguous() && output.is_contiguous(),
                 "IQ2R route reduction tensors must be contiguous");
     const int64_t elements = output.numel();
-    hipLaunchKernelGGL(iq2r_route_reduce_indexed_kernel,
-                       dim3(launch_blocks(elements)),
-                       dim3(kThreads),
-                       0,
-                       getCurrentHIPStream(),
-                       static_cast<const __hip_bfloat16*>(route_output.data_ptr()),
-                       static_cast<const float*>(route_weights.data_ptr()),
-                       static_cast<const int32_t*>(scatter_indices.data_ptr()),
-                       static_cast<__hip_bfloat16*>(output.data_ptr()),
-                       elements,
-                       static_cast<int>(output.size(1)),
-                       static_cast<int>(topk));
+    if(topk == kGptOssTopK && output.size(1) % kRouteReduceVector == 0)
+        hipLaunchKernelGGL(
+            iq2r_route_reduce_indexed_top4_kernel,
+            dim3(static_cast<uint32_t>(output.size(0))),
+            dim3(kThreads),
+            0,
+            getCurrentHIPStream(),
+            static_cast<const __hip_bfloat16*>(route_output.data_ptr()),
+            static_cast<const float*>(route_weights.data_ptr()),
+            static_cast<const int32_t*>(scatter_indices.data_ptr()),
+            static_cast<__hip_bfloat16*>(output.data_ptr()),
+            static_cast<int>(output.size(0)),
+            static_cast<int>(output.size(1)));
+    else
+        hipLaunchKernelGGL(
+            iq2r_route_reduce_indexed_kernel,
+            dim3(launch_blocks(elements)),
+            dim3(kThreads),
+            0,
+            getCurrentHIPStream(),
+            static_cast<const __hip_bfloat16*>(route_output.data_ptr()),
+            static_cast<const float*>(route_weights.data_ptr()),
+            static_cast<const int32_t*>(scatter_indices.data_ptr()),
+            static_cast<__hip_bfloat16*>(output.data_ptr()),
+            elements,
+            static_cast<int>(output.size(1)),
+            static_cast<int>(topk));
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 

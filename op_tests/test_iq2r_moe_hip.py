@@ -15,6 +15,7 @@ from aiter.ops.iq2r import (
     iq2r_materialize_device,
     iq2r_route_direct_gather_quant_out,
     iq2r_route_gather_indexed_out,
+    iq2r_route_gather_quant_broadcast_out,
     iq2r_route_gather_quant_out,
     iq2r_route_sort_tasks_out,
     iq2r_route_topk_direct_gather_quant_out,
@@ -372,6 +373,7 @@ def test_stable_route_sort_and_task_construction():
     gather = torch.empty_like(expert_ids)
     scatter = torch.empty_like(expert_ids)
     capacity = iq2r_task_capacity(routes, 4, 16)
+    sort_workspace = torch.empty((16 * 5,), dtype=torch.int32, device="cuda")
     tasks = torch.empty((capacity, 3), dtype=torch.int32, device="cuda")
     task_count = torch.empty((1,), dtype=torch.int32, device="cuda")
     iq2r_route_sort_tasks_out(
@@ -379,6 +381,7 @@ def test_stable_route_sort_and_task_construction():
         sorted_ids,
         gather,
         scatter,
+        sort_workspace,
         tasks,
         task_count,
         expert_count=4,
@@ -401,7 +404,7 @@ def test_stable_route_sort_and_task_construction():
     ]
 
 
-@pytest.mark.parametrize("routes", [17, 32, 64, 128, 256, 257])
+@pytest.mark.parametrize("routes", [17, 32, 64, 128, 256, 257, 2048, 8192])
 def test_route_sort_boundaries(routes):
     expert_count = 128
     task_rows = 16
@@ -417,6 +420,9 @@ def test_route_sort_boundaries(routes):
     gather = torch.empty_like(expert_ids)
     scatter = torch.empty_like(expert_ids)
     capacity = iq2r_task_capacity(routes, expert_count, task_rows)
+    sort_workspace = torch.empty(
+        (16 * (expert_count + 1),), dtype=torch.int32, device="cuda"
+    )
     tasks = torch.empty((capacity, 3), dtype=torch.int32, device="cuda")
     task_count = torch.empty((1,), dtype=torch.int32, device="cuda")
 
@@ -425,6 +431,7 @@ def test_route_sort_boundaries(routes):
         sorted_ids,
         gather,
         scatter,
+        sort_workspace,
         tasks,
         task_count,
         expert_count=expert_count,
@@ -751,6 +758,51 @@ def test_fused_gather_quant_accepts_padded_row_stride():
         hidden.contiguous(), gather, expected, expected_scales, topk=4
     )
     iq2r_route_gather_quant_out(hidden_view, gather, actual, actual_scales, topk=4)
+
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8))
+    torch.testing.assert_close(actual_scales, expected_scales)
+
+
+def test_broadcast_gather_quant_matches_route_major_path():
+    tokens = 257
+    hidden, _, topk_ids = _inputs(tokens, seed=0xB40A)
+    routes = tokens * 4
+    workspace = IQ2RMoeWorkspace.allocate(tokens, 4, device="cuda", task_rows=32)
+    task_capacity = iq2r_task_capacity(routes, 128, 32)
+    iq2r_route_sort_tasks_out(
+        topk_ids.reshape(-1),
+        workspace.sorted_expert_ids[:routes],
+        workspace.gather_indices[:routes],
+        workspace.scatter_indices[:routes],
+        workspace.sort_workspace,
+        workspace.tasks[:task_capacity],
+        workspace.task_count,
+        expert_count=128,
+        task_rows=32,
+    )
+
+    expected = torch.empty(
+        (routes, hidden.shape[1]), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    expected_scales = torch.empty(
+        (routes, hidden.shape[1] // 32), dtype=torch.uint8, device="cuda"
+    )
+    actual = torch.empty_like(expected)
+    actual_scales = torch.empty_like(expected_scales)
+    iq2r_route_gather_quant_out(
+        hidden,
+        workspace.gather_indices[:routes],
+        expected,
+        expected_scales,
+        topk=4,
+    )
+    iq2r_route_gather_quant_broadcast_out(
+        hidden,
+        workspace.scatter_indices[:routes],
+        actual,
+        actual_scales,
+        topk=4,
+    )
 
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8))
     torch.testing.assert_close(actual_scales, expected_scales)

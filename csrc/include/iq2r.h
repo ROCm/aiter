@@ -55,6 +55,7 @@ void iq2r_route_sort_tasks_out(const aiter_tensor_t& expert_ids,
                                aiter_tensor_t& sorted_expert_ids,
                                aiter_tensor_t& gather_indices,
                                aiter_tensor_t& scatter_indices,
+                               aiter_tensor_t& sort_workspace,
                                aiter_tensor_t& tasks,
                                aiter_tensor_t& task_count,
                                int64_t expert_count,
@@ -70,6 +71,13 @@ void iq2r_route_gather_quant_out(const aiter_tensor_t& input,
                                  aiter_tensor_t& output,
                                  aiter_tensor_t& scales,
                                  int64_t topk);
+
+void iq2r_route_gather_quant_broadcast_out(
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& scatter_indices,
+    aiter_tensor_t& output,
+    aiter_tensor_t& scales,
+    int64_t topk);
 
 void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
                                         const aiter_tensor_t& expert_ids,

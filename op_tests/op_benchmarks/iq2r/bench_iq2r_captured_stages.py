@@ -27,7 +27,7 @@ from aiter.iq2r_moe import (
 )
 from aiter.ops.iq2r import (
     iq2r_route_direct_gather_quant_out,
-    iq2r_route_gather_quant_out,
+    iq2r_route_gather_quant_broadcast_out,
     iq2r_route_reduce_indexed_out,
     iq2r_route_sort_tasks_out,
     iq2r_route_topk_direct_gather_quant_out,
@@ -210,14 +210,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         sorted_ids,
                         gather,
                         scatter,
+                        workspace.sort_workspace,
                         tasks,
                         workspace.task_count,
                         expert_count=EXPERTS,
                         task_rows=task_rows,
                     )
-                    iq2r_route_gather_quant_out(
+                    iq2r_route_gather_quant_broadcast_out(
                         hidden,
-                        gather,
+                        scatter,
                         route_input_fp8,
                         route_input_scales,
                         topk=TOPK,
@@ -341,8 +342,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             reduce_call()
             torch.cuda.synchronize()
 
-            timings: dict[str, float | list[float]] = {}
-            for name, call in (
+            benchmark_calls = [
                 ("topk", topk_call),
                 ("route", route_call),
                 ("gate_up", gate_up_call),
@@ -352,9 +352,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 ("experts", experts_call),
                 ("post_topk", post_topk_call),
                 ("full", full_call),
-                ("fused_frontend", fused_frontend_call),
-                ("fused_full", fused_full_call),
-            ):
+            ]
+            fused_router_supported = tokens <= 16
+            if fused_router_supported:
+                benchmark_calls.extend(
+                    (
+                        ("fused_frontend", fused_frontend_call),
+                        ("fused_full", fused_full_call),
+                    )
+                )
+
+            timings: dict[str, float | list[float]] = {}
+            for name, call in benchmark_calls:
                 latency, samples = _benchmark(
                     call, args.warmup, args.iterations, args.samples
                 )
@@ -373,6 +382,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     "down_family": args.down_family or "auto",
                     "task_count": int(workspace.task_count.item()),
                     "direct_routes": direct_routes,
+                    "fused_router_supported": fused_router_supported,
                     "unique_experts": int(captured_ids.unique().numel()),
                     "max_expert_load": int(
                         torch.bincount(captured_ids.reshape(-1), minlength=EXPERTS)
@@ -400,9 +410,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "fused_frontend",
             "fused_full",
         ):
-            row[f"{name}_median_ms"] = median(
-                float(record[f"{name}_ms"]) for record in selected
-            )
+            values = [
+                float(record[f"{name}_ms"])
+                for record in selected
+                if f"{name}_ms" in record
+            ]
+            row[f"{name}_median_ms"] = median(values) if values else None
         row["summed_stage_median_ms"] = sum(
             float(row[f"{name}_median_ms"])
             for name in ("topk", "route", "gate_up", "swiglu_quant", "down", "reduce")

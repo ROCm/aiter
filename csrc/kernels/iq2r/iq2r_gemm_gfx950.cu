@@ -66,6 +66,25 @@ __device__ __forceinline__ int64_t metadata_offset(int64_t tile, int lane)
            kAtomTwoMetadata;
 }
 
+// Reorder logical tiles so neighboring ranges stay on the same XCD despite
+// the hardware's round-robin workgroup placement.  This improves reuse of an
+// expert's compact weight/codebook working set without changing the logical
+// task order or output layout.
+__device__ __forceinline__ int iq2r_remap_xcd(int block_id,
+                                               int total_tiles,
+                                               int num_xcds = 8)
+{
+    const int ids_per_xcd = (total_tiles + num_xcds - 1) / num_xcds;
+    int tall_xcds = total_tiles % num_xcds;
+    tall_xcds = tall_xcds == 0 ? num_xcds : tall_xcds;
+    const int xcd = block_id % num_xcds;
+    const int local_id = block_id / num_xcds;
+    return xcd < tall_xcds
+               ? xcd * ids_per_xcd + local_id
+               : tall_xcds * ids_per_xcd +
+                     (xcd - tall_xcds) * (ids_per_xcd - 1) + local_id;
+}
+
 __device__ __forceinline__ uint32_t load_u32(const uint8_t* pointer)
 {
     return *reinterpret_cast<const uint32_t*>(pointer);
@@ -1176,11 +1195,17 @@ void iq2r_task_gemm_large_m_x192_kernel(
 
 // Two-stage high-M pipeline for the GPT-OSS K=2880 expert shapes.  Each wave
 // keeps two compact IQ2R weight triplets in a register ring while the whole
-// workgroup stages two 32x128 activation tiles through LDS.  The counted VMEM
-// staircase retires only the current tile, leaving the next tile outstanding
-// across codebook expansion and the six MFMAs per wave.
-template<int MAtoms, bool TaskPersistent, bool PinToAgpr = false>
-__global__ __launch_bounds__(256, MAtoms == 2 ? 2 : 1)
+// workgroup stages two (MAtoms*16)x128 activation tiles through LDS. The
+// counted VMEM staircase retires only the current tile, leaving the next tile
+// outstanding across codebook expansion and the six MFMAs per wave.
+template<int MAtoms,
+         int PhysicalWaves,
+         bool StagedScales,
+         bool TaskPersistent,
+         bool PinToAgpr = false,
+         bool UseBias = false>
+__global__ __launch_bounds__(64 * PhysicalWaves,
+                             PhysicalWaves == 4 && MAtoms == 2 ? 2 : 1)
 void iq2r_task_gemm_prefetch_x192_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ activation_scales,
@@ -1199,24 +1224,50 @@ void iq2r_task_gemm_prefetch_x192_kernel(
     int task_splits)
 {
 #if defined(__gfx950__)
-    constexpr int kPhysicalWaves = 4;
     static_assert(MAtoms == 2 || MAtoms == 4);
+    static_assert(PhysicalWaves == 4 || PhysicalWaves == 8);
+    static_assert(PhysicalWaves == 4 || MAtoms == 4);
     constexpr int kMAtoms = MAtoms;
     constexpr int kNAtomsPerWave = 3;
-    constexpr int kOutputColumns = 192;
+    constexpr int kOutputColumns =
+        PhysicalWaves * kNAtomsPerWave * kTileN;
     constexpr int kKTiles = 23;
     constexpr int kActivationColumns = kTileK / sizeof(uint64_t);
     constexpr int kActivationElements = kMAtoms * kTileN * kActivationColumns;
+    constexpr int kThreads = PhysicalWaves * 64;
+    constexpr int kActivationColumnsPerLoad = 16;
+    constexpr int kActivationLoadColumns =
+        kTileK / kActivationColumnsPerLoad;
+    constexpr int kActivationLoadRows = kThreads / kActivationLoadColumns;
+    static_assert(kThreads % kActivationLoadColumns == 0);
+    static_assert((kMAtoms * kTileN) % kActivationLoadRows == 0);
+    constexpr int kActivationLoadsPerThread =
+        (kMAtoms * kTileN) / kActivationLoadRows;
+    constexpr int kScaleGroupsPerTile = kTileK / kScaleBlock;
+    constexpr int kScaleElements = kMAtoms * kTileN * kScaleGroupsPerTile;
+
+    struct InputPayload
+    {
+        alignas(16) uint64_t activation_cache[2][kActivationElements];
+        alignas(16) uint8_t
+            scale_cache[StagedScales ? 2 * kScaleElements : 1];
+    };
 
     struct SharedStorage
     {
         alignas(16) uint64_t codebook[kCodebookBytes / sizeof(uint64_t)];
-        alignas(16) uint64_t activation_cache[2][kActivationElements];
+        union
+        {
+            InputPayload input;
+            alignas(16) __hip_bfloat16
+                epilogue_cache[2][kTileN * kOutputColumns];
+        } payload;
     };
     struct ActivationSlot
     {
-        opus::vector_t<uint8_t, 16> data[kMAtoms / 2];
-        uint32_t scales[kMAtoms];
+        opus::vector_t<uint8_t, 16> data[kActivationLoadsPerThread];
+        uint32_t scales[StagedScales ? 1 : kMAtoms];
+        uint8_t staged_scale;
     };
     __shared__ SharedStorage shared;
 
@@ -1225,8 +1276,8 @@ void iq2r_task_gemm_prefetch_x192_kernel(
     const int linear_thread = wave * 64 + lane;
     const int lane_row = lane % 16;
     const int lane_group = lane / 16;
-    const int load_column = linear_thread % 8;
-    const int load_row = linear_thread / 8;
+    const int load_column = linear_thread % kActivationLoadColumns;
+    const int load_row = linear_thread / kActivationLoadColumns;
     const int num_tasks = task_count[0];
     if(num_tasks <= 0 || K != 2880)
         return;
@@ -1252,10 +1303,15 @@ void iq2r_task_gemm_prefetch_x192_kernel(
     for(int work_index = work_begin; work_index < work_end;
         work_index += work_step)
     {
+        const int remapped_work_index = TaskPersistent
+                                            ? work_index
+                                            : iq2r_remap_xcd(work_index,
+                                                             total_tiles);
         const int task_index =
-            TaskPersistent ? fixed_task : work_index / n_tiles;
-        const int n_tile_index = TaskPersistent ? work_index
-                                                : work_index % n_tiles;
+            TaskPersistent ? fixed_task : remapped_work_index / n_tiles;
+        const int n_tile_index = TaskPersistent
+                                     ? remapped_work_index
+                                     : remapped_work_index % n_tiles;
         const int row_begin = tasks[task_index * 3];
         const int row_count = tasks[task_index * 3 + 1];
         const int expert_index = tasks[task_index * 3 + 2];
@@ -1277,7 +1333,7 @@ void iq2r_task_gemm_prefetch_x192_kernel(
         {
             for(int entry = linear_thread;
                 entry < kCodebookBytes / static_cast<int>(sizeof(uint64_t));
-                entry += 256)
+                entry += kThreads)
                 shared.codebook[entry] =
                     reinterpret_cast<const uint64_t*>(auxiliary)[entry];
             __syncthreads();
@@ -1310,10 +1366,13 @@ void iq2r_task_gemm_prefetch_x192_kernel(
             auto issue_tile = [&](int k_tile, int slot) {
                 const int input_column = k_tile * kTileK + load_column * 16;
 #pragma unroll
-                for(int load_atom = 0; load_atom < kMAtoms / 2; ++load_atom)
+                for(int load_atom = 0;
+                    load_atom < kActivationLoadsPerThread;
+                    ++load_atom)
                 {
                     const int input_row =
-                        row_base + load_row + load_atom * 32;
+                        row_base + load_row +
+                        load_atom * kActivationLoadRows;
                     if(input_row < sub_end && input_column + 15 < K)
                         activation_ring[slot].data[load_atom] =
                             activation_buffer.template load<16>(
@@ -1322,17 +1381,39 @@ void iq2r_task_gemm_prefetch_x192_kernel(
                         activation_ring[slot].data[load_atom] = {};
                 }
 
-#pragma unroll
-                for(int m_atom = 0; m_atom < kMAtoms; ++m_atom)
+                if constexpr(StagedScales)
                 {
-                    const int scale_row = row_base + m_atom * kTileN + lane_row;
+                    // Keep the scale request count uniform across all waves so
+                    // the counted VMEM wait below remains valid. Eight-wave
+                    // workgroups load each unique scale twice; four-wave
+                    // workgroups load it exactly once.
+                    const int scale_index = linear_thread % kScaleElements;
+                    const int scale_row =
+                        row_base + scale_index / kScaleGroupsPerTile;
+                    const int scale_group = scale_index % kScaleGroupsPerTile;
                     if(scale_row < sub_end)
-                        activation_ring[slot].scales[m_atom] =
+                        activation_ring[slot].staged_scale =
                             scale_buffer.template load<1>(
                                 scale_row * (K / kScaleBlock) +
-                                k_tile * 4 + lane_group)[0];
+                                k_tile * kScaleGroupsPerTile + scale_group)[0];
                     else
-                        activation_ring[slot].scales[m_atom] = 127;
+                        activation_ring[slot].staged_scale = 127;
+                }
+                else
+                {
+#pragma unroll
+                    for(int m_atom = 0; m_atom < kMAtoms; ++m_atom)
+                    {
+                        const int scale_row =
+                            row_base + m_atom * kTileN + lane_row;
+                        if(scale_row < sub_end)
+                            activation_ring[slot].scales[m_atom] =
+                                scale_buffer.template load<1>(
+                                    scale_row * (K / kScaleBlock) +
+                                    k_tile * kScaleGroupsPerTile + lane_group)[0];
+                        else
+                            activation_ring[slot].scales[m_atom] = 127;
+                    }
                 }
 
                 const auto paired = data_buffer.template load<16>(
@@ -1341,15 +1422,10 @@ void iq2r_task_gemm_prefetch_x192_kernel(
                     __builtin_bit_cast(uint4, paired);
                 const int third_base = next_data_base + kAtomTwoOffset +
                                        lane * kAtomTwoRecordBytes;
-                const auto third_xy = data_buffer.template load<8>(third_base);
-                const auto third_z = data_buffer.template load<4>(third_base + 8);
-                const uint64_t packed_xy =
-                    __builtin_bit_cast(uint64_t, third_xy);
-                weight_ring[slot].third.x = static_cast<uint32_t>(packed_xy);
-                weight_ring[slot].third.y =
-                    static_cast<uint32_t>(packed_xy >> 32);
-                weight_ring[slot].third.z =
-                    __builtin_bit_cast(uint32_t, third_z);
+                const auto third_record =
+                    data_buffer.template load<12>(third_base);
+                weight_ring[slot].third =
+                    __builtin_bit_cast(uint4, third_record);
                 weight_ring[slot].third.w = 0;
                 next_data_base += kGroupBytes;
             };
@@ -1361,7 +1437,8 @@ void iq2r_task_gemm_prefetch_x192_kernel(
             {
                 const int slot = k_tile & 1;
                 if(k_tile + 1 < kKTiles)
-                    iq2r_wait_vmcnt<3 + kMAtoms / 2 + kMAtoms>();
+                    iq2r_wait_vmcnt<2 + kActivationLoadsPerThread +
+                                     (StagedScales ? 1 : kMAtoms)>();
                 else
                     iq2r_wait_vmcnt<0>();
 
@@ -1369,18 +1446,30 @@ void iq2r_task_gemm_prefetch_x192_kernel(
                 const int pair = pair_column >> 1;
                 const int bit = pair_column & 1;
 #pragma unroll
-                for(int load_atom = 0; load_atom < kMAtoms / 2; ++load_atom)
+                for(int load_atom = 0;
+                    load_atom < kActivationLoadsPerThread;
+                    ++load_atom)
                 {
-                    const int row = load_row + load_atom * 32;
+                    const int row =
+                        load_row + load_atom * kActivationLoadRows;
                     const int swizzled_column =
                         ((pair ^ (row & (kActivationColumns / 2 - 1))) << 1) +
                         bit;
                     const auto staged = __builtin_bit_cast(
                         uint4, activation_ring[slot].data[load_atom]);
                     *reinterpret_cast<uint4*>(
-                        &shared.activation_cache[slot]
-                                                 [row * kActivationColumns +
-                                                  swizzled_column]) = staged;
+                        &shared.payload.input.activation_cache[slot]
+                                                              [row *
+                                                                   kActivationColumns +
+                                                               swizzled_column]) =
+                        staged;
+                }
+                if constexpr(StagedScales)
+                {
+                    if(linear_thread < kScaleElements)
+                        shared.payload.input.scale_cache
+                            [slot * kScaleElements + linear_thread] =
+                                activation_ring[slot].staged_scale;
                 }
                 __syncthreads();
 
@@ -1404,13 +1493,15 @@ void iq2r_task_gemm_prefetch_x192_kernel(
                     auto* halves = reinterpret_cast<uint4*>(
                         &activation_fragments[m_atom]);
                     halves[0] = *reinterpret_cast<const uint4*>(
-                        &shared.activation_cache[slot]
-                                                 [row * kActivationColumns +
-                                                  swizzled0]);
+                        &shared.payload.input.activation_cache[slot]
+                                                              [row *
+                                                                   kActivationColumns +
+                                                               swizzled0]);
                     halves[1] = *reinterpret_cast<const uint4*>(
-                        &shared.activation_cache[slot]
-                                                 [row * kActivationColumns +
-                                                  swizzled1]);
+                        &shared.payload.input.activation_cache[slot]
+                                                              [row *
+                                                                   kActivationColumns +
+                                                               swizzled1]);
                 }
                 asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 
@@ -1423,8 +1514,16 @@ void iq2r_task_gemm_prefetch_x192_kernel(
 #pragma unroll
                 for(int m_atom = 0; m_atom < kMAtoms; ++m_atom)
                 {
-                    const uint32_t scale_a =
-                        activation_ring[slot].scales[m_atom] * 0x01010101u;
+                    uint32_t exponent;
+                    if constexpr(StagedScales)
+                        exponent = shared.payload.input.scale_cache[
+                            slot * kScaleElements +
+                            (m_atom * kTileN + lane_row) *
+                                kScaleGroupsPerTile +
+                            lane_group];
+                    else
+                        exponent = activation_ring[slot].scales[m_atom];
+                    const uint32_t scale_a = exponent * 0x01010101u;
                     iq2r_cooperative_triplet_mfma<0, PinToAgpr>(
                         activation_fragments[m_atom],
                         weight_fragments,
@@ -1437,32 +1536,109 @@ void iq2r_task_gemm_prefetch_x192_kernel(
                     issue_tile(k_tile + 2, slot);
             }
 
+            constexpr int kEpilogueElementsPerThread = 8;
+            constexpr int kEpilogueFragmentColumns =
+                kOutputColumns / kEpilogueElementsPerThread;
+            constexpr int kEpilogueRowsPerIteration =
+                kThreads / kEpilogueFragmentColumns;
+            constexpr int kEpilogueWriteIterations =
+                (kTileN + kEpilogueRowsPerIteration - 1) /
+                kEpilogueRowsPerIteration;
+            constexpr int kEpilogueStageElements = kTileN * kOutputColumns;
+            auto* epilogue_cache = &shared.payload.epilogue_cache[0][0];
+
+            auto epilogue_offset = [](int row, int column) {
+                constexpr int kSwizzleMask = 7;
+                const int fragment_column =
+                    column / kEpilogueElementsPerThread;
+                return row * kOutputColumns +
+                       (fragment_column ^ (row & kSwizzleMask)) *
+                           kEpilogueElementsPerThread +
+                       column % kEpilogueElementsPerThread;
+            };
+
+            float bias_values[kNAtomsPerWave] = {};
 #pragma unroll
-            for(int m_atom = 0; m_atom < kMAtoms; ++m_atom)
+            for(int atom = 0; atom < kNAtomsPerWave; ++atom)
             {
+                const int output_column =
+                    (n_block_base + atom) * kTileN + lane_row;
+                if constexpr(UseBias)
+                {
+                    if(output_column < N)
+                        bias_values[atom] = __bfloat162float(all_bias[
+                            static_cast<int64_t>(expert_index) * N +
+                            output_column]);
+                }
+            }
+
+            auto push_epilogue = [&](int m_atom, int stage) {
+                auto* stage_base =
+                    epilogue_cache + stage * kEpilogueStageElements;
 #pragma unroll
                 for(int atom = 0; atom < kNAtomsPerWave; ++atom)
                 {
-                    const int output_column =
-                        (n_block_base + atom) * kTileN + lane_row;
+                    const int local_column =
+                        wave * kNAtomsPerWave * kTileN + atom * kTileN +
+                        lane_row;
 #pragma unroll
                     for(int item = 0; item < 4; ++item)
                     {
-                        const int output_row =
-                            row_base + m_atom * kTileN + lane_group * 4 + item;
-                        if(output_row < sub_end && output_column < N)
-                        {
-                            float value = accumulators[m_atom][atom][item];
-                            if(all_bias != nullptr)
-                                value += __bfloat162float(all_bias[
-                                    static_cast<int64_t>(expert_index) * N +
-                                    output_column]);
-                            output[static_cast<int64_t>(output_row) * N +
-                                   output_column] = __float2bfloat16(value);
-                        }
+                        const int local_row = lane_group * 4 + item;
+                        const float value = accumulators[m_atom][atom][item] +
+                                            bias_values[atom];
+                        stage_base[epilogue_offset(local_row, local_column)] =
+                            __float2bfloat16(value);
                     }
                 }
+            };
+
+            auto pop_epilogue = [&](int m_atom, int stage) {
+                auto* stage_base =
+                    epilogue_cache + stage * kEpilogueStageElements;
+                const int epilogue_row =
+                    linear_thread / kEpilogueFragmentColumns;
+                const int local_column =
+                    (linear_thread % kEpilogueFragmentColumns) *
+                    kEpilogueElementsPerThread;
+#pragma unroll
+                for(int iteration = 0; iteration < kEpilogueWriteIterations;
+                    ++iteration)
+                {
+                    const int local_row =
+                        epilogue_row + iteration * kEpilogueRowsPerIteration;
+                    const int output_row =
+                        row_base + m_atom * kTileN + local_row;
+                    const int output_column =
+                        n_tile_index * kOutputColumns + local_column;
+                    if(local_row < kTileN && output_row < sub_end &&
+                       output_column + kEpilogueElementsPerThread <= N)
+                    {
+                        const uint4 packed = *reinterpret_cast<const uint4*>(
+                            stage_base +
+                            epilogue_offset(local_row, local_column));
+                        *reinterpret_cast<uint4*>(
+                            output + static_cast<int64_t>(output_row) * N +
+                            output_column) = packed;
+                    }
+                }
+            };
+
+            // The activation LDS is dead after the final K tile, so reuse it
+            // as a two-stage output transpose. This turns per-lane scalar
+            // writes into coalesced 128-bit stores for the full output tile.
+            __syncthreads();
+            push_epilogue(0, 0);
+#pragma unroll
+            for(int m_atom = 0; m_atom < kMAtoms - 1; ++m_atom)
+            {
+                __syncthreads();
+                pop_epilogue(m_atom, m_atom & 1);
+                push_epilogue(m_atom + 1, (m_atom + 1) & 1);
             }
+            __syncthreads();
+            pop_epilogue(kMAtoms - 1, (kMAtoms - 1) & 1);
+            __syncthreads();
         }
     }
 #endif
@@ -2360,6 +2536,18 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
             logical_n == 2880 &&
             (routed_m == 16 || (routed_m >= 20 && routed_m <= 32) ||
              routed_m == 64);
+        // Real GPT-OSS c7/c8 route captures show a small decode crossover that
+        // is hidden by the generic routed-M heuristic.  At 20 routed rows the
+        // gate/up projection benefits from the narrower 3-output-atom family;
+        // at 24..32 rows both projections (except the 32-row down projection)
+        // benefit from the lookahead 6-output-atom family.  These choices are
+        // confined to the two MoE projections and preserve the same IQ2R math.
+        const bool use_narrow_four_wave_gate =
+            logical_n == 5760 && routed_m == 20;
+        const bool use_lookahead_four_wave_gate =
+            logical_n == 5760 && routed_m >= 24 && routed_m <= 32;
+        const bool use_lookahead_four_wave_down =
+            logical_n == 2880 && routed_m >= 24 && routed_m <= 28;
         const bool use_narrow = routed_m < 16 && !use_wide_eight_wave_down;
         const int output_columns = use_narrow ? 48 : 96;
         const int estimated_tiles =
@@ -2396,11 +2584,44 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
         }
         const bool use_prefetch32a_auto =
             (family_override == nullptr || family_override[0] == '\0') &&
+            !tiled_activation_scales &&
             logical_k == 2880 && routed_m == 4096 &&
             (logical_n == 5760 || logical_n == 2880);
-        if(use_prefetch32a_auto &&
-           (grid_override == nullptr || grid_override[0] == '\0'))
-            launch_grid = (logical_n == 5760 ? 11 : 10) * cu_count;
+        const bool use_prefetch64_auto =
+            (family_override == nullptr || family_override[0] == '\0') &&
+            !tiled_activation_scales &&
+            logical_k == 2880 &&
+            (routed_m == 8192 ||
+             (routed_m >= 16384 && routed_m <= 65536)) &&
+            (logical_n == 5760 || logical_n == 2880);
+        const bool use_prefetch64_serving_auto =
+            use_prefetch64_auto && routed_m > 16384;
+        const bool use_prefetch64_staged_auto =
+            use_prefetch64_auto &&
+            (logical_n == 5760 || use_prefetch64_serving_auto);
+        const bool use_prefetch64_wide_auto =
+            use_prefetch64_staged_auto && logical_n == 5760 &&
+            routed_m >= 16384;
+        if(grid_override == nullptr || grid_override[0] == '\0')
+        {
+            if(use_narrow_four_wave_gate)
+                launch_grid = 5 * cu_count;
+            else if(use_lookahead_four_wave_gate)
+                launch_grid = 4 * cu_count;
+            else if(logical_n == 2880 && routed_m >= 20 && routed_m <= 28)
+                launch_grid = 6 * cu_count;
+            else if(use_prefetch32a_auto)
+                launch_grid = (logical_n == 5760 ? 11 : 10) * cu_count;
+            else if(use_prefetch64_auto && routed_m == 8192)
+                launch_grid = (logical_n == 5760 ? 12 : 10) * cu_count;
+            else if(use_prefetch64_serving_auto)
+                // Captured 16K-cap serving routes span token M=6556..16383
+                // (routed M=26224..65532).  Sixteen CU waves is within 1%
+                // of the per-shape optimum for both GPT-OSS projections.
+                launch_grid = 16 * cu_count;
+            else if(use_prefetch64_auto)
+                launch_grid = 8 * cu_count;
+        }
 
 #define IQ2R_LAUNCH_DATA_PARALLEL(TILE_N)                                    \
     hipLaunchKernelGGL(                                                       \
@@ -2447,7 +2668,7 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
             HIP_CALL_LAUNCH(hipGetLastError());
             return;
         }
-        if(use_prefetch32a_auto ||
+        if(use_prefetch32a_auto || use_prefetch64_auto ||
            (family_override != nullptr &&
             (std::strcmp(family_override, "large32") == 0 ||
             std::strcmp(family_override, "large32n") == 0 ||
@@ -2458,6 +2679,8 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
             std::strcmp(family_override, "prefetch32t") == 0 ||
             std::strcmp(family_override, "prefetch64") == 0 ||
             std::strcmp(family_override, "prefetch64a") == 0 ||
+            std::strcmp(family_override, "prefetch64s") == 0 ||
+            std::strcmp(family_override, "prefetch64w8s") == 0 ||
             std::strcmp(family_override, "large192") == 0)))
         {
 #define IQ2R_LAUNCH_LARGE_M(M_ATOMS, N_MAJOR)                                 \
@@ -2481,17 +2704,32 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
         expert_count,                                                         \
         static_cast<int>(data.size(1)),                                       \
         static_cast<int>(auxiliary.size(1)))
-            if(use_prefetch32a_auto ||
+            if(use_prefetch32a_auto || use_prefetch64_auto ||
                std::strcmp(family_override, "prefetch32") == 0 ||
                std::strcmp(family_override, "prefetch32a") == 0 ||
                std::strcmp(family_override, "prefetch32t") == 0 ||
                std::strcmp(family_override, "prefetch64") == 0 ||
-               std::strcmp(family_override, "prefetch64a") == 0)
+               std::strcmp(family_override, "prefetch64a") == 0 ||
+               std::strcmp(family_override, "prefetch64s") == 0 ||
+               std::strcmp(family_override, "prefetch64w8s") == 0)
             {
                 AITER_CHECK(logical_k == 2880,
                             "IQ2R prefetch family requires K=2880");
+                AITER_CHECK(!tiled_activation_scales,
+                            "IQ2R prefetch family requires row-major activation scales");
+                const bool wide_prefetch =
+                    use_prefetch64_wide_auto ||
+                    (family_override != nullptr &&
+                     std::strcmp(family_override, "prefetch64w8s") == 0);
+                const bool staged_prefetch =
+                    use_prefetch64_staged_auto ||
+                    (family_override != nullptr &&
+                     (std::strcmp(family_override, "prefetch64s") == 0 ||
+                      std::strcmp(family_override, "prefetch64w8s") == 0));
+                AITER_CHECK(!wide_prefetch || logical_n % 384 == 0,
+                            "IQ2R prefetch64w8s family requires N divisible by 384");
                 const bool task_persistent =
-                    !use_prefetch32a_auto &&
+                    !use_prefetch32a_auto && !use_prefetch64_auto &&
                     std::strcmp(family_override, "prefetch32t") == 0;
                 const int task_splits =
                     grid_override != nullptr && grid_override[0] != '\0'
@@ -2501,13 +2739,21 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
                                               ? static_cast<int>(tasks.size(0)) *
                                                     task_splits
                                               : launch_grid;
-#define IQ2R_LAUNCH_PREFETCH(M_ATOMS, TASK_PERSISTENT, PIN_TO_AGPR)           \
+#define IQ2R_LAUNCH_PREFETCH(M_ATOMS,                                         \
+                             PHYSICAL_WAVES,                                  \
+                             STAGED_SCALES,                                   \
+                             TASK_PERSISTENT,                                 \
+                             PIN_TO_AGPR,                                     \
+                             USE_BIAS)                                        \
     hipLaunchKernelGGL(                                                       \
         (iq2r_task_gemm_prefetch_x192_kernel<M_ATOMS,                         \
+                                              PHYSICAL_WAVES,                 \
+                                              STAGED_SCALES,                  \
                                               TASK_PERSISTENT,                \
-                                              PIN_TO_AGPR>),                  \
+                                              PIN_TO_AGPR,                    \
+                                              USE_BIAS>),                     \
         dim3(static_cast<uint32_t>(prefetch_grid)),                           \
-        dim3(64, 4),                                                          \
+        dim3(64, PHYSICAL_WAVES),                                             \
         0,                                                                    \
         getCurrentHIPStream(),                                                \
         static_cast<const opus::fp8_t*>(activations.data_ptr()),              \
@@ -2525,18 +2771,62 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
         static_cast<int>(data.size(1)),                                       \
         static_cast<int>(auxiliary.size(1)),                                  \
         task_splits)
-                if(!use_prefetch32a_auto &&
-                   std::strcmp(family_override, "prefetch32") == 0)
-                    IQ2R_LAUNCH_PREFETCH(2, false, false);
-                else if(use_prefetch32a_auto ||
-                        std::strcmp(family_override, "prefetch32a") == 0)
-                    IQ2R_LAUNCH_PREFETCH(2, false, true);
-                else if(task_persistent)
-                    IQ2R_LAUNCH_PREFETCH(2, true, false);
-                else if(std::strcmp(family_override, "prefetch64") == 0)
-                    IQ2R_LAUNCH_PREFETCH(4, false, false);
+                if(bias_pointer != nullptr)
+                {
+                    if(use_prefetch32a_auto)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, false, true, true);
+                    else if(use_prefetch64_auto)
+                    {
+                        if(wide_prefetch)
+                            IQ2R_LAUNCH_PREFETCH(4, 8, true, false, false, true);
+                        else if(staged_prefetch)
+                            IQ2R_LAUNCH_PREFETCH(4, 4, true, false, false, true);
+                        else
+                            IQ2R_LAUNCH_PREFETCH(4, 4, false, false, false, true);
+                    }
+                    else if(std::strcmp(family_override, "prefetch32") == 0)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, false, false, true);
+                    else if(std::strcmp(family_override, "prefetch32a") == 0)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, false, true, true);
+                    else if(task_persistent)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, true, false, true);
+                    else if(std::strcmp(family_override, "prefetch64") == 0)
+                        IQ2R_LAUNCH_PREFETCH(4, 4, false, false, false, true);
+                    else if(wide_prefetch)
+                        IQ2R_LAUNCH_PREFETCH(4, 8, true, false, false, true);
+                    else if(staged_prefetch)
+                        IQ2R_LAUNCH_PREFETCH(4, 4, true, false, false, true);
+                    else
+                        IQ2R_LAUNCH_PREFETCH(4, 4, false, false, true, true);
+                }
                 else
-                    IQ2R_LAUNCH_PREFETCH(4, false, true);
+                {
+                    if(use_prefetch32a_auto)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, false, true, false);
+                    else if(use_prefetch64_auto)
+                    {
+                        if(wide_prefetch)
+                            IQ2R_LAUNCH_PREFETCH(4, 8, true, false, false, false);
+                        else if(staged_prefetch)
+                            IQ2R_LAUNCH_PREFETCH(4, 4, true, false, false, false);
+                        else
+                            IQ2R_LAUNCH_PREFETCH(4, 4, false, false, false, false);
+                    }
+                    else if(std::strcmp(family_override, "prefetch32") == 0)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, false, false, false);
+                    else if(std::strcmp(family_override, "prefetch32a") == 0)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, false, true, false);
+                    else if(task_persistent)
+                        IQ2R_LAUNCH_PREFETCH(2, 4, false, true, false, false);
+                    else if(std::strcmp(family_override, "prefetch64") == 0)
+                        IQ2R_LAUNCH_PREFETCH(4, 4, false, false, false, false);
+                    else if(wide_prefetch)
+                        IQ2R_LAUNCH_PREFETCH(4, 8, true, false, false, false);
+                    else if(staged_prefetch)
+                        IQ2R_LAUNCH_PREFETCH(4, 4, true, false, false, false);
+                    else
+                        IQ2R_LAUNCH_PREFETCH(4, 4, false, false, true, false);
+                }
 #undef IQ2R_LAUNCH_PREFETCH
             }
             else if(std::strcmp(family_override, "large32") == 0)
@@ -2628,7 +2918,8 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
                             "data128, or "
                             "large32, large32n, large64, large64n, "
                             "prefetch32, prefetch32a, prefetch32t, "
-                            "prefetch64, prefetch64a, or "
+                            "prefetch64, prefetch64a, prefetch64s, "
+                            "prefetch64w8s, or "
                             "large192");
         }
         else if(use_narrow)
@@ -2660,6 +2951,20 @@ void iq2r_task_gemm_out(const aiter_tensor_t& activations,
                 IQ2R_LAUNCH_COOPERATIVE(6, 8, false, false, true, true, 2);
             else
                 IQ2R_LAUNCH_COOPERATIVE(6, 8, false, false, false, true, 2);
+        }
+        else if(use_narrow_four_wave_gate)
+        {
+            if(tiled_activation_scales)
+                IQ2R_LAUNCH_COOPERATIVE(3, 4, false, false, true, true, 2);
+            else
+                IQ2R_LAUNCH_COOPERATIVE(3, 4, false, false, false, true, 2);
+        }
+        else if(use_lookahead_four_wave_gate || use_lookahead_four_wave_down)
+        {
+            if(tiled_activation_scales)
+                IQ2R_LAUNCH_COOPERATIVE(6, 4, true, false, true, true, 2);
+            else
+                IQ2R_LAUNCH_COOPERATIVE(6, 4, true, false, false, true, 2);
         }
         else if(use_narrow_four_wave_down)
         {

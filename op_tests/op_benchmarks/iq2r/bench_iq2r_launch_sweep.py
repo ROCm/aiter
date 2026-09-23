@@ -36,6 +36,7 @@ EXPERTS = 128
 TOPK = 4
 HIDDEN = 2880
 FAMILIES = (
+    "auto",
     "3x4",
     "3x4scalar",
     "3x4t",
@@ -53,6 +54,20 @@ FAMILIES = (
     "6x8",
     "6x8t",
     "6x8a",
+    "data64",
+    "data128",
+    "large32",
+    "large32n",
+    "large64",
+    "large64n",
+    "prefetch32",
+    "prefetch32a",
+    "prefetch32t",
+    "prefetch64",
+    "prefetch64a",
+    "prefetch64s",
+    "prefetch64w8s",
+    "large192",
 )
 
 
@@ -92,8 +107,14 @@ def _benchmark_graph(
 
 def _set_launch(projection: str, family: str, grid: int) -> None:
     prefix = "IQ2R_GEMM_GATE_UP" if projection == "gate_up" else "IQ2R_GEMM_DOWN"
-    os.environ[f"{prefix}_FAMILY"] = family
-    os.environ[f"{prefix}_GRID_MULTIPLIER"] = str(grid)
+    if family == "auto":
+        os.environ.pop(f"{prefix}_FAMILY", None)
+    else:
+        os.environ[f"{prefix}_FAMILY"] = family
+    if grid == 0:
+        os.environ.pop(f"{prefix}_GRID_MULTIPLIER", None)
+    else:
+        os.environ[f"{prefix}_GRID_MULTIPLIER"] = str(grid)
 
 
 def _clear_launches() -> None:
@@ -126,6 +147,8 @@ def _select_files(root: Path, tokens: int, limit: int) -> list[Path]:
         raise FileNotFoundError(f"no m={tokens} route captures under {root}")
     if len(files) <= limit:
         return files
+    if limit == 1:
+        return [files[0]]
     # Even spacing retains examples from early/middle/late layers and decode steps.
     indices = [round(i * (len(files) - 1) / (limit - 1)) for i in range(limit)]
     return [files[i] for i in indices]
@@ -165,7 +188,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     for tokens in args.m:
         workspace = IQ2RMoeWorkspace.allocate(
-            tokens, TOPK, device=device, task_rows=args.task_rows
+            tokens,
+            TOPK,
+            device=device,
+            task_rows=args.task_rows,
+            scale_layout=args.scale_layout,
         )
         routes = tokens * TOPK
         task_capacity = iq2r_task_capacity(routes, EXPERTS, args.task_rows)
@@ -174,10 +201,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         gather = workspace.gather_indices[:routes]
         scatter = workspace.scatter_indices[:routes]
         route_input_fp8 = workspace.route_input_fp8[:routes]
-        route_input_scales = workspace.route_input_scales[:routes]
+        route_input_scales = (
+            workspace.route_input_scales[:routes]
+            if args.scale_layout == "row_major"
+            else workspace.route_input_scales
+        )
         gate_up = workspace.gate_up[:routes]
         intermediate_fp8 = workspace.intermediate_fp8[:routes]
-        intermediate_scales = workspace.intermediate_scales[:routes]
+        intermediate_scales = (
+            workspace.intermediate_scales[:routes]
+            if args.scale_layout == "row_major"
+            else workspace.intermediate_scales
+        )
         route_output = workspace.route_output[:routes]
 
         for route_name, topk_ids in _route_cases(args, tokens, device):
@@ -207,6 +242,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     sorted_ids,
                     gather,
                     scatter,
+                    workspace.sort_workspace,
                     tasks,
                     workspace.task_count,
                     expert_count=EXPERTS,
@@ -232,101 +268,107 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
             _clear_launches()
             gate_call()
-            gate_reference = gate_up.clone()
-            for family, grid in candidates:
-                _set_launch("gate_up", family, grid)
-                latency, samples = _benchmark_graph(
-                    gate_call, args.warmup, args.iterations, args.samples
-                )
-                error = float((gate_up.float() - gate_reference.float()).abs().max())
-                relative_rmse, cosine = _relative_metrics(gate_up, gate_reference)
-                records.append(
-                    {
-                        "M": tokens,
-                        "routing": route_name.removeprefix("synthetic-")
-                        if route_name.startswith("synthetic-")
-                        else "captured",
-                        "route_file": route_name,
-                        "projection": "gate_up",
-                        "family": family,
-                        "grid_multiplier": grid,
-                        "latency_ms": latency,
-                        "samples_ms": samples,
-                        "max_abs_error_vs_default": error,
-                        "relative_rmse_vs_default": relative_rmse,
-                        "mean_cosine_vs_default": cosine,
-                        "task_count": int(workspace.task_count.item()),
-                        "unique_experts": int(topk_ids.unique().numel()),
-                        "max_expert_load": int(
-                            torch.bincount(
-                                topk_ids.reshape(-1), minlength=EXPERTS
-                            ).max()
-                        ),
-                    }
-                )
+            if "gate_up" in args.projections:
+                gate_reference = gate_up.clone()
+                for family, grid in candidates:
+                    _set_launch("gate_up", family, grid)
+                    latency, samples = _benchmark_graph(
+                        gate_call, args.warmup, args.iterations, args.samples
+                    )
+                    error = float(
+                        (gate_up.float() - gate_reference.float()).abs().max()
+                    )
+                    relative_rmse, cosine = _relative_metrics(gate_up, gate_reference)
+                    records.append(
+                        {
+                            "M": tokens,
+                            "routing": route_name.removeprefix("synthetic-")
+                            if route_name.startswith("synthetic-")
+                            else "captured",
+                            "route_file": route_name,
+                            "projection": "gate_up",
+                            "family": family,
+                            "grid_multiplier": grid,
+                            "latency_ms": latency,
+                            "samples_ms": samples,
+                            "max_abs_error_vs_default": error,
+                            "relative_rmse_vs_default": relative_rmse,
+                            "mean_cosine_vs_default": cosine,
+                            "task_count": int(workspace.task_count.item()),
+                            "unique_experts": int(topk_ids.unique().numel()),
+                            "max_expert_load": int(
+                                torch.bincount(
+                                    topk_ids.reshape(-1), minlength=EXPERTS
+                                ).max()
+                            ),
+                        }
+                    )
 
-            # Produce one stable intermediate for the independent down sweep.
-            _clear_launches()
-            gate_call()
-            iq2r_swiglu_quant_out(gate_up, intermediate_fp8, intermediate_scales)
+            if "down" in args.projections:
+                # Produce one stable intermediate for the independent down sweep.
+                _clear_launches()
+                gate_call()
+                iq2r_swiglu_quant_out(gate_up, intermediate_fp8, intermediate_scales)
 
-            def down_call():
-                iq2r_task_gemm_out(
-                    intermediate_fp8,
-                    intermediate_scales,
-                    checkpoint.down_data,
-                    checkpoint.down_auxiliary,
-                    tasks,
-                    workspace.task_count,
-                    checkpoint.down_metadata,
-                    route_output,
-                    tile_n=checkpoint.down_tile_n,
-                    bias=checkpoint.down_bias,
-                )
+                def down_call():
+                    iq2r_task_gemm_out(
+                        intermediate_fp8,
+                        intermediate_scales,
+                        checkpoint.down_data,
+                        checkpoint.down_auxiliary,
+                        tasks,
+                        workspace.task_count,
+                        checkpoint.down_metadata,
+                        route_output,
+                        tile_n=checkpoint.down_tile_n,
+                        bias=checkpoint.down_bias,
+                    )
 
-            _clear_launches()
-            down_call()
-            down_reference = route_output.clone()
-            for family, grid in candidates:
-                _set_launch("down", family, grid)
-                latency, samples = _benchmark_graph(
-                    down_call, args.warmup, args.iterations, args.samples
-                )
-                error = float(
-                    (route_output.float() - down_reference.float()).abs().max()
-                )
-                relative_rmse, cosine = _relative_metrics(route_output, down_reference)
-                records.append(
-                    {
-                        "M": tokens,
-                        "routing": route_name.removeprefix("synthetic-")
-                        if route_name.startswith("synthetic-")
-                        else "captured",
-                        "route_file": route_name,
-                        "projection": "down",
-                        "family": family,
-                        "grid_multiplier": grid,
-                        "latency_ms": latency,
-                        "samples_ms": samples,
-                        "max_abs_error_vs_default": error,
-                        "relative_rmse_vs_default": relative_rmse,
-                        "mean_cosine_vs_default": cosine,
-                        "task_count": int(workspace.task_count.item()),
-                        "unique_experts": int(topk_ids.unique().numel()),
-                        "max_expert_load": int(
-                            torch.bincount(
-                                topk_ids.reshape(-1), minlength=EXPERTS
-                            ).max()
-                        ),
-                    }
-                )
+                _clear_launches()
+                down_call()
+                down_reference = route_output.clone()
+                for family, grid in candidates:
+                    _set_launch("down", family, grid)
+                    latency, samples = _benchmark_graph(
+                        down_call, args.warmup, args.iterations, args.samples
+                    )
+                    error = float(
+                        (route_output.float() - down_reference.float()).abs().max()
+                    )
+                    relative_rmse, cosine = _relative_metrics(
+                        route_output, down_reference
+                    )
+                    records.append(
+                        {
+                            "M": tokens,
+                            "routing": route_name.removeprefix("synthetic-")
+                            if route_name.startswith("synthetic-")
+                            else "captured",
+                            "route_file": route_name,
+                            "projection": "down",
+                            "family": family,
+                            "grid_multiplier": grid,
+                            "latency_ms": latency,
+                            "samples_ms": samples,
+                            "max_abs_error_vs_default": error,
+                            "relative_rmse_vs_default": relative_rmse,
+                            "mean_cosine_vs_default": cosine,
+                            "task_count": int(workspace.task_count.item()),
+                            "unique_experts": int(topk_ids.unique().numel()),
+                            "max_expert_load": int(
+                                torch.bincount(
+                                    topk_ids.reshape(-1), minlength=EXPERTS
+                                ).max()
+                            ),
+                        }
+                    )
             _clear_launches()
 
     aggregate = []
     route_groups = args.routing if args.routing else ["captured"]
     for tokens in args.m:
         for routing_pattern in route_groups:
-            for projection in ("gate_up", "down"):
+            for projection in args.projections:
                 for family, grid in candidates:
                     selected = [
                         float(record["latency_ms"])
@@ -406,7 +448,18 @@ def main() -> None:
     parser.add_argument("--m", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--families", nargs="+", choices=FAMILIES, default=FAMILIES)
     parser.add_argument(
+        "--projections",
+        nargs="+",
+        choices=("gate_up", "down"),
+        default=("gate_up", "down"),
+    )
+    parser.add_argument(
         "--task-rows", type=int, choices=(16, 32, 64, 128, 256), default=16
+    )
+    parser.add_argument(
+        "--scale-layout",
+        choices=("row_major", "tile16"),
+        default="row_major",
     )
     parser.add_argument("--grid", type=int, nargs="+", default=[1, 2, 3, 4, 5])
     parser.add_argument("--max-route-files", type=int, default=16)
@@ -422,7 +475,7 @@ def main() -> None:
     route_groups = args.routing if args.routing else ["captured"]
     for tokens in args.m:
         for routing_pattern in route_groups:
-            for projection in ("gate_up", "down"):
+            for projection in args.projections:
                 rows = [
                     row
                     for row in result["aggregate"]

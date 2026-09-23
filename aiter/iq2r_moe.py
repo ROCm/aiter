@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from .ops.iq2r import (
-    iq2r_route_gather_quant_out,
+    iq2r_route_gather_quant_broadcast_out,
     iq2r_route_direct_gather_quant_out,
     iq2r_route_reduce_add_rmsnorm_indexed_out,
     iq2r_route_reduce_indexed_out,
@@ -63,6 +63,7 @@ class IQ2RMoeWorkspace:
     sorted_expert_ids: Tensor
     gather_indices: Tensor
     scatter_indices: Tensor
+    sort_workspace: Tensor
     tasks: Tensor
     task_count: Tensor
     topk_weights: Tensor
@@ -134,6 +135,7 @@ class IQ2RMoeWorkspace:
             sorted_expert_ids=torch.empty((routes,), **i32),
             gather_indices=torch.empty((routes,), **i32),
             scatter_indices=torch.empty((routes,), **i32),
+            sort_workspace=torch.empty((16 * (max_experts + 1),), **i32),
             tasks=torch.empty((task_capacity, 3), **i32),
             task_count=torch.empty((1,), **i32),
             topk_weights=torch.empty(
@@ -212,6 +214,12 @@ def _validate_workspace(
         ),
         ("gather_indices", workspace.gather_indices, torch.int32, (routes,)),
         ("scatter_indices", workspace.scatter_indices, torch.int32, (routes,)),
+        (
+            "sort_workspace",
+            workspace.sort_workspace,
+            torch.int32,
+            (16 * (workspace.max_experts + 1),),
+        ),
         ("tasks", workspace.tasks, torch.int32, (task_capacity, 3)),
         ("task_count", workspace.task_count, torch.int32, (1,)),
         (
@@ -395,13 +403,24 @@ def iq2r_fused_moe_out(
             raise ValueError("router_bias must be contiguous on the hidden-state GPU")
 
     routes = tokens * topk
-    # The pinned high-M prefetch kernel is validated for the production
-    # 1024-token prefill shape (GPT-OSS top-k=4 => 4096 routed rows). Matching
-    # its 32-row tile there avoids serial work for a hot expert while leaving
-    # larger prefills on the established task policy; stitched M=2048 captures
-    # regress when this specialization is applied beyond its measured shape.
-    task_rows = 32 if routes == 4096 else workspace.task_rows
-    regular_task_capacity = iq2r_task_capacity(routes, experts, workspace.task_rows)
+    # Use only task shapes qualified on captured GPT-OSS production routes.
+    # The 1024-token prefill shape favors 32-row tasks, while 2048/4096-token
+    # prefills favor the independent 64-row family.  A caller may provide a
+    # workspace sized for a larger custom task shape, so fall back instead of
+    # slicing beyond its fixed, graph-safe task buffer.
+    if routes == 4096:
+        preferred_task_rows = 32
+    elif routes >= 8192:
+        preferred_task_rows = 64
+    else:
+        preferred_task_rows = workspace.task_rows
+    preferred_task_capacity = iq2r_task_capacity(routes, experts, preferred_task_rows)
+    task_rows = (
+        preferred_task_rows
+        if workspace.tasks.shape[0] >= preferred_task_capacity
+        else workspace.task_rows
+    )
+    regular_task_capacity = iq2r_task_capacity(routes, experts, task_rows)
     direct_task_mode = (
         routes <= IQ2R_DIRECT_ROUTE_MAX and workspace.tasks.shape[0] >= routes
     )
@@ -481,14 +500,15 @@ def iq2r_fused_moe_out(
             sorted_expert_ids,
             gather_indices,
             scatter_indices,
+            workspace.sort_workspace,
             tasks,
             workspace.task_count,
             expert_count=experts,
             task_rows=task_rows,
         )
-        iq2r_route_gather_quant_out(
+        iq2r_route_gather_quant_broadcast_out(
             hidden_states,
-            gather_indices,
+            scatter_indices,
             route_input_fp8,
             route_input_scales,
             topk=topk,

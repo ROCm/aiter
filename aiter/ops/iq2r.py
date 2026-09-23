@@ -76,6 +76,7 @@ def _iq2r_route_sort_tasks_out(
     sorted_expert_ids: Tensor,
     gather_indices: Tensor,
     scatter_indices: Tensor,
+    sort_workspace: Tensor,
     tasks: Tensor,
     task_count: Tensor,
     expert_count: int,
@@ -96,6 +97,20 @@ def _iq2r_route_gather_indexed_out(
 def _iq2r_route_gather_quant_out(
     input: Tensor,
     gather_indices: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    topk: int,
+) -> None: ...
+
+
+@compile_ops(
+    "module_iq2r_moe",
+    fc_name="iq2r_route_gather_quant_broadcast_out",
+    develop=True,
+)
+def _iq2r_route_gather_quant_broadcast_out(
+    input: Tensor,
+    scatter_indices: Tensor,
     output: Tensor,
     scales: Tensor,
     topk: int,
@@ -553,7 +568,7 @@ def iq2r_task_gemm(
 
 
 def iq2r_task_capacity(routes: int, expert_count: int, task_rows: int) -> int:
-    """Worst-case task capacity for stable expert runs plus invalid IDs."""
+    """Worst-case task capacity for expert groups plus invalid IDs."""
 
     for name, value in (("routes", routes), ("expert_count", expert_count)):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -570,13 +585,14 @@ def iq2r_route_sort_tasks_out(
     sorted_expert_ids: Tensor,
     gather_indices: Tensor,
     scatter_indices: Tensor,
+    sort_workspace: Tensor,
     tasks: Tensor,
     task_count: Tensor,
     *,
     expert_count: int,
     task_rows: int,
 ) -> None:
-    """Stable-sort routes by expert and build bounded GEMM tasks."""
+    """Group routes by expert and build bounded GEMM tasks."""
 
     if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
         raise ValueError("expert_ids must be int32 [routes]")
@@ -588,6 +604,12 @@ def iq2r_route_sort_tasks_out(
         t.dtype != torch.int32 or tuple(t.shape) != (routes,) for t in expected_vectors
     ):
         raise ValueError("sorted/gather/scatter tensors must be int32 [routes]")
+    if (
+        sort_workspace.dtype != torch.int32
+        or sort_workspace.ndim != 1
+        or sort_workspace.numel() < 16 * (expert_count + 1)
+    ):
+        raise ValueError("sort_workspace must be int32 [at least 16*(expert_count+1)]")
     if tasks.dtype != torch.int32 or tasks.ndim != 2 or tasks.shape[1] != 3:
         raise ValueError("tasks must be int32 [capacity,3]")
     if task_count.dtype != torch.int32 or tuple(task_count.shape) != (1,):
@@ -602,6 +624,7 @@ def iq2r_route_sort_tasks_out(
         sorted_expert_ids,
         gather_indices,
         scatter_indices,
+        sort_workspace,
         tasks,
         task_count,
     )
@@ -616,6 +639,7 @@ def iq2r_route_sort_tasks_out(
         sorted_expert_ids,
         gather_indices,
         scatter_indices,
+        sort_workspace,
         tasks,
         task_count,
         expert_count,
@@ -630,7 +654,7 @@ def iq2r_route_gather_indexed_out(
     *,
     topk: int,
 ) -> None:
-    """Gather token rows into stable expert-sorted route order."""
+    """Gather token rows into expert-grouped route order."""
 
     if input.dtype != torch.bfloat16 or input.ndim != 2:
         raise ValueError("input must be BF16 [tokens,hidden]")
@@ -697,6 +721,52 @@ def iq2r_route_gather_quant_out(
             "IQ2R fused gather/quant indices and outputs must be contiguous"
         )
     _iq2r_route_gather_quant_out(input, gather_indices, output, scales, topk)
+
+
+def iq2r_route_gather_quant_broadcast_out(
+    input: Tensor,
+    scatter_indices: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    *,
+    topk: int,
+) -> None:
+    """Quantize each source token once and scatter it to sorted top-k routes."""
+
+    if input.dtype != torch.bfloat16 or input.ndim != 2:
+        raise ValueError("input must be BF16 [tokens,hidden]")
+    if scatter_indices.dtype != torch.int32 or scatter_indices.ndim != 1:
+        raise ValueError("scatter_indices must be int32 [routes]")
+    if topk != 4 or scatter_indices.numel() != input.shape[0] * topk:
+        raise ValueError("broadcast gather/quant requires GPT-OSS topk=4")
+    if input.shape[1] % 32 or input.shape[1] // 32 > 128:
+        raise ValueError(
+            "broadcast gather/quant requires 32-aligned hidden with at most 128 groups"
+        )
+    expected_output = (scatter_indices.numel(), input.shape[1])
+    scale_rows = scatter_indices.numel()
+    scale_groups = input.shape[1] // 32
+    if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != expected_output:
+        raise ValueError(f"output must be float8_e4m3fn {expected_output}")
+    if not _valid_activation_scale_shape(scales, scale_rows, scale_groups):
+        raise ValueError(
+            f"scales must be row-major uint8 [{scale_rows},{scale_groups}] "
+            "or tile16 uint8 "
+            f"[{(scale_groups + 3) // 4},{(scale_rows + 15) // 16},4,16]"
+        )
+    tensors = (input, scatter_indices, output, scales)
+    if any(t.device != input.device for t in tensors) or input.device.type != "cuda":
+        raise ValueError("IQ2R broadcast gather/quant tensors must share one GPU")
+    if input.stride(-1) != 1 or input.stride(0) < input.shape[1]:
+        raise ValueError(
+            "IQ2R broadcast gather/quant input must have contiguous columns and "
+            "non-overlapping rows"
+        )
+    if any(not t.is_contiguous() for t in (scatter_indices, output, scales)):
+        raise ValueError(
+            "IQ2R broadcast gather/quant indices and outputs must be contiguous"
+        )
+    _iq2r_route_gather_quant_broadcast_out(input, scatter_indices, output, scales, topk)
 
 
 def iq2r_route_direct_gather_quant_out(
@@ -1158,6 +1228,7 @@ __all__ = [
     "iq2r_materialize_out",
     "iq2r_route_gather_indexed_out",
     "iq2r_route_gather_quant_out",
+    "iq2r_route_gather_quant_broadcast_out",
     "iq2r_route_direct_gather_quant_out",
     "iq2r_route_topk_direct_gather_quant_out",
     "iq2r_route_topk_sort_gather_quant_out",

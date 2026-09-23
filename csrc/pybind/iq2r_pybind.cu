@@ -60,6 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("sorted_expert_ids"),
           py::arg("gather_indices"),
           py::arg("scatter_indices"),
+          py::arg("sort_workspace"),
           py::arg("tasks"),
           py::arg("task_count"),
           py::arg("expert_count"),
@@ -74,6 +75,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           &aiter::iq2r_route_gather_quant_out,
           py::arg("input"),
           py::arg("gather_indices"),
+          py::arg("output"),
+          py::arg("scales"),
+          py::arg("topk"));
+    m.def("iq2r_route_gather_quant_broadcast_out",
+          &aiter::iq2r_route_gather_quant_broadcast_out,
+          py::arg("input"),
+          py::arg("scatter_indices"),
           py::arg("output"),
           py::arg("scales"),
           py::arg("topk"));
