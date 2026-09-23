@@ -41,12 +41,24 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_BACKENDS,
     MHA_FWD_CANDIDATE_FIELDS,
     MHA_FWD_CONFIG_ENV,
+    MHA_FWD_ERROR_ATOL,
+    MHA_FWD_ERROR_METRIC,
+    MHA_FWD_ERROR_RTOL,
     MHA_FWD_FAMILY,
+    MHA_FWD_FINALIST_ROUNDS,
+    MHA_FWD_FINALISTS,
     MHA_FWD_INDIFFERENCE_DELTA,
+    MHA_FWD_MAX_ERROR_RATIO,
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
+    MHA_FWD_RACE_ALPHA,
+    MHA_FWD_RACE_BLOCK_CALLS,
+    MHA_FWD_RACE_MAX_BLOCKS,
+    MHA_FWD_RACE_MIN_BLOCKS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_SAMPLE_SEED,
     MHA_FWD_SIGNIFICANCE_SIGMA,
+    MHA_FWD_TASK_TIMEOUT_S,
     MHA_FWD_TILE_CONFIG_BACKENDS,
     MHA_FWD_TUNING_KEY_FIELDS,
     MHA_FWD_UNTUNED_CSV,
@@ -67,10 +79,6 @@ from aiter.utility.block_race import (
     race,
 )
 from aiter.utility.mp_tuner import MpTunerTask, mp_tuner
-
-# Fixed so that --race-candidates draws the same subset on every run; a
-# sampled field that changed between runs would make two runs incomparable.
-MHA_FWD_RACE_SAMPLE_SEED = 20240917
 
 UNTUNED_FIELDS = MHA_FWD_PROBLEM_KEY_FIELDS
 RESULT_FIELDS = (*MHA_FWD_CANDIDATE_FIELDS, *MHA_FWD_METRIC_FIELDS)
@@ -390,15 +398,15 @@ class MhaFwdTuner(TunerCommon):
         "tune_file": AITER_CONFIG_MHA_FWD,
         "untune_file": f"aiter/configs/{MHA_FWD_UNTUNED_CSV}",
         "batch": 8,
-        "errRatio": 0.0,
-        "timeout": 7200,
+        "errRatio": MHA_FWD_MAX_ERROR_RATIO,
+        "timeout": MHA_FWD_TASK_TIMEOUT_S,
         "config_env_name": MHA_FWD_CONFIG_ENV,
-        "finalist_rounds": 3,
+        "finalist_rounds": MHA_FWD_FINALIST_ROUNDS,
     }
     # errRatio is the fraction of output elements outside these tolerances.
-    ERROR_METRIC = "allclose_mismatch_fraction"
-    ERROR_RTOL = 2e-2
-    ERROR_ATOL = 2e-2
+    ERROR_METRIC = MHA_FWD_ERROR_METRIC
+    ERROR_RTOL = MHA_FWD_ERROR_RTOL
+    ERROR_ATOL = MHA_FWD_ERROR_ATOL
 
     def __init__(self):
         super().__init__(
@@ -472,25 +480,25 @@ class MhaFwdTuner(TunerCommon):
         self.parser.add_argument(
             "--race-alpha",
             type=float,
-            default=0.05,
+            default=MHA_FWD_RACE_ALPHA,
             help="race only: error budget, spread over every candidate and look",
         )
         self.parser.add_argument(
             "--race-block-calls",
             type=int,
-            default=10,
+            default=MHA_FWD_RACE_BLOCK_CALLS,
             help="race only: timed calls per candidate per block",
         )
         self.parser.add_argument(
             "--race-min-blocks",
             type=int,
-            default=3,
+            default=MHA_FWD_RACE_MIN_BLOCKS,
             help="race only: blocks before any candidate may be eliminated",
         )
         self.parser.add_argument(
             "--race-max-blocks",
             type=int,
-            default=30,
+            default=MHA_FWD_RACE_MAX_BLOCKS,
             help=(
                 "race only: ceiling on blocks. Reaching it without certifying "
                 "returns a ranking rather than a guarantee, and the evidence "
@@ -878,9 +886,7 @@ class MhaFwdTuner(TunerCommon):
         )
         sample = getattr(args, "candidate_sample", None)
         if sample is not None and sample < len(candidates):
-            candidates = random.Random(MHA_FWD_RACE_SAMPLE_SEED).sample(
-                candidates, sample
-            )
+            candidates = random.Random(MHA_FWD_SAMPLE_SEED).sample(candidates, sample)
         autoselect = self._resolve_autoselect(row)
         self._autoselect_by_key[key] = autoselect
         incumbent = self._resolve_incumbent(row, args, key, autoselect)
@@ -986,14 +992,12 @@ class MhaFwdTuner(TunerCommon):
 
         finalist_infos = []
         for _, row in untunedf.iterrows():
-            key = MhaFwdProblem.from_mapping(
-                {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
-            ).key()
             finalist_infos.extend(
                 result[0]
                 for result in sorted(
-                    finalists_by_key.get(key, ()), key=lambda item: item[1]
-                )[:8]
+                    finalists_by_key.get(self.lookup_key(row), ()),
+                    key=lambda item: item[1],
+                )[:MHA_FWD_FINALISTS]
             )
         if not finalist_infos:
             return first_pass
@@ -1115,7 +1119,7 @@ class MhaFwdTuner(TunerCommon):
                 "block_calls": int(args.race_block_calls),
                 "min_blocks": int(args.race_min_blocks),
                 "max_blocks": int(args.race_max_blocks),
-                "seed": int(MHA_FWD_RACE_SAMPLE_SEED),
+                "seed": int(MHA_FWD_SAMPLE_SEED),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1213,7 +1217,7 @@ class MhaFwdTuner(TunerCommon):
             block_calls=args.race_block_calls,
             min_blocks=args.race_min_blocks,
             max_blocks=args.race_max_blocks,
-            seed=MHA_FWD_RACE_SAMPLE_SEED,
+            seed=MHA_FWD_SAMPLE_SEED,
             journal=journal,
             resume=args.resume,
             verbose=args.verbose,
@@ -2064,6 +2068,7 @@ class MhaFwdTuner(TunerCommon):
             "measurement": {
                 "warmup": int(self._args.warmup),
                 "iterations": int(self._args.iters),
+                "finalists": MHA_FWD_FINALISTS,
                 "finalist_rounds": int(self._args.finalist_rounds),
                 "statistic": "median of finalist round means",
                 "rtol": self.ERROR_RTOL,
