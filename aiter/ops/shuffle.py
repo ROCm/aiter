@@ -347,7 +347,14 @@ def shuffle_scale(
             dtype=src.dtype,
             device=src.device,
         )
-
+        # Initialise the pad. torch.empty leaves it undefined, and kernels that
+        # read whole 8-group tiles then consume garbage (E8M0 0xFF is NaN), so
+        # the result depends on stale device memory. 0x7F is E8M0 1.0, matching
+        # the is_guinterleave branch below.
+        if scale_padded.element_size() == 1:
+            scale_padded.view(torch.uint8).fill_(0x7F)
+        else:
+            scale_padded.fill_(1.0)
         scale_padded[:m, :n] = src
         scale = scale_padded
         sm, sn = scale.shape

@@ -155,8 +155,14 @@ def fused_recurrent_gated_delta_rule(
 
     # Log operation
     _LOGGER.info(
-        f"GATED_DELTA_RULE: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_g={g is not None}, use_gk={gk is not None}, use_gv={gv is not None}"
+        "GATED_DELTA_RULE: q=%s, k=%s, v=%s, scale=%s, use_g=%s, use_gk=%s, use_gv=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        g is not None,
+        gk is not None,
+        gv is not None,
     )
 
     # Calculate block sizes
@@ -314,8 +320,12 @@ def chunk_gated_delta_rule(
 
     # Log operation
     _LOGGER.info(
-        f"CHUNK_GATED_DELTA_RULE: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+        "CHUNK_GATED_DELTA_RULE: q=%s, k=%s, v=%s, scale=%s, use_qk_l2norm=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        use_qk_l2norm_in_kernel,
     )
 
     # Apply L2 normalization if requested. ``need_rstd`` defaults to
@@ -418,8 +428,12 @@ def chunk_gated_delta_rule_opt(
 
     # Log operation
     _LOGGER.info(
-        f"CHUNK_GATED_DELTA_RULE_OPT: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+        "CHUNK_GATED_DELTA_RULE_OPT: q=%s, k=%s, v=%s, scale=%s, use_qk_l2norm=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        use_qk_l2norm_in_kernel,
     )
 
     # Apply L2 normalization if requested
@@ -559,8 +573,12 @@ def chunk_gated_delta_rule_opt_vk(
         scale = k.shape[-1] ** -0.5
 
     _LOGGER.info(
-        f"CHUNK_GATED_DELTA_RULE_OPT_VK: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+        "CHUNK_GATED_DELTA_RULE_OPT_VK: q=%s, k=%s, v=%s, scale=%s, use_qk_l2norm=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        use_qk_l2norm_in_kernel,
     )
 
     if use_qk_l2norm_in_kernel:
