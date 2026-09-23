@@ -32,16 +32,20 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import zlib
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.flydsl import linear_attention_prefill_kernels
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+    _flydsl_run_only,
     chunk_gated_delta_rule_fwd_h_flydsl_opt,
 )
 from aiter.ops.prefill_batch_metadata import (
@@ -437,7 +441,7 @@ def _case_seed(context_lens, case: PrefillArgs) -> int:
     return zlib.crc32(f"{case!r}|{list(context_lens)}".encode()) & 0x7FFFFFFF
 
 
-def _make_inputs(case: PrefillArgs, context_lens):
+def _make_inputs(case: PrefillArgs, context_lens, *, stable_coupling=False):
     """Build the K5 operands as the serving stack hands them over.
 
     ``k`` is GQA token-major ``[B, T, Hg, K]``; ``w``/``u`` are the head-major
@@ -459,18 +463,28 @@ def _make_inputs(case: PrefillArgs, context_lens):
         N = B
 
     dtype = case.dtype
-    k = torch.randn(B, T_total, Hg, case.K, dtype=dtype, device=device) * 0.1
-    w_orig = torch.randn(B, T_total, H, case.K, dtype=dtype, device=device) * 0.1
-    u_orig = torch.randn(B, T_total, H, case.V, dtype=dtype, device=device) * 0.1
+    scale = 0.01 if stable_coupling else 0.1
+    k = torch.randn(B, T_total, Hg, case.K, dtype=dtype, device=device) * scale
+    w_orig = torch.randn(B, T_total, H, case.K, dtype=dtype, device=device) * scale
+    u_orig = torch.randn(B, T_total, H, case.V, dtype=dtype, device=device) * scale
 
-    # g is always 3-D, matching the wrapper/HIP contract, with cumsum along T.
-    # Generate head-major first (cumsum on the last dim), then transpose, so
-    # both layouts hold identical values.
+    # Both gate layouts hold identical values.
     if not case.use_g:
         g = None
     else:
-        gh = torch.randn(B, H, T_total, dtype=torch.float32, device=device).abs() * -0.5
-        gh = gh.cumsum(dim=-1)
+        gate_scale = -1e-4 if stable_coupling else -0.5
+        gh = torch.randn(B, H, T_total, dtype=torch.float32, device=device).abs()
+        gh *= gate_scale
+        if stable_coupling:
+            # Chunk-local decay retains state across adaptive block boundaries.
+            bos = 0
+            for length in context_lens:
+                for start in range(bos, bos + length, case.BT):
+                    end = min(start + case.BT, bos + length)
+                    gh[..., start:end] = gh[..., start:end].cumsum(dim=-1)
+                bos += length
+        else:
+            gh = gh.cumsum(dim=-1)
         g = gh.contiguous() if case.g_head_major else gh.transpose(1, 2).contiguous()
 
     w_c = w_orig.permute(0, 2, 1, 3).contiguous()
@@ -478,7 +492,11 @@ def _make_inputs(case: PrefillArgs, context_lens):
 
     # Allocate in f32 first so the reference built off this tensor stays clean,
     # then cast down when a bf16 state is asked for.
-    h0 = torch.randn(N, H, case.V, case.K, dtype=torch.float32, device=device) * 0.01
+    state_scale = 0.1 if stable_coupling else 0.01
+    h0 = (
+        torch.randn(N, H, case.V, case.K, dtype=torch.float32, device=device)
+        * state_scale
+    )
     if case.ssm_state_dtype != torch.float32:
         h0 = h0.to(case.ssm_state_dtype)
 
@@ -623,6 +641,137 @@ def ref_chunk_gated_delta_rule_fwd_h(
 
 
 # -- Benchmark -----------------------------------------------------------
+
+
+def _make_blocked_case(context_lens, trace_tag):
+    return PrefillArgs(
+        K=128,
+        V=128,
+        Hk=4,
+        Hv=16,
+        tp=1,
+        full_prompt_len=max(context_lens),
+        model_name="K5-blocked",
+        max_num_batched_tokens=sum(context_lens),
+        context_lens=list(context_lens),
+        trace_tag=trace_tag,
+        output_final_state=True,
+        g_head_major=True,
+    )
+
+
+@benchmark()
+def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
+    """Check adaptive dispatch, state coupling, and the empty-sequence fallback."""
+    case = _make_blocked_case(context_lens, case_name)
+    k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(
+        case, context_lens, stable_coupling=True
+    )
+    # Production consumes log2 gates; the oracle consumes natural-log gates.
+    g_log2 = g * math.log2(math.e)
+    metadata = _build_prefill_metadata(context_lens, cu)
+    ref_h, ref_vn, ref_fs = ref_chunk_gated_delta_rule_fwd_h(
+        k,
+        w_orig,
+        u_orig,
+        g=g,
+        initial_state=h0,
+        output_final_state=True,
+        chunk_size=case.BT,
+        cu_seqlens=cu,
+        g_head_major=True,
+    )
+    common = {
+        "initial_state": h0,
+        "output_final_state": True,
+        "chunk_size": case.BT,
+        "cu_seqlens": cu,
+        "state_dtype": torch.float32,
+        "snapshot_dtype": None,
+        "prefill_metadata": metadata,
+        "use_exp2": True,
+    }
+
+    candidates = {
+        "flydsl": lambda: chunk_gated_delta_rule_fwd_h_flydsl_opt(
+            k, w_c, u_c, g=g_log2, g_head_major=True, **common
+        ),
+    }
+    total_chunks = sum(_cdiv(length, case.BT) for length in context_lens)
+    flops = 4 * total_chunks * case.BT * case.H * case.K * case.V
+    nbytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in (k, w_c, u_c, g_log2, h0)
+    )
+    nbytes += u_c.numel() * u_c.element_size()
+    nbytes += total_chunks * case.H * case.V * case.K * k.element_size()
+    nbytes += h0.numel() * h0.element_size()
+    ret = {"gfx": get_gfx_runtime()}
+    blocked = linear_attention_prefill_kernels._chunk_gated_delta_rule_fwd_h_blocked
+
+    for name, fn in candidates.items():
+        blocked_calls = 0
+
+        def record_blocked(*args, **kwargs):
+            nonlocal blocked_calls
+            blocked_calls += 1
+            return blocked(*args, **kwargs)
+
+        # Routing and metadata mutation stay outside the timed callable.
+        with patch.object(
+            linear_attention_prefill_kernels,
+            "_chunk_gated_delta_rule_fwd_h_blocked",
+            side_effect=record_blocked,
+        ):
+            outputs = [fn()]
+            expected_calls = int(0 not in context_lens)
+            assert blocked_calls == expected_calls, f"{case_name}: first dispatch"
+            if expected_calls:
+                cu_version = cu._version
+                cu.copy_(cu.clone())
+                assert cu._version > cu_version, f"{case_name}: cu version"
+                common["prefill_metadata"] = _build_prefill_metadata(context_lens, cu)
+                outputs.append(fn())
+                assert blocked_calls == 2, f"{case_name}: refill dispatch"
+
+        output, us = run_perftest(fn)
+        outputs.append(output)
+        err = 0.0
+        for h, vn, fs in outputs:
+            err = max(
+                err,
+                checkAllclose(
+                    ref_h.to(dtypes.fp32),
+                    h.to(dtypes.fp32),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=f"{case_name}: K5 h snapshots",
+                ),
+                checkAllclose(
+                    ref_vn.to(dtypes.fp32),
+                    _normalize_opt_v_new(vn).to(dtypes.fp32),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=f"{case_name}: K5 v_new",
+                ),
+                checkAllclose(
+                    ref_fs.to(dtypes.fp32),
+                    fs.to(dtypes.fp32),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=f"{case_name}: K5 final_state",
+                ),
+            )
+            if 0 in context_lens:
+                empty_idx = context_lens.index(0)
+                assert torch.equal(
+                    fs[empty_idx], h0[empty_idx]
+                ), f"{case_name}: empty-sequence final state must equal initial state"
+        ret["blocked_calls"] = blocked_calls
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
 
 
 def _build_case(model, tp, seqlen, total_tokens, mode, snapshot_dtype, state_dtype):
@@ -817,8 +966,9 @@ def _sweep_rows(args, model):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("GDN prefill K5 unsupported on %s; skipping", get_gfx())
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("GDN prefill K5 unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(
@@ -894,6 +1044,24 @@ def main():
         e.g.: --state-dtype fp32 bf16""",
     )
     args = parser.parse_args()
+
+    if gfx == "gfx950" and not _flydsl_run_only():
+        cases = [
+            ("ragged_coupling_refill", [8257]),
+            ("empty_sequence", [8192, 0]),
+        ]
+        df = pd.DataFrame([test_chunk_gdn_prefill_h_blocked(*case) for case in cases])
+        aiter.logger.info(
+            "chunk_gdn_prefill_h blocked dispatch summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+    else:
+        aiter.logger.warning(
+            "Skipping blocked dispatch cases: requires gfx950 and run-only disabled "
+            "(gfx=%s, run_only=%s)",
+            gfx,
+            _flydsl_run_only(),
+        )
 
     for model in args.model:  # one table per model (Hv differs -> different shapes)
         df = [test_chunk_gdn_prefill_h(*row) for row in _sweep_rows(args, model)]
