@@ -25,7 +25,7 @@ rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
 # agent/job timeout kills with SIGTERM, which skips a plain EXIT trap) that did NOT classify
 # itself still leaves a status so _notify.py routes it -- to the bot owner (flow) for triage --
 # instead of dying silently. Trap both the exit and the terminating signals.
-_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; }
+_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; return 0; }
 _on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; exit 143; }
 trap _on_exit EXIT
 trap _on_signal TERM INT

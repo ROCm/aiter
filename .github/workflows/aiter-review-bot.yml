@@ -109,7 +109,7 @@ jobs:
 
       - name: Review (headless GLM)
         id: review
-        run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR"
+        run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR" "$GITHUB_REPOSITORY"
 
       - name: Publish the review card (every verdict, as aiter-bot)
         if: success()
