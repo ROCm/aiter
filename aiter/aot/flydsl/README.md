@@ -11,6 +11,7 @@ the JIT path hits the cache instead of compiling again.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
+| `unified_attention.py` | `UNIFIED_ATTENTION` | gfx950 fp8 unified-attention kernels (no CSV; fixed prefill/decode cross-product) |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
@@ -49,6 +50,9 @@ python -m aiter.aot.flydsl.grouped_moe
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
 
+# unified attention (gfx950; fixed job list, no CSV)
+python -m aiter.aot.flydsl.unified_attention
+
 # MegaMoE profile bundles (all token buckets and all eight ranks)
 python -m aiter.aot.flydsl.mega_moe
 
@@ -63,10 +67,12 @@ one profile cannot safely reuse another profile's bundle.
 ### Common arguments
 
 ```bash
-# Custom CSV(s) — every module supports --csv and accepts multiple paths
+# Custom CSV(s) — CSV-backed modules support --csv and accept multiple paths
 python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 ```
+
+Unified attention uses a fixed job list and does not accept `--csv`.
 
 ### Environment variables
 
@@ -82,11 +88,12 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
-> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
-> for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV.
+> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`);
+> unified attention is the exception and hardcodes `gfx950` because it has no
+> CSV. The target is applied internally via `FLYDSL_GPU_ARCH`, overwriting the
+> shell value for every job. Setting `ARCH` / `GPU_ARCHS` /
+> `FLYDSL_GPU_ARCH` therefore does **not** change what gets built. To
+> cross-compile a CSV-backed family, edit the `cu_num` column in the CSV.
 
 Example:
 
