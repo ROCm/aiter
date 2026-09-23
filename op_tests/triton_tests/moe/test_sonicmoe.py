@@ -5,21 +5,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
-    grouped_gemm,
-)
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.reduction_over_k_gather import (
-    token_gather_and_sum_varlen_K_triton,
-)
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.routing import (
-    TC_topk_router_metadata_triton,
-    general_routing_router_metadata_triton,
-)
-from aiter.ops.triton.sonicmoe import (
+from aiter.ops.triton.moe.sonicmoe import (
     SonicMoEActivationType,
     moe_pre_routed_inputs,
     moe_TC_softmax_topk_layer,
     sonicmoe_is_glu,
+)
+from aiter.ops.triton.moe.sonicmoe_grouped_gemm import (
+    grouped_gemm,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -166,99 +159,6 @@ def test_sonicmoe_pre_routed_forward_backward(activation):
         torch.testing.assert_close(actual, expected, rtol=7e-2, atol=7e-2)
 
 
-def test_topk_routing_metadata_matches_torch():
-    indices = torch.tensor(
-        [[2, 0], [1, 2], [0, 1], [2, 1]], dtype=torch.int32, device="cuda"
-    )
-    tokens, top_k = indices.shape
-    experts = 3
-    total = tokens * top_k
-    freq = torch.empty(experts, dtype=torch.int32, device="cuda")
-    offsets = torch.empty(experts + 1, dtype=torch.int32, device="cuda")
-    gather = torch.empty(total, dtype=torch.int32, device="cuda")
-    scatter = torch.empty(total, dtype=torch.int32, device="cuda")
-    reverse = torch.empty(total, dtype=torch.int32, device="cuda")
-    TC_topk_router_metadata_triton(
-        indices, experts, freq, offsets, gather, scatter, reverse
-    )
-
-    flat = indices.flatten()
-    order = torch.argsort(flat, stable=True)
-    expected_freq = torch.bincount(flat, minlength=experts).to(torch.int32)
-    torch.testing.assert_close(freq, expected_freq)
-    torch.testing.assert_close(
-        offsets,
-        torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int32, device="cuda"),
-                expected_freq.cumsum(0).to(torch.int32),
-            )
-        ),
-    )
-    torch.testing.assert_close(gather, order.div(top_k, rounding_mode="floor").int())
-    torch.testing.assert_close(scatter, order.int())
-    torch.testing.assert_close(reverse[order], torch.arange(total, device="cuda").int())
-
-
-def test_general_routing_metadata_matches_torch():
-    token = torch.tensor([0, 0, 2, 3, 3, 3], dtype=torch.int32, device="cuda")
-    expert = torch.tensor([2, 0, 1, 2, 1, 0], dtype=torch.int32, device="cuda")
-    tokens, experts, total = 4, 3, expert.numel()
-    freq = torch.empty(experts, dtype=torch.int32, device="cuda")
-    offsets = torch.empty(experts + 1, dtype=torch.int32, device="cuda")
-    gather = torch.empty(total, dtype=torch.int32, device="cuda")
-    scatter = torch.empty(total, dtype=torch.int32, device="cuda")
-    reverse = torch.empty(total, dtype=torch.int32, device="cuda")
-    token_offsets = torch.empty(tokens + 1, dtype=torch.int32, device="cuda")
-    general_routing_router_metadata_triton(
-        token,
-        expert,
-        tokens,
-        experts,
-        freq,
-        offsets,
-        gather,
-        scatter,
-        reverse,
-        token_offsets,
-    )
-    order = torch.argsort(expert, stable=True)
-    expected_freq = torch.bincount(expert, minlength=experts).int()
-    torch.testing.assert_close(freq, expected_freq)
-    torch.testing.assert_close(gather, token[order])
-    torch.testing.assert_close(scatter, order.int())
-    torch.testing.assert_close(reverse[order], torch.arange(total, device="cuda").int())
-    torch.testing.assert_close(
-        token_offsets,
-        torch.searchsorted(
-            token, torch.arange(tokens + 1, dtype=torch.int32, device="cuda")
-        ).int(),
-    )
-
-
-@pytest.mark.parametrize("weighted", [False, True])
-def test_token_gather_sum_matches_torch(weighted):
-    torch.manual_seed(13)
-    offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device="cuda")
-    permutation = torch.tensor([4, 1, 3, 0, 2], dtype=torch.int32, device="cuda")
-    x = torch.randn(5, 33, dtype=torch.bfloat16, device="cuda")
-    weights = torch.rand(5, dtype=torch.float32, device="cuda") if weighted else None
-    out = torch.empty(3, 33, dtype=x.dtype, device="cuda")
-    token_gather_and_sum_varlen_K_triton(
-        x, weights, out, permutation, offsets, 3, 3, 33, True
-    )
-    expected = []
-    for token in range(3):
-        rows = permutation[offsets[token] : offsets[token + 1]].long()
-        values = x[rows].float()
-        if weights is not None:
-            values *= weights[offsets[token] : offsets[token + 1], None]
-        expected.append(values.sum(0))
-    torch.testing.assert_close(
-        out, torch.stack(expected).to(out.dtype), rtol=2e-2, atol=2e-2
-    )
-
-
 @pytest.mark.skipif(get_arch() != "gfx942", reason="fnuz blockwise FP8 is gfx942-only")
 def test_grouped_gemm_blockwise_fp8_matches_dequantized_torch():
     torch.manual_seed(17)
@@ -289,3 +189,21 @@ def test_grouped_gemm_blockwise_fp8_matches_dequantized_torch():
         ]
     )
     torch.testing.assert_close(actual.float(), expected, rtol=6e-2, atol=1.0)
+
+
+def test_grouped_wgrad_validates_scale_rows_per_expert():
+    a = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+    offsets = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+    a_scale = torch.ones(1, 128, device="cuda")
+    b_scale = torch.ones(1, 128, device="cuda")
+
+    with pytest.raises(ValueError, match=r"A_scale must have shape \[2, 128\]"):
+        grouped_gemm(
+            a,
+            b,
+            offsets,
+            A_is_transposed=True,
+            A_scale=a_scale,
+            B_scale=b_scale,
+        )

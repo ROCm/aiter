@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _LAUNCH_META = frozenset({"num_warps", "num_stages"})
 
@@ -15,11 +16,15 @@ _LAUNCH_META = frozenset({"num_warps", "num_stages"})
 def load_sonicmoe_configs() -> dict[str, Any]:
     cfg_dir = resolve_config_dir("moe", "SONICMOE-BF16", backend="triton")
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    if config is None:
+    if config is None and get_arch() == "gfx950":
         fallback_dir = resolve_config_dir(
             "moe", "SONICMOE-BF16", backend="triton", arch="gfx942"
         )
         config = load_config_json(f"{fallback_dir}/DEFAULT.json")
+    if config is None:
+        raise FileNotFoundError(
+            f"SonicMoE has no BF16 Triton config for architecture {get_arch()}"
+        )
     return config
 
 

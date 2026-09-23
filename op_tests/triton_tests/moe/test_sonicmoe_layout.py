@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.sonicmoe import (
+from aiter.ops.triton.moe.sonicmoe import (
     SonicMoEActivationType,
     moe_general_routing_inputs,
 )

@@ -7,7 +7,7 @@ import argparse
 import torch
 import triton
 
-from aiter.ops.triton.sonicmoe import (
+from aiter.ops.triton.moe.sonicmoe import (
     SonicMoEActivationType,
     moe_TC_softmax_topk_layer,
 )
@@ -69,14 +69,14 @@ def benchmark(args):
 
         if provider == "forward":
             fn = forward
-            flops = 4 * tokens * top_k * hidden * intermediate
+            flops = 6 * tokens * top_k * hidden * intermediate
         else:
 
             def fn():
                 out = forward()
                 torch.autograd.grad(out, (x, w1, w2), grad)
 
-            flops = 12 * tokens * top_k * hidden * intermediate
+            flops = 18 * tokens * top_k * hidden * intermediate
 
         ms = triton.testing.do_bench(fn, warmup=10, rep=50)
         if args.metric == "time":
