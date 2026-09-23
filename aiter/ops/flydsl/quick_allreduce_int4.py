@@ -336,18 +336,7 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
 
 
 def kernel_symbol(launch) -> str:
-    """The JIT symbol a kernel factory stamped on its launch wrapper.
-
-    Every factory names its wrapper ``launch_<kernel>_<tag>``, where the tag
-    carries every compile-time knob that changes the emitted code -- world
-    size, super-tile, inbox memory and wire format. That string is the only
-    place the *actual* variant that ran is written down, so a benchmark
-    reporting a candidate alias cannot say which binary it timed, and an
-    "auto" row that walks a size ladder cannot say anything at all.
-
-    Falls back to ``"?"`` rather than raising: this is reporting metadata, and
-    a flydsl build that stops exposing ``.func`` should not take a sweep down.
-    """
+    """The JIT symbol a kernel factory stamped on its launch wrapper."""
     name = getattr(getattr(launch, "func", None), "__name__", None)
     if not name:
         return "?"
@@ -844,19 +833,12 @@ class QuickAllReduceInt4:
             return
 
     def variant(self, nbytes: int) -> str:
-        """Identity of the binary an *nbytes* payload would actually run.
-
-        ``<jit symbol>/g<grid_cap>/x<grid_x>``. Resolves the super-tile through
-        the same ``_pick_st`` the launch path uses, so for a ladder-driven
-        engine this is the only way to see which rung a given size takes --
-        ``super_tile`` on the object is the *nominal* value, not the one a
-        particular payload gets. Pure: builds nothing and launches nothing.
-        """
+        """Identity of the binary an *nbytes* payload would actually run. """
         live_bytes = int(nbytes)
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         eng = self._by_st[self._pick_st(num_tiles, live_bytes)]
         grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
-        return f"{kernel_symbol(eng.launch)}/g{eng.grid}/x{grid_x}"
+        return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"
 
     def is_beneficial(self, nbytes: int) -> bool:
         """Whether *nbytes* is large enough for this kernel to be worth using.

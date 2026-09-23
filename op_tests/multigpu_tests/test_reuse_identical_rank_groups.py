@@ -21,6 +21,8 @@ Two independent test surfaces:
      - flag off:        no group reuses
      - flag disagreement across ranks: the unanimity all_reduce asserts (turns a
        silent new_group() hang into a loud error).
+   Plus the real CudaCommunicator.destroy() over recording stand-ins: an owner
+   closes its allreduce slots exactly once, a borrower only drops them.
 
 2. **Handle sharing (needs 2 GPUs / NCCL).** Drives the real CudaCommunicator and
    asserts the reusing group shares pynccl/ca/qr handles and process groups, that
@@ -609,6 +611,9 @@ def main():
     for topo in _TOPO_NAMES:
         _spawn(_saving_worker, 4, topo)
     _spawn(_unanimity_worker, 4)
+    test_destroy_closes_owned_allreduce_comms()
+    test_destroy_leaves_borrowed_allreduce_comms_open()
+    test_destroy_is_idempotent()
     print("decision-logic tests: PASSED")
 
     if torch.cuda.device_count() >= 2:

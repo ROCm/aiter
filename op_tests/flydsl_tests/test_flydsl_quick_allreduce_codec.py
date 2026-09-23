@@ -312,9 +312,9 @@ def test_group_extremum_keeps_its_sign(codec_name):
     x_ext = xg.gather(-1, idx).squeeze(-1)
     y_ext = yg.gather(-1, idx).squeeze(-1)
     live = x_ext.abs() > 1e-6
-    assert bool((torch.sign(x_ext[live]) == torch.sign(y_ext[live])).all()), (
-        "Sign changed"
-    )
+    assert bool(
+        (torch.sign(x_ext[live]) == torch.sign(y_ext[live])).all()
+    ), "Sign changed"
     rel = float(((y_ext[live] - x_ext[live]).abs() / x_ext[live].abs()).max())
     bound = _err_bound(CODECS[codec_name].bias)
     assert rel <= bound, f"extremum moved {rel:.4f} > {bound:.4f}"
@@ -412,9 +412,9 @@ def test_extremum_below_e4m3_floor_survives_instead_of_zeroing(codec_name):
     """
     decoded = codec_roundtrip(_spike_group(1e-3, fill=0.0), codec_name)
     assert torch.isfinite(decoded.float()).all()
-    assert float(decoded[0]) == pytest.approx(1e-3, rel=0.2), (
-        f"expected the sub-floor extremum to survive; got {float(decoded[0])}"
-    )
+    assert float(decoded[0]) == pytest.approx(
+        1e-3, rel=0.2
+    ), f"expected the sub-floor extremum to survive; got {float(decoded[0])}"
     # Exact zero still encodes as exact zero -- the bump must not perturb it.
     zeros = codec_roundtrip(_spike_group(0.0, fill=0.0), codec_name)
     assert float(zeros.float().abs().max()) == 0.0

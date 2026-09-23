@@ -620,11 +620,7 @@ def make_one_shot_allreduce_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    # Every compile-time knob that changes the emitted code has to be in the
-    # symbol name, or two variants collide in the JIT cache. At ``atoms == 1``,
-    # the (peer, atom) product has one atom per peer, so both fanout orders
-    # unroll to the same store sequence.
-    tag = f"ws{world_size}_a{atoms}_{inbox_memory}"
+    tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}"
     if block != DEFAULT_BLOCK:
         tag += f"_b{block}"
     if atoms > 1:

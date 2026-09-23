@@ -636,10 +636,7 @@ def make_quick_allreduce_int4_kernel(
             stream=stream,
         )
 
-    # The inbox memory type and wire codec both change the emitted code, so
-    # both have to be part of the symbol name -- two variants that differ only
-    # in cache bits or wire format must not collide in the JIT cache.
-    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
+    tag = f"ws{world_size}_st{super_tile}_g{grid}_{inbox_memory}_{codec}"
     launch_quick_allreduce_int4.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
     try:
         quick_allreduce_int4.func.__name__ = f"quick_allreduce_int4_{tag}"

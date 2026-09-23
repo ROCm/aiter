@@ -356,17 +356,11 @@ class OneShotAllReduce:
             self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
 
     def variant(self, nbytes: int) -> str:
-        """Identity of the binary an *nbytes* payload would run.
-
-        ``<jit symbol>/g<grid_cap>/x<grid_x>``, matching
-        ``QuickAllReduceInt4.variant``. Resolves the rung through the same ``_pick_cfg`` the launch path uses,
-        so for a ladder-driven engine this is the only way to see which rung a
-        given size takes.
-        """
+        """Identity of the binary an *nbytes* payload would run."""
         cfg = self._pick_cfg(int(nbytes))
         eng, spec = self._by_cfg[cfg]
         grid_x = self._grid_x(self._num_tiles(int(nbytes), spec["tile_bytes"]), cfg[1])
-        return f"{kernel_symbol(eng.launch)}/g{cfg[1]}/x{grid_x}"
+        return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"
 
     def is_beneficial(self, nbytes: int) -> bool:
         return int(nbytes) <= self.max_bytes

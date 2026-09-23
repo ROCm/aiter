@@ -707,10 +707,10 @@ def make_quick_allreduce_int4_ring_kernel(
             stream=stream,
         )
 
-    # rank is baked into the schedule, and the inbox memory type into the store
-    # policy, so both have to reach the symbol name -- variants that differ only
-    # in a compile-time constant must not collide in the JIT cache.
-    tag = f"ws{world_size}_r{rank}_st{super_tile}_{inbox_memory}_{rs_codec}_{ag_codec}"
+    tag = (
+        f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
+        f"_{rs_codec}_{ag_codec}"
+    )
     launch_quick_allreduce_int4_ring.func.__name__ = (
         f"launch_quick_allreduce_int4_ring_{tag}"
     )
