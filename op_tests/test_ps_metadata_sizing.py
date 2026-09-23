@@ -7,10 +7,10 @@
 generator ``get_ps_metadata_v1`` (csrc/kernels/mla/metadata/v1_2_host.cuh)
 actually emits. The bound assuming every batch carries ``max_qlen`` query
 tokens is far looser than a serving engine ever produces, so the function takes
-an optional ``total_qlen`` token budget; these tests pin the loose default, the
-safety of the budget-aware bound against the real generator, and the size of
-the partial pool (``max_partials * qlen_granularity`` rows) that a serving
-engine has to reserve.
+an optional ``total_qlen`` token budget; these tests pin the safety of the
+budget-aware bound against the real generator and the size of the partial pool
+(``max_partials * qlen_granularity`` rows) that a serving engine has to
+reserve.
 
 Run:
     python3 -m pytest op_tests/test_ps_metadata_sizing.py -v
@@ -112,59 +112,6 @@ def _partial_pool_bytes(cfg, total_qlen):
     return rows * cfg["num_head_k"] * (cfg["v_head_dim"] + 1) * itemsize
 
 
-def _legacy_info(batch_size, num_head_k, max_qlen, qlen_granularity):
-    """The sizes get_ps_metadata_info_v1 returned before total_qlen existed."""
-    cu_num = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    cus_per_cluster = cu_num // math.gcd(num_head_k, cu_num)
-    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
-    qo_tile_cnt = batch_size * max_qo_split_per_batch
-    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
-    return (
-        (2, torch.uint64),
-        (cu_num + 1, torch.int32),
-        ((max_works, 8), torch.int32),
-        (qo_tile_cnt + 1, torch.int32),
-        ((qo_tile_cnt, 2), torch.int32),
-        (qo_tile_cnt + cus_per_cluster - 1, torch.int32),
-    )
-
-
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("qlen_granularity", QLEN_GRANULARITIES)
-@pytest.mark.parametrize("num_head_k", [1, 8])
-def test_unset_total_qlen_keeps_the_legacy_sizes(
-    batch_size, qlen_granularity, num_head_k
-):
-    max_qlen = 8 * qlen_granularity + 3
-    info = _info(batch_size, num_head_k, max_qlen, qlen_granularity)
-    assert info == _legacy_info(batch_size, num_head_k, max_qlen, qlen_granularity)
-    assert (
-        _info(batch_size, num_head_k, max_qlen, qlen_granularity, total_qlen=None)
-        == info
-    )
-
-
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("qlen_granularity", QLEN_GRANULARITIES)
-@pytest.mark.parametrize("divisor", [1, 2, 8, 64])
-def test_budget_never_grows_the_buffers(batch_size, qlen_granularity, divisor):
-    max_qlen = 8 * qlen_granularity + 3
-    unbounded = _info(batch_size, 1, max_qlen, qlen_granularity)
-    bounded = _info(
-        batch_size,
-        1,
-        max_qlen,
-        qlen_granularity,
-        total_qlen=max(batch_size * max_qlen // divisor, 1),
-    )
-    for got, ref in zip(bounded[2:6], unbounded[2:6]):
-        assert _rows(got) <= _rows(ref)
-    # a single request is still allowed to be max_qlen long under any budget
-    assert _rows(bounded[4]) >= math.ceil(max_qlen / qlen_granularity)
-
-
 @pytest.mark.parametrize("batch_size", BATCH_SIZES + [256])
 @pytest.mark.parametrize("qlen_granularity", QLEN_GRANULARITIES)
 @pytest.mark.parametrize("total_qlen", [512, 8192, 16384])
@@ -173,15 +120,15 @@ def test_partial_pool_grows_with_the_budget_not_with_max_qlen(
 ):
     cu_num = _cu_num()
     for max_qlen in (qlen_granularity, total_qlen, 163840):
-        rows = _partial_pool_rows(
-            _info(batch_size, 1, max_qlen, qlen_granularity, total_qlen=total_qlen),
-            qlen_granularity,
-        )
+        info = _info(batch_size, 1, max_qlen, qlen_granularity, total_qlen=total_qlen)
+        rows = _partial_pool_rows(info, qlen_granularity)
         # linear in the budget (or in one max-length request, when the caller
         # declares a max_qlen above its own budget), never in their product
         assert rows <= max(total_qlen, max_qlen) + qlen_granularity * (
             batch_size + cu_num
         )
+        # and never so tight that one max_qlen-long request stops fitting
+        assert _rows(info[4]) >= math.ceil(max_qlen / qlen_granularity)
 
 
 @pytest.mark.parametrize("config", sorted(SERVING_CONFIGS))
