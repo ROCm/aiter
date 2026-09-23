@@ -50,7 +50,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
     const_expr,
@@ -69,7 +68,6 @@ from ..kernels_common import LOG2E as _LOG2E
 from ..kernels_common import dtype_to_elem_type
 from ..tensor_shim import _run_compiled
 from .flash_attn_func_common import (
-    configure_gpu_module,
     flatten_scores,
     kv_load_schedule,
     mask_scores,
@@ -707,14 +705,27 @@ def build_flash_attn_func_module(
         v_scale_ptr: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
         flash_attn_func_kernel._func.__name__ = KERNEL_NAME
+        passthrough_entries = (
+            [
+                ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                ["no-nans-fp-math", "true"],
+                ["unsafe-fp-math", "true"],
+            ]
+            if const_expr(daz)
+            else None
+        )
+        kernel_attrs = {
+            "rocdl.waves_per_eu": waves_per_eu,
+            "rocdl.flat_work_group_size": f"{flat_work_group_size},{flat_work_group_size}",
+            "passthrough": passthrough_entries,
+        }
+
         launcher = flash_attn_func_kernel(
             Q,
             K,
@@ -726,9 +737,8 @@ def build_flash_attn_func_module(
             q_scale_ptr,
             k_scale_ptr,
             v_scale_ptr,
+            value_attrs=kernel_attrs,
         )
-
-        configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz)
 
         launcher.launch(grid=(grid_x, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 

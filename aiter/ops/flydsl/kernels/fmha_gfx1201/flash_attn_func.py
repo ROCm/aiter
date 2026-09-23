@@ -12,14 +12,12 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from ..kernels_common import LOG2E as _LOG2E
 from ..tensor_shim import _run_compiled
 from .flash_attn_func_common import (
-    configure_gpu_module,
     flatten_scores,
     kv_load_schedule,
     mask_scores,
@@ -680,18 +678,36 @@ def build_flash_attn_func_module(
             None
         ),
     ):
-        ctx = CompilationContext.get_current()
-
         bs_idx = fx.Uint64(batch_size)
         sl_idx = fx.Uint64(seq_len)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
-        launcher = flash_attn_func_kernel(
-            Q, K, V, O, seq_len, seq_len_kv_real, seq_len_kv
+        passthrough_entries = (
+            [
+                ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                ["no-nans-fp-math", "true"],
+                ["unsafe-fp-math", "true"],
+            ]
+            if const_expr(daz)
+            else None
         )
+        kernel_attrs = {
+            "rocdl.waves_per_eu": waves_per_eu,
+            "rocdl.flat_work_group_size": f"{flat_work_group_size},{flat_work_group_size}",
+            "passthrough": passthrough_entries,
+        }
 
-        configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz)
+        launcher = flash_attn_func_kernel(
+            Q,
+            K,
+            V,
+            O,
+            seq_len,
+            seq_len_kv_real,
+            seq_len_kv,
+            value_attrs=kernel_attrs,
+        )
 
         launcher.launch(grid=(grid_x, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 

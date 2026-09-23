@@ -4,9 +4,7 @@
 """Shared representation-independent helpers for gfx1201 flash attention."""
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T
 
 from ..tensor_shim import ptr_arg as _ptr_arg
 
@@ -54,39 +52,6 @@ def mask_scores(
             )
             masked.append(pred.select(c_neg_inf, scores[idx]))
     return masked
-
-
-def configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz):
-    """Apply raw GPU/LLVM attributes without public FlyDSL launch wrappers."""
-    if const_expr(waves_per_eu is not None):
-        value = int(waves_per_eu)
-        if const_expr(value >= 1):
-            for op in ctx.gpu_module_body.operations:
-                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                        T.i32, value
-                    )
-    if const_expr(flat_work_group_size is not None):
-        value = int(flat_work_group_size)
-        if const_expr(value >= 1):
-            flat_wg_attr = ir.StringAttr.get(f"{value},{value}")
-            for op in ctx.gpu_module_body.operations:
-                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                    op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
-
-    passthrough_entries = []
-    if const_expr(daz):
-        for name, value in (
-            ("denormal-fp-math-f32", "preserve-sign,preserve-sign"),
-            ("no-nans-fp-math", "true"),
-            ("unsafe-fp-math", "true"),
-        ):
-            passthrough_entries.append(
-                ir.ArrayAttr.get([ir.StringAttr.get(name), ir.StringAttr.get(value)])
-            )
-    for op in ctx.gpu_module_body.operations:
-        if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-            op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
 
 
 def pointer_arg(value):
