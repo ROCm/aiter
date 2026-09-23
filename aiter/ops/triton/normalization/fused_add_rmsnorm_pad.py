@@ -29,7 +29,7 @@ def fused_add_rmsnorm_pad(
     x: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
-    res: torch.Tensor = None,
+    res: torch.Tensor | None = None,
     x_pad_to_multiple: int = 0,
     backend: str | None = None,
 ):

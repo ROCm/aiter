@@ -27,6 +27,15 @@ _DEFAULT_SORT_BLOCK_M = 32
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1
 
 
+def _route_workspace_token_capacity(token_num: int) -> int:
+    """Round a route workspace token count up to a reusable capacity class."""
+
+    token_num = int(token_num)
+    if token_num <= 0:
+        raise ValueError(f"token_num must be positive, got {token_num}")
+    return 1 << (token_num - 1).bit_length()
+
+
 @dataclass(frozen=True)
 class OpusA8W4LaunchConfig:
     """Resolved runtime plan for one tuned Opus A8W4 Stage2 selection."""
@@ -252,7 +261,13 @@ def opus_moe_stage2_a8w4_decode_fwd(
         if route_out_fp8:
             # MXFP8 route_out: uint8 [rows, md fp8 | md/8 e8m0 scale].
             rows = token_num * topk
-            out = torch.empty((rows, md + md // 8), dtype=torch.uint8, device=w2.device)
+            cols = md + md // 8
+            capacity_tokens = _route_workspace_token_capacity(token_num)
+            out = torch.empty(
+                (capacity_tokens * topk, cols),
+                dtype=torch.uint8,
+                device=w2.device,
+            )[:rows]
         else:
             shape = (
                 (token_num, topk, w2.shape[1])

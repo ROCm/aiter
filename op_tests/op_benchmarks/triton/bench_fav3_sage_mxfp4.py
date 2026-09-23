@@ -523,7 +523,7 @@ def run_benchmark_block_sparse_repetitions(args):
                     ]
                 )
             writer.writerow(row)
-        logger.info(f"Wrote CSV row to {csv_path}")
+        logger.info("Wrote CSV row to %s", csv_path)
 
 
 def parse_args():

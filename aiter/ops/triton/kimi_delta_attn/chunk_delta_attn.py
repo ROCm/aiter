@@ -221,10 +221,15 @@ def chunk_kimi_delta_attn(
         raise ValueError(f"`scale` must be positive, got {scale}.")
 
     _LOGGER.info(
-        f"CHUNK_KIMI_DELTA_ATTN: q={tuple(q.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, chunk_size={chunk_size or 'auto'}, safe_gate={safe_gate}, "
-        f"lower_bound={lower_bound}, state_v_first={state_v_first}, "
-        f"varlen={cu_seqlens is not None}"
+        "CHUNK_KIMI_DELTA_ATTN: q=%s, v=%s, scale=%s, chunk_size=%s, safe_gate=%s, lower_bound=%s, state_v_first=%s, varlen=%s",
+        tuple(q.shape),
+        tuple(v.shape),
+        scale,
+        chunk_size or "auto",
+        safe_gate,
+        lower_bound,
+        state_v_first,
+        cu_seqlens is not None,
     )
 
     # Match fla, which puts `@input_guard` on its autograd Function. Several
