@@ -56,12 +56,15 @@ def _exp2(x):
     return Float32(fx.rocdl.exp2(Float32.ir_type, Float32(x).ir_value()))
 
 
-def _ds_write2st64_b64(addr, data0, data1):
-    """Store two BF16x4 vectors 8192 bytes apart in gfx950 LDS."""
+def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
+    """Store two BF16x4 vectors in gfx950 LDS. Offsets are st64 units (512 B)."""
+    off = f"offset0:{offset0} offset1:{offset1}"
+    if offset0 == 0:
+        off = f"offset1:{offset1}"
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
         [as_mlir_value(addr), as_mlir_value(data0), as_mlir_value(data1)],
-        "ds_write2st64_b64 $0, $1, $2 offset1:16\n",
+        f"ds_write2st64_b64 $0, $1, $2 {off}\n",
         "v,v,v,~{memory}",
         has_side_effects=True,
     )
@@ -461,26 +464,26 @@ def build_qsa_k2_family_a_module(
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
             elif const_expr(use_k32):
+                store_elem = (
+                    (col % Int32(32)) * Int32(4)
+                    + chunk_owner * Int32(128)
+                    + _idiv(col, Int32(32)) * Int32(32 * _D)
+                )
+                store_addr = store_elem * Int32(2)
                 for gr in range_constexpr(gather_rounds):
                     v_vec = live.select(
                         fx.Vector(fx.memref_load_vec(v_frags_pf[gr])),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    d_chunk = chunk_owner + Int32(gr * col_owners)
                     lo = fx.Vector.from_elements(
                         [v_vec[i] for i in range_constexpr(4)], BFloat16
                     ).bitcast(fx.Int64)[0]
                     hi = fx.Vector.from_elements(
                         [v_vec[i + 4] for i in range_constexpr(4)], BFloat16
                     ).bitcast(fx.Int64)[0]
-                    # p(n,d): token bits spread the b64 bases over banks;
-                    # d bit 2 selects the st64 pair's 8192-byte region.
-                    store_elem = (
-                        (col % Int32(32)) * Int32(4)
-                        + d_chunk * Int32(128)
-                        + _idiv(col, Int32(32)) * Int32(32 * _D)
-                    )
-                    _ds_write2st64_b64(store_elem * Int32(2), lo, hi)
+                    # One base VGPR; round gr is +gr st64 (512 B) and hi is
+                    # +16 st64 (8192 B), matching AMD's offset0/offset1 pairs.
+                    _ds_write2st64_b64(store_addr, lo, hi, offset0=gr, offset1=gr + 16)
                 gpu.barrier()
             elif const_expr(not use_k32):
                 v_row = fx.logical_divide(
