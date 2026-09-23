@@ -110,6 +110,16 @@ AITER_CONFIG_GEMM_A6W6 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W4_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A6W4_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a6w4_asm_tuned_gemm.csv"
+)
+
+AITER_CONFIG_GEMM_A4W6_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A4W6_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a4w6_asm_tuned_gemm.csv"
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -153,6 +163,11 @@ AITER_CONFIG_GROUPED_FMOE = os.getenv(
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
 )
 
 AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
@@ -222,6 +237,22 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A6W4_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W4_ASM",
+            AITER_CONFIG_GEMM_A6W4_ASM,
+            "a6w4_asm_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W6_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W6_ASM",
+            AITER_CONFIG_GEMM_A4W6_ASM,
+            "a4w6_asm_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_GEMM_A8W8_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
@@ -285,6 +316,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
             "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE,
+            "a8w8_blockscale_abpreshuffle_tuned_gemm",
         )
 
     @property
@@ -482,7 +521,7 @@ class AITER_CONFIG:
     # process-lifetime singleton, so the retained reference is not a leak.
     @functools.lru_cache(maxsize=20)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
-        config_env_file = os.getenv(env_name)
+        config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 

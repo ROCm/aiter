@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..utility import dtypes
 
 
@@ -46,6 +47,7 @@ def gemm_a8w4_mxfp8(
 
     K is taken from A (mxfp8, ``A.shape[1] == K``); B is packed mxfp4 with
     ``B.shape == [N, K/2]``."""
+    require_gfx1250_asm("gemm_a8w4_mxfp8")
     M = A.shape[0]
     N = B.shape[0]
     K = A.shape[1]
