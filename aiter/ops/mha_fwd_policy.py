@@ -58,9 +58,15 @@ MHA_FWD_METRIC_FIELDS = (
     "samples_us",
     "tflops",
 )
+# The winning candidate's latency rides along with the row it justifies, as it
+# does in every other tuned CSV in this repo. Dispatch never reads it; it is
+# there so a human can see at a glance that a row was measured on plausible
+# hardware. The rest of MHA_FWD_METRIC_FIELDS stays in the evidence CSV.
+MHA_FWD_RUNTIME_EVIDENCE_FIELDS = ("us",)
 MHA_FWD_RUNTIME_CSV_FIELDS = (
     *MHA_FWD_TUNING_KEY_FIELDS,
     *MHA_FWD_CANDIDATE_FIELDS,
+    *MHA_FWD_RUNTIME_EVIDENCE_FIELDS,
 )
 MhaFwdBackend = Literal["asm_v3", "ck", "flydsl", "gluon", "opus", "triton"]
 MHA_FWD_BACKENDS = frozenset({"asm_v3", "ck", "flydsl", "gluon", "opus", "triton"})

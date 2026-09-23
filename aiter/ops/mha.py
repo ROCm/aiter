@@ -4,6 +4,7 @@
 import csv
 import functools
 import json
+import math
 import os
 from typing import Any
 
@@ -67,7 +68,7 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any
         if extra:
             raise ValueError(
                 f"{path} contains non-runtime MHA columns: {extra}; "
-                "measurement evidence must be stored separately"
+                "the rest of the measurement evidence is stored separately"
             )
         for line, row in enumerate(reader, start=2):
             backend = str(row.get("backend", "")).strip()
@@ -76,6 +77,7 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any
             except ValueError as exc:
                 raise ValueError(f"{path}:{line}: invalid num_splits") from exc
             try:
+                us = _tuned_row_latency(row)
                 backend_config = parse_backend_config(row.get("backend_config", ""))
                 problem = MhaFwdProblem.from_mapping(row)
                 plan = MhaFwdPlan(
@@ -93,8 +95,30 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any
                 "backend": backend,
                 "num_splits": num_splits,
                 "backend_config": backend_config,
+                "us": us,
             }
     return table
+
+
+def _tuned_row_latency(row: dict[str, str]) -> float | None:
+    """The measured latency a tuned row carries, if it carries one.
+
+    Evidence rather than dispatch input, so a blank is allowed: a row
+    hand-written to pin a backend is still a valid row. A value that is
+    present must be a real latency, because a nonsense one means the row came
+    out of something other than a tuning run.
+    """
+
+    raw = str(row.get("us", "")).strip()
+    if not raw:
+        return None
+    try:
+        us = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid us {raw!r}") from exc
+    if not math.isfinite(us) or us <= 0.0:
+        raise ValueError(f"invalid us {raw!r}: not a positive, finite latency")
+    return us
 
 
 @functools.lru_cache(maxsize=4)

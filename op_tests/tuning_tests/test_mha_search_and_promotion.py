@@ -317,7 +317,13 @@ class TestRetunedIncumbent(unittest.TestCase):
         return MhaFwdProblem.from_mapping(self.ROW).key()
 
     def _write_table(self, **overrides):
-        row = {**self.ROW, "backend": "gluon", "num_splits": 0, "backend_config": ""}
+        row = {
+            **self.ROW,
+            "backend": "gluon",
+            "num_splits": 0,
+            "backend_config": "",
+            "us": 42.0,
+        }
         row.update(overrides)
         handle, path = tempfile.mkstemp(prefix="tuned-", suffix=".csv")
         os.close(handle)
