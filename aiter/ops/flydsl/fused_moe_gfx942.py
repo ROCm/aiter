@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-from dataclasses import dataclass
-from functools import cache
+import math
+from contextlib import nullcontext
 from typing import Any
 
 import flydsl.compiler as flyc
@@ -12,110 +12,28 @@ import aiter
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
-from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
     invert_sorted_ids,
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
-
-@dataclass
-class Config:
-    BLOCK_M: int
-    BLOCK_N: int
-    BLOCK_K: int
-    use_prefill: bool
-
-    def to_string(self):
-        return (
-            str(self.BLOCK_M)
-            + "_"
-            + str(self.BLOCK_N)
-            + "_"
-            + str(self.BLOCK_K)
-            + "_"
-            + str(self.use_prefill)
-        )
-
-    @classmethod
-    def from_string(cls, data: str):
-        parts = data.split("_")
-        if len(parts) != 4:
-            raise ValueError(f"Invalid config string: {data}")
-
-        def parse_bool(value: str) -> bool:
-            if value == "True":
-                return True
-            if value == "False":
-                return False
-            raise ValueError(f"Invalid boolean value in config string: {value}")
-
-        return cls(
-            int(parts[0]),
-            int(parts[1]),
-            int(parts[2]),
-            parse_bool(parts[3]),
-        )
-
-    def unsupported_reason(self, problem: "_Problem") -> str | None:
-        if self.use_prefill and problem.gateup_dim % self.BLOCK_N != 0:
-            return (
-                f"gateup_dim={problem.gateup_dim} is not divisible by "
-                f"BLOCK_N={self.BLOCK_N}"
-            )
-        if self.use_prefill and problem.inter_dim % 64 != 0:
-            return (
-                f"inter_dim={problem.inter_dim} is not divisible by the "
-                "down BLOCK_K=64"
-            )
-        if self.use_prefill and problem.hidden_dim % (2 * self.BLOCK_K) != 0:
-            return (
-                f"hidden_dim={problem.hidden_dim} is not divisible by "
-                f"2*BLOCK_K={2 * self.BLOCK_K} for the gateup pipeline"
-            )
-        if self.use_prefill and problem.model_dim % 256 != 0:
-            return (
-                f"model_dim={problem.model_dim} is not divisible by 256; "
-                "the prefill down pipeline processes paired 128-wide tiles"
-            )
-        return None
-
-
-@dataclass(frozen=True)
-class _Problem:
-    batch: int
-    experts: int
-    gateup_dim: int
-    hidden_dim: int
-    model_dim: int
-    inter_dim: int
-    topk: int
-    quant_type: str
-
-    @classmethod
-    def from_inputs(
-        cls,
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_ids: torch.Tensor,
-        quant_type: QuantType,
-    ):
-        experts, gateup_dim, hidden_dim = w1.shape
-        model_dim, inter_dim = w2.shape[1], w2.shape[2]
-        assert gateup_dim == 2 * inter_dim
-        return cls(
-            batch=int(hidden_states.shape[0]),
-            experts=experts,
-            gateup_dim=gateup_dim,
-            hidden_dim=hidden_dim,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            topk=topk_ids.shape[1],
-            quant_type=("ptpc" if quant_type == QuantType.per_Token else "per_tensor"),
-        )
+from aiter.ops.flydsl.moe_gemm_2stage import (
+    Config as Config,  # noqa: PLC0414
+)
+from aiter.ops.flydsl.moe_gemm_2stage import (
+    _get_compiled_kernel as _get_compiled_kernel,  # noqa: PLC0414
+)
+from aiter.ops.flydsl.moe_gemm_2stage import (
+    _get_compiled_kernel_cached as _get_compiled_kernel_cached,  # noqa: PLC0414
+)
+from aiter.ops.flydsl.moe_gemm_2stage import (
+    _Problem as _Problem,  # noqa: PLC0414
+)
+from aiter.ops.flydsl.moe_gemm_2stage import (
+    precompile_flydsl_moe as precompile_flydsl_moe,  # noqa: PLC0414
+)
 
 
 def get_tune_space():
@@ -125,44 +43,6 @@ def get_tune_space():
         Config(64, 128, 256, True).to_string(),
         Config(64, 128, 128, True).to_string(),
     ]
-
-
-@cache
-def _get_compiled_kernel(
-    N,
-    K,
-    weight_dtype_str,
-    quant_type_str,
-    TOPK,
-    BLOCK_TILE_SIZE_M,
-    BLOCK_TILE_SIZE_N,
-    stage,
-    alg,
-    E,
-    act_quant_type_str=None,
-    BLOCK_TILE_SIZE_K=None,
-    activation_str="silu",
-    swiglu_limit=None,
-):
-    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_gemm
-
-    return compile_gemm(
-        N=N,
-        K=K,
-        weight_dtype=weight_dtype_str,
-        weight_quant_type=quant_type_str,
-        TOPK=TOPK,
-        BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
-        BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
-        tile_k=BLOCK_TILE_SIZE_K,
-        stage=stage,
-        alg=alg,
-        E=E,
-        USE_ATOMIC_WRITE=True,
-        act_quant_type=act_quant_type_str,
-        activation=activation_str,
-        swiglu_limit=swiglu_limit,
-    )
 
 
 _TORCH_TO_FX = {
@@ -179,11 +59,17 @@ def _ptr(t):
 
 
 def _launch(kernel_fn, *args):
-    stream = torch.cuda.current_stream()
-    prepared_args = [
-        _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
-    ]
-    _run_compiled(kernel_fn, *prepared_args, stream)
+    device = args[0].device
+    with (
+        nullcontext()
+        if device.type == "cuda" and device.index == torch.cuda.current_device()
+        else torch.cuda.device(device)
+    ):
+        stream = torch.cuda.current_stream(device)
+        prepared_args = [
+            _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
+        ]
+        _run_compiled(kernel_fn, *prepared_args, stream)
 
 
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
@@ -192,8 +78,8 @@ def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=N
 
     amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     xq = torch.empty_like(x, dtype=quant_dtype)
-    flydsl_absmax()(x, amax)
-    flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)
+    flydsl_absmax(device=x.device)(x, amax)
+    flydsl_quant_per_tensor(quant_dtype, device=x.device)(x, amax, xq)
     fmax = torch.finfo(quant_dtype).max
     xs = amax / fmax
     xs = xs.reshape(1).to(torch.float32)
@@ -263,6 +149,7 @@ def _run_prefill(
 
     gemm1_out = _gateup_output(hidden_states, problem)
     gateup_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -311,6 +198,7 @@ def _run_prefill(
         device=hidden_states.device,
     )
     down_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -343,14 +231,14 @@ def _run_prefill(
         dtype=torch.int32,
         device=hidden_states.device,
     )
-    invert_sorted_ids(problem.topk)(
+    invert_sorted_ids(problem.topk, device=hidden_states.device)(
         sorted_ids,
         loc_ids,
         num_valid_ids,
         sorted_ids.shape[0],
         problem.batch,
     )
-    sorted_sum(problem.topk, problem.model_dim)(
+    sorted_sum(problem.topk, problem.model_dim, device=hidden_states.device)(
         loc_ids, gemm2_out, cur_out, problem.batch
     )
     return cur_out
@@ -378,6 +266,7 @@ def _run_batch1(
         device=hidden_states.device,
     )
     gateup_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str="fp8",
@@ -403,6 +292,7 @@ def _run_batch1(
     )
 
     down_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str="fp8",
@@ -460,6 +350,7 @@ def _run_decode(
 
     gemm1_out = _gateup_output(hidden_states, problem)
     gateup_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str="fp8",
@@ -488,6 +379,7 @@ def _run_decode(
     )
 
     down_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str="fp8",
@@ -535,6 +427,22 @@ def run_flydsl_moe_gfx942(
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support num_local_tokens"
         )
+    if (
+        activation == ActivationType.Silu
+        and swiglu_limit
+        and math.isfinite(swiglu_limit)
+    ):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support a finite "
+            "swiglu_limit for Silu"
+        )
+    if hidden_states.device.type != "cuda":
+        raise ValueError("gfx942 FlyDSL whole-graph backend requires CUDA/HIP tensors")
+    runtime_arch = torch.cuda.get_device_properties(hidden_states.device).gcnArchName
+    if runtime_arch.split(":", 1)[0] != "gfx942":
+        raise NotImplementedError(
+            f"This FlyDSL whole-graph backend requires gfx942, got {runtime_arch}"
+        )
     for name, tensor in (
         ("hidden_states", hidden_states),
         ("w1", w1),
@@ -544,6 +452,8 @@ def run_flydsl_moe_gfx942(
         ("w1_scale", w1_scale),
         ("w2_scale", w2_scale),
     ):
+        if tensor is not None and tensor.device != hidden_states.device:
+            raise ValueError(f"{name} must be on the hidden_states device")
         if tensor is not None and not tensor.is_contiguous():
             raise NotImplementedError(
                 f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
@@ -561,63 +471,85 @@ def run_flydsl_moe_gfx942(
         raise RuntimeError(f"Unsupported quant_type: {quant_type}")
     if w1_scale is None or w2_scale is None:
         raise ValueError("FP8 weights require both w1_scale and w2_scale")
+    if w1_scale.dtype != torch.float32 or w2_scale.dtype != torch.float32:
+        raise ValueError("FP8 weight scales must use torch.float32")
+    if topk_ids.dtype != torch.int32 or topk_weight.shape != topk_ids.shape:
+        raise ValueError(
+            "Routing requires int32 topk_ids and matching topk_weight shape"
+        )
+    # Sorting and Down kernels read routing weights as float32 on every path.
+    if topk_weight.dtype != torch.float32:
+        raise ValueError("topk_weight must use torch.float32")
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    scale_rows = (
+        (problem.gateup_dim, problem.model_dim)
+        if quant_type == QuantType.per_Token
+        else (1, 1)
+    )
+    if (
+        w1_scale.numel() < problem.experts * scale_rows[0]
+        or w2_scale.numel() < problem.experts * scale_rows[1]
+    ):
+        raise ValueError("FP8 weight scale buffers are smaller than the expert layout")
     unsupported_reason = config.unsupported_reason(problem)
     if unsupported_reason is not None:
         raise RuntimeError(
             f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
         )
-    if config.use_prefill:
-        return _run_prefill(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            quant_type,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            config,
-            problem,
-            activation_str,
-            swiglu_limit,
-        )
-    if problem.batch == 1:
-        return _run_batch1(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            problem,
-            activation_str,
-            swiglu_limit,
-        )
-    if 2 <= problem.batch <= 256:
-        return _run_decode(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            config,
-            problem,
-            activation_str,
-            swiglu_limit,
-        )
+    # HIP sorting and quantization also use the current device, not only the
+    # FlyDSL launchers. Restore the caller's device on success and on failure.
+    with torch.cuda.device(hidden_states.device):
+        if config.use_prefill:
+            return _run_prefill(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                quant_type,
+                w1_scale,
+                w2_scale,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                config,
+                problem,
+                activation_str,
+                swiglu_limit,
+            )
+        if problem.batch == 1:
+            return _run_batch1(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+                problem,
+                activation_str,
+                swiglu_limit,
+            )
+        if 2 <= problem.batch <= 256:
+            return _run_decode(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                config,
+                problem,
+                activation_str,
+                swiglu_limit,
+            )
     raise RuntimeError(f"Unsupported batch-size {problem.batch}")
 
 

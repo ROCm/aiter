@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 from collections.abc import Callable
@@ -1316,6 +1317,7 @@ def _fused_moe_impl(
             has_stage2_scatter=stage2_scatter is not None,
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
+            requested_block_size_m=block_size_M,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -2874,6 +2876,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    requested_block_size_m=None,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3239,12 +3242,28 @@ def get_2stage_cfgs(
             unsupported = "prequantized activations"
         elif has_num_local_tokens:
             unsupported = "num_local_tokens"
+        elif requested_block_size_m is not None and requested_block_size_m != cfg.get(
+            "block_m"
+        ):
+            # An override needs an explicit matching block size in the tuned row.
+            unsupported = (
+                f"block_size_M={requested_block_size_m!r} "
+                f"(tuned block_m={cfg.get('block_m')!r})"
+            )
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
         elif gate_mode is not GateMode.SEPARATED:
             unsupported = f"gate mode {gate_mode.value!r}"
         elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
             unsupported = f"activation {activation}"
+        elif (
+            activation == ActivationType.Silu
+            and swiglu_limit
+            and math.isfinite(swiglu_limit)
+        ):
+            # These kernels clamp Swiglu only; zero is the reference's
+            # no-clamp sentinel.
+            unsupported = f"swiglu_limit={swiglu_limit!r} for Silu"
         if unsupported is not None:
             cfg = None
             full_impl = None
@@ -4010,6 +4029,11 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if metadata.full_impl is not None:
+        raise NotImplementedError(
+            "fused_moe_2stages does not support whole-graph implementations; "
+            "use fused_moe with unsorted topk_ids and topk_weight instead"
+        )
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS

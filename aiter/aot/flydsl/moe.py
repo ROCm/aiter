@@ -63,6 +63,93 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
+_WHOLE_GRAPH_IMPL_PREFIX = "impl__flydsl_gfx942__"
+
+
+def _parse_whole_graph_job(row: dict[str, str], kernel_name: str) -> dict | None:
+    """Validate only whole-graph rows; leave stage-specific CSV semantics intact."""
+    from aiter.ops.flydsl.moe_gemm_2stage import Config, _Problem
+
+    try:
+        config_string = kernel_name[len(_WHOLE_GRAPH_IMPL_PREFIX) :]
+        config = Config.from_string(config_string)
+        token = int(row["token"])
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        experts = int(row["expert"])
+        topk = int(row["topk"])
+        # Zero is an internal unspecified sentinel, never a CU_NUM=0 override.
+        cu_num = int(row.get("cu_num", "0") or "0")
+        gfx = (row.get("gfx") or "").strip()
+        if (
+            gfx not in ("", "gfx942")
+            or cu_num < 0
+            or cu_num_to_arch(cu_num, default="gfx942") != "gfx942"
+        ):
+            raise ValueError("the implementation and compile target must be gfx942")
+        if int(row.get("use_g1u1", "1")) != 1:
+            raise ValueError("paired gate/up weights require use_g1u1=1")
+        if int(row.get("doweight_stage1", "0") or "0") != 0:
+            raise ValueError("doweight_stage1 must be 0")
+        if int(row.get("ksplit", "0") or "0") != 0:
+            raise ValueError("ksplit must be 0")
+        if int(row.get("shared_expert_id", "-1") or "-1") >= 0:
+            raise ValueError("the whole-graph backend does not support FHMoE jobs")
+        if int(row.get("block_m", "0") or "0") not in (0, config.BLOCK_M):
+            raise ValueError("block_m must match the whole-graph config")
+
+        act = (row.get("act_type") or "").strip().split(".")[-1].lower()
+        if act not in ("silu", "swiglu"):
+            raise ValueError("only Silu and Swiglu activations are supported")
+        quant_type = {
+            "per_Token": "ptpc",
+            "per_Tensor": "per_tensor",
+        }.get((row.get("q_type") or "").strip().split(".")[-1])
+        if quant_type is None:
+            raise ValueError("only per_Token and per_Tensor quantization are supported")
+        if (row.get("dtype") or "").strip() != "torch.bfloat16" or (
+            row.get("q_dtype_w") or ""
+        ).strip() != "torch.float8_e4m3fnuz":
+            raise ValueError("BF16 input/output and FP8 E4M3FNUZ weights are required")
+        # Decode internally consumes BF16, but the request API still requires
+        # q_dtype_a=None or FP8 E4M3FNUZ. Do not admit BF16-only CSV keys here.
+        if (row.get("q_dtype_a") or "").strip() not in ("", "torch.float8_e4m3fnuz"):
+            raise ValueError("q_dtype_a must be unspecified or FP8 E4M3FNUZ")
+
+        reason = config.unsupported_reason(
+            _Problem(
+                batch=token,
+                experts=experts,
+                gateup_dim=2 * inter_dim,
+                hidden_dim=model_dim,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                topk=topk,
+                quant_type=quant_type,
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
+    except (KeyError, TypeError, ValueError) as error:
+        print(
+            f"  [WARN] Unsupported whole-graph row {kernel_name!r}: {error}, skipping"
+        )
+        return None
+
+    return {
+        "kernel_name": kernel_name,
+        "stage": "whole_graph",
+        "config_string": config_string,
+        "token_num": token,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "cu_num": cu_num,
+        "act": act,
+        "weight_dtype": "fp8",
+        "quant_type": quant_type,
+    }
 
 
 def parse_csv(csv_path: str):
@@ -73,7 +160,10 @@ def parse_csv(csv_path: str):
         doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
 
     Deduplicates with ``job_identity``, including token bucket, block size, and
-    the shared-expert ID when present.
+    the shared-expert ID when present. Baseline gfx942 implementation rows emit
+    one whole_graph job, including both stages and their FlyDSL auxiliaries.
+    Swiglu whole-graph jobs cover the legacy default limit unless the caller
+    supplies swiglu_limit to compile_one_config.
     """
     jobs = []
     seen = set()
@@ -81,6 +171,15 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            whole_graph_name = row.get("kernelName1", "").strip()
+            if whole_graph_name.startswith(_WHOLE_GRAPH_IMPL_PREFIX):
+                job = _parse_whole_graph_job(row, whole_graph_name)
+                if job is not None:
+                    key = job_identity(job)
+                    if key not in seen:
+                        seen.add(key)
+                        jobs.append(job)
+                continue
             token = int(row["token"])
             model_dim = int(row["model_dim"])
             inter_dim = int(row["inter_dim"])
@@ -1022,10 +1121,17 @@ def compile_one_config(
     Uses COMPILE_ONLY=1 with dummy tensors to trigger MLIR compilation and
     pkl cache write without depending on HIP ops or executing on GPU.
 
+    Whole-graph jobs instead preload typed placeholder pointers. The optional
+    swiglu_limit keyword selects one legacy compile-time specialization; it
+    does not enable arbitrary runtime limits in a cold RUN_ONLY process.
+
     Returns a dict with timing info.
     """
-    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
     is_epilogue = kwargs.get("stage") == "epilogue"
+    is_whole_graph = kwargs.get("stage") == "whole_graph"
+    aot_arch = cu_num_to_arch(
+        cu_num, default="gfx942" if is_whole_graph else MOE_AOT_ARCH_DEFAULT
+    )
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
         if is_epilogue
@@ -1049,6 +1155,7 @@ def compile_one_config(
     # real (COMPILE_ONLY) tensors outside FakeTensorMode.
     is_a16w_port = (
         not is_epilogue
+        and not is_whole_graph
         and kwargs.get("shared_expert_id", -1) < 0
         and kwargs.get("a_dtype") == "bf16"
         and kwargs.get("b_dtype") in ("fp4", "int4")
@@ -1056,7 +1163,43 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        if is_a16w_port:
+        if is_whole_graph:
+            if not kernel_name.startswith(_WHOLE_GRAPH_IMPL_PREFIX):
+                raise ValueError(
+                    "Only the gfx942 whole-graph implementation is supported"
+                )
+            if (
+                aot_arch != "gfx942"
+                or kwargs.get("gfx", "gfx942") != "gfx942"
+                or cu_num < 0
+            ):
+                raise ValueError("Whole-graph AOT requires a gfx942 compile target")
+            if kwargs["config_string"] != kernel_name[len(_WHOLE_GRAPH_IMPL_PREFIX) :]:
+                raise ValueError(
+                    "Whole-graph kernel name and config_string do not match"
+                )
+
+            from aiter.ops.flydsl.moe_gemm_2stage import precompile_flydsl_moe
+
+            with (
+                compile_only_env(),
+                override_env("ARCH", aot_arch),
+                override_env("FLYDSL_GPU_ARCH", aot_arch),
+                override_env("CU_NUM", str(cu_num) if cu_num > 0 else None),
+            ):
+                precompile_flydsl_moe(
+                    config_string=kwargs["config_string"],
+                    batch=kwargs["token_num"],
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    experts=experts,
+                    topk=topk,
+                    weight_dtype=kwargs["weight_dtype"],
+                    quant_type=kwargs["quant_type"],
+                    activation=kwargs["act"],
+                    swiglu_limit=kwargs.get("swiglu_limit"),
+                )
+        elif is_a16w_port:
             with override_env("FLYDSL_GPU_ARCH", aot_arch):
                 _precompile_a16w4_to_cache(
                     model_dim=model_dim,
@@ -1116,6 +1259,12 @@ def main():
         default=DEFAULT_CSVS,
         help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
     )
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help="Precompile this Swiglu limit for whole-graph jobs (default: legacy 7.0)",
+    )
     args = parser.parse_args()
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
@@ -1134,6 +1283,11 @@ def main():
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
     epilogue_jobs = [j for j in all_jobs if j["stage"] == "epilogue"]
+    whole_graph_jobs = [j for j in all_jobs if j["stage"] == "whole_graph"]
+    if args.swiglu_limit is not None:
+        for job in whole_graph_jobs:
+            if job["act"] == "swiglu":
+                job["swiglu_limit"] = args.swiglu_limit
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
@@ -1142,6 +1296,7 @@ def main():
     print(f"  Stage1 jobs:    {len(stage1_jobs)}")
     print(f"  Stage2 jobs:    {len(stage2_jobs)}")
     print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
+    print(f"  Whole graph:    {len(whole_graph_jobs)}")
     print(f"  Total jobs:     {len(all_jobs)}")
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
@@ -1150,12 +1305,14 @@ def main():
 
     total_t0 = time.time()
 
-    # Stage1, stage2 and CK-Tile epilogue kernels are independent compiles
-    # (each writes its own artifact to cache; none reads another's output), so
-    # they share a single pool for maximum fan-out instead of serial passes.
-    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2 + epilogue) ---")
+    # Stage and whole-graph jobs materialize independent artifacts in one pool.
+    print(
+        f"\n--- Compiling {len(all_jobs)} kernels "
+        "(stage1 + stage2 + epilogue + whole graph) ---"
+    )
     results = run_jobs_parallel(
-        compile_one_config, stage1_jobs + stage2_jobs + epilogue_jobs
+        compile_one_config,
+        stage1_jobs + stage2_jobs + epilogue_jobs + whole_graph_jobs,
     )
 
     total_elapsed = time.time() - total_t0

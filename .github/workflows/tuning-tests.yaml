@@ -1,6 +1,43 @@
 name: Tuning Tests
 
 on:
+  pull_request:
+    # Cancel an in-flight PR run if the PR is converted back to a draft.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    branches: [main]
+    paths:
+      - "aiter/ops/flydsl/kernels/moe_gemm_2stage/**"
+      - "aiter/ops/flydsl/kernels/moe_gemm_2stage*.py"
+      - "aiter/ops/flydsl/kernels/tensor_shim.py"
+      - "aiter/ops/flydsl/fused_moe_gfx942.py"
+      - "aiter/ops/flydsl/moe_gemm_2stage.py"
+      - "aiter/ops/flydsl/moe_kernels.py"
+      - "aiter/aot/flydsl/**"
+      - "aiter/fused_moe.py"
+      - "aiter/fused_moe_registry.py"
+      - "aiter/__init__.py"
+      - "aiter/jit/**"
+      - "aiter/utility/**"
+      - "aiter/ops/enum.py"
+      - "aiter/ops/moe_sorting.py"
+      - "aiter/ops/quant.py"
+      - "aiter/ops/shuffle.py"
+      - "aiter/test_common.py"
+      - "aiter/configs/**"
+      - "op_tests/tuning_tests/**"
+      - ".github/workflows/tuning-tests.yaml"
+      - ".github/workflows/ci-config.yaml"
+      - ".github/runner-config.yml"
+      - ".github/scripts/build_aiter_triton.sh"
+      - ".github/scripts/install_triton.sh"
+      - ".github/scripts/verify_triton_pin.py"
+      - ".github/scripts/clean_up_rocm.sh"
+      - ".github/requirements/**"
+      - "requirements*.txt"
+      - "pyproject.toml"
+      - "setup.py"
+      - ".gitmodules"
+      - "3rdparty/composable_kernel"
   schedule:
     # Runs daily at 04:00 Beijing time.
     - cron: "0 20 * * *"
@@ -16,6 +53,10 @@ on:
           - level01
           - tune_pipeline
           - run_config
+          - whole_graph_cache
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,18 +71,53 @@ jobs:
   ci_config:
     uses: ./.github/workflows/ci-config.yaml
 
+  workflow-guard:
+    name: FlyDSL MoE CI policy (CPU only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Explain skipped runtime coverage
+        if: >-
+          github.event_name == 'pull_request' &&
+          (github.event.pull_request.draft ||
+           github.event.pull_request.head.repo.full_name != github.repository)
+        run: |
+          {
+            echo "## FlyDSL MoE runtime coverage: SKIPPED"
+            echo "Draft and fork PRs do not execute this workflow's self-hosted runtime jobs."
+            echo "Fork PRs require local two-GPU gfx942 evidence, followed by maintainer-reviewed trusted staging/manual validation."
+            echo "The CPU-only workflow guard is not runtime validation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check workflow wiring without runtime dependencies
+        run: python3 -m unittest op_tests.tuning_tests.test_flydsl_moe_ci -v
+
   cpu-validation:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
+    # Even host-only tests import aiter core/FlyDSL in a real ROCm environment.
+    # Never execute fork or draft PR code on persistent self-hosted runners.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01'))
     name: README Level 0+1
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 45
-    needs: ci_config
+    needs: [ci_config, workflow-guard]
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Sync CK submodule
         run: |
@@ -93,7 +169,7 @@ jobs:
             -e PYTHONUNBUFFERED=1 \
             -w /workspace \
             tuning_tests_level01 \
-            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_csv_validation op_tests.tuning_tests.test_tuner_infra op_tests.tuning_tests.test_mp_tuner_logic op_tests.tuning_tests.test_config_shape_collision op_tests.tuning_tests.test_a6w6_tuning op_tests.tuning_tests.test_mixed_mxfp_tuning -v 2>&1 | tee /workspace/${LOG_DIR}/level01.log"
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_csv_validation op_tests.tuning_tests.test_tuner_infra op_tests.tuning_tests.test_mp_tuner_logic op_tests.tuning_tests.test_config_shape_collision op_tests.tuning_tests.test_a6w6_tuning op_tests.tuning_tests.test_mixed_mxfp_tuning op_tests.tuning_tests.test_flydsl_moe_cache -v 2>&1 | tee /workspace/${LOG_DIR}/level01.log"
 
       - name: Upload level 0+1 artifacts
         if: always()
@@ -114,7 +190,10 @@ jobs:
         run: ./.github/scripts/clean_up_rocm.sh
 
   gpu-pipeline:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline'))
     name: README Level 2 Pipeline
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 75
@@ -125,6 +204,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Sync CK submodule
         run: |
@@ -196,8 +277,84 @@ jobs:
         if: always()
         run: ./.github/scripts/clean_up_rocm.sh
 
+  whole_graph_cache:
+    # Manual dispatch retains the existing maintainer-controlled trust boundary.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'whole_graph_cache'))
+    name: Whole-graph MoE cache (gfx942, two GPUs)
+    # runner-config.yml declares eight MI300X GPUs for this allocation. The
+    # one-GPU label cannot test cross-device caches; the general multi-GPU job
+    # in aiter-test.yaml currently uses MI350X and is not suitable for gfx942.
+    runs-on: linux-aiter-oci-mi300x-8
+    timeout-minutes: 120
+    needs: [ci_config, workflow-guard]
+    env:
+      GPU_ARCHS: gfx942
+      AITER_TEST_EXPECTED_GFX: gfx942
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Run whole-graph MoE cache suite
+        run: |
+          set -euo pipefail
+          mkdir -p "${LOG_DIR}"
+          if [[ -f "/etc/podinfo/gha-render-devices" ]]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          # Use only two GPUs from the reserved eight-GPU allocation. The test
+          # fails, rather than skips, if either GPU is missing, is not gfx942,
+          # or has a different CU count. Keep ROCr visible to the AOT worker.
+          docker run --rm \
+            --name "tuning_tests_whole_graph_cache_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e AITER_TEST_EXPECTED_GFX="${AITER_TEST_EXPECTED_GFX}" \
+            -e ROCR_VISIBLE_DEVICES=0,1 \
+            -e HIP_VISIBLE_DEVICES=0,1 \
+            -e CUDA_VISIBLE_DEVICES=0,1 \
+            -e PYTHONUNBUFFERED=1 \
+            -e AITER_ONLINE_TUNE=0 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "$DOCKER_IMAGE" \
+            bash -lc 'set -euo pipefail; BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh; python3 -m unittest op_tests.tuning_tests.test_flydsl_moe_run_only -v' \
+            2>&1 | tee "${LOG_DIR}/whole-graph-cache-gfx942.log"
+
+      - name: Upload whole-graph cache results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-tests-whole-graph-cache-gfx942-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: ${{ env.LOG_DIR }}/whole-graph-cache-gfx942.log
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f "tuning_tests_whole_graph_cache_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" || true
+
   gpu-run-config:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config'))
     name: README Level 2 Run Config
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 120
@@ -208,6 +365,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Sync CK submodule
         run: |
