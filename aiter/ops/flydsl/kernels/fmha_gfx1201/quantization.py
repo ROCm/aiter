@@ -20,8 +20,8 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
-from ...stream_readiness import register_ready, wait_ready
 from .fp8_quant import flydsl_fp8_pertensor_quant
+from .stream_readiness import register_ready, wait_ready
 
 _FP8_MAX = 448.0
 _ROT_ROWS = 64

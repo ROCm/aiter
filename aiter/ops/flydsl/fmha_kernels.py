@@ -37,11 +37,11 @@ from .kernels.fmha_gfx1201.flash_attn_func_fp8 import (
 )
 from .kernels.fmha_gfx1201.flash_attn_func_fp8 import get_flash_attn_fp8_lds_bytes
 from .kernels.fmha_gfx1201.quantization import flydsl_fp8_quant
+from .kernels.fmha_gfx1201.stream_readiness import register_ready, wait_ready
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8,
     flash_attn_varlen_m32x8,
 )
-from .stream_readiness import register_ready, wait_ready
 
 __all__ = [
     "flydsl_flash_attn_batch_func",

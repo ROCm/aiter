@@ -679,7 +679,7 @@ def test_stream_readiness_concurrent_producers_chain_same_storage():
     """The latest registration covers every earlier in-flight producer."""
     import threading
 
-    from aiter.ops.flydsl.stream_readiness import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.stream_readiness import (
         register_ready,
         wait_ready,
     )
