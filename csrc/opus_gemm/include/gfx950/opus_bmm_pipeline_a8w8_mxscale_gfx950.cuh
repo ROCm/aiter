@@ -12,6 +12,55 @@
 
 #ifdef __HIP_DEVICE_COMPILE__
 
+// The scale word an op_sel-0 MFMA reads, for this pipeline's traits.
+//
+// At GROUP_K=128 one byte covers the MFMA's whole K extent, and pack_e8m0x4
+// fills the word with it. At 32 the lane already holds exactly the byte this
+// MFMA wants -- that is what addressing the scale by lane_id / W_M buys -- and
+// byte 0 is where op_sel 0 looks, so the broadcast is a v_mul_lo_u32 (quarter
+// rate) whose result nothing reads.
+//
+// It is not one stray multiply: rep_n_per_scale is GROUP_N / (W_N * T_N), so
+// the number of distinct B scale words per K step is four times larger at
+// GROUP_N=32 than at 128. The built code object for the 512x256x256x128 pair
+// counts 86 v_mul_lo_u32 at 32 against 34 at 128, all of the excess inside the
+// MFMA span.
+//
+// A deliberate twin of the flatmm split-K pipeline's sf_scale_word rather than
+// a shared definition, for the same reason sf_lane_k_block_scale above is one:
+// that header's helpers carry an always_inline added to dodge clang 22's
+// "operand has incorrect register class" on the 128 kernels, and folding the
+// two would put that workaround's codegen at risk for a family it was not
+// tuned on.
+template<typename T, typename S>
+__attribute__((always_inline)) OPUS_D int sf_scale_word_pipeline(S scale) {
+    if constexpr (T::SF_PER_MFMA_K == 1) {
+        return pack_e8m0x4(scale);
+    } else {
+        return static_cast<int>(scale) & 0xFF;
+    }
+}
+
+// The scale bytes a lane holds, one dword at a time.
+//
+// A lane's scale vector is a packed byte vector, so v[j] costs a shift and a
+// mask to get the byte out of the register it already shares with its
+// neighbours. scale_op_sel picks a byte of the scale operand for the whole wave
+// (see the traits note), and the subtile index that selects it is a compile-time
+// constant, so handing the MFMA the whole dword and the index of the byte within
+// it does the same selection in the hardware for no instruction at all.
+//
+// Only usable where the vector is a whole number of dwords wide, which is why
+// the call site guards on sizeof: the A scale vector is E_M bytes and the loads
+// build it at the layout's width, so widening it to suit this would cost the
+// repack it is meant to avoid.
+template<int IDX, typename V>
+__attribute__((always_inline)) OPUS_D int sf_scale_dword(const V& v) {
+    static_assert(sizeof(V) % 4 == 0, "scale vector must be a whole dword wide");
+    using W = opus::vector_t<int, (int)sizeof(V) / 4>;
+    return __builtin_bit_cast(W, v)[IDX / 4];
+}
+
 template<typename T, int ELEM_C, typename Mma, typename VA, typename VB,
          typename VSFA, typename VSFB, typename VC>
 OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
@@ -33,8 +82,8 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
         static_assert(T::HALF_B_N % T::GROUP_N == 0,
                       "e8m0 path assumes the half-tile spans whole B scale groups");
         if constexpr (T::E_M == 1) {
-            const int scale_a = pack_e8m0x4(v_sfa[0]);
-            const int scale_b = pack_e8m0x4(v_sfb[0]);
+            const int scale_a = sf_scale_word_pipeline<T>(v_sfa[0]);
+            const int scale_b = sf_scale_word_pipeline<T>(v_sfb[0]);
             v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
         } else {
             using MMA = typename Mma::MMA;
@@ -43,15 +92,21 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
             constexpr int c_len = Mma::mma_c_len;
             constexpr int rep_n_per_scale = T::GROUP_N / (T::W_N * T::T_N);
             static_assert(T::GROUP_N % (T::W_N * T::T_N) == 0);
+            // Take the B scale straight out of the dword it shares when there
+            // is more than one N group per half-tile and they fill one exactly
+            // -- GROUP_N=32 on a 128-wide half tile, which is the case this is
+            // for. Anything else, including every GROUP_K=128 kid, keeps the
+            // broadcast word and op_sel 0.
+            constexpr bool SFB_OPSEL =
+                T::SF_PER_MFMA_K > 1 && sizeof(VSFB) % 4 == 0;
             opus::static_for<T::E_M>([&](auto im_c) {
                 constexpr int im = decltype(im_c)::value;
                 opus::static_for<T::E_N>([&](auto in_c) {
                     constexpr int in = decltype(in_c)::value;
                     opus::static_for<T::E_K>([&](auto ik_c) {
                         constexpr int ik = decltype(ik_c)::value;
-                        const int scale_a = pack_e8m0x4(v_sfa[im * T::E_K + ik]);
-                        const int scale_b =
-                            pack_e8m0x4(v_sfb[(in / rep_n_per_scale) * T::E_K + ik]);
+                        constexpr int j_sfa = im * T::E_K + ik;
+                        constexpr int j_sfb = (in / rep_n_per_scale) * T::E_K + ik;
                         constexpr int i_tile_a = im * T::E_K + ik;
                         constexpr int i_tile_b = in * T::E_K + ik;
                         constexpr int i_tile_c = im * T::E_N + in;
@@ -64,7 +119,16 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
                         auto s_c = opus::slice(v_c,
                             opus::number<i_tile_c * c_len>{},
                             opus::number<i_tile_c * c_len + c_len>{});
-                        s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, 0_I, 0_I);
+                        const int scale_a = sf_scale_word_pipeline<T>(v_sfa[j_sfa]);
+                        if constexpr (SFB_OPSEL) {
+                            s_c = MMA{}(s_a, s_b, s_c, scale_a,
+                                        sf_scale_dword<j_sfb>(v_sfb),
+                                        0_I, opus::number<j_sfb % 4>{});
+                        } else {
+                            const int scale_b =
+                                sf_scale_word_pipeline<T>(v_sfb[j_sfb]);
+                            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, 0_I, 0_I);
+                        }
                         opus::set_slice(v_c, s_c,
                             opus::number<i_tile_c * c_len>{},
                             opus::number<i_tile_c * c_len + c_len>{});
@@ -454,14 +518,41 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         // measured, that costs more than the division saves (1891 -> 1793
         // TFLOPS at b8/m32768/k4096), so the runtime divisor stays.
         const int sfa_total = SFA_ROWS * cols;
+        // Issue SFA_FILL_BATCH passes before storing any of them, so the panel
+        // costs that many global round trips rather than one per pass. Written
+        // as store(load(...)) it is one load, one vmcnt(0), one ds_write, over
+        // and over: at K=4096 and GROUP_K=32 a window is 48 bytes per thread,
+        // which is twelve serial round trips every time the window moves. That
+        // is the same reason the B panel above holds its loads in registers
+        // first, and it is what made a slide cost ~10us of stall rather than the
+        // one latency the data actually needs.
+        //
+        // The batch is registers held live across the loads, so it is small on
+        // purpose: this kernel allocates the full 256 VGPRs already.
+        constexpr int SFA_FILL_BATCH = 4;
         auto fill = [&](auto vec_c) {
             constexpr int VEC = decltype(vec_c)::value;
-            for (int idx = tid * VEC; idx < sfa_total; idx += T::BLOCK_SIZE * VEC) {
-                const int m  = idx / cols;
-                const int kt = idx - m * cols;
-                s_sfa.template store<VEC>(
-                    load<VEC>(g_sfa, m * kargs.stride_sfa + col0 + kt),
-                    m * sfa_lds_stride + kt);
+            const int stride = T::BLOCK_SIZE * VEC;
+            for (int base = tid * VEC; base < sfa_total;
+                 base += stride * SFA_FILL_BATCH) {
+                vector_t<D_SF, VEC> val[SFA_FILL_BATCH];
+                int dst[SFA_FILL_BATCH];
+                bool take[SFA_FILL_BATCH];
+                opus::static_for<SFA_FILL_BATCH>([&](auto it_c) {
+                    constexpr int it = decltype(it_c)::value;
+                    const int idx = base + it * stride;
+                    take[it] = idx < sfa_total;
+                    if (take[it]) {
+                        const int m  = idx / cols;
+                        const int kt = idx - m * cols;
+                        dst[it] = m * sfa_lds_stride + kt;
+                        val[it] = load<VEC>(g_sfa, m * kargs.stride_sfa + col0 + kt);
+                    }
+                });
+                opus::static_for<SFA_FILL_BATCH>([&](auto it_c) {
+                    constexpr int it = decltype(it_c)::value;
+                    if (take[it]) s_sfa.template store<VEC>(val[it], dst[it]);
+                });
             }
         };
         // A sliding refill is inlined into the main loop, so it takes the one
