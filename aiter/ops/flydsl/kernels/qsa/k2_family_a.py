@@ -322,13 +322,9 @@ def build_qsa_k2_family_a_module(
                 fx.copy(g_copy, k_src, k_frag)
                 k_frags.append(k_frag)
             for gr in range_constexpr(gather_rounds):
-                k_vec = fx.Vector(fx.memref_load_vec(k_frags[gr]))
-                k_vec = fx.Vector.from_elements(
-                    [
-                        live.select(k_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                        for i in range_constexpr(vec)
-                    ],
-                    BFloat16,
+                k_vec = live.select(
+                    fx.Vector(fx.memref_load_vec(k_frags[gr])),
+                    fx.Vector.filled(vec, 0.0, BFloat16),
                 )
                 k_tile = make_k_lds_view(
                     k_arr,
@@ -395,13 +391,9 @@ def build_qsa_k2_family_a_module(
             gpu.barrier()
             if const_expr(decode_tr_pv):
                 for gr in range_constexpr(gather_rounds):
-                    v_vec = fx.Vector(fx.memref_load_vec(v_frags[gr]))
-                    v_vec = fx.Vector.from_elements(
-                        [
-                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                            for i in range_constexpr(vec)
-                        ],
-                        BFloat16,
+                    v_vec = live.select(
+                        fx.Vector(fx.memref_load_vec(v_frags[gr])),
+                        fx.Vector.filled(vec, 0.0, BFloat16),
                     )
                     v_tile = fx.make_view(
                         fx.get_iter(v_lds) + Int32(gr * gather_span),
@@ -415,13 +407,9 @@ def build_qsa_k2_family_a_module(
                 fx.rocdl.s_barrier()
             elif const_expr(use_k32):
                 for gr in range_constexpr(gather_rounds):
-                    v_vec = fx.Vector(fx.memref_load_vec(v_frags_pf[gr]))
-                    v_vec = fx.Vector.from_elements(
-                        [
-                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                            for i in range_constexpr(vec)
-                        ],
-                        BFloat16,
+                    v_vec = live.select(
+                        fx.Vector(fx.memref_load_vec(v_frags_pf[gr])),
+                        fx.Vector.filled(vec, 0.0, BFloat16),
                     )
                     v_tile = make_k_lds_view(
                         k_arr,
@@ -442,13 +430,9 @@ def build_qsa_k2_family_a_module(
                     v_src = fx.slice(v_row, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(g_copy, v_src, v_frag)
-                    v_vec = fx.Vector(fx.memref_load_vec(v_frag))
-                    v_vec = fx.Vector.from_elements(
-                        [
-                            live.select(v_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                            for i in range_constexpr(vec)
-                        ],
-                        BFloat16,
+                    v_vec = live.select(
+                        fx.Vector(fx.memref_load_vec(v_frag)),
+                        fx.Vector.filled(vec, 0.0, BFloat16),
                     )
                     fx.memref_store_vec(v_vec, v_frag)
                     v_tile = fx.make_view(
