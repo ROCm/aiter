@@ -36,7 +36,7 @@ convention.
 
 - [x] 0. Overlay PMC (MFMA/conflict/VMEM per wave vs AMD)
 - [x] 1. Prefill V overlay store map
-- [ ] 2. Prefill packed K32 PV (`cvt_pk`); decode MFMA unchanged
+- [x] 2. Prefill packed K32 PV (`cvt_pk`); decode MFMA unchanged (miss; DNR)
 - [ ] 3. Reuse gather `live` for softmax (optional; after a keep)
 - [ ] 4. Drop leftover `v_perm` on the pack path (optional; after 1)
 - [ ] 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
@@ -287,10 +287,23 @@ with `v_cvt_pk_bf16_f32` into K32 PV (**48** K32 total).
 PV as K32 so static MFMA goes **64 → 48**. Softmax stays in the
 transposed register C map. No P-LDS. Do not change decode (12 MFMA).
 
-- [ ] ISA: prefill K16 PV count → 0; MFMA/wave ≈ AMD at `M=512`.
-- [ ] Focused pytest; keep-gate. Decode must stay flat.
-- [ ] **Done when:** kept with evidence, or reverted and listed under
+- [x] ISA: prefill K16 PV count → 0; MFMA/wave ≈ AMD at `M=512`.
+- [x] Focused pytest; keep-gate. Decode must stay flat.
+- [x] **Done when:** kept with evidence, or reverted and listed under
       do-not-retry.
+
+Missed the 3% keep-gate (2026-09-23). Reverted to phase-1 HEAD
+`a4ec4c938`. Oracle **2 passed**. Prefill ISA
+(`tickets/1047/tmp/k2_phase2_k32pv_isa/`): **0** `v_mfma_f32_16x16x16`,
+**48** `v_mfma_f32_16x16x32`, **40** `v_cvt_pk_bf16_f32`. Decode ISA
+stayed **8** K32 QK + **4** K16 PV. PMC `M=512`
+(`tickets/1047/tmp/k2_phase2_k32pv_pmc/`): MFMA/wave **2112 → 1584**
+(1.00× AMD), conflict unchanged **44352**, wait-LDS **9781 → 9280**,
+busy **9808 → 9865**, VGPR **124**. Keep-gate vs phase 1
+**20.14 / 20.18 / 261.54**: FlyDSL **20.32 / 20.41 / 259.26** (`M=512`
+**−0.9%**). Prefill is still LDS-bound; matching AMD’s MFMA count does
+not move wall clock 3%. Keep register `.to(BFloat16)` P and K16 PV
+gemm.
 
 ### 3. Reuse gather `live` for softmax (optional; after a keep)
 
@@ -333,4 +346,6 @@ Do not start here.
 Paste misses here **and** in `SILOTIGER-1047-plan.md`. Inherited DNR is
 not repeated unless an overlay retry is proposed.
 
-- *(empty — no overlay-era miss yet)*
+- Prefill packed K32 PV (`v_cvt_pk_bf16_f32` + `MFMA 16×16×32` so
+  static MFMA 64→48). ISA and MFMA/wave matched AMD; `M=512` only
+  **−0.9%** vs phase-1 XOR. Kernel restored.

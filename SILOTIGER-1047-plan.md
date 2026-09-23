@@ -952,6 +952,15 @@ went 18.65 → 19.28 us at ``M=1``, 21.15 → 21.98 us at ``M=8``, and
 513.29 → 566.07 us at ``M=512``. This is the P half of the earlier
 P/C widening miss. Keep scalar ``p_lds[h, n]`` stores.
 
+**Do not retry** overlay prefill packed K32 PV
+(``v_cvt_pk_bf16_f32`` of two 16-token P groups + ``MFMA 16x16x32`` so
+static MFMA 64→48, no P-LDS, decode left on 12 MFMA). GPU 6 / gfx950
+stayed exact; prefill ISA was 48 K32 (0 K16 PV) and PMC MFMA/wave
+2112→1584 (1.00× AMD). Width-2051 ``L=512`` vs phase-1 XOR
+20.14 / 20.18 / 261.54 µs went 20.32 / 20.41 / 259.26 (**M=512 −0.9%**).
+Conflict/wave stayed 44352. Keep K16 PV gemm and scalar/register P
+``.to(BFloat16)``.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
