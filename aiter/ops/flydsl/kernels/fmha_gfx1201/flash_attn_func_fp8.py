@@ -65,7 +65,10 @@ try:
 except ImportError:
     from aiter.ops.flydsl.kernels import buffer_ops
 
-from .flash_attn_func_common_gfx1201 import (
+from ..kernels_common import LOG2E as _LOG2E
+from ..kernels_common import dtype_to_elem_type
+from ..tensor_shim import _run_compiled
+from .flash_attn_func_common import (
     configure_gpu_module,
     flatten_scores,
     kv_load_schedule,
@@ -73,9 +76,6 @@ from .flash_attn_func_common_gfx1201 import (
     pointer_arg,
     wrap_pointer_args,
 )
-from .kernels_common import LOG2E as _LOG2E
-from .kernels_common import dtype_to_elem_type
-from .tensor_shim import _run_compiled
 
 NUM_PREFETCH_K = 1
 NUM_PREFETCH_V = 1

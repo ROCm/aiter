@@ -8,7 +8,7 @@ from flydsl._mlir import ir
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from .tensor_shim import ptr_arg as _ptr_arg
+from ..tensor_shim import ptr_arg as _ptr_arg
 
 
 def kv_load_schedule(block_size, head_dim, block_n, vec_width):

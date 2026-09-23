@@ -578,7 +578,7 @@ def test_flydsl_fp8_quant_backend_agreement():
 def test_flydsl_fp8_quant_fp16_fallback_and_direct_guard():
     """FP16 must use a safe public fallback and fail fast at the bf16-only
     low-level FlyDSL producer instead of being reinterpreted as bf16 bits."""
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -597,17 +597,17 @@ def test_flydsl_fp8_quant_fp16_fallback_and_direct_guard():
 
 
 def test_flydsl_fp8_quant_fp16_rotation_uses_fp16_matrix(monkeypatch):
-    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
 
     q, k, v = _make_qkv(1, 128, 2, 128, torch.float16)
     seen_dtypes = []
-    original = fmha_kernels._hadamard_matrix
+    original = quantization._hadamard_matrix
 
     def _record_dtype(head_dim, device, dtype):
         seen_dtypes.append(dtype)
         return original(head_dim, device, dtype)
 
-    monkeypatch.setattr(fmha_kernels, "_hadamard_matrix", _record_dtype)
+    monkeypatch.setattr(quantization, "_hadamard_matrix", _record_dtype)
     flydsl_fp8_quant(q, k, v, rotation=True, backend="torch")
     assert seen_dtypes == [torch.float16]
 
@@ -617,14 +617,14 @@ def test_flydsl_hadamard_matrix_uses_target_device():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires >=2 visible GPUs")
 
-    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
 
     current_device = torch.cuda.current_device()
     try:
         torch.cuda.set_device(0)
         target = torch.device("cuda:1")
-        fmha_kernels._HADAMARD_CACHE.clear()
-        rotation = fmha_kernels._hadamard_matrix(128, target, torch.bfloat16)
+        quantization._HADAMARD_CACHE.clear()
+        rotation = quantization._hadamard_matrix(128, target, torch.bfloat16)
         assert rotation.device == target
     finally:
         torch.cuda.set_device(current_device)
@@ -634,10 +634,10 @@ def test_flydsl_hadamard_cache_concurrent_first_use_and_reuse():
     """Concurrent streams share one fully-produced cached matrix."""
     import threading
 
-    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
 
     device = torch.device("cuda", 0)
-    fmha_kernels._HADAMARD_CACHE.clear()
+    quantization._HADAMARD_CACHE.clear()
     barrier = threading.Barrier(2)
     results = [None, None]
     errors = []
@@ -648,7 +648,7 @@ def test_flydsl_hadamard_cache_concurrent_first_use_and_reuse():
             stream = torch.cuda.Stream(device=device)
             barrier.wait()
             with torch.cuda.stream(stream):
-                matrix = fmha_kernels._hadamard_matrix(128, device, torch.bfloat16)
+                matrix = quantization._hadamard_matrix(128, device, torch.bfloat16)
                 checksum = matrix.float().sum()
             stream.synchronize()
             results[index] = (matrix.data_ptr(), checksum.item())
@@ -668,7 +668,7 @@ def test_flydsl_hadamard_cache_concurrent_first_use_and_reuse():
 
     reuse_stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(reuse_stream):
-        reused = fmha_kernels._hadamard_matrix(128, device, torch.bfloat16)
+        reused = quantization._hadamard_matrix(128, device, torch.bfloat16)
         reused_checksum = reused.float().sum()
     reuse_stream.synchronize()
     assert reused.data_ptr() == results[0][0]
@@ -751,13 +751,13 @@ def test_flydsl_fp8_quant_rejects_unknown_backend():
 
 
 def test_flydsl_arch_detection_does_not_require_rocminfo(monkeypatch):
-    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
 
     def _broken_rocminfo():
         raise RuntimeError("rocminfo unavailable")
 
-    monkeypatch.setattr(fmha_kernels, "get_gfx_runtime", _broken_rocminfo)
-    assert fmha_kernels._live_gfx(torch.device("cuda:0")) == "gfx1201"
+    monkeypatch.setattr(quantization, "get_gfx_runtime", _broken_rocminfo)
+    assert quantization._live_gfx(torch.device("cuda:0")) == "gfx1201"
 
 
 def test_flydsl_fp8_quant_validates_input_contract():
@@ -781,7 +781,7 @@ def test_flydsl_fp8_quant_rejects_empty_inputs(backend, empty_index):
 
 
 def test_flydsl_fp8_quant_non_current_stream():
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -806,7 +806,7 @@ def test_flydsl_fp8_quant_non_current_stream():
 
 def test_flydsl_fp8_quant_reuses_out_across_non_current_streams():
     """A second stream must wait before overwriting a registered output."""
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -834,7 +834,7 @@ def test_flydsl_fp8_quant_reuses_out_across_non_current_streams():
 
 def test_low_level_fp8_quant_waits_for_registered_attention_input():
     """Low-level quant waits for an async attention producer on another stream."""
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -882,7 +882,7 @@ def test_flydsl_fp8_quant_cross_stream_consumer_needs_no_manual_sync():
 
 
 def test_low_level_fp8_quant_cross_stream_consumer_needs_no_manual_sync():
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -904,7 +904,7 @@ def test_low_level_fp8_quant_cross_stream_consumer_needs_no_manual_sync():
 
 
 def test_flydsl_fp8_quant_validates_low_level_contract():
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -924,7 +924,7 @@ def test_flydsl_fp8_quant_validates_low_level_contract():
 
 
 def test_flydsl_fp8_quant_rejects_out_overlapping_input_storage():
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -1183,9 +1183,9 @@ def test_bf16_attention_result_chains_across_streams():
 def test_async_attention_result_feeds_public_fp8_quant(backend):
     """Public quant backends wait for an asynchronous attention producer."""
     if backend == "triton":
-        from aiter.ops.flydsl import fmha_kernels
+        from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
 
-        if not fmha_kernels._HAS_TRITON:
+        if not quantization._HAS_TRITON:
             pytest.skip("Triton is unavailable")
 
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
@@ -1341,7 +1341,7 @@ def test_flydsl_fmha_rejects_invalid_stream_type():
 
 
 def test_low_level_fp8_quant_rejects_invalid_stream_type():
-    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+    from aiter.ops.flydsl.kernels.fmha_gfx1201.fp8_quant import (
         flydsl_fp8_pertensor_quant,
     )
 
@@ -1408,11 +1408,11 @@ def test_gfx1201_compiled_caches_are_device_specific():
         pytest.skip("requires >=2 visible GPUs")
 
     from aiter.ops.flydsl import fmha_kernels
-    from aiter.ops.flydsl.kernels import fp8_quant_gfx1201
+    from aiter.ops.flydsl.kernels.fmha_gfx1201 import fp8_quant
 
     fmha_kernels._get_kernel.cache_clear()
     fmha_kernels._get_fp8_gfx1201_kernel.cache_clear()
-    fp8_quant_gfx1201._compile.cache_clear()
+    fp8_quant._compile.cache_clear()
 
     for index in (0, 1):
         device = torch.device("cuda", index)
@@ -1431,9 +1431,9 @@ def test_gfx1201_compiled_caches_are_device_specific():
             )
             assert bf16_cos.mean().item() > 0.999
 
-            q8, sq = fp8_quant_gfx1201.flydsl_fp8_pertensor_quant(q, rotate=True)
-            k8, sk = fp8_quant_gfx1201.flydsl_fp8_pertensor_quant(k, rotate=True)
-            v8, sv = fp8_quant_gfx1201.flydsl_fp8_pertensor_quant(v, rotate=False)
+            q8, sq = fp8_quant.flydsl_fp8_pertensor_quant(q, rotate=True)
+            k8, sk = fp8_quant.flydsl_fp8_pertensor_quant(k, rotate=True)
+            v8, sv = fp8_quant.flydsl_fp8_pertensor_quant(v, rotate=False)
             assert all(t.device == device for t in (q8, k8, v8, sq, sk, sv))
 
             fp8_out = flydsl_flash_attn_func(
@@ -1451,9 +1451,9 @@ def test_gfx1201_compiled_caches_are_device_specific():
 def test_public_triton_quant_uses_input_device_when_current_device_differs():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires >=2 visible GPUs")
-    from aiter.ops.flydsl import fmha_kernels
+    from aiter.ops.flydsl.kernels.fmha_gfx1201 import quantization
 
-    if not fmha_kernels._HAS_TRITON:
+    if not quantization._HAS_TRITON:
         pytest.skip("Triton is unavailable")
 
     original_device = torch.cuda.current_device()

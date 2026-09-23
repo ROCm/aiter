@@ -47,10 +47,10 @@ from flydsl.expr.typing import Stream, T
 try:
     from flydsl.expr import buffer_ops
 except ImportError:
-    from . import buffer_ops
+    from .. import buffer_ops
 
-from ..stream_readiness import register_ready, wait_ready
-from .tensor_shim import _run_compiled, _to_raw
+from ...stream_readiness import register_ready, wait_ready
+from ..tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 32  # 1 wave32
 _FP8_MAX = 448.0  # e4m3fn max normal (gfx1201 native fp8)
