@@ -262,6 +262,109 @@ def _fwd_kernel_stage2_asm(
                 )
 
 
+@triton.jit
+def _fwd_kernel_stage2_dchunk(
+    Mid_O,  # [total_q, num_kv_splits, num_heads, Lv] fp32
+    Mid_lse,  # [total_q, num_kv_splits, num_heads, 1] fp32
+    O,
+    qo_indptr,
+    kv_indptr,
+    num_kv_splits_indptr,
+    valid_split_count,
+    stride_mid_ob: tl.int64,
+    stride_mid_oh: tl.int64,
+    stride_mid_os: tl.int64,
+    stride_obs: tl.int64,
+    stride_oh: tl.int64,
+    Lv: tl.constexpr,
+    mgc: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+    MAX_SPLITS: tl.constexpr,
+):
+    """Cross-split merge for v4 nm decode (page_size=1, num_kv_splits > 1).
+
+    Same math as _fwd_kernel_stage2_asm, but Lv is split across grid axis 2 and
+    the splits are reduced as one [MAX_SPLITS, D_CHUNK] tile instead of a serial
+    online-softmax loop: more CTAs, no loop-carried dependency, and a tile small
+    enough to stay out of register pressure at large split counts.
+    """
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    offs_d = tl.program_id(2) * D_CHUNK + tl.arange(0, D_CHUNK)
+    mask_d = offs_d < Lv
+    splits = tl.arange(0, MAX_SPLITS)
+
+    kv_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+    num_valid = tl.minimum(
+        tl.load(num_kv_splits_indptr + cur_batch + 1)
+        - tl.load(num_kv_splits_indptr + cur_batch),
+        tl.cdiv(kv_len, mgc),
+    )
+    num_valid = tl.minimum(num_valid, tl.load(valid_split_count + cur_batch))
+    valid = splits < num_valid
+
+    for cur_qo in range(
+        tl.load(qo_indptr + cur_batch), tl.load(qo_indptr + cur_batch + 1)
+    ):
+        base = cur_qo * stride_mid_ob + cur_head * stride_mid_oh
+        lse = tl.load(
+            Mid_lse + base + splits * stride_mid_os, mask=valid, other=-float("inf")
+        )
+        w = tl.where(valid, tl.exp(lse - tl.max(lse, axis=0)), 0.0)
+        v = tl.load(
+            Mid_O + (base + splits[:, None] * stride_mid_os) * Lv + offs_d[None, :],
+            mask=valid[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        acc = tl.sum(w[:, None] * v, axis=0) / tl.sum(w, axis=0)
+        tl.store(
+            O + cur_qo * stride_obs + cur_head * stride_oh + offs_d, acc, mask=mask_d
+        )
+
+
+def _launch_stage2_dchunk(
+    logits,
+    attn_lse,
+    output,
+    qo_indptr,
+    kv_indptr,
+    split_indptr,
+    valid_split_count,
+    num_seqs,
+    num_heads,
+    num_kv_splits,
+    Lv,
+    mgc,
+):
+    max_splits = triton.next_power_of_2(num_kv_splits)
+    # Narrower chunks at more splits keep the CTA count up; cap the tile at 4K
+    # fp32 elements (64 VGPRs/lane at num_warps=1).
+    d_chunk = min(256 if num_kv_splits <= 8 else 128, triton.next_power_of_2(Lv))
+    while max_splits * d_chunk > 4096 and d_chunk > 64:
+        d_chunk //= 2
+    _fwd_kernel_stage2_dchunk[(num_seqs, num_heads, triton.cdiv(Lv, d_chunk))](
+        logits,
+        attn_lse,
+        output,
+        qo_indptr,
+        kv_indptr,
+        split_indptr,
+        valid_split_count,
+        attn_lse.stride(0),  # stride_mid_ob = num_kv_splits * num_heads
+        attn_lse.stride(2),  # stride_mid_oh = 1
+        attn_lse.stride(1),  # stride_mid_os = num_heads
+        output.stride(0),
+        output.stride(1),
+        Lv=Lv,
+        mgc=mgc,
+        D_CHUNK=d_chunk,
+        MAX_SPLITS=max_splits,
+        num_warps=1,
+        num_stages=2,
+        waves_per_eu=4,
+    )
+
+
 @functools.lru_cache
 def get_meta_param(
     num_kv_splits,
@@ -1900,6 +2003,26 @@ def mla_decode_fwd_v4_nm(
             mgc = 32 if get_gfx() == "gfx950" else 64
         else:
             mgc = 16
+
+        # Small grids underfill the GPU with one CTA per (seq, head): chunk Lv
+        # across more CTAs and reduce the splits as a tile instead. Large grids
+        # are bandwidth-bound and already full, where the loop kernel is faster.
+        if num_seqs * num_heads <= 2048:
+            _launch_stage2_dchunk(
+                logits,
+                attn_lse,
+                output,
+                qo_indptr,
+                kv_indptr,
+                split_indptr,
+                valid_split_count,
+                num_seqs,
+                num_heads,
+                num_kv_splits,
+                Lv,
+                mgc,
+            )
+            return logits, attn_lse
 
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
