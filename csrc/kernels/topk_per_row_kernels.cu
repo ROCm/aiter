@@ -2452,6 +2452,270 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
 }
 
 /**
+ * Register-resident one-block radix specialization for fp32/k=2048 rows short
+ * enough to hold in VGPRs.
+ *
+ * Between 4096 and 8194 elements the row is four to nine values per thread, so
+ * it can be read once into registers and both radix passes can run out of
+ * them. That matters more here than anywhere else in this file: what the
+ * generic kernel spends on a row this short is almost all fixed cost, three
+ * full passes and three block-wide 4096-bucket scans over 16--32KB of data.
+ * Measured on gfx950 at k=2048, us, generic three-pass against this shape:
+ *
+ *   N=4096   M=1 6.17->4.58   M=8 6.41->4.82   M=64 6.47->4.94  M=256 6.63->5.28
+ *   N=8192   M=1 8.34->6.98   M=8 8.65->7.25   M=64 8.87->7.44  M=256 9.06->7.80
+ *
+ * The 32K specialization above cannot use this: at 32 values per thread the
+ * row does not fit without spilling, and past about 512 rows the register
+ * pressure costs more than the re-read it saves (measured at N=16384, M=4096:
+ * 256.6us register-resident against 155.8us for the shipped staged form). So
+ * the two specializations split at the width where registers stop paying.
+ *
+ * Staging overflow -- more than CandidateCapacity elements sharing the top 12
+ * bits, which a constant row produces -- discards the partial output and takes
+ * the exact pass-2 path, as the 32K specialization does.
+ */
+template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int ElemsPerThread>
+__global__ void radix_topk_one_block_reg_kernel(T const* in,
+                                                const int64_t len,
+                                                const IdxT k,
+                                                T* out,
+                                                IdxT* out_idx,
+                                                bool const select_min)
+{
+    static_assert(std::is_same_v<T, float>);
+    static_assert(std::is_same_v<IdxT, int>);
+    static_assert(!WRITE_TOPK_VALUES);
+    constexpr int BitsPerPass       = 12;
+    constexpr int num_buckets       = calc_num_buckets<BitsPerPass>();
+    constexpr int tail_num_buckets  = 1 << 8;
+    constexpr int CandidateCapacity = 2048;
+    constexpr int WinnerCapacity    = 2048;
+    constexpr int pass0_start_bit   = 20;
+    constexpr int pass1_start_bit   = 8;
+    constexpr int pass2             = 2;
+
+    __shared__ Counter<T, IdxT> counter;
+    __shared__ IdxT histogram[num_buckets];
+    __shared__ IdxT wave_sums[BlockSize / WARP_SIZE];
+    __shared__ T candidate_values[CandidateCapacity];
+    __shared__ IdxT candidate_indices[CandidateCapacity];
+    __shared__ IdxT winner_indices[WinnerCapacity];
+    __shared__ IdxT candidate_count;
+    __shared__ int candidate_overflow;
+
+    const int64_t batch_id = blockIdx.x;
+    const IdxT row_len     = static_cast<IdxT>(len);
+
+    if(threadIdx.x == 0)
+    {
+        counter.k              = k;
+        counter.len            = row_len;
+        counter.previous_len   = row_len;
+        counter.kth_value_bits = 0;
+        counter.filter_cnt     = 0;
+        counter.out_cnt        = 0;
+        counter.out_back_cnt   = 0;
+        candidate_count        = 0;
+        candidate_overflow     = 0;
+    }
+    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+    {
+        histogram[i] = 0;
+    }
+
+    in += batch_id * len;
+    out_idx += batch_id * k;
+    if constexpr(WRITE_TOPK_VALUES)
+    {
+        out += batch_id * k;
+    }
+
+    // The row, read once. Consecutive threads take consecutive elements, so
+    // each step is one coalesced wave-wide load, and nothing reads memory
+    // again until the overflow path -- which a row of this width almost never
+    // takes.
+    T vals[ElemsPerThread];
+#pragma unroll
+    for(int j = 0; j < ElemsPerThread; ++j)
+    {
+        IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+        vals[j]      = (i < row_len) ? in[i] : static_cast<T>(0);
+    }
+    __syncthreads();
+
+    // Pass 0: the high 12-bit histogram, out of registers.
+#pragma unroll
+    for(int j = 0; j < ElemsPerThread; ++j)
+    {
+        IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+        if(i < row_len)
+        {
+            auto const bits  = twiddle_in(vals[j], select_min);
+            int const bucket = __builtin_amdgcn_ubfe(
+                bits, static_cast<unsigned>(pass0_start_bit), static_cast<unsigned>(BitsPerPass));
+            atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+        }
+    }
+    __syncthreads();
+    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+        &counter, histogram, wave_sums, k, pass0_start_bit);
+    __syncthreads();
+
+    // Pass 1: emit the definite winners, stage the crossing bucket and build
+    // the middle-12 histogram, all from the same registers.
+    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+    {
+        histogram[i] = 0;
+    }
+    __syncthreads();
+
+    auto const high_prefix = counter.kth_value_bits;
+#pragma unroll
+    for(int j = 0; j < ElemsPerThread; ++j)
+    {
+        IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+        if(i < row_len)
+        {
+            T const value     = vals[j];
+            auto const bits   = twiddle_in(value, select_min);
+            auto const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
+            if(prefix < high_prefix)
+            {
+                IdxT const pos      = atomicAdd(&counter.out_cnt, static_cast<IdxT>(1));
+                winner_indices[pos] = i;
+            }
+            else if(prefix == high_prefix)
+            {
+                IdxT const pos = atomicAdd(&candidate_count, static_cast<IdxT>(1));
+                if(pos < CandidateCapacity)
+                {
+                    candidate_values[pos]  = value;
+                    candidate_indices[pos] = i;
+                }
+                else
+                {
+                    atomicExch(&candidate_overflow, 1);
+                }
+                int const bucket =
+                    __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(pass1_start_bit),
+                                          static_cast<unsigned>(BitsPerPass));
+                atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+            }
+        }
+    }
+    __syncthreads();
+
+    IdxT const pass1_k = counter.k;
+    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+        &counter, histogram, wave_sums, pass1_k, pass1_start_bit);
+    __syncthreads();
+
+    if(!candidate_overflow)
+    {
+        IdxT const winner_count = counter.out_cnt;
+        for(IdxT i = static_cast<IdxT>(threadIdx.x); i < winner_count; i += BlockSize)
+        {
+            out_idx[i] = winner_indices[i];
+        }
+    }
+
+    if(candidate_overflow)
+    {
+        // The pass-1 choice is exact even though the staging overflowed.
+        // Discard the partial output and take the ordinary pass-2 scan, which
+        // can also run out of registers.
+        if(threadIdx.x == 0)
+        {
+            counter.out_cnt      = 0;
+            counter.out_back_cnt = 0;
+        }
+        IdxT const pass2_k = counter.k;
+        for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+        {
+            histogram[i] = 0;
+        }
+        __syncthreads();
+
+        auto const pass1_prefix = counter.kth_value_bits;
+#pragma unroll
+        for(int j = 0; j < ElemsPerThread; ++j)
+        {
+            IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+            if(i < row_len)
+            {
+                auto const bits   = twiddle_in(vals[j], select_min);
+                auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
+                if(prefix == pass1_prefix)
+                {
+                    int const bucket =
+                        __builtin_amdgcn_ubfe(bits, 0u, static_cast<unsigned>(BitsPerPass));
+                    atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+                }
+            }
+        }
+        __syncthreads();
+        choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+            &counter, histogram, wave_sums, pass2_k, 0);
+        __syncthreads();
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+            in, static_cast<IdxT const*>(nullptr), out, out_idx, row_len, k, &counter, select_min,
+            pass2);
+        return;
+    }
+
+    // With random fp32 data the selected 24-bit prefix almost always names a
+    // single element, and the remaining low byte is then already known from it.
+    if(counter.len == 1)
+    {
+        auto const middle_prefix = counter.kth_value_bits;
+        IdxT const staged_len    = candidate_count;
+        for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
+        {
+            auto const bits   = twiddle_in(candidate_values[i], select_min);
+            auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
+            if(prefix == middle_prefix)
+            {
+                counter.kth_value_bits |= bits & 0xffu;
+            }
+        }
+        __syncthreads();
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+            candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
+            pass2);
+        return;
+    }
+
+    // Resolve the final eight bits from the staged crossing bucket.
+    for(int i = threadIdx.x; i < tail_num_buckets; i += blockDim.x)
+    {
+        histogram[i] = 0;
+    }
+    __syncthreads();
+
+    IdxT const staged_len    = candidate_count;
+    auto const middle_prefix = counter.kth_value_bits;
+    for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
+    {
+        auto const bits   = twiddle_in(candidate_values[i], select_min);
+        auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
+        if(prefix == middle_prefix)
+        {
+            atomicAdd(histogram + (bits & 0xffu), static_cast<IdxT>(1));
+        }
+    }
+    __syncthreads();
+
+    IdxT const pass2_k = counter.k;
+    choose_bucket_reduce<T, IdxT, 8, BlockSize>(&counter, histogram, wave_sums, pass2_k, 0);
+    __syncthreads();
+
+    last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+        candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
+        pass2);
+}
+
+/**
  * Short-row one-block radix specialization for fp32/k=2048 on BPP=12 parts.
  *
  * The regular kernel performs three full-row histogram scans, followed by a
@@ -3429,14 +3693,36 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
     if constexpr(std::is_same_v<T, float> && std::is_same_v<IdxT, int> && BlockSize == 1024 &&
                  !WRITE_TOPK_VALUES && !STABLE && phase == Phase::Prefill)
     {
-        bool const use_lds_tail = buf != nullptr && topk_oneblock_use_large_bpp() &&
-                                  in_idx == nullptr && rowStarts == nullptr && rowEnds == nullptr &&
-                                  !select_min && k == 2048 && len >= 16384 && len <= 32770;
-        if(use_lds_tail)
+        bool const specialized = buf != nullptr && topk_oneblock_use_large_bpp() &&
+                                 in_idx == nullptr && rowStarts == nullptr &&
+                                 rowEnds == nullptr && !select_min && k == 2048;
+        if(specialized && len >= 16384 && len <= 32770)
         {
             radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
                 <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
             return;
+        }
+        // Rows short enough to hold in registers. The upper bound is where the
+        // register copy stops paying for itself, not where it stops fitting.
+        if(specialized && len >= 4096 && len <= 8194)
+        {
+            int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
+#define AITER_OB_REG_LAUNCH(EPT)                                                              \
+    case EPT:                                                                                 \
+        radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, EPT>            \
+            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);      \
+        return;
+            switch(ept)
+            {
+                AITER_OB_REG_LAUNCH(4)
+                AITER_OB_REG_LAUNCH(5)
+                AITER_OB_REG_LAUNCH(6)
+                AITER_OB_REG_LAUNCH(7)
+                AITER_OB_REG_LAUNCH(8)
+                AITER_OB_REG_LAUNCH(9)
+            default: break;
+            }
+#undef AITER_OB_REG_LAUNCH
         }
     }
 
