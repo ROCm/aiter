@@ -302,13 +302,16 @@ def flydsl_flash_attn_paged_fp8_func(
         )
         if launch_stream.device != q.device:
             raise ValueError("paged FP8 stream must be on Q's device")
+        needs_record_stream = (
+            stream is not None or launch_stream != torch.cuda.default_stream(q.device)
+        )
         with torch.cuda.stream(launch_stream) if stream is not None else nullcontext():
             if out is None:
                 out = torch.empty(output_shape, dtype=torch.bfloat16, device=q.device)
             if return_lse:
                 if lse is None:
                     lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
-                if stream is not None:
+                if needs_record_stream:
                     lse.record_stream(launch_stream)
             if (
                 q.numel() == 0
@@ -319,7 +322,7 @@ def flydsl_flash_attn_paged_fp8_func(
                 out.zero_()
                 if return_lse:
                     lse.fill_(float("-inf"))
-                if stream is not None:
+                if needs_record_stream:
                     out.record_stream(launch_stream)
                 return (out, lse) if return_lse else out
             paired = page_size == 64 and max_pages % 2 == 0
@@ -358,7 +361,7 @@ def flydsl_flash_attn_paged_fp8_func(
                 guard_output_rows=guard_output_rows,
                 return_lse=return_lse,
             )
-            if stream is not None:
+            if needs_record_stream:
                 # Copies must keep their caller-owned sources alive too, even
                 # if compilation or launch raises after a copy is queued.
                 for tensor in (q, k, v, page_indices, cu_seqlens_q, metadata):
@@ -395,7 +398,7 @@ def flydsl_flash_attn_paged_fp8_func(
                 lse_stride_h=q.shape[0] if return_lse else 0,
                 stream=launch_stream,
             )
-            if stream is not None:
+            if needs_record_stream:
                 for tensor in (
                     query,
                     key,

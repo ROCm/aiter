@@ -521,7 +521,8 @@ def test_copies_follow_nondefault_stream(page, layout, d, dv, return_lse):
 
 
 @gfx950
-def test_side_stream_keeps_copy_source_alive():
+@pytest.mark.parametrize("explicit_stream", [False, True])
+def test_side_stream_keeps_copy_source_alive(explicit_stream):
     case = make_case(64, "vectorized", 128, 128)
     stream = torch.cuda.Stream()
     expected = check_case(case, stream=stream).clone()
@@ -539,7 +540,10 @@ def test_side_stream_keeps_copy_source_alive():
     # creation-stream allocator before the side stream consumes the bytes.
     with torch.cuda.stream(stream):
         torch.cuda._sleep(3_000_000_000)
-    run_case(case, stream=stream)
+        if not explicit_stream:
+            run_case(case)
+    if explicit_stream:
+        run_case(case, stream=stream)
     del case.v
     replacements = []
     source_reused = False
