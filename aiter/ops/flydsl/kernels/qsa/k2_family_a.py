@@ -250,6 +250,27 @@ def build_qsa_k2_family_a_module(
             fx.gemm(pv_mma, pv_c, pv_a, pv_b, pv_c)
             return fx.Vector(fx.memref_load_vec(pv_c))
 
+        def amd_k_elem(n_tok, d0):
+            # Match the live AMD prefill K LDS lowering. Each lane owns one
+            # token and one 8xbf16 vector; D chunks are permuted in 4x4
+            # groups while bits 5:6 of tid XOR the 128-bit bank address.
+            d_chunk = _idiv(d0, Int32(8))
+            owner = d_chunk % Int32(2)
+            store_tid = n_tok + owner * Int32(64)
+            group = _idiv(d_chunk, Int32(8))
+            quarter = _idiv(d_chunk, Int32(2)) % Int32(4)
+            base_bytes = store_tid * Int32(16)
+            base_bytes = base_bytes ^ _idiv(store_tid & Int32(0x60), Int32(2))
+            base_bytes = base_bytes ^ (group * Int32(64))
+            byte_offset = base_bytes + group * Int32(2048) + quarter * Int32(8192)
+            return _idiv(byte_offset, Int32(2))
+
+        def load_amd_k8(n_tok, d0):
+            src = fx.make_view(k_arr.ptr + amd_k_elem(n_tok, d0), fx.make_layout(8, 1))
+            frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
+            fx.copy_atom_call(lds_copy, src, frag)
+            return fx.Vector(fx.memref_load_vec(frag))
+
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
         safe_req = valid_req.select(req, zero)
@@ -340,15 +361,25 @@ def build_qsa_k2_family_a_module(
                     fx.Vector(fx.memref_load_vec(k_frags[gr])),
                     fx.Vector.filled(vec, 0.0, BFloat16),
                 )
-                k_tile = make_k_lds_view(
-                    k_arr,
-                    Int32(gr * gather_span),
-                    (block_n, gather_span),
-                )
-                k_dst = kv_store.partition_D(k_tile)
-                k_store_frag = fx.make_fragment_like(k_dst)
-                fx.memref_store_vec(k_vec, k_store_frag)
-                fx.copy(lds_copy, k_store_frag, k_dst)
+                if const_expr(use_k32) and const_expr(not decode_tr_pv):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    k_dst = fx.make_view(
+                        k_arr.ptr + amd_k_elem(col, d_chunk * Int32(8)),
+                        fx.make_layout(8, 1),
+                    )
+                    k_store_frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
+                    fx.memref_store_vec(k_vec, k_store_frag)
+                    fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                else:
+                    k_tile = make_k_lds_view(
+                        k_arr,
+                        Int32(gr * gather_span),
+                        (block_n, gather_span),
+                    )
+                    k_dst = kv_store.partition_D(k_tile)
+                    k_store_frag = fx.make_fragment_like(k_dst)
+                    fx.memref_store_vec(k_vec, k_store_frag)
+                    fx.copy(lds_copy, k_store_frag, k_dst)
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
@@ -373,31 +404,41 @@ def build_qsa_k2_family_a_module(
             for ng in range_constexpr(n_subtiles):
                 n0 = Int32(ng * 16)
                 acc4 = fx.Vector.filled(4, 0.0, Float32)
-                k_row_bytes = Int32(_D if use_k32 else _K_STRIDE)
-                sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
-                a_src = qk_a_copy.partition_S(sA)
-                a_frag = fx.make_fragment_like(a_src)
-                fx.copy(qk_b_atom, a_src, a_frag)
-                for ks in range_constexpr(qk_steps - 1):
-                    sA_n = make_k_lds_view(
-                        k_arr,
-                        n0 * k_row_bytes + Int32((ks + 1) * qk_k),
-                        (16, qk_k),
-                    )
-                    a_src_n = qk_a_copy.partition_S(sA_n)
-                    a_frag_n = fx.make_fragment_like(a_src_n)
-                    fx.copy(qk_b_atom, a_src_n, a_frag_n)
+                if const_expr(use_k32) and const_expr(not decode_tr_pv):
+                    n_tok = n0 + lane_m
+                    a_vec = load_amd_k8(n_tok, lane_kg * Int32(8))
+                    for ks in range_constexpr(qk_steps):
+                        if const_expr(ks > 0):
+                            a_vec = load_amd_k8(
+                                n_tok, Int32(ks * qk_k) + lane_kg * Int32(8)
+                            )
+                        acc4 = qk_mfma(a_vec, fx.Vector(q_regs[ks]), acc4)
+                else:
+                    k_row_bytes = Int32(_D if use_k32 else _K_STRIDE)
+                    sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
+                    a_src = qk_a_copy.partition_S(sA)
+                    a_frag = fx.make_fragment_like(a_src)
+                    fx.copy(qk_b_atom, a_src, a_frag)
+                    for ks in range_constexpr(qk_steps - 1):
+                        sA_n = make_k_lds_view(
+                            k_arr,
+                            n0 * k_row_bytes + Int32((ks + 1) * qk_k),
+                            (16, qk_k),
+                        )
+                        a_src_n = qk_a_copy.partition_S(sA_n)
+                        a_frag_n = fx.make_fragment_like(a_src_n)
+                        fx.copy(qk_b_atom, a_src_n, a_frag_n)
+                        acc4 = qk_mfma(
+                            fx.Vector(fx.memref_load_vec(a_frag)),
+                            fx.Vector(q_regs[ks]),
+                            acc4,
+                        )
+                        a_frag = a_frag_n
                     acc4 = qk_mfma(
                         fx.Vector(fx.memref_load_vec(a_frag)),
-                        fx.Vector(q_regs[ks]),
+                        fx.Vector(q_regs[qk_steps - 1]),
                         acc4,
                     )
-                    a_frag = a_frag_n
-                acc4 = qk_mfma(
-                    fx.Vector(fx.memref_load_vec(a_frag)),
-                    fx.Vector(q_regs[qk_steps - 1]),
-                    acc4,
-                )
                 qk_accs.append(acc4)
 
             # K and V share one MMA scratch. All waves must finish their K
