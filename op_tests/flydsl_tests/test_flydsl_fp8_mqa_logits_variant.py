@@ -10,18 +10,25 @@ shape is below the top RPB threshold, so ``r4`` never gets selected there).
 
 import pytest
 
-from aiter.ops.flydsl.kernels.mqa_logits.fp8_mqa_logits import (
+from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
+    _ARCH,
     KERNEL_VARIANTS,
     _auto_variant,
     _resolve_variant,
 )
 
+pytestmark = pytest.mark.skipif(
+    _ARCH != "gfx942", reason="gfx942 variant selector and registry"
+)
+
 RPB2_MIN_ELEMS = 2**19
 RPB4_MIN_ELEMS = 2**21
+# The gfx942 rule ignores num_heads; it only has to be a multiple of MFMA_M=16.
+NUM_HEADS = 32
 
 
 def _rpb_wpb(seq_len, seq_len_kv):
-    tag = _auto_variant(seq_len, seq_len_kv)
+    tag = _auto_variant(seq_len, seq_len_kv, NUM_HEADS)
     assert tag in KERNEL_VARIANTS, f"{tag} is not a registered variant"
     _, rpb, wpb = tag.split("_")
     return int(rpb[1:]), int(wpb[1:])
@@ -104,14 +111,14 @@ def test_auto_variant_wpb_rule_unchanged(seq_len, seq_len_kv, expected_wpb):
 def test_resolve_variant_precedence(monkeypatch):
     """Explicit > env > shape-adaptive, so the auto path is what runs by default."""
     monkeypatch.delenv("FLYDSL_FP8_MQA_LOGITS_VARIANT", raising=False)
-    assert _resolve_variant(None, 1024, 131072) == "mfma_r4_w4"
+    assert _resolve_variant(None, 1024, 131072, NUM_HEADS) == "mfma_r4_w4"
 
     monkeypatch.setenv("FLYDSL_FP8_MQA_LOGITS_VARIANT", "mfma_r1_w1")
-    assert _resolve_variant(None, 1024, 131072) == "mfma_r1_w1"
-    assert _resolve_variant("mfma_r2_w2", 1024, 131072) == "mfma_r2_w2"
+    assert _resolve_variant(None, 1024, 131072, NUM_HEADS) == "mfma_r1_w1"
+    assert _resolve_variant("mfma_r2_w2", 1024, 131072, NUM_HEADS) == "mfma_r2_w2"
 
 
 def test_resolve_variant_rejects_unknown_tag(monkeypatch):
     monkeypatch.delenv("FLYDSL_FP8_MQA_LOGITS_VARIANT", raising=False)
     with pytest.raises(ValueError, match="unknown fp8_mqa_logits variant"):
-        _resolve_variant("mfma_r3_w4", 1024, 131072)
+        _resolve_variant("mfma_r3_w4", 1024, 131072, NUM_HEADS)

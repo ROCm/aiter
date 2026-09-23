@@ -1,0 +1,140 @@
+# aiter-review-bot — on-demand PR review triggered by an `@aiter-bot review` comment.
+# Native issue_comment trigger, no polling and no local daemon.
+#
+# Install at ROCm/aiter as .github/workflows/aiter-review-bot.yml and merge to the default
+# branch (issue_comment workflows only run from the definition on the default branch).
+#
+# Trigger (an authorized aiter reviewer comments on a PR):
+#   @aiter-bot review   reviews the PR. Comment again after pushing fixes for a fresh pass —
+#                       a new head SHA is reviewed, repeats on the same SHA are deduped, so this
+#                       one command covers both the first pass and repeat passes.
+# Commands inside quote (`>`) lines do not trigger; non-allowlisted commenters are ignored.
+#
+# Two jobs so an unauthorized comment never touches the self-hosted box:
+#   gate    (ubuntu-latest, free): quote-aware trigger + allowlist check, reading
+#           authorized.txt from the default branch (or the AITER_REVIEW_AUTHORIZED repo var).
+#   review  (self-hosted box308): only when gate passes — checkout, claim 👀, run_one.sh
+#           (headless GLM review), then _publish.py (posts the card for EVERY verdict) or
+#           _notify.py (routes a failed run to its owner).
+name: aiter-review-bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read          # read-only; comments are posted with the aiter-bot PAT
+
+concurrency:
+  # Serialize repeated triggers on the same PR; do not cancel an in-flight review.
+  group: aiter-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # Cheap pre-filter (a PR comment carrying the phrase); the real, quote-aware + allowlist
+    # check runs in the step below on this free GitHub-hosted runner, so an unauthorized comment
+    # never starts a job on the single self-hosted box.
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@aiter-bot review')
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.gate.outputs.ok }}
+    steps:
+      - name: Authorize (trigger + allowlist) before any self-hosted checkout
+        id: gate
+        uses: actions/github-script@v7
+        env:
+          AITER_REVIEW_AUTHORIZED: ${{ vars.AITER_REVIEW_AUTHORIZED }}   # optional; empty -> authorized.txt
+        with:
+          script: |
+            const body = context.payload.comment.body || '';
+            const who = (context.payload.comment.user.login || '').toLowerCase();
+            // real trigger: line-based, skip quote (>) lines
+            let trig = false;
+            for (const raw of body.split('\n')) {
+              if (raw.replace(/^\s+/, '').startsWith('>')) continue;
+              if (/@aiter-bot\s+review\b/i.test(raw)) { trig = true; break; }
+            }
+            // allowlist: the repo var wins, else authorized.txt from the default branch
+            let allow = new Set();
+            const v = (process.env.AITER_REVIEW_AUTHORIZED || '').trim();
+            if (v) {
+              for (const x of v.split(',')) if (x.trim()) allow.add(x.trim().toLowerCase());
+            } else {
+              try {
+                const r = await github.rest.repos.getContent({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: '.claude/skills/review-pr/authorized.txt' });
+                const txt = Buffer.from(r.data.content, 'base64').toString('utf8');
+                for (const l of txt.split('\n')) {
+                  const s = l.trim();
+                  if (s && !s.startsWith('#')) allow.add(s.toLowerCase());
+                }
+              } catch (e) { core.warning('authorized.txt read failed: ' + e); }
+            }
+            const ok = trig && allow.has(who);
+            core.setOutput('ok', ok ? 'true' : 'false');
+            core.notice(`commenter=${who} trigger=${trig} authorized=${allow.has(who)} -> ${ok ? 'run' : 'ignored'}`);
+
+  review:
+    needs: gate
+    if: needs.gate.outputs.ok == 'true'
+    runs-on: [self-hosted, box308]        # label the runner with these at registration
+    timeout-minutes: 90     # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
+    env:
+      PR: ${{ github.event.issue.number }}          # issue number == PR number here
+      COMMENTER: ${{ github.event.comment.user.login }}
+      REVIEW_AUTO_VALIDATE: '0'   # kernel validation off by default (self-hosted + public repo)
+    steps:
+      - name: Checkout tooling (base/main, trusted)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                 # full history: fetch.sh needs the PR + merge-target refs
+          persist-credentials: false
+
+      - name: Resolve tooling dir
+        id: rl
+        run: echo "dir=${GITHUB_WORKSPACE}/.claude/skills/review-pr" >> "$GITHUB_OUTPUT"
+
+      - name: Claim 👀 (as aiter-bot)
+        env:
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+        run: |
+          curl -s -X POST -H "Authorization: token $AITER_BOT_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"eyes"}' >/dev/null || true
+
+      - name: Review (headless GLM)
+        id: review
+        run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR" "$GITHUB_REPOSITORY"
+
+      - name: Publish the review card (every verdict, as aiter-bot)
+        if: success()
+        env:
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+        run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
+
+      - name: Report a failed review to the owner (as aiter-bot)
+        # Runs even when the review step failed. run_one.sh writes .aiter-review-status as
+        # "<class>\t<message>"; _notify.py maps the class to its owner and posts one comment
+        # @-mentioning them (glm->yhl-amd, atom->valarLip, machine->gyohuangxin, flow/env->the
+        # bot owner), never the PR author. The class->owner map lives ONLY in _notify.py, and
+        # check_prompts.py fails if run_one emits a class it does not know -- so they cannot drift.
+        if: always()
+        env:
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+          AITER_GLM_OWNER: ${{ vars.AITER_GLM_OWNER }}
+          AITER_ATOM_OWNER: ${{ vars.AITER_ATOM_OWNER }}
+          AITER_MACHINE_OWNER: ${{ vars.AITER_MACHINE_OWNER }}
+          AITER_FLOW_OWNER: ${{ vars.AITER_FLOW_OWNER }}
+          AITER_RUNNER_OWNER: ${{ vars.AITER_RUNNER_OWNER }}
+        run: |
+          # belt-and-suspenders: if the review step failed but left no status (a hard job-timeout
+          # kill before run_one's trap ran), synthesize one so it still routes to an owner.
+          if [ "${{ steps.review.outcome }}" = "failure" ] && [ ! -f "$GITHUB_WORKSPACE/.aiter-review-status" ]; then
+            printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.aiter-review-status"
+          fi
+          python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"

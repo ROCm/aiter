@@ -230,6 +230,36 @@ def _fused_kda_decode_unified_kernel(
                 conv_weight_ptr + cw_q + o_k * stride_cw_ch + j * stride_cw_width
             ).to(tl.float32)
         b_q = b_q * tl.sigmoid(b_q)
+
+        # -------- Conv1d K --------
+        b_x_k = tl.load(p_x + k_off + o_k).to(tl.float32)
+        p_csk = p_cs + (k_off + o_k) * stride_cs_dim
+        b_k = b_x_k * tl.load(
+            conv_weight_ptr + cw_k + o_k * stride_cw_ch + (W - 1) * stride_cw_width
+        ).to(tl.float32)
+        for j in tl.static_range(W - 1):
+            cs_pos = (STATE_LEN - W + 1 + j) if IS_SPEC else j
+            b_k += tl.load(p_csk + cs_pos * stride_cs_pos).to(tl.float32) * tl.load(
+                conv_weight_ptr + cw_k + o_k * stride_cw_ch + j * stride_cw_width
+            ).to(tl.float32)
+        b_k = b_k * tl.sigmoid(b_k)
+
+        # -------- Conv1d V --------
+        b_x_v = tl.load(p_x + v_off + o_v).to(tl.float32)
+        p_csv = p_cs + (v_off + o_v) * stride_cs_dim
+        b_v = b_x_v * tl.load(
+            conv_weight_ptr + cw_v + o_v * stride_cw_ch + (W - 1) * stride_cw_width
+        ).to(tl.float32)
+        for j in tl.static_range(W - 1):
+            cs_pos = (STATE_LEN - W + 1 + j) if IS_SPEC else j
+            b_v += tl.load(p_csv + cs_pos * stride_cs_pos).to(tl.float32) * tl.load(
+                conv_weight_ptr + cw_v + o_v * stride_cw_ch + j * stride_cw_width
+            ).to(tl.float32)
+        b_v = b_v * tl.sigmoid(b_v)
+
+        # -------- Conv state shift --------
+        # Barriers: shift stores must not race tap loads across replicated warps.
+        tl.debug_barrier()
         if IS_SPEC:
             for j in tl.static_range(STATE_LEN - 1):
                 tl.store(
@@ -245,19 +275,6 @@ def _fused_kda_decode_unified_kernel(
                     p_csq + j * stride_cs_pos, tl.load(p_csq + (j + 1) * stride_cs_pos)
                 )
             tl.store(p_csq + (W - 2) * stride_cs_pos, b_x_q.to(p_csq.dtype.element_ty))
-
-        # -------- Conv1d K --------
-        b_x_k = tl.load(p_x + k_off + o_k).to(tl.float32)
-        p_csk = p_cs + (k_off + o_k) * stride_cs_dim
-        b_k = b_x_k * tl.load(
-            conv_weight_ptr + cw_k + o_k * stride_cw_ch + (W - 1) * stride_cw_width
-        ).to(tl.float32)
-        for j in tl.static_range(W - 1):
-            cs_pos = (STATE_LEN - W + 1 + j) if IS_SPEC else j
-            b_k += tl.load(p_csk + cs_pos * stride_cs_pos).to(tl.float32) * tl.load(
-                conv_weight_ptr + cw_k + o_k * stride_cw_ch + j * stride_cw_width
-            ).to(tl.float32)
-        b_k = b_k * tl.sigmoid(b_k)
         if IS_SPEC:
             for j in tl.static_range(STATE_LEN - 1):
                 tl.store(
@@ -273,19 +290,6 @@ def _fused_kda_decode_unified_kernel(
                     p_csk + j * stride_cs_pos, tl.load(p_csk + (j + 1) * stride_cs_pos)
                 )
             tl.store(p_csk + (W - 2) * stride_cs_pos, b_x_k.to(p_csk.dtype.element_ty))
-
-        # -------- Conv1d V --------
-        b_x_v = tl.load(p_x + v_off + o_v).to(tl.float32)
-        p_csv = p_cs + (v_off + o_v) * stride_cs_dim
-        b_v = b_x_v * tl.load(
-            conv_weight_ptr + cw_v + o_v * stride_cw_ch + (W - 1) * stride_cw_width
-        ).to(tl.float32)
-        for j in tl.static_range(W - 1):
-            cs_pos = (STATE_LEN - W + 1 + j) if IS_SPEC else j
-            b_v += tl.load(p_csv + cs_pos * stride_cs_pos).to(tl.float32) * tl.load(
-                conv_weight_ptr + cw_v + o_v * stride_cw_ch + j * stride_cw_width
-            ).to(tl.float32)
-        b_v = b_v * tl.sigmoid(b_v)
         if IS_SPEC:
             for j in tl.static_range(STATE_LEN - 1):
                 tl.store(
@@ -301,6 +305,7 @@ def _fused_kda_decode_unified_kernel(
                     p_csv + j * stride_cs_pos, tl.load(p_csv + (j + 1) * stride_cs_pos)
                 )
             tl.store(p_csv + (W - 2) * stride_cs_pos, b_x_v.to(p_csv.dtype.element_ty))
+        tl.debug_barrier()
 
         # -------- QK L2 Norm + Decay + Beta --------
         b_q = b_q * tl.math.rsqrt(tl.sum(b_q * b_q) + 1e-6) * qk_scale
