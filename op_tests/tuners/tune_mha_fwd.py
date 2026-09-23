@@ -40,14 +40,16 @@ from aiter.ops.mha import (
 from aiter.ops.mha_fwd_policy import (
     MHA_FWD_BACKENDS,
     MHA_FWD_CANDIDATE_FIELDS,
+    MHA_FWD_CONFIG_ENV,
+    MHA_FWD_FAMILY,
     MHA_FWD_INDIFFERENCE_DELTA,
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
-    MHA_FWD_SEARCH_STRATEGIES,
     MHA_FWD_SIGNIFICANCE_SIGMA,
     MHA_FWD_TILE_CONFIG_BACKENDS,
     MHA_FWD_TUNING_KEY_FIELDS,
+    MHA_FWD_UNTUNED_CSV,
     MhaFwdCandidate,
     MhaFwdProblem,
     as_bool,
@@ -64,7 +66,7 @@ from aiter.utility.block_race import (
     cuda_event_timer,
     race,
 )
-from aiter.utility.mp_tuner import mp_tuner
+from aiter.utility.mp_tuner import MpTunerTask, mp_tuner
 
 # Fixed so that --race-candidates draws the same subset on every run; a
 # sampled field that changed between runs would make two runs incomparable.
@@ -386,13 +388,17 @@ class MhaFwdTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "tune_file": AITER_CONFIG_MHA_FWD,
-        "untune_file": "aiter/configs/untuned_mha_fwd.csv",
+        "untune_file": f"aiter/configs/{MHA_FWD_UNTUNED_CSV}",
         "batch": 8,
         "errRatio": 0.0,
         "timeout": 7200,
-        "config_env_name": "AITER_CONFIG_MHA_FWD",
+        "config_env_name": MHA_FWD_CONFIG_ENV,
         "finalist_rounds": 3,
     }
+    # errRatio is the fraction of output elements outside these tolerances.
+    ERROR_METRIC = "allclose_mismatch_fraction"
+    ERROR_RTOL = 2e-2
+    ERROR_ATOL = 2e-2
 
     def __init__(self):
         super().__init__(
@@ -442,14 +448,13 @@ class MhaFwdTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--strategy",
-            choices=(*MHA_FWD_SEARCH_STRATEGIES, "race"),
+            choices=("exhaustive", "race"),
             default="exhaustive",
             help=(
-                "candidate search strategy; smoke samples each tile grid so the "
-                "measure-publish-replay path can be exercised without the full "
-                "catalogue, and records itself in the evidence. race measures "
-                "the exhaustive catalogue as an interleaved elimination race "
-                "instead of screening every candidate once in its own worker"
+                "how the field is measured: exhaustive screens every candidate "
+                "once in its own worker, race measures them as an interleaved "
+                "elimination race. Use --candidate-sample and --backends to "
+                "make the field smaller"
             ),
         )
         self.parser.add_argument(
@@ -613,6 +618,18 @@ class MhaFwdTuner(TunerCommon):
             os.remove(self._journal_path)
 
     @staticmethod
+    def lookup_key(row) -> tuple[str, ...]:
+        """The key dispatch derives for this catalogue row.
+
+        MHA publishes under the shape it measured, so this is the catalogue
+        key in canonical spelling; a family whose runtime quantizes a
+        dimension would map it here instead.
+        """
+        return MhaFwdProblem.from_mapping(
+            {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
+        ).key()
+
+    @staticmethod
     def _problem_and_candidate(info):
         key, backend, num_splits, backend_config = info
         problem = MhaFwdProblem.from_mapping(dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key)))
@@ -753,16 +770,6 @@ class MhaFwdTuner(TunerCommon):
                     )
         return records
 
-    def _catalogue_strategy(self) -> str:
-        """Which catalogue the candidates come from.
-
-        ``race`` names how the field is measured, not which field it is, so it
-        draws from the full catalogue. Keeping the two apart stops a sampled
-        grid from being reported as a complete search.
-        """
-        strategy = getattr(self._args, "strategy", "exhaustive")
-        return "exhaustive" if strategy == "race" else strategy
-
     def tune(self, untunedf, tunedf, args):
         all_infos, task_by_info, plans = self._plan_candidates(untunedf, args)
         if getattr(args, "strategy", "exhaustive") == "race":
@@ -783,43 +790,14 @@ class MhaFwdTuner(TunerCommon):
             problem = MhaFwdProblem.from_mapping(
                 {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
             )
-            key = problem.key()
+            key = self.lookup_key(row)
             softmax_scale = int(row.hdim_q) ** -0.5
-            candidates = list(
-                enumerate_mha_fwd_candidates(
-                    str(row.gfx),
-                    self._catalogue_strategy(),
-                    self._restricted_backends(),
-                )
-            )
-            sample = getattr(args, "candidate_sample", None)
-            if sample is not None and sample < len(candidates):
-                candidates = random.Random(MHA_FWD_RACE_SAMPLE_SEED).sample(
-                    candidates, sample
-                )
-            # Measuring what the kernel resolves today, in the same sweep and
-            # on the same GPU, is what lets the run tell an improvement from a
-            # reordering of noise. Without it the comparison is against a
-            # number from another session.
-            autoselect = self._resolve_autoselect(row)
-            self._autoselect_by_key[key] = autoselect
-            incumbent = self._resolve_incumbent(row, args, key, autoselect)
-            self._incumbent_probe_by_key[key] = incumbent
-            incumbents = self._incumbent_candidates(incumbent)
-            known = {candidate.identity for candidate in candidates}
-            for extra in (*self._shipped_tile_candidates(row), *incumbents):
-                if extra.identity not in known:
-                    candidates.append(extra)
-                    known.add(extra.identity)
-            self._incumbents_by_key[key] = {
-                (candidate.backend, canonical_backend_config(candidate.backend_config))
-                for candidate in incumbents
-            }
-            candidates = tuple(candidates)
+            candidates = self.candidate_field(row, key, args)
             print(
                 f"tuning MHA row {row_index}: {len(candidates)} candidates for {key}",
                 flush=True,
             )
+            launch_tail = self._launch_args(row, softmax_scale)
             gen_args = (
                 int(row.batch),
                 int(row.total_q),
@@ -846,35 +824,21 @@ class MhaFwdTuner(TunerCommon):
                     if candidate.backend_config is not None
                     else None
                 )
-                task = (
-                    info,
-                    generate_data,
-                    gen_args,
-                    _run_candidate,
-                    (
+                task_by_info[info] = MpTunerTask(
+                    info=info,
+                    gen_data=generate_data,
+                    gen_args=gen_args,
+                    func=_run_candidate,
+                    args=(
                         ["q", "k", "v", "cu_q", "cu_k"],
                         candidate.backend,
                         candidate.num_splits,
                         config,
-                        int(row.max_seqlen_q),
-                        int(row.max_seqlen_k),
-                        int(row.min_seqlen_q),
-                        float(row.dropout_p),
-                        softmax_scale,
-                        float(row.logits_soft_cap),
-                        int(row.how_v3_bf16_cvt),
-                        bool(row.causal),
-                        int(row.window_left),
-                        int(row.window_right),
-                        bool(row.return_lse),
+                        *launch_tail,
                     ),
-                    {
-                        "num_warmup": args.warmup,
-                        "num_iters": args.iters,
-                        "use_cuda_event": True,
-                    },
-                    _chunked_reference,
-                    (
+                    kwargs=self.measurement_kwargs(args, use_cuda_event=True),
+                    ref_func=_chunked_reference,
+                    ref_args=(
                         ["q", "k", "v", "cu_q", "cu_k"],
                         softmax_scale,
                         bool(row.causal),
@@ -882,12 +846,11 @@ class MhaFwdTuner(TunerCommon):
                         int(row.window_right),
                         bool(row.return_lse),
                     ),
-                    {},
-                    None,
-                    2e-2,
-                    2e-2,
+                    ref_kwargs={},
+                    ref=None,
+                    rtol=self.ERROR_RTOL,
+                    atol=self.ERROR_ATOL,
                 )
-                task_by_info[info] = task
 
             plans.append(
                 {
@@ -896,24 +859,60 @@ class MhaFwdTuner(TunerCommon):
                     "gen_args": gen_args,
                     "candidates": candidates,
                     "softmax_scale": softmax_scale,
-                    # Everything _run_candidate needs after the five tensors.
-                    "launch_tail": (
-                        int(row.max_seqlen_q),
-                        int(row.max_seqlen_k),
-                        int(row.min_seqlen_q),
-                        float(row.dropout_p),
-                        softmax_scale,
-                        float(row.logits_soft_cap),
-                        int(row.how_v3_bf16_cvt),
-                        bool(row.causal),
-                        int(row.window_left),
-                        int(row.window_right),
-                        bool(row.return_lse),
-                    ),
+                    "launch_tail": launch_tail,
                 }
             )
 
         return all_infos, task_by_info, plans
+
+    def candidate_field(self, row, key, args) -> tuple[MhaFwdCandidate, ...]:
+        """Every candidate measured for one shape.
+
+        The catalogue, optionally sampled, plus what the shape runs today.
+        Measuring the incumbents in the same sweep, on the same GPU, is what
+        lets the run tell an improvement from a reordering of noise, so they
+        are entered whatever the sample drew.
+        """
+        candidates = list(
+            enumerate_mha_fwd_candidates(str(row.gfx), self._restricted_backends())
+        )
+        sample = getattr(args, "candidate_sample", None)
+        if sample is not None and sample < len(candidates):
+            candidates = random.Random(MHA_FWD_RACE_SAMPLE_SEED).sample(
+                candidates, sample
+            )
+        autoselect = self._resolve_autoselect(row)
+        self._autoselect_by_key[key] = autoselect
+        incumbent = self._resolve_incumbent(row, args, key, autoselect)
+        self._incumbent_probe_by_key[key] = incumbent
+        incumbents = self._incumbent_candidates(incumbent)
+        known = {candidate.identity for candidate in candidates}
+        for extra in (*self._shipped_tile_candidates(row), *incumbents):
+            if extra.identity not in known:
+                candidates.append(extra)
+                known.add(extra.identity)
+        self._incumbents_by_key[key] = {
+            (candidate.backend, canonical_backend_config(candidate.backend_config))
+            for candidate in incumbents
+        }
+        return tuple(candidates)
+
+    @staticmethod
+    def _launch_args(row, softmax_scale) -> tuple:
+        """Everything _run_candidate needs after the five tensors and the plan."""
+        return (
+            int(row.max_seqlen_q),
+            int(row.max_seqlen_k),
+            int(row.min_seqlen_q),
+            float(row.dropout_p),
+            softmax_scale,
+            float(row.logits_soft_cap),
+            int(row.how_v3_bf16_cvt),
+            bool(row.causal),
+            int(row.window_left),
+            int(row.window_right),
+            bool(row.return_lse),
+        )
 
     def _tune_by_screening(self, args, untunedf, all_infos, task_by_info):
         journal = self._load_journal()
@@ -1241,8 +1240,8 @@ class MhaFwdTuner(TunerCommon):
                     checkAllclose(
                         got,
                         want,
-                        rtol=2e-2,
-                        atol=2e-2,
+                        rtol=MhaFwdTuner.ERROR_RTOL,
+                        atol=MhaFwdTuner.ERROR_ATOL,
                         tol_err_ratio=args.errRatio,
                         printLog=False,
                     )
@@ -1391,6 +1390,7 @@ class MhaFwdTuner(TunerCommon):
             self._atomic_write_csv(resultdf_for_profile, args.profile_file)
 
         winners = []
+        retained = []
         failures = []
         for key, group in resultdf.groupby(
             list(MHA_FWD_TUNING_KEY_FIELDS), dropna=False
@@ -1411,14 +1411,22 @@ class MhaFwdTuner(TunerCommon):
             # and no row is how a shape reaches auto-select.
             if winner is not None:
                 winners.append(winner)
+                continue
+            # The shape is settled, not missing, so it counts as covered; it is
+            # kept out of winnerdf so no runtime row is written for it.
+            kept = valid.iloc[0].copy()
+            kept["status"] = "retained"
+            kept["detail"] = "incumbent retained: no challenger cleared the margin"
+            retained.append(kept)
 
         winnerdf = pd.DataFrame(winners, columns=self.columns)
+        covered = pd.DataFrame([*winners, *retained], columns=self.columns)
         failuredf = pd.DataFrame(failures, columns=self.columns)
-        if not winnerdf.empty:
+        if not covered.empty:
             self.success = (
-                winnerdf.copy()
+                covered.copy()
                 if self.success.empty
-                else pd.concat([self.success, winnerdf], ignore_index=True)
+                else pd.concat([self.success, covered], ignore_index=True)
             )
         if not failuredf.empty:
             self.failed = (
@@ -1935,9 +1943,9 @@ class MhaFwdTuner(TunerCommon):
         environment = os.environ.copy()
         environment.update(
             {
-                "AITER_CONFIG_MHA_FWD": os.path.abspath(config_file),
+                MHA_FWD_CONFIG_ENV: os.path.abspath(config_file),
                 "AITER_GPU_MODEL": str(row["gpu_model"]),
-                "AITER_MHA_FWD_SELECTION_PROOF_FILE": proof_path,
+                "AITER_SELECTION_PROOF_FILE": proof_path,
                 "AITER_MHA_FWD_PROBE_PROBLEM": json.dumps(problem),
                 "PYTHONPATH": os.pathsep.join(
                     [str(repository_root), os.environ.get("PYTHONPATH", "")]
@@ -2039,7 +2047,7 @@ class MhaFwdTuner(TunerCommon):
         runtime_bytes = runtime_path.read_bytes() if runtime_path.is_file() else b""
         payload = {
             "schema_version": 1,
-            "family": "mha_fwd",
+            "family": MHA_FWD_FAMILY,
             "run_state": run_state,
             "strategy": self._args.strategy,
             "hardware": [
@@ -2058,9 +2066,9 @@ class MhaFwdTuner(TunerCommon):
                 "iterations": int(self._args.iters),
                 "finalist_rounds": int(self._args.finalist_rounds),
                 "statistic": "median of finalist round means",
-                "rtol": 2e-2,
-                "atol": 2e-2,
-                "error_metric": "fraction failing elementwise allclose",
+                "rtol": self.ERROR_RTOL,
+                "atol": self.ERROR_ATOL,
+                "error_metric": self.ERROR_METRIC,
                 "maximum_error_ratio": float(self._args.errRatio),
                 "candidate_count": len(self._all_results),
                 "status_counts": dict(sorted(status_counts.items())),
@@ -2079,6 +2087,7 @@ class MhaFwdTuner(TunerCommon):
                 ),
             },
             "selection_proofs": self._selection_proofs,
+            "outcomes": self._outcomes(),
             "search_strategy": getattr(self._args, "strategy", "exhaustive"),
             "candidate_sample": getattr(self._args, "candidate_sample", None),
             "restricted_backends": self._restricted_backends(),
@@ -2108,6 +2117,29 @@ class MhaFwdTuner(TunerCommon):
         }
         self._atomic_write_json(payload, self._evidence_path)
 
+    def _outcomes(self) -> list[dict[str, Any]]:
+        """What the run concluded for each catalogue key.
+
+        ``retained`` is a finished answer, not a gap: the incumbent held, so
+        the table is already right for that shape.
+        """
+
+        failed = {self.lookup_key(row) for _, row in self.failed.iterrows()}
+        succeeded = {
+            self.lookup_key(row): row["status"] for _, row in self.success.iterrows()
+        }
+        outcomes = []
+        for _, row in self.untunedf.iterrows():
+            key = self.lookup_key(row)
+            if key in failed:
+                outcome = "failed"
+            elif key in succeeded:
+                outcome = "retained" if succeeded[key] == "retained" else "published"
+            else:
+                outcome = "unmeasured"
+            outcomes.append({"key": list(key), "outcome": outcome})
+        return outcomes
+
     def tune_summary(self, status):
         if status != "Finished":
             self._write_evidence(
@@ -2120,7 +2152,7 @@ class MhaFwdTuner(TunerCommon):
         _load_mha_fwd_tuning_table.cache_clear()
 
     def run_config(self, args):
-        config_file = os.environ.get("AITER_CONFIG_MHA_FWD", args.tune_file)
+        config_file = os.environ.get(MHA_FWD_CONFIG_ENV, args.tune_file)
         results = []
         for _, row in self.untunedf.iterrows():
             proof = self._run_fresh_probe(row, config_file)
@@ -2206,7 +2238,9 @@ def _selection_probe() -> int:
     if len(reference_items) != len(observed_items):
         raise AssertionError("public MHA result structure differs from reference")
     for expected, actual in zip(reference_items, observed_items):
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            actual, expected, rtol=MhaFwdTuner.ERROR_RTOL, atol=MhaFwdTuner.ERROR_ATOL
+        )
 
     warmup = max(0, int(row.get("_proof_warmup", 5)))
     iterations = max(1, int(row.get("_proof_iters", 101)))

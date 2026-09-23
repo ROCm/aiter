@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU-only tests for how the MHA forward tuner chooses what to measure and
-what to publish: the sampled search strategy, the backend restriction, and the
+what to publish: the candidate sample, the backend restriction, and the
 gate that refuses to displace a configuration it cannot beat."""
 
-import collections
 import json
 import os
 import tempfile
@@ -17,7 +16,6 @@ import pandas as pd
 
 from aiter.ops.mha_fwd_policy import (
     MHA_FWD_RUNTIME_CSV_FIELDS,
-    MHA_FWD_TILE_CONFIG_BACKENDS,
     MhaFwdCandidate,
     MhaFwdProblem,
     enumerate_mha_fwd_candidates,
@@ -481,80 +479,37 @@ class TestRaceJournalBinding(unittest.TestCase):
         )
 
 
-class TestSmokeStrategy(unittest.TestCase):
-    def test_smoke_is_a_strict_subset_of_the_exhaustive_catalogue(self):
-        for gfx in ("gfx942", "gfx950", "gfx1250"):
-            with self.subTest(gfx=gfx):
-                full = {c.identity for c in enumerate_mha_fwd_candidates(gfx)}
-                smoke = {c.identity for c in enumerate_mha_fwd_candidates(gfx, "smoke")}
-                self.assertTrue(smoke <= full)
+class TestCandidateSample(unittest.TestCase):
+    """--candidate-sample is how a run shrinks its field, so two runs given
+    the same sample have to measure the same candidates."""
 
-    def test_smoke_keeps_every_name_is_config_backend(self):
-        full = collections.Counter(
-            c.backend for c in enumerate_mha_fwd_candidates("gfx950")
-        )
-        smoke = collections.Counter(
-            c.backend for c in enumerate_mha_fwd_candidates("gfx950", "smoke")
-        )
-        for backend, count in full.items():
-            if backend not in MHA_FWD_TILE_CONFIG_BACKENDS:
-                with self.subTest(backend=backend):
-                    self.assertEqual(smoke[backend], count)
+    ROW = types.SimpleNamespace(gfx="gfx950")
+    KEY = ("gfx950", "mi355x", 256)
 
-    def test_a_sampled_grid_still_varies_every_tuning_axis(self):
-        """A stride over the flattened product pins the inner axes; if that
-        regresses, a smoke run would only ever sample block sizes."""
-        for backend in ("triton", "gluon"):
-            values = collections.defaultdict(set)
-            for candidate in enumerate_mha_fwd_candidates("gfx950", "smoke"):
-                if candidate.backend == backend:
-                    for key, value in candidate.backend_config.items():
-                        values[key].add(value)
-            full_axes = collections.defaultdict(set)
-            for candidate in enumerate_mha_fwd_candidates("gfx950"):
-                if candidate.backend == backend:
-                    for key, value in candidate.backend_config.items():
-                        full_axes[key].add(value)
-            for key, sampled in values.items():
-                if len(full_axes[key]) > 1:
-                    with self.subTest(backend=backend, axis=key):
-                        self.assertGreater(len(sampled), 1)
+    def _field(self, sample, backends=""):
+        tuner = MhaFwdTuner.__new__(MhaFwdTuner)
+        tuner._args = types.SimpleNamespace(backends=backends)
+        tuner._autoselect_by_key = {}
+        tuner._incumbent_probe_by_key = {}
+        tuner._incumbents_by_key = {}
+        tuner._resolve_autoselect = lambda row: None
+        tuner._resolve_incumbent = lambda row, args, key, autoselect: None
+        tuner._shipped_tile_candidates = lambda row: []
+        tuner._incumbent_candidates = lambda selection: []
+        args = types.SimpleNamespace(candidate_sample=sample)
+        return [c.identity for c in tuner.candidate_field(self.ROW, self.KEY, args)]
 
-    def test_a_sampled_grid_does_not_lock_axes_to_each_other(self):
-        """Varying every axis is not enough. Advancing all axes together
-        varies each one while walking a single diagonal, which leaves whole
-        regions of the grid unreachable -- BLOCK_N=64 with num_warps=8 never
-        appears. Require each pair of axes to take more joint values than
-        either takes alone, which a diagonal cannot satisfy."""
-        for backend in ("triton", "gluon"):
-            sample = [
-                c.backend_config
-                for c in enumerate_mha_fwd_candidates("gfx950", "smoke")
-                if c.backend == backend
-            ]
-            axes = sorted(sample[0])
-            for i, left in enumerate(axes):
-                for right in axes[i + 1 :]:
-                    distinct_left = {cfg[left] for cfg in sample}
-                    distinct_right = {cfg[right] for cfg in sample}
-                    if len(distinct_left) < 2 or len(distinct_right) < 2:
-                        continue
-                    joint = {(cfg[left], cfg[right]) for cfg in sample}
-                    with self.subTest(backend=backend, pair=(left, right)):
-                        self.assertGreater(
-                            len(joint),
-                            max(len(distinct_left), len(distinct_right)),
-                            f"{left} and {right} advance in lockstep",
-                        )
+    def test_a_sample_is_drawn_from_the_catalogue_and_is_reproducible(self):
+        full = {c.identity for c in enumerate_mha_fwd_candidates("gfx950")}
+        first = self._field(5)
+        self.assertEqual(len(first), 5)
+        self.assertTrue(set(first) <= full)
+        self.assertEqual(first, self._field(5))
 
-    def test_smoke_is_deterministic(self):
-        first = [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "smoke")]
-        second = [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "smoke")]
-        self.assertEqual(first, second)
-
-    def test_an_unknown_strategy_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "unknown MHA search strategy"):
-            enumerate_mha_fwd_candidates("gfx950", "random")
+    def test_the_sample_composes_with_the_backend_restriction(self):
+        field = self._field(3, backends="triton")
+        self.assertEqual(len(field), 3)
+        self.assertEqual({identity[0] for identity in field}, {"triton"})
 
 
 class TestBackendRestriction(unittest.TestCase):
@@ -562,37 +517,26 @@ class TestBackendRestriction(unittest.TestCase):
     actually restrict and has to be visible when it does."""
 
     def test_only_the_named_backends_are_measured(self):
-        candidates = enumerate_mha_fwd_candidates(
-            "gfx950", "exhaustive", ["triton", "gluon"]
-        )
+        candidates = enumerate_mha_fwd_candidates("gfx950", ["triton", "gluon"])
         self.assertEqual(sorted({c.backend for c in candidates}), ["gluon", "triton"])
 
     def test_the_restricted_catalogue_is_a_subset_of_the_full_one(self):
         full = {c.identity for c in enumerate_mha_fwd_candidates("gfx950")}
         restricted = {
-            c.identity
-            for c in enumerate_mha_fwd_candidates("gfx950", "exhaustive", ["gluon"])
+            c.identity for c in enumerate_mha_fwd_candidates("gfx950", ["gluon"])
         }
         self.assertTrue(restricted <= full)
         self.assertLess(len(restricted), len(full))
 
     def test_no_restriction_is_the_full_catalogue(self):
         self.assertEqual(
-            [c.identity for c in enumerate_mha_fwd_candidates("gfx950", "exhaustive")],
-            [
-                c.identity
-                for c in enumerate_mha_fwd_candidates("gfx950", "exhaustive", None)
-            ],
+            [c.identity for c in enumerate_mha_fwd_candidates("gfx950")],
+            [c.identity for c in enumerate_mha_fwd_candidates("gfx950", None)],
         )
 
     def test_an_unknown_backend_is_rejected_rather_than_silently_empty(self):
         with self.assertRaisesRegex(ValueError, "unknown MHA backends"):
-            enumerate_mha_fwd_candidates("gfx950", "exhaustive", ["trition"])
-
-    def test_the_restriction_composes_with_the_smoke_strategy(self):
-        candidates = enumerate_mha_fwd_candidates("gfx950", "smoke", ["triton"])
-        self.assertTrue(candidates)
-        self.assertEqual({c.backend for c in candidates}, {"triton"})
+            enumerate_mha_fwd_candidates("gfx950", ["trition"])
 
 
 if __name__ == "__main__":

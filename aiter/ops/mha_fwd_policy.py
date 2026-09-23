@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import math
-import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -14,6 +13,14 @@ from itertools import product
 from typing import Any, Literal
 
 from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
+
+# The family's identity, stated once for the tuner and the tuning-test tables.
+MHA_FWD_FAMILY = "mha_fwd"
+MHA_FWD_TUNER_SCRIPT = "op_tests/tuners/tune_mha_fwd.py"
+MHA_FWD_CONFIG_ENV = "AITER_CONFIG_MHA_FWD"
+MHA_FWD_CONFIG_PROPERTY = "AITER_CONFIG_MHA_FWD_FILE"
+MHA_FWD_TUNED_CSV = "tuned_mha_fwd.csv"
+MHA_FWD_UNTUNED_CSV = "untuned_mha_fwd.csv"
 
 MHA_FWD_PROBLEM_KEY_FIELDS = (
     "mode",
@@ -388,8 +395,6 @@ def validate_mha_fwd_backend_arch(backend: str, gfx: str) -> None:
         raise ValueError(f"MHA backend {backend!r} does not support {gfx!r}")
 
 
-MHA_FWD_SEARCH_STRATEGIES = ("exhaustive", "smoke")
-
 # Multiples of the combined standard error a winner must clear before it
 # displaces the configuration already in use. Two is the conventional ~95%
 # two-sample separation; the point is that the bar is stated once and is
@@ -407,64 +412,18 @@ MHA_FWD_SIGNIFICANCE_SIGMA = 2.0
 # is, and running both would let one promote what the other called settled.
 MHA_FWD_INDIFFERENCE_DELTA = 0.02
 
-# How many configurations the smoke strategy keeps per dict-config backend.
-# Small enough that a full run finishes in minutes, large enough that the
-# winner is still chosen between genuinely different tile shapes.
-MHA_FWD_SMOKE_SEED = 20240917
-MHA_FWD_SMOKE_PER_BACKEND = 8
-
-
-def _tile_grid(axes: tuple[tuple, ...], strategy: str) -> list[tuple]:
-    """Expand tuning axes into configurations for the requested strategy.
-
-    Exhaustive is the full cartesian product. Smoke draws a short sample, and
-    the sample has to be spread rather than merely varied. Every arithmetic
-    scheme tried here has had a lattice artifact. Striding the flattened
-    product lands on the period of the product's inner axes and pins warps and
-    stages to a single value. Advancing all axes together unpins them but locks
-    them to each other, walking one diagonal so BLOCK_N=64 with num_warps=8
-    stays unreachable. Per-axis coprime strides still collide whenever two axes
-    of equal length draw the same stride modulo that length.
-
-    A seeded sample of the product has no such structure, is reproducible, and
-    is obviously unbiased. The product is at most a few thousand tuples here,
-    so materializing it to sample from costs nothing worth saving.
-    """
-    if strategy != "smoke":
-        return list(product(*axes))
-
-    population = list(product(*axes))
-    if len(population) <= MHA_FWD_SMOKE_PER_BACKEND:
-        return population
-    return random.Random(MHA_FWD_SMOKE_SEED).sample(
-        population, MHA_FWD_SMOKE_PER_BACKEND
-    )
-
 
 def enumerate_mha_fwd_candidates(
     gfx: str,
-    strategy: str = "exhaustive",
     backends: Sequence[str] | None = None,
 ) -> tuple[MhaFwdCandidate, ...]:
     """Return the legal offline search catalogue for one architecture.
-
-    ``exhaustive`` is the full catalogue and the only strategy whose evidence
-    may claim the fastest legal configuration was found. ``smoke`` keeps every
-    name-is-config backend but only a slice of each tile grid, for exercising
-    the measure-publish-replay path end to end without paying for thousands of
-    launches; its evidence identifies it so a sampled run is never mistaken
-    for a complete search.
 
     ``backends`` restricts the catalogue to the named backends. This is a
     control for comparing storage contracts, not a tuning mode: a winner drawn
     from a restricted field is the fastest of what was allowed to run, not the
     fastest available, so its evidence records the restriction.
     """
-    if strategy not in MHA_FWD_SEARCH_STRATEGIES:
-        raise ValueError(
-            f"unknown MHA search strategy {strategy!r}; "
-            f"expected one of {list(MHA_FWD_SEARCH_STRATEGIES)}"
-        )
     if backends is not None:
         unknown = sorted(set(backends) - MHA_FWD_BACKENDS)
         if unknown:
@@ -483,9 +442,7 @@ def enumerate_mha_fwd_candidates(
         (1, 2, 3, 4),
         (1, 2, 3),
     )
-    for block_m, block_n, preload_v, warps, waves, stages in _tile_grid(
-        triton_axes, strategy
-    ):
+    for block_m, block_n, preload_v, warps, waves, stages in product(*triton_axes):
         candidates.append(
             MhaFwdCandidate(
                 "triton",
@@ -508,7 +465,7 @@ def enumerate_mha_fwd_candidates(
             (2, 4, 8),
             (1, 2, 3, 4),
         )
-        for block_m, block_n, warps, waves in _tile_grid(gluon_axes, strategy):
+        for block_m, block_n, warps, waves in product(*gluon_axes):
             candidates.append(
                 MhaFwdCandidate(
                     "gluon",
