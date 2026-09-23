@@ -260,27 +260,57 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // kid157: preload the whole A-scale panel into LDS once, then read per-tile
     // A-scale from LDS (ds_read/lgkmcnt) in the main loop instead of a per-tile
     // global buffer_load_b8 (vmcnt) every K iteration. The panel is a compact
-    // [B_M/GROUP_M rows][K/B_K K-blocks] row-major byte tile (GROUP_M==1 and
-    // B_K==GROUP_K for this traits). The LDS buffer is sized for a compile-time
-    // K upper bound (SFA_K_MAX); the actual packed K-tile count is a runtime
-    // value so any K<=SFA_K_MAX (and K%B_K==0) works. SFA_K_MAX=8192 keeps the
-    // panel <=16 KiB, so total LDS stays 1 WG/CU.
+    // [B_M/GROUP_M rows][K/GROUP_K scales] row-major byte tile (GROUP_M==1 for
+    // this traits). The LDS buffer is sized for a compile-time K upper bound
+    // (SFA_K_MAX); the actual packed scale count is a runtime value so any
+    // K<=SFA_K_MAX (and K%B_K==0) works.
+    //
+    // The budget is stated in bytes, not in K, because 16 KiB is what the tile
+    // has to spare at 1 WG/CU (the measured code object: 132 KiB of A/B tiles,
+    // 150 KiB total with both panels, against a 160 KiB cap). What changes with
+    // the quantisation block is how much K that buys: 64 scale columns is
+    // K=8192 at GROUP_K=128 and only K=2048 at 32.
+    //
+    // Rather than decline the K=4096 shapes the 32 twin exists for, the panel
+    // becomes a sliding window when the whole row does not fit: it holds
+    // SFA_TILES_RESIDENT K-tiles and is refilled from the main loop when the
+    // window runs out. Whether that ever happens is a compile-time property, so
+    // GROUP_K=128 -- where 64 columns already covers the largest K the kid
+    // accepts -- keeps a plain one-shot fill and a window base of a literal 0.
+    // The hard K ceiling of the kid, independent of the block size.
     constexpr int SFA_K_MAX     = 8192;
-    constexpr int SFA_K_TILES_MAX = PRELOAD_SFA_LDS ? (SFA_K_MAX / T::B_K) : 1;
+    constexpr int SFA_PANEL_BYTES = 24576;
     constexpr int SFA_ROWS      = T::B_M / T::GROUP_M;
+    // Never wider than a whole row: at GROUP_K=128 the row is 64 columns and
+    // the budget goes unspent, which is why the 128 kids keep the 16 KiB panel
+    // and the exact LDS footprint they were tuned at.
+    constexpr int SFA_ROW_COLS  = SFA_K_MAX / T::GROUP_K;
+    constexpr int SFA_COLS_CAP  = SFA_PANEL_BYTES / SFA_ROWS;
+    constexpr int SFA_SCALES_MAX = PRELOAD_SFA_LDS
+        ? (SFA_ROW_COLS < SFA_COLS_CAP ? SFA_ROW_COLS : SFA_COLS_CAP)
+        : 1;
+    constexpr int SFA_SPK       = T::B_K / T::GROUP_K;
+    constexpr int SFA_TILES_RESIDENT = SFA_SCALES_MAX / SFA_SPK;
+    constexpr bool SFA_SLIDING =
+        PRELOAD_SFA_LDS && (SFA_TILES_RESIDENT < (SFA_K_MAX / T::B_K));
     constexpr int SFA_LDS_BYTES =
-        PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_K_TILES_MAX * (int)sizeof(D_SF)) : 1;
+        PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_SCALES_MAX * (int)sizeof(D_SF)) : 1;
     // 16B-aligned so the panel fill below can land ds_write_b128; a bare char
     // array is only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) char smem_sfa[SFA_LDS_BYTES];
     D_SF* s_sfa_ptr = reinterpret_cast<D_SF*>(smem_sfa);
-    // Runtime packed K-tile count (== loops); used as the compact LDS M-row
+    // Runtime packed scale count per M row; used as the compact LDS M-row
     // stride so the read layout reuses make_layout_sfa with stride_sfa replaced.
-    const int sfa_k_tiles = PRELOAD_SFA_LDS ? (kargs.k / T::B_K) : 1;
-    auto u_sfa_lds = make_layout_sfa<T>(lane_id, wave_id_m, sfa_k_tiles);
+    // A sliding panel's rows are the resident width, not the shape's.
+    const int sfa_k_scales = PRELOAD_SFA_LDS ? (kargs.k / T::GROUP_K) : 1;
+    const int sfa_lds_stride = SFA_SLIDING ? SFA_SCALES_MAX : sfa_k_scales;
+    // First K-tile resident in the panel; stays 0 unless the window slides.
+    int sfa_base_tile = 0;
+    auto u_sfa_lds = make_layout_sfa<T>(lane_id, wave_id_m, sfa_lds_stride);
     auto sfa_lds_offset = [&](int half_tile_m, int tile_k) {
-        return half_tile_m * (T::HALF_B_M / T::GROUP_M) * sfa_k_tiles +
-               tile_k * (T::B_K / T::GROUP_K);
+        const int local_k = SFA_SLIDING ? (tile_k - sfa_base_tile) : tile_k;
+        return half_tile_m * (T::HALF_B_M / T::GROUP_M) * sfa_lds_stride +
+               local_k * SFA_SPK;
     };
     auto load_sfa = [&](int half_tile_m, int tile_k) {
         if constexpr (PRELOAD_SFA_LDS) {
@@ -377,24 +407,40 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // kid157: one-shot cooperative fill of the A-scale panel into LDS, published by
     // the barrier below. Byte-at-a-time was 16 iterations per thread at K=4096, each
     // stalling on its own vmcnt(0). A chunk must not span two M rows nor land
-    // unaligned, so the width has to divide both sfa_k_tiles and stride_sfa.
-    if constexpr (PRELOAD_SFA_LDS) {
+    // unaligned, so the width has to divide both sfa_k_scales and stride_sfa.
+    // Fills the panel with the SFA_SCALES_MAX-wide window starting at scale
+    // column col0. Without sliding there is exactly one such call, col0 is 0 and
+    // the window is the whole row, which is the one-shot fill this started as.
+    auto sfa_fill_window = [&](int col0) {
+        // Guarded even though every call site is: the panel is a one-byte stub
+        // for a kid without the preload, and a 16-wide ds_write into it does not
+        // type-check, so the body must not be instantiated there.
+        if constexpr (!PRELOAD_SFA_LDS) { (void)col0; return; } else {
         auto s_sfa = make_smem(s_sfa_ptr);
         const int tid = opus::thread_id_x();
-        const int sfa_total = SFA_ROWS * sfa_k_tiles;
+        const int cols = SFA_SLIDING
+            ? (sfa_k_scales - col0 < SFA_SCALES_MAX ? sfa_k_scales - col0 : SFA_SCALES_MAX)
+            : sfa_k_scales;
+        const int sfa_total = SFA_ROWS * cols;
         auto fill = [&](auto vec_c) {
             constexpr int VEC = decltype(vec_c)::value;
             for (int idx = tid * VEC; idx < sfa_total; idx += T::BLOCK_SIZE * VEC) {
-                const int m  = idx / sfa_k_tiles;
-                const int kt = idx - m * sfa_k_tiles;
+                const int m  = idx / cols;
+                const int kt = idx - m * cols;
                 s_sfa.template store<VEC>(
-                    load<VEC>(g_sfa, m * kargs.stride_sfa + kt), idx);
+                    load<VEC>(g_sfa, m * kargs.stride_sfa + col0 + kt),
+                    m * sfa_lds_stride + kt);
             }
         };
-        const int widths = sfa_k_tiles | kargs.stride_sfa;
+        const int widths = cols | kargs.stride_sfa | col0 | sfa_lds_stride;
         if      ((widths & 15) == 0) fill(number<16>{});
         else if ((widths & 3) == 0)  fill(number<4>{});
         else                         fill(number<1>{});
+        }
+    };
+
+    if constexpr (PRELOAD_SFA_LDS) {
+        sfa_fill_window(0);
     }
 
     // Land the B scale fetched above; its latency is already spent by now.
@@ -416,6 +462,23 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
     }
+
+    // Slide the panel so that K-tiles [first, first+SFA_TILES_RESIDENT) are
+    // resident. Called only from the top of a main-loop body, where the tile
+    // index is uniform across the workgroup, so the barriers below are too.
+    //
+    // The first barrier retires every other wave's ds_reads of the outgoing
+    // window before this one overwrites it; the fill's own global loads drain
+    // to vmcnt(0), which also drains the A/B prefetches in flight -- correct,
+    // and the price of the slide. Once per SFA_TILES_RESIDENT tiles, so at
+    // K=4096 and GROUP_K=32 that is twice in a 32-tile loop.
+    auto sfa_slide = [&](int first) {
+        __builtin_amdgcn_s_barrier();
+        sfa_base_tile = first;
+        sfa_fill_window(first * SFA_SPK);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+    };
 
     // Prologue
     v_sfa[tic][0] = load_sfa(0, 0);
@@ -446,6 +509,13 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
 
     // Main loop
     for(int tile = 0; tile < loops - 2; tile += 2) {
+        // This body reads A scales for tiles tile+1..tile+3; slide before the
+        // first of them if the far end has walked off the resident window. The
+        // new base is tile+1 rather than tile+3 so a window always starts on the
+        // first tile of a body, and no body can straddle two windows.
+        if constexpr (SFA_SLIDING) {
+            if (tile + 3 >= sfa_base_tile + SFA_TILES_RESIDENT) sfa_slide(tile + 1);
+        }
         // First tile
         v_sfb[toc][1] = load_sfb(1, tile + 1);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
@@ -725,21 +795,16 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a8w8_scale_k1024_l
 // Supports any K<=8192 (K%B_K==0); LDS panels sized for the compile-time upper
 // bound, packed K-tile count resolved at runtime.
 //
-// The A panel is carried only when the quantisation block spans the whole MFMA
-// K extent (SF_PER_MFMA_K==1, i.e. GROUP_K==128 here). At GROUP_K=32 one K-tile
-// holds B_K/GROUP_K scale bytes per row instead of one, so the same panel would
-// be SFA_ROWS(256) * 64 tiles * 4 = 64 KiB and no longer fits beside the A/B
-// smem tiles at 1 WG/CU; shrinking SFA_K_MAX to buy it back would exclude the
-// K=4096 shapes this kid exists for. B keeps its panel either way -- it is the
-// one that pays, since at GROUP_N=32 the four N-groups are separate rows and
-// the steady-state SFB fetch is four uncoalesceable loads inside the vmcnt gate.
+// Both panels have a fixed LDS budget rather than a fixed K reach, so the K a
+// kid accepts shrinks with the quantisation block: the A panel is 16 KiB either
+// way, which is K<=8192 at GROUP_K=128 and K<=2048 at 32. Shapes past the reach
+// are declined at the top of the impl.
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
 void gemm_a8w8_scale_preload_sf_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    gemm_a8w8_scale_kernel_impl<Traits, false,
-                                (Traits::SF_PER_MFMA_K == 1), true>(kargs);
+    gemm_a8w8_scale_kernel_impl<Traits, false, true, true>(kargs);
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }
