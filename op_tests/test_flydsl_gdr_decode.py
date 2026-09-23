@@ -1,30 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CI-visible numerics tests for the FlyDSL GDR decode kernel.
+"""CI-visible numerics and contract checks for FlyDSL GDR decode, including KDA.
 
-CI shards ``op_tests/test_*.py`` at depth 1 (``.github/scripts/split_tests.sh``)
-and runs each as ``python3 <file>`` (``.github/scripts/aiter_test.sh``), so the
-in-package suite at ``aiter/ops/flydsl/test_flydsl_linear_attention.py`` never
-runs automatically, and a file without the ``__main__`` entry below collects
-nothing and still exits 0. Being listed is not the same as being run.
+Run:
+    python3 op_tests/test_flydsl_gdr_decode.py
+    python3 op_tests/test_flydsl_gdr_decode.py -d bf16 -b 1 4
 """
 
-import pytest
+from __future__ import annotations
+
+import argparse
+import re
+import time
+
+import pandas as pd
 import torch
+import torch.nn.functional as F
 
-import aiter.ops.flydsl as flydsl_ops
-from aiter.test_common import checkAllclose
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_gdr_decode
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-try:
-    import flydsl  # noqa: F401
+torch.set_default_device("cuda")
 
-    _FLYDSL_AVAILABLE = True
-except ImportError:
-    _FLYDSL_AVAILABLE = False
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+G_MIN = -5.0
+K = V = 128
+RTOL = ATOL = 1e-3
+_TOL_ERR_RATIO = 1e-3
+_PERF_ROTATION_BUDGET = 1024**3
+_MAX_PERF_ROTATIONS = 101
 
-# CI runs this file as a script, so ``op_tests`` is not a package on sys.path;
-# under pytest from the repo root it is.
 try:
     from kda_ref import kda_gate, l2norm, naive_recurrent_kda
 except ModuleNotFoundError as e:
@@ -32,69 +41,44 @@ except ModuleNotFoundError as e:
         raise
     from op_tests.kda_ref import kda_gate, l2norm, naive_recurrent_kda
 
-pytestmark = pytest.mark.skipif(not _FLYDSL_AVAILABLE, reason="flydsl is not installed")
 
-# This import skips the whole module when flydsl or a GPU is missing.
-from aiter.ops.flydsl.test_flydsl_linear_attention import (
-    Args,
-    check_gdr_decode,
-)
+def _perf_rotation_count(*tensors):
+    bytes_per_call = max(1, sum(t.nbytes for t in tensors))
+    return max(1, min(_MAX_PERF_ROTATIONS, _PERF_ROTATION_BUDGET // bytes_per_call))
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        # Smallest GQA shape on the scalar-gate path.
-        Args(
-            dtype=torch.bfloat16,
-            b=1,
-            sq=1,
-            num_k_heads=2,
-            num_v_heads=8,
-            head_k_dim=128,
-            head_v_dim=128,
-        ),
-        # Batch large enough to exercise the state-shuffle indices.
-        Args(
-            dtype=torch.bfloat16,
-            b=128,
-            sq=1,
-            num_k_heads=2,
-            num_v_heads=8,
-            head_k_dim=128,
-            head_v_dim=128,
-        ),
-        # f32 bias against a bf16 query, decoupled from the query dtype for KDA.
-        Args(
-            dtype=torch.bfloat16,
-            b=1,
-            sq=1,
-            num_k_heads=2,
-            num_v_heads=8,
-            head_k_dim=128,
-            head_v_dim=128,
-            dt_bias_dtype=torch.float32,
-        ),
-    ],
-    ids=["gqa_b1", "gqa_b128", "f32_dt_bias"],
-)
-def test_flydsl_gdr_decode_matches_reference(args):
-    check_gdr_decode(args)
-
-
-G_MIN = -5.0
-K = V = 128
-RTOL = ATOL = 1e-3
-
-
-def assert_close(name, ref, out):
-    """Every element must sit within rtol/atol of the torch reference."""
-    ref, out = ref.detach().float(), out.detach().float()
-    mismatched = checkAllclose(out, ref, rtol=RTOL, atol=ATOL, msg=f"{name} ")
-    assert mismatched == 0, (
-        f"{name}: {mismatched:.3%} of elements outside rtol={RTOL} atol={ATOL}, "
-        f"max abs delta {(out - ref).abs().max().item():.3e}"
+def _kda_decode_work(B, H, query, state, A_log, indices):
+    tokens = B
+    flops = tokens * H * (7 * K * V + 2 * V) + tokens * H * 6 * K
+    data_elements = 3 * tokens * H * K + tokens * H * V + tokens * H
+    state_elements = B * H * K * V
+    nbytes = (
+        data_elements * query.element_size()
+        + 2 * state_elements * state.element_size()
+        + H * K * 4
+        + H * A_log.element_size()
+        + B * indices.element_size()
     )
+    return flops, nbytes
+
+
+def _gdr_decode_work(b, sq, num_k_heads, num_v_heads, query, state, A_log, indices):
+    tokens = b * sq
+    flops = tokens * num_v_heads * (7 * K * V + 2 * V) + tokens * num_k_heads * 6 * K
+    data_elements = (
+        2 * tokens * num_k_heads * K
+        + 2 * tokens * num_v_heads * V
+        + 2 * tokens * num_v_heads
+        + num_v_heads
+    )
+    state_elements = b * num_v_heads * K * V
+    nbytes = (
+        data_elements * query.element_size()
+        + 2 * state_elements * state.element_size()
+        + num_v_heads * A_log.element_size()
+        + b * indices.element_size()
+    )
+    return flops, nbytes
 
 
 def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1):
@@ -105,50 +89,44 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1
     two are shape-identical, so feeding the wrong one tests the harness.
     """
     torch.manual_seed(seed)
-    dev = "cuda"
     T = 1
     args = {
-        "q": torch.randn(B, T, H, K, dtype=dt, device=dev),
-        "k": torch.randn(B, T, H, K, dtype=dt, device=dev),
-        "v": torch.randn(B, T, H, V, dtype=dt, device=dev),
-        "a": torch.randn(B, T, H, K, dtype=dt, device=dev),
-        "b": torch.randn(B, T, H, dtype=dt, device=dev),
-        "dt_bias": torch.randn(H, K, dtype=torch.float32, device=dev) * 0.1,
-        "A_log": torch.randn(H, dtype=torch.float32, device=dev) * 0.5,
-        "out": torch.zeros(B, T, H, V, dtype=dt, device=dev),
+        "q": torch.randn(B, T, H, K, dtype=dt, device="cuda"),
+        "k": torch.randn(B, T, H, K, dtype=dt, device="cuda"),
+        "v": torch.randn(B, T, H, V, dtype=dt, device="cuda"),
+        "a": torch.randn(B, T, H, K, dtype=dt, device="cuda"),
+        "b": torch.randn(B, T, H, dtype=dt, device="cuda"),
+        "dt_bias": torch.randn(H, K, dtype=torch.float32, device="cuda") * 0.1,
+        "A_log": torch.randn(H, dtype=torch.float32, device="cuda") * 0.5,
+        "out": torch.zeros(B, T, H, V, dtype=dt, device="cuda"),
     }
 
     d0, d1 = (K, V) if shuffle else (V, K)
     n_slots = B + first_index
     if padded:
-        # A serving stack hands the state pool over as one field of a wider
-        # per-slot allocation, so the slot stride exceeds the state size. The
-        # kernel must index slots by that stride, not assume they are packed.
-        storage = torch.randn(n_slots, H * K * V + 17, dtype=torch.float32, device=dev)
+        # Serving stacks pass the pool as one field of a wider per-slot allocation.
+        storage = torch.randn(
+            n_slots, H * K * V + 17, dtype=torch.float32, device="cuda"
+        )
         pool = storage[:, : H * K * V].view(n_slots, H, d0, d1)
-        # Only the outer stride is padded; each slot stays internally contiguous.
         assert not pool.is_contiguous()
         assert pool.stride()[1:] == (d0 * d1, d1, 1)
     else:
-        pool = torch.randn(n_slots, H, d0, d1, dtype=torch.float32, device=dev)
+        pool = torch.randn(n_slots, H, d0, d1, dtype=torch.float32, device="cuda")
 
     if indices_stride > 1:
-        # The serving stack passes a strided column of a wider index table, not
-        # a fresh contiguous array. The wrapper must densify it correctly before
-        # the kernel's unit-stride load.
-        storage = torch.zeros(B, indices_stride, dtype=torch.int32, device=dev)
+        storage = torch.zeros(B, indices_stride, dtype=torch.int32, device="cuda")
         indices = storage[:, 0]
     else:
-        indices = torch.empty(B, dtype=torch.int32, device=dev)
+        indices = torch.empty(B, dtype=torch.int32, device="cuda")
     indices.copy_(
-        torch.arange(first_index, first_index + B, dtype=torch.int32, device=dev)
+        torch.arange(first_index, first_index + B, dtype=torch.int32, device="cuda")
     )
     return args, pool, indices
 
 
 def _clone_pool(pool):
-    """Copy the pool keeping its layout; ``clone()`` would densify a padded view
-    and hand the kernel a contiguous pool instead of the strided one."""
+    """Copy the pool keeping its layout; ``clone()`` densifies a padded view."""
     out = torch.empty_strided(
         pool.shape, pool.stride(), dtype=pool.dtype, device=pool.device
     )
@@ -170,54 +148,8 @@ def _kda_reference(args, initial_state):
     )
 
 
-@pytest.mark.parametrize(
-    ("B", "H", "dt", "shuffle", "padded", "first_index", "indices_stride"),
-    [
-        (1, 8, torch.bfloat16, True, False, 0, 1),
-        (4, 12, torch.bfloat16, True, False, 0, 1),
-        (2, 12, torch.float16, True, False, 0, 1),
-        # Every awkward input at once: (D_v, D_k) state layout, padded storage,
-        # slots numbered from 1, and a strided index column.
-        (4, 12, torch.bfloat16, False, True, 1, 8),
-        (4, 12, torch.bfloat16, False, False, 1, 1),
-        (4, 12, torch.bfloat16, True, True, 1, 1),
-        (4, 12, torch.bfloat16, True, False, 1, 8),
-        # The remaining batch sizes that select a tuned launch config, so every
-        # tuned geometry runs rather than only the one B=4 picks.
-        (1, 12, torch.bfloat16, True, False, 1, 1),
-        (64, 12, torch.bfloat16, True, False, 1, 1),
-        (256, 12, torch.bfloat16, True, False, 1, 1),
-        # A large head count with no tuned config, on the fallback geometry.
-        (2, 64, torch.bfloat16, True, False, 1, 1),
-    ],
-    ids=[
-        "b1_h8_bf16",
-        "b4_h12_bf16",
-        "b2_h12_fp16",
-        "all_at_once",
-        "no_shuffle",
-        "padded_state",
-        "strided_indices",
-        "b1_h12_tuned",
-        "b64_h12_tuned",
-        "b256_h12_tuned",
-        "b2_h64",
-    ],
-)
-def test_kda_per_channel_gate_matches_torch_reference(
-    B, H, dt, shuffle, padded, first_index, indices_stride
-):
-    """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x)."""
-    args, pool, indices = _kda_inputs(
-        B, H, dt, first_index, padded, shuffle, indices_stride=indices_stride
-    )
-
-    initial_state = pool[indices.long()].clone()
-    if not shuffle:
-        initial_state = initial_state.transpose(-1, -2)
-
-    kernel_pool = _clone_pool(pool)
-    flydsl_ops.flydsl_gdr_decode(
+def _run_kda(args, indices, pool, out, shuffle):
+    flydsl_gdr_decode(
         args["q"],
         args["k"],
         args["v"],
@@ -226,40 +158,227 @@ def test_kda_per_channel_gate_matches_torch_reference(
         args["dt_bias"],
         args["A_log"],
         indices,
-        kernel_pool,
-        args["out"],
+        pool,
+        out,
         use_qk_l2norm=True,
         need_shuffle_state=shuffle,
     )
 
+
+def _gdr_reference(
+    query,
+    key,
+    value,
+    a,
+    b,
+    dt_bias,
+    A_log,
+    indices,
+    state,
+    out,
+    num_k_heads,
+    num_v_heads,
+):
+    q = query.float()
+    k = key.float()
+    v = value.float()
+    q = q * torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
+    k = k * torch.rsqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
+    q = q * (K**-0.5)
+    heads_per_k_head = num_v_heads // num_k_heads
+    q = q.repeat_interleave(heads_per_k_head, dim=2)
+    k = k.repeat_interleave(heads_per_k_head, dim=2)
+    decay = torch.exp(
+        -torch.exp(A_log.float())
+        * F.softplus(a.float() + dt_bias.float(), beta=1.0, threshold=20.0)
+    )
+    beta = torch.sigmoid(b.float())
+    for batch_idx, state_idx in enumerate(indices.tolist()):
+        if state_idx < 0:
+            continue
+        h = state[state_idx].float()
+        h = h * decay[batch_idx, 0, :, None, None]
+        residual = v[batch_idx, 0] - torch.einsum("hkv,hk->hv", h, k[batch_idx, 0])
+        residual = residual * beta[batch_idx, 0, :, None]
+        h = h + k[batch_idx, 0, :, :, None] * residual[:, None, :]
+        out[batch_idx, 0].copy_(torch.einsum("hkv,hk->hv", h, q[batch_idx, 0]))
+        state[state_idx].copy_(h)
+
+
+def _expect_raises(exc_type, pattern, fn):
+    try:
+        fn()
+    except exc_type as exc:
+        if re.search(pattern, str(exc)) is None:
+            raise AssertionError(
+                f"expected {exc_type.__name__} matching {pattern!r}, got {exc!r}"
+            ) from exc
+        return
+    raise AssertionError(f"expected {exc_type.__name__} matching {pattern!r}")
+
+
+def summarize(name, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
+
+
+def _print_passed(passed, elapsed):
+    print(f" {passed} passed in {elapsed:.2f}s ".center(78, "="))
+
+
+@benchmark()
+def test_kda_decode(b, h, dtype, shuffle, padded, first_index, indices_stride):
+    args, pool, indices = _kda_inputs(
+        b, h, dtype, first_index, padded, shuffle, indices_stride=indices_stride
+    )
+    initial_state = pool[indices.long()].clone()
+    if not shuffle:
+        initial_state = initial_state.transpose(-1, -2)
     ref_out, ref_state = _kda_reference(args, initial_state)
+
+    def run(candidate_pool, candidate_out):
+        _run_kda(args, indices, candidate_pool, candidate_out, shuffle)
+
+    flops, nbytes = _kda_decode_work(b, h, args["q"], pool, args["A_log"], indices)
+    ret = {"gfx": get_gfx()}
+    perf_pool = _clone_pool(pool)
+    perf_out = torch.zeros_like(args["out"])
+    _, us = run_perftest(
+        run,
+        perf_pool,
+        perf_out,
+        num_rotate_args=_perf_rotation_count(perf_pool, perf_out),
+    )
+    kernel_pool = _clone_pool(pool)
+    kernel_out = torch.zeros_like(args["out"])
+    run(kernel_pool, kernel_out)
     got_state = kernel_pool[indices.long()]
     if not shuffle:
         got_state = got_state.transpose(-1, -2)
+    err_out = checkAllclose(
+        ref_out.to(dtypes.fp32),
+        kernel_out.to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="flydsl: KDA decode output ",
+    )
+    err_state = checkAllclose(
+        ref_state.to(dtypes.fp32),
+        got_state.to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="flydsl: KDA decode state ",
+    )
+    assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO, (
+        f"mismatch ratio exceeds {_TOL_ERR_RATIO:g} "
+        f"(output {err_out:.3e}, state {err_state:.3e})"
+    )
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = flops / us / 1e6
+    ret["flydsl TB/s"] = nbytes / us / 1e6
+    ret["flydsl err"] = max(err_out, err_state)
+    return ret
 
-    assert_close("o", ref_out, args["out"])
-    assert_close("ht", ref_state, got_state)
+
+@benchmark()
+def test_gdr_decode(b, dt_bias_dtype):
+    num_k_heads, num_v_heads, sq = 2, 8, 1
+    dtype = torch.bfloat16
+    query = torch.randn(b, sq, num_k_heads, K, dtype=dtype, device="cuda")
+    key = torch.randn_like(query)
+    value = torch.randn(b, sq, num_v_heads, V, dtype=dtype, device="cuda")
+    a = torch.randn(b, sq, num_v_heads, dtype=dtype, device="cuda")
+    beta = torch.randn_like(a)
+    dt_bias = torch.randn(num_v_heads, dtype=dt_bias_dtype, device="cuda")
+    dt_bias.uniform_(1, 2)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device="cuda")
+    A_log.uniform_(0, 16)
+    indices = torch.arange(b - 1, -1, -1, dtype=torch.int32, device="cuda")
+    state = torch.randn(b, num_v_heads, K, V, dtype=torch.float32, device="cuda")
+    ref_state = state.clone()
+    ref_out = torch.zeros(b, sq, num_v_heads, V, dtype=dtype, device="cuda")
+    _gdr_reference(
+        query,
+        key,
+        value,
+        a,
+        beta,
+        dt_bias,
+        A_log,
+        indices,
+        ref_state,
+        ref_out,
+        num_k_heads,
+        num_v_heads,
+    )
+
+    def run(candidate_state, candidate_out):
+        flydsl_gdr_decode(
+            query,
+            key,
+            value,
+            a,
+            beta,
+            dt_bias,
+            A_log,
+            indices,
+            candidate_state,
+            candidate_out,
+            use_qk_l2norm=True,
+            need_shuffle_state=True,
+        )
+
+    flops, nbytes = _gdr_decode_work(
+        b, sq, num_k_heads, num_v_heads, query, state, A_log, indices
+    )
+    ret = {"gfx": get_gfx()}
+    perf_state = state.clone()
+    perf_out = torch.zeros_like(ref_out)
+    _, us = run_perftest(
+        run,
+        perf_state,
+        perf_out,
+        num_rotate_args=_perf_rotation_count(perf_state, perf_out),
+    )
+    got_state = state.clone()
+    got_out = torch.zeros_like(ref_out)
+    run(got_state, got_out)
+    err_out = checkAllclose(
+        ref_out.to(dtypes.fp32),
+        got_out.to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="flydsl: GDR decode output ",
+    )
+    err_state = checkAllclose(
+        ref_state.to(dtypes.fp32),
+        got_state.to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="flydsl: GDR decode state ",
+    )
+    assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO, (
+        f"mismatch ratio exceeds {_TOL_ERR_RATIO:g} "
+        f"(output {err_out:.3e}, state {err_state:.3e})"
+    )
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = flops / us / 1e6
+    ret["flydsl TB/s"] = nbytes / us / 1e6
+    ret["flydsl err"] = max(err_out, err_state)
+    return ret
 
 
 def test_channel_strided_a_is_rejected():
-    """A gap between `a`'s channels is rejected rather than read as garbage.
-
-    The kernel vector-loads `a` along D_k, and the wrapper forwards `a`'s strides
-    instead of copying it the way it copies q/k/v, so a non-dense channel axis
-    would read the wrong elements. Only D_k must be dense; other axes stay free.
-    """
     B, H, dt = 2, 12, torch.bfloat16
     args, pool, indices = _kda_inputs(
         B, H, dt, first_index=0, padded=False, shuffle=True
     )
-
-    # Every other channel of a 2K-wide buffer: stride(-1) == 2.
     wide = torch.randn(B, 1, H, 2 * K, dtype=dt, device="cuda")
     strided_a = wide[..., ::2]
     assert strided_a.shape == args["a"].shape and strided_a.stride(-1) == 2
 
-    with pytest.raises(AssertionError, match="dense along D_k"):
-        flydsl_ops.flydsl_gdr_decode(
+    def run():
+        flydsl_gdr_decode(
             args["q"],
             args["k"],
             args["v"],
@@ -274,26 +393,20 @@ def test_channel_strided_a_is_rejected():
             need_shuffle_state=True,
         )
 
+    _expect_raises(AssertionError, "dense along D_k", run)
+
 
 def test_consumer_native_a_layout_is_rejected():
-    """`a` held as (1, B, H_v, D_k) must be rejected, not read row-shifted.
-
-    Consumers hold the gate that way and are expected to pass a (B, Sq, H_v, D_k)
-    view. The un-transposed buffer clears every dtype and stride check, so
-    without a full shape check it reaches the kernel and reads the Sq axis as
-    batch: wrong for B > 1, out of bounds once B exceeds H_v.
-    """
     B, H, dt = 2, 12, torch.bfloat16
     args, pool, indices = _kda_inputs(
         B, H, dt, first_index=0, padded=False, shuffle=True
     )
-
     consumer_native = args["a"].transpose(0, 1)
     assert consumer_native.shape == (1, B, H, K)
-    assert consumer_native.stride(-1) == 1  # passes the D_k density check
+    assert consumer_native.stride(-1) == 1
 
-    with pytest.raises(ValueError, match=r"`a` must have shape"):
-        flydsl_ops.flydsl_gdr_decode(
+    def run():
+        flydsl_gdr_decode(
             args["q"],
             args["k"],
             args["v"],
@@ -308,48 +421,26 @@ def test_consumer_native_a_layout_is_rejected():
             need_shuffle_state=True,
         )
 
+    _expect_raises(ValueError, r"`a` must have shape", run)
+
 
 def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
-    """A staged `.contiguous()` copy must be issued on the launch stream.
-
-    Ordering the inputs against ``side`` is the caller's job, so the sync does it
-    and leaves only the wrapper's own copies under test. The sleep then makes the
-    failure deterministic: it holds the current stream, so a copy left there
-    cannot finish before a launch on ``side`` would start.
-    """
     B, H, dt = 2, 12, torch.bfloat16
     args, pool, indices = _kda_inputs(
         B, H, dt, first_index=0, padded=False, shuffle=True
     )
-
     wide_bias = torch.randn(H, 2 * K, dtype=torch.float32, device="cuda") * 0.1
     args["dt_bias"] = wide_bias[:, ::2]
     assert not args["dt_bias"].is_contiguous()
-
     initial_state = pool[indices.long()].clone()
     kernel_pool = pool.clone()
-
-    # A compile inside the timed section runs for seconds and outlasts the
-    # sleep, closing the window; warm this config on throwaway buffers first.
-    flydsl_ops.flydsl_gdr_decode(
-        args["q"],
-        args["k"],
-        args["v"],
-        args["a"],
-        args["b"],
-        args["dt_bias"],
-        args["A_log"],
-        indices,
-        pool.clone(),
-        torch.empty_like(args["out"]),
-        use_qk_l2norm=True,
-        need_shuffle_state=True,
-    )
+    # Warm the config so JIT does not overlap the current-stream sleep below.
+    _run_kda(args, indices, pool.clone(), torch.empty_like(args["out"]), True)
 
     side = torch.cuda.Stream()
     torch.cuda.synchronize()
     torch.cuda._sleep(100_000_000)
-    flydsl_ops.flydsl_gdr_decode(
+    flydsl_gdr_decode(
         args["q"],
         args["k"],
         args["v"],
@@ -365,103 +456,96 @@ def test_staging_copies_are_ordered_against_a_caller_supplied_stream():
         stream=side,
     )
     torch.cuda.synchronize()
-
     ref_out, ref_state = _kda_reference(args, initial_state)
-    assert_close("o", ref_out, args["out"])
-    assert_close("ht", ref_state, kernel_pool[indices.long()])
+    err_out = checkAllclose(
+        ref_out.to(dtypes.fp32),
+        args["out"].to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="stream o ",
+    )
+    err_state = checkAllclose(
+        ref_state.to(dtypes.fp32),
+        kernel_pool[indices.long()].to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="stream ht ",
+    )
+    assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO
 
 
 def test_negative_slot_is_skipped_and_zero_is_not():
-    """A negative slot is padding; slot 0 is a live slot and is decoded.
-
-    The kernel guards each row on ``read_pool_idx >= 0 & write_pool_idx >= 0``.
-    A negative index is graph padding: it writes positive zero to that output
-    row (so the caller can ``torch.empty`` ``out``) and does not index the
-    pool. Slot 0 still goes through like any other live slot; that is the
-    divergence from the KDA torch reference, which treats ``state_idx <= 0``
-    as invalid.
-    """
     B, H, dt = 4, 12, torch.bfloat16
     args, pool, _ = _kda_inputs(B, H, dt, first_index=0, padded=False, shuffle=True)
-
     indices = torch.tensor([-1, 0, 1, 2], dtype=torch.int32, device="cuda")
     args["out"].fill_(7.0)
     kernel_pool = pool.clone()
+    _run_kda(args, indices, kernel_pool, args["out"], True)
 
-    flydsl_ops.flydsl_gdr_decode(
-        args["q"],
-        args["k"],
-        args["v"],
-        args["a"],
-        args["b"],
-        args["dt_bias"],
-        args["A_log"],
-        indices,
-        kernel_pool,
-        args["out"],
-        use_qk_l2norm=True,
-        need_shuffle_state=True,
-    )
-
-    assert flydsl_ops.flydsl_gdr_decode.zeroes_invalid_output
-    # Row 0 asked for slot -1: zeroed, not left at the fill, not wrapped to
-    # the last pool row.
+    assert flydsl_gdr_decode.zeroes_invalid_output
     assert (args["out"][0] == 0).all()
     assert torch.equal(kernel_pool[3], pool[3])
 
-    # Slots 0-2 are live here even though vLLM's packed-decode wrapper treats
-    # slot 0 as invalid. Check their decode, not merely that values changed.
     live_args = dict(args)
     for name in ("q", "k", "v", "a", "b"):
         live_args[name] = args[name][1:]
     ref_out, ref_state = _kda_reference(live_args, pool[:3])
-    assert_close("live o", ref_out, args["out"][1:])
-    assert_close("live ht", ref_state, kernel_pool[:3])
+    err_out = checkAllclose(
+        ref_out.to(dtypes.fp32),
+        args["out"][1:].to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="live o ",
+    )
+    err_state = checkAllclose(
+        ref_state.to(dtypes.fp32),
+        kernel_pool[:3].to(dtypes.fp32),
+        rtol=RTOL,
+        atol=ATOL,
+        msg="live ht ",
+    )
+    assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO
 
 
-def test_only_kda_uses_the_kda_tiling_table(monkeypatch):
-    """KDA uses its tuned row while scalar GDR keeps main's tiling policy."""
+def test_only_kda_uses_the_kda_tiling_table():
     from aiter.ops.flydsl import linear_attention_kernels as lak
 
     kda_config = {"NUM_BLOCKS_PER_V_DIM": 4, "NUM_WARPS": 2, "WARP_THREADS_K": 32}
-    dtypes = ("torch.bfloat16", "torch.float32")
+    dtypes_key = ("torch.bfloat16", "torch.float32")
     geometry = (4, 1, 12, 12, 128, 128)
     part = (lak.GDR_GPU_ARCH, lak.get_num_sms())
+    saved = lak._KDA_DECODE_BY_PART
+    try:
+        lak._KDA_DECODE_BY_PART = {part: {4: (4, 2, 32)}}
+        assert lak.get_default_kwargs(*dtypes_key, *geometry, "kda") == kda_config
+        assert lak.get_default_kwargs(
+            *dtypes_key, *geometry, "gdr"
+        ) == lak._decode_tiling(
+            geometry[0], geometry[3], geometry[4], geometry[5], dtypes_key[1]
+        )
+    finally:
+        lak._KDA_DECODE_BY_PART = saved
 
-    monkeypatch.setattr(lak, "_KDA_DECODE_BY_PART", {part: {4: (4, 2, 32)}})
-    assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == kda_config
-    assert lak.get_default_kwargs(*dtypes, *geometry, "gdr") == lak._decode_tiling(
-        geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]
-    )
 
-
-def test_a_row_swept_on_another_part_is_not_reused(monkeypatch):
-    """A tuned row belongs to the CU count it was swept on.
-
-    Keyed on the arch name alone, an 80-CU MI308X picked up MI300X's 304-CU row
-    and lost to the shape-based tiling it was meant to beat. A part with no row
-    of its own has to fall through to `_decode_tiling`.
-    """
+def test_a_row_swept_on_another_part_is_not_reused():
     from aiter.ops.flydsl import linear_attention_kernels as lak
 
-    dtypes = ("torch.bfloat16", "torch.float32")
+    dtypes_key = ("torch.bfloat16", "torch.float32")
     geometry = (4, 1, 12, 12, 128, 128)
     foreign = (lak.GDR_GPU_ARCH, lak.get_num_sms() + 1)
+    saved = lak._KDA_DECODE_BY_PART
+    try:
+        lak._KDA_DECODE_BY_PART = {foreign: {4: (4, 2, 32)}}
+        assert lak.get_default_kwargs(
+            *dtypes_key, *geometry, "kda"
+        ) == lak._decode_tiling(
+            geometry[0], geometry[3], geometry[4], geometry[5], dtypes_key[1]
+        )
+    finally:
+        lak._KDA_DECODE_BY_PART = saved
 
-    monkeypatch.setattr(lak, "_KDA_DECODE_BY_PART", {foreign: {4: (4, 2, 32)}})
-    assert lak.get_default_kwargs(*dtypes, *geometry, "kda") == lak._decode_tiling(
-        geometry[0], geometry[3], geometry[4], geometry[5], dtypes[1]
-    )
 
-
-@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float16])
 def test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype):
-    """A bf16 pool must be written as bf16 whatever the activations are.
-
-    The store used to take its vector type from the activations, so fp16 ones
-    truncated to fp16 and landed in a bf16 pool: same width, other exponent.
-    bf16 activations hid it, both types agreeing by luck.
-    """
     B, Sq, H, D = 2, 1, 4, 128
 
     def run(state_dtype):
@@ -477,7 +561,7 @@ def test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype):
             state_dtype
         )
         out = torch.zeros(B, Sq, H, D, **kw)
-        flydsl_ops.flydsl_gdr_decode(
+        flydsl_gdr_decode(
             q,
             k,
             v,
@@ -495,13 +579,10 @@ def test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype):
 
     ref = run(torch.float32)
     got = run(torch.bfloat16)
-    # bf16 keeps 8 mantissa bits, so rounding alone stays well inside 5%.
     assert (got - ref).abs().max() < 0.05 * ref.abs().max()
 
 
 def test_kda_supports_bf16_state():
-    """The per-channel path supports the wrapper's bf16 state contract."""
-
     def run(state_dtype):
         args, pool, indices = _kda_inputs(
             B=2,
@@ -513,20 +594,7 @@ def test_kda_supports_bf16_state():
             seed=0,
         )
         pool = pool.to(state_dtype)
-        flydsl_ops.flydsl_gdr_decode(
-            args["q"],
-            args["k"],
-            args["v"],
-            args["a"],
-            args["b"],
-            args["dt_bias"],
-            args["A_log"],
-            indices,
-            pool,
-            args["out"],
-            use_qk_l2norm=True,
-            need_shuffle_state=True,
-        )
+        _run_kda(args, indices, pool, args["out"], True)
         return args["out"].float(), pool.float()
 
     ref_out, ref_state = run(torch.float32)
@@ -536,15 +604,13 @@ def test_kda_supports_bf16_state():
 
 
 def test_fp32_activations_are_rejected():
-    """The out store converts to fp16 for anything but bf16, so f32 must not
-    reach the kernel and be silently narrowed."""
     B, Sq, H, D = 1, 1, 4, 128
     kw = {"dtype": torch.float32, "device": "cuda"}
     q, k, v = (torch.randn(B, Sq, H, D, **kw) for _ in range(3))
     a, b = (torch.randn(B, Sq, H, **kw) for _ in range(2))
 
-    with pytest.raises(ValueError, match=r"`query` must be fp16 or bf16"):
-        flydsl_ops.flydsl_gdr_decode(
+    def run():
+        flydsl_gdr_decode(
             q,
             k,
             v,
@@ -559,9 +625,94 @@ def test_fp32_activations_are_rejected():
             need_shuffle_state=True,
         )
 
+    _expect_raises(ValueError, r"`query` must be fp16 or bf16", run)
 
-# CI runs each file as `python3 <file>`, which collects nothing on its own.
+
+_KDA_CASES = [
+    (1, 8, torch.bfloat16, True, False, 0, 1),
+    (4, 12, torch.bfloat16, True, False, 0, 1),
+    (2, 12, torch.float16, True, False, 0, 1),
+    (4, 12, torch.bfloat16, False, True, 1, 8),
+    (4, 12, torch.bfloat16, False, False, 1, 1),
+    (4, 12, torch.bfloat16, True, True, 1, 1),
+    (4, 12, torch.bfloat16, True, False, 1, 8),
+    (1, 12, torch.bfloat16, True, False, 1, 1),
+    (64, 12, torch.bfloat16, True, False, 1, 1),
+    (256, 12, torch.bfloat16, True, False, 1, 1),
+    (2, 64, torch.bfloat16, True, False, 1, 1),
+]
+_GDR_CASES = [
+    (1, torch.float32),
+    (1, torch.bfloat16),
+    (128, torch.bfloat16),
+]
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("FlyDSL GDR decode unsupported on %s; skipping", get_gfx())
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16, dtypes.fp16],
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp16],
+        help="Activation dtype.\n        e.g.: -d bf16",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[1, 2, 4, 64, 128, 256],
+        help="Batch sizes.\n        e.g.: -b 1 4",
+    )
+    args = parser.parse_args()
+    passed = 0
+    t0 = time.perf_counter()
+
+    kda_rows = []
+    for b, h, dtype, shuffle, padded, first_index, indices_stride in _KDA_CASES:
+        if dtype not in args.dtype or b not in args.batch:
+            continue
+        kda_rows.append(
+            test_kda_decode(b, h, dtype, shuffle, padded, first_index, indices_stride)
+        )
+        passed += 1
+    if kda_rows:
+        summarize("flydsl_gdr_decode kda", kda_rows)
+
+    gdr_rows = []
+    for b, dt_bias_dtype in _GDR_CASES:
+        if torch.bfloat16 not in args.dtype or b not in args.batch:
+            continue
+        gdr_rows.append(test_gdr_decode(b, dt_bias_dtype))
+        passed += 1
+    if gdr_rows:
+        summarize("flydsl_gdr_decode gdr", gdr_rows)
+
+    test_channel_strided_a_is_rejected()
+    test_consumer_native_a_layout_is_rejected()
+    test_staging_copies_are_ordered_against_a_caller_supplied_stream()
+    test_negative_slot_is_skipped_and_zero_is_not()
+    test_only_kda_uses_the_kda_tiling_table()
+    test_a_row_swept_on_another_part_is_not_reused()
+    passed += 6
+    for act_dtype in args.dtype:
+        test_state_store_follows_the_pool_dtype_not_the_activations(act_dtype)
+        passed += 1
+    test_kda_supports_bf16_state()
+    test_fp32_activations_are_rejected()
+    passed += 2
+    _print_passed(passed, time.perf_counter() - t0)
+
+
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v"]))
+    main()
