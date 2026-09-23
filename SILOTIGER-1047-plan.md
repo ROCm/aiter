@@ -972,6 +972,18 @@ busy/wave **8889→8405**. Keep the experimental kernel diff; details and
 the physical address formula are in
 ``SILOTIGER-1047-optimize-overlay-split-plan.md``.
 
+**Retained:** overlay prefill K/QK now matches live AMD's 128-bit XOR
+LDS map instead of reusing V's map. The byte address is
+``tid*16 ^ ((tid & 0x60)>>1) ^ (group*64)`` plus the AMD D-chunk
+permutation. Prefill ISA has AMD's exact 16-store ``ds_write_b128``
+immediate sequence and keeps 32 ``ds_read_b128`` / K32 QK MFMA;
+decode ISA is byte-identical. Focused oracle passed. Same-session
+width-2051 ``L=512`` prefill improved **230.21→189.77 µs** (−17.6%)
+vs live AMD **211.55 µs**. PMC/wave vs the write2st64 keeper:
+conflict **31680→6336**, wait-LDS **16543→8055**, busy **8405→6903**;
+MFMA/VMEM are unchanged. Keep the kernel diff; full map and ATT evidence
+are in ``SILOTIGER-1047-optimize-overlay-split-plan.md``.
+
 **Do not retry** overlay prefill software-pipeline of
 ``ds_read_b64_tr_b16`` ahead of the current PV MFMA on a **single** B
 fragment (issue next tr16, then ``pv_mfma`` of ``v_cur``). GPU 6 /

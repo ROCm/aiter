@@ -39,6 +39,7 @@ convention.
 - [x] 2. Prefill packed K32 PV (`cvt_pk`); decode MFMA unchanged (miss; DNR)
 - [x] 3. Reuse gather `live` for softmax (optional; after a keep)
 - [x] 4. Drop leftover `v_perm` on the pack path (optional; after 1)
+- [x] 4a. Match live AMD's prefill K/QK 128-bit XOR map (kept)
 - [ ] 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 
 ## Locked decisions
@@ -378,6 +379,51 @@ within noise.
 
 Prefill VALU **−38%**. Conflict unchanged; wait-LDS rose (decode VGPR
 128). Wall clock still keeps on `M=512`.
+
+### 4a. Match live AMD's prefill K/QK 128-bit XOR map
+
+Kept (2026-09-23). This is the QK analogue of the retained V
+store/read lowering, but it matches AMD's **K** opcode family rather
+than reusing V's `write2st64` map. Prefill K now uses the live AMD
+byte map
+
+`base = tid*16 ^ ((tid & 0x60)>>1) ^ (group*64)`,
+
+with D chunks permuted by `group=(d/8)//8` and
+`quarter=((d/8)//2)%4`. The direct 128-bit store/read inverse preserves
+eight consecutive BF16 D values for QK A. Decode remains on the generic
+XOR path.
+
+**ISA** (`tickets/1047/tmp/k2_amd_kmap_isa/`). The prefill K store is
+the live AMD **16× `ds_write_b128`** sequence: four base VGPRs with
+immediates `0/8192/16384/24576`, then
+`2048/10240/18432/26624`, through `6144/14336/22528/30720`.
+QK remains **32× `ds_read_b128`** + **32× K32 MFMA**. The decode ISA is
+byte-identical to the retained keeper.
+
+**Correctness.** Focused decode and prefill oracle tests: **2 passed**.
+
+**Prefill keep-gate** (`CACHE=0`, GPU 6, five-run median) vs the
+write2st64 keeper: **230.21 → 189.77 µs** (**−17.6%**), passing the
+3% gate (≤223.30 µs). Same-session live AMD median is **211.55 µs**;
+this FlyDSL row is **10.3% faster**.
+
+**PMC** (`tickets/1047/tmp/k2_amd_kmap_pmc/`) vs the write2st64 keeper,
+per wave:
+
+| | keeper | AMD K map | Δ |
+|--|--:|--:|--:|
+| busy | 8405 | 6903 | **−17.9%** |
+| conflict | 31680 | 6336 | **−80.0%** |
+| wait-LDS | 16543 | 8055 | **−51.3%** |
+| MFMA | 2112 | 2112 | 0 |
+| VALU | 14825 | 14708 | −0.8% |
+| VMEM | 1162 | 1162 | 0 |
+
+Conflict is now **0.60×** live AMD (10560/wave), wait-LDS **0.87×**
+(9264/wave), and busy **0.92×** (7522/wave). Prefill ATT
+(`tickets/1047/tmp/k2_amd_kmap_att/`) puts `ds_write*` at **4.0%** of
+stall vs AMD **6.1%**; `s_waitcnt` remains the largest FlyDSL family.
 
 ### 5. Stop: keep-gate dry **or** prefill store/MFMA in AMD’s band
 
