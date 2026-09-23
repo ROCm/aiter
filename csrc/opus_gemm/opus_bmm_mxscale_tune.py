@@ -91,7 +91,9 @@ from opus_gemm_common import (
 # kid needs 32-block scales and its tuned row is meaningless for a 128 one. So
 # it is read off the instance here rather than taken from the module constant.
 _KID_INSTANCE = {
-    kid: inst for family in a8w8_mxscale_bmm_kernel_lists for kid, inst in family.items()
+    kid: inst
+    for family in a8w8_mxscale_bmm_kernel_lists
+    for kid, inst in family.items()
 }
 
 
@@ -104,6 +106,8 @@ def _kid_group(kid):
         f"({inst.GROUP_N}/{inst.GROUP_K}); the tuned schema carries one groupSize"
     )
     return inst.GROUP_K
+
+
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -204,11 +208,13 @@ _TUNE_POLICY = {
 #
 # groupSize is part of the tuned key, so a twin competes only against other 32
 # kids for its shape and gets its own winning row.
-_TUNE_POLICY.update({
-    twin: factors
-    for mirror, factors in list(_TUNE_POLICY.items())
-    if (twin := mirror + 1000) in _KID_INSTANCE
-})
+_TUNE_POLICY.update(
+    {
+        twin: factors
+        for mirror, factors in list(_TUNE_POLICY.items())
+        if (twin := mirror + 1000) in _KID_INSTANCE
+    }
+)
 
 # Only non-direct flatmm split-K launchers are swept with splitK>1.
 # Any other family sweeping it is a policy bug, so fail loudly at import.
@@ -346,7 +352,11 @@ def gen_bmm_mxscale_data(
         if workspace_numel
         else None
     )
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group).transpose(0, 1).to(out_dtype)
+    ref = (
+        run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group)
+        .transpose(0, 1)
+        .to(out_dtype)
+    )
     return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref)
 
 
@@ -424,11 +434,11 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         info, time, _err = results
         if time == self.INVALID_TIME:
             return 0, 0
-        # info[0] is the key tuple, and the tuned schema gained groupSize, so it
-        # carries six fields now. Unpacking five names off it raised for every
-        # single candidate, which is why the sweep reported "tune 0 shapes".
-        shape = dict(zip(self.keys, info[0]))
-        b, m, n, k = (int(shape[name]) for name in ("b", "m", "n", "k"))
+        # Keyed by name, not by position: KEYS grew a groupSize column when the
+        # 32-block twins got their own tuned rows, and a positional unpack here
+        # silently became an arity error that failed every shape.
+        _keys = dict(zip(self.keys, info[0]))
+        b, m, n, k = (_keys["b"], _keys["m"], _keys["n"], _keys["k"])
         us_s = time * 1e-6
         tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
         # fp8 A + fp8 W + bf16 out.
