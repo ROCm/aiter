@@ -1207,18 +1207,22 @@ def _iter_legacy_cases():
                 ):
                     continue
                 for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        act_type,
-                        **_situv2_beta_kwargs(act_type),
-                    ), extras
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            **_situv2_beta_kwargs(act_type),
+                        ),
+                        extras,
+                    )
 
 
 def test_bm16_tiled_scale_boundary():
