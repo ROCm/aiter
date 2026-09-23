@@ -915,6 +915,11 @@ def _dispatch(
             input.stride(0),
             input.stride(1),
             k=topk,
+            # `ragged` is `end is not None` -- whether the CALLER gave row
+            # bounds. When it did not, the pair above is 0 and the full width for
+            # every row, and saying so lets the entry run the kernels that do not
+            # bounds-check every element.
+            ragged=ragged,
         )
     elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)

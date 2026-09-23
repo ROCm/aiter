@@ -539,6 +539,8 @@ def top_k_per_row_prefill(
             stride0,
             stride1,
             k,
+            # Reached with the caller's own bounds, so the ragged kernels stay.
+            ragged=True,
         )
 
     use_mulblocks = not stable and _use_mulblocks(numRows, stride0)
@@ -607,6 +609,7 @@ def _top_k_per_row_prefill_sampled(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    ragged: bool = True,
 ) -> None: ...
 
 
@@ -667,6 +670,13 @@ def top_k_per_row_prefill_sampled(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    # Whether the CALLER supplied per-row bounds. topk_select synthesises a
+    # [0, width) pair when it did not, and the entry cannot tell that from a
+    # genuinely ragged batch, so it has always run the bounds-checking kernels.
+    # Passing False picks the plain ones: measured through this entry at k=2048
+    # --dist gaussian m=2048 n=131072, phase_b 202.96 -> 193.14 us, phase_a
+    # 38.31 -> 37.44, phase_c 40.80 -> 41.09, the whole call 282.07 -> 271.67.
+    ragged: bool = True,
 ) -> None:
     """Per-row top-k (prefill) via the topk-prefill-avo kernels.
 
@@ -770,6 +780,7 @@ def top_k_per_row_prefill_sampled(
         stride1,
         k,
         workspace,
+        ragged,
     )
 
 

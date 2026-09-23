@@ -635,6 +635,30 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
 
     const int v4_per_chunk = SAMPLE_CHUNK_ELEMS / FP32_EPT;
     const int total_v4     = S / FP32_EPT;
+    // phase_a's load is latency-bound, not bandwidth-bound: ABLATE_PA=1 measures
+    // 18.10us at m=4096 n=131072 with S=4096 and the SAME 18.09us at S=512, where
+    // the bytes are eight times fewer. At S=4096 total_v4 equals blockDim, so each
+    // thread issues exactly one load and the block waits out one round trip with
+    // only 2 blocks per CU to hide it. PA_UNROLL asks for several rounds in flight.
+//
+// Interleaved against PA_UNROLL=1, three rounds each, three-kernel device total,
+// k=2048 --dist gaussian --seed 0:
+//
+//   m=4096 n=131072   548.93 549.94 551.46   ->  542.62 542.52 544.56   0.9875
+//   m=4096 n=262144   971.28 966.97 970.47   ->  960.49 953.18 956.77   0.9868
+//   m=2048 n=131072   262.62 260.61 262.52   ->  259.14 260.82 260.52   0.9933
+//   m=1024 n=131072   151.07 151.16 150.80   ->  151.11 150.72 151.43   1.0005
+//   m=512  n=131072    73.41  73.33  73.19   ->   72.66  73.44  73.09   0.9966
+//   m=256  n=131072    47.09  46.28  47.49   ->   45.82  47.65  47.65   1.0019
+//   m=64   n=1048576   68.15  68.63  68.26   ->   68.16  68.21  68.57   0.9994
+//
+// It pays exactly where there are many block-rounds to overlap and is neutral
+// where one round covers every row, which is the mechanism. 8 is worse than 4
+// at m=4096 (65.35us of phase_a against 59.02us), so this stops at 4.
+#ifndef PA_UNROLL
+#define PA_UNROLL 4
+#endif
+#pragma unroll PA_UNROLL
     for(int u = threadIdx.x; u < total_v4; u += blockDim.x)
     {
         const int chunk = u / v4_per_chunk;
@@ -1742,16 +1766,34 @@ bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k)
 }
 
 // rowStarts[row] and rowEnds[row] bound [start, end); indices are absolute columns.
-void top_k_per_row_prefill_sampled(const aiter_tensor_t& logits,
-                                   const aiter_tensor_t& rowStarts,
-                                   const aiter_tensor_t& rowEnds,
-                                   aiter_tensor_t& indices,
-                                   std::optional<aiter_tensor_t> values,
-                                   int64_t numRows,
-                                   int64_t stride0,
-                                   int64_t stride1,
-                                   int64_t k                               = 2048,
-                                   std::optional<aiter_tensor_t> workspace = std::nullopt)
+void top_k_per_row_prefill_sampled(
+    const aiter_tensor_t& logits,
+    const aiter_tensor_t& rowStarts,
+    const aiter_tensor_t& rowEnds,
+    aiter_tensor_t& indices,
+    std::optional<aiter_tensor_t> values,
+    int64_t numRows,
+    int64_t stride0,
+    int64_t stride1,
+    int64_t k                               = 2048,
+    std::optional<aiter_tensor_t> workspace = std::nullopt,
+    // Whether the caller actually gave per-row bounds. The default keeps
+    // every existing caller on the path they have today.
+    //
+    // topk_select synthesises rowStarts=0 and rowEnds=N when the caller
+    // passes no `end`, so the entry cannot tell a genuinely ragged batch
+    // from a plain [M, N] one, and it has always assumed the first. The
+    // RAGGED=true kernels then bounds-check every element against a limit
+    // that is the row length. Measured through aiter at k=2048 --dist
+    // gaussian, the same instantiation in both builds:
+    //
+    //   m=2048 n=131072  phase_b 202.96 -> 193.14us, phase_a 38.31 ->
+    //   37.44, phase_c 40.80 -> 41.09; per call 282.07 -> 271.67, -3.7%
+    //
+    // The shape plan is deliberately left alone -- params_for still sizes
+    // by geometry_k_ragged -- so this changes which kernel runs and
+    // nothing else.
+    bool ragged = true)
 {
     if(numRows <= 0)
         return;
@@ -1799,10 +1841,20 @@ void top_k_per_row_prefill_sampled(const aiter_tensor_t& logits,
 
     if(sp.path == PATH_SMALL_N)
     {
-        if(val)
-            topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
+        if(ragged)
+        {
+            if(val)
+                topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
+            else
+                topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+        }
         else
-            topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+        {
+            if(val)
+                topk_small_n<false, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
+            else
+                topk_small_n<false, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+        }
         return;
     }
 
@@ -1812,9 +1864,21 @@ void top_k_per_row_prefill_sampled(const aiter_tensor_t& logits,
                 workspace.value().numel() * workspace.value().element_size(),
                 L.total);
     Bufs b = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
-    if(val)
-        topk_fused_impl<true, true>(in, M, N, row_starts, row_ends, K, idx, val, b, sp, stream);
+    if(ragged)
+    {
+        if(val)
+            topk_fused_impl<true, true>(in, M, N, row_starts, row_ends, K, idx, val, b, sp, stream);
+        else
+            topk_fused_impl<true, false>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, sp, stream);
+    }
     else
-        topk_fused_impl<true, false>(
-            in, M, N, row_starts, row_ends, K, idx, nullptr, b, sp, stream);
+    {
+        if(val)
+            topk_fused_impl<false, true>(
+                in, M, N, row_starts, row_ends, K, idx, val, b, sp, stream);
+        else
+            topk_fused_impl<false, false>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, sp, stream);
+    }
 }
