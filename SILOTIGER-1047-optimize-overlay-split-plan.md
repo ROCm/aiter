@@ -495,3 +495,11 @@ not repeated unless an overlay retry is proposed.
   median flat. Kernel restored. Do not retry pinning QK A dests
   through rmem/gemm authoring. Inline-asm dest constraints are a
   different experiment.
+- Prefill PV-B ping-pong dests (two-fragment refill and a 4-read tr16
+  burst, gemm from the B fragment). Oracle **2 passed**. Prefill ISA
+  (`tickets/1047/tmp/k2_pv_pong_isa/`) still issues
+  `ds_read_b64_tr_b16 v[66:67]` then `s_waitcnt lgkmcnt(0)` before every
+  K16 MFMA (same dest reuse as the single-buffer DNR). Same-session
+  keep-gate vs K-map HEAD **179.56** µs: FlyDSL **179.48** (`M=512`
+  **−0.04%**, need ≤ **174.17**). Kernel restored. Do not retry pinning
+  PV-B dests through rmem/gemm authoring.
