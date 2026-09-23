@@ -388,9 +388,11 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     if out is None or out.numel() < num_ctas * 4:
         out = torch.empty(num_ctas * 4, dtype=torch.int32,
                           device=context_lens.device)
-    # Slots one scheduler program describes, it will try to create equal work per WG
-    # while generating enough WGs
-    SCHED_BLOCK_P = 4
+    # Slots one scheduler program describes. Every program redoes the unit
+    # reductions, so this trades that redundancy against the BLOCK_P x ALIGN_W
+    # ownership matrix: 16 is 1.4-4.7x over 4 on the wide grids and flat on the
+    # narrow ones, 32 is worse again.
+    SCHED_BLOCK_P = 16
     _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(num_ctas, SCHED_BLOCK_P),)](
         context_lens,
         row_ends,
