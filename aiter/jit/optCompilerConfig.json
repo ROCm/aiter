@@ -441,6 +441,30 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f6gemm --output_dir {{}}'"
     },
+    "module_gemm_a6w4_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a6w4.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f6f4gemm --output_dir {{}}'"
+    },
+    "module_gemm_a4w6_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w6.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4f6gemm --output_dir {{}}'"
+    },
     "module_f4gemm_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_f4gemm.cu'"
@@ -1003,6 +1027,7 @@
             "f'{AITER_CSRC_DIR}/pybind/quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_mxfp4.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quant_mxfp4_gemm.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_mxfp6_gemm.cu'"
         ],
         "flags_extra_cc": [],

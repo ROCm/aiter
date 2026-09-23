@@ -826,6 +826,13 @@ def mla_decode_fwd(
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q <= 6
             )
+            or (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and nhead == 12
+                and nhead * max_seqlen_q <= 128
+            )
         ):
             # Natively support cases
             pass

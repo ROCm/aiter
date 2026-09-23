@@ -165,6 +165,32 @@ class TestA6W6TuningLookup(unittest.TestCase):
             gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
         )
 
+    def test_compiled_selector_matches_exact_then_padded_shape(self):
+        configs = (
+            (9450, 5120, 5120, "exact_kernel"),
+            (9472, 5120, 5120, "padded_kernel"),
+        )
+        with (
+            mock.patch.object(torch.compiler, "is_compiling", return_value=True),
+            mock.patch.object(
+                gemm_op_a6w6,
+                "_compiled_gemm_a6w6_configs",
+                return_value=configs,
+            ),
+        ):
+            self.assertEqual(
+                gemm_op_a6w6._select_gemm_a6w6_kernel(
+                    9450, 5120, 5120, None, device=torch.device("cuda:0")
+                ),
+                "exact_kernel",
+            )
+            self.assertEqual(
+                gemm_op_a6w6._select_gemm_a6w6_kernel(
+                    9451, 5120, 5120, None, device=torch.device("cuda:0")
+                ),
+                "padded_kernel",
+            )
+
 
 class TestA6W6ApiValidation(unittest.TestCase):
     def test_asm_wrapper_selects_safe_default_kernel(self):
