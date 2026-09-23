@@ -39,6 +39,8 @@ logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
+GiB = 1024 * 1024 * 1024
+
 
 def _worker(tp_size, rankID, mode, shape):
     # Must precede CUDA init in this process: the allocator reads the setting
@@ -55,13 +57,22 @@ def _worker(tp_size, rankID, mode, shape):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
 
+    keep = None
     if mode == "dirty":
-        # Leave a large segment in the caching allocator so the IPC pool that
-        # init_dist_env allocates next comes back as a sub-block rather than
-        # its own segment. This is what a co-resident second engine does
-        # incidentally; here it is made deterministic.
-        scratch = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
-        del scratch
+        # Make the IPC pool that init_dist_env allocates next come back as a
+        # sub-block of an existing allocation rather than as its own segment:
+        # hold a few GiB of "weights", free a large activation segment, and
+        # keep one live block at its head. This is the shape a loaded,
+        # co-resident engine produces incidentally.
+        #
+        # Scale matters. A 512 MiB segment is not enough -- the allocations
+        # init_dist_env makes on the way to the pool consume the remainder and
+        # the pool still gets a fresh segment (measured: offset 0). Multi-GiB
+        # reproduces reliably.
+        keep = [torch.empty(GiB, dtype=torch.uint8, device=device) for _ in range(6)]
+        act = torch.empty(4 * GiB, dtype=torch.uint8, device=device)
+        del act
+        keep.append(torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device))
 
     # The regression: under expandable segments this call used to die either
     # exporting the signal tensor (hipIpcGetMemHandle, "invalid argument") or
@@ -88,10 +99,22 @@ def _worker(tp_size, rankID, mode, shape):
     out = tensor_model_parallel_all_reduce(x).cpu()
 
     destroy_dist_env()
+    del keep
     return pool_mode, ipc_offset, out
 
 
 def test_init_dist_env(tp_size, shape, run_mode):
+    if run_mode == "dirty":
+        free = min(
+            torch.cuda.mem_get_info(torch.device(f"cuda:{i}"))[0]
+            for i in range(tp_size)
+        )
+        if free < 16 * GiB:
+            logger.warning(
+                "skipping dirty mode: needs ~16 GiB free per GPU, have %.1f GiB",
+                free / GiB,
+            )
+            return {"pool_modes": [], "ipc_offsets": [], "skipped": True}
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49374"
     pool = Pool(processes=tp_size)
