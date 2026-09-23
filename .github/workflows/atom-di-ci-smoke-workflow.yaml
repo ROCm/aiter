@@ -30,11 +30,6 @@ on:
         required: false
         default: true
         type: boolean
-      minimax_m3_mxfp8_model_path:
-        description: "MiniMax-M3-MXFP8 model path visible on Spur nodes"
-        required: false
-        type: string
-        default: "/data/models2/MiniMax-M3-MXFP8"
       run_minimax_m3_fp8_2p1d_tp8:
         description: "Run MiniMax-M3-MXFP8 2P+1D TP8, DPA-TP8, and DPA-TP8-EAGLE3 ATOMesh nightly cases"
         required: false
@@ -57,11 +52,6 @@ on:
         default: ""
       conc_list:
         description: "Concurrency list for the smoke benchmark"
-        required: false
-        type: string
-        default: "16"
-      eval_conc_list:
-        description: "Concurrency list for GSM8K eval; empty uses benchmark concurrency"
         required: false
         type: string
         default: "16"
@@ -151,10 +141,7 @@ jobs:
           print(f"RUN_GLM_5_2_FP8={str(run_glm).lower()}")
           print(
               "ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8="
-              + value(
-                  "minimax_m3_mxfp8_model_path",
-                  "ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8_DEFAULT",
-              )
+              + os.environ["ATOMESH_MODEL_PATH_MINIMAX_M3_MXFP8_DEFAULT"]
           )
           print(f"RUN_MINIMAX_M3_FP8_2P1D_TP8={str(run_minimax).lower()}")
           print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
@@ -170,10 +157,7 @@ jobs:
           print("ISL_LIST=" + os.environ["ISL_LIST_DEFAULT"])
           print("OSL=" + os.environ["OSL_DEFAULT"])
           print("CONC_LIST=" + value("conc_list", "CONC_LIST_DEFAULT"))
-          eval_conc = inputs.get("eval_conc_list", "")
-          if eval_conc in ("", None):
-              eval_conc = os.environ["DEEPSEEK_EVAL_CONC_LIST_DEFAULT"]
-          print(f"EVAL_CONC_LIST={eval_conc}")
+          print(f"EVAL_CONC_LIST={os.environ['DEEPSEEK_EVAL_CONC_LIST_DEFAULT']}")
           print(f"GLM_OSL={os.environ['GLM_OSL_DEFAULT']}")
           print(f"GLM_CONC_LIST={os.environ['GLM_CONC_LIST_DEFAULT']}")
           print(f"GLM_EVAL_CONC_LIST={os.environ['GLM_EVAL_CONC_LIST_DEFAULT']}")
