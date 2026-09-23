@@ -26,7 +26,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_device_name, get_gfx
 from aiter.ops.mha import _fmha_v3_varlen_splitkv_fwd, flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -182,10 +182,24 @@ def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
                 atol=2e-2,
                 msg=f"{name} LSE sq={sq} sk={sk} hq={hq} ns={num_splits}",
             )
-    if "public" in outs and "splitkv" in outs:
-        ret["public_eq_splitkv"] = int(torch.equal(outs["public"], outs["splitkv"]))
+    auto_split = sk >= 8192 and ret["q_wgs"] <= 2 * ret["cu"]
     if "public" in outs and "unsplit" in outs:
-        ret["public_eq_unsplit"] = int(torch.equal(outs["public"], outs["unsplit"]))
+        public_eq_unsplit = torch.equal(outs["public"], outs["unsplit"])
+        ret["public_eq_unsplit"] = int(public_eq_unsplit)
+        if auto_split:
+            assert not public_eq_unsplit, (
+                sq,
+                sk,
+                hq,
+                "public auto should not be unsplit",
+            )
+        else:
+            assert public_eq_unsplit, (sq, sk, hq, "public auto should stay unsplit")
+    if "public" in outs and "splitkv" in outs:
+        public_eq_splitkv = torch.equal(outs["public"], outs["splitkv"])
+        ret["public_eq_splitkv"] = int(public_eq_splitkv)
+        if auto_split and num_splits == 3:
+            assert public_eq_splitkv, (sq, sk, hq, "public auto should be split-3")
     return ret
 
 
@@ -301,9 +315,10 @@ def _check_cuda_graph():
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx() not in SUPPORTED_GFX or get_device_name() == "MI308":
         aiter.logger.warning(
-            "gfx942 hd192 split-KV unsupported on %s; skipping", get_gfx()
+            "gfx942 hd192 split-KV unsupported on %s; skipping",
+            get_device_name() if get_gfx() == "gfx942" else get_gfx(),
         )
         return
 
