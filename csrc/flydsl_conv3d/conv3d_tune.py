@@ -198,12 +198,25 @@ class Conv3dTuner(TunerCommon):
         if self.untunedf is None or self.untunedf.empty:
             return
         bad = []
+        suspect = []
         for _, row in self.untunedf.iterrows():
             keys = tuple(row[k] for k in self.keys)
             _, _, _, extents = self._gemm_dims(keys)
             if min(extents) < 1:
                 shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
                 bad.append(f"  {shape} -> output {extents}")
+            # Legal, so only warned: a 2D conv written as kT=1, D=1 with pad_d
+            # left over tunes a depth-(1 + 2*pad_d) problem whose padded slices
+            # are bias only. Not rejected, because the row has to match what the
+            # model really calls with to be looked up at all.
+            elif int(row["kT"]) == 1 and int(row["D"]) == 1 and int(row["pad_d"]) > 0:
+                shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
+                suspect.append(f"  {shape} -> output depth {extents[0]}")
+        if suspect:
+            logger.warning(
+                "row(s) with kT=1, D=1 but pad_d>0 tune a depth > 1 problem; "
+                "clear pad_d if a 2D conv was meant:\n" + "\n".join(suspect)
+            )
         if bad:
             raise ValueError(
                 "untuned CSV has row(s) whose filter is larger than the padded "

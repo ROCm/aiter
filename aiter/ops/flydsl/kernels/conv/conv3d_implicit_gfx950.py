@@ -134,8 +134,18 @@ def make_conv3d_implicit_param(
     )
 
 
-def _shape_agnostic_key(grid, im2col_plan, scatter_plan):
-    """Closure constants with booleans blanked. Integers must not carry D/H/W."""
+def _dyn_hw_closure_key(grid, im2col_plan, scatter_plan, unit):
+    """The compile-time constants a dyn_hw kernel closes over, booleans included.
+
+    ``grid`` as the kernel holds it (x/z/m blanked). Every boolean here, and
+    every ``unit`` flag, may follow the resolution and selects a different
+    artifact, so AOT dedupe must key on this, not ``_shape_agnostic_key``.
+    """
+    return (*grid, *im2col_plan, *scatter_plan, *unit)
+
+
+def _shape_agnostic_key(grid, im2col_plan, scatter_plan, unit):
+    """``_dyn_hw_closure_key`` with booleans blanked. Integers must not carry D/H/W."""
 
     def _blank(value):
         if isinstance(value, bool):
@@ -144,10 +154,12 @@ def _shape_agnostic_key(grid, im2col_plan, scatter_plan):
             return tuple(_blank(v) for v in value)
         return value
 
-    return tuple(_blank(v) for v in (*grid, *im2col_plan, *scatter_plan))
+    return tuple(
+        _blank(v) for v in _dyn_hw_closure_key(grid, im2col_plan, scatter_plan, unit)
+    )
 
 
-def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan):
+def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, unit):
     """Check dyn_hw plans match a probe one output step larger. Unexpressible probes skip."""
     st, sh, sw = param.st, param.sh, param.sw
     probe = make_conv3d_implicit_param(
@@ -187,6 +199,7 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan):
         probe_plans = (
             make_im2col_plan(probe, probe_geom, cfg),
             make_output_scatter_plan(probe, probe_geom, cfg, probe_grid),
+            unit_divisors(probe, probe_geom),
         )
     except AssertionError:
         return
@@ -194,7 +207,7 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan):
     # Against the grid as the kernel closes over it: x/z/m are blanked there
     # because the launch reads them from the runtime scalars instead, so they
     # are the one part of the grid that is allowed to follow the resolution.
-    mine = _shape_agnostic_key(kernel_grid, im2col_plan, scatter_plan)
+    mine = _shape_agnostic_key(kernel_grid, im2col_plan, scatter_plan, unit)
     theirs = _shape_agnostic_key(
         probe_grid._replace(grid_x=0, grid_z=0, grid_m=0), *probe_plans
     )
@@ -253,7 +266,9 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         extra_args = dyn_shape_values(param, geom, grid)
         dyn_unit = unit_divisors(param, geom)
         kernel_grid = grid._replace(grid_x=0, grid_z=0, grid_m=0)
-        _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan)
+        _assert_shape_agnostic(
+            param, cfg, kernel_grid, im2col_plan, scatter_plan, dyn_unit
+        )
     else:
         extra_args = ()
         dyn_unit = None

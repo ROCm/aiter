@@ -57,10 +57,11 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     make_output_scatter_plan,
     make_tile_config,
     out_extent,
+    unit_divisors,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_im2col import make_im2col_plan
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
-    _shape_agnostic_key,
+    _dyn_hw_closure_key,
     compile_conv3d_implicit,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_transpose import (
@@ -90,8 +91,10 @@ _RESOLUTION_COLS = ("N", "D", "H", "W")
 
 
 def _conv_dedupe_key(job):
-    """Compile identity: whole row, or ``_shape_agnostic_key`` plus non-extent fields.
+    """Compile identity: whole row, or ``_dyn_hw_closure_key`` plus non-extent fields.
 
+    Not ``_shape_agnostic_key``: that blanks the booleans, and two resolutions
+    of one layer that differ in e.g. ``row_chk`` are two artifacts.
     Falls back to the whole row if plans cannot be derived here.
     """
     if not job["dyn_hw"]:
@@ -129,14 +132,15 @@ def _conv_dedupe_key(job):
         cfg = make_tile_config(param.tile)
         geom = make_conv_geometry(param)
         grid = make_launch_grid(param, geom, cfg)
-        agnostic = _shape_agnostic_key(
+        closure = _dyn_hw_closure_key(
             grid._replace(grid_x=0, grid_z=0, grid_m=0),
             make_im2col_plan(param, geom, cfg),
             make_output_scatter_plan(param, geom, cfg, grid),
+            unit_divisors(param, geom),
         )
     except (AssertionError, ValueError):
         return job_identity(job)
-    return (agnostic,) + tuple(
+    return (closure,) + tuple(
         sorted((k, v) for k, v in job.items() if k not in _RESOLUTION_COLS)
     )
 
