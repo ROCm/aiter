@@ -13,11 +13,12 @@ import time
 
 import torch
 
-from aiter.ops.mha import _fmha_v3_varlen_splitkv_fwd
+from aiter.ops.mha import fmha_v3_varlen_fwd
 
 
 def production_asm(q, k, v, cu_q, cu_k, scale, num_splits):
-    out, _, _, _ = _fmha_v3_varlen_splitkv_fwd(
+    out = torch.empty(q.shape[0], q.shape[1], 128, dtype=q.dtype, device=q.device)
+    result, _, _, _ = fmha_v3_varlen_fwd(
         q,
         k,
         v,
@@ -25,11 +26,21 @@ def production_asm(q, k, v, cu_q, cu_k, scale, num_splits):
         cu_k,
         q.shape[0],
         k.shape[0],
+        0,
+        0.0,
         scale,
+        0.0,
         False,
+        False,
+        -1,
+        -1,
+        False,
+        False,
+        1,
+        out=out,
         num_splits=num_splits,
     )
-    return out
+    return result
 
 
 def measure_paired(fn, num_splits: int, warmup: int, samples: int):

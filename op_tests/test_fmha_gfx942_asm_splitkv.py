@@ -3,7 +3,7 @@
 """Correctness + performance test for gfx942 packed-varlen hd192 split-KV FMHA.
 
 Public API:  aiter.flash_attn_varlen_func  (the path vLLM / the ticket calls)
-Ops layer:   aiter.ops.mha._fmha_v3_varlen_splitkv_fwd
+Ops layer:   aiter.ops.mha.fmha_v3_varlen_fwd  (num_splits last; default 0)
 
 Built to the aiter op-test standard (see .claude/skills/aiter-op-test).
 
@@ -27,7 +27,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_device_name, get_gfx
-from aiter.ops.mha import _fmha_v3_varlen_splitkv_fwd, flash_attn_varlen_func
+from aiter.ops.mha import flash_attn_varlen_func, fmha_v3_varlen_fwd
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -91,8 +91,11 @@ def _empty_final_split(sk, num_splits):
     return split_tiles * (num_splits - 1) >= kv_tiles
 
 
-def _split_op(q, k, v, cu_q, cu_k, scale, num_splits, return_lse):
-    out, lse, p, rng = _fmha_v3_varlen_splitkv_fwd(
+def _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, return_lse, out=None, causal=False):
+    """Full fmha_v3_varlen_fwd entry: caller args reach the impl, including out=."""
+    if out is None:
+        out = torch.empty(q.shape[0], q.shape[1], HD_V, dtype=q.dtype, device=q.device)
+    return fmha_v3_varlen_fwd(
         q,
         k,
         v,
@@ -100,11 +103,20 @@ def _split_op(q, k, v, cu_q, cu_k, scale, num_splits, return_lse):
         cu_k,
         q.shape[0],
         k.shape[0],
+        0,
+        0.0,
         scale,
+        0.0,
+        False,
+        causal,
+        -1,
+        -1,
         return_lse,
-        num_splits,
+        False,
+        1,
+        out=out,
+        num_splits=num_splits,
     )
-    return (out, lse, p, rng)
 
 
 def _public(q, k, v, cu_q, cu_k, scale, return_lse, out=None):
@@ -145,13 +157,13 @@ def test_fmha_gfx942_asm_splitkv(sq, sk, hq, num_splits, return_lse):
 
     candidates = {
         # Production unsplit ASM (num_splits=1).
-        "unsplit": lambda: _split_op(q, k, v, cu_q, cu_k, scale, 1, return_lse)[:2],
+        "unsplit": lambda: _v3_fwd(q, k, v, cu_q, cu_k, scale, 1, return_lse)[:2],
         # The path the model actually runs.
         "public": lambda: _public(q, k, v, cu_q, cu_k, scale, return_lse, out=out_buf),
     }
     # Forced split is rejected when the last KV partition would be empty.
     if not _empty_final_split(sk, num_splits):
-        candidates["splitkv"] = lambda: _split_op(
+        candidates["splitkv"] = lambda: _v3_fwd(
             q, k, v, cu_q, cu_k, scale, num_splits, return_lse
         )[:2]
 
@@ -216,8 +228,8 @@ def test_fmha_gfx942_asm_splitkv_empty_k(sq, hq, num_splits):
     flops, nbytes = _flops_bytes(hq, sq, 0, q.element_size())
 
     candidates = {
-        "unsplit": lambda: _split_op(q, k, v, cu_q, cu_k, scale, 1, False)[:2],
-        "splitkv": lambda: _split_op(q, k, v, cu_q, cu_k, scale, num_splits, False)[:2],
+        "unsplit": lambda: _v3_fwd(q, k, v, cu_q, cu_k, scale, 1, False)[:2],
+        "splitkv": lambda: _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, False)[:2],
         "public": lambda: _public(q, k, v, cu_q, cu_k, scale, False),
     }
     ret = {"gfx": get_gfx()}
@@ -244,7 +256,7 @@ def _check_empty_partition_rejected():
     cu_q = torch.tensor([0, sq], dtype=torch.int32)
     cu_k = torch.tensor([0, sk], dtype=torch.int32)
     try:
-        _split_op(q, k, v, cu_q, cu_k, 1.0 / math.sqrt(HD_QK), 5, False)
+        _v3_fwd(q, k, v, cu_q, cu_k, 1.0 / math.sqrt(HD_QK), 5, False)
     except RuntimeError as err:
         if "empty final KV partition" not in str(err):
             raise
@@ -262,7 +274,27 @@ def _check_compile_outputs():
     scale = 1.0 / math.sqrt(HD_QK)
 
     def call(q, k, v):
-        return _fmha_v3_varlen_splitkv_fwd(q, k, v, cu_q, cu_k, sq, sk, scale, True, 3)
+        return fmha_v3_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            sq,
+            sk,
+            0,
+            0.0,
+            scale,
+            0.0,
+            False,
+            False,
+            -1,
+            -1,
+            True,
+            False,
+            1,
+            num_splits=3,
+        )
 
     eager = call(q, k, v)
     compiled = torch.compile(call, fullgraph=True)(q, k, v)
@@ -312,6 +344,46 @@ def _check_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, first)
+
+
+def _check_forced_split_writes_out():
+    sq, sk, hq = 129, 2048, 4
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    out = torch.empty(sq, hq, HD_V, dtype=q.dtype)
+    sentinel = out.data_ptr()
+    result = _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False, out=out)
+    assert result[0].data_ptr() == sentinel, "forced split must write the caller out="
+    assert torch.equal(result[0], out)
+    ref_out, _ = run_torch(q, k, v, scale)
+    checkAllclose(
+        ref_out.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg="forced split out=",
+    )
+
+
+def _check_forced_split_causal_rejected():
+    sq, sk, hq = 129, 2048, 4
+    q = torch.randn(sq, hq, HD_QK, dtype=dtypes.bf16)
+    k = torch.randn(sk, hq, HD_QK, dtype=dtypes.bf16)
+    v = torch.randn(sk, hq, HD_V, dtype=dtypes.bf16)
+    cu_q = torch.tensor([0, sq], dtype=torch.int32)
+    cu_k = torch.tensor([0, sk], dtype=torch.int32)
+    scale = 1.0 / math.sqrt(HD_QK)
+    try:
+        _v3_fwd(q, k, v, cu_q, cu_k, scale, 3, False, causal=True)
+    except RuntimeError as err:
+        if "incompatible with this input" not in str(err):
+            raise
+        return
+    raise AssertionError("forced split with causal=True should raise")
 
 
 def main():
@@ -389,6 +461,8 @@ def main():
         )
 
     _check_empty_partition_rejected()
+    _check_forced_split_writes_out()
+    _check_forced_split_causal_rejected()
     _check_compile_outputs()
     _check_cuda_graph()
 

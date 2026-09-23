@@ -1179,19 +1179,8 @@ namespace py = pybind11;
           py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
-          py::arg("cu_seqlens_k_padded") = std::nullopt); \
-    m.def("fmha_v3_varlen_splitkv_fwd",                  \
-          &aiter::torch_itfs::fmha_v3_varlen_splitkv_fwd, \
-          py::arg("q"),                                  \
-          py::arg("k"),                                  \
-          py::arg("v"),                                  \
-          py::arg("cu_seqlens_q"),                       \
-          py::arg("cu_seqlens_k"),                       \
-          py::arg("max_seqlen_q"),                       \
-          py::arg("max_seqlen_k"),                       \
-          py::arg("softmax_scale"),                      \
-          py::arg("return_softmax_lse"),                 \
-          py::arg("num_splits"))
+          py::arg("cu_seqlens_k_padded") = std::nullopt, \
+          py::arg("num_splits")          = 0);
 
 #define MHA_VARLEN_BWD_PYBIND                            \
     m.def("mha_varlen_bwd",                              \
