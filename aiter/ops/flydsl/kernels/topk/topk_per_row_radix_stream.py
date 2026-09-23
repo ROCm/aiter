@@ -363,9 +363,7 @@ def topk_per_row_radix_stream_window_cap(
 ) -> int:
     """Maximum row width that completes in the initial candidate window."""
     lds_budgets = lds_budgets or _lds_budgets()
-    resolved = _resolve_lds(
-        k, block_threads, lds_budgets, vec, plan=lds_plan
-    )
+    resolved = _resolve_lds(k, block_threads, lds_budgets, vec, plan=lds_plan)
     if resolved is None:
         raise ValueError(
             "[FlyDSL topk_per_row_radix_stream] no LDS plan for "
@@ -510,8 +508,7 @@ def build_topk_per_row_radix_stream_module(
     signature_args.update(blk=block_threads, vec=vec, cap=capacity)
 
     @flyc.kernel(
-        name="topk_per_row_radix_stream_"
-        + kernel_signature(**signature_args),
+        name="topk_per_row_radix_stream_" + kernel_signature(**signature_args),
         known_block_size=[block_threads, 1, 1],
     )
     def topk_per_row_radix_stream_kernel(
