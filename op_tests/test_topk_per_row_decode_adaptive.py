@@ -512,3 +512,86 @@ def test_a_bound_call_selects_correctly_on_a_padded_ragged_buffer(monkeypatch):
         torch.cuda.empty_cache()
 
     assert not bad, f"{2 * len(cells)} checks, {len(bad)} bad:\n" + "\n".join(bad)
+
+
+def _strided_view(rows, width, stride0):
+    """A `(rows, width)` view whose storage ends exactly at its last element."""
+    flat = torch.randn((rows - 1) * stride0 + width, device="cuda")
+    return flat.as_strided((rows, width), (stride0, 1))
+
+
+@pytest.mark.parametrize(
+    "stride_of",
+    [
+        pytest.param(lambda w: w + 3, id="padded"),
+        pytest.param(lambda w: w // 2, id="overlapping"),
+        pytest.param(lambda w: 0, id="broadcast"),
+    ],
+)
+def test_every_row_is_read_whole_whatever_its_stride(monkeypatch, stride_of):
+    """The host accepts any `stride0`, so each row must be read from its own
+    base to its own length rather than inside a bound on the whole tensor."""
+    import aiter
+    from aiter.ops.flydsl.topk import topk_per_row as host
+
+    arch, cu_count = _this_card()
+    if (arch, cu_count) not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+        pytest.skip(f"{arch} at {cu_count} CU is not in the table")
+
+    cells = sorted(
+        (
+            (w, rows, k, stable)
+            for w, rows, k, stable in _band_edge_cells(arch, cu_count)
+            if rows > 1
+            and topk._decode_backend(arch, cu_count, stable, w, rows, k, True, w)
+            == topk.BACKEND_ADAPTIVE
+        ),
+        key=lambda c: c[0] * c[1],
+    )[:4]
+    if not cells:
+        pytest.skip("no admitted band edge has more than one row")
+
+    launched = []
+    real = host._run_adaptive
+
+    def spy(*args, **kwargs):
+        launched.append(True)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(host, "_run_adaptive", spy)
+
+    torch.manual_seed(0)
+    bad = []
+    for width, rows, k, stable in cells:
+        logits = _strided_view(rows, width, stride_of(width))
+        lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+
+        launched.clear()
+        aiter.top_k_per_row_decode(
+            logits,
+            1,
+            lens,
+            out,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=k,
+            stable=stable,
+            max_row_len=width,
+        )
+        assert launched, f"width={width} rows={rows} k={k}: adaptive did not run"
+
+        want = torch.sort(torch.topk(logits, k, dim=1).values, dim=1).values
+        got = torch.sort(logits.gather(1, out.long()), dim=1).values
+        wrong = (want != got).any(dim=1).nonzero().flatten().tolist()
+        if wrong:
+            bad.append(
+                f"width={width} rows={rows} k={k} stable={stable} "
+                f"stride0={logits.stride(0)}: rows {wrong} selected wrong values"
+            )
+
+        del logits, lens, out, want, got
+        torch.cuda.empty_cache()
+
+    assert not bad, f"{len(cells)} cells, {len(bad)} bad:\n" + "\n".join(bad)

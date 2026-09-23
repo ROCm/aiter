@@ -733,15 +733,6 @@ def create_topk_per_row_decode_adaptive_kernel(
             fx.make_layout(num_buckets if ordered else 1, 1)
         )
 
-        # Bound this descriptor to the real allocation instead of 4 GiB. The vec4 tail
-        # loads a whole group even when 1-3 elements remain and predicates the lanes
-        # only afterwards, so the last row of an unpadded buffer fetches past the
-        # tensor. The true size restores the hardware range check, which returns zero
-        # for those lanes, and the tail mask discards it as before.
-        logits_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(stride0) * fx.Int64(4)
-        logits_rsrc = buffer_ops.create_buffer_resource(
-            logits, max_size=False, num_records_bytes=logits_bytes
-        )
         seq_lens_rsrc = buffer_ops.create_buffer_resource(seq_lens, max_size=True)
         indices_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(top_k) * fx.Int64(4)
         indices_rsrc = buffer_ops.create_buffer_resource(
@@ -760,7 +751,15 @@ def create_topk_per_row_decode_adaptive_kernel(
         )
         row_len = seq_len - next_n + slot + c_one
         row_len = (row_len > c_zero).select(row_len, c_zero)
-        row_base = row * stride0
+        # One descriptor per row, based at the row and sized to its live length, so
+        # no stride0 can move the bound and the vec4 tail reads zeros past the row.
+        # The base is 64-bit, which keeps a tensor past 4 GiB addressable.
+        logits_rsrc = buffer_ops.create_buffer_resource(
+            logits,
+            max_size=False,
+            num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
+            base_byte_offset=fx.Int64(row) * fx.Int64(stride0) * fx.Int64(4),
+        )
         row_out = row * c_top_k
         row_ws_base = row * c_row_ws
 
@@ -980,7 +979,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             return fx.Vector(
                 buffer_ops.buffer_load(
                     logits_rsrc,
-                    row_base + col_base_i32,
+                    col_base_i32,
                     vec_width=LOAD_VEC,
                     dtype=T.f32,
                 )
