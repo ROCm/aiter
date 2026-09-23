@@ -125,6 +125,19 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
+        op_tests/test_flydsl_pa_decode.py)
+            # The CLI sweep is separate from the compact parametrized regression.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 -m pytest -q "$test_file"
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/test_gemm_a6w6.py)
             {
                 echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
@@ -139,6 +152,12 @@ for file in "${sharded_files[@]}"; do
                 '
                 _ "$file"
             )
+            ;;
+        op_tests/test_gemm_a6w4.py|op_tests/test_gemm_a4w6.py)
+            {
+                echo "Running tuned dispatch, independent Wan references, and every mixed ASM kernel on fully padded M/N/K tails"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)
