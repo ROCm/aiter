@@ -4,20 +4,19 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 import torch
 
 import aiter
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
-from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
     invert_sorted_ids,
     sorted_sum,
 )
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
@@ -144,7 +143,7 @@ def _get_compiled_kernel(
     activation_str="silu",
     swiglu_limit=None,
 ):
-    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_gemm
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_gemm
 
     return compile_gemm(
         N=N,
@@ -163,19 +162,6 @@ def _get_compiled_kernel(
         activation=activation_str,
         swiglu_limit=swiglu_limit,
     )
-
-
-_TORCH_TO_FX = {
-    torch.bfloat16: fx.BFloat16,
-    torch.float32: fx.Float32,
-    torch.int32: fx.Int32,
-    torch.float8_e4m3fnuz: fx.Uint8,
-    torch.float8_e4m3fn: fx.Uint8,
-}
-
-
-def _ptr(t):
-    return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
 
 
 def _launch(kernel_fn, *args):
