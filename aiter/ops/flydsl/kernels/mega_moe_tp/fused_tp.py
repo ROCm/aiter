@@ -45,8 +45,10 @@ from .. import buffer_ops
 from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax, _fabs_f32
 
 __all__ = [
+    "FLAG_INTS",
     "MAX_TP",
     "NCK_MAX",
+    "NCTA_MAX",
     "compile_fused_tp",
     "fused_tp_consts",
     "fused_tp_supported",
@@ -54,8 +56,19 @@ __all__ = [
 
 MAX_TP = 8
 NCK_MAX = 64
-FLAG_STRIDE = 16  # ints between AllGather flags (one 64 B line each)
-FLAG_RDY = MAX_TP * FLAG_STRIDE
+# Flag arena (ints), all written by peers:
+#   FLAG_RDY + c*MAX_TP + r   ReduceScatter: rank r pushed chunk c
+#   FLAG_AGM + r*32           AllGather: rank r's routing (ids, weights) landed
+#   FLAG_AGC + (q*MAX_TP + r)*NCTA_MAX + b
+#                             AllGather: rank r's CTA b landed its rows' K-chunk q
+# Flags hold the launch epoch (monotonic), so nothing is reset; each has one
+# writer, so nothing contends.
+FLAG_RDY = 0
+FLAG_AGM = FLAG_RDY + MAX_TP * NCK_MAX
+FLAG_AGC = FLAG_AGM + MAX_TP * 32
+NCHA_MAX = 64
+NCTA_MAX = 256
+FLAG_INTS = FLAG_AGC + NCHA_MAX * MAX_TP * NCTA_MAX
 CTRL_CNT = 64  # ctrl ints: [0] epoch [1] ag_arrive [2] fin; counters at 64
 CTRL_LRDY = CTRL_CNT + 2 * NCK_MAX
 LRDY_STRIDE = 32  # polled flags live on their own 128 B lines
@@ -151,6 +164,7 @@ def fused_tp_consts(H: int, I: int, TOPK: int, MT: int, TMAX: int) -> dict:
     # control ints
     c["L_CTL"] = take(64 * 4)
     c["LDS_BYTES"] = (off + 127) // 128 * 128
+    assert H // 256 <= NCHA_MAX
     assert KS1 % NSK == 0 and NSK % KCS == 0
     assert (NSK - 1) * OPS <= 63 and NA_L * (ALOAD_DEPTH - 1) <= 63
     assert NCK <= NCK_MAX
@@ -165,6 +179,7 @@ C_ASEQ = 16  # [NAB]
 C_AFREE = 20  # [NAB]
 C_QBASE = 24  # [NW]
 C_MBOX = 28  # [NW + NCOMM] per-wave mailbox
+C_AGFREE = 41  # the AllGather staging (in the GEMM2 operand area) is read out
 
 
 @functools.cache
@@ -180,6 +195,8 @@ def compile_fused_tp(
     situ_linear_beta: float = 1.0,
     npieces: int = 0,
     route_fp8: bool = False,
+    agr: int = 1,
+    tp: int = MAX_TP,
 ):
     """Build the launcher for one (shape, MT) instance."""
     c = fused_tp_consts(H, I, TOPK, MT, TMAX)
@@ -193,6 +210,8 @@ def compile_fused_tp(
     WAIT_B1 = (NSK - 1) * OPS
     VPL = (CW // 8 + 63) // 64
     HALF = KS2 // 2 if (KS2 % 2 == 0 and KS2 > 2) else 1
+    SCAN_IT = (TMAX * TOPK // 4 + NT - 1) // NT  # route-scan vector loads per thread
+    SCAN_G = 8
     NPC = max(int(npieces), 1)  # pieces per split expert (1: no split experts)
     # Route rows: bf16, or (route_fp8) E4M3 with one E8M0 scale per 32 columns
     # -- the numerics of the split path's FP8 stage-2 route output -- which
@@ -208,6 +227,7 @@ def compile_fused_tp(
         f"mega_moe_tp_fused_h{H}_i{I}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
         + (f"_p{NPC}" if NPC > 1 else "")
         + ("_r8" if route_fp8 else "")
+        + f"_ag{agr}_tp{tp}"
     )
 
     const_expr = fx.const_expr
@@ -362,9 +382,12 @@ def compile_fused_tp(
             (uni(lds_addr), i32(voff), rs, uni(soff)),
         )
 
-    def dma4(lds_addr, rs, voff, soff):
+    def dma4(lds_addr, rs, voff, soff, sys=False):
+        # sys: read memory, not a cached copy (sc0 sc1)
         asm(
-            "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, $3 offen lds",
+            "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, $3 offen"
+            + (" sc0 sc1" if sys else "")
+            + " lds",
             "s,v,s,s",
             (uni(lds_addr), i32(voff), rs, uni(soff)),
         )
@@ -551,20 +574,30 @@ def compile_fused_tp(
         n = ttot * i32(TOPK)
         n4 = n // i32(4)
         rid = rsrc(ids_addr)
-        for q_ in range(tid, n4, i32(NT)):
-            q = i32(q_)
-            v = fx.Vector(bld(rid, q * i32(16), 0, V4I, 0))
-            for j in range_constexpr(4):
-                if fx.Int32(v[j]) == expert:
-                    slot = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
-                    idx = q * i32(4) + i32(j)
-                    if slot < i32(TMAX):
-                        lds_st(L, L_RIX + slot * i32(4), idx)
-                        lds_st(
-                            L,
-                            L_WT + slot * i32(4),
-                            g_ld_i32(fx.Int64(tw_addr) + fx.Int64(idx) * fx.Int64(4)),
-                        )
+        # All of this thread's loads go out before any compare: the scan runs
+        # while other CTAs stream weights, and a load-compare chain would pay
+        # the loaded-HBM latency once per iteration.
+        rtw = rsrc(tw_addr)
+        # (in groups of SCAN_G so the batch never pushes the kernel's registers)
+        for g0 in range_constexpr(0, SCAN_IT, SCAN_G):
+            its = list(range(g0, min(g0 + SCAN_G, SCAN_IT)))
+            vs = []
+            for it in its:
+                q = fx.min(tid + i32(it * NT), n4 - i32(1))
+                vs.append(fx.Vector(bld(rid, q * i32(16), 0, V4I, 0)))
+            for x, it in enumerate(its):
+                q = tid + i32(it * NT)
+                for j in range_constexpr(4):
+                    if (q < n4) & (fx.Int32(vs[x][j]) == expert):
+                        slot = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
+                        idx = q * i32(4) + i32(j)
+                        if slot < i32(TMAX):
+                            lds_st(L, L_RIX + slot * i32(4), idx)
+                            lds_st(
+                                L,
+                                L_WT + slot * i32(4),
+                                bld(rtw, idx * i32(4), 0, T.i32, 0),
+                            )
         for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
             idx = i32(idx_)
             if g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * fx.Int64(4)) == expert:
@@ -736,6 +769,7 @@ def compile_fused_tp(
                     if k == KCS - 1:
                         release_a_chunk(L, lane, buf)
                 res = yield acc
+            ag_stage_free(L, lane)
             act_quant_store(L, lane, w, res[: 2 * MT], res[2 * MT :], pas)
         _store_qbase(L, lane, w, qbase + nnb * i32(NCH))
         wait_vm(0)
@@ -800,6 +834,8 @@ def compile_fused_tp(
                         )
                     rocdl.sched_barrier(0)
                     cc = cidx % i32(NCH)
+                    if cidx < i32(NCH):
+                        ag_wait_chunk(L, lane, a, a["epoch"], cc, r0, rows)
                     abase = L + i32(L_A) + b * i32(RG * ACB)
                     for j in range_constexpr(NA_ROWOPS):
                         dma16(abase + i32(j * 1024), rx, arow[j], cc * i32(ACB))
@@ -811,7 +847,10 @@ def compile_fused_tp(
                                 + b * i32(KCS * NSC_BLK * 64 * 4)
                                 + i32((k * NSC_BLK + j) * 64 * 4)
                             )
-                            dma4(dst, rxs, ascl[j], cc * i32(8) + i32(k * 4))
+                            # A-scale lines hold 16 K-chunks of a row, some of
+                            # them possibly still on the wire when an earlier
+                            # chunk is read: never let a cached copy serve them
+                            dma4(dst, rxs, ascl[j], cc * i32(8) + i32(k * 4), sys=True)
                     _loader_advance(L, lane, q)
                 wait_vm(0)
                 _loader_flush(L, lane)
@@ -1081,6 +1120,8 @@ def compile_fused_tp(
     @traced
     def compute_units(L, tid, a):
         lane = tid % i32(64)
+        ag_wait_meta(a, tid, a["epoch"])
+        cbar(L, tid)
         bid = gpu.block_id("x")
         ub = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid) * fx.Int64(4))
         ue = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid + 1) * fx.Int64(4))
@@ -1387,12 +1428,34 @@ def compile_fused_tp(
                 rocdl.s_sleep(POLL_SLEEP)
 
     # ---------------------------- AllGather ------------------------------
+    # AllGather. Every CTA owns token rows bid, bid + nblk, ... (at most AGR).
+    # All threads quantize them into the GEMM2 operand area (idle until the
+    # first GEMM1 pass ends); the comm wave then sends ids/weights and the
+    # MXFP4 payload in K-chunk order, so peers start GEMM1 on chunk 0 while
+    # the rest is on the wire, and bumps the receivers' arrival counters.
+    AGR = int(agr)
+    TPC = int(tp)  # peers the AllGather sends to (the engine's world size)
+    # chunks in flight per comm wave before the oldest one is counted
+    AG_D = max(1, min(8, 63 // (2 * TPC)))
+    AG_SROW = H // 2
+    AG_SCB = AGR * AG_SROW
+    assert AG_SCB + AGR * (H // 32) <= L_INTERS - L_INTER + RG * (I // 32)
+
+    def ag_rows(a):
+        bid = i32(gpu.block_id("x"))
+        nblk = i32(gpu.grid_dim.x)
+        nrows = fx.min(fx.max((a["m"] - bid + nblk - i32(1)) // nblk, i32(0)), i32(AGR))
+        return bid, nblk, nrows
+
     @traced
-    def quant_push_row(L, tid, a, i):
-        gslot = a["rank"] * a["m"] + i
+    def ag_quant(L, tid, a):
+        bid, nblk, nrows = ag_rows(a)
         rxl = rsrc(a["x"])
-        for g_ in range(tid, i32(H // 32), i32(NTT)):
-            g = i32(g_)
+        for q_ in range(tid, nrows * i32(H // 32), i32(NTT)):
+            q = i32(q_)
+            r = q // i32(H // 32)
+            g = q - r * i32(H // 32)
+            i = bid + r * nblk
             f = []
             for v in range_constexpr(4):
                 raw = fx.Vector(
@@ -1427,101 +1490,226 @@ def compile_fused_tp(
                     T.i32, pk, _u(f[dw * 8 + 6]), _u(f[dw * 8 + 7]), _u(qs), 3
                 )
                 words.append(fx.Int32(pk))
-            # 16 consecutive groups' E8M0 bytes -> one 16 B word held by the
-            # group-of-16 leader (H/32 is a multiple of 16, so a 16-group span
-            # is always fully active); no LDS round trip, no barrier.
-            lane = tid % i32(64)
-            sw = (fx.Int32(e8) & i32(0xFF)) << ((g & i32(3)) * i32(8))
-            sw = sw | i32(
-                rocdl.ds_bpermute(T.i32, _u((lane ^ i32(1)) * i32(4)), _u(sw))
+            lds_st(
+                L,
+                L_INTER + r * i32(AG_SROW) + g * i32(16),
+                fx.Vector.from_elements(words, fx.Int32),
+                16,
             )
-            sw = sw | i32(
-                rocdl.ds_bpermute(T.i32, _u((lane ^ i32(2)) * i32(4)), _u(sw))
+            lds_st(
+                L, L_INTER + i32(AG_SCB) + r * i32(H // 32) + g, fx.Int8(e8), align=1
             )
-            sv = fx.Vector.from_elements(
-                [sw]
-                + [
-                    i32(
-                        rocdl.ds_bpermute(
-                            T.i32, _u((lane + i32(4 * k)) * i32(4)), _u(sw)
-                        )
-                    )
-                    for k in range(1, 4)
-                ],
-                fx.Int32,
+
+    @traced
+    def ag_send(L, lane, a):
+        """Comm wave: ids/weights, then the payload chunk by chunk. Every chunk
+        issues exactly 2 * TPC stores (dead rows read past num_records), so
+        wait_vm(2 * TPC * AG_D) after chunk q means chunk q - AG_D landed and
+        its counters may be bumped; AG_D chunks stay in flight."""
+        bid, nblk, nrows = ag_rows(a)
+        m = a["m"]
+        rank = a["rank"]
+        # let the (small) routing metadata out first: the payload would queue
+        # it behind a megabyte per peer
+        mp = _meta_pending(a, lane, a["epoch"], own=True)
+        while mp != i32(0):
+            rocdl.s_sleep(1)
+            mp = _meta_pending(a, lane, a["epoch"], own=True)
+        NCHA = H // 256
+        r = lane // i32(8)
+        j = lane - r * i32(8)
+        rok = r < nrows
+        i = bid + fx.min(r, fx.max(nrows - i32(1), i32(0))) * nblk
+        gslot = rank * m + i
+        x_bytes = a["ttot"] * i32(H // 2)
+        xs_bytes = a["ttot"] * i32(H // 32)
+        rx = [
+            rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_x"]), x_bytes)
+            for p in range(TPC)
+        ]
+        rs = [
+            rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_xs"]), xs_bytes)
+            for p in range(TPC)
+        ]
+        for q in range_constexpr(NCHA):
+            rr = fx.min(r, i32(AGR - 1))
+            dv = lds_ld(
+                L, L_INTER + rr * i32(AG_SROW) + i32(q * 128) + j * i32(16), V4I, 16
             )
-            pkv = fx.Vector.from_elements(words, fx.Int32)
-            for p in range_constexpr(MAX_TP):
-                if i32(p) < a["tp"]:
+            sv = lds_ld(
+                L, L_INTER + i32(AG_SCB) + rr * i32(H // 32) + i32(q * 8), V2I, 8
+            )
+            for p in range_constexpr(TPC):
+                live = rok
+                bst(
+                    dv,
+                    rx[p],
+                    live.select(
+                        gslot * i32(H // 2) + i32(q * 128) + j * i32(16), x_bytes
+                    ),
+                    0,
+                    AUX_SYS,
+                )
+                bst(
+                    sv,
+                    rs[p],
+                    (live & (j == i32(0))).select(
+                        gslot * i32(H // 32) + i32(q * 8), xs_bytes
+                    ),
+                    0,
+                    AUX_SYS,
+                )
+            if const_expr(q == NCHA - 1):
+                # every staged byte is in registers: GEMM2 may reuse its area
+                wait_lgkm0()
+                _ag_free(L, lane)
+            if const_expr(q >= AG_D):
+                wait_vm(2 * TPC * AG_D)
+                _ag_bump(a, lane, rank, i32(q - AG_D))
+            # keep the scheduler from hoisting every chunk's LDS reads (and
+            # their registers) to the top of the fully unrolled loop
+            rocdl.sched_barrier(0)
+        wait_vm(0)
+        for q in range_constexpr(max(0, NCHA - AG_D), NCHA):
+            _ag_bump(a, lane, rank, i32(q))
+
+    @traced
+    def _ag_free(L, lane):
+        if lane == i32(0):
+            lds_st_rel(L, L_CTL + C_AGFREE * 4, i32(1))
+
+    NMETA_MAX = 32  # CTAs that send routing metadata, 1 KB each (FLAG_AGM stride)
+
+    def _ag_nmeta(a):
+        return fx.max((a["m"] * i32(TOPK) // i32(4) + i32(63)) // i32(64), i32(1))
+
+    @traced
+    def _ag_send_meta(lane, a):
+        """The first nmeta CTAs each copy 64 x 16 B of this rank's routing (ids,
+        weights) to every peer -- one load and one store round, no serial chain
+        -- then raise their own flag per peer."""
+        bid = i32(gpu.block_id("x"))
+        if bid < _ag_nmeta(a):
+            m = a["m"]
+            rank = a["rank"]
+            n = m * i32(TOPK)
+            n4 = n // i32(4)
+            rid = rsrc(a["ids_in"])
+            rtw = rsrc(a["tw_in"])
+            dst0 = rank * n * i32(4)
+            v = bid * i32(64) + lane
+            vok = v < n4
+            idv = bld(rid, v * i32(16), 0, V4I, 0)
+            wvv = bld(rtw, v * i32(16), 0, V4I, 0)
+            e = n4 * i32(4) + lane  # the < 4 tail ints, by CTA 0
+            eok = (bid == i32(0)) & (e < n)
+            ide = bld(rid, e * i32(4), 0, T.i32, 0)
+            wte = bld(rtw, e * i32(4), 0, T.i32, 0)
+            big = i32(1 << 30)
+            for p in range_constexpr(TPC):
+                base = fx.Int64(a["peer"][p])
+                ri = rsrc(base + fx.Int64(a["off_ids"]), big)
+                rw = rsrc(base + fx.Int64(a["off_w"]), big)
+                vo = vok.select(dst0 + v * i32(16), big)
+                eo = eok.select(dst0 + e * i32(4), big)
+                bst(idv, ri, vo, 0, AUX_SYS)
+                bst(wvv, rw, vo, 0, AUX_SYS)
+                bst(ide, ri, eo, 0, AUX_SYS)
+                bst(wte, rw, eo, 0, AUX_SYS)
+            wait_vm(0)
+            if lane == i32(0):
+                for p in range_constexpr(TPC):
+                    rf = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_flag"]))
                     bst(
-                        pkv,
-                        rsrc(
-                            fx.Int64(a["peer"][p])
-                            + fx.Int64(a["off_x"])
-                            + fx.Int64(gslot) * fx.Int64(H // 2)
-                        ),
-                        g * i32(16),
+                        a["epoch"],
+                        rf,
+                        (i32(FLAG_AGM) + rank * i32(32) + bid) * i32(4),
                         0,
                         AUX_SYS,
                     )
-            if (g & i32(15)) == i32(0):
-                for p in range_constexpr(MAX_TP):
-                    if i32(p) < a["tp"]:
-                        bst(
-                            sv,
-                            rsrc(
-                                fx.Int64(a["peer"][p])
-                                + fx.Int64(a["off_xs"])
-                                + fx.Int64(gslot) * fx.Int64(H // 32)
-                            ),
-                            g,
-                            0,
-                            AUX_SYS,
-                        )
-        kk = tid - i32(NTT - 64)
-        if (kk >= i32(0)) & (kk < i32(TOPK)):
-            idv = g_ld_i32(
-                fx.Int64(a["ids_in"]) + fx.Int64(i * i32(TOPK) + kk) * fx.Int64(4)
+
+    def _wave_any(v, lane):
+        for k in (1, 2, 4, 8, 16, 32):
+            v = fx.max(
+                v, i32(rocdl.ds_bpermute(T.i32, _u((lane ^ i32(k)) * i32(4)), _u(v)))
             )
-            wvv = g_ld_i32(
-                fx.Int64(a["tw_in"]) + fx.Int64(i * i32(TOPK) + kk) * fx.Int64(4)
+        return uni(v)
+
+    def _meta_pending(a, lane, epoch, own=False):
+        rf = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_flag"]))
+        nmeta = _ag_nmeta(a)
+        pend = i32(0)
+        for it in range_constexpr(MAX_TP * NMETA_MAX // 64):
+            e = i32(it * 64) + lane
+            p = e // i32(NMETA_MAX)
+            j = e - p * i32(NMETA_MAX)
+            ok = ((p == a["rank"]) if own else (p < a["tp"])) & (j < nmeta)
+            f = fx.Int32(
+                bld(rf, (i32(FLAG_AGM) + p * i32(32) + j) * i32(4), 0, T.i32, AUX_SYS)
             )
-            for p in range_constexpr(MAX_TP):
-                if i32(p) < a["tp"]:
-                    base = fx.Int64(a["peer"][p])
-                    g_st_sys(
-                        base
-                        + fx.Int64(a["off_ids"])
-                        + fx.Int64(gslot * i32(TOPK) + kk) * fx.Int64(4),
-                        idv,
-                    )
-                    g_st_sys(
-                        base
-                        + fx.Int64(a["off_w"])
-                        + fx.Int64(gslot * i32(TOPK) + kk) * fx.Int64(4),
-                        wvv,
-                    )
+            pend = fx.max(pend, (ok & (f < epoch)).select(i32(1), i32(0)))
+        return _wave_any(pend, lane)
 
     @traced
-    def ag_handshake(L, tid, a, epoch):
-        if tid == i32(0):
-            nblk = gpu.grid_dim.x
-            arr = fx.Int64(a["ctrl"]) + fx.Int64(4)
-            old = g_add_agent(arr, 1)
-            if old == i32(nblk) - i32(1):
-                g_st_sys(arr, i32(0))
-                for p in range_constexpr(MAX_TP):
-                    if i32(p) < a["tp"]:
-                        g_st_sys(
-                            fx.Int64(a["peer"][p])
-                            + fx.Int64(a["off_flag"])
-                            + fx.Int64(a["rank"] * i32(FLAG_STRIDE * 4)),
-                            epoch,
-                        )
-            mine = peer_sel(a, a["rank"]) + fx.Int64(a["off_flag"])
-            for p in range_constexpr(MAX_TP):
-                if i32(p) < a["tp"]:
-                    spin_sys_ge(mine + fx.Int64(p * FLAG_STRIDE * 4), epoch)
+    def ag_stage_free(L, lane):
+        """GEMM1 is about to write the GEMM2 operand: the AllGather staging
+        that shares the area must have been read out."""
+        if lane == i32(0):
+            spin_lds_ge(L, L_CTL + C_AGFREE * 4, i32(1))
+        rocdl.sched_barrier(0)
+
+    def _ag_ctr(a, p, idx):
+        return fx.Int64(a["peer"][p]) + fx.Int64(a["off_flag"]) + fx.Int64(idx * i32(4))
+
+    @traced
+    def _ag_bump(a, lane, rank, q):
+        """Chunk q of this CTA's rows landed everywhere: raise its flag."""
+        if lane == i32(0):
+            idx = (
+                i32(FLAG_AGC)
+                + (q * i32(MAX_TP) + rank) * i32(NCTA_MAX)
+                + i32(gpu.block_id("x"))
+            )
+            for p in range_constexpr(TPC):
+                rf = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_flag"]))
+                bst(a["epoch"], rf, idx * i32(4), 0, AUX_SYS)
+
+    @traced
+    def ag_wait_meta(a, tid, epoch):
+        """Every rank's routing metadata landed (checked by compute wave 0)."""
+        if tid < i32(64):
+            lane = tid % i32(64)
+            pend = _meta_pending(a, lane, epoch)
+            while pend != i32(0):
+                rocdl.s_sleep(1)
+                pend = _meta_pending(a, lane, epoch)
+
+    def _ag_pending(L, lane, a, epoch, cc, r0, rows):
+        """1 if some row of this tile still misses K-chunk cc (wave-uniform)."""
+        rf = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_flag"]))
+        nblk = i32(gpu.grid_dim.x)
+        pend = i32(0)
+        for jr in range_constexpr((RG + 63) // 64):
+            row = i32(jr * 64) + lane
+            ok = row < rows
+            tok = lds_ld_i32(L, L_RIX + (r0 + ok.select(row, i32(0))) * i32(4)) // i32(
+                TOPK
+            )
+            srank = tok // a["m"]
+            scta = (tok - srank * a["m"]) % nblk
+            idx = i32(FLAG_AGC) + (cc * i32(MAX_TP) + srank) * i32(NCTA_MAX) + scta
+            f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
+            pend = fx.max(pend, (ok & (f < epoch)).select(i32(1), i32(0)))
+        return _wave_any(pend, lane)
+
+    @traced
+    def ag_wait_chunk(L, lane, a, epoch, cc, r0, rows):
+        """Loader: K-chunk cc of every row of this tile is in the arena."""
+        pend = _ag_pending(L, lane, a, epoch, cc, r0, rows)
+        while pend != i32(0):
+            rocdl.s_sleep(1)
+            pend = _ag_pending(L, lane, a, epoch, cc, r0, rows)
+        rocdl.sched_barrier(0)
 
     @traced
     def finish(tid, a, epoch):
@@ -1556,6 +1744,7 @@ def compile_fused_tp(
             comm_help(L, tid, a, epoch)
         else:
             if tid < i32(NT + 64):
+                ag_send(L, tid % i32(64), a)
                 comm_wave(L, tid, a, epoch)
             else:
                 a_loader(L, tid, a)
@@ -1641,15 +1830,15 @@ def compile_fused_tp(
         init_lds(L, tid, a)
         gpu.barrier()
         epoch = lds_ld_i32(L, L_CTL + C_EPOCH * 4)
-        # AllGather: quantize + push this rank's tokens.
-        for i_ in range(i32(gpu.block_id("x")), m, i32(gpu.grid_dim.x)):
-            i = i32(i_)
-            quant_push_row(L, tid, a, i)
-        wait_vm(0)
+        a["epoch"] = epoch
+        # Drop stale cached copies of the arena (previous launch) once per CTA:
+        # every later arena read happens only after its data's flag is up.
+        if tid < i32(64):
+            fence(_llvm.AtomicOrdering.acquire, "one-as")
+        if (tid >= i32(NT)) & (tid < i32(NT + 64)):
+            _ag_send_meta(tid % i32(64), a)
+        ag_quant(L, tid, a)
         gpu.barrier()
-        ag_handshake(L, tid, a, epoch)
-        gpu.barrier()
-        fence(_llvm.AtomicOrdering.acquire, "one-as")
         # the gathered operand of this rank lives in its own arena
         mine = peers[0]
         for j in range_constexpr(1, MAX_TP):

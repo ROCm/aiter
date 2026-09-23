@@ -16,9 +16,9 @@ import torch
 from ..tensor_shim import _run_compiled
 from .fused_tp import (
     CTRL_INTS,
-    FLAG_RDY,
+    FLAG_INTS,
     MAX_TP,
-    NCK_MAX,
+    NCTA_MAX,
     compile_fused_tp,
     fused_tp_supported,
 )
@@ -78,7 +78,7 @@ class FusedTpMegaMoe:
         # ReduceScatter receive slots [source rank][row][H]. A peer only writes
         # launch n + 1's rows after this rank joined n + 1's AllGather.
         self._recv = arena.reserve("recv", (self.tp, self.mmax, H), torch.bfloat16)
-        self._flag = arena.reserve("flag", (FLAG_RDY + MAX_TP * NCK_MAX,), torch.int32)
+        self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         arena.commit()
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
@@ -90,6 +90,10 @@ class FusedTpMegaMoe:
 
         props = torch.cuda.get_device_properties(self.device)
         self.n_cta = int(props.multi_processor_count)
+        # every CTA sends ceil(mmax / n_cta) of this rank's tokens in the AllGather
+        self.agr = max(1, -(-self.mmax // self.n_cta))
+        if self.n_cta > NCTA_MAX:
+            raise ValueError(f"at most {NCTA_MAX} CTAs (AllGather flag layout)")
         self._units, self._cta_units = self._schedule()
         # K-slice partials of split experts' pieces 1..P-1, one route-row set each
         # (piece 0 writes the route's own row); the push adds them up.
@@ -161,6 +165,8 @@ class FusedTpMegaMoe:
             situ_linear_beta=self.situ[1],
             npieces=self._npieces,
             route_fp8=self.route_fp8,
+            agr=self.agr,
+            tp=self.tp,
         )
 
     def forward(
