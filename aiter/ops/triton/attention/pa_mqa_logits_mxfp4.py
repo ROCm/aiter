@@ -27,6 +27,9 @@ SPEC_ROWS = 8
 MIN_DYNAMIC_BATCH = 4
 # Descriptors the scheduler may hand out, 1 MB of them
 SCHED_SLOT_CAP = 1 << 16
+# How far above max_tiles_per_split a slice must sit before splitting it
+# further is worth the extra workgroups
+CAP_ENGAGE = 4
 # this is the most performant page size
 IDEAL_PAGE_SIZE = 64
 
@@ -375,6 +378,13 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     assert max_model_len, "build_schedule sizes its slices from max_model_len"
     cap = plan["max_tiles_per_split"]
     n_tiles = max(1, (max_model_len + block_kv - 1) // block_kv)
+    # target_wgs is one occupancy wave, so capping past it leaves a partly
+    # filled one. Only worth that when the slice would otherwise be many times
+    # the cap, as a prefill chunk's is; a decode slice is already close to it.
+    room0 = max(target_wgs - work, 1)
+    plain = max(1, (n_tiles * work + room0 - 1) // room0)
+    if plain < CAP_ENGAGE * cap:
+        cap = plain
     per_unit = (n_tiles + cap - 1) // cap
     slots = work * per_unit
     num_ctas = max(target_wgs, min(slots, SCHED_SLOT_CAP))
