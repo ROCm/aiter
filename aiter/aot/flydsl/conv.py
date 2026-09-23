@@ -50,7 +50,7 @@ from aiter.ops.flydsl.conv_kernels import (
     _parse_tuned_bool,
     _resolve_splitk,
 )
-from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import (
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     LDG_VEC,
     make_conv_geometry,
     make_launch_grid,
@@ -58,12 +58,12 @@ from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import (
     make_tile_config,
     out_extent,
 )
-from aiter.ops.flydsl.kernels.conv3d_im2col import make_im2col_plan
-from aiter.ops.flydsl.kernels.conv3d_implicit_gfx950 import (
+from aiter.ops.flydsl.kernels.conv.conv3d_im2col import make_im2col_plan
+from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
     _shape_agnostic_key,
     compile_conv3d_implicit,
 )
-from aiter.ops.flydsl.kernels.conv3d_transpose import (
+from aiter.ops.flydsl.kernels.conv.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
     compile_transpose_ncdhw_ndhwc,

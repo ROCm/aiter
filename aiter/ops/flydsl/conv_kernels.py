@@ -15,7 +15,7 @@ import weakref
 
 import torch
 
-from .kernels.conv3d_gfx950_utils import (
+from .kernels.conv.conv3d_gfx950_utils import (
     BF16_BYTES,
     DEFAULT_TILE,
     LDG_VEC,
@@ -26,12 +26,12 @@ from .kernels.conv3d_gfx950_utils import (
     _as_stream,
     out_extent,
 )
-from .kernels.conv3d_im2col import PADDING_MODES
-from .kernels.conv3d_implicit_gfx950 import (
+from .kernels.conv.conv3d_im2col import PADDING_MODES
+from .kernels.conv.conv3d_implicit_gfx950 import (
     compile_conv3d_implicit,
     make_conv3d_implicit_param,
 )
-from .kernels.conv3d_transpose import (
+from .kernels.conv.conv3d_transpose import (
     TR_MAX_BIG_S,
     TR_VEC,
     compile_transpose_ncdhw_ndhwc,

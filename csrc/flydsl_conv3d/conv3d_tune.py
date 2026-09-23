@@ -38,7 +38,7 @@ from aiter.ops.flydsl.conv_kernels import (
     _pad_channels,
     _parse_tuned_bool,
 )
-from aiter.ops.flydsl.kernels.conv3d_gfx950_utils import out_extent
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import out_extent
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
