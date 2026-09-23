@@ -947,20 +947,9 @@ def make_output_scatter_plan(param, geom, cfg, grid):
     # rather than left to fail inside the trace with no shape to point at.
     assert not need_chk or not (use_splitk or big_out), (
         f"{'split-K' if use_splitk else 'BIG_OUT'} cannot mask a tile tail, and this "
-        "launch has one: "
-        + "; ".join(
-            m
-            for m in (
-                (
-                    f"npq={npq} is not a multiple of tile_m={cfg.tile_m}"
-                    if row_chk
-                    else ""
-                ),
-                f"kg={kg} is not a multiple of tile_n={cfg.tile_n}" if n_tail else "",
-            )
-            if m
-        )
-        + ". Use a tile that divides the problem, or drop the split."
+        f"launch has one (row_chk={row_chk}, n_tail={n_tail}): npq={npq} against "
+        f"tile_m={cfg.tile_m}, kg={kg} against tile_n={cfg.tile_n}. Use a tile that "
+        "divides the problem, or drop the split."
     )
     return OutputScatterPlan(
         k=k,
