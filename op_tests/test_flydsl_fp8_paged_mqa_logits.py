@@ -9,9 +9,14 @@ calls: compact Q ``[B, next_n, 32, 128]``, preallocated ``out_logits``, optional
 on the uniform compact path.
 
 Shape mapping (decode indexer):
-- ``batch`` = nq sequences
+- ``batch`` / ``nq`` = sequences
 - ``next_n`` = MTP rows per sequence (compact ``Q.shape[1]`` / ragged pad)
 - ``kv_len`` = tokens per sequence (multiple of kvb=64 preferred)
+
+``test_fp8_paged_mqa_logits_probe1079`` is the production decode contract from
+the probe_1079 bs64 histogram: 44362-block KV pool, scattered 8 KiB pages,
+``max_model_len=258048``, mean Nq=117. The 212-call histogram sweep stays in
+the WaveScope driver; this table is the mean-Nq next_n × ctx grid.
 """
 
 from __future__ import annotations
@@ -40,8 +45,14 @@ KV_BLOCK_SIZE = 64
 INDEX_DIM = HEAD_DIM + 4
 MAX_NN = 8
 WIDE_MAX_MODEL_LEN = 1 << 20
+# probe_1079 decode (bs64): 44362 × 64-token pages, output stride 258048.
+PROBE_NUM_BLOCKS = 44362
+PROBE_MAX_MODEL_LEN = 258048
+PROBE_MEAN_NQ = 117
+PROBE_SEED = 1079
 _E4M3_NATIVE = get_fp8_e4m3_dtype()
 _Q_DTYPE = {"fn": torch.float8_e4m3fn}
+_PROBE_KV = None
 
 try:
     from aiter.ops.triton.attention.pa_mqa_logits import (
@@ -223,6 +234,74 @@ def _build_inputs(
         block_tables,
         max_model_len,
         fp8_dtype,
+    )
+
+
+def scattered_block_tables(
+    nq, pages, num_blocks=PROBE_NUM_BLOCKS, max_model_len=PROBE_MAX_MODEL_LEN
+):
+    """Random physical pages; consecutive logical pages are not adjacent in HBM."""
+    used = nq * pages
+    max_blocks_seq = max_model_len // KV_BLOCK_SIZE
+    if used <= num_blocks:
+        ids = torch.randperm(num_blocks, device="cuda")[:used]
+    else:
+        reps = (used + num_blocks - 1) // num_blocks
+        ids = torch.cat(
+            [torch.randperm(num_blocks, device="cuda") for _ in range(reps)]
+        )[:used]
+    tables = torch.zeros((nq, max_blocks_seq), dtype=torch.int32, device="cuda")
+    tables[:, :pages] = ids.reshape(nq, pages).to(torch.int32)
+    return tables
+
+
+def _probe_kv_pool():
+    global _PROBE_KV
+    if _PROBE_KV is None:
+        fp8 = get_fp8_e4m3_dtype()
+        kv = torch.randn(
+            (PROBE_NUM_BLOCKS, KV_BLOCK_SIZE, 1, HEAD_DIM), dtype=torch.bfloat16
+        )
+        raw = kv_cache_cast_to_fp8(kv, fp8)
+        _PROBE_KV = (raw, preshuffle_kv_data(raw, HEAD_DIM), fp8)
+    return _PROBE_KV
+
+
+def _build_probe_inputs(nq, next_n, kv_len, q_dtype):
+    """Compact decode tensors matching probe_1079 / the indexer call."""
+    if kv_len % KV_BLOCK_SIZE:
+        raise ValueError(f"kv_len {kv_len} must be a multiple of kvb={KV_BLOCK_SIZE}")
+    if kv_len > PROBE_MAX_MODEL_LEN:
+        raise ValueError(
+            f"kv_len {kv_len} exceeds probe max_model_len {PROBE_MAX_MODEL_LEN}"
+        )
+    torch.manual_seed(PROBE_SEED)
+    random.seed(PROBE_SEED)
+    pages = kv_len // KV_BLOCK_SIZE
+    kv_raw, kv_kernel, fp8_dtype = _probe_kv_pool()
+    q = torch.randn((nq, next_n, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+    weights = torch.randn((nq * next_n, HEADS), dtype=torch.float32)
+    context_lens = torch.full((nq,), kv_len, device="cuda", dtype=torch.int32)
+    tables = scattered_block_tables(nq, pages)
+    out = torch.full(
+        (nq * next_n, PROBE_MAX_MODEL_LEN),
+        float("-inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    return (
+        Inputs(
+            q,
+            q.to(q_dtype),
+            kv_raw,
+            weights,
+            context_lens,
+            tables,
+            PROBE_MAX_MODEL_LEN,
+            fp8_dtype,
+        ),
+        kv_kernel,
+        out,
     )
 
 
@@ -412,6 +491,68 @@ def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
         batch, next_n, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
     )
     return _time_candidates(candidates, ref, flops, nbytes, "paged fp8_mqa_logits")
+
+
+@benchmark()
+def test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype):
+    """Mean-Nq decode: scattered 44362-block pool, production output stride."""
+    q_dtype = _Q_DTYPE[dtype]
+    inp, kv_cache_kernel, out = _build_probe_inputs(nq, next_n, kv_len, q_dtype)
+    scored = out[:, :kv_len]
+    ref = run_torch(
+        inp.q,
+        inp.kv_cache_fp8,
+        inp.weights,
+        inp.context_lens,
+        inp.block_tables,
+        kv_len,
+        inp.fp8_dtype,
+        block_size=KV_BLOCK_SIZE,
+    )
+
+    def flydsl():
+        out.fill_(float("-inf"))
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out,
+            inp.context_lens,
+            inp.block_tables,
+            PROBE_MAX_MODEL_LEN,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+        )
+        return scored
+
+    candidates = {"flydsl": (flydsl, scored)}
+    if deepgemm_fp8_paged_mqa_logits is not None:
+        out_g = out.clone()
+        scored_g = out_g[:, :kv_len]
+
+        def gluon():
+            out_g.fill_(float("-inf"))
+            deepgemm_fp8_paged_mqa_logits(
+                inp.q_fp8,
+                kv_cache_kernel,
+                inp.weights,
+                out_g,
+                inp.context_lens,
+                inp.block_tables,
+                PROBE_MAX_MODEL_LEN,
+                ChunkK=256,
+                Preshuffle=True,
+                KVBlockSize=KV_BLOCK_SIZE,
+                WavePerEU=2,
+            )
+            return scored_g
+
+        candidates["gluon"] = (gluon, scored_g)
+
+    flops, nbytes = _roofline(
+        nq, next_n, kv_len, inp.context_lens, inp.q_fp8, inp.weights, scored
+    )
+    return _time_candidates(candidates, ref, flops, nbytes, "paged probe1079")
 
 
 @benchmark()
@@ -634,6 +775,29 @@ def main():
         default=[65],
         help="Batch for the wide-output i32-offset table.",
     )
+    parser.add_argument(
+        "--hist-nq",
+        type=int,
+        nargs="*",
+        default=[PROBE_MEAN_NQ],
+        help="Nq for the probe_1079 table (mean of the 212-call histogram is 117).\n"
+        "    e.g.: --hist-nq 16 117 256",
+    )
+    parser.add_argument(
+        "--hist-next-n",
+        type=int,
+        nargs="*",
+        default=list(range(1, MAX_NN + 1)),
+        help="Compact next_n for the probe_1079 table.\n    e.g.: --hist-next-n 1 8",
+    )
+    parser.add_argument(
+        "--hist-kv-len",
+        type=int,
+        nargs="*",
+        default=[8192],
+        help="Tokens/seq for the probe_1079 table (scattered 8 KiB pages).\n"
+        "    e.g.: --hist-kv-len 8192 131072",
+    )
     args = parser.parse_args()
 
     compact = [
@@ -672,6 +836,15 @@ def main():
     ]
     if wide:
         _summarize("fp8_paged_mqa_logits_wide_out", wide)
+
+    hist = [
+        test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype)
+        for dtype, nq, next_n, kv_len in itertools.product(
+            args.dtype, args.hist_nq, args.hist_next_n, args.hist_kv_len
+        )
+    ]
+    if hist:
+        _summarize("fp8_paged_mqa_logits_probe1079", hist)
 
 
 if __name__ == "__main__":
