@@ -57,6 +57,16 @@ def _sum_combine(a, b):
 
 
 @gluon.jit
+def _load_persistent_mqa_tile(cta_info, pid, next_n, ChunkK: gl.constexpr):
+    row = gl.load(cta_info + pid * 4)
+    start = gl.load(cta_info + pid * 4 + 1) * ChunkK
+    count = gl.load(cta_info + pid * 4 + 2)
+    context_length = gl.load(cta_info + pid * 4 + 3)
+    length = gl.minimum(context_length - start, count * ChunkK)
+    return row // next_n, row % next_n, start, length, context_length
+
+
+@gluon.jit
 def _gluon_deepgemm_fp8_paged_mqa_logits(
     batch_size,
     next_n,
@@ -85,24 +95,38 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     KVBlockSize: tl.constexpr = 1,
     CDNA_VERSION: gl.constexpr = 3,
     ARCH: gl.constexpr = "gfx942",
+    PERSISTENT: gl.constexpr = False,
+    PERSISTENT_NEXT_N: gl.constexpr = 1,
 ):
     IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
+    if PERSISTENT:
+        next_n = PERSISTENT_NEXT_N
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
 
-    pid_q_head, remain_pid = pid % num_block_q_head, pid // num_block_q_head
-    pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
-    pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
+    if PERSISTENT:
+        pid_q_head = 0
+        (
+            pid_batch,
+            pid_next_n,
+            split_context_start,
+            split_context_length,
+            context_length,
+        ) = _load_persistent_mqa_tile(SplitKV, pid, next_n, ChunkK)
+    else:
+        pid_q_head, remain_pid = pid % num_block_q_head, pid // num_block_q_head
+        pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
+        pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
 
-    context_length = gl.load(context_len_ptr + pid_batch)
+        context_length = gl.load(context_len_ptr + pid_batch)
 
-    context_chunk_num = tl.cdiv(context_length, ChunkK)
-    split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
+        context_chunk_num = tl.cdiv(context_length, ChunkK)
+        split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
 
-    split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
-    split_context_length = min(
-        context_length - split_context_start, split_context_chunk_num * ChunkK
-    )
+        split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
+        split_context_length = min(
+            context_length - split_context_start, split_context_chunk_num * ChunkK
+        )
 
     if split_context_length <= 0:
         return
@@ -174,6 +198,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
     layout_scale: gl.constexpr = gl.SliceLayout(1, mfma_layout)
 
+    # KVBlockSize > ChunkK leaves ChunkK % KVBlockSize != 0, and the quotient no
+    # longer advances by a constant, so those shapes keep the general form.
+    HoistKvAddr: gl.constexpr = KVBlockSize > 1 and ChunkK % KVBlockSize == 0
+
     # ===---------------------------------------------------
     # Pipeline Start
     # ===---------------------------------------------------
@@ -209,39 +237,101 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         >= 0
     )
+    # Preserve scalar-first address arithmetic for per-token paging. Grouping
+    # the token offsets first increases register pressure on that path.
+    kv_table_offsets = (
+        pid_batch * max_block_len
+        + split_context_start
+        - residual_context
+        + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+    )
+    if KVBlockSize > 1:
+        logical_kv_idx_next = (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+        )
+        kv_table_offsets = (
+            pid_batch * max_block_len + logical_kv_idx_next // KVBlockSize
+        )
     context_kv_idx_next = gl.amd.cdna3.buffer_load(
         ptr=kv_indices,
-        offsets=pid_batch * max_block_len
-        + split_context_start
-        - residual_context
-        + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+        offsets=kv_table_offsets,
         mask=mask_kv_next,
     )
-    context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
-        ptr=kv_indices,
-        offsets=pid_batch * max_block_len
+    scale_table_offsets = (
+        pid_batch * max_block_len
         + split_context_start
         - residual_context
-        + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+        + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+    )
+    if KVBlockSize > 1:
+        logical_kv_scale_idx_next = (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+        )
+        scale_table_offsets = (
+            pid_batch * max_block_len + logical_kv_scale_idx_next // KVBlockSize
+        )
+    context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
+        ptr=kv_indices,
+        offsets=scale_table_offsets,
         mask=mask_kv_scale_next,
     )
 
     mfma_q = gl.convert_layout(q, mfma_layout_a)
 
+    # The backward-shifted first tile can contain negative token positions.
+    # Send those masked lanes to token 0 of block 0, including its scale.
     context_kv_idx_next = tl.where(mask_kv_next, context_kv_idx_next, 0)
-    k_next = gl.amd.cdna3.buffer_load(
-        ptr=KV_buffer,
-        offsets=context_kv_idx_next[:, None] * stride_k_seq
-        + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :],
+    kv_offsets = (
+        context_kv_idx_next[:, None] * stride_k_seq
+        + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :]
     )
+    if KVBlockSize > 1:
+        kv_offsets += (gl.maximum(logical_kv_idx_next, 0) % KVBlockSize)[
+            :, None
+        ] * HiddenDim
+    # The KV strides are 64-bit, so a cache past the 2 GiB buffer descriptor
+    # range still addresses correctly. Global pointers, not buffer loads.
+    k_next = gl.load(KV_buffer + kv_offsets)
     context_kv_scale_idx_next = tl.where(
         mask_kv_scale_next, context_kv_scale_idx_next, 0
     )
-    k_scale_f_next = gl.amd.cdna3.buffer_load(
-        ptr=scale_buffer, offsets=context_kv_scale_idx_next * stride_scale_seq
-    )
+    scale_offsets = context_kv_scale_idx_next * stride_scale_seq
+    if KVBlockSize > 1:
+        scale_offsets += gl.maximum(logical_kv_scale_idx_next, 0) % KVBlockSize
+    k_scale_f_next = gl.load(scale_buffer + scale_offsets)
 
     zero = gl.zeros((ChunkQ, ChunkK), dtype=tl.float32, layout=mfma_layout)
+
+    if HoistKvAddr:
+        # Every iteration addresses token `context_idx + ChunkK + t`. context_idx
+        # advances by ChunkK and ChunkK % KVBlockSize == 0, so the in-block
+        # offset is the same in every iteration and the block index grows by
+        # ChunkK // KVBlockSize. Both are taken from the first tile here; the
+        # loop then only adds. The first tile's tokens are non-negative because
+        # residual_context < ChunkK, so no clamping is needed.
+        first_next_kv = (
+            split_context_start
+            - residual_context
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+        )
+        first_next_scale = (
+            split_context_start
+            - residual_context
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+        )
+        kv_inblk_bytes = (first_next_kv % KVBlockSize)[:, None] * HiddenDim
+        scale_inblk = first_next_scale % KVBlockSize
+        kv_table_offsets = pid_batch * max_block_len + first_next_kv // KVBlockSize
+        scale_table_offsets = (
+            pid_batch * max_block_len + first_next_scale // KVBlockSize
+        )
+
     for context_idx in range(
         split_context_start - residual_context,
         split_context_start + split_context_length - ChunkK,
@@ -250,20 +340,48 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         k = k_next
         k_scale_f = k_scale_f_next
 
+        if not HoistKvAddr:
+            kv_table_offsets = (
+                pid_batch * max_block_len
+                + context_idx
+                + ChunkK
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            )
+            if KVBlockSize > 1:
+                logical_kv_idx_next = (
+                    context_idx
+                    + ChunkK
+                    + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+                )
+                kv_table_offsets = (
+                    pid_batch * max_block_len + logical_kv_idx_next // KVBlockSize
+                )
         context_kv_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
-            offsets=pid_batch * max_block_len
-            + context_idx
-            + ChunkK
-            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+            offsets=kv_table_offsets,
         )
+        if not HoistKvAddr:
+            scale_table_offsets = (
+                pid_batch * max_block_len
+                + context_idx
+                + ChunkK
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            )
+            if KVBlockSize > 1:
+                logical_kv_scale_idx_next = (
+                    context_idx
+                    + ChunkK
+                    + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                )
+                scale_table_offsets = (
+                    pid_batch * max_block_len + logical_kv_scale_idx_next // KVBlockSize
+                )
         context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
-            ptr=kv_indices,
-            offsets=pid_batch * max_block_len
-            + context_idx
-            + ChunkK
-            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+            ptr=kv_indices, offsets=scale_table_offsets
         )
+        if HoistKvAddr:
+            kv_table_offsets += ChunkK // KVBlockSize
+            scale_table_offsets += ChunkK // KVBlockSize
 
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
@@ -279,28 +397,34 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
         #!=----------------------------
-        k_next = gl.amd.cdna3.buffer_load(
-            ptr=KV_buffer,
-            offsets=context_kv_idx_next[:, None] * stride_k_seq
-            + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :],
+        kv_offsets = (
+            context_kv_idx_next[:, None] * stride_k_seq
+            + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :]
         )
+        if HoistKvAddr:
+            kv_offsets += kv_inblk_bytes
+        elif KVBlockSize > 1:
+            kv_offsets += (logical_kv_idx_next % KVBlockSize)[:, None] * HiddenDim
+        k_next = gl.load(KV_buffer + kv_offsets)
         o = gl.maximum(o, 0.0)
         o = o * scale_weight[:, None]
 
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
         #!=----------------------------
-        k_scale_f_next = gl.amd.cdna3.buffer_load(
-            ptr=scale_buffer, offsets=context_kv_scale_idx_next * stride_scale_seq
-        )
+        scale_offsets = context_kv_scale_idx_next * stride_scale_seq
+        if HoistKvAddr:
+            scale_offsets += scale_inblk
+        elif KVBlockSize > 1:
+            scale_offsets += logical_kv_scale_idx_next % KVBlockSize
+        k_scale_f_next = gl.load(scale_buffer + scale_offsets)
 
         mask = (
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
             <= context_length - next_n + pid_next_n
         )
-        o = tl.where(mask[None, :], o, float("-inf"))
-
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+        logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
             ptr=OutLogits_buffer
@@ -311,7 +435,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
             ),
             mask=context_idx
             + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-            >= 0,
+            >= (split_context_start if PERSISTENT else 0),
         )
 
     context_idx = split_context_start + split_context_length - ChunkK
@@ -332,9 +456,8 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         <= context_length - next_n + pid_next_n
     )
-    o = tl.where(mask[None, :], o, float("-inf"))
-
     logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+    logits = tl.where(mask, logits, float("-inf"))
     gl.amd.cdna3.buffer_store(
         logits,
         ptr=OutLogits_buffer
@@ -343,7 +466,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         ),
         mask=context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-        >= 0,
+        >= (split_context_start if PERSISTENT else 0),
     )
 
 
@@ -369,15 +492,19 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     max_model_len,
     max_block_len,
     num_block,
-    SplitKV: gl.constexpr,
+    SplitKV,
     ChunkQ: gl.constexpr,
     ChunkK: gl.constexpr,
     HiddenDim: gl.constexpr,
     KVBlockSize: gl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
     ARCH: gl.constexpr = "gfx942",
+    PERSISTENT: gl.constexpr = False,
+    PERSISTENT_NEXT_N: gl.constexpr = 1,
 ):
     IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
+    if PERSISTENT:
+        next_n = PERSISTENT_NEXT_N
     # ===---------------------------------------------------
     # Gluon Layout
     # ===---------------------------------------------------
@@ -620,23 +747,32 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     pid = tl.program_id(0)
 
     # ===---------------------------------------------------
-    pid_batch, remain_pid = pid % batch_size, pid // batch_size
-    pid_next_n, pid_split_kv = remain_pid % next_n, remain_pid // next_n
-    # ===---------------------------------------------------
-    context_length = gl.load(context_len_ptr + pid_batch)
+    if PERSISTENT:
+        (
+            pid_batch,
+            pid_next_n,
+            split_context_start,
+            split_context_length,
+            context_length,
+        ) = _load_persistent_mqa_tile(SplitKV, pid, next_n, ChunkK)
+    else:
+        pid_batch, remain_pid = pid % batch_size, pid // batch_size
+        pid_next_n, pid_split_kv = remain_pid % next_n, remain_pid // next_n
+        # ===---------------------------------------------------
+        context_length = gl.load(context_len_ptr + pid_batch)
 
-    context_chunk_num = tl.cdiv(context_length, ChunkK)
-    split_context_chunk_num = context_chunk_num // SplitKV
-    residual_context_chunks = context_chunk_num % SplitKV
-    split_context_start = (
-        pid_split_kv * split_context_chunk_num * ChunkK
-        + min(pid_split_kv, residual_context_chunks) * ChunkK
-    )
-    split_context_length = min(
-        context_length - split_context_start,
-        split_context_chunk_num * ChunkK
-        + (ChunkK if pid_split_kv < residual_context_chunks else 0),
-    )
+        context_chunk_num = tl.cdiv(context_length, ChunkK)
+        split_context_chunk_num = context_chunk_num // SplitKV
+        residual_context_chunks = context_chunk_num % SplitKV
+        split_context_start = (
+            pid_split_kv * split_context_chunk_num * ChunkK
+            + min(pid_split_kv, residual_context_chunks) * ChunkK
+        )
+        split_context_length = min(
+            context_length - split_context_start,
+            split_context_chunk_num * ChunkK
+            + (ChunkK if pid_split_kv < residual_context_chunks else 0),
+        )
 
     if split_context_length <= 0:
         return
@@ -804,17 +940,21 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         _amd_s_set_prio(1)
 
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+        store_cols = context_idx + gl.arange(
+            0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+        )
+        if PERSISTENT and PERSISTENT_NEXT_N > 1:
+            logits = tl.where(
+                store_cols <= context_length - next_n + pid_next_n,
+                logits,
+                float("-inf"),
+            )
         gl.amd.cdna3.buffer_store(
             logits,
             ptr=OutLogits_buffer
             + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-            offsets=(
-                context_idx
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            ),
-            mask=context_idx
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
+            offsets=store_cols,
+            mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
         )
 
         for context_idx in range(
@@ -870,21 +1010,23 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             _amd_s_set_prio(1)
 
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+            store_cols = (
+                context_idx
+                + ChunkKPerStage
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+            )
+            if PERSISTENT and PERSISTENT_NEXT_N > 1:
+                logits = tl.where(
+                    store_cols <= context_length - next_n + pid_next_n,
+                    logits,
+                    float("-inf"),
+                )
             gl.amd.cdna3.buffer_store(
                 logits,
                 ptr=OutLogits_buffer
                 + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-                offsets=(
-                    context_idx
-                    + ChunkKPerStage
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                ),
-                mask=context_idx
-                + ChunkKPerStage
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-                >= split_context_start,
+                offsets=store_cols,
+                mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
             )
 
             # =======================================================================================
@@ -943,6 +1085,19 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             _amd_s_set_prio(0)
 
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+            if PERSISTENT and PERSISTENT_NEXT_N > 1:
+                store_cols = (
+                    context_idx
+                    + ChunkK
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                )
+                logits = tl.where(
+                    store_cols <= context_length - next_n + pid_next_n,
+                    logits,
+                    float("-inf"),
+                )
             gl.amd.cdna3.buffer_store(
                 logits,
                 ptr=OutLogits_buffer
@@ -987,19 +1142,17 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
         logits = tl.where(mask, logits, float("-inf"))
+        store_cols = (
+            context_idx
+            + ChunkKPerStage
+            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+        )
         gl.amd.cdna3.buffer_store(
             logits,
             ptr=OutLogits_buffer
             + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-            offsets=(
-                context_idx
-                + ChunkKPerStage
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            ),
-            mask=context_idx
-            + ChunkKPerStage
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
+            offsets=store_cols,
+            mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
         )
     else:
         context_idx = split_context_start
@@ -1058,11 +1211,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         #!=----------------------------
         mfma_q = gl.convert_layout(q, mfma_layout_a)
 
-        k_next_0 = gl.amd.cdna3.buffer_load(
-            ptr=KV_buffer,
-            offsets=offset_k_fixed
-            + context_kv_idx_next_0 * stride_k_seq
-            + context_idx % KVBlockSize * HiddenDim,
+        k_next_0 = gl.load(
+            KV_buffer
+            + context_kv_idx_next_0.to(gl.int64) * stride_k_seq
+            + offset_k_fixed
+            + context_idx % KVBlockSize * HiddenDim
         )
         k_scale_f_next_0 = gl.load(
             scale_buffer
@@ -1095,11 +1248,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
         #!=----------------------------
-        k_next_1 = gl.amd.cdna3.buffer_load(
-            ptr=KV_buffer,
-            offsets=offset_k_fixed
-            + context_kv_idx_next_0 * stride_k_seq
-            + (context_idx + ChunkKPerStage) % KVBlockSize * HiddenDim,
+        k_next_1 = gl.load(
+            KV_buffer
+            + context_kv_idx_next_0.to(gl.int64) * stride_k_seq
+            + offset_k_fixed
+            + (context_idx + ChunkKPerStage) % KVBlockSize * HiddenDim
         )
         k_scale_f_next_1 = gl.load(
             scale_buffer
@@ -1180,11 +1333,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 )
                 block_idx += 1
 
-            k_next_0 = gl.amd.cdna3.buffer_load(
-                ptr=KV_buffer,
-                offsets=offset_k_fixed
-                + context_kv_idx_next_0 * stride_k_seq
-                + (context_idx_ + ChunkK) % KVBlockSize * HiddenDim,
+            k_next_0 = gl.load(
+                KV_buffer
+                + context_kv_idx_next_0.to(gl.int64) * stride_k_seq
+                + offset_k_fixed
+                + (context_idx_ + ChunkK) % KVBlockSize * HiddenDim
             )
             k_scale_f_next_0 = gl.load(
                 scale_buffer
@@ -1221,6 +1374,21 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             _amd_s_set_prio(1)
 
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+            if PERSISTENT and PERSISTENT_NEXT_N > 1:
+                # An MTP row may end in this stage, even when the sequence has
+                # another chunk. Mask all stages, not just the final epilogue.
+                store_cols = (
+                    context_idx_
+                    + ChunkKPerStage
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                )
+                logits = tl.where(
+                    store_cols <= context_length - next_n + pid_next_n,
+                    logits,
+                    float("-inf"),
+                )
             gl.amd.cdna3.buffer_store(
                 logits,
                 ptr=OutLogits_buffer
@@ -1250,15 +1418,15 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             #!=----------------------------
             _amd_iglp_sched_barrier(0x0)
             #!=----------------------------
-            k_next_1 = gl.amd.cdna3.buffer_load(
-                ptr=KV_buffer,
-                offsets=offset_k_fixed
-                + context_kv_idx_next_0 * stride_k_seq
-                + (context_idx_ + ChunkK + ChunkKPerStage) % KVBlockSize * HiddenDim,
+            k_next_1 = gl.load(
+                KV_buffer
+                + context_kv_idx_next_0.to(gl.int64) * stride_k_seq
+                + offset_k_fixed
+                + (context_idx_ + ChunkK + ChunkKPerStage) % KVBlockSize * HiddenDim
             )
-            k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
-                ptr=scale_buffer,
-                offsets=context_kv_idx_next_0 * stride_scale_seq
+            k_scale_f_next_1 = gl.load(
+                scale_buffer
+                + context_kv_idx_next_0.to(gl.int64) * stride_scale_seq
                 + (
                     context_idx_
                     + ChunkK
@@ -1267,7 +1435,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
                     )
                 )
-                % KVBlockSize,
+                % KVBlockSize
             )
             current_chunk_rank += 2
 
