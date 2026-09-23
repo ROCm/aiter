@@ -31,10 +31,10 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIG_MHA_FWD
 from aiter.jit.utils.chip_info import TUNING_HARDWARE_FIELDS, get_gpu_model
 from aiter.ops.mha import (
-    _fmha_v3_varlen_splitkv_fwd,
     _load_mha_fwd_tuning_table,
     flash_attn_varlen_func,
     fmha_fwd_bf16_opus_varlen_fwd,
+    fmha_v3_varlen_fwd,
     mha_varlen_fwd,
 )
 from aiter.ops.mha_fwd_policy import (
@@ -282,7 +282,7 @@ def _run_candidate(
     return_lse,
 ):
     if backend == "asm_v3":
-        out, lse, _, _ = _fmha_v3_varlen_splitkv_fwd(
+        out, lse, _, _ = fmha_v3_varlen_fwd(
             q,
             k,
             v,
@@ -290,9 +290,18 @@ def _run_candidate(
             cu_k,
             int(max_seqlen_q),
             int(max_seqlen_k),
+            int(min_seqlen_q),
+            float(dropout_p),
             float(softmax_scale),
+            float(logits_soft_cap),
+            False,
+            bool(causal),
+            int(window_left),
+            int(window_right),
             bool(return_lse),
-            int(num_splits),
+            False,
+            int(how_v3_bf16_cvt),
+            num_splits=int(num_splits),
         )
         return _normalize_result((out, lse), return_lse, q.shape[0], q.shape[1])
     if backend == "ck":

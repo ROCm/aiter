@@ -465,7 +465,9 @@ class TestMhaWinnerPromotion(unittest.TestCase):
 
 
 class TestMhaPublicDispatch(unittest.TestCase):
-    def test_csv_asm_plan_launches_splitkv_operator(self):
+    def test_csv_asm_plan_forces_the_split_count(self):
+        # The split count rides the full entry point, so the caller's out=,
+        # mask and padding reach the kernel alongside it.
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
         sentinel = (
             torch.empty(1),
@@ -475,10 +477,7 @@ class TestMhaPublicDispatch(unittest.TestCase):
         )
         with (
             mock.patch.object(mha, "get_gfx", return_value="gfx942"),
-            mock.patch.object(
-                mha, "_fmha_v3_varlen_splitkv_fwd", return_value=sentinel
-            ) as splitkv,
-            mock.patch.object(mha, "fmha_v3_varlen_fwd") as auto,
+            mock.patch.object(mha, "fmha_v3_varlen_fwd", return_value=sentinel) as asm,
         ):
             mha._flash_attn_varlen_forward(
                 q,
@@ -497,14 +496,12 @@ class TestMhaPublicDispatch(unittest.TestCase):
                 num_splits=3,
                 selected_backend="asm_v3",
             )
-        splitkv.assert_called_once()
-        auto.assert_not_called()
-        self.assertEqual(splitkv.call_args.args[-1], 3)
+        asm.assert_called_once()
+        self.assertEqual(asm.call_args.args[-1], 3)
 
-    def test_arguments_the_split_entry_point_drops_keep_the_full_one(self):
-        # _fmha_v3_varlen_splitkv_fwd takes neither out nor causal and passes
-        # its own constants for both, so honoring the split count here would
-        # leave the caller's buffer unwritten and drop the mask.
+    def test_a_split_count_the_kernel_cannot_serve_falls_back_to_auto(self):
+        # Forcing a split the contract rejects is a TORCH_CHECK in C++, and a
+        # tuned row is a hint: hand those calls back to auto-select instead.
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
         sentinel = (
             torch.empty(1),
@@ -513,23 +510,20 @@ class TestMhaPublicDispatch(unittest.TestCase):
             torch.empty(1),
         )
         for name, kwargs in (
-            ("out", {"out": torch.empty((8, 12, 128), dtype=torch.bfloat16)}),
             ("causal", {"causal": True}),
-            ("min_seqlen_q", {"min_seqlen_q": 4}),
             ("cu_seqlens_q_padded", {"cu_seqlens_q_padded": cu_q}),
+            ("how_v3_bf16_cvt", {"how_v3_bf16_cvt": 0}),
         ):
             with self.subTest(argument=name):
                 with (
                     mock.patch.object(mha, "get_gfx", return_value="gfx942"),
-                    mock.patch.object(mha, "_fmha_v3_varlen_splitkv_fwd") as splitkv,
                     mock.patch.object(
                         mha, "fmha_v3_varlen_fwd", return_value=sentinel
-                    ) as auto,
+                    ) as asm,
                 ):
                     call = {
                         "cu_seqlens_q_padded": None,
                         "cu_seqlens_k_padded": None,
-                        "min_seqlen_q": 0,
                         "causal": False,
                         **kwargs,
                     }
@@ -543,7 +537,7 @@ class TestMhaPublicDispatch(unittest.TestCase):
                         call.pop("cu_seqlens_k_padded"),
                         8,
                         16,
-                        call.pop("min_seqlen_q"),
+                        0,
                         0.0,
                         0.125,
                         call.pop("causal"),
@@ -551,8 +545,10 @@ class TestMhaPublicDispatch(unittest.TestCase):
                         selected_backend="asm_v3",
                         **call,
                     )
-                splitkv.assert_not_called()
-                auto.assert_called_once()
+                asm.assert_called_once()
+                self.assertEqual(
+                    asm.call_args.args[-1], 0, "auto-select must reach the kernel"
+                )
 
     def test_no_plan_uses_public_asm_auto_select(self):
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
@@ -564,7 +560,6 @@ class TestMhaPublicDispatch(unittest.TestCase):
         )
         with (
             mock.patch.object(mha, "get_gfx", return_value="gfx942"),
-            mock.patch.object(mha, "_fmha_v3_varlen_splitkv_fwd") as splitkv,
             mock.patch.object(mha, "fmha_v3_varlen_fwd", return_value=sentinel) as auto,
         ):
             mha._flash_attn_varlen_forward(
@@ -585,7 +580,7 @@ class TestMhaPublicDispatch(unittest.TestCase):
                 selected_backend=None,
             )
         auto.assert_called_once()
-        splitkv.assert_not_called()
+        self.assertEqual(auto.call_args.args[-1], 0)
 
     def test_flash_attn_varlen_func_routes_csv_backends(self):
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
