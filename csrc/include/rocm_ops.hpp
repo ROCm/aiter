@@ -1550,7 +1550,8 @@ namespace py = pybind11;
           py::arg("num_tiles"),                          \
           py::arg("num_ctas"),                           \
           py::arg("cta_resident"),                       \
-          py::arg("block_k"));                           \
+          py::arg("block_k"),                            \
+          py::arg("q_per_block"));                       \
     m.def("pa_mqa_logits_mxfp4_fwd_sched",               \
           &pa_mqa_logits_mxfp4_fwd_sched,                \
           py::arg("q"),                                  \

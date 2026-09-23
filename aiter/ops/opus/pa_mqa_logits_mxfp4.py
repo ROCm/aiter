@@ -123,8 +123,10 @@ class MqaLogitsBuffers:
     Allocate it with :func:`pa_mqa_logits_mxfp4_plan_buffers` and hand the whole object back to
     :func:`pa_mqa_logits_mxfp4_plan` every forward. The instance travels WITH the memory because
     the memory is sized for it: ``cta_info``'s length follows ``cta_resident`` and ``cu_tiles``'
-    follows ``q_per_block``, so a set allocated for one instance -- or one arch -- cannot build a
-    plan for another.
+    follows ``q_per_block`` -- it is EMPTY at ``q_per_block == 1``, where a tile is a row and the
+    schedule reads that mapping directly instead of an array, so there is no second buffer to
+    hold at a fixed address under a cudagraph. A set allocated for one instance -- or one arch --
+    cannot build a plan for another.
     """
 
     cta_info: torch.Tensor
@@ -246,6 +248,7 @@ def _build_sched_raw(
     num_ctas: int,
     cta_resident: int,
     block_k: int,
+    q_per_block: int,
 ) -> None: ...
 
 
@@ -325,8 +328,10 @@ def _compute_tiles(cu_seq_q, total_q, variant, out=None):
 
     ``num_tiles`` is an UPPER BOUND, so it stays a host int and no device read is needed to
     launch; tiles past the real count are written empty. This cut is what guarantees "a tile is
-    contiguous rows of one batch", which the kernel cannot check and does not survive. gfx950
-    passes ``q_per_block == 1``, so the cut is one tile per row and the union window is the row's.
+    contiguous rows of one batch", which the kernel cannot check and does not survive.
+
+    Only reached at ``q_per_block > 1``. At 1 a tile IS a row, so the boundaries are the arange
+    the host already knows and the schedule reads that mapping instead of an array.
     """
     cu = cu_seq_q.to(torch.int32).contiguous()
     batch = int(cu.shape[0]) - 1
@@ -361,7 +366,7 @@ def _compute_schedule(
         cta_info = _cta_info(local_ends.device, slots)
     empty = torch.empty(0, dtype=torch.int32, device=local_ends.device)
     _build_sched_raw(
-        cu_tiles,
+        cu_tiles if cu_tiles is not None else empty,
         local_starts if local_starts is not None else empty,
         local_ends,
         row_to_batch if row_to_batch is not None else empty,
@@ -370,6 +375,7 @@ def _compute_schedule(
         slots,
         variant.cta_resident,
         variant.block_k,
+        variant.q_per_block,
     )
     return cta_info, slots
 
@@ -449,6 +455,10 @@ class MqaLogitsPlan:
     # travel WITH the plan because the kernel reads them PER ROW for the store mask while the
     # table carries only each tile's union, and they must be the same arrays the schedule was
     # built from. `num_tiles` is the cut's UPPER BOUND, not its exact count.
+    #
+    # `cu_tiles` is EMPTY at `q_per_block == 1`: there the cut is the IDENTITY -- tile t is row
+    # t -- so no array is built and the schedule reads the mapping directly. Only a tile wider
+    # than one row needs boundaries.
     cu_tiles: torch.Tensor
     num_tiles: int
     local_ends: torch.Tensor
@@ -605,7 +615,12 @@ def pa_mqa_logits_mxfp4_plan_buffers(
     slots = _sched_slots(num_tiles, v) if num_ctas is None else int(num_ctas)
     return MqaLogitsBuffers(
         cta_info=_cta_info(device, slots),
-        cu_tiles=_cu_tiles(device, num_tiles),
+        # The identity cut reads no array, so there is nothing to size.
+        cu_tiles=(
+            torch.empty(0, dtype=torch.int32, device=device)
+            if v.q_per_block == 1
+            else _cu_tiles(device, num_tiles)
+        ),
         num_ctas=slots,
         variant=v,
     )
@@ -622,10 +637,11 @@ def pa_mqa_logits_mxfp4_plan(
 ) -> MqaLogitsPlan:
     """Build one forward's schedule on device. Call ONCE PER FORWARD, not once per layer.
 
-    ``cu_seq_q`` is the batch's ``[batch + 1]`` query-row prefix sum. Both arches cut their
-    tiles from it, and that cut is what keeps a tile to contiguous rows of one batch -- a
-    condition the kernel cannot check and DEADLOCKS on rather than answering wrong. gfx950 cuts
-    at ``q_per_block == 1``, so its tiles are its rows.
+    ``cu_seq_q`` is the batch's ``[batch + 1]`` query-row prefix sum. At ``q_per_block > 1``
+    the tiles are cut from it, and that cut is what keeps a tile to contiguous rows of one
+    batch -- a condition the kernel cannot check and DEADLOCKS on rather than answering wrong.
+    At 1 a tile IS a row, so no cut is needed and **the row domain is ``total_q``**, not
+    ``cu_seq_q[batch]``; pass ``total_q`` when ``local_ends`` is larger than ``q``.
 
     ``local_ends`` is the per-row window end, ``[total_q]`` int32; ``total_q`` defaults to its
     element count. The windows are the CALLER's, so any rule works that satisfies the two
@@ -670,7 +686,19 @@ def pa_mqa_logits_mxfp4_plan(
     # All three ONCE, here, and the plan carries the result -- the launch reads the windows per
     # CSA LAYER, so converting there would be 61 copies for a caller holding int64.
     ends, starts = _as_i32(local_ends), _as_i32(local_starts)
-    tiles, num_tiles = _compute_tiles(cu_seq_q, n, v, out=cu_tiles)
+    if v.q_per_block == 1:
+        # ONE TILE PER ROW: the boundaries are the arange the host already knows, so the cut
+        # kernel is not launched. Exact rather than an approximation because `_max_tiles_for`
+        # has no slack at 1 -- there is no surplus tile for the built array's tail clamp to
+        # mark, and the row domain is `num_tiles` itself.
+        tiles = (
+            cu_tiles
+            if cu_tiles is not None
+            else torch.empty(0, dtype=torch.int32, device=ends.device)
+        )
+        num_tiles = _max_tiles_for(n, int(cu_seq_q.shape[0]) - 1, v)
+    else:
+        tiles, num_tiles = _compute_tiles(cu_seq_q, n, v, out=cu_tiles)
     info, slots = _compute_schedule(
         tiles,
         ends,
@@ -727,6 +755,23 @@ def pa_mqa_logits_mxfp4(
             "forward AND per device"
         )
     _check_layout(arch, q_scale, kv_scale, kv_cache)
+    # gfx950 ONLY: it stands in for a row bound that arch has nowhere else.
+    #
+    # At q_per_block == 1 a tile IS a row, so the plan's row domain is `num_tiles` -- and
+    # `total_q`, which it comes from, defaults to `local_ends.numel()`, which a caller is
+    # allowed to oversize. gfx1250 bounds `rec.row_id` against `num_rows` in the kernel; the
+    # MFMA arm reads the record unbounded, so the bound has to be taken here. Two host shape
+    # values, so the launch stays cudagraph-safe.
+    if (
+        arch == GFX950
+        and plan.variant is not None
+        and plan.variant.q_per_block == 1
+        and plan.num_tiles > int(q_fp4.shape[0])
+    ):
+        raise ValueError(
+            f"the plan schedules {plan.num_tiles} rows and q holds {int(q_fp4.shape[0])}; "
+            "pass total_q= to pa_mqa_logits_mxfp4_plan when local_ends is oversized"
+        )
     if plan.variant is None:
         # Unreachable from `pa_mqa_logits_mxfp4_plan`, which always settles one. A default here
         # would dispatch to an instance the buffers were not sized for.

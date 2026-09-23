@@ -44,7 +44,10 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
                                      int num_tiles,
                                      int num_ctas,
                                      int cta_resident,
-                                     int block_k);
+                                     int block_k,
+                                     // 1 is the IDENTITY cut -- a tile is a row -- and then
+                                     // `cu_tiles` is not read and may be empty.
+                                     int q_per_block);
 
 void pa_mqa_logits_mxfp4_fwd_sched(aiter_tensor_t& q,
                                    aiter_tensor_t& q_scale,
@@ -293,6 +296,13 @@ __device__ inline int tile_union_start(const int* __restrict__ local_starts, int
     return (local_starts && r1 > r0) ? local_starts[r0] : 0;
 }
 
+// Tile `t`'s row bound, and the one place the cut is read. A NULL `cu_tiles` is the IDENTITY
+// cut -- `q_per_block == 1`, where a tile IS a row. The predicate is a loop-invariant scalar,
+// unlike the one the next comment is about.
+__device__ inline int tile_row(const int* __restrict__ cu_tiles, int t) {
+    return cu_tiles ? cu_tiles[t] : t;
+}
+
 // BRANCHLESS ON PURPOSE. An `if (e <= 0) return 0;` here reads naturally and costs 38% at 16384
 // tiles on the gfx950 sibling: the callers are latency-bound strided walks, and a branch on the
 // value just loaded serializes what was a pipelined stream.
@@ -300,8 +310,8 @@ __device__ inline int tile_kv_tiles(const int* __restrict__ cu_tiles,
                                     const int* __restrict__ local_starts,
                                     const int* __restrict__ local_ends,
                                     int t, int block_k) {
-    const int r0    = cu_tiles[t];
-    const int r1    = cu_tiles[t + 1];
+    const int r0    = tile_row(cu_tiles, t);
+    const int r1    = tile_row(cu_tiles, t + 1);
     const int e     = tile_union_end(local_ends, r0, r1);
     const int first = tile_union_start(local_starts, r0, r1) / block_k;
     const int end   = e > 0 ? ((e + block_k - 1) / block_k) : 0;
@@ -330,8 +340,8 @@ __device__ inline void emit_fast(const int* __restrict__ cu_tiles,
     part_sum = 0;
     part_nz  = 0;
     for (int t = first_tile; t < num_tiles; t += stride) {
-        const int r0    = cu_tiles[t];
-        const int r1    = cu_tiles[t + 1];
+        const int r0    = tile_row(cu_tiles, t);
+        const int r1    = tile_row(cu_tiles, t + 1);
         const int e     = tile_union_end(local_ends, r0, r1);
         const int s     = tile_union_start(local_starts, r0, r1);
         const int b     = row_to_batch ? row_to_batch[r0] : r0;
@@ -406,8 +416,8 @@ __device__ inline int general_emit(const int* __restrict__ cu_tiles,
         const int nc = (tiles + safe - 1) / safe;
         int block_total = 0;
         const int excl = block_scan_excl<BLOCK>(nc, smem, tid, block_total);
-        const int r0 = (t < num_tiles) ? cu_tiles[t]     : 0;
-        const int r1 = (t < num_tiles) ? cu_tiles[t + 1] : 0;
+        const int r0 = (t < num_tiles) ? tile_row(cu_tiles, t)     : 0;
+        const int r1 = (t < num_tiles) ? tile_row(cu_tiles, t + 1) : 0;
         s_excl[tid]  = excl;
         s_tiles[tid] = tiles;
         s_batch[tid] = (t < num_tiles) ? (row_to_batch ? row_to_batch[r0] : r0) : 0;
@@ -492,7 +502,8 @@ __host__ __device__ inline int max_tiles_for(int total_q, int batch, int qpb) {
     return (total_q + batch * (qpb - 1)) / qpb;
 }
 
-// Cut each batch's rows into runs of at most `qpb` and write the tile boundaries.
+// Cut each batch's rows into runs of at most `qpb` and write the tile boundaries. NOT reached
+// at `qpb == 1`, where a tile is a row and the schedule takes that mapping from `tile_row`.
 //
 // **THIS RETIRES A CONTRACT THE CALLER CANNOT SAFELY BREAK.** "A tile is contiguous rows of
 // ONE batch" gives no wrong answer when violated -- the CTA's waves disagree about the trip

@@ -452,9 +452,12 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
                                              int num_tiles,
                                              int num_ctas,
                                              int cta_resident,
-                                             int block_k)
+                                             int block_k,
+                                             int q_per_block)
 {
     aiter_detail::g_aiter_can_throw = true;
+    AITER_CHECK(q_per_block >= 1, "q_per_block must be >= 1, got ", q_per_block);
+    const bool identity_cut = (q_per_block == 1);
     // `cta_resident` is the CTAs the part holds at once. It follows the kernel's OCCUPANCY,
     // which nothing here can read back, so it is the caller's number; a wrong one leaves most of
     // the part idle and nothing reports it. `<= 0` turns the split's aim off entirely.
@@ -463,19 +466,21 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
     // records carry.
     AITER_CHECK(block_k >= 1, "block_k must be >= 1, got ", block_k);
     namespace ol                    = opus_logits;
-    AITER_CHECK(cu_tiles.dtype() == AITER_DTYPE_i32 && cu_tiles.is_contiguous(),
-                "cu_tiles must be contiguous int32");
+    if(!identity_cut)
+        AITER_CHECK(cu_tiles.dtype() == AITER_DTYPE_i32 && cu_tiles.is_contiguous(),
+                    "cu_tiles must be contiguous int32");
     AITER_CHECK(local_ends.dtype() == AITER_DTYPE_i32 && local_ends.is_contiguous(),
                 "local_ends must be contiguous int32");
     AITER_CHECK(cta_info.dtype() == AITER_DTYPE_i32 && cta_info.is_contiguous(),
                 "cta_info must be contiguous int32");
     AITER_CHECK(num_tiles >= 0, "num_tiles must be >= 0, got ", num_tiles);
-    // Tile t reads BOTH cu_tiles[t] and cu_tiles[t + 1].
-    AITER_CHECK(static_cast<int64_t>(cu_tiles.numel()) >= (int64_t)num_tiles + 1,
+    // Tile t reads BOTH cu_tiles[t] and cu_tiles[t + 1] -- unless the cut is the identity.
+    if(!identity_cut)
+        AITER_CHECK(static_cast<int64_t>(cu_tiles.numel()) >= (int64_t)num_tiles + 1,
                 "cu_tiles holds one boundary per tile PLUS a terminator; need ",
-                num_tiles + 1,
-                ", got ",
-                cu_tiles.numel());
+                    num_tiles + 1,
+                    ", got ",
+                    cu_tiles.numel());
     // Below this a tile could get no CTA at all and its rows would keep whatever the caller
     // pre-filled -- silently, since every other row would still be right.
     AITER_CHECK(num_ctas >= num_tiles,
@@ -518,7 +523,8 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
 
     HipDeviceGuard guard(local_ends.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    const int* p_cut         = reinterpret_cast<const int*>(cu_tiles.data_ptr());
+    const int* p_cut =
+        identity_cut ? nullptr : reinterpret_cast<const int*>(cu_tiles.data_ptr());
     const int* p_le          = reinterpret_cast<const int*>(local_ends.data_ptr());
     auto* p_cta              = reinterpret_cast<opus_mqa_cta_record*>(cta_info.data_ptr());
 
