@@ -552,3 +552,11 @@ not repeated unless an overlay retry is proposed.
   median **174.37 µs** (**+9.4%**, need ≤ **154.63**). Kernel restored.
   Do not retry pinning V gathers through rmem/`sched_vmem`. Inline-asm
   buffer-load dests are a different experiment.
+- Prefill inline-asm V `buffer_load_dwordx4` with `=&v` dests after
+  K-publish, plus a `vmcnt(0)` passthrough before overlay stores.
+  Oracle **2 passed**. Prefill ISA (`tickets/1047/tmp/k2_vmem_asm_isa/`)
+  issues all 16 V loads before the first QK MFMA. Keep-gate vs
+  st64-imm HEAD **159.41 µs**: five-run median **174.14 µs**
+  (**+9.2%**, need ≤ **154.63**). Extra live dest VGPRs serialize QK
+  (`lgkmcnt(0)` per MFMA). Kernel restored. Do not retry dest-pinned
+  inline-asm V gathers on overlay prefill.

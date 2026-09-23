@@ -1038,6 +1038,14 @@ st64-imm HEAD **159.41 µs** went **174.37 µs** (``M=512 +9.4%``,
 keep-gate 3% / ≤154.63). Kernel restored. Inline-asm buffer-load dests
 are a different experiment.
 
+**Do not retry** overlay prefill dest-pinned inline-asm V
+``buffer_load_dwordx4`` (``=&v`` dests after K-publish, ``vmcnt(0)``
+passthrough before overlay stores). GPU 6 / gfx950 stayed exact; all
+16 V loads issued before the first QK MFMA. Width-2051 ``L=512`` vs
+st64-imm HEAD **159.41 µs** went **174.14 µs** (``M=512 +9.2%``,
+keep-gate 3% / ≤154.63). Extra live dest VGPRs serialize QK. Kernel
+restored.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
