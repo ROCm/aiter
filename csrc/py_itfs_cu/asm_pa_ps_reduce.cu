@@ -121,7 +121,8 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
                 __func__, ": output must have non-overlapping rows with 32-bit byte strides");
 
     const uint32_t query_groups = static_cast<uint32_t>(std::min(max_seqlen_q, 4));
-    const uint32_t target_groups = get_num_cu_func() * 16;
+    const uint32_t num_cu = get_num_cu_func();
+    const uint32_t target_groups = num_cu * 16;
     const uint32_t groups_per_tile = static_cast<uint32_t>(num_heads) * query_groups;
     const uint32_t tile_groups = static_cast<uint32_t>(std::min<int64_t>(
         num_tiles, std::max<uint32_t>(1, (target_groups + groups_per_tile - 1) / groups_per_tile)));
@@ -141,8 +142,21 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
     args.tile_stride = tile_groups;
     args.query_stride = query_groups;
 
+    const bool adaptive = num_heads * final_output->size(0) < num_cu;
+    const int merge_waves = adaptive ? 8 : 1;
+
     AiterAsmKernel* kernel = nullptr;
-    if(final_output->dtype() == AITER_DTYPE_fp16)
+    if(adaptive)
+    {
+        const std::string stem = std::string("pa_p16_d128_8w_reduce_ps_auto") +
+            (final_output->dtype() == AITER_DTYPE_fp16 ? "_fp16" : "_bf16");
+        const std::string symbol = "_ZN5aiter" + std::to_string(stem.size()) + stem + "E";
+        static SynchronizedCache<std::string, AiterAsmKernel> implementations;
+        kernel = &implementations.get_or_create(stem, [&]() {
+            return AiterAsmKernel(symbol.c_str(), ("pa/" + stem + ".co").c_str());
+        });
+    }
+    else if(final_output->dtype() == AITER_DTYPE_fp16)
     {
         static AiterAsmKernel implementation("_ZN5aiter26pa_p16_d128_reduce_ps_fp16E",
                                               "pa/pa_p16_d128_reduce_ps_fp16.co");
@@ -157,5 +171,5 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
     size_t argument_size = sizeof(args);
     kernel->launch_kernel({&args, &argument_size, static_cast<int>(num_heads),
                             static_cast<int>(query_groups), static_cast<int>(tile_groups),
-                            64, 1, 1, stream});
+                            64 * merge_waves, 1, 1, stream});
 }
