@@ -691,6 +691,13 @@ def pa_decode(
             output_5d = output.reshape(
                 num_seqs, query_length, num_kv_heads, query_group_size, head_dim
             )
+            reduce_partitions = num_partitions
+            if sliding_window > 0:
+                # Bound the unaligned MTP window without shrinking the reusable plan.
+                window_tiles = (
+                    sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+                ) // KV_COMPUTE_BLOCK + 1
+                reduce_partitions = min(reduce_partitions, window_tiles)
             launch_pa_decode_ps_reduce(
                 output_5d,
                 psum,
@@ -711,7 +718,7 @@ def pa_decode(
                 query_seq_len=query_length,
                 query_group_size=query_group_size,
                 head_size=head_dim,
-                context_partition_num=num_partitions,
+                context_partition_num=reduce_partitions,
                 stream=s,
                 reduce_info=work_plan.reduce_info if work_plan is not None else None,
             )

@@ -95,6 +95,8 @@ class DecodeCase:
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
+    # Eager, shorter contexts, all-empty replay, restored contexts.
+    active_partition_maxima: tuple[int, int, int, int] | None = None
 
 
 def _require_gpu():
@@ -866,6 +868,90 @@ CASES = [
         lengths=(1, 3, 257, 258, 514, 515, 0, 0),
         workgroup_budget=32,
     ),
+    # Preserve the native CU cap while hitting the smaller window task bound.
+    # At the just-over-boundary windows, shortening by seven crosses a tile
+    # boundary and increases the active count; captured refresh must allow it.
+    *_cases(
+        "window lengths cache dtype sink active_partition_maxima",
+        [
+            (
+                "w1024",
+                1024,
+                (0, 1, 1544),
+                (128, 1, 1),
+                BF16,
+                FP32,
+                (5, 6, 0, 5),
+            ),
+            (
+                "bound4",
+                766,
+                (0, 1, 1288),
+                (128, 1, 1),
+                BF16,
+                None,
+                (4, 4, 0, 4),
+            ),
+            (
+                "bound5-refresh-fp16",
+                767,
+                (0, 1, 1288),
+                (16, 0, 1),
+                FP16,
+                FP16,
+                (4, 5, 0, 4),
+            ),
+            (
+                "bound8-scalar",
+                1790,
+                (0, 1, 2312),
+                (128, 1, 0),
+                BF16,
+                FP32,
+                (8, 8, 0, 8),
+            ),
+            (
+                "bound9-refresh",
+                1791,
+                (0, 1, 2312),
+                (64, 0, 1),
+                BF16,
+                BF16,
+                (8, 9, 0, 8),
+            ),
+            (
+                "bound64-fp16",
+                16126,
+                (0, 1, 16648),
+                (128, 1, 1),
+                FP16,
+                FP32,
+                (64, 64, 0, 64),
+            ),
+            (
+                "bound65-refresh",
+                16127,
+                (0, 1, 16648),
+                (16, 1, 1),
+                BF16,
+                None,
+                (64, 65, 0, 64),
+            ),
+        ],
+        prefix="reduce-default-cu-",
+        parts=None,
+    ),
+    _case(
+        "reduce-default-cu-hkv2-head256-fp16",
+        (4, 2, 8, 256),
+        (64, 0, 1),
+        parts=None,
+        window=1024,
+        sink=FP32,
+        dtype=FP16,
+        lengths=(0, 1, 1544),
+        active_partition_maxima=(5, 6, 0, 5),
+    ),
     _case("empty", window=1, sink=FP16, lengths=(0,) * 4),
 ]
 
@@ -932,7 +1018,22 @@ def test_pa_decode(case, planned, monkeypatch):
 
         monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
 
-    def check(disabled_sink=False):
+    reducer_caps = []
+    if plan is not None and case.active_partition_maxima is not None:
+        build_reduce = module.compile_pa_decode_ps_reduce
+        expected_reducer_cap = min(
+            plan.max_partitions, max(case.active_partition_maxima)
+        )
+
+        def compile_reduce(**kwargs):
+            assert kwargs["use_work_plan"]
+            assert kwargs["max_context_partition_num"] == expected_reducer_cap
+            reducer_caps.append(kwargs["max_context_partition_num"])
+            return build_reduce(**kwargs)
+
+        monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compile_reduce)
+
+    def check(disabled_sink=False, phase=0):
         _assert_close(output, reference(sinks=None) if disabled_sink else reference())
         visible = (
             context[:, None]
@@ -945,6 +1046,9 @@ def test_pa_decode(case, planned, monkeypatch):
             assert (output[:, torch.isposinf(sinks)] == 0).all()
         if plan is not None:
             active = _assert_plan(plan, context.cpu().tolist())
+            if case.active_partition_maxima is not None:
+                expected = min(case.active_partition_maxima[phase], plan.max_partitions)
+                assert plan.reduce_info[:, 1].max().item() == expected
             for tensor in scratch:
                 assert torch.isnan(tensor[:, active:]).all()
         elif args[8] == 1:
@@ -972,8 +1076,11 @@ def test_pa_decode(case, planned, monkeypatch):
         for tensor in (output, *scratch):
             tensor.fill_(float("nan"))
         graph.replay()
-        check(disabled_sink=step == 2)
+        check(disabled_sink=step == 2, phase=step + 1)
 
+    if plan is not None and case.active_partition_maxima is not None:
+        assert len(reducer_caps) >= 2  # Both eager and graph capture used the spy.
+        monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", build_reduce)
     _assert_contracts(args, options)
     if plan is not None:
         # Check int32 limits without allocating a matching KV cache.
