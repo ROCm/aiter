@@ -95,6 +95,7 @@ _V4_PACKED_FP8_DTYPES = (torch.float8_e4m3fn, torch.uint8)
 # gcd(bs*584, 8): the units that make the gather row indices integral.
 # ---------------------------------------------------------------------------
 _V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
+_V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE  # 7 quant groups
 _V4_SC_RAW = _V4_DIM_NOPE // _FP8_GROUP_SIZE + 1  # 7 real + 1 pad = 8
 _V4_REC_BYTES = _V4_ROW_BYTES + _V4_SC_RAW  # 584
 _V4_DATA_UNIT = 64
@@ -1192,6 +1193,57 @@ def _pa_decode_sparse_v4_2buff(
         waves_per_eu=reduce_waves_per_eu,
     )
     return out
+
+
+def v4_pack_q_2buff(q: torch.Tensor):
+    """``[..., 512]`` bf16 Q -> ``(packed [..., 512] fp8, rope [..., 64] bf16)``.
+
+    The Q form ``_pa_decode_sparse_v4`` reads on gfx1250 (a8w8):
+
+        [  0, 448)   NoPE, e4m3, one UE8M0 scale per 64-element group
+        [448, 462)   the 7 scale bytes, EACH WRITTEN TWICE
+        [462, 512)   zero
+
+    The duplication is not redundancy: the scaled-MMA blocks are 32 elements
+    wide while the quant group is 64, so the kernel reads each group's scale
+    twice.
+
+    RoPE is never quantized -- it leaves as a separate bf16 plane, which is why
+    this returns a pair.
+
+    Padding head slots must arrive already zeroed and stay zeroed: 0xFF is E8M0
+    NaN, and a NaN scale poisons a whole score row through ``0 * NaN``. An
+    all-zero head packs to an all-zero record here, scale bytes included.
+    """
+    if q.shape[-1] != _V4_DIM_QK:
+        raise RuntimeError(
+            f"q last dim must be {_V4_DIM_QK} (448 NoPE + 64 RoPE), got "
+            f"{q.shape[-1]}"
+        )
+    lead = q.shape[:-1]
+    nope = q[..., :_V4_DIM_NOPE].float()
+    rope = q[..., _V4_DIM_NOPE:].contiguous()
+
+    tiled = nope.reshape(*lead, _V4_NUM_TILES, _FP8_GROUP_SIZE)
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    amax = tiled.abs().amax(dim=-1)
+    # amax/fp8_max rounded UP to a power of two -- exactly what E8M0 stores.
+    scale = torch.pow(2.0, torch.clamp_min(amax / fp8_max, 1e-4).log2().ceil())
+    nope_fp8 = (tiled / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
+    # An all-zero group stores the 1e-4 floor's exponent (114) rather than 0.
+    # That is deliberate: it keeps this bit-identical to the reference packing
+    # the kernel's own tests use, and it is harmless -- the mantissa is zero, so
+    # the group dequantizes to zero whatever the exponent says. What must never
+    # appear is an UNWRITTEN scale byte: 0xFF is E8M0 NaN and a NaN scale
+    # poisons a whole score row through 0 * NaN.
+
+    packed = torch.zeros((*lead, _V4_DIM_QK), dtype=torch.uint8, device=q.device)
+    packed[..., :_V4_DIM_NOPE] = nope_fp8.reshape(*lead, _V4_DIM_NOPE).view(torch.uint8)
+    packed[..., _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES] = (
+        e8m0.repeat_interleave(2, dim=-1)
+    )
+    return packed.view(torch.float8_e4m3fn), rope
 
 
 def _v4_cache_geometry(cache: torch.Tensor, name: str):
