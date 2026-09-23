@@ -10,10 +10,17 @@ Run with ``pytest op_tests/flydsl_tests/test_flydsl_allreduce_policy.py``.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
+from aiter.dist.device_communicators.custom_all_reduce import (
+    CustomAllreduce,
+    is_weak_contiguous,
+)
+from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     SUPPORTED_ATOMS,
@@ -365,6 +372,48 @@ def test_resolvers_reject_unknown_keys():
             resolve("infiniband", 4)
         with pytest.raises(ValueError):
             resolve("pcie", 3)
+
+
+def _full_storage_transpose(nbytes: int) -> torch.Tensor:
+    """A bf16 view that is weakly but not strictly contiguous.
+
+    The transpose of a whole contiguous allocation covers its storage exactly,
+    so ``is_weak_contiguous`` accepts it while ``Tensor.is_contiguous()`` does
+    not -- the gap the FlyDSL selectors have to close.
+    """
+    cols = 64
+    rows = nbytes // (cols * 2)
+    t = torch.zeros(rows, cols, dtype=torch.bfloat16).t()
+    assert not t.is_contiguous() and is_weak_contiguous(t)
+    return t
+
+
+def test_selectors_reject_non_contiguous():
+    """Both FlyDSL selectors decline a weakly-contiguous view.
+
+    ``CustomAllreduce`` admits weakly-contiguous tensors, but both FlyDSL
+    engines require strict contiguity and raise otherwise. Once dispatch has
+    picked FlyDSL the exception replaces the fallback, so the selectors must
+    decline these tensors themselves. Each selector is run against a stand-in
+    ``self`` (the fields it reads), so no process group or GPU is needed. The
+    contiguous copy of the same payload is accepted, which shows the refusal
+    comes from contiguity rather than from size, dtype or alignment.
+    """
+    quant = P.resolve_quant("pcie", 4)
+    qr = SimpleNamespace(
+        _fly_policy=quant, _fly_engines={"mesh": object(), "ring": object()}
+    )
+    t = _full_storage_transpose(quant.floor + (64 << 10))
+    assert QuickAllReduce._should_fly(qr, t.contiguous())
+    assert not QuickAllReduce._should_fly(qr, t)
+
+    one = P.resolve_oneshot("pcie", 4)
+    ca = SimpleNamespace(
+        _fly_oneshot=object(), _fly_policy=one, device=torch.device("cpu")
+    )
+    t = _full_storage_transpose(max(one.min_bytes, 1 << 12))
+    assert CustomAllreduce._should_fly_oneshot(ca, t.contiguous(), True, False)
+    assert not CustomAllreduce._should_fly_oneshot(ca, t, True, False)
 
 
 if __name__ == "__main__":

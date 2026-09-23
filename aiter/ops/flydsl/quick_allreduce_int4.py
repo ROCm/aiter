@@ -260,6 +260,13 @@ def has_xgmi_peer_links() -> bool:
     uncached allocation on any host we cannot classify -- the failure mode of
     guessing "PCIe" on an xGMI box is a silent perf regression on hardware
     where the current design is already optimal.
+
+    The answer is per host, not per process group: one xGMI link anywhere
+    classifies every group on the node as xGMI. That assumes a node is uniformly
+    xGMI or uniformly PCIe, which holds for the single-node systems this targets.
+    On a mixed host, a group of PCIe-only peers would get the xGMI policy and an
+    uncached inbox; fixing that means classifying only the links between the
+    group's own devices.
     """
     try:
         for subdir in ("io_links", "p2p_links"):

@@ -40,6 +40,7 @@ from .rocm_version import get_rocm_version
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
+
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
@@ -817,9 +818,9 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert dist.get_backend(group) != dist.Backend.NCCL, (
-            "CustomAllreduce should be attached to a non-NCCL group."
-        )
+        assert (
+            dist.get_backend(group) != dist.Backend.NCCL
+        ), "CustomAllreduce should be attached to a non-NCCL group."
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
@@ -960,7 +961,7 @@ class CustomAllreduce:
 
         if self.disabled or not _FLY_IMPORT_OK or not fly_policy.enabled():
             return
-        
+
         if self.world_size not in _FLY_SUPPORTED_WORLDS:
             return
 

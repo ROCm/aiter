@@ -136,7 +136,11 @@ def enabled() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def detect_link() -> str:
-    """``"xgmi"`` or ``"pcie"`` for this host, probed once per process."""
+    """``"xgmi"`` or ``"pcie"`` for this host, probed once per process.
+
+    Host-wide, not per group; see ``has_xgmi_peer_links`` for the uniform-node
+    assumption that makes that safe.
+    """
 
     from .quick_allreduce_int4 import has_xgmi_peer_links
 
@@ -195,7 +199,7 @@ def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
 
 def resolve_quant(link: str, world_size: int) -> QuantPolicy:
     """The mesh/ring window for a rank, environment overrides applied."""
-    
+
     base = _base(link, world_size)
     floor = _oneshot_boundary(base)
     mesh = base.mesh_max

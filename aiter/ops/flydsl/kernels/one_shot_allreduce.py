@@ -101,7 +101,7 @@ def _store_v4i32_peer_multi(pairs, policy):
 
 
 DEFAULT_BLOCK = 256
-# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``. 
+# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``.
 # It sets the parallelism floor at a given payload.
 #
 # The trade is flags and per-block fixed cost: the flag count (``blocks * (N-1)``)
@@ -137,7 +137,7 @@ DEFAULT_GRID_CAP = 64
 #                               to 1.5 MiB: at a 16 KiB tile that is 96 tiles,
 #                               so a cap of 64 would leave half the blocks
 #                               running two serialized handshake rounds.
-#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB, 
+#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB,
 #                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
 #     TP8  block 256, atoms=4, cap 64 -- the fattest tile, one rung over the
 #                               whole 80 KiB window: the fanout is to 7 peers
@@ -145,7 +145,7 @@ DEFAULT_GRID_CAP = 64
 #                               the handful of blocks lost.
 #
 #   TODO: xGMI needs to re-measured to see if self-skip is beneficial also here.
-#   xGMI 
+#   xGMI
 #     TP2  atoms=2, cap 64   -- one rung over the whole 4 MiB window.
 #     TP4  atoms=1, cap 128  -- the narrow tile wins throughout, and the extra
 #                               blocks matter more than tile width because peer
@@ -490,10 +490,7 @@ def make_one_shot_allreduce_kernel(
                 )
                 v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
                 _store_v4i32_peer_multi(
-                    [
-                        (peer_vec[peer] + _i32_to_bytes(elem), v4)
-                        for peer in push_peers
-                    ],
+                    [(peer_vec[peer] + _i32_to_bytes(elem), v4) for peer in push_peers],
                     flag_policy,
                 )
 
@@ -513,7 +510,7 @@ def make_one_shot_allreduce_kernel(
             # Computed before the guard rather than nested inside it, so the
             # remap is a flat ``scf.if`` yielding one value.
             spin_src = tid
-            if const_expr(skip_self):
+            if const_expr(skip_self):  # noqa: SIM102
                 if tid >= fx.Int32(self_rank):
                     spin_src = tid + fx.Int32(1)
             if tid < fx.Int32(len(push_peers)):
@@ -624,8 +621,8 @@ def make_one_shot_allreduce_kernel(
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
     # Every compile-time knob that changes the emitted code has to be in the
-    # symbol name, or two variants collide in the JIT cache. At ``atoms == 1``, 
-    # the (peer, atom) product has one atom per peer, so both fanout orders 
+    # symbol name, or two variants collide in the JIT cache. At ``atoms == 1``,
+    # the (peer, atom) product has one atom per peer, so both fanout orders
     # unroll to the same store sequence.
     tag = f"ws{world_size}_a{atoms}_{inbox_memory}"
     if block != DEFAULT_BLOCK:

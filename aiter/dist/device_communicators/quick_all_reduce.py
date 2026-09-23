@@ -43,6 +43,7 @@ except Exception:  # noqa: BLE001
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
     from aiter.ops.flydsl.quick_allreduce_int4 import QuickAllReduceInt4
+
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
@@ -144,9 +145,9 @@ class QuickAllReduce:
             return
 
         self.group = group
-        assert dist.get_backend(group) != dist.Backend.NCCL, (
-            "Custom quick allreduce should be attached to a non-NCCL group."
-        )
+        assert (
+            dist.get_backend(group) != dist.Backend.NCCL
+        ), "Custom quick allreduce should be attached to a non-NCCL group."
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom quick allreduce for
             # multi-node case.
@@ -272,7 +273,6 @@ class QuickAllReduce:
                 else f"{policy.mesh_max >> 10} KiB"
             ),
             sum(e.inbox_bytes for e in self._fly_engines.values()) / 2**20,
-            self.use_fp16_kernels,
         )
 
     def _close_fly_engines(self):
@@ -369,7 +369,7 @@ class QuickAllReduce:
         p = self._fly_policy
         if not p.floor < nbytes <= p.max_bytes:
             return False
-        
+
         return fly_policy.pick_quant_family(nbytes, p) in self._fly_engines
 
     def should_quick_allreduce(self, inp: torch.Tensor):
