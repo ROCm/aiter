@@ -94,7 +94,7 @@ def pod_attention(
             matching respective query tensors.
     """
     _LOGGER.info(
-        f"POD_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        "POD_ATTENTION: q=%s k=%s v=%s", tuple(q.shape), tuple(k.shape), tuple(v.shape)
     )
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
