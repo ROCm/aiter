@@ -305,35 +305,6 @@ def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     return ret
 
 
-def swizzle_scales_gfx950(data):
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
-
-
-def swizzle_scales_gfx1250(data):
-    E, K_SCALE, N = data.shape
-    preshuffle_factor = 32
-    num_chunk_n = N // preshuffle_factor
-    SCALE_KWIDTH = 8
-    num_chunk_k = K_SCALE // SCALE_KWIDTH
-
-    data = data.transpose(-1, -2)
-    data = data.view(E, num_chunk_n, preshuffle_factor, num_chunk_k, SCALE_KWIDTH)
-    data = data.permute(0, 1, 3, 2, 4).contiguous()
-    data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
-    data = data.transpose(-1, -2)
-
-    return data
-
-
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -359,7 +330,7 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    backend: str | None = None,
+    backend: str | Dict | None = None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
