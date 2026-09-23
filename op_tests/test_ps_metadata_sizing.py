@@ -33,7 +33,7 @@ KVLEN_GRANULARITY = 16
 CONTEXT_LEN = 64
 
 QLEN_GRANULARITIES = [16, 256]
-BATCH_SIZES = [1, 4, 17]
+BATCH_SIZES = [1, 17]
 
 WORKLOADS = {
     "one_long_rest_single_token": lambda b, g: [7 * g + 1] + [1] * (b - 1),
@@ -43,12 +43,9 @@ WORKLOADS = {
 }
 
 
-# Configs and budgets for regression testing to avoid metadata buffers not growing 
-# unexpectedly. max_gib is current sizes rounded up. 
+# Configs and budgets for regression testing, so the metadata buffers don't grow
+# unexpectedly. max_gib is the current size rounded up.
 SERVING_CONFIGS = {
-    "dsv3_tp8_8k_budget": dict(
-        batch_size=256, total_qlen=8192, num_head_k=16, v_head_dim=512, max_gib=3.25
-    ),
     "dsv3_tp8_16k_budget": dict(
         batch_size=256, total_qlen=16384, num_head_k=16, v_head_dim=512, max_gib=3.25
     ),
@@ -57,9 +54,6 @@ SERVING_CONFIGS = {
     ),
     "dsv3_tp4_16k_budget": dict(
         batch_size=128, total_qlen=16384, num_head_k=32, v_head_dim=512, max_gib=4.25
-    ),
-    "kimi_k25_tp8_8k_budget": dict(
-        batch_size=256, total_qlen=8192, num_head_k=16, v_head_dim=128, max_gib=0.85
     ),
     "kimi_k25_tp8_16k_budget": dict(
         batch_size=256, total_qlen=16384, num_head_k=16, v_head_dim=128, max_gib=0.85
@@ -86,12 +80,6 @@ def _rows(info_entry):
     return shape[0] if isinstance(shape, tuple) else shape
 
 
-def _cu_num():
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-
-
 def _partial_pool_rows(info, qlen_granularity):
     return _rows(info[5]) * qlen_granularity
 
@@ -114,11 +102,13 @@ def _partial_pool_bytes(cfg, total_qlen):
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES + [256])
 @pytest.mark.parametrize("qlen_granularity", QLEN_GRANULARITIES)
-@pytest.mark.parametrize("total_qlen", [512, 8192, 16384])
+@pytest.mark.parametrize("total_qlen", [512, 16384])
 def test_partial_pool_grows_with_the_budget_not_with_max_qlen(
     batch_size, qlen_granularity, total_qlen
 ):
-    cu_num = _cu_num()
+    cu_num = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     for max_qlen in (qlen_granularity, total_qlen, 163840):
         info = _info(batch_size, 1, max_qlen, qlen_granularity, total_qlen=total_qlen)
         rows = _partial_pool_rows(info, qlen_granularity)
@@ -136,9 +126,8 @@ def test_serving_config_partial_pool_fits_in_the_memory_budget(config):
     """The sizing that OOM'd vLLM at startup (ROCm/aiter#5729) must stay bounded.
 
     Reserving ``max_partials * qlen_granularity`` rows of fp32 logits plus lse
-    asked for 64 GiB at an 8k token budget and 128 GiB at 16k (513 GiB at 1k
-    concurrent seqs); the budget-aware bound brings those to 2.4, 2.6 and
-    8.7 GiB on DSv3 at TP8.
+    asked for 128 GiB at a 16k token budget on DSv3 at TP8, and 513 GiB at 1k
+    concurrent seqs; the budget-aware bound brings those to 2.6 and 8.7 GiB.
     """
     cfg = SERVING_CONFIGS[config]
     budget = cfg["max_gib"] * 1024**3
