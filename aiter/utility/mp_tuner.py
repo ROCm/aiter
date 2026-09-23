@@ -7,6 +7,7 @@ import os
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
 from queue import Empty
+from typing import Any, NamedTuple
 
 import torch
 
@@ -15,6 +16,31 @@ from aiter.test_common import checkAllclose
 
 _TASK_START_TIMES = None
 _TASK_PIDS = None
+
+
+class MpTunerTask(NamedTuple):
+    """One candidate for mp_tuner, by name rather than by position.
+
+    It is still a tuple in the order work_group unpacks, so plain tuples keep
+    working. The optional tail defaults to what work_group assumes when a
+    tuple stops short.
+    """
+
+    info: Any
+    gen_data: Any
+    gen_args: Any
+    func: Any
+    args: Any
+    kwargs: dict
+    ref_func: Any
+    ref_args: Any
+    ref_kwargs: dict
+    ref: Any
+    rtol: float = 1e-2
+    atol: float = 1e-2
+    compare_fn: Any = None
+    max_abs_delta: Any = None
+    output_keys: Any = None
 
 
 def _is_mapping_error(exc: BaseException) -> bool:
