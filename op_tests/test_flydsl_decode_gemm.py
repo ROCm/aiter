@@ -17,8 +17,9 @@ import pandas as pd
 import torch
 
 import aiter
+import aiter.ops.flydsl.gemm_kernels as flydsl_gemm_kernels
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.gemm_kernels import (
     ActivationSource,
     BlockMfmaDecodeConfig,
@@ -28,6 +29,7 @@ from aiter.ops.flydsl.gemm_kernels import (
     gemm_decode_bf16,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_, tgemm
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
@@ -238,12 +240,92 @@ def test_gemm_decode(m, n, k, dtype):
     return ret
 
 
+def _shipped_decode_rows() -> list[tuple]:
+    """Every `flydsl_decode` key in the merged tuned config for this card."""
+    cu_num = get_cu_num()
+    return sorted(
+        key
+        for key, row in get_GEMM_A16W16_config_().items()
+        if row.get("libtype") == "flydsl_decode"
+        and key[0] == ARCH
+        and int(key[1]) == cu_num
+    )
+
+
+def check_tuned_rows_dispatch() -> None:
+    """Every shipped decode row is selected by the dispatcher and runs.
+
+    The cases above call `gemm_decode_bf16` with hand-built configs, so they
+    never touch the tuned CSV. The dispatcher drops a `flydsl_decode` row
+    silently -- no log, no error -- when its kernelName fails to parse or names
+    another shape, and falls through to a different backend. A typo in any
+    shipped row would therefore pass every other check here. This one asks the
+    dispatcher about each row, then drives a few through `tgemm.mm`.
+    """
+    rows = _shipped_decode_rows()
+    if not rows:
+        aiter.logger.warning(
+            "no flydsl_decode rows for %s/cu_num=%s; skipping", ARCH, get_cu_num()
+        )
+        return
+
+    dropped = []
+    for key in rows:
+        _, _, m, n, k, bias, dtype, otype, scale_ab, bpreshuffle = key
+        cfg = get_GEMM_A16W16_config(m, n, k, bias, dtype, otype, scale_ab, bpreshuffle)
+        shipped = get_GEMM_A16W16_config_()[key]["kernelName"]
+        if (
+            cfg is None
+            or cfg.get("libtype") != "flydsl_decode"
+            or cfg.get("kernelName") != shipped
+        ):
+            dropped.append((m, n, k, None if cfg is None else cfg.get("libtype")))
+    assert not dropped, (
+        f"{len(dropped)} of {len(rows)} flydsl_decode rows are not selected by "
+        f"the dispatcher (M, N, K, got): {dropped[:10]}"
+    )
+
+    # End to end through the public entry point: the smallest shape per M, so
+    # the check stays cheap while covering every M the kernel supports.
+    smallest = {}
+    for key in rows:
+        m, n, k = key[2], key[3], key[4]
+        if key[5] is False and (m not in smallest or n * k < smallest[m][0]):
+            smallest[m] = (n * k, n, k)
+    calls = {"n": 0}
+    real = flydsl_gemm_kernels.gemm_decode_bf16
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    flydsl_gemm_kernels.gemm_decode_bf16 = counted
+    try:
+        for m, (_, n, k) in sorted(smallest.items()):
+            a, b = _inputs(m, n, k)
+            before = calls["n"]
+            out = tgemm.mm(a, b)
+            torch.cuda.synchronize()
+            assert (
+                calls["n"] == before + 1
+            ), f"tgemm.mm did not route M={m} ({n},{k}) to the decode kernel"
+            _assert_output(out, _reference(a, b))
+    finally:
+        flydsl_gemm_kernels.gemm_decode_bf16 = real
+    aiter.logger.info(
+        "dispatcher selected all %d decode rows; ran %d through tgemm.mm",
+        len(rows),
+        len(smallest),
+    )
+
+
 CORRECTNESS_CASES = (
     check_wave_no_bias,
     check_wave_bias_and_odd_tails,
     check_block_mfma_global,
     check_block_mfma_lds_k_padding,
     check_block_mfma_persistent_n,
+    check_tuned_rows_dispatch,
 )
 
 
