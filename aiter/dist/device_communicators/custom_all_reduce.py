@@ -15,6 +15,7 @@
 * limitations under the License.
 """
 
+import ctypes
 import os
 import pickle
 from contextlib import contextmanager
@@ -99,6 +100,39 @@ def _expandable_segments_enabled() -> bool:
         if raw:
             return _parse_expandable_segments(raw)
     return False
+
+
+def _ipc_base_ptr(data_ptr: int) -> int:
+    """Base address of the device allocation containing *data_ptr*.
+
+    ``hipIpcGetMemHandle`` always returns a handle for the whole allocation
+    that contains the pointer, never for the pointer itself, and the importing
+    rank maps that allocation at its own base address. A buffer that is a
+    sub-block of a larger allocation therefore has to travel with its
+    ``data_ptr - base`` offset, or peers address the wrong region -- silently
+    reading whatever else lives at the base of that allocation.
+
+    The C++ graph path already does exactly this (``get_graph_buffer_ipc_meta``
+    in ``csrc/include/custom_all_reduce.cuh``); this is the Python-side
+    equivalent for the named pool buffers.
+
+    Raw ``hipMalloc``/``hipExtMallocWithFlags`` buffers are their own base, so
+    this returns *data_ptr* unchanged for them.
+    """
+    from .vmm_allocator import load_hip_runtime
+
+    hip = load_hip_runtime()
+    base = ctypes.c_void_p()
+    size = ctypes.c_size_t()
+    err = hip.hipMemGetAddressRange(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(data_ptr)
+    )
+    if err != 0 or not base.value:
+        raise RuntimeError(
+            f"hipMemGetAddressRange failed (err={err}) for pointer "
+            f"0x{data_ptr:x}; cannot compute the IPC handle offset"
+        )
+    return base.value
 
 
 # ROCm release at which hipIpc is reported to work on gfx1250. Below this we fall
@@ -601,10 +635,15 @@ class IPCBufferPool:
     # ---- Private IPC primitives ----
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
-        """Get IPC handle for *data_ptr* and broadcast across all ranks."""
+        """Get IPC handle + offset for *data_ptr* and broadcast across ranks.
+
+        The handle covers the whole allocation containing *data_ptr*, so the
+        buffer's offset within it travels alongside; see _ipc_base_ptr.
+        """
+        base_ptr = _ipc_base_ptr(data_ptr)
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
-        self._ipc_handle_fn(data_ptr, handle.data_ptr())
-        return self._gather_ipc_meta((handle, 0))
+        self._ipc_handle_fn(base_ptr, handle.data_ptr())
+        return self._gather_ipc_meta((handle, data_ptr - base_ptr))
 
     def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
@@ -1057,11 +1096,16 @@ class CustomAllreduce:
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
         # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
-        # expandable segments. Its use case is co-resident engines on one node
-        # (#4921): a second engine's torch.empty input pool can fail
-        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
-        # everything else (meta pool, capture-time outputs) stays exportable
-        # under the default allocator.
+        # expandable segments. It remains as an escape hatch only. It used to
+        # be the mitigation for co-resident engines on one node, where a second
+        # engine's torch.empty pool lands as a sub-block of an already-cached
+        # allocator segment; the real bug there was _broadcast_ipc pinning the
+        # IPC offset to 0, so peers addressed the segment base instead of the
+        # pool. That is fixed in _broadcast_ipc / _ipc_base_ptr, and the
+        # default torch.empty pool is correct for sub-block pointers again --
+        # which matters because a raw hipMalloc pool is invisible to torch's
+        # memory accounting, so engines that size their KV cache from it
+        # over-estimate free memory.
         raw_cached = _expandable_segments_enabled() or env_flag(
             "AITER_CUSTOM_AR_RAW_INPUT_POOL"
         )
