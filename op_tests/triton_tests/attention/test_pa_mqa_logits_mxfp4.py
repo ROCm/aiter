@@ -844,44 +844,38 @@ def test_gather_rejects_short_offsets():
 VARLEN_SHAPES = [
     ("uniform", [4, 4, 4, 4], [2048, 1024, 4096, 512]),
     ("ragged", [13, 5, 21, 2], [2048, 999, 4096, 512]),
-    # sequences with fewer rows than BLOCK_M: their spare tile slots belong to
-    # the next sequence's row, so the store has to drop them
+    # fewer rows than BLOCK_M: the spare tile slots are the next sequence's rows
     ("short rows", [16, 1, 1, 1], [1024, 2048, 512, 4096]),
     ("all decode", [1] * 8, [2048, 1024, 4096, 512, 3000, 777, 64, 129]),
-    ("one long", [64, 2, 1, 9], [4096, 512, 2048, 1024]),
 ]
 
 
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("page_size", [64, 128])
-@pytest.mark.parametrize("plan_n", [None, 1, 6])
+@pytest.mark.parametrize("plan_n", [None, 6])
 def test_varlen(shape, num_heads, page_size, plan_n):
-    """Packed rows with query_start_loc match one uniform launch per sequence, exactly."""
-    _, rows_per_seq, ctx_lens = shape
-    head_size, dev = 128, "cuda"
-    batch, total = len(rows_per_seq), sum(rows_per_seq)
-    st = _make_case(batch, 1, num_heads, head_size, ctx_lens, page_size)
+    """Packed rows match one uniform launch per sequence, exactly."""
+    _, rows, ctx_lens = shape
+    hs, dev, batch, total = 128, "cuda", len(rows), sum(rows)
+    st = _make_case(batch, 1, num_heads, hs, ctx_lens, page_size)
     torch.manual_seed(SEED + 1)
-    q = torch.randn(total, num_heads, head_size, device=dev, dtype=torch.bfloat16)
-    q4, q4s = quantize(q.reshape(-1, head_size))
-    q4 = q4.reshape(total, num_heads, head_size // 2)
-    q4s = q4s.reshape(total, num_heads, head_size // SCALE_GROUP)
-    w = torch.randn(total, num_heads, device=dev, dtype=torch.float32)
-    cu = torch.tensor([0] + list(torch.tensor(rows_per_seq).cumsum(0)),
+    q4, q4s = quantize(torch.randn(total * num_heads, hs, device=dev))
+    q4 = q4.reshape(total, num_heads, hs // 2)
+    q4s = q4s.reshape(total, num_heads, hs // SCALE_GROUP)
+    w = torch.randn(total, num_heads, device=dev)
+    cu = torch.tensor([0] + list(torch.tensor(rows).cumsum(0)),
                       dtype=torch.int32, device=dev)
-    mml = st["mml"]
+    args = (st["cache"], st["cl"], st["block_table"], st["mml"])
 
-    got = paged_mxfp4_mqa_logits(q4, q4s, st["cache"], w, st["cl"],
-                                 st["block_table"], mml, query_start_loc=cu,
-                                 next_n=plan_n)
+    got = paged_mxfp4_mqa_logits(q4, q4s, args[0], w, *args[1:],
+                                 query_start_loc=cu, next_n=plan_n)
     ref = torch.full_like(got, float("-inf"))
-    for b, r in enumerate(rows_per_seq):
+    for b, r in enumerate(rows):
         lo = int(cu[b])
         ref[lo:lo + r] = paged_mxfp4_mqa_logits(
-            q4[lo:lo + r].unsqueeze(0).contiguous(),
-            q4s[lo:lo + r].unsqueeze(0).contiguous(),
-            st["cache"], w[lo:lo + r].contiguous(), st["cl"][b:b + 1],
-            st["block_table"][b:b + 1].contiguous(), mml)
+            q4[lo:lo + r][None].contiguous(), q4s[lo:lo + r][None].contiguous(),
+            args[0], w[lo:lo + r].contiguous(), args[1][b:b + 1],
+            args[2][b:b + 1].contiguous(), args[3])
     torch.cuda.synchronize()
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))

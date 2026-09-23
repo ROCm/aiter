@@ -969,9 +969,8 @@ class Program:
                 scores = gl.where(pos < row_hi[r], scores, float("-inf"))
                 if cfg.STORE_LOGITS:
                     mask = pos < self.store_hi
-            # A varlen tile can hold rows past the end of its sequence -- the
-            # slot belongs to the next sequence's row, so it must not store.
-            # The shared predicate only selects -inf into the values.
+            # A slot past the sequence is the next sequence's row: the shared
+            # predicate only selects -inf, so it has to be masked out here.
             if cfg.VARLEN and cfg.BLOCK_M > 1 and cfg.STORE_LOGITS:
                 mask = mask & (row_hi[r] > 0)
             if cfg.STORE_LOGITS:
@@ -1221,8 +1220,6 @@ def _pa_mqa_logits_mxfp4_kernel(
     if context_len <= 0:
         return
 
-    # Under VARLEN the rows are packed and query_start_loc says where this sequence starts
-    # and how many it owns; otherwise every sequence owns next_n.
     if VARLEN:
         q_start = gl.load(query_start_loc_ptr + batch_id)
         rows = gl.load(query_start_loc_ptr + batch_id + 1) - q_start
@@ -1356,10 +1353,10 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
         blive = b < batch
         q0 = tl.load(query_start_loc_ptr + b, mask=blive, other=0)
         rows_of = tl.load(query_start_loc_ptr + b + 1, mask=blive, other=0) - q0
-        # The unit space is query_start_loc[s] // BLOCK_M + s. The + s gives every
-        # sequence one spare unit, which absorbs its partial last block and
-        # keeps the space monotone -- that is what makes the search below work
-        # and what bounds the count at total_rows // BLOCK_M + batch.
+        # Unit space is query_start_loc[s] // BLOCK_M + s: the spare unit per
+        # sequence absorbs its partial last block, which keeps the space
+        # monotone for the search and bounds the count at
+        # total_rows // BLOCK_M + batch.
         ustart = q0 // BLOCK_M + b
         found = (ustart[None, :] <= unit[:, None]) & blive[None, :]
         seq = tl.maximum(tl.sum(found.to(tl.int32), axis=1) - 1, 0)
