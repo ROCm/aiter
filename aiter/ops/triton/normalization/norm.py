@@ -260,7 +260,9 @@ def layer_norm(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
-    _LOGGER.info(f"LAYERNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
+    _LOGGER.info(
+        "LAYERNORM: input=%s weight=%s ", tuple(input.shape), tuple(weight.shape)
+    )
     return _LayerNorm.apply(input, weight, bias, eps, torch.is_grad_enabled())
 
 
@@ -291,7 +293,10 @@ def layernorm2d_fwd_with_add(
     - residual_out: Output tensor that is input + residual_in with shape (M, N).
     """
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+        "LAYERNORM_2D_FWD_ADD: input=%s weight=%s residual_in=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
     )
     return _Layernorm2dFwdWithAdd.apply(
         out,
@@ -330,7 +335,10 @@ def layernorm2d_fwd_with_dynamicquant(
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+        "LAYERNORM_2D_FWD_DYNAMICQUANT: input=%s weight=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(yscale.shape),
     )
     M, N = input.shape
 
@@ -392,7 +400,11 @@ def layernorm2d_fwd_with_smoothquant(
     - Output: The output tensor with shape (M, N).
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "LAYERNORM_2D_FWD_SMOOTHQUANT: input=%s weight=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     M, N = input.shape
 
@@ -457,7 +469,11 @@ def layernorm2d_fwd_with_add_dynamicquant(
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+        "LAYERNORM_2D_FWD_ADD_DYNAMICQUANT: input=%s weight=%s residual_in=%s yscale=%s  ",
+        input.shape,
+        weight.shape,
+        residual_in.shape,
+        yscale.shape,
     )
     M, N = input.shape
 
@@ -527,8 +543,12 @@ def layernorm2d_fwd_with_add_smoothquant(
     """
 
     _LOGGER.info(
-        f"LAYERNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
-        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "LAYERNORM_2D_FWD_ADD_SMOOTHQUANT: input=%s weight=%s residual_in=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     M, N = input.shape
 
