@@ -596,49 +596,6 @@ static fmha_v3_varlen_fwd_impl(at::Tensor &q,      // [total_q, hq, d]
 }
 
 std::vector<at::Tensor>
-fmha_v3_varlen_splitkv_fwd(at::Tensor &q,
-                           const at::Tensor &k,
-                           const at::Tensor &v,
-                           const at::Tensor &cu_seqlens_q,
-                           const at::Tensor &cu_seqlens_k,
-                           int max_seqlen_q,
-                           int max_seqlen_k,
-                           float softmax_scale,
-                           bool return_softmax_lse,
-                           int num_splits)
-{
-    return fmha_v3_varlen_fwd_impl(q,
-                                   k,
-                                   v,
-                                   cu_seqlens_q,
-                                   cu_seqlens_k,
-                                   max_seqlen_q,
-                                   max_seqlen_k,
-                                   0,
-                                   0.0f,
-                                   softmax_scale,
-                                   0.0f,
-                                   false,
-                                   false,
-                                   -1,
-                                   -1,
-                                   return_softmax_lse,
-                                   false,
-                                   1,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   std::nullopt,
-                                   num_splits);
-}
-
-std::vector<at::Tensor>
 fmha_v3_varlen_fwd(at::Tensor &q,
                    const at::Tensor &k,
                    const at::Tensor &v,
@@ -666,7 +623,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,
                    std::optional<const at::Tensor> v_descale,
                    std::optional<at::Generator> gen,
                    std::optional<const at::Tensor> cu_seqlens_q_padded,
-                   std::optional<const at::Tensor> cu_seqlens_k_padded)
+                   std::optional<const at::Tensor> cu_seqlens_k_padded,
+                   int num_splits)
 {
     return fmha_v3_varlen_fwd_impl(q,
                                    k,
@@ -696,7 +654,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,
                                    gen,
                                    cu_seqlens_q_padded,
                                    cu_seqlens_k_padded,
-                                   0);
+                                   num_splits);
 }
 
 } // namespace torch_itfs
