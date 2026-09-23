@@ -34,13 +34,21 @@ def cache_strides(kv_cache, head_size, kv_scale_cache=None):
     addresses the wrong page, which is silent.
     """
     if kv_scale_cache is None:
-        _, _, page_size, page_bytes = _split_cache(kv_cache, head_size)
-        return page_size, page_bytes, page_bytes
-    num_pages = kv_cache.shape[0]
-    head_bytes = head_size // 2
-    page_size = kv_cache.reshape(num_pages, -1).shape[1] // head_bytes
-    return (page_size, page_size * head_bytes,
-            page_size * (head_size // SCALE_GROUP))
+        _, _, page_size, page_stride = _split_cache(kv_cache, head_size)
+        return page_size, page_stride, page_stride
+    page_size = kv_cache[0].numel() // (head_size // 2)
+    return page_size, kv_cache.stride(0), kv_scale_cache.stride(0)
+
+
+def offset_dtype(num_pages, kv_stride, kvs_stride, s_unit):
+    """The width the resolved offsets need.
+
+    int32 while both streams still reach: values are stored in K_WIDTH units
+    and scales in s_unit, so the scales bind first -- 4 GiB against 32 GiB.
+    """
+    fits = (num_pages * kv_stride <= 2 ** 31 * K_WIDTH
+            and num_pages * kvs_stride <= 2 ** 31 * s_unit)
+    return torch.int32 if fits else torch.int64
 
 
 def gather_s_unit(block, num_scales):
@@ -56,7 +64,8 @@ def gather_s_unit(block, num_scales):
 
 
 def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
-                  kv_stride, kvs_stride, block, preshuffle=1, scale_mode=1):
+                  kv_stride, kvs_stride, block, preshuffle=1, scale_mode=1,
+                  dtype=torch.int32):
     """Resolved (value, scale) offsets for the candidate blocks starting at pos0.
 
     `pos0` is [R, K] int64 KV positions, each a multiple of the candidate block
@@ -103,14 +112,14 @@ def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
     # page, which is what makes this file's opening `c` term loop invariant. A
     # misaligned start satisfies both checks above and reads the wrong bytes.
     assert p_mod == 0, "positions must be block-aligned"
-    assert v_max < 2 ** 31 and s_max < 2 ** 31, (
-        "resolved offsets are i32: the reachable cache is 2 GiB of scale bytes "
-        "and 32 GiB of value bytes on this path")
-    return (voff // K_WIDTH).to(torch.int32), (soff // s_unit).to(torch.int32)
+    assert dtype == torch.int64 or (v_max < 2 ** 31 and s_max < 2 ** 31), (
+        "resolved offsets do not fit i32; pass dtype=torch.int64")
+    return (voff // K_WIDTH).to(dtype), (soff // s_unit).to(dtype)
 
 
 def build_gather(positions, block_table, kv_cache, num_heads, head_size,
-                 block=8, kv_scale_cache=None, preshuffle=1, scale_mode=1):
+                 block=8, kv_scale_cache=None, preshuffle=1, scale_mode=1,
+                 dtype=None):
     """[R, K] int64 block-start positions -> the kernel's `gather=` argument.
 
     `positions[r]` must be sorted ascending, unique, every entry a multiple of
@@ -126,9 +135,12 @@ def build_gather(positions, block_table, kv_cache, num_heads, head_size,
                                                      kv_scale_cache)
     assert page_size % block == 0 and block <= n_per_tile
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
+    if dtype is None:
+        dtype = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride,
+                             gather_s_unit(block, head_size // SCALE_GROUP))
     voff, soff = block_offsets(positions, block_table, page_size, head_size,
                                n_per_tile, kv_stride, kvs_stride, block,
-                               preshuffle, scale_mode)
+                               preshuffle, scale_mode, dtype)
     return dict(voff=voff.contiguous(), soff=soff.contiguous(), block=block,
                 positions=positions)
 

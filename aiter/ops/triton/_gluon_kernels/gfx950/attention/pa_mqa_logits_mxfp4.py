@@ -155,6 +155,7 @@ def _prepare_candidates_kernel(
     HEAD_BYTES: tl.constexpr, NUM_SCALES: tl.constexpr,
     KV_STRIDE: tl.constexpr, KVS_STRIDE: tl.constexpr,
     KW: tl.constexpr, SU: tl.constexpr, TOK_STRIDE: tl.constexpr,
+    OFF64: tl.constexpr,
 ):
     """Ranked block ids -> the walk's candidate list, one row per program.
 
@@ -185,10 +186,11 @@ def _prepare_candidates_kernel(
     pid = tl.load(bt_ptr + row * stride_bt + page).to(tl.int64)
     bn = (t0 % NPT) * KW + (t0 // NPT) * (NPT * HEAD_BYTES)
     bs = (t0 % NPT) * TOK_STRIDE + (t0 // NPT) * (NPT * NUM_SCALES)
-    tl.store(voff_ptr + row * K + cols,
-             ((pid * KV_STRIDE + bn) // KW).to(tl.int32))
-    tl.store(soff_ptr + row * K + cols,
-             ((pid * KVS_STRIDE + bs) // SU).to(tl.int32))
+    v = (pid * KV_STRIDE + bn) // KW
+    sc = (pid * KVS_STRIDE + bs) // SU
+    # i32 while it reaches; a pool past 4 GiB of scale bytes needs the width
+    tl.store(voff_ptr + row * K + cols, v if OFF64 else v.to(tl.int32))
+    tl.store(soff_ptr + row * K + cols, sc if OFF64 else sc.to(tl.int32))
 
 @gluon.jit
 def _max_nan(a, b):

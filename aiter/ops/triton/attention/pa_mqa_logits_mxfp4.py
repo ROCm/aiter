@@ -144,14 +144,20 @@ def pack_cache(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 
 def _split_cache(kv_cache: torch.Tensor, head_size: int):
+    """(values, scales, page_size, page stride in bytes).
+
+    A page is contiguous in itself but pages need not be adjacent: vLLM keeps
+    one layer's pages inside a block-major pool, a whole block apart. view() so
+    a cache that is not contiguous within a page raises instead of being copied
+    on every call.
+    """
     num_pages = kv_cache.shape[0]
-    flat = kv_cache.reshape(num_pages, -1)
-    page_bytes = flat.shape[1]
+    flat = kv_cache.view(num_pages, -1)
     idim = head_size // 2 + head_size // SCALE_GROUP
-    page_size = page_bytes // idim
+    page_size = flat.shape[1] // idim
     head_bytes = head_size // 2
     return (flat[:, :page_size * head_bytes], flat[:, page_size * head_bytes:],
-            page_size, page_bytes)
+            page_size, flat.stride(0))
 
 
 # heuristics
@@ -277,19 +283,21 @@ def select_config(num_heads, head_size, next_n, page_size, preshuffle=1,
 
 def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
                            head_size, block=CANDIDATE_BLOCK,
-                           kv_scale_cache=None, scale_mode=SCALE_MODE_WIDE):
+                           kv_scale_cache=None, scale_mode=SCALE_MODE_WIDE,
+                           offsets=None):
     """Ranked block ids -> (gather, cu_ends), in one launch.
 
     candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
     ends:        [B * NEXT_N] int32 exclusive per-row key bound
     block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row
+    offsets:     resolved-offset width; None picks it from the cache's span
 
     Does what build_gather does from positions, plus the sort and the slot
     count, so a layer group builds the pool once and hands it to every
     consumer.
     """
     from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import (
-        cache_strides, gather_s_unit)
+        cache_strides, gather_s_unit, offset_dtype)
     rows, k = candidates.shape
     assert k & (k - 1) == 0, "the sort needs a power-of-two candidate count"
     # One program per row, so the warps are what fills the machine when the
@@ -304,17 +312,20 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
     num_scales = head_size // SCALE_GROUP
     s_lo = 64 // n_per_tile
     dev = candidates.device
+    s_unit = gather_s_unit(block, num_scales)
+    if offsets is None:
+        offsets = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride, s_unit)
     pos = torch.empty((rows, k), dtype=torch.int64, device=dev)
     cu = torch.empty((rows,), dtype=torch.int32, device=dev)
-    voff = torch.empty((rows, k), dtype=torch.int32, device=dev)
-    soff = torch.empty((rows, k), dtype=torch.int32, device=dev)
+    voff = torch.empty((rows, k), dtype=offsets, device=dev)
+    soff = torch.empty((rows, k), dtype=offsets, device=dev)
     _prepare_candidates_kernel[(rows,)](
         candidates, ends, block_table, pos, cu, voff, soff,
         candidates.stride(0), block_table.stride(0), k, block, page_size,
         n_per_tile, head_size // 2, num_scales, kv_stride, kvs_stride,
-        K_WIDTH, gather_s_unit(block, num_scales),
+        K_WIDTH, s_unit,
         (num_scales // s_lo) if scale_mode == SCALE_MODE_WIDE else 1,
-        num_warps=num_warps)
+        OFF64=offsets == torch.int64, num_warps=num_warps)
     return dict(voff=voff, soff=soff, block=block, positions=pos), cu
 
 def build_schedule(context_lens, next_n, num_heads, head_size,
@@ -497,15 +508,15 @@ def paged_mxfp4_mqa_logits(
     # page_size comes from the cache rather than the caller: both layouts pin it
     # exactly, and a second source could disagree with the bytes.
     if kv_scale_cache is None:
-        values, scales, page_size, page_bytes = _split_cache(kv_cache, head_size)
-        kv_page_stride = kvs_page_stride = page_bytes
+        values, scales, page_size, page_stride = _split_cache(kv_cache, head_size)
+        kv_page_stride = kvs_page_stride = page_stride
         num_pages = kv_cache.shape[0]
     else:
         values, scales = kv_cache, kv_scale_cache
         num_pages = values.shape[0]
-        page_size = values.reshape(num_pages, -1).shape[1] // head_bytes
-        kv_page_stride = page_size * head_bytes
-        kvs_page_stride = page_size * num_scales
+        page_size = values[0].numel() // head_bytes
+        kv_page_stride = values.stride(0)
+        kvs_page_stride = scales.stride(0)
     assert values.dtype == torch.uint8 and scales.dtype == torch.uint8
     assert kv_page_stride % 16 == 0, (
         f"value page stride ({kv_page_stride} B) must be 16-byte aligned or the "
@@ -567,7 +578,8 @@ def paged_mxfp4_mqa_logits(
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:
         g_voff, g_soff = gather["voff"], gather["soff"]
-        assert g_voff.dtype == torch.int32 and g_soff.dtype == torch.int32
+        assert g_voff.dtype == g_soff.dtype, "both streams take one width"
+        assert g_voff.dtype in (torch.int32, torch.int64), g_voff.dtype
         assert g_voff.shape == g_soff.shape, (g_voff.shape, g_soff.shape)
         assert g_voff.stride(1) == 1 and g_soff.stride(1) == 1
         assert g_voff.stride(0) == g_soff.stride(0)
@@ -618,9 +630,8 @@ def paged_mxfp4_mqa_logits(
         assert block_kv % gather_block == 0 and page_size % gather_block == 0
         assert gather_block <= n_per_tile, (
             "a candidate block must sit inside one shuffle group")
-        # The whole address is in the offsets here, so a cache past 2 GiB drops
-        # to 64-bit
-        use_buffer_load = num_pages * max(kv_page_stride, kvs_page_stride) < 2 ** 31
+        # The whole address is in the list here, so its width decides.
+        use_buffer_load = gather["voff"].dtype == torch.int32
 
     # The two that need the batch, which select_config does not see.
     cfg["num_kv_splits"] = _kv_splits(

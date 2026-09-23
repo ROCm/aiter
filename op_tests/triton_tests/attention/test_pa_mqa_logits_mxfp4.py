@@ -753,3 +753,51 @@ def test_candidates_implicit(num_heads):
                                use_gather=True, candidates=ids, cu_ends=ends)
     torch.cuda.synchronize()
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("pad", [256, 9472])
+def test_strided_pages(num_heads, page_size, pad):
+    """Pages a whole block apart, as vLLM's block-major pool lays them out."""
+    st = _make_case(2, 1, num_heads, 128, [4096, 2048], page_size)
+    cache = st["cache"]
+    pages, page_bytes = cache.shape[0], cache[0].numel()
+    stride = page_bytes + pad
+    pool = torch.zeros(pages * stride, dtype=torch.uint8, device=st["dev"])
+    torch.as_strided(pool, (pages, page_bytes), (stride, 1), 0).copy_(
+        cache.view(pages, -1))
+    strided = torch.as_strided(pool, cache.shape,
+                               (stride,) + cache.stride()[1:], 0)
+
+    args = (st["q4"], st["q4s"])
+    rest = (st["weights"], st["cl"], st["block_table"], st["mml"])
+    ref = paged_mxfp4_mqa_logits(*args, cache, *rest)
+    got = paged_mxfp4_mqa_logits(*args, strided, *rest)
+    torch.cuda.synchronize()
+    assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("block", [8, 32])
+def test_gather_offsets_i64(num_heads, block):
+    """A 64-bit candidate list, for a pool past the i32 reach, walks the same."""
+    rows, K = 4, 128
+    st = _make_case(1, rows, num_heads, 128, [4096], 64)
+    g = torch.Generator(device=st["dev"]).manual_seed(11)
+    ids = torch.rand(rows, st["ctx"][0] // block, generator=g,
+                     device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
+    ends = row_ends(st["ctx"], rows, None)
+    bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
+
+    out = []
+    for width in (torch.int32, torch.int64):
+        meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
+                                          128, block, offsets=width)
+        assert meta["voff"].dtype == width and meta["soff"].dtype == width
+        out.append(paged_mxfp4_mqa_logits(
+            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
+            st["block_table"], K * block, use_gather=True, candidates=meta,
+            cu_ends=cu, candidate_block_size=block))
+    torch.cuda.synchronize()
+    assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
