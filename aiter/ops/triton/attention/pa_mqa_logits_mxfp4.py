@@ -210,6 +210,14 @@ def _kv_splits(batch, row_blocks, max_model_len, block_kv, target_wgs,
     by_occupancy = (target_wgs + tile_q - 1) // tile_q
     by_balance = (n_tiles + max_tiles - 1) // max_tiles
     by_length = max(1, n_tiles // max(1, min_tiles))
+    # A second wave that is only part filled costs a whole wave of latency for
+    # a fraction of the work, so drop back to one. Not worth it once the launch
+    # is tall enough to hide the tail, or if it would leave the machine idle.
+    if by_occupancy < by_balance < CAP_ENGAGE * by_occupancy:
+        if tile_q * by_balance < 2 * target_wgs:
+            whole = max(1, target_wgs // tile_q)
+            if whole * tile_q >= 0.9 * target_wgs:
+                by_balance = by_occupancy = whole
     return max(1, min(max(by_occupancy, by_balance), by_length))
 
 
