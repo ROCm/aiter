@@ -931,6 +931,9 @@ def fused_moe(
             stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+        ep_combine_quant=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         ep_source_token_map=scatter_source_map,
         output=output,
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
@@ -972,6 +975,7 @@ def fused_moe_fake(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
@@ -1032,6 +1036,7 @@ def fused_moe_(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
@@ -1047,6 +1052,7 @@ def fused_moe_(
             max_tokens_per_rank=ep_max_tokens_per_rank,
             world_size=ep_world_size,
             source_token_map=ep_source_token_map,
+            combine_quant_bits=int(ep_combine_quant),
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -2996,10 +3002,6 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
     keys = (
         gfx,
         cu_num,
