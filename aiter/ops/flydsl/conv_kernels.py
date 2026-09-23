@@ -420,7 +420,12 @@ def _tuned_rows_by_layer():
 
 
 def _borrow_tuned_tile(dev, key):
-    """Nearest same-layer tuned tile by npq, or None. Does not borrow splitK."""
+    """Nearest same-layer tuned tile by npq, or None. Does not borrow splitK.
+
+    Two bars, both of which drop back to ``_pick_tile``: the row has to be
+    within ``_BORROW_NPQ_RATIO`` of the npq being served, and its tile has to
+    still fill the device there (``_tile_fills_device``).
+    """
     rows = _tuned_rows_by_layer().get(dev + _layer_key(key))
     if not rows:
         return None
@@ -429,6 +434,9 @@ def _borrow_tuned_tile(dev, key):
         return None
     npq, hit = min(rows, key=lambda row: abs(row[0] - want))
     if not npq or not 1 / _BORROW_NPQ_RATIO <= want / npq <= _BORROW_NPQ_RATIO:
+        return None
+    f = dict(zip(TUNED_KEY_COLUMNS, key))
+    if not _tile_fills_device(want, f["K"], f["groups"], hit[0], dev[1]):
         return None
     return (hit[0], hit[1], None)
 
@@ -490,16 +498,29 @@ def _blocks(npq, kg, groups, tile):
     return ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
 
 
+def _tile_fills_device(npq, k, groups, tile, num_cu):
+    """Whether ``tile`` still has the waves to fill ``num_cu`` CUs at this npq.
+
+    The bar ``_pick_tile`` holds its own ladder to, factored out so a borrowed
+    tile is held to it as well: a tuned tile transfers to another resolution of
+    its layer only while M stays large enough that the tile shape is not what
+    decides occupancy. Below the bar it measured up to 2.0x slower than the
+    heuristic's own pick, which is why ``_borrow_tuned_tile`` drops it there.
+    """
+    kg = k // groups
+    return _blocks(npq, kg, groups, tile) * tile[2] * tile[3] >= (
+        TILE_MIN_WAVES_PER_CU * num_cu
+    )
+
+
 def _pick_tile(npq, k, groups, device):
     kg = k // groups
-    target = TILE_MIN_WAVES_PER_CU * _num_cu(device)
+    num_cu = _num_cu(device)
 
     # Single-n-tile wide case first; see TILE_WIDE_N. The wave check keeps it off
     # problems too small to fill the device, where the halved M grid would hurt.
-    if (
-        TILE_WIDE_N_MIN_KG <= kg <= TILE_WIDE_N[1]
-        and _blocks(npq, kg, groups, TILE_WIDE_N) * TILE_WIDE_N[2] * TILE_WIDE_N[3]
-        >= target
+    if TILE_WIDE_N_MIN_KG <= kg <= TILE_WIDE_N[1] and _tile_fills_device(
+        npq, k, groups, TILE_WIDE_N, num_cu
     ):
         return TILE_WIDE_N
 
@@ -510,9 +531,9 @@ def _pick_tile(npq, k, groups, device):
     legal = [t for t in TILE_LADDER if kg >= t[1] * TILE_MIN_N_FILL] or [
         TILE_LADDER[-1]
     ]
-    for tile_m, tile_n, wave_m, wave_n in legal:
-        if _blocks(npq, kg, groups, (tile_m, tile_n)) * wave_m * wave_n >= target:
-            return (tile_m, tile_n, wave_m, wave_n)
+    for tile in legal:
+        if _tile_fills_device(npq, k, groups, tile, num_cu):
+            return tile
     return legal[-1]
 
 
