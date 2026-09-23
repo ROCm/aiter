@@ -109,7 +109,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     }
 }
 
-template <bool RAGGED>
+template <bool RAGGED, bool NT>
 __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     int pitch,
                                     RowExtents<RAGGED> extents,
@@ -236,7 +236,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         vfloat4 v       = {0.f, 0.f, 0.f, 0.f};
         const bool live = (i < i1);
         if(live)
-            v = load_row_f4<RAGGED>(ri, i, len);
+            v = load_row_f4<RAGGED, NT>(ri, i, len);
         const int base_idx = i * FP32_EPT;
         const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
         const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
@@ -318,6 +318,10 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 //       __syncthreads, the serial prefix over waves and the block atomicAdd stay.
 //   2 = return right after the filter loop: the whole epilogue goes.
 // Both give wrong results and exist only to price a half.
+#ifndef NT_CAND
+#define NT_CAND 0
+#endif
+
 #ifndef ABLATE_EPI
 #define ABLATE_EPI 0
 #endif
@@ -570,13 +574,34 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     const int c          = (int)c_raw;
     const uint64_t* base = cand_pack + (size_t)row * cap;
 
+    // Prices the other half of fusing phase_b into phase_c: if the candidates were
+    // already in this block's LDS, this read would not happen. Wrong results.
+#ifndef ABLATE_CREAD
+#define ABLATE_CREAD 0
+#endif
+#if ABLATE_CREAD
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
-        uint64_t p    = base[i];
+        s_keys_ext[i] = (uint32_t)i;
+        if(!keys_only)
+            s_idx[i] = i;
+    }
+#else
+    for(int i = threadIdx.x; i < c; i += blockDim.x)
+    {
+#if NT_CAND
+        // The candidate array is read once here and never again, and phase_b now
+        // writes it non-temporally so it is not in cache to begin with. Pricing
+        // knob: NT_CAND=0 puts the ordinary load back.
+        uint64_t p = __builtin_nontemporal_load(&base[i]);
+#else
+        uint64_t p = base[i];
+#endif
         s_keys_ext[i] = fp32_to_sortable_bits((uint32_t)(p >> 32));
         if(!keys_only)
             s_idx[i] = (int)(uint32_t)p;
     }
+#endif
     __syncthreads();
 
     uint32_t pivot;

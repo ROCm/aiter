@@ -53,6 +53,10 @@ static float g_margin    = 0.0f; // 0 => derive from the estimator's own noise
 // with R0 = K*S/N (the margin-free rank) reproduces 1.36 at K=2048 and demands
 // 2.13 at K=512, which is what the data shows.
 // auto_margin() lives in topk_generalize.hip.hpp
+// Distinct from g_use_nt_load above: that one flips a __constant__ read inside
+// load_f4, so it applies to every phase and costs a branch in the innermost
+// load. This one is a template parameter on phase_b only.
+static int g_nt_load     = -1;  // -1 = the size gate below, 0 = never, 1 = always
 static int g_cf_block    = 512; // Phase B block size
 static int g_cf_gx       = 16;  // Phase B blocks per row (grid.x)
 static int g_use_nt_load = 0;   // non-temporal streaming loads in Phase B
@@ -646,6 +650,20 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
 
     uint32_t pivot;
     int eq_needed;
+    // Splits phase_a into its read and its select. The sampler moves 268MB at
+    // m=4096 n=262144 and takes 124us, which is 2.16 TB/s against phase_b's 5.93
+    // on the same card -- but that 124us also contains a multi-pass radix select
+    // over LDS, so the read is not necessarily what is slow. ABLATE_PA=1 keeps the
+    // load and the LDS fill and drops the select. Wrong results; pricing only.
+#ifndef ABLATE_PA
+#define ABLATE_PA 0
+#endif
+#if ABLATE_PA
+    pivot     = s_keys[threadIdx.x % S];
+    eq_needed = 1;
+    (void)rank_row;
+    (void)npasses;
+#else
     if constexpr(COMPACT)
     {
         block_select_lds_compact(
@@ -656,6 +674,7 @@ __global__ __launch_bounds__(1024) void phase_a_threshold(const float* __restric
         block_select_lds(
             s_keys, S, rank_row, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses);
     }
+#endif
     if(threadIdx.x == 0)
     {
         threshold[row]   = pivot;
@@ -1356,8 +1375,47 @@ static void topk_fused_impl(const float* d_in,
 
         if(coop)
         {
-            phase_b_filter_coop<RAGGED><<<dim3(sp.coop_g, M), g_cf_block, 0, s>>>(
-                d_in, pitch, ext, n4, b.threshold_f, b.cand_pack, b.cand_reserved, b.cand_bad, cap);
+            // Stream the row data past the caches when the input is too big to have
+            // stayed resident anyway. Every element is read by exactly one block and
+            // never looked at again, so the only thing a cache line does for it is
+            // evict what the other blocks are still reading -- but below the MALL's
+            // 256MB the input CAN stay resident across calls, and then the eviction
+            // is the whole benefit. Measured, three-kernel device total, k=2048
+            // --dist gaussian --seed 0, non-temporal against cached:
+            //
+            //   M*N >= 2^27          M*N <= 2^26
+            //   4096 x 1048576 0.903  64 x 262144 1.050
+            //   1024 x 1048576 0.906  128 x 131072 1.042
+            //    128 x 1048576 0.890   16 x 1048576 1.031
+            //    256 x  524288 0.892   64 x 131073  1.029
+            //   1024 x  131072 0.969    1 x 1048576 1.020
+            //
+            // The two groups do not overlap and 2^27 elements is 512MB, which is the
+            // first size that cannot fit. g_nt_load forces it either way for pricing.
+            const bool nt =
+                g_nt_load < 0 ? ((size_t)M * (size_t)pitch >= ((size_t)1 << 27)) : (g_nt_load != 0);
+            if(nt)
+                phase_b_filter_coop<RAGGED, true>
+                    <<<dim3(sp.coop_g, M), g_cf_block, 0, s>>>(d_in,
+                                                               pitch,
+                                                               ext,
+                                                               n4,
+                                                               b.threshold_f,
+                                                               b.cand_pack,
+                                                               b.cand_reserved,
+                                                               b.cand_bad,
+                                                               cap);
+            else
+                phase_b_filter_coop<RAGGED, false>
+                    <<<dim3(sp.coop_g, M), g_cf_block, 0, s>>>(d_in,
+                                                               pitch,
+                                                               ext,
+                                                               n4,
+                                                               b.threshold_f,
+                                                               b.cand_pack,
+                                                               b.cand_reserved,
+                                                               b.cand_bad,
+                                                               cap);
         }
         else if(g_phase_b == 4)
         {

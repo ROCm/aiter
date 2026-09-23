@@ -50,8 +50,11 @@ constexpr int PHASE_C_CAP_MAX = 8192;
 // to go, and a row with nowhere to go costs a flat ~350 us in the exact
 // fallback.
 constexpr double CAP_SAFE_FILL = 0.85;
-constexpr int WSTAGE_WAVES     = 8;
-constexpr int WSTAGE_CAP       = 320;
+#ifndef WSTAGE_WAVES_OVERRIDE
+#define WSTAGE_WAVES_OVERRIDE 8
+#endif
+constexpr int WSTAGE_WAVES = WSTAGE_WAVES_OVERRIDE;
+constexpr int WSTAGE_CAP   = 320;
 
 // The K the GEOMETRY has to serve on a ragged launch, which is not the caller's
 // K. A ragged row ranks min(K, row_len) <= min(K, N) elements and pads the rest

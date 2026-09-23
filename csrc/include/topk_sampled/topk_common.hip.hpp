@@ -358,20 +358,33 @@ __device__ __forceinline__ vfloat4 load_f4(const vfloat4* p)
 //   clamp armed only on row == gridDim-1          +0.55% .. +2.63%
 // So the cost is the branch existing in the loop at all, not the arithmetic
 // feeding it, and paying it once per vector beats trying to predicate it away.
-template <bool RAGGED>
+template <bool RAGGED, bool NT = false>
 __device__ __forceinline__ vfloat4 load_row_f4(const float* __restrict__ row, int i, int len)
 {
     const vfloat4* v4 = reinterpret_cast<const vfloat4*>(row);
     if constexpr(!RAGGED)
     {
         (void)len;
-        return load_f4(v4 + i);
+        // NT: every element of a row is read by exactly one block and never looked
+        // at again, so a cache line buys the row data nothing and evicts what the
+        // other blocks are still reading. Same bytes, same addresses. Whether that
+        // helps depends on whether the input could have stayed resident at all --
+        // see the gate at the phase_b launch.
+        if constexpr(NT)
+            return __builtin_nontemporal_load(v4 + i);
+        else
+            return load_f4(v4 + i);
     }
     else
     {
         const int e = i * FP32_EPT;
         if(e + FP32_EPT <= len)
-            return load_f4(v4 + i);
+        {
+            if constexpr(NT)
+                return __builtin_nontemporal_load(v4 + i);
+            else
+                return load_f4(v4 + i);
+        }
         // Zero, not garbage: no consumer looks at a lane whose column is >= len, so
         // the value is unobservable, and zero keeps it that way if one ever does.
         vfloat4 v = {0.f, 0.f, 0.f, 0.f};
