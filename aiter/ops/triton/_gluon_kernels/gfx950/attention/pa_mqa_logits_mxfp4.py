@@ -174,7 +174,7 @@ def _prepare_candidates_kernel(
     key = tl.sort(tl.where(ok, ids, 0x7FFFFFFF))
 
     # Padding repeats the last legal block, so a short row still walks blocks
-    # it owns and cu_ends drops the slots.
+    # it owns and row_ends drops the slots.
     last = ((nblocks - 1) * C).to(tl.int64)
     pos = tl.where(key == 0x7FFFFFFF, last, key.to(tl.int64) * C)
     tl.store(pos_ptr + row * K + cols, pos)
@@ -1112,9 +1112,9 @@ def _pa_mqa_logits_mxfp4_kernel(
     kv_scales_ptr,     # uint8 paged, page p's e8m0 at p * KVS_PAGE_STRIDE
     weights_ptr,       # fp32  [B * NEXT_N, H]
     context_lens_ptr,  # int32 [B]
-    cu_q_ptr,          # int32 [B + 1] row prefix sum, unused unless VARLEN
-    cu_ends_ptr,       # int32 [B * NEXT_N] exclusive row end, or the row's
-                       # candidate slot count under GATHER; None unless HAS_CU_ENDS
+    query_start_loc_ptr,          # int32 [B + 1] row prefix sum, unused unless VARLEN
+    row_ends_ptr,       # int32 [B * NEXT_N] exclusive row end, or the row's
+                       # candidate slot count under GATHER; None unless HAS_ROW_ENDS
     block_table_ptr,   # int32 [B, stride_blk_b]
     sched_ptr,         # int32 [grid, 4] descriptors; unused unless DYNAMIC
     gather_v_ptr,      # int32 [B*NEXT_N, blocks] resolved value offsets
@@ -1158,7 +1158,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     KV_REREAD: gl.constexpr,
     DYNAMIC: gl.constexpr,
     VARLEN: gl.constexpr,
-    HAS_CU_ENDS: gl.constexpr,
+    HAS_ROW_ENDS: gl.constexpr,
     GATHER: gl.constexpr,        # walk a host-resolved candidate list
     GATHER_BLOCK: gl.constexpr,  # KV tokens per candidate block
     GATHER_PIPE: gl.constexpr,   # hoist the candidate-list read one iteration
@@ -1177,8 +1177,8 @@ def _pa_mqa_logits_mxfp4_kernel(
         "shuffle group, and the gather is one query row per workgroup",
     )
     gl.static_assert(
-        (GATHER == 0) | (HAS_CU_ENDS == 1),
-        "the gather takes its walk length from cu_ends, read as a slot count",
+        (GATHER == 0) | (HAS_ROW_ENDS == 1),
+        "the gather takes its walk length from row_ends, read as a slot count",
     )
     gl.static_assert(
         (BSCORE == 0) | ((BSCORE_BLOCK <= BLOCK_KV)
@@ -1221,11 +1221,11 @@ def _pa_mqa_logits_mxfp4_kernel(
     if context_len <= 0:
         return
 
-    # Under VARLEN the rows are packed and cu_q says where this sequence starts
+    # Under VARLEN the rows are packed and query_start_loc says where this sequence starts
     # and how many it owns; otherwise every sequence owns next_n.
     if VARLEN:
-        q_start = gl.load(cu_q_ptr + batch_id)
-        rows = gl.load(cu_q_ptr + batch_id + 1) - q_start
+        q_start = gl.load(query_start_loc_ptr + batch_id)
+        rows = gl.load(query_start_loc_ptr + batch_id + 1) - q_start
     else:
         q_start = batch_id * next_n
         rows = next_n
@@ -1255,15 +1255,15 @@ def _pa_mqa_logits_mxfp4_kernel(
                                q_scales_ptr + (qs_base + rr * stride_qs_n),
                                weights_ptr + (w_row + rr) * stride_w_s)
         mfma_qs, q_scales, w_blocks = mfma_qs + (q,), q_scales + (qs,), w_blocks + (w,)
-        if HAS_CU_ENDS:
-            e = gl.load(cu_ends_ptr + (w_row + rr))
+        if HAS_ROW_ENDS:
+            e = gl.load(row_ends_ptr + (w_row + rr))
         else:
             e = context_len - rows + n0 + r + 1
         if VARLEN:
             e = gl.where(n0 + r < rows, e, 0)
         ends = ends + (e,)
 
-    if HAS_CU_ENDS or VARLEN:
+    if HAS_ROW_ENDS or VARLEN:
         block_end = ends[0]
         for r in gl.static_range(1, BLOCK_M):
             block_end = gl.maximum(block_end, ends[r])
@@ -1336,10 +1336,10 @@ def _pa_mqa_logits_mxfp4_kernel(
 
 @triton.jit
 def _pa_mqa_logits_mxfp4_sched_kernel(
-    context_lens_ptr, cu_ends_ptr, cu_q_ptr, sched_ptr, batch, next_n,
+    context_lens_ptr, row_ends_ptr, query_start_loc_ptr, sched_ptr, batch, next_n,
     num_ctas, num_units,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
-    ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_CU_ENDS: tl.constexpr,
+    ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_ROW_ENDS: tl.constexpr,
     GATHER: tl.constexpr, VARLEN: tl.constexpr, ALIGN_B: tl.constexpr,
     MAX_TILES: tl.constexpr,
 ):
@@ -1354,9 +1354,9 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     if VARLEN:
         b = tl.arange(0, ALIGN_B)
         blive = b < batch
-        q0 = tl.load(cu_q_ptr + b, mask=blive, other=0)
-        rows_of = tl.load(cu_q_ptr + b + 1, mask=blive, other=0) - q0
-        # The unit space is cu_q[s] // BLOCK_M + s. The + s gives every
+        q0 = tl.load(query_start_loc_ptr + b, mask=blive, other=0)
+        rows_of = tl.load(query_start_loc_ptr + b + 1, mask=blive, other=0) - q0
+        # The unit space is query_start_loc[s] // BLOCK_M + s. The + s gives every
         # sequence one spare unit, which absorbs its partial last block and
         # keeps the space monotone -- that is what makes the search below work
         # and what bounds the count at total_rows // BLOCK_M + batch.
@@ -1382,12 +1382,12 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # whatever the trim thinks, and the kernel re-derives the real walk.
     first_row = (row_blk if BLOCK_M == 1
                  else tl.maximum(tl.minimum(row_blk * BLOCK_M, rows - BLOCK_M), 0))
-    if HAS_CU_ENDS:
+    if HAS_ROW_ENDS:
         block_end = tl.zeros([ALIGN_W], tl.int32)
         for r in tl.static_range(0, BLOCK_M):
             block_end = tl.maximum(
                 block_end,
-                tl.load(cu_ends_ptr + q_start + first_row + r,
+                tl.load(row_ends_ptr + q_start + first_row + r,
                         mask=live, other=0))
     else:
         block_end = ctx - rows + first_row + BLOCK_M
@@ -1395,7 +1395,7 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # length does not bound.
     keys = block_end if GATHER else tl.minimum(ctx, block_end)
     # Floored at one so a live unit always owns a slot. Whether a unit is live
-    # must not depend on the bound: the launch may hold a cu_ends this kernel was
+    # must not depend on the bound: the launch may hold a row_ends this kernel was
     # not given, and a unit with no slot has nothing to compute its rows.
     tiles = tl.maximum(tl.cdiv(keys, BLOCK_KV), 1)
     tiles = tl.where(live & (ctx > 0), tiles, 0)

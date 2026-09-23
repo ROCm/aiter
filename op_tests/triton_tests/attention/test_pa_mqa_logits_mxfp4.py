@@ -55,7 +55,7 @@ def calc_diff(x, y):
     return 1 - 2 * (x * y).sum() / (x * x + y * y).sum()
 
 
-def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len, cu_ends=None):
+def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len, row_ends=None):
     batch, next_n = q_deq.shape[0], q_deq.shape[1]
     out = torch.full((batch * next_n, max_model_len), float("-inf"),
                      dtype=torch.float32, device=q_deq.device)
@@ -69,15 +69,15 @@ def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len, cu_ends=None):
                    * weights[b * next_n + n].float()[:, None]).sum(dim=0)
             # Exclusive, and clamped to the context the way the kernel's
             # store_hi clamps it. Without a tensor it is the kernel's own rule.
-            end = (ctx - next_n + n + 1 if cu_ends is None
-                   else min(int(cu_ends[b * next_n + n]), ctx))
+            end = (ctx - next_n + n + 1 if row_ends is None
+                   else min(int(row_ends[b * next_n + n]), ctx))
             pos = torch.arange(ctx, device=q_deq.device)
             out[b * next_n + n, :ctx] = torch.where(
                 pos < end, row, torch.full_like(row, float("-inf")))
     return out
 
 
-def cu_ends_for(kind, ctx_lens, next_n, ratio=2, device="cuda"):
+def row_ends_for(kind, ctx_lens, next_n, ratio=2, device="cuda"):
     """Per-row exclusive bounds, indexed like weights.
 
     compressed  one key per `ratio` tokens, so the bound steps every `ratio` rows
@@ -153,7 +153,7 @@ def _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
 
 def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
              page_offset=0, seed=SEED, check_inf=True, preshuffle=1,
-             clean_logits=True, dynamic=0, cu_ends=None):
+             clean_logits=True, dynamic=0, row_ends=None):
     st = _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
                     page_offset, seed, preshuffle)
     q4, q4s, kv4, kv4s = st["q4"], st["q4s"], st["kv4"], st["kv4s"]
@@ -163,11 +163,11 @@ def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
     out = paged_mxfp4_mqa_logits(
         q4, q4s, cache, weights, st["cl"], st["block_table"], mml,
         preshuffle=preshuffle, clean_logits=clean_logits, dynamic=dynamic,
-        cu_ends=cu_ends)
+        row_ends=row_ends)
     torch.cuda.synchronize()
 
     ref = reference(dequantize(q4, q4s), dequantize(kv4, kv4s), weights, ctx, mml,
-                    cu_ends)
+                    row_ends)
     # Only the in-window positions are defined without clean_logits, and they
     # are the ones a top-k reads either way.
     fin = torch.isfinite(ref)
@@ -214,7 +214,7 @@ def test_shape(shape, num_heads, head_size, page_size, preshuffle,
     assert inf_ok, "the -inf pattern does not match the reference"
 
 
-CU_ENDS_SHAPES = [
+ROW_ENDS_SHAPES = [
     ("decode b8", 8, 1, [2048, 1024, 4096, 512, 3000, 777, 64, 129]),
     ("spec n=6", 4, 6, [2048, 1500, 601, 64]),
     ("chunk n=16", 4, 16, [4096, 97, 1024, 33]),
@@ -223,18 +223,18 @@ CU_ENDS_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("shape", CU_ENDS_SHAPES,
+@pytest.mark.parametrize("shape", ROW_ENDS_SHAPES,
                          ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("kind", ["compressed", "padded"])
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("dynamic", [0, 1])
-def test_cu_ends(shape, kind, num_heads, dynamic):
+def test_row_ends(shape, kind, num_heads, dynamic):
     """Bounds the kernel's own rule cannot express: a compressed cache, whose
     bound steps once per two rows, and parked rows."""
     _, batch, next_n, ctx_lens = shape
-    ends = cu_ends_for(kind, ctx_lens, next_n)
+    ends = row_ends_for(kind, ctx_lens, next_n)
     diff, inf_ok, _ = run_case(batch, next_n, num_heads, 128, ctx_lens, 64,
-                               seed=SEED, dynamic=dynamic, cu_ends=ends)
+                               seed=SEED, dynamic=dynamic, row_ends=ends)
     assert diff <= TOL, f"residual {diff:.3e}"
     assert inf_ok, "the -inf pattern does not match the reference"
 
@@ -246,7 +246,7 @@ GATHER_SHAPES = [
 
 
 def _gather_run(st, num_heads, head_size, next_n, block, preshuffle,
-                positions, cu_ends, dynamic=0):
+                positions, row_ends, dynamic=0):
     meta = build_gather(positions,
                         st["block_table"].repeat_interleave(next_n, 0),
                         st["cache"], num_heads, head_size, block,
@@ -254,7 +254,7 @@ def _gather_run(st, num_heads, head_size, next_n, block, preshuffle,
     out = paged_mxfp4_mqa_logits(
         st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
         st["block_table"], st["mml"], preshuffle=preshuffle, use_gather=True, candidates=meta,
-        cu_ends=cu_ends, dynamic=dynamic)
+        row_ends=row_ends, dynamic=dynamic)
     torch.cuda.synchronize()
     return out
 
@@ -307,8 +307,8 @@ def test_gather_identity(shape, num_heads, preshuffle, block):
 def test_gather_scattered(num_heads, preshuffle):
     """A genuinely scattered list, against the dequantised cache.
 
-    Also checks cu_ends is read in slot space: the output is compact, so row r
-    holds its candidates at [0, cu_ends[r]) and everything past stays -inf.
+    Also checks row_ends is read in slot space: the output is compact, so row r
+    holds its candidates at [0, row_ends[r]) and everything past stays -inf.
     """
     batch, next_n, block, nb = 2, 2, 8, 16
     st = _make_case(batch, next_n, num_heads, 128, [1024, 768], 64,
@@ -336,10 +336,10 @@ def test_gather_scattered(num_heads, preshuffle):
 
 
 def test_gather_needs_cu_ends():
-    """cu_ends is the gather's walk length, so it is not optional there."""
+    """row_ends is the gather's walk length, so it is not optional there."""
     st = _make_case(1, 1, 32, 128, [512], 64)
     pos, _ = _identity_list(st, 1, 8)
-    with pytest.raises(AssertionError, match="cu_ends"):
+    with pytest.raises(AssertionError, match="row_ends"):
         _gather_run(st, 32, 128, 1, 8, 1, pos, None)
 
 
@@ -409,19 +409,19 @@ def block_scores_reference(logits, ends, block):
     return out
 
 
-def row_ends(ctx_lens, next_n, cu_ends, device="cuda"):
+def _row_ends(ctx_lens, next_n, row_ends, device="cuda"):
     """The exclusive per-row column bound the kernel's stores answer to."""
     out = []
     for b, ctx in enumerate(ctx_lens):
         for n in range(next_n):
-            e = (ctx - next_n + n + 1 if cu_ends is None
-                 else int(cu_ends[b * next_n + n]))
+            e = (ctx - next_n + n + 1 if row_ends is None
+                 else int(row_ends[b * next_n + n]))
             out.append(max(min(e, ctx), 0))
     return torch.tensor(out, dtype=torch.int32, device=device)
 
 
 def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
-                dynamic=0, cu_ends=None, only=False):
+                dynamic=0, row_ends=None, only=False):
     """One launch of the fused reduce. `only` drops the logits store.
 
     Returns what the launcher returned and the score tensor -- which are the
@@ -434,7 +434,7 @@ def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
     out = paged_mxfp4_mqa_logits(
         st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
         st["block_table"], mml, preshuffle=preshuffle,
-        clean_logits=clean_logits, dynamic=dynamic, cu_ends=cu_ends,
+        clean_logits=clean_logits, dynamic=dynamic, row_ends=row_ends,
         block_scores=bs, calc_logits=not only, calc_block_scores=True,
         candidate_block_size=block)
     torch.cuda.synchronize()
@@ -484,7 +484,7 @@ def test_block_scores_knobs(shape, num_heads, dynamic, clean_logits):
     st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
     logits, bs = _bscore_run(st, num_heads, next_n, 8, clean_logits=clean_logits,
                              dynamic=dynamic)
-    ends = row_ends(st["ctx"], next_n, None)
+    ends = _row_ends(st["ctx"], next_n, None)
     ref = block_scores_reference(logits, ends, 8)
     nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
     assert nd == 0, f"{nd} differing words"
@@ -520,7 +520,7 @@ def test_block_scores_rejects_gather():
     with pytest.raises(AssertionError, match="dense producer"):
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], use_gather=True, candidates=meta, cu_ends=ends,
+            st["block_table"], st["mml"], use_gather=True, candidates=meta, row_ends=ends,
             block_scores=bs, calc_block_scores=True)
 
 
@@ -557,7 +557,7 @@ def test_scores_only(shape, num_heads, block, preshuffle):
                                          preshuffle=preshuffle)
     nd = _same_words(beside, alone)
     assert nd == 0, f"{nd} differing words against the alongside arm"
-    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), block)
+    ref = block_scores_reference(logits, _row_ends(st["ctx"], next_n, None), block)
     nd = _same_words(ref, alone)
     assert nd == 0, f"{nd} differing words against the reference"
 
@@ -576,25 +576,25 @@ def test_scores_only_knobs(shape, num_heads, dynamic):
     logits, beside, alone = _bscore_arms(st, num_heads, next_n, 8,
                                          dynamic=dynamic)
     assert _same_words(beside, alone) == 0
-    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), 8)
+    ref = block_scores_reference(logits, _row_ends(st["ctx"], next_n, None), 8)
     nd = _same_words(ref, alone)
     assert nd == 0, f"{nd} differing words"
 
 
-@pytest.mark.parametrize("shape", CU_ENDS_SHAPES,
+@pytest.mark.parametrize("shape", ROW_ENDS_SHAPES,
                          ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("kind", ["compressed", "padded"])
-def test_scores_only_cu_ends(shape, kind):
+def test_scores_only_row_ends(shape, kind):
     """The row bound still reaches the reduce with no store to share it with.
 
     The boundary's -inf select belongs to the block max, not to the store.
     """
     _, batch, next_n, ctx_lens = shape
-    ends_t = cu_ends_for(kind, ctx_lens, next_n)
+    ends_t = row_ends_for(kind, ctx_lens, next_n)
     st = _make_case(batch, next_n, 32, 128, ctx_lens, 64)
-    logits, beside, alone = _bscore_arms(st, 32, next_n, 8, cu_ends=ends_t)
+    logits, beside, alone = _bscore_arms(st, 32, next_n, 8, row_ends=ends_t)
     assert _same_words(beside, alone) == 0
-    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, ends_t), 8)
+    ref = block_scores_reference(logits, _row_ends(st["ctx"], next_n, ends_t), 8)
     nd = _same_words(ref, alone)
     assert nd == 0, f"{nd} differing words"
 
@@ -611,7 +611,7 @@ def test_scores_only_nan(block):
     logits, beside, alone = _bscore_arms(st, 32, next_n, block)
     assert int(torch.isnan(alone).sum()) > 0, "the NaN did not reach a block"
     assert _same_words(beside, alone) == 0
-    ref = block_scores_reference(logits, row_ends(st["ctx"], next_n, None), block)
+    ref = block_scores_reference(logits, _row_ends(st["ctx"], next_n, None), block)
     nd = _same_words(ref, alone)
     assert nd == 0, f"{nd} differing words"
 
@@ -689,7 +689,7 @@ def test_scores_only_rejects_gather():
     with pytest.raises(AssertionError, match="dense producer"):
         paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], use_gather=True, candidates=meta, cu_ends=ends,
+            st["block_table"], st["mml"], use_gather=True, candidates=meta, row_ends=ends,
             block_scores=bs, calc_logits=False, calc_block_scores=True)
 
 
@@ -741,16 +741,16 @@ def test_candidates_implicit(num_heads):
     g = torch.Generator(device=st["dev"]).manual_seed(7)
     ids = torch.rand(rows, ctx // block, generator=g,
                      device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
-    ends = row_ends(st["ctx"], rows, None)
+    ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
     meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
                                       128, block)
     a = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
                                st["cl"], st["block_table"], K * block,
-                               use_gather=True, candidates=meta, cu_ends=cu)
+                               use_gather=True, candidates=meta, row_ends=cu)
     b = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
                                st["cl"], st["block_table"], K * block,
-                               use_gather=True, candidates=ids, cu_ends=ends)
+                               use_gather=True, candidates=ids, row_ends=ends)
     torch.cuda.synchronize()
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
@@ -787,7 +787,7 @@ def test_gather_offsets_i64(num_heads, block):
     g = torch.Generator(device=st["dev"]).manual_seed(11)
     ids = torch.rand(rows, st["ctx"][0] // block, generator=g,
                      device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
-    ends = row_ends(st["ctx"], rows, None)
+    ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
 
     out = []
@@ -798,7 +798,7 @@ def test_gather_offsets_i64(num_heads, block):
         out.append(paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
             st["block_table"], K * block, use_gather=True, candidates=meta,
-            cu_ends=cu, candidate_block_size=block))
+            row_ends=cu, candidate_block_size=block))
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
@@ -813,7 +813,7 @@ def test_gather_span_window():
     g = torch.Generator(device=st["dev"]).manual_seed(13)
     ids = torch.rand(rows, st["ctx"][0] // block, generator=g,
                      device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
-    ends = row_ends(st["ctx"], rows, None)
+    ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
 
     out = []
@@ -823,7 +823,7 @@ def test_gather_span_window():
         out.append(paged_mxfp4_mqa_logits(
             st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
             st["block_table"], K * block, use_gather=True, candidates=meta,
-            cu_ends=cu, candidate_block_size=block))
+            row_ends=cu, candidate_block_size=block))
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
@@ -855,9 +855,9 @@ VARLEN_SHAPES = [
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("page_size", [64, 128])
-@pytest.mark.parametrize("plan_rows", [None, 1, 3])
-def test_varlen(shape, num_heads, page_size, plan_rows):
-    """Packed rows with cu_q match one uniform launch per sequence, exactly."""
+@pytest.mark.parametrize("plan_n", [None, 1, 6])
+def test_varlen(shape, num_heads, page_size, plan_n):
+    """Packed rows with query_start_loc match one uniform launch per sequence, exactly."""
     _, rows_per_seq, ctx_lens = shape
     head_size, dev = 128, "cuda"
     batch, total = len(rows_per_seq), sum(rows_per_seq)
@@ -873,8 +873,8 @@ def test_varlen(shape, num_heads, page_size, plan_rows):
     mml = st["mml"]
 
     got = paged_mxfp4_mqa_logits(q4, q4s, st["cache"], w, st["cl"],
-                                 st["block_table"], mml, cu_q=cu,
-                                 plan_rows=plan_rows)
+                                 st["block_table"], mml, query_start_loc=cu,
+                                 next_n=plan_n)
     ref = torch.full_like(got, float("-inf"))
     for b, r in enumerate(rows_per_seq):
         lo = int(cu[b])

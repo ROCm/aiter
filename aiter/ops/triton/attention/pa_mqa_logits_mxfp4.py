@@ -292,7 +292,7 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
                            head_size, block=CANDIDATE_BLOCK,
                            kv_scale_cache=None, scale_mode=SCALE_MODE_WIDE,
                            offsets=None):
-    """Ranked block ids -> (gather, cu_ends), in one launch.
+    """Ranked block ids -> (gather, row_ends), in one launch.
 
     candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
     ends:        [B * NEXT_N] int32 exclusive per-row key bound
@@ -340,14 +340,14 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
 
 def build_schedule(context_lens, next_n, num_heads, head_size,
                    page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
-                   cu_ends=None, gather=0, cu_q=None, total_rows=None,
+                   row_ends=None, gather=0, query_start_loc=None, total_rows=None,
                    max_model_len=None):
     """Descriptors for one launch, or None if the shape does not fit.
 
     A descriptor is (sequence, row block, slice index, slice count), relative
     rather than absolute, so the kernel converts it against its own tile count.
 
-    cu_ends only affects balance here. Pass the same gather flag the launch
+    row_ends only affects balance here. Pass the same gather flag the launch
     uses, or the slot counts are read as key positions.
     """
     plan = select_config(num_heads, head_size, next_n, page_size, preshuffle)
@@ -356,7 +356,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         row_blocks, block_m = next_n, 1
     block_kv, target_wgs = plan["block_kv"], plan["target_wgs"]
     batch = int(context_lens.numel())
-    varlen = cu_q is not None
+    varlen = query_start_loc is not None
     if varlen:
         assert total_rows is not None, "varlen needs the packed row count"
         # One spare unit per sequence absorbs its partial last block.
@@ -393,8 +393,8 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     SCHED_BLOCK_P = 4
     _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(num_ctas, SCHED_BLOCK_P),)](
         context_lens,
-        cu_ends,
-        cu_q,
+        row_ends,
+        query_start_loc,
         out,
         batch,
         next_n,
@@ -405,7 +405,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         ROW_BLOCKS=row_blocks,
         ALIGN_W=align_w,
         BLOCK_P=SCHED_BLOCK_P,
-        HAS_CU_ENDS=1 if cu_ends is not None else 0,
+        HAS_ROW_ENDS=1 if row_ends is not None else 0,
         GATHER=int(gather),
         VARLEN=1 if varlen else 0,
         ALIGN_B=align_b,
@@ -448,9 +448,9 @@ def paged_mxfp4_mqa_logits(
     scale_mode: int = SCALE_MODE_WIDE,
     dynamic: int = 0,
     schedule: torch.Tensor | None = None,
-    cu_ends: torch.Tensor | None = None,
-    cu_q: torch.Tensor | None = None,
-    plan_rows: int | None = None,
+    row_ends: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    next_n: int | None = None,
     use_gather: bool = False,
     candidates: torch.Tensor | dict | None = None,
     block_scores: torch.Tensor | None = None,
@@ -484,7 +484,7 @@ def paged_mxfp4_mqa_logits(
                     sequences differ in length
     schedule:       [NUM_CTAS, 4], dtype int32, work descriptors from
                     build_schedule. Takes precedence over dynamic
-    cu_ends:        [B * NEXT_N], dtype int32, optional. Exclusive per-row key
+    row_ends:        [B * NEXT_N], dtype int32, optional. Exclusive per-row key
                     bound, indexed like weights, defaulting to
                     context_lens[b] - NEXT_N + n + 1; pass it under compression
                     or context parallelism. build_schedule needs the same tensor.
@@ -492,7 +492,7 @@ def paged_mxfp4_mqa_logits(
     use_gather:     bool. Walk a candidate list rather than the context, so
                     output column j holds candidate slot j
     candidates:     [B * NEXT_N, K] int32 ranked block ids, resolved here, or
-                    what build_candidate_gather returned, used as is. cu_ends
+                    what build_candidate_gather returned, used as is. row_ends
                     is the per-row key bound for the first and the slot count
                     for the second
     block_scores:   [B * NEXT_N, ceil(max_model_len / candidate_block_size)],
@@ -526,16 +526,18 @@ def paged_mxfp4_mqa_logits(
     assert arch_info.get_arch() == "gfx950", "gfx950 only"
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
 
-    varlen = cu_q is not None
+    varlen = query_start_loc is not None
     if varlen:
         assert q.dim() == 3, "varlen q is [TOTAL_ROWS, NUM_HEADS, HEAD_SIZE // 2]"
-        assert cu_q.dtype == torch.int32 and cu_q.stride(0) == 1
+        assert query_start_loc.dtype == torch.int32 and query_start_loc.stride(0) == 1
         total_rows, num_heads, head_bytes = q.shape
-        batch = cu_q.numel() - 1
-        # One BLOCK_M for the launch, planned from the row count most of the
-        # work belongs to. plan_rows overrides it.
-        next_n = int(plan_rows or max(1, total_rows // max(batch, 1)))
+        batch = query_start_loc.numel() - 1
+        # q has no next_n axis when the rows are packed, so the caller names
+        # the row count to plan the launch's one config from; the average is
+        # the count most of the work belongs to.
+        next_n = next_n or max(1, total_rows // max(batch, 1))
     else:
+        assert next_n is None, "next_n comes from q's shape unless rows are packed"
         batch, next_n, num_heads, head_bytes = q.shape
         total_rows = batch * next_n
     head_size = head_bytes * 2
@@ -555,10 +557,10 @@ def paged_mxfp4_mqa_logits(
     assert block_table.shape[0] == batch
     assert context_lens.dtype == torch.int32
     assert weights.shape == (total_rows, num_heads) and weights.stride(1) == 1
-    if cu_ends is not None:
-        assert cu_ends.dtype == torch.int32, "cu_ends must be int32"
-        assert cu_ends.shape == (total_rows,) and cu_ends.stride(0) == 1, (
-            "cu_ends must be a contiguous [B * NEXT_N] vector, indexed like weights")
+    if row_ends is not None:
+        assert row_ends.dtype == torch.int32, "row_ends must be int32"
+        assert row_ends.shape == (total_rows,) and row_ends.stride(0) == 1, (
+            "row_ends must be a contiguous [B * NEXT_N] vector, indexed like weights")
 
     # page_size comes from the cache rather than the caller: both layouts pin it
     # exactly, and a second source could disagree with the bytes.
@@ -623,10 +625,10 @@ def paged_mxfp4_mqa_logits(
             # Resolved here for a single consumer. A layer group should call
             # build_candidate_gather once and pass what it returns.
             n = torch.arange(next_n, device=q.device, dtype=torch.int32)
-            key_ends = (cu_ends if cu_ends is not None else
+            key_ends = (row_ends if row_ends is not None else
                         torch.clamp(context_lens.repeat_interleave(next_n)
                                     - next_n + n.repeat(batch) + 1, min=0))
-            gather, cu_ends = build_candidate_gather(
+            gather, row_ends = build_candidate_gather(
                 candidates, key_ends,
                 block_table.repeat_interleave(next_n, 0).contiguous(),
                 kv_cache, num_heads, head_size, cand_block, kv_scale_cache,
@@ -641,8 +643,8 @@ def paged_mxfp4_mqa_logits(
         assert g_voff.stride(1) == 1 and g_soff.stride(1) == 1
         assert g_voff.stride(0) == g_soff.stride(0)
         assert g_voff.shape[0] == total_rows, g_voff.shape
-        assert cu_ends is not None, (
-            "the gather takes its walk length from cu_ends, read as the row's "
+        assert row_ends is not None, (
+            "the gather takes its walk length from row_ends, read as the row's "
             "count of valid candidate slots")
 
     cfg = select_config(num_heads, head_size, next_n, page_size, preshuffle,
@@ -705,8 +707,8 @@ def paged_mxfp4_mqa_logits(
     # A gather launch does not build one
     if schedule is None and (dynamic or varlen) and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
-                                  page_size, preshuffle, cu_ends=cu_ends,
-                                  cu_q=cu_q, total_rows=total_rows,
+                                  page_size, preshuffle, row_ends=row_ends,
+                                  query_start_loc=query_start_loc, total_rows=total_rows,
                                   max_model_len=max_model_len)
     use_dynamic = schedule is not None
     assert not varlen or use_dynamic, (
@@ -730,8 +732,8 @@ def paged_mxfp4_mqa_logits(
         weights_ptr=weights,
         context_lens_ptr=context_lens,
         # None specializes to a constexpr, so an unused argument leaves no trace.
-        cu_ends_ptr=cu_ends,
-        cu_q_ptr=cu_q,
+        row_ends_ptr=row_ends,
+        query_start_loc_ptr=query_start_loc,
         block_table_ptr=block_table,
         sched_ptr=schedule,
         gather_v_ptr=g_voff if gather_on else schedule,
@@ -778,7 +780,7 @@ def paged_mxfp4_mqa_logits(
         HAS_KV_SPLIT=1 if (num_kv_splits > 1 or use_dynamic) else 0,
         KV_REREAD=cfg["kv_reread"],
         DYNAMIC=int(use_dynamic),
-        HAS_CU_ENDS=1 if cu_ends is not None else 0,
+        HAS_ROW_ENDS=1 if row_ends is not None else 0,
         GATHER=gather_on,
         GATHER_BLOCK=gather_block,
         GATHER_PIPE=cfg["gather_pipe"] if gather_on else 0,

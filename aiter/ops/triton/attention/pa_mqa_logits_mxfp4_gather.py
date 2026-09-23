@@ -127,7 +127,7 @@ def build_gather(positions, block_table, kv_cache, num_heads, head_size,
     and no causal limit of its own.
 
     How many of the expanded `K * block` slots are real is the launch's
-    `cu_ends` -- the same per-row exclusive bound the dense path takes, read in
+    `row_ends` -- the same per-row exclusive bound the dense path takes, read in
     slot space rather than key space. Slots past it are dropped by store_hi.
     """
     n_per_tile = mfma_nonk_dim(num_heads, head_size)
