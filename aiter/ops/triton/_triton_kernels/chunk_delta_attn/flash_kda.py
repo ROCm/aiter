@@ -69,6 +69,8 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
@@ -424,6 +426,7 @@ def _flash_kda_segment_kernel(
     STORE_H_OUT: tl.constexpr,
     STORE_FINAL: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     CM_OUT: tl.constexpr = "",
 ):
     """Delta-rule recurrence over one segment of chunks.
@@ -441,8 +444,18 @@ def _flash_kda_segment_kernel(
     With one segment per sequence this degenerates to a plain sequential scan
     and only the third form runs.
     """
-    i_w = tl.program_id(0).to(tl.int64)
-    i_sh = tl.program_id(1).to(tl.int64)
+    # Every V block of one (segment, head) re-reads that segment's whole chunk
+    # workspace. Workgroups reach the XCDs round-robin in launch order, x
+    # fastest, so unmapped those blocks land on different XCDs and each pulls
+    # the workspace through its own L2 -- 6-8x the compulsory traffic at BW=16,
+    # which is what bound this kernel. Renumbered, each XCD owns a contiguous
+    # run of flat ids, so a (segment, head)'s V blocks share an L2.
+    n_w = tl.num_programs(0)
+    pid = remap_xcd(
+        tl.program_id(1) * n_w + tl.program_id(0), n_w * tl.num_programs(1), NUM_XCDS
+    )
+    i_w = (pid % n_w).to(tl.int64)
+    i_sh = (pid // n_w).to(tl.int64)
     i_seg, i_h = i_sh // H, i_sh % H
 
     chunk_base = tl.load(seg_chunk_base + i_seg).to(tl.int64)
@@ -1051,6 +1064,7 @@ def flash_kda_fwd(
         "V": V,
         "C": C,
         "STATE_V_FIRST": state_v_first,
+        "NUM_XCDS": get_num_xcds(),
         "CM_OUT": CM_OUT_STORE,
     }
 
@@ -1093,6 +1107,7 @@ def flash_kda_fwd(
                 V=V,
                 C=C,
                 BW=bw,
+                NUM_XCDS=get_num_xcds(),
                 **_g2.build_layouts(nw),
                 num_warps=nw,
             )

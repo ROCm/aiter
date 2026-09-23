@@ -8,6 +8,7 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 
 KW = 8
 KW_BIG = 8
@@ -139,6 +140,7 @@ def k2_ab_fused_gluon(
     B_OP_B: gl.constexpr,
     BLK: gl.constexpr,
     SH_KR: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
 ):
     """Both pass-A recurrences in one launch, sharing every operand load.
 
@@ -150,8 +152,14 @@ def k2_ab_fused_gluon(
     states are then the same width and one program covers a column block of
     both.
     """
-    i_w = gl.program_id(0).to(gl.int64)
-    i_sh = gl.program_id(1).to(gl.int64)
+    # Keeps a (segment, head)'s V blocks on one XCD, so their re-reads of the
+    # chunk workspace share an L2. See the Triton K2 for the full reasoning.
+    n_w = gl.num_programs(0)
+    pid = remap_xcd(
+        gl.program_id(1) * n_w + gl.program_id(0), n_w * gl.num_programs(1), NUM_XCDS
+    )
+    i_w = (pid % n_w).to(gl.int64)
+    i_sh = (pid // n_w).to(gl.int64)
     i_seg = i_sh // H
     i_h = i_sh % H
 
