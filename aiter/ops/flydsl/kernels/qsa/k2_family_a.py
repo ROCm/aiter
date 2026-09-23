@@ -21,8 +21,11 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import BFloat16, Float32, Int32, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fxmath
+from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_GQA
@@ -51,6 +54,17 @@ def _neg_inf():
 
 def _exp2(x):
     return Float32(fx.rocdl.exp2(Float32.ir_type, Float32(x).ir_value()))
+
+
+def _ds_write2st64_b64(addr, data0, data1):
+    """Store two BF16x4 vectors 8192 bytes apart in gfx950 LDS."""
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [as_mlir_value(addr), as_mlir_value(data0), as_mlir_value(data1)],
+        "ds_write2st64_b64 $0, $1, $2 offset1:16\n",
+        "v,v,v,~{memory}",
+        has_side_effects=True,
+    )
 
 
 def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
@@ -411,15 +425,21 @@ def build_qsa_k2_family_a_module(
                         fx.Vector(fx.memref_load_vec(v_frags_pf[gr])),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    v_tile = make_k_lds_view(
-                        k_arr,
-                        Int32(gr * gather_span),
-                        (block_n, gather_span),
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    lo = fx.Vector.from_elements(
+                        [v_vec[i] for i in range_constexpr(4)], BFloat16
+                    ).bitcast(fx.Int64)[0]
+                    hi = fx.Vector.from_elements(
+                        [v_vec[i + 4] for i in range_constexpr(4)], BFloat16
+                    ).bitcast(fx.Int64)[0]
+                    # p(n,d): token bits spread the b64 bases over banks;
+                    # d bit 2 selects the st64 pair's 8192-byte region.
+                    store_elem = (
+                        (col % Int32(32)) * Int32(4)
+                        + d_chunk * Int32(128)
+                        + _idiv(col, Int32(32)) * Int32(32 * _D)
                     )
-                    v_dst = kv_store.partition_D(v_tile)
-                    v_store_frag = fx.make_fragment_like(v_dst)
-                    fx.memref_store_vec(v_vec, v_store_frag)
-                    fx.copy(lds_copy, v_store_frag, v_dst)
+                    _ds_write2st64_b64(store_elem * Int32(2), lo, hi)
                 gpu.barrier()
             elif const_expr(not use_k32):
                 v_row = fx.logical_divide(
@@ -511,19 +531,34 @@ def build_qsa_k2_family_a_module(
                                 + d_base,
                                 fx.make_layout((16, 16), (1, _D)),
                             )
+                            b_src = pv_b_copy.partition_S(sB)
+                            b_frag = fx.make_fragment_like(b_src)
+                            fx.copy(pv_b_atom, b_src, b_frag)
+                            v_ops.append(b_frag)
                         else:
-                            sB = fx.make_view(
-                                k_arr.ptr,
-                                fx.make_composed_layout(
-                                    fx.static(fx.SwizzleType.get(3, 3, 3)),
-                                    Int32(ng * 16) * Int32(_D) + d_base,
-                                    fx.make_layout((16, 16), (1, _D)),
-                                ),
+                            # ds_read_tr16 transposes a 16-lane x 4-bf16
+                            # footprint. Lane t must source token t//4 and
+                            # dimensions (t%4)*4 so its output is four tokens
+                            # at this lane's output dimension.
+                            src_n = (
+                                Int32(ng * 16)
+                                + lane_kg * Int32(4)
+                                + _idiv(lane_m, Int32(4))
                             )
-                        b_src = pv_b_copy.partition_S(sB)
-                        b_frag = fx.make_fragment_like(b_src)
-                        fx.copy(pv_b_atom, b_src, b_frag)
-                        v_ops.append(b_frag)
+                            src_d = d_base + (lane_m % Int32(4)) * Int32(4)
+                            src_off = (
+                                src_d % Int32(4)
+                                + (src_n % Int32(32)) * Int32(4)
+                                + _idiv(src_d, Int32(8)) * Int32(128)
+                                + (_idiv(src_d, Int32(4)) % Int32(2)) * Int32(16 * _D)
+                                + _idiv(src_n, Int32(32)) * Int32(32 * _D)
+                            )
+                            src = fx.make_view(
+                                k_arr.ptr + src_off, fx.make_layout(4, 1)
+                            )
+                            b_frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
+                            fx.copy_atom_call(pv_b_atom, src, b_frag)
+                            v_ops.append(b_frag)
                     else:
                         v_ops.append(
                             fx.Vector.from_elements(
