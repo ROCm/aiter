@@ -610,14 +610,12 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
             s_idx[i] = i;
     }
 #else
-    // One load, one wait, one use per iteration: ATT puts s_waitcnt vmcnt(0) at
-    // 20.8% of phase_c's traced latency, 1049 cycles a hit. Nothing here carries
-    // between iterations, so asking for several in flight costs only registers.
-    // Same lever as PA_UNROLL in phase_a's sampler.
-#ifndef PC_UNROLL
-#define PC_UNROLL 4
-#endif
-#pragma unroll PC_UNROLL
+    // ATT puts s_waitcnt vmcnt(0) at 20.8% of phase_c's traced latency here, but
+    // unrolling this loop is worth nothing: measured at depth 1, 2, 4 and 8,
+    // phase_c reads 14.24, 14.27, 14.40 and 14.31us at m=512 n=131072. The trace
+    // shows four separate load sites already, and c is about 2867 against a
+    // 1024-thread block, so there are three iterations and nothing left to
+    // overlap. The wait is the latency of the read itself.
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
 #if NT_CAND
