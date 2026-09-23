@@ -17,7 +17,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
-from .types import Stage2ScatterContext, _from_gpu_ptr
+from .types import Stage1MegaContext, Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
@@ -256,9 +256,14 @@ class MegaMoEConfig:
     # fp8, a4w4 -> fp4). It is not a free choice: the receiver hands the payload
     # to the grouped GEMM as-is, so a mismatch is a width error, not a slow path.
     dispatch_wire: str = "bf16"
+    # None reads the constructor path; an explicit value wins over ``stage1_fused``.
+    compact_plan_override: bool | None = None
     # Fuse stage-1 routing/layout planning with dispatch through the compact
     # expert-row plan consumed directly by the grouped GEMM.
     stage1_fused: bool = False
+    # Opt in to the gfx1250 persistent dispatch+GEMM1 kernel. Unsupported
+    # geometries deliberately fall back to the compact multi-kernel path.
+    stage1_single_kernel_requested: bool = False
 
     def __post_init__(self):
         if self.dispatch_wire not in _DISPATCH_WIRES:
@@ -325,6 +330,29 @@ class MegaMoEConfig:
     @property
     def max_recv(self) -> int:
         return self.world_size * self.max_tokens_per_rank
+
+    @property
+    def compact_plan(self) -> bool:
+        """Send-side compact dest rows. ``stage1_fused`` is the explicit switch."""
+        if self.dispatch_backend != "flydsl" or not self.is_quant_dispatch_wire:
+            return False
+        if self.compact_plan_override is not None:
+            return self.compact_plan_override
+        return bool(self.stage1_fused)
+
+    @property
+    def stage1_single_kernel(self) -> bool:
+        """Whether this config is in the deliberately narrow first rollout."""
+        return bool(
+            self.stage1_single_kernel_requested
+            and self.compact_plan
+            and self.dispatch_backend == "flydsl"
+            and self.world_size == 4
+            and self.hidden_dim == 7168
+            and self.topk in (6, 8)
+            and self.is_quant_dispatch_wire
+        )
+
 
     def compact_row_cap(self, tile_m: int = 64) -> int:
         from .compact_plan import compact_row_capacity
@@ -451,6 +479,7 @@ class MegaMoEGfx1250:
         dispatch_backend: str | None = None,
         dispatch_wire: str | None = None,
         stage1_fused: bool = False,
+        stage1_single_kernel: bool = False,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -548,6 +577,7 @@ class MegaMoEGfx1250:
                     else read_dispatch_wire_env()
                 ),
                 stage1_fused=bool(stage1_fused),
+                stage1_single_kernel_requested=bool(stage1_single_kernel),
             ),
             communicator,
         )
@@ -654,7 +684,10 @@ class MegaMoEGfx1250:
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            launch_payload=not self._stage1_single_kernel,
         )
         if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
@@ -769,6 +802,10 @@ class MegaMoEGfx1250:
                 )
             hist0 = self._arena.offset("compact_hist")
             done0 = self._arena.offset("compact_done")
+            off_tile = None
+            if self._stage1_single_kernel:
+                tile0 = self._arena.offset("stage1_tile_state")
+                off_tile = tile0 + slot * self._compact_tile_layout.slot_nbytes
             launch = compile_tdm_compact_plan(
                 rank=self._config.rank,
                 npes=self._config.world_size,
@@ -779,10 +816,11 @@ class MegaMoEGfx1250:
                 # may write against the region it writes into.
                 compact_cap=self._compact_cap,
                 off_hist=hist0 + slot * self._compact_hist_stride * 4,
-                off_done=done0 + slot * 4,
+                off_done=done0 + slot * self._config.world_size * 4,
                 hist_stride=self._compact_hist_stride,
                 max_routes=self._compact_max_routes,
                 hist_pingpong=False,
+                off_tile=off_tile,
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -932,9 +970,10 @@ class MegaMoEGfx1250:
     def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
         self._config = config
         self._closed = False
+        self._stage1_single_kernel = config.stage1_single_kernel
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
-        self._compact_plan = config.stage1_fused
+        self._compact_plan = config.compact_plan
         self._compact_tile_m = _compact_gemm_align_m(
             config,
             activation=self.activation,
@@ -959,6 +998,8 @@ class MegaMoEGfx1250:
             PLAN_BLOCKS,
             compact_done_nbytes,
             compact_hist_stride,
+            compact_tile_layout,
+            compact_tile_nbytes,
         )
 
         segs = config.world_size * config.experts_per_rank
@@ -970,6 +1011,11 @@ class MegaMoEGfx1250:
         )
         self._compact_hist_stride = hist_stride
         self._compact_max_routes = max_routes
+        self._compact_tile_layout = (
+            compact_tile_layout(compact_cap=self._compact_cap)
+            if self._stage1_single_kernel
+            else None
+        )
         arena_regions = [
             ("tok_off", 4),
             ("recv_num", config.world_size * 4),
@@ -988,9 +1034,23 @@ class MegaMoEGfx1250:
                 [
                     ("ep_rowmap", (recv_rows + 1) * 8),
                     ("compact_hist", 2 * hist_stride * 4),
-                    ("compact_done", compact_done_nbytes()),
+                    (
+                        "compact_done",
+                        compact_done_nbytes(npes=config.world_size),
+                    ),
                 ]
             )
+            if self._stage1_single_kernel:
+                arena_regions.append(
+                    (
+                        "stage1_tile_state",
+                        compact_tile_nbytes(compact_cap=self._compact_cap),
+                    )
+                )
+        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+        # holds a step on any of them and a quantized one just packs into the
+        # front of it at its own pitch.
+
         arena_regions.append(
             (
                 "comb_inp",
@@ -1478,6 +1538,8 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        launch_payload: bool = True,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
@@ -1512,19 +1574,66 @@ class MegaMoEGfx1250:
             self._compact_psum = self._psums[self._compact_slot]
         else:
             tok_map = self._token_destination_map
-        self._dispatch_variants[spec](
-            self._arena.handle,
-            payload.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            tok_map.data_ptr(),
-            self._destination_peer_counter.data_ptr(),
-            self._dispatch_barrier.data_ptr(),
-            self._total_recv.data_ptr(),
-            self._config.rank,
-            token_count,
-            stream,
-        )
+        self._stage1_mega_context = None
+        if launch_payload:
+            self._dispatch_variants[spec](
+                self._arena.handle,
+                payload.data_ptr(),
+                topk_ids.data_ptr(),
+                topk_weights.data_ptr(),
+                tok_map.data_ptr(),
+                self._destination_peer_counter.data_ptr(),
+                self._dispatch_barrier.data_ptr(),
+                self._total_recv.data_ptr(),
+                self._config.rank,
+                token_count,
+                stream,
+            )
+        else:
+            slot = int(self._compact_slot)
+            tile_state_addr = self._arena.local_ptr("stage1_tile_state")
+            tile_state_addr += slot * self._compact_tile_layout.slot_nbytes
+
+            def fallback_dispatch() -> None:
+                self._dispatch_variants[spec](
+                    self._arena.handle,
+                    payload.data_ptr(),
+                    topk_ids.data_ptr(),
+                    topk_weights.data_ptr(),
+                    tok_map.data_ptr(),
+                    self._destination_peer_counter.data_ptr(),
+                    self._dispatch_barrier.data_ptr(),
+                    self._total_recv.data_ptr(),
+                    self._config.rank,
+                    token_count,
+                    fx.Stream(torch.cuda.current_stream()),
+                )
+
+            self._stage1_mega_context = Stage1MegaContext(
+                source_payload=payload,
+                source_scale=self._dispatch_quant_scales[:token_count],
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                token_destination_map=tok_map,
+                rank=int(self._config.rank),
+                arena_handle=self._arena.handle,
+                output_offset=self._arena.offset("disp_out"),
+                rowmap_offset=self._arena.offset("ep_rowmap"),
+                tile_state_offset=(
+                    self._arena.offset("stage1_tile_state")
+                    + slot * self._compact_tile_layout.slot_nbytes
+                ),
+                wire_row_stride=int(self._compact_wire_row),
+                generation_addr=self._barriers[slot].data_ptr() + 2 * 4,
+                plan_slot=slot,
+                tile_m=int(self._compact_step_align_m),
+                tile_count=self._compact_tile_layout.tiles_for(
+                    self._compact_step_align_m
+                ),
+                compact_cap=int(self._compact_cap),
+                tile_state_addr=tile_state_addr,
+                fallback_dispatch=fallback_dispatch,
+            )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
             (self._config.max_recv,),
@@ -1570,6 +1679,7 @@ class MegaMoEGfx1250:
             ),
             compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
             compact_rows=(self._compact_step_rows if self._compact_plan else 0),
+            stage1_mega=self._stage1_mega_context,
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:

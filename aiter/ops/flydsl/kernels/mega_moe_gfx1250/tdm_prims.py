@@ -33,10 +33,12 @@ none is wanted for a point-to-point copy.
 
 The engine commits global memory in whole 128-byte blocks. A store that covers
 only part of its first or last block still rewrites the rest of it out of the
-tile, so a run must begin and end on a 128B boundary unless nothing else is
-writing the blocks it straddles. :func:`tdm_plan_xfer_4b` is how a caller with
-arbitrary endpoints gets there: it peels the unaligned ends off for the caller
-to move by hand and leaves a body the engine can own outright.
+tile, so a long run must begin and end on a 128B boundary unless nothing else
+is writing the blocks it straddles. :func:`tdm_plan_xfer_4b` is how a caller
+with arbitrary endpoints gets there: two or more full rows become a peeled
+head/body/tail, and a short leftover (or a src/dst phase mismatch) becomes a
+dense 2D whole-tile when that is cheaper than going fully scalar -- matching
+mori ``TdmPlanXfer4B``.
 """
 
 from __future__ import annotations
@@ -64,6 +66,10 @@ TDM_ROW_FLOOR_BYTES = 128
 TDM_ROW_ELEMS_4B = TDM_ROW_FLOOR_BYTES // 4
 
 _TDM_ROW_LOG2_4B = TDM_ROW_ELEMS_4B.bit_length() - 1
+
+#: Empirical ceiling from mori ``kTdmWholeMaxElems``: a whole-tile longer than
+#: this is faster left on the scalar path. Raising it costs ~4us at ct=16384.
+TDM_WHOLE_MAX_ELEMS = 48
 
 
 def _i32(v):
@@ -110,48 +116,135 @@ def tdm_group1(dim0, dim1, elem_bytes, stride=None):
 def tdm_group1_rows_4b(rows):
     """GROUP1 for a ``rows`` x 128B dense tile of 4-byte elements.
 
-    The runtime twin of :func:`tdm_group1`. A metadata body planned by
-    :func:`tdm_plan_xfer_4b` is always exactly one row wide, so only the row
-    count is dynamic and just three of the eight words stop being constants.
-    ``rows`` must be wave-uniform and in ``[1, TDM_MAX_DIM]``; it is put through
-    ``readfirstlane`` for the same reason :func:`tdm_group0` does it.
+    The runtime twin of :func:`tdm_group1` when the body is a peeled row-split
+    (``dim0 == TDM_ROW_ELEMS_4B``). ``rows`` must be wave-uniform and in
+    ``[1, TDM_MAX_DIM]``; it is put through ``readfirstlane`` for the same
+    reason :func:`tdm_group0` does it.
     """
-    dim0 = TDM_ROW_ELEMS_4B
-    r = readfirstlane(T.i32, arith.unwrap(rows))
-    r_hi = arith.shli(r, _i32(16))
+    return tdm_group1_2d(_i32(TDM_ROW_ELEMS_4B), rows)
+
+
+def tdm_group1_2d(dim0, dim1):
+    """Runtime GROUP1 for a dense 4-byte ``dim1`` x ``dim0`` tile.
+
+    ``TdmShape2D`` in mori: both extents live in SGPRs, the row stride equals
+    ``dim0``. Used for a row-split body (``dim0 == 32``) and for a whole-tile
+    leftover whose ``dim0``/``dim1`` come from :func:`tdm_plan_xfer_4b`.
+    """
+    d0 = readfirstlane(T.i32, arith.unwrap(dim0))
+    d1 = readfirstlane(T.i32, arith.unwrap(dim1))
+    d0_lo = arith.andi(d0, _i32(0xFFFF))
+    d0_hi = arith.shrui(d0, _i32(16))
+    d1_lo = arith.andi(d1, _i32(0xFFFF))
+    d1_hi = arith.shrui(d1, _i32(16))
+    d0_lo_hi = arith.shli(d0_lo, _i32(16))
+    d1_lo_hi = arith.shli(d1_lo, _i32(16))
     return vector.from_elements(
         T.vec(8, T.i32),
         [
             _i32(2 << 16),  # data_size = log2(4B)
-            _i32(dim0 << 16),
-            r_hi,
-            _i32(dim0 << 16),
-            r,
-            _i32(dim0),  # row stride == row width: the body is dense
-            r_hi,
-            _i32(0),
+            d0_lo_hi,
+            arith.ori(d0_hi, d1_lo_hi),
+            arith.ori(d1_hi, d0_lo_hi),
+            d1_lo,
+            d0,
+            d1_lo_hi,
+            d1_hi,
         ],
     )
 
 
+def _tdm_cheap_dim1(n_elems):
+    """mori ``TdmCheapDim1``: a factor that keeps each row at least 128B."""
+    c8 = (arith.andi(n_elems, _i32(7)) == 0) & (
+        arith.shrui(n_elems, _i32(3)) >= TDM_ROW_ELEMS_4B
+    )
+    c4 = (arith.andi(n_elems, _i32(3)) == 0) & (
+        arith.shrui(n_elems, _i32(2)) >= TDM_ROW_ELEMS_4B
+    )
+    c2 = (arith.andi(n_elems, _i32(1)) == 0) & (
+        arith.shrui(n_elems, _i32(1)) >= TDM_ROW_ELEMS_4B
+    )
+    return arith.select(
+        c8,
+        _i32(8),
+        arith.select(c4, _i32(4), arith.select(c2, _i32(2), _i32(0))),
+    )
+
+
+def _tdm_plan_whole(n_elems):
+    """mori ``TdmPlanWhole``: one dense 2D descriptor covering a short run.
+
+    Returns ``(head, body, dim0, dim1)``. ``head`` is 0 on a hit and ``n_elems``
+    (all scalar) on a miss; ``body`` is the even prefix the engine owns.
+    """
+    zero = _i32(0)
+    n_pos = n_elems > 0
+    n = arith.select(n_pos, n_elems, zero)
+    cover = arith.select(arith.andi(n, _i32(1)) != 0, n - 1, n)
+    cheap = _tdm_cheap_dim1(cover)
+    fits = (cheap > 0) | (
+        (cover >= 4) & (arith.andi(cover, _i32(1)) == 0)
+    )
+    in_bound = n_pos & (n <= TDM_WHOLE_MAX_ELEMS) & fits
+    d1 = arith.select(cheap > 0, cheap, _i32(2))
+    d0 = arith.select(
+        d1 == 8,
+        arith.shrui(cover, _i32(3)),
+        arith.select(
+            d1 == 4, arith.shrui(cover, _i32(2)), arith.shrui(cover, _i32(1))
+        ),
+    )
+    head_s = arith.select(n_pos, n, zero)
+    return (
+        arith.select(in_bound, zero, head_s),
+        arith.select(in_bound, cover, zero),
+        arith.select(in_bound, d0, zero),
+        arith.select(in_bound, d1, zero),
+    )
+
+
+def _tdm_plan_run(phase, n_elems):
+    """mori ``TdmPlanRun``: peel a 128B-aligned body, else fall back to whole."""
+    zero = _i32(0)
+    empty = n_elems <= 0
+    head = arith.andi(
+        arith.subi(_i32(TDM_ROW_ELEMS_4B), phase), _i32(TDM_ROW_ELEMS_4B - 1)
+    )
+    head = arith.select(head > n_elems, n_elems, head)
+    rows = arith.shrui(arith.subi(n_elems, head), _i32(_TDM_ROW_LOG2_4B))
+    use_rows = (n_elems > 0) & (rows >= 2)
+    body_r = arith.shli(rows, _i32(_TDM_ROW_LOG2_4B))
+    h_w, b_w, d0_w, d1_w = _tdm_plan_whole(n_elems)
+    return (
+        arith.select(empty, zero, arith.select(use_rows, head, h_w)),
+        arith.select(empty, zero, arith.select(use_rows, body_r, b_w)),
+        arith.select(
+            empty, zero, arith.select(use_rows, _i32(TDM_ROW_ELEMS_4B), d0_w)
+        ),
+        arith.select(empty, zero, arith.select(use_rows, rows, d1_w)),
+    )
+
+
 def tdm_plan_xfer_4b(src_addr, dst_addr, n_elems):
-    """Split a dword run into a scalar head/tail and a row-aligned TDM body.
+    """Split a dword run into a scalar head/tail and a TDM body.
 
-    Returns ``(head, rows)``: ``head`` leading elements the caller moves itself,
-    then ``rows`` x 32 elements for the engine, then whatever is left over --
-    also the caller's. ``rows == 0`` asks for the whole run by hand.
+    Returns ``(head, body, dim0, dim1)``. The caller scalar-copies
+    ``[0, head)`` and ``[head + body, n_elems)`` and, when ``body > 0``, issues
+    one dense 4-byte descriptor of shape ``dim1`` x ``dim0`` at
+    ``src/dst + head``.
 
-    The engine commits global memory in whole 128-byte blocks, so a transfer
-    that only partly covers its first or last block rewrites the rest of that
-    block from the tile, and two runs sharing an end block clobber each other.
-    Deciding the split from the element count alone -- long enough, therefore
-    row-aligned -- is precisely that bug: the phase has to come from the
-    addresses, which is why this takes them rather than a length.
+    Two or more full 128B rows with matching src/dst phase become a row-split
+    (``dim0 == 32``). Shorter leftovers, and runs whose endpoints sit on
+    different 128B phases, try a whole-tile (``head == 0``, ``dim0 * dim1``
+    even and ``<= TDM_WHOLE_MAX_ELEMS``) instead of going fully scalar -- the
+    gfx1250 512-token A1B0 fix. Sub-dword addresses stay scalar.
 
     ``src_addr``/``dst_addr`` are the run's real start addresses (i64), so a
     misaligned arena base is caught here and not by a peer's corrupted
-    metadata. Runs of fewer than two rows go entirely scalar: a single row is
-    not worth a descriptor once the head and tail are peeled off it.
+    metadata. A whole-tile may rewrite the rest of a straddled 128B block;
+    the caller must not have another agent writing that block (mori collapses
+    per-peer metadata splits on small batches for the same reason).
     """
     row_mask = TDM_ROW_FLOOR_BYTES - 1
     s_lo = arith.trunci(T.i32, arith.unwrap(src_addr))
@@ -159,15 +252,25 @@ def tdm_plan_xfer_4b(src_addr, dst_addr, n_elems):
     skew = arith.andi(arith.xori(s_lo, d_lo), _i32(row_mask))
     sub_dword = arith.andi(arith.ori(s_lo, d_lo), _i32(3))
     phase = arith.shrui(arith.andi(s_lo, _i32(row_mask)), _i32(2))
-    head = arith.andi(
-        arith.subi(_i32(TDM_ROW_ELEMS_4B), phase), _i32(TDM_ROW_ELEMS_4B - 1)
-    )
-    head = arith.select(head > n_elems, n_elems, head)
-    rows = arith.shrui(arith.subi(n_elems, head), _i32(_TDM_ROW_LOG2_4B))
-    usable = (skew == 0) & (sub_dword == 0) & (rows >= 2)
+    h_run, b_run, d0_run, d1_run = _tdm_plan_run(phase, n_elems)
+    h_wh, b_wh, d0_wh, d1_wh = _tdm_plan_whole(n_elems)
+    n_pos = n_elems > 0
+    head_s = arith.select(n_pos, n_elems, _i32(0))
+    use_run = (sub_dword == 0) & (skew == 0)
+    use_whole = (sub_dword == 0) & (skew != 0)
     return (
-        arith.select(usable, head, n_elems),
-        arith.select(usable, rows, arith.constant(0, type=T.i32)),
+        arith.select(
+            use_run, h_run, arith.select(use_whole, h_wh, head_s)
+        ),
+        arith.select(
+            use_run, b_run, arith.select(use_whole, b_wh, _i32(0))
+        ),
+        arith.select(
+            use_run, d0_run, arith.select(use_whole, d0_wh, _i32(0))
+        ),
+        arith.select(
+            use_run, d1_run, arith.select(use_whole, d1_wh, _i32(0))
+        ),
     )
 
 

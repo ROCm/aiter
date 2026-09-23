@@ -25,6 +25,7 @@ _WARNED_NAIVE_EPILOGUE = False
 # Cache the contiguous uint8 view of static MoE weights so a non-contiguous
 # weight is materialized at most once (not re-copied on every fused_moe call).
 _GROUPED_WEIGHT_CACHE = {}
+_WARNED_STAGE1_MEGA_FALLBACK = set()
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect
 # (name, callable) per-kernel launches; None in production.
@@ -559,7 +560,10 @@ def _grouped_a8w4_tdm_moe(
 
     import torch
 
-    from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+        _select_num_waves_per_tensor_tdm,
+        flydsl_grouped_gemm_a8w4_masked,
+    )
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_ep_route_quant_compact,
         flydsl_moe_fused_quant_preshuffle,
@@ -946,6 +950,15 @@ def _grouped_a8w4_tdm_moe(
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
     _fuse_quant = _b1 is None
+    _stage1_mega_ctx = (
+        getattr(stage2_scatter, "stage1_mega", None)
+        if stage2_scatter is not None
+        else None
+    )
+    if _stage1_mega_ctx is not None and not _fuse_quant:
+        # Bias forces the legacy bf16 intermediate + separate quant pass, which
+        # the first single-kernel implementation intentionally does not inline.
+        _stage1_mega_ctx.fallback_dispatch()
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -965,41 +978,159 @@ def _grouped_a8w4_tdm_moe(
         # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
         # quant_scale / arg_quant_scale).
-        flydsl_grouped_gemm_a8w4_masked(
-            a2_payload.view(torch.uint8),
-            a1_payload,
-            w1_u8,
-            a1_scale,
-            w1s_i32,
-            psum,
-            n_experts=E,
-            contiguous_m=contiguous_m,
-            N=two_inter,
-            K=model_dim,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            out_is_f16=out_is_f16,
-            a_is_fp4=_a_is_fp4,
-            stage1_act=stage1_act,
-            bias=_b1,
-            swiglu_limit=sl,
-            num_buffers=num_buffers,
-            stage1_quant_out=1,
-            quant_scale=a2_scale,
-            quant_wmma_rep=wmma_rep2,
-            cluster_n=cluster_n,
-            waves_per_tensor_tdm=waves_per_tensor_tdm,
-            next_stage_prefetch=next_stage_prefetch,
-            tdm_as_in_prologue=tdm_as_in_prologue,
-            tdm_b_th=tdm_b_th,
-            row_major_ascale=int(_row_major_ascale),
-            a_row_stride_bytes=_a1_wire_stride,
-            a_scale_row_stride_bytes=_a1_wire_stride,
-            **_situ_kw,
-        )
+        _mega_ctx = _stage1_mega_ctx
+        _mega_launched = False
+        if _mega_ctx is not None:
+            try:
+                import flydsl.expr as fx
+
+                from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stage1_mega_emitter import (
+                    Gfx1250Stage1MegaEmitter,
+                )
+                from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stage1_mega_kernel import (
+                    Stage1MegaKernelConfig,
+                    run_stage1_mega_kernel,
+                )
+
+                if not (_compact and _prequantized and _row_major_ascale):
+                    raise ValueError(
+                        "stage1 mega requires compact prequantized row-major A"
+                    )
+                if int(_mega_ctx.tile_m) != int(tile_m):
+                    raise ValueError(
+                        f"plan tile_m={_mega_ctx.tile_m} != GEMM tile_m={tile_m}"
+                    )
+                _waves = int(m_warp) * int(n_warp)
+                if _waves not in (4, 8):
+                    raise ValueError(f"unsupported GEMM wave count {_waves}")
+                _cu = int(torch.cuda.get_device_properties(device).multi_processor_count)
+                _producer_ctas = 64 if int(token_num) <= 512 else 128
+                _producer_ctas = min(_producer_ctas, _cu - 1)
+                _emitter = Gfx1250Stage1MegaEmitter(
+                    rank=int(_mega_ctx.rank),
+                    world_size=int(stage2_scatter.world_size),
+                    topk=int(topk),
+                    max_tokens_per_rank=int(stage2_scatter.max_tokens_per_rank),
+                    output_offset=int(_mega_ctx.output_offset),
+                    rowmap_offset=int(_mega_ctx.rowmap_offset),
+                    tile_state_offset=int(_mega_ctx.tile_state_offset),
+                    compact_cap=int(_mega_ctx.compact_cap),
+                    wire_row_stride=int(_mega_ctx.wire_row_stride),
+                    dispatch_payload_elems=int(_mega_ctx.source_payload.shape[-1]),
+                    dispatch_elem_size=int(_mega_ctx.source_payload.element_size()),
+                    dispatch_scale_bytes=int(
+                        _mega_ctx.source_scale.shape[-1]
+                        * _mega_ctx.source_scale.element_size()
+                    ),
+                    K=int(model_dim),
+                    N=int(two_inter),
+                    tile_m=int(tile_m),
+                    tile_n=int(tile_n),
+                    tile_k=int(tile_k),
+                    m_warp=int(m_warp),
+                    n_warp=int(n_warp),
+                    out_is_f16=int(out_is_f16),
+                    num_buffers=int(num_buffers),
+                    a_is_fp4=int(_a_is_fp4),
+                    n_experts=int(E),
+                    stage1_act=int(stage1_act),
+                    quant_wmma_rep=int(wmma_rep2),
+                    next_stage_prefetch=int(next_stage_prefetch),
+                    num_waves_per_tensor_tdm=_select_num_waves_per_tensor_tdm(
+                        int(waves_per_tensor_tdm)
+                    ),
+                    tdm_as_in_prologue=int(tdm_as_in_prologue),
+                    tdm_b_th=int(tdm_b_th),
+                    swiglu_limit=float(sl),
+                    situ_beta=float(situ_beta),
+                    situ_linear_beta=float(situ_linear_beta),
+                )
+                _mega_config = Stage1MegaKernelConfig(
+                    hidden_dim=int(model_dim),
+                    topk=int(topk),
+                    dispatch_wire="fp4" if _is_fp4 else "fp8",
+                    world_size=int(stage2_scatter.world_size),
+                    rank=int(_emitter.rank),
+                    experts_per_rank=int(E),
+                    tile_m=int(tile_m),
+                    tile_n=int(tile_n),
+                    tile_k=int(tile_k),
+                    gemm_n=int(two_inter),
+                    num_cu=_cu,
+                    producer_ctas=_producer_ctas,
+                    waves_per_cta=_waves,
+                    compact_cap=int(_mega_ctx.compact_cap),
+                    tile_count=int(_mega_ctx.tile_count),
+                )
+                run_stage1_mega_kernel(
+                    config=_mega_config,
+                    emitter=_emitter,
+                    addr_plan_generation=int(_mega_ctx.generation_addr),
+                    addr_tile_state=int(_mega_ctx.tile_state_addr),
+                    stream=fx.Stream(torch.cuda.current_stream()),
+                    user_args=(
+                        int(_mega_ctx.arena_handle),
+                        int(_mega_ctx.source_payload.data_ptr()),
+                        int(_mega_ctx.source_scale.data_ptr()),
+                        int(_mega_ctx.token_destination_map.data_ptr()),
+                        int(_mega_ctx.topk_weights.data_ptr()),
+                        int(a2_payload.data_ptr()),
+                        int(w1_u8.data_ptr()),
+                        int(w1s_i32.data_ptr()),
+                        int(psum.data_ptr()),
+                        int(a2_scale.data_ptr()),
+                        0,
+                        int(a1_payload.data_ptr()),
+                        int(a1_scale.data_ptr()),
+                        int(_mega_ctx.source_payload.shape[0]),
+                        int(contiguous_m),
+                    ),
+                )
+                _mega_launched = True
+            except Exception as error:
+                if os.environ.get("AITER_STAGE1_MEGA_STRICT", "0") in _TRUTHY_ENV:
+                    raise
+                _mega_ctx.fallback_dispatch()
+                _fallback_key = (type(error).__name__, str(error))
+                if _fallback_key not in _WARNED_STAGE1_MEGA_FALLBACK:
+                    _WARNED_STAGE1_MEGA_FALLBACK.add(_fallback_key)
+                    logger.warning("[stage1 mega] falling back to two kernels: %s", error)
+        if not _mega_launched:
+            flydsl_grouped_gemm_a8w4_masked(
+                a2_payload.view(torch.uint8),
+                a1_payload,
+                w1_u8,
+                a1_scale,
+                w1s_i32,
+                psum,
+                n_experts=E,
+                contiguous_m=contiguous_m,
+                N=two_inter,
+                K=model_dim,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                out_is_f16=out_is_f16,
+                a_is_fp4=_a_is_fp4,
+                stage1_act=stage1_act,
+                bias=_b1,
+                swiglu_limit=sl,
+                num_buffers=num_buffers,
+                stage1_quant_out=1,
+                quant_scale=a2_scale,
+                quant_wmma_rep=wmma_rep2,
+                cluster_n=cluster_n,
+                waves_per_tensor_tdm=waves_per_tensor_tdm,
+                next_stage_prefetch=next_stage_prefetch,
+                tdm_as_in_prologue=tdm_as_in_prologue,
+                tdm_b_th=tdm_b_th,
+                row_major_ascale=int(_row_major_ascale),
+                a_row_stride_bytes=_a1_wire_stride,
+                a_scale_row_stride_bytes=_a1_wire_stride,
+                **_situ_kw,
+            )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
         y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)

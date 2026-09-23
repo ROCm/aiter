@@ -35,6 +35,8 @@ row alongside it, padded to a 128-byte stride so a run of them is something the
 engine can move. ``scale_bytes == 0`` compiles the whole scale path away.
 """
 
+from dataclasses import dataclass
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -125,6 +127,362 @@ def tdm_max_warps(*, hidden_dim, hidden_elem_size, npes, slab_bytes=0):
     while warps * 2 <= room:
         warps *= 2
     return warps
+
+
+# ── The compact payload wire, as a callable emitter ─────────────────────────
+#
+# Everything a compact dispatch does to a payload row lives here rather than
+# inline in the kernel below, because a fused stage-1 kernel has to run this
+# exact sequence off its own work partition. ``compact_plan`` has already
+# chosen every route's destination row, so a producer only moves bytes and
+# publishes the rowmap entry -- no histogram, no slot reservation, no metadata
+# staging, none of the LDS or grid budget those need.
+#
+# These are ordinary Python functions executed while FlyDSL traces a
+# ``@flyc.kernel`` body. They never read ``fx.block_idx``/``fx.thread_idx``:
+# the work id, the lane and the LDS tile all come in as arguments, so the
+# caller owns the partition and the LDS layout.
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompactPayloadSpec:
+    """Compile-time geometry of one compact dispatch payload row.
+
+    ``compact_row_stride`` is the wire row -- the payload plane followed by the
+    token's padded e8m0 scale plane -- and is what a destination row index is
+    scaled by. ``tile_bytes`` is the LDS tile the caller lends the emitter: the
+    whole wire row is assembled there, so it must hold one.
+
+    ``tok_map`` on a compact wire is not the dispatch kernel's ``pe * max_recv
+    + tok`` encoding; ``compact_plan`` packs ``(dest_tok << peer_bits) |
+    dest_pe`` and leaves a dead route negative.
+    """
+
+    rank: int
+    npes: int
+    topk: int
+    hidden_dim: int
+    hidden_elem_size: int
+    compact_row_stride: int
+    tile_bytes: int
+    max_tok_slot_stride: int
+    off_out_tok: int
+    off_ep_rowmap: int
+    scale_bytes: int = 0
+
+    def __post_init__(self):
+        if WAVE != 32:
+            raise ValueError(
+                f"the compact payload wire is gfx1250-only (wave32); wave size "
+                f"resolved to {WAVE}"
+            )
+        if self.npes < 1:
+            raise ValueError(f"npes must be positive, got {self.npes}")
+        if not 0 <= self.rank < self.npes:
+            raise ValueError(
+                f"rank must be in [0, {self.npes}), got {self.rank}"
+            )
+        if not 1 <= self.topk <= WAVE:
+            raise ValueError(
+                f"topk={self.topk} must fit one wave; a token's routes are "
+                f"read by one lane each"
+            )
+        if self.hidden_dim < 1:
+            raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
+        if self.hidden_elem_size not in (1, 2, 4, 8):
+            raise ValueError(
+                "TDM data_size encodes 1/2/4/8-byte elements, got "
+                f"{self.hidden_elem_size}"
+            )
+        if self.payload_bytes % 128:
+            raise ValueError(
+                f"TDM payload rows must be 128-byte aligned, got "
+                f"{self.payload_bytes}B"
+            )
+        if self.scale_bytes < 0 or self.scale_bytes % 4:
+            raise ValueError(
+                f"scale rows must be dword-sized, got {self.scale_bytes}B"
+            )
+        if (
+            self.compact_row_stride < self.payload_bytes + self.scale_bytes
+            or self.compact_row_stride % 128
+        ):
+            raise ValueError(
+                "compact_row_stride must contain payload and scale and be "
+                f"128-byte aligned, got {self.compact_row_stride}B"
+            )
+        if self.compact_row_stride > TDM.TDM_MAX_DIM:
+            raise ValueError(
+                f"a compact wire row of {self.compact_row_stride}B exceeds the "
+                f"{TDM.TDM_MAX_DIM}-byte TDM extent"
+            )
+        if self.tile_bytes % 128 or self.tile_bytes < self.compact_row_stride:
+            raise ValueError(
+                "compact wire row does not fit a 128-byte aligned LDS tile: "
+                f"row={self.compact_row_stride}B tile={self.tile_bytes}B"
+            )
+        if self.max_tok_slot_stride < 1:
+            raise ValueError(
+                "max_tok_slot_stride must be positive; it is what keeps one "
+                "rank's packed rowmap slots off another's"
+            )
+        if self.off_out_tok < 0 or self.off_ep_rowmap < 0:
+            raise ValueError("symmetric arena offsets must be non-negative")
+
+    @property
+    def payload_bytes(self):
+        """Bytes of one source token row."""
+        return self.hidden_dim * self.hidden_elem_size
+
+    @property
+    def scale_src_dw(self):
+        """Dwords of the caller's packed e8m0 row; 0 on an unquantized wire."""
+        return self.scale_bytes // 4
+
+    @property
+    def peer_bits(self):
+        """Low bits of a packed ``tok_map`` entry holding ``dest_pe``."""
+        return max(1, (self.npes - 1).bit_length())
+
+    @property
+    def peer_mask(self):
+        return (1 << self.peer_bits) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class CompactPayloadInvariants:
+    """Per-wave values :func:`emit_compact_payload_token` would otherwise rebuild.
+
+    The two GROUP1 descriptors fold to eight SGPR constants each and the lane
+    probe is one select, so hoisting them out of a token loop keeps a
+    multi-token caller from re-emitting both at every iteration.
+    """
+
+    group1_load: object
+    group1_store: object
+    probe_off: object
+
+
+def compact_payload_invariants(spec, *, lane):
+    """Build the loop-invariant half of the compact payload emitter."""
+    return CompactPayloadInvariants(
+        group1_load=TDM.tdm_group1(spec.hidden_dim, 1, spec.hidden_elem_size),
+        group1_store=TDM.tdm_group1(spec.compact_row_stride, 1, 1),
+        probe_off=arith.select(lane < spec.topk, lane, 0),
+    )
+
+
+@comm_ops.traced
+def emit_compact_payload_token(
+    spec,
+    *,
+    token,
+    token_limit,
+    lane,
+    tile_addr,
+    window,
+    addr_inp_tok,
+    rsrc_tok_map,
+    rsrc_inp_wts,
+    rsrc_inp_scale=None,
+    invariants=None,
+    on_route_complete=None,
+):
+    """Emit one token's compact payload sends: one TDM load, one store per route.
+
+    Call this from a ``@flyc.kernel`` body with the whole wave converged.
+    ``token`` is a wave-uniform source token id, guarded here against
+    ``token_limit`` so a caller may hand over a padded partition.
+    ``tile_addr`` is a wave-uniform i32 LDS byte address of a
+    ``spec.tile_bytes`` tile the wave owns; it is overwritten. ``window`` is a
+    ``cco.Window`` over the symmetric arena.
+
+    ``on_route_complete`` is an optional per-route arrival callback, invoked
+    once for each surviving route of this token, called wave-uniformly with
+    every lane active, after the route's payload TDM store and its rowmap store
+    have both been drained and a system release fence separates them from
+    whatever the callback publishes. That ordering is the point of the hook: a
+    consumer woken by it may read the row. It receives keyword arguments
+    ``dest_pe`` and ``dest_tok`` (both wave-uniform i32, the destination row the
+    route just landed on), plus ``token``, ``route`` (the python topk slot) and
+    ``lane``; take ``**_`` so later arguments do not break the callback. A
+    callback with dynamic control flow of its own has to be traceable the same
+    way these emitters are -- nested in the kernel body, or decorated with
+    ``@comm_ops.traced``.
+
+    Without a callback the rowmap stores are left in flight -- the drain that
+    covers them belongs with whatever the caller publishes next.
+    """
+    if spec.scale_bytes and rsrc_inp_scale is None:
+        raise ValueError(
+            "a quantized compact wire carries a per-token e8m0 row; "
+            "rsrc_inp_scale is required when spec.scale_bytes > 0"
+        )
+    if invariants is None:
+        invariants = compact_payload_invariants(spec, lane=lane)
+    topk = spec.topk
+    nbytes = spec.payload_bytes
+    scale_src_dw = spec.scale_src_dw
+    if token < token_limit:
+        flat = buffer_load(
+            rsrc_tok_map,
+            token * topk + invariants.probe_off,
+            vec_width=1,
+            dtype=T.i32,
+        )
+        # `flat >= 0` rejects the host's -1 fill, so a slot the planner never
+        # published can never name a route.
+        live = (lane < topk) & (flat >= 0)
+        live_mask = ballot(T.i32, live)
+        wt_bits = arith.constant(0)
+        packed_meta = arith.constant(0)
+        if live:
+            wt_bits = arith.bitcast(
+                T.i32,
+                buffer_load(
+                    rsrc_inp_wts,
+                    token * topk + lane,
+                    vec_width=1,
+                    dtype=T.f32,
+                ),
+            )
+            packed_meta = (
+                fx.Int32(spec.rank) * fx.Int32(spec.max_tok_slot_stride)
+                + token * fx.Int32(topk)
+                + lane
+            )
+        if live_mask != 0:
+            TDM.tdm_load(
+                TDM.tdm_group0(
+                    tile_addr,
+                    fx.Int64(addr_inp_tok) + fx.Int64(token) * fx.Int64(nbytes),
+                ),
+                invariants.group1_load,
+            )
+            # All compact rows of this token carry the same scale. Read it once
+            # into the unused tail of this wave's LDS tile instead of
+            # re-reading the global row per route.
+            scale_lds = fx.Int64(tile_addr) + fx.Int64(nbytes)
+            if const_expr(spec.scale_bytes > 0):
+                scale_vec = 2 if scale_src_dw % 2 == 0 else 1
+                for si in range(lane * scale_vec, scale_src_dw, WAVE * scale_vec):
+                    val = buffer_load(
+                        rsrc_inp_scale,
+                        token * scale_src_dw + si,
+                        vec_width=scale_vec,
+                        dtype=T.i32,
+                    )
+                    if const_expr(scale_vec == 2):
+                        comm_ops.store_i32_lds(
+                            scale_lds + fx.Int64(si) * fx.Int64(4), val[0]
+                        )
+                        comm_ops.store_i32_lds(
+                            scale_lds + fx.Int64(si + 1) * fx.Int64(4), val[1]
+                        )
+                    else:
+                        comm_ops.store_i32_lds(
+                            scale_lds + fx.Int64(si) * fx.Int64(4), val
+                        )
+                fx.rocdl.s_wait_dscnt(0)
+            TDM.tdm_wait(0)
+            # Unroll the live routes so each TDM descriptor is a distinct issue
+            # site. The ctpop walk serializes too many SGPR descriptor rebuilds
+            # through one loop.
+            for k in range_constexpr(topk):
+                bit = arith.constant(1 << k)
+                if (live_mask & bit) != 0:
+                    flat_l = readlane(T.i32, flat, k)
+                    dest_pe = flat_l & spec.peer_mask
+                    dest_tok = flat_l >> spec.peer_bits
+                    TDM.tdm_store(
+                        TDM.tdm_group0(
+                            tile_addr,
+                            fx.Int64(window.lsa_ptr(dest_pe, spec.off_out_tok))
+                            + fx.Int64(dest_tok) * fx.Int64(spec.compact_row_stride),
+                        ),
+                        invariants.group1_store,
+                    )
+                    if lane == k:
+                        buffer_store(
+                            fx.Vector.from_elements(
+                                [packed_meta, wt_bits], dtype=fx.Int32
+                            ),
+                            create_buffer_resource_from_addr(
+                                fx.Int64(
+                                    window.lsa_ptr(dest_pe, spec.off_ep_rowmap)
+                                )
+                            ),
+                            dest_tok * 2,
+                        )
+            TDM.tdm_wait(0)
+            if on_route_complete is not None:
+                # The wait above retired the payload on the tensor counter,
+                # which storecnt does not track, so the rowmap stores need
+                # their own drain before anything says the row is readable.
+                # The destinations are recomputed rather than carried out of
+                # the store loop: they are two ALU ops off `flat`, and the
+                # values there live inside a dynamic branch.
+                comm_ops.waitcnt_stores()
+                comm_ops.fence_system_release()
+                for k in range_constexpr(topk):
+                    bit = arith.constant(1 << k)
+                    if (live_mask & bit) != 0:
+                        flat_l = readlane(T.i32, flat, k)
+                        on_route_complete(
+                            dest_pe=flat_l & spec.peer_mask,
+                            dest_tok=flat_l >> spec.peer_bits,
+                            token=token,
+                            route=k,
+                            lane=lane,
+                        )
+
+
+@comm_ops.traced
+def emit_compact_payload_rows(
+    spec,
+    *,
+    work_id,
+    work_stride,
+    token_limit,
+    lane,
+    tile_addr,
+    window,
+    addr_inp_tok,
+    rsrc_tok_map,
+    rsrc_inp_wts,
+    rsrc_inp_scale=None,
+    on_route_complete=None,
+):
+    """Emit a wave's whole share of the compact payload, one token at a time.
+
+    ``work_id``/``work_stride`` are the caller's partition -- a global wave id
+    and the number of waves in the grid for the dispatch kernel, but any
+    strided cover of ``[0, token_limit)`` does. ``work_stride`` must be
+    positive at runtime: a zero step is a loop that never advances, a hang no
+    correctness check can report because the check hangs with it.
+
+    Unlike the dispatch kernel's token-major phase, every route of a token is
+    read from ``tok_map`` here, which a compact wire may do from any wave --
+    the planner filled ``tok_map`` in a prior kernel, so no entry depends on
+    what this wave itself wrote. The remaining arguments are
+    :func:`emit_compact_payload_token`'s.
+    """
+    invariants = compact_payload_invariants(spec, lane=lane)
+    for token in range(work_id, token_limit, work_stride):
+        emit_compact_payload_token(
+            spec,
+            token=token,
+            token_limit=token_limit,
+            lane=lane,
+            tile_addr=tile_addr,
+            window=window,
+            addr_inp_tok=addr_inp_tok,
+            rsrc_tok_map=rsrc_tok_map,
+            rsrc_inp_wts=rsrc_inp_wts,
+            rsrc_inp_scale=rsrc_inp_scale,
+            invariants=invariants,
+            on_route_complete=on_route_complete,
+        )
 
 
 def _make_dispatch_tdm(
@@ -218,8 +576,6 @@ def _make_dispatch_tdm(
     stg_cap, _stage_slots = tdm_stage_capacity(npes=npes, max_recv=max_recv)
     # sentinel: tok_map dropped-slot marker whose dest_pe (value // max_recv) == npes.
     sentinel_val = npes * max_recv
-    compact_peer_bits = max(1, (npes - 1).bit_length())
-    compact_peer_mask = (1 << compact_peer_bits) - 1
 
     tile_bytes = _tile_bytes(nbytes, slab_bytes)
     if compact_plan and compact_row_stride > tile_bytes:
@@ -236,13 +592,31 @@ def _make_dispatch_tdm(
             f"warp_num_per_block"
         )
 
+    # The compact payload phase is shared with the fused stage-1 producer, so
+    # its geometry is a value rather than a set of closed-over locals.
+    if compact_plan:
+        compact_spec = CompactPayloadSpec(
+            rank=rank,
+            npes=npes,
+            topk=topk,
+            hidden_dim=hidden_dim,
+            hidden_elem_size=hidden_elem_size,
+            compact_row_stride=compact_row_stride,
+            tile_bytes=tile_bytes,
+            max_tok_slot_stride=max_tok_slot_stride,
+            off_out_tok=off_out_tok,
+            off_ep_rowmap=off_ep_rowmap,
+            scale_bytes=scale_bytes,
+        )
+
     # A metadata batch reuses the warp's payload tile for four runs: idx,
     # weights, srcmap and (for mxfp4/a8w4) the padded e8m0 scale row. Only the
     # token count per batch is fixed here -- each run's split into a scalar
-    # head, a TDM body and a scalar tail is decided on device from the real
-    # source and destination addresses, because a destination token id is a
-    # remote atomic's return value and lands wherever it lands. 128B of tile
-    # slack per field pays for rounding each body up to a whole row.
+    # head, a TDM body (peeled rows or a short 2D whole-tile) and a scalar
+    # tail is decided on device from the real source and destination addresses,
+    # because a destination token id is a remote atomic's return value and
+    # lands wherever it lands. 128B of tile slack per field pays for rounding
+    # each body up to a 32-dword LDS region.
     meta_fields = 4 if scale_bytes else 3
     meta_per_tok = topk * 4 * 2 + 4 + scale_stride
     meta_cap = (tile_bytes - meta_fields * 128) // meta_per_tok
@@ -250,18 +624,12 @@ def _make_dispatch_tdm(
     use_meta_tdm = bool(meta_tdm) and meta_cap > 0
 
     # One warp per peer would leave every warp past the world size idle, so the
-    # peers are split across the warps that exist.
-    #
-    # mori collapses this to one warp per peer once the batch is under two
-    # tokens per warp, on the grounds that the sub-runs get shorter than a TDM
-    # row. That does not carry over: the runs here are planned per field from
-    # their own addresses, so a short or misaligned piece degrades to a scalar
-    # head and tail rather than losing the transfer, and the split is worth its
-    # parallelism all the way down. Measured on 4x gfx1250, a4w4 h7168 topk6,
-    # 61 layers -- collapsing the split costs 6us at 8..2048 tokens/rank and
-    # gains nothing at 1.
-    peer_split = max(1, warp_num_per_block // npes) if npes else 1
-    meta_runs = npes * peer_split
+    # peers are split across the warps that exist. mori collapses that split to
+    # 1 once ``numTokens <= warps * 2``: a whole-tile metadata TDM may rewrite
+    # the rest of a straddled 128B block, and two warps sharing a peer's run
+    # would clobber each other. Large batches keep the split -- each sub-run
+    # is then long enough for a peeled row-split that owns whole rows.
+    peer_split_max = max(1, warp_num_per_block // npes) if npes else 1
 
     @flyc.kernel(
         name=f"ep_dispatch_tdm_{block_num}x{warp_num_per_block}",
@@ -512,6 +880,27 @@ def _make_dispatch_tdm(
                         dst_off + i,
                     )
 
+            def _pad_body_elems(n):
+                """Round a TDM body up to 32 dwords so the next LDS region stays 128B-aligned."""
+                return arith.andi(
+                    arith.addi(n, arith.constant(31, type=T.i32)),
+                    arith.constant(-32, type=T.i32),
+                )
+
+            def _tdm_load(lds, glob, head, body, dim0, dim1):
+                if body > 0:
+                    TDM.tdm_load(
+                        TDM.tdm_group0(lds, glob + fx.Int64(head) * fx.Int64(4)),
+                        TDM.tdm_group1_2d(dim0, dim1),
+                    )
+
+            def _tdm_store(lds, glob, head, body, dim0, dim1):
+                if body > 0:
+                    TDM.tdm_store(
+                        TDM.tdm_group0(lds, glob + fx.Int64(head) * fx.Int64(4)),
+                        TDM.tdm_group1_2d(dim0, dim1),
+                    )
+
             def _ship_meta(
                 peer_id, n_tok, src_tok, dst_tok, p_idx, p_wts, p_tis, p_scales
             ):
@@ -519,11 +908,11 @@ def _make_dispatch_tdm(
 
                 Every field is planned on its own: they start at unrelated phases
                 within a 128B row, so one can earn a TDM body where the next goes
-                entirely scalar. The tile regions are packed at each body's real
-                size, which is a whole number of rows and so keeps every region as
-                128B-aligned as the tile base.
+                entirely scalar. A short leftover (or a phase mismatch) can still
+                take a dense 2D whole-tile. Tile regions are packed at each body's
+                size rounded up to 32 dwords, so every region stays as 128B-aligned
+                as the tile base.
                 """
-                row = TDM.TDM_ROW_ELEMS_4B
                 n_kv = n_tok * topk
                 kv_bytes = fx.Int64(src_tok) * fx.Int64(topk * 4)
                 kv_dbytes = fx.Int64(dst_tok) * fx.Int64(topk * 4)
@@ -535,30 +924,19 @@ def _make_dispatch_tdm(
                 d_src = fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(
                     dst_tok
                 ) * fx.Int64(4)
-                h_idx, r_idx = TDM.tdm_plan_xfer_4b(s_idx, d_idx, n_kv)
-                h_wt, r_wt = TDM.tdm_plan_xfer_4b(s_wt, d_wt, n_kv)
-                h_src, r_src = TDM.tdm_plan_xfer_4b(s_src, d_src, n_tok)
-                b_idx = r_idx * row
-                b_wt = r_wt * row
-                b_src = r_src * row
+                h_idx, b_idx, d0_idx, d1_idx = TDM.tdm_plan_xfer_4b(
+                    s_idx, d_idx, n_kv
+                )
+                h_wt, b_wt, d0_wt, d1_wt = TDM.tdm_plan_xfer_4b(s_wt, d_wt, n_kv)
+                h_src, b_src, d0_src, d1_src = TDM.tdm_plan_xfer_4b(
+                    s_src, d_src, n_tok
+                )
                 l_idx = my_tile
-                l_wt = l_idx + b_idx * 4
-                l_src = l_wt + b_wt * 4
-                if r_idx > 0:
-                    TDM.tdm_load(
-                        TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_idx),
-                    )
-                if r_wt > 0:
-                    TDM.tdm_load(
-                        TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_wt),
-                    )
-                if r_src > 0:
-                    TDM.tdm_load(
-                        TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_src),
-                    )
+                l_wt = l_idx + _pad_body_elems(b_idx) * 4
+                l_src = l_wt + _pad_body_elems(b_wt) * 4
+                _tdm_load(l_idx, s_idx, h_idx, b_idx, d0_idx, d1_idx)
+                _tdm_load(l_wt, s_wt, h_wt, b_wt, d0_wt, d1_wt)
+                _tdm_load(l_src, s_src, h_src, b_src, d0_src, d1_src)
                 if const_expr(scale_bytes > 0):
                     n_sc = n_tok * scale_dst_dw
                     s_sc = fx.Int64(addr_stg_scale) + fx.Int64(src_tok) * fx.Int64(
@@ -567,14 +945,11 @@ def _make_dispatch_tdm(
                     d_sc = fx.Int64(window.lsa_ptr(peer_id, off_out_scales)) + fx.Int64(
                         dst_tok
                     ) * fx.Int64(scale_stride)
-                    h_sc, r_sc = TDM.tdm_plan_xfer_4b(s_sc, d_sc, n_sc)
-                    b_sc = r_sc * row
-                    l_sc = l_src + b_src * 4
-                    if r_sc > 0:
-                        TDM.tdm_load(
-                            TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * fx.Int64(4)),
-                            TDM.tdm_group1_rows_4b(r_sc),
-                        )
+                    h_sc, b_sc, d0_sc, d1_sc = TDM.tdm_plan_xfer_4b(
+                        s_sc, d_sc, n_sc
+                    )
+                    l_sc = l_src + _pad_body_elems(b_src) * 4
+                    _tdm_load(l_sc, s_sc, h_sc, b_sc, d0_sc, d1_sc)
                 # The edges are global-to-global and owe the tile nothing, so they
                 # run while the loads above are still in flight.
                 _copy_edge(
@@ -601,37 +976,28 @@ def _make_dispatch_tdm(
                         n_sc,
                     )
                 TDM.tdm_wait(0)
-                if r_idx > 0:
-                    TDM.tdm_store(
-                        TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_idx),
-                    )
-                if r_wt > 0:
-                    TDM.tdm_store(
-                        TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_wt),
-                    )
-                if r_src > 0:
-                    TDM.tdm_store(
-                        TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_src),
-                    )
-                if const_expr(scale_bytes > 0) and r_sc > 0:
-                    TDM.tdm_store(
-                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_sc),
-                    )
+                _tdm_store(l_idx, d_idx, h_idx, b_idx, d0_idx, d1_idx)
+                _tdm_store(l_wt, d_wt, h_wt, b_wt, d0_wt, d1_wt)
+                _tdm_store(l_src, d_src, h_src, b_src, d0_src, d1_src)
+                if const_expr(scale_bytes > 0):
+                    _tdm_store(l_sc, d_sc, h_sc, b_sc, d0_sc, d1_sc)
                 TDM.tdm_wait(0)
 
-            for run_id in range(warp, meta_runs, warp_num_per_block):
-                peer = run_id // peer_split
-                part = run_id - peer * peer_split
+            split = arith.select(
+                inp_cur_tok <= (warps_total * 2),
+                fx.Int32(1),
+                fx.Int32(peer_split_max),
+            )
+            n_runs = fx.Int32(npes) * split
+            for run_id in range(warp, n_runs, warp_num_per_block):
+                peer = run_id // split
+                part = run_id - peer * split
                 cnt_all = comm_ops.load_i32_lds(s_n(peer))
                 base_all = comm_ops.load_i32_lds(s_base(peer))
-                # Split the peer's run across `peer_split` warps, remainder to the
+                # Split the peer's run across `split` warps, remainder to the
                 # low parts so the sub-runs differ by at most one token.
-                q = cnt_all // peer_split
-                rem = cnt_all - q * peer_split
+                q = cnt_all // split
+                rem = cnt_all - q * split
                 my_beg = part * q + arith.select(part < rem, part, rem)
                 my_cnt = q + arith.select(part < rem, fx.Int32(1), fx.Int32(0))
                 # RESERVE counted every route, FINALIZE published only those that
@@ -718,144 +1084,72 @@ def _make_dispatch_tdm(
         # No barrier before this. The tile a warp is about to overwrite is the
         # one it just drained itself; the cross-warp state (staging, s_base) was
         # published by the barrier after FINALIZE.
-        #
-        # The token partition has to be FINALIZE's, walked one token at a time.
-        # tok_map goes through global memory but the only barrier between the two
-        # phases is a workgroup one, so a warp may read back nothing but the
-        # entries it wrote itself. A grid-strided `range(global_warp_id, ...)`
-        # reads slots other BLOCKS own: at 512 tokens on a 64x8 grid it is warps
-        # 0..127 (blocks 0..15) that route, and every one of the remaining 48
-        # blocks would send payload off entries still holding the host's -1 fill.
-        # -1 passes a `< sentinel` liveness test and decodes to dest_pe 0,
-        # dest_tok -1, i.e. a TDM store one whole token BEFORE a peer's recv
-        # buffer -- an out-of-bounds fabric write, which is what wedges the
-        # engine rather than merely corrupting the result.
-        #
-        # `sub` is a runtime loop and not `range_constexpr` on purpose: the route
-        # loop below already unrolls `topk` descriptor sites, and unrolling this
-        # one too would multiply them by `tpi`.
-        g_payload_load = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
-        g_payload_store = TDM.tdm_group1(
-            compact_row_stride if compact_plan else hidden_dim,
-            1,
-            1 if compact_plan else hidden_elem_size,
-        )
-        probe_off = arith.select(lane < topk, lane, 0)
-        row_stride = compact_row_stride if compact_plan else nbytes
-        # Compact plan fills tok_map in a prior low-LDS kernel, so every warp
-        # may read it. Token-major dispatch still only trusts entries it wrote.
-        tok_step = warps_total if compact_plan else (warps_total * etpi)
-        tok_begin = global_warp_id if compact_plan else (global_warp_id * etpi)
-        for tok_base in range(tok_begin, inp_cur_tok, tok_step):
-            sub_limit = fx.Int32(1) if compact_plan else etpi
-            for sub in range(sub_limit):
-                tok = tok_base + sub
-                if tok < inp_cur_tok:
-                    flat = buffer_load(
-                        rsrc_tok_map, tok * topk + probe_off, vec_width=1, dtype=T.i32
-                    )
-                    # `flat >= 0` rejects the host's -1 fill as well as the
-                    # sentinel, so a slot FINALIZE never published can never name
-                    # a route.
-                    live = (lane < topk) & (flat >= 0)
-                    if const_expr(not compact_plan):
-                        live = live & (flat < sentinel_val)
-                    live_mask = ballot(T.i32, live)
-                    wt_bits = arith.constant(0)
-                    packed_meta = arith.constant(0)
-                    if const_expr(compact_plan) and live:
-                        wt_bits = arith.bitcast(
-                            T.i32,
-                            buffer_load(
-                                rsrc_inp_wts,
-                                tok * topk + lane,
-                                vec_width=1,
-                                dtype=T.f32,
-                            ),
+        if const_expr(compact_plan):
+            # The compact wire is the shared emitter's, warp-strided over the
+            # grid: the planner filled tok_map in a prior low-LDS kernel, so
+            # every warp may read every entry.
+            emit_compact_payload_rows(
+                compact_spec,
+                work_id=global_warp_id,
+                work_stride=warps_total,
+                token_limit=inp_cur_tok,
+                lane=lane,
+                tile_addr=my_tile,
+                window=window,
+                addr_inp_tok=addr_inp_tok,
+                rsrc_tok_map=rsrc_tok_map,
+                rsrc_inp_wts=rsrc_inp_wts,
+                rsrc_inp_scale=rsrc_inp_scale if scale_bytes else None,
+            )
+        else:
+            # The token partition has to be FINALIZE's, walked one token at a
+            # time. tok_map goes through global memory but the only barrier
+            # between the two phases is a workgroup one, so a warp may read back
+            # nothing but the entries it wrote itself. A grid-strided
+            # `range(global_warp_id, ...)` reads slots other BLOCKS own: at 512
+            # tokens on a 64x8 grid it is warps 0..127 (blocks 0..15) that route,
+            # and every one of the remaining 48 blocks would send payload off
+            # entries still holding the host's -1 fill. -1 passes a `< sentinel`
+            # liveness test and decodes to dest_pe 0, dest_tok -1, i.e. a TDM
+            # store one whole token BEFORE a peer's recv buffer -- an
+            # out-of-bounds fabric write, which is what wedges the engine rather
+            # than merely corrupting the result.
+            #
+            # `sub` is a runtime loop and not `range_constexpr` on purpose: the
+            # route loop below already unrolls `topk` descriptor sites, and
+            # unrolling this one too would multiply them by `tpi`.
+            g_payload_load = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
+            g_payload_store = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
+            probe_off = arith.select(lane < topk, lane, 0)
+            for tok_base in range(
+                global_warp_id * etpi, inp_cur_tok, warps_total * etpi
+            ):
+                for sub in range(etpi):
+                    tok = tok_base + sub
+                    if tok < inp_cur_tok:
+                        flat = buffer_load(
+                            rsrc_tok_map,
+                            tok * topk + probe_off,
+                            vec_width=1,
+                            dtype=T.i32,
                         )
-                        packed_meta = (
-                            fx.Int32(rank) * fx.Int32(max_tok_slot_stride)
-                            + tok * fx.Int32(topk)
-                            + lane
+                        # `flat >= 0` rejects the host's -1 fill as well as the
+                        # sentinel, so a slot FINALIZE never published can never
+                        # name a route.
+                        live = (
+                            (lane < topk) & (flat >= 0) & (flat < sentinel_val)
                         )
-                    if live_mask != 0:
-                        TDM.tdm_load(
-                            TDM.tdm_group0(
-                                my_tile,
-                                fx.Int64(addr_inp_tok)
-                                + fx.Int64(tok) * fx.Int64(nbytes),
-                            ),
-                            g_payload_load,
-                        )
-                        # All compact rows of this token carry the same scale.
-                        # Read it once into the unused tail of this warp's LDS
-                        # tile instead of re-reading the global row per route.
-                        scale_lds = fx.Int64(my_tile) + fx.Int64(nbytes)
-                        if const_expr(compact_plan and scale_bytes > 0):
-                            scale_vec = 2 if scale_src_dw % 2 == 0 else 1
-                            for si in range(
-                                lane * scale_vec,
-                                scale_src_dw,
-                                WAVE * scale_vec,
-                            ):
-                                val = buffer_load(
-                                    rsrc_inp_scale,
-                                    tok * scale_src_dw + si,
-                                    vec_width=scale_vec,
-                                    dtype=T.i32,
-                                )
-                                if const_expr(scale_vec == 2):
-                                    comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si) * fx.Int64(4),
-                                        val[0],
-                                    )
-                                    comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si + 1) * fx.Int64(4),
-                                        val[1],
-                                    )
-                                else:
-                                    comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si) * fx.Int64(4),
-                                        val,
-                                    )
-                            fx.rocdl.s_wait_dscnt(0)
-                        TDM.tdm_wait(0)
-                        if const_expr(compact_plan):
-                            # Unroll the live routes so each TDM descriptor is a
-                            # distinct issue site. The ctpop walk serializes too
-                            # many SGPR descriptor rebuilds through one loop.
-                            for k in range_constexpr(topk):
-                                bit = arith.constant(1 << k)
-                                if (live_mask & bit) != 0:
-                                    flat_l = readlane(T.i32, flat, k)
-                                    dest_pe = flat_l & compact_peer_mask
-                                    dest_tok = flat_l >> compact_peer_bits
-                                    TDM.tdm_store(
-                                        TDM.tdm_group0(
-                                            my_tile,
-                                            fx.Int64(
-                                                window.lsa_ptr(dest_pe, off_out_tok)
-                                            )
-                                            + fx.Int64(dest_tok) * fx.Int64(row_stride),
-                                        ),
-                                        g_payload_store,
-                                    )
-                                    if lane == k:
-                                        buffer_store(
-                                            fx.Vector.from_elements(
-                                                [packed_meta, wt_bits],
-                                                dtype=fx.Int32,
-                                            ),
-                                            create_buffer_resource_from_addr(
-                                                fx.Int64(
-                                                    window.lsa_ptr(
-                                                        dest_pe, off_ep_rowmap
-                                                    )
-                                                )
-                                            ),
-                                            dest_tok * 2,
-                                        )
-                        else:
+                        live_mask = ballot(T.i32, live)
+                        if live_mask != 0:
+                            TDM.tdm_load(
+                                TDM.tdm_group0(
+                                    my_tile,
+                                    fx.Int64(addr_inp_tok)
+                                    + fx.Int64(tok) * fx.Int64(nbytes),
+                                ),
+                                g_payload_load,
+                            )
+                            TDM.tdm_wait(0)
                             rest = live_mask
                             for _ in range(fx.ctpop(live_mask)):
                                 src_lane = fx.cttz(rest)
@@ -867,11 +1161,11 @@ def _make_dispatch_tdm(
                                     TDM.tdm_group0(
                                         my_tile,
                                         fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
-                                        + fx.Int64(dest_tok) * fx.Int64(row_stride),
+                                        + fx.Int64(dest_tok) * fx.Int64(nbytes),
                                     ),
                                     g_payload_store,
                                 )
-                        TDM.tdm_wait(0)
+                            TDM.tdm_wait(0)
 
         if const_expr(enable_signal and compact_plan):
             TDM.tdm_wait(0)

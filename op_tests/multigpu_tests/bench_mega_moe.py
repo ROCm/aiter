@@ -30,7 +30,7 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
-           --stage1_fused --dispatch_wire --combine
+           --stage1_fused --stage1_single_kernel --dispatch_wire --combine
            -tpr -hd -id -e -k --shared_E -q
            --data-init --seed --warmup --iters --prof_replays
 
@@ -657,6 +657,7 @@ class DeviceMoEPipeline:
                 dispatch_wire=self.spec["dispatch_wire"],
                 dispatch_backend=self.spec["dispatch_backend"],
                 stage1_fused=self.spec["stage1_fused"],
+                stage1_single_kernel=self.spec["stage1_single_kernel"],
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -1099,8 +1100,11 @@ def main():
     spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
     spec["dispatch_backend"] = args.dispatch_backend
     spec["stage1_fused"] = bool(args.stage1_fused)
+    spec["stage1_single_kernel"] = bool(args.stage1_single_kernel)
     if spec["stage1_fused"] and spec["dispatch_backend"] != "flydsl":
         raise ValueError("--stage1_fused=1 requires --dispatch_backend=flydsl")
+    if spec["stage1_single_kernel"] and not spec["stage1_fused"]:
+        raise ValueError("--stage1_single_kernel=1 requires --stage1_fused=1")
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
@@ -1127,6 +1131,7 @@ def main():
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
             f"combine={args.combine} dispatch={spec['dispatch_backend']} "
             f"stage1_fused={spec['stage1_fused']} "
+            f"stage1_single_kernel={spec['stage1_single_kernel']} "
             f"dispatch_wire={spec['dispatch_wire']} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} "
@@ -1263,6 +1268,7 @@ def main():
                 "combine": combine_mode,
                 "dispatch": spec["dispatch_backend"],
                 "stage1_fused": spec["stage1_fused"],
+                "stage1_single_kernel": spec["stage1_single_kernel"],
                 "data_init": data_dist,
                 "seed": args.seed,
                 "world_size": dist_ctx.world,
@@ -1432,6 +1438,13 @@ def _parse_args():
         choices=[0, 1],
         default=0,
         help="use the compact-plan fused stage-1 path (flydsl dispatch only)",
+    )
+    p.add_argument(
+        "--stage1_single_kernel",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="fuse compact dispatch payload and GEMM1 in one gfx1250 kernel",
     )
     p.add_argument(
         "--dispatch_wire",
