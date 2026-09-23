@@ -2488,10 +2488,18 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     constexpr int pass0_start_bit   = 20;
     constexpr int pass1_start_bit   = 8;
     constexpr int pass2             = 2;
+    // How much of the row's leading slice may be used to predict the staging
+    // threshold, and how many elements the staging may hold.
+    constexpr int MaxSampleVecs = 2;
+    constexpr int StageCapacity = 4096;
 
     __shared__ Counter<T, IdxT> counter;
+    __shared__ Counter<T, IdxT> pre_counter;
     __shared__ IdxT histogram[num_buckets];
     __shared__ IdxT wave_sums[BlockSize / WARP_SIZE];
+    __shared__ unsigned long long staged_packed[StageCapacity];
+    __shared__ IdxT staged_count;
+    __shared__ int staged_overflow;
     __shared__ T candidate_values[CandidateCapacity];
     __shared__ IdxT candidate_indices[CandidateCapacity];
     // Pass-1 winners are sparse across the row.  Staging their indices in LDS
@@ -2515,6 +2523,11 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         counter.filter_cnt     = 0;
         counter.out_cnt        = 0;
         counter.out_back_cnt   = 0;
+        pre_counter.k              = 0;
+        pre_counter.len            = 0;
+        pre_counter.kth_value_bits = 0;
+        staged_count               = 0;
+        staged_overflow            = 0;
     }
     __syncthreads();
 
@@ -2540,13 +2553,108 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __syncthreads();
 
     IdxT* const pass0_histogram = histogram;
-    auto build_pass0_histogram = [pass0_histogram, select_min](T value, IdxT) {
+    auto histogram_one = [pass0_histogram, select_min](T value) {
         auto const bits = twiddle_in(value, select_min);
         int const bucket = __builtin_amdgcn_ubfe(
             bits, static_cast<unsigned>(pass0_start_bit), static_cast<unsigned>(BitsPerPass));
         atomicAdd(pass0_histogram + bucket, static_cast<IdxT>(1));
+        return bits;
     };
-    vectorized_process(threadIdx.x, blockDim.x, in, row_len, build_pass0_histogram);
+
+    // Predict a staging threshold from the row's leading slice, so that the
+    // one full-row scan that pass 0 already does can also put the elements
+    // pass 1 will want into LDS.
+    //
+    // Pass 1 exists only to find the roughly k elements at or above the
+    // crossing prefix, and it pays a full traversal of the row to do it --
+    // measured on gfx950 by stopping the kernel after each phase, 66.1us of a
+    // 188.0us kernel at M=4096 N=32768, and 8.6us of 16.7us at M=1. If those
+    // elements are already in LDS it only has to look at the staged set.
+    //
+    // The prediction is not trusted. The histogram this builds is the exact
+    // full-row one either way, so `high_prefix` stays exact; the staged set is
+    // used only when it provably contains every element pass 1 could want
+    // (`high_prefix <= pre_prefix`) and did not overflow. Otherwise the
+    // original full-row pass runs, unchanged. A sorted row, whose leading
+    // slice says nothing about the rest, lands there and pays one slice of
+    // histogram work for the attempt.
+    //
+    // The slice is up to an eighth of the row, one element per thread per
+    // step, capped at two steps. It is read with scalar loads rather than
+    // through the vector loop, so a longer one costs load instructions at high
+    // row counts; a shorter one leaves the count the threshold has to resolve
+    // noisy enough that the margin must widen, which costs more staging than
+    // the shorter slice saves. Measured on gfx950 at N=32768 (us, one step /
+    // two steps / four steps): M=512 30.5/25.1/25.1, M=4096 154.4/154.9/162.7.
+    int nsample = static_cast<int>((row_len / 8 + BlockSize - 1) / BlockSize);
+    if(nsample < 1) nsample = 1;
+    if(nsample > MaxSampleVecs) nsample = MaxSampleVecs;
+    IdxT const sample_len = static_cast<IdxT>(nsample) * BlockSize;
+
+    T sample_values[MaxSampleVecs];
+#pragma unroll
+    for(int j = 0; j < MaxSampleVecs; ++j)
+    {
+        sample_values[j] = static_cast<T>(0);
+        if(j < nsample)
+        {
+            sample_values[j] = in[static_cast<IdxT>(threadIdx.x) + j * BlockSize];
+            histogram_one(sample_values[j]);
+        }
+    }
+    __syncthreads();
+    // Aim the threshold at the midpoint between what the answer needs (k) and
+    // what the staging can hold, so sampling error and the coarseness of a
+    // 4096-bucket boundary have the same room on either side. Undershoot loses
+    // the fast path, overshoot overflows it, and near the cut one bucket is
+    // already several hundred elements wide.
+    IdxT const stage_target = k + k / 4;
+    IdxT sample_k = static_cast<IdxT>((static_cast<int64_t>(stage_target) * sample_len) /
+                                      static_cast<int64_t>(row_len));
+    if(sample_k < 1) sample_k = 1;
+    if(sample_k > sample_len) sample_k = sample_len;
+    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+        &pre_counter, histogram, wave_sums, sample_k, pass0_start_bit);
+    __syncthreads();
+    auto const pre_prefix = pre_counter.kth_value_bits;
+    auto const pre_last   = static_cast<decltype(pre_prefix)>(
+        pre_prefix | ((1u << pass0_start_bit) - 1u));
+
+    auto stage_one = [&](decltype(pre_prefix) bits, IdxT idx, T value) {
+        if(bits <= pre_last)
+        {
+            IdxT const pos = atomicAdd(&staged_count, static_cast<IdxT>(1));
+            if(pos < StageCapacity)
+            {
+                staged_packed[pos] =
+                    (static_cast<unsigned long long>(__float_as_uint(value)) << 32) |
+                    static_cast<unsigned long long>(static_cast<unsigned>(idx));
+            }
+            else
+            {
+                atomicExch(&staged_overflow, 1);
+            }
+        }
+    };
+
+    // The rest of the row: histogram and stage in the same read.
+    auto build_and_stage = [&](T value, IdxT i) {
+        auto const bits = histogram_one(value);
+        stage_one(bits, i + sample_len, value);
+    };
+    vectorized_process(
+        threadIdx.x, blockDim.x, in + sample_len, row_len - sample_len, build_and_stage);
+    // The leading slice, from the registers it was read into.
+#pragma unroll
+    for(int j = 0; j < MaxSampleVecs; ++j)
+    {
+        if(j < nsample)
+        {
+            stage_one(twiddle_in(sample_values[j], select_min),
+                      static_cast<IdxT>(threadIdx.x) + j * BlockSize,
+                      sample_values[j]);
+        }
+    }
     __syncthreads();
     choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
         &counter, histogram, wave_sums, k, pass0_start_bit);
@@ -2606,7 +2714,23 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
             atomicAdd(histogram_ptr + bucket, static_cast<IdxT>(1));
         }
     };
-    vectorized_process(threadIdx.x, blockDim.x, in, row_len, stage_pass1);
+    // Prediction held: every element pass 1 wants is in the staged set, so
+    // walk that instead of the row -- about 1.25k entries against a row of
+    // 16K to 32K.
+    if(!staged_overflow && high_prefix <= pre_prefix)
+    {
+        IdxT const n = staged_count;
+        for(IdxT s = static_cast<IdxT>(threadIdx.x); s < n; s += BlockSize)
+        {
+            unsigned long long const packed = staged_packed[s];
+            stage_pass1(__uint_as_float(static_cast<unsigned>(packed >> 32)),
+                        static_cast<IdxT>(static_cast<unsigned>(packed)));
+        }
+    }
+    else
+    {
+        vectorized_process(threadIdx.x, blockDim.x, in, row_len, stage_pass1);
+    }
     __syncthreads();
 
     IdxT const pass1_k = counter.k;
