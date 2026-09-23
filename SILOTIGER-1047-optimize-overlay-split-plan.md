@@ -543,3 +543,12 @@ not repeated unless an overlay retry is proposed.
   keep-gate vs K-map HEAD **179.56** µs: FlyDSL **179.48** (`M=512`
   **−0.04%**, need ≤ **174.17**). Kernel restored. Do not retry pinning
   PV-B dests through rmem/gemm authoring.
+- Prefill VMEM depth after K-publish: live Vector V gathers plus
+  `sched_vmem(16)` so 16 `buffer_load`s overlap QK (no hoist across
+  the K-publish barrier). Oracle **2 passed**. Prefill ISA
+  (`tickets/1047/tmp/k2_vmem_depth_isa/`) still issues every V load
+  after the first QK MFMA; first `write2st64` waits `vmcnt(8)` instead
+  of `vmcnt(4)`. Keep-gate vs st64-imm HEAD **159.41 µs**: five-run
+  median **174.37 µs** (**+9.4%**, need ≤ **154.63**). Kernel restored.
+  Do not retry pinning V gathers through rmem/`sched_vmem`. Inline-asm
+  buffer-load dests are a different experiment.

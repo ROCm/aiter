@@ -1030,6 +1030,14 @@ refill or bursting all four ``ds_read_b64_tr_b16`` before MFMA). GPU 6
 K-map HEAD **179.56** µs went **179.48** (``M=512 −0.04%``, keep-gate
 3% / ≤174.17). Kernel restored.
 
+**Do not retry** overlay prefill VMEM depth by pinning V gathers as
+live Vectors plus ``sched_vmem(16)`` after K-publish (no hoist across
+that barrier). GPU 6 / gfx950 stayed exact; every V ``buffer_load``
+still issued after the first QK MFMA. Width-2051 ``L=512`` vs
+st64-imm HEAD **159.41 µs** went **174.37 µs** (``M=512 +9.4%``,
+keep-gate 3% / ≤154.63). Kernel restored. Inline-asm buffer-load dests
+are a different experiment.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one
