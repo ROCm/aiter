@@ -164,8 +164,9 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 - **Type**: int
 - **Default**: 96
 - **Description**: Cap on enumerated candidates per shape. The kernel's own
-  candidate table and heuristic ladder are unioned in on top of the cap, so the
-  tuned pick can never come out worse than the shipped default.
+  candidate table and heuristic ladder are unioned in on top of the cap, and so
+  is the tile the shape would borrow from another tuned resolution of its layer,
+  so the tuned pick can never come out worse than the shipped default.
 
 ## Common Options
 

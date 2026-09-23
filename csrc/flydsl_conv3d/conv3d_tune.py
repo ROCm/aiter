@@ -143,8 +143,9 @@ class Conv3dTuner(TunerCommon):
             "--max_configs",
             type=int,
             default=96,
-            help="cap on enumerated candidates per shape (baseline tiles are "
-            "always added on top, so the real count is slightly higher)",
+            help="cap on enumerated candidates per shape (baseline tiles and the "
+            "tile the shape would borrow are always added on top, so the real "
+            "count is slightly higher)",
         )
 
     # -------------------------------------------------------------------
@@ -194,23 +195,39 @@ class Conv3dTuner(TunerCommon):
             self.untunedf = self.untunedf[~skip].reset_index(drop=True)
 
     def _check_shapes_expressible(self):
-        """Reject a row whose padded input is smaller than the filter."""
+        """Reject a row no candidate could run, naming the row rather than the task."""
         if self.untunedf is None or self.untunedf.empty:
             return
         bad = []
         suspect = []
         for _, row in self.untunedf.iterrows():
             keys = tuple(row[k] for k in self.keys)
+            shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
+            # Ahead of the extents: _gemm_dims divides by the stride, and a
+            # negative pad or zero dilation reaches _conv3d_impl's asserts intact.
+            p = _row_params(dict(zip(self.keys, keys)))
+            if min(p["stride"]) < 1 or min(p["dilation"]) < 1 or min(p["padding"]) < 0:
+                bad.append(
+                    f"  {shape} -> stride {p['stride']} and dilation "
+                    f"{p['dilation']} must be >= 1, padding {p['padding']} >= 0"
+                )
+                continue
+            try:
+                _parse_tuned_bool(row["bias"])
+            except ValueError as exc:
+                bad.append(f"  {shape} -> bias: {exc}")
+                continue
             _, _, _, extents = self._gemm_dims(keys)
             if min(extents) < 1:
-                shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
-                bad.append(f"  {shape} -> output {extents}")
+                bad.append(
+                    f"  {shape} -> output {extents}: the dilated filter is larger "
+                    f"than the padded input"
+                )
             # Legal, so only warned: a 2D conv written as kT=1, D=1 with pad_d
             # left over tunes a depth-(1 + 2*pad_d) problem whose padded slices
             # are bias only. Not rejected, because the row has to match what the
             # model really calls with to be looked up at all.
             elif int(row["kT"]) == 1 and int(row["D"]) == 1 and int(row["pad_d"]) > 0:
-                shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
                 suspect.append(f"  {shape} -> output depth {extents[0]}")
         if suspect:
             logger.warning(
@@ -219,8 +236,7 @@ class Conv3dTuner(TunerCommon):
             )
         if bad:
             raise ValueError(
-                "untuned CSV has row(s) whose filter is larger than the padded "
-                "input, so the convolution has no output:\n" + "\n".join(bad)
+                "untuned CSV has row(s) this tuner cannot express:\n" + "\n".join(bad)
             )
 
     def pre_process(self, args):
@@ -256,7 +272,7 @@ class Conv3dTuner(TunerCommon):
     # -------------------------------------------------------------------
 
     def _shape_tasks(self, keys, max_configs):
-        from aiter.ops.flydsl.conv_kernels import _resolve_splitk
+        from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile, _resolve_splitk
 
         kv = dict(zip(self.keys, keys))
         n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
@@ -269,6 +285,15 @@ class Conv3dTuner(TunerCommon):
         configs = get_flydsl_conv3d_configs(
             m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
         )
+        # BASELINE_TILES covers the heuristic default but not a borrowed one: a
+        # tile tuned at another resolution of this layer can fall outside this
+        # npq's max_configs cut, and the runtime serves it until this row exists.
+        borrowed = _borrow_tuned_tile(
+            (self.get_gfx(), self.get_cu_num()),
+            _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
+        )
+        if borrowed is not None and (*borrowed[0], borrowed[1]) not in configs:
+            configs.append((*borrowed[0], borrowed[1]))
 
         # crs is built from the *padded* per-group channel count, matching what
         # the kernel computes; splitK divisibility depends on it.
@@ -468,7 +493,23 @@ class Conv3dTuner(TunerCommon):
         from aiter.ops.flydsl import conv_kernels
 
         conv_kernels._load_tuned_table.cache_clear()
+        # Built from the table above, so it goes stale with it: a borrow after
+        # the config swap would still pick among the old table's rows.
+        conv_kernels._tuned_rows_by_layer.cache_clear()
         conv_kernels._TUNED_LOOKUP_LOGGED.clear()
+
+    def _restore_config_env(self, env_name, old_val, old_rebuild=0):
+        """Also drop what the swapped-in table left cached.
+
+        The base restores the env var only, so with ``--batch`` below the shape
+        count the next batch's pre-tune baseline would still read the previous
+        batch's candidate table.
+        """
+        from aiter.jit.core import AITER_CONFIGS
+
+        super()._restore_config_env(env_name, old_val, old_rebuild)
+        AITER_CONFIGS.get_config_file.cache_clear()
+        self._clear_op_caches()
 
     @staticmethod
     def _ramp_clocks(seconds=2.0):
