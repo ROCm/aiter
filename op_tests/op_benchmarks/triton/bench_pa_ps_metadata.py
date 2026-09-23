@@ -1,3 +1,5 @@
+"""Benchmark metadata planning for the existing page16 PA_PS ASM kernels."""
+
 import argparse
 import hashlib
 import json
@@ -27,7 +29,7 @@ def make_lengths(batch, pattern):
 def summarize(metadata, lengths, page_offsets, num_heads_k, gqa, block_size, overhead):
     _, work_indptr, work_info, reduce_indptr, _, _ = metadata
     work_ptr = work_indptr.cpu().tolist()
-    records = work_info[:work_ptr[-1]].cpu().tolist()
+    records = work_info[: work_ptr[-1]].cpu().tolist()
     reduce_ptr = reduce_indptr.cpu().tolist()
     assert work_ptr[0] == reduce_ptr[0] == 0
     assert work_ptr == sorted(work_ptr) and reduce_ptr == sorted(reduce_ptr)
@@ -37,14 +39,29 @@ def summarize(metadata, lengths, page_offsets, num_heads_k, gqa, block_size, ove
     work_counts, tile_counts, costs = [], [], []
     for first, last in pairwise(work_ptr):
         tiles = 0
-        for sequence, _, query_start, query_end, begin, end, offset, head_range in records[first:last]:
+        for (
+            sequence,
+            _,
+            query_start,
+            query_end,
+            begin,
+            end,
+            offset,
+            head_range,
+        ) in records[first:last]:
             head = (head_range & 0xFFFF) // gqa
             assert head_range == ((head + 1) * gqa << 16) | (head * gqa)
             assert 0 <= head < num_heads_k and 0 <= sequence < len(lengths)
             assert query_start == sequence and query_end == sequence + 1 and offset == 0
             assert page_offsets[sequence] <= begin < end <= page_offsets[sequence + 1]
             coverage[head][sequence].append((begin, end))
-            tiles += (min((end - begin) * block_size, lengths[sequence] - (begin - page_offsets[sequence]) * block_size) + 255) // 256
+            tiles += (
+                min(
+                    (end - begin) * block_size,
+                    lengths[sequence] - (begin - page_offsets[sequence]) * block_size,
+                )
+                + 255
+            ) // 256
         work_counts.append(last - first)
         tile_counts.append(tiles)
         costs.append(tiles + (last - first) * overhead)
@@ -100,8 +117,12 @@ def measure(calls, rounds, repeat):
             graph.reset()
     torch.cuda.current_stream().wait_stream(stream)
     return {
-        name: {"median_us": statistics.median(values), "min_us": min(values),
-               "max_us": max(values), "samples_us": values}
+        name: {
+            "median_us": statistics.median(values),
+            "min_us": min(values),
+            "max_us": max(values),
+            "samples_us": values,
+        }
         for name, values in samples.items()
     }
 
@@ -117,43 +138,86 @@ def run_case(batch, pattern, args):
         for shape, dtype in aiter.get_pa_metadata_info_v1(batch, args.kv_heads)
     ]
     plan = plan_pa_ps_metadata(
-        qo_indptr, kv_indptr, context, args.gqa, args.kv_heads,
-        max_qlen=1, block_size=args.block_size,
+        qo_indptr,
+        kv_indptr,
+        context,
+        args.gqa,
+        args.kv_heads,
+        max_qlen=1,
+        block_size=args.block_size,
     )
 
     def legacy_call():
         aiter.get_pa_metadata_v1(
-            qo_indptr, kv_indptr, context, args.gqa, args.kv_heads, False, *legacy,
-            kv_granularity=args.block_size, block_size=args.block_size,
-            max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=True, max_split_per_batch=-1,
+            qo_indptr,
+            kv_indptr,
+            context,
+            args.gqa,
+            args.kv_heads,
+            False,
+            *legacy,
+            kv_granularity=args.block_size,
+            block_size=args.block_size,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            max_split_per_batch=-1,
         )
 
     def tile_call():
         plan_pa_ps_metadata(
-            qo_indptr, kv_indptr, context, args.gqa, args.kv_heads,
-            max_qlen=1, block_size=args.block_size, plan=plan,
+            qo_indptr,
+            kv_indptr,
+            context,
+            args.gqa,
+            args.kv_heads,
+            max_qlen=1,
+            block_size=args.block_size,
+            plan=plan,
         )
 
     legacy_call()
-    tile = [getattr(plan, name) for name in (
-        "work_metadata_ptrs", "work_indptr", "work_info", "reduce_indptr",
-        "reduce_final_map", "reduce_partial_map",
-    )]
+    tile = [
+        getattr(plan, name)
+        for name in (
+            "work_metadata_ptrs",
+            "work_indptr",
+            "work_info",
+            "reduce_indptr",
+            "reduce_final_map",
+            "reduce_partial_map",
+        )
+    ]
     offsets = kv_indptr.cpu().tolist()
     summaries = {
-        name: summarize(metadata, lengths, offsets, args.kv_heads, args.gqa,
-                        args.block_size, plan.work_overhead)
+        name: summarize(
+            metadata,
+            lengths,
+            offsets,
+            args.kv_heads,
+            args.gqa,
+            args.block_size,
+            plan.work_overhead,
+        )
         for name, metadata in (("legacy", legacy), ("tile", tile))
     }
-    timing = measure({"legacy": legacy_call, "tile": tile_call}, args.rounds, args.repeat)
+    timing = measure(
+        {"legacy": legacy_call, "tile": tile_call}, args.rounds, args.repeat
+    )
     return {"batch": batch, "pattern": pattern, "summary": summaries, "timing": timing}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare GPU PA_PS metadata planners without changing ASM.")
+    parser = argparse.ArgumentParser(
+        description="Compare GPU PA_PS metadata planners without changing ASM."
+    )
     parser.add_argument("--batch", nargs="+", type=int, default=[8, 200, 32768])
-    parser.add_argument("--pattern", nargs="+", choices=["uniform", "mixed", "prefix", "shuffled"],
-                        default=["uniform", "mixed", "prefix", "shuffled"])
+    parser.add_argument(
+        "--pattern",
+        nargs="+",
+        choices=["uniform", "mixed", "prefix", "shuffled"],
+        default=["uniform", "mixed", "prefix", "shuffled"],
+    )
     parser.add_argument("--kv-heads", type=int, default=1)
     parser.add_argument("--gqa", type=int, choices=[8, 16], default=16)
     parser.add_argument("--block-size", type=int, choices=[16], default=16)
@@ -164,24 +228,45 @@ def main():
     if args.output.exists() or args.rounds < 1 or args.repeat < 1:
         raise ValueError("use a new output path and positive rounds/repeat")
     root = Path(aiter.__file__).resolve().parents[1]
-    protected = [root / "aiter/ops/attention.py", root / "csrc/py_itfs_cu/asm_pa.cu",
-                 root / "csrc/py_itfs_cu/asm_pa_ps_reduce.cu", *sorted((root / "hsa/gfx950/pa").glob("*.co"))]
-    hashes = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in protected}
+    protected = [
+        root / "aiter/ops/attention.py",
+        root / "csrc/py_itfs_cu/asm_pa.cu",
+        root / "csrc/py_itfs_cu/asm_pa_ps_reduce.cu",
+        *sorted((root / "hsa/gfx950/pa").glob("*.co")),
+    ]
+    hashes = {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in protected
+    }
     result = {
-        "status": "running", "scope": "metadata_only", "args": {**vars(args), "output": str(args.output)},
-        "device": torch.cuda.get_device_name(), "torch_version": torch.__version__,
-        "cu_count": torch.cuda.get_device_properties(context_device := torch.cuda.current_device()).multi_processor_count,
-        "device_ordinal": context_device, "protected_sha256": hashes, "results": [],
+        "status": "running",
+        "scope": "metadata_only",
+        "args": {**vars(args), "output": str(args.output)},
+        "device": torch.cuda.get_device_name(),
+        "torch_version": torch.__version__,
+        "cu_count": torch.cuda.get_device_properties(
+            context_device := torch.cuda.current_device()
+        ).multi_processor_count,
+        "device_ordinal": context_device,
+        "protected_sha256": hashes,
+        "results": [],
     }
     try:
         for batch in args.batch:
             for pattern in args.pattern:
                 row = run_case(batch, pattern, args)
                 result["results"].append(row)
-                aiter.logger.info("B=%d pattern=%s legacy=%.3f us tile=%.3f us",
-                                  batch, pattern, row["timing"]["legacy"]["median_us"],
-                                  row["timing"]["tile"]["median_us"])
-        assert hashes == {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in protected}
+                aiter.logger.info(
+                    "B=%d pattern=%s legacy=%.3f us tile=%.3f us",
+                    batch,
+                    pattern,
+                    row["timing"]["legacy"]["median_us"],
+                    row["timing"]["tile"]["median_us"],
+                )
+        assert hashes == {
+            str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in protected
+        }
         result["protected_unchanged"] = True
         result["status"] = "passed"
     finally:

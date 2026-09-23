@@ -1044,7 +1044,9 @@ for dtype in args.dtype:
                 (kv_dtype, mask)
                 for kv_dtype in kv_dtypes
                 for mask in (
-                    [args.mask] if args.mask is not None else ([0, 1] if qlen > 2 else [1])
+                    [args.mask]
+                    if args.mask is not None
+                    else ([0, 1] if qlen > 2 else [1])
                 )
             ]
         if args.kv_dtype is not None:
@@ -1054,11 +1056,17 @@ for dtype in args.dtype:
                 "noquant": dtype,
             }[args.kv_dtype]
             if block_size == 16:
-                test_cases = [case for case in test_cases if case[0] == selected_kv_dtype]
+                test_cases = [
+                    case for case in test_cases if case[0] == selected_kv_dtype
+                ]
                 if not test_cases:
-                    raise ValueError("The selected KV dtype is not supported by this test geometry")
+                    raise ValueError(
+                        "The selected KV dtype is not supported by this test geometry"
+                    )
             else:
-                test_cases = [(selected_kv_dtype, 1 if args.mask is None else args.mask)]
+                test_cases = [
+                    (selected_kv_dtype, 1 if args.mask is None else args.mask)
+                ]
         for test_case in test_cases:
             ret = test_pa_ps(
                 ctx_len,
