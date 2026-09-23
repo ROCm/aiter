@@ -44,11 +44,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import Stream, T
 
-try:
-    from flydsl.expr import buffer_ops
-except ImportError:
-    from .. import buffer_ops
-
 from ..tensor_shim import _run_compiled, _to_raw
 from .stream_readiness import register_ready, wait_ready
 
@@ -114,13 +109,12 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         row_idx = fx.Int64(row)
 
         # ---- load VEC bf16 for this lane: elems [row*D + tid*VEC, +VEC) ----
-        in_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(x_in)).ir_value()
-        )
         row_off_elems = row_idx * D + fx.Int64(tid) * VEC
         row_off_dw = fx.Int32(row_off_elems // 2)
-        x_raw = buffer_ops.buffer_load(
-            in_rsrc, row_off_dw, vec_width=VEC // 2, dtype=i32
+        x_raw = (
+            (fx.recast_iter(fx.Int32, x_in) + row_off_dw)
+            .view(fx.make_layout(VEC // 2, 1))
+            .load()
         )
         x_bf16 = fx.Vector(x_raw).bitcast(fx.BFloat16)
         xf = [
@@ -170,21 +164,11 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
                 peer = _to_raw(fx.Float32(am).shuffle_xor(off, BLOCK_THREADS))
                 am = arith.maximumf(am, peer)
             if tid == fx.Int32(0):
-                s_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                    fx.Int64(fx.ptrtoint(scale_io)).ir_value()
-                )
-                buffer_ops.buffer_store(am, s_rsrc, _to_raw(row), offset_is_bytes=False)
+                fx.recast_iter(fx.Float32, scale_io)[fx.Int32(row)] = am
             return
 
         # mode == "scale": read the single global descale (all lanes broadcast).
-        sc_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(scale_io)).ir_value()
-        )
-        scale = _to_raw(
-            buffer_ops.buffer_load(
-                sc_rsrc, arith.constant(0, type=i32), vec_width=1, dtype=f32
-            )
-        )
+        scale = _to_raw(fx.recast_iter(fx.Float32, scale_io).load())
         inv_scale = arith.divf(arith.constant(1.0, type=f32), scale, fastmath=fm_fast)
 
         # ---- scale + clamp + pack to fp8 (VEC=4 -> 1 dword), store ----
@@ -199,12 +183,9 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         c0 = arith.constant(0, type=i32)
         pk = rocdl.cvt_pk_fp8_f32(i32, q[0], q[1], c0, 0)
         pk = rocdl.cvt_pk_fp8_f32(i32, q[2], q[3], pk, 1)
-        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(fx.ptrtoint(x_out)).ir_value()
-        )
         # fp8 out: 1 byte/elem, VEC=4 bytes = 1 dword. dword offset = row_off_elems/4
         out_off_dw = fx.Int32(row_off_elems // 4)
-        buffer_ops.buffer_store(pk, out_rsrc, out_off_dw, offset_is_bytes=False)
+        fx.recast_iter(fx.Int32, x_out)[out_off_dw] = pk
 
     @flyc.jit
     def launch(
@@ -301,8 +282,8 @@ def flydsl_fp8_pertensor_quant(
     if caller_out is not None:
         wait_ready(stream, (caller_out,))
 
-    def _ptr(t):
-        return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+    def _ptr(t, dtype):
+        return flyc.from_c_void_p(dtype, t.data_ptr())
 
     with torch.cuda.device(x.device), torch.cuda.stream(stream):
         x = x.contiguous()
@@ -318,14 +299,28 @@ def flydsl_fp8_pertensor_quant(
         amax_k = _compile(
             device_index=x.device.index, head_dim=D, rotate=rotate, mode="amax"
         )
-        _run_compiled(amax_k, _ptr(x), _ptr(x), _ptr(partials), M, fx_stream)
+        _run_compiled(
+            amax_k,
+            _ptr(x, fx.Int32),
+            _ptr(x, fx.Int32),
+            _ptr(partials, fx.Float32),
+            M,
+            fx_stream,
+        )
         scale = (partials.amax() / _FP8_MAX).clamp(min=1e-12).reshape(1)
 
         # Pass 2 scales, clamps, and casts using the global descale.
         scale_k = _compile(
             device_index=x.device.index, head_dim=D, rotate=rotate, mode="scale"
         )
-        _run_compiled(scale_k, _ptr(x), _ptr(out), _ptr(scale), M, fx_stream)
+        _run_compiled(
+            scale_k,
+            _ptr(x, fx.Int32),
+            _ptr(out, fx.Int32),
+            _ptr(scale, fx.Float32),
+            M,
+            fx_stream,
+        )
 
         # Associate every participating allocation with the actual launch
         # stream. This is required even when it is the current stream because a
