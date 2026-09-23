@@ -11,6 +11,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
@@ -26,6 +27,7 @@ from aiter.ops.mha_fwd_policy import (
     MhaFwdPlan,
     MhaFwdProblem,
     enumerate_mha_fwd_candidates,
+    hd192_splitkv_rejections,
     mha_fwd_candidate_id,
 )
 
@@ -138,6 +140,63 @@ class TestMhaTypedPolicy(unittest.TestCase):
             MhaFwdPlan("ck", backend_config={"BLOCK_M": 64})
 
 
+class TestHd192SplitKvPolicy(unittest.TestCase):
+    """A forced split must describe a call splitkv_compatible would accept.
+
+    The entry point that carries a split count supplies constants for the
+    mask, the padding and the conversion mode, so the C++ guard never judges
+    the caller's own values and this policy is the only check there is.
+    """
+
+    # csrc/py_itfs_cu/asm_mha_varlen_fwd.cu splitkv_compatible, field by field.
+    INCOMPATIBLE: ClassVar[dict[str, dict]] = {
+        "mi308": {"gpu_model": "mi308x"},
+        "causal": {"causal": 1},
+        "bottom_right_window": {"causal": 1, "window_right": 0},
+        "left_window": {"window_left": 128},
+        "physical_padding": {"has_physical_padding": 1},
+        "bf16_cvt": {"how_v3_bf16_cvt": 0},
+        "gqa": {"nhead_k": 6},
+        "multi_sequence": {"batch": 2, "total_q": 8192, "total_k": 85400},
+    }
+
+    def _plan_for(self, overrides, num_splits=3):
+        row = {**_problem_row(), **overrides}
+        problem = MhaFwdProblem.from_mapping(row)
+        MhaFwdPlan("asm_v3", num_splits).validate_for(problem)
+
+    def test_seeded_shape_is_compatible(self):
+        self._plan_for({})
+        self.assertEqual(
+            hd192_splitkv_rejections(MhaFwdProblem.from_mapping(_problem_row())),
+            (),
+        )
+
+    def test_each_incompatible_field_is_rejected(self):
+        for name, overrides in self.INCOMPATIBLE.items():
+            with self.subTest(field=name):
+                problem = MhaFwdProblem.from_mapping({**_problem_row(), **overrides})
+                self.assertNotEqual(hd192_splitkv_rejections(problem), ())
+                with self.assertRaises(ValueError):
+                    self._plan_for(overrides)
+
+    def test_split_one_leaves_the_kv_loop_unsplit(self):
+        # num_splits=1 asks C++ for the ordinary kernel, which handles causal.
+        self._plan_for({"causal": 1}, num_splits=1)
+
+    def test_loader_rejects_an_incompatible_row(self):
+        row = {**_problem_row(), "causal": 1, "backend": "asm_v3", "num_splits": 3}
+        row["backend_config"] = ""
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tuned_mha_fwd.csv")
+            with open(path, "w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=MHA_FWD_RUNTIME_CSV_FIELDS)
+                writer.writeheader()
+                writer.writerow(row)
+            with self.assertRaisesRegex(ValueError, "causal masking is unsupported"):
+                mha._load_mha_fwd_tuning_table(path)
+
+
 class TestMhaProblemBuckets(unittest.TestCase):
     def test_balanced_lengths_preserve_runtime_key_summary(self):
         lengths = _TUNER._balanced_lengths(12, 3, 5)
@@ -234,18 +293,25 @@ class TestMhaTunedPolicy(unittest.TestCase):
             "cu_seqlens_k_padded": None,
         }
 
-    def test_seeded_kimi_row_is_exact(self):
+    def _shipped_table(self):
         config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
-        table = mha._load_mha_fwd_tuning_table(os.fspath(config))
+        return mha._load_mha_fwd_tuning_table(os.fspath(config))
+
+    def _kimi_key(self, gpu_model="mi325x"):
         with mock.patch.object(
             mha,
             "get_tuning_hardware",
-            return_value={"gfx": "gfx942", "gpu_model": "mi325x", "cu_num": 304},
+            return_value={"gfx": "gfx942", "gpu_model": gpu_model, "cu_num": 304},
         ):
-            key = mha._mha_fwd_tuning_key(**self._key_args())
-        self.assertEqual(table[key]["backend"], "asm_v3")
-        self.assertEqual(table[key]["num_splits"], 3)
-        self.assertIsNone(table[key]["backend_config"])
+            return mha._mha_fwd_tuning_key(**self._key_args())
+
+    def test_the_runtime_key_finds_the_seeded_kimi_row(self):
+        # The row's split count is tuning output and may legitimately move, so
+        # this pins the key derivation and the plan shape, not the winner.
+        plan = self._shipped_table()[self._kimi_key()]
+        self.assertEqual(plan["backend"], "asm_v3")
+        self.assertIsNone(plan["backend_config"])
+        self.assertGreaterEqual(plan["num_splits"], 1)
 
     def test_lookup_returns_tiles_only_for_the_winning_backend(self):
         tiles = {"BLOCK_M": 64, "BLOCK_N": 32}
@@ -293,15 +359,10 @@ class TestMhaTunedPolicy(unittest.TestCase):
                 mha._load_mha_fwd_tuning_table(path)
 
     def test_different_gpu_model_does_not_match(self):
-        config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
-        table = mha._load_mha_fwd_tuning_table(os.fspath(config))
-        with mock.patch.object(
-            mha,
-            "get_tuning_hardware",
-            return_value={"gfx": "gfx942", "gpu_model": "mi300x", "cu_num": 304},
-        ):
-            key = mha._mha_fwd_tuning_key(**self._key_args())
-        self.assertNotIn(key, table)
+        table = self._shipped_table()
+        # Assert the match first: otherwise an emptied table passes this.
+        self.assertIn(self._kimi_key(), table)
+        self.assertNotIn(self._kimi_key("mi300x"), table)
 
     def test_runtime_csv_has_no_measurement_columns(self):
         config = Path(mha.__file__).parents[1] / "configs" / "tuned_mha_fwd.csv"
@@ -439,6 +500,59 @@ class TestMhaPublicDispatch(unittest.TestCase):
         splitkv.assert_called_once()
         auto.assert_not_called()
         self.assertEqual(splitkv.call_args.args[-1], 3)
+
+    def test_arguments_the_split_entry_point_drops_keep_the_full_one(self):
+        # _fmha_v3_varlen_splitkv_fwd takes neither out nor causal and passes
+        # its own constants for both, so honoring the split count here would
+        # leave the caller's buffer unwritten and drop the mask.
+        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
+        sentinel = (
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1),
+        )
+        for name, kwargs in (
+            ("out", {"out": torch.empty((8, 12, 128), dtype=torch.bfloat16)}),
+            ("causal", {"causal": True}),
+            ("min_seqlen_q", {"min_seqlen_q": 4}),
+            ("cu_seqlens_q_padded", {"cu_seqlens_q_padded": cu_q}),
+        ):
+            with self.subTest(argument=name):
+                with (
+                    mock.patch.object(mha, "get_gfx", return_value="gfx942"),
+                    mock.patch.object(mha, "_fmha_v3_varlen_splitkv_fwd") as splitkv,
+                    mock.patch.object(
+                        mha, "fmha_v3_varlen_fwd", return_value=sentinel
+                    ) as auto,
+                ):
+                    call = {
+                        "cu_seqlens_q_padded": None,
+                        "cu_seqlens_k_padded": None,
+                        "min_seqlen_q": 0,
+                        "causal": False,
+                        **kwargs,
+                    }
+                    mha._flash_attn_varlen_forward(
+                        q,
+                        k,
+                        v,
+                        cu_q,
+                        cu_k,
+                        call.pop("cu_seqlens_q_padded"),
+                        call.pop("cu_seqlens_k_padded"),
+                        8,
+                        16,
+                        call.pop("min_seqlen_q"),
+                        0.0,
+                        0.125,
+                        call.pop("causal"),
+                        num_splits=3,
+                        selected_backend="asm_v3",
+                        **call,
+                    )
+                splitkv.assert_not_called()
+                auto.assert_called_once()
 
     def test_no_plan_uses_public_asm_auto_select(self):
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
@@ -600,6 +714,26 @@ class TestMhaPublicDispatch(unittest.TestCase):
         self.assertEqual(result, "ok")
         lookup.assert_not_called()
         self.assertEqual(apply.call_args.args[-1], explicit)
+
+    def test_declined_flydsl_row_falls_back_instead_of_raising(self):
+        # FlyDSL screens things the tuning key does not carry, so a row can
+        # name it for a call it then declines. Every other backend here treats
+        # a tuned row as a hint, and failing inference over one is worse.
+        q, k, v, cu_q, cu_k = _dummy_varlen_tensors()
+        plan = {"backend": "flydsl", "num_splits": 0, "backend_config": None}
+        with (
+            mock.patch.object(mha, "_get_mha_fwd_tuned_plan", return_value=plan),
+            mock.patch(
+                "aiter.ops.flydsl.fmha_kernels.flydsl_flash_attn_varlen_func",
+                return_value=None,
+            ),
+            mock.patch.object(
+                mha.FlashAttnVarlenFunc, "apply", return_value="fallback"
+            ) as apply,
+        ):
+            result = mha.flash_attn_varlen_func(q, k, v, cu_q, cu_k, 8, 16)
+        self.assertEqual(result, "fallback")
+        apply.assert_called_once()
 
     def test_unknown_backend_fails_closed(self):
         q, k, v, cu_q, cu_k = _dummy_varlen_tensors()

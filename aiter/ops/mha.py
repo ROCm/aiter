@@ -3358,8 +3358,49 @@ def _flash_attn_varlen_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif selected_backend in (None, "asm_v3") and can_impl_fmha_v3_fwd():
-        _record_mha_fwd_selection("asm_v3", num_splits)
-        if int(num_splits) >= 1:
+        # _fmha_v3_varlen_splitkv_fwd is the only entry point that accepts a
+        # split count, and it hard-codes every argument it does not take, so a
+        # caller that set one of them differently would have it dropped without
+        # a trace.  Those calls keep the full entry point and let C++ pick the
+        # split count.  #5592 is adding num_splits to fmha_v3_varlen_fwd; this
+        # narrowing goes away with the rebase onto it.
+        force_splits = int(num_splits) >= 1
+        if force_splits:
+            dropped = [
+                name
+                for name, carried in (
+                    ("out", out is None),
+                    ("min_seqlen_q", min_seqlen_q == 0),
+                    ("dropout_p", dropout_p == 0.0),
+                    ("logits_soft_cap", logits_soft_cap == 0.0),
+                    ("zero_tensors", not zero_tensors),
+                    ("causal", not causal),
+                    ("window_size_left", window_size_left == -1),
+                    ("window_size_right", window_size_right == -1),
+                    ("return_softmax", not return_softmax),
+                    ("how_v3_bf16_cvt", how_v3_bf16_cvt == 1),
+                    ("block_table", block_table is None),
+                    ("bias", bias is None),
+                    ("alibi_slopes", alibi_slopes is None),
+                    ("q_descale", q_descale is None),
+                    ("k_descale", k_descale is None),
+                    ("v_descale", v_descale is None),
+                    ("cu_seqlens_q_padded", cu_seqlens_q_padded is None),
+                    ("cu_seqlens_k_padded", cu_seqlens_k_padded is None),
+                )
+                if not carried
+            ]
+            if dropped:
+                logger.warning(
+                    "tuned num_splits=%d cannot be honored for this call: the "
+                    "split entry point does not carry %s; letting C++ select "
+                    "the split count",
+                    int(num_splits),
+                    ", ".join(dropped),
+                )
+                force_splits = False
+        _record_mha_fwd_selection("asm_v3", int(num_splits) if force_splits else 0)
+        if force_splits:
             out, softmax_lse, S_dmask, rng_state = _fmha_v3_varlen_splitkv_fwd(
                 q,
                 k,
@@ -4162,7 +4203,14 @@ def flash_attn_varlen_func(
             _record_mha_fwd_selection("flydsl")
             return _flydsl_result
         if tuned_backend == "flydsl":
-            raise ValueError("tuned flydsl backend rejected this MHA call")
+            # FlyDSL screens things the tuning key does not carry, such as the
+            # layout of out, so a row can name it for a call it then declines.
+            # Same rule as every other backend here: a tuned row is a
+            # performance hint, so run the call rather than fail it.
+            logger.warning(
+                "tuned MHA backend 'flydsl' declined this call; "
+                "falling back to untuned dispatch"
+            )
 
     if tuned_backend in ("triton", "gluon") or (
         not ENABLE_CK and tuned_backend in (None, "ck")
