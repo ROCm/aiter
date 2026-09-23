@@ -217,17 +217,35 @@ class Conv3dTuner(TunerCommon):
             self.untunedf = self.untunedf[~skip].reset_index(drop=True)
 
     def _check_shapes_expressible(self):
-        """Reject a row no candidate could run, naming the row rather than the task."""
+        """Reject a row no candidate could run, naming the row rather than the task.
+
+        Nothing downstream says which row is at fault: the policy's last
+        relaxation still returns candidates for an impossible shape, and every
+        one of them then dies on ``_conv3d_impl``'s own assert inside an mp
+        worker, which surfaces as a screen of failed tasks.
+        """
         if self.untunedf is None or self.untunedf.empty:
             return
         bad = []
         suspect = []
         for _, row in self.untunedf.iterrows():
             keys = tuple(row[k] for k in self.keys)
-            shape = ", ".join(f"{c}={row[c]}" for c in SHAPE_KEYS)
-            # Ahead of the extents: _gemm_dims divides by the stride, and a
+            kv = dict(zip(self.keys, keys))
+            c, k, groups = int(kv["C"]), int(kv["K"]), int(kv["groups"])
+            shape = ", ".join(f"{col}={row[col]}" for col in SHAPE_KEYS)
+            # Checked before the extents because _gemm_dims floor-divides by
+            # groups: an indivisible channel count would hand conv3d_policy a
+            # GEMM N that the convolution does not have, and enumerate against
+            # it, rather than failing here.
+            if groups < 1 or c % groups or k % groups:
+                bad.append(
+                    f"  {shape} -> groups={groups} must be >= 1 and divide both "
+                    f"C={c} and K={k}"
+                )
+                continue
+            # Also ahead of the extents: _gemm_dims divides by the stride, and a
             # negative pad or zero dilation reaches _conv3d_impl's asserts intact.
-            p = _row_params(dict(zip(self.keys, keys)))
+            p = _row_params(kv)
             if min(p["stride"]) < 1 or min(p["dilation"]) < 1 or min(p["padding"]) < 0:
                 bad.append(
                     f"  {shape} -> stride {p['stride']} and dilation "
@@ -235,7 +253,7 @@ class Conv3dTuner(TunerCommon):
                 )
                 continue
             try:
-                _parse_tuned_bool(row["bias"])
+                _parse_tuned_bool(kv["bias"])
             except ValueError as exc:
                 bad.append(f"  {shape} -> bias: {exc}")
                 continue
@@ -333,8 +351,11 @@ class Conv3dTuner(TunerCommon):
             # pinned rather than re-derived at dispatch, so the column records
             # the value that ran and AOT compiles the artifact the runtime asks
             # for.
+            # num_cu explicitly, so the CU count behind the split is the same
+            # one the policy enumerated against and the tuned row is stamped
+            # with; the device probe it would fall back to is a second source.
             sk = _resolve_splitk(
-                None, m_gemm, crs, k, torch.cuda.current_device(), tile, groups
+                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
             )
             info = (
                 keys,
