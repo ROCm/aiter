@@ -11,7 +11,7 @@
 import torch
 from torch import Tensor
 
-from ..jit.core import compile_ops, torch_compile_guard
+from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..utility import dtypes
 from .gemm_op_a8w8 import (
@@ -19,6 +19,7 @@ from .gemm_op_a8w8 import (
     _reduce_mxfp8_partials,
     _resolve_mxfp8_gemm_config,
 )
+from .mxfp8fp4gemm_common import mxfp8_compile_guard
 
 
 @compile_ops(
@@ -58,7 +59,7 @@ def _gemm_a8w4_mxfp8_fake(
     return torch.empty((A.shape[0], B.shape[0]), dtype=dtype, device=A.device)
 
 
-@torch_compile_guard(mutates_args=[], gen_fake=_gemm_a8w4_mxfp8_fake)
+@mxfp8_compile_guard(mutates_args=[], gen_fake=_gemm_a8w4_mxfp8_fake)
 def gemm_a8w4_mxfp8(
     A: Tensor,  # A:[M, K]   mxfp8 e4m3
     B: Tensor,  # B:[N, K/2] mxfp4 e2m1

@@ -6,8 +6,8 @@ Cross-file shape-collision guard for tuned config CSVs.
 At runtime ``aiter.jit.core.AITER_CONFIGS.get_config_file`` merges, per family,
 the canonical ``aiter/configs/<name>.csv`` with every
 ``aiter/configs/model_configs/*<name>*.csv``, then ``update_config_files``
-de-duplicates on the family's lookup key (usually derived from the matching
-*untuned* CSV's columns) and **raises** if two rows collide.
+de-duplicates on a key derived from the matching *untuned* CSV's columns and
+**raises** if two rows collide.
 
 A single PR's CI only ever merges *its own* changed file with current ``main``,
 so two PRs that each add the same shape to different model files both pass, then
@@ -19,8 +19,7 @@ How it stays side-effect free: ``update_config_files`` writes de-duplicated CSVs
 back to their source paths when it finds collisions. We copy the entire
 ``aiter/configs/`` tree to a temp dir and point ``core.AITER_ROOT_DIR`` at it, so
 all globbing, untuned-key lookups, and any write-backs hit the copy, never the
-real repo. The merged-output directory is also redirected into the temp tree,
-and config environment overrides are restored after each resolution.
+real repo.
 
 Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. The
 level 0+1 tuning workflow runs it as a PR/main regression guard.
@@ -35,8 +34,6 @@ import shutil
 import sys
 import tempfile
 import unittest
-from itertools import product
-from unittest.mock import patch
 
 try:  # importing aiter requires torch; skip cleanly where it is unavailable.
     from aiter.jit import core
@@ -76,7 +73,6 @@ FAMILIES = [
         "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
     ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
-    ("AITER_CONFIG_GEMM_MXFP8FP4", "asm_mxfp8fp4gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
@@ -101,36 +97,24 @@ class TestConfigShapeCollision(unittest.TestCase):
             os.path.join(cls._tmp, "aiter", "configs"),
         )
         cls._orig_root = core.AITER_ROOT_DIR
-        cls._orig_output_dir = core._CONFIG_MERGE_OUTPUT_DIR
         core.AITER_ROOT_DIR = cls._tmp
-        core._CONFIG_MERGE_OUTPUT_DIR = os.path.join(cls._tmp, "merged_configs")
         _cache_clear()
 
     @classmethod
     def tearDownClass(cls):
         core.AITER_ROOT_DIR = cls._orig_root
-        core._CONFIG_MERGE_OUTPUT_DIR = cls._orig_output_dir
         _cache_clear()
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     @staticmethod
-    def _resolve(root, env_name, name, *, via_property=True):
+    def _resolve(root, env_name, name):
         """Drive the production (no-env) resolution path against `root`.
         Raises RuntimeError on a duplicate-shape collision."""
+        os.environ.pop(env_name, None)
+        core.AITER_ROOT_DIR = root
+        _cache_clear()
         default_file = os.path.join(root, "aiter", "configs", f"{name}.csv")
-        with (
-            patch.dict(os.environ),
-            patch.object(core, "AITER_ROOT_DIR", root),
-            patch.object(core, env_name, default_file),
-        ):
-            os.environ.pop(env_name, None)
-            _cache_clear()
-            try:
-                if via_property:
-                    return getattr(core.AITER_CONFIGS, f"{env_name}_FILE")
-                return core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
-            finally:
-                _cache_clear()
+        return core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
 
     def _check_family(self, env_name, name):
         try:
@@ -273,131 +257,6 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
-
-    def test_mxfp8fp4(self):
-        self._check_family("AITER_CONFIG_GEMM_MXFP8FP4", "asm_mxfp8fp4gemm")
-
-    def test_mxfp8fp4_merge_uses_lookup_key(self):
-        # This family has no "tuned" token in its filename and no untuned
-        # sibling. A changed kernel/split count must still collide on the same
-        # lookup key, while distinct B types, A layouts and shapes coexist.
-        names = ("asm_mxfp8fp4gemm", "renamed_mxfp8fp4gemm")
-        env_name = "AITER_CONFIG_GEMM_MXFP8FP4"
-        row = {
-            "gfx": "gfx1250",
-            "M": 512,
-            "N": 2048,
-            "K": 7168,
-            "b_intype": "mxfp8",
-            "a_preshuffle": 0,
-            "outdtype": "torch.bfloat16",
-            "splitK": 8,
-            "kernelName": "kernel_a",
-            "cu_num": 256,
-            "_tag": "",
-        }
-        variants = (
-            ({}, True),
-            ({"splitK": 4}, True),
-            ({"kernelName": "kernel_b"}, True),
-            ({"cu_num": 304}, True),
-            ({"_tag": "alternate"}, True),
-            ({"b_intype": "mxfp4"}, False),
-            ({"a_preshuffle": 1}, False),
-            ({"M": 513}, False),
-            ({"N": 4096}, False),
-            ({"K": 8192}, False),
-            ({"gfx": "gfx950"}, False),
-            ({"outdtype": "torch.float16"}, False),
-        )
-        for name, (changes, collision) in product(names, variants):
-            with (
-                self.subTest(name=name, changes=changes),
-                tempfile.TemporaryDirectory() as tmp,
-            ):
-                cfg = os.path.join(tmp, "aiter", "configs")
-                model = os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv")
-                os.makedirs(os.path.dirname(model))
-                for path, saved in (
-                    (os.path.join(cfg, f"{name}.csv"), row),
-                    (model, dict(row, **changes)),
-                ):
-                    with open(path, "w") as f:
-                        writer = csv.DictWriter(f, fieldnames=list(row))
-                        writer.writeheader()
-                        writer.writerow(saved)
-                try:
-                    if collision:
-                        with self.assertRaisesRegex(RuntimeError, "duplicate shape"):
-                            self._resolve(
-                                tmp, env_name, name, via_property=name == names[0]
-                            )
-                    else:
-                        merged = self._resolve(
-                            tmp, env_name, name, via_property=name == names[0]
-                        )
-                        self.assertEqual(
-                            os.path.dirname(merged), core._CONFIG_MERGE_OUTPUT_DIR
-                        )
-                        with open(merged) as f:
-                            self.assertEqual(len(list(csv.DictReader(f))), 2)
-                finally:
-                    core.AITER_ROOT_DIR = self._tmp
-                    _cache_clear()
-
-    def test_mxfp8fp4_rejects_missing_or_empty_strings_before_merge(self):
-        row = {
-            "gfx": "gfx1250",
-            "M": 512,
-            "N": 2048,
-            "K": 7168,
-            "b_intype": "mxfp8",
-            "a_preshuffle": 0,
-            "outdtype": "torch.bfloat16",
-            "splitK": 8,
-            "kernelName": "kernel_a",
-            "us": 10,
-        }
-        for column, invalid in product(
-            ("gfx", "b_intype", "outdtype", "kernelName"), (None, "", " ", 0)
-        ):
-            with (
-                self.subTest(column=column, invalid=invalid),
-                tempfile.TemporaryDirectory() as tmp,
-            ):
-                paths = [
-                    os.path.join(tmp, name) for name in ("valid.csv", "invalid.csv")
-                ]
-                bad = dict(row, us=1)
-                if invalid is None:
-                    del bad[column]
-                else:
-                    bad[column] = invalid
-                for path, saved in zip(paths, (row, bad)):
-                    with open(path, "w") as f:
-                        writer = csv.DictWriter(f, fieldnames=list(saved))
-                        writer.writeheader()
-                        writer.writerow(saved)
-                with self.assertLogs(core.logger, level="WARNING") as logs:
-                    merged = core.AITER_CONFIGS.update_config_files(
-                        os.pathsep.join(paths),
-                        "string_validation",
-                        config_name="AITER_CONFIG_GEMM_MXFP8FP4",
-                    )
-                self.assertIn(paths[1], "\n".join(logs.output))
-                self.assertIn(column, "\n".join(logs.output))
-                with open(merged) as f:
-                    saved = list(csv.DictReader(f))
-                self.assertEqual(len(saved), 1)
-                self.assertEqual(saved[0]["kernelName"], row["kernelName"])
-                self.assertEqual(float(saved[0]["us"]), 10)
-
-    def test_resolve_restores_environment(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env_name, name = self._build_synthetic_family(tmp, dup=False)
-            with patch.dict(os.environ, {env_name: "/user/config.csv"}):
-                self._resolve(tmp, env_name, name)
-                self.assertEqual(os.environ[env_name], "/user/config.csv")
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")

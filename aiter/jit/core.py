@@ -125,11 +125,6 @@ AITER_CONFIG_GEMM_A8W8 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
 )
 
-AITER_CONFIG_GEMM_MXFP8FP4 = os.getenv(
-    "AITER_CONFIG_GEMM_MXFP8FP4",
-    f"{AITER_ROOT_DIR}/aiter/configs/asm_mxfp8fp4gemm.csv",
-)
-
 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
@@ -219,27 +214,6 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
 )
 
 
-# Families without an untuned sibling declare their exact runtime lookup keys.
-# Use the stable config identifier so renaming a CSV cannot change its key.
-_CONFIG_MERGE_KEYS = {
-    "AITER_CONFIG_GEMM_MXFP8FP4": (
-        "gfx",
-        "M",
-        "N",
-        "K",
-        "b_intype",
-        "a_preshuffle",
-        "outdtype",
-    ),
-}
-_CONFIG_MERGE_OUTPUT_DIR = "/tmp/aiter_configs/"
-
-
-_CONFIG_REQUIRED_STRING_COLUMNS = {
-    "AITER_CONFIG_GEMM_MXFP8FP4": ("gfx", "b_intype", "outdtype", "kernelName"),
-}
-
-
 class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
@@ -277,14 +251,6 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_A8W8_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
-        )
-
-    @property
-    def AITER_CONFIG_GEMM_MXFP8FP4_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_GEMM_MXFP8FP4",
-            AITER_CONFIG_GEMM_MXFP8FP4,
-            "asm_mxfp8fp4gemm",
         )
 
     @property
@@ -401,9 +367,7 @@ class AITER_CONFIG:
             "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
-    def update_config_files(
-        self, file_path: str, merge_name: str, *, config_name: str | None = None
-    ):
+    def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
@@ -418,31 +382,11 @@ class AITER_CONFIG:
                 continue
 
             df = pd.read_csv(path)
-            required = _CONFIG_REQUIRED_STRING_COLUMNS.get(config_name, ())
-            missing = set(required) - set(df.columns)
-            if missing:
-                logger.warning(
-                    "Skipping config %r: missing columns %s", path, sorted(missing)
-                )
-                continue
-            for column in required:
-                valid = df[column].map(
-                    lambda value: isinstance(value, str)
-                    and value.strip() not in ("", "0")
-                )
-                if not valid.all():
-                    logger.warning(
-                        "Skipping config rows in %r: invalid %s at CSV lines %s",
-                        path,
-                        column,
-                        (df.index[~valid] + 2).tolist(),
-                    )
-                    df = df.loc[valid]
             source_pairs.append((path, df))
 
         if not source_pairs:
             raise FileNotFoundError(
-                f"No usable config files found in '{file_path}' "
+                f"No existing config files found in '{file_path}' "
                 f"when merging '{merge_name}'."
             )
 
@@ -483,19 +427,14 @@ class AITER_CONFIG:
         # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
         untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        explicit_keys = _CONFIG_MERGE_KEYS.get(config_name)
-        keys = None
-        if explicit_keys is not None:
-            keys = list(explicit_keys)
-        elif untuned_name != merge_name and os.path.exists(untuned_path):
+        if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
                 keys.append("cu_num")
-        if keys is not None:
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
-            dedup_keys = keys + ["_tag"] if has_tag and explicit_keys is None else keys
+            dedup_keys = keys + ["_tag"] if has_tag else keys
             # Only key on columns actually present in the merged frame. Most
             # families carry cu_num, but some (e.g. the mxscale batched-GEMM
             # table) key on gfx and never carry cu_num; keeping a missing column
@@ -546,13 +485,12 @@ class AITER_CONFIG:
                 )
         else:
             logger.warning(
-                f"No registered lookup keys or distinct untuned config for '{merge_name}'; "
-                "skipping shape collision checks."
+                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
 
         from pathlib import Path
 
-        config_path = Path(_CONFIG_MERGE_OUTPUT_DIR)
+        config_path = Path("/tmp/aiter_configs/")
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
         new_file_path = f"{config_path}/{merge_name}.csv"
@@ -590,13 +528,9 @@ class AITER_CONFIG:
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
-                config_file = self.update_config_files(
-                    tuned_files, tuned_file_name, config_name=env_name
-                )
+                config_file = self.update_config_files(tuned_files, tuned_file_name)
         else:
-            config_file = self.update_config_files(
-                config_env_file, tuned_file_name, config_name=env_name
-            )
+            config_file = self.update_config_files(config_env_file, tuned_file_name)
             # print(f"get config file from environment ", config_file)
         return config_file
 
@@ -662,10 +596,9 @@ HIP_KITTENS_DIR = os.environ.get(
 )
 
 
-@functools.lru_cache(maxsize=8)
-def get_asm_dir(gfx: str | None = None):
-    """Resolve an ASM arch directory, defaulting to the build target."""
-    return os.path.join(AITER_ASM_DIR, get_gfx() if gfx is None else gfx)
+@functools.lru_cache(maxsize=1)
+def get_asm_dir():
+    return os.path.join(AITER_ASM_DIR, get_gfx())
 
 
 @functools.lru_cache(maxsize=1)

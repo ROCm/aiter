@@ -36,7 +36,6 @@ from aiter.benchmark_data_init import (
     fill_scale_e8m0,
     make_generator,
 )
-from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import (
     _mxfp8_kernel_configs,
@@ -44,6 +43,7 @@ from aiter.ops.gemm_op_a8w8 import (
     _resolve_mxfp8_gemm_config,
     _validate_mxfp8_splitk,
 )
+from aiter.ops.mxfp8fp4gemm_common import get_mxfp8_asm_dir
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -75,7 +75,7 @@ def _kernel_geometry(M, kernel_name=""):
         # Native heuristic used when no tuned or explicit kernel is selected.
         return (64, 512, 4, 1) if M <= 64 else (256, 256, 4, 4)
     try:
-        config = _mxfp8_kernel_configs(get_asm_dir(get_gfx()))[kernel_name]
+        config = _mxfp8_kernel_configs(get_mxfp8_asm_dir(get_gfx()))[kernel_name]
         geometry = tuple(
             int(config[key]) for key in ("tile_m", "tile_n", "cluster_x", "cluster_y")
         )

@@ -18,7 +18,6 @@ from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
-    get_asm_dir,
 )
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num
@@ -27,6 +26,12 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
+from .mxfp8fp4gemm_common import (
+    _MXFP8_GEMM_CONFIG_KEYS,
+    get_mxfp8_asm_dir,
+    get_mxfp8_config_file,
+    mxfp8_compile_guard,
+)
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -1484,7 +1489,6 @@ def _reduce_mxfp8_partials(partials: Tensor) -> Tensor:
 
 
 _MXFP8_GEMM_CONFIG_CACHE: dict = {}
-_MXFP8_GEMM_CONFIG_KEYS = ("gfx", "M", "N", "K", "b_intype", "a_preshuffle", "outdtype")
 _MXFP8_128_MIN_K = 8 * 128  # K128/PF8 prologue
 
 
@@ -1632,7 +1636,7 @@ def _validate_mxfp8_tuned_config(
 ):
     """Check the saved launch before allocating partials; match the native guards."""
     splitk = _mxfp8_config_int(config["splitK"], "splitK")
-    asm_dir = get_asm_dir(gfx)
+    asm_dir = get_mxfp8_asm_dir(gfx)
     kernel = _mxfp8_kernel_configs(asm_dir)[config["kernelName"]]
     if (
         dtype != dtypes.bf16
@@ -1681,7 +1685,7 @@ def get_mxfp8_gemm_config(
         _validate_mxfp8_splitk(M, N, K, splitk)
     if tuned_file is None:
         try:
-            tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8FP4_FILE
+            tuned_file = get_mxfp8_config_file()
         except (OSError, UnicodeError, ValueError) as exc:
             # Preserve the shared merger's RuntimeError/rerun protocol.
             logger.warning(
@@ -1815,7 +1819,7 @@ def _gemm_a8w8_mxfp8_fake(
     return torch.empty((A.shape[0], B.shape[0]), dtype=dtype, device=A.device)
 
 
-@torch_compile_guard(mutates_args=[], gen_fake=_gemm_a8w8_mxfp8_fake)
+@mxfp8_compile_guard(mutates_args=[], gen_fake=_gemm_a8w8_mxfp8_fake)
 def gemm_a8w8_mxfp8(
     A: Tensor,  # A:[M, K]   mxfp8 e4m3
     B: Tensor,  # B:[N, K]   mxfp8 e4m3
