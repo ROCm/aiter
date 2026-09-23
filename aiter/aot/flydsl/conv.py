@@ -364,10 +364,10 @@ def _compile_conv3d_to_cache(
     wgm: int,
     out_ndhwc: bool = False,
     dyn_hw: bool = False,
-    **kwargs,
 ):
-    del kwargs
-
+    # No **kwargs: a job field this does not name is a compile-time parameter
+    # being dropped, which would cache an artifact under the default and leave
+    # the runtime JITing the one it asked for. Let it raise TypeError instead.
     exe = compile_conv3d_implicit(
         _implicit_param_from_problem(
             N,
@@ -402,9 +402,7 @@ def _compile_conv3d_to_cache(
         _dispatch(exe, *_conv_probe_args(splitk), stream=None)
 
 
-def _compile_transpose_to_cache(*, N: int, c_padded: int, s: int, **kwargs):
-    del kwargs
-
+def _compile_transpose_to_cache(*, N: int, c_padded: int, s: int):
     exe = compile_transpose_ncdhw_ndhwc(N, c_padded, s)
     with compile_only_env():
         # (n, t, h, w, c) out, (n, c, t, h, w) in -- both rank 5.
