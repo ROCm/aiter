@@ -1365,6 +1365,7 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     ALIGN_W: tl.constexpr, BLOCK_S: tl.constexpr, HAS_ROW_ENDS: tl.constexpr,
     GATHER: tl.constexpr, VARLEN: tl.constexpr, ALIGN_B: tl.constexpr,
     MAX_TILES: tl.constexpr, MAX_SLICES: tl.constexpr, N_TILES: tl.constexpr,
+    SLICE_ROOM: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     # A "unit" is one (sequence, row block) pair; a "slot" is one workgroup of
@@ -1435,6 +1436,12 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # past residency. The host sizes num_ctas so the extra slices fit.
     if MAX_TILES > 0:
         tiles_per_slice = tl.minimum(tiles_per_slice, MAX_TILES)
+    # Bound one unit's slices so the write below stays a few bands. Measured
+    # against its average share of the slots, not max_model_len, which on a
+    # spread of lengths sits well above what the balance wants.
+    share = tl.maximum((num_ctas - live_units) // tl.maximum(live_units, 1), 1)
+    tiles_per_slice = tl.maximum(
+        tiles_per_slice, tl.cdiv(tl.max(tiles), share * SLICE_ROOM))
 
     # Step 3: lay each unit's slices end to end over the slots, so unit i owns
     # slots [first_slot_i, first_slot_i + n_slices_i).

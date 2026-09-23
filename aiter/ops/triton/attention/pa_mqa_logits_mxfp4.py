@@ -30,6 +30,9 @@ SCHED_SLOT_CAP = 1 << 16
 # How far above max_tiles_per_split a slice must sit before splitting it
 # further is worth the extra workgroups
 CAP_ENGAGE = 4
+# How many times its average share of the slots one unit may take before
+# slices are shortened to rein it in
+SLICE_ROOM = 4
 # this is the most performant page size
 IDEAL_PAGE_SIZE = 64
 
@@ -436,6 +439,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         MAX_TILES=max_tiles,
         MAX_SLICES=max_slices,
         N_TILES=n_tiles,
+        SLICE_ROOM=SLICE_ROOM,
         BLOCK_T=256,
         num_warps=4,
     )
