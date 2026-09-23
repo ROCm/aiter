@@ -53,7 +53,7 @@
 #define DINLINE __device__ __forceinline__
 #endif
 
-#define DISPATCH_AR_NGPUS_1250(ws, CALL) \
+#define DISPATCH_NGPUS_1250(ws, CALL)   \
     switch(ws) {                        \
         case 2: CALL(2); break;         \
         case 4: CALL(4); break;         \
@@ -63,27 +63,15 @@
                 "unsupported world_size " + std::to_string(ws)); \
     }
 
-#define DISPATCH_AG_NGPUS_1250(ws, CALL) \
-    switch(ws) {                         \
-        case 2:  CALL(2);  break;        \
-        case 4:  CALL(4);  break;        \
-        case 8:  CALL(8);  break;        \
-        case 16: CALL(16); break;        \
-        case 32: CALL(32); break;        \
-        default:                         \
-            throw std::runtime_error(    \
-                "unsupported world_size " + std::to_string(ws)); \
-    }
-
 namespace aiter {
 
 // ---------------------------------------------------------------------------
 // Constants & data structures
 // ---------------------------------------------------------------------------
-constexpr int kMaxBlocks  = 512;
-constexpr int kMaxNgpusAr = 8;
-constexpr int kMaxNgpusAg = 32;
-constexpr int kMaxNgpus   = kMaxNgpusAg;
+constexpr int kMaxBlocks = 512;
+// Matches DISPATCH_NGPUS_1250. Sizes Signal/RankData/RankSignals; the last two
+// are passed by value on every launch, so widening this costs all world sizes.
+constexpr int kMaxNgpus = 8;
 
 struct Signal
 {
@@ -101,6 +89,17 @@ struct __align__(16) RankSignals
 {
     Signal* signals[kMaxNgpus];
 };
+
+// Construction-time counterpart to DISPATCH_NGPUS_1250, so an unsupported
+// world size fails at init instead of from a dispatch default arm on the first
+// collective. init_custom_ar* are public bindings called directly downstream.
+inline void check_ngpus(int world_size)
+{
+    if(world_size != 2 && world_size != 4 && world_size != 8)
+        throw std::invalid_argument(
+            "gfx1250 custom allreduce: unsupported world size " +
+            std::to_string(world_size) + " (supported: 2, 4, 8)");
+}
 
 // ---------------------------------------------------------------------------
 // Scalar cast helpers
@@ -132,14 +131,14 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // shared Signal meta buffer (offset kLLScratchOffset), so no extra cross-rank
 // exchange is needed — peer scratch base = (char*)sg_.signals[i] + off.
 
-constexpr int    kLLMaxRanks       = kMaxNgpusAr;
+constexpr int    kLLMaxRanks       = kMaxNgpus;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
 // Hard per-message payload cap (one slot). Comfortably above the routing
 // threshold so all dtypes at <=128 KiB fit.
 constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
 // Per-rank staging slot capacity, in 8-byte packets.
-constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 32768
+constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 524288
 
 // 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
 union LLPackedMsg
@@ -155,18 +154,19 @@ union LLPackedMsg
 };
 static_assert(sizeof(LLPackedMsg) == 16, "LLPackedMsg must be exactly 16 bytes");
 
-// Per-rank scratch footprint: 2 banks * kLLMaxRanks slots * slotStride * 16B.
-// 4 MiB at the 256 KiB / 4-rank defaults. Uniform across ranks so the
-// double-buffered slot layout is identical everywhere.
-constexpr size_t llScratchBytes()
+// Per-rank scratch: 2 banks * ngpus slots * 16B, i.e. 32 MiB at TP=2 and
+// 128 MiB at TP=8. Sized by world size rather than kLLMaxRanks because
+// ar_ll_gfx1250 indexes with its template ngpus: bankOffPkts peaks at
+// (2*ngpus-1)*slot, so 2*ngpus slots is exactly what it touches.
+constexpr size_t llScratchBytes(int ngpus)
 {
-    return (size_t)2 * kLLMaxRanks * kLLPackCapacity * sizeof(LLPackedMsg);
+    return (size_t)2 * ngpus * kLLPackCapacity * sizeof(LLPackedMsg);
 }
 
 // Byte offset of the LL scratch within the shared meta buffer: right after the
 // Signal struct, 128-byte aligned. The meta buffer (see meta_size()) is sized
-// kLLScratchOffset + llScratchBytes() and zero-initialized, which doubles as the
-// LL flag reset (flag 0 == cleared line).
+// kLLScratchOffset + llScratchBytes(world_size) and zero-initialized, which
+// doubles as the LL flag reset (flag 0 == cleared line).
 constexpr size_t kLLScratchOffset =
     ((sizeof(Signal) + 127) / 128) * 128;
 
@@ -1115,7 +1115,7 @@ public:
 #define LAUNCH_LL(NG) \
         ar_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>( \
             peers, output, input, nPk, rank_, d_ll_block_flags_)
-        DISPATCH_AR_NGPUS_1250(world_size_, LAUNCH_LL);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL);
 #undef LAUNCH_LL
     }
 
@@ -1299,7 +1299,7 @@ public:
 #define LAUNCH_AG_SCALAR(NG) \
         ag_gfx1250_scalar<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
 #undef LAUNCH_AG_SCALAR
     }
 
@@ -1323,7 +1323,7 @@ public:
 #define LAUNCH_AG_VEC(NG) \
         ag_gfx1250_naive_vec<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
 #undef LAUNCH_AG_VEC
     }
 
@@ -1347,7 +1347,7 @@ public:
 #define LAUNCH_AG_NAIVE(NG) \
         ag_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
 #undef LAUNCH_AG_NAIVE
     }
 
@@ -1371,7 +1371,7 @@ public:
 #define LAUNCH_AG_WARP(NG) \
         ag_gfx1250_warpsplit_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_WARP);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_WARP);
 #undef LAUNCH_AG_WARP
     }
 
@@ -1398,7 +1398,7 @@ public:
 #define LAUNCH_AG_LAST(NG) \
         ag_gfx1250_lastdim<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size)
-        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
 #undef LAUNCH_AG_LAST
     }
 
@@ -1460,7 +1460,7 @@ public:
 #define LAUNCH_AR(NG) \
         ar_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_AR_NGPUS_1250(world_size_, LAUNCH_AR);
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR);
 #undef LAUNCH_AR
     }
 
@@ -1482,7 +1482,7 @@ public:
 #define LAUNCH_RS_FIRST(NG) \
             rs_gfx1250_split_first_dim<T, NG> \
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range)
-            DISPATCH_AR_NGPUS_1250(world_size_, LAUNCH_RS_FIRST);
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_RS_FIRST);
 #undef LAUNCH_RS_FIRST
             break;
         }
@@ -1503,7 +1503,7 @@ public:
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
                                              rank_, n, k);                      \
     } while(0)
-            DISPATCH_AR_NGPUS_1250(world_size_, LAUNCH_LAST_1250);
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_LAST_1250);
 #undef LAUNCH_LAST_1250
             break;
         }
@@ -1524,7 +1524,7 @@ public:
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
                                              rank_, m, n, k);                   \
     } while(0)
-            DISPATCH_AR_NGPUS_1250(world_size_, LAUNCH_MID_1250);
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_MID_1250);
 #undef LAUNCH_MID_1250
             break;
         }

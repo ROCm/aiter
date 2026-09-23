@@ -197,11 +197,23 @@ parser.add_argument(
     default=None,
     help="single shape override, e.g. -s 128,8192 (default: swept size list)",
 )
+parser.add_argument(
+    "--transport",
+    type=str,
+    choices=["auto", "symm"],
+    default="auto",
+    help="peer-buffer transport: 'auto' keeps the arch/ROCm default (IPC or "
+    "VMM), 'symm' requests torch.symm_mem. A failed probe falls back silently, "
+    "so check the log for 'using torch.symm_mem transport' (default: auto)",
+)
 
 
 if __name__ == "__main__":
     freeze_support()
     args = parser.parse_args()
+    if args.transport == "symm":
+        # Read at import time, so it must be set before the workers spawn.
+        os.environ["AITER_CUSTOM_AR_USE_SYMM_MEM"] = "1"
     dtype = dtypes.d_dtypes[args.dtype]
     with_graph = args.mode == "graph"
     if args.shape is not None:
