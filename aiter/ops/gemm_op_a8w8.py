@@ -1568,11 +1568,11 @@ def _normalize_mxfp8_splitk(splitk):
     """Accept integer-like counts without truncating floats at the C++ ABI."""
     message = "splitk must be a positive C++ int"
     if isinstance(splitk, bool):
-        raise ValueError(message)
+        raise TypeError(message)
     try:
         splitk = operator.index(splitk)
     except TypeError as exc:
-        raise ValueError(message) from exc
+        raise TypeError(message) from exc
     if not 1 <= splitk <= (1 << 31) - 1:
         raise ValueError(message)
     return splitk
@@ -1583,8 +1583,8 @@ def _validate_mxfp8_splitk(M, N, K, splitk, kernel=None):
     context = f"splitk={splitk} for M={M}, N={N}, K={K}"
     try:
         splitk = _normalize_mxfp8_splitk(splitk)
-    except ValueError as exc:
-        raise ValueError(f"{context}: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(f"{context}: {exc}") from exc
     if splitk == 1:
         return
     if splitk & (splitk - 1):
