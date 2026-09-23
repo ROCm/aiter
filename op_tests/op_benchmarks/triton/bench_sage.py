@@ -178,8 +178,10 @@ KERNEL_SPECS = {
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
-    "mha4_bf16": _mha_v4_spec((2.0, 2.0, 2.0), quantized=False),
-    "mha4_bf16fp8": _mha_v4_spec((2.0, 2.0, 1.0)),
+    "mha4_bf16": _mha_v4_spec(
+        (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
+    ),
+    "mha4_bf16fp8": _mha_v4_spec((2.0, 2.0, 1.0), supports_block_sparse=True),
     "mha4_i8fp8": _mha_v4_spec((1.0, 1.0, 1.0), supports_block_sparse=True),
     "mha4_mxfp8": _mha_v4_spec(
         (1.0, 1.0, 1.0),
