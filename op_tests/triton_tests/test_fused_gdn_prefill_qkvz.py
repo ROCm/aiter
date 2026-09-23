@@ -308,16 +308,18 @@ def _split_ref_kwargs(inp):
 
 
 # Each case names the tile it must dispatch to (see the wrapper's profile map).
-# The two 12289-token cases are heavy for the sequential reference -> slow-marked.
+# One case per tile so every dispatched schedule is checked against the single
+# reference below. The two 12289-token cases are heavier (the sequential
+# reference is O(tokens)) but are deliberately left unmarked: aiter CI runs
+# ``pytest op_tests/triton_tests/`` with no marker filter, so an unconditional
+# param is what guarantees they actually execute in CI rather than silently rot.
 _CASES = [
     pytest.param([1024], "m1024_3071", id="m1024_b1"),
     pytest.param([1024, 1024], "m1024_3071", id="m2048_b2"),
     pytest.param([3072], "m3072_16384", id="m3072_b1"),
     pytest.param([2048, 2048, 2048], "m3072_16384", id="m6144_b3"),
-    pytest.param([12289], "m12289_16384_b1_5", marks=pytest.mark.slow, id="m12289_b1"),
-    pytest.param(
-        [1600] * 8, "m12289_16384_b6_15", marks=pytest.mark.slow, id="m12800_b8"
-    ),
+    pytest.param([12289], "m12289_16384_b1_5", id="m12289_b1"),
+    pytest.param([1600] * 8, "m12289_16384_b6_15", id="m12800_b8"),
 ]
 
 

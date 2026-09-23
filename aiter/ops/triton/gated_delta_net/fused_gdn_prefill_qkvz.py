@@ -32,6 +32,25 @@ back to the four-kernel chain instead of crashing. Two hard gates:
   any build without ``triton.experimental.gluon``) the gate returns ``False`` so
   the caller falls back; importing this module never raises, and the Gluon/HIP
   imports only fire once a tile is actually dispatched on a supported device.
+
+Not adopted in-tree yet
+-----------------------
+aiter's own GDN prefill path does not call this op; it is offered for an external
+caller (e.g. sglang) to opt into. The fallback is therefore the *caller's*
+responsibility: probe :func:`fused_gdn_prefill_qkvz_supported` and, when it
+returns ``(False, reason)``, run the existing four-kernel chain. The narrow
+:class:`ValueError` in :func:`fused_gdn_prefill_qkvz` is only for a caller that
+skipped that probe -- it flags misuse, it is not a shape-dispatch fallback.
+
+Keeping the four tiles in sync
+------------------------------
+The four M-tile schedules are ported autotuner output (the Artemis MI355 v1
+kernel-pack), specialized per token/batch band, not four hand-derived rewrites of
+the math. They share one contract: for any covered shape the result must match
+the single ``ref_gdn_prefill`` in ``test_fused_gdn_prefill_qkvz.py``, which every
+tile is parametrized against. A GDN math or spec change lands in that reference;
+CI then fails any tile that drifts, so the reference -- not four parallel edits --
+is the source of truth the tiles are pinned to.
 """
 
 import functools
