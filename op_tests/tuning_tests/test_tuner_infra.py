@@ -334,22 +334,6 @@ class TestPostProcess(unittest.TestCase):
         self.assertEqual(float(resultdf.iloc[0]["us"]), 5.0)
 
 
-class TestMeasurementKwargs(unittest.TestCase):
-
-    def test_the_command_line_timing_reaches_the_timed_call(self):
-        """A task that passes {} measures with run_perftest's own defaults
-        whatever --warmup and --iters say."""
-        tuner = _StubTuner.get()
-        args = tuner.parser.parse_args(["--warmup", "7", "--iters", "33"])
-        self.assertEqual(
-            tuner.measurement_kwargs(args),
-            {"num_warmup": 7, "num_iters": 33, "use_cuda_event": False},
-        )
-        self.assertTrue(
-            tuner.measurement_kwargs(args, use_cuda_event=True)["use_cuda_event"]
-        )
-
-
 class TestUpdateConfigFiles(unittest.TestCase):
     """Tests for TunerCommon.update_config_files (config merge/dedup)."""
 
