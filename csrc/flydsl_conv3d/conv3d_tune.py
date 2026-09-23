@@ -430,10 +430,13 @@ class Conv3dTuner(TunerCommon):
 
         Both are derived from an end-to-end time. NDHWC in and out leaves no
         layout transpose in it, but the entry point still runs two steps outside
-        the kernel: the weight repack, which run_perftest's rotated copies redo
-        once per copy at a microsecond or two, and, where C/groups is not a
-        multiple of LDG_VEC, a channel pad that copies the whole input on every
-        call -- the C=3 input conv of both VAEs. A floor on kernel figures, then.
+        the kernel: the weight repack, which run_perftest redoes on every timed
+        call because it rotates as many weight copies as it runs iterations --
+        about 5.5us at the median on gfx950, and up to ~40% of us on the smallest
+        rows -- and, where C/groups is not a multiple of LDG_VEC, a channel pad
+        that copies the whole input on every call -- the C=3 input conv of both
+        VAEs. Neither depends on the tile, so the ranking holds, but both
+        figures are a floor on the kernel's own rather than close to it.
         """
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
