@@ -23,7 +23,7 @@ from .combine import (
     _make_combine_fused_sync,
     combine_reduce_lds_bytes,
 )
-from .config import _WAVE_SIZE, _select_dispatch_config
+from .config import _DISPATCH_COMPACT, _WAVE_SIZE, _select_dispatch_config
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
@@ -1276,11 +1276,7 @@ class MegaMoEGfx1250:
             # tuned buckets.
             config.schedule = _mori_dispatch_schedule(config)
         elif self._compact_plan:
-            # Compact dispatch has one warp load a token and fan it out to all
-            # final expert rows. Prefill needs enough token-owner warps to cover
-            # the input in one pass; the wider grid cuts dispatch roughly in
-            # half at 1K+ tokens, while its launch/synchronization overhead loses
-            # on decode and smaller prompt buckets.
+            # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
             blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
             warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
             if blocks_env is not None or warps_env is not None:
@@ -1288,15 +1284,11 @@ class MegaMoEGfx1250:
                 compact_warps = int(warps_env or "8")
                 config.schedule = ((None, compact_blocks, compact_warps),)
             else:
-                config.schedule = (
-                    (512, 64, 8),
-                    (None, 128, 16),
-                )
+                config.schedule = _DISPATCH_COMPACT
 
+        # A spec is (block, warp), plus route_parallel on the compact path.
         if config.schedule:
-            dispatch_specs = sorted(
-                {(block, warp) for _, block, warp in config.schedule}
-            )
+            dispatch_specs = sorted({tuple(entry[1:]) for entry in config.schedule})
         else:
             dispatch_specs = [
                 (
@@ -1376,7 +1368,13 @@ class MegaMoEGfx1250:
                 )
         # On a quantized wire the metadata batch grew by a scale row while the
         # payload shrank, so the shared LDS tile is floored at the bf16 width.
-        slab_bytes = config.hidden_dim * 2 if config.is_quant_dispatch_wire else 0
+        # Compact compiles the metadata batch away, so its tile is one wire row.
+        if self._compact_plan:
+            slab_bytes = self._compact_wire_row
+        elif config.is_quant_dispatch_wire:
+            slab_bytes = config.hidden_dim * 2
+        else:
+            slab_bytes = 0
         # Clamp warp count to the LDS tile budget but keep the tuned block
         # count, which is what paces the grid barrier, and keep the caller's
         # spec as the variant key so the runtime pick still resolves.
@@ -1428,7 +1426,8 @@ class MegaMoEGfx1250:
         built = {}
         variants = {}
         for spec in self._dispatch_specs:
-            geom = (spec[0], min(spec[1], max_warps))
+            route_parallel = len(spec) > 2 and bool(spec[2])
+            geom = (spec[0], min(spec[1], max_warps), route_parallel)
             if geom not in built:
                 built[geom] = _make_dispatch_tdm(
                     rank=config.rank,
@@ -1473,6 +1472,7 @@ class MegaMoEGfx1250:
                         self._arena.offset("ep_rowmap") if self._compact_plan else 0
                     ),
                     max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
+                    route_parallel=route_parallel,
                 )
             variants[spec] = make_variant(built[geom])
         self._tdm_stage_capacity = stg_cap
@@ -1569,12 +1569,12 @@ class MegaMoEGfx1250:
 
         return {spec: make_variant(plan) for spec, plan in plans.items()}
 
-    def _select_dispatch(self, token_count: int) -> tuple[int, int]:
+    def _select_dispatch(self, token_count: int) -> tuple:
         if not self._config.schedule:
             return self._dispatch_specs[0]
-        for upper_bound, block, warp in self._config.schedule:
+        for upper_bound, *spec in self._config.schedule:
             if upper_bound is None or token_count <= upper_bound:
-                spec = (block, warp)
+                spec = tuple(spec)
                 return (
                     spec
                     if spec in self._dispatch_variants

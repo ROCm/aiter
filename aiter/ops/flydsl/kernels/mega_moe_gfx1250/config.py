@@ -31,6 +31,23 @@ _DISPATCH_EP8_TDM = (
     (None, 128, 16),
 )
 
+# Compact (stage1_fused) dispatch: (bound, block, warp, route_parallel). One
+# warp's remote TDM stores retire serially, so decode walks routes and wants
+# about one warp per route (tokens * topk); prefill keeps the token-major walk,
+# where one load feeds all topk stores. EP4 h7168 topk6 fp4 wire, dispatch us:
+#   tpr   token-major 64x8   route 64x8   96x16   192x8   192x16   384x8
+#   1           27.3            10.7
+#   64          29.6            11.8
+#   128                                           13.2
+#   256         31.0            21.2      16.3    14.4
+#   512         32.0            34.2                       18.6     18.8
+_DISPATCH_COMPACT = (
+    (64, 64, 8, True),
+    (256, 192, 8, True),
+    (512, 192, 16, True),
+    (None, 128, 16, False),
+)
+
 _DISPATCH_TDM_SCHEDULES = {
     (4, 7168, 8): _DISPATCH_EP4_TDM,
     (4, 7168, 6): _DISPATCH_EP4_TDM,
