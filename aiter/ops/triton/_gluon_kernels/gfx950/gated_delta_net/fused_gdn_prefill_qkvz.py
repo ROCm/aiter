@@ -46,6 +46,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 # schedule m1024_3071
 ##############################################################################
 
+
 @gluon.jit
 def _add(a, b):
     return a + b
@@ -943,6 +944,7 @@ def _render_segment_chunks(
 ##############################################################################
 # schedule m12289_16384_b1_5
 ##############################################################################
+
 
 @gluon.jit
 def _gate_values(a, b, decay_weight, valid=None):
@@ -2163,6 +2165,7 @@ def _normalize_quantize(
 ##############################################################################
 # schedule m12289_16384_b6_15
 ##############################################################################
+
 
 @gluon.jit
 def _projection_channel(group, column):
@@ -4383,4 +4386,3 @@ def _norm_and_quantize(
     )
     gl.store(quantized + row[:, None] * 128 + d[None, :], codes, row[:, None] < M * 8)
     gl.store(scales + row, quant_scale, row < M * 8)
-

@@ -59,6 +59,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_prefill_qk
     _update_conv_state_b6_15,
 )
 
+
 @dataclass(frozen=True)
 class FP8PrecisionConfig:
     dtype: torch.dtype
@@ -75,7 +76,6 @@ FP8_E4M3_FN = FP8PrecisionConfig(torch.float8_e4m3fn, 448.0, 448.0)
 ##############################################################################
 # schedule m1024_3071
 ##############################################################################
-
 
 
 def _run_chunked_delta(
@@ -324,10 +324,10 @@ def gdn_prefill_group_fp8_quant_m1024_3071(
     )
     return normalized, conv_state, delta_state, quantized, scales
 
+
 ##############################################################################
 # schedule m12289_16384_b1_5
 ##############################################################################
-
 
 
 @dataclass(frozen=True)
@@ -696,10 +696,10 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b1_5(
         )
     return normalized, conv_state, delta_state, quantized, scales
 
+
 ##############################################################################
 # schedule m12289_16384_b6_15
 ##############################################################################
-
 
 
 def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
@@ -951,10 +951,10 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
     )
     return normalized, conv_state, delta_state, values, scales
 
+
 ##############################################################################
 # schedule m3072_16384
 ##############################################################################
-
 
 
 def gdn_prefill_group_fp8_quant_m3072_16384(
