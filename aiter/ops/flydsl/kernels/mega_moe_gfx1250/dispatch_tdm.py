@@ -156,6 +156,7 @@ def _make_dispatch_tdm(
     compact_row_stride=0,
     off_ep_rowmap=0,
     max_tok_slot_stride=0,
+    route_parallel=False,
 ):
     """Build the TDM dispatch kernel. Returns a ``@flyc.jit`` launcher.
 
@@ -170,6 +171,9 @@ def _make_dispatch_tdm(
     row. All three are 0 on a bf16 wire and the scale path disappears.
     """
     compact_plan = bool(compact_plan)
+    route_parallel = bool(route_parallel)
+    if route_parallel and not compact_plan:
+        raise ValueError("route_parallel requires compact_plan")
     compact_row_stride = int(compact_row_stride)
     off_ep_rowmap = int(off_ep_rowmap)
     max_tok_slot_stride = int(max_tok_slot_stride)
@@ -744,12 +748,27 @@ def _make_dispatch_tdm(
         row_stride = compact_row_stride if compact_plan else nbytes
         # Compact plan fills tok_map in a prior low-LDS kernel, so every warp
         # may read it. Token-major dispatch still only trusts entries it wrote.
+        #
+        # route_parallel walks routes, not tokens: `tok_base` is a route id and
+        # each warp ships one row per step. One warp's remote TDM stores retire
+        # serially, so fanning a token out from a single warp costs topk
+        # back-to-back fabric writes; one route per warp overlaps them. Ids go
+        # block-minor so a token's routes land on different CUs.
         tok_step = warps_total if compact_plan else (warps_total * etpi)
-        tok_begin = global_warp_id if compact_plan else (global_warp_id * etpi)
-        for tok_base in range(tok_begin, inp_cur_tok, tok_step):
+        if const_expr(route_parallel):
+            tok_begin = warp * fx.Int32(block_num) + bid
+            tok_end = inp_cur_tok * fx.Int32(topk)
+        else:
+            tok_begin = global_warp_id if compact_plan else (global_warp_id * etpi)
+            tok_end = inp_cur_tok
+        for tok_base in range(tok_begin, tok_end, tok_step):
             sub_limit = fx.Int32(1) if compact_plan else etpi
             for sub in range(sub_limit):
-                tok = tok_base + sub
+                if const_expr(route_parallel):
+                    tok = tok_base // fx.Int32(topk)
+                    route_k = tok_base - tok * fx.Int32(topk)
+                else:
+                    tok = tok_base + sub
                 if tok < inp_cur_tok:
                     flat = buffer_load(
                         rsrc_tok_map, tok * topk + probe_off, vec_width=1, dtype=T.i32
@@ -758,6 +777,8 @@ def _make_dispatch_tdm(
                     # sentinel, so a slot FINALIZE never published can never name
                     # a route.
                     live = (lane < topk) & (flat >= 0)
+                    if const_expr(route_parallel):
+                        live = live & (lane == route_k)
                     if const_expr(not compact_plan):
                         live = live & (flat < sentinel_val)
                     live_mask = ballot(T.i32, live)
