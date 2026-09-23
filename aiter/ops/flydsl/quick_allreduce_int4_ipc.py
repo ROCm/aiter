@@ -112,20 +112,18 @@ class UncachedIpcHeap:
                     want,
                 )
         if cls._hip is None:
-            for name in (
-                *mapped,
-                "libamdhip64.so",
-                "libamdhip64.so.7",
-                "libamdhip64.so.6",
-                "libamdhip64.so.5",
-            ):
+            for path in mapped:
                 try:
-                    cls._hip = ctypes.CDLL(name)
+                    cls._hip = ctypes.CDLL(path)
                     break
                 except OSError:
                     continue
         if cls._hip is None:
-            raise RuntimeError("Failed to load HIP runtime library")
+            from aiter.dist.device_communicators.vmm_allocator import (
+                load_hip_runtime,
+            )
+
+            cls._hip = load_hip_runtime()
 
         class hipIpcMemHandle_t(ctypes.Structure):
             _fields_ = [("reserved", ctypes.c_byte * cls._HIP_IPC_HANDLE_BYTES)]

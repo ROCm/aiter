@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from . import _get_compiled
+from op_tests.triton_tests.torch_compile import _get_compiled
 
 
 @triton.jit

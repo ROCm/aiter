@@ -17,6 +17,8 @@ import torch
 import triton
 from packaging import version
 
+from aiter.ops.triton.utils.tuned_config_utils import autotune_enabled
+
 logger = logging.getLogger(__name__)
 
 # Autotune cache support
@@ -48,31 +50,12 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-GATED_DELTA_RULE_TRITON_AUTOTUNE = os.environ.get(
-    "GATED_DELTA_RULE_TRITON_AUTOTUNE", "0"
-).lower() in ("1", "true", "yes", "on")
+GATED_DELTA_RULE_TRITON_AUTOTUNE = autotune_enabled("GATED_DELTA_RULE")
 
 # log2(e) == 1/ln(2). Converts natural-log gate values to log2 space so
 # kernels can use exp2 instead of exp. Python/wrapper-only: pass into kernels
 # as a constexpr scale (e.g. G_SCALE); never reference inside @triton.jit kernels.
 RCP_LN2: float = math.log2(math.e)
-
-
-def gated_delta_rule_autotune_configs(
-    configs: list[triton.Config], default_config: triton.Config | None = None
-) -> list[triton.Config]:
-    """
-    Select Triton autotune configs based on the gated delta rule env flag.
-
-    When ``GATED_DELTA_RULE_TRITON_AUTOTUNE`` is enabled, return the full config
-    list so ``@triton.autotune`` benchmarks candidate kernels. When disabled,
-    return only ``default_config`` (or the first config) to skip tuning overhead
-    while keeping the decorator shape uniform across decode and prefill kernels.
-    """
-    if GATED_DELTA_RULE_TRITON_AUTOTUNE:
-        return configs
-    cfg = default_config if default_config is not None else configs[0]
-    return [cfg]
 
 
 @lru_cache(maxsize=1)
@@ -95,9 +78,8 @@ def check_environments():
 
     if triton_version < required_triton_version:
         logger.warning(
-            f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
-            "Errors may occur and these issues will not be fixed. "
-            "Please consider upgrading Triton.",
+            "Current Triton version %s is below the recommended 3.2.0 version. Errors may occur and these issues will not be fixed. Please consider upgrading Triton.",
+            triton_version,
         )
 
     # Check Python version
@@ -106,8 +88,8 @@ def check_environments():
 
     if py_version < required_py_version:
         logger.warning(
-            f"Current Python version {py_version} is below the recommended 3.11 version. "
-            "It is recommended to upgrade to Python 3.11 or higher for the best experience.",
+            "Current Python version %s is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.",
+            py_version,
         )
 
 

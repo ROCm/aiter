@@ -294,6 +294,8 @@ def _resolve_inbox_flags(mode: str) -> tuple[int, str]:
 
 
 def _cuda_index(device) -> int:
+    if isinstance(device, str):
+        device = torch.device(device)
     if isinstance(device, torch.device):
         if device.type != "cuda":
             raise ValueError(f"QuickAllReduceInt4 requires a CUDA device, got {device}")
@@ -568,9 +570,7 @@ class QuickAllReduceInt4:
             rungs = [(super_tile, cap)]
             ladder = ()
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
-        # set_device rejects torch.device("cuda") with no index; resolve first.
         self._device_index = _cuda_index(device)
-        torch.cuda.set_device(self._device_index)
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -620,36 +620,37 @@ class QuickAllReduceInt4:
         self._ladder = ladder
         self._by_st = {}
         try:
-            for st in sorted(by_cap):
-                # A persistent kernel deadlocks if it launches more workgroups
-                # than fit, and the ranks have to agree on the number: take the
-                # minimum across the group so a heterogeneous node converges.
-                grid = clamp_grid_cap(
-                    by_cap[st],
-                    arch=arch,
-                    world_size=self.world_size,
-                    super_tile=st,
-                    cu_count=cu_count,
-                )
-                shared_grid = torch.tensor(grid, dtype=torch.int64)
-                dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                spec = algo.build(
-                    world_size=self.world_size,
-                    rank=self.rank,
-                    super_tile=st,
-                    grid=int(shared_grid.item()),
-                    inbox_memory=resolved_inbox,
-                    rs_codec=rs_codec,
-                    ag_codec=ag_codec,
-                )
-                self._by_st[st] = _StEngine(
-                    spec=spec,
-                    group=self.group,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    inbox_flags=inbox_flags,
-                    device_index=self._device_index,
-                )
+            with torch.cuda.device(self._device_index):
+                for st in sorted(by_cap):
+                    # A persistent kernel deadlocks if it launches more workgroups
+                    # than fit, and the ranks have to agree on the number: take the
+                    # minimum across the group so a heterogeneous node converges.
+                    grid = clamp_grid_cap(
+                        by_cap[st],
+                        arch=arch,
+                        world_size=self.world_size,
+                        super_tile=st,
+                        cu_count=cu_count,
+                    )
+                    shared_grid = torch.tensor(grid, dtype=torch.int64)
+                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
+                    spec = algo.build(
+                        world_size=self.world_size,
+                        rank=self.rank,
+                        super_tile=st,
+                        grid=int(shared_grid.item()),
+                        inbox_memory=resolved_inbox,
+                        rs_codec=rs_codec,
+                        ag_codec=ag_codec,
+                    )
+                    self._by_st[st] = _StEngine(
+                        spec=spec,
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        inbox_flags=inbox_flags,
+                        device_index=self._device_index,
+                    )
         except Exception:
             self.close()
             raise
@@ -796,7 +797,8 @@ class QuickAllReduceInt4:
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
         self._has_launched = True
-        _run_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
 
     def compile_and_launch(self, inp, out=None, stream=None) -> None:
         """Eager-JIT every ST binary and launch each of them once, for real,
@@ -819,12 +821,13 @@ class QuickAllReduceInt4:
         engines = getattr(self, "_by_st", None)
         if not engines:
             return
-        if getattr(self, "_has_launched", False):
-            torch.cuda.synchronize(self._device_index)
-            self._has_launched = False
-        for eng in engines.values():
-            eng.close()
-        engines.clear()
+        with torch.cuda.device(self._device_index):
+            if getattr(self, "_has_launched", False):
+                torch.cuda.synchronize(self._device_index)
+                self._has_launched = False
+            for eng in engines.values():
+                eng.close()
+            engines.clear()
 
     def __del__(self):
         try:
