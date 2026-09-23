@@ -958,8 +958,9 @@ static MFMA 64→48, no P-LDS, decode left on 12 MFMA). GPU 6 / gfx950
 stayed exact; prefill ISA was 48 K32 (0 K16 PV) and PMC MFMA/wave
 2112→1584 (1.00× AMD). Width-2051 ``L=512`` vs phase-1 XOR
 20.14 / 20.18 / 261.54 µs went 20.32 / 20.41 / 259.26 (**M=512 −0.9%**).
-Conflict/wave stayed 44352. Keep K16 PV gemm and scalar/register P
-``.to(BFloat16)``.
+Conflict/wave stayed 44352. Reopened on the st64-imm keeper: same
+opcode mix on current tr16 V loads; ``M=512`` **159.41 → 169.79 µs**
+(**+6.5%**). Keep K16 PV gemm and scalar/register P ``.to(BFloat16)``.
 
 **Retained:** overlay prefill V now uses a specialized blocked
 permutation with direct ``ds_write2st64_b64 offset1:16`` and direct

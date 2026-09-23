@@ -475,7 +475,13 @@ not repeated unless an overlay retry is proposed.
 
 - Prefill packed K32 PV (`v_cvt_pk_bf16_f32` + `MFMA 16×16×32` so
   static MFMA 64→48). ISA and MFMA/wave matched AMD; `M=512` only
-  **−0.9%** vs phase-1 XOR. Kernel restored.
+  **−0.9%** vs phase-1 XOR. Kernel restored. **Reopened on the
+  st64-imm keeper** (2026-09-23) after wait-LDS matched AMD: same
+  ISA line on current tr16 V loads (prefill **0** K16 / **48** K32 /
+  **40** `cvt_pk`; decode still 8 K32 + 4 K16). Oracle **2 passed**.
+  Keep-gate vs st64-imm HEAD **159.41 µs**: five-run median
+  **169.79 µs** (**+6.5%**, need ≤ **154.63**). Kernel restored.
+  Do not retry packed K32 PV on overlay prefill.
 - The first AMD-like pair-store attempt was incomplete, not a DNR.
   Rank-matched destination layout compiled to `ds_write2_b64`, and its
   nested tiled-MMA `partition_S` was not the inverse of the store
