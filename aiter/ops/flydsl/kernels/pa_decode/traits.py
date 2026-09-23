@@ -45,9 +45,11 @@ class PaDecodeSchedule:
         query_length: int = 1,
         trans_v: bool = True,
         wide_kv_addressing: bool = False,
+        kv_buffer_u32: bool = False,
         query_splits: int | None = None,
         use_work_plan: bool = False,
         work_capacity: int | None = None,
+        max_context_length: int | None = None,
         sliding_window: int = 0,
         use_sinks: bool = False,
         sink_dtype_str: str = "f32",
@@ -69,6 +71,13 @@ class PaDecodeSchedule:
         if use_work_plan:
             if work_capacity is not None:
                 split_workgroups = work_capacity * num_kv_heads
+            if sliding_window == 0 and max_context_length is not None:
+                context_tiles = (
+                    max_context_length + KV_COMPUTE_BLOCK - 1
+                ) // KV_COMPUTE_BLOCK
+                split_workgroups = min(
+                    split_workgroups, num_seqs * num_kv_heads * context_tiles
+                )
             if sliding_window > 0:
                 # Bound the unaligned MTP window union, excluding padding CTAs.
                 window_tiles = (
@@ -95,19 +104,39 @@ class PaDecodeSchedule:
                 and trans_v
                 else query_length
             )
-            query_splits = (
-                query_length
-                if TUNED_PER_TOKEN
-                and num_kv_heads == 1
+            query_splits = 1
+            if (
+                TUNED_PER_TOKEN
+                and (num_kv_heads == 1 or (use_work_plan and sliding_window == 0))
                 and query_length in (2, 4)
                 and query_group_size == 16
                 and split_weight * split_workgroups <= 2 * num_compute_units
-                else 1
-            )
+            ):
+                query_splits = query_length
+            elif (
+                TUNED_PER_TOKEN
+                and use_work_plan
+                and sliding_window == 0
+                and query_length == 4
+                and query_group_size == 8
+                and block_size == 128
+                and trans_v
+                and 2 * split_workgroups <= num_compute_units
+            ):
+                query_splits = 2
         assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
         assert query_length % query_splits == 0, "query_splits must divide query_length"
         QUERIES_PER_CTA = query_length // query_splits
         TOTAL_ROWS = query_length * query_group_size
+        CTA_ROWS = QUERIES_PER_CTA * query_group_size
+        M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
+        WIDE_FP8_MFMA = (
+            TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
+        )
+        MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
+        BUFFER_KV = (
+            kv_buffer_u32 and MTP4_FUSED and wide_kv_addressing and block_size == 128
+        )
 
         # Prefetch single-M-tile queries; large multi-tile grids favor fewer registers.
         PER_TOKEN_M1 = (
@@ -153,6 +182,7 @@ class PaDecodeSchedule:
             query_length,
             trans_v,
             wide_kv_addressing,
+            BUFFER_KV,
             prefetch_v,
             query_splits,
             use_work_plan,
@@ -208,6 +238,7 @@ class PaDecodeTraits:
     PACKS_PER_MFMA: int
     MTP4_FUSED: bool
     MTP4_PREFETCH_V: bool
+    BUFFER_KV: bool
     PAGE16_VPIPE: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
@@ -285,6 +316,7 @@ class PaDecodeTraits:
             query_length,
             trans_v,
             wide_kv_addressing,
+            BUFFER_KV,
             prefetch_v,
             query_splits,
             use_work_plan,
@@ -363,8 +395,9 @@ class PaDecodeTraits:
         MFMA_K = 128 if WIDE_FP8_MFMA else FP8_PACK_K
         PACKS_PER_MFMA = MFMA_K // FP8_PACK_K
         MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
-        # Wide page128 addresses make carrying V across QK too register-heavy.
-        MTP4_PREFETCH_V = MTP4_FUSED and (block_size == 16 or not wide_kv_addressing)
+        MTP4_PREFETCH_V = MTP4_FUSED and (
+            block_size == 16 or not wide_kv_addressing or BUFFER_KV
+        )
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
         REUSE_KV_PAGES = PER_TOKEN_M1
@@ -507,6 +540,7 @@ class PaDecodeTraits:
             PACKS_PER_MFMA=PACKS_PER_MFMA,
             MTP4_FUSED=MTP4_FUSED,
             MTP4_PREFETCH_V=MTP4_PREFETCH_V,
+            BUFFER_KV=BUFFER_KV,
             PAGE16_VPIPE=PAGE16_VPIPE,
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,

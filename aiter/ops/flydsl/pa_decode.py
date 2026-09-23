@@ -148,6 +148,13 @@ def launch_pa_decode_ps_reduce(
         query_group_size=query_group_size,
         bounded_plan_logits=bounded_plan_logits,
         vectorize_plan_logits=vectorize_plan_logits,
+        compact_plan=(
+            use_work_plan
+            and head_size == 128
+            and context_partition_num > 64
+            and exp_sums.ndim == 3
+            and exp_sums.shape[1] <= 32 * output.shape[0]
+        ),
     )
     sink_ptr = (
         ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
@@ -556,8 +563,10 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # Widen before either cache's i32 element offsets can wrap.
-    wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
+    # FP8 element offsets are bytes; 4 GiB caches require i64 addressing.
+    cache_extent = max(key_cache.numel(), value_cache.numel())
+    wide_kv_addressing = cache_extent >= 2**31
+    kv_buffer_u32 = cache_extent < 2**32
 
     # Add sinks once: here for static NP=1, otherwise in reduction.
     use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None
@@ -578,8 +587,10 @@ def pa_decode(
             query_length=query_length,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
+            kv_buffer_u32=kv_buffer_u32,
             use_work_plan=work_plan is not None,
             work_capacity=work_plan.capacity if work_plan is not None else None,
+            max_context_length=int(max_blocks_per_seq) * int(block_size),
             sliding_window=sliding_window,
             use_sinks=use_direct_sinks,
             sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",
@@ -691,6 +702,13 @@ def pa_decode(
             output_5d = output.reshape(
                 num_seqs, query_length, num_kv_heads, query_group_size, head_dim
             )
+            reduce_partitions = num_partitions
+            if sliding_window > 0:
+                # Bound the unaligned MTP window without shrinking the reusable plan.
+                window_tiles = (
+                    sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+                ) // KV_COMPUTE_BLOCK + 1
+                reduce_partitions = min(reduce_partitions, window_tiles)
             launch_pa_decode_ps_reduce(
                 output_5d,
                 psum,
@@ -711,7 +729,7 @@ def pa_decode(
                 query_seq_len=query_length,
                 query_group_size=query_group_size,
                 head_size=head_dim,
-                context_partition_num=num_partitions,
+                context_partition_num=reduce_partitions,
                 stream=s,
                 reduce_info=work_plan.reduce_info if work_plan is not None else None,
             )

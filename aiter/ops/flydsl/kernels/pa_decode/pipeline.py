@@ -275,6 +275,12 @@ class PaDecodePipeline:
             m_new_saved = self.softmax.pack_fused(
                 masked_chunks_saved, ostate, cur_kv_buf, norm_factor_b
             )
+            if const_expr(not self.traits.MTP4_PREFETCH_V and self.traits.trans_v):
+                # Overlap current V with next K and the P barrier.
+                v_vh_shared = [
+                    self.kv.load_v(v_page_cur, vh)
+                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                ]
             if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
                 # Saved scores are dead; next K can overlap the P barrier/PV.
                 k_next = self.kv.load_k_from_pages(self.kv.read_k_pages())
@@ -282,12 +288,6 @@ class PaDecodePipeline:
 
             gpu.barrier()
 
-            if const_expr(not self.traits.MTP4_PREFETCH_V and self.traits.trans_v):
-                # Delay transposed V until saved score registers are dead.
-                v_vh_shared = [
-                    self.kv.load_v(v_page_cur, vh)
-                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
-                ]
             v_next_chunks = []
             for m in range_constexpr(self.traits.M_TILES):
                 p_base = self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES

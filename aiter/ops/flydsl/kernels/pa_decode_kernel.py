@@ -79,9 +79,11 @@ def compile_pa_decode_tile(
     query_length: int = 1,
     trans_v: bool = True,
     wide_kv_addressing: bool = False,
+    kv_buffer_u32: bool = False,
     query_splits: int | None = None,
     use_work_plan: bool = False,
     work_capacity: int | None = None,
+    max_context_length: int | None = None,
     sliding_window: int = 0,
     use_sinks: bool = False,
     sink_dtype_str: str = "f32",
@@ -90,6 +92,8 @@ def compile_pa_decode_tile(
 
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
+    ``max_context_length`` bounds dense planned work for scheduling only; it does not
+    change the launch capacity, scratch layout, or single-tile guarantee.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
     M-tiles. Partial output stays unsplit for the shared reducer.
 
@@ -108,8 +112,9 @@ def compile_pa_decode_tile(
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
-    unwritten tail of the last owned page finite. ``wide_kv_addressing`` uses
-    i64 offsets when a cache reaches 2 GiB and the i32 page product would wrap.
+    unwritten tail of the last owned page finite. ``wide_kv_addressing`` protects
+    offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
+    and permits unsigned buffer offsets instead of i64.
     """
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
@@ -125,9 +130,11 @@ def compile_pa_decode_tile(
         query_length=query_length,
         trans_v=trans_v,
         wide_kv_addressing=wide_kv_addressing,
+        kv_buffer_u32=kv_buffer_u32,
         query_splits=query_splits,
         use_work_plan=use_work_plan,
         work_capacity=work_capacity,
+        max_context_length=max_context_length,
         sliding_window=sliding_window,
         use_sinks=use_sinks,
         sink_dtype_str=sink_dtype_str,

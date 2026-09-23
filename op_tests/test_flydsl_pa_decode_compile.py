@@ -19,6 +19,27 @@ _KERNELS = Path(__file__).resolve().parents[1] / "aiter/ops/flydsl/kernels"
 _CASES = {
     "partitioned": {},
     "mtp4": {"query_length": 4, "query_splits": 1},
+    "mtp4_wide": {
+        "query_length": 4,
+        "query_splits": 1,
+        "wide_kv_addressing": True,
+    },
+    "mtp4_buffer": {
+        "query_length": 4,
+        "query_splits": 1,
+        "wide_kv_addressing": True,
+        "kv_buffer_u32": True,
+    },
+    "planned_dense_split2": {
+        "query_group_size": 8,
+        "num_seqs": 1,
+        "num_kv_heads": 8,
+        "num_partitions": 256,
+        "query_length": 4,
+        "use_work_plan": True,
+        "work_capacity": 32,
+        "max_context_length": 4096,
+    },
     "planned_odd_rows": {
         "query_group_size": 9,
         "block_size": 16,

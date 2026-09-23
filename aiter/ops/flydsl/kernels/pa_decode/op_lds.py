@@ -239,10 +239,24 @@ class PaDecodeKVLoader:
         self.value_scale = None
 
     def _make_raw_flat_loader(self, tensor_ptr, elem_ty, reg_width, extent):
-        copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
+        # Stream dense KV; retain cache locality for sliding windows.
+        copy_op = (
+            fx.rocdl.BufferCopy128b(
+                cache_modifier=2 if const_expr(self.traits.sliding_window == 0) else 0
+            )
+            if const_expr(self.traits.BUFFER_KV)
+            else fx.UniversalCopy128b()
+        )
+        copy_atom = fx.make_copy_atom(copy_op, elem_ty)
         reg = fx.make_rmem_tensor(fx.make_layout(reg_width, 1), elem_ty)
-        flat = fx.Tensor(
-            fx.make_view(fx.recast_iter(elem_ty, tensor_ptr), fx.make_layout(extent, 1))
+        flat = (
+            ptr_buf_tensor(tensor_ptr, elem_ty)
+            if const_expr(self.traits.BUFFER_KV)
+            else fx.Tensor(
+                fx.make_view(
+                    fx.recast_iter(elem_ty, tensor_ptr), fx.make_layout(extent, 1)
+                )
+            )
         )
         tiled = fx.logical_divide(flat, fx.make_layout(1, 1))
 
@@ -261,6 +275,8 @@ class PaDecodeKVLoader:
         )
 
     def kv_address(self, phys, page_elems, rest):
+        if const_expr(self.traits.BUFFER_KV):
+            return fx.Uint32(phys) * fx.Uint32(page_elems) + fx.Uint32(rest)
         # Widen before the page product reaches 2^31 FP8 elements.
         if const_expr(self.traits.wide_kv_addressing):
             return fx.Int64(phys) * fx.Int64(page_elems) + fx.Int64(rest)
