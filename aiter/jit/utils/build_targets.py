@@ -103,3 +103,72 @@ def filter_tune_df(tune_df, targets: list):
     for gfx, cu_num in targets:
         mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
     return tune_df[mask]
+
+
+# Mirrors CK example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py get_factory().
+# More-specific prefixes first (gfx950 before gfx9, gfx115 before gfx11,
+# gfx125 before gfx12). gfx120 and gfx115 are the same length — "longest
+# first" is the wrong invariant. Bare "gfx12" does not match gfx120/gfx125
+# and is omitted.
+_CK_FMHA_ARCH_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("gfx950", "gfx950"),
+    ("gfx125", "gfx125"),
+    ("gfx120", "gfx12"),
+    ("gfx115", "gfx115"),
+    ("gfx11", "gfx11"),
+    ("gfx9", "gfx9"),
+)
+
+
+def map_gpu_archs_to_ck_fmha_targets(archs: list[str]) -> list[str]:
+    """Map GPU_ARCHS / get_gfx_list() names to CK fmha factory keys.
+
+    Unknown names are omitted. Already-emitted keys are skipped. Order follows
+    the input arch list.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    for arch in archs:
+        name = arch.split(":", 1)[0].lower()
+        mapped = None
+        for prefix, key in _CK_FMHA_ARCH_PREFIXES:
+            if name.startswith(prefix):
+                mapped = key
+                break
+        if mapped is None or mapped in seen:
+            continue
+        seen.add(mapped)
+        keys.append(mapped)
+    return keys
+
+
+def ck_fmha_targets() -> str:
+    """Comma-joined CK fmha --targets for the current get_gfx_list().
+
+    Unmapped lists (cpu, gfx1030, empty) keep CK's default gfx9,gfx950.
+    """
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    keys = map_gpu_archs_to_ck_fmha_targets(get_gfx_list())
+    return ",".join(keys) if keys else "gfx9,gfx950"
+
+
+def ck_fmha_factory_key(gfx: str) -> str:
+    """CK fmha factory key for an explicit gfx name, '' when unmapped."""
+    keys = map_gpu_archs_to_ck_fmha_targets([gfx])
+    return keys[0] if keys else ""
+
+
+def ck_fmha_batch_prefill_gen_targets() -> str:
+    """--targets for 01_fmha generate.py -d batch_prefill.
+
+    CK drops every batch_prefill kernel if any --targets token is not gfx9*.
+    Pass the gfx9* subset when the mapped list has one; otherwise pass
+    ck_fmha_targets() so generate.py still emits fmha_batch_prefill_api.cpp.
+    Never return ''.
+    """
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    keys = map_gpu_archs_to_ck_fmha_targets(get_gfx_list())
+    gfx9 = ",".join(k for k in keys if k.startswith("gfx9"))
+    return gfx9 or ck_fmha_targets()
