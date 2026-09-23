@@ -147,9 +147,7 @@ class OneShotAllReduce:
             raise ValueError(f"grid_cap must be positive, got {cap}")
 
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
-        # set_device rejects torch.device("cuda") with no index; resolve first.
         self._device_index = _cuda_index(device)
-        torch.cuda.set_device(self._device_index)
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self._has_launched = False
@@ -199,33 +197,34 @@ class OneShotAllReduce:
         # ever be a no-op bought with an extra collective per engine.
         self._by_cfg = {}
         try:
-            for rung in self._ladder:
-                key = self._cfg_of(rung)
-                if key in self._by_cfg:
-                    continue
-                spec = make_one_shot_allreduce_kernel(
-                    world_size=self.world_size,
-                    atoms=key[0],
-                    grid=key[1],
-                    inbox_memory=resolved_inbox,
-                    fanout=key[2],
-                    block=key[3],
-                    probe=probe,
-                    spin_sleep=int(spin_sleep),
-                    skip_self=key[4],
-                    rank=self.rank,
-                )
-                self._by_cfg[key] = (
-                    _StEngine(
-                        spec=spec,
-                        group=group,
-                        rank=self.rank,
+            with torch.cuda.device(self._device_index):
+                for rung in self._ladder:
+                    key = self._cfg_of(rung)
+                    if key in self._by_cfg:
+                        continue
+                    spec = make_one_shot_allreduce_kernel(
                         world_size=self.world_size,
-                        inbox_flags=inbox_flags,
-                        device_index=self._device_index,
-                    ),
-                    spec,
-                )
+                        atoms=key[0],
+                        grid=key[1],
+                        inbox_memory=resolved_inbox,
+                        fanout=key[2],
+                        block=key[3],
+                        probe=probe,
+                        spin_sleep=int(spin_sleep),
+                        skip_self=key[4],
+                        rank=self.rank,
+                    )
+                    self._by_cfg[key] = (
+                        _StEngine(
+                            spec=spec,
+                            group=group,
+                            rank=self.rank,
+                            world_size=self.world_size,
+                            inbox_flags=inbox_flags,
+                            device_index=self._device_index,
+                        ),
+                        spec,
+                    )
         except Exception:
             self.close()
             raise
@@ -327,7 +326,8 @@ class OneShotAllReduce:
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
         self._has_launched = True
-        _run_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
 
     def _launch(self, inp, out, stream, *, live_bytes: int) -> None:
         eng, spec = self._by_cfg[self._pick_cfg(live_bytes)]
@@ -395,12 +395,13 @@ class OneShotAllReduce:
         engines = getattr(self, "_by_cfg", None)
         if not engines:
             return
-        if getattr(self, "_has_launched", False):
-            torch.cuda.synchronize(self._device_index)
-            self._has_launched = False
-        for eng, _ in engines.values():
-            eng.close()
-        engines.clear()
+        with torch.cuda.device(self._device_index):
+            if getattr(self, "_has_launched", False):
+                torch.cuda.synchronize(self._device_index)
+                self._has_launched = False
+            for eng, _ in engines.values():
+                eng.close()
+            engines.clear()
 
     def __del__(self):
         try:
