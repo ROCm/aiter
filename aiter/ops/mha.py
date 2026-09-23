@@ -34,6 +34,7 @@ from ..jit.utils.mha_recipes import (
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .mha_fwd_policy import (
+    HD192_SPLITKV_MIN_SPLITS,
     MHA_FWD_BACKENDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
     MHA_FWD_TUNING_KEY_FIELDS,
@@ -3358,92 +3359,70 @@ def _flash_attn_varlen_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif selected_backend in (None, "asm_v3") and can_impl_fmha_v3_fwd():
-        # _fmha_v3_varlen_splitkv_fwd is the only entry point that accepts a
-        # split count, and it hard-codes every argument it does not take, so a
-        # caller that set one of them differently would have it dropped without
-        # a trace.  Those calls keep the full entry point and let C++ pick the
-        # split count.  #5592 is adding num_splits to fmha_v3_varlen_fwd; this
-        # narrowing goes away with the rebase onto it.
-        force_splits = int(num_splits) >= 1
+        # A forced split count that the kernel contract cannot serve is a
+        # hard error in C++, so screen the call here first: a tuned row is a
+        # performance hint, and auto-select is the right answer for the rest.
+        force_splits = int(num_splits) >= HD192_SPLITKV_MIN_SPLITS
         if force_splits:
-            dropped = [
+            unsupported = [
                 name
-                for name, carried in (
-                    ("out", out is None),
-                    ("min_seqlen_q", min_seqlen_q == 0),
-                    ("dropout_p", dropout_p == 0.0),
-                    ("logits_soft_cap", logits_soft_cap == 0.0),
-                    ("zero_tensors", not zero_tensors),
+                for name, holds in (
                     ("causal", not causal),
                     ("window_size_left", window_size_left == -1),
                     ("window_size_right", window_size_right == -1),
-                    ("return_softmax", not return_softmax),
                     ("how_v3_bf16_cvt", how_v3_bf16_cvt == 1),
                     ("block_table", block_table is None),
-                    ("bias", bias is None),
-                    ("alibi_slopes", alibi_slopes is None),
                     ("q_descale", q_descale is None),
-                    ("k_descale", k_descale is None),
-                    ("v_descale", v_descale is None),
+                    ("return_softmax", not return_softmax),
                     ("cu_seqlens_q_padded", cu_seqlens_q_padded is None),
                     ("cu_seqlens_k_padded", cu_seqlens_k_padded is None),
+                    ("batch_size", batch_size == 1),
+                    ("nhead_k", nhead_q == nhead_k),
                 )
-                if not carried
+                if not holds
             ]
-            if dropped:
+            if unsupported:
                 logger.warning(
                     "tuned num_splits=%d cannot be honored for this call: the "
-                    "split entry point does not carry %s; letting C++ select "
-                    "the split count",
+                    "gfx942 hd192 split-KV kernel does not support %s; "
+                    "letting C++ select the split count",
                     int(num_splits),
-                    ", ".join(dropped),
+                    ", ".join(unsupported),
                 )
                 force_splits = False
-        _record_mha_fwd_selection("asm_v3", int(num_splits) if force_splits else 0)
-        if force_splits:
-            out, softmax_lse, S_dmask, rng_state = _fmha_v3_varlen_splitkv_fwd(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                softmax_scale,
-                return_lse,
-                int(num_splits),
-            )
-        else:
-            out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                min_seqlen_q,
-                dropout_p,
-                softmax_scale,
-                logits_soft_cap,
-                zero_tensors,
-                causal,
-                window_size_left,
-                window_size_right,
-                return_lse,
-                return_softmax,
-                how_v3_bf16_cvt,
-                out,
-                block_table,
-                bias,
-                alibi_slopes,
-                q_descale,
-                k_descale,
-                v_descale,
-                None,
-                cu_seqlens_q_padded,
-                cu_seqlens_k_padded,
-            )
+        split_request = int(num_splits) if force_splits else 0
+        _record_mha_fwd_selection("asm_v3", split_request)
+        out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            how_v3_bf16_cvt,
+            out,
+            block_table,
+            bias,
+            alibi_slopes,
+            q_descale,
+            k_descale,
+            v_descale,
+            None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
+            split_request,
+        )
     else:
         if selected_backend not in (None, "ck"):
             # A tuned row is a performance hint, not a correctness contract:
