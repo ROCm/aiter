@@ -306,6 +306,42 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 #endif
 #endif
     }
+    // The vector loop stops at n4 = pitch / FP32_EPT, which TRUNCATES when the row
+    // width is not a multiple of four, so the last one to three columns would
+    // never be looked at. The ragged path covers them because n4_cover rounds up
+    // and every consumer predicates on `< len` -- and that per-element predicate
+    // is exactly what makes the ragged path slower, so giving it back to all N
+    // columns to reach three of them would be the wrong trade.
+    //
+    // The block that owns the last chunk picks the tail up instead: at most three
+    // columns, one lane each, staged exactly like any other candidate so the
+    // epilogue needs no special case. bcnt is at most WSTAGE_CAP - 4 * WAVE_SIZE
+    // here because the drain check runs at the end of every iteration, so the
+    // three extra entries cannot overflow the staging buffer.
+    //
+    // Measured before this existed: at m=4 N=131075 the answer was exactly
+    // torch.topk over the first 131072 columns, with the 2049th largest value
+    // standing in for the one that fell in the tail (scripts/probe72.py).
+    if(!RAGGED)
+    {
+        const int tail0 = n4 * FP32_EPT;
+        const int ncols = len - tail0;
+        if(ncols > 0 && bid == G - 1 && bcnt >= 0)
+        {
+            const bool mine   = (int)threadIdx.x < ncols;
+            const float vv    = mine ? ri[tail0 + (int)threadIdx.x] : 0.f;
+            const bool act    = mine && !(vv < th);
+            const uint64_t bt = __ballot(act);
+            const int t       = __popcll(bt);
+            if(t > 0)
+            {
+                if(act)
+                    buf[bcnt + __popcll(bt & lt)] = ((uint64_t)__float_as_uint(vv) << 32) |
+                                                    (uint32_t)(tail0 + (int)threadIdx.x);
+                bcnt += t;
+            }
+        }
+    }
 #undef COOP_DRAIN_WAVE
 
 // The epilogue, priced. Every ABLATE_DRAIN variant above missed this block:

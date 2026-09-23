@@ -1889,11 +1889,13 @@ void top_k_per_row_prefill_sampled(
     // 72.5% of the wrong elements, which is more than the dropped tail can
     // explain and is not yet understood.
     //
-    // So `ragged = false` is honoured only where the two paths are provably the
-    // same kernel over the same elements. Every power-of-two width and every
-    // other multiple of four keeps the faster path; the rest go back to the
-    // bounds-checking one, which is what they did before the parameter existed.
-    const bool ragged_eff = ragged || (N % FP32_EPT) != 0;
+    // phase_b_filter_coop now reads the tail explicitly, so the fused path is
+    // correct at any width and the restriction is lifted there. topk_small_n
+    // still truncates the same way and has no tail handling, so it keeps the
+    // gate; it only serves PATH_SMALL_N, well below the widths this parameter
+    // was introduced for.
+    const bool ragged_fused = ragged;
+    const bool ragged_small = ragged || (N % FP32_EPT) != 0;
 
     HipDeviceGuard device_guard(logits.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -1907,7 +1909,7 @@ void top_k_per_row_prefill_sampled(
 
     if(sp.path == PATH_SMALL_N)
     {
-        if(ragged_eff)
+        if(ragged_small)
         {
             if(val)
                 topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
@@ -1930,7 +1932,7 @@ void top_k_per_row_prefill_sampled(
                 workspace.value().numel() * workspace.value().element_size(),
                 L.total);
     Bufs b = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
-    if(ragged_eff)
+    if(ragged_fused)
     {
         if(val)
             topk_fused_impl<true, true>(in, M, N, row_starts, row_ends, K, idx, val, b, sp, stream);
