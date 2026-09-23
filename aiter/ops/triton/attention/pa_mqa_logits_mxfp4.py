@@ -340,7 +340,8 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
 
 def build_schedule(context_lens, next_n, num_heads, head_size,
                    page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
-                   cu_ends=None, gather=0, max_model_len=None):
+                   cu_ends=None, gather=0, cu_q=None, total_rows=None,
+                   max_model_len=None):
     """Descriptors for one launch, or None if the shape does not fit.
 
     A descriptor is (sequence, row block, slice index, slice count), relative
@@ -355,7 +356,13 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         row_blocks, block_m = next_n, 1
     block_kv, target_wgs = plan["block_kv"], plan["target_wgs"]
     batch = int(context_lens.numel())
-    work = batch * row_blocks
+    varlen = cu_q is not None
+    if varlen:
+        assert total_rows is not None, "varlen needs the packed row count"
+        # One spare unit per sequence absorbs its partial last block.
+        work = total_rows // block_m + batch
+    else:
+        work = batch * row_blocks
     # Too few sequences to have an imbalance worth the scheduler launch.
     if batch < MIN_DYNAMIC_BATCH:
         return None
@@ -374,6 +381,10 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         room = max(num_ctas - work, 1)
         max_tiles = max(cap, (n_tiles * work + room - 1) // room)
     align_w = max(16, 1 << (work - 1).bit_length())
+    align_b = max(16, 1 << (batch - 1).bit_length())
+    # The varlen search is one ALIGN_W x ALIGN_B predicate matrix per program
+    if varlen and align_w * align_b > 1 << 20:
+        return None
     if out is None or out.numel() < num_ctas * 4:
         out = torch.empty(num_ctas * 4, dtype=torch.int32,
                           device=context_lens.device)
@@ -383,10 +394,12 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(num_ctas, SCHED_BLOCK_P),)](
         context_lens,
         cu_ends,
+        cu_q,
         out,
         batch,
         next_n,
         num_ctas,
+        work,
         BLOCK_M=block_m,
         BLOCK_KV=block_kv,
         ROW_BLOCKS=row_blocks,
@@ -394,6 +407,8 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         BLOCK_P=SCHED_BLOCK_P,
         HAS_CU_ENDS=1 if cu_ends is not None else 0,
         GATHER=int(gather),
+        VARLEN=1 if varlen else 0,
+        ALIGN_B=align_b,
         MAX_TILES=max_tiles,
         num_warps=4,
     )
@@ -434,6 +449,8 @@ def paged_mxfp4_mqa_logits(
     dynamic: int = 0,
     schedule: torch.Tensor | None = None,
     cu_ends: torch.Tensor | None = None,
+    cu_q: torch.Tensor | None = None,
+    plan_rows: int | None = None,
     use_gather: bool = False,
     candidates: torch.Tensor | dict | None = None,
     block_scores: torch.Tensor | None = None,
@@ -509,22 +526,38 @@ def paged_mxfp4_mqa_logits(
     assert arch_info.get_arch() == "gfx950", "gfx950 only"
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
 
-    batch, next_n, num_heads, head_bytes = q.shape
+    varlen = cu_q is not None
+    if varlen:
+        assert q.dim() == 3, "varlen q is [TOTAL_ROWS, NUM_HEADS, HEAD_SIZE // 2]"
+        assert cu_q.dtype == torch.int32 and cu_q.stride(0) == 1
+        total_rows, num_heads, head_bytes = q.shape
+        batch = cu_q.numel() - 1
+        # One BLOCK_M for the launch, planned from the row count most of the
+        # work belongs to. plan_rows overrides it.
+        next_n = int(plan_rows or max(1, total_rows // max(batch, 1)))
+    else:
+        batch, next_n, num_heads, head_bytes = q.shape
+        total_rows = batch * next_n
     head_size = head_bytes * 2
     num_scales = head_size // SCALE_GROUP
     assert num_heads & (num_heads - 1) == 0, "head count must be a power of 2"
     assert head_size & (head_size - 1) == 0, "head size must be a power of 2"
     assert q.dtype == torch.uint8 and q_scales.dtype == torch.uint8
-    assert q_scales.shape == (batch, next_n, num_heads, num_scales)
-    assert q.stride()[2:] == (head_bytes, 1), "q must be row-contiguous over (H, D)"
-    assert q_scales.stride()[2:] == (num_scales, 1)
+    if varlen:
+        assert q_scales.shape == (total_rows, num_heads, num_scales)
+        assert q.stride()[1:] == (head_bytes, 1), "q rows must be contiguous over (H, D)"
+        assert q_scales.stride()[1:] == (num_scales, 1)
+    else:
+        assert q_scales.shape == (batch, next_n, num_heads, num_scales)
+        assert q.stride()[2:] == (head_bytes, 1), "q must be row-contiguous over (H, D)"
+        assert q_scales.stride()[2:] == (num_scales, 1)
     assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
     assert block_table.shape[0] == batch
     assert context_lens.dtype == torch.int32
-    assert weights.shape == (batch * next_n, num_heads) and weights.stride(1) == 1
+    assert weights.shape == (total_rows, num_heads) and weights.stride(1) == 1
     if cu_ends is not None:
         assert cu_ends.dtype == torch.int32, "cu_ends must be int32"
-        assert cu_ends.shape == (batch * next_n,) and cu_ends.stride(0) == 1, (
+        assert cu_ends.shape == (total_rows,) and cu_ends.stride(0) == 1, (
             "cu_ends must be a contiguous [B * NEXT_N] vector, indexed like weights")
 
     # page_size comes from the cache rather than the caller: both layouts pin it
@@ -559,7 +592,7 @@ def paged_mxfp4_mqa_logits(
     def _alloc(cols):
         # clean_logits picks the fill for both outputs: the walk leaves the
         # columns past the context untouched either way.
-        shape = (batch * next_n, cols)
+        shape = (total_rows, cols)
         if clean_logits:
             return torch.full(shape, float("-inf"), dtype=torch.float32,
                               device=q.device)
@@ -568,7 +601,7 @@ def paged_mxfp4_mqa_logits(
     logits = None
     if calc_logits:
         logits = out_logits if out_logits is not None else _alloc(max_model_len)
-        assert logits.shape == (batch * next_n, max_model_len)
+        assert logits.shape == (total_rows, max_model_len)
     if calc_block_scores and block_scores is None:
         block_scores = _alloc((max_model_len + cand_block - 1) // cand_block)
     if logits is not None:
@@ -579,6 +612,8 @@ def paged_mxfp4_mqa_logits(
 
     assert use_gather or candidates is None, (
         "candidates is inapplicable with use_gather off")
+    assert not (varlen and use_gather), (
+        "the gather already takes one block-table row per query row")
     gather = None
     if use_gather:
         assert candidates is not None, "use_gather needs a candidate list"
@@ -605,7 +640,7 @@ def paged_mxfp4_mqa_logits(
         assert g_voff.shape == g_soff.shape, (g_voff.shape, g_soff.shape)
         assert g_voff.stride(1) == 1 and g_soff.stride(1) == 1
         assert g_voff.stride(0) == g_soff.stride(0)
-        assert g_voff.shape[0] == batch * next_n, g_voff.shape
+        assert g_voff.shape[0] == total_rows, g_voff.shape
         assert cu_ends is not None, (
             "the gather takes its walk length from cu_ends, read as the row's "
             "count of valid candidate slots")
@@ -638,7 +673,7 @@ def paged_mxfp4_mqa_logits(
             f"candidate_block_size {cand_block} must divide BLOCK_KV "
             f"{block_kv} or a block straddles a tile")
         n_blocks = (max_model_len + cand_block - 1) // cand_block
-        assert block_scores.shape[0] == batch * next_n, block_scores.shape
+        assert block_scores.shape[0] == total_rows, block_scores.shape
         assert block_scores.shape[1] >= n_blocks, (
             f"block_scores is {block_scores.shape[1]} blocks wide, needs "
             f"{n_blocks} for max_model_len {max_model_len}")
@@ -668,11 +703,16 @@ def paged_mxfp4_mqa_logits(
 
     num_kv_splits = cfg["num_kv_splits"]
     # A gather launch does not build one
-    if schedule is None and dynamic and not gather_on:
+    if schedule is None and (dynamic or varlen) and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
                                   page_size, preshuffle, cu_ends=cu_ends,
+                                  cu_q=cu_q, total_rows=total_rows,
                                   max_model_len=max_model_len)
     use_dynamic = schedule is not None
+    assert not varlen or use_dynamic, (
+        "varlen needs the dynamic schedule and this shape does not get one "
+        f"(batch {batch} under {MIN_DYNAMIC_BATCH}, or the work does not fit); "
+        "group the rows by count and launch per group instead")
     if use_dynamic:
         schedule = _check_schedule(schedule, context_lens.device)
         # schedule length is the grid
@@ -691,6 +731,7 @@ def paged_mxfp4_mqa_logits(
         context_lens_ptr=context_lens,
         # None specializes to a constexpr, so an unused argument leaves no trace.
         cu_ends_ptr=cu_ends,
+        cu_q_ptr=cu_q,
         block_table_ptr=block_table,
         sched_ptr=schedule,
         gather_v_ptr=g_voff if gather_on else schedule,
@@ -701,10 +742,10 @@ def paged_mxfp4_mqa_logits(
         logits_ptr=logits,
         next_n=next_n,
         num_kv_splits=num_kv_splits,
-        stride_q_b=q.stride(0),
-        stride_q_n=q.stride(1),
-        stride_qs_b=q_scales.stride(0),
-        stride_qs_n=q_scales.stride(1),
+        stride_q_b=0 if varlen else q.stride(0),
+        stride_q_n=q.stride(0) if varlen else q.stride(1),
+        stride_qs_b=0 if varlen else q_scales.stride(0),
+        stride_qs_n=q_scales.stride(0) if varlen else q_scales.stride(1),
         stride_w_s=weights.stride(0),
         stride_logits_s=logits.stride(0) if logits is not None else 0,
         stride_logits_k=logits.stride(1) if logits is not None else 0,
@@ -729,6 +770,7 @@ def paged_mxfp4_mqa_logits(
         FOLD_ASM=cfg["fold_asm"],
         RELU_ADD=cfg["relu_add"],
         RELAXED_STORE=cfg["relaxed_store"],
+        VARLEN=1 if varlen else 0,
         PRESHUFFLE=preshuffle,
         SCALE_MODE=int(scale_mode),
         USE_BUFFER_LOAD=use_buffer_load,

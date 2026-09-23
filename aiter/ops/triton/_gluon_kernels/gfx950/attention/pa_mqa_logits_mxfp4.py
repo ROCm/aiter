@@ -286,6 +286,7 @@ class Config:
     SCALE_MODE: gl.constexpr
     USE_BUFFER_LOAD: gl.constexpr
     RELAXED_STORE: gl.constexpr
+    VARLEN: gl.constexpr
     GATHER: gl.constexpr
     GATHER_BLOCK: gl.constexpr
     GATHER_PIPE: gl.constexpr
@@ -312,7 +313,7 @@ class Config:
                  KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
                  UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
                  PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
-                 MFMA_NONK_DIM, HAS_KV_SPLIT,
+                 VARLEN, MFMA_NONK_DIM, HAS_KV_SPLIT,
                  KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE,
                  BSCORE, BSCORE_BLOCK):
         self.NUM_HEADS = gl.constexpr(NUM_HEADS)
@@ -345,6 +346,7 @@ class Config:
         self.SCALE_MODE = gl.constexpr(SCALE_MODE)
         self.USE_BUFFER_LOAD = gl.constexpr(USE_BUFFER_LOAD)
         self.RELAXED_STORE = gl.constexpr(RELAXED_STORE)
+        self.VARLEN = gl.constexpr(VARLEN)
         # Walk a candidate list in GATHER_BLOCK-token units
         # instead of BLOCK_KV contiguous positions. GATHER_PIPE reads that list
         # an iteration early, the way PAGE_PIPE reads the block table.
@@ -967,11 +969,20 @@ class Program:
                 scores = gl.where(pos < row_hi[r], scores, float("-inf"))
                 if cfg.STORE_LOGITS:
                     mask = pos < self.store_hi
+            # A varlen tile can hold rows past the end of its sequence -- the
+            # slot belongs to the next sequence's row, so it must not store.
+            # The shared predicate only selects -inf into the values.
+            if cfg.VARLEN and cfg.BLOCK_M > 1 and cfg.STORE_LOGITS:
+                mask = mask & (row_hi[r] > 0)
             if cfg.STORE_LOGITS:
                 gl.amd.cdna4.buffer_store(scores, ptr=self.out_ptr + r * self.stride_s,
                                           offsets=offsets, mask=mask)
             if cfg.BSCORE:
-                self.block_max(scores, r, tile_pos)
+                if cfg.VARLEN and cfg.BLOCK_M > 1:
+                    if row_hi[r] > 0:
+                        self.block_max(scores, r, tile_pos)
+                else:
+                    self.block_max(scores, r, tile_pos)
 
 
 @gluon.jit
@@ -1101,6 +1112,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     kv_scales_ptr,     # uint8 paged, page p's e8m0 at p * KVS_PAGE_STRIDE
     weights_ptr,       # fp32  [B * NEXT_N, H]
     context_lens_ptr,  # int32 [B]
+    cu_q_ptr,          # int32 [B + 1] row prefix sum, unused unless VARLEN
     cu_ends_ptr,       # int32 [B * NEXT_N] exclusive row end, or the row's
                        # candidate slot count under GATHER; None unless HAS_CU_ENDS
     block_table_ptr,   # int32 [B, stride_blk_b]
@@ -1145,6 +1157,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     HAS_KV_SPLIT: gl.constexpr,
     KV_REREAD: gl.constexpr,
     DYNAMIC: gl.constexpr,
+    VARLEN: gl.constexpr,
     HAS_CU_ENDS: gl.constexpr,
     GATHER: gl.constexpr,        # walk a host-resolved candidate list
     GATHER_BLOCK: gl.constexpr,  # KV tokens per candidate block
@@ -1183,7 +1196,7 @@ def _pa_mqa_logits_mxfp4_kernel(
                  KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
                  UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
                  PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
-                 MFMA_NONK_DIM, HAS_KV_SPLIT,
+                 VARLEN, MFMA_NONK_DIM, HAS_KV_SPLIT,
                  KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE,
                  BSCORE, BSCORE_BLOCK)
 
@@ -1208,26 +1221,49 @@ def _pa_mqa_logits_mxfp4_kernel(
     if context_len <= 0:
         return
 
+    # Under VARLEN the rows are packed and cu_q says where this sequence starts
+    # and how many it owns; otherwise every sequence owns next_n.
+    if VARLEN:
+        q_start = gl.load(cu_q_ptr + batch_id)
+        rows = gl.load(cu_q_ptr + batch_id + 1) - q_start
+    else:
+        q_start = batch_id * next_n
+        rows = next_n
+
     # The trailing block still owns BLOCK_M real rows when BLOCK_M does not
-    # divide next_n. Rows two blocks share are computed twice, identically.
-    n0 = row_block if BLOCK_M == 1 else gl.minimum(row_block * BLOCK_M,
-                                                   next_n - BLOCK_M)
-    q_base = batch_id.to(gl.int64) * stride_q_b + n0.to(gl.int64) * stride_q_n
-    qs_base = batch_id.to(gl.int64) * stride_qs_b + n0.to(gl.int64) * stride_qs_n
-    w_row = batch_id.to(gl.int64) * next_n + n0
+    # divide the count. Rows two blocks share are computed twice, identically.
+    # A varlen sequence can own fewer rows than BLOCK_M, so the floor matters.
+    n0 = row_block if BLOCK_M == 1 else gl.maximum(
+        gl.minimum(row_block * BLOCK_M, rows - BLOCK_M), 0)
+    if VARLEN:
+        row0 = (q_start + n0).to(gl.int64)
+        q_base, qs_base, w_row = row0 * stride_q_n, row0 * stride_qs_n, row0
+    else:
+        q_base = batch_id.to(gl.int64) * stride_q_b + n0.to(gl.int64) * stride_q_n
+        qs_base = batch_id.to(gl.int64) * stride_qs_b + n0.to(gl.int64) * stride_qs_n
+        w_row = batch_id.to(gl.int64) * next_n + n0
 
     mfma_qs, q_scales, w_blocks, ends = (), (), (), ()
     for r in gl.static_range(0, BLOCK_M):
-        q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + r * stride_q_n),
-                               q_scales_ptr + (qs_base + r * stride_qs_n),
-                               weights_ptr + (w_row + r) * stride_w_s)
+        # A short varlen sequence repeats its last row rather than reading past
+        # itself; end 0 then drops it at the store.
+        if VARLEN:
+            rr = gl.minimum(n0 + r, rows - 1) - n0
+        else:
+            rr = r
+        q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + rr * stride_q_n),
+                               q_scales_ptr + (qs_base + rr * stride_qs_n),
+                               weights_ptr + (w_row + rr) * stride_w_s)
         mfma_qs, q_scales, w_blocks = mfma_qs + (q,), q_scales + (qs,), w_blocks + (w,)
         if HAS_CU_ENDS:
-            ends = ends + (gl.load(cu_ends_ptr + (w_row + r)),)
+            e = gl.load(cu_ends_ptr + (w_row + rr))
         else:
-            ends = ends + (context_len - next_n + n0 + r + 1,)
+            e = context_len - rows + n0 + r + 1
+        if VARLEN:
+            e = gl.where(n0 + r < rows, e, 0)
+        ends = ends + (e,)
 
-    if HAS_CU_ENDS:
+    if HAS_CU_ENDS or VARLEN:
         block_end = ends[0]
         for r in gl.static_range(1, BLOCK_M):
             block_end = gl.maximum(block_end, ends[r])
@@ -1300,10 +1336,12 @@ def _pa_mqa_logits_mxfp4_kernel(
 
 @triton.jit
 def _pa_mqa_logits_mxfp4_sched_kernel(
-    context_lens_ptr, cu_ends_ptr, sched_ptr, batch, next_n, num_ctas,
+    context_lens_ptr, cu_ends_ptr, cu_q_ptr, sched_ptr, batch, next_n,
+    num_ctas, num_units,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
     ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_CU_ENDS: tl.constexpr,
-    GATHER: tl.constexpr, MAX_TILES: tl.constexpr,
+    GATHER: tl.constexpr, VARLEN: tl.constexpr, ALIGN_B: tl.constexpr,
+    MAX_TILES: tl.constexpr,
 ):
     # A "unit" is one (sequence, row block) pair; a "slot" is one workgroup of
     # the launch. The job is to give every slot a slice of some unit's KV walk,
@@ -1313,9 +1351,29 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
 
     # Step 1: how many KV tiles each unit actually walks.
     unit = tl.arange(0, ALIGN_W)
-    seq = unit // ROW_BLOCKS
-    row_blk = unit % ROW_BLOCKS
-    live = unit < batch * ROW_BLOCKS
+    if VARLEN:
+        b = tl.arange(0, ALIGN_B)
+        blive = b < batch
+        q0 = tl.load(cu_q_ptr + b, mask=blive, other=0)
+        rows_of = tl.load(cu_q_ptr + b + 1, mask=blive, other=0) - q0
+        # The unit space is cu_q[s] // BLOCK_M + s. The + s gives every
+        # sequence one spare unit, which absorbs its partial last block and
+        # keeps the space monotone -- that is what makes the search below work
+        # and what bounds the count at total_rows // BLOCK_M + batch.
+        ustart = q0 // BLOCK_M + b
+        found = (ustart[None, :] <= unit[:, None]) & blive[None, :]
+        seq = tl.maximum(tl.sum(found.to(tl.int32), axis=1) - 1, 0)
+        pick = (b[None, :] == seq[:, None]) & blive[None, :]
+        row_blk = unit - tl.sum(tl.where(pick, ustart[None, :], 0), axis=1)
+        rows = tl.sum(tl.where(pick, rows_of[None, :], 0), axis=1)
+        q_start = tl.sum(tl.where(pick, q0[None, :], 0), axis=1)
+        live = (unit < num_units) & (row_blk < tl.cdiv(rows, BLOCK_M))
+    else:
+        seq = unit // ROW_BLOCKS
+        row_blk = unit % ROW_BLOCKS
+        rows = next_n
+        q_start = seq * next_n
+        live = unit < batch * ROW_BLOCKS
     ctx = tl.load(context_lens_ptr + seq, mask=live, other=0)
 
     # The same causal trim the main kernel applies, clamped trailing row block
@@ -1323,16 +1381,16 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # the balance: a live unit is floored at one tile below, so it keeps its slot
     # whatever the trim thinks, and the kernel re-derives the real walk.
     first_row = (row_blk if BLOCK_M == 1
-                 else tl.minimum(row_blk * BLOCK_M, next_n - BLOCK_M))
+                 else tl.maximum(tl.minimum(row_blk * BLOCK_M, rows - BLOCK_M), 0))
     if HAS_CU_ENDS:
         block_end = tl.zeros([ALIGN_W], tl.int32)
         for r in tl.static_range(0, BLOCK_M):
             block_end = tl.maximum(
                 block_end,
-                tl.load(cu_ends_ptr + seq * next_n + first_row + r,
+                tl.load(cu_ends_ptr + q_start + first_row + r,
                         mask=live, other=0))
     else:
-        block_end = ctx - next_n + first_row + BLOCK_M
+        block_end = ctx - rows + first_row + BLOCK_M
     # Under the gather block_end counts candidate slots, which the context
     # length does not bound.
     keys = block_end if GATHER else tl.minimum(ctx, block_end)
@@ -1381,7 +1439,13 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # save the schedule, ownership info and slide indices and num slices
     in_range = slot < num_ctas
     base = sched_ptr + slot * 4
-    tl.store(base + 0, owner_unit // ROW_BLOCKS, mask=in_range)
-    tl.store(base + 1, owner_unit % ROW_BLOCKS, mask=in_range)
+    if VARLEN:
+        own_seq = tl.sum(tl.where(is_owner_unit, seq[None, :], 0), axis=1)
+        own_blk = tl.sum(tl.where(is_owner_unit, row_blk[None, :], 0), axis=1)
+    else:
+        own_seq = owner_unit // ROW_BLOCKS
+        own_blk = owner_unit % ROW_BLOCKS
+    tl.store(base + 0, own_seq, mask=in_range)
+    tl.store(base + 1, own_blk, mask=in_range)
     tl.store(base + 2, slice_idx, mask=in_range)
     tl.store(base + 3, num_slices, mask=in_range)
