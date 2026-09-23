@@ -166,8 +166,25 @@ def _mha_fwd_tuning_key(
 
 
 @torch._dynamo.assume_constant_result
-def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
+def _mha_fwd_plan_for_key(
+    key: tuple[str, ...], prefix: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Read the table for one already-derived key.
+
+    Constant-folded under torch.compile: it reads the filesystem, and its
+    result depends only on its arguments, which the caller has specialized on.
+    """
+
     path = os.path.abspath(AITER_CONFIGS.AITER_CONFIG_MHA_FWD_FILE)
+    if prefix not in _mha_fwd_tuned_hardware(path):
+        return None
+    plan = _load_mha_fwd_tuning_table(path).get(key)
+    if plan is not None and AITER_LOG_TUNED_CONFIG:
+        logger.info("MHA fwd matched a tuned row on %s in %s: %s", prefix, path, plan)
+    return plan
+
+
+def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     q = key_args["q"]
     device_id = q.device.index if q.device.index is not None else 0
     hardware = get_tuning_hardware(device_id)
@@ -176,12 +193,11 @@ def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
     if hardware["gfx"] != get_gfx():
         return None
     prefix = tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
-    if prefix not in _mha_fwd_tuned_hardware(path):
-        return None
-    plan = _load_mha_fwd_tuning_table(path).get(_mha_fwd_tuning_key(**key_args))
-    if plan is not None and AITER_LOG_TUNED_CONFIG:
-        logger.info("MHA fwd matched a tuned row on %s in %s: %s", prefix, path, plan)
-    return plan
+    # Deriving the key here rather than inside the constant-folded read is what
+    # keeps the lookup honest under torch.compile: dynamo specializes on the
+    # sizes this reads, so a second shape recompiles and looks itself up
+    # instead of inheriting the first shape's row.
+    return _mha_fwd_plan_for_key(_mha_fwd_tuning_key(**key_args), prefix)
 
 
 def lookup_mha_fwd_tile_config(backend: str, **key_args) -> dict[str, Any] | None:

@@ -15,6 +15,7 @@ import os
 import random
 import tempfile
 import unittest
+from typing import ClassVar
 
 from aiter.utility.block_race import (
     JsonlBlockJournal,
@@ -324,6 +325,54 @@ class TestStrategyAgreement(unittest.TestCase):
             len(entrants) * RACE_ARGS["max_blocks"] * RACE_ARGS["block_calls"]
         )
         self.assertLess(raced.calls_spent, exhaustive_calls / 2)
+
+
+class TestUnusableMeasurements(unittest.TestCase):
+    """A candidate that cannot be timed must leave, not decide the race."""
+
+    TRUTH: ClassVar[dict] = {"fast": 100.0, "near": 100.6, "slow": 250.0}
+
+    def _race_with(self, broken_label, broken_timer):
+        entrants = [RaceEntrant(label) for label in self.TRUTH]
+        honest = constant_timer(self.TRUTH, seed=5)
+
+        def time_calls(entrant, count):
+            if entrant.label == broken_label:
+                return broken_timer(count)
+            return honest(entrant, count)
+
+        return race(entrants, time_calls, **RACE_ARGS)
+
+    def test_a_faulting_candidate_is_dropped_rather_than_ending_the_run(self):
+        def explode(count):
+            raise RuntimeError("HIP error: illegal memory access")
+
+        result = self._race_with("slow", explode)
+        states = {v.label: v.state for v in result.verdicts}
+        self.assertEqual(states["slow"], "crashed")
+        self.assertEqual(result.winner, "fast")
+        self.assertNotIn("slow", result.survivors)
+
+    def test_a_zero_latency_cannot_win(self):
+        """Zero is a broken reading, not a fast one, and the leader's
+        estimate divides the tolerance and every reported gap."""
+        result = self._race_with("slow", lambda count: [0.0] * count)
+        states = {v.label: v.state for v in result.verdicts}
+        self.assertEqual(states["slow"], "crashed")
+        self.assertEqual(result.winner, "fast")
+
+    def test_a_negative_latency_cannot_win(self):
+        result = self._race_with("slow", lambda count: [-1.0] * count)
+        self.assertEqual(result.winner, "fast")
+
+    def test_a_field_that_cannot_be_timed_at_all_fails_loudly(self):
+        entrants = [RaceEntrant(label) for label in self.TRUTH]
+
+        def explode(entrant, count):
+            raise RuntimeError("HIP error: illegal memory access")
+
+        with self.assertRaisesRegex(RuntimeError, "every entrant failed to time"):
+            race(entrants, explode, **RACE_ARGS)
 
 
 class TestJournalReplay(unittest.TestCase):
