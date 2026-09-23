@@ -1078,28 +1078,38 @@ class MhaFwdTuner(TunerCommon):
             results.extend(self._race_one_shape(args, plan))
         return results
 
-    def _race_block_journal(self, args, key, candidates):
+    def _race_block_journal(self, args, key, entrants):
         """Per-block checkpoint for one shape, beside the candidate journal.
 
         The candidate journal records finished candidate-phases while a race's
         unit of durable progress is the finished block, so they cannot share a
         file. They do share the ``--resume`` flag and the directory.
 
-        The name digests the candidate field and the race parameters as well
-        as the shape, because a replayed block is only meaningful for the race
-        that produced it. Changing the catalogue or the thresholds therefore
-        lands on a different file and the stale blocks are never read, rather
-        than being replayed into a race they do not describe.
+        The name digests everything that decides how the race runs, not only
+        the shape: the candidate field, who is protected from elimination, the
+        thresholds, the block budget and the shuffle seed. A replayed block is
+        only meaningful for the race that produced it, so changing any of them
+        lands on a different file and the stale blocks are never read. The
+        shape key carries the arch, the SKU and the CU count, so a journal
+        from another GPU already lands elsewhere too.
         """
         if not self._journal_path:
             return None
         fingerprint = json.dumps(
             {
                 "key": list(map(str, key)),
-                "candidates": sorted(candidate.identity for candidate in candidates),
+                "candidates": sorted(
+                    entrant.payload.identity for entrant in entrants
+                ),
+                "protected": sorted(
+                    entrant.label for entrant in entrants if entrant.protected
+                ),
                 "delta": float(args.delta),
                 "alpha": float(args.race_alpha),
                 "block_calls": int(args.race_block_calls),
+                "min_blocks": int(args.race_min_blocks),
+                "max_blocks": int(args.race_max_blocks),
+                "seed": int(MHA_FWD_RACE_SAMPLE_SEED),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1183,9 +1193,7 @@ class MhaFwdTuner(TunerCommon):
             f"(delta={args.delta:.1%}, at most {args.race_max_blocks} blocks)",
             flush=True,
         )
-        journal_path = self._race_block_journal(
-            args, key, [entrant.payload for entrant in entrants]
-        )
+        journal_path = self._race_block_journal(args, key, entrants)
         journal = (
             JsonlBlockJournal(journal_path, resume=args.resume)
             if journal_path

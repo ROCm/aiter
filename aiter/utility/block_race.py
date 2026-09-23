@@ -320,11 +320,28 @@ def race(
         # reach a different verdict than an uninterrupted one.
         record = replay[block_index] if block_index < len(replay) else None
         if record is not None:
-            journaled = [label for label in record["order"] if label in by_label]
-            if [e.label for e in order] != journaled:
-                # A different seed or a changed catalogue. The journal is the
+            journaled = [
+                label
+                for label in record["order"]
+                if label in by_label and label in record["latencies"]
+            ]
+            if set(journaled) != set(active):
+                # The journal has stopped describing this race: an entrant
+                # still active here was not measured in that block, so
+                # replaying it would pair blocks that never ran against each
+                # other. Keep the blocks that did match and measure the rest.
+                if verbose:
+                    report(
+                        f"  journal diverges at block {block_index + 1}; "
+                        f"measuring the remaining blocks live"
+                    )
+                replay = replay[:block_index]
+                record = None
+            elif [e.label for e in order] != journaled:
+                # The same field in a different order. The journal is the
                 # record of what actually ran, so it wins.
                 order = [by_label[label] for label in journaled]
+        if record is not None:
             for entrant in order:
                 samples[entrant.label].blocks.append(record["latencies"][entrant.label])
             calls_spent += sum(len(v) for v in record["latencies"].values())

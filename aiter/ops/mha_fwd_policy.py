@@ -296,6 +296,55 @@ class MhaFwdPlan:
                 "ASM split policy requires the compatible gfx942 packed-varlen "
                 "bf16 D_QK=192/D_V=128 inference path"
             )
+        if self.backend == "asm_v3" and self.num_splits >= HD192_SPLITKV_MIN_SPLITS:
+            rejected = hd192_splitkv_rejections(problem)
+            if rejected:
+                raise ValueError(
+                    f"num_splits={self.num_splits} needs the gfx942 hd192 "
+                    f"split-KV kernel: {', '.join(rejected)}"
+                )
+
+
+# Below this the C++ selector leaves the KV loop unsplit, so the split-KV
+# kernel's constraints do not apply. Mirrors kFmhaHd192SplitKvMinSplits in
+# csrc/include/mha_fwd.h.
+HD192_SPLITKV_MIN_SPLITS = 2
+
+
+def hd192_splitkv_rejections(problem: MhaFwdProblem) -> tuple[str, ...]:
+    """Reasons the gfx942 hd192 split-KV kernel cannot serve ``problem``.
+
+    Mirrors ``splitkv_compatible`` in ``csrc/py_itfs_cu/asm_mha_varlen_fwd.cu``.
+    The C++ guard only judges the arguments that reached it, and the entry
+    point which accepts a split count supplies constants for the mask, the
+    padding and the conversion mode, so every condition has to hold before a
+    row may force a split.
+    """
+
+    checks = (
+        (problem.gfx == "gfx942", "arch is not gfx942"),
+        (not problem.gpu_model.startswith("mi308"), "MI308 has no split-KV kernel"),
+        (problem.mode == "varlen", "mode is not varlen"),
+        (problem.dtype == "bfloat16", "dtype is not bf16"),
+        (problem.batch == 1, "batch is not 1"),
+        (problem.total_q == problem.max_seqlen_q, "q is not one packed sequence"),
+        (problem.total_k == problem.max_seqlen_k, "k is not one packed sequence"),
+        (problem.nhead_q == problem.nhead_k, "GQA is unsupported"),
+        (problem.hdim_q == 192 and problem.hdim_v == 128, "head dims are not 192/128"),
+        (not problem.causal, "causal masking is unsupported"),
+        (problem.window_left == -1, "a left window is unsupported"),
+        (problem.window_right == -1, "a right window is unsupported"),
+        (problem.dropout_p == 0.0, "dropout is unsupported"),
+        (problem.logits_soft_cap == 0.0, "a logits soft cap is unsupported"),
+        (not problem.has_bias, "bias is unsupported"),
+        (not problem.has_alibi, "alibi is unsupported"),
+        (not problem.has_block_table, "paged KV is unsupported"),
+        (not problem.has_q_descale, "descaling is unsupported"),
+        (not problem.return_attn_probs, "returning dropout randval is unsupported"),
+        (not problem.has_physical_padding, "padded cu_seqlens are unsupported"),
+        (problem.how_v3_bf16_cvt == 1, "how_v3_bf16_cvt is not 1"),
+    )
+    return tuple(reason for holds, reason in checks if not holds)
 
 
 def validate_mha_fwd_plan_fields(

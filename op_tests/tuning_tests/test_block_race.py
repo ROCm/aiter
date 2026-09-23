@@ -444,6 +444,44 @@ class TestJournalReplay(unittest.TestCase):
             "a resume that already has every block should measure nothing",
         )
 
+    def test_a_journal_missing_an_active_entrant_is_not_replayed(self):
+        """The alternative is worse than losing the blocks: an entrant that
+        left the first race early has no latencies in the later journalled
+        blocks, so replaying them would pair each survivor's block n against
+        a block the entrant never ran."""
+        truth = {"fast": 100.0, "near": 100.6, "slow": 250.0}
+        entrants = [RaceEntrant(label) for label in truth]
+        race(
+            entrants,
+            constant_timer(truth, seed=3),
+            journal=JsonlBlockJournal(self.path),
+            **dict(RACE_ARGS, max_blocks=6),
+        )
+        with open(self.path) as handle:
+            records = [json.loads(line) for line in handle]
+        dropped = records[-1]["order"][0]
+        for record in records[len(records) // 2 :]:
+            record["order"] = [n for n in record["order"] if n != dropped]
+            record["latencies"].pop(dropped, None)
+        with open(self.path, "w") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+        resumed = race(
+            entrants,
+            constant_timer(truth, seed=11),
+            journal=JsonlBlockJournal(self.path, resume=True),
+            resume=True,
+            **dict(RACE_ARGS, max_blocks=6),
+        )
+        self.assertEqual(resumed.blocks_replayed, len(records) // 2)
+        lengths = {len(samples.block_medians) for samples in resumed.samples.values()}
+        self.assertEqual(
+            lengths,
+            {resumed.blocks_run},
+            "every entrant that ran to the end must hold one block per look",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ from aiter.ops.mha_fwd_policy import (
     MhaFwdProblem,
     enumerate_mha_fwd_candidates,
 )
+from aiter.utility.block_race import RaceEntrant
 from op_tests.tuners.tune_mha_fwd import MhaFwdTuner
 
 
@@ -401,7 +402,13 @@ class TestRetunedIncumbent(unittest.TestCase):
 class TestRaceJournalBinding(unittest.TestCase):
     """Replay is only meaningful for the race that produced the blocks."""
 
-    ARGS = types.SimpleNamespace(delta=0.02, race_alpha=0.05, race_block_calls=20)
+    ARGS = types.SimpleNamespace(
+        delta=0.02,
+        race_alpha=0.05,
+        race_block_calls=20,
+        race_min_blocks=3,
+        race_max_blocks=30,
+    )
     KEY = ("gfx950", "mi355x", 256)
 
     def _path(self, candidates, args=None, key=None):
@@ -410,8 +417,15 @@ class TestRaceJournalBinding(unittest.TestCase):
         return tuner._race_block_journal(args or self.ARGS, key or self.KEY, candidates)
 
     @staticmethod
-    def _candidates(*names):
-        return [MhaFwdCandidate(name) for name in names]
+    def _candidates(*names, protected=()):
+        return [
+            RaceEntrant(
+                label=name,
+                payload=MhaFwdCandidate(name),
+                protected=name in protected,
+            )
+            for name in names
+        ]
 
     def test_the_same_race_resumes_the_same_journal(self):
         first = self._path(self._candidates("ck", "opus"))
@@ -428,17 +442,33 @@ class TestRaceJournalBinding(unittest.TestCase):
         )
 
     def test_a_changed_threshold_lands_on_a_different_journal(self):
+        for field, value in (
+            ("delta", 0.05),
+            ("race_alpha", 0.01),
+            ("race_block_calls", 40),
+            ("race_min_blocks", 8),
+            ("race_max_blocks", 10),
+        ):
+            with self.subTest(field=field):
+                changed = types.SimpleNamespace(**vars(self.ARGS))
+                setattr(changed, field, value)
+                self.assertNotEqual(
+                    self._path(self._candidates("ck")),
+                    self._path(self._candidates("ck"), args=changed),
+                )
+
+    def test_a_changed_incumbent_lands_on_a_different_journal(self):
+        """Who is protected decides who leaves the field, and who leaves
+        decides which blocks the survivors are paired over. A re-tune after
+        the published row moved is a different race."""
         self.assertNotEqual(
-            self._path(self._candidates("ck")),
-            self._path(
-                self._candidates("ck"),
-                args=types.SimpleNamespace(
-                    delta=0.05, race_alpha=0.05, race_block_calls=20
-                ),
-            ),
+            self._path(self._candidates("ck", "opus")),
+            self._path(self._candidates("ck", "opus", protected=("ck",))),
         )
 
     def test_two_shapes_do_not_share_a_journal(self):
+        # The shape key opens with arch, SKU and CU count, so a journal
+        # carried to another GPU lands on a different file too.
         self.assertNotEqual(
             self._path(self._candidates("ck")),
             self._path(self._candidates("ck"), key=("gfx942", "mi325x", 304)),

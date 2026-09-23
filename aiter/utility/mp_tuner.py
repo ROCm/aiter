@@ -95,6 +95,42 @@ def _format_worker_result(info, us, max_err_ratio, status, return_status, detail
     return (*result, status, detail) if return_status else result
 
 
+def _failed_group_results(
+    tasks,
+    shape_grouped,
+    progress_results,
+    return_status,
+    fallback_info,
+    status="crash",
+    detail="",
+):
+    """Stand-in results for a group the worker pool never returned.
+
+    Returns the results in task order plus the subset to checkpoint. A
+    candidate the worker already measured keeps its real result, so one GPU
+    fault costs the shape a single candidate rather than every timing taken
+    before it. Only the first unmeasured candidate is reported as failed; the
+    ones behind it never ran and stay eligible for a resume.
+    """
+
+    group = tasks if shape_grouped and isinstance(tasks, list) else [tasks]
+    results = []
+    to_publish = []
+    for task in group:
+        info = task[0] if len(task) > 0 else fallback_info
+        measured = progress_results.get(info)
+        if measured is not None:
+            results.append(measured)
+            continue
+        result = _format_worker_result(
+            info, float("inf"), 1.0, status, return_status, detail
+        )
+        results.append(result)
+        if not to_publish:
+            to_publish.append(result)
+    return results, to_publish
+
+
 def worker(
     gpu_id,
     info,
@@ -546,8 +582,11 @@ def mp_tuner(
 
     print(f"Distributing {len(task_group)} task groups across {mp_num} GPUs")
 
-    manager = mp.Manager() if result_callback is not None else None
-    progress_queue = manager.Queue() if manager is not None else None
+    # Every caller gets per-candidate progress, not just checkpointing ones: a
+    # group that faults loses only the candidate that faulted, instead of every
+    # measurement the worker had already finished for that shape.
+    manager = mp.Manager()
+    progress_queue = manager.Queue()
     progress_results = {}
 
     def publish_progress(result):
@@ -557,8 +596,6 @@ def mp_tuner(
             result_callback(result)
 
     def drain_progress():
-        if progress_queue is None:
-            return
         while True:
             try:
                 publish_progress(progress_queue.get_nowait())
@@ -620,37 +657,17 @@ def mp_tuner(
 
     def add_dummy_result(k, results_list, status="crash", detail=""):
         """Helper function to add dummy failed result"""
-        detail = detail or f"no result returned by the worker pool ({status})"
-        if shape_grouped:
-            task_info = (
-                task_group[k] if isinstance(task_group[k], list) else [task_group[k]]
-            )
-            published_failure = False
-            for task in task_info:
-                info = task[0] if len(task) > 0 else f"task_{k}"
-                if info in progress_results:
-                    results_list.append(progress_results[info])
-                    continue
-                result = _format_worker_result(
-                    info, float("inf"), 1.0, status, return_status, detail
-                )
-                results_list.append(result)
-                # The first unfinished candidate is the one that faulted or
-                # timed out. Later candidates never ran; leave them out of the
-                # checkpoint so a resume loop can continue with them.
-                if not published_failure:
-                    publish_progress(result)
-                    published_failure = True
-        else:
-            task = task_group[k]
-            info = task[0] if len(task) > 0 else f"task_{k}"
-            if info in progress_results:
-                results_list.append(progress_results[info])
-                return
-            result = _format_worker_result(
-                info, float("inf"), 1.0, status, return_status, detail
-            )
-            results_list.append(result)
+        results, to_publish = _failed_group_results(
+            task_group[k],
+            shape_grouped,
+            progress_results,
+            return_status,
+            f"task_{k}",
+            status,
+            detail or f"no result returned by the worker pool ({status})",
+        )
+        results_list.extend(results)
+        for result in to_publish:
             publish_progress(result)
 
     # Process tasks as they complete
@@ -864,9 +881,8 @@ def mp_tuner(
         pool.join()
     except Exception as e:  # noqa: BLE001
         print(f"Warning: Error during pool cleanup: {e}")
-    if manager is not None:
-        drain_progress()
-        manager.shutdown()
+    drain_progress()
+    manager.shutdown()
 
     # Print summary
     if failed_tasks:
