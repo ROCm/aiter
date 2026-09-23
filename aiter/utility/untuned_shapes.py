@@ -1,40 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Record the shapes that miss a tuned table, in the schema its tuner consumes.
+"""Record untuned GEMM shapes in process-local CSV shards.
 
-``AITER_TUNE_GEMM=1`` has long done this for the bf16 path (``tuned_gemm.py``),
-which is the only reason tuning a real bf16 deployment is self-service: run the
-server, collect ``bf16_untuned_gemm.csv``, feed it straight back to the tuner.
-The fp8 / block-scale / mxfp4 families log their misses to INFO and write
-nothing, so their shape lists have to be scraped out of server logs by hand --
-which is also how shape-key mistakes creep in.
-
-This module gives every family the same behaviour. Call :func:`record` from a
-lookup's miss path with the row its tuner expects; the file name is derived
-from the tuned table's own name (``*_tuned_*`` -> ``*_untuned_*``) so a family
-never has to name its untuned file twice.
-
-Environment:
-    AITER_TUNE_GEMM=1        enable recording (same switch as the bf16 path)
-    AITER_TUNE_GEMM_DIR=DIR  write there instead of ``aiter/configs``; useful
-                             when the package directory is read-only or lives
-                             inside a container you would rather not reach into.
-                             Set this to a model-specific directory such as
-                             ``/tuning/glm-5.2`` to collect every GEMM family in
-                             one place.
+Set ``AITER_TUNE_GEMM=1`` to enable recording. ``AITER_TUNE_GEMM_DIR`` selects
+the output directory (for example ``/tuning/glm-5.2``); otherwise shards are
+written below the current working directory, never inside the installed package.
+Tuners already de-duplicate their inputs, so a later merge of ``*.pid.csv``
+shards avoids interprocess coordination in dispatch paths.
 """
 
 import os
-import tempfile
 import threading
 
 from aiter import logger
 
 _ENABLED = None
 _LOCK = threading.Lock()
-# file path -> {ordered column names, process-local rows, separator state}
-_SEEN: dict = {}
-_THIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SEEN: dict[str, set[tuple[str, ...]]] = {}
 
 
 def enabled() -> bool:
@@ -45,162 +27,43 @@ def enabled() -> bool:
 
 
 def untuned_path_for(tuned_file: str) -> str:
-    """``.../a8w8_bpreshuffle_tuned_gemm.csv`` -> ``<dir>/a8w8_bpreshuffle_untuned_gemm.csv``
-
-    The runtime may be reading a merged copy out of ``/tmp/aiter_configs``, so
-    only the base name is reused; the destination directory is always the
-    configs dir (or ``AITER_TUNE_GEMM_DIR``).
-    """
-    base = os.path.basename(tuned_file)
-    if "_tuned_" in base:
-        base = base.replace("_tuned_", "_untuned_", 1)
-    else:
+    """Return this process's shard for ``tuned_file``'s untuned counterpart."""
+    base = os.path.basename(tuned_file).replace("_tuned_", "_untuned_", 1)
+    if base == os.path.basename(tuned_file):
         base = "untuned_" + base
-    out_dir = os.environ.get("AITER_TUNE_GEMM_DIR") or os.path.join(
-        _THIS_DIR, "configs"
-    )
-    return os.path.join(out_dir, base)
+    stem, extension = os.path.splitext(base)
+    out_dir = os.environ.get("AITER_TUNE_GEMM_DIR") or os.getcwd()
+    return os.path.join(out_dir, f"{stem}.{os.getpid()}{extension}")
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    while data:
+        written = os.write(fd, data)
+        if written <= 0:
+            raise OSError("short write while recording untuned GEMM shape")
+        data = data[written:]
 
 
 def record(tuned_file: str, row: dict) -> None:
-    """Append one missed shape in the tuner's input schema.
-
-    Rows are de-duplicated within this process. Different workers may append the
-    same row; the tuners already drop duplicates when reading their inputs. Each
-    new row is one ``O_APPEND`` write, so workers never need an interprocess lock
-    or a full-file duplicate scan. Never raises: a read-only output directory or
-    a full disk must not take down inference.
-    """
+    """Append a locally unique shape to this worker's shard without raising."""
     if not enabled():
         return
     try:
         path = untuned_path_for(tuned_file)
-        cols = list(row.keys())
-        key = tuple(str(v) for v in row.values())
+        cols, values = list(row), tuple(str(value) for value in row.values())
         with _LOCK:
-            state = _SEEN.get(path)
-            if state is not None and key in state["rows"]:
+            seen = _SEEN.setdefault(path, set())
+            if values in seen:
                 return
-
-            first_use = state is None
-            if first_use:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                needs_separator = _ensure_header(path, cols)
-                # Publish initialization state only after the directory and a
-                # valid CSV header exist, so a transient failure can recover.
-                state = _SEEN[path] = {
-                    "cols": cols,
-                    "rows": set(),
-                    "needs_separator": needs_separator,
-                }
-            elif state["cols"] != cols:
-                raise ValueError(
-                    f"schema for {path} changed from {state['cols']} to {cols}"
-                )
-
-            if first_use:
-                logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
-
-            prefix = "\n" if state["needs_separator"] else ""
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             try:
-                _append_line(path, (prefix + ",".join(key) + "\n").encode())
-            except ShortAppend as short:
-                # The row did not land. If its fragment could not be closed,
-                # the retry has to open a fresh line rather than extend it.
-                state["needs_separator"] = not short.terminated
-                raise
-            state["needs_separator"] = False
-            # Only cache a row after its append succeeds. A transient write
-            # failure must remain retryable on the next dispatch.
-            state["rows"].add(key)
-    except Exception as e:  # noqa: BLE001 - never break dispatch over telemetry
-        logger.warning(f"[AITER_TUNE_GEMM] could not record untuned shape: {e}")
-
-
-def _ensure_header(path: str, cols: list[str]) -> bool:
-    """Atomically publish a new header and validate an existing one once.
-
-    A temporary file plus ``link`` ensures another worker cannot observe an
-    empty destination between file creation and header write. Returns whether
-    the existing file needs a newline before its first appended row.
-    """
-    try:
-        fh = open(path, "rb")
-    except FileNotFoundError:
-        header = (",".join(cols) + "\n").encode()
-        fd, temp_path = tempfile.mkstemp(
-            dir=os.path.dirname(path),
-            prefix=f".{os.path.basename(path)}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "wb") as temp_fh:
-                temp_fh.write(header)
-            try:
-                os.link(temp_path, path)
-            except FileExistsError:
-                pass
-        finally:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
-        fh = open(path, "rb")
-
-    with fh:
-        disk_cols = fh.readline().rstrip(b"\r\n").decode().split(",")
-        if disk_cols != cols:
-            raise ValueError(
-                f"schema for {path} is {disk_cols}, expected {cols}; refusing to append"
-            )
-        fh.seek(0, os.SEEK_END)
-        if fh.tell() == 0:
-            return False
-        fh.seek(-1, os.SEEK_END)
-        return fh.read(1) not in (b"\n", b"\r")
-
-
-class ShortAppend(OSError):
-    """A row reached the file only partially.
-
-    ``terminated`` reports whether the surviving fragment ends in a newline.
-    When it does not, the next append has to start with a separator or it
-    would splice itself onto the fragment and produce one malformed row out
-    of two.
-    """
-
-    def __init__(self, message: str, terminated: bool):
-        super().__init__(message)
-        self.terminated = terminated
-
-
-def _append_line(path: str, payload: bytes) -> None:
-    """Append a complete CSV row with one operating-system write.
-
-    ``os.write`` may return a short count -- an exhausted disk or quota is the
-    usual cause -- and under ``O_APPEND`` the remainder cannot simply be
-    written again: a concurrent worker may have appended in between, so the
-    tail would land after *their* row and corrupt both. The fragment is closed
-    with a single-byte newline instead, which the kernel either writes whole or
-    not at all, so the damage stays confined to its own line and the caller can
-    retry the row intact.
-    """
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
-    try:
-        written = os.write(fd, payload)
-        if written == len(payload):
-            return
-        message = f"short append to {path}: wrote {written}/{len(payload)} bytes"
-        fragment = payload[:written]
-        if not fragment:
-            # Nothing reached the file, so there is no fragment to isolate.
-            raise ShortAppend(message, terminated=True)
-        terminated = fragment.endswith(b"\n")
-        if not terminated:
-            try:
-                terminated = os.write(fd, b"\n") == 1
-            except OSError:
-                terminated = False
-        raise ShortAppend(message, terminated)
-    finally:
-        os.close(fd)
+                if os.fstat(fd).st_size == 0:
+                    _write_all(fd, (",".join(cols) + "\n").encode())
+                _write_all(fd, (",".join(values) + "\n").encode())
+            finally:
+                os.close(fd)
+            seen.add(values)
+            logger.info(f"[AITER_TUNE_GEMM] recorded untuned shape in {path}")
+    except Exception as error:  # noqa: BLE001 - telemetry must not break dispatch
+        logger.warning(f"[AITER_TUNE_GEMM] could not record untuned shape: {error}")

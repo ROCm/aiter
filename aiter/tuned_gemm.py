@@ -39,6 +39,7 @@ except ImportError:
 from torch import Tensor
 
 from aiter.ops.gemm_op_common import get_padded_m
+from aiter.utility.untuned_shapes import record as _record_untuned_shape
 
 try:
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
@@ -63,20 +64,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 extensions_created = False
-untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
 tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
-tuned_df = pd.DataFrame(
-    columns=[
-        "M",
-        "N",
-        "K",
-        "bias",
-        "dtype",
-        "outdtype",
-        "scaleAB",
-        "bpreshuffle",
-    ]
-)
 
 
 @functools.lru_cache(maxsize=1)
@@ -246,27 +234,19 @@ def save_shapes(
     scaleAB,
     bpreshuffle,
 ):
-    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
-    global tuned_df
-    if save_gemm:
-        tuned_df = pd.concat(
-            [
-                tuned_df,
-                pd.DataFrame(
-                    {
-                        "M": [M],
-                        "N": [N],
-                        "K": [K],
-                        "bias": [bias is not None],
-                        "dtype": [dtype],
-                        "outdtype": [otype],
-                        "scaleAB": [scaleAB],
-                        "bpreshuffle": [bpreshuffle],
-                    }
-                ),
-            ]
-        ).drop_duplicates()
-        tuned_df.to_csv(untune_path, index=False)
+    _record_untuned_shape(
+        tune_path,
+        {
+            "M": M,
+            "N": N,
+            "K": K,
+            "bias": bias is not None,
+            "dtype": dtype,
+            "outdtype": otype,
+            "scaleAB": scaleAB,
+            "bpreshuffle": bpreshuffle,
+        },
+    )
 
 
 def gen_gemm_a16w16_fake_tensor(
@@ -618,24 +598,7 @@ class TunedGemm:
 
     def __init__(self):
         # self.extensions_created = False
-        self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
-        self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
-        if self.save_gemm == 1:
-            self.tuned_df = pd.DataFrame(
-                columns=[
-                    "M",
-                    "N",
-                    "K",
-                    "bias",
-                    "dtype",
-                    "outdtype",
-                    "scaleAB",
-                    "bpreshuffle",
-                ]
-            )
-        else:
-            self.tuned_df = None
 
     def mm(
         self,
