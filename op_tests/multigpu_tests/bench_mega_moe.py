@@ -87,6 +87,10 @@ os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
+# 0 withholds next_topk_ids, the way a model does: its next-layer routing depends
+# on this layer's output, so the compact plan lands on the critical path.
+_PLAN_PREFETCH = os.environ.get("AITER_MEGA_PLAN_PREFETCH", "1") != "0"
+
 QUANT_KEYS = ["a8w4_mxfp4", "a4w4_mxfp4"]
 # add_data_init_args' --scale-init default. Kept here so main() can tell whether
 # the caller asked for a scale distribution this test cannot honour.
@@ -681,7 +685,7 @@ class DeviceMoEPipeline:
         if self.mega is not None:
             next_ids = (
                 self.routings[layer_idx + 1][0]
-                if layer_idx + 1 < self.n_layers
+                if _PLAN_PREFETCH and layer_idx + 1 < self.n_layers
                 else None
             )
             y = self.mega(
@@ -743,7 +747,7 @@ class DeviceMoEPipeline:
         x = x0
         if self.mega is not None:
             prefetch = getattr(self.mega, "prefetch_compact_plan", None)
-            if prefetch is not None:
+            if prefetch is not None and _PLAN_PREFETCH:
                 prefetch(self.routings[0][0])
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
