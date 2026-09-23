@@ -1097,6 +1097,40 @@ class CustomAllreduce:
             offsets,
         )
 
+        if self._is_gfx1250:
+            self._init_gfx1250_staging_ipc()
+
+    def _init_gfx1250_staging_ipc(self):
+        """Allocate the LL128 and CAS staging buffers and exchange their bases.
+
+        These live outside the shared meta buffer (sizing them for the worst case
+        world size would cost every rank several hundred MiB), so they need their
+        own IPC exchange. Until this runs the LL128 and CAS routing bands stay
+        disabled and those sizes fall back to the naive kernel — which is why the
+        VMM transport, where a plain hipMalloc cannot be exported, simply skips it.
+        """
+        scratch_ptr = ops.alloc_ll128_unroll2_scratch_gfx1250(self._ptr)
+        handles, offsets = self._pool._broadcast_ipc(scratch_ptr)
+        ops.init_ll128_unroll2_peers_ipc_gfx1250(
+            self._ptr, [h.data_ptr() for h in handles], offsets
+        )
+
+        flags_ptr = ops.alloc_cas_flags_gfx1250(self._ptr)
+        handles, offsets = self._pool._broadcast_ipc(flags_ptr)
+        ops.init_cas_peers_ipc_gfx1250(
+            self._ptr, [h.data_ptr() for h in handles], offsets
+        )
+
+        # Staging for all_reduce_cas_2shot_scratch. Not on the routed path; set up
+        # only when AITER_GFX1250_CAS_SCRATCH=1 so the allocation is not paid for
+        # by runs that never call that entry point.
+        if os.environ.get("AITER_GFX1250_CAS_SCRATCH", "") == "1":
+            cas_scratch_ptr = ops.alloc_cas_scratch_gfx1250(self._ptr)
+            handles, offsets = self._pool._broadcast_ipc(cas_scratch_ptr)
+            ops.init_cas_scratch_peers_ipc_gfx1250(
+                self._ptr, [h.data_ptr() for h in handles], offsets
+            )
+
     @contextmanager
     def capture(self):
         """
