@@ -3,6 +3,7 @@
 
 import argparse
 import math
+import sys
 
 import pandas as pd
 import pytest
@@ -10,6 +11,8 @@ import torch
 
 import aiter
 from aiter import dtypes, per_tensor_quant
+from aiter.jit.utils.build_targets import ck_fmha_factory_key
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import (
     _flash_attn_forward,
     flash_attn_fp8_pertensor_func,
@@ -17,6 +20,11 @@ from aiter.ops.mha import (
 )
 from aiter.test_common import run_perftest
 from aiter.test_mha_common import attention_ref
+
+_SKIP_FP8_ON_GFX11 = pytest.mark.skipif(
+    ck_fmha_factory_key(get_gfx()) in ("gfx11", "gfx115"),
+    reason="CK fmha_fwd has no fp8 factory on gfx11/gfx115",
+)
 
 benchmark = {}
 
@@ -86,6 +94,7 @@ def run_ck(
 
 
 # @pytest.mark.parametrize("local", [False, True])
+@_SKIP_FP8_ON_GFX11
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 8])
@@ -313,6 +322,13 @@ parser.add_argument(
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    if ck_fmha_factory_key(get_gfx()) in ("gfx11", "gfx115"):
+        aiter.logger.warning(
+            "CK fmha_fwd has no fp8 factory on %s; skipping",
+            ck_fmha_factory_key(get_gfx()),
+        )
+        sys.exit(0)
 
     nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
     seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q

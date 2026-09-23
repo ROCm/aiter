@@ -77,6 +77,8 @@ Environment Variables
      - Default
    * - ``GPU_ARCHS``
      - Target GPU architecture(s), semicolon-separated. Use ``native`` to auto-detect.
+       CK fmha kernels are generated only for the architectures listed here
+       (``GPU_ARCHS="gfx942"`` no longer also emits gfx950 FA kernels).
      - ``native``
    * - ``PREBUILD_KERNELS``
      - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
