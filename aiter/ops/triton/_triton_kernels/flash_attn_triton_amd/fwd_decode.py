@@ -637,15 +637,15 @@ def _fwd_kernel_splitK(
                 + offs_d[None, :] * stride_vd_i64
             )
 
-            # load k
-            kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
-            v = tl.load(V_ptrs, mask=v_mask, other=0.0)
-
-            # Use the same inner loop logic
             # Precompute column validity mask for this tile (all True for full tiles).
             # hi is the upper bound of the overall split range; start_n marks this tile's base.
             col_valid_mask = offs_n < (hi - start_n)
 
+            # load k
+            kT = tl.load(kT_ptrs, mask=kT_mask & col_valid_mask[None, :], other=0.0)
+            v = tl.load(V_ptrs, mask=v_mask & col_valid_mask[:, None], other=0.0)
+
+            # Use the same inner loop logic
             m_i, l_i, acc = _attn_fwd_inner(
                 q,
                 kT,
