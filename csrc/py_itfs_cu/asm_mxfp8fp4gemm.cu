@@ -39,10 +39,12 @@
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_mxfp8fp4gemm_configs.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <vector>
 #include <hip/hip_runtime.h>
 
 constexpr int MX_SCALE_BLOCK = 32;
@@ -88,10 +90,10 @@ static bool supports_splitk(const mxfp8fp4gemmConfig& cfg)
            (cfg.tile_m == 64 && cfg.tile_n == 512 && cfg.cluster_y == 1);
 }
 
-static bool is_tuned_kernel(const mxfp8fp4gemmConfig& cfg)
+static bool is_tuned_geometry(const mxfp8fp4gemmConfig& cfg)
 {
-    // CSV-only selection is independent of Split-K capability: the refreshed
-    // general kernels must remain reachable on a config miss.
+    // These geometries are selected through tuning or as a last-resort
+    // fallback. This checks tile metadata, not membership in the tuning CSV.
     return (cfg.tile_m == 256 && cfg.tile_n == 256 && cfg.cluster_x == 4 &&
             cfg.cluster_y == 2) ||
            (cfg.tile_m == 128 && cfg.tile_n == 128);
@@ -137,8 +139,18 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
     std::string selectedKernelName = "";
     std::string fallbackKernelName = ""; // any valid variant if the wanted tile is absent
 
+    // The first compatible entry is the fallback; keep it independent of the
+    // unordered map's hash layout and the standard library implementation.
+    std::vector<const CFG::value_type*> sorted_configs;
+    sorted_configs.reserve(cfgs->size());
     for(const auto& el : *cfgs)
+        sorted_configs.push_back(&el);
+    std::sort(sorted_configs.begin(), sorted_configs.end(),
+              [](const auto* lhs, const auto* rhs) { return lhs->first < rhs->first; });
+
+    for(const auto* entry : sorted_configs)
     {
+        const auto& el = *entry;
         if(el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
@@ -147,11 +159,6 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
 
         if(cfg.outtype != outtype)
             continue;
-        // Tuned kernels are selected by kernelName from the Python CSV lookup.
-        // A config miss keeps the original general dispatch.
-        if(is_tuned_kernel(cfg))
-            continue;
-
         const int m_align = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
         if((M % m_align) != 0 || (N % F8GEMM_N_ALIGN) != 0 || (K % F8GEMM_K_ALIGN) != 0)
             continue;
@@ -160,6 +167,11 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
         // only ships one tile still resolves.
         if(fallbackKernelName.empty())
             fallbackKernelName = el.first;
+
+        // Keep tuned geometries in the fallback safety net, but select the
+        // preferred general tile when it is available.
+        if(is_tuned_geometry(cfg))
+            continue;
 
         if(cfg.tile_m == want_tile_m && cfg.tile_n == want_tile_n && cfg.cluster_x == 4 &&
            cfg.cluster_y == want_cluster_y)
@@ -188,28 +200,26 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
     return std::make_tuple(selectedKernelName, 1);
 }
 
-// Shared dispatch body for both a8w8 (B=mxfp8) and a8w4 (B=mxfp4).
-static void mxfp8fp4_launch(aiter_tensor_t* A,
-                            aiter_tensor_t* B,
-                            aiter_tensor_t* ScaleA,
-                            aiter_tensor_t* ScaleB,
-                            aiter_tensor_t* out,
-                            const char* kernelName,
-                            const std::string& b_intype,
-                            int a_preshuffle,
-                            int splitk,
-                            hipStream_t stream)
+// Select and validate without touching an output buffer or launching a kernel.
+// Both the public-op preflight and the raw launcher use this exact path.
+static const mxfp8fp4gemmConfig& resolve_mxfp8fp4_config(int Mdim,
+                                                       int Ndim,
+                                                       int Kdim,
+                                                       const char* kernelName,
+                                                       const std::string& b_intype,
+                                                       int a_preshuffle,
+                                                       int splitk)
 {
-    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only supports BFloat16 output");
     const char* out_type = "bf16";
     AITER_CHECK(
         b_intype == "mxfp8" || b_intype == "mxfp4", __func__, " unsupported b_intype ", b_intype);
     AITER_CHECK(a_preshuffle == 0 || a_preshuffle == 1, __func__, " a_preshuffle must be 0 or 1");
 
-    int Mdim = A->size(0);
-    int Ndim = B->size(0);
-    int Kdim = A->size(1); // A is mxfp8: 1 byte/elem, so col count == K
-
+    AITER_CHECK(Ndim % F8GEMM_N_ALIGN == 0,
+                __func__, " N must be divisible by ", F8GEMM_N_ALIGN, " (got N=", Ndim, ")");
+    AITER_CHECK(!a_preshuffle || Mdim % F8GEMM_M_ALIGN_APRE == 0,
+                __func__, " a_preshuffle requires M divisible by ", F8GEMM_M_ALIGN_APRE,
+                " (got M=", Mdim, ")");
     AITER_CHECK(Kdim % F8GEMM_K_ALIGN == 0,
                 __func__,
                 " K must be divisible by ",
@@ -217,33 +227,6 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
                 " (got K=",
                 Kdim,
                 ")");
-
-    // Strides in bytes. A is fp8 (1 byte); B fp8 (1 byte) or fp4 (0.5 byte);
-    // D is bf16 (2 bytes). Scales are e8m0, one per 32-K block.
-    unsigned int stride_a = static_cast<unsigned int>(Kdim);
-    unsigned int stride_b = (b_intype == "mxfp4") ? static_cast<unsigned int>(Kdim / 2)
-                                                  : static_cast<unsigned int>(Kdim);
-    unsigned int stride_d = static_cast<unsigned int>(Ndim) * 2;
-    unsigned int scale_k  = static_cast<unsigned int>(Kdim / MX_SCALE_BLOCK);
-
-    KernelArgs args{};
-    args.ptr_D      = out->ptr;
-    args.ptr_A      = A->ptr;
-    args.ptr_B      = B->ptr;
-    args.ptr_ScaleA = ScaleA->ptr;
-    args.ptr_ScaleB = ScaleB->ptr;
-    args.stride_C   = stride_d;
-    args.stride_A   = stride_a;
-    args.stride_B   = stride_b;
-    args.ScaleA_K   = scale_k;
-    args.ScaleB_K   = scale_k;
-    args.M          = Mdim;
-    args.N          = Ndim;
-    args.K          = Kdim;
-    args.batch_size = 1;
-    size_t arg_size = sizeof(KernelArgs);
-
-    const HipDeviceGuard device_guard(A->device_id);
 
     static CFG* config_map = &cfg_mxfp8fp4gemm;
     AITER_CHECK(!config_map->empty(),
@@ -312,6 +295,54 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     }
     AITER_CHECK(splitk_is_valid(Mdim, Ndim, Kdim, cfg, splitk),
                 __func__, " invalid splitk=", splitk, " for ", cfg.knl_name);
+    return cfg;
+}
+
+// Shared dispatch body for both a8w8 (B=mxfp8) and a8w4 (B=mxfp4).
+static void mxfp8fp4_launch(aiter_tensor_t* A,
+                            aiter_tensor_t* B,
+                            aiter_tensor_t* ScaleA,
+                            aiter_tensor_t* ScaleB,
+                            aiter_tensor_t* out,
+                            const char* kernelName,
+                            const std::string& b_intype,
+                            int a_preshuffle,
+                            int splitk,
+                            hipStream_t stream)
+{
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only supports BFloat16 output");
+    int Mdim = A->size(0);
+    int Ndim = B->size(0);
+    int Kdim = A->size(1);
+    const HipDeviceGuard device_guard(A->device_id);
+    const auto& cfg = resolve_mxfp8fp4_config(
+        Mdim, Ndim, Kdim, kernelName, b_intype, a_preshuffle, splitk);
+
+    // Strides in bytes. A is fp8 (1 byte); B fp8 (1 byte) or fp4 (0.5 byte);
+    // D is bf16 (2 bytes). Scales are e8m0, one per 32-K block.
+    unsigned int stride_a = static_cast<unsigned int>(Kdim);
+    unsigned int stride_b = (b_intype == "mxfp4") ? static_cast<unsigned int>(Kdim / 2)
+                                                  : static_cast<unsigned int>(Kdim);
+    unsigned int stride_d = static_cast<unsigned int>(Ndim) * 2;
+    unsigned int scale_k  = static_cast<unsigned int>(Kdim / MX_SCALE_BLOCK);
+
+    KernelArgs args{};
+    args.ptr_D      = out->ptr;
+    args.ptr_A      = A->ptr;
+    args.ptr_B      = B->ptr;
+    args.ptr_ScaleA = ScaleA->ptr;
+    args.ptr_ScaleB = ScaleB->ptr;
+    args.stride_C   = stride_d;
+    args.stride_A   = stride_a;
+    args.stride_B   = stride_b;
+    args.ScaleA_K   = scale_k;
+    args.ScaleB_K   = scale_k;
+    args.M          = Mdim;
+    args.N          = Ndim;
+    args.K          = Kdim;
+    args.batch_size = 1;
+    size_t arg_size = sizeof(KernelArgs);
+
     // The launcher passes a compact N-element row stride. A larger contiguous
     // workspace is allowed, but only its first splitk*M*N elements are written,
     // starting at out->ptr (which may already include a storage offset).
@@ -359,6 +390,22 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
 }
 
 AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mxfp8fp4_gemm_validate,
+    (aiter_tensor_t* A,
+     aiter_tensor_t* B,
+     const char* kernelName,
+     const char* b_intype,
+     int a_preshuffle,
+     int splitk,
+     hipStream_t stream),
+    (A, B, kernelName, b_intype, a_preshuffle, splitk, stream))
+{
+    const HipDeviceGuard device_guard(A->device_id);
+    resolve_mxfp8fp4_config(
+        A->size(0), B->size(0), A->size(1), kernelName, b_intype, a_preshuffle, splitk);
+}
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mxfp8_mxfp8_gemm_asm,

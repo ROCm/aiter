@@ -14,7 +14,11 @@ from torch import Tensor
 from ..jit.core import compile_ops, torch_compile_guard
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..utility import dtypes
-from .gemm_op_a8w8 import _resolve_mxfp8_gemm_config
+from .gemm_op_a8w8 import (
+    _mxfp8fp4_gemm_validate,
+    _reduce_mxfp8_partials,
+    _resolve_mxfp8_gemm_config,
+)
 
 
 @compile_ops(
@@ -74,14 +78,16 @@ def gemm_a8w4_mxfp8(
     Missing CSVs and invalid tuned rows are logged and discarded as config misses.
     A miss uses the native heuristic and preserves an explicit ``splitk``;
     otherwise it defaults to one split. Explicit kernels bypass the CSV and
-    default to one split. Invalid explicit split counts raise.
+    default to one split. A CSV kernel incompatible with an explicit split count
+    is skipped; an invalid explicit kernel/count combination raises before
+    output allocation.
 
     Split counts are literal counts, not log2 values. The 256x256_4x4 and
     64x512_4x1 kernels support power-of-two splits with K/splitk a multiple
     of 128 and at least 512 or 768, respectively, subject to
-    splitk * ceil(M/tile_m) * ceil(N/tile_n) <= 256. BF16 partials are summed
-    here to preserve the public [M,N] output. Each partial is rounded before
-    reduction, so results can differ from ``splitk=1``.
+    splitk * ceil(M/tile_m) * ceil(N/tile_n) <= 256. The shared FlyDSL reducer
+    accumulates BF16 partials in FP32 and writes the public BF16 [M,N] output.
+    Each partial is rounded before reduction, so results can differ from ``splitk=1``.
 
     K is taken from A (mxfp8, ``A.shape[1] == K``); B is packed mxfp4 with
     ``B.shape == [N, K/2]``."""
@@ -108,7 +114,12 @@ def gemm_a8w4_mxfp8(
     kernelName, splitk = _resolve_mxfp8_gemm_config(
         M, N, K, a_preshuffle, dtype, kernelName, splitk, b_intype="mxfp4"
     )
-    out = torch.empty(
+    if splitk > 1:
+        _mxfp8fp4_gemm_validate(
+            A, B, kernelName or None, "mxfp4", int(bool(a_preshuffle)), splitk
+        )
+    allocate = torch.zeros if splitk > 1 else torch.empty
+    out = allocate(
         (splitk, M, N) if splitk > 1 else (M, N), dtype=dtype, device=A.device
     )
     _mxfp8_mxfp4_gemm_asm(
@@ -121,4 +132,4 @@ def gemm_a8w4_mxfp8(
         int(bool(a_preshuffle)),
         splitk,
     )
-    return out.sum(dim=0, dtype=dtype) if splitk > 1 else out
+    return _reduce_mxfp8_partials(out) if splitk > 1 else out

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+import functools
 import importlib
 import types
 from collections.abc import Callable
@@ -207,6 +208,7 @@ def torch_compile_guard(
         # In core.py, we calling wrapper, but actually we need use aiter.op func
         calling_func = calling_func_ if calling_func_ is not None else func
 
+        @functools.wraps(calling_func)
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
@@ -289,6 +291,7 @@ def torch_compile_guard(
 
         loadName = calling_func.__name__
 
+        @functools.wraps(calling_func)
         def wrapper_custom(*args, **kwargs):
             result = (
                 getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)

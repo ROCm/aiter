@@ -15,6 +15,8 @@
 #  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
 #  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %2==0.
 #  - K is always a multiple of 128.
+#  - The 128x128 kernels require positive M/N multiples of 512 for both A
+#    layouts (complete 4x4 clusters), K>=1024, and splitk=1.
 #  - OUTTYPE is BF16-only today. fp8 out (e4m3 + per-block E8M0, as f4gemm does)
 #    is planned; the sweep axis and dispatch seam below are already in place.
 # ===============================================================================
@@ -38,6 +40,7 @@ from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import (
     _mxfp8_kernel_configs,
+    _normalize_mxfp8_splitk,
     _resolve_mxfp8_gemm_config,
     _validate_mxfp8_splitk,
 )
@@ -47,7 +50,6 @@ from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_scale,
 )
 from aiter.test_common import (
-    assertAllclose,
     benchmark,
     checkAllclose,
     run_perftest,
@@ -73,7 +75,7 @@ def _kernel_geometry(M, kernel_name=""):
         # Native heuristic used when no tuned or explicit kernel is selected.
         return (64, 512, 4, 1) if M <= 64 else (256, 256, 4, 4)
     try:
-        config = _mxfp8_kernel_configs(get_asm_dir())[kernel_name]
+        config = _mxfp8_kernel_configs(get_asm_dir(get_gfx()))[kernel_name]
         geometry = tuple(
             int(config[key]) for key in ("tile_m", "tile_n", "cluster_x", "cluster_y")
         )
@@ -120,6 +122,13 @@ PERF_SHAPES = {
     "a8w8": [
         (32768, 16384, 8192),  # compute-bound
         (2, 1048576, 16384),  # memory-bound (N16K x BS64 folded into M)
+        # Tuned CSV shapes; default timing includes Split-K reduction.
+        (512, 2048, 7168),
+        (512, 7168, 16384),
+        (512, 6144, 7168),
+        (512, 7168, 3072),
+        (512, 65536, 1536),
+        (512, 8192, 1536),
     ],
     "a8w4": [
         (16384, 16384, 16384),  # compute-bound
@@ -194,8 +203,8 @@ _ATOL = 1.0
 _SPLITK_MAX_RELATIVE_L2 = 1e-2
 
 
-def _check_splitk_accuracy(actual, reference, msg=""):
-    """Enforce final-output accuracy; warnings within the declared limits are OK.
+def _check_splitk_accuracy(actual, reference, msg="", *, raise_on_error=True):
+    """Check final-output accuracy; optionally return metrics for CLI reporting.
 
     The reference is the full-K FP32 matmul rounded once to the output dtype,
     or a splitk=1 output for a paired comparison. Neither comparison uses a
@@ -207,7 +216,7 @@ def _check_splitk_accuracy(actual, reference, msg=""):
         torch.isfinite(actual).all() and torch.isfinite(reference).all()
     ), f"{msg}: nonfinite output/reference (possibly an unwritten split plane)"
     # Preserve the native benchmark's isclose argument order and 5% policy.
-    err = assertAllclose(
+    err = checkAllclose(
         reference,
         actual,
         rtol=_RTOL,
@@ -224,10 +233,14 @@ def _check_splitk_accuracy(actual, reference, msg=""):
     relative_l2 = (
         delta_norm / ref_norm if ref_norm else (float("inf") if delta_norm else 0.0)
     )
-    assert relative_l2 <= _SPLITK_MAX_RELATIVE_L2, (
-        f"{msg}: relative L2 error {relative_l2:.6%} exceeds "
-        f"{_SPLITK_MAX_RELATIVE_L2:.2%}"
-    )
+    if raise_on_error:
+        assert (
+            err <= _TOL_ERR_RATIO
+        ), f"{msg}: {err:.3%} of elements exceed atol={_ATOL} rtol={_RTOL}"
+        assert relative_l2 <= _SPLITK_MAX_RELATIVE_L2, (
+            f"{msg}: relative L2 error {relative_l2:.6%} exceeds "
+            f"{_SPLITK_MAX_RELATIVE_L2:.2%}"
+        )
     return err, relative_l2
 
 
@@ -343,10 +356,52 @@ def test_gemm(
     explicit_splitk = splitk is not None
     if explicit_splitk:
         # Reject malformed counts even when the shape would otherwise be skipped.
-        _validate_mxfp8_splitk(M, N, K, splitk)
+        splitk = _normalize_mxfp8_splitk(splitk)
+        if splitk & (splitk - 1):
+            raise ValueError("splitk must be a power of two")
+
+    # Preserve the user's arguments for the public op. Resolved values below
+    # are for reporting, compatibility checks, and the raw partial-output path.
+    requested_splitk = splitk
+    requested_knl = "" if knl_name in (None, "", "auto") else knl_name
+    knl = requested_knl
+    geometry = _kernel_geometry(M, knl)
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
     reason = _support_reason(outtype, apre, M, N, K)
+    if reason is None:
+        out_dtype = _OUT_DTYPE[outtype]
+        try:
+            # Resolve before building the partial reference so --no-reduce
+            # validates the actual split count.
+            knl, splitk = _resolve_mxfp8_gemm_config(
+                M,
+                N,
+                K,
+                apre,
+                out_dtype,
+                knl,
+                splitk,
+                b_intype="mxfp4" if intype == "a8w4" else "mxfp8",
+            )
+            geometry = _kernel_geometry(M, knl)
+            if explicit_splitk:
+                kernel = None
+                if geometry is not None:
+                    kernel = dict(
+                        zip(("tile_m", "tile_n", "cluster_x", "cluster_y"), geometry),
+                        b_intype="mxfp4" if intype == "a8w4" else "mxfp8",
+                        outtype=outtype,
+                    )
+                # Validate against the resolved geometry; unknown metadata
+                # stays native dispatch's concern.
+                _validate_mxfp8_splitk(M, N, K, splitk, kernel)
+        except ValueError as exc:
+            if not explicit_splitk:
+                raise
+            # The count itself is well-formed, but this shape/kernel cannot
+            # host it. Record a skipped row and continue the sweep.
+            reason = str(exc)
     if reason is not None:
         aiter.logger.warning(
             "mxfp8fp4 not supported (%s): intype=%s outtype=%s apre=%s M=%s N=%s K=%s",
@@ -358,12 +413,10 @@ def test_gemm(
             N,
             K,
         )
-        geometry = _kernel_geometry(
-            M, "" if knl_name in (None, "", "auto") else knl_name
-        )
         return {
             "gfx": get_gfx(),
-            "knl_name": knl_name or "(heuristic)",
+            "knl_name": knl or knl_name or "(heuristic)",
+            "splitk": splitk,
             "tile": f"{geometry[0]}x{geometry[1]}" if geometry else "unknown",
             "cluster": f"{geometry[2]}x{geometry[3]}" if geometry else "unknown",
             "asm us": float("nan"),
@@ -374,32 +427,6 @@ def test_gemm(
         }
 
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
-    out_dtype = _OUT_DTYPE[outtype]
-    # Share the public op's CSV lookup and override rules. Resolve before building
-    # the partial reference so --no-reduce validates the actual split count.
-    knl = "" if knl_name in (None, "", "auto") else knl_name
-    knl, splitk = _resolve_mxfp8_gemm_config(
-        M,
-        N,
-        K,
-        apre,
-        out_dtype,
-        knl,
-        splitk,
-        b_intype="mxfp4" if intype == "a8w4" else "mxfp8",
-    )
-    geometry = _kernel_geometry(M, knl)
-    if explicit_splitk:
-        kernel = None
-        if geometry is not None:
-            kernel = dict(
-                zip(("tile_m", "tile_n", "cluster_x", "cluster_y"), geometry),
-                b_intype="mxfp4" if intype == "a8w4" else "mxfp8",
-                outtype=outtype,
-            )
-        # Use the resolved kernel's tile geometry, including a CSV-selected or
-        # explicit override. Unknown metadata stays native dispatch's concern.
-        _validate_mxfp8_splitk(M, N, K, splitk, kernel)
     if knl_name == "auto" and not knl:
         _tile_m, _tile_n, _cx, _cy = geometry
         middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
@@ -451,8 +478,10 @@ def test_gemm(
             sB,
             dtype=out_dtype,
             a_preshuffle=bool(apre),
-            kernelName=knl,
-            splitk=splitk,
+            # 'auto' is an explicit-kernel debug mode. Ordinary default calls
+            # must let the public op perform its own CSV lookup and fallback.
+            kernelName=knl if knl_name == "auto" else requested_knl,
+            splitk=splitk if knl_name == "auto" else requested_splitk,
         )
 
     asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
@@ -483,13 +512,15 @@ def test_gemm(
     ret["reference_splitk"] = splitk if no_reduce else 1
     ret["reduced"] = not no_reduce and splitk > 1
     ret["timing_scope"] = "gemm_with_reduce" if ret["reduced"] else "gemm_only"
-    # Only a missing .co is reported as "not support"; any other failure (OOM,
-    # memory fault, shape assert, ...) must propagate, not show as a green cell.
+    # Shape-incompatible explicit splits and unavailable default kernels are
+    # skipped. Other failures (OOM, memory faults, ...) must propagate.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
-    # build), so "kernel not in cfg" is benign ONLY on the heuristic path (knl == "").
+    # build). A name resolved from the CSV is still a default selection.
     _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel",)
-    if not knl:
+    if not knl_name:
         _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_mxfp8fp4gemm",)
+    if explicit_splitk:
+        _NOT_SUPPORTED_MARKERS += ("invalid splitk=",)
     for name, (cand, cand_args) in candidates.items():
         try:
             out, us = run_perftest(
@@ -525,17 +556,34 @@ def test_gemm(
         # increase elementwise mismatches even when the total error is small.
         # Enforce both criteria on the public reduced output, including perf
         # runs. --no-reduce remains a separate per-plane diagnostic.
-        if splitk > 1 and not no_reduce:
-            err, relative_l2 = _check_splitk_accuracy(out, ref, f"{intype} {name}")
-            ret[f"{name} relative_l2"] = relative_l2
-        else:
-            err = checkAllclose(
-                ref.to(dtypes.fp32),
-                out.to(dtypes.fp32),
-                rtol=_RTOL,
-                atol=_ATOL,
-                msg=f"{intype} {name}",
-            )
+        accuracy_error = None
+        try:
+            if splitk > 1 and not no_reduce:
+                err, relative_l2 = _check_splitk_accuracy(
+                    out, ref, f"{intype} {name}", raise_on_error=False
+                )
+                ret[f"{name} relative_l2"] = relative_l2
+                if relative_l2 > _SPLITK_MAX_RELATIVE_L2:
+                    accuracy_error = (
+                        f"relative L2 error {relative_l2:.6%} exceeds "
+                        f"{_SPLITK_MAX_RELATIVE_L2:.2%}"
+                    )
+            else:
+                err = checkAllclose(
+                    ref.to(dtypes.fp32),
+                    out.to(dtypes.fp32),
+                    rtol=_RTOL,
+                    atol=_ATOL,
+                    msg=f"{intype} {name}",
+                )
+        except AssertionError as exc:
+            # Accuracy assertions (e.g. nonfinite output) become failed rows.
+            # Kernel execution errors above still propagate immediately.
+            err = float("nan")
+            accuracy_error = str(exc)
+        if accuracy_error is not None:
+            ret[f"{name} accuracy_error"] = accuracy_error
+            aiter.logger.error("%s %s: %s", intype, name, accuracy_error)
         # Logical traffic for the timed scope, not measured HBM traffic:
         # raw mode writes S BF16 planes; reduction also reads those S planes
         # and writes the final [M,N] output. Input partitions cover K once.
@@ -549,7 +597,9 @@ def test_gemm(
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(io_bytes / us / 1e6, 2)
         ret[f"{name} err"] = err
-        ret[f"{name} result"] = _verdict(err)
+        ret[f"{name} result"] = (
+            "failed" if accuracy_error is not None else _verdict(err)
+        )
         if needTrace:
             ret[f"{name} trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
     return ret
@@ -693,7 +743,8 @@ def main():
         help="Power-of-two split counts for a8w8/a8w4 (not log2). Unset: use the tuned CSV; "
         "a config miss or explicit kernel defaults to 1. Each K partition must be "
         "a multiple of 128 and at least 512 (768 for a8w4 64x512); "
-        "split count times tile count must not exceed 256. 128x128 requires splitk=1.",
+        "split count times tile count must not exceed 256. 128x128 requires splitk=1. "
+        "Malformed counts raise; shape-incompatible counts produce not-support rows.",
     )
     parser.add_argument(
         "--no-reduce",
