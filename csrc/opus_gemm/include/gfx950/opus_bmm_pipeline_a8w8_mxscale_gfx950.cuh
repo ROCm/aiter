@@ -437,7 +437,8 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // Fills the panel with the SFA_SCALES_MAX-wide window starting at scale
     // column col0. Without sliding there is exactly one such call, col0 is 0 and
     // the window is the whole row, which is the one-shot fill this started as.
-    auto sfa_fill_window = [&](int col0) {
+    auto sfa_fill_window = [&](int col0, auto in_loop_c) {
+        constexpr bool IN_LOOP = decltype(in_loop_c)::value;
         // Guarded even though every call site is: the panel is a one-byte stub
         // for a kid without the preload, and a 16-wide ds_write into it does not
         // type-check, so the body must not be instantiated there.
@@ -463,15 +464,25 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
                     m * sfa_lds_stride + kt);
             }
         };
-        const int widths = cols | kargs.stride_sfa | col0 | sfa_lds_stride;
-        if      ((widths & 15) == 0) fill(number<16>{});
-        else if ((widths & 3) == 0)  fill(number<4>{});
-        else                         fill(number<1>{});
+        // A sliding refill is inlined into the main loop, so it takes the one
+        // width it can always use rather than all three: the window base is a
+        // K-tile, hence col0 is a multiple of B_K/GROUP_K, and cols, the panel
+        // width and a scale row are all multiples of it too. Three dead
+        // instantiations in the loop cost register pressure the 128 kids, whose
+        // fill happens once in the prologue, never pay.
+        if constexpr (IN_LOOP) {
+            fill(number<(SFA_SPK % 4 == 0) ? 4 : 1>{});
+        } else {
+            const int widths = cols | kargs.stride_sfa | col0 | sfa_lds_stride;
+            if      ((widths & 15) == 0) fill(number<16>{});
+            else if ((widths & 3) == 0)  fill(number<4>{});
+            else                         fill(number<1>{});
+        }
         }
     };
 
     if constexpr (PRELOAD_SFA_LDS) {
-        sfa_fill_window(0);
+        sfa_fill_window(0, opus::bool_constant<false>{});
     }
 
     // Land the B scale fetched above; its latency is already spent by now.
@@ -511,7 +522,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     auto sfa_slide = [&](int first) {
         __builtin_amdgcn_s_barrier();
         sfa_base_tile = first;
-        sfa_fill_window(first * SFA_SPK);
+        sfa_fill_window(first * SFA_SPK, opus::bool_constant<true>{});
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
     };
