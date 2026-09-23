@@ -25,6 +25,8 @@ COMPUTE_CHUNK = 512
 SPEC_ROWS = 8
 # no need for dynamic scheduling for lower conc.
 MIN_DYNAMIC_BATCH = 4
+# Descriptors the scheduler may hand out, 1 MB of them
+SCHED_SLOT_CAP = 1 << 16
 # this is the most performant page size
 IDEAL_PAGE_SIZE = 64
 
@@ -338,7 +340,7 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
 
 def build_schedule(context_lens, next_n, num_heads, head_size,
                    page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
-                   cu_ends=None, gather=0):
+                   cu_ends=None, gather=0, max_model_len=None):
     """Descriptors for one launch, or None if the shape does not fit.
 
     A descriptor is (sequence, row block, slice index, slice count), relative
@@ -360,20 +362,31 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     # enough work already
     if work > target_wgs:
         return None
+    # Slots enough to keep a slice under the cap the static grid uses, which
+    # is what its _kv_splits by_balance term does. Without max_model_len the
+    # walk length is unknown here, so the slice stays uncapped as before.
+    num_ctas, max_tiles = target_wgs, 0
+    if max_model_len:
+        cap = plan["max_tiles_per_split"]
+        n_tiles = max(1, (max_model_len + block_kv - 1) // block_kv)
+        slots = work * ((n_tiles + cap - 1) // cap)
+        num_ctas = max(target_wgs, min(slots, SCHED_SLOT_CAP))
+        room = max(num_ctas - work, 1)
+        max_tiles = max(cap, (n_tiles * work + room - 1) // room)
     align_w = max(16, 1 << (work - 1).bit_length())
-    if out is None or out.numel() < target_wgs * 4:
-        out = torch.empty(target_wgs * 4, dtype=torch.int32,
+    if out is None or out.numel() < num_ctas * 4:
+        out = torch.empty(num_ctas * 4, dtype=torch.int32,
                           device=context_lens.device)
     # Slots one scheduler program describes, it will try to create equal work per WG
     # while generating enough WGs
     SCHED_BLOCK_P = 4
-    _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(target_wgs, SCHED_BLOCK_P),)](
+    _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(num_ctas, SCHED_BLOCK_P),)](
         context_lens,
         cu_ends,
         out,
         batch,
         next_n,
-        target_wgs,
+        num_ctas,
         BLOCK_M=block_m,
         BLOCK_KV=block_kv,
         ROW_BLOCKS=row_blocks,
@@ -381,10 +394,11 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         BLOCK_P=SCHED_BLOCK_P,
         HAS_CU_ENDS=1 if cu_ends is not None else 0,
         GATHER=int(gather),
+        MAX_TILES=max_tiles,
         num_warps=4,
     )
     # The launcher takes the grid from the length, so the length is the contract
-    return out[:target_wgs * 4]
+    return out[:num_ctas * 4]
 
 
 def _check_schedule(schedule, device):
@@ -656,7 +670,8 @@ def paged_mxfp4_mqa_logits(
     # A gather launch does not build one
     if schedule is None and dynamic and not gather_on:
         schedule = build_schedule(context_lens, next_n, num_heads, head_size,
-                                  page_size, preshuffle, cu_ends=cu_ends)
+                                  page_size, preshuffle, cu_ends=cu_ends,
+                                  max_model_len=max_model_len)
     use_dynamic = schedule is not None
     if use_dynamic:
         schedule = _check_schedule(schedule, context_lens.device)

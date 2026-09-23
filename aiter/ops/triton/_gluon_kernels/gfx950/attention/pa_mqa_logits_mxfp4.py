@@ -1303,7 +1303,7 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     context_lens_ptr, cu_ends_ptr, sched_ptr, batch, next_n, num_ctas,
     BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
     ALIGN_W: tl.constexpr, BLOCK_P: tl.constexpr, HAS_CU_ENDS: tl.constexpr,
-    GATHER: tl.constexpr,
+    GATHER: tl.constexpr, MAX_TILES: tl.constexpr,
 ):
     # A "unit" is one (sequence, row block) pair; a "slot" is one workgroup of
     # the launch. The job is to give every slot a slice of some unit's KV walk,
@@ -1347,6 +1347,12 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     live_units = tl.sum((tiles > 0).to(tl.int32))
     tiles_per_slice = tl.maximum(
         tl.cdiv(total_tiles, tl.maximum(num_ctas - live_units, 1)), 1)
+    # Filling the machine once is not enough on a long walk: the static grid
+    # caps a workgroup at max_tiles_per_split through _kv_splits and ends up
+    # with far more, shorter workgroups, which this kernel keeps gaining from
+    # past residency. The host sizes num_ctas so the extra slices fit.
+    if MAX_TILES > 0:
+        tiles_per_slice = tl.minimum(tiles_per_slice, MAX_TILES)
 
     # Step 3: lay each unit's slices end to end over the slots, so unit i owns
     # slots [first_slot_i, first_slot_i + n_slices_i).
