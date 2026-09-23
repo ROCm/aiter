@@ -15,6 +15,7 @@ import argparse
 import itertools
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -26,6 +27,10 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+
+def _gfx_supported():
+    return torch.cuda.is_available() and get_gfx() in SUPPORTED_GFX
 
 
 def sorted_pairs(ids, weights):
@@ -165,7 +170,8 @@ def bench_fused(tokens, num_experts, hidden, topk, num_shared, scale, renorm, dt
 
     w = torch.empty(tokens, total, dtype=dtypes.fp32)
     ids = torch.empty(tokens, total, dtype=dtypes.i32)
-    tei = torch.empty(tokens, total, dtype=dtypes.i32)
+    # token_expert_indices is write-only scratch, written with stride topk (routed only).
+    tei = torch.empty(tokens, topk, dtype=dtypes.i32)
 
     def fn():
         topk_softmax_fused_shared_gate(
@@ -200,6 +206,119 @@ def bench_fused(tokens, num_experts, hidden, topk, num_shared, scale, renorm, dt
         "TB/s": nbytes / us / 1e6,
         "err": err,
     }
+
+
+# (num_shared, dtype, hidden): sweep shared-expert counts (incl. 8), fp32 gating, and
+# a larger hidden that exceeds the gate-LDS staging cap so the global-read fallback runs.
+_CORRECTNESS_CASES = [
+    (1, dtypes.bf16, 4096),
+    (2, dtypes.bf16, 4096),
+    (8, dtypes.bf16, 4096),
+    (1, dtypes.fp32, 4096),
+    (1, dtypes.bf16, 8192),
+]
+
+
+@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
+@pytest.mark.parametrize("num_shared, dtype, hidden", _CORRECTNESS_CASES)
+def test_correctness(num_shared, dtype, hidden):
+    """pytest exercises real cases (not just bench_*): the fused op and the unfused
+    baseline must both match the torch reference across shared-expert counts, dtypes,
+    and hidden sizes (including the larger-H gate-LDS global fallback)."""
+    tokens, num_experts, topk = 64, 512, 10
+    scale, renorm = 1.0, True
+    base = num_experts
+    total = topk + num_shared
+    gating, hs, gate_weight = _make_inputs(
+        tokens, num_experts, hidden, num_shared, dtype
+    )
+    ref = run_torch(gating, hs, gate_weight, topk, num_shared, base, scale, renorm)
+
+    w = torch.empty(tokens, total, dtype=dtypes.fp32)
+    ids = torch.empty(tokens, total, dtype=dtypes.i32)
+    tei = torch.empty(tokens, topk, dtype=dtypes.i32)  # scratch, stride topk
+    topk_softmax_fused_shared_gate(
+        w, ids, tei, gating, renorm, num_shared, "sigmoid", hs, gate_weight, scale, base
+    )
+    _check(w, ids, topk, ref, "fused")
+
+    w_u = torch.empty(tokens, total, dtype=dtypes.fp32)
+    ids_u = torch.empty(tokens, total, dtype=dtypes.i32)
+    r_w = torch.empty(tokens, topk, dtype=dtypes.fp32)
+    r_i = torch.empty(tokens, topk, dtype=dtypes.i32)
+    r_tei = torch.empty(tokens, topk, dtype=dtypes.i32)
+    shared_ids = (
+        (base + torch.arange(num_shared, dtype=dtypes.i32))
+        .unsqueeze(0)
+        .expand(tokens, num_shared)
+    )
+    topk_softmax(r_w, r_i, r_tei, gating, renorm)
+    shared_w = torch.sigmoid(hs.float() @ gate_weight.float().t()) * scale
+    w_u[:, :topk], w_u[:, topk:] = r_w, shared_w
+    ids_u[:, :topk], ids_u[:, topk:] = r_i, shared_ids
+    _check(w_u, ids_u, topk, ref, "unfused")
+
+
+def _make_fused_buffers(tokens, topk, num_shared):
+    total = topk + num_shared
+    return (
+        torch.empty(tokens, total, dtype=dtypes.fp32),
+        torch.empty(tokens, total, dtype=dtypes.i32),
+        torch.empty(tokens, topk, dtype=dtypes.i32),  # token_expert_indices scratch
+    )
+
+
+@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
+def test_misaligned_hidden_raises():
+    """A hidden dim whose row byte-stride is not 64B-aligned must be rejected: otherwise
+    the gate GEMV's vectorized loads are misaligned on every row after the first (UB).
+    """
+    tokens, num_experts, topk, num_shared = 64, 512, 10, 1
+    hidden = 4008  # 4008 * 2B = 8016 B, not a multiple of 64
+    gating, hs, gate_weight = _make_inputs(
+        tokens, num_experts, hidden, num_shared, dtypes.bf16
+    )
+    w, ids, tei = _make_fused_buffers(tokens, topk, num_shared)
+    with pytest.raises(RuntimeError, match="64B-aligned"):
+        topk_softmax_fused_shared_gate(
+            w,
+            ids,
+            tei,
+            gating,
+            True,
+            num_shared,
+            "sigmoid",
+            hs,
+            gate_weight,
+            1.0,
+            num_experts,
+        )
+
+
+@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
+def test_non_power_of_2_experts_raises():
+    """The fused op supports only power-of-2 num_experts (<= 512); a non-power-of-2
+    routing-expert count must be rejected, not run the removed serial fallback."""
+    tokens, num_experts, topk, num_shared = 64, 384, 10, 1
+    hidden = 4096
+    gating, hs, gate_weight = _make_inputs(
+        tokens, num_experts, hidden, num_shared, dtypes.bf16
+    )
+    w, ids, tei = _make_fused_buffers(tokens, topk, num_shared)
+    with pytest.raises(RuntimeError, match="power-of-2"):
+        topk_softmax_fused_shared_gate(
+            w,
+            ids,
+            tei,
+            gating,
+            True,
+            num_shared,
+            "sigmoid",
+            hs,
+            gate_weight,
+            1.0,
+            num_experts,
+        )
 
 
 def _sweep(fn, args, dtype):

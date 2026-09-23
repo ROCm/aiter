@@ -53,7 +53,7 @@ void topk_softmax(const aiter_tensor_t& topk_weights,
 void topk_softmax_fused_shared_gate(
     const aiter_tensor_t& topk_weights,          // [num_tokens, topk + num_shared_experts]
     const aiter_tensor_t& topk_indices,          // [num_tokens, topk + num_shared_experts]
-    const aiter_tensor_t& token_expert_indices,  // [num_tokens, topk + num_shared_experts]
+    const aiter_tensor_t& token_expert_indices,  // [num_tokens, topk]  (written stride = topk)
     const aiter_tensor_t& gating_output,         // [num_tokens, num_experts]  routed only
     const aiter_tensor_t& softmax_workspace,
     bool need_renorm,

@@ -872,8 +872,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     if constexpr(NUM_SHARED_EXPERTS > 0 && SCORING_FUNC != SharedExpertScoringFunc::NONE &&
                  GATE_LDS_FITS)
     {
-        use_lds_gate =
-            (shared_gate_weight != nullptr) && (shared_hidden_size <= GATE_LDS_CAP);
+        use_lds_gate = shared_hidden_size <= GATE_LDS_CAP;
         if(use_lds_gate)
         {
             const int tid      = threadIdx.y * blockDim.x + threadIdx.x;
@@ -931,81 +930,54 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     // All threads in THREADS_PER_ROW collaborate for maximum coalescing
     if constexpr(NUM_SHARED_EXPERTS > 0 && SCORING_FUNC != SharedExpertScoringFunc::NONE)
     {
-        if(shared_gate_weight != nullptr)
+        // Fuse-gate (Option A): the THREADS_PER_ROW lanes of this row cooperate on
+        // each shared expert's gate GEMV. Lanes issue WIDE vectorized loads (AccessType
+        // = ELTS_PER_LDG bf16, matching the softmax half's BYTES_PER_LDG) striding the
+        // hidden dim -- coalesced and with enough loads in flight to hide latency at
+        // only THREADS_PER_ROW lanes -- then multithread_reduce sums the partials.
+        // (A narrower 8-wide vector regressed: more load instructions, not VGPR-bound.)
+        // gate rows come from LDS (staged in the prologue) when cached, else global.
+        // The host op requires a non-null gate_weight, so this is the only path.
+        const DTYPE* gate_base   = use_lds_gate ? s_gate : shared_gate_weight;
+        const DTYPE* hs_row      = shared_hidden_states + thread_row * shared_hidden_stride;
+        // The host op guards (shared_hidden_size * dtype_size) % 64 == 0 and
+        // BYTES_PER_LDG <= 64, so shared_hidden_size is an exact multiple of
+        // ELTS_PER_LDG: the vectorized loads cover the whole row and no scalar tail
+        // is needed.
+        const int num_vecs       = shared_hidden_size / ELTS_PER_LDG;
+        const AccessType* hs_vec = reinterpret_cast<const AccessType*>(hs_row);
+#pragma unroll
+        for(int s = 0; s < NUM_SHARED_EXPERTS; ++s)
         {
-            // Fuse-gate (Option A): the THREADS_PER_ROW lanes of this row cooperate on
-            // each shared expert's gate GEMV. Lanes issue WIDE vectorized loads (AccessType
-            // = ELTS_PER_LDG bf16, matching the softmax half's BYTES_PER_LDG) striding the
-            // hidden dim -- coalesced and with enough loads in flight to hide latency at
-            // only THREADS_PER_ROW lanes -- then multithread_reduce sums the partials.
-            // (A narrower 8-wide vector regressed: more load instructions, not VGPR-bound.)
-            // gate rows come from LDS (staged in the prologue) when cached, else global.
-            const DTYPE* gate_base   = use_lds_gate ? s_gate : shared_gate_weight;
-            const DTYPE* hs_row      = shared_hidden_states + thread_row * shared_hidden_stride;
-            const int num_vecs       = shared_hidden_size / ELTS_PER_LDG;
-            const int vec_tail_start = num_vecs * ELTS_PER_LDG;
-            const AccessType* hs_vec = reinterpret_cast<const AccessType*>(hs_row);
-#pragma unroll
-            for(int s = 0; s < NUM_SHARED_EXPERTS; ++s)
+            const DTYPE* gw_row      = gate_base + s * shared_hidden_size;
+            const AccessType* gw_vec = reinterpret_cast<const AccessType*>(gw_row);
+            float thread_acc         = 0.0f;
+            for(int vi = thread_group_idx; vi < num_vecs; vi += THREADS_PER_ROW)
             {
-                const DTYPE* gw_row      = gate_base + s * shared_hidden_size;
-                const AccessType* gw_vec = reinterpret_cast<const AccessType*>(gw_row);
-                float thread_acc         = 0.0f;
-                for(int vi = thread_group_idx; vi < num_vecs; vi += THREADS_PER_ROW)
-                {
-                    AccessType hv = hs_vec[vi];
-                    AccessType gv = gw_vec[vi];
+                AccessType hv = hs_vec[vi];
+                AccessType gv = gw_vec[vi];
 #pragma unroll
-                    for(int j = 0; j < ELTS_PER_LDG; ++j)
-                    {
-                        thread_acc += static_cast<float>(hv[j]) * static_cast<float>(gv[j]);
-                    }
-                }
-                // Tail for hidden sizes not divisible by ELTS_PER_LDG (none for H=4096).
-                for(int h = vec_tail_start + thread_group_idx; h < shared_hidden_size;
-                    h += THREADS_PER_ROW)
+                for(int j = 0; j < ELTS_PER_LDG; ++j)
                 {
-                    thread_acc += static_cast<float>(hs_row[h]) * static_cast<float>(gw_row[h]);
-                }
-                const float logit = multithread_reduce(
-                    thread_acc, [](float a, float b) { return a + b; }, THREADS_PER_ROW);
-
-                if(thread_group_idx == 0)
-                {
-                    float score = 0.0f;
-                    if constexpr(SCORING_FUNC == SharedExpertScoringFunc::SIGMOID)
-                    {
-                        score = 1.0f / (1.0f + expf(-logit));
-                    }
-                    score *= shared_expert_scale;
-
-                    const int out_idx = output_stride * thread_row + k + s;
-                    output[out_idx]   = score;
-                    if(shared_expert_base >= 0)
-                    {
-                        indices[indices_stride * thread_row + k + s] = shared_expert_base + s;
-                    }
+                    thread_acc += static_cast<float>(hv[j]) * static_cast<float>(gv[j]);
                 }
             }
-        }
-        else
-        {
-            // Legacy: shared logit precomputed in input's trailing columns
-            // (perfectly coalesced across threads).
-#pragma unroll
-            for(int shared_idx = thread_group_idx; shared_idx < NUM_SHARED_EXPERTS;
-                shared_idx += THREADS_PER_ROW)
+            const float logit = multithread_reduce(
+                thread_acc, [](float a, float b) { return a + b; }, THREADS_PER_ROW);
+
+            if(thread_group_idx == 0)
             {
-                const float logit = static_cast<float>(thread_row_ptr[NUM_EXPERTS + shared_idx]);
-                float score;
+                float score = 0.0f;
                 if constexpr(SCORING_FUNC == SharedExpertScoringFunc::SIGMOID)
                 {
                     score = 1.0f / (1.0f + expf(-logit));
                 }
                 score *= shared_expert_scale;
 
-                const int out_idx = output_stride * thread_row + k + shared_idx;
+                const int out_idx = output_stride * thread_row + k + s;
                 output[out_idx]   = score;
+                // host validates shared_expert_base >= 0, so always write the shared id.
+                indices[indices_stride * thread_row + k + s] = shared_expert_base + s;
             }
         }
     }
@@ -1096,7 +1068,14 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int idx         = k * thread_row + k_idx;
             const float numer     = expf(max_val - thread_max);
             output[output_idx]    = numer;
-            indices[indices_idx]  = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
+            // Filtered-slot marker must sit OUTSIDE the valid id space
+            // [0, NUM_EXPERTS + NUM_SHARED_EXPERTS): the shared ids occupy
+            // [NUM_EXPERTS, NUM_EXPERTS + NUM_SHARED_EXPERTS), so plain NUM_EXPERTS would
+            // alias shared expert 0. (This op passes finished=nullptr and the full
+            // [0, num_experts) range, so no slot is filtered today; the marker is chosen
+            // defensively for any future expert-parallel wiring.)
+            indices[indices_idx] =
+                should_process_row ? (expert - start_expert) : (NUM_EXPERTS + NUM_SHARED_EXPERTS);
             source_rows[idx]      = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
@@ -1289,63 +1268,6 @@ void topkGatingSoftmaxFusedGateLauncherHelper(const DTYPE* input,
         }                                                                                   \
     } while(0)
 
-// Kernel to apply sigmoid scoring to shared experts (non-power-of-2 / >256 path).
-// When shared_gate_weight != nullptr, the shared logit is computed in-kernel via a
-// gate GEMV (Option A) and the shared id (shared_expert_base + s) is written too.
-template <typename DTYPE, int TPB>
-__launch_bounds__(TPB) __global__
-    void applySharedExpertSigmoidFusedGate(const DTYPE* shared_gating_input,
-                                  float* shared_weights,
-                                  const int num_tokens,
-                                  const int num_shared_experts,
-                                  const int input_stride,
-                                  const int output_stride,
-                                  const int shared_expert_start_idx,
-                                  const DTYPE* shared_hidden_states,
-                                  const DTYPE* shared_gate_weight,
-                                  const int shared_hidden_size,
-                                  const int shared_hidden_stride,
-                                  const float shared_expert_scale,
-                                  int* shared_ids,
-                                  const int shared_ids_stride,
-                                  const int shared_expert_base)
-{
-    const int token_idx = blockIdx.x;
-    if(token_idx >= num_tokens)
-        return;
-
-    for(int expert_idx = threadIdx.x; expert_idx < num_shared_experts; expert_idx += TPB)
-    {
-        float logit;
-        if(shared_gate_weight != nullptr)
-        {
-            const DTYPE* hs_row = shared_hidden_states + token_idx * shared_hidden_stride;
-            const DTYPE* gw_row = shared_gate_weight + expert_idx * shared_hidden_size;
-            float acc = 0.0f;
-            for(int h = 0; h < shared_hidden_size; ++h)
-            {
-                acc += static_cast<float>(hs_row[h]) * static_cast<float>(gw_row[h]);
-            }
-            logit = acc;
-        }
-        else
-        {
-            const int input_idx = token_idx * input_stride + shared_expert_start_idx + expert_idx;
-            logit               = static_cast<float>(shared_gating_input[input_idx]);
-        }
-
-        // Apply sigmoid: 1 / (1 + exp(-x)), then optional scale
-        const float sigmoid_val  = 1.0f / (1.0f + expf(-logit));
-        const int output_idx     = token_idx * output_stride + expert_idx;
-        shared_weights[output_idx] = sigmoid_val * shared_expert_scale;
-        if(shared_gate_weight != nullptr && shared_expert_base >= 0)
-        {
-            shared_ids[token_idx * shared_ids_stride + expert_idx] =
-                shared_expert_base + expert_idx;
-        }
-    }
-}
-
 template <typename DTYPE>
 void topkGatingSoftmaxFusedGateKernelLauncher(const DTYPE* gating_output,
                                      float* topk_weights,
@@ -1398,50 +1320,14 @@ void topkGatingSoftmaxFusedGateKernelLauncher(const DTYPE* gating_output,
     case 128: LAUNCH_SOFTMAX_FUSED(128, WARPS_PER_TB); break;
     case 256: LAUNCH_SOFTMAX_FUSED(256, WARPS_PER_TB); break;
     case 512: LAUNCH_SOFTMAX_FUSED(512, 2); break;
-    default: {
-        AITER_CHECK(
-            softmax_workspace != nullptr,
-            "softmax_workspace must be provided for num_experts that are not a power of 2.");
-        static constexpr int TPB = 256;
-        moeSoftmax<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
-            gating_output, nullptr, softmax_workspace, num_experts, gating_token_stride);
-        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace,
-                                                     nullptr,
-                                                     topk_weights,
-                                                     topk_indicies,
-                                                     token_expert_indices,
-                                                     num_experts,
-                                                     topk,
-                                                     0,
-                                                     num_experts,
-                                                     topk_weights_stride,
-                                                     topk_id_stride,
-                                                     need_renorm);
-
-        // Handle shared experts for non-power-of-2 case
-        if(num_shared_experts > 0 && !shared_experts_scoring_func.empty())
-        {
-            if(shared_experts_scoring_func == "sigmoid")
-            {
-                applySharedExpertSigmoidFusedGate<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
-                    gating_output,
-                    topk_weights + topk,
-                    num_tokens,
-                    num_shared_experts,
-                    gating_token_stride,
-                    topk_weights_stride,
-                    num_experts,
-                    shared_hidden_states,
-                    shared_gate_weight,
-                    shared_hidden_size,
-                    shared_hidden_stride,
-                    shared_expert_scale,
-                    topk_indicies + topk,
-                    topk_id_stride,
-                    shared_expert_base);
-            }
-        }
-    }
+    default:
+        // Only the power-of-2 expert counts with a template specialization above
+        // (<= 512) are supported. The non-power-of-2 fallback would run a serial
+        // per-thread gate GEMV slower than the unfused path, so reject it rather
+        // than ship a pessimized kernel.
+        AITER_CHECK(false,
+                    "topk_softmax_fused_shared_gate supports only power-of-2 "
+                    "num_experts up to 512");
     }
 }
 
@@ -1523,7 +1409,7 @@ void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, to
 void topk_softmax_fused_shared_gate(
     const aiter_tensor_t& topk_weights,          // [num_tokens, topk + num_shared_experts]
     const aiter_tensor_t& topk_indices,          // [num_tokens, topk + num_shared_experts]
-    const aiter_tensor_t& token_expert_indices,  // [num_tokens, topk + num_shared_experts]
+    const aiter_tensor_t& token_expert_indices,  // [num_tokens, topk]  (written stride = topk)
     const aiter_tensor_t& gating_output,         // [num_tokens, num_experts]  routed only
     const aiter_tensor_t& softmax_workspace,
     bool need_renorm,
@@ -1534,6 +1420,10 @@ void topk_softmax_fused_shared_gate(
     float shared_expert_scale,
     int shared_expert_base)
 {
+    // Surface AITER_CHECK failures as a Python RuntimeError (pybind path) instead of
+    // aborting the process, so callers get a catchable error on bad input.
+    aiter_detail::g_aiter_can_throw = true;
+
     // Option A ("fuse-gate") SEPARATE OP: always fuse-gate. The shared logit is computed
     // in-kernel via a gate GEMV, gating_output holds ONLY routed experts, and topk_indices
     // is wide enough for the appended shared columns. Physically duplicated from
@@ -1561,13 +1451,14 @@ void topk_softmax_fused_shared_gate(
     AITER_CHECK(token_expert_indices.dtype() == AITER_DTYPE_i32,
                 "token_expert_indices must be int32");
 
-    // Validate shared expert scoring function
-    if(num_shared_experts > 0 && !shared_expert_scoring_func.empty())
-    {
-        AITER_CHECK(shared_expert_scoring_func == "sigmoid",
-                   "Only 'sigmoid' scoring function is supported for shared experts, got: " +
-                   shared_expert_scoring_func);
-    }
+    // Scoring is mandatory for this op: an empty scoring_func silently resolves to
+    // NONE and writes no shared weights/ids, leaving the output uninitialized with
+    // no error. Require both a shared expert and the sigmoid scorer unconditionally.
+    AITER_CHECK(num_shared_experts > 0,
+                "fuse-gate op requires num_shared_experts > 0");
+    AITER_CHECK(shared_expert_scoring_func == "sigmoid",
+                "fuse-gate op requires shared_expert_scoring_func == 'sigmoid', got: " +
+                shared_expert_scoring_func);
 
     // Fuse-gate (Option A): the GEMV pointers are reinterpret_cast to the gating dtype,
     // so hidden_states / gate_weight must share that dtype, and the indices/weights
@@ -1584,6 +1475,17 @@ void topk_softmax_fused_shared_gate(
                 "fuse-gate gate_weight must be contiguous");
     AITER_CHECK(gate_weight.size(0) == num_shared_experts,
                 "gate_weight.size(0) must equal num_shared_experts");
+    // The GEMV reinterpret_casts each hidden_states / gate_weight row to a
+    // BYTES_PER_LDG-wide vector (<= 64B), so a row is aligned only when its byte
+    // offset is a multiple of that width; otherwise every row after the first is
+    // misaligned (UB). Require the row byte stride divisible by 64 (the max
+    // BYTES_PER_LDG), which is conservative for every specialization.
+    AITER_CHECK((hidden_states.stride(0) * hidden_states.element_size()) % 64 == 0,
+                "fuse-gate hidden_states row stride must be 64B-aligned "
+                "(hidden * dtype_size divisible by 64)");
+    AITER_CHECK((gate_weight.size(-1) * gate_weight.element_size()) % 64 == 0,
+                "fuse-gate gate_weight row width must be 64B-aligned "
+                "(hidden * dtype_size divisible by 64)");
     // topk is derived as topk_indices.size(-1) - num_shared_experts, so require the
     // buffer to leave at least one routed slot (catches a too-narrow output).
     AITER_CHECK(topk_indices.size(-1) > num_shared_experts,
