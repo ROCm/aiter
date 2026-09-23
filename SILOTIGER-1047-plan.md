@@ -972,6 +972,17 @@ busy/wave **8889→8405**. Keep the experimental kernel diff; details and
 the physical address formula are in
 ``SILOTIGER-1047-optimize-overlay-split-plan.md``.
 
+**Do not retry** overlay prefill software-pipeline of
+``ds_read_b64_tr_b16`` ahead of the current PV MFMA on a **single** B
+fragment (issue next tr16, then ``pv_mfma`` of ``v_cur``). GPU 6 /
+gfx950 stayed exact; ISA still waited ``s_waitcnt lgkmcnt(0)`` before
+every PV MFMA because the next load reused ``v[66:67]``. Width-2051
+``L=512`` vs same-session write2st64 HEAD **30.79 / 27.02 / 230.93** µs
+went **25.66 / 26.01 / 229.34** (``M=512 −0.7%``, keep-gate 3% /
+≤224.00). Decode did not regress. Same-session AMD **42.84 / 42.53 /
+211.96**. Kernel restored. Ping-pong B dest VGPRs are a different
+experiment.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

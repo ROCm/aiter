@@ -418,3 +418,14 @@ not repeated unless an overlay retry is proposed.
   (**−5.4%**); MFMA and VMEM are unchanged. Conflict is still **3.0×**
   AMD (10560), but this reproduces the material Triton lowering:
   bank-spread addressing, `write2st64`, and transposed LDS reads.
+- Prefill overlap of `ds_read_b64_tr_b16` with the current PV MFMA by
+  issuing `load_pv_b(ng+1)` before `pv_mfma(..., v_cur)` on a **single**
+  B fragment (no ping-pong dest VGPRs). Decode/prefill oracle passed.
+  Prefill ISA (`tickets/1047/tmp/k2_tr16_overlap_isa/`) still has
+  `s_waitcnt lgkmcnt(0)` before **every** PV MFMA because the next
+  `ds_read_b64_tr_b16` reuses `v[66:67]`. Keep-gate vs same-session
+  write2st64 HEAD **30.79 / 27.02 / 230.93** µs: FlyDSL
+  **25.66 / 26.01 / 229.34**; AMD same session **42.84 / 42.53 / 211.96**.
+  `M=512` **−0.7%** (need ≤ **224.00**). Decode did not regress. Kernel
+  restored. Do not retry this single-buffer interleave. Ping-pong B
+  dests are a different experiment.
