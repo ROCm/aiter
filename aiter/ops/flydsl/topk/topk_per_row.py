@@ -35,13 +35,6 @@ _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 _BACKEND_ADAPTIVE = "adaptive"
 
 
-@lru_cache(maxsize=8)
-def _adaptive_cu_count(device_index: int) -> int:
-    """CU count of the device the row will run on, which one arch name spans
-    several of, so the kernel's grid tables cannot take it as a constant."""
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 @lru_cache(maxsize=16)
 def _get_cached_adaptive_workspace(
     device: torch.device, stream_id: int, slots: int
@@ -415,14 +408,18 @@ def _run_adaptive(
     Defaulting `cfg_width` to `width` is the conservative reading of a caller
     who said nothing, and was the only behaviour before `max_row_len` existed.
     """
+    from aiter.ops import topk as _gate
+
     if cfg_width is None:
         cfg_width = width
+    # The gate's own count, so the band it admitted and the grid built here
+    # describe the same card.
     cfg = _adaptive.decode_adaptive_config(
         rows,
         cfg_width,
         k,
         ordered=stable,
-        cu_count=_adaptive_cu_count(logits.device.index),
+        cu_count=_gate._decode_cu_count(logits.device.index),
     )
     kw = cfg["kw"]
     launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(top_k=k, **kw)

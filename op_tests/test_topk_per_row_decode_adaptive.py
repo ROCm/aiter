@@ -240,6 +240,54 @@ def _this_card():
     return get_gfx(), topk._decode_cu_count(torch.cuda.current_device())
 
 
+@pytest.fixture
+def card_of_304_cu(monkeypatch):
+    """A 304 CU device, with the cached count cleared on both sides of the test."""
+
+    class _Props:
+        multi_processor_count = 304
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: _Props())
+    topk._decode_cu_count.cache_clear()
+    yield
+    topk._decode_cu_count.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "cu_num,expected",
+    [(None, 304), ("0", 304), ("80", 80), ("304", 304), ("512", 304)],
+)
+def test_cu_num_can_lower_the_count_but_never_raise_it(
+    monkeypatch, card_of_304_cu, cu_num, expected
+):
+    if cu_num is None:
+        monkeypatch.delenv("CU_NUM", raising=False)
+    else:
+        monkeypatch.setenv("CU_NUM", cu_num)
+    assert topk._decode_cu_count(0) == expected
+
+
+def test_the_launcher_sizes_its_grid_from_the_gates_count(monkeypatch):
+    """A second reader of the CU count could disagree with the gate's, and the
+    band it admitted would then describe a grid that was never built."""
+    from aiter.ops.flydsl.topk import topk_per_row as host
+
+    class _Stop(Exception):
+        pass
+
+    seen = []
+
+    def config(*args, cu_count, **kwargs):
+        seen.append(cu_count)
+        raise _Stop
+
+    monkeypatch.setattr(topk, "_decode_cu_count", lambda _: 123)
+    monkeypatch.setattr(host._adaptive, "decode_adaptive_config", config)
+    with pytest.raises(_Stop):
+        host._run_adaptive(torch.empty(1, 8), 1, None, None, 1, 8, 8, 1, 8, False, None)
+    assert seen == [123]
+
+
 def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
     """Per band-edge cell: the gate agrees with the table, the launch agrees
     with the gate, and the indices select the right values."""

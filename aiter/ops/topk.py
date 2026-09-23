@@ -775,9 +775,14 @@ def _decode_backend(
 
 @functools.lru_cache(maxsize=8)
 def _decode_cu_count(device_index: int) -> int:
-    """CU count of the device the rows will run on, which one arch name spans
-    several of, so the bands cannot be keyed by arch alone."""
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+    """CU count the gate keys on and the adaptive launcher sizes its grid for.
+
+    `CU_NUM` may lower it but never raise it past the device, because a row's
+    parts must be co-resident on the card that actually runs them.
+    """
+    physical = torch.cuda.get_device_properties(device_index).multi_processor_count
+    override = int(os.getenv("CU_NUM", "0"))
+    return min(override, physical) if override > 0 else physical
 
 
 def decode_adaptive_width(width: int, max_row_len: int) -> int:
