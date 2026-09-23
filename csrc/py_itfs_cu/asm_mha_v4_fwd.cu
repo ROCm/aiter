@@ -827,7 +827,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
                  double softmax_scale,
-                 std::optional<at::Tensor> seqlens_k)
+                 std::optional<at::Tensor> seqlens_k,
+                 std::optional<at::Tensor> lse)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -883,6 +884,31 @@ void fmha_v4_fwd(const at::Tensor& q,
                     " for batch ",
                     shapes.batch);
         args.ptr_kseq.value = seqlens_k->data_ptr();
+    }
+
+    // LSE is opt-in the same way: the kernels branch on s_lse and skip the store when it is zero,
+    // so a launch without it leaves the reserved slots at zero and keeps the same code object.
+    if(lse.has_value())
+    {
+        TORCH_CHECK(lse->is_cuda(), "MHA v4 lse must be a GPU tensor");
+        TORCH_CHECK(lse->scalar_type() == at::kFloat,
+                    "MHA v4 lse must be float32, got ",
+                    lse->scalar_type());
+        TORCH_CHECK(lse->is_contiguous(), "MHA v4 lse must be contiguous");
+        TORCH_CHECK(lse->dim() == 3 && lse->size(0) == shapes.batch &&
+                        lse->size(1) == shapes.nhead_q && lse->size(2) == shapes.seqlen_q,
+                    "MHA v4 lse must be [batch, nhead_q, seqlen_q] = [",
+                    shapes.batch,
+                    ", ",
+                    shapes.nhead_q,
+                    ", ",
+                    shapes.seqlen_q,
+                    "]");
+        // The kernel derives the batch stride as q_head_num * s_lse_Hs, which only holds for a
+        // contiguous [batch, head, seqlen_q] buffer.
+        args.ptr_lse.value  = lse->data_ptr();
+        args.s_lse.value    = 1;
+        args.s_lse_Hs.value = byte_stride(*lse, 1, "LSE head stride");
     }
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;

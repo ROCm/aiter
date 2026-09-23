@@ -908,7 +908,9 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="do not produce LSE"):
+    # Dense LSE is supported for every shipped format row; the sorted-sparse path is not.
+    block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
+    with pytest.raises(NotImplementedError, match="sorted-sparse path"):
         mha_v4(
             q,
             q,
@@ -917,6 +919,7 @@ def test_mha_v4_rejects_unsupported_contracts():
             AttentionFormat.FP8,
             AttentionFormat.FP8,
             return_lse=True,
+            block_mask=block_mask,
         )
     with pytest.raises(ValueError, match="matching Q and K formats"):
         mha_v4(
@@ -927,6 +930,70 @@ def test_mha_v4_rejects_unsupported_contracts():
             AttentionFormat.INT8,
             AttentionFormat.FP8,
         )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "scale_modes"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16, None),
+        (AttentionFormat.BF16, AttentionFormat.FP8, None),
+        (AttentionFormat.INT8, AttentionFormat.FP8, None),
+        (AttentionFormat.FP8, AttentionFormat.FP8, None),
+        (AttentionFormat.FP8, AttentionFormat.MXFP6, None),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, None),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, None),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, None),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, None),
+        (
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            (
+                AttentionScaleMode.E8M0_PER_1X32,
+                AttentionScaleMode.E8M0_PER_1X32,
+                AttentionScaleMode.F32_PER_TENSOR,
+            ),
+        ),
+    ],
+)
+def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
+    """A wrong LSE does not fail output validation, so it needs its own reference check.
+
+    The quantized rows carry a small systematic bias from the approximate exp2; the bound here is
+    wide enough to pass that but far tighter than the failure modes it guards, which are a missing
+    log2(L) term (error grows like ln(Sk)) and an unapplied P-pack divisor (a constant ln2 or 2ln2).
+    """
+    torch.manual_seed(31)
+    q = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    softmax_scale = 128**-0.5
+    qsm, ksm, vsm = scale_modes if scale_modes else (None, None, None)
+    kwargs = {
+        "softmax_scale": softmax_scale,
+        "q_scale_mode": qsm,
+        "k_scale_mode": ksm,
+        "v_scale_mode": vsm,
+    }
+
+    out_only = mha_v4(q, k, v, q_format, q_format, v_format, **kwargs)
+    out, lse = mha_v4(q, k, v, q_format, q_format, v_format, return_lse=True, **kwargs)
+
+    scores = torch.matmul(
+        q.float().permute(0, 2, 1, 3),
+        k.float().permute(0, 2, 1, 3).transpose(-1, -2),
+    )
+    reference = torch.logsumexp(scores * softmax_scale, dim=-1)
+
+    assert lse.shape == reference.shape
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(lse).all()
+    # Asking for the LSE must not perturb O: the epilogue runs either way and only the store is
+    # gated, so its scratch registers must not touch anything O still needs.
+    assert torch.equal(out_only, out)
+    error = (lse - reference).abs()
+    assert error.max().item() < 0.25, error.max().item()
+    assert error.mean().item() < 0.05, error.mean().item()
 
 
 @pytest.mark.parametrize(
