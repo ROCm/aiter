@@ -519,8 +519,31 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         if(cnt > 0)
         {
             uint64_t* dst = row_base + s_base + s_off[wid];
-            for(int j = lane; j < cnt; j += WAVE_SIZE)
-                __builtin_nontemporal_store(buf[j], &dst[j]);
+            // The store takes the same gate as the load, and for the same reason.
+            // Measured three-kernel total, per-wave with an ordinary store against
+            // per-wave with a non-temporal one, k=2048 --dist gaussian --seed 0:
+            //
+            //   m=1    n=131072  (2^17)   18.49us   19.72us
+            //   m=16   n=1048576 (2^24)   42.02us   43.45us
+            //   m=64   n=131072  (2^23)   31.39us   31.75us
+            //   m=128  n=262144  (2^25)   46.52us   46.68us
+            //   m=1024 n=131072  (2^27)  151.85us  150.72us
+            //   m=4096 n=131072  (2^29)  571.96us  552.59us
+            //   m=4096 n=1048576 (2^32) 2802.07us 2761.22us
+            //
+            // It crosses at the same 2^27 the loads do. Writing each wave's own run
+            // rather than having the block walk all eight is a win at every size, so
+            // only the non-temporal part is gated.
+            if constexpr(NT)
+            {
+                for(int j = lane; j < cnt; j += WAVE_SIZE)
+                    __builtin_nontemporal_store(buf[j], &dst[j]);
+            }
+            else
+            {
+                for(int j = lane; j < cnt; j += WAVE_SIZE)
+                    dst[j] = buf[j];
+            }
         }
     }
 #endif
