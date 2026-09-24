@@ -260,6 +260,7 @@ def gemm2_body_v2(
     resolved_input_rows=(),
     output_n_base=0,
     output_width=None,
+    write_limit=None,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -633,6 +634,7 @@ def gemm2_body_v2(
             output_n_base=output_n_base,
             output_width=output_width,
             reduce_store_cache_modifier=reduce_store_cache_modifier,
+            write_limit=write_limit,
             **kw,
         )
 
@@ -869,6 +871,7 @@ def atomic_bf16_epilog(
     output_n_base=0,
     output_width=None,
     reduce_store_cache_modifier=None,
+    write_limit=None,
 ):
     if SBM is None:
         SBM = BM
@@ -1261,7 +1264,8 @@ def atomic_bf16_epilog(
 
         @flyc.jit
         def store_if_valid(token_id, route_slot, mr):
-            valid = token_id < i32_M
+            token_limit = i32_M if const_expr(write_limit is None) else write_limit
+            valid = token_id < token_limit
             if const_expr(use_reduce):
                 valid = valid & (route_slot < fx.Int32(topk))
             if valid:

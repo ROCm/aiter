@@ -2530,6 +2530,7 @@ def _mxfp4_a4w4_stage2_fw(
     bias2=None,
     kernelName2="",
     reverse_sorted=None,
+    use_valid_token_count=False,
     **_kwargs,
 ):
 
@@ -2579,6 +2580,7 @@ def _mxfp4_a4w4_stage2_fw(
             topk_weights=topk_weights,
             bias2=bias2,
             block_m=block_m,
+            use_valid_token_count=use_valid_token_count,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -2655,6 +2657,7 @@ def _flydsl_v2_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     topk_weights=None,
+    use_valid_token_count=False,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -2753,6 +2756,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
+        use_valid_token_count=use_valid_token_count,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -4217,16 +4221,17 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
-    if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
-        # FP8 route-output reduction applies the route weights after GEMM2.
-        stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
-        uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
-            stage2_func is _mxfp4_a4w4_stage2_fw
-            and str(stage2_keywords.get("kernelName2", "")).startswith(
-                "flydsl_moe2_layout_"
-            )
+    stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
+    uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
+        stage2_func is _mxfp4_a4w4_stage2_fw
+        and str(stage2_keywords.get("kernelName2", "")).startswith(
+            "flydsl_moe2_layout_"
         )
-        if uses_flydsl_v2_stage2:
+    )
+    if uses_flydsl_v2_stage2:
+        extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
+        if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
+            # FP8 route-output reduction applies the route weights after GEMM2.
             extra_stage2_args["topk_weights"] = topk_weights
     if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
