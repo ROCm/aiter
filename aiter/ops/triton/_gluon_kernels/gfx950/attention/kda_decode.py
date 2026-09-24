@@ -258,7 +258,7 @@ def fused_recurrent_kda_packed_decode_kernel(
         b_p = beta_ptr + tok0 * stride_beta_token + i_hv
     if USE_RMS_GATE:
         og_p = out_gate_ptr + tok0 * stride_og_token + i_hv * V
-        nw = gl.amd.cdna4.buffer_load(norm_weight_ptr, off_o)
+        nw = gl.amd.cdna4.buffer_load(norm_weight_ptr, off_o).to(gl.float32)
     if IS_CONTINUOUS_BATCHING:
         slot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(gl.int32)
     else:
