@@ -82,7 +82,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.ok == 'true'
     runs-on: [self-hosted, box308]        # label the runner with these at registration
-    timeout-minutes: 90     # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
+    timeout-minutes: 120    # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
     env:
       PR: ${{ github.event.issue.number }}          # issue number == PR number here
       COMMENTER: ${{ github.event.comment.user.login }}

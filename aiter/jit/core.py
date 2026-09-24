@@ -208,6 +208,15 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
+# Head shapes to AOT-compile the gfx950 FlyDSL FP8 flash-attention forward for
+# (aiter/aot/flydsl/fmha_fp8.py). Per-model rows live under model_configs/
+# (*_fmha_fp8_aot.csv) and get merged into this canonical file, which ships
+# header-only like chunk_gdn_h_opt_tuned.csv.
+AITER_CONFIG_FMHA_FP8_AOT = os.getenv(
+    "AITER_CONFIG_FMHA_FP8_AOT",
+    f"{AITER_ROOT_DIR}/aiter/configs/fmha_fp8_aot.csv",
+)
+
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
@@ -341,6 +350,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_FMHA_FP8_AOT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMHA_FP8_AOT",
+            AITER_CONFIG_FMHA_FP8_AOT,
+            "fmha_fp8_aot",
         )
 
     @property
