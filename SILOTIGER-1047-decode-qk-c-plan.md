@@ -53,8 +53,9 @@ Stage then one-line commit when that is the ticket convention.
 - [x] 1. Head-major decode QK C (miss: requires forbidden fragment transpose)
 - [x] 2. AMD-matched decode PV: V-as-A / P-as-B + D-vector output
 - [x] 3. Overlap QK/PV LDS reads (blocked: LLVM coalesces dests; no coloring API)
-- [x] 4. `ns64` merge: vectorized `BLOCK_SPLITS`-style scan (miss; restored)
-- [ ] 5. Stop: decode split ≤ Live AMD at M=1 and M=8
+- [x] 4. `ns64` merge: vectorized `BLOCK_SPLITS`-style scan (miss; restored;
+      goal later met a different way — see the §4 follow-up)
+- [x] 5. Stop: decode split ≤ Live AMD at M=1 and M=8 (not met; stop)
 
 ## Why the map campaign is not the leftover
 
@@ -536,7 +537,8 @@ The final map campaign was 1.21× / 1.23×; PV ownership closes about
 half of the remaining relative split gap. The phase-5 40-dispatch
 absolute reference was 7.80 / 12.82 µs vs AMD 6.44 / 10.44 µs.
 Success is still not met at either M. M=1 merge remains the
-wrapper-visible follow-on.
+wrapper-visible follow-on. (Resolved after the campaign closed; see
+the §4 follow-up.)
 
 **Wrapper** (five-run median, interleaved, `CACHE=0`; not a
 keep-gate):
@@ -678,17 +680,132 @@ accumulation, but removing it in FlyDSL trades pipelined VMEM for
 global tensor scheduling needs compiler-level fusion/scheduling, not
 another Python loop shape. Do not retry this gather in this ticket.
 
+**Follow-up: the phase-4 verdict was wrong (2026-09-24, commit
+`4ad19cb6b`).** The `ns64` merge ladder was a *loop-shape* problem
+after all, just not the loop shape phase 4 tried. Phase 4 kept the
+runtime `range(fx.Int64(0), fx.Int64(n_splits), …, init=[…])` scan and
+re-vectorized the payload by split; that is what forced `vmcnt(0)`
+before each wave reduction. `n_splits` is a `Constexpr`, so the scan
+never needed to be a runtime loop at all. Replacing it with
+`range_constexpr(n_splits)` over a plain accumulator — no partition
+change, no 256-thread launch, no BF16 partials, ns32 untouched — lets
+every per-split load issue before the first wait.
+
+Merge ISA at `ns64` goes from a ×4-unrolled `scf.for` with **4**
+outstanding `global_load_dword` behind `vmcnt(3..0)`, to one straight
+block of **129** loads with up to **62** outstanding, no backward
+branch and no spills (VGPR 64 → 76).
+
+Same-session kernel trace, grid `(rows, 24, 1)`, 128 threads, GPU 6:
+
+| M | merge before | merge after | AMD merge |
+|--:|--:|--:|--:|
+| 1 (`ns64`) | 12.22 µs | **3.76 µs** | 3.44 µs |
+| 2 (`ns64`) | 11.10 µs | **3.70 µs** | 3.76 µs |
+| 8 (`ns32`) | 3.76 µs | 3.68 µs | 3.62 µs |
+
+Wrapper (`run_perftest`, rotate=1): M=1 L=512 **19.85 → 11.49 µs**
+against AMD 9.91 (2.00× → 1.16×); M=1 L=32768 20.34 → 11.53 (2.00× →
+1.14×); M=2 19.56 → 11.80 (1.86× → 1.12×). M=8 and prefill are
+unchanged — prefill runs `n_splits == 1` and never launches merge.
+Full `op_tests/test_flydsl_qsa.py`: **18 passed**.
+
+So the `ns64` merge "Done when" bar is met, and the phase-4 DNR should
+be read narrowly: do not retry the **vectorized `BLOCK_SPLITS`
+gather**. It does not cover making the split scan constexpr.
+
 ### 5. Stop: decode split ≤ Live AMD at M=1 and M=8
 
-- [ ] Same-session five-run medians, `CACHE=0`, GPU 6: FlyDSL decode
+- [x] Same-session five-run medians, `CACHE=0`, GPU 6: FlyDSL decode
       split ≤ Live AMD split at **M=1 and M=8**.
-- [ ] If split is ahead and wrapper is not, say so; phase 4 must be
+- [x] If split is ahead and wrapper is not, say so; phase 4 must be
       done or recorded as a follow-on with numbers.
-- [ ] Prefill `M=512` still in the st64-imm keeper band (~159 µs).
-- [ ] ISA cheat-sheet: C layout, dest overlap, `v_perm`/`bpermute`,
+- [x] Prefill `M=512` still in the st64-imm keeper band (~159 µs).
+- [x] ISA cheat-sheet: C layout, dest overlap, `v_perm`/`bpermute`,
       PMC busy/conflict, ATT stall mix.
-- [ ] **Done when:** the success bar in the intro is met. Do not
+- [x] **Done when:** the success bar in the intro is met. Do not
       keep iterating waitcnt folklore after that.
+
+**Not met; campaign stop (2026-09-24).** HEAD is the phase-2 PV keep
+(`k2_family_a.py`; no kernel edit this phase). Focused
+decode+prefill oracle: **2 passed** (`CACHE=0`, GPU 6). Decode split
+ISA is byte-identical to the PV-keep dump
+(`tickets/1047/tmp/k2_decode_pv/isa_m8_pack/launch/22_final_isa.s`).
+Prefill ISA sha is the st64-imm keeper
+`64ee586155fc6a634edb8dfa5b71d835b5bdbe480b40a65d8a49191da653ae0c`.
+
+**Same-process kernel trace** (five warmup + five timed interleaved
+dispatches; last-5 median µs;
+`tickets/1047/tmp/k2_decode_qk/phase5/ktrace_same_session/`):
+
+| M | FlyDSL split | AMD split | ratio | FlyDSL merge | AMD merge |
+|--:|--:|--:|--:|--:|--:|
+| 1 (`ns64`) | **7.880 µs** | **6.760 µs** | **1.17×** | 12.120 | 4.200 |
+| 8 (`ns32`) | **12.760 µs** | **11.000 µs** | **1.16×** | 3.800 | 3.521 |
+
+Split is **not** ≤ Live AMD at either M. The PV keep still holds
+about half of the map-campaign relative gap (1.21–1.23× → 1.16–1.17×).
+Split is not ahead, so wrapper is not a split win to cash. Phase-4
+ns64 merge miss stands as of this phase: merge is **12.12 µs vs AMD
+4.20 µs** at M=1; ns32 merge is in AMD’s band. (Closed later by the
+constexpr split scan; see the §4 follow-up.)
+
+**Wrapper** (five-run median after five warmups, interleaved,
+`CACHE=0`; not a keep-gate; first timed sample is an outlier):
+
+| M | FlyDSL µs | AMD µs |
+|--:|--:|--:|
+| 1 | **41.521** | 50.840 |
+| 8 | **38.121** | 49.640 |
+| 512 | **191.722** | 241.682 |
+
+Prefill wall is above the ~159 µs historical band (phase-2 was
+155.993) while the ISA hash is unchanged; treat the delta as
+run-to-run noise. FlyDSL prefill still beats AMD on this session.
+
+**ISA cheat-sheet** (decode split M=8;
+`tickets/1047/tmp/k2_decode_qk/phase5/isa_m8/launch/22_final_isa.s`):
+
+| | FlyDSL decode split | Live AMD decode |
+|--|--:|--:|
+| QK C | token vector / head lane (`K @ Q^T`) | same |
+| PV / output C | V-as-A / P-as-B; D vector / head lane | same |
+| `v_perm` / `ds_bpermute` | **0 / 0** | 0 / 0 |
+| `v_cvt_pk_bf16_f32` | 2 | 2 |
+| K32 / K16 | 8 / 4 | 8 / 4 |
+| split `s_waitcnt` / `s_barrier` | 33 / 4 | 33–34 / 5 |
+| VGPR | 102 | 106 |
+| QK LDS dests | first pair `lgkmcnt(1)` then dest reuse + `lgkmcnt(0)` | distinct dests + `lgkmcnt(1)` |
+| PV tr16 dests | one dest, `lgkmcnt(0)` each | `offset:256` dual-issue |
+
+**PMC last split dispatch** (SE totals summed; per wave;
+`tickets/1047/tmp/k2_decode_qk/phase5/pmc_flydsl_m{1,8}/`):
+
+| M | waves | busy/w | wait-LDS/w | conflict/w | MFMA total |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 512 | 929.5 | 42.7 | 48.4 | 12,384 |
+| 8 | 2,048 | 399.4 | 137.6 | 96.8 | 99,072 |
+
+Conflict and MFMA match the map-campaign win. One-dispatch busy is
+noisy vs phase 2 (1017.3 / 411.8); do not chase it.
+
+**ATT stall mix** (not re-run; dest coloring did not change): M=8
+map-campaign sample
+(`tickets/1047/tmp/k2_decode_final/att_{flydsl,amd}_m8/`) still
+applies. FlyDSL total stall ~1.83× AMD; `s_waitcnt` 75.9% vs 63.8%;
+`lgkmcnt` 28.8% vs 13.2% (`lgkmcnt(0)` 27.4% vs AMD 7.2%). Leftover
+`vmcnt(0)` hot sites are `indices` / `page_table` loads, not V overlay.
+
+**Stop.** Do not retry Q@K (forbidden fragment transpose), dest
+coloring / named-dest burst / inline-asm pins, ns64 merge gather, extra
+MFMA, C/P LDS, or waitcnt folklore. Remaining ~16% split gap is
+compiler dest overlap plus C occupancy, not a kernel-authoring
+recipe in this ticket. Next work, if any, is outside this campaign
+(FlyDSL/LLVM dest-coloring), not another overlay Python edit.
+
+The `ns64` merge was also called compiler-blocked here. That was
+wrong, and the §4 follow-up dated the same day records the fix and
+its numbers.
 
 ## Non-goals (do not pull into this plan)
 
