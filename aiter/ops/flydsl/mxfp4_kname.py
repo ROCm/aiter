@@ -55,7 +55,7 @@ def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
 
 _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
-    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
+    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce|scatter)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?"
     r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?$"
 )

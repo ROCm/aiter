@@ -1127,6 +1127,10 @@ class FmoeTuner(TunerCommon):
 
         token = ref2.shape[0]
         epilog = kparams["epilog"]
+        if epilog == "scatter":
+            raise NotImplementedError(
+                "v2 epilog='scatter' needs reverse_sorted; tune it via fused_moe"
+            )
         bm_s2 = kparams["tile_m"]
         sbm = kparams["sort_block_m"]
         out = torch.empty((token, model_dim), dtype=dtypes.bf16, device=isq.device)
