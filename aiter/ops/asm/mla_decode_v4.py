@@ -215,6 +215,8 @@ def mla_decode_v4_asm_gfx1250_eager(
         raise ValueError(
             "mla_decode_v4_asm_gfx1250: only support num_kv_heads==1 for now"
         )
+    if page_size != 1:
+        raise ValueError("mla_decode_v4_asm_gfx1250: only support KV page_size==1")
     if Q.size(2) != dim_qk_packed:
         raise ValueError(
             "mla_decode_v4_asm_gfx1250: Q head_size must equal KV head_size "
@@ -418,6 +420,10 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
     if KV.size(2) != 1:
         raise ValueError(
             "mla_decode_v4_fused_asm_gfx1250: only support num_kv_heads==1"
+        )
+    if KV.size(1) != 1:
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: only support KV page_size==1"
         )
     if Q.size(2) != KV.size(3):
         raise ValueError(
