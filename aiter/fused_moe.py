@@ -789,13 +789,13 @@ def resolve_activation_dtype(
             q_dtype_a = _bound_split(
                 M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
             )
+        elif activation == ActivationType.Relu2:
+            q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if gfx != "gfx950":
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
-        elif activation == ActivationType.Relu2:
-            q_dtype_a = dtypes.bf16
         else:
             q_dtype_a = dtypes.fp4x2
 
