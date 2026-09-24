@@ -6,10 +6,10 @@ import argparse
 
 import torch
 import triton
-from aiter.ops.triton.moe.moe_sorting_tiled import try_m3_tiled_sort
 
 from aiter.fused_moe import moe_sorting
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.triton.moe.moe_sorting_tiled import try_m3_tiled_sort
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 
