@@ -101,9 +101,7 @@ def _mla_v4_csv_path(csv_name: str = _MLA_V4_CSV) -> str:
     return os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, csv_name)
 
 
-def _find_kernel_cfg(
-    csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
-):
+def _find_kernel_cfg(csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse):
     """Return the ``csv_name`` row matching the 8 lookup keys, or None."""
     csv_path = _mla_v4_csv_path(csv_name)
     if not os.path.isfile(csv_path):
@@ -307,9 +305,7 @@ def mla_v4_fused_slot_f32(num_heads: int, v_head_dim: int) -> int:
 
 @functools.cache
 def _fused_co_for(q_type, kv_type, gqa, qseqlen):
-    cfg = _find_kernel_cfg(
-        _MLA_V4_FUSED_CSV, q_type, kv_type, gqa, 0, 0, 0, qseqlen, 0
-    )
+    cfg = _find_kernel_cfg(_MLA_V4_FUSED_CSV, q_type, kv_type, gqa, 0, 0, 0, qseqlen, 0)
     if cfg is None:
         return None
     co_path = os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, cfg["co_name"])

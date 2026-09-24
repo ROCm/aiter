@@ -1838,9 +1838,7 @@ def mla_decode_fwd_v4_nm(
     expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
 
-    fused = get_mla_v4_fused_kernel(
-        q, kv_buffer, max_seqlen_q, num_kv_splits
-    )
+    fused = get_mla_v4_fused_kernel(q, kv_buffer, max_seqlen_q, num_kv_splits)
     if fused is not None:
         slot = mla_v4_fused_slot_f32(num_heads, v_head_dim)
         fused_logits_shape = (total_q, num_kv_splits, slot)
