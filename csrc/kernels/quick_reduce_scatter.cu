@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// quick_all_reduce.cuh requires these standard-library declarations first.
+#include <limits>
+#include <optional>
+
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "quick_all_reduce.cuh"
-#include <limits>
-#include <optional>
 
 namespace aiter {
 
