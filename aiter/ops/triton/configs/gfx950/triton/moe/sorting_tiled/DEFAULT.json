@@ -1,0 +1,8 @@
+{
+    "any": {
+        "TILE": 256,
+        "num_warps": 4,
+        "prefix_num_warps": 8,
+        "num_stages": 1
+    }
+}
