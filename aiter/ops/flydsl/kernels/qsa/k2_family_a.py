@@ -114,6 +114,8 @@ def build_qsa_k2_family_a_module(
         raise ValueError(f"block_threads must be 128 or 256, got {block_threads}")
     if block_threads % 64 or block_threads % block_n:
         raise ValueError("thread and column mappings must divide evenly")
+    if n_splits < 1 or n_splits > 64:
+        raise ValueError(f"n_splits must be in 1..64, got {n_splits}")
     if _HQ != _HK * _GROUP:
         raise ValueError("family A GQA head counts do not form groups")
 
