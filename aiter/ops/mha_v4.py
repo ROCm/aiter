@@ -784,8 +784,14 @@ _LSE_CAPABLE_QV = frozenset(
 )
 
 
-def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
+def _check_lse_capable(
+    q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
+) -> None:
     """Reject LSE where the exported value has not been measured."""
+    if sparse:
+        raise NotImplementedError(
+            "MHA v4 does not produce LSE on the sorted-sparse path yet"
+        )
     arch = get_gfx()
     if arch != "gfx950":
         # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
@@ -833,6 +839,19 @@ def _empty_lse(q: Tensor, return_lse: bool) -> Optional[Tensor]:  # noqa: UP045
     )
 
 
+def _validate_gqa_heads(query_heads: int, kv_heads: int, operation: str) -> None:
+    """K and V may carry fewer heads than Q; the kernel addresses them through the ratio."""
+    if kv_heads == 0:
+        raise ValueError(f"{operation} requires non-empty KV heads")
+    if query_heads % kv_heads != 0:
+        raise ValueError(
+            f"{operation} requires query heads to be divisible by KV heads"
+        )
+    gqa_ratio = query_heads // kv_heads
+    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
+        raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
+
+
 def mha_v4_packed(
     q: Tensor,
     k: Tensor,
@@ -868,11 +887,7 @@ def mha_v4_packed(
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     if return_lse:
-        if lut is not None:
-            raise NotImplementedError(
-                "MHA v4 does not produce LSE on the sorted-sparse path yet"
-            )
-        _check_lse_capable(q_format, v_format)
+        _check_lse_capable(q_format, v_format, lut is not None)
     _validate_pack_contract(v_format, v_pack)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
@@ -884,14 +899,7 @@ def mha_v4_packed(
         raise ValueError("Q, K, and V must have the same batch size")
     if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
         raise ValueError("K and V must have matching sequence and head dimensions")
-    kv_heads = k.shape[2]
-    if kv_heads == 0:
-        raise ValueError("MHA v4 requires non-empty KV heads")
-    if query_heads % kv_heads != 0:
-        raise ValueError("MHA v4 requires query heads to be divisible by KV heads")
-    gqa_ratio = query_heads // kv_heads
-    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
-        raise ValueError("MHA v4 supports power-of-two GQA ratios up to 16")
+    _validate_gqa_heads(query_heads, k.shape[2], "MHA v4")
     if not q.is_cuda or not k.is_cuda or not v.is_cuda:
         raise ValueError("MHA v4 expects GPU tensors")
     if q.device != k.device or q.device != v.device:
@@ -1196,16 +1204,7 @@ def _validate_mha_v4_raw_inputs(
         raise ValueError(
             f"{operation} requires K and V with matching sequence and head dimensions"
         )
-    kv_heads = k.shape[2]
-    if kv_heads == 0:
-        raise ValueError(f"{operation} requires non-empty KV heads")
-    if q.shape[2] % kv_heads != 0:
-        raise ValueError(
-            f"{operation} requires query heads to be divisible by KV heads"
-        )
-    gqa_ratio = q.shape[2] // kv_heads
-    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
-        raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
+    _validate_gqa_heads(q.shape[2], k.shape[2], operation)
     if out is None:
         return torch.empty_like(q, dtype=torch.bfloat16)
     if out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
@@ -1245,11 +1244,7 @@ def mha_v4(
     ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
     """
     if return_lse:
-        if block_mask is not None:
-            raise NotImplementedError(
-                "MHA v4 does not produce LSE on the sorted-sparse path yet"
-            )
-        _check_lse_capable(q_format, v_format)
+        _check_lse_capable(q_format, v_format, block_mask is not None)
     # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
     # own launchers, which never forward seqlens_k.
     if seqlens_k is not None:
