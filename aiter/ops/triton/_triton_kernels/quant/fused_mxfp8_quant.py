@@ -46,7 +46,8 @@ def _fused_rms_mxfp8_kernel(
     epsilon,
     BLOCK_SIZE_K: tl.constexpr,  # power-of-2 covering full K
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32
-    NUM_PRGMS: tl.constexpr,  # for persistent-loop variant; usually =M
+    NUM_PRGMS,  # row-loop stride, = the grid. Runtime: it is M, the token
+    # count, and a constexpr there builds one kernel per prefill chunk length.
 ):
     """One program processes one row: rmsnorm then MXFP8 quant in registers."""
     row_start = tl.program_id(0)
@@ -152,7 +153,7 @@ def _fused_dual_rmsnorm_mxfp8_quant_kernel(
     BLOCK_SIZE_KQ: tl.constexpr,  # power-of-2 covering full KQ
     BLOCK_SIZE_KK: tl.constexpr,  # power-of-2 covering full KK
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group size)
-    NUM_PRGMS: tl.constexpr,  # row-loop bound (usually =M)
+    NUM_PRGMS,  # row-loop stride; runtime, see `_fused_rms_mxfp8_kernel`
 ):
     """One program per row: do Q-side RMSNorm+MXFP8 quant AND K-side RMSNorm
     (bf16 out) in one launch. Mirrors the CK `fused_qk_rmsnorm_group_quant`

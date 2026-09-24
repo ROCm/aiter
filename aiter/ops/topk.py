@@ -11,6 +11,7 @@ import torch
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
+from ..utility.graph_alloc import persistent_alloc
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -335,7 +336,8 @@ def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
-    return torch.zeros(size, dtype=torch.uint8, device=device)
+    with persistent_alloc(device):
+        return torch.zeros(size, dtype=torch.uint8, device=device)
 
 
 def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:

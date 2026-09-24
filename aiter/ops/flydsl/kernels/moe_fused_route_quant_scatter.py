@@ -99,6 +99,21 @@ BLOCK_THREADS = 256
 # once: slicing k costs nothing on the store side but makes the gathered loads
 # shorter, which is what that pass is short of.
 _PRESHUF_LDS = 32768
+
+
+@fx.struct
+class _EpPsumScanStorage:
+    """Ping-pong buffers for the per-block exclusive prefix of tile-aligned counts.
+
+    Copied from ``moe_contiguous_psum_remap_ep`` so this kernel can retire that
+    launch: every workgroup re-derives the tiny (E,) table in LDS, then uses it
+    both to land payload rows and to scatter the GEMM2 ep_rowmap.
+    """
+
+    lds0: fx.Array[fx.Int32, BLOCK_THREADS, 16]
+    lds1: fx.Array[fx.Int32, BLOCK_THREADS, 16]
+
+
 # Nominal extent of a live destination descriptor; a dead one gets 0 instead.
 # It only has to exceed any real buffer, and stays under 2 GiB because the
 # descriptor builder sign-extends the size to 64 bits.
@@ -1589,6 +1604,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     ksplit: bool = True,
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
+    fuse_ep_psum: bool = False,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1647,7 +1663,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         )
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
-    remap_tag = "_remap" if remap_rows else ""
+    remap_tag = "_remap" if remap_rows or fuse_ep_psum else ""
+    psum_tag = "_eppsum" if fuse_ep_psum else ""
     ksplit_tag = "" if ksplit else "_noKS"
     # In the name because it changes what the kernel READS, not just how fast:
     # two builds with the same feat_dim/quant_mode are not interchangeable.
@@ -1657,7 +1674,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
+        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{psum_tag}{ksplit_tag}"
         f"{prequant_tag}"
     )
 
@@ -1672,6 +1689,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         numel: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
         src_scale: fx.Pointer,  # (tokens, src_scale_bytes_per_row) e8m0, read iff prequantized
+        masked_m: fx.Pointer,  # (E,) int32, read iff fuse_ep_psum
+        psum_out: fx.Pointer,  # (E,) int32, written iff fuse_ep_psum
+        gather_w: fx.Pointer,  # (numel,) bf16, read iff fuse_ep_psum
+        tis: fx.Pointer,  # (recv_cap,) i32, read iff fuse_ep_psum
+        ep_rowmap: fx.Pointer,  # (cap_rows+1, 2) i32, written iff fuse_ep_psum
+        experts: Int32,
+        tile_m: Int32,
+        ep_topk: Int32,
+        max_tok: Int32,
+        slot_stride: Int32,
     ):
         """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
@@ -1700,6 +1727,63 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
+        # Dynamic EP token count is block-uniform.  Load it before the optional
+        # prefix scan so blocks whose first route is already in the dead tail
+        # can skip all scan LDS traffic and barriers.  Block 0 still scans when
+        # nvr==0 because it owns the psum output.
+        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        valid_route_count = fx.Uint32(numel)
+        if num_valid_routes_is_set:
+            valid_route_count = fx.Uint32(ptr_buf_tensor(num_valid_routes)[c0_i32])
+        starts_lds = None
+        if const_expr(fuse_ep_psum):
+            # Independent per-block scan: identical to moe_contiguous_psum_remap_ep,
+            # so no cross-block wait is introduced. E fits one 256-thread block on
+            # the MegaMoE path that enables this (experts_per_rank <= 256).
+            lds = fx.SharedAllocator().allocate(_EpPsumScanStorage).peek()
+            lds0 = lds.lds0.ptr
+            lds1 = lds.lds1.ptr
+            # Eight Hillis-Steele swaps (1..128) leave the exclusive starts in
+            # lds1. Keep this pointer assignment outside the dynamic branch so
+            # FlyDSL does not have to yield a pointer against the outer None.
+            starts_lds = lds1
+            m_p = ptr_buf_tensor(masked_m)
+            p_p = ptr_buf_tensor(psum_out)
+            first_route = bid * fx.Uint32(warps_per_block)
+            scan_block = (bid == fx.Uint32(0)) | (first_route < valid_route_count)
+            if scan_block:
+                tile_v = fx.Uint32(tile_m)
+                tile_minus_1 = tile_v - 1
+                in_expert = tid < fx.Uint32(experts)
+                if in_expert:
+                    m_e = fx.Uint32(m_p[tid])
+                    lds0[tid] = fx.Int32((m_e + tile_minus_1) // tile_v * tile_v)
+                gpu.barrier()
+                src, dst = lds0, lds1
+                for offset in range_constexpr(1, BLOCK_THREADS):
+                    if const_expr((offset & (offset - 1)) != 0):
+                        continue
+                    if in_expert:
+                        val = src[tid]
+                        has_prev = tid >= offset
+                        prev = fx.Int32(0)
+                        if has_prev:
+                            prev = src[tid - offset]
+                        dst[tid] = val + prev
+                    gpu.barrier()
+                    src, dst = dst, src
+                is_writer = bid == fx.Uint32(0)
+                if const_expr(ksplit):
+                    is_writer = is_writer & (fx.Uint32(fx.block_idx.y) == fx.Uint32(0))
+                if in_expert:
+                    is_not_first = tid != 0
+                    start = fx.Int32(0)
+                    if is_not_first:
+                        start = src[tid - 1]
+                    starts_lds[tid] = start
+                    if is_writer:
+                        p_p[tid] = start + fx.Int32(m_p[tid])
+                gpu.barrier()
 
         # One warp owns one route, so tid // wave is wave-invariant -- but the
         # backend cannot see that. readfirstlane says it, which keeps `route`
@@ -1714,10 +1798,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
         # When truncation is disabled the caller passes a null pointer, which must
         # not be dereferenced, so the load is predicated rather than unconditional.
-        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
-        valid_route_count = fx.Uint32(numel)
-        if num_valid_routes_is_set:
-            valid_route_count = fx.Uint32(ptr_buf_tensor(num_valid_routes)[c0_i32])
         route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
         rows_t = ptr_buf_tensor(topids_to_rows)
         # An EP route with no grouped row carries the negative DROPPED_ROUTE_ROW
@@ -1732,7 +1812,12 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_is_mapped = row_raw >= fx.Int32(0)
         if row_is_mapped:
             row = fx.Uint32(row_raw)
-            if const_expr(remap_rows):
+            if const_expr(fuse_ep_psum):
+                m = fx.Uint32(route_max_m)
+                expert = fx.Uint32(row) // m
+                slot = row - expert * m
+                row = fx.Uint32(starts_lds[expert]) + slot
+            elif const_expr(remap_rows):
                 m = fx.Uint32(route_max_m)
                 expert = fx.Uint32(row) // m
                 slot = row - expert * m
@@ -1741,6 +1826,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     fx.Uint32(buf_scalar_load(ptr_buf_tensor(row_starts), expert))
                     + slot
                 )
+            if const_expr(remap_rows or fuse_ep_psum):
                 is_lane0 = lane == c0_i32
                 if const_expr(ksplit):
                     k_group = fx.Uint32(fx.block_idx.y)
@@ -1750,6 +1836,24 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     store_cond = is_lane0
                 if store_cond:
                     rows_t[route] = row
+                    if const_expr(fuse_ep_psum):
+                        w_f32 = ptr_buf_tensor(gather_w, fx.BFloat16)[route].to(
+                            fx.Float32
+                        )
+                        topk_v = fx.Uint32(ep_topk)
+                        max_tok_v = fx.Uint32(max_tok)
+                        t = fx.Uint32(route) // topk_v
+                        k = fx.Uint32(route) - t * topk_v
+                        enc = fx.Uint32(ptr_buf_tensor(tis)[t])
+                        origin_pe = enc // max_tok_v
+                        origin_lid = enc - origin_pe * max_tok_v
+                        packed = (
+                            origin_pe * fx.Uint32(slot_stride) + origin_lid * topk_v + k
+                        )
+                        ep_p = ptr_buf_tensor(ep_rowmap)
+                        ep_base = row * 2
+                        ep_p[ep_base] = packed
+                        ep_p[ep_base + 1] = w_f32.bitcast(fx.Int32)
 
             scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = row - scale_tile * c_rows_per_tile
@@ -1845,6 +1949,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         numel: fx.Int32,
         num_valid_routes: fx.Pointer,
         src_scale: fx.Pointer,
+        masked_m: fx.Pointer,
+        psum_out: fx.Pointer,
+        gather_w: fx.Pointer,
+        tis: fx.Pointer,
+        ep_rowmap: fx.Pointer,
+        experts: fx.Int32,
+        tile_m: fx.Int32,
+        ep_topk: fx.Int32,
+        max_tok: fx.Int32,
+        slot_stride: fx.Int32,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -1860,6 +1974,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             numel,
             num_valid_routes,
             src_scale,
+            masked_m,
+            psum_out,
+            gather_w,
+            tis,
+            ep_rowmap,
+            experts,
+            tile_m,
+            ep_topk,
+            max_tok,
+            slot_stride,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -2550,6 +2674,9 @@ def build_moe_fused_route_psum_quant_scatter_module(
     topk: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    direct_ep: bool = False,
+    prequantized: bool = False,
+    src_scale_bytes_per_row: int = 0,
 ):
     """Return a JIT launcher for the *fully fused* DeepGEMM contiguous-M stage1 prep.
 
@@ -2627,10 +2754,16 @@ def build_moe_fused_route_psum_quant_scatter_module(
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
+    if prequantized:
+        assert src_scale_bytes_per_row >= L.scale_bytes_per_row
+    src_bytes_per_row = payload_bytes_per_row if prequantized else model_dim * 2
+    payload_dwords_per_lane = payload_bytes_per_lane // 4
 
     module_name = format_kernel_name(
         f"moe_fused_route_psum_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
+        f"{'_ep' if direct_ep else ''}"
+        f"{f'_pq{src_scale_bytes_per_row}' if prequantized else ''}"
     )
 
     # gfx12 split the memory wait counters (s_wait_loadcnt / s_wait_storecnt);
@@ -2640,6 +2773,10 @@ def build_moe_fused_route_psum_quant_scatter_module(
     # L2-coherent cross-CU producer/consumer pattern on gfx1250 (hand-rolled
     # inline-asm coherent global load/store miscompiles here).
     _is_gfx12 = str(L.arch).startswith("gfx12")
+
+    @fx.struct
+    class _RoleStorage:
+        ticket: fx.Array[fx.Int32, 1, 16]
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
@@ -2653,10 +2790,19 @@ def build_moe_fused_route_psum_quant_scatter_module(
         hidden: fx.Pointer,  # (token_num*model_dim,) bf16
         grouped_payload: fx.Pointer,  # (contiguous_m*payload_bytes_per_row,) uint8 out
         grouped_scale: fx.Pointer,  # preshuffled e8m0 out
+        num_valid_tokens: fx.Pointer,  # (1,) i32, read iff direct_ep
+        src_scale: fx.Pointer,  # row-major e8m0, read iff prequantized
+        weight_in: fx.Pointer,  # route weights f32, read iff direct_ep
+        tis: fx.Pointer,  # recv token -> source token encoding, read iff direct_ep
+        ep_rowmap: fx.Pointer,  # contiguous row -> (destination, weight bits)
         numel: Int32,
         experts: Int32,
         tile_m: Int32,
-        num_workers: Int32,
+        num_workers: Int32,  # route worker count
+        quant_workers: Int32,
+        rank: Int32,
+        max_tok: Int32,
+        slot_stride: Int32,
     ):
         """Write ``(contiguous_m//(wmma_rep*16), K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
@@ -2712,24 +2858,40 @@ def build_moe_fused_route_psum_quant_scatter_module(
             )
 
         tid = fx.Uint32(fx.thread_idx.x)
-        bid = fx.Uint32(fx.block_idx.x)
+        role_lds = fx.SharedAllocator().allocate(_RoleStorage).peek().ticket.ptr
+        if tid == c0_i32:
+            role_lds[c0_i32] = fx.Int32(_atomic_add(barrier, c0_i32, c1_i32))
+        gpu.barrier()
+        ticket = fx.Uint32(role_lds[c0_i32])
+        is_route_worker = ticket < fx.Uint32(num_workers)
+        route_slot = ticket
+        quant_slot = ticket - fx.Uint32(num_workers)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave  # tid % wave_size
-        route0 = bid * c_warps_per_block + warp_in_block  # first route this warp owns
+        route0 = route_slot * c_warps_per_block + warp_in_block
         stride = fx.Uint32(num_workers) * c_warps_per_block
 
         topk_ids_t = ptr_buf_tensor(topk_ids)
         count_t = ptr_buf_tensor(count)
+        valid_routes = fx.Uint32(numel)
+        if const_expr(direct_ep):
+            valid_routes = fx.Uint32(ptr_buf_tensor(num_valid_tokens)[c0_i32]) * c_topk
+        route0 = is_route_worker.select(route0, valid_routes)
 
         # ============================ Phase 1: count ============================
         # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds
         # are warp-uniform (lane-independent) so the post-phase gpu.barrier() is hit
         # by every thread of the block.
-        numel_i32 = fx.Uint32(numel)
+        numel_i32 = valid_routes
         for route_i32 in range(route0, numel_i32, stride):
-            expert = fx.Uint32(topk_ids_t[route_i32])
-            if lane == 0:
+            global_expert = fx.Int32(topk_ids_t[route_i32])
+            expert = fx.Uint32(global_expert)
+            keep = global_expert >= c0_i32
+            if const_expr(direct_ep):
+                keep = keep & (global_expert // fx.Int32(experts) == fx.Int32(rank))
+                expert = fx.Uint32(global_expert % fx.Int32(experts))
+            if (lane == 0) & keep:
                 _atomic_add(count, expert, c1_i32)
 
         # ===================== Barrier A + Phase 2: prefix sum ==================
@@ -2738,8 +2900,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
         rocdl.sched_barrier(0)
 
         is_block_leader = tid == c0_i32
-        if is_block_leader:
-            my_arrival = _atomic_add(barrier, c0_i32, c1_i32)
+        if is_block_leader & is_route_worker:
+            my_arrival = _atomic_add(barrier, c1_i32, c1_i32)
             nwm1 = fx.Uint32(num_workers) - 1
             is_last = my_arrival == nwm1
             is_not_last = my_arrival != nwm1
@@ -2781,7 +2943,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 # coherent store/load barrier is unreliable on gfx1250 -- readers can
                 # observe the flag set before starts/psum are visible).
                 _wait_mem()
-                _atomic_add(barrier, c1_i32, c1_i32)
+                _atomic_add(barrier, fx.Int32(2), c1_i32)
 
             # Other blocks: spin on the release flag until the last block publishes.
             if is_not_last:
@@ -2789,7 +2951,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 while rel == 0:
                     # Coherent read via agent-scope atomic add of 0 (reliable on
                     # gfx1250, unlike the inline-asm coherent load).
-                    rel = _atomic_add(barrier, c1_i32, c0_i32)
+                    rel = _atomic_add(barrier, fx.Int32(2), c0_i32)
 
         # All threads converge here; the leader has observed the release flag, so
         # ``starts`` is committed and visible to coherent reads in Phase 3.
@@ -2810,13 +2972,18 @@ def build_moe_fused_route_psum_quant_scatter_module(
         topids_to_rows_t = ptr_buf_tensor(topids_to_rows)
 
         for route_i32 in range(route0, numel_i32, stride):
-            expert = fx.Uint32(topk_ids_t[route_i32])
+            global_expert = fx.Int32(topk_ids_t[route_i32])
+            expert = fx.Uint32(global_expert)
+            keep = global_expert >= c0_i32
+            if const_expr(direct_ep):
+                keep = keep & (global_expert // fx.Int32(experts) == fx.Int32(rank))
+                expert = fx.Uint32(global_expert % fx.Int32(experts))
 
             # lane 0 claims the within-expert slot and reads the (published) per-
             # expert row base; both are warp-uniform, broadcast via readlane.
             slot_on_lane0 = arith.constant(0, type=i32)
             rowbase_on_lane0 = arith.constant(0, type=i32)
-            if lane == 0:
+            if (lane == 0) & keep:
                 slot_on_lane0 = _atomic_add(slot_counter, expert, c1_i32)
                 rowbase_on_lane0 = starts_rd_t[expert]
             slot = fx.Uint32(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
@@ -2827,62 +2994,168 @@ def build_moe_fused_route_psum_quant_scatter_module(
             token = fx.Uint32(route_i32) // fx.Uint32(c_topk)
 
             if lane == 0:
-                topids_to_rows_t[route_i32] = grouped_row
-
-            # per-row scale-preshuffle geometry from the global grouped_row.
-            scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
-            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
-            row_lane16 = row_in_tile - wmma_row * c16_i32
-            scale_row_dword_base = (
-                scale_tile * c_dst_scale_dwords_per_row * c16_i32
-                + wmma_row * c16_i32
-                + row_lane16
-            )
-
-            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
-            lane_in_block = lane - block_in_wave * c_lanes_per_block
-            is_block_lead = lane_in_block == c0_i32
-
-            c = SimpleNamespace(
-                i32=i32,
-                f32=f32,
-                block_iters=block_iters,
-                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                mx_blocks_per_row=mx_blocks_per_row,
-                amax_shuffle_dists=amax_shuffle_dists,
-                is_fp8=is_fp8,
-                use_native=use_native,
-                use_pk8=use_pk8,
-                mx_dtype=mx_dtype,
-                c0_i32=c0_i32,
-                c1_i32=c1_i32,
-                c4_i32=c4_i32,
-                c23_i32=c23_i32,
-                c254_i32=c254_i32,
-                c0_f32=c0_f32,
-                c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                c_wmma_rep=c_wmma_rep,
-                block_in_wave=block_in_wave,
-                lane_in_block=lane_in_block,
-                is_block_lead=is_block_lead,
-                dests=[
-                    SimpleNamespace(
-                        payload_row_i32=grouped_row,
-                        scale_row_dword_base=scale_row_dword_base,
+                topids_to_rows_t[route_i32] = keep.select(
+                    fx.Int32(grouped_row), fx.Int32(DROPPED_ROUTE_ROW)
+                )
+                if const_expr(direct_ep) and keep:
+                    w_f32 = ptr_buf_tensor(weight_in, fx.Float32)[route_i32]
+                    w_f32 = w_f32.to(fx.BFloat16).to(fx.Float32)
+                    token = fx.Uint32(route_i32) // c_topk
+                    k = fx.Uint32(route_i32) - token * c_topk
+                    enc = fx.Uint32(ptr_buf_tensor(tis)[token])
+                    origin_pe = enc // fx.Uint32(max_tok)
+                    origin_lid = enc - origin_pe * fx.Uint32(max_tok)
+                    packed = (
+                        origin_pe * fx.Uint32(slot_stride) + origin_lid * c_topk + k
                     )
-                ],
-                payload_base=payload_base,
-                payload_bytes_per_row=payload_bytes_per_row,
-                hidden_base=hidden_base,
-                feat_bytes_per_row=model_dim * 2,
-                feat_row_i32=token,
-                scale_t=scale_t,
+                    ep_p = ptr_buf_tensor(ep_rowmap)
+                    ep_p[grouped_row * 2] = packed
+                    ep_p[grouped_row * 2 + 1] = w_f32.bitcast(fx.Int32)
+
+            if keep:
+                # per-row scale-preshuffle geometry from the global grouped_row.
+                scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
+                row_in_tile = grouped_row - scale_tile * c_rows_per_tile
+                wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
+                row_lane16 = row_in_tile - wmma_row * c16_i32
+                scale_row_dword_base = (
+                    scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                    + wmma_row * c16_i32
+                    + row_lane16
+                )
+
+                block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+                lane_in_block = lane - block_in_wave * c_lanes_per_block
+                is_block_lead = lane_in_block == c0_i32
+
+                c = SimpleNamespace(
+                    i32=i32,
+                    f32=f32,
+                    block_iters=block_iters,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    mx_blocks_per_row=mx_blocks_per_row,
+                    amax_shuffle_dists=amax_shuffle_dists,
+                    is_fp8=is_fp8,
+                    use_native=use_native,
+                    use_pk8=use_pk8,
+                    mx_dtype=mx_dtype,
+                    c0_i32=c0_i32,
+                    c1_i32=c1_i32,
+                    c4_i32=c4_i32,
+                    c23_i32=c23_i32,
+                    c254_i32=c254_i32,
+                    c0_f32=c0_f32,
+                    c_wave=c_wave,
+                    c_elems_per_lane=c_elems_per_lane,
+                    c_payload_bytes_per_block=c_payload_bytes_per_block,
+                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    c_wmma_rep=c_wmma_rep,
+                    block_in_wave=block_in_wave,
+                    lane_in_block=lane_in_block,
+                    is_block_lead=is_block_lead,
+                    dests=[
+                        SimpleNamespace(
+                            payload_row_i32=grouped_row,
+                            scale_row_dword_base=scale_row_dword_base,
+                        )
+                    ],
+                    payload_base=payload_base,
+                    payload_bytes_per_row=payload_bytes_per_row,
+                    hidden_base=hidden_base,
+                    feat_bytes_per_row=src_bytes_per_row,
+                    feat_row_i32=token,
+                    prequantized=prequantized,
+                    payload_dwords_per_lane=payload_dwords_per_lane,
+                    src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                    src_scale_bytes_per_row=src_scale_bytes_per_row,
+                    scale_t=scale_t,
+                )
+                if const_expr(not direct_ep):
+                    _emit_quant_block_loop(c)
+                else:
+                    if quant_workers == c0_i32:
+                        _emit_quant_block_loop(c)
+
+        if const_expr(direct_ep):
+            # Publish the complete route map before quant specialists consume it.
+            gpu.barrier()
+            if (tid == c0_i32) & is_route_worker:
+                route_done = _atomic_add(barrier, fx.Int32(3), c1_i32)
+                if route_done == fx.Uint32(num_workers) - 1:
+                    _wait_mem()
+                    _atomic_add(barrier, fx.Int32(4), c1_i32)
+            if (tid == c0_i32) & (~is_route_worker):
+                mapped = fx.Uint32(0)
+                while mapped == 0:
+                    rocdl.s_sleep(127)
+                    mapped = _atomic_add(barrier, fx.Int32(4), c0_i32)
+            gpu.barrier()
+
+            quant_route0 = quant_slot * c_warps_per_block + warp_in_block
+            safe_quant_workers = (quant_workers > c0_i32).select(
+                quant_workers, fx.Int32(1)
             )
-            _emit_quant_block_loop(c)
+            quant_stride = fx.Uint32(safe_quant_workers) * c_warps_per_block
+            quant_route0 = is_route_worker.select(valid_routes, quant_route0)
+            for route_i32 in range(quant_route0, valid_routes, quant_stride):
+                row_raw = fx.Int32(topids_to_rows_t[route_i32])
+                if row_raw >= c0_i32:
+                    row = fx.Uint32(row_raw)
+                    source_row = fx.Uint32(route_i32) // c_topk
+                    scale_tile = row // fx.Uint32(c_rows_per_tile)
+                    row_in_tile = row - scale_tile * c_rows_per_tile
+                    wmma_row = row_in_tile // fx.Uint32(c16_i32)
+                    row_lane16 = row_in_tile - wmma_row * c16_i32
+                    scale_row_dword_base = (
+                        scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                        + wmma_row * c16_i32
+                        + row_lane16
+                    )
+                    block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+                    lane_in_block = lane - block_in_wave * c_lanes_per_block
+                    qc = SimpleNamespace(
+                        i32=i32,
+                        f32=f32,
+                        block_iters=block_iters,
+                        payload_base=payload_base,
+                        payload_bytes_per_row=payload_bytes_per_row,
+                        hidden_base=hidden_base,
+                        feat_bytes_per_row=src_bytes_per_row,
+                        feat_row_i32=source_row,
+                        prequantized=prequantized,
+                        payload_dwords_per_lane=payload_dwords_per_lane,
+                        src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                        src_scale_bytes_per_row=src_scale_bytes_per_row,
+                        mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                        mx_blocks_per_row=mx_blocks_per_row,
+                        amax_shuffle_dists=amax_shuffle_dists,
+                        is_fp8=is_fp8,
+                        use_native=use_native,
+                        use_pk8=use_pk8,
+                        mx_dtype=mx_dtype,
+                        c0_i32=c0_i32,
+                        c1_i32=c1_i32,
+                        c4_i32=c4_i32,
+                        c23_i32=c23_i32,
+                        c254_i32=c254_i32,
+                        c0_f32=c0_f32,
+                        c_wave=c_wave,
+                        c_elems_per_lane=c_elems_per_lane,
+                        c_payload_bytes_per_block=c_payload_bytes_per_block,
+                        c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                        c_wmma_rep=c_wmma_rep,
+                        block_in_wave=block_in_wave,
+                        lane_in_block=lane_in_block,
+                        is_block_lead=lane_in_block == c0_i32,
+                        dests=[
+                            SimpleNamespace(
+                                payload_row_i32=row,
+                                scale_row_dword_base=scale_row_dword_base,
+                            )
+                        ],
+                        scale_t=scale_t,
+                    )
+                    _emit_quant_block_loop(qc)
 
     @flyc.jit
     def launch_fused(
@@ -2896,10 +3169,19 @@ def build_moe_fused_route_psum_quant_scatter_module(
         hidden: fx.Pointer,
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
+        num_valid_tokens: fx.Pointer,
+        src_scale: fx.Pointer,
+        weight_in: fx.Pointer,
+        tis: fx.Pointer,
+        ep_rowmap: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         tile_m: fx.Int32,
         num_workers: fx.Int32,
+        quant_workers: fx.Int32,
+        rank: fx.Int32,
+        max_tok: fx.Int32,
+        slot_stride: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -2919,10 +3201,19 @@ def build_moe_fused_route_psum_quant_scatter_module(
             hidden,
             grouped_payload,
             grouped_scale,
+            num_valid_tokens,
+            src_scale,
+            weight_in,
+            tis,
+            ep_rowmap,
             numel,
             experts,
             tile_m,
             num_workers,
+            quant_workers,
+            rank,
+            max_tok,
+            slot_stride,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_THREADS, 1, 1),

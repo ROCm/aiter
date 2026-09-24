@@ -19,6 +19,7 @@ self-hosted-runner:
     - linux-aiter-mi35x-8
     - linux-aiter-mi355-1
     - linux-aiter-mi355-8
+    - box308
 
 config-variables: null
 

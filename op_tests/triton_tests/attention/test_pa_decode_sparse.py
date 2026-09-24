@@ -251,7 +251,7 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 64, 256, 2048])
+@pytest.mark.parametrize("T", [1, 64, 256, 2437])
 @pytest.mark.parametrize("H", [16, 32, 64, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [136, 388, 1024])
@@ -799,6 +799,7 @@ def two_loop_reference(
     T = main_indptr.numel() - 1
     mi, mp = main_idx.long(), main_indptr.long()
     ei, ep = extra_idx.long(), extra_indptr.long()
+    ei = torch.where(ei < 0, -1 - main_pages, ei)  # -1 again after the shift below
     rows, lens = [], []
     for tok in range(T):
         row = torch.cat(
@@ -814,7 +815,7 @@ def two_loop_reference(
     )
 
 
-@pytest.mark.parametrize("T", [1, 32, 64, 128])
+@pytest.mark.parametrize("T", [1, 32, 64, 128, 2437])
 @pytest.mark.parametrize("H", [16, 32, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("main_len", [128])
@@ -883,6 +884,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
     extra_idx = torch.randint(
         0, extra_pool, (T, extra_len), device=device, dtype=torch.int32
     ).reshape(-1)
+    extra_idx[::5] = -1  # -1 sentinels, skipped by the kernel
     extra_indptr = torch.arange(
         0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
     )
