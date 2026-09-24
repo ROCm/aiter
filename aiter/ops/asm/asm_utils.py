@@ -127,6 +127,7 @@ def load_hip():
 
 
 _hip = None
+_hip_launch_kernel_ex = None
 
 
 def _get_hip():
@@ -162,14 +163,31 @@ def _get_hip():
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p),
     ]
-    hip.hipDrvLaunchKernelEx.argtypes = [
+    _hip = hip
+    return _hip
+
+
+def _get_hip_launch_kernel_ex():
+    """Bind the optional cluster-launch entry point only when it is needed."""
+    global _hip_launch_kernel_ex
+    if _hip_launch_kernel_ex is not None:
+        return _hip_launch_kernel_ex
+    hip = _get_hip()
+    try:
+        launch_kernel_ex = hip.hipDrvLaunchKernelEx
+    except AttributeError as exc:
+        raise RuntimeError(
+            "launch_co_cluster requires hipDrvLaunchKernelEx, but the loaded "
+            "HIP runtime does not export it"
+        ) from exc
+    launch_kernel_ex.argtypes = [
         ctypes.POINTER(_HIPLaunchConfig),
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p),
     ]
-    _hip = hip
-    return _hip
+    _hip_launch_kernel_ex = launch_kernel_ex
+    return _hip_launch_kernel_ex
 
 
 def hip_check(err, what):
@@ -296,7 +314,7 @@ def launch_co_cluster(
     cfg.attrs = ctypes.pointer(attr)
     cfg.numAttrs = 1
     hip_check(
-        _get_hip().hipDrvLaunchKernelEx(ctypes.byref(cfg), func, None, extra),
+        _get_hip_launch_kernel_ex()(ctypes.byref(cfg), func, None, extra),
         "hipDrvLaunchKernelEx",
     )
 

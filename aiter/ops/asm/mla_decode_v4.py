@@ -51,6 +51,7 @@ from aiter.ops.asm.asm_utils import (
 # as its softmax pre-scale, independent of head_size (mirror asm_mla_v4.cu).
 _KV4_DIM_NOPE = 448
 _KV4_DIM_ROPE = 64
+_KV4_HEAD_DIM = _KV4_DIM_NOPE + _KV4_DIM_ROPE
 
 _MLA_V4_SUBDIR = "mla_v4"
 _MLA_V4_CSV = "mla_v4_asm.csv"
@@ -299,8 +300,13 @@ mla_decode_v4_asm_gfx1250 = register_asm_custom_op(
 # ---------------------------------------------------------------------------
 def mla_v4_fused_slot_f32(num_heads: int, v_head_dim: int) -> int:
     """fp32 elements per (token, split) slot of the fused partial scratch: the
-    kernel pads each slot by one extra head row (``(num_heads + 1) * dv``)."""
-    return (num_heads + 1) * v_head_dim
+    kernel pads each slot by one extra fixed-width head row."""
+    if v_head_dim != _KV4_HEAD_DIM:
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: fused QH32 requires "
+            f"v_head_dim={_KV4_HEAD_DIM}, got {v_head_dim}"
+        )
+    return (num_heads + 1) * _KV4_HEAD_DIM
 
 
 @functools.cache
