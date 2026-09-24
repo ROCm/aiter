@@ -3284,7 +3284,8 @@ def get_2stage_cfgs(
     if (
         cfg is not None
         and cfg.get("run_1stage", False)
-        and activation not in (ActivationType.Silu, ActivationType.Gelu, ActivationType.Swiglu)
+        and activation
+        not in (ActivationType.Silu, ActivationType.Gelu, ActivationType.Swiglu)
     ):
         cfg = None
         logger.warning(
@@ -4526,7 +4527,9 @@ def torch_moe(
                 sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = torch_moe_act(act_input, torch_act, inter_dim, activation=activation)
+            act_out = torch_moe_act(
+                act_input, torch_act, inter_dim, activation=activation
+            )
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))
