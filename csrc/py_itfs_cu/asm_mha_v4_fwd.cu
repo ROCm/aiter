@@ -894,7 +894,8 @@ void fmha_v4_fwd(const at::Tensor& q,
     // so a launch without it leaves the reserved slots at zero and keeps the same code object.
     if(lse.has_value())
     {
-        TORCH_CHECK(lse->is_cuda(), "MHA v4 lse must be a GPU tensor");
+        TORCH_CHECK(lse->is_cuda() && lse->device() == q.device(),
+                    "MHA v4 lse must be a GPU tensor on the same device as Q");
         TORCH_CHECK(lse->scalar_type() == at::kFloat,
                     "MHA v4 lse must be float32, got ",
                     lse->scalar_type());

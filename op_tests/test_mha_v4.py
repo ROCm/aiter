@@ -1895,35 +1895,46 @@ def test_mha_v4_rejects_unusable_seqlens_k():
         )
 
 
-def test_mha_v4_launch_rejects_off_device_seqlens_k():
-    """The launcher hands this pointer straight to the GPU, so it guards independently of Python.
-
-    Driven through the custom op because mha_v4_packed screens the device first.
-    """
+def _launch_bf16_dense(q, out, seqlens_k=None, lse=None):
+    """Drive the dense launcher directly, past the screening mha_v4_packed does first."""
     bf16 = int(AttentionFormat.BF16)
+    torch.ops.aiter.mha_v4_fwd_launch(
+        q,
+        q,
+        q,
+        q,
+        q,
+        q,
+        out,
+        bf16,
+        bf16,
+        bf16,
+        int(AttentionPack.DEFAULT),
+        0,
+        0,
+        0,
+        128**-0.5,
+        seqlens_k,
+        lse,
+    )
+
+
+def test_mha_v4_launch_rejects_off_device_seqlens_k():
+    """The launcher hands this pointer straight to the GPU, so it guards independently of Python."""
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
     out = torch.empty_like(q)
 
     with pytest.raises(RuntimeError, match="same device as Q"):
-        torch.ops.aiter.mha_v4_fwd_launch(
-            q,
-            q,
-            q,
-            q,
-            q,
-            q,
-            out,
-            bf16,
-            bf16,
-            bf16,
-            int(AttentionPack.DEFAULT),
-            0,
-            0,
-            0,
-            128**-0.5,
-            torch.full((2,), 256, dtype=torch.int32),
-            None,
-        )
+        _launch_bf16_dense(q, out, seqlens_k=torch.full((2,), 256, dtype=torch.int32))
+
+
+def test_mha_v4_launch_rejects_off_device_lse():
+    """mha_v4_packed takes an LSE buffer from the caller and never checks where it lives."""
+    q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+
+    with pytest.raises(RuntimeError, match="same device as Q"):
+        _launch_bf16_dense(q, out, lse=torch.empty((2, 4, 256), dtype=torch.float32))
 
 
 @pytest.mark.parametrize(
