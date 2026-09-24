@@ -49,9 +49,9 @@ def _fmha_kv_byte_extent_ge_u32(
 
 
 def _check_fp8_factory(gfx: str, dtype) -> None:
-    # gfx is passed in: get_gfx() at cmdGenFunc (build, honors GPU_ARCHS),
-    # get_gfx_runtime() at the public fp8 API and compile_ops lookup
-    # (live device). compile_ops calls gen_func on every invocation.
+    # gfx is always the live device: get_gfx_runtime(), passed in by both the
+    # public fp8 API and the compile_ops gen_func lookup. compile_ops calls
+    # gen_func on every invocation, so this sits on the hot path.
     key = ck_fmha_factory_key(gfx)
     if key in ("gfx11", "gfx115") and dtype == dtypes.fp8:
         raise NotImplementedError(
@@ -62,10 +62,9 @@ def _check_fp8_factory(gfx: str, dtype) -> None:
 def _check_batch_prefill_arch(gfx: str) -> None:
     """Reject non-gfx9 batch_prefill before CK's api-only stub TORCH_CHECKs.
 
-    cmdGenFunc_mha_batch_prefill passes get_gfx() (build, honors GPU_ARCHS).
-    mha_batch_prefill_func and the compile_ops gen_func lookup path pass
-    get_gfx_runtime() (live device). compile_ops calls gen_func on every
-    invocation, so that path must not use GPU_ARCHS last-token.
+    Always called with get_gfx_runtime() (live device), from both
+    mha_batch_prefill_func and the compile_ops gen_func lookup. compile_ops
+    calls gen_func on every invocation, so this must never read GPU_ARCHS.
     """
     key = ck_fmha_factory_key(gfx)
     if not key.startswith("gfx9"):
@@ -107,11 +106,7 @@ def cmdGenFunc_mha_fwd(
     v_descale: Tensor | None = None,
     sink_ptr: Tensor | None = None,
     gen: Generator | None = None,
-    *,
-    check_build_arch: bool = True,
 ):
-    if check_build_arch:
-        _check_fp8_factory(get_gfx(), q.dtype)
     _, seqlen_q, _, _ = q.shape
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -177,10 +172,9 @@ def cmdGenFunc_mha_fwd(
 def _cmdGenFunc_mha_fwd_lookup(q, *args, **kwargs):
     # compile_ops calls gen_func on every invocation (md_name lookup).
     # Gate on the live device so GPU_ARCHS last-token cannot reject a
-    # gfx12/gfx9 card that has an fp8 factory. Direct cmdGenFunc still
-    # uses get_gfx().
+    # gfx12/gfx9 card that has an fp8 factory.
     _check_fp8_factory(get_gfx_runtime(), q.dtype)
-    return cmdGenFunc_mha_fwd(q, *args, **kwargs, check_build_arch=False)
+    return cmdGenFunc_mha_fwd(q, *args, **kwargs)
 
 
 def common_mha_fwd_fake_tensors(
@@ -915,11 +909,7 @@ def cmdGenFunc_mha_varlen_fwd(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: torch.Tensor | None = None,
-    *,
-    check_build_arch: bool = True,
 ):
-    if check_build_arch:
-        _check_fp8_factory(get_gfx(), q.dtype)
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
@@ -1015,9 +1005,9 @@ def cmdGenFunc_mha_varlen_fwd(
 
 def _cmdGenFunc_mha_varlen_fwd_lookup(q, *args, **kwargs):
     # compile_ops calls gen_func on every invocation (md_name lookup).
-    # Gate on the live device; direct cmdGenFunc still uses get_gfx().
+    # Gate on the live device.
     _check_fp8_factory(get_gfx_runtime(), q.dtype)
-    return cmdGenFunc_mha_varlen_fwd(q, *args, **kwargs, check_build_arch=False)
+    return cmdGenFunc_mha_varlen_fwd(q, *args, **kwargs)
 
 
 def gen_mha_varlen_fwd_fake_tensor(
@@ -1600,11 +1590,7 @@ def cmdGenFunc_mha_batch_prefill(
     seqlen_k: Tensor | None = None,
     sink_ptr: Tensor | None = None,
     gen: Generator | None = None,
-    *,
-    check_build_arch: bool = True,
 ):
-    if check_build_arch:
-        _check_batch_prefill_arch(get_gfx())
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
@@ -1693,9 +1679,9 @@ def cmdGenFunc_mha_batch_prefill(
 def _cmdGenFunc_mha_batch_prefill_lookup(*args, **kwargs):
     # compile_ops calls gen_func on every invocation (md_name lookup), not
     # only on cache miss. Gate on the live device so GPU_ARCHS last-token
-    # cannot reject a gfx9 card (B2). Direct cmdGenFunc still uses get_gfx().
+    # cannot reject a gfx9 card (B2).
     _check_batch_prefill_arch(get_gfx_runtime())
-    return cmdGenFunc_mha_batch_prefill(*args, **kwargs, check_build_arch=False)
+    return cmdGenFunc_mha_batch_prefill(*args, **kwargs)
 
 
 def gen_mha_varlen_bwd_fake_tensors_common(
