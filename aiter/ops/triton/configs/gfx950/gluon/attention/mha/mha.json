@@ -1,10 +1,10 @@
 {
   "fwd": {
     "default": {
-      "BLOCK_M": 128,
+      "BLOCK_M": 256,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 4
+      "num_warps": 8
     },
     "pe": {
       "BLOCK_M": 128,
@@ -17,6 +17,18 @@
       "BLOCK_N": 64,
       "waves_per_eu": 2,
       "num_warps": 4
+    },
+    "causal": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 8
+    },
+    "pe_narrow_v": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 8
     }
   }
 }
