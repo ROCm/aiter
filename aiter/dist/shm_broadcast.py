@@ -50,7 +50,6 @@ from .utils import (
 
 
 class SpinTimer:
-
     def record_activity(self):
         pass
 
@@ -87,7 +86,6 @@ class SpinSleepTimer(SpinTimer):
 
 
 class ShmRingBuffer:
-
     def __init__(
         self,
         n_reader: int,
@@ -241,7 +239,6 @@ class Handle:
 
 
 class MessageQueue:
-
     def __init__(
         self,
         n_reader,  # number of all readers
@@ -344,7 +341,7 @@ class MessageQueue:
             # anything undelivered instead of blocking teardown.
             try:
                 ctx.destroy(linger=0)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110
                 pass
             self.context = None
             self.local_socket = None
