@@ -1511,8 +1511,8 @@
     },
     "module_pa_mqa_logits_mxfp4_opus": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_mqa_logits_mxfp4_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/pa_mqa_logits_mxfp4_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/pa_mqa_logits/pa_mqa_logits_mxfp4_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/pa_mqa_logits/pa_mqa_logits_mxfp4_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
