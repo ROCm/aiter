@@ -5,6 +5,7 @@ import functools
 import os
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 import torch
@@ -1317,6 +1318,9 @@ def _fused_moe_impl(
             and getattr(w2, "is_shuffled", False),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
+            # Resolved here rather than read inside get_2stage_cfgs so it lands in
+            # that function's lru_cache key.
+            moe_regime=get_moe_regime(),
             q_dtype_a2=quant_dtype_a2,
             input_dtype=hidden_states.dtype,
             has_stage2_scatter=stage2_scatter is not None,
@@ -1794,6 +1798,63 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+
+# ---- per-regime tuned tables -------------------------------------------------
+# Prefill and decode route to completely different experts, so they want
+# different kernels for the *same* shape. The tuned key cannot separate them on
+# its own: it carries get_padded_M(M), and both regimes land in the same padded
+# buckets (on a DSV4 EP8 deployment every bucket 512..32768 is first resolved
+# during decode CUDA-graph capture, and prefill then hits the same lru_cache
+# entries). Whoever resolves a bucket first therefore decides the kernel for
+# both regimes.
+#
+# So the regime has to be an explicit input. AITER_CONFIG_FMOE_PREFILL /
+# AITER_CONFIG_FMOE_DECODE name a table per regime; the host sets the active
+# regime with set_moe_regime() and get_2stage_cfgs takes it as a cached
+# argument, so the two regimes get separate cache entries rather than
+# overwriting each other. Unset, everything falls back to AITER_CONFIG_FMOE and
+# behaviour is exactly as before.
+#
+# Note this is deliberately not aiter's `config_file=` argument: that selects
+# the dedicated FHMoE path, which needs extra index columns and raises
+# NotImplementedError on any key miss.
+_MOE_REGIME_ENV = {
+    "prefill": "AITER_CONFIG_FMOE_PREFILL",
+    "decode": "AITER_CONFIG_FMOE_DECODE",
+}
+_active_moe_regime = ""
+
+
+def set_moe_regime(regime):
+    """Select the tuned table for subsequent MoE calls ('prefill'/'decode'/'')."""
+    global _active_moe_regime
+    regime = regime or ""
+    if regime and regime not in _MOE_REGIME_ENV:
+        raise ValueError(f"unknown MoE regime {regime!r}")
+    prev, _active_moe_regime = _active_moe_regime, regime
+    return prev
+
+
+def get_moe_regime():
+    return _active_moe_regime
+
+
+@contextmanager
+def moe_regime(regime):
+    prev = set_moe_regime(regime)
+    try:
+        yield
+    finally:
+        set_moe_regime(prev)
+
+
+def moe_regime_config_file(regime):
+    """Tuned table for `regime`, or None to use the default table."""
+    env = _MOE_REGIME_ENV.get(regime or "")
+    path = os.environ.get(env) if env else None
+    return path or None
+
+
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -2879,6 +2940,7 @@ def get_2stage_cfgs(
     opus_weights_shuffled=None,
     config_file=None,
     _disable_inline_sort=False,
+    moe_regime="",
     q_dtype_a2=None,
     input_dtype=None,
     has_stage2_scatter=False,
@@ -2991,11 +3053,15 @@ def get_2stage_cfgs(
         return primary, fallback
 
     global cfg_2stages
-    tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    # A regime table overrides the default one but keeps every normal lookup
+    # semantic (act_type fallback, tier fallback, heuristic on miss); only
+    # config_file switches to the strict dedicated-FHMoE behaviour.
+    regime_file = moe_regime_config_file(moe_regime)
+    tune_file = config_file or regime_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     config_path = os.path.dirname(tune_file)
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
-    if config_file is None:
+    if config_file is None and regime_file is None:
         if cfg_2stages is None:
             cfg_2stages = get_cfg_2stages(tune_file)
         active_cfg_2stages = cfg_2stages
@@ -4026,6 +4092,7 @@ def fused_moe_2stages(
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        moe_regime=get_moe_regime(),
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
