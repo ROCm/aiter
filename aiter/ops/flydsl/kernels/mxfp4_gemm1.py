@@ -1032,6 +1032,10 @@ def _gemm1_body(
                 a_cur = issue_a_ds_read(read_slot)
                 asc_cur = issue_a_scale_ds_read(K_C - k_stages)
             if const_expr(not inline_quant):
+                # Keep the LDS reads ahead of the next DMA into LDS: if the DMA is
+                # hoisted above them, the waitcnt pass cannot tell the slots apart
+                # and drains every in-flight load (vmcnt(0)) before the reads.
+                rocdl.sched_barrier(0)
                 issue_a_load_lds(write_slot, K_C)
             if const_expr(inline_quant and not prefetch_hidden):
                 h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)

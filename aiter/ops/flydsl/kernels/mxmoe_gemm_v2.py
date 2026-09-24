@@ -1245,18 +1245,8 @@ def atomic_bf16_epilog(
                 fx.copy(reduce_bf16x8, out_frag, out_bf16[None, out_off])
         else:
             for s in range_constexpr(BN // store_group_n):
-                # adjacent ee=0,1 contiguous -> one 2-wide load.
-                idx0 = row_in_block * BN + col_start + s * store_group_n
                 if const_expr(g2_bf16_lds):
-                    pk = Vec(
-                        lds_vec_load(
-                            lds_acc_base,
-                            idx0 * 2,
-                            Vec.make_type(store_vec, BFloat16),
-                            BFloat16,
-                            align=4,
-                        )
-                    )
+                    pk = lds_pre[mr][s]
                     if const_expr(enable_bias):
                         bias_col = n_block_idx * BN + col_start + s * store_group_n
                         bias0 = load_bias(bias_col)
@@ -1272,15 +1262,7 @@ def atomic_bf16_epilog(
                             Float32,
                         ).to(BFloat16)
                 else:
-                    v2 = Vec(
-                        lds_vec_load(
-                            lds_acc_base,
-                            idx0 * 4,
-                            Vec.make_type(store_vec, Float32),
-                            Float32,
-                            align=8,
-                        )
-                    )
+                    v2 = lds_pre[mr][s]
                     v0 = fx.Float32(v2[0])
                     v1 = fx.Float32(v2[1])
                     if const_expr(enable_bias):
@@ -1300,6 +1282,40 @@ def atomic_bf16_epilog(
                     fx.ptr_store(pk, out_bf16_ptr + out_off)
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
+
+    def lds_pk_load(mr, s):
+        # adjacent ee=0,1 contiguous -> one 2-wide load.
+        idx0 = (fx.Int32(mr * EPI_ROWS) + m_lane) * BN + col_start + s * store_group_n
+        if const_expr(g2_bf16_lds):
+            return Vec(
+                lds_vec_load(
+                    lds_acc_base,
+                    idx0 * 2,
+                    Vec.make_type(store_vec, BFloat16),
+                    BFloat16,
+                    align=4,
+                )
+            )
+        return Vec(
+            lds_vec_load(
+                lds_acc_base,
+                idx0 * 4,
+                Vec.make_type(store_vec, Float32),
+                Float32,
+                align=8,
+            )
+        )
+
+    # Read every row group's C from LDS before the per-row validity branches, so
+    # the LDS latency overlaps instead of serializing read -> wait -> store per row.
+    lds_pre = None
+    if const_expr(
+        not (use_reduce and route_out_fp8) and reduce_store_cache_modifier is None
+    ):
+        lds_pre = [
+            [lds_pk_load(mr, s) for s in range_constexpr(BN // store_group_n)]
+            for mr in range_constexpr(M_REPS)
+        ]
 
     if const_expr(prefetched_ids is not None or (use_reduce and route_out_fp8)):
         rocdl.s_waitcnt(vmcnt=0)
