@@ -312,16 +312,12 @@ def _moe_gemm_a16w4(
 
     # W scale pointers
     WMxScale_base = WMxScale + expt_id * stride_w_mx_e
-    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-        gl.static_assert(stride_w_mx_k is not None)
-        gl.static_assert(stride_w_mx_n is not None)
-        PRESHUFFLE_FACTOR: gl.constexpr = 32
-        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
-        SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
-    else:
-        PRESHUFFLE_FACTOR: gl.constexpr = 1
-        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
-        SCALE_BLOCK_N: gl.constexpr = BLOCK_N
+    gl.static_assert(stride_w_mx_k is not None)
+    gl.static_assert(stride_w_mx_n is not None)
+    PRESHUFFLE_FACTOR: gl.constexpr = 32
+    PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
+    SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
+
     offs_w_n_scale = (
         pid_n * SCALE_BLOCK_N
         + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))

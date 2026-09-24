@@ -330,7 +330,7 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    backend: str | Dict | None = None,
+    backend: str | None = None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
