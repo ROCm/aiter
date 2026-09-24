@@ -530,10 +530,31 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
         return;
     }
     const int k_out = RAGGED ? k_take_dev(K, len) : K;
-    const int n4    = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
     uint32_t pivot;
     int eq_needed;
-    block_select_stream<RAGGED>(rif0, n4, len, k_out, s_hist, s_red, s_scan, pivot, eq_needed);
+    // The gather below is given `len` and scans EVERY column, so the pivot has to
+    // see every column too. The plain n4 is `pitch / FP32_EPT`, which truncates:
+    // the pivot search then never counts the last one to three columns, while the
+    // gather still emits them, so the "greater than pivot" bucket overruns its
+    // quota by exactly the number of winners living in that tail and that many
+    // genuine winners are cut instead. Measured through aiter's router on plain
+    // input at m=8 K=512: placing w winners in the tail loses exactly w elements
+    // per row, w = 1, 2, 3 at N % 4 = 1, 2, 3, and nothing at N % 4 == 0.
+    //
+    // block_select_stream's RAGGED parameter only selects load_row_f4<RAGGED> and
+    // the `col < len` predicate, and load_row_f4<true> reads the final partial
+    // vector element-wise. So the ragged instantiation is safe on a plain row and
+    // is what makes the two halves agree.
+    if(!RAGGED && (len % FP32_EPT) != 0)
+    {
+        block_select_stream<true>(
+            rif0, n4_cover(len), len, k_out, s_hist, s_red, s_scan, pivot, eq_needed);
+    }
+    else
+    {
+        const int n4 = RAGGED ? n4_cover(len) : (pitch / FP32_EPT);
+        block_select_stream<RAGGED>(rif0, n4, len, k_out, s_hist, s_red, s_scan, pivot, eq_needed);
+    }
     if(threadIdx.x == 0)
     {
         *s_wgt = 0;
