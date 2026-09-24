@@ -1071,6 +1071,39 @@ def flydsl_gdr_mtp_sglang(
         stream=stream,
     )
 
+_GDN_VARLEN_VITER4_MIN_DRAFT = 4
+_GDN_VARLEN_VITER4_BLOCKS_PER_CU = 1.5
+_GDN_VARLEN_VITER2_BLOCKS_PER_CU = 12.0
+
+
+def _gdn_varlen_viter(n, tokens_per_seq, num_v_heads, head_v_dim, ksplit, block):
+    """Widest v-iteration this launch's grid can pay for.
+
+    A VITER that does not divide the head width is skipped rather than rounded,
+    since the kernel would refuse it.
+    """
+    vlanes = block // ksplit
+    num_sms = get_num_sms()
+    draft = max(1, tokens_per_seq)
+
+    def blocks(viter):
+        vtile = vlanes * viter
+        if head_v_dim % vtile:
+            return None
+        return n * num_v_heads * (head_v_dim // vtile)
+
+    wide = blocks(4)
+    if (
+        draft >= _GDN_VARLEN_VITER4_MIN_DRAFT
+        and wide is not None
+        and wide >= _GDN_VARLEN_VITER4_BLOCKS_PER_CU * num_sms
+    ):
+        return 4
+    mid = blocks(2)
+    if mid is not None and mid >= (_GDN_VARLEN_VITER2_BLOCKS_PER_CU / draft) * num_sms:
+        return 2
+    return 1
+
 
 def flydsl_gdn_decode_varlen(
     *,
@@ -1092,6 +1125,7 @@ def flydsl_gdn_decode_varlen(
     intermediate_state_indices: torch.Tensor | None = None,
     ksplit: int = 8,
     block: int = 256,
+    viter: int | None = None,
 ) -> torch.Tensor:
     """Gated Delta Net decode recurrence over a packed (varlen) batch.
 
@@ -1153,43 +1187,50 @@ def flydsl_gdn_decode_varlen(
         cache_steps = 0
 
     out = q.new_empty(1, T, HV, V)
-    launch = create_gdn_decode_verify_kernel(
-        HV,
-        Hg,
-        V,
-        tokens_per_seq,
-        out.numel() * out.element_size(),
-        state.stride(0),
-        q.stride()[1],
-        k.stride()[1],
-        v.stride()[1],
-        a.stride()[1] if a.ndim == 3 else a.stride()[-2],
-        b.stride()[1] if b.ndim == 3 else b.stride()[-2],
-        float(K**-0.5) if scale is None else float(scale),
-        float(softplus_beta),
-        float(softplus_threshold),
-        not disable_state_update,
-        cache_states,
-        int(cache_steps),
-        str(a.dtype),
-        str(b.dtype),
-        ksplit,
-        block,
-    )
-    launch(
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        state,
-        state_indices,
-        out,
-        cu_seqlens,
-        intermediate_states if cache_states else state,
-        intermediate_state_indices if cache_states else state_indices,
-        fx.Int32(n),
-    )
+
+    with CompilationContext.compile_hints({"fastmath": "fast"}):
+        launch = create_gdn_decode_verify_kernel(
+            HV,
+            Hg,
+            V,
+            tokens_per_seq,
+            out.numel() * out.element_size(),
+            state.stride(0),
+            q.stride()[1],
+            k.stride()[1],
+            v.stride()[1],
+            a.stride()[1] if a.ndim == 3 else a.stride()[-2],
+            b.stride()[1] if b.ndim == 3 else b.stride()[-2],
+            float(K**-0.5) if scale is None else float(scale),
+            float(softplus_beta),
+            float(softplus_threshold),
+            not disable_state_update,
+            cache_states,
+            int(cache_steps),
+            str(a.dtype),
+            str(b.dtype),
+            ksplit,
+            block,
+            (
+                _gdn_varlen_viter(n, tokens_per_seq, HV, V, ksplit, block)
+                if viter is None
+                else int(viter)
+            ),
+        )
+        launch(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            out,
+            cu_seqlens,
+            intermediate_states if cache_states else state,
+            intermediate_state_indices if cache_states else state_indices,
+            fx.Int32(n),
+        )
     return out

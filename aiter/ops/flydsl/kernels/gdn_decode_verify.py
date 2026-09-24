@@ -62,15 +62,18 @@ def create_gdn_decode_verify_kernel(
     b_dtype: str,
     KSPLIT: int = 8,
     BLOCK: int = 256,
+    VITER: int = 1,
 ):
     HV, Hg, V, TSTATIC = num_v_heads, num_k_heads, head_v_dim, tokens_per_seq
-    VTILE = BLOCK // KSPLIT
+
+    VLANES = BLOCK // KSPLIT
+    VTILE = VLANES * VITER
     KLOCAL = KDIM // KSPLIT
     NHALF = KLOCAL // HALF
-    if KLOCAL % HALF or VTILE * KSPLIT != BLOCK or V % VTILE:
+    if KLOCAL % HALF or VLANES * KSPLIT != BLOCK or V % VTILE or VITER < 1:
         raise ValueError(
-            f"bad geometry: KSPLIT={KSPLIT} BLOCK={BLOCK} V={V} -> "
-            f"KLOCAL={KLOCAL} VTILE={VTILE}"
+            f"bad geometry: KSPLIT={KSPLIT} BLOCK={BLOCK} VITER={VITER} V={V} -> "
+            f"KLOCAL={KLOCAL} VLANES={VLANES} VTILE={VTILE}"
         )
     group = HV // Hg
     A_DT, B_DT = _dt(a_dtype), _dt(b_dtype)
@@ -155,10 +158,14 @@ def create_gdn_decode_verify_kernel(
         neg_exp_alog = -fx.exp(alog)
 
         sbase = hv * V * KDIM + vcol * KDIM + kbase
-        h = [fx.Vector.filled(HALF, 0.0, fx.Float32) for _ in range(NHALF)]
+        VSTEP = VLANES * KDIM
+        h = [fx.Vector.filled(HALF, 0.0, fx.Float32) for _ in range(VITER * NHALF)]
         if slot >= 0:
             h = [
-                _load_vec(ss, sbase + j * HALF, HALF, fx.BFloat16).to(fx.Float32)
+                _load_vec(ss, sbase + i * VSTEP + j * HALF, HALF, fx.BFloat16).to(
+                    fx.Float32
+                )
+                for i in range(VITER)
                 for j in range(NHALF)
             ]
 
@@ -190,11 +197,13 @@ def create_gdn_decode_verify_kernel(
             bv_in = fx.Float32(
                 _load_vec(bb, tok * b_token_stride + hv, 1, B_DT)[0].to(fx.Float32)
             )
-            vval = fx.Float32(
-                _load_vec(vbuf, tok * v_token_stride + hv * V + vcol, 1, fx.BFloat16)[
-                    0
-                ].to(fx.Float32)
-            )
+            voff = tok * v_token_stride + hv * V + vcol
+            vval = [
+                fx.Float32(
+                    _load_vec(vbuf, voff + i * VLANES, 1, fx.BFloat16)[0].to(fx.Float32)
+                )
+                for i in range(VITER)
+            ]
 
             x = av + dtb
             bx = softplus_beta * x
@@ -207,41 +216,65 @@ def create_gdn_decode_verify_kernel(
             beta = fx.Float32(1.0) / (fx.Float32(1.0) + fx.exp(-bv_in))
 
             hd = [y * decay for y in h]
-            dv_local = functools.reduce(
-                lambda p, c: p + c, [hd[j] * kvec[j] for j in range(NHALF)]
-            )
-            dv = _group_sum(dv_local.reduce(fx.ReductionOp.ADD, fx.Float32(0.0)))
-            vnew = (vval - dv) * beta
-            h = [hd[j] + kvec[j] * vnew for j in range(NHALF)]
+            dv = [
+                _group_sum(
+                    functools.reduce(
+                        lambda p, c: p + c,
+                        [hd[i * NHALF + j] * kvec[j] for j in range(NHALF)],
+                    ).reduce(fx.ReductionOp.ADD, fx.Float32(0.0))
+                )
+                for i in range(VITER)
+            ]
+            vnew = [(vval[i] - dv[i]) * beta for i in range(VITER)]
+            h = [
+                hd[i * NHALF + j] + kvec[j] * vnew[i]
+                for i in range(VITER)
+                for j in range(NHALF)
+            ]
 
-            ov_local = functools.reduce(
-                lambda p, c: p + c, [h[j] * qvec[j] for j in range(NHALF)]
-            )
-            ov = _group_sum(ov_local.reduce(fx.ReductionOp.ADD, fx.Float32(0.0)))
-            oaddr = (kpart == 0).select((tok * HV + hv) * V + vcol, fx.Int64(OOB))
-            _store_vec(
-                ob,
-                oaddr,
-                fx.Vector.from_elements([ov.to(fx.BFloat16)], fx.BFloat16),
-                fx.BFloat16,
-            )
+            ov = [
+                _group_sum(
+                    functools.reduce(
+                        lambda p, c: p + c,
+                        [h[i * NHALF + j] * qvec[j] for j in range(NHALF)],
+                    ).reduce(fx.ReductionOp.ADD, fx.Float32(0.0))
+                )
+                for i in range(VITER)
+            ]
+            obase = (tok * HV + hv) * V + vcol
+            oaddr = [
+                (kpart == 0).select(obase + i * VLANES, fx.Int64(OOB))
+                for i in range(VITER)
+            ]
+            for i in range_constexpr(VITER):
+                _store_vec(
+                    ob,
+                    oaddr[i],
+                    fx.Vector.from_elements([ov[i].to(fx.BFloat16)], fx.BFloat16),
+                    fx.BFloat16,
+                )
 
             if const_expr(cache_states):
                 if cslot >= 0:
-                    for j in range_constexpr(NHALF):
-                        _store_vec(
-                            cb,
-                            t * (HV * V * KDIM) + sbase + j * HALF,
-                            h[j].to(fx.BFloat16),
-                            fx.BFloat16,
-                        )
+                    for i in range_constexpr(VITER):
+                        for j in range_constexpr(NHALF):
+                            _store_vec(
+                                cb,
+                                t * (HV * V * KDIM) + sbase + i * VSTEP + j * HALF,
+                                h[i * NHALF + j].to(fx.BFloat16),
+                                fx.BFloat16,
+                            )
 
         if const_expr(update_state):
             if slot >= 0:
-                for j in range_constexpr(NHALF):
-                    _store_vec(
-                        ss, sbase + j * HALF, h[j].to(fx.BFloat16), fx.BFloat16
-                    )
+                for i in range_constexpr(VITER):
+                    for j in range_constexpr(NHALF):
+                        _store_vec(
+                            ss,
+                            sbase + i * VSTEP + j * HALF,
+                            h[i * NHALF + j].to(fx.BFloat16),
+                            fx.BFloat16,
+                        )
 
     @flyc.jit
     def launch(
