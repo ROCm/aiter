@@ -85,8 +85,10 @@ def _mxfp8_gfx1250_config(M: int, K: int) -> dict:
     tree (see config_utils.select_tuned_config), tuned by a benchmark sweep.
     BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived, not tunable via JSON, when
     M <= 32: BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS >= 4 required by
-    scaled_downcast, see _mxfp8_quant_op) and is capped at 512 to avoid
-    overflowing the TDM descriptor's pad-interval field (see repo notes).
+    scaled_downcast, see _mxfp8_quant_op), is capped at 512 to avoid
+    overflowing the TDM descriptor's pad-interval field (see repo notes), and
+    is narrowed to 128 for K > 1024 (more, narrower CTAs beat one wider tile
+    there; verified with repeated benchmark trials, not just a single sample).
     NUM_BUFFERS defaults to 2 (double-buffered/prefetching loads+stores);
     some rules pin it to 1 (no prefetch, fully synchronous per-tile) --
     empirically found to be both faster and required for correctness there.
@@ -96,7 +98,13 @@ def _mxfp8_gfx1250_config(M: int, K: int) -> dict:
     cfg = select_tuned_config(tuned, M=M, K=K)
     if M <= 32:
         cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
-        cfg["BLOCK_SIZE_N"] = min(4096 // cfg["BLOCK_SIZE_M"], 512)
+        if K <= 1024:
+            cfg["BLOCK_SIZE_N"] = min(4096 // cfg["BLOCK_SIZE_M"], 512)
+        else:
+            # Larger K: a narrower tile wins instead -- more independent
+            # CTAs to hide TDM latency outweighs per-tile transfer
+            # efficiency here (benchmark-verified, ~11-13% at M=8).
+            cfg["BLOCK_SIZE_N"] = 128
     return cfg
 
 
