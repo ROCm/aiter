@@ -821,6 +821,18 @@ def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) 
         )
 
 
+def _empty_lse(q: Tensor, return_lse: bool) -> Optional[Tensor]:  # noqa: UP045
+    """An FP32 ``[batch, heads, Sq]`` LSE buffer for a BSHD ``q``, or None.
+
+    The kernel derives the LSE batch stride as heads * head stride, so this must stay contiguous.
+    """
+    if not return_lse:
+        return None
+    return torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device
+    )
+
+
 def mha_v4_packed(
     q: Tensor,
     k: Tensor,
@@ -929,15 +941,8 @@ def mha_v4_packed(
     elif out.dtype != torch.bfloat16 or out.device != q.device:
         raise ValueError("out must be a BF16 tensor on the same device as Q")
 
-    # The kernel derives the LSE batch stride as heads * head_stride, so this must stay contiguous.
-    if return_lse and lse is None:
-        lse = torch.empty(
-            (batch, query_heads, query_length),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    elif not return_lse:
-        lse = None
+    if lse is None or not return_lse:
+        lse = _empty_lse(q, return_lse)
 
     launch_args = (
         q,
@@ -1319,15 +1324,7 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
         v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
-            lse_out = (
-                torch.empty(
-                    (q.shape[0], q.shape[2], q.shape[1]),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                if return_lse
-                else None
-            )
+            lse_out = _empty_lse(q, return_lse)
             _launch_mxfp4_coalesced(
                 q_quantized,
                 q_descale,
@@ -1362,15 +1359,7 @@ def mha_v4(
         else:
             v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
-            lse_out = (
-                torch.empty(
-                    (q.shape[0], q.shape[2], q.shape[1]),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                if return_lse
-                else None
-            )
+            lse_out = _empty_lse(q, return_lse)
             _launch_mxfp6(
                 q_quantized,
                 q_descale,
