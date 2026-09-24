@@ -419,7 +419,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: gl.constexpr = False,
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
+    APPLY_ROPE: gl.constexpr = True,
 ):
+    # Accepted only to keep the signature aligned with the Triton kernel; the
+    # TDM cos/sin staging below has no NoPE variant.
+    tl.static_assert(APPLY_ROPE, "gluon MLA cat+cache kernel requires rope")
+
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
     L_NOPE: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[8], threads_per_warp=[32], warps_per_cta=[1], order=[0]

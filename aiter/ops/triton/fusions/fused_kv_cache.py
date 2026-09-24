@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from typing import Optional
 
 import torch
 import triton
@@ -134,6 +135,8 @@ def fused_qk_rope_cat_and_cache_mla(
     B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cache is the max number of tokens of kv_cache
     QH must be multiple of KH
 
+    Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
+
     Returns:
     - q_out: The output matrix with shape (B, QH, D1+D2).
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
@@ -150,13 +153,158 @@ def fused_qk_rope_cat_and_cache_mla(
         tuple(kv_cache.shape),
         tuple(slot_mapping.shape),
     )
+    return _cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        pos,
+        cos,
+        sin,
+        k_scale,
+        is_neox,
+        num_decode_toks_for_zeros,
+        apply_scale,
+        q_out,
+        decode_q_pe_out,
+        k_pe_out,
+        q_out_dtype,
+        shuffled_kv_cache,
+        upcast_operand,
+    )
+
+
+def fused_qk_cat_and_cache_mla_fake_tensor(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    num_decode_toks_for_zeros: int = 0,
+    apply_scale: bool = True,
+    q_out: torch.Tensor = None,
+    decode_q_pe_out: torch.Tensor = None,
+    k_pe_out: torch.Tensor = None,
+    q_out_dtype: torch.dtype = None,
+    shuffled_kv_cache: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return fused_qk_rope_cat_and_cache_mla_fake_tensor(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        None,
+        None,
+        None,
+        k_scale,
+        False,
+        num_decode_toks_for_zeros=num_decode_toks_for_zeros,
+        q_out=q_out,
+        decode_q_pe_out=decode_q_pe_out,
+        k_pe_out=k_pe_out,
+        q_out_dtype=q_out_dtype,
+    )
+
+
+@torch_compile_guard(gen_fake=fused_qk_cat_and_cache_mla_fake_tensor)
+def fused_qk_cat_and_cache_mla(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    num_decode_toks_for_zeros: int = 0,
+    apply_scale: bool = True,
+    q_out: torch.Tensor = None,
+    decode_q_pe_out: torch.Tensor = None,
+    k_pe_out: torch.Tensor = None,
+    q_out_dtype: torch.dtype = None,
+    shuffled_kv_cache: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    fused_qk_rope_cat_and_cache_mla for models without a rotary embedding
+    (e.g. Kimi-K3): the PE halves are copied through unrotated, and the q
+    concat, the k concat, the k_scale quantization and the KV-cache write stay
+    fused in one launch. Shapes, outputs and the remaining arguments are those
+    of fused_qk_rope_cat_and_cache_mla.
+
+    Not available on gfx1250: the gluon kernel stages cos/sin through TDM and
+    has no NoPE form.
+    """
+    assert DEVICE_ARCH != "gfx1250", (
+        "fused_qk_cat_and_cache_mla has no gfx1250 kernel; the gluon "
+        "fused_qk_rope_cat_and_cache_mla kernel requires rope"
+    )
+    _LOGGER.info(
+        "FUSED_QK_CAT_AND_CACHE_MLA: q_nope=%s q_pe=%s k_nope=%s k_pe=%s kv_cache=%s slot_mapping=%s",
+        tuple(q_nope.shape),
+        tuple(q_pe.shape),
+        tuple(k_nope.shape),
+        tuple(k_pe.shape),
+        tuple(kv_cache.shape),
+        tuple(slot_mapping.shape),
+    )
+    return _cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        None,
+        None,
+        None,
+        k_scale,
+        False,
+        num_decode_toks_for_zeros,
+        apply_scale,
+        q_out,
+        decode_q_pe_out,
+        k_pe_out,
+        q_out_dtype,
+        shuffled_kv_cache,
+        False,
+    )
+
+
+def _cat_and_cache_mla(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    pos: Optional[torch.Tensor],
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
+    k_scale: torch.Tensor,
+    is_neox: bool,
+    num_decode_toks_for_zeros: int,
+    apply_scale: bool,
+    q_out: Optional[torch.Tensor],
+    decode_q_pe_out: Optional[torch.Tensor],
+    k_pe_out: Optional[torch.Tensor],
+    q_out_dtype: Optional[torch.dtype],
+    shuffled_kv_cache: bool,
+    upcast_operand: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared launch for both entry points; pos=cos=sin=None is the NoPE form."""
+    apply_rope = cos is not None
 
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     kv_cache_dtype = kv_cache.dtype
-    d_freq = cos.shape[-1]
+    d_freq = cos.shape[-1] if apply_rope else d_pe
     assert kv_cache_dtype in [
         torch.bfloat16,
         e4m3_dtype,
@@ -275,6 +423,11 @@ def fused_qk_rope_cat_and_cache_mla(
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
 
+    # The kernel never dereferences these when APPLY_ROPE is False.
+    pos_stride_b = pos.stride(0) if apply_rope else 0
+    cos_stride_b = cos.stride(0) if apply_rope else 0
+    cos_stride_d = cos.stride(-1) if apply_rope else 0
+
     _kernel[grid](
         q_nope,
         q_pe,
@@ -296,9 +449,9 @@ def fused_qk_rope_cat_and_cache_mla(
         *q_pe.stride(),
         *k_nope.stride(),
         *k_pe.stride(),
-        pos.stride(0),
-        cos.stride(0),
-        cos.stride(-1),
+        pos_stride_b,
+        cos_stride_b,
+        cos_stride_d,
         *q_out.stride(),
         *decode_q_pe_out.stride(),
         *k_pe_out.stride(),
@@ -322,6 +475,7 @@ def fused_qk_rope_cat_and_cache_mla(
         OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
+        APPLY_ROPE=apply_rope,
         num_warps=1,
     )
 

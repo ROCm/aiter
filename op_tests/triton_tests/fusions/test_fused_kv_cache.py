@@ -3,6 +3,7 @@ import torch
 import triton
 
 from aiter.ops.triton.fusions.fused_kv_cache import (
+    fused_qk_cat_and_cache_mla,
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_cosine_cache_llama,
     fused_qk_rope_reshape_and_cache,
@@ -258,6 +259,145 @@ def test_fused_qk_rope_cat_and_cache_mla(
         )
         torch.testing.assert_close(torch_zeros, triton_zeros, atol=0.1, rtol=0.1)
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("T", [1, 8, 2048])
+@pytest.mark.parametrize("QH", [16])
+@pytest.mark.parametrize("D_pe", [64])
+@pytest.mark.parametrize("D_lora", [512])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize(
+    "cache_dtype, shuffled_kv_cache, block_size",
+    [
+        (torch.bfloat16, True, 64),
+        (torch.bfloat16, False, 1),
+        (e4m3_dtype, True, 64),
+        # sglang's MLA pool, as Kimi-K3 runs it: flat fp8 (tokens, 1, D).
+        (e4m3_dtype, False, 1),
+    ],
+)
+@pytest.mark.parametrize("mixed_prefill", [False, True])
+@pytest.mark.parametrize("output_zeros", [False, True])
+@pytest.mark.parametrize("padded_slots", [False, True])
+def test_fused_qk_cat_and_cache_mla(
+    T: int,
+    QH: int,
+    D_pe: int,
+    D_lora: int,
+    num_kv_cahce_tokens: int,
+    cache_dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    block_size: int,
+    mixed_prefill: bool,
+    output_zeros: bool,
+    padded_slots: bool,
+):
+    # The gluon kernel has no NoPE form. That also rules out the NVFP4 cache,
+    # which is gfx1250-only.
+    if DEVICE_ARCH == "gfx1250":
+        pytest.skip("fused_qk_cat_and_cache_mla has no gfx1250 kernel")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    KH = 1  # MLA: a single latent KV head
+    D_qk_nope = 128
+    # q exists only for the decode tokens; with mixed_prefill the trailing
+    # tokens just write k (the kernel's tail branch).
+    B = max(T // 2, 1) if mixed_prefill else T
+
+    # Layouts as sglang's MLA absorb path hands them over: q_nope is the
+    # absorbed BMM output (QH, B, D_lora) seen through a transpose, q_pe is the
+    # tail of the q_b_proj split, and k_pe is the tail of the kv_a latent.
+    q_nope = torch.randn((QH, B, D_lora), dtype=dtype, device="cuda").transpose(0, 1)
+    q_pe = torch.randn((B, QH, D_qk_nope + D_pe), dtype=dtype, device="cuda")[
+        ..., D_qk_nope:
+    ]
+    latent = (
+        torch.randn((T, D_lora + D_pe), dtype=torch.float32, device="cuda")
+        / (20 if cache_dtype != torch.bfloat16 else 1)
+    ).to(dtype)
+    k_nope = latent[:, :D_lora].contiguous().unsqueeze(1)
+    k_pe = latent[:, D_lora:].unsqueeze(1)
+
+    if cache_dtype != torch.bfloat16:
+        k_scale = torch.rand([1], dtype=torch.float32, device="cuda")[0]
+    else:
+        k_scale = torch.ones([1], dtype=torch.float32, device="cuda")[0]
+    slot_mapping = torch.randperm(num_kv_cahce_tokens, device="cuda")[:T]
+    if padded_slots:
+        # Kernel contract: slot -1 (padding) writes neither the cache nor
+        # k_pe_out. Every other token, so the decode and the tail branch both
+        # see padded and valid slots.
+        slot_mapping[1::2] = -1
+    valid = slot_mapping >= 0
+
+    # NoPE reference: plain concats, no rotation anywhere.
+    torch_q = torch.cat((q_nope, q_pe), dim=-1)
+    torch_k = torch.cat((k_nope, k_pe), dim=-1)
+    if cache_dtype != torch.bfloat16:
+        torch_k = (torch_k.to(torch.float32) / k_scale).to(torch.bfloat16)
+    torch_kv_cache = torch.zeros(
+        (num_kv_cahce_tokens, KH, D_lora + D_pe), dtype=torch.bfloat16, device="cuda"
+    )
+    torch_kv_cache[slot_mapping[valid]] = torch_k[valid]
+    if shuffled_kv_cache:
+        torch_kv_cache = shuffle_kv_buffer(
+            torch_kv_cache.reshape(
+                num_kv_cahce_tokens // block_size, block_size, KH, D_lora + D_pe
+            ).to(cache_dtype),
+            D_lora,
+        )
+    else:
+        torch_kv_cache = torch_kv_cache.to(cache_dtype)
+    triton_kv_cache = torch.zeros_like(torch_kv_cache)
+
+    # Only 0 or B: the kernel picks rows for the zeros / decode q_pe outputs by
+    # its head-major pid, which matches the token index only in those two cases.
+    num_decode_toks_for_zeros = B if output_zeros else 0
+    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
+        fused_qk_cat_and_cache_mla(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            triton_kv_cache,
+            slot_mapping,
+            k_scale,
+            num_decode_toks_for_zeros=num_decode_toks_for_zeros,
+            apply_scale=(k_pe.dtype != triton_kv_cache.dtype),
+            # sglang hands q to the decode kernel in the cache dtype.
+            q_out_dtype=cache_dtype,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
+    )
+
+    check_kv_buffer(
+        torch_kv_cache,
+        triton_kv_cache,
+        slot_mapping[valid],
+        block_size,
+        shuffled_kv_cache,
+        D_lora,
+        D_pe,
+        dtype,
+    )
+
+    # Everything outside the cache is a pure copy, so bf16 outputs must match
+    # bit for bit; an fp8 q_out may differ by one e4m3 ulp in the cast.
+    if cache_dtype == torch.bfloat16:
+        q_tol = dict(atol=0, rtol=0)
+    else:
+        q_tol = dict(atol=2**-9, rtol=0.125)
+    torch.testing.assert_close(
+        torch_q.to(cache_dtype).to(torch.float32),
+        triton_q.to(torch.float32),
+        **q_tol,
+    )
+    torch.testing.assert_close(k_pe[valid], triton_k_pe[valid], atol=0, rtol=0)
+    if num_decode_toks_for_zeros > 0:
+        torch.testing.assert_close(q_pe, triton_decode_q_pe, atol=0, rtol=0)
+        torch.testing.assert_close(
+            torch.zeros_like(q_nope), triton_zeros, atol=0, rtol=0
+        )
 
 
 @pytest.mark.parametrize("T", [1, 8, 2048])
