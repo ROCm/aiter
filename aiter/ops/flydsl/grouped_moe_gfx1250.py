@@ -30,17 +30,17 @@ _GROUPED_WEIGHT_CACHE = {}
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
-# fused_moe_ rebuilds Stage2ScatterContext without compact fields (custom-op
-# schema). MegaMoE stashes the live plan here for the grouped helper.
-_COMPACT_PLAN_TLS = threading.local()
+# fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
+# (custom-op schema). MegaMoE stashes the live context here for the grouped helper.
+_MEGA_DISPATCH_TLS = threading.local()
 
 
-def set_tdm_compact_plan(ctx: Stage2ScatterContext | None):
-    _COMPACT_PLAN_TLS.ctx = ctx
+def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
+    _MEGA_DISPATCH_TLS.ctx = ctx
 
 
-def _tdm_compact_plan():
-    return getattr(_COMPACT_PLAN_TLS, "ctx", None)
+def _flydsl_dispatch_context():
+    return getattr(_MEGA_DISPATCH_TLS, "ctx", None)
 
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
@@ -473,7 +473,7 @@ def _build_g2l_lut(
             nvr = torch.empty(1, dtype=torch.int32, device=device)
             _get_compiled_g2l_lut(
                 clear_counter=not (
-                    os.environ.get("MEGA_DISPATCH", "") == "tdm"
+                    _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                 )
@@ -602,7 +602,7 @@ def _grouped_a8w4_tdm_moe(
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
-    _compact_ctx = _tdm_compact_plan()
+    _compact_ctx = _flydsl_dispatch_context()
     _compact = bool(
         _compact_ctx is not None and getattr(_compact_ctx, "compact_layout", False)
     )
@@ -700,9 +700,9 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = os.environ.get(
-            "MEGA_DISPATCH", ""
-        ) == "tdm" and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1") in (
+        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
+            "AITER_TDM_DIRECT_EP_MASK", "1"
+        ) in (
             "1",
             "true",
             "True",
@@ -793,7 +793,7 @@ def _grouped_a8w4_tdm_moe(
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
-        and os.environ.get("MEGA_DISPATCH", "") == "tdm"
+        and _flydsl_dispatch_context() is not None
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
@@ -1447,7 +1447,7 @@ def grouped_gemm_gfx1250_a8w4(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    _cctx = _tdm_compact_plan()
+    _cctx = _flydsl_dispatch_context()
     _csv_tokens = token_num
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap

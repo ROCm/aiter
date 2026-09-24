@@ -29,8 +29,9 @@ Launch (4x gfx1250; every env knob below is already the script's default):
       -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine both
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_wire --combine
-           --combine_quant -tpr -hd -id -e -k --shared_E -q
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
+           --stage1_fused --dispatch_wire --combine --combine_quant
+           -tpr -hd -id -e -k --shared_E -q
            --data-init --seed --warmup --iters --prof_replays
 
 ``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
@@ -80,12 +81,9 @@ os.environ.setdefault("ENABLE_CK", "0")
 os.environ.setdefault("AITER_FORCE_A8W4", "0")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
-# Both EP paths go through mori's HIP/JIT dispatch: MORI_V2_KERNEL_BACKEND picks
-# it for the `base` path's EpDispatchCombineOp, MEGA_DISPATCH for the dispatch
-# inside MegaMoEGfx1250. Same dispatch on both sides -> the kernel tables differ
-# only in the combine.
+# The base path uses mori's EpDispatchCombineOp. MegaMoE's dispatch backend is
+# selected independently by --dispatch_backend.
 os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
-os.environ.setdefault("MEGA_DISPATCH", "mori")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
@@ -616,6 +614,8 @@ class DeviceMoEPipeline:
                 quant_type=self.spec["aiter_qtype"],
                 # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
                 dispatch_wire=self.spec["dispatch_wire"],
+                dispatch_backend=self.spec["dispatch_backend"],
+                stage1_fused=self.spec["stage1_fused"],
                 combine_quant=self.combine_quant,
             )
         else:
@@ -1115,6 +1115,10 @@ def main():
     os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
     spec = resolve_spec(args.quant_type)
     spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
+    spec["dispatch_backend"] = args.dispatch_backend
+    spec["stage1_fused"] = bool(args.stage1_fused)
+    if spec["stage1_fused"] and spec["dispatch_backend"] != "flydsl":
+        raise ValueError("--stage1_fused=1 requires --dispatch_backend=flydsl")
 
     if get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
@@ -1139,7 +1143,9 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={args.combine} dispatch_wire={spec['dispatch_wire']} "
+            f"combine={args.combine} dispatch={spec['dispatch_backend']} "
+            f"stage1_fused={spec['stage1_fused']} "
+            f"dispatch_wire={spec['dispatch_wire']} "
             f"combine_quant={args.combine_quant} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} "
@@ -1275,6 +1281,8 @@ def main():
             {
                 "quant_type": args.quant_type,
                 "combine": combine_mode,
+                "dispatch": spec["dispatch_backend"],
+                "stage1_fused": spec["stage1_fused"],
                 "data_init": data_dist,
                 "seed": args.seed,
                 "world_size": dist_ctx.world,
@@ -1432,10 +1440,28 @@ def _parse_args():
         "can stall multi-rank graph-profile runs)",
     )
     p.add_argument(
+        "--dispatch_backend",
+        type=str,
+        choices=["flydsl", "mori"],
+        default=os.environ.get("MEGA_DISPATCH", "flydsl"),
+        help="MegaMoE dispatch implementation: flydsl (TDM) or mori",
+    )
+    p.add_argument(
+        "--stage1_fused",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="use the compact-plan fused stage-1 path (flydsl dispatch only)",
+    )
+    p.add_argument(
         "--dispatch_wire",
         type=str,
         choices=["auto", "bf16", "fp8", "fp4"],
-        default=read_dispatch_wire_env(),
+        default=(
+            read_dispatch_wire_env()
+            if "MEGA_DISPATCH_WIRE" in os.environ or "MEGA_WIRE" in os.environ
+            else "auto"
+        ),
         help="what dispatch puts on the wire, on BOTH combine modes: bf16 sends "
         "activations and the receiver quantizes each copy; fp8/fp4 quantize once "
         "on the sender and forward the e8m0 row. 'auto' picks what the quant "
