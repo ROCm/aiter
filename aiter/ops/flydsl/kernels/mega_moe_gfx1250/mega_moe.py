@@ -1071,6 +1071,9 @@ class MegaMoEGfx1250:
     def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
         self._config = config
         self._closed = False
+        # tokoff-ext slot allocator (built in _build_mori_dispatch when the
+        # mori dispatch backend is on); None otherwise so close() is uniform.
+        self._tokoff_ext = None
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
         self._compact_plan = config.compact_plan
@@ -1518,6 +1521,25 @@ class MegaMoEGfx1250:
         # The kernels dereference the window, so the plans have to outlive them.
         self._mori_plans = plans
 
+        # mori's op layer builds the tokoff-ext slot allocator in
+        # EpDispatchCombineOpHip.__init__; driving EpDispatchPlan directly
+        # bypasses that, leaving EpArgs.tokOffPeers null and dispatch on the
+        # serializing cco-window atomic. Mirror mori's gate (default on;
+        # MORI_EP_TOKOFF_EXT=0/false/no/off opts out) so the env var is not
+        # dead on this path. Reuse mori's builder rather than duplicate its
+        # IPC handle protocol, which must match the kernel byte for byte.
+        if os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
+
+            self._tokoff_ext = TokOffExt(
+                config.rank, config.world_size, self._total_recv.device
+            )
+
         def make_variant(plan):
             def launch(
                 arena_handle,
@@ -1544,6 +1566,11 @@ class MegaMoEGfx1250:
                     dest_pe_token_counter=addr_dest_ctr,
                     total_recv_token_num=addr_total_recv,
                     grid_barrier=addr_disp_bar,
+                    tok_off_peers=(
+                        None
+                        if self._tokoff_ext is None
+                        else self._tokoff_ext.peers
+                    ),
                     num_tokens=inp_cur_tok,
                     # Read off self rather than through the variant's argument
                     # list: the list is shared with the FlyDSL dispatch, whose
@@ -1766,3 +1793,6 @@ class MegaMoEGfx1250:
             return
         self._closed = True
         self._arena.close()
+        if self._tokoff_ext is not None:
+            self._tokoff_ext.close()
+            self._tokoff_ext = None
