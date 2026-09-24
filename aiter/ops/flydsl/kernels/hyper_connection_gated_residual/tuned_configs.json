@@ -1,0 +1,164 @@
+{
+  "gfx950": {
+    "up_gate_mix": {
+      "256": {
+        "block_m": 64,
+        "block_n": 32,
+        "m_waves": 1,
+        "n_waves": 2,
+        "_us": 13.136
+      },
+      "512": {
+        "block_m": 64,
+        "block_n": 32,
+        "m_waves": 1,
+        "n_waves": 1,
+        "_us": 17.421
+      },
+      "1024": {
+        "block_m": 128,
+        "block_n": 32,
+        "m_waves": 2,
+        "n_waves": 1,
+        "_us": 32.474
+      },
+      "2048": {
+        "block_m": 64,
+        "block_n": 64,
+        "m_waves": 1,
+        "n_waves": 2,
+        "_us": 48.345
+      },
+      "4096": {
+        "block_m": 64,
+        "block_n": 32,
+        "m_waves": 1,
+        "n_waves": 1,
+        "_us": 87.241
+      },
+      "8192": {
+        "block_m": 64,
+        "block_n": 32,
+        "m_waves": 1,
+        "n_waves": 1,
+        "_us": 165.803
+      }
+    },
+    "k1": {
+      "4096": {
+        "method": "decouple",
+        "_us": 124.185,
+        "block_k": 64,
+        "dn_block_m": 64,
+        "dn_block_n": 128,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "8192": {
+        "method": "decouple",
+        "_us": 214.784,
+        "block_k": 128,
+        "dn_block_m": 128,
+        "dn_block_n": 128,
+        "dn_m_waves": 4,
+        "dn_n_waves": 2
+      },
+      "12288": {
+        "method": "decouple",
+        "_us": 280.373,
+        "block_k": 64,
+        "dn_block_m": 64,
+        "dn_block_n": 192,
+        "dn_m_waves": 1,
+        "dn_n_waves": 2
+      },
+      "16384": {
+        "method": "decouple",
+        "_us": 326.033,
+        "block_k": 64,
+        "dn_block_m": 64,
+        "dn_block_n": 192,
+        "dn_m_waves": 1,
+        "dn_n_waves": 2
+      },
+      "24576": {
+        "method": "decouple",
+        "_us": 500.85,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 384,
+        "dn_m_waves": 4,
+        "dn_n_waves": 2
+      },
+      "32768": {
+        "method": "decouple",
+        "_us": 586.6,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 384,
+        "dn_m_waves": 4,
+        "dn_n_waves": 2
+      },
+      "49152": {
+        "method": "decouple",
+        "_us": 977.529,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 384,
+        "dn_m_waves": 4,
+        "dn_n_waves": 2
+      },
+      "65536": {
+        "method": "decouple",
+        "_us": 1145.072,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 384,
+        "dn_m_waves": 4,
+        "dn_n_waves": 2
+      },
+      "2048": {
+        "method": "splitk",
+        "_us": 65.369,
+        "split_k": 8,
+        "sk_block_m": 64,
+        "block_k": 64,
+        "dn_block_n": 128,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      }
+    }
+  },
+  "gfx942": {
+    "k1": {
+      "2048": {
+        "method": "splitk",
+        "_us": 169.495,
+        "split_k": 16,
+        "sk_block_m": 64,
+        "block_k": 64,
+        "dn_block_n": 384,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "4096": {
+        "method": "decouple",
+        "_us": 291.411,
+        "block_k": 64,
+        "dn_block_m": 64,
+        "dn_block_n": 128,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "8192": {
+        "method": "decouple",
+        "_us": 518.829,
+        "block_k": 64,
+        "dn_block_m": 64,
+        "dn_block_n": 192,
+        "dn_m_waves": 4,
+        "dn_n_waves": 2
+      }
+    }
+  }
+}
