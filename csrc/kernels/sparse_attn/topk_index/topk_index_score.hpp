@@ -9,7 +9,7 @@
 // not here. The incumbent fp8-Q path (pa_sparse_block_select.hpp) is neither
 // included nor modified.
 
-#include "aiter_hip_common.h"
+#include <hip/hip_runtime.h>
 #include "topk_index_score_kernels.cuh"
 
 // Build constants, fixed like the incumbent's (SPARSE_HEAD_DIM /

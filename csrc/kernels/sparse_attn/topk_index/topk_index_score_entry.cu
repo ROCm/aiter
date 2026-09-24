@@ -6,8 +6,9 @@
 // topk_index_score.hpp. Every unsupported input is refused here with a reason,
 // never routed onto a neighbouring cell.
 
-// aiter_ctypes_error.h needs aiter_detail from the headers this pulls in, so
-// keep it first (blank line stops clang-format from sorting the two together).
+// No device code is instantiated in this entry TU.
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_hip_common.h"
 #include "topk_index_score.hpp"
 
 #include "aiter_ctypes_error.h"
@@ -242,3 +243,4 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(topk_index_score_decode,
                 " aux_k=",
                 aux_k);
 }
+#endif // !__HIP_DEVICE_COMPILE__ && !__HIPCC_RTC__

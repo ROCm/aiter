@@ -85,15 +85,6 @@ fp8x8_to_bf16x8(const vector_t<fp8_t, kPackA>& v)
     return r;
 }
 
-template <typename K_T>
-__device__ __forceinline__ vector_t<bf16_t, kPackA> k_to_bf16(const vector_t<K_T, kPackA>& v)
-{
-    if constexpr(std::is_same_v<K_T, bf16_t>)
-        return v; // bf16 cache: identity (excluded path, ledger D0)
-    else
-        return fp8x8_to_bf16x8(v); // fp8 cache: exact lift
-}
-
 // One wave's work for its whole 128-token blocks. K_T is fp8_t only; the
 // parameter is kept so bf16 is a compile-time refusal rather than a deletion.
 // HEAD_DIM 128, BLOCK_K 128, NUM_HEADS x MAX_Q <= 16, AUX_K in {0, 3}.
@@ -112,19 +103,7 @@ __device__ void decode_index_score_impl(const opus_decode_score_args& a)
     static_assert(BLOCK_K % kMfmaM == 0, "BLOCK_K must be a multiple of 16");
     static_assert(NUM_HEADS * MAX_Q <= kBlockN,
                   "this kernel specialises BLOCK_SIZE_N = 16 (max NUM_HEADS*MAX_Q = 4*4)");
-    // Layer K refusals, fail-closed (integration.md section 8.2).
-#ifndef OPUS_IDX_SCORE_ALLOW_BF16_K
-    static_assert(std::is_same_v<K_T, fp8_t>,
-                  "bf16 index-K is excluded by human decision (integration.md ledger D0): "
-                  "the fallback is the existing Python ValueError, not this kernel");
-#else
-    // PROBE BUILD ONLY. Defined by opus_decode_index_score_bf16_probe.cu and by
-    // nothing else; the shipped translation units never see it, so the tokens
-    // they compile are unchanged (verified by comparing their object hashes
-    // before and after this edit -- the T1 pattern applied to our own TUs).
-    static_assert(std::is_same_v<K_T, fp8_t> || std::is_same_v<K_T, bf16_t>,
-                  "probe build: fp8 or bf16 index-K only");
-#endif
+    static_assert(std::is_same_v<K_T, fp8_t>, "fp8 index-K only");
     static_assert(PAGE_HOIST == 16 && SWIZZLE && HALF_PAD == 0,
                   "aiter builds the accepted config 3 only (PAGE_HOIST=16, SWIZZLE=on, "
                   "HALF_PAD=0); the phase-1 staircase points are not shipped");
@@ -212,9 +191,7 @@ __device__ void decode_index_score_impl(const opus_decode_score_args& a)
     constexpr int kLdsTileBytes = kHalfStride + kHalfBytes; // LDS buffer stride
     static_assert(!kUseLdsStage || kHalfStride % 16 == 0,
                   "the LDS half stride must be 16-B aligned (dwordx4 direct-to-LDS writes)");
-    // 4 waves x B=2 buffers x one 2-KiB M-tile = 16 KiB/workgroup -> 8 waves/SIMD
-    // (invariant I2). The 1-byte dummy keeps a non-staging instantiation at zero
-    // LDS.
+    // 4 waves x 2 buffers x one 2-KiB M-tile = 16 KiB/workgroup.
     __shared__ __align__(128) char lds_raw[kUseLdsStage ? kOpusNumWarps * 2 * kLdsTileBytes : 1];
     auto s_buf = make_smem(reinterpret_cast<K_T*>(&lds_raw[warp * 2 * kLdsTileBytes]));
 
@@ -351,24 +328,7 @@ __device__ void decode_index_score_impl(const opus_decode_score_args& a)
                 // the bit-equality contract (invariant I4), not a preference.
                 vector_t<fp32_t, kPackC> acc = {};
                 static_for<kKChunks>(
-                    [&](auto kc) { acc = mma(k_to_bf16<K_T>(frag[kc.value]), b_frag[kc.value], acc); });
-                fold_tile(acc, mt.value);
-            });
-        }
-        else
-        {
-            // Direct path (no LDS trip). Unreachable in aiter: the static_assert
-            // above refuses every K_T but fp8_t, and fp8_t stages. Retained
-            // verbatim because the bf16 index-K path is a recorded phase-1
-            // exclusion (ledger D0), not a deletion.
-            static_for<kMTiles>([&](auto mt) {
-                vector_t<fp32_t, kPackC> acc = {};
-                static_for<kKChunks>([&](auto kc) {
-                    auto raw = g_k.template load<kPackA, AUX_K>(
-                        (mt.value * kMfmaM + lane_mn) * HEAD_DIM + kc.value * kMfmaK
-                        + lane_g * kPackA);
-                    acc = mma(k_to_bf16<K_T>(raw), b_frag[kc.value], acc);
-                });
+                    [&](auto kc) { acc = mma(fp8x8_to_bf16x8(frag[kc.value]), b_frag[kc.value], acc); });
                 fold_tile(acc, mt.value);
             });
         }
