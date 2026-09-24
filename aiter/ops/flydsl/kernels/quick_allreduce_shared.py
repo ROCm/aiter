@@ -68,10 +68,8 @@ _CM_SC1 = 16
 #   _ST_SYSTEM  global_store_* ... sc0 sc1   (a relaxed system-scope atomic)
 #
 # ``release`` is the sync scope of the release fence that precedes the flag, or
-# None for none. At agent scope the fence is ``buffer_wbl2 sc1`` followed by
-# ``s_waitcnt vmcnt(0)``. The peers are other agents, so the memory model asks
-# for system scope (``buffer_wbl2 sc0 sc1``); agent scope is what has always
-# shipped and is kept until the two are measured against each other.
+# None for none. System scope: the peers are other GPUs, and
+# only a system-scope release orders the payload before the flag for them.
 #
 # ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
 # consecutive quads; see the layouts in the kernel body.
@@ -83,7 +81,7 @@ _CM_SC1 = 16
 _ST_PLAIN = ()
 _ST_NT = (("nontemporal", True),)
 _ST_SYSTEM = (("memory_order", fx.AtomicOrdering.Monotonic),)
-_RELEASE_SCOPE = rocdl.SyncScope.AgentOneAs
+_RELEASE_SCOPE = rocdl.SyncScope.OneAs
 
 _INBOX_POLICY = {
     "uncached": {
@@ -200,10 +198,10 @@ def _store_flag_peer(addr_i64, color, policy):
 def _release_inbox(scope):
     """Release fence over global memory: publish everything stored before it.
 
-    At ``agent-one-as`` the backend emits ``buffer_wbl2 sc1`` followed by
-    ``s_waitcnt vmcnt(0)``: the L2 writeback that a cacheable inbox needs
-    before its flag goes out. ``one-as`` scopes it to global memory, so it does
-    not wait on ``lgkmcnt``.
+    At system scope (``one-as``) the backend emits ``buffer_wbl2 sc0 sc1``
+    followed by ``s_waitcnt vmcnt(0)``: the L2 writeback that a cacheable inbox
+    needs before its flag goes out. ``one-as`` scopes it to global memory, so it
+    does not wait on ``lgkmcnt``.
     """
     fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope=scope)
 
