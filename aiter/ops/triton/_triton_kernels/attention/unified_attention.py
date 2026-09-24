@@ -129,13 +129,10 @@ def kernel_unified_attention_2d(
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
 ):
-    # A config entry setting SPLIT_UNMASKED_LOOP needs SW and SHUF siblings,
-    # identical on every other axis and with the flag off, or windowed and
-    # shuffled calls reach it: the lookup tries those keys first. See the
-    # gfx950 table added in #4761.
+    # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
-        "SPLIT_UNMASKED_LOOP is incompatible with SHUFFLED_KV_CACHE",
+        "SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE",
     )
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SLIDING_WINDOW > 0),
