@@ -40,7 +40,7 @@ Stage then one-line commit when that is the ticket convention.
 
 - [x] 0. Decode baseline: ISA / PMC / ATT vs Live AMD M=1 and M=8
 - [x] 1. AMD-matched decode K LDS map + inverse QK reads
-- [ ] 2. AMD-matched decode V publication (`ds_write_b64` ×4) + inverse PV reads
+- [x] 2. AMD-matched decode V publication (`ds_write_b64` ×4) + inverse PV reads
 - [ ] 3. Cut leftover permute / bpermute / extra waits that AMD decode does not emit
 - [ ] 4. Waitcnt / barrier schedule toward AMD’s decode mix
 - [ ] 5. Split-count specializations (`ns64` at M=1, `ns32` at M=8)
@@ -404,16 +404,71 @@ stores to `ds_write_b32`. Match AMD’s decode V geometry and the
 inverse tr16 sources. Do **not** transplant prefill’s 16×
 `write2st64` lattice; that is a BN64 map and was DNR on decode.
 
-- [ ] Four `ds_write_b64` (or an equivalent pair sequence AMD
+- [x] Four `ds_write_b64` (or an equivalent pair sequence AMD
       actually emits on decode) into the overlaid 8 KiB scratch
       after the K-read barrier.
-- [ ] PV B from that map via 4× `ds_read_b64_tr_b16`, still 4× K16
+- [x] PV B from that map via 4× `ds_read_b64_tr_b16`, still 4× K16
       PV. Drop decode `UniversalCopy64b` / `ds_write_b32` if they
       remain.
-- [ ] Oracle decode+prefill. Record wall / ISA / PMC (conflict/wave
+- [x] Oracle decode+prefill. Record wall / ISA / PMC (conflict/wave
       is the metric that should move first: 1258 → toward 81).
-- [ ] **Done when:** decode V opcode mix is AMD’s 4 write-b64 + 4
+- [x] **Done when:** decode V opcode mix is AMD’s 4 write-b64 + 4
       tr16, MFMA still 8+4, prefill untouched.
+
+Kept (2026-09-24). Decode V stores use Live AMD’s 256-thread 8 KiB
+b64 map, behind `decode_tr_pv` only. Each 8×bf16 gather splits into
+two 4×bf16 `ds_write_b64`:
+
+`A = (tid*16) ^ ((tid & 0xe0)>>2)`, then `A`, `A^8`,
+`(A^64)+4096`, `(A^0x48)+4096`.
+
+PV B is the inverse 4-pack (`amd_decode_v_pack`) + existing
+`LDSReadTrans16_64b` / 4× K16. Not prefill `write2st64`. Oracle
+decode+prefill: **2 passed**. Prefill ISA sha still
+`64ee586155fc6a63`.
+
+**ISA** (`tickets/1047/tmp/k2_decode_vmap_isa/launch/22_final_isa.s`)
+vs phase 1:
+
+| | phase 1 | phase 2 | AMD decode |
+|--|--:|--:|--:|
+| `ds_write_b128` / `b64` / `b32` | 4 / 0 / 2 | **2 / 4 / 2** | **4 / 4 / 0** |
+| `ds_read_b128` / tr16 | 16 / 4 | 16 / **4** | 16 / 4 |
+| K32 / K16 | 8 / 4 | 8 / 4 | 8 / 4 |
+| `s_waitcnt` | 102 | 103 | 33 |
+| `v_bitop3` | 5 | 12 | 6 |
+| `v_perm` / `bpermute` | 34 / 12 | 34 / 12 | 0 / 0 |
+
+V publication is AMD’s `offset:4096` b64 pair. Overlay K is still
+two `ds_write_b128` (AMD’s extra 2 b128 are its `[M,N]` C map). The
+leftover 2 `ds_write_b32 offset:256` are not V overlay (epilogue).
+tr16 is 4 ops but 4 addr VGPRs, not AMD’s one addr + 128/256/384
+immediates (phase 4).
+
+**Wall** (five-run median, interleaved; not a keep-gate) vs phase 1:
+
+| M | phase 1 FlyDSL | phase 2 FlyDSL | AMD wrapper |
+|--:|--:|--:|--:|
+| 1 | 19.22 | 20.38 | 37.50 |
+| 8 | 19.35 | 20.56 | 37.90 |
+| 512 | 156.30 | 156.18 | 199.74 |
+
+**Kernel-trace M=1 split:** **10.503 µs** vs phase 1 **10.459 µs**
+vs AMD **6.406 µs**. Merge ~3.77 µs.
+
+**PMC M=1** (`tickets/1047/tmp/k2_decode_vmap/pmc_flydsl_m1/`) per
+wave vs phase 1:
+
+| | phase 1 | phase 2 | AMD |
+|--|--:|--:|--:|
+| conflict | 677.2 | **96.8** | 80.6 |
+| wait-LDS | 206.5 | **103.0** | 49.8 |
+| busy | 2715.6 | 2560.4 | 769.6 |
+| MFMA tot | 12384 | 12384 | 12384 |
+| VGPR | 108 | 124 | 108 |
+
+Conflict/wave is now **1.2×** AMD (was 8.4×). Phase 3 is leftover
+`v_perm` / `bpermute`.
 
 ### 3. Cut leftover permute / bpermute / extra waits
 
@@ -515,8 +570,13 @@ item.
       into 32 KiB. Decode uses `(tid*16)^((tid&0xe0)>>1)` and
       `(that^0x80)+4096` into 8 KiB. Do not reuse `amd_k_elem` on
       decode.
-- [ ] Whether AMD’s 4 `ds_write_b64` are one 8×bf16 vector split in
+- [x] Whether AMD’s 4 `ds_write_b64` are one 8×bf16 vector split in
       the compiler or an authored 64-bit TV copy (phase 2).
+      **Compiler split of two 8×bf16 gathers.** AMD ISA writes
+      `v[78:79]`/`v[80:81]` then `v[86:87]`/`v[88:89]` from two
+      `buffer_load_dwordx4`. FlyDSL authors the same: lo/hi 4 of
+      each gather with `UniversalCopy64b`. Not a 64-bit TV tile and
+      not `write2st64`.
 - [ ] Whether leftover FlyDSL `v_perm` is softmax/epilogue or K/V
       packing (phase 3).
 - [ ] Whether M=1 still needs `ns64` after the tile matches AMD, or

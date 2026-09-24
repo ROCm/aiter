@@ -121,7 +121,7 @@ def build_qsa_k2_family_a_module(
 
     def make_k_lds_view(k_arr, offset, shape):
         # gfx950 XOR on stride D. Prefill V overlay reuses this map;
-        # decode V stays unswizzled 64-bit stores.
+        # decode V uses the AMD 8 KiB b64 XOR map, not this swizzle.
         if use_k32:
             layout = fx.make_composed_layout(
                 fx.static(fx.SwizzleType.get(3, 3, 3)),
@@ -283,6 +283,24 @@ def build_qsa_k2_family_a_module(
             )
             return _idiv(byte_offset, Int32(2))
 
+        def amd_decode_v_pack(n_tok, d0):
+            # Live AMD decode V (BN16 / 256 threads / 8 KiB): four 64-bit
+            # stores per thread, the compiler split of two 8xbf16 gathers.
+            # Bytes are ``A``, ``A^8``, ``(A^64)+4096``, ``(A^0x48)+4096``
+            # with ``A = (tid*16) ^ ((tid & 0xe0)>>2)``.
+            d_chunk = _idiv(d0, Int32(8))
+            store_tid = (d_chunk % Int32(16)) * Int32(16) + n_tok
+            base_bytes = store_tid * Int32(16)
+            base_bytes = base_bytes ^ _idiv(store_tid & Int32(0xE0), Int32(4))
+            hi = d_chunk >= Int32(16)
+            half = (d0 % Int32(8)) >= Int32(4)
+            lo_addr = half.select(base_bytes ^ Int32(8), base_bytes)
+            hi_addr = half.select(
+                (base_bytes ^ Int32(0x48)) + Int32(4096),
+                (base_bytes ^ Int32(64)) + Int32(4096),
+            )
+            return _idiv(hi.select(hi_addr, lo_addr), Int32(2))
+
         def load_amd_k8(n_tok, d0):
             off = (
                 amd_decode_k_elem(n_tok, d0)
@@ -293,6 +311,15 @@ def build_qsa_k2_family_a_module(
             frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
             fx.copy_atom_call(lds_copy, src, frag)
             return fx.Vector(fx.memref_load_vec(frag))
+
+        def store_amd_v4(byte_addr, vec4):
+            dst = fx.make_view(
+                k_arr.ptr + _idiv(byte_addr, Int32(2)),
+                fx.make_layout(4, 1),
+            )
+            frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
+            fx.memref_store_vec(vec4, frag)
+            fx.copy_atom_call(lds_copy64, frag, dst)
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
@@ -485,14 +512,21 @@ def build_qsa_k2_family_a_module(
                         fx.Vector(fx.memref_load_vec(v_frags[gr])),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    v_tile = fx.make_view(
-                        fx.get_iter(v_lds) + Int32(gr * gather_span),
-                        fx.make_layout((block_n, gather_span), (_D, 1)),
+                    base_bytes = tid * Int32(16)
+                    base_bytes = base_bytes ^ _idiv(tid & Int32(0xE0), Int32(4))
+                    a0 = base_bytes
+                    a1 = base_bytes ^ Int32(8)
+                    if const_expr(gr != 0):
+                        a0 = (base_bytes ^ Int32(64)) + Int32(4096)
+                        a1 = (base_bytes ^ Int32(0x48)) + Int32(4096)
+                    lo = fx.Vector.from_elements(
+                        [v_vec[i] for i in range_constexpr(4)], BFloat16
                     )
-                    v_dst = v64_store.partition_D(v_tile)
-                    v_store_frag = fx.make_fragment_like(v_dst)
-                    fx.memref_store_vec(v_vec, v_store_frag)
-                    fx.copy(lds_copy64, v_store_frag, v_dst)
+                    hi = fx.Vector.from_elements(
+                        [v_vec[i + 4] for i in range_constexpr(4)], BFloat16
+                    )
+                    store_amd_v4(a0, lo)
+                    store_amd_v4(a1, hi)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
             elif const_expr(use_k32):
@@ -601,15 +635,18 @@ def build_qsa_k2_family_a_module(
                     if const_expr(use_k32):
                         d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
                         if const_expr(decode_tr_pv):
-                            sB = fx.make_view(
-                                fx.get_iter(v_lds)
-                                + Int32(ng * 16) * Int32(_D)
-                                + d_base,
-                                fx.make_layout((16, 16), (1, _D)),
+                            src_n = (
+                                Int32(ng * 16)
+                                + lane_kg * Int32(4)
+                                + _idiv(lane_m, Int32(4))
                             )
-                            b_src = pv_b_copy.partition_S(sB)
-                            b_frag = fx.make_fragment_like(b_src)
-                            fx.copy(pv_b_atom, b_src, b_frag)
+                            src_d = d_base + (lane_m % Int32(4)) * Int32(4)
+                            src = fx.make_view(
+                                k_arr.ptr + amd_decode_v_pack(src_n, src_d),
+                                fx.make_layout(4, 1),
+                            )
+                            b_frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
+                            fx.copy_atom_call(pv_b_atom, src, b_frag)
                             v_ops.append(b_frag)
                         else:
                             # ds_read_tr16 transposes a 16-lane x 4-bf16
