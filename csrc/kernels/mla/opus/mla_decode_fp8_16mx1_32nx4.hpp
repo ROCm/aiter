@@ -1195,9 +1195,15 @@ mla_decode_fwd_simple(opus_mla_decode_fp8_kargs kargs,
     }
     else
     {
+        // LARGE_KV waits out the indices here too. Its global_load_lds is inline asm the
+        // compiler does not count, so when the prefetch below first uses an index it waits
+        // with vmcnt(1) / vmcnt(0) -- draining the part of the prefetch already issued, twice
+        // a tile. The indices went out at the end of the previous QK and have had its softmax
+        // and PV to land. The buffer path counts its DMAs and waits exactly; left alone.
+        constexpr int top_wait = T::LARGE_KV ? 0 : T::kv_idx_load_insts;
         for(int t = tile_begin; t < tile_end; ++t)
         {
-            s_waitcnt_vmcnt(number<T::kv_idx_load_insts>{});
+            s_waitcnt_vmcnt(number<top_wait>{});
             stage_end_barrier();
 
             const int nxt_slot_off = kv_slot_off ^ static_cast<int>(T::smem_kv_slot_bytes);

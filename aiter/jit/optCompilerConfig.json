@@ -1984,6 +1984,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_mxfp8_16mx8_32nx1.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx8_32nx1.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx1_32nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx4_64nx1.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_kargs.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_traits.h'"

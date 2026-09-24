@@ -451,6 +451,287 @@ struct opus_mla_decode_fp8_16mx1_16nx8_traits
 };
 
 // ============================================================================
+// Traits for the 16mx4 / 64nx1 variant, the HIP port of the SP3 kernel
+// MLA_A8W8_QH16_1TG_4W_16mx4_64nx1_PS: 4 waves, 64 packed query rows, 64-token tiles.
+//
+// Two decompositions of the same 64 x 64 score block:
+//   GEMM0 (QK)  wave w owns query rows 16w .. 16w+15 against all 64 tokens (16x16x128
+//               f8f6f4, d = 576 padded to 640 in five 128-deep k-steps), so the online
+//               softmax -- row max, row sum, the running m / l -- is wave-private.
+//   GEMM1 (PV)  wave w owns query rows 32*(w/2) .. +31 and output d 256*(w%2) .. +255, with
+//               the full-rate 32x32x64 f8f6f4: eight MFMA per tile. A 32-row operand spans
+//               two GEMM0 waves, so P goes through LDS (and with it each row's rescale
+//               factor, since the wave that owns an O row is not the one that owns its m).
+//
+// KV LDS geometry (design_16mx4_64nx1.xlsx, K_LOAD / V_LOAD): a slot is smem_d_rpt_kv = 5
+// chunks of 128 d; a chunk is 8 blocks of 8 token rows of 128 B, each block exactly one
+// wave's 1 KB buffer_load_lds plus 32 B of padding. The d = 640 pad is real LDS -- the DMA
+// fills it (from the same token's rope, see the kernel) and the K read clears it instead.
+// ============================================================================
+template <int Q_TILE_SIZE_  = 16,
+          int KV_TILE_SIZE_ = 64,
+          int NUM_WARPS_    = 4,
+          typename D_Q_     = fp8_t,
+          typename D_K_     = fp8_t,
+          typename D_OUT_   = bf16_t,
+          bool CAUSAL_      = false,
+          bool LARGE_KV_    = false,
+          int KV_SLOTS_     = 3>
+struct opus_mla_decode_fp8_16mx4_64nx1_traits
+{
+    static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave owns in GEMM0
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_; // tokens one tile carries
+    static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool CAUSAL      = CAUSAL_;
+    static constexpr bool LARGE_KV    = LARGE_KV_;
+    static constexpr int PAGE_SIZE    = 1;
+    // Tile t (QK now, its V read into registers during the same phase), t+1 and t+2 in
+    // flight. V(t-1) already sits in registers when phase t starts, so t-1's slot is free at
+    // the phase's first barrier and t+2 goes into it: a distance-2 prefetch on three slots,
+    // SP3's own scheme.
+    static constexpr int KV_SLOTS = KV_SLOTS_;
+    static_assert(KV_SLOTS == 3, "the phase structure is built around this slot count");
+
+    static constexpr int WARP_SIZE  = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE; // 256, SP3's 1TG_4W
+
+    static constexpr int D_NOPE_SIZE        = 512;
+    static constexpr int D_ROPE_SIZE        = 64;
+    static constexpr int D_HEAD_SIZE        = D_NOPE_SIZE + D_ROPE_SIZE; // 576, row stride
+    static constexpr int D_HEAD_SIZE_PADDED = 640;                       // SP3's H_QK_dim_align
+
+    using D_Q   = D_Q_;
+    using D_K   = D_K_;
+    using D_V   = D_K_; // V is raw fp8 (= K nope), transpose-read from the K LDS
+    using D_OUT = D_OUT_;
+    using D_ACC = float;
+
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    // ----- GEMM0: 16x16x128 f8f6f4 -----
+    static constexpr int W_M      = 16;
+    static constexpr int W_N      = 16;
+    static constexpr int W_K      = 128;
+    static constexpr int W_K_HALF = W_K / 2; // the operand's two 64-deep passes
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;        // 1
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / W_N;       // 4 token tiles, "16m x 4"
+    static constexpr int GEMM0_E_K = D_HEAD_SIZE_PADDED / W_K; // 5
+    // e_n tiles issued two at a time so consecutive MFMA accumulate into different registers.
+    static constexpr int EN_GROUP  = 2;
+    static constexpr int EN_GROUPS = GEMM0_E_N / EN_GROUP; // 2
+    static_assert(GEMM0_E_N % EN_GROUP == 0);
+
+    // ----- GEMM1: 32x32x64 f8f6f4, swap_ab (HW A = V with M = d, HW B = P with N = q) -----
+    static constexpr int W_M_PV = 32;
+    static constexpr int W_N_PV = 32;
+    static constexpr int W_K_PV = 64;
+    static_assert(W_K_PV == KV_TILE_SIZE, "one PV MFMA contracts the whole tile");
+    static constexpr int PV_WAVES_D = 2;                        // waves along d
+    static constexpr int PV_ROWS    = W_N_PV;                   // 32 rows / wave
+    static constexpr int PV_D       = D_NOPE_SIZE / PV_WAVES_D; // 256 d / wave
+    static constexpr int GEMM1_E_N  = PV_D / W_M_PV;            // 8 d-tiles
+    static_assert(PV_ROWS * (NUM_WARPS / PV_WAVES_D) == NUM_WARPS * Q_TILE_SIZE);
+
+    static constexpr int VEC_Q    = 16; // fp8 dwordx4
+    static constexpr int VEC_KV   = 16;
+    static constexpr int VEC_TR_V = 8; // ds_read_b64_tr_b8
+    static constexpr int VEC_P    = 4; // one 16x16 C row-group cast to fp8: ds_write_b32
+    static constexpr int VEC_O    = 4;
+
+    static constexpr int dwordx4_size = 16;
+
+    // ----- KV LDS geometry (K_LOAD) -----
+    static constexpr int smem_row_kv         = W_K;                                    // 128 B
+    static constexpr int smem_linear_wave_kv = WARP_SIZE * dwordx4_size / sizeof(D_K); // 1024
+    static constexpr int smem_rows_per_block = smem_linear_wave_kv / smem_row_kv;      // 8
+    static constexpr int smem_padding_32B    = 32 / sizeof(D_K);
+    static constexpr int smem_kv_block       = smem_linear_wave_kv + smem_padding_32B; // 1056
+    static constexpr int smem_blocks_kv      = KV_TILE_SIZE / smem_rows_per_block;     // 8
+    static constexpr int smem_kv_chunk       = smem_blocks_kv * smem_kv_block;         // 8448
+    static constexpr int smem_d_rpt_kv       = D_HEAD_SIZE_PADDED / smem_row_kv;       // 5
+    // A wave covers smem_rows_per_block tokens per transfer; the 4 waves take 32 tokens per
+    // pass, so each chunk is KV_PASSES transfers per wave.
+    static constexpr int KV_PASSES = smem_blocks_kv / NUM_WARPS; // 2
+    // The pass/block deal: token t of the tile sits in block 4 * (t / 32) + t % 4, row
+    // (t % 32) / 4, so 16 tokens of a pass take 4 rows of every block.
+    static constexpr int smem_rows_per_16tok = 16 / NUM_WARPS;       // 4
+    static constexpr int kv_threads_d        = smem_row_kv / VEC_KV; // 8 lanes per token row
+
+    static constexpr size_t smem_kv_slot_bytes = smem_d_rpt_kv * smem_kv_chunk; // 42240
+
+    // ----- P exchange (V_P) -----
+    // 64 query rows x 64 fp8 tokens; the 16 B groups of a row are XOR-swizzled by (q / 4) % 4
+    // so both the ds_write_b32 of the 16x16 C output and the ds_read_b128 of the 32x32x64
+    // operand stay conflict-free (without it: 4-way and 2-way).
+    static constexpr int smem_p_row       = KV_TILE_SIZE;                  // 64 B
+    static constexpr int P_ROWS           = NUM_WARPS * Q_TILE_SIZE;       // 64
+    static constexpr size_t smem_p_offset = KV_SLOTS * smem_kv_slot_bytes; // 126720
+    static constexpr size_t smem_p_bytes  = P_ROWS * smem_p_row;           // 4096
+    // One float per query row, written as WARP_SIZE / W_M copies so every lane of the 16x16
+    // C layout stores its own (the copy index is its lane group) with no exec juggling. The
+    // copies are ROW_COPY_PITCH floats apart, not P_ROWS: 64 would put all four on one bank.
+    static constexpr int ROW_COPIES            = WARP_SIZE / W_M; // 4
+    static constexpr int ROW_COPY_PITCH        = P_ROWS + 16;     // 80
+    static constexpr size_t smem_row_f32_bytes = ROW_COPIES * ROW_COPY_PITCH * sizeof(float);
+    static constexpr size_t smem_scale_offset  = smem_p_offset + smem_p_bytes;
+    static constexpr size_t smem_lsum_offset   = smem_scale_offset + smem_row_f32_bytes;
+    static_assert(smem_p_offset % 64 == 0, "the P swizzle XORs address bits 4..5");
+
+    // ----- page indices, DMA'd per wave per tile into a ring (the DMA of t+2 reads them) -----
+    static constexpr int IDX_RING           = 4;
+    static constexpr size_t smem_idx_tile   = KV_TILE_SIZE * sizeof(int); // 256 B
+    static constexpr size_t smem_idx_offset = smem_lsum_offset + smem_row_f32_bytes;
+    static constexpr size_t smem_idx_bytes  = IDX_RING * NUM_WARPS * smem_idx_tile; // 4096
+
+    static constexpr size_t smem_bytes() { return smem_idx_offset + smem_idx_bytes; } // 137472
+    static_assert(smem_bytes() <= 160 * 1024, "gfx950 gives a workgroup 160 KB of LDS");
+
+    // ----- per-thread instruction counts (waitcnt budgets) -----
+    static constexpr int kv_buffer_load_insts = KV_PASSES * smem_d_rpt_kv; // 10 per tile
+    static constexpr int kv_index_load_insts  = 1; // one index DMA per wave per tile
+    // One GEMM0 step is EN_GROUP e_n tiles x one 128-deep k, i.e. two VEC_KV reads each.
+    static constexpr int k_step_ds_read_insts = EN_GROUP * (W_K / W_K_HALF);          // 4
+    static constexpr int k_ds_read_insts      = GEMM0_E_N * (D_HEAD_SIZE / W_K_HALF); // 36
+    // One PV d-tile: 64 tokens x 32 d at 8 B per lane.
+    static constexpr int v_ds_read_insts = W_K_PV * W_M_PV / (WARP_SIZE * VEC_TR_V); // 4
+    static constexpr int p_ds_read_insts = W_K_PV * W_N_PV / (WARP_SIZE * VEC_KV);   // 2
+};
+
+// ============================================================================
+// Traits for the 32mx4 / 64nx1 variant, the HIP port of the SP3 kernel
+// MLA_A8W8_QH32_1TG_4W_32mx4_64nx1_PS: 4 waves x 32 packed query rows, 64-token tiles, and
+// the full-rate 32x32x64 f8f6f4 for both GEMMs.
+//
+// Unlike 16mx4 one decomposition serves both GEMMs: wave w owns query rows 32w .. 32w+31
+// against the whole tile in GEMM0 (A = K, M = tokens; B = Q, N = q) and against the whole
+// output d in GEMM1 (A = V, M = d; B = P, N = q). Softmax state and P are wave-private,
+// so nothing but the KV tile crosses waves.
+//
+// LDS geometry (design_32mx4_64nx1.xlsx, K_LOAD / V_LOAD): the 16mx4 K image -- a slot is 5
+// chunks of 128 d, a chunk 8 blocks of 8 token rows x 128 B + 32 B pad, token t in block
+// 4 * (t / 32) + t % 4, row (t % 32) / 4 -- plus a 16 B-group swizzle: rows 4..7 of a block
+// hold their d-groups XORed by one, which takes the K read to conflict-free.
+// ============================================================================
+template <int Q_TILE_SIZE_  = 32,
+          int KV_TILE_SIZE_ = 64,
+          int NUM_WARPS_    = 4,
+          typename D_Q_     = fp8_t,
+          typename D_K_     = fp8_t,
+          typename D_OUT_   = bf16_t,
+          bool CAUSAL_      = false,
+          bool LARGE_KV_    = false,
+          int KV_SLOTS_     = 3,
+          int K_DEPTH_      = 2,
+          int V_DEPTH_      = 4,
+          bool SPLIT_DMA_   = true>
+struct opus_mla_decode_fp8_32mx4_64nx1_traits
+{
+    static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave owns
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_; // tokens one tile carries
+    static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool CAUSAL      = CAUSAL_;
+    static constexpr bool LARGE_KV    = LARGE_KV_;
+    static constexpr int PAGE_SIZE    = 1;
+    // Tile t-1 (PV reads V out of it this phase), t (QK now) and t+1 (in flight). V is too
+    // big to stage in registers (128 per tile), so t-1's slot is busy until PV(t-1) is done
+    // and the DMA runs one phase ahead: phase t issues tile t+1 right behind its barrier.
+    static constexpr int KV_SLOTS = KV_SLOTS_;
+    static_assert(KV_SLOTS == 3, "the phase structure is built around this slot count");
+
+    static constexpr int WARP_SIZE  = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE; // 256, SP3's 1TG_4W
+
+    static constexpr int D_NOPE_SIZE        = 512;
+    static constexpr int D_ROPE_SIZE        = 64;
+    static constexpr int D_HEAD_SIZE        = D_NOPE_SIZE + D_ROPE_SIZE; // 576, row stride
+    static constexpr int D_HEAD_SIZE_PADDED = 640;                       // SP3's H_QK_dim_align
+
+    using D_Q   = D_Q_;
+    using D_K   = D_K_;
+    using D_V   = D_K_; // V is raw fp8 (= K nope), transpose-read from the K LDS
+    using D_OUT = D_OUT_;
+    using D_ACC = float;
+
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    // ----- 32x32x64 f8f6f4, both GEMMs. The operand is 32 B per lane in two 32-deep passes:
+    //       lane l holds row l % 32 and k = 32 * (b / 16) + 16 * (l / 32) + b % 16. -----
+    static constexpr int W_M      = 32;
+    static constexpr int W_N      = 32;
+    static constexpr int W_K      = 64;
+    static constexpr int W_K_HALF = W_K / 2;
+    static_assert(Q_TILE_SIZE == W_N, "a wave's query rows are one MFMA N");
+
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / W_M; // 2 token tiles
+    static constexpr int GEMM0_E_K = D_HEAD_SIZE / W_K;  // 9, the rope is the last k-step
+    static_assert(GEMM0_E_K * W_K == D_HEAD_SIZE);
+    static constexpr int GEMM1_E_M = D_NOPE_SIZE / W_M; // 16 d-tiles
+    static_assert(W_K == KV_TILE_SIZE, "one PV MFMA contracts the whole tile");
+
+    // O is 16 C tiles of 16 floats. The first O_AGPR_TILES live in AGPRs (112), the rest in
+    // VGPRs (144).
+    static constexpr int O_TILE_REGS  = W_M * W_N / WARP_SIZE; // 16
+    static constexpr int O_AGPR_TILES = 7;
+    static constexpr int O_VGPR_TILES = GEMM1_E_M - O_AGPR_TILES; // 9
+
+    // K and V share one register ring: K_DEPTH GEMM0 k-steps (16 registers each, both token
+    // tiles) during QK, V_DEPTH d-tiles (8 each) during PV.
+    static constexpr int K_DEPTH = K_DEPTH_;
+    static constexpr int V_DEPTH = V_DEPTH_;
+    static_assert(K_DEPTH >= 2 && K_DEPTH < GEMM0_E_K);
+    // Release a KV slot a chunk at a time (see SPLIT_DMA in the kernel). Pays on long work
+    // items; on a handful of tiles its extra barrier per phase costs more than it hides.
+    static constexpr bool SPLIT_DMA = SPLIT_DMA_;
+    static_assert(V_DEPTH >= 2 && V_DEPTH < GEMM1_E_M);
+
+    static constexpr int VEC_Q    = 16; // fp8 dwordx4
+    static constexpr int VEC_KV   = 16;
+    static constexpr int VEC_TR_V = 8; // ds_read_b64_tr_b8
+    static constexpr int VEC_O    = 4;
+
+    static constexpr int dwordx4_size = 16;
+
+    // ----- KV LDS geometry (K_LOAD) -----
+    static constexpr int smem_row_kv         = 128;                                    // 128 B
+    static constexpr int smem_linear_wave_kv = WARP_SIZE * dwordx4_size / sizeof(D_K); // 1024
+    static constexpr int smem_rows_per_block = smem_linear_wave_kv / smem_row_kv;      // 8
+    static constexpr int smem_padding_32B    = 32 / sizeof(D_K);
+    static constexpr int smem_kv_block       = smem_linear_wave_kv + smem_padding_32B; // 1056
+    static constexpr int smem_blocks_kv      = KV_TILE_SIZE / smem_rows_per_block;     // 8
+    static constexpr int smem_kv_chunk       = smem_blocks_kv * smem_kv_block;         // 8448
+    static constexpr int smem_d_rpt_kv       = D_HEAD_SIZE_PADDED / smem_row_kv;       // 5
+    static constexpr int KV_PASSES           = smem_blocks_kv / NUM_WARPS;             // 2
+    static constexpr int kv_threads_d        = smem_row_kv / VEC_KV; // 8 lanes per token row
+    static_assert(KV_PASSES * NUM_WARPS * smem_rows_per_block == KV_TILE_SIZE);
+    static_assert(KV_PASSES == GEMM0_E_N, "a DMA pass is exactly one GEMM0 token tile");
+    // The d-group swizzle keys on row >= SWZ_ROW, i.e. on DMA lane >= 32 and on the K
+    // operand's m >= 16.
+    static constexpr int SWZ_ROW = smem_rows_per_block / 2; // 4
+
+    static constexpr size_t smem_kv_slot_bytes = smem_d_rpt_kv * smem_kv_chunk; // 42240
+
+    // ----- page indices, DMA'd per wave per tile into a ring -----
+    static constexpr int IDX_RING           = 4;
+    static constexpr size_t smem_idx_tile   = KV_TILE_SIZE * sizeof(int); // 256 B
+    static constexpr size_t smem_idx_offset = KV_SLOTS * smem_kv_slot_bytes;
+    static constexpr size_t smem_idx_bytes  = IDX_RING * NUM_WARPS * smem_idx_tile;
+    static constexpr size_t smem_bytes() { return smem_idx_offset + smem_idx_bytes; } // 130816
+    static_assert(smem_bytes() <= 160 * 1024, "gfx950 gives a workgroup 160 KB of LDS");
+    static_assert(smem_kv_slot_bytes % 128 == 0 && smem_idx_offset % 128 == 0);
+
+    // ----- per-thread instruction counts (waitcnt budgets) -----
+    static constexpr int kv_buffer_load_insts = KV_PASSES * smem_d_rpt_kv; // 10 per tile
+    static constexpr int kv_index_load_insts  = 1;
+    static constexpr int k_step_ds_read_insts = GEMM0_E_N * (W_K / W_K_HALF);       // 4
+    static constexpr int v_tile_ds_read_insts = W_K * W_M / (WARP_SIZE * VEC_TR_V); // 4
+};
+
+// ============================================================================
 // Traits for the 16mx1 / 32nx4 variant: the M side of 16mx1 (one Q tile every wave shares,
 // staged through LDS) on the N side of 16mx8 (a wave owns KV_TILE_SIZE = 32 tokens and reads
 // them out of the 16mx8 K LDS image), with NUM_WARPS = 4 waves tiling N.

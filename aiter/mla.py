@@ -974,7 +974,7 @@ def mla_decode_fwd(
                 final_lse,
             )
         elif use_hk:
-            aiter.hk_mla_decode_fwd(
+            aiter.hk_mla_v32_decode_fwd(
                 q,
                 kv_buffer,
                 qo_indptr,
