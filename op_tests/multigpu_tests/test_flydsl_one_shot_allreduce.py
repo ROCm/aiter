@@ -75,6 +75,14 @@ SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [(1, 1024), (1, 2048), (1, 30
 GRAPH_CASES = ((8, 5, HIDDEN),)
 GRAPH_REPLAYS = 4
 
+# Pinned configurations a default run covers next to the shipped ladder, for
+# widths no shipped rung uses yet. Block 512 is the widest workgroup; at atoms=4
+# it is a 32 KiB tile, so every shape above is a single partial tile.
+EXTRA_CONFIGS = (
+    {"atoms": 1, "grid_cap": 64, "fanout": "peer", "block": 512, "skip_self": False},
+    {"atoms": 4, "grid_cap": 64, "fanout": "peer", "block": 512, "skip_self": True},
+)
+
 RUN_AHEAD_M = 5
 RUN_AHEAD_ITERS = 200
 SQNR_FLOOR_DB = 45.0
@@ -485,6 +493,10 @@ def main():
             args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
         )
     ]
+    # Nothing pinned on the command line: the shipped ladder, plus the widths it
+    # does not use yet.
+    if configs == [dict.fromkeys(KNOBS)]:
+        configs += [dict(c) for c in EXTRA_CONFIGS]
 
     # Register every row before running any, so each (tp, config) is one spawn.
     shapes = [(int(t), int(h)) for t, h in args.mnk]

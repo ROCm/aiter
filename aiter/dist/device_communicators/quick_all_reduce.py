@@ -242,6 +242,7 @@ class QuickAllReduce:
                     rs_codec=rs_codec,
                     ag_codec=ag_codec,
                     min_bytes=0,
+                    link=link,
                 )
         except Exception:
             logger.warning(

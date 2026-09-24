@@ -17,7 +17,16 @@
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
   passthrough, on an exactly representable input: the result must be
   bit-identical to the fp32 reference, which separates a chunk-addressing or
-  flag-protocol bug from a codec one.
+  flag-protocol bug from a codec one. Swept over ``block`` and, on the mesh,
+  ``skip_self``, which change every address the kernel computes.
+* ``test_quick_allreduce_int4`` again, as a second table -- the shipping INT4
+  ladder with ``block`` and ``skip_self`` overridden on every rung.
+
+Every mesh row also checks that all ranks wrote bit-identical output: each
+rank decodes every chunk from the same packets, its own included, and under
+``skip_self`` it decodes its own from the packet it sent rather than from its
+inbox. The ring's owner stores its chunk before the all-gather quantization, so
+its ranks legitimately differ and only report the count.
 
 Every rank is a ``multiprocessing`` spawn worker that builds its own engine.
 All rows that share an engine configuration ride one spawn. The oracle is an
@@ -56,11 +65,12 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import MESH_ST_LADDER
+from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
+from aiter.ops.flydsl.kernels.quick_allreduce_int4 import mesh_st_ladder
 from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import ring_st_ladder
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import (
+    ATOMS,
     SUPPORTED_WORLDS,
-    TILE_BYTES,
     has_release_fence,
 )
 
@@ -86,9 +96,10 @@ SQNR_MIN_DB = 18.0
 # shipping floor.
 SQNR_MIN_DB_TP8_INT4_RING = 15.0
 
-# A 32 KiB tile the kernel never wrote scores ~0 dB; codec noise stays above 8.
+# A tile the kernel never wrote scores ~0 dB; codec noise stays above 8.
 # Per-tile rather than whole-payload, so one unwritten tile cannot be averaged
-# away by the rest of a large message.
+# away by the rest of a large message. The tile is the engine's own, which
+# ``block`` sets.
 TILE_SQNR_MIN_DB = 8.0
 
 # Calibrated to the INT4 group-16 codec vs fp32 all-reduce, not bit identity.
@@ -128,18 +139,65 @@ PINNED_CODEC_CASES = (
     (8, 512, 5120, "int4", "fp16"),
 )
 
-# (tp, algorithm, tokens, hidden, super_tile) on the lossless fp16 wire.
+# (tp, algorithm, tokens, hidden, super_tile, block, skip_self) on the lossless
+# fp16 wire.
 TRANSPORT_CASES = (
-    (8, "ring", 8, 1024, 1),
-    (8, "ring", 512, 5120, 1),
-    (8, "ring", 4096, 4096, 8),
-    (4, "ring", 512, 5120, 1),
-    (4, "ring", 4096, 4096, 8),
-    (2, "ring", 512, 5120, 1),
-    (8, "mesh", 512, 5120, 1),
-    (8, "mesh", 4096, 4096, 8),
+    (8, "ring", 8, 1024, 1, 256, False),
+    (8, "ring", 512, 5120, 1, 256, False),
+    (8, "ring", 4096, 4096, 8, 256, False),
+    (4, "ring", 512, 5120, 1, 256, False),
+    (4, "ring", 4096, 4096, 8, 256, False),
+    (2, "ring", 512, 5120, 1, 256, False),
+    (8, "mesh", 512, 5120, 1, 256, False),
+    (8, "mesh", 4096, 4096, 8, 256, False),
+    # block and skip_self.
+    (8, "mesh", 512, 5120, 1, 128, True),
+    (8, "mesh", 4096, 4096, 8, 64, True),
+    (8, "ring", 512, 5120, 8, 128, False),
+    (4, "mesh", 512, 5120, 1, 64, False),
+    (4, "mesh", 4096, 4096, 8, 64, True),
+    (4, "mesh", 512, 5120, 1, 128, True),
+    (4, "mesh", 4096, 4096, 8, 128, False),
+    (4, "mesh", 512, 5120, 1, 256, True),
+    (4, "mesh", 4096, 4096, 8, 256, True),
+    (4, "mesh", 512, 5120, 1, 512, True),
+    (4, "mesh", 4096, 4096, 8, 512, False),
+    (4, "ring", 512, 5120, 1, 64, False),
+    (4, "ring", 4096, 4096, 8, 128, False),
+    (4, "ring", 4096, 4096, 8, 512, False),
+    (2, "mesh", 512, 5120, 1, 64, True),
+    (2, "mesh", 4096, 4096, 8, 128, True),
+    (2, "mesh", 512, 5120, 1, 512, False),
+    (2, "mesh", 4096, 4096, 8, 256, True),
+    (2, "ring", 4096, 4096, 8, 64, False),
+    (2, "ring", 512, 5120, 1, 512, False),
+    # Sub-tile and single-tile payloads, where one block owns the lot.
+    (4, "mesh", 8, 1024, 1, 64, True),
+    (2, "mesh", 8, 1024, 8, 512, True),
 )
 TRANSPORT_GRID_CAP = 64
+
+# (tp, algorithm, tokens, hidden, block, skip_self): the shipping INT4 ladder
+# with both knobs overridden on every rung.
+#
+# The TP4 mesh rows at blocks 64 and 128 without skip_self are the ones that
+# caught the VMEM store-data hazard in ``_store_v4i32_peer``: 
+# INT4's peer-major fanout at those widths is where the register
+# allocator recycles the store's data VGPRs. The fp16 transport rows at the
+# same geometry never did.
+KNOB_CASES = (
+    (8, "mesh", 512, 5120, 128, True),
+    (8, "ring", 512, 5120, 128, False),
+    (4, "mesh", 512, 5120, 64, False),
+    (4, "mesh", 512, 5120, 128, False),
+    (4, "mesh", 512, 5120, 64, True),
+    (4, "mesh", 9216, 4096, 128, True),
+    (4, "mesh", 9216, 4096, 512, False),
+    (4, "ring", 9216, 4096, 64, False),
+    (2, "mesh", 512, 5120, 128, True),
+    (2, "mesh", 9216, 4096, 512, True),
+    (2, "ring", 9216, 4096, 128, False),
+)
 
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
 # by peers, so a protocol bug or a dead rank hangs the rest.
@@ -196,8 +254,13 @@ def _make_inp(
     return src.to(device=device, dtype=torch.bfloat16)
 
 
-def _num_tiles(nbytes: int) -> int:
-    return max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
+def _tile_bytes(block: int) -> int:
+    return block * ATOMS * 16
+
+
+def _num_tiles(nbytes: int, block: int) -> int:
+    tile = _tile_bytes(block)
+    return max(1, (nbytes + tile - 1) // tile)
 
 
 def _expected_st(
@@ -205,10 +268,15 @@ def _expected_st(
     *,
     algorithm: str,
     world_size: int,
+    link: str,
     inbox_memory: str,
-    grid_by_st: dict[int, int],
+    grid_by_cfg: dict[tuple, int],
+    block: int | None = None,
+    skip_self: bool | None = None,
 ) -> int:
-    """Mirror of ``QuickAllReduceInt4._pick_st`` for an unpinned engine.
+    """Mirror of ``QuickAllReduceInt4._pick_cfg``'s super-tile for an engine
+    with no super-tile pinned. *block* and *skip_self* are the overrides the
+    engine was built with, ``None`` for the rung's own.
 
     Two rules compose. The payload one: the schedule's ladder assigns a
     super-tile by size -- publishes per rank are ``num_tiles / ST * 2(N-1)``,
@@ -219,25 +287,27 @@ def _expected_st(
     property of the host, so it comes from the rank's reported
     ``inbox_memory`` rather than being assumed.
 
-    *grid_by_st* must hold the engines' *clamped* grids, not the requested
+    *grid_by_cfg* must hold the engines' *clamped* grids, not the requested
     caps: the host reduces them to the measured resident workgroups per CU,
     and the clamped value is what the selection compares against.
     """
     ladder = (
-        MESH_ST_LADDER[world_size]
+        mesh_st_ladder(world_size, link)
         if algorithm == "mesh"
-        else ring_st_ladder(world_size)
+        else ring_st_ladder(world_size, link)
     )
-    want = 1
-    for floor, rung_st, _cap in ladder:
+    want, b, ss = 1, None, None
+    for floor, rung_st, _cap, rung_b, rung_ss in ladder:
         if nbytes >= floor:
-            want = rung_st
+            want, b, ss = rung_st, rung_b, rung_ss
+    b = b if block is None else block
+    ss = ss if skip_self is None else skip_self
     if want == 1:
         return 1
-    tiles = _num_tiles(nbytes)
+    tiles = _num_tiles(nbytes, b)
     if has_release_fence(inbox_memory):
         return want if tiles >= want else 1
-    return want if tiles > grid_by_st[want] else 1
+    return want if tiles > grid_by_cfg[(want, b, ss)] else 1
 
 
 def _sqnr(ref_pow: torch.Tensor, mse: torch.Tensor) -> torch.Tensor:
@@ -255,9 +325,11 @@ def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
     )
 
 
-def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
-    """Worst 32 KiB-tile SQNR, so one unwritten tile cannot be averaged away."""
-    tile_elems = TILE_BYTES // 2
+def _min_tile_sqnr_db(
+    got: torch.Tensor, reference: torch.Tensor, tile_bytes: int
+) -> float:
+    """Worst per-tile SQNR, so one unwritten tile cannot be averaged away."""
+    tile_elems = tile_bytes // 2
     g = got.reshape(-1)
     r = reference.reshape(-1)
     n = int(g.numel())
@@ -280,7 +352,19 @@ def _rel_mae(got: torch.Tensor, reference: torch.Tensor) -> float:
     return err / scale if scale else 0.0
 
 
-def _metrics(out: torch.Tensor, ref: torch.Tensor, rank: int) -> dict:
+def _lanes_differing(out: torch.Tensor, group) -> int:
+    """bf16 lanes where any rank's output differs, bit for bit, from rank 0's."""
+    import torch.distributed as dist
+
+    gathered = [torch.empty_like(out) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, out.contiguous(), group=group)
+    bits = [g.view(torch.int16) for g in gathered]
+    return max(int((b != bits[0]).sum().item()) for b in bits)
+
+
+def _metrics(
+    out: torch.Tensor, ref: torch.Tensor, rank: int, tile_bytes: int, group
+) -> dict:
     got = out.to(torch.float32)
     mismatch = got != ref
     n_mismatch = int(mismatch.sum().item())
@@ -299,7 +383,8 @@ def _metrics(out: torch.Tensor, ref: torch.Tensor, rank: int) -> dict:
     )
     return {
         "sqnr_db": _sqnr_db(got, ref),
-        "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
+        "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref, tile_bytes),
+        "lanes_differing": _lanes_differing(out, group),
         "rel_mae": _rel_mae(got, ref),
         "err": float(err),
         "n_mismatch": n_mismatch,
@@ -313,7 +398,7 @@ def _worst(a: dict, b: dict) -> dict:
     out = dict(a)
     for key in ("sqnr_db", "min_tile_sqnr_db"):
         out[key] = min(a[key], b[key])
-    for key in ("err", "n_mismatch", "max_abs_err"):
+    for key in ("err", "n_mismatch", "max_abs_err", "lanes_differing"):
         out[key] = max(a[key], b[key])
     # NaN must win, so compare with isfinite rather than max().
     if not math.isfinite(b["rel_mae"]) or b["rel_mae"] > a["rel_mae"]:
@@ -384,11 +469,15 @@ def _run_rank(
             dist.all_reduce(ref, group=group)
             dist.barrier()
 
+            nbytes = int(inp.numel()) * int(inp.element_size())
+            cfg_used, _ = fly._pick_cfg(nbytes)
+            tile_bytes = _tile_bytes(cfg_used[1])
+
             out = torch.zeros_like(inp)
             fly.allreduce(inp, out)
             torch.cuda.synchronize()
             dist.barrier()
-            m = _metrics(out, ref, rank)
+            m = _metrics(out, ref, rank, tile_bytes, group)
 
             g = None
             if graph:
@@ -403,14 +492,12 @@ def _run_rank(
                     g.replay()
                     torch.cuda.synchronize()
                     dist.barrier()
-                    m = _worst(m, _metrics(out, ref, rank))
+                    m = _worst(m, _metrics(out, ref, rank, tile_bytes, group))
 
-            nbytes = int(inp.numel()) * int(inp.element_size())
-            # Pass nbytes as well: with a ladder the super-tile is chosen by
-            # payload size, and omitting it silently reports the fallback.
-            st_used = fly._pick_st(_num_tiles(nbytes), nbytes)
+            st_used, block_used, skip_used = cfg_used
             row = {
                 **m,
+                "link": fly.link,
                 "inbox_memory": fly.inbox_memory,
                 # Resolved, not requested: these come from the per-world-size
                 # default unless the caller pinned a lap, and a regression
@@ -418,7 +505,9 @@ def _run_rank(
                 "rs_codec": fly.rs_codec,
                 "ag_codec": fly.ag_codec,
                 "st_used": int(st_used),
-                "grid_by_st": {st: int(e.grid) for st, e in fly._by_st.items()},
+                "block_used": int(block_used),
+                "skip_self_used": bool(skip_used),
+                "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
                 "us": None,
             }
             if time_it:
@@ -516,14 +605,26 @@ def _check(label: str, fails: list[str]) -> bool:
     return not fails
 
 
+def _identity_fails(rows: list[dict], algorithm: str) -> list[str]:
+    """Cross-rank bit-identity, asserted for the mesh onlr."""
+    if algorithm != "mesh":
+        return []
+    return [
+        f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between ranks"
+        for rank, row in enumerate(rows)
+        if row["lanes_differing"]
+    ]
+
+
 def _check_sqnr(
     label: str,
     rows: list[dict],
     *,
     floor: float,
     expected_st: int | None,
+    algorithm: str,
 ) -> bool:
-    fails = []
+    fails = _identity_fails(rows, algorithm)
     for rank, row in enumerate(rows):
         if expected_st is not None and row["st_used"] != expected_st:
             fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
@@ -544,13 +645,23 @@ def _check_sqnr(
     return _check(label, fails)
 
 
-def _shipping_st(rows: list[dict], nbytes: int, algorithm: str, tp: int) -> int:
+def _shipping_st(
+    rows: list[dict],
+    nbytes: int,
+    algorithm: str,
+    tp: int,
+    block: int | None = None,
+    skip_self: bool | None = None,
+) -> int:
     return _expected_st(
         nbytes,
         algorithm=algorithm,
         world_size=tp,
+        link=rows[0]["link"],
         inbox_memory=rows[0]["inbox_memory"],
-        grid_by_st=rows[0]["grid_by_st"],
+        grid_by_cfg=rows[0]["grid_by_cfg"],
+        block=block,
+        skip_self=skip_self,
     )
 
 
@@ -561,20 +672,36 @@ def _summary(rows: list[dict]) -> dict:
         "rs_codec": rows[0]["rs_codec"],
         "ag_codec": rows[0]["ag_codec"],
         "st_used": rows[0]["st_used"],
+        "block_used": rows[0]["block_used"],
+        "skip_self_used": rows[0]["skip_self_used"],
+        "lanes_differing": max(r["lanes_differing"] for r in rows),
         "err": max(r["err"] for r in rows),
         "sqnr_db": min(r["sqnr_db"] for r in rows),
         "min_tile_sqnr_db": min(r["min_tile_sqnr_db"] for r in rows),
     }
 
 
-def _ship_key(tp: int, algorithm: str, grid_cap: int | None) -> tuple:
+def _ship_key(
+    tp: int,
+    algorithm: str,
+    grid_cap: int | None,
+    block: int | None = None,
+    skip_self: bool | None = None,
+) -> tuple:
     kw = {"algorithm": algorithm}
-    if grid_cap is not None:
-        kw["grid_cap"] = grid_cap
+    for name, val in (
+        ("grid_cap", grid_cap),
+        ("block", block),
+        ("skip_self", skip_self),
+    ):
+        if val is not None:
+            kw[name] = val
     return _key(tp, **kw)
 
 
-def _transport_key(tp: int, algorithm: str, super_tile: int) -> tuple:
+def _transport_key(
+    tp: int, algorithm: str, super_tile: int, block: int, skip_self: bool
+) -> tuple:
     return _key(
         tp,
         algorithm=algorithm,
@@ -582,23 +709,36 @@ def _transport_key(tp: int, algorithm: str, super_tile: int) -> tuple:
         grid_cap=TRANSPORT_GRID_CAP,
         rs_codec="fp16",
         ag_codec="fp16",
+        block=block,
+        skip_self=skip_self,
     )
 
 
 @benchmark()
 def test_quick_allreduce_int4(
-    tokens, hidden, dtype, tp, algorithm, grid_cap=None, graph=False
+    tokens,
+    hidden,
+    dtype,
+    tp,
+    algorithm,
+    grid_cap=None,
+    graph=False,
+    block=None,
+    skip_self=None,
 ):
     """Shipping configuration: no codec or super-tile pinned."""
     rows = _result(
-        _ship_key(tp, algorithm, grid_cap), (tokens, hidden, "normal", graph, True)
+        _ship_key(tp, algorithm, grid_cap, block, skip_self),
+        (tokens, hidden, "normal", graph, True),
     )
     nbytes = tokens * hidden * 2
     _check_sqnr(
-        f"tp={tp} {algorithm} {tokens}x{hidden} graph={graph}",
+        f"tp={tp} {algorithm} {tokens}x{hidden} graph={graph} block={block} "
+        f"skip_self={skip_self}",
         rows,
         floor=SQNR_MIN_DB,
-        expected_st=_shipping_st(rows, nbytes, algorithm, tp),
+        expected_st=_shipping_st(rows, nbytes, algorithm, tp, block, skip_self),
+        algorithm=algorithm,
     )
     # (tp - 1) adds per element; codec ALU work is not counted.
     flops = tokens * hidden * (tp - 1)
@@ -638,6 +778,7 @@ def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
             rows,
             floor=SQNR_MIN_DB,
             expected_st=_shipping_st(rows, tokens * hidden * 2, algorithm, tp),
+            algorithm=algorithm,
         )
     ret = _summary(rows)
     ret["rel_mae"] = max(r["rel_mae"] for r in rows)
@@ -655,6 +796,7 @@ def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_code
         rows,
         floor=SQNR_MIN_DB_TP8_INT4_RING,
         expected_st=_shipping_st(rows, tokens * hidden * 2, "ring", tp),
+        algorithm="ring",
     )
     _check(
         label,
@@ -668,7 +810,9 @@ def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_code
 
 
 @benchmark()
-def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile):
+def test_quick_allreduce_transport(
+    tokens, hidden, tp, algorithm, super_tile, block, skip_self
+):
     """fp16 wire, exact-grid input: bit-identical to the fp32 reference.
 
     Exercises chunk/slot addressing, the flag protocol, the super-tile loop and
@@ -676,11 +820,12 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile):
     pinned, so there is no selection to check.
     """
     rows = _result(
-        _transport_key(tp, algorithm, super_tile),
+        _transport_key(tp, algorithm, super_tile, block, skip_self),
         (tokens, hidden, "exact", False, False),
     )
     _check(
-        f"tp={tp} {algorithm} {tokens}x{hidden} st={super_tile} fp16-exact",
+        f"tp={tp} {algorithm} {tokens}x{hidden} st={super_tile} block={block} "
+        f"skip_self={skip_self} fp16-exact",
         [
             f"rank {rank}: {row['n_mismatch']} mismatched elements, "
             f"max |err| {row['max_abs_err']:.3e}, "
@@ -691,6 +836,7 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile):
     )
     return {
         "gfx": ARCH,
+        "st_used": rows[0]["st_used"],
         "n_mismatch": max(r["n_mismatch"] for r in rows),
         "max_abs_err": max(r["max_abs_err"] for r in rows),
     }
@@ -759,6 +905,24 @@ def main():
         "workgroups per CU.",
     )
     parser.add_argument(
+        "--block",
+        type=int,
+        nargs="*",
+        default=[None],
+        choices=(*SUPPORTED_BLOCKS, None),
+        help="Threads per block for the shipping sweep, on every rung. Default:\n"
+        "each rung's own.",
+    )
+    parser.add_argument(
+        "--skip-self",
+        type=int,
+        nargs="*",
+        default=[None],
+        choices=(0, 1, None),
+        help="Pin skip_self off (0) or on (1) for the shipping sweep, on every\n"
+        "rung. Mesh only; ignored for the ring. Default: each rung's own.",
+    )
+    parser.add_argument(
         "-o",
         "--out",
         default=None,
@@ -784,19 +948,37 @@ def main():
     # Register every row before running any, so rows sharing an engine share
     # a spawn.
     ship = []
-    for tp, algorithm, grid_cap in itertools.product(tps, algos, args.grid_cap):
+    for tp, algorithm, grid_cap, block, skip_self in itertools.product(
+        tps, algos, args.grid_cap, args.block, args.skip_self
+    ):
+        skip_self = None if skip_self is None else bool(skip_self)
+        if algorithm != "mesh":
+            skip_self = None
         shapes = args.mnk if args.mnk is not None else SHAPES_PER_WORLD_SIZE[tp]
         for mnk in shapes:
             if not isinstance(mnk, tuple) or len(mnk) != 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
-            ship.append((int(mnk[0]), int(mnk[1]), tp, algorithm, grid_cap, False))
+            row = (int(mnk[0]), int(mnk[1]), tp, algorithm, grid_cap, False)
+            if row + (block, skip_self) not in ship:
+                ship.append(row + (block, skip_self))
     for tp, algorithm, tokens, hidden in GRAPH_CASES:
         if tp in tps and algorithm in algos:
-            ship.append((tokens, hidden, tp, algorithm, args.grid_cap[0], True))
+            ship.append(
+                (tokens, hidden, tp, algorithm, args.grid_cap[0], True, None, None)
+            )
+    # Knob rows only in a default run: pinning --block or --skip-self already
+    # sweeps them over the shipping shapes.
+    knobs = []
+    if args.block == [None] and args.skip_self == [None]:
+        knobs = [
+            (tokens, hidden, tp, algorithm, None, False, block, skip_self)
+            for tp, algorithm, tokens, hidden, block, skip_self in KNOB_CASES
+            if tp in tps and algorithm in algos
+        ]
     if dts:
-        for tokens, hidden, tp, algorithm, grid_cap, graph in ship:
+        for tokens, hidden, tp, algorithm, grid_cap, graph, block, ss in ship + knobs:
             _register(
-                _ship_key(tp, algorithm, grid_cap),
+                _ship_key(tp, algorithm, grid_cap, block, ss),
                 (tokens, hidden, "normal", graph, True),
             )
     edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
@@ -809,19 +991,32 @@ def main():
             (tokens, hidden, "normal", False, False),
         )
     transport = [c for c in TRANSPORT_CASES if c[0] in tps and c[1] in algos]
-    for tp, algorithm, tokens, hidden, st in transport:
+    for tp, algorithm, tokens, hidden, st, block, ss in transport:
         _register(
-            _transport_key(tp, algorithm, st), (tokens, hidden, "exact", False, False)
+            _transport_key(tp, algorithm, st, block, ss),
+            (tokens, hidden, "exact", False, False),
         )
 
-    for dtype in dts:
-        rows = [
+    def _int4_rows(cases):
+        return [
             test_quick_allreduce_int4(
-                tokens, hidden, dtype, tp, algorithm, grid_cap=grid_cap, graph=graph
+                tokens,
+                hidden,
+                dtype,
+                tp,
+                algorithm,
+                grid_cap=grid_cap,
+                graph=graph,
+                block=block,
+                skip_self=ss,
             )
-            for tokens, hidden, tp, algorithm, grid_cap, graph in ship
+            for tokens, hidden, tp, algorithm, grid_cap, graph, block, ss in cases
         ]
+
+    for dtype in dts:
+        rows = _int4_rows(ship)
         _summarize("flydsl quick allreduce INT4", rows)
+        _summarize("flydsl quick allreduce INT4 block/skip_self", _int4_rows(knobs))
         if args.out and rows:
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
             with open(args.out, "w") as fh:
@@ -852,8 +1047,8 @@ def main():
     _summarize(
         "flydsl quick allreduce transport (fp16 wire, bit-exact)",
         [
-            test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st)
-            for tp, algorithm, tokens, hidden, st in transport
+            test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block, ss)
+            for tp, algorithm, tokens, hidden, st, block, ss in transport
         ],
     )
 

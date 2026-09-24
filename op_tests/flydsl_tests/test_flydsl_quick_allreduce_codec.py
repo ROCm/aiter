@@ -18,6 +18,9 @@ Two properties are load-bearing:
   extremum is within 1/16 of the true one; on top of that a value can miss by
   half a step, and one near the extreme can land a whole code short. That gives
   ``|err| <= |ext| * (1/16 + 1.05/bias)`` with no free parameters.
+
+Both are also checked at every workgroup width the codec supports, since the
+plane and scale offsets scale with it and block 64 pads its scale region.
 """
 
 from __future__ import annotations
@@ -44,6 +47,8 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     CODECS,
+    SECTOR_I32,
+    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -51,6 +56,7 @@ from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     _codec_load,
     _codec_quant,
     _scale_from_word,
+    codecs_for_block,
     scale_slot_of,
     thread_lane,
 )
@@ -79,11 +85,13 @@ def _global_i32_ptr(addr_i64):
     return fx.inttoptr(ptr_ty, addr_i64)
 
 
-def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
-    codec = CODECS[codec_name]
+def make_codec_roundtrip_kernel(
+    codec_name: str, via_memory: bool = True, block: int = BLOCK
+):
+    codec = codecs_for_block(block)[codec_name]
     PackStorage = make_pack_storage(codec.rank_tile_i32)
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(known_block_size=[block, 1, 1])
     def codec_roundtrip(
         num_rows: Int32,
         inp_ptr: Int64,
@@ -94,8 +102,8 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        _wave, lane = thread_lane(tid)
-        scale_slot, pair_in_slot = scale_slot_of(tid)
+        _wave, lane = thread_lane(tid, block)
+        scale_slot, pair_in_slot = scale_slot_of(tid, block)
 
         in_ptr = _global_i32_ptr(inp_ptr)
         out_ptr_g = _global_i32_ptr(out_ptr)
@@ -108,8 +116,8 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
         row0 = fx.Int32(0)
 
         def _row_i32_off(row):
-            # 4 i32 (16 B) per thread; BLOCK*4 i32 per row.
-            return row * fx.Int32(BLOCK * 4) + tid * fx.Int32(4)
+            # 4 i32 (16 B) per thread; block*4 i32 per row.
+            return row * fx.Int32(block * 4) + tid * fx.Int32(4)
 
         def _load_atom(row):
             v4 = fx.ptr_load(
@@ -160,7 +168,7 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
             else:
                 _row_in_registers(row)
 
-    flat_wg = f"{BLOCK},{BLOCK}"
+    flat_wg = f"{block},{block}"
 
     @flyc.jit
     def launch(
@@ -176,9 +184,9 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
             out_ptr,
             grid_x,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
-        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    tag = f"{codec_name}_{'mem' if via_memory else 'reg'}"
+    tag = f"{codec_name}_{'mem' if via_memory else 'reg'}_b{block}"
     launch.func.__name__ = f"launch_codec_roundtrip_{tag}"
     try:
         codec_roundtrip.func.__name__ = f"codec_roundtrip_{tag}"
@@ -188,28 +196,30 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
 
 
 @functools.cache
-def _engine(codec_name: str, via_memory: bool):
-    return [make_codec_roundtrip_kernel(codec_name, via_memory), None]
+def _engine(codec_name: str, via_memory: bool, block: int):
+    return [make_codec_roundtrip_kernel(codec_name, via_memory, block), None]
 
 
 def codec_roundtrip(
-    x: torch.Tensor, codec_name: str, *, via_memory: bool = True
+    x: torch.Tensor, codec_name: str, *, via_memory: bool = True, block: int = BLOCK
 ) -> torch.Tensor:
     """Quantize and dequantize *x* with the real kernel codec.
 
-    *x* is bf16 on a GPU with a whole number of :data:`TILE_ELEMS`.
-    ``via_memory=False`` skips the LDS staging and keeps the quantized words in
-    registers; the two must agree bit for bit.
+    *x* is bf16 on a GPU with a whole number of rows of ``block * 8`` elements
+    (:data:`TILE_ELEMS` at the default block). ``via_memory=False`` skips the
+    LDS staging and keeps the quantized words in registers; the two must agree
+    bit for bit.
     """
+    row_elems = block * _ATOM_BF16
     if x.dtype != torch.bfloat16 or not x.is_cuda:
         raise ValueError("codec_roundtrip needs a bf16 CUDA tensor")
-    if x.numel() % TILE_ELEMS:
-        raise ValueError(f"numel must be a multiple of {TILE_ELEMS}, got {x.numel()}")
+    if x.numel() % row_elems:
+        raise ValueError(f"numel must be a multiple of {row_elems}, got {x.numel()}")
     x = x.contiguous()
     out = torch.empty_like(x)
-    num_rows = x.numel() // TILE_ELEMS
+    num_rows = x.numel() // row_elems
     grid_x = max(1, min(num_rows, _GRID_CAP))
-    eng = _engine(codec_name, via_memory)
+    eng = _engine(codec_name, via_memory, block)
     args = (
         Int32(num_rows),
         Int64(int(x.data_ptr())),
@@ -238,9 +248,12 @@ E4M3_REL_SLACK = 1.0 / 16.0
 CODEC_NAMES = ("int4", "int6")
 
 
-def _payload(*, n_tiles: int, seed: int, scale: float = 1.0) -> torch.Tensor:
+def _payload(
+    *, n_tiles: int, seed: int, scale: float = 1.0, block: int = BLOCK
+) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(n_tiles * TILE_ELEMS, generator=g, dtype=torch.float32) * scale
+    n = n_tiles * block * _ATOM_BF16
+    x = torch.randn(n, generator=g, dtype=torch.float32) * scale
     return x.to(device="cuda:0", dtype=torch.bfloat16)
 
 
@@ -263,17 +276,19 @@ def _err_bound(bias: int) -> float:
     return E4M3_REL_SLACK + 1.05 / bias
 
 
+@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
-def test_memory_path_matches_register_path(codec_name):
+def test_memory_path_matches_register_path(codec_name, block):
     """Staging through the wire layout must not change a single bit.
 
     This is the store/load consistency check. It would catch the two sides
     disagreeing about where the INT6 2-bit plane lives, or a half-swap between
-    the threads that share one of its i32 slots.
+    the threads that share one of its i32 slots. At every block, because the
+    plane and scale offsets scale with it.
     """
-    x = _payload(n_tiles=2, seed=17)
-    through_lds = codec_roundtrip(x, codec_name, via_memory=True)
-    in_regs = codec_roundtrip(x, codec_name, via_memory=False)
+    x = _payload(n_tiles=2, seed=17, block=block)
+    through_lds = codec_roundtrip(x, codec_name, via_memory=True, block=block)
+    in_regs = codec_roundtrip(x, codec_name, via_memory=False, block=block)
     mismatch = int((through_lds != in_regs).sum())
     assert mismatch == 0, (
         f"{mismatch}/{x.numel()} elements differ between the staged and "
@@ -281,10 +296,11 @@ def test_memory_path_matches_register_path(codec_name):
     )
 
 
+@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
-def test_error_within_analytic_bound(codec_name):
-    x = _payload(n_tiles=4, seed=23)
-    y = codec_roundtrip(x, codec_name)
+def test_error_within_analytic_bound(codec_name, block):
+    x = _payload(n_tiles=4, seed=23, block=block)
+    y = codec_roundtrip(x, codec_name, block=block)
     xg, yg = _groups(x), _groups(y)
     ext = _signed_extremum(xg).abs().clamp_min(1e-20)
     worst = float(((yg - xg).abs().max(-1).values / ext).max())
@@ -424,16 +440,56 @@ def test_extremum_below_e4m3_floor_survives_instead_of_zeroing(codec_name):
 # all-gather transport in isolation.
 
 
+@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
+@pytest.mark.parametrize("codec_name", ("int4", "int6", "fp16"))
+def test_rank_tile_regions_are_whole_sectors(codec_name, block):
+    """Every region starts and the rank-tile ends on a 64 B fabric sector.
+
+    The fanout moves one sector per quad, so a region ending mid-sector would
+    ship the next region's bytes with it. Block 64 is the case that needs the
+    scale region padded.
+    """
+    c = codecs_for_block(block)[codec_name]
+    offsets = [c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32]
+    for off in (o for o in offsets if o is not None):
+        assert off % SECTOR_I32 == 0, (codec_name, block, offsets)
+    # No region is short: one nibble i32 per thread, one 2-bit i32 per lane
+    # pair, one scale i32 per group of 8 threads, four fp16x2 i32 per thread.
+    if c.name == "fp16":
+        assert c.rank_tile_i32 == 4 * block
+        return
+    if c.hi2_i32_off is not None:
+        assert c.hi2_i32_off == block
+        assert c.scale_i32_off - c.hi2_i32_off == block // 2
+    else:
+        assert c.scale_i32_off == block
+    assert c.rank_tile_i32 - c.scale_i32_off >= block // 8
+
+
+def test_default_block_keeps_the_original_geometry():
+    """``block=256`` is the geometry every kernel shipped with."""
+    geometry = {
+        n: (c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32)
+        for n, c in CODECS.items()
+    }
+    assert geometry == {
+        "int4": (None, 256, 288),
+        "int6": (256, 384, 416),
+        "fp16": (None, None, 1024),
+    }
+
+
 def test_fp16_codec_roundtrip_is_identity():
     x = _payload(n_tiles=2, seed=53)
     y = codec_roundtrip(x, "fp16")
     assert torch.equal(x, y), "fp16 passthrough must not alter a single bit"
 
 
-def test_fp16_codec_memory_path_matches_register_path():
-    x = _payload(n_tiles=2, seed=59)
-    through_lds = codec_roundtrip(x, "fp16", via_memory=True)
-    in_regs = codec_roundtrip(x, "fp16", via_memory=False)
+@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
+def test_fp16_codec_memory_path_matches_register_path(block):
+    x = _payload(n_tiles=2, seed=59, block=block)
+    through_lds = codec_roundtrip(x, "fp16", via_memory=True, block=block)
+    in_regs = codec_roundtrip(x, "fp16", via_memory=False, block=block)
     assert torch.equal(through_lds, in_regs)
 
 

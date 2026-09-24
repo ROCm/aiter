@@ -3,18 +3,22 @@
 
 """INT4, INT6 and FP16 wire codecs for quick-allreduce.
 
-A rank-tile is 256 threads x one 16 B atom, quantized in packed fp16 with a
-group-16 signed E4M3 scale. INT4 is one nibble plane; INT6 adds a dense 2-bit
+A rank-tile is ``block`` threads x one 16 B atom, quantized in packed fp16 with
+a group-16 signed E4M3 scale. INT4 is one nibble plane; INT6 adds a dense 2-bit
 plane, which keeps the nibble plane byte-identical to INT4's and every region
 on the 64 B fabric sector grid. FP16 is a passthrough wire format -- the
 thread's eight fp16 values verbatim, no quantization -- used to test the
 reduce-scatter/all-gather transport in isolation from the codec.
 
+``block`` is a build parameter it sets the tile width, and through it how many 
+blocks a payload gets.
+
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``quick_allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``WAVES``,
-and on ``I32_BYTES``.
+Depends on ``quick_allreduce_shared`` for ``BLOCK`` and ``WAVE``, and on
+``I32_BYTES``.
 """
 
+import functools
 from dataclasses import dataclass
 
 import flydsl.expr as fx
@@ -22,17 +26,37 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import as_ir_value
 
-from .quick_allreduce_shared import BLOCK, I32_BYTES, WAVE, WAVES
+from .quick_allreduce_shared import BLOCK, I32_BYTES, WAVE
 
-RANK_TILE_BYTES = 1152
-RANK_TILE_I32 = RANK_TILE_BYTES // 4
 SUPER_TILES = (1, 8)
-# 1024 B INT4 (256 i32) then 128 B group-16 E4M3 (32 i32). Rank-tile 1152 B.
-SCALE_I32_OFF = 256
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
-N_SECTORS = RANK_TILE_BYTES // 64
+
+# Workgroup widths a codec can be built for.
+#
+# Every region of a rank-tile has to be a whole number of 64 B fabric sectors:
+# the fanout moves one sector per quad, so a region ending mid-sector would
+# ship the next region's bytes with it and overwrite them in the peer's inbox.
+# The nibble and 2-bit planes are 4*block and 2*block bytes, whole sectors at
+# every width here. The scale region is block/2 bytes, a whole sector only from
+# block 128 up; at 64 it is padded, see :func:`codecs_for_block`.
+SUPPORTED_BLOCKS = (64, 128, 256, 512)
+# i32 per 64 B fabric sector.
+SECTOR_I32 = 16
+
+
+def validate_block(block: int) -> int:
+    block = int(block)
+    if block not in SUPPORTED_BLOCKS:
+        raise ValueError(
+            f"codec block must be one of {SUPPORTED_BLOCKS}, got {block!r}"
+        )
+    return block
+
+
+def _round_up_to_sector(n_i32: int) -> int:
+    return -(-n_i32 // SECTOR_I32) * SECTOR_I32
 
 # Dequant bit-trick: code | 0x6400 then + (-(1024+bias)) as f16x2 reconstructs
 # (q - bias). fp16 with exponent field 1024.0 holds the integer in its low
@@ -78,6 +102,8 @@ class Codec:
     rank_tile_i32: int
     #: Payload i32 a thread contributes per atom.
     n_words_per_thread: int
+    #: Workgroup width this instance was built for.
+    block: int = BLOCK
 
     @property
     def has_scale(self) -> bool:
@@ -120,64 +146,90 @@ class Codec:
             hi2_leader, hi2_slot = hi2_slot_of(tid)
             return [(tid, True), (fx.Int32(self.hi2_i32_off) + hi2_slot, hi2_leader)]
         # Dense multi-word codec (fp16): every thread owns every word, at a
-        # fixed stride of one rank-tile row (BLOCK i32) per word.
+        # fixed stride of one rank-tile row (``block`` i32) per word.
         return [
-            (fx.Int32(w * BLOCK) + tid, True)
+            (fx.Int32(w * self.block) + tid, True)
             for w in range_constexpr(self.n_words_per_thread)
         ]
 
 
-# 1024 B nibbles then 128 B scale; 1152 B rank-tile, 18 sectors.
-INT4 = Codec(
-    name="int4",
-    bits=4,
-    bias=8,
-    dequant_bias=_K_HALF2_1032,
-    hi2_i32_off=None,
-    scale_i32_off=SCALE_I32_OFF,
-    rank_tile_i32=RANK_TILE_I32,
-    n_words_per_thread=1,
-)
-# 1024 B nibbles, 512 B 2-bit plane, 128 B scale; 1664 B rank-tile, 26 sectors.
-INT6 = Codec(
-    name="int6",
-    bits=6,
-    bias=32,
-    dequant_bias=_K_HALF2_1056,
-    hi2_i32_off=256,
-    scale_i32_off=384,
-    rank_tile_i32=416,
-    n_words_per_thread=2,
-)
-# Four dense fp16x2 planes, no scale region: 4096 B rank-tile, 64 sectors.
-# Passthrough wire format.
-FP16 = Codec(
-    name="fp16",
-    bits=16,
-    bias=None,
-    dequant_bias=None,
-    hi2_i32_off=None,
-    scale_i32_off=None,
-    rank_tile_i32=BLOCK * 4,
-    n_words_per_thread=4,
-)
-CODECS = {c.name: c for c in (INT4, INT6, FP16)}
+@functools.cache
+def codecs_for_block(block: int = BLOCK) -> dict[str, "Codec"]:
+    """The three wire formats at a given workgroup width."""
+
+    block = validate_block(block)
+    nibble = block  # one i32 of nibbles per thread
+    hi2 = block // PAIR  # INT6's dense 2-bit plane, one i32 per lane pair
+    # One i32 per GROUP threads (4 packed E4M3 bytes), padded to a sector.
+    scale = _round_up_to_sector(block // GROUP)
+    return {
+        c.name: c
+        for c in (
+            # block*4 B nibbles then block/2 B scale: a 4.5*block B rank-tile,
+            # 1152 B and 18 sectors at block=256.
+            Codec(
+                name="int4",
+                bits=4,
+                bias=8,
+                dequant_bias=_K_HALF2_1032,
+                hi2_i32_off=None,
+                scale_i32_off=nibble,
+                rank_tile_i32=nibble + scale,
+                n_words_per_thread=1,
+                block=block,
+            ),
+            # Plus a block*2 B 2-bit plane between them: 6.5*block B, 1664 B
+            # and 26 sectors at block=256.
+            Codec(
+                name="int6",
+                bits=6,
+                bias=32,
+                dequant_bias=_K_HALF2_1056,
+                hi2_i32_off=nibble,
+                scale_i32_off=nibble + hi2,
+                rank_tile_i32=nibble + hi2 + scale,
+                n_words_per_thread=2,
+                block=block,
+            ),
+            # Four dense fp16x2 planes, no scale region: 16*block B, 4096 B and
+            # 64 sectors at block=256. Passthrough wire format.
+            Codec(
+                name="fp16",
+                bits=16,
+                bias=None,
+                dequant_bias=None,
+                hi2_i32_off=None,
+                scale_i32_off=None,
+                rank_tile_i32=block * 4,
+                n_words_per_thread=4,
+                block=block,
+            ),
+        )
+    }
+
+CODECS = codecs_for_block(BLOCK)
+INT4, INT6, FP16 = CODECS["int4"], CODECS["int6"], CODECS["fp16"]
 
 
-def thread_lane(tid):
-    """(wave, lane) for *tid* in a ``WAVES x WAVE`` block.
+def thread_lane(tid, block: int = BLOCK):
+    """(wave, lane) for *tid* in a ``(block // WAVE) x WAVE`` block.
 
     ``lane`` is the codec's own required argument to :func:`_codec_quant` /
     :func:`_codec_dequant` (the pairing and shuffle width both key off it);
     ``wave`` is only a byproduct callers use for their own fanout layouts.
     Identical across the mesh, ring and codec-test kernels, so extracted here
     rather than repeated in each.
+
+    Every supported *block* is a whole number of waves, so there is no partial
+    wave for the shuffles to fall off.
     """
-    thread_layout = fx.make_layout((WAVES, WAVE), (WAVE, 1))
+    if block == WAVE:
+        return fx.Int32(0), tid
+    thread_layout = fx.make_layout((block // WAVE, WAVE), (WAVE, 1))
     return fx.idx2crd(tid, thread_layout).unpack()
 
 
-def scale_slot_of(tid):
+def scale_slot_of(tid, block: int = BLOCK):
     """(scale_slot, pair_in_slot) -- this thread's group-16 E4M3 scale slot,
     and which half of the ``PAIR`` sharing that slot this thread is.
 
@@ -186,7 +238,7 @@ def scale_slot_of(tid):
     :func:`_scale_from_word`.
     """
     scale_own_layout = fx.make_layout(
-        (BLOCK // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
+        (block // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
     )
     scale_slot, pair_in_slot, _lane_in_pair = fx.idx2crd(tid, scale_own_layout).unpack()
     return scale_slot, pair_in_slot

@@ -375,7 +375,7 @@ class _FlyAutoOracle:
                 # engine is the right one, and the class's standalone floor
                 # would reject sizes the policy just chose it for.
                 self._engines[family] = QuickAllReduceInt4(
-                    **common, algorithm=family, min_bytes=0
+                    **common, algorithm=family, min_bytes=0, link=link
                 )
         self.disabled = False
 
@@ -515,12 +515,13 @@ class Candidate:
     # value means a distinct engine with its own inbox.
     atoms: int | None = None
     fanout: str | None = None
-    # Drop this rank's own trip through its own inbox, family == "fly1s". None
-    # leaves it to the rung; False and True both pin it, and pinning it True
-    # specialises the binary per rank.
+    # Drop this rank's own trip through its own inbox, family == "fly1s", and
+    # family == "fly" with algorithm == "mesh" (the ring has no such trip).
+    # None leaves it to the rung; False and True both pin it, and pinning it
+    # True specialises the binary per rank.
     skip_self: bool | None = None
-    # Threads per block, family == "fly1s". Also the tile width, so it is the
-    # knob that sets how many blocks a decode payload gets. None leaves it to
+    # Threads per block, families "fly1s" and "fly". Also the tile width, so it
+    # is the knob that sets how many blocks a payload gets. None leaves it to
     # the rung.
     block: int | None = None
 
@@ -533,6 +534,32 @@ class Candidate:
             self.grid_cap,
             self.rs_codec,
             self.ag_codec,
+            self.block,
+            self.skip_self,
+        )
+
+    def fly_rung(self, min_bytes: int) -> tuple:
+        """This candidate as a ``MESH_ST_LADDER``/``RING_ST_LADDER`` rung, for
+        the fit's paste."""
+        if self.family != "fly":
+            raise ValueError(f"{self.key} is not a two-stage candidate")
+        unpinned = [
+            n
+            for n in ("super_tile", "grid_cap", "block", "skip_self")
+            if getattr(self, n) is None
+        ]
+        if unpinned:
+            raise ValueError(
+                f"{self.key} leaves {', '.join(unpinned)} to the QuickAllReduceInt4 "
+                "default, so it has no ladder rung. Pin every knob (see "
+                "_FLY_MESH_GRID / _FLY_RING_GRID) or keep the row out of the fit."
+            )
+        return (
+            int(min_bytes),
+            self.super_tile,
+            self.grid_cap,
+            self.block,
+            self.skip_self,
         )
 
     @property
@@ -579,7 +606,61 @@ _FLY1S_GRID = (
     (256, 4, 64, "peer"),  # 16 KiB
     (256, 4, 64, "atom"),  # 16 KiB
     (256, 4, 128, "peer"),  # 16 KiB
+    (512, 1, 64, "peer"),  # 8 KiB
+    (512, 2, 64, "peer"),  # 16 KiB
+    (512, 4, 64, "peer"),  # 32 KiB
+    (512, 4, 128, "peer"),  # 32 KiB
 )
+
+
+# Two-stage knob grids, as (block, super_tile, grid_cap). Every block the codec
+# supports, at the super-tiles each schedule's ladder uses and the cap every
+# shipped rung has. The mesh rows are crossed with skip_self below; the ring has
+# no self round trip to skip.
+_FLY_MESH_GRID = tuple(
+    (block, st, 128) for block in (64, 128, 256, 512) for st in (1, 8)
+)
+_FLY_RING_GRID = tuple(
+    (block, st, 128) for block in (64, 128, 256, 512) for st in (8, 16, 32)
+)
+
+
+def _fly_grid_rows():
+    """``_FLY_MESH_GRID`` x self-skip and ``_FLY_RING_GRID`` as Candidates.
+
+    SQNR floors follow the shipping rows': 15 dB for the mesh, 14 for the ring.
+    """
+    rows = []
+    for skip_self in (False, True):
+        for block, st, cap in _FLY_MESH_GRID:
+            key = f"fly_int4_b{block}_st{st}_g{cap}" + ("_ss" if skip_self else "")
+            rows.append(
+                Candidate(
+                    key,
+                    "fly",
+                    15.0,
+                    False,
+                    super_tile=st,
+                    grid_cap=cap,
+                    block=block,
+                    skip_self=skip_self,
+                )
+            )
+    for block, st, cap in _FLY_RING_GRID:
+        rows.append(
+            Candidate(
+                f"fly_int4_ring_b{block}_st{st}_g{cap}",
+                "fly",
+                14.0,
+                False,
+                algorithm="ring",
+                super_tile=st,
+                grid_cap=cap,
+                block=block,
+                skip_self=False,
+            )
+        )
+    return tuple(rows)
 
 
 def _fly1s_grid_rows():
@@ -632,6 +713,9 @@ CANDIDATES = (
     # same 128 the ring's rungs use.
     Candidate("fly_int4_st1", "fly", 15.0, False, super_tile=1),
     Candidate("fly_int4_g128", "fly", 15.0, False, grid_cap=128),
+    # Pinned mesh and ring rows: the knob grid the two-stage ladders are fitted
+    # over. See _FLY_MESH_GRID / _FLY_RING_GRID.
+    *_fly_grid_rows(),
     # Exact FlyDSL one-shot: no codec, fp32 accumulate, one rounding, so it
     # lands at the same bf16 floor as cdr and shares its 40 dB gate and its
     # `exact=True` checkAllclose. Decode-only -- it pushes the whole payload to
@@ -1483,7 +1567,8 @@ def _worker(
 
     fly = {}  # QuickAllReduceInt4 config tuple -> engine
     # One engine per distinct (schedule, super_tile, grid_cap, rs_codec,
-    # ag_codec): each owns its own IPC inbox, whose layout depends on all five.
+    # ag_codec, block, skip_self): each owns its own IPC inbox, whose layout
+    # depends on all of them.
     # Sorted so every rank performs its handle exchanges in the same sequence --
     # the exchange is a collective, so a differing order across ranks deadlocks.
     # ``None`` means "constructor default" and does not order against an int,
@@ -1512,7 +1597,15 @@ def _worker(
                 # Measure every size the sweep asks for.
                 min_bytes=0,
                 **_fly_kwargs(
-                    cfg[1:], ("super_tile", "grid_cap", "rs_codec", "ag_codec")
+                    cfg[1:],
+                    (
+                        "super_tile",
+                        "grid_cap",
+                        "rs_codec",
+                        "ag_codec",
+                        "block",
+                        "skip_self",
+                    ),
                 ),
             )
         # compile() JIT-compiles every super-tile engine without launching any

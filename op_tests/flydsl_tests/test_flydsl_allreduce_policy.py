@@ -27,7 +27,13 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     SUPPORTED_BLOCKS,
     oneshot_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import MESH_ST_LADDER, SUPER_TILES
+from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
+    SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
+)
+from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+    SUPER_TILES,
+    mesh_st_ladder,
+)
 from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import (
     RING_SUPER_TILES,
     ring_st_ladder,
@@ -72,16 +78,22 @@ def test_ladders_are_well_formed(ws):
     one that is not ascending makes ``_pick_st``/``_pick_cfg`` -- which take the
     *last* rung at or below the payload -- select something arbitrary.
     """
-    for name, rungs, valid_st in (
-        ("mesh", MESH_ST_LADDER[ws], SUPER_TILES),
-        ("ring", ring_st_ladder(ws), RING_SUPER_TILES),
-    ):
-        assert rungs, name
-        assert rungs[0][0] == 0, name
-        assert [r[0] for r in rungs] == sorted(r[0] for r in rungs), name
-        for _floor, st, cap in rungs:
-            assert st in valid_st, (name, st)
-            assert cap >= 1, (name, cap)
+    for link in P.LINKS:
+        for name, rungs, valid_st in (
+            ("mesh", mesh_st_ladder(ws, link), SUPER_TILES),
+            ("ring", ring_st_ladder(ws, link), RING_SUPER_TILES),
+        ):
+            assert rungs, (name, link)
+            assert rungs[0][0] == 0, (name, link)
+            assert [r[0] for r in rungs] == sorted(r[0] for r in rungs), (name, link)
+            for _floor, st, cap, block, skip_self in rungs:
+                assert st in valid_st, (name, link, st)
+                assert cap >= 1, (name, link, cap)
+                assert block in TWO_STAGE_BLOCKS, (name, link, block)
+                assert isinstance(skip_self, bool), (name, link, skip_self)
+                # The ring never writes its own inbox, so it has no self round
+                # trip to skip; the host rejects the combination.
+                assert not (name == "ring" and skip_self), (link, ws)
 
     for link in P.LINKS:
         one = oneshot_ladder(ws, link)
@@ -133,7 +145,7 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
         one_hi = max(P.resolve_oneshot(link, ws).max_bytes, quant.floor)
         for _floor, *_ in oneshot_ladder(ws, link)[1:]:
             assert _floor < one_hi, ("oneshot", link, ws, _floor)
-        for floor, *_ in MESH_ST_LADDER[ws][1:]:
+        for floor, *_ in mesh_st_ladder(ws, link)[1:]:
             assert floor < quant.mesh_max, ("mesh", link, ws, floor)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.

@@ -160,13 +160,27 @@ def _store_v4i32_peer(addr_i64, data, policy):
     ``quick_allreduce_1stage._store_v4i32_peer_multi``, its only consumer.
     Both emit ``global_store_dwordx4 ... {policy}``, so a change to that
     encoding has to be made in both places.
+
+    The trailing ``s_nop 1`` is not optional. A VMEM store of more than 64 bits
+    needs wait states before a VALU may overwrite its data VGPRs -- two on
+    gfx940 and later. LLVM's hazard recognizer inserts them after a real store,
+    but it cannot see into inline asm, so it treats the data as dead the
+    instant the asm "executes" and will recycle those VGPRs on the very next
+    instruction. The store then ships whatever was written there:
+
+        global_store_dwordx4 v[8:9], v[4:7], off nt
+        v_add_u32_e32        v4, 0x490, v10        ; clobbers dword 0
+
+    It depends entirely on register allocation. The mesh at a 256-thread block
+    never hit it; the same kernel at 128 threads with the peer-major fanout
+    corrupted two dwords in every packet's fourth sector.
     """
     ptr_ty = ir.Type.parse("!llvm.ptr<1>")
     ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
     llvm.InlineAsmOp(
         None,
         [ptr, as_ir_value(data)],
-        f"global_store_dwordx4 $0, $1, off {policy}",
+        f"global_store_dwordx4 $0, $1, off {policy}\n\ts_nop 1",
         "v,v",
         has_side_effects=True,
     )

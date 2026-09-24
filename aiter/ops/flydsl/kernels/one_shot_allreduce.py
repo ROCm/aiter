@@ -88,8 +88,13 @@ def _store_v4i32_peer_multi(pairs, policy):
             data_slot[key] = len(operands) - 1
         slots.append((a, data_slot[key]))
 
+    # The trailing ``s_nop 1`` covers the last store of the group: a VMEM store
+    # of more than 64 bits needs two wait states before a VALU may overwrite its
+    # data VGPRs, and LLVM, blind to the asm, can schedule one right after it.
+    # See ``quick_allreduce_shared._store_v4i32_peer``.
     asm = "\n\t".join(
-        f"global_store_dwordx4 ${a}, ${d}, off {policy}" for a, d in slots
+        [f"global_store_dwordx4 ${a}, ${d}, off {policy}" for a, d in slots]
+        + ["s_nop 1"]
     )
     llvm.InlineAsmOp(
         None,
@@ -106,7 +111,7 @@ DEFAULT_BLOCK = 256
 #
 # The trade is flags and per-block fixed cost: the flag count (``blocks * (N-1)``)
 # rises by the same factor the block count does.
-SUPPORTED_BLOCKS = (64, 128, 256)
+SUPPORTED_BLOCKS = (64, 128, 256, 512)
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4

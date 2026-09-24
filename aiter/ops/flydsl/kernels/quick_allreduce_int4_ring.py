@@ -32,8 +32,8 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
 from .quick_allreduce_codec import (
-    CODECS,
     GROUP,
+    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -41,6 +41,7 @@ from .quick_allreduce_codec import (
     _codec_load,
     _codec_quant,
     _scale_from_word,
+    codecs_for_block,
     scale_slot_of,
     thread_lane,
 )
@@ -54,9 +55,6 @@ from .quick_allreduce_shared import (
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
-    TILE_BYTES,
-    TILE_FP16,
-    TILE_I32,
     _acquire_inbox,
     _i32_to_bytes,
     _store_v4i32_peer,
@@ -83,18 +81,34 @@ from .quick_allreduce_shared import (
 # Pin ``grid_cap`` alongside ``super_tile``.
 RING_SUPER_TILES = (1, 8, 16, 32)
 
-# Payload-size ladder: ``(min_bytes, super_tile, grid_cap)``, ascending, per
-# world size.
+# Payload-size ladder: ``(min_bytes, super_tile, grid_cap, block, skip_self)``,
+# ascending, per ``(link, world_size)``. ``skip_self`` is always False: the ring never
+# round-trips through its own inbox.
+_RING_DEFAULT = {
+    2: ((0, 8, 128, BLOCK, False), (24 << 20, 16, 128, BLOCK, False)),
+    4: (
+        (0, 8, 128, BLOCK, False),
+        (24 << 20, 16, 128, BLOCK, False),
+        (48 << 20, 32, 128, BLOCK, False),
+    ),
+    8: ((0, 16, 128, BLOCK, False), (48 << 20, 32, 128, BLOCK, False)),
+}
+
+# TODO: Run tuning for TP=8
+# ``(min_bytes, super_tile, grid_cap, block, skip_self)``
 RING_ST_LADDER = {
-    2: ((0, 8, 128), (24 << 20, 16, 128)),
-    4: ((0, 8, 128), (24 << 20, 16, 128), (48 << 20, 32, 128)),
-    8: ((0, 16, 128), (48 << 20, 32, 128)),
+    **{("xgmi", ws): rungs for ws, rungs in _RING_DEFAULT.items()},
+    ("pcie", 2): ((0, 16, 128, 512, False),),
+    ("pcie", 4): ((0, 32, 128, 512, False),),
+    ("pcie", 8): _RING_DEFAULT[8],
 }
 
 
-def ring_st_ladder(world_size: int):
-    """Rungs for *world_size*, or the TP4 shape for an unlisted one."""
-    return RING_ST_LADDER.get(int(world_size), RING_ST_LADDER[4])
+def ring_st_ladder(world_size: int, link: str = "pcie"):
+    """Rungs for *(link, world_size)*, or the PCIe TP4 shape for an unlisted one."""
+    return RING_ST_LADDER.get(
+        (str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)]
+    )
 
 
 # Wire formats accepted per lap.
@@ -106,9 +120,6 @@ def ring_st_ladder(world_size: int):
 # quantization -- the one at op ``N``, where this rank's chunk is final.
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
-
-# 64 quads of 4 lanes; one quad writes one 64 B fabric sector.
-QUADS_PER_BLOCK = BLOCK // QUAD_LANES
 
 # Cache policy for reading a rank-tile out of our own inbox.
 #
@@ -151,6 +162,7 @@ def make_quick_allreduce_int4_ring_kernel(
     inbox_memory: str = "finegrained",
     rs_codec: str = "int4",
     ag_codec: str = "int4",
+    block: int = BLOCK,
 ):
     """Build the ring kernel for one *rank*.
 
@@ -164,6 +176,8 @@ def make_quick_allreduce_int4_ring_kernel(
 
     The kernel *signature* keeps its ``rank`` argument, unused, so the host's
     ``_launch_eng`` is identical for both schedules.
+
+    ``block`` is threads per workgroup.
     """
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
@@ -179,6 +193,8 @@ def make_quick_allreduce_int4_ring_kernel(
         raise ValueError(f"rs_codec must be one of {RS_CODECS}, got {rs_codec!r}")
     if ag_codec not in AG_CODECS:
         raise ValueError(f"ag_codec must be one of {AG_CODECS}, got {ag_codec!r}")
+    if block not in SUPPORTED_BLOCKS:
+        raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
     if super_tile not in RING_SUPER_TILES:
         raise ValueError(
             f"super_tile must be one of {RING_SUPER_TILES}, got {super_tile!r}"
@@ -202,8 +218,13 @@ def make_quick_allreduce_int4_ring_kernel(
     n_ops = 2 * world_size - 1  # ops are 1-based; op k reads slot k-2, writes k-1
     nxt = (rank + 1) % world_size
 
-    rs = CODECS[rs_codec]
-    ag = CODECS[ag_codec]
+    codecs = codecs_for_block(block)
+    rs = codecs[rs_codec]
+    ag = codecs[ag_codec]
+    tile_bytes = block * ATOMS * 16
+    tile_i32 = tile_bytes // 4
+    # Quads of 4 lanes; one quad writes one 64 B fabric sector.
+    quads_per_block = block // QUAD_LANES
     # Which codec each wire slot carries. Ops 1..N-1 fill the reduce-scatter
     # slots and ops N..2N-1 the all-gather ones, so the split is exactly at
     # N-1 and is a compile-time property of the step index.
@@ -226,7 +247,7 @@ def make_quick_allreduce_int4_ring_kernel(
     # atomics-free design sound here (there are no peer atomics over PCIe), and
     # it makes the buffer (N-1)/N of the mesh's rather than larger.
     total_sectors = [rank_atoms * c.n_sectors for c in step_codec]
-    fanout_rounds = [-(-t // QUADS_PER_BLOCK) for t in total_sectors]
+    fanout_rounds = [-(-t // quads_per_block) for t in total_sectors]
 
     # One staging buffer, sized for whichever codec needs more. Only
     # ``rank_atoms`` rows: a ring stages one destination's packet, not every
@@ -248,7 +269,7 @@ def make_quick_allreduce_int4_ring_kernel(
         j = k if k <= world_size else k - world_size
         return (rank - j) % world_size
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(known_block_size=[block, 1, 1])
     def quick_allreduce_int4_ring(
         rank_unused: Int32,
         nbytes: Int64,
@@ -263,23 +284,23 @@ def make_quick_allreduce_int4_ring_kernel(
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        wave, lane = thread_lane(tid)
+        wave, lane = thread_lane(tid, block)
         quad_layout = fx.make_layout((QUADS_PER_WAVE, QUAD_LANES), (QUAD_LANES, 1))
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
         hbm_layout = fx.make_layout(
-            (num_tiles, ATOMS, BLOCK * 4),
-            (TILE_I32, BLOCK * 4, 1),
+            (num_tiles, ATOMS, block * 4),
+            (tile_i32, block * 4, 1),
         )
-        hbm_row_layout = fx.make_layout((1, BLOCK * 4), (BLOCK * 4, 1))
+        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
         hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
         hbm_copy = fx.make_tiled_copy_tv(
             hbm_copy_atom,
-            fx.make_layout((1, BLOCK), (1, 1)),
+            fx.make_layout((1, block), (1, 1)),
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
-        scale_slot, pair_in_slot = scale_slot_of(tid)
+        scale_slot, pair_in_slot = scale_slot_of(tid, block)
         color_layout = fx.make_layout((grid,), (1,))
 
         # One allocation, one view per codec.
@@ -436,7 +457,7 @@ def make_quick_allreduce_int4_ring_kernel(
             n_sectors = codec.n_sectors
             n_total = total_sectors[step]
             for rnd in range_constexpr(fanout_rounds[step]):
-                s = quad_id + fx.Int32(rnd * QUADS_PER_BLOCK)
+                s = quad_id + fx.Int32(rnd * quads_per_block)
                 in_range = s < fx.Int32(n_total)
                 safe = in_range.select(s, fx.Int32(0))
                 # Flat sector id -> (rank-atom, sector), then -> i32 offset. Both
@@ -677,7 +698,7 @@ def make_quick_allreduce_int4_ring_kernel(
             _store_color(color)
         gpu.barrier()
 
-    flat_wg = f"{BLOCK},{BLOCK}"
+    flat_wg = f"{block},{block}"
 
     @flyc.jit
     def launch_quick_allreduce_int4_ring(
@@ -703,7 +724,7 @@ def make_quick_allreduce_int4_ring_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
-            block=(BLOCK, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
@@ -711,6 +732,7 @@ def make_quick_allreduce_int4_ring_kernel(
         f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
         f"_{rs_codec}_{ag_codec}"
     )
+    tag += f"_b{block}"
     launch_quick_allreduce_int4_ring.func.__name__ = (
         f"launch_quick_allreduce_int4_ring_{tag}"
     )
@@ -723,8 +745,8 @@ def make_quick_allreduce_int4_ring_kernel(
         "flags_bytes": 0,  # the handshake rides in each slot's 64 B tail
         "data_bytes": inbox_bytes,
         "lds_bytes": lds_bytes,
-        "tile_bytes": TILE_BYTES,
-        "tile_fp16": TILE_FP16,
+        "tile_bytes": tile_bytes,
+        "tile_fp16": tile_bytes // 2,
         "rank_tile_bytes": rs.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_i32[0] * 4,
         "ag_rank_tile_bytes": ag.rank_tile_bytes,
@@ -741,5 +763,6 @@ def make_quick_allreduce_int4_ring_kernel(
         "rank_atoms": rank_atoms,
         "steps": steps,
         "grid": grid,
-        "block": BLOCK,
+        "block": block,
+        "skip_self": False,
     }
