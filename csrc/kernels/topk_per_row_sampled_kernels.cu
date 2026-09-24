@@ -1893,22 +1893,34 @@ void top_k_per_row_prefill_sampled(
     // 72.5% of the wrong elements, which is more than the dropped tail can
     // explain and is not yet understood.
     //
-    // phase_b_filter_coop now reads the tail explicitly, so the fused path is
-    // correct at any width and the restriction is lifted there. topk_small_n
-    // still truncates the same way and has no tail handling, so it keeps the
-    // gate; it only serves PATH_SMALL_N, well below the widths this parameter
-    // was introduced for.
-    const bool ragged_fused = ragged;
-    const bool ragged_small = ragged || (N % FP32_EPT) != 0;
-
+    // The fused path has THREE phase_b kernels and only one of them reads the
+    // tail. phase_b_filter_coop does; phase_b_filter_wavestage and
+    // phase_b_filter_waveseg, which topk_fused_impl launches when coop_g == 1,
+    // still take the truncating n4 and never look at the last one to three
+    // columns. An earlier version of this gate lifted the restriction for the
+    // whole fused path on the strength of the coop kernel alone, which was
+    // wrong and shipped: measured through aiter's router on plain [M, N] input,
+    // 124 cells returned wrong results -- M 128 to 4096, N in 2^k+1/+2/+3 for
+    // k 13 to 16, K 128 / 512 / 2048, and none at N % 4 == 0. Every one of them
+    // returned ZERO indices in the truncated tail against 16 to 3071 expected,
+    // and the wrong-row count tracked the expected tail hits (m=4096 N=8193:
+    // 1067 wrong rows against 1023.9 expected).
+    //
+    // So the gate is lifted exactly where the coop kernel runs, and nowhere
+    // else. topk_small_n truncates the same way with no tail handling and keeps
+    // the gate outright.
     HipDeviceGuard device_guard(logits.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const ShapeParams sp  = sampled::params_for(M, N, K);
-    const float* in       = static_cast<const float*>(logits.data_ptr());
-    const int* row_starts = static_cast<const int*>(rowStarts.data_ptr());
-    const int* row_ends   = static_cast<const int*>(rowEnds.data_ptr());
-    int* idx              = static_cast<int*>(indices.data_ptr());
+    const ShapeParams sp = sampled::params_for(M, N, K);
+
+    const bool tail_cols    = (N % FP32_EPT) != 0;
+    const bool ragged_fused = ragged || (tail_cols && sp.coop_g <= 1);
+    const bool ragged_small = ragged || tail_cols;
+    const float* in         = static_cast<const float*>(logits.data_ptr());
+    const int* row_starts   = static_cast<const int*>(rowStarts.data_ptr());
+    const int* row_ends     = static_cast<const int*>(rowEnds.data_ptr());
+    int* idx                = static_cast<int*>(indices.data_ptr());
     float* val = values.has_value() ? static_cast<float*>(values.value().data_ptr()) : nullptr;
 
     if(sp.path == PATH_SMALL_N)
