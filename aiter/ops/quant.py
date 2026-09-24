@@ -436,6 +436,13 @@ def per_token_quant_hip(
     return y, scale
 
 
+# Capability marker: per_group_quant_hip / dynamic_per_group_scaled_quant and
+# aiter.ops.rmsnorm.rmsnorm_quant / add_rmsnorm_quant accept
+# `scale_layout_m32k4` (MXFP8 1x32 scale written in the gfx1250 ASM GEMM A-scale
+# layout). The entry points are wrapped, so callers cannot inspect signatures.
+SCALE_LAYOUT_M32K4_SUPPORTED = True
+
+
 @torch_compile_guard()
 def per_group_quant_hip(
     x: Tensor,
@@ -446,9 +453,28 @@ def per_group_quant_hip(
     num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
     scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
 ) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
+    if scale_layout_m32k4:
+        # MXFP8 1x32 with the scale written in the gfx1250 ASM GEMM A-scale layout
+        # (shuffle_mxfp8fp4_scale bytes). Rows are padded to 32; the kernel fills the pad.
+        assert (
+            quant_dtype == dtypes.fp8
+            and group_size == 32
+            and scale_type == dtypes.fp8_e8m0
+            and scale is None
+        ), "scale_layout_m32k4 needs fp8 output, group_size 32 and an e8m0 scale"
+        m = x.numel() // shape[-1]
+        scale = torch.empty(
+            ((m + 31) // 32 * 32, shape[-1] // 32), dtype=scale_type, device=device
+        )
+        y = torch.empty(shape, dtype=quant_dtype, device=device)
+        dynamic_per_group_scaled_quant(
+            y, x, scale, group_size, num_rows=num_rows, scale_layout_m32k4=True
+        )
+        return y, scale
     if scale is None:
         scale = torch.empty(
             (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
@@ -773,6 +799,7 @@ def dynamic_per_group_scaled_quant(
     shuffle_scale: bool = True,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    scale_layout_m32k4: bool = False,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
@@ -789,6 +816,12 @@ def dynamic_per_group_scaled_quant(
     sizes.
 
     Only ``group_size`` in {32, 64, 128} is supported.
+
+    ``scale_layout_m32k4=True`` (fp8 output, e8m0 scale, ``group_size == 32``)
+    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout,
+    i.e. the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`:
+    ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
+    as 0x7F, and ``shuffle_scale`` is ignored.
     """
 
 
