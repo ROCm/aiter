@@ -874,6 +874,8 @@ void fmha_v4_fwd(const at::Tensor& q,
     // dense launch leaves it zero rather than selecting a different code object.
     if(seqlens_k.has_value())
     {
+        TORCH_CHECK(seqlens_k->is_cuda() && seqlens_k->device() == q.device(),
+                    "MHA v4 seqlens_k must be a GPU tensor on the same device as Q");
         TORCH_CHECK(seqlens_k->scalar_type() == at::kInt,
                     "MHA v4 seqlens_k must be int32, got ",
                     seqlens_k->scalar_type());
@@ -883,6 +885,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                     seqlens_k->numel(),
                     " for batch ",
                     shapes.batch);
+        // Contents stay the caller's contract, as they do for cu_seqlens on the varlen path:
+        // they live on the device, so bounding them here would synchronize every launch.
         args.ptr_kseq.value = seqlens_k->data_ptr();
     }
 
