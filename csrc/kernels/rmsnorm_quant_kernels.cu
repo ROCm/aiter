@@ -361,6 +361,13 @@ __global__ void add_rmsnorm_quant_kernel(
         ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true); \
     }
 
+// A grouped quant needs `group_size % thread_data_size == 0`: the group is
+// reduced across whole threads. So a width whose widest shape is 24 elements
+// per thread has no grouped kernel at all -- neither 32 nor 128 divides 24 --
+// and the `4096 < n <= 6144` bucket used to fail the check rather than pick
+// another shape. It now falls back to the same pair the 8192 bucket already
+// uses for grouped quant, whose 16 and 8 divide every group this op supports.
+// Both instantiations already exist, so this adds no compile time.
 #define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
@@ -459,6 +466,8 @@ __global__ void add_rmsnorm_quant_kernel(
         }
     }
 
+// Same grouped-quant fallback as the residual dispatch above, and for the same
+// reason: 24 elements per thread cannot carry a 32- or 128-wide group.
 #define RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \

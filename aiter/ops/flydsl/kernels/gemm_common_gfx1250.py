@@ -5,10 +5,12 @@ from collections import namedtuple
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, gpu, rocdl
-from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
+
+from .act import sigmoid_f32
+from .kernels_common import LOG2E
 
 
 def make_lds_copy_ops(bits):
@@ -30,13 +32,13 @@ def make_lds_copy_ops(bits):
 
     def load(lds_base_idx, byte_offset):
         rmem = fx.make_rmem_tensor(layout, fx.Int32)
-        fx.copy_atom_call(atom, _view(lds_base_idx, byte_offset), rmem)
+        fx.copy(atom, _view(lds_base_idx, byte_offset), rmem)
         return rmem.load()
 
     def store(lds_base_idx, byte_offset, data):
         rmem = fx.make_rmem_tensor(layout, fx.Int32)
         rmem.store(data)
-        fx.copy_atom_call(atom, rmem, _view(lds_base_idx, byte_offset))
+        fx.copy(atom, rmem, _view(lds_base_idx, byte_offset))
 
     return load, store
 
@@ -55,7 +57,7 @@ def make_sgpr_opaque(val_i32):
     """
     op = llvm_dialect.InlineAsmOp(
         res=ir.IntegerType.get_signless(32),
-        operands_=[_raw(val_i32)],
+        operands_=[as_ir_value(val_i32)],
         asm_string="",
         constraints="=s,s",
         has_side_effects=False,
@@ -66,15 +68,9 @@ def make_sgpr_opaque(val_i32):
 
 def _raw_lds_ptr(lds_base_idx, byte_offset):
     """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
-    from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr.arith import ArithValue as _AV
-
-    if not isinstance(_raw(byte_offset).type, ir.IndexType):
-        byte_offset = arith.index_cast(T.index, byte_offset)
     lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total_byte = _AV(lds_base_idx) + byte_offset
-    addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
-    return _llvm.inttoptr(lds_ptr_ty, addr_i32)
+    total_byte = fx.Index(lds_base_idx) + fx.Index(byte_offset)
+    return llvm_dialect.inttoptr(lds_ptr_ty, fx.Int32(total_byte).ir_value())
 
 
 def lds_load_b128_raw(lds_base_idx, byte_offset):
@@ -94,7 +90,7 @@ def lds_load_b32_raw(lds_base_idx, byte_offset):
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
     """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM)."""
     ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    llvm_dialect.store(_raw(data), ptr_val)
+    llvm_dialect.store(as_ir_value(data), ptr_val)
 
 
 def workgroup_barrier(use_cluster=False):
@@ -137,40 +133,37 @@ def pipeline_fence_wait(use_cluster=False):
         cluster.cluster_wait()
 
 
-import math as _math
-
-LOG2E = _math.log2(_math.e)
-
-
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
-    import flydsl.expr as _fx
+    from flydsl.expr import arith
 
-    return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
+    return fx.Float32(arith.minnumf(as_ir_value(a), as_ir_value(b)))
 
 
 def fclamp_f32(x, lo, hi):
     """Scalar f32 clamp via v_med3_num_f32."""
-    import flydsl.expr as _fx
-
-    return _fx.Float32(rocdl.fmed3(T.f32, _raw(x), _raw(lo), _raw(hi)))
+    return fx.Float32(
+        rocdl.fmed3(T.f32, as_ir_value(x), as_ir_value(lo), as_ir_value(hi))
+    )
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
-    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
-    import flydsl.expr as _fx
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp).
 
-    _one = _fx.Float32(1.0)
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+    """
+    _one = fx.Float32(1.0)
+    _half = fx.Float32(0.5)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
     if swiglu:
-        nlog2e = _fx.Float32(-1.702 * LOG2E)
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+        _half_beta = fx.Float32(1.702 * 0.5)
+        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(g * _half_beta)))
+        sig = _half * (_one + th)
         return g * sig * (u + _one)
-    nlog2e = _fx.Float32(-LOG2E)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(g * _half)))
+    sig = _half * (_one + th)
     return g * sig * u
 
 
@@ -183,12 +176,10 @@ def _tanh_f32(x, tanh_mul):
     drives exp2 to +inf and rcp(+inf) to 0 (-> -1), a large negative one drives
     exp2 to 0 (-> +1), so no |x| fixup or sign select is needed.
     """
-    import flydsl.expr as _fx
-
-    _one = _fx.Float32(1.0)
-    _two = _fx.Float32(2.0)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(x * tanh_mul)))
-    rcp_val = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    _one = fx.Float32(1.0)
+    _two = fx.Float32(2.0)
+    exp_val = fx.Float32(rocdl.exp2(T.f32, as_ir_value(x * tanh_mul)))
+    rcp_val = fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
     return _two * rcp_val - _one
 
 
@@ -208,14 +199,13 @@ def situv2_consts(beta, linear_beta):
 
     Hoisting keeps the inner loop at 3 exp2 + 3 rcp per element.
     """
-    import flydsl.expr as _fx
-
-    neg_two_log2e = _fx.Float32(-2.0 * LOG2E)
+    neg_two_log2e = fx.Float32(-2.0 * LOG2E)
     return SituV2Consts(
         beta=beta,
-        gate_tanh_mul=neg_two_log2e * _fx.Float32(rocdl.rcp(T.f32, _raw(beta))),
+        gate_tanh_mul=neg_two_log2e * fx.Float32(rocdl.rcp(T.f32, as_ir_value(beta))),
         linear_beta=linear_beta,
-        up_tanh_mul=neg_two_log2e * _fx.Float32(rocdl.rcp(T.f32, _raw(linear_beta))),
+        up_tanh_mul=neg_two_log2e
+        * fx.Float32(rocdl.rcp(T.f32, as_ir_value(linear_beta))),
     )
 
 
@@ -227,12 +217,7 @@ def fused_situv2_elem(g, u, *, consts):
     ``consts`` comes from situv2_consts(). No clamp: SiTUv2 is bounded by
     construction, so the swiglu limit does not apply.
     """
-    import flydsl.expr as _fx
-
-    _one = _fx.Float32(1.0)
-    nlog2e = _fx.Float32(-LOG2E)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    sig = sigmoid_f32(g)
     gate_act = consts.beta * _tanh_f32(g, consts.gate_tanh_mul) * sig
     up_act = consts.linear_beta * _tanh_f32(u, consts.up_tanh_mul)
     return gate_act * up_act
@@ -254,11 +239,9 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     Returns:
         list of activated f32 values, same length as *pairs*.
     """
-    import flydsl.expr as _fx
-
-    _one = _fx.Float32(1.0)
-    _two = _fx.Float32(2.0)
-    nlog2e = _fx.Float32(-LOG2E)
+    _one = fx.Float32(1.0)
+    _two = fx.Float32(2.0)
+    nlog2e = fx.Float32(-LOG2E)
     N = len(pairs)
     # Stage 1: all exp2 arguments, then all exp2.
     args = []
@@ -270,7 +253,7 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     rocdl.sched_barrier(0)
     exp_vals = []
     for i in range_constexpr(3 * N):
-        exp_vals.append(_fx.Float32(rocdl.exp2(T.f32, _raw(args[i]))))
+        exp_vals.append(fx.Float32(rocdl.exp2(T.f32, as_ir_value(args[i]))))
     # Stage 2a: 1 + exp
     rocdl.sched_barrier(0)
     sum_vals = []
@@ -280,7 +263,7 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     rocdl.sched_barrier(0)
     rcp_vals = []
     for i in range_constexpr(3 * N):
-        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
+        rcp_vals.append(fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
     # Stage 3: sigmoid / tanh assembly and the final product.
     rocdl.sched_barrier(0)
     results = []
@@ -294,7 +277,15 @@ def batched_situv2(pairs, *, consts, range_constexpr):
 
 
 def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
-    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
+    """Batched silu/swiglu with pipelined tanh for better TRANS utilisation.
+
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+
+    Tanh is issued in groups of CHUNK; after each group a sched_barrier
+    lets the compiler interleave the previous group's VALU consumers
+    (add-one, mul-half, final products) with the next group's TRANS
+    latency, avoiding a long TRANS-only stall.
 
     Args:
         pairs: list of (gate, up) f32 value pairs.
@@ -305,40 +296,48 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     Returns:
         list of activated f32 values, same length as *pairs*.
     """
-    import flydsl.expr as _fx
-
-    _one = _fx.Float32(1.0)
-    nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    _one = fx.Float32(1.0)
+    _half = fx.Float32(0.5)
+    _half_scale = fx.Float32((1.702 * 0.5) if swiglu else 0.5)
     N = len(pairs)
-    # Stage 1: clamp + exp2
-    gs, us, exp_vals = [], [], []
+    CHUNK = 4
+    # Stage 1: clamp all pairs
+    gs, us = [], []
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
         gs.append(g)
         us.append(u)
     rocdl.sched_barrier(0)
-    for i in range_constexpr(N):
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
-        exp_vals.append(exp_val)
-    # Stage 2a: add 1+exp
-    rocdl.sched_barrier(0)
-    sum_vals = []
-    for i in range_constexpr(N):
-        sum_vals.append(_one + exp_vals[i])
-    # Stage 2b: rcp
-    rocdl.sched_barrier(0)
-    rcp_vals = []
-    for i in range_constexpr(N):
-        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
-    # Stage 3: final mul
-    rocdl.sched_barrier(0)
-    results = []
-    for i in range_constexpr(N):
+    # Stage 2+3 interleaved: issue CHUNK tanh, then consume previous CHUNK.
+    tanh_vals = [None] * N
+    results = [None] * N
+    n_chunks = (N + CHUNK - 1) // CHUNK
+    for c in range_constexpr(n_chunks):
+        lo = c * CHUNK
+        hi = min(lo + CHUNK, N)
+        for i in range_constexpr(lo, hi):
+            tanh_vals[i] = fx.Float32(
+                rocdl.tanh(T.f32, as_ir_value(gs[i] * _half_scale))
+            )
+        rocdl.sched_barrier(0)
+        prev_lo = (c - 1) * CHUNK if c > 0 else None
+        prev_hi = lo if c > 0 else None
+        if prev_lo is not None:
+            for i in range_constexpr(prev_lo, prev_hi):
+                sig = _half * (_one + tanh_vals[i])
+                if swiglu:
+                    results[i] = gs[i] * sig * (us[i] + _one)
+                else:
+                    results[i] = gs[i] * sig * us[i]
+    # Drain last chunk's VALU
+    drain_lo = (n_chunks - 1) * CHUNK
+    for i in range_constexpr(drain_lo, N):
+        sig = _half * (_one + tanh_vals[i])
         if swiglu:
-            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+            results[i] = gs[i] * sig * (us[i] + _one)
         else:
-            results.append(gs[i] * rcp_vals[i] * us[i])
+            results[i] = gs[i] * sig * us[i]
     return results
 
 
