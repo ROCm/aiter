@@ -533,11 +533,10 @@ BACKEND_ADAPTIVE = "adaptive"
 # these were measured against is built from that count. A pair the table does
 # not name keeps the chunked gate below, so an unmeasured shape is unchanged.
 #
-# A cell is taken only when this kernel is no slower than the best of the four
-# and at least 1.05x faster than what runs there today, on a full buffer and on
-# a padded one alike, which the gate cannot tell apart. Every entry assumes the
-# caller declares `max_row_len`; without it the config comes from the buffer and
-# these bands stop being safe. The PR description holds the per-cell scores.
+# A cell is admitted only when this kernel is the fastest of the four and at
+# least 1.05x faster than the kernel the gate would pick without it, on a full
+# buffer and on a padded one alike, which the gate cannot tell apart. Every entry
+# assumes the caller declares `max_row_len`.
 _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx942", 80): {
         True: {
@@ -796,11 +795,10 @@ def decode_adaptive_width(width: int, max_row_len: int) -> int:
     how a band admits a shape that then runs the wrong kernel for it.
 
     `max_row_len` is a **guarantee, not a hint** -- see `top_k_per_row_decode`.
-    It is required here: `None` reaching this function is a bug, because the gate
-    declines the adaptive path outright when the caller states no bound (see
-    `decode_backend_for_call`). Configuring from the physical width instead --
-    what a `None` fallback would do -- was measured to send a third of the
-    admitted MI308X shapes backwards, so it is not offered.
+    It is required here: the gate declines the adaptive path when the caller
+    states no bound (see `decode_backend_for_call`), so `None` reaching this
+    function is a bug. The physical width is not a fallback, because the bands
+    were admitted assuming a configuration sized to the bound.
     """
     if max_row_len is None:
         raise ValueError(
@@ -847,10 +845,8 @@ def decode_backend_for_call(
         num_rows,
         k,
         values is None,
-        # No bound means the host cannot size the adaptive config, and the only
-        # value it could fall back to -- the physical width -- ships a measured
-        # regression. Decline it; the chunked bands above still see the width,
-        # so the call lands where it does today.
+        # No bound means the host cannot size the adaptive config, so decline it;
+        # the chunked bands still see the physical width.
         None if max_row_len is None else decode_adaptive_width(width, max_row_len),
     )
     if backend == BACKEND_UPSTREAM:
@@ -929,13 +925,11 @@ def top_k_per_row_decode(
 
     `max_row_len` is an upper bound on every entry of `seqLens`, for callers
     whose `logits` is a context-sized buffer that decode only partly fills. It
-    is what opts a call into the adaptive path: the host picks the kernel from
-    it, and configuring from the physical width instead costs up to 1.21x median
-    and 1.91x p90 on a 1M buffer. `None` means the caller states no bound, and
-    the gate then **declines the adaptive path only**, leaving the call on the
-    kernel it runs without this argument. A serving stack
-    that assembles the batch already knows this value (it is `max(seqLens)`), so
-    passing it is one argument, not new bookkeeping.
+    is what opts a call into the adaptive path, whose kernel is configured from
+    it rather than from the physical width. `None` means the caller states no
+    bound, and the gate then **declines the adaptive path only**, leaving the
+    call on the kernel it runs without this argument. The caller assembling the
+    batch already knows the value: it is `max(seqLens)`.
 
     **It is a guarantee, not a hint.** Some of what it selects is compiled in,
     so a bound below the longest live row does not merely give up performance,

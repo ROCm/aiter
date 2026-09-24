@@ -7,8 +7,7 @@ Computes an unordered Top-K index set per decode row from one persistent launch,
 grid=(blocks_per_row, num_rows), picking a per-row strategy by valid length --
 which is what a decode batch needs, since its sequences differ in length. Each row
 derives how many of its blocks_per_row workgroups cooperate (active_parts); the
-rest return immediately. The candidate buffer is what distinguishes this kernel
-from the ancestor `topk_per_row_decode_tiered`: a pass writes the elements that
+rest return immediately. A per-row candidate buffer holds the elements that
 survive the settled digit, and the passes behind it read those instead of the row.
 
 Inputs/outputs:
@@ -66,8 +65,7 @@ from flydsl.expr import (
 )
 from flydsl.expr.typing import T
 
-# buffer_ops comes from aiter's own shim, not flydsl.expr: the flydsl cleanup in
-# #4501 dropped it from the stable interface.
+# buffer_ops comes from aiter's own shim; flydsl.expr's stable interface lacks it.
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 
@@ -138,18 +136,15 @@ SMEM_META_SHORT_FRONT_COUNT = 6
 SMEM_META_SHORT_BACK_COUNT = 7
 
 
-# The legacy name is still read so an old A/B script cannot silently mean "on".
 EARLY_STOP_DEFAULT = True
 EARLY_STOP_ENV = "FLYDSL_TOPK_ADAPTIVE_ES"
-_EARLY_STOP_ENV_LEGACY = "FLYDSL_TOPK_COMPACT_ES"
 
 
 def early_stop_default() -> bool:
     """Whether a config built with `early_stop=None` asks for the early stop."""
-    for name in (EARLY_STOP_ENV, _EARLY_STOP_ENV_LEGACY):
-        asked = os.environ.get(name)
-        if asked is not None:
-            return asked not in ("0", "")
+    asked = os.environ.get(EARLY_STOP_ENV)
+    if asked is not None:
+        return asked not in ("0", "")
     return EARLY_STOP_DEFAULT
 
 
@@ -517,8 +512,8 @@ def create_topk_per_row_decode_adaptive_kernel(
     # At one block per row "auto" cannot tell a short row from a row the grid could
     # only give one workgroup: `active_parts` folds to a compile-time one either
     # way, so a long row has nowhere to go but the single-workgroup tier. Only
-    # there is the length read at runtime, which keeps every other build's
-    # cooperating path exactly as dead or as live as it was.
+    # there is the length read at runtime; every other build keeps its
+    # cooperating path fixed at compile time.
     short_tier_by_len = short_tier and tier_mode == "auto" and blocks_per_row == 1
     if compact_early_carry and not compact_fast_scan:
         raise ValueError("compact_early_carry=True requires compact_fast_scan=True")
@@ -995,7 +990,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             The attempt cap is a liveness guard, not a recovery: a row that reaches
             it settles its digit from an incomplete histogram and returns a wrong
             answer that nothing catches, because no caller inspects the result.
-            Reaching the cap has only ever meant a bug elsewhere.
+            Reaching the cap means a bug elsewhere.
             """
             load_global_histogram(pass_id, coherent=True)
             choose_bucket_prefix(target_k)
@@ -1530,12 +1525,9 @@ def create_topk_per_row_decode_adaptive_kernel(
         def unordered_emit(need, kth_bits):
             """Row walk for the unordered emit, over a uniform number of tiles.
 
-            The loop this replaces started every thread at its own vec block and
-            stepped by the grid, so the trip count differed by one across the block
-            and a block scan inside it would have been a barrier that some threads
-            never reached. Every thread now runs the same tile count and the tail is
-            predicated away by `col_hi`, which is what `ordered_emit` already does
-            for the same reason.
+            The block scan inside is a barrier every thread must reach, so every
+            thread runs the same tile count and `col_hi` predicates the tail away,
+            as in `ordered_emit`.
             """
             stages = ORDERED_STAGES
             tile_stride = active_threads * fx.Int32(stages)
@@ -1543,9 +1535,8 @@ def create_topk_per_row_decode_adaptive_kernel(
             for tile, place_state in range(
                 fx.Index(0), fx.Index(tiles_i32), fx.Index(1), init=[c_zero]
             ):
-                # The whole tile is classified under one scan, so the staging that
-                # the old loop spent on memory parallelism now also amortises the
-                # scan and the atomic over `stages` times as many columns.
+                # The whole tile is classified under one scan, so the staging also
+                # amortises the scan and the atomic over `stages` times the columns.
                 tile_first = global_vec_tid + fx.Int32(tile) * tile_stride
                 spans = []
                 for s in range_constexpr(stages):
@@ -1771,7 +1762,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             # Same tiled walk and block scan as `unordered_emit`, which is what
             # keeps the scan's barrier at a uniform trip count and costs one atomic
             # per tile rather than one per winner -- the winners are exactly top_k,
-            # so a per-winner atomic scales with k and cost 1.41x at k=2048.
+            # so a per-winner atomic would scale with k.
             stages = ORDERED_STAGES
             tile_stride = active_threads * fx.Int32(stages)
             tiles_i32 = (vec_blocks_i32 + tile_stride - c_one) // tile_stride
@@ -1869,7 +1860,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         ):
             """Merge the pass histogram, settle its digit, and emit on the last one.
 
-            Split out of scan_pass because the compact passes reach it after reading
+            Separate from scan_pass because the compact passes reach it after reading
             the candidate buffer rather than the row; everything from the merge on is
             the same work either way.
             """

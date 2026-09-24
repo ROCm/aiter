@@ -405,8 +405,7 @@ def _run_adaptive(
     work. The kernel still folds each row onto as many of the launch's
     workgroups as that row's own `seq_lens` entry needs.
 
-    Defaulting `cfg_width` to `width` is the conservative reading of a caller
-    who said nothing, and was the only behaviour before `max_row_len` existed.
+    `cfg_width` defaults to `width` for a caller that states no bound.
     """
     from aiter.ops import topk as _gate
 
