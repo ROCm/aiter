@@ -171,6 +171,7 @@ def launch_gemm_a8w4_tdm(
     lds_soa_load_interleave: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
+    m_align: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -273,6 +274,7 @@ def launch_gemm_a8w4_tdm(
         ep_quant_bits,
         persistent_workers,
         rolled_drain,
+        m_align,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -439,6 +441,7 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _malign = f"_ma{m_align}" if m_align else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -448,7 +451,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -554,6 +557,16 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+        if const_expr(m_align):
+            # tile_map holds unpadded expert ends while experts start on
+            # m_align boundaries; a tile narrower than m_align can start in the
+            # previous expert's padding, which the bisect hands to this expert.
+            prev = (expert > 0).select(expert - 1, 0)
+            start = (tile_map[prev] + (m_align - 1)) // m_align * m_align
+            start = (expert > 0).select(start, 0)
+            in_expert = blk_m >= start
+            has_work = has_work & in_expert
+            expert = in_expert.select(expert, n_experts)
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
