@@ -1,26 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness + refusal + perf for the MiniMax-M3 decode index block-score pass.
+"""Correctness, refusals and perf for the MiniMax-M3 decode index block-score.
 
-``topk_index_score_decode`` scores every block of an **fp8** index key cache
-against an **unquantised bf16** index query -- the dtype pair the incumbent
-``pa_sparse_block_score_decode`` cannot express, because it requires an fp8
-query and the same dtype on both sides. See ``aiter/ops/topk_index_score.py``
-for why the query is never quantised.
-
-WHAT THIS FILE CHECKS, AND WHAT IT DOES NOT.
-
-The reference here is **torch, to a tolerance**. It checks that the kernel
-computes the documented function and that it refuses exactly what it documents.
-It does NOT establish bit-pattern equality with ATOM's Triton implementation:
-that claim needs ATOM's kernel as the comparator, which is not in this
-repository, and it is carried by that project's certification sweep instead.
-Saying so here keeps the two claims from being confused for one another.
-
-The refusal cases, by contrast, ARE exact -- a refusal either happens or it does
-not -- and they are the half of the contract most likely to rot, because every
-one of them is a shape or dtype somebody will eventually pass by accident.
+The reference here is torch, to a tolerance: this does NOT establish bit-pattern
+equality with the framework's Triton kernel, which is not in this repository.
+The refusal cases, by contrast, are exact.
 """
 
 import argparse
@@ -120,20 +105,8 @@ def run_port(q, k, score, block_table, seq_lens, max_q, ctx):
     return score
 
 
-# NAMED bench_*, NOT test_*, ON PURPOSE.
-#
-# The house style in this directory is test_<thing>(args) under @benchmark(),
-# driven from __main__ -- test_msa_block_select.py:153 has the identical shape.
-# pytest COLLECTS those names and then fails them on their required arguments,
-# so validate-kernel-pr ran this file and returned
-#     BLOCK: the PR adds this test target and it fails on head
-#     FAILED ...::test_index_score - TypeError
-# on its first pass. The sweep keeps the house shape and loses the
-# collected name; the collectable entry points below take no arguments.
-#
-# This is a property of the convention, not of this file: every op_tests target
-# written this way is un-collectable the same way. Reported as an observation
-# about the directory rather than fixed across it here.
+# Named bench_*, not test_*: pytest collects test_* names and would fail this
+# one on its required arguments. The collectable entry points take none.
 @benchmark()
 def bench_index_score(batch, ctx, heads, max_q):
     q, k, bt, seq, score, max_blk = _setup(batch, ctx, heads, max_q)
@@ -166,14 +139,6 @@ def _must_refuse(fn):
 
 def test_aux_k_legs():
     """D08 / rule A3 (review): both compiled cache-policy legs, for every cell.
-
-    The table compiles 14 specialisations -- 7 cells x aux_k in {0, 3} -- and
-    every other call in this file omits aux_k, which resolves to the default 3.
-    That left the seven aux_k=0 specialisations shipping compiled, dispatchable
-    and executed by nothing. aux_k selects a load cache policy, not a different
-    computation, so both legs must agree with the same reference and with each
-    other; if they ever do not, the difference is the policy, which is exactly
-    what this catches.
     """
     if not torch.cuda.is_available():
         return
@@ -327,10 +292,6 @@ def test_supported_predicate():
 
 def test_index_score():
     """The collectable correctness entry point: no arguments, so pytest runs it.
-
-    One small case per certified cell -- enough that a build which computes the
-    wrong function cannot pass, small enough to run in CI. The batch/context
-    sweep is bench_index_score, driven from __main__.
     """
     if not torch.cuda.is_available():
         return

@@ -1,29 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// topk_index_score_bf16_probe.cu -- A FEASIBILITY PROBE, NOT A PRODUCT.
-//
-// It answers exactly two questions about a bf16 index-K cache and nothing else:
-//   1. is the retained bf16 branch bitwise-equal to the Triton bf16 reference?
-//   2. what does it cost, against Triton's bf16 leg, across the shape surface?
-//
-// WHAT THIS IS NOT:
-//   * not dispatchable. No Python or C++ path reaches this symbol; layer P still
-//     REFUSES bf16 K (ledger D0) and the shipped entry point is untouched.
-//   * not certified, not tuned, and not covered by any gate. The sweep, the
-//     surface and the dispatch set all describe the fp8 path only.
-//   * not the accepted config. The bf16 branch takes the DIRECT path
-//     (kUseLdsStage is false for K_T != fp8_t), so it has NO page-hoist staging,
-//     NO LDS double buffering and NO XOR swizzle. The swizzle alone is worth
-//     4.3% and is derived for 128-byte rows; a bf16 row is 256 bytes and pi_X
-//     would have to be re-derived from scratch. A number from this probe is a
-//     FLOOR for what a bf16 path could do, not an estimate of it.
-//
-// The one edit it required elsewhere is the OPUS_IDX_SCORE_ALLOW_BF16_K guard
-// around the Layer-K fp8 static_assert in the kernels header. That macro is
-// defined here and nowhere else, so the shipped TUs compile the same tokens
-// they compiled before -- checked, not assumed, by comparing their object
-// hashes across the edit.
+// bf16 index-K FEASIBILITY PROBE -- not a product. Unregistered, bound by no
+// Python entry, and the operator still refuses a bf16 cache.
+// OPUS_IDX_SCORE_ALLOW_BF16_K is defined here and nowhere else.
 #define OPUS_IDX_SCORE_ALLOW_BF16_K 1
 
 #include "topk_index_score.hpp"
