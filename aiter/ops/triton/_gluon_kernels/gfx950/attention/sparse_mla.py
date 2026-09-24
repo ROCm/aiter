@@ -68,17 +68,20 @@ def _cache_load(
     mask=None,
     other=None,
     CACHE: gl.constexpr = _CG,
+    BUF_ZERO: gl.constexpr = False,
 ):
     """Gather rows[i] + col[j]. row is the per-token offset in ptr's element
     units; col a small compile-time arange. Keeping them apart resolves one
     pointer per token on the 64-bit path (the column offset folds into the
-    load's immediate) instead of a 64-bit add per element."""
+    load's immediate) instead of a 64-bit add per element.
+    BUF_ZERO: other is zero, which a masked buffer_load already returns (the
+    mask moves the offset out of range), so skip the select that waits on it."""
     if USE_BUFFER_LOAD:
         return gl.amd.cdna4.buffer_load(
             ptr=ptr,
             offsets=row.to(gl.int32)[:, None] + col.to(gl.int32)[None, :],
             mask=mask,
-            other=other,
+            other=None if BUF_ZERO else other,
             cache=CACHE,
         )
     row_ptr = ptr + row.to(gl.int64)
@@ -744,9 +747,10 @@ def _slots(
         if HAS_INVALID:
             if UNI_TILE:
                 valid = valid & (slot >= 0)
-            # -1 sentinels read slot 0 and the score mask drops them. Lanes past
-            # hi keep the duplicate of the last key: their p is 0, and slot 0
-            # can hold NaN (the null block), which 0 * NaN would carry into V.
+            # -1 sentinels clamp to slot 0 to stay addressable, and the gather
+            # is masked on valid: slot 0 can hold NaN (the null block), which a
+            # masked score would still carry into V as 0 * NaN. Lanes past hi
+            # keep the duplicate of the last key.
             slot = gl.maximum(slot, 0)
     block, pos = _split_slot(cfg, slot, BLOCK_SIZE)
     return block, pos, valid
@@ -938,6 +942,10 @@ def _gather_full(
             valid = valid & (slot >= 0)
             slot = gl.maximum(slot, 0)  # as in _slots: tail lanes keep their key
         bg, pg = _split_slot(cfg, slot, fmt.BLOCK_SIZE)
+    # -1 sentinels (and UNI_TILE's tail lanes) point at slot 0 or a duplicate;
+    # masking the gather on valid keeps slot 0's contents out of the dots.
+    MK: gl.constexpr = cfg.HAS_INVALID
+    vm = valid[:, None] if MK else None
     if fmt.KIND == "fp8_g64":
         NGRP: gl.constexpr = cfg.KV_DIM // 64
         x_u8 = _cache_load(
@@ -945,14 +953,20 @@ def _gather_full(
             bg * cs0 + pg * cfg.KV_DIM,
             offs_full,
             fmt.USE_BUFFER_LOAD,
+            mask=vm,
+            other=0 if MK else None,
             CACHE=cfg.GATHER_CACHE,
+            BUF_ZERO=MK,
         )
         sc = _cache_load(
             seg.alt_ptr,
             bg * NGRP,
             offs_full // 64,
             fmt.USE_BUFFER_LOAD,
+            mask=vm,
+            other=0.0 if MK else None,
             CACHE=cfg.GATHER_CACHE,
+            BUF_ZERO=MK,
         )
         k_rope = x_u8  # no rope side-channel -> DCE'd
     elif fmt.KIND == "fp8_scalar":
@@ -963,11 +977,14 @@ def _gather_full(
             bg * cs0 + pg * fmt.TOK_EL,
             offs_full,
             fmt.USE_BUFFER_LOAD,
+            mask=vm,
+            other=0 if MK else None,
             CACHE=cfg.GATHER_CACHE,
+            BUF_ZERO=MK,
         )
         sc = x_u8  # no scale vector -> DCE'd
         if cfg.ROPE_SEPARATE:
-            bgr, pgr, _ = _slots(
+            bgr, pgr, vr = _slots(
                 cfg,
                 seg,
                 k_start + k_rng_rope,
@@ -981,7 +998,10 @@ def _gather_full(
                 bgr * cs0 + pgr * fmt.TOK_EL + cfg.KV_DIM,
                 offs_rope,
                 fmt.USE_BUFFER_LOAD,
+                mask=vr[:, None] if MK else None,
+                other=0 if MK else None,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=MK,
             )
         else:
             k_rope = x_u8  # rope lives inside the KV buffer -> DCE'd
@@ -995,13 +1015,13 @@ def _gather_full(
             sc = _scale_load(
                 seg.scl_ptr,
                 scl_row,
-                scl_row,
+                valid if MK else scl_row,
                 fmt.USE_BUFFER_LOAD,
                 cfg.gather_l,
                 fmt.scl_l,
                 fmt.NG,
                 cfg.KV_DIM,
-                False,
+                MK,
                 0.0,
             )
         else:
@@ -1010,16 +1030,22 @@ def _gather_full(
                 scl_row,
                 offs_full // fmt.GROUP,
                 fmt.USE_BUFFER_LOAD,
+                mask=vm,
+                other=0.0 if MK else None,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=MK,
             )
         x_u8 = _cache_load(
             seg.cache_ptr,
             nope_row,
             offs_full,
             fmt.USE_BUFFER_LOAD,
+            mask=vm,
+            other=0 if MK else None,
             CACHE=cfg.GATHER_CACHE,
+            BUF_ZERO=MK,
         )
-        bgr, pgr, _ = _slots(
+        bgr, pgr, vr = _slots(
             cfg,
             seg,
             k_start + k_rng_rope,
@@ -1033,7 +1059,10 @@ def _gather_full(
             bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
             offs_rope,
             fmt.USE_BUFFER_LOAD,
+            mask=vr[:, None] if MK else None,
+            other=0.0 if MK else None,
             CACHE=cfg.GATHER_CACHE,
+            BUF_ZERO=MK,
         )
     else:  # "fp8_dsv4_mla"
         nope_row = bg * cs0 + pg * fmt.TOK_U8
@@ -1043,14 +1072,14 @@ def _gather_full(
             sc = _scale_load(
                 seg.cache_ptr,
                 scl_row,
-                scl_row,
+                valid if MK else scl_row,
                 fmt.USE_BUFFER_LOAD,
                 cfg.gather_l,
                 fmt.scl_l,
                 fmt.NG,
                 cfg.KV_DIM,
-                False,
-                127,
+                MK,
+                0,  # E8M0 0 = 2^-127: finite, and the data it scales is 0
             )
         else:
             sc = _cache_load(
@@ -1058,7 +1087,10 @@ def _gather_full(
                 scl_row,
                 offs_full // 64,
                 fmt.USE_BUFFER_LOAD,
+                mask=vm,
+                other=0 if MK else None,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=MK,
             )
         if fmt.DEQ == "asm":
             # 2-byte elements: <2 x i16> = 4 packed fp8 per VGPR out of one
@@ -1070,7 +1102,14 @@ def _gather_full(
                 row16,
                 offs_full16,
                 fmt.USE_BUFFER_LOAD,
+                mask=(
+                    gl.convert_layout(valid, gl.SliceLayout(1, cfg.gather16_l))[:, None]
+                    if MK
+                    else None
+                ),
+                other=0.0 if MK else None,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=MK,
             )
         else:
             x_u8 = _cache_load(
@@ -1078,10 +1117,13 @@ def _gather_full(
                 nope_row,
                 offs_full,
                 fmt.USE_BUFFER_LOAD,
+                mask=vm,
+                other=0 if MK else None,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=MK,
             )
         if pre is None:
-            bgr, pgr, _ = _slots(
+            bgr, pgr, vr = _slots(
                 cfg,
                 seg,
                 k_start + k_rng_rope,
@@ -1092,7 +1134,9 @@ def _gather_full(
             )
         else:
             slot_r = pre[1]
+            vr = k_start + k_rng_rope < seg_hi
             if cfg.HAS_INVALID:
+                vr = vr & (slot_r >= 0)
                 slot_r = gl.maximum(slot_r, 0)
             bgr, pgr = _split_slot(cfg, slot_r, fmt.BLOCK_SIZE)
         k_rope = _cache_load(
@@ -1100,7 +1144,10 @@ def _gather_full(
             bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
             offs_rope,
             fmt.USE_BUFFER_LOAD,
+            mask=vr[:, None] if MK else None,
+            other=0.0 if MK else None,
             CACHE=cfg.GATHER_CACHE,
+            BUF_ZERO=MK,
         )
     return x_u8, sc, k_rope, valid
 
@@ -1284,8 +1331,8 @@ def _decode_tile(
     MASKED: gl.constexpr,
 ):
     """One KV tile -> online-softmax update. MASKED=True is the peeled tail
-    (fully predicated); full tiles clamp -1 sentinels and mask scores when
-    HAS_INVALID."""
+    (fully predicated); with HAS_INVALID full tiles clamp -1 sentinels and
+    predicate their gathers too."""
     neg_inf = float("-inf")
     fmt = seg.fmt
     cs0 = seg.cs0
@@ -1301,7 +1348,9 @@ def _decode_tile(
     )
     block_idx_g = gl.convert_layout(block_idx, gl.SliceLayout(1, cfg.gather_l))
     pos_g = gl.convert_layout(pos, gl.SliceLayout(1, cfg.gather_l))
-    if MASKED:
+    # With HAS_INVALID the full tiles gather masked too (see _gather_full).
+    LM: gl.constexpr = MASKED or cfg.HAS_INVALID
+    if LM:
         valid_g = gl.convert_layout(valid1d, gl.SliceLayout(1, cfg.gather_l))
 
     if fmt.KIND == "fp8_g64":
@@ -1309,7 +1358,7 @@ def _decode_tile(
         kv_row = block_idx_g * cs0 + pos_g * cfg.KV_DIM
         scl_row = block_idx_g * NGRP
         scl_col = offs_full // 64
-        if MASKED:
+        if LM:
             x_u8 = _cache_load(
                 seg.cache_ptr,
                 kv_row,
@@ -1318,6 +1367,7 @@ def _decode_tile(
                 mask=valid_g[:, None],
                 other=0,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=cfg.HAS_INVALID,
             )
             sc = _cache_load(
                 seg.alt_ptr,
@@ -1327,6 +1377,7 @@ def _decode_tile(
                 mask=valid_g[:, None],
                 other=0.0,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=cfg.HAS_INVALID,
             )
         else:
             x_u8 = _cache_load(
@@ -1350,7 +1401,7 @@ def _decode_tile(
             block_idx_g * cs0 + fmt.BLOCK_SIZE * fmt.TOK_U8 + pos_g * fmt.SCL_TRAILER_U8
         )
         scl_col = offs_full // 64
-        if MASKED:  # scales first: see _gather_full
+        if LM:  # scales first: see _gather_full
             if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
                 exps = _scale_load(
                     seg.cache_ptr,
@@ -1388,6 +1439,7 @@ def _decode_tile(
                     ],
                     other=0.0,
                     CACHE=cfg.GATHER_CACHE,
+                    BUF_ZERO=cfg.HAS_INVALID,
                 )
             else:
                 x_u8 = _cache_load(
@@ -1398,6 +1450,7 @@ def _decode_tile(
                     mask=valid_g[:, None],
                     other=0,
                     CACHE=cfg.GATHER_CACHE,
+                    BUF_ZERO=cfg.HAS_INVALID,
                 )
         else:
             if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
@@ -1450,7 +1503,7 @@ def _decode_tile(
             MASKED,
         )
         rope_row = block_idx_gr * (cs0 // 2) + pos_gr * fmt.TOK_U16 + fmt.ROPE_U16_OFF
-        if MASKED:
+        if LM:
             k_rope = _cache_load(
                 seg.alt_ptr,
                 rope_row,
@@ -1459,6 +1512,7 @@ def _decode_tile(
                 mask=valid_gr[:, None],
                 other=0.0,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=cfg.HAS_INVALID,
             )
         else:
             k_rope = _cache_load(
@@ -1471,7 +1525,7 @@ def _decode_tile(
         kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
     else:  # "bf16" (tensor/dsmla require UNI_TILE, so they never come here)
         kv_row2 = block_idx_g * cs0 + pos_g * fmt.TOK_EL
-        if MASKED:
+        if LM:
             kv = _cache_load(
                 seg.alt_ptr,
                 kv_row2,
@@ -1480,6 +1534,7 @@ def _decode_tile(
                 mask=valid_g[:, None],
                 other=0.0,
                 CACHE=cfg.GATHER_CACHE,
+                BUF_ZERO=cfg.HAS_INVALID,
             )
         else:
             kv = _cache_load(
@@ -1500,7 +1555,7 @@ def _decode_tile(
                 MASKED,
             )
             rope_row = block_idx_gr * cs0 + pos_gr * fmt.TOK_EL + cfg.KV_DIM
-            if MASKED:
+            if LM:
                 k_rope = _cache_load(
                     seg.alt_ptr,
                     rope_row,
@@ -1509,6 +1564,7 @@ def _decode_tile(
                     mask=valid_gr[:, None],
                     other=0.0,
                     CACHE=cfg.GATHER_CACHE,
+                    BUF_ZERO=cfg.HAS_INVALID,
                 )
             else:
                 k_rope = _cache_load(

@@ -569,12 +569,13 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
 
 
+@pytest.mark.parametrize("sentinels", [False, True])
 @pytest.mark.parametrize("T", [13, 2437])
-def test_pa_decode_sparse_tail_skips_slot0(T):
-    """Rows that end mid-tile must not read slot 0 for their unused lanes. vLLM's
-    null block sits there and can hold NaN, which 0 * NaN would carry into the
-    output although no index points at it. T=2437 takes the prefill config
-    (prefetched slot ids)."""
+def test_pa_decode_sparse_skips_slot0(T, sentinels):
+    """Neither the unused lanes of a row that ends mid-tile nor -1 entries may
+    read slot 0. vLLM's null block sits there and can hold NaN, which 0 * NaN
+    would carry into the output although no index points at it. T=2437 takes
+    the prefill config (prefetched slot ids)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if arch_info.get_arch() != "gfx950":
@@ -596,6 +597,10 @@ def test_pa_decode_sparse_tail_skips_slot0(T):
     indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
     indptr[1:] = lens.cumsum(0)
     idx = torch.arange(1, int(lens.sum()) + 1, dtype=torch.int32, device=device)
+    if sentinels:
+        drop = torch.rand(idx.shape, device=device) < 0.2
+        drop[indptr[:-1].long()] = False  # every row keeps a key
+        idx[drop] = -1
 
     ref = pa_decode_sparse_reference(
         q, deq.to(q.dtype), idx, indptr, attn_sink, softmax_scale
