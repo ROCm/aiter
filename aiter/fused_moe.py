@@ -612,15 +612,23 @@ def moe_sorting(
     output=None,
     use_tiled_sort: bool = False,
 ):
-    if use_tiled_sort:
-        from aiter.ops.triton.moe_sorting_tiled import try_m3_tiled_sort
+    if use_tiled_sort and output is None:
+        from aiter.ops.triton.moe.moe_sorting_tiled import try_m3_tiled_sort
 
         tiled_result = try_m3_tiled_sort(
-            topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype,
-            block_size, expert_mask=expert_mask,
-            num_local_tokens=num_local_tokens, dispatch_policy=dispatch_policy,
-            return_local_topk_ids=return_local_topk_ids, accumulate=accumulate,
-            flat=flat, output_aux=output_aux,
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
+            dispatch_policy=dispatch_policy,
+            return_local_topk_ids=return_local_topk_ids,
+            accumulate=accumulate,
+            flat=flat,
+            output_aux=output_aux,
         )
         if tiled_result is not None:
             return tiled_result
