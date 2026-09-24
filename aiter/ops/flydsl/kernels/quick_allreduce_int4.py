@@ -76,7 +76,6 @@ __all__ = [
     "DEFAULT_GRID_CAP",
     "MESH_CODECS",
     "MESH_ST_LADDER",
-    "mesh_st_ladder",
     "SUPER_TILES",
     "SUPPORTED_BLOCKS",
     "SUPPORTED_WORLDS",
@@ -84,6 +83,7 @@ __all__ = [
     "WORLD",
     "clamp_grid_cap",
     "make_quick_allreduce_int4_kernel",
+    "mesh_st_ladder",
 ]
 
 PHASES = 2
