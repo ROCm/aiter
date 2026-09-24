@@ -15,7 +15,12 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.asm.mla_decode_v4 import mla_decode_v4_asm_gfx1250
+from aiter.ops.asm.mla_decode_v4 import (
+    get_mla_v4_fused_kernel,
+    mla_decode_v4_asm_gfx1250,
+    mla_decode_v4_fused_asm_gfx1250,
+    mla_v4_fused_slot_f32,
+)
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
@@ -1718,6 +1723,20 @@ def mla_decode_fwd_v4_nm(
          FlashAttention LSE merge across the `num_kv_splits` axis and
          writes the merged result directly into the BF16 `output` tensor.
 
+    Fused multi-pass (gfx1250, `2 <= num_kv_splits <= 16`, variant listed in
+    `mla_v4_fused_asm.csv`, e.g. qh32 decode):
+      stage1 and the cross-split merge run in ONE cluster launch (no triton
+      stage2); the final BF16 result is written into `output`. The fp32
+      partial scratch uses a padded slot of `(num_heads + 1) * v_head_dim`
+      elements, so it is allocated here unless the caller passes `logits` in
+      that native shape `[total_q, num_kv_splits, (num_heads+1)*v_head_dim]`
+      (a caller `logits` in the regular 4D shape is ignored). The returned
+      `logits` / `attn_lse` are kernel scratch, viewed as
+      `[total_q, num_kv_splits, num_heads, v_head_dim]` / the regular lse
+      shape; read the result from `output`. `num_kv_splits > 16` keeps the
+      stage1 + stage2 path. Set `AITER_MLA_V4_FUSED=0` to force stage1 +
+      stage2 everywhere.
+
       `sink` (REQUIRED, keyword-only):
       Per-Q-head attention sink logit, total `num_heads` FP32 values
       (= `num_kv_heads * gqa_ratio`). Adds a virtual K-column of logit
@@ -1818,6 +1837,57 @@ def mla_decode_fwd_v4_nm(
 
     expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
+
+    fused = get_mla_v4_fused_kernel(
+        q, kv_buffer, max_seqlen_q, num_kv_splits
+    )
+    if fused is not None:
+        slot = mla_v4_fused_slot_f32(num_heads, v_head_dim)
+        fused_logits_shape = (total_q, num_kv_splits, slot)
+        if logits is not None and tuple(logits.shape) == fused_logits_shape:
+            scratch = logits
+        elif logits is None or tuple(logits.shape) == expected_logits_shape:
+            # Write-only scratch: empty splits are never read back.
+            scratch = torch.empty(
+                fused_logits_shape, dtype=dtypes.fp32, device=q.device
+            )
+        else:
+            raise ValueError(
+                f"mla_decode_fwd_v4_nm: caller-provided `logits` has shape "
+                f"{tuple(logits.shape)}, expected {fused_logits_shape} (fused "
+                f"native) or {expected_logits_shape}."
+            )
+        if attn_lse is None:
+            attn_lse = torch.empty(
+                expected_lse_shape, dtype=dtypes.fp32, device=q.device
+            )
+        elif tuple(attn_lse.shape) != expected_lse_shape:
+            raise ValueError(
+                f"mla_decode_fwd_v4_nm: caller-provided `attn_lse` has shape "
+                f"{tuple(attn_lse.shape)}, expected {expected_lse_shape}."
+            )
+        mla_decode_v4_fused_asm_gfx1250(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            sink,
+            scratch,
+            attn_lse,
+            output,
+            max_seqlen_q,
+            int(num_kv_splits),
+            kv_last_page_lens,
+        )
+        logits = scratch.as_strided(
+            expected_logits_shape,
+            (num_kv_splits * slot, slot, v_head_dim, 1),
+        )
+        return logits, attn_lse
+
     if out_16_nosplit != 0:
         # V3-style zero-copy final output. When out_16_nosplit=1 (single-pass),
         # the kernel writes the final DENSELY-PACKED BF16 result into ptr_R
@@ -1865,30 +1935,51 @@ def mla_decode_fwd_v4_nm(
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    mla_decode_v4_asm = (
-        mla_decode_v4_asm_gfx1250 if get_gfx() == "gfx1250" else aiter.mla_decode_v4_asm
-    )
-    mla_decode_v4_asm(
-        q,
-        qrope,
-        kv_buffer,
-        kvrope,
-        qo_indptr,
-        kv_indptr,
-        kv_page_indices,
-        split_indptr,
-        sink,
-        max_seqlen_q,
-        sm_scale_arg,
-        int(out_16_nosplit),
-        int(num_kv_splits),
-        logits,
-        attn_lse,
-        output,
-        valid_split_count,
-        use_valid_split_count_reduce,
-        kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
-    )
+    if get_gfx() == "gfx1250":
+        mla_decode_v4_asm_gfx1250(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            split_indptr,
+            sink,
+            logits,
+            attn_lse,
+            output,
+            valid_split_count,
+            max_seqlen_q,
+            sm_scale_arg,
+            int(out_16_nosplit),
+            int(num_kv_splits),
+            use_valid_split_count_reduce,
+            kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
+        )
+    else:
+        # The canonical C++ dispatcher retains its C-ABI-compatible order.
+        aiter.mla_decode_v4_asm(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            split_indptr,
+            sink,
+            max_seqlen_q,
+            sm_scale_arg,
+            int(out_16_nosplit),
+            int(num_kv_splits),
+            logits,
+            attn_lse,
+            output,
+            valid_split_count,
+            use_valid_split_count_reduce,
+            kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
+        )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
     if num_kv_splits > 1:

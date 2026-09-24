@@ -10,7 +10,7 @@ kernels off their C++ dispatchers:
 
   * device / arch info            -> get_warp_size
   * HIP ``.co`` launch via ctypes -> load_hip / hip_check / get_function /
-                                     launch_co
+                                     launch_co / launch_co_cluster
   * asm kernel registry helpers   -> dtype_str / strip_csv_comments /
                                      load_asm_cfg_csv
   * torch.compile interop          -> register_asm_custom_op
@@ -52,6 +52,44 @@ def get_warp_size() -> int:
 HIP_LAUNCH_PARAM_BUFFER_POINTER = ctypes.c_void_p(0x01)
 HIP_LAUNCH_PARAM_BUFFER_SIZE = ctypes.c_void_p(0x02)
 HIP_LAUNCH_PARAM_END = ctypes.c_void_p(0x03)
+# hipLaunchAttributeID::hipLaunchAttributeClusterDimension.
+HIP_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION = 4
+
+
+class _HIPClusterDim(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_uint), ("y", ctypes.c_uint), ("z", ctypes.c_uint)]
+
+
+class _HIPLaunchAttrVal(ctypes.Union):
+    # hipLaunchAttributeValue is a 64-byte union.
+    _fields_ = [
+        ("clusterDim", _HIPClusterDim),
+        ("_pad", ctypes.c_ubyte * 64),
+    ]
+
+
+class _HIPLaunchAttr(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_int),
+        ("_align", ctypes.c_ubyte * 4),
+        ("val", _HIPLaunchAttrVal),
+    ]
+
+
+class _HIPLaunchConfig(ctypes.Structure):
+    # HIP_LAUNCH_CONFIG: 7 x uint32, stream, attrs pointer, numAttrs.
+    _fields_ = [
+        ("gridDimX", ctypes.c_uint),
+        ("gridDimY", ctypes.c_uint),
+        ("gridDimZ", ctypes.c_uint),
+        ("blockDimX", ctypes.c_uint),
+        ("blockDimY", ctypes.c_uint),
+        ("blockDimZ", ctypes.c_uint),
+        ("sharedMemBytes", ctypes.c_uint),
+        ("hStream", ctypes.c_void_p),
+        ("attrs", ctypes.POINTER(_HIPLaunchAttr)),
+        ("numAttrs", ctypes.c_uint),
+    ]
 
 
 def load_hip():
@@ -115,6 +153,12 @@ def _get_hip():
         ctypes.c_uint,
         ctypes.c_uint,
         ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    hip.hipDrvLaunchKernelEx.argtypes = [
+        ctypes.POINTER(_HIPLaunchConfig),
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p),
@@ -196,6 +240,59 @@ def launch_co(func, grid, block, kernarg, stream=None, shared_mem=0):
             extra,
         ),
         "hipModuleLaunchKernel",
+    )
+
+
+def launch_co_cluster(
+    func, grid, block, kernarg, cluster_dim, stream=None, shared_mem=0
+):
+    """Like :func:`launch_co`, but launches through ``hipDrvLaunchKernelEx``
+    with ``hipLaunchAttributeClusterDimension`` set to ``cluster_dim``
+    (``(cx, cy, cz)``). Each grid dim must be a multiple of the matching
+    cluster dim, and the ``.co`` must be built for that cluster shape. A
+    ``(1, 1, 1)`` cluster falls back to the plain launch.
+    """
+    if cluster_dim is None or tuple(cluster_dim) == (1, 1, 1):
+        return launch_co(
+            func, grid, block, kernarg, stream=stream, shared_mem=shared_mem
+        )
+    gx, gy, gz = grid
+    bx, by, bz = block
+    cx, cy, cz = cluster_dim
+    if gx % cx or gy % cy or gz % cz:
+        raise ValueError(
+            f"launch_co_cluster: grid {tuple(grid)} is not a multiple of "
+            f"cluster {tuple(cluster_dim)}"
+        )
+    arg_size = ctypes.c_size_t(ctypes.sizeof(kernarg))
+    extra = (ctypes.c_void_p * 5)(
+        HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        ctypes.cast(ctypes.byref(kernarg), ctypes.c_void_p),
+        HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        ctypes.cast(ctypes.byref(arg_size), ctypes.c_void_p),
+        HIP_LAUNCH_PARAM_END,
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream().cuda_stream
+    attr = _HIPLaunchAttr()
+    attr.id = HIP_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+    attr.val.clusterDim.x = cx
+    attr.val.clusterDim.y = cy
+    attr.val.clusterDim.z = cz
+    cfg = _HIPLaunchConfig()
+    cfg.gridDimX = gx
+    cfg.gridDimY = gy
+    cfg.gridDimZ = gz
+    cfg.blockDimX = bx
+    cfg.blockDimY = by
+    cfg.blockDimZ = bz
+    cfg.sharedMemBytes = shared_mem
+    cfg.hStream = ctypes.c_void_p(stream)
+    cfg.attrs = ctypes.pointer(attr)
+    cfg.numAttrs = 1
+    hip_check(
+        _get_hip().hipDrvLaunchKernelEx(ctypes.byref(cfg), func, None, extra),
+        "hipDrvLaunchKernelEx",
     )
 
 
