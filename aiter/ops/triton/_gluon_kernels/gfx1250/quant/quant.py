@@ -155,10 +155,7 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
                 x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
             )
         else:
-            # Tail N-tile may have columns >= N whose LDS contents are stale
-            # ring-buffer garbage, not zero -- exclude them from the amax
-            # reduction (and downstream scaled_downcast input) or the e8m0
-            # scale for the whole quant-block gets corrupted.
+            # Tail N-tile: mask stale ring-buffer garbage past N before amax/quant.
             col_valid = (
                 pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)
             ) < N

@@ -163,15 +163,12 @@ _COND_OPS = {
 
 
 def select_tuned_config(tuned: dict, **variables) -> dict:
-    """Resolve a launch config from a JSON rule-tree instead of a hardcoded
-    if/else chain.
-
-    ``tuned`` is ``{"default": {...}, "rules": [{"if": {"<var>_<op>": <bound>,
-    ...}, "set": {...}}, ...]}``. Each rule fires when all its conditions
-    hold against ``variables`` (``<op>`` is one of leq/lt/geq/gt/eq); rules
-    are applied in list order and merged via ``dict.update``, so a JSON
-    author expresses a boundary walk by listing rules smallest-bound-first.
-    Returns a fresh, mutable dict.
+    """Resolve a launch config from a JSON ``{"default": {...}, "rules":
+    [{"if": {"<var>_<op>": <bound>, ...}, "set": {...}}, ...]}`` tree. Each
+    rule fires when all its conditions hold against ``variables`` (``<op>``
+    is one of leq/lt/geq/gt/eq); rules apply in list order and merge via
+    ``dict.update``, so list rules smallest-bound-first. Returns a fresh,
+    mutable dict.
     """
     config = dict(tuned["default"])
     for rule in tuned.get("rules", ()):

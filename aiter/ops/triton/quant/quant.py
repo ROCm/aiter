@@ -78,33 +78,44 @@ def _mxfp4_gfx1250_config(M: int, N: int) -> dict:
     return cfg
 
 
+# BLOCK_SIZE_N for M <= 32, keyed by (BLOCK_SIZE_M upper bound, K upper
+# bound); first matching row wins. Must stay >= 128 (NUM_QUANT_BLOCKS >= 4,
+# required by scaled_downcast, see _mxfp8_quant_op), capped at 512 (else the
+# TDM descriptor's pad-interval field overflows, see repo notes), and
+# narrowed to 128 for K > 1024 (more, narrower CTAs beat one wide tile there
+# -- benchmark-verified with repeated trials, ~11-13% win at M=8).
+_MXFP8_SMALL_M_BLOCK_SIZE_N = [
+    (8, 1024, 512),
+    (16, 1024, 256),
+    (32, 1024, 128),
+    (32, None, 128),
+]
+
+
+def _mxfp8_small_m_block_size_n(block_size_m: int, K: int) -> int:
+    for bm_max, k_max, block_size_n in _MXFP8_SMALL_M_BLOCK_SIZE_N:
+        if block_size_m <= bm_max and (k_max is None or K <= k_max):
+            return block_size_n
+    raise ValueError(f"no BLOCK_SIZE_N rule for BLOCK_SIZE_M={block_size_m}, K={K}")
+
+
 def _mxfp8_gfx1250_config(M: int, K: int) -> dict:
     """
-    Tuned launch config for dynamic_mxfp8_quant's gfx1250 gluon path, resolved
-    from configs/gfx1250/gluon/quant/quant_mxfp8/DEFAULT.json's default+rules
-    tree (see config_utils.select_tuned_config), tuned by a benchmark sweep.
-    BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived, not tunable via JSON, when
-    M <= 32: BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS >= 4 required by
-    scaled_downcast, see _mxfp8_quant_op), is capped at 512 to avoid
-    overflowing the TDM descriptor's pad-interval field (see repo notes), and
-    is narrowed to 128 for K > 1024 (more, narrower CTAs beat one wider tile
-    there; verified with repeated benchmark trials, not just a single sample).
-    NUM_BUFFERS defaults to 2 (double-buffered/prefetching loads+stores);
-    some rules pin it to 1 (no prefetch, fully synchronous per-tile) --
-    empirically found to be both faster and required for correctness there.
+    Tuned launch config for dynamic_mxfp8_quant's gfx1250 gluon path. For
+    M > 32, resolved from configs/gfx1250/gluon/quant/quant_mxfp8/DEFAULT.json's
+    default+rules tree (see config_utils.select_tuned_config), tuned by a
+    benchmark sweep. NUM_BUFFERS defaults to 2 (double-buffered/prefetching
+    loads+stores); some rules pin it to 1 (no prefetch, fully synchronous
+    per-tile) -- empirically found to be both faster and required for
+    correctness there. For M <= 32, BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived
+    instead of JSON-tuned (see _MXFP8_SMALL_M_BLOCK_SIZE_N above).
     """
     cfg_dir = resolve_config_dir("quant", "QUANT-MXFP8", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     cfg = select_tuned_config(tuned, M=M, K=K)
     if M <= 32:
         cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
-        if K <= 1024:
-            cfg["BLOCK_SIZE_N"] = min(4096 // cfg["BLOCK_SIZE_M"], 512)
-        else:
-            # Larger K: a narrower tile wins instead -- more independent
-            # CTAs to hide TDM latency outweighs per-tile transfer
-            # efficiency here (benchmark-verified, ~11-13% at M=8).
-            cfg["BLOCK_SIZE_N"] = 128
+        cfg["BLOCK_SIZE_N"] = _mxfp8_small_m_block_size_n(cfg["BLOCK_SIZE_M"], K)
     return cfg
 
 
