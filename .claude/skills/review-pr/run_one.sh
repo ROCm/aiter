@@ -111,14 +111,14 @@ fi
 say "WORK=$W"
 
 # The GLM backend can be slow or time out on a shared box; a single request timeout must not
-# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 2) with backoff,
+# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 1) with backoff,
 # requiring its output file to exist and be non-empty before counting the attempt as success.
 run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local label="$1" pf="$2" out="$3"; shift 3
-  local n=0 max="${AITER_REVIEW_RETRIES:-2}"
+  local n=0 max="${AITER_REVIEW_RETRIES:-1}"
   while :; do
     n=$((n + 1)); rm -f "$out"
-    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1000}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
+    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1500}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
     if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error/timeout?)"; return 1; fi
     say "$label attempt $n failed (GLM slow/timeout?); retrying in $((n * 10))s"; sleep $((n * 10))
   done
