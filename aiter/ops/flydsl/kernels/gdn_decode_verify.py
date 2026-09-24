@@ -1,47 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gated Delta Net decode recurrence for packed (varlen) batches.
-
-Companion to ``gdr_decode.py``. That kernel serves batch-major decode
-(``[B, S, H, D]`` with ``S`` baked in, one state read and one state write). This
-one serves the layout an SGLang-style server actually hands over during
-speculative decoding:
-
-* **packed / varlen** -- ``q``/``k``/``v`` arrive as ``[1, T, H, D]`` with a
-  ``cu_seqlens`` marking sequence starts, not as a batch dimension;
-* **EAGLE target-verify** -- the draft tokens of one step are verified together,
-  so the caller wants each draft step's post-update state snapshotted into an
-  ``intermediate_states`` buffer and the final write-back *suppressed* (the
-  accepted prefix is committed separately).
-
-Neither is expressible through ``flydsl_gdr_decode``, which is why this is a
-separate entry point rather than more flags on that one.
-
-Decomposition
--------------
-K is split across lanes rather than living inside one lane::
-
-    lane owns  v = vb + tid // KSPLIT,  k in [ (tid % KSPLIT) * KLOCAL, +KLOCAL )
-
-so ``KSPLIT`` lanes cooperate on one v column and every reduction over K -- the
-two l2-norms, the delta-rule projection and the output projection -- becomes
-``log2(KSPLIT)`` ``shuffle_xor`` steps. No LDS and no barriers. Each lane
-carries only ``KLOCAL`` floats of state, and the ``KSPLIT`` lanes of a v group
-cover one contiguous ``K * 2``-byte state row, so the loads coalesce.
-
-Two constraints that are easy to reintroduce by accident
---------------------------------------------------------
-1. The token loop is unrolled at compile time (``TSTATIC``), not a runtime
-   ``range``. A global store inside a FlyDSL runtime carry loop miscompiles;
-   the draft-token count is a small constant anyway, so this costs nothing.
-2. Only one lane per v group writes the output, but wrapping a store in an
-   ``if`` triggers (1). Non-writing lanes are instead steered past the output
-   descriptor's ``num_records`` so the hardware drops them. That *requires*
-   ``max_size=False`` with an explicit ``num_records_bytes``; with the default
-   unbounded descriptor the steered stores are not dropped and scribble far
-   past the tensor.
-"""
+"""Gated Delta Net decode recurrence for packed (varlen) batches."""
 
 import functools
 
@@ -50,7 +10,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 
 KDIM = 128
-HALF = 8  # b128 is the widest buffer load: 8 bf16
+HALF = 8
 
 
 def _dt(name: str):
@@ -172,8 +132,7 @@ def create_gdn_decode_verify_kernel(
         vbuf = fx.rocdl.make_buffer_tensor(v)
         ab = fx.rocdl.make_buffer_tensor(a)
         bb = fx.rocdl.make_buffer_tensor(b)
-        # Bounded on purpose -- the predicated output store relies on
-        # out-of-range offsets being dropped. See the module docstring.
+
         ob = fx.rocdl.make_buffer_tensor(
             out, max_size=False, num_records_bytes=fx.Int64(out_bytes)
         )
@@ -216,9 +175,6 @@ def create_gdn_decode_verify_kernel(
                 for j in range(NHALF)
             ]
 
-            # Reductions built as expressions: a statement-level `for` in a
-            # kernel body is rewritten into a runtime scf.for, which would make
-            # the index a DSL value and break the Python-list subscript.
             sk_local = functools.reduce(lambda p, c: p + c, [x * x for x in kvec])
             sq_local = functools.reduce(lambda p, c: p + c, [x * x for x in qvec])
             sk = _group_sum(sk_local.reduce(fx.ReductionOp.ADD, fx.Float32(0.0)))
