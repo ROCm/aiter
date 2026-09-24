@@ -3495,6 +3495,7 @@ def get_2stage_cfgs(
         and not use_g1u1
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
         and dtype == dtypes.bf16
         and is_shuffled
         and get_gfx() in ("gfx942", "gfx950")
