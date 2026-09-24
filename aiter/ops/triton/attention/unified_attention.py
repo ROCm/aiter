@@ -458,12 +458,12 @@ def _unified_attention_2d_triton(params: _UAParams):
         # on gfx942, pages up to 128 are hardware-validated (the tuned SHUF
         # entries and the BS-agnostic M16/stages-1 fallback both fit 64 KiB
         # LDS at TILE_SIZE=128); a larger page forces a single K or V tile
-        # past the LDS budget with no tuned entry to compensate. gfx1250's
-        # tables carry their own BS_GEQ_256 entries and take the gluon path,
-        # which does not come through here.
-        assert params.block_size <= 128, (
+        # past the LDS budget with no tuned entry to compensate. Other archs
+        # (gfx950/gfx1250) take their own table entries and keep their
+        # existing behavior, including the gluon paths that bypass this fn.
+        assert not (DEVICE_ARCH == "gfx942" and params.block_size > 128), (
             "Unified Attention 2D Triton path with pre-shuffled KV cache "
-            f"supports pages up to 128 on this target; got block_size="
+            f"supports pages up to 128 on gfx942; got block_size="
             f"{params.block_size}"
         )
 
