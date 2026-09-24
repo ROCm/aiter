@@ -3482,8 +3482,9 @@ def get_2stage_cfgs(
         and not use_g1u1
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
-        and dtype in [dtypes.bf16, dtypes.fp16]
+        and dtype == dtypes.bf16
         and is_shuffled
+        and get_gfx() in ("gfx942", "gfx950")
     ):
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
