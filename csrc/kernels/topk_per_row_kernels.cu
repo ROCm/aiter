@@ -2616,7 +2616,11 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         IdxT const winner_count = counter.out_cnt;
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < winner_count; i += BlockSize)
         {
-            out_idx[i] = winner_indices[i];
+            // The indices are final output and are not consumed by a later
+            // kernel.  Keep the dense flush from allocating against the row
+            // data still resident in the last-level cache, matching the
+            // proven 16K--32K specialization below.
+            __builtin_nontemporal_store(winner_indices[i], out_idx + i);
         }
     }
 
