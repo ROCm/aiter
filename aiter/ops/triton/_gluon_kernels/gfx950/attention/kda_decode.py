@@ -141,6 +141,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     W: gl.constexpr = 4,
     USE_CONV: gl.constexpr = False,
     USE_RMS_GATE: gl.constexpr = False,
+    TDM_STORE_BUFS: gl.constexpr = 2,
 ):
     gl.static_assert(STATE_V_FIRST, "gfx950 kda decode keeps the state [V, K]")
     gl.static_assert(BV == V and K == V, "gfx950 kda decode needs BV == V == K")

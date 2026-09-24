@@ -237,6 +237,8 @@ def fused_recurrent_kda(
     use_tdm_store = config.get("use_tdm_store", False)
     use_tdm_load = config.get("use_tdm_load", False)
     use_tdm_fused_load = config.get("use_tdm_fused_load", False)
+    tdm_store_bufs = config.get("tdm_store_bufs", 2)
+    sched_strategy = config.get("sched_strategy")
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (
@@ -397,10 +399,16 @@ def fused_recurrent_kda(
         CACHE_STATE_UPDATES=cache_state_updates,
         PAD_SLOT_GUARD=pad_slot_guard,
         USE_TDM_FUSED_LOAD=use_tdm_fused_load,
+        TDM_STORE_BUFS=tdm_store_bufs,
         W=W,
         USE_CONV=use_conv,
         USE_RMS_GATE=use_rms_gate,
         num_warps=num_warps,
+        **(
+            {"llvm_fn_attrs": f"amdgpu-sched-strategy={sched_strategy}"}
+            if sched_strategy
+            else {}
+        ),
     )
     return out, final_state
 

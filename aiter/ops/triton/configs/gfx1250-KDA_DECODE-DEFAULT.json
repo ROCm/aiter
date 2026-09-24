@@ -3,7 +3,11 @@
     "BV": 128,
     "SK": 16,
     "num_warps": 4,
-    "num_buffers": 2
+    "num_buffers": 2,
+    "use_tdm_load": true,
+    "use_tdm_store": true,
+    "tdm_store_bufs": 1,
+    "sched_strategy": "max-ilp"
   },
   "t_gt1_seq_heads_geq_3072": {
     "BV": 128,
