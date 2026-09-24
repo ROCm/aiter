@@ -14,6 +14,10 @@ from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_post_pre_split_kernel,
     _mhc_reduce_apply_kernel,
 )
+from aiter.ops.triton._triton_kernels.fusions.mhc_post_pre_delayed import (
+    _mhc_post_pre_delayed_main_kernel,
+    _mhc_post_pre_delayed_reduce_kernel,
+)
 
 __all__ = [
     "_mhc_asymmetric_sinkhorn_kernel",
@@ -21,6 +25,8 @@ __all__ = [
     "_mhc_fused_split_kernel",
     "_mhc_head_kernel",
     "_mhc_post_kernel",
+    "_mhc_post_pre_delayed_main_kernel",
+    "_mhc_post_pre_delayed_reduce_kernel",
     "_mhc_post_pre_reduce_apply_kernel",
     "_mhc_post_pre_split_kernel",
     "_mhc_reduce_apply_kernel",
