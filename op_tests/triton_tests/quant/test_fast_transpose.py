@@ -118,10 +118,12 @@ def test_transpose_packed_fp4_supports_strided_input():
     )
 
 
-def test_transpose_packed_fp4_accepts_int64_strides():
+def test_transpose_packed_fp4_with_large_unused_stride():
+    # A singleton dimension preserves large stride metadata without a 4 GiB allocation.
     huge_stride = (1 << 32) + 1
     input_storage = torch.tensor([0x21, 0x43], dtype=torch.uint8, device="cuda")
     data_fp4 = torch.as_strided(input_storage, (2, 1), (1, huge_stride))
+    assert data_fp4.stride(1) == huge_stride
 
     output = transpose_packed_fp4(data_fp4)
 
