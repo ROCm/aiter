@@ -67,12 +67,14 @@ def compact_hist_layout(*, npes: int, experts_per_rank: int, max_routes: int):
 
     Returns ``(row_dwords, sparse_cap, use_sparse)``. Dense rows are ``npes*epr``
     dwords. Sparse rows pack ``nnz`` plus ``(seg, cnt)`` pairs when local routes
-    cannot fill the dense table (decode).
+    cannot fill the dense table; they are only the fallback for a row TDM cannot
+    ship whole, since a dense row carries its own arrival tags and even at one
+    token that beats the sparse row's separate arrival counter.
     """
     segs = int(npes) * int(experts_per_rank)
     max_routes = max(1, int(max_routes))
     sparse_cap = min(segs, _align32(max_routes))
-    use_sparse = sparse_cap < segs
+    use_sparse = sparse_cap < segs and segs % 32 != 0
     row_dwords = _align32(1 + sparse_cap) if use_sparse else segs
     return row_dwords, sparse_cap, use_sparse
 
@@ -87,6 +89,21 @@ def compact_hist_stride(*, npes: int, experts_per_rank: int, max_routes: int) ->
 def compact_done_nbytes() -> int:
     """Two parity arrival counters (one i32 each)."""
     return 8
+
+
+@comm_ops.traced
+def _spin_until_tag(addr_i64, tag):
+    """Spin until the upper half of an i32 slot is ``tag`` or newer; return it.
+
+    Newer, not just equal: with no global sync between two plans on one slot
+    (back-to-back plans, no dispatch between) a fast peer can already have
+    written the next generation, and waiting for an exact match would hang.
+    The pipeline always dispatches in between, so there it is always equal.
+    """
+    cur = fx.Int32(comm_ops.load_i32_acquire(addr_i64))
+    while ((cur & fx.Int32(-65536)) - tag) < fx.Int32(0):
+        cur = fx.Int32(comm_ops.load_i32_acquire(addr_i64))
+    return cur
 
 
 @flyc.jit
@@ -169,6 +186,14 @@ def compile_tdm_compact_plan(
         raise ValueError(
             f"hist_stride={hist_stride} != npes*row_dwords={npes * row_dwords}"
         )
+    # Dense rows ship (gen16 << 16) | count, so a count must fit 16 bits; one
+    # source's count toward an expert is at most its token count.
+    use_tag = (
+        not use_sparse
+        and plan_blocks == 1
+        and segs % 32 == 0
+        and max_routes // max(1, int(topk)) < (1 << 16)
+    )
     merge_routes = max_routes <= _LDS_ROUTE_CAP
     if max_routes % 4 == 0:
         route_vec = 4
@@ -222,6 +247,13 @@ def compile_tdm_compact_plan(
             recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
             lds_pack = fx.Int64(fx.ptrtoint(pack_ptr))
             lds_recv = fx.Int64(fx.ptrtoint(recv_ptr))
+
+        if const_expr(plan_blocks == 1):
+            # Issued now so the round trip hides behind the tally; the previous
+            # plan on this slot finished before this launch, so it is current.
+            gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32) + arith.constant(
+                1
+            )
 
         for s in range(tid, segs, plan_threads):
             comm_ops.store_i32_lds(
@@ -309,19 +341,25 @@ def compile_tdm_compact_plan(
                 comm_ops.waitcnt_stores()
                 fx.barrier()
 
-            if tid == 0:
-                gen = buffer_load(
-                    rsrc_bar, 2, vec_width=1, dtype=T.i32
-                ) + arith.constant(1)
-                buffer_store(gen, rsrc_bar, 2)
-            fx.barrier()
-            gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32)
+            if const_expr(plan_blocks == 1):
+                if tid == 0:
+                    buffer_store(gen, rsrc_bar, 2)
+            else:
+                if tid == 0:
+                    gen = buffer_load(
+                        rsrc_bar, 2, vec_width=1, dtype=T.i32
+                    ) + arith.constant(1)
+                    buffer_store(gen, rsrc_bar, 2)
+                fx.barrier()
+                gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32)
             if const_expr(hist_pingpong):
                 parity = gen & arith.constant(1)
                 hist_off = off_hist + parity * hist_stride * 4
             else:
                 hist_off = off_hist
             done_off = off_done
+            if const_expr(use_tag):
+                tag = (gen & arith.constant(0xFFFF)) << arith.constant(16)
 
             if const_expr(use_sparse):
                 for s in range(tid, row_dwords, plan_threads):
@@ -352,6 +390,13 @@ def compile_tdm_compact_plan(
                 fx.barrier()
                 TDM.tdm_wait(0)
             elif const_expr(plan_blocks == 1 and segs % 32 == 0):
+                if const_expr(use_tag):
+                    for s in range(tid, segs, plan_threads):
+                        slot_addr = lds_hist + fx.Int64(s) * fx.Int64(4)
+                        comm_ops.store_i32_lds(
+                            slot_addr, comm_ops.load_i32_lds(slot_addr) | tag
+                        )
+                    fx.barrier()
                 if warp < npes:
                     peer_hist = fx.Int64(window.lsa_ptr(warp, hist_off)) + fx.Int64(
                         rank * segs * 4
@@ -362,8 +407,9 @@ def compile_tdm_compact_plan(
                         ),
                         TDM.tdm_group1(32, segs // 32, 4),
                     )
-                fx.barrier()
-                TDM.tdm_wait(0)
+                if const_expr(not use_tag):
+                    fx.barrier()
+                    TDM.tdm_wait(0)
             else:
                 hist_vec = 2 if segs % 2 == 0 else 1
                 for peer in range_constexpr(npes):
@@ -388,35 +434,37 @@ def compile_tdm_compact_plan(
                             s,
                         )
                 comm_ops.waitcnt_stores()
-            fx.barrier()
-            if tid == 0:
-                comm_ops.fence_system_release()
-            fx.barrier()
-            if tid < npes:
-                comm_ops.atomic_add_system(
-                    fx.Int64(window.lsa_ptr(tid, done_off)),
-                    arith.constant(1),
-                )
-            comm_ops.waitcnt_stores()
-            fx.barrier()
-            if tid == 0:
-                comm_ops.wait_i32_until_equals(
-                    fx.Int64(window.lsa_ptr(rank, done_off)),
-                    gen * fx.Int32(npes),
-                )
-                comm_ops.fence_system_acquire()
-            fx.barrier()
+            if const_expr(not use_tag):
+                fx.barrier()
+                if tid == 0:
+                    comm_ops.fence_system_release()
+                fx.barrier()
+                if tid < npes:
+                    comm_ops.atomic_add_system(
+                        fx.Int64(window.lsa_ptr(tid, done_off)),
+                        arith.constant(1),
+                    )
+                comm_ops.waitcnt_stores()
+                fx.barrier()
+                if tid == 0:
+                    comm_ops.wait_i32_until_equals(
+                        fx.Int64(window.lsa_ptr(rank, done_off)),
+                        gen * fx.Int32(npes),
+                    )
+                    comm_ops.fence_system_acquire()
+                fx.barrier()
 
             if const_expr(use_sparse):
                 tdm_rows = (npes * row_dwords) // 32
-                TDM.tdm_load(
-                    TDM.tdm_group0(
-                        arith.trunci(T.i32, arith.unwrap(lds_recv)),
-                        fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off)),
-                    ),
-                    TDM.tdm_group1(32, tdm_rows, 4),
-                )
-                TDM.tdm_wait(0)
+                if warp == 0:
+                    TDM.tdm_load(
+                        TDM.tdm_group0(
+                            arith.trunci(T.i32, arith.unwrap(lds_recv)),
+                            fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off)),
+                        ),
+                        TDM.tdm_group1(32, tdm_rows, 4),
+                    )
+                    TDM.tdm_wait(0)
                 for s in range(tid, npes * segs, plan_threads):
                     comm_ops.store_i32_lds(
                         lds_matrix + fx.Int64(s) * fx.Int64(4), arith.constant(0)
@@ -442,15 +490,31 @@ def compile_tdm_compact_plan(
                 fx.barrier()
             else:
                 matrix_n = npes * segs
-                if const_expr(matrix_n % 32 == 0):
-                    TDM.tdm_load(
-                        TDM.tdm_group0(
-                            arith.trunci(T.i32, arith.unwrap(lds_matrix)),
-                            fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off)),
-                        ),
-                        TDM.tdm_group1(32, matrix_n // 32, 4),
-                    )
-                    TDM.tdm_wait(0)
+                if const_expr(use_tag):
+                    # Every dword carries its writer's generation, so a slot is
+                    # final once its tag matches: no separate arrival counter.
+                    local_hist = fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off))
+                    for s in range(tid, matrix_n, plan_threads):
+                        packed = _spin_until_tag(
+                            local_hist + fx.Int64(s) * fx.Int64(4), tag
+                        )
+                        comm_ops.store_i32_lds(
+                            lds_matrix + fx.Int64(s) * fx.Int64(4),
+                            packed & arith.constant(0xFFFF),
+                        )
+                    # The scan below overwrites lds_hist, which the stores read.
+                    if warp < npes:
+                        TDM.tdm_wait(0)
+                elif const_expr(matrix_n % 32 == 0):
+                    if warp == 0:
+                        TDM.tdm_load(
+                            TDM.tdm_group0(
+                                arith.trunci(T.i32, arith.unwrap(lds_matrix)),
+                                fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off)),
+                            ),
+                            TDM.tdm_group1(32, matrix_n // 32, 4),
+                        )
+                        TDM.tdm_wait(0)
                 else:
                     local_hist_rsrc = create_buffer_resource_from_addr(
                         fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off))
