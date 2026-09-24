@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os as _os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -74,6 +73,7 @@ CTRL_CNT = (
     64  # ctrl ints: [0] epoch [2] fin [32 + x] XCD x's L2 dropped; counters at 64
 )
 CTRL_XF = 32
+CTRL_XE = 40  # [N_XCD] workgroups of XCD x done with this launch
 N_XCD = 8  # workgroups are dealt round-robin over the XCDs
 CTRL_LRDY = CTRL_CNT + 2 * NCK_MAX
 LRDY_STRIDE = 32  # polled flags live on their own 128 B lines
@@ -84,8 +84,9 @@ CTRL_INTS = CTRL_GRAB + 2 * NCK_MAX * LRDY_STRIDE
 
 NW = 4  # compute waves
 NCOMM = 2  # comm wave + loader wave
+NPUSH = 2  # extra waves that only push/reduce (fill the SIMDs to 2 waves each)
 NT = NW * 64
-NTT = NT + 64 * NCOMM
+NTT = NT + 64 * (NCOMM + NPUSH)
 NSK = 4  # weight ring depth (k-steps) per compute wave
 SLOT = 4 * 1024 + 2 * 256  # 4 x 1 KB fragments + 2 scale dwords (256 B each)
 OPS = 6  # DMA ops per k-step
@@ -186,8 +187,9 @@ C_DONE = 12  # [NW]
 C_ASEQ = 16  # [NAB]
 C_AFREE = 20  # [NAB]
 C_QBASE = 24  # [NW]
-C_MBOX = 28  # [NW + NCOMM] per-wave mailbox
+C_MBOX = 28  # [NW + NCOMM + NPUSH] per-wave mailbox
 C_AGFREE = 41  # the AllGather staging (in the GEMM2 operand area) is read out
+C_UNIT = 48  # [5] this CTA's unit range and first unit (ub, ue, expert, i0, icnt)
 
 
 @functools.cache
@@ -237,7 +239,6 @@ def compile_fused_tp(
     TB = max(1, (RED_INFLIGHT // 2 if NPC > 2 else RED_INFLIGHT) // TOPK)
     ROW_B = H + H // 32 if FP8R else 2 * H
     name = (
-        "dev" + "".join(_os.environ.get(k, "0") for k in ("XP_NOCW", "XP_V1", "XP_V2", "XP_V3")) +
         f"mega_moe_tp_fused_h{H}_i{I}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
         + (f"_p{NPC}" if NPC > 1 else "")
         + ("_r8" if route_fp8 else "")
@@ -365,12 +366,6 @@ def compile_fused_tp(
 
     def g_ld_i32(addr):
         return i32(_llvm.LoadOp(T.i32, gptr(addr), alignment=4).res)
-
-    def _now():
-        return fx.Int64(_llvm.inline_asm(T.i64, [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True))
-
-    def _paddr(a, slot):
-        return fx.Int64(a["ctrl"]) + fx.Int64(CTRL_INTS * 4 + 64) + fx.Int64(i32(gpu.block_id("x"))) * fx.Int64(4096) + fx.Int64(i32(slot)) * fx.Int64(8)
 
     def fence(ordering, scope):
         _llvm.FenceOp(ordering, syncscope=scope)
@@ -602,10 +597,12 @@ def compile_fused_tp(
         # (in groups of SCAN_G so the batch never pushes the kernel's registers)
         for g0 in range_constexpr(0, SCAN_IT, SCAN_G):
             its = list(range(g0, min(g0 + SCAN_G, SCAN_IT)))
-            vs = []
+            vs, ws = [], []
             for it in its:
                 q = fx.min(tid + i32(it * NT), n4 - i32(1))
                 vs.append(fx.Vector(bld(rid, q * i32(16), 0, V4I, 0)))
+                # the weights ride along: a match then costs no second round trip
+                ws.append(fx.Vector(bld(rtw, q * i32(16), 0, V4I, 0)))
             for x, it in enumerate(its):
                 q = tid + i32(it * NT)
                 for j in range_constexpr(4):
@@ -614,11 +611,7 @@ def compile_fused_tp(
                         idx = q * i32(4) + i32(j)
                         if slot < i32(TMAX):
                             lds_st(L, L_RIX + slot * i32(4), idx)
-                            lds_st(
-                                L,
-                                L_WT + slot * i32(4),
-                                bld(rtw, idx * i32(4), 0, T.i32, 0),
-                            )
+                            lds_st(L, L_WT + slot * i32(4), fx.Int32(ws[x][j]))
         for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
             idx = i32(idx_)
             if g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * fx.Int64(4)) == expert:
@@ -803,24 +796,27 @@ def compile_fused_tp(
 
     # ---------------------------- loader -------------------------------
     @traced
+    def unit_fields(L, a, u, ub):
+        """(expert, i0, icnt) of unit u: the first from LDS (read at entry)."""
+        f = [lds_ld_i32(L, L_CTL + i32((C_UNIT + 2 + k) * 4)) for k in range(3)]
+        if u != ub:
+            ubase = fx.Int64(a["units"]) + fx.Int64(u) * fx.Int64(16)
+            f = [g_ld_i32(ubase + fx.Int64(4 * k)) for k in range(3)]
+        return f[0], f[1], f[2]
+
+    @traced
     def a_loader(L, tid, a):
         lane = tid % i32(64)
         rx = rsrc(a["ax"])
         rxs = rsrc(a["axs"])
-        ub = g_ld_i32(
-            fx.Int64(a["cta_units"]) + fx.Int64(gpu.block_id("x")) * fx.Int64(4)
-        )
-        ue = g_ld_i32(
-            fx.Int64(a["cta_units"]) + fx.Int64(gpu.block_id("x") + 1) * fx.Int64(4)
-        )
+        ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
+        ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         for u_ in range(ub, ue, i32(1)):
             u = i32(u_)
             if lane == i32(0):
                 spin_lds_ge(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
             R = uni(lds_ld_acq(L, L_CTL + C_UROWS * 4))
-            nnb = g_ld_i32(
-                fx.Int64(a["units"]) + fx.Int64(u) * fx.Int64(16) + fx.Int64(8)
-            ) // i32(128)
+            nnb = unit_fields(L, a, u, ub)[2] // i32(128)
             for r0_ in range(i32(0), R, i32(RG)):
                 r0 = i32(r0_)
                 rows = fx.min(R - r0, i32(RG))
@@ -855,9 +851,8 @@ def compile_fused_tp(
                         )
                     rocdl.sched_barrier(0)
                     cc = cidx % i32(NCH)
-                    if const_expr(_os.environ.get("XP_NOCW", "0") != "1"):
-                        if cidx < i32(NCH):
-                            ag_wait_chunk(L, lane, a, a["epoch"], cc, r0, rows)
+                    if cidx < i32(NCH):
+                        ag_wait_chunk(L, lane, a, a["epoch"], cc, r0, rows)
                     abase = L + i32(L_A) + b * i32(RG * ACB)
                     for j in range_constexpr(NA_ROWOPS):
                         dma16(abase + i32(j * 1024), rx, arow[j], cc * i32(ACB))
@@ -1141,10 +1136,13 @@ def compile_fused_tp(
 
     @traced
     def _drop_stale(tid, a):
+        # Each XCD's L2 is dropped by its last workgroup at the end of every
+        # launch (finish); only the first launch has to do it here.
         if tid < i32(64):
             asm("buffer_inv sc0")
         bid = i32(gpu.block_id("x"))
-        if (tid < i32(64)) & (bid < i32(N_XCD)):
+        first = a["epoch"] == i32(1)
+        if (tid < i32(64)) & (bid < i32(N_XCD)) & first:
             fence(_llvm.AtomicOrdering.acquire, "one-as")
             if tid == i32(0):
                 g_st_sys(
@@ -1154,29 +1152,11 @@ def compile_fused_tp(
     @traced
     def _stale_dropped(tid, a):
         """This XCD's L2 no longer holds the previous launch's arena lines."""
-        if tid == i32(0):
+        if (tid == i32(0)) & (a["epoch"] == i32(1)):
             x = i32(gpu.block_id("x")) % i32(N_XCD)
             spin_sys_ge(
                 fx.Int64(a["ctrl"]) + fx.Int64((i32(CTRL_XF) + x) * i32(4)), a["epoch"]
             )
-
-    @traced
-    def _pacc(a, tid, slot, dt):
-        if tid == i32(0):
-            _llvm.AtomicRMWOp(_llvm.AtomicBinOp.add, gptr(_paddr(a, slot)), _u(dt), _llvm.AtomicOrdering.monotonic, syncscope="agent")
-
-    @traced
-    def _pacc_lane(a, lane, slot, dt, on):
-        if (lane == i32(0)) & on:
-            _llvm.AtomicRMWOp(_llvm.AtomicBinOp.add, gptr(_paddr(a, slot)), _u(dt), _llvm.AtomicOrdering.monotonic, syncscope="agent")
-
-    @traced
-    def _pst_lane(a, lane, slot, t):
-        if lane == i32(0):
-            _llvm.StoreOp(_u(t), gptr(_paddr(a, slot)), alignment=8)
-
-    def pchunk(a, lane, cidx, k):
-        _pst_lane(a, lane, i32(16 + k) + cidx * i32(6), _now())
 
     @traced
     def compute_units(L, tid, a):
@@ -1184,20 +1164,14 @@ def compile_fused_tp(
         ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
         cbar(L, tid)
-        bid = gpu.block_id("x")
-        ub = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid) * fx.Int64(4))
-        ue = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid + 1) * fx.Int64(4))
+        ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
+        ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         if ub == ue:
             report_chunk(L, lane, tid // i32(64), i32(NCK - 1))
         for u_ in range(ub, ue, i32(1)):
             u = i32(u_)
-            ubase = fx.Int64(a["units"]) + fx.Int64(u) * fx.Int64(16)
-            expert = g_ld_i32(ubase)
-            i0 = g_ld_i32(ubase + fx.Int64(4))
-            icnt = g_ld_i32(ubase + fx.Int64(8))
-            tg = _now()
+            expert, i0, icnt = unit_fields(L, a, u, ub)
             R = gather_routes(L, tid, a["ids"], a["tw"], a["ttot"], expert)
-            _pacc(a, tid, 9, _now() - tg)
             if tid == i32(0):
                 lds_st(L, L_CTL + C_UROWS * 4, R)
                 lds_st_rel(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
@@ -1255,11 +1229,7 @@ def compile_fused_tp(
         pr_bytes = i32(NPC - 1) * routes_bytes
         r_pr = rsrc(a["proutes"], pr_bytes)
         ids_base = peer_sel(a, a["rank"]) + fx.Int64(a["off_ids"])
-        on = cidx < i32(4)
-        tq = _now()
         u = grab(lane, gslot)
-        tq2 = _now()
-        _pacc_lane(a, lane, 100, tq2 - tq, on)
         n = i32(0)
         while u < ns:
             for t0_ in range(u, ttot, ns * i32(TB)):
@@ -1327,19 +1297,9 @@ def compile_fused_tp(
                         else:
                             _push_store(a, r_dst, pd, v, acc, live)
             n = n + i32(1)
-            tq3 = _now()
-            _pacc_lane(a, lane, 101, tq3 - tq2, on)
             u = grab(lane, gslot)
-            tq2 = _now()
-            _pacc_lane(a, lane, 100, tq2 - tq3, on)
-        tq4 = _now()
         wait_vm(0)
-        tq5 = _now()
-        _pacc_lane(a, lane, 102, tq5 - tq4, on)
         _push_done(a, lane, epoch, cidx, ns, n)
-        _pacc_lane(a, lane, 103, _now() - tq5, on)
-        _pacc_lane(a, lane, 104, fx.Int64(n), on)
-        _pacc_lane(a, lane, 105, fx.Int64(1), on)
 
     @traced
     def _push_split_token(
@@ -1494,14 +1454,10 @@ def compile_fused_tp(
         w = tid // i32(64)
         cr = claim(L, lane, w, C_LRED, 0, a, epoch)
         if cr >= i32(0):
-            pchunk(a, lane, cr, 2)
             push_chunk(L, tid, a, epoch, cr)
-            pchunk(a, lane, cr, 3)
         cp = claim(L, lane, w, C_PULL, 1, a, epoch)
         if cp >= i32(0):
-            pchunk(a, lane, cp, 4)
             final_chunk(tid, a, cp)
-            pchunk(a, lane, cp, 5)
         return ((cr >= i32(0)) | (cp >= i32(0))).select(i32(1), i32(0))
 
     @traced
@@ -1528,7 +1484,6 @@ def compile_fused_tp(
     @traced
     def _signal_one(a, lane, epoch, nblk, cidx):
         cnt_addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(CTRL_CNT) + cidx) * i32(4))
-        pchunk(a, lane, cidx, 0)
         old = g_add_agent(cnt_addr, 1)
         if old == i32(nblk) - i32(1):
             g_st_sys(cnt_addr, i32(0))
@@ -1571,8 +1526,11 @@ def compile_fused_tp(
     # the rest is on the wire, and bumps the receivers' arrival counters.
     AGR = int(agr)
     TPC = int(tp)  # peers the AllGather sends to (the engine's world size)
-    # chunks in flight per comm wave before the oldest one is counted
-    AG_D = max(1, min(8, 63 // (2 * TPC)))
+    # Chunks in flight per comm wave before the oldest one is counted. One:
+    # the payload is xGMI bound anyway, and deeper queues of remote stores
+    # back up the fabric in front of every CTA's local loads (route scan,
+    # first A tiles), which costs more than the payload gains.
+    AG_D = 1
     AG_SROW = H // 2
     AG_SCB = AGR * AG_SROW
     assert AG_SCB + AGR * (H // 32) <= L_INTERS - L_INTER + RG * (I // 32)
@@ -1753,16 +1711,23 @@ def compile_fused_tp(
                 bst(ide, ri, eo, 0, AUX_SYS)
                 bst(wte, rw, eo, 0, AUX_SYS)
             wait_vm(0)
+            # Peers' flags first, own flag once they are acknowledged: the
+            # payload waits on the own flags, so it cannot overtake the peers'
+            # flags on the links.
             if lane == i32(0):
+                fo = (i32(FLAG_AGM) + rank * i32(32) + bid) * i32(4)
                 for p in range_constexpr(TPC):
-                    rf = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_flag"]))
-                    bst(
-                        a["epoch"],
-                        rf,
-                        (i32(FLAG_AGM) + rank * i32(32) + bid) * i32(4),
-                        0,
-                        AUX_SYS,
-                    )
+                    if i32(p) != rank:
+                        rf = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_flag"]))
+                        bst(a["epoch"], rf, fo, 0, AUX_SYS)
+                wait_vm(0)
+                bst(
+                    a["epoch"],
+                    rsrc(peer_sel(a, rank) + fx.Int64(a["off_flag"])),
+                    fo,
+                    0,
+                    AUX_SYS,
+                )
 
     def _wave_any(v, lane):
         for k in (1, 2, 4, 8, 16, 32):
@@ -1851,6 +1816,14 @@ def compile_fused_tp(
     def finish(tid, a, epoch):
         if tid == i32(0):
             nblk = gpu.grid_dim.x
+            # The XCD's last workgroup drops its L2 (arena lines peers rewrite
+            # next launch) here, off the next launch's critical path.
+            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            nx = (i32(nblk) - x + i32(N_XCD - 1)) // i32(N_XCD)
+            xc = fx.Int64(a["ctrl"]) + fx.Int64((i32(CTRL_XE) + x) * i32(4))
+            if g_add_agent(xc, 1) == nx - i32(1):
+                g_st_sys(xc, i32(0))
+                fence(_llvm.AtomicOrdering.acquire, "one-as")
             fin = fx.Int64(a["ctrl"]) + fx.Int64(8)
             old = g_add_agent(fin, 1)
             if old == i32(nblk) - i32(1):
@@ -1866,8 +1839,20 @@ def compile_fused_tp(
     @traced
     def init_lds(L, tid, a):
         # One writer per control int: done[] start at -1, the epoch slot takes
-        # this launch's epoch, everything else 0.
-        if tid < i32(64):
+        # this launch's epoch, the unit slots (static schedule: no staleness,
+        # so read before the L2 drop, off the critical path) come from wave 1,
+        # everything else 0.
+        if tid == i32(64):
+            bid = gpu.block_id("x")
+            ub = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid) * fx.Int64(4))
+            ue = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid + 1) * fx.Int64(4))
+            ubase = fx.Int64(a["units"]) + fx.Int64(
+                (ub < ue).select(ub, i32(0))
+            ) * fx.Int64(16)
+            vals = [ub, ue] + [g_ld_i32(ubase + fx.Int64(4 * k)) for k in range(3)]
+            for k in range_constexpr(5):
+                lds_st(L, L_CTL + i32((C_UNIT + k) * 4), vals[k])
+        if (tid < i32(C_UNIT)) | ((tid >= i32(C_UNIT + 5)) & (tid < i32(64))):
             is_done = (tid >= i32(C_DONE)) & (tid < i32(C_DONE + NW))
             ep = g_ld_rel(fx.Int64(a["ctrl"]), "agent") + i32(1)
             v = is_done.select(i32(-1), (tid == i32(C_EPOCH)).select(ep, i32(0)))
@@ -1877,16 +1862,16 @@ def compile_fused_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
-            if tid == i32(0):
-                _llvm.StoreOp(_u(_now()), gptr(_paddr(a, 3)), alignment=8)
             comm_help(L, tid, a, epoch)
         else:
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
                 comm_wave(L, tid, a, epoch)
-            else:
+            elif tid < i32(NT + 128):
                 a_loader(L, tid, a)
                 signal_loop(L, tid, a, epoch)
+                comm_help(L, tid, a, epoch)
+            else:
                 comm_help(L, tid, a, epoch)
 
     # Explicit annotation: the module's postponed annotations cannot see LDS_BYTES.
@@ -1965,8 +1950,6 @@ def compile_fused_tp(
             "piece_e0": piece_e0,
             "ttot": tp * m,
         }
-        if tid == i32(0):
-            _llvm.StoreOp(_u(_now()), gptr(_paddr(a, 0)), alignment=8)
         init_lds(L, tid, a)
         gpu.barrier()
         epoch = lds_ld_i32(L, L_CTL + C_EPOCH * 4)
@@ -1992,8 +1975,6 @@ def compile_fused_tp(
         roles(L, tid, a, epoch)
         gpu.barrier()
         finish(tid, a, epoch)
-        if tid == i32(0):
-            _llvm.StoreOp(_u(_now()), gptr(_paddr(a, 5)), alignment=8)
 
     @flyc.jit
     def launch(

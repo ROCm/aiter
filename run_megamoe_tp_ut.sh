@@ -9,13 +9,14 @@
 #   split  vs torch reference   rel_l2 < 0.06   (test gate)
 #   fused  vs split             rel_l2 < 0.06   (test gate; split runs FP8 route outputs)
 #   fused  vs torch reference   rel_l2 < 0.06   (test gate)
-#                                      < UT_REF_TOL (default 0.01, this script)
+#                                      < UT_REF_TOL (default 0.04, this script)
 # plus a NaN check on both outputs. Exit status is non-zero if any cell fails.
 #
 # GPUs: before each cell, waits for -n idle GPUs (prefers 4-7). Set GPUS=4,5,6,7
 # to pin them instead. Environment overrides: PYTHON, TORCHRUN, UT_REF_TOL.
-# AITER_MEGAMOE_ROUTE_FP8=1 tests the fused kernel's FP8 route rows (then raise
-# UT_REF_TOL: that mode is about as accurate as the split baseline, ~0.03).
+# The fused kernel keeps FP8 route rows by default (~0.027 vs torch, the split
+# baseline is ~0.034); AITER_MEGAMOE_ROUTE_FP8=0 tests bf16 routes (~0.003,
+# then UT_REF_TOL=0.01 is a meaningful gate).
 set -u
 AITER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS="dsv3 glm5 kimi3 dsv4"
@@ -33,7 +34,7 @@ while getopts "m:t:n:o:h" opt; do
 done
 PYTHON=${PYTHON:-/tmp/aiter_venv/bin/python}
 TORCHRUN=${TORCHRUN:-$(dirname "$PYTHON")/torchrun}
-UT_REF_TOL=${UT_REF_TOL:-0.01}
+UT_REF_TOL=${UT_REF_TOL:-0.04}
 mkdir -p "$OUT"
 
 export PYTHONPATH=$AITER_DIR

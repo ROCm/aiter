@@ -10,7 +10,7 @@
 # split/fused speedup per cell. With -r, compares fused time against a previous
 # run's output directory and flags cells slower by more than -x (fraction).
 #
-# AITER_MEGAMOE_ROUTE_FP8=1 runs the fused kernel with FP8 route rows. GPUs:
+# The fused kernel uses FP8 route rows (AITER_MEGAMOE_ROUTE_FP8=0: bf16). GPUs:
 # waits for -n idle GPUs before each cell (prefers 4-7); GPUS=4,5,6,7 pins them.
 # Overrides: PYTHON, TORCHRUN.
 set -u

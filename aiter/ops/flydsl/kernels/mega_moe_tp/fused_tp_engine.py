@@ -81,7 +81,7 @@ class FusedTpMegaMoe:
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS + 16 + 256 * 1024, dtype=torch.int32, device=self.device)
+        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
         # Per-route GEMM2 rows (weighted, bf16); the comm waves reduce them.
         self.routes = torch.empty(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
