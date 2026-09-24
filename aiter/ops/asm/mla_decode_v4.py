@@ -36,10 +36,10 @@ import os
 import torch
 
 from aiter.jit.core import AITER_ASM_DIR
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.asm.asm_utils import (
     dtype_str,
     get_function,
+    get_gfx_from_device,
     get_warp_size,
     launch_co,
     launch_co_cluster,
@@ -97,14 +97,16 @@ assert ctypes.sizeof(MlaV4KernelArgsPreload) == 120, ctypes.sizeof(
 )
 
 
-def _mla_v4_csv_path(csv_name: str = _MLA_V4_CSV) -> str:
+def _mla_v4_csv_path(arch: str, csv_name: str = _MLA_V4_CSV) -> str:
     """Path to a shipped gfx1250 v4 kernel registry (default ``mla_v4_asm.csv``)."""
-    return os.path.join(AITER_ASM_DIR, get_gfx_runtime(), _MLA_V4_SUBDIR, csv_name)
+    return os.path.join(AITER_ASM_DIR, arch, _MLA_V4_SUBDIR, csv_name)
 
 
-def _find_kernel_cfg(csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse):
+def _find_kernel_cfg(
+    arch, csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
+):
     """Return the ``csv_name`` row matching the 8 lookup keys, or None."""
-    csv_path = _mla_v4_csv_path(csv_name)
+    csv_path = _mla_v4_csv_path(arch, csv_name)
     if not os.path.isfile(csv_path):
         return None
     for cfg in load_asm_cfg_csv(csv_path):
@@ -120,12 +122,14 @@ def _find_kernel_cfg(csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqle
     return None
 
 
-def _get_heuristic_kernel(q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse):
+def _get_heuristic_kernel(
+    arch, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
+):
     """Return the CSV row matching the 8 lookup keys, or raise (mirror
     asm_mla_v4.cu::get_heuristic_kernel_mla_v4). The registry is parsed once
     (process-cached) by :func:`aiter.ops.asm.asm_utils.load_asm_cfg_csv`."""
     cfg = _find_kernel_cfg(
-        _MLA_V4_CSV, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
+        arch, _MLA_V4_CSV, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
     )
     if cfg is not None:
         return cfg
@@ -169,7 +173,7 @@ def mla_decode_v4_asm_gfx1250_eager(
     This is the raw launcher: lowest host overhead, but opaque to TorchDynamo.
     Prefer the :func:`mla_decode_v4_asm_gfx1250` dispatcher, which routes to the
     ``torch.compile``-safe custom op while tracing and here otherwise."""
-    runtime_gfx = get_gfx_runtime()
+    runtime_gfx = get_gfx_from_device(Q.device)
     if runtime_gfx != "gfx1250":
         raise RuntimeError(
             "mla_decode_v4_asm_gfx1250 is only supported on gfx1250, "
@@ -219,11 +223,18 @@ def mla_decode_v4_asm_gfx1250_eager(
 
     # ---- Kernel selection: pure CSV table lookup (no computed heuristic) ---
     cfg = _get_heuristic_kernel(
-        q_type, kv_type, gqa_ratio, ps, prefill, causal, max_seqlen_q, lse_flag
+        runtime_gfx,
+        q_type,
+        kv_type,
+        gqa_ratio,
+        ps,
+        prefill,
+        causal,
+        max_seqlen_q,
+        lse_flag,
     )
     sub_Q = int(cfg["sub_Q"])
     co_path = os.path.join(AITER_ASM_DIR, runtime_gfx, _MLA_V4_SUBDIR, cfg["co_name"])
-    func = get_function(co_path, cfg["knl_name"])
 
     # ---- pack the 120-byte preload kernarg ---------------------------------
     args = MlaV4KernelArgsPreload()
@@ -276,7 +287,9 @@ def mla_decode_v4_asm_gfx1250_eager(
     gdy = num_seqs
     gdz = int(num_kv_splits)
 
-    launch_co(func, (gdx, gdy, gdz), (block_dim, 1, 1), args)
+    with torch.cuda.device(Q.device):
+        func = get_function(co_path, cfg["knl_name"])
+        launch_co(func, (gdx, gdy, gdz), (block_dim, 1, 1), args)
 
 
 # Mutated buffers precede SymInt scalars so this implementation can be
@@ -316,33 +329,39 @@ def mla_v4_fused_slot_f32(num_heads: int, v_head_dim: int) -> int:
 
 
 @functools.cache
-def _fused_co_for(q_type, kv_type, gqa, qseqlen):
-    cfg = _find_kernel_cfg(_MLA_V4_FUSED_CSV, q_type, kv_type, gqa, 0, 0, 0, qseqlen, 0)
+def _fused_co_for(arch, q_type, kv_type, gqa, qseqlen):
+    cfg = _find_kernel_cfg(
+        arch, _MLA_V4_FUSED_CSV, q_type, kv_type, gqa, 0, 0, 0, qseqlen, 0
+    )
     if cfg is None:
         return None
-    co_path = os.path.join(
-        AITER_ASM_DIR, get_gfx_runtime(), _MLA_V4_SUBDIR, cfg["co_name"]
-    )
+    co_path = os.path.join(AITER_ASM_DIR, arch, _MLA_V4_SUBDIR, cfg["co_name"])
     if not os.path.isfile(co_path):
         return None
     return cfg, co_path
 
 
-def get_mla_v4_fused_kernel(Q, KV, max_seqlen_q, num_kv_splits):
-    """Return ``(cfg, co_path)`` of the fused kernel for this call, or None when
-    the fused path does not apply (not gfx1250, split count outside
-    ``[2, MLA_V4_FUSED_MAX_SPLITS]``, no shipped variant / .co, or disabled
-    via ``AITER_MLA_V4_FUSED=0``). Callers fall back to stage1 + stage2 on
-    None."""
-    if get_gfx_runtime() != "gfx1250":
-        return None
+def is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, num_kv_splits):
+    """Compile-safe static dispatch predicate for the shipped fused variant.
+
+    Registry and filesystem validation intentionally happen inside the custom
+    op's eager implementation, outside the Dynamo-traced region.
+    """
+    if get_gfx_from_device(Q.device) != "gfx1250":
+        return False
     nsplit = int(num_kv_splits)
     if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):
-        return None
+        return False
     if os.environ.get("AITER_MLA_V4_FUSED", "1") == "0":
-        return None
+        return False
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     gqa = Q.size(1) // KV.size(2)
-    return _fused_co_for(dtype_str(Q), dtype_str(KV), gqa, int(max_seqlen_q))
+    return (
+        Q.dtype in fp8_dtypes
+        and KV.dtype in fp8_dtypes
+        and gqa == 32
+        and int(max_seqlen_q) == 1
+    )
 
 
 def mla_decode_v4_fused_asm_gfx1250_eager(
@@ -366,7 +385,16 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
     ``splitData`` / ``splitLse`` are write-only scratch (no init needed; empty
     splits are never read back). The final bf16 result lands in ``output``."""
     nsplit = int(num_kv_splits)
-    found = get_mla_v4_fused_kernel(Q, KV, max_seqlen_q, nsplit)
+    runtime_gfx = get_gfx_from_device(Q.device)
+    found = None
+    if is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, nsplit):
+        found = _fused_co_for(
+            runtime_gfx,
+            dtype_str(Q),
+            dtype_str(KV),
+            Q.size(1) // KV.size(2),
+            int(max_seqlen_q),
+        )
     if found is None:
         raise RuntimeError(
             f"mla_decode_v4_fused_asm_gfx1250: no fused variant for "
@@ -433,7 +461,6 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
             f"fp32 with >= {need_lse} elements"
         )
 
-    func = get_function(co_path, cfg["knl_name"])
     sub_Q = int(cfg["sub_Q"])
 
     args = MlaV4KernelArgsPreload()
@@ -459,13 +486,15 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
     args.ptr_sink = sink.data_ptr()
 
     gdx = (num_heads * max_seqlen_q + sub_Q - 1) // sub_Q
-    launch_co_cluster(
-        func,
-        (nsplit * gdx, num_seqs, 1),
-        (4 * get_warp_size(), 1, 1),
-        args,
-        cluster_dim=(nsplit, 1, 1),
-    )
+    with torch.cuda.device(Q.device):
+        func = get_function(co_path, cfg["knl_name"])
+        launch_co_cluster(
+            func,
+            (nsplit * gdx, num_seqs, 1),
+            (4 * get_warp_size(), 1, 1),
+            args,
+            cluster_dim=(nsplit, 1, 1),
+        )
 
 
 mla_decode_v4_fused_asm_gfx1250 = register_asm_custom_op(
