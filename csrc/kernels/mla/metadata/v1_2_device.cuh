@@ -23,6 +23,28 @@ struct MlaMetadataV12Traits
 };
 
 static constexpr int32_t MLA_V12_FILL_WARPS = 8;
+// Batches per phase-1/phase-2 pass in the parallel planner. The five prefix
+// arrays hold 20 bytes per batch, so 4096 costs 80 KiB of gfx950's 160 KiB and
+// leaves room for the qo/kv arrays. Sizing those arrays by num_batches instead
+// capped the planner at 8191 batches, and a prefill chunk carries one batch per
+// query token -- so every full 16384-token chunk took the single-wavefront
+// serial fallback at ~5.6 ms. Across six traces that fallback was 83.8% of all
+// metadata time while being 4% of the calls.
+#ifndef MLA_V12_PARALLEL_BATCH_CHUNK
+#define MLA_V12_PARALLEL_BATCH_CHUNK 4096
+#endif
+
+// Below this the three barriers bracketing each pass cost more than the pass
+// saves, so the dispatch prefers the serial planner. See the measurement in the
+// commit message: 4096 -> 1024 costs 3.7%, and it degrades from there.
+#ifndef MLA_V12_PARALLEL_BATCH_CHUNK_MIN
+#define MLA_V12_PARALLEL_BATCH_CHUNK_MIN 256
+#endif
+
+// Scratch layout: three scalars and the five-slot scan carry, then the five
+// per-batch prefix arrays.
+static constexpr int32_t kMlaV12ScratchScalarBytes   = sizeof(int32_t) * (3 + 5);
+static constexpr int32_t kMlaV12ScratchBytesPerBatch = sizeof(int32_t) * 5;
 
 // Scales the sqrt(workload) split-K law; absorbs the arch reduction/compute
 // cost ratio. 1.2 tuned on gfx950; retune per arch if needed.
@@ -125,7 +147,12 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
 // Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan
 // recording each batch's start CU / remainder / prefix counts;
 // phase 2 fills every batch's fragments in parallel (one warp per batch).
-template <typename Traits>
+// kStaticChunk pins the chunk at compile time; 0 takes it from params instead.
+// Both are correct, but folding it is worth ~19% -- the offsets and the loop
+// bounds stop being values the compiler has to carry. The card that fits the
+// full chunk therefore gets the pinned instantiation, and anything else falls
+// back to the runtime one rather than to the serial planner.
+template <typename Traits, int32_t kStaticChunk = 0>
 __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     void kn_get_mla_metadata_v1_2_parallel(MlaMetadataV1KernelParameter params)
 {
@@ -141,12 +168,20 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
 
     // Scalars [payload, num_works, last_reduce_indptr] followed by five per-batch
     // prefix arrays produced by the phase-1 scan.
+    // Set by the dispatch to the most batches whose scratch fits this card's
+    // LDS, which is what lets one build serve gfx942's 64 KiB and gfx950's 160.
+    const int32_t kBatchChunk = (kStaticChunk > 0) ? kStaticChunk : params.batch_chunk;
+
     int32_t* p_lds_scalars        = p_lds_after;
-    int32_t* p_lds_start_cu       = p_lds_scalars + 3;
-    int32_t* p_lds_remain_payload = p_lds_start_cu + num_batches;
-    int32_t* p_lds_works_before   = p_lds_remain_payload + num_batches;
-    int32_t* p_lds_reduce_before  = p_lds_works_before + num_batches;
-    int32_t* p_lds_partial_before = p_lds_reduce_before + num_batches;
+    // Five slots for the scan state carried between chunks. They must sit
+    // inside the reserved scalar block: writing past index 2 would land on
+    // p_lds_start_cu and silently corrupt the chunk's own prefix.
+    int32_t* p_lds_carry          = p_lds_scalars + 3;
+    int32_t* p_lds_start_cu       = p_lds_carry + 5;
+    int32_t* p_lds_remain_payload = p_lds_start_cu + kBatchChunk;
+    int32_t* p_lds_works_before   = p_lds_remain_payload + kBatchChunk;
+    int32_t* p_lds_reduce_before  = p_lds_works_before + kBatchChunk;
+    int32_t* p_lds_partial_before = p_lds_reduce_before + kBatchChunk;
 
     QoState qo_state(
         params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
@@ -185,18 +220,56 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_work_info_set));
             p_lds_scalars[0] = payload;
 
-            int32_t curr_cu            = 0;
-            int32_t remain_payload     = payload;
-            int32_t num_works          = 0;
-            int32_t last_reduce_indptr = 0;
-            int32_t partial_idx        = 0;
-            for(int32_t bid = 0; bid < num_batches; ++bid)
+        }
+    }
+
+    __syncthreads();
+
+    const int32_t payload       = p_lds_scalars[0];
+    const int32_t blocks_per_cu = payload - overhead;
+    const int32_t num_cu        = params.num_cu;
+
+    // Phase 2a: mark every CU as "nothing assigned". The totals are only known
+    // once the last chunk has been scanned, so the entries phase 2 never writes
+    // get patched to total_works after the loop instead. Deriving them from the
+    // carry is what lets the separate totals-only pre-pass go: that pre-pass was
+    // one thread walking every batch, and it cost 245 us at 4096 batches.
+    constexpr int32_t kNoWork = -1;
+    for(int32_t cid = tid + 1; cid <= num_cu; cid += blockDim.x)
+    {
+        params.p_work_indptr[cid] = kNoWork;
+    }
+
+    __syncthreads();
+
+    // Chunked phase 1 + phase 2. The scan state below is carried ACROSS chunks:
+    // stopping at a batch boundary and resuming is exactly what phase 1 does
+    // between batches anyway.
+    int32_t scan_curr_cu        = 0;
+    int32_t scan_remain_payload = p_lds_scalars[0];
+    int32_t scan_num_works      = 0;
+    int32_t scan_reduce_indptr  = 0;
+    int32_t scan_partial_idx    = 0;
+
+    for(int32_t chunk_lo = 0; chunk_lo < num_batches; chunk_lo += kBatchChunk)
+    {
+        const int32_t chunk_hi = opus::min(chunk_lo + kBatchChunk, num_batches);
+
+        // Phase 1 for this chunk (warp 0, lane 0): record the per-batch prefix.
+        if(warp_id == 0 && lane_idx == 0)
+        {
+            int32_t curr_cu             = scan_curr_cu;
+            int32_t remain_payload      = scan_remain_payload;
+            int32_t num_works           = scan_num_works;
+            int32_t last_reduce_indptr  = scan_reduce_indptr;
+            int32_t partial_idx         = scan_partial_idx;
+            for(int32_t bid = chunk_lo; bid < chunk_hi; ++bid)
             {
-                p_lds_start_cu[bid]       = curr_cu;
-                p_lds_remain_payload[bid] = remain_payload;
-                p_lds_works_before[bid]   = num_works;
-                p_lds_reduce_before[bid]  = last_reduce_indptr;
-                p_lds_partial_before[bid] = partial_idx;
+                p_lds_start_cu[bid - chunk_lo]       = curr_cu;
+                p_lds_remain_payload[bid - chunk_lo] = remain_payload;
+                p_lds_works_before[bid - chunk_lo]   = num_works;
+                p_lds_reduce_before[bid - chunk_lo]  = last_reduce_indptr;
+                p_lds_partial_before[bid - chunk_lo] = partial_idx;
 
                 const int32_t seqlen_kv =
                     Traits::kLdsBatchInfo
@@ -241,151 +314,166 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                     }
                 }
             }
-            p_lds_scalars[1] = num_works;          // total works
-            p_lds_scalars[2] = last_reduce_indptr; // total reduce tiles
-        }
-    }
-
-    __syncthreads();
-
-    const int32_t payload       = p_lds_scalars[0];
-    const int32_t blocks_per_cu = payload - overhead;
-    const int32_t total_works   = p_lds_scalars[1];
-    const int32_t num_cu        = params.num_cu;
-
-    // Phase 2a: init work_indptr to total_works
-    for(int32_t cid = tid + 1; cid <= num_cu; cid += blockDim.x)
-    {
-        params.p_work_indptr[cid] = total_works;
-    }
-
-    __syncthreads();
-
-    // Phase 2b: fill works / reduce / work_indptr
-    for(int32_t bid = warp_id; bid < num_batches; bid += num_warps)
-    {
-        const int32_t start_cu           = p_lds_start_cu[bid];
-        const int32_t remain_payload     = p_lds_remain_payload[bid];
-        const int32_t num_works_before   = p_lds_works_before[bid];
-        const int32_t reduce_before      = p_lds_reduce_before[bid];
-        const int32_t partial_idx_before = p_lds_partial_before[bid];
-
-        const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
-        const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
-        const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
-        const int32_t seqlen_kv =
-            Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
-        const int32_t num_kv_blocks =
-            integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
-        const int32_t qo_tile_size = qo_state.get_seqlen(bid);
-        const int32_t qo_start     = qo_state.get_begin(bid);
-        const int32_t qo_end       = qo_state.get_end(bid);
-
-        const bool fits_current_cu = (num_kv_blocks + overhead <= remain_payload);
-        int32_t num_fresh_frags, num_frags;
-        bool waste_start_cu;
-        if(fits_current_cu)
-        {
-            num_fresh_frags = 1;
-            num_frags       = 1;
-            waste_start_cu  = false;
-        }
-        else if(remain_payload > overhead)
-        {
-            const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
-            num_fresh_frags             = integer_divide_ceil(remain_blocks, blocks_per_cu);
-            num_frags                   = num_fresh_frags + 1;
-            waste_start_cu              = false;
-        }
-        else
-        {
-            num_fresh_frags = integer_divide_ceil(num_kv_blocks, blocks_per_cu);
-            num_frags       = num_fresh_frags;
-            waste_start_cu  = true;
-        }
-        const bool is_split             = (num_frags > 1);
-        const int32_t first_frag_blocks = remain_payload - overhead;
-
-        // Per-batch reduce bookkeeping + the wasted-CU close (lane 0).
-        if(lane_idx == 0)
-        {
-            if(is_split)
-            {
-                params.p_reduce_indptr[bid + 1]        = reduce_before + num_frags;
-                params.p_reduce_final_map[bid * 2]     = qo_start;
-                params.p_reduce_final_map[bid * 2 + 1] = qo_end;
-            }
-            else
-            {
-                params.p_reduce_indptr[bid + 1] = reduce_before;
-            }
-            if(waste_start_cu && (start_cu + 1 <= num_cu))
-            {
-                params.p_work_indptr[start_cu + 1] = num_works_before;
-            }
+            p_lds_carry[0] = curr_cu;
+            p_lds_carry[1] = remain_payload;
+            p_lds_carry[2] = num_works;
+            p_lds_carry[3] = last_reduce_indptr;
+            p_lds_carry[4] = partial_idx;
         }
 
-        // Each fragment -> one work covering kv blocks [block_begin, block_end)
-        // of this batch, landing in CU frag_cu.
-        for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
+        __syncthreads();
+
+        // Phase 2 for this chunk: one warp per batch, as before.
+        for(int32_t bid = chunk_lo + warp_id; bid < chunk_hi; bid += num_warps)
         {
-            int32_t block_begin, block_end, frag_cu;
+            const int32_t start_cu           = p_lds_start_cu[bid - chunk_lo];
+            const int32_t remain_payload     = p_lds_remain_payload[bid - chunk_lo];
+            const int32_t num_works_before   = p_lds_works_before[bid - chunk_lo];
+            const int32_t reduce_before      = p_lds_reduce_before[bid - chunk_lo];
+            const int32_t partial_idx_before = p_lds_partial_before[bid - chunk_lo];
+
+            const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
+            const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
+            const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
+            const int32_t seqlen_kv =
+                Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
+            const int32_t num_kv_blocks =
+                integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
+            const int32_t qo_tile_size = qo_state.get_seqlen(bid);
+            const int32_t qo_start     = qo_state.get_begin(bid);
+            const int32_t qo_end       = qo_state.get_end(bid);
+
+            const bool fits_current_cu = (num_kv_blocks + overhead <= remain_payload);
+            int32_t num_fresh_frags, num_frags;
+            bool waste_start_cu;
             if(fits_current_cu)
             {
-                block_begin = 0;
-                block_end   = num_kv_blocks;
-                frag_cu     = start_cu;
+                num_fresh_frags = 1;
+                num_frags       = 1;
+                waste_start_cu  = false;
             }
-            else if(!waste_start_cu)
+            else if(remain_payload > overhead)
             {
-                block_begin =
-                    (frag_idx == 0) ? 0 : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
-                block_end = (frag_idx < num_fresh_frags)
-                                ? (first_frag_blocks + frag_idx * blocks_per_cu)
-                                : num_kv_blocks;
-                frag_cu   = start_cu + frag_idx;
+                const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
+                num_fresh_frags             = integer_divide_ceil(remain_blocks, blocks_per_cu);
+                num_frags                   = num_fresh_frags + 1;
+                waste_start_cu              = false;
             }
             else
             {
-                block_begin = frag_idx * blocks_per_cu;
-                block_end   = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
-                                                               : num_kv_blocks;
-                frag_cu     = start_cu + 1 + frag_idx;
+                num_fresh_frags = integer_divide_ceil(num_kv_blocks, blocks_per_cu);
+                num_frags       = num_fresh_frags;
+                waste_start_cu  = true;
             }
+            const bool is_split             = (num_frags > 1);
+            const int32_t first_frag_blocks = remain_payload - overhead;
 
-            const int32_t frag_kv_start = kv_begin + block_begin * kv_gran;
-            const int32_t frag_kv_end   = opus::min(kv_begin + block_end * kv_gran, kv_end);
-            const int32_t work_idx      = num_works_before + frag_idx;
-            const int32_t partial_qo_loc =
-                is_split ? (partial_idx_before + frag_idx * qo_tile_size) : -1;
-
-            MlaWorkInfo work_info{};
-            work_info.batch_idx       = bid;
-            work_info.qo_start        = qo_start;
-            work_info.qo_end          = qo_end;
-            work_info.kv_start        = frag_kv_start;
-            work_info.kv_end          = frag_kv_end;
-            work_info.kv_offset       = kv_end - frag_kv_end;
-            work_info.partial_qo_loc  = partial_qo_loc;
-            p_work_info_set[work_idx] = work_info;
-
-            if(is_split)
+            // Per-batch reduce bookkeeping + the wasted-CU close (lane 0).
+            if(lane_idx == 0)
             {
-                params.p_reduce_partial_map[reduce_before + frag_idx] =
-                    partial_idx_before + frag_idx * qo_tile_size;
+                if(is_split)
+                {
+                    params.p_reduce_indptr[bid + 1]        = reduce_before + num_frags;
+                    params.p_reduce_final_map[bid * 2]     = qo_start;
+                    params.p_reduce_final_map[bid * 2 + 1] = qo_end;
+                }
+                else
+                {
+                    params.p_reduce_indptr[bid + 1] = reduce_before;
+                }
+                if(waste_start_cu && (start_cu + 1 <= num_cu))
+                {
+                    params.p_work_indptr[start_cu + 1] = num_works_before;
+                }
             }
 
-            // Non-final fragments fully fill (close) their CU with one work.
-            const bool is_last_frag = (frag_idx == num_frags - 1);
-            if(!is_last_frag && (frag_cu + 1 <= num_cu))
+            // Each fragment -> one work covering kv blocks [block_begin, block_end)
+            // of this batch, landing in CU frag_cu.
+            for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
             {
-                params.p_work_indptr[frag_cu + 1] = work_idx + 1;
+                int32_t block_begin, block_end, frag_cu;
+                if(fits_current_cu)
+                {
+                    block_begin = 0;
+                    block_end   = num_kv_blocks;
+                    frag_cu     = start_cu;
+                }
+                else if(!waste_start_cu)
+                {
+                    block_begin =
+                        (frag_idx == 0) ? 0 : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
+                    block_end = (frag_idx < num_fresh_frags)
+                                    ? (first_frag_blocks + frag_idx * blocks_per_cu)
+                                    : num_kv_blocks;
+                    frag_cu   = start_cu + frag_idx;
+                }
+                else
+                {
+                    block_begin = frag_idx * blocks_per_cu;
+                    block_end   = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
+                                                                   : num_kv_blocks;
+                    frag_cu     = start_cu + 1 + frag_idx;
+                }
+
+                const int32_t frag_kv_start = kv_begin + block_begin * kv_gran;
+                const int32_t frag_kv_end   = opus::min(kv_begin + block_end * kv_gran, kv_end);
+                const int32_t work_idx      = num_works_before + frag_idx;
+                const int32_t partial_qo_loc =
+                    is_split ? (partial_idx_before + frag_idx * qo_tile_size) : -1;
+
+                MlaWorkInfo work_info{};
+                work_info.batch_idx       = bid;
+                work_info.qo_start        = qo_start;
+                work_info.qo_end          = qo_end;
+                work_info.kv_start        = frag_kv_start;
+                work_info.kv_end          = frag_kv_end;
+                work_info.kv_offset       = kv_end - frag_kv_end;
+                work_info.partial_qo_loc  = partial_qo_loc;
+                p_work_info_set[work_idx] = work_info;
+
+                if(is_split)
+                {
+                    params.p_reduce_partial_map[reduce_before + frag_idx] =
+                        partial_idx_before + frag_idx * qo_tile_size;
+                }
+
+                // Non-final fragments fully fill (close) their CU with one work.
+                const bool is_last_frag = (frag_idx == num_frags - 1);
+                if(!is_last_frag && (frag_cu + 1 <= num_cu))
+                {
+                    params.p_work_indptr[frag_cu + 1] = work_idx + 1;
+                }
             }
+        }
+
+        __syncthreads();
+
+        // Every thread takes a private copy of where the scan stopped, so the
+        // next chunk's phase 1 resumes from it and the totals are in hand after
+        // the loop. The second barrier is what keeps that next phase 1 from
+        // overwriting p_lds_carry while a straggler is still reading it.
+        scan_curr_cu        = p_lds_carry[0];
+        scan_remain_payload = p_lds_carry[1];
+        scan_num_works      = p_lds_carry[2];
+        scan_reduce_indptr  = p_lds_carry[3];
+        scan_partial_idx    = p_lds_carry[4];
+
+        __syncthreads();
+    }
+
+    // The carry holds exactly what the pre-pass used to produce.
+    const int32_t total_works = scan_num_works;
+
+    for(int32_t cid = tid + 1; cid <= num_cu; cid += blockDim.x)
+    {
+        if(params.p_work_indptr[cid] == kNoWork)
+        {
+            params.p_work_indptr[cid] = total_works;
         }
     }
 
     // Phase 3: fill the reduce_indptr tail
-    const int32_t total_reduce = p_lds_scalars[2];
+    const int32_t total_reduce = scan_reduce_indptr;
     for(int32_t i = num_batches + tid; i < params.reduce_indptr_size; i += blockDim.x)
     {
         params.p_reduce_indptr[i] = total_reduce;
@@ -1090,12 +1178,49 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     const bool parallel_wanted = (parallel_env == nullptr) || (std::atoi(parallel_env) != 0);
     const bool use_parallel = parallel_wanted && (max_seqlen_qo == 1) && !kQoSplits && !kIsSparse &&
                               (params.page_size == 1) && (params.qk_batch_ratio == 1);
-    const int32_t scratch_bytes =
-        static_cast<int32_t>(sizeof(int32_t)) * (3 + 5 * params.num_batches);
     const int32_t qo_bytes =
         is_unique ? 0 : static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
     const int32_t kv_bytes   = static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
     const int32_t fill_block = warp_size * MLA_V12_FILL_WARPS;
+
+    // Largest chunk whose scratch fits once `reserved` is spoken for: 32 B of
+    // scalars plus 20 B per batch in the chunk. Asking this rather than fixing
+    // the chunk and testing whether it fits is what keeps one build usable on
+    // both cards -- 4096 batches need 81,952 B, which gfx950 has and gfx942,
+    // with 64 KiB, does not. A fixed chunk would leave MI300 on the serial
+    // fallback at exactly the batch counts the chunking was written for.
+    // opus::min is OPUS_D and this is host code, hence the ternaries.
+    // Deliberately not capped by num_batches: a short batch list still wants the
+    // pinned instantiation, which is what ran before the chunk became a
+    // parameter at all. Capping here would push every decode-sized call onto the
+    // runtime path and cost it the folding.
+    // Lowering the ceiling forces the runtime-chunk instantiation. On a card
+    // whose LDS fits the full chunk the dispatch always picks the folded one, so
+    // without this hook the runtime path -- the path gfx942 takes in production
+    // -- is unreachable from any gfx950 test.
+    int32_t chunk_ceiling = MLA_V12_PARALLEL_BATCH_CHUNK;
+    if(const char* chunk_env = std::getenv("AITER_MLA_META_BATCH_CHUNK"))
+    {
+        const int32_t want = std::atoi(chunk_env);
+        if((want > 0) && (want < chunk_ceiling))
+        {
+            chunk_ceiling = want;
+        }
+    }
+
+    auto chunk_that_fits = [&](const int32_t reserved) -> int32_t {
+        const int32_t room = lds_size - reserved - kMlaV12ScratchScalarBytes;
+        if(room < kMlaV12ScratchBytesPerBatch)
+        {
+            return 0;
+        }
+        const int32_t chunk = room / kMlaV12ScratchBytesPerBatch;
+        return (chunk > chunk_ceiling) ? chunk_ceiling : chunk;
+    };
+    // A chunk below the floor spends more on the three barriers bracketing each
+    // pass than the pass saves, so the serial planner is the better answer.
+    const int32_t chunk_with_kv = chunk_that_fits(qo_bytes + kv_bytes);
+    const int32_t chunk_no_kv   = chunk_that_fits(qo_bytes);
 
     // The XCD planner keeps its whole plan in LDS on top of the per-batch info: three per-batch
     // arrays, the group -> batch map, and the per-lane / per-(lane, row) / per-workgroup tables.
@@ -1120,17 +1245,41 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
         }
     }
 
-    if(use_parallel && (scratch_bytes + qo_bytes + kv_bytes <= lds_size))
+    // params arrives by const reference and the kernel takes it by value, so the
+    // chunk rides in on a copy rather than widening the caller's contract.
+    if(use_parallel && (chunk_with_kv >= MLA_V12_PARALLEL_BATCH_CHUNK_MIN))
     {
+        MlaMetadataV1KernelParameter chunked = params;
+        chunked.batch_chunk                  = chunk_with_kv;
         using Traits =
             MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, true, kIsSparse>;
-        kn_get_mla_metadata_v1_2_parallel<Traits><<<grid, fill_block, lds_size, stream>>>(params);
+        if(chunk_with_kv == MLA_V12_PARALLEL_BATCH_CHUNK)
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits, MLA_V12_PARALLEL_BATCH_CHUNK>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
+        else
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
     }
-    else if(use_parallel && (scratch_bytes + qo_bytes <= lds_size))
+    else if(use_parallel && (chunk_no_kv >= MLA_V12_PARALLEL_BATCH_CHUNK_MIN))
     {
+        MlaMetadataV1KernelParameter chunked = params;
+        chunked.batch_chunk                  = chunk_no_kv;
         using Traits =
             MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, false, kIsSparse>;
-        kn_get_mla_metadata_v1_2_parallel<Traits><<<grid, fill_block, lds_size, stream>>>(params);
+        if(chunk_no_kv == MLA_V12_PARALLEL_BATCH_CHUNK)
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits, MLA_V12_PARALLEL_BATCH_CHUNK>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
+        else
+        {
+            kn_get_mla_metadata_v1_2_parallel<Traits>
+                <<<grid, fill_block, lds_size, stream>>>(chunked);
+        }
     }
     else if(params.num_batches <= max_lds_batch_size)
     {
