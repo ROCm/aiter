@@ -3,7 +3,6 @@
 
 """Quantization and packed-layout producers for MHA v4."""
 
-
 from typing import Optional
 
 import torch

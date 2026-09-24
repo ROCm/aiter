@@ -552,7 +552,11 @@ def test_mha_v4_k_quantizers_reject_an_off_device_mean(quantize):
         torch.cuda.synchronize()
         """)
     finished = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, timeout=1800
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
     )
 
     assert finished.returncode != 0
