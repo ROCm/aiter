@@ -740,10 +740,18 @@ class opus_gemm_codegen:
         ) as f:
             f.write(header)
             f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            emit(f, "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)", entry,
-                 lambda r: {"kid": r[0], "kernel_name": r[1]})
-            emit(f, "GENERATE_BMM_MXSCALE_KID_GROUPS", group_entry,
-                 lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]})
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)",
+                entry,
+                lambda r: {"kid": r[0], "kernel_name": r[1]},
+            )
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_GROUPS",
+                group_entry,
+                lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]},
+            )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
