@@ -157,28 +157,30 @@ Keep this shape unless a later note explicitly supersedes it.
 Same Triton source as prefill, **different compile**. Fresh GPU-6
 captures (2026-09-23) under `/tmp/k2_amd_lowering_compare/`:
 
-| | AMD M=1 | AMD M=8 | AMD M=512 | FlyDSL decode HEAD |
+| | AMD M=1 | AMD M=8 | AMD M=512 | FlyDSL decode final |
 |--|--:|--:|--:|--:|
-| BLOCK_N / threads / splits | 16 / 256 / **64** | 16 / 256 / **32** | 64 / 128 / 1 | 16 / 256 / **32** |
+| BLOCK_N / threads / splits | 16 / 256 / **64** | 16 / 256 / **32** | 64 / 128 / 1 | 16 / 256 / **64 M=1, 32 M=8** |
 | Split WGs | **128** | **512** | 1024 | **128 (M=1 ns64) / 512 (M=8 ns32)** |
 | LDS B | 8192 | 8192 | 32768 | 8192 |
-| VGPR | 106 | 106 | 245 | 108 |
-| Static inst | 1002 | 1017 | 2374 | 1070 |
+| VGPR | 106 | 106 | 245 | 113 |
+| Static inst | 1002 | 1017 | 2374 | **663 split** |
 | `buffer_load_dwordx4` | 6 | 6 | 36 | 12 |
-| `ds_write_b128` / `b64` / `write2st64` | **4 / 4 / 0** | 4 / 4 / 0 | 20 / 0 / 16 | **4 / 0 / 0** |
-| `ds_read_b128` / `tr16` | **16 / 4** | 16 / 4 | 40 / 32 | 16 / 4 |
+| `ds_write_b128` / `b64` / `write2st64` | **4 / 4 / 0** | 4 / 4 / 0 | 20 / 0 / 16 | **2 / 4 / 0** |
+| `ds_read_b128` / tr16 | **16 / 4** | 16 / 4 | 40 / 32 | **8 / 4** |
 | K32 / K16 MFMA | **8 / 4** | 8 / 4 | 48 / 0 | 8 / 4 |
 | `s_waitcnt` / `s_barrier` | **33 / 5** | 34 / 5 | 102 / 5 | **32 / 4 split** (whole-file ~108 includes merge) |
-| `v_perm` / `ds_bpermute` | **0 / 0** | 0 / 0 | 0 / 0 | **34 / 12** |
+| `v_perm` / `ds_bpermute` | **0 / 0** | 0 / 0 | 0 / 0 | **2 / 8** |
 
 M=1 vs M=8 opcode-sequence similarity is **~0.97**; decode vs prefill
 is **~0.50**. FlyDSL decode vs AMD decode opcode similarity is
 **~0.06**. Match the **decode** column, not the prefill column.
 
-AMD K/V publication on decode is **4× `ds_write_b128` + 4×
-`ds_write_b64`**, then **16× `ds_read_b128` + 4× `ds_read_b64_tr_b16`**.
-Current FlyDSL V stores lower to **`ds_write_b32`**, not `b64`. That
-is the first material opcode miss.
+Final ISA dumps are under `tickets/1047/tmp/k2_decode_final/isa_m{1,8}/`.
+FlyDSL now has AMD's K/V publication classes: 2 K `ds_write_b128` plus
+4 V `ds_write_b64`. AMD's extra 2 b128 and 8 b128 reads stage/read Q;
+overlay Q remains in registers and computes `K @ Q^T`. The remaining
+material lowering difference is token-major QK C plus reused QK/PV LDS
+read destinations, not the K/V physical maps.
 
 ### Profiling
 
@@ -662,12 +664,68 @@ runtime split count. Phase 6.
       split ≤ Live AMD split at **M=1 and M=8**. Wrapper may still
       include merge; if split is ahead and wrapper is not, say so
       and open a merge follow-on rather than widening this plan.
-- [ ] Prefill `M=512` still at or better than the st64-imm keeper
+- [x] Prefill `M=512` still at or better than the st64-imm keeper
       band (no silent decode-branch leak).
-- [ ] ISA cheat-sheet updated: opcode mix vs AMD decode, PMC
+- [x] ISA cheat-sheet updated: opcode mix vs AMD decode, PMC
       conflict/wait, ATT stall mix.
 - [ ] **Done when:** the success bar in the intro is met. Do not
       keep iterating permute/wait folklore after that.
+
+**Attempted; success bar not met (2026-09-24).** No phase-6 kernel
+edit. Same-process, interleaved five-dispatch kernel trace with
+`CACHE=0` on GPU 6
+(`tickets/1047/tmp/k2_decode_final/ktrace_same_session/`):
+
+| M | FlyDSL split | AMD split | ratio | FlyDSL merge | AMD merge |
+|--:|--:|--:|--:|--:|--:|
+| 1 (`ns64`) | **8.840 µs** | **7.280 µs** | **1.21×** | 12.280 | 6.040 |
+| 8 (`ns32`) | **14.240 µs** | **11.600 µs** | **1.23×** | 3.680 | 5.480 |
+
+The longer 40-dispatch phase-5 traces agree: 7.80 vs 6.44 at M=1 and
+12.82 vs 10.44 at M=8. FlyDSL does not match AMD at either acceptance
+point, so progress item 6 and the two success checkboxes stay open.
+M=1 merge is also a separate regression, but it is not hiding a split
+win: split itself remains 21% behind.
+
+Prefill remains **159.31 µs** at M=512 (`CACHE=0`, phase-5 five-run
+median), effectively the retained 159.41-µs st64-imm band and ahead of
+AMD 202.11 µs. Under kernel tracing both paths inflate (171.721 vs
+213.921 µs); that traced value is not the no-regress wall row.
+
+**Final PMC** (one timed dispatch; totals summed across SE instances):
+
+| M / backend | waves | busy/w | wait-LDS/w | conflict/w | MFMA total |
+|--|--:|--:|--:|--:|--:|
+| 1 FlyDSL ns64 | 512 | 965.5 | **36.5** | **48.4** | 12,384 |
+| 1 AMD ns64 | 512 | 760.9 | 48.3 | 80.6 | 12,384 |
+| 8 FlyDSL ns32 | 2,048 | 399.9 | **129.6** | **96.8** | 99,072 |
+| 8 AMD ns32 | 2,048 | 304.1 | 150.0 | 161.2 | 99,072 |
+
+Physical K/V maps are no longer the bottleneck: FlyDSL has lower
+conflict and wait-LDS counters than AMD while issuing exactly the same
+MFMA total. The remaining 21–23% split gap tracks higher busy cycles
+and the extra token-major QK-C/softmax work.
+
+**Final ATT M=8** (`--att-gpu-index 6`, CU 0; dumps
+`tickets/1047/tmp/k2_decode_final/att_{flydsl,amd}_m8/`):
+
+| | FlyDSL | AMD |
+|--|--:|--:|
+| total stall | 176,436 | 96,520 |
+| `s_waitcnt` | 75.9% | 63.8% |
+| `vmcnt` share of all stall | 47.1% | 50.6% |
+| `lgkmcnt` share of all stall | **28.8%** | **13.2%** |
+| `s_barrier` | 8.1% | 6.8% |
+
+The final blocker is not static wait count (32 vs AMD 33–34), split
+count, or LDS conflicts. It is the cost behind reused LDS read
+destinations and the token-major overlay dataflow: FlyDSL remains
+~2.2× AMD in ATT stall and ~1.3× in PMC busy cycles. Phase 4 proved
+ordinary FlyDSL named-dest bursting does not change those physical
+destinations; inline-asm dest pinning remains DNR. Stop this campaign
+without claiming success. A follow-on must change the QK-C/softmax
+dataflow or compiler destination control, not retry wait/barrier
+folklore.
 
 ## Do not retry (this campaign)
 
