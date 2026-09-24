@@ -20,10 +20,10 @@ import os
 import sys
 import time
 
+import bench_mega_moe as B
 import flydsl.expr as fx
 import torch
 
-import bench_mega_moe as B
 from aiter.ops.quant import dynamic_per_group_scaled_quant
 
 _REPS = int(os.environ.get("STAGE1_REPS", "16"))
