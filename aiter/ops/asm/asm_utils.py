@@ -36,10 +36,10 @@ import torch
 # ---------------------------------------------------------------------------
 # Device / arch info
 # ---------------------------------------------------------------------------
-def get_warp_size() -> int:
-    """Hardware wave size of device 0 (32 on RDNA-family gfx1250, 64 on CDNA)."""
+def get_warp_size(device=None) -> int:
+    """Hardware wave size of ``device`` (current device when omitted)."""
     try:
-        return int(torch.cuda.get_device_properties(0).warp_size)
+        return int(torch.cuda.get_device_properties(device).warp_size)
     except AttributeError:
         return 32  # gfx1250 (RDNA-family) is wave32
 
