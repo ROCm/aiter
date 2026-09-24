@@ -267,6 +267,10 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
             }
         }
     }
+    TORCH_CHECK(false,
+	            "moe_dispatch: unsupported (activation=", activation,
+	            ", has_bias=", has_bias, ", split_k=", split_k,
+	            ") combination \u2014 no generated kernel instance covers this case");
 }
 
 torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
