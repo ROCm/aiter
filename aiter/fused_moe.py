@@ -2633,11 +2633,10 @@ def _flydsl_v2_stage2_wrapper(
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
     target = out
-    _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
-    if _s2_fp8_inter and _kstatic:
+    if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
-    _defer_w = _s2_fp8_inter and _kstatic
+    _defer_w = _s2_fp8_inter
     _fp8_scale_blk = None
     _fp8_pitch_align = None
     if epilog == "scatter":
@@ -2666,8 +2665,8 @@ def _flydsl_v2_stage2_wrapper(
                     "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible "
                     f"by {FP8OUT_SCALE_BLK_MIN}"
                 )
-            _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime) if _kstatic else 8
-            _fp8_pitch_align = FP8OUT_PITCH_ALIGN if _kstatic else 0
+            _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime)
+            _fp8_pitch_align = FP8OUT_PITCH_ALIGN
 
             target = torch.empty(
                 (

@@ -133,7 +133,6 @@ def compile_gemm2_a4w4_port(
     g2_ascale_pf=None,
     g2_spart=None,
     g2_bf16_lds=None,
-    g2_kstatic=False,
     out_dtype="bf16",
     enable_bias=False,
     _composition=None,
@@ -141,7 +140,7 @@ def compile_gemm2_a4w4_port(
     _input_row_resolver=None,
     _output_n_range=None,
 ):
-    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
+    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce", "scatter"):
         raise AssertionError(
@@ -172,7 +171,6 @@ def compile_gemm2_a4w4_port(
     route_out_fp8 = out_dtype == "fp8"
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
-    g2_kstatic = bool(g2_kstatic)
     compact_route = _output_n_range is not None
     if compact_route:
         if not route_out_fp8:
@@ -180,7 +178,7 @@ def compile_gemm2_a4w4_port(
         g2_defer_weight = False
         g2_out_pitch_align = 0
         g2_scale_blk = 8
-    elif g2_kstatic and route_out_fp8:
+    elif route_out_fp8:
         from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
         g2_defer_weight = True
@@ -209,8 +207,7 @@ def compile_gemm2_a4w4_port(
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
-        default_bf16_lds = "1" if g2_kstatic else "0"
-        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", default_bf16_lds) == "1"
+        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
@@ -229,7 +226,7 @@ def compile_gemm2_a4w4_port(
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     K_TILES_RT_MAX = INTER_MAX // BK
-    g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
+    g2_apre = aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
@@ -289,9 +286,8 @@ def compile_gemm2_a4w4_port(
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
-    noil_tag = "_noil" if g2_kstatic and g2_bf16_lds and compact_route else ""
+    noil_tag = "_noil" if g2_bf16_lds and compact_route else ""
     dw_tag = "_dw" if g2_defer_weight else ""
-    kst_tag = "_kst" if g2_kstatic else ""
     pitch_tag = (
         f"_pa{g2_out_pitch_align}" if (route_out_fp8 and g2_out_pitch_align) else ""
     )
@@ -302,7 +298,7 @@ def compile_gemm2_a4w4_port(
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -406,7 +402,6 @@ def compile_gemm2_a4w4_port(
                 BK=BK,
                 use_nt=use_nt,
                 INTER_MAX=INTER_MAX,
-                g2_kstatic=g2_kstatic,
                 aStages=aStages,
                 a_slot_alias=a_slot_alias,
                 a_dtype=a_dtype,
@@ -686,11 +681,10 @@ def get_g2(
     out_dtype="bf16",
     g2_bf16_lds=None,
     g2_spart=None,
-    g2_kstatic=False,
     enable_bias=False,
 ):
-    # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
-    # launcher while remaining within their respective caps.
+    # Cache key uses compile-time buckets; runtime model_dim shares a launcher
+    # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
     SBM = _norm_sbm(SBM, BM)
     out_dtype = str(out_dtype).strip().lower()
     topk_key = topk if epilog == "reduce" else 1
@@ -702,10 +696,8 @@ def get_g2(
     if g2_spart is None:
         g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
     g2_spart = int(g2_spart)
-    g2_kstatic = bool(g2_kstatic)
     if g2_bf16_lds is None:
-        default_bf16_lds = "1" if g2_kstatic else "0"
-        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", default_bf16_lds) == "1"
+        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
     key = (
         BM,
@@ -725,7 +717,6 @@ def get_g2(
         g2_ascale_pf,
         g2_spart,
         g2_bf16_lds,
-        g2_kstatic,
         out_dtype,
         enable_bias,
     )
@@ -749,7 +740,6 @@ def get_g2(
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
-            g2_kstatic=g2_kstatic,
             out_dtype=out_dtype,
             enable_bias=enable_bias,
         )
@@ -787,7 +777,6 @@ def mxfp4_moe_gemm2(
     n_sorted_padded=None,
     out_dtype="bf16",
     HIDDEN_MAX=8192,
-    INTER_MAX=8192,
     g2_bf16_lds=None,
     g2_spart=None,
     stream=None,
@@ -818,10 +807,6 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
         )
-    if D_INTER > INTER_MAX:
-        raise AssertionError(
-            f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
-        )
     if (
         str(out_dtype).strip().lower() == "bf16"
         and getattr(out, "dtype", None) != torch.bfloat16
@@ -835,9 +820,6 @@ def mxfp4_moe_gemm2(
             "FlyDSL v2 GEMM2 requires sorted_weights; "
             "doweight_stage1=True is not supported"
         )
-    _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
-    if _kstatic or epilog == "scatter":
-        INTER_MAX = D_INTER
     if epilog == "scatter":
         HIDDEN_MAX = D_HIDDEN
     if bias is not None:
@@ -852,9 +834,8 @@ def mxfp4_moe_gemm2(
         use_nt,
         HIDDEN_MAX,
         epilog,
-        INTER_MAX,
+        D_INTER,  # INTER_MAX: the K-loop is unrolled at compile time
         a_dtype,
-        g2_kstatic=_kstatic,
         b_dtype=b_dtype,
         topk=topk,
         SBM=SBM,

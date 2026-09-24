@@ -237,7 +237,6 @@ def gemm2_body_v2(
     BK=256,
     use_nt,
     INTER_MAX,
-    g2_kstatic=False,
     aStages,
     a_slot_alias=False,
     a_dtype,
@@ -281,11 +280,10 @@ def gemm2_body_v2(
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
-    # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
+    # Contraction K = inter_dim (i32_inter); the K-loop is unrolled over INTER_MAX // BK tiles, so i32_inter must equal INTER_MAX.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = _udiv(K_rt, fx.Int32(a_pack))
     kc_rt = _udiv(K_rt + fx.Int32(255), fx.Int32(256))
-    K_TILES_RT = _udiv(K_rt, fx.Int32(BK))
     kAS_per_chunk_dw = kc_rt * fx.Int32(64)
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
@@ -580,7 +578,7 @@ def gemm2_body_v2(
         if const_expr(interleave is not None):
             interleave[numAccN - 1]()
 
-    # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
+    # C accumulator: register fragments, zeroed then accumulated in place.
     zero4 = Vec.filled(4, 0.0, Float32)
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
@@ -589,20 +587,6 @@ def gemm2_body_v2(
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(numAccN):
             c_frags[i][J].store(zero4)
-
-    def load_c_carry():
-        return [c_frags[i][J].load() for i in range(kMChunks) for J in range(numAccN)]
-
-    def init_c_carry():
-        return load_c_carry()
-
-    def store_c_carry(state):
-        n = 0
-        for i in range_constexpr(kMChunks):
-            for J in range_constexpr(numAccN):
-                c_frags[i][J].store(state[n])
-                n += 1
-        return n
 
     def _epilog(accm, **kw):
         atomic_bf16_epilog(
@@ -637,9 +621,7 @@ def gemm2_body_v2(
             **kw,
         )
 
-    g2_interleave = const_expr(
-        g2_kstatic and g2_bf16_lds and not nonatomic and output_width is None
-    )
+    g2_interleave = const_expr(g2_bf16_lds and not nonatomic and output_width is None)
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
@@ -735,7 +717,7 @@ def gemm2_body_v2(
                     issued = kt + kStages
                 mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
                 cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
-    elif const_expr(g2_kstatic):
+    else:
         KT = K_TILES_MAX
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(numAccN):
@@ -809,117 +791,6 @@ def gemm2_body_v2(
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
-    else:
-        # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
-        cur_bqf = make_bq_fragments()
-        cur_bsf = make_scale_fragments(nPairs)
-        nxt_bqf = make_bq_fragments()
-        nxt_bsf = make_scale_fragments(nPairs)
-        # g2_ascale_pf: carry the A-scale through scf.for state, same rotating-buffer model as B.
-        cur_saf = nxt_saf = None
-        if const_expr(g2_ascale_pf):
-            cur_saf = make_scale_fragments(kScaleSubBlocks)
-            nxt_saf = make_scale_fragments(kScaleSubBlocks)
-
-        def load_b_fragments(bqf, bsf, saf):
-            out = []
-            for j in range_constexpr(numAccN):
-                for half in range_constexpr(kHalves):
-                    out.append(bqf[j][half].load())
-            for mw in range_constexpr(nPairs):
-                out.append(bsf[mw].load())
-            if const_expr(g2_ascale_pf):
-                for sub in range_constexpr(kScaleSubBlocks):
-                    out.append(saf[sub].load())
-            return out
-
-        def store_b_carry(state, base):
-            n = base
-            for j in range_constexpr(numAccN):
-                for half in range_constexpr(kHalves):
-                    cur_bqf[j][half].store(state[n])
-                    n += 1
-            for mw in range_constexpr(nPairs):
-                cur_bsf[mw].store(state[n])
-                n += 1
-            if const_expr(g2_ascale_pf):
-                for sub in range_constexpr(kScaleSubBlocks):
-                    cur_saf[sub].store(state[n])
-                    n += 1
-            return n
-
-        def issue_a_scale_load_into(saf, kt_rt):
-            sa = load_a_scale_tile(kt_rt)
-            for sub in range_constexpr(kScaleSubBlocks):
-                saf[sub].store(Vec.from_elements([sa[sub]], Int32))
-
-        def load_carry():
-            return init_c_carry() + load_b_fragments(cur_bqf, cur_bsf, cur_saf)
-
-        def store_carry(state):
-            base = store_c_carry(state)
-            store_b_carry(state, base)
-
-        def yield_carry():
-            return load_c_carry() + load_b_fragments(nxt_bqf, nxt_bsf, nxt_saf)
-
-        # Prologue: prefetch tile 0's B/B-scale into "current" (VALUES enter via init=load_carry()).
-        issue_b_load_into(cur_bqf, cur_bsf, fx.Int32(0))
-        if const_expr(g2_ascale_pf):
-            issue_a_scale_load_into(cur_saf, fx.Int32(0))
-        rocdl.sched_barrier(0)
-
-        def prefetch_next_b(kt_rt):
-            # Prefetch NEXT tile's B; if none, copy current through (rotate_b_carry state, unused after loop).
-            nxt_b = kt_rt + fx.Int32(1)
-            if nxt_b < K_TILES_RT:
-                issue_b_load_into(nxt_bqf, nxt_bsf, nxt_b)
-                if const_expr(g2_ascale_pf):
-                    issue_a_scale_load_into(nxt_saf, nxt_b)
-            else:
-                for j in range_constexpr(numAccN):
-                    for half in range_constexpr(kHalves):
-                        nxt_bqf[j][half].store(cur_bqf[j][half].load())
-                for mw in range_constexpr(nPairs):
-                    nxt_bsf[mw].store(cur_bsf[mw].load())
-                if const_expr(g2_ascale_pf):
-                    for sub in range_constexpr(kScaleSubBlocks):
-                        nxt_saf[sub].store(cur_saf[sub].load())
-
-        for kt_iv, state in range(
-            fx.Int32(0),
-            K_TILES_RT,
-            fx.Int32(1),
-            init=load_carry(),
-        ):
-            store_carry(state)
-            kt_rt = fx.Int32(kt_iv)
-            if const_expr(g2_bhoist):
-                prefetch_next_b(kt_rt)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
-            nxt_a = kt_rt + fx.Int32(kStages)
-            if const_expr(a_slot_alias):
-                gpu.barrier()  # outside the runtime if: barriers must be uniform
-            if nxt_a < K_TILES_RT:
-                issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
-            if const_expr(g2_ascale_pf):
-                sa = [
-                    Vec(cur_saf[sub].load())[0]
-                    for sub in range_constexpr(kScaleSubBlocks)
-                ]
-            else:
-                sa = load_a_scale_tile(kt_rt)
-            if const_expr(not g2_bhoist):
-                prefetch_next_b(kt_rt)
-            rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
-            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
-            rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
-            results = yield yield_carry()
-        store_carry(results)
-
     if const_expr(nonatomic):
         nonatomic_bf16_epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
