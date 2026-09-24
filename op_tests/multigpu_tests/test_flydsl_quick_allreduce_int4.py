@@ -68,11 +68,8 @@ set_start_method("spawn", force=True)
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
 from aiter.ops.flydsl.kernels.quick_allreduce_int4 import mesh_st_ladder
 from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import ring_st_ladder
-from aiter.ops.flydsl.kernels.quick_allreduce_shared import (
-    ATOMS,
-    SUPPORTED_WORLDS,
-    has_release_fence,
-)
+from aiter.ops.flydsl.kernels.quick_allreduce_shared import ATOMS, SUPPORTED_WORLDS
+from aiter.ops.flydsl.quick_allreduce_int4 import batches_publishes
 
 try:
     ARCH = get_gfx_runtime()
@@ -280,12 +277,12 @@ def _expected_st(
 
     Two rules compose. The payload one: the schedule's ladder assigns a
     super-tile by size -- publishes per rank are ``num_tiles / ST * 2(N-1)``,
-    so a bigger payload wants a bigger one. The interconnect one: an inbox that
-    needs a release fence makes each publish expensive enough to take the
-    super-tile as soon as there is a whole one, while without a fence ST=1 is
+    so a bigger payload wants a bigger one. The interconnect one: when the
+    engine batches publishes (a release fence, or the ring on PCIe) it takes the
+    super-tile as soon as there is a whole one, while otherwise ST=1 is
     preferred until there are more tiles than blocks. Which applies is a
     property of the host, so it comes from the rank's reported
-    ``inbox_memory`` rather than being assumed.
+    ``inbox_memory`` and ``link`` rather than being assumed.
 
     *grid_by_cfg* must hold the engines' *clamped* grids, not the requested
     caps: the host reduces them to the measured resident workgroups per CU,
@@ -305,7 +302,7 @@ def _expected_st(
     if want == 1:
         return 1
     tiles = _num_tiles(nbytes, b)
-    if has_release_fence(inbox_memory):
+    if batches_publishes(inbox_memory, algorithm, link):
         return want if tiles >= want else 1
     return want if tiles > grid_by_cfg[(want, b, ss)] else 1
 

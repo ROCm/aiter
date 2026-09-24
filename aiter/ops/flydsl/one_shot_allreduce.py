@@ -77,6 +77,8 @@ class OneShotAllReduce:
     ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
+    One exception: at TP2 it picks ``uncached`` on PCIe too, since a single
+    remote destination cannot collapse.
 
     ``skip_self`` drops the round trip this rank does through its own inbox.
     It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_``
@@ -144,7 +146,7 @@ class OneShotAllReduce:
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
 
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device)
         self.group = group
         self.device = torch.device("cuda", self._device_index)

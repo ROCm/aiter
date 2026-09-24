@@ -314,20 +314,39 @@ def has_xgmi_peer_links() -> bool:
         return True
 
 
-def _resolve_inbox_flags(mode: str) -> tuple[int, str]:
-    """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``."""
+def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
+    """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``.
+
+    ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
+    TP2, where it is ``uncached`` on PCIe too. The PCIe rule exists because
+    uncached peer writes serialize per destination and collapse as the fanout
+    widens. At TP2 every schedule rites to a single remote peer, 
+    so there is nothing to collapse, and an uncached inbox skips the L2 writeback 
+    a cacheable one pays at every publish.
+    """
     if mode not in INBOX_MEMORY_MODES:
         raise ValueError(
             f"inbox_memory must be one of {INBOX_MEMORY_MODES}, got {mode!r}"
         )
     if mode == "auto":
-        mode = "uncached" if has_xgmi_peer_links() else "finegrained"
+        single_peer = int(world_size) == 2
+        mode = "uncached" if single_peer or has_xgmi_peer_links() else "finegrained"
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
         "default": UncachedIpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
     }[mode]
     return flags, mode
+
+
+def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
+    """Whether ``QuickAllReduceInt4`` batches publishes by default.
+
+    Always with a release fence, where every publish is an L2 writeback. The
+    PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
+    handshake that is a PCIe round trip whether or not a writeback precedes it.
+    """
+    return has_release_fence(inbox_memory) or (algorithm == "ring" and link == "pcie")
 
 
 def _cuda_index(device) -> int:
@@ -501,7 +520,8 @@ class QuickAllReduceInt4:
     ``inbox_memory`` selects how the IPC inbox is allocated:
 
     * ``"auto"`` (default) -- ``uncached`` on hosts with xGMI peer links,
-      ``finegrained`` on PCIe-attached hosts. Decided from the KFD topology.
+      ``finegrained`` on PCIe-attached hosts, decided from the KFD topology.
+      TP2 is ``uncached`` on PCIe too: one remote peer cannot collapse.
     * ``"uncached"`` -- correct everywhere, but peer writes collapse on PCIe.
     * ``"finegrained"`` -- device-coherent, full PCIe rate. Cacheable, so each
       publish writes the payload back from the writer's L2 with a release fence
@@ -612,7 +632,7 @@ class QuickAllReduceInt4:
             )
         else:
             ladder = ((0, int(super_tile), cap, *_knobs(BLOCK, False)),)
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device)
         self.group = group
         self.device = torch.device("cuda", self._device_index)
@@ -632,9 +652,8 @@ class QuickAllReduceInt4:
         lds_capacity = get_lds_capacity_bytes(arch)
 
         self._batch_publishes = (
-            has_release_fence(resolved_inbox)
-            if batch_publishes is None
-            else bool(batch_publishes)
+            batches_publishes(resolved_inbox, algorithm, link)
+            if batch_publishes is None else bool(batch_publishes)
         )
 
         self.min_bytes = (
