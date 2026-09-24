@@ -567,3 +567,42 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("T", [13, 2437])
+def test_pa_decode_sparse_tail_skips_slot0(T):
+    """Rows that end mid-tile must not read slot 0 for their unused lanes. vLLM's
+    null block sits there and can hold NaN, which 0 * NaN would carry into the
+    output although no index points at it. T=2437 takes the prefill config
+    (prefetched slot ids)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
+
+    device = "cuda"
+    H, D = 16, 512
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    softmax_scale = float(D) ** -0.5
+
+    # Rows attend 1..70 slots, none of them slot 0: most end mid-tile.
+    lens = torch.arange(T, device=device) % 70 + 1
+    cache, deq = make_packed_cache(int(lens.sum()) + 1, D, "fp8")
+    flat = cache.view(cache.shape[0], -1)
+    flat[0, 5] = 0x7F  # fp8 e4m3fn NaN in slot 0's nope
+    flat[0, 448 + 6 : 448 + 8] = torch.tensor([0xC0, 0x7F], dtype=torch.uint8)  # bf16
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    indptr[1:] = lens.cumsum(0)
+    idx = torch.arange(1, int(lens.sum()) + 1, dtype=torch.int32, device=device)
+
+    ref = pa_decode_sparse_reference(
+        q, deq.to(q.dtype), idx, indptr, attn_sink, softmax_scale
+    )
+    out = pa_decode_sparse(
+        q, cache, idx, indptr, attn_sink, softmax_scale, has_invalid=True
+    )
+
+    assert not out.isnan().any()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

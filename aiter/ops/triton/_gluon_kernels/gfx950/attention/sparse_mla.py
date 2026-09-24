@@ -744,7 +744,10 @@ def _slots(
         if HAS_INVALID:
             if UNI_TILE:
                 valid = valid & (slot >= 0)
-            slot = gl.where(valid, slot, 0)  # -1 sentinels: clamp, mask score below
+            # -1 sentinels read slot 0 and the score mask drops them. Lanes past
+            # hi keep the duplicate of the last key: their p is 0, and slot 0
+            # can hold NaN (the null block), which 0 * NaN would carry into V.
+            slot = gl.maximum(slot, 0)
     block, pos = _split_slot(cfg, slot, BLOCK_SIZE)
     return block, pos, valid
 
@@ -933,7 +936,7 @@ def _gather_full(
         valid = k_start + k_rng_slot < seg_hi
         if cfg.HAS_INVALID:
             valid = valid & (slot >= 0)
-            slot = gl.where(valid, slot, 0)
+            slot = gl.maximum(slot, 0)  # as in _slots: tail lanes keep their key
         bg, pg = _split_slot(cfg, slot, fmt.BLOCK_SIZE)
     if fmt.KIND == "fp8_g64":
         NGRP: gl.constexpr = cfg.KV_DIM // 64
