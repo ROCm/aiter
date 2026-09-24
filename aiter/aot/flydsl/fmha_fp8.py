@@ -16,25 +16,41 @@ only and the flattened tensors by dtype only. So the full set a model can hit is
 finite and is enumerated here from the heuristics' own module constants, which
 keeps the job list in step with them.
 
-Shapes are opt-in: no ``--shape`` / ``AITER_FLYDSL_AOT_FMHA_FP8`` means no jobs,
-so ``setup.py`` stays unchanged for models that never call this kernel.
+Head shapes come from ``AITER_CONFIGS.AITER_CONFIG_FMHA_FP8_AOT_FILE``: the
+header-only ``aiter/configs/fmha_fp8_aot.csv`` merged with every
+``model_configs/*_fmha_fp8_aot.csv`` (columns ``cu_num, num_heads,
+num_kv_heads, head_dim, head_dim_v, layout, model``), so ``setup.py`` builds
+them with the other FlyDSL AOT kinds. ``model`` is informational, but it is
+part of the merge key: two models sharing a head shape stay distinct rows
+(the merge rejects exact duplicates) and their jobs dedupe by kernel name.
 
-    AITER_FLYDSL_AOT_FMHA_FP8="12:12:192:128"          # H:Hkv:D:Dv[@layout];...
-    python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+    python -m aiter.aot.flydsl.fmha_fp8                          # config CSVs
+    python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128    # ad hoc
 
-``layout`` is ``varlen_cross`` (default; packed Q/KV with independent lengths, the
+``layout`` is ``varlen_cross`` (packed Q/KV with independent lengths, the
 chunked-prefill serving path), ``varlen``, ``dense`` or ``dense_cross``.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
+import sys
 import time
 
-from aiter.aot.flydsl.common import compile_only_env, override_env, run_jobs_parallel
+from aiter.aot.flydsl.common import (
+    _CU_NUM_TO_ARCH,
+    collect_aot_jobs,
+    compile_only_env,
+    cu_num_to_arch,
+    dedupe_jobs,
+    override_env,
+    run_jobs_parallel,
+)
+from aiter.jit.core import AITER_CONFIGS
 
-ENV_VAR = "AITER_FLYDSL_AOT_FMHA_FP8"
+DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_FMHA_FP8_AOT_FILE]
 AOT_ARCH = "gfx950"
 LAYOUTS = {
     "varlen_cross": (True, True),
@@ -51,16 +67,34 @@ _DEFAULT_FLAGS = {
 }
 
 
-def parse_shape(spec: str) -> tuple[int, int, int, int, str]:
-    """``"H:Hkv:D:Dv[@layout]"`` -> ``(H, Hkv, D, Dv, layout)``."""
-    dims, _, layout = spec.strip().partition("@")
-    layout = layout or "varlen_cross"
+def _layout(value) -> str:
+    # get_config_file fills a column a model file lacks with 0, and pandas writes
+    # a blank cell back as "" or "nan": all of those mean "not given".
+    layout = str(value if value is not None else "").strip()
+    layout = "varlen_cross" if layout in ("", "0", "nan") else layout
     if layout not in LAYOUTS:
         raise ValueError(
             f"unknown layout {layout!r}; expected one of {sorted(LAYOUTS)}"
         )
+    return layout
+
+
+def parse_shape(spec: str) -> tuple[int, int, int, int, str]:
+    """``"H:Hkv:D:Dv[@layout]"`` -> ``(H, Hkv, D, Dv, layout)``."""
+    dims, _, layout = spec.strip().partition("@")
     h, hkv, d, dv = (int(x) for x in dims.split(":"))
-    return h, hkv, d, dv, layout
+    return h, hkv, d, dv, _layout(layout)
+
+
+def unsupported_reason(h: int, hkv: int, d: int, dv: int) -> str | None:
+    """Why the kernel cannot serve this head shape, or None. The runtime gate
+    (flydsl_flash_attn_fp8_supported) uses the same check, so a rejected shape
+    is never dispatched and its kernels would only fail the build."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        _fp8_config_reason,
+    )
+
+    return _fp8_config_reason(h, hkv, d, dv)
 
 
 def _variant_space(causal: bool, cross: bool) -> list[tuple[float, int, int, int]]:
@@ -71,6 +105,8 @@ def _variant_space(causal: bool, cross: bool) -> list[tuple[float, int, int, int
     - block_m: the narrow tile only while kv_tiles <= _FP8_NARROW_MAX_KV_TILES.
     - splits: a candidate s > 1 needs kv_tiles // s >= _FP8_AUTOSPLIT_MIN_TILES,
       so the largest kv_tiles a (threshold, block_m) bucket admits bounds s.
+      Causal self-attention always lands in the skewed branch (kept < 0.75 once
+      split-K is allowed), which only returns 1 or 2.
     - interleave group: > 1 only for causal self-attention without split-K.
     """
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
@@ -88,9 +124,12 @@ def _variant_space(causal: bool, cross: bool) -> list[tuple[float, int, int, int
     if narrow_tiles > long_tiles:
         buckets.append((4.0, narrow, narrow_tiles))
 
+    max_splits = 2 if causal and not cross else max(fa._FP8_AUTOSPLIT_CANDIDATES)
     out = []
     for thr, bm, max_tiles in buckets:
         for s in fa._FP8_AUTOSPLIT_CANDIDATES:
+            if s > max_splits:
+                continue
             if (
                 s > 1
                 and max_tiles is not unbounded
@@ -135,11 +174,44 @@ def jobs_for_shape(h: int, hkv: int, d: int, dv: int, layout: str) -> list[dict]
     return jobs
 
 
-def default_jobs(specs: str | None = None) -> list[dict]:
-    specs = os.environ.get(ENV_VAR, "") if specs is None else specs
+def parse_csv(csv_path: str) -> list[dict]:
+    """One row per head shape -> every variant that shape can reach.
+
+    A row that is malformed, not gfx950, or a shape the kernel rejects is
+    skipped with a warning rather than failing the whole build.
+    """
     jobs = []
-    for spec in filter(None, (x.strip() for x in specs.split(";"))):
-        jobs.extend(jobs_for_shape(*parse_shape(spec)))
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        rows = csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
+        for row in rows:
+            try:
+                cu_num = int(float(row["cu_num"]))
+                h, hkv, d, dv = (
+                    int(float(row[k]))
+                    for k in ("num_heads", "num_kv_heads", "head_dim", "head_dim_v")
+                )
+                layout = _layout(row.get("layout"))
+            except (KeyError, TypeError, ValueError) as error:
+                print(f"  [WARN] {csv_path}: malformed row {dict(row)}: {error}")
+                continue
+            if cu_num not in _CU_NUM_TO_ARCH:
+                print(
+                    f"  [WARN] {csv_path}: unknown cu_num={cu_num}, assuming {AOT_ARCH}"
+                )
+            arch = cu_num_to_arch(cu_num)
+            if arch != AOT_ARCH:
+                print(
+                    f"  [WARN] {csv_path}: cu_num={cu_num} is {arch}; "
+                    f"the FP8 FMHA kernel is {AOT_ARCH}-only, skipping"
+                )
+                continue
+            reason = unsupported_reason(h, hkv, d, dv)
+            if reason:
+                print(
+                    f"  [WARN] {csv_path}: {h}:{hkv}:{d}:{dv} unsupported ({reason}), skipping"
+                )
+                continue
+            jobs.extend(jobs_for_shape(h, hkv, d, dv, layout))
     return jobs
 
 
@@ -239,21 +311,42 @@ def compile_one_config(**job) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
+        "--csv",
+        nargs="+",
+        default=DEFAULT_CSVS,
+        help="head-shape CSV(s) (default: AITER_CONFIG_FMHA_FP8_AOT_FILE)",
+    )
+    parser.add_argument(
         "--shape",
         action="append",
         default=[],
-        help=f"H:Hkv:D:Dv[@layout], repeatable (default: ${ENV_VAR})",
+        help="H:Hkv:D:Dv[@layout], repeatable; replaces --csv",
     )
     parser.add_argument("--list", action="store_true", help="print the jobs and exit")
     args = parser.parse_args()
-    jobs = default_jobs(";".join(args.shape)) if args.shape else default_jobs()
+    if args.shape:
+        jobs = []
+        for spec in args.shape:
+            h, hkv, d, dv, layout = parse_shape(spec)
+            reason = unsupported_reason(h, hkv, d, dv)
+            if reason:
+                print(f"Error: {spec} is unsupported by the FP8 FMHA kernel: {reason}")
+                sys.exit(1)
+            jobs.extend(jobs_for_shape(h, hkv, d, dv, layout))
+        jobs = dedupe_jobs(jobs)
+    else:
+        for csv_path in args.csv:
+            if not os.path.isfile(csv_path):
+                print(f"Error: CSV file not found: {csv_path}")
+                sys.exit(1)
+        jobs = collect_aot_jobs(args.csv, parse_csv)
     if args.list:
         for job in jobs:
             print(job["kernel_name"])
         print(f"{len(jobs)} jobs")
         return
     if not jobs:
-        print(f"no shapes given (--shape or ${ENV_VAR}); nothing to compile")
+        print("no head shapes configured; nothing to compile")
         return
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
