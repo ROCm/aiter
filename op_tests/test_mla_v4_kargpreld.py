@@ -416,9 +416,11 @@ def test_mla_v4_nm(
         f"variants {_SHIPPED_TILE_VARIANTS}: the qh64 .co picks sub_Q=64 and "
         f"launches gdx=ceil(gqa*max_seqlen_q/64); only these three pairs resolve."
     )
-    # Multi-split guard: the .co inner KV loop processes pass_size=16 tokens per
-    # iteration; the SMALLEST split must be >= 16 or its tail is dropped.
-    if num_kv_splits > 1:
+    # Multi-split guard: the qh16/qh64 .co inner KV loop processes pass_size=16
+    # tokens per iteration; the SMALLEST split must be >= 16 or its tail is
+    # dropped. The qh32 .co (and its fused variant) handles short and empty
+    # splits, so it is exempt.
+    if num_kv_splits > 1 and (gqa_ratio, q_seq_logical) != (32, 1):
         min_split = kv_seq_lens // num_kv_splits  # page_size=1
         assert min_split >= 16, (
             f"smallest KV split = floor({kv_seq_lens}/{num_kv_splits}) = "

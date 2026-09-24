@@ -19,21 +19,30 @@ Scope is intentionally narrow — it is a thin wrapper, exactly like the .cu:
 It does NOT handle gfx950 (that arch uses the legacy 21-slot kernarg and keeps
 going through the C++ dispatcher ``aiter.mla_decode_v4_asm``) and it does NOT
 touch v3. The public entry :func:`mla_decode_v4_asm_gfx1250` mirrors the
-signature of ``aiter.mla_decode_v4_asm`` so callers can swap between the two.
+operation of ``aiter.mla_decode_v4_asm``, but uses a buffer-first argument
+order so the eager launcher can be registered directly as a custom op.
+
+It also hosts the fused split-KV variant (``mla_v4_fused_asm.csv``,
+:func:`mla_decode_v4_fused_asm_gfx1250`): stage1 and the cross-split LSE
+merge run in one cluster launch, replacing the stage1 + triton stage2 pair for
+``2 <= num_kv_splits <= MLA_V4_FUSED_MAX_SPLITS``.
 """
 
 import ctypes
+import functools
 import math
 import os
 
 import torch
 
 from aiter.jit.core import get_asm_dir
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.asm.asm_utils import (
     dtype_str,
     get_function,
     get_warp_size,
     launch_co,
+    launch_co_cluster,
     load_asm_cfg_csv,
     register_asm_custom_op,
 )
@@ -45,6 +54,10 @@ _KV4_DIM_ROPE = 64
 
 _MLA_V4_SUBDIR = "mla_v4"
 _MLA_V4_CSV = "mla_v4_asm.csv"
+_MLA_V4_FUSED_CSV = "mla_v4_fused_asm.csv"
+# The fused kernel merges splits inside one hardware cluster of num_kv_splits
+# workgroups; 16 is the largest cluster it supports.
+MLA_V4_FUSED_MAX_SPLITS = 16
 
 
 class MlaV4KernelArgsPreload(ctypes.Structure):
@@ -83,16 +96,19 @@ assert ctypes.sizeof(MlaV4KernelArgsPreload) == 120, ctypes.sizeof(
 )
 
 
-def _mla_v4_csv_path() -> str:
-    """Path to the shipped gfx1250 v4 kernel registry (``mla_v4_asm.csv``)."""
-    return os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, _MLA_V4_CSV)
+def _mla_v4_csv_path(csv_name: str = _MLA_V4_CSV) -> str:
+    """Path to a shipped gfx1250 v4 kernel registry (default ``mla_v4_asm.csv``)."""
+    return os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, csv_name)
 
 
-def _get_heuristic_kernel(q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse):
-    """Return the CSV row matching the 8 lookup keys, or raise (mirror
-    asm_mla_v4.cu::get_heuristic_kernel_mla_v4). The registry is parsed once
-    (process-cached) by :func:`aiter.ops.asm.asm_utils.load_asm_cfg_csv`."""
-    for cfg in load_asm_cfg_csv(_mla_v4_csv_path()):
+def _find_kernel_cfg(
+    csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
+):
+    """Return the ``csv_name`` row matching the 8 lookup keys, or None."""
+    csv_path = _mla_v4_csv_path(csv_name)
+    if not os.path.isfile(csv_path):
+        return None
+    for cfg in load_asm_cfg_csv(csv_path):
         if cfg["qType"] != q_type or cfg["kvType"] != kv_type:
             continue
         if cfg["Gqa"] != gqa or cfg["ps"] != ps or cfg["prefill"] != prefill:
@@ -101,6 +117,18 @@ def _get_heuristic_kernel(q_type, kv_type, gqa, ps, prefill, causal, qseqlen, ls
             continue
         if cfg["lse"] != lse:
             continue
+        return cfg
+    return None
+
+
+def _get_heuristic_kernel(q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse):
+    """Return the CSV row matching the 8 lookup keys, or raise (mirror
+    asm_mla_v4.cu::get_heuristic_kernel_mla_v4). The registry is parsed once
+    (process-cached) by :func:`aiter.ops.asm.asm_utils.load_asm_cfg_csv`."""
+    cfg = _find_kernel_cfg(
+        _MLA_V4_CSV, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse
+    )
+    if cfg is not None:
         return cfg
     raise RuntimeError(
         f"mla_decode_v4_asm_gfx1250: no shipped variant for q_type:{q_type} "
@@ -119,24 +147,25 @@ def mla_decode_v4_asm_gfx1250_eager(
     kv_page_indices: torch.Tensor,
     split_indptr: torch.Tensor,
     sink: torch.Tensor,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    valid_split_count: torch.Tensor | None,
     max_seqlen_q: int,
     softmax_scale: float,
     out_16_nosplit: int,
     num_kv_splits: int,
-    splitData: torch.Tensor,
-    splitLse: torch.Tensor,
-    output: torch.Tensor,
-    valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
     kv_last_page_lens: torch.Tensor | None = None,
-):
+) -> None:
     """gfx1250 v4 nm decode stage1 launch (eager, pure Python + ctypes) — Python
     peer of ``aiter.mla_decode_v4_asm`` (asm_mla_v4.cu) restricted to the gfx1250
-    preload path. Same call signature; ``softmax_scale`` and ``split_indptr``
-    are accepted for parity but unused on this ABI (the preload kernarg carries
-    neither: the kernel hardcodes 1/sqrt(512) and derives splits from
-    s_kv_split). ``out_16_nosplit`` is derived from ``num_kv_splits`` to match
-    the canonical dispatcher.
+    preload path. It uses a buffer-first signature for direct custom-op
+    registration; ``softmax_scale`` and ``split_indptr`` are accepted for
+    semantic parity but unused on this ABI (the preload kernarg carries neither:
+    the kernel hardcodes 1/sqrt(512) and derives splits from s_kv_split).
+    ``out_16_nosplit`` is derived from ``num_kv_splits`` to match the canonical
+    dispatcher.
 
     This is the raw launcher: lowest host overhead, but opaque to TorchDynamo.
     Prefer the :func:`mla_decode_v4_asm_gfx1250` dispatcher, which routes to the
@@ -245,38 +274,68 @@ def mla_decode_v4_asm_gfx1250_eager(
     launch_co(func, (gdx, gdy, gdz), (block_dim, 1, 1), args)
 
 
+# Mutated buffers precede SymInt scalars so this implementation can be
+# registered directly without a schema adapter. This order is required by
+# torch's auto-functionalization under ``torch.compile(fullgraph=True)``.
+mla_decode_v4_asm_gfx1250 = register_asm_custom_op(
+    "mla_decode_v4_asm_gfx1250",
+    mla_decode_v4_asm_gfx1250_eager,
+    mutates_args=["splitData", "splitLse", "output", "valid_split_count"],
+)
+
+
 # ---------------------------------------------------------------------------
-# torch.compile support.
+# Fused split-KV decode (mla_v4_fused_asm.csv).
 #
-# The launcher above is pure Python + ctypes, so it graph-breaks under
-# `torch.compile(fullgraph=True)`. Exposing it as an aiter custom op via the
-# generic `register_asm_custom_op` helper (asm_utils) makes Dynamo treat the
-# launch as one opaque graph node. This does NOT change the eager dispatch in
-# aiter/mla.py; callers opt in via
-# `torch.ops.aiter.mla_decode_v4_asm_gfx1250(...)`. Only the schema-clean,
-# type-annotated adapter below is op-specific — the registration + no-op fake
-# are shared.
+# One launch does stage1 + the cross-split LSE merge: grid.x = nsplit * gdx,
+# and the nsplit workgroups of one (seq, q-tile) form a hardware cluster along
+# x. Split 0 of each cluster reduces the partials of the others (read back from
+# the fp32 scratch) and writes the final bf16 result. Kernarg ABI is the same
+# 120-byte MlaV4KernelArgsPreload, with:
+#   ptr_R           = fp32 partial scratch [total_q, nsplit, (gqa+1)*dv]
+#   ptr_LSE         = fp32 partial lse     [total_q, nsplit, num_heads, 1]
+#   ptr_valid_split = final bf16 output    [total_q, num_heads, dv]
+#   out_16_nosplit = 0, s_use_valid_split = 0
+# The .co carries no .cluster_dims metadata, so the cluster size comes from the
+# launch attribute and one code object serves every split count.
 # ---------------------------------------------------------------------------
-# TODO(mla-pyco): remove this adapter once ``mla_decode_v4_asm_gfx1250_eager``
-# can be registered as a custom op directly. ``_eager`` is now fully type
-# annotated, so ``torch.library.infer_schema`` can derive a schema from it.
-# The ONLY remaining reason this adapter still exists is ARG ORDER (verified
-# empirically): ``_eager`` uses the C-ABI parity order (SymInt scalars BEFORE
-# the mutated buffers), and registering that order makes ``fullgraph=True`` fail
-# ("Attempted to call function marked as skipped"), because a SymInt ahead of
-# the mutated tensors breaks torch's auto-functionalization arg boxing. The
-# buffer-first order below is what makes fullgraph pass (12/12); this adapter
-# just reorders to buffer-first and forwards to ``_eager``.
-#
-# To drop it in the future, move the mutated buffers (``splitData`` /
-# ``splitLse`` / ``output`` / ``valid_split_count``) ahead of the SymInt scalars
-# in ``_eager`` itself, then pass ``_eager`` straight to
-# ``register_asm_custom_op`` and update the ``mla_decode_v4_asm_gfx1250``
-# dispatcher to the new arg order. The cost is that ``_eager`` stops mirroring
-# ``aiter.mla_decode_v4_asm``'s C-ABI signature. Alternatively, revisit if a
-# newer torch fixes the SymInt-before-mutated-tensor auto-functionalization
-# ordering constraint, which would remove the need entirely.
-def _mla_decode_v4_asm_gfx1250_op(
+def mla_v4_fused_slot_f32(num_heads: int, v_head_dim: int) -> int:
+    """fp32 elements per (token, split) slot of the fused partial scratch: the
+    kernel pads each slot by one extra head row (``(num_heads + 1) * dv``)."""
+    return (num_heads + 1) * v_head_dim
+
+
+@functools.cache
+def _fused_co_for(q_type, kv_type, gqa, qseqlen):
+    cfg = _find_kernel_cfg(
+        _MLA_V4_FUSED_CSV, q_type, kv_type, gqa, 0, 0, 0, qseqlen, 0
+    )
+    if cfg is None:
+        return None
+    co_path = os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, cfg["co_name"])
+    if not os.path.isfile(co_path):
+        return None
+    return cfg, co_path
+
+
+def get_mla_v4_fused_kernel(Q, KV, max_seqlen_q, num_kv_splits):
+    """Return ``(cfg, co_path)`` of the fused kernel for this call, or None when
+    the fused path does not apply (not gfx1250, split count outside
+    ``[2, MLA_V4_FUSED_MAX_SPLITS]``, no shipped variant / .co, or disabled
+    via ``AITER_MLA_V4_FUSED=0``). Callers fall back to stage1 + stage2 on
+    None."""
+    if get_gfx() != "gfx1250":
+        return None
+    nsplit = int(num_kv_splits)
+    if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):
+        return None
+    if os.environ.get("AITER_MLA_V4_FUSED", "1") == "0":
+        return None
+    gqa = Q.size(1) // KV.size(2)
+    return _fused_co_for(dtype_str(Q), dtype_str(KV), gqa, int(max_seqlen_q))
+
+
+def mla_decode_v4_fused_asm_gfx1250_eager(
     Q: torch.Tensor,
     qrope: torch.Tensor,
     KV: torch.Tensor,
@@ -284,119 +343,123 @@ def _mla_decode_v4_asm_gfx1250_op(
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    split_indptr: torch.Tensor,
     sink: torch.Tensor,
     splitData: torch.Tensor,
     splitLse: torch.Tensor,
     output: torch.Tensor,
-    valid_split_count: torch.Tensor | None,
     max_seqlen_q: int,
-    softmax_scale: float,
-    out_16_nosplit: int,
     num_kv_splits: int,
-    use_valid_split_count_reduce: int,
     kv_last_page_lens: torch.Tensor | None = None,
 ) -> None:
-    """Schema-clean, `torch.compile`-safe entry point for the gfx1250 v4 nm
-    launch. Thin adapter: reorders args to the positional signature of
-    :func:`mla_decode_v4_asm_gfx1250` (which carries keyword defaults torch
-    schema inference cannot represent) and forwards to it.
+    """gfx1250 fused v4 decode launch (stage1 + split merge, eager ctypes).
 
-    NOTE: the mutated tensors (`splitData` / `splitLse` / `output` /
-    `valid_split_count`) are deliberately placed BEFORE the SymInt scalars here.
-    Putting a value-0 SymInt (e.g. out_16_nosplit=0) ahead of the mutated tensors
-    trips torch's auto-functionalization arg boxing under
-    `torch.compile(fullgraph=True)` (it mis-types a later SymInt as a Tensor), so
-    this buffer-first order is load-bearing, not cosmetic."""
-    mla_decode_v4_asm_gfx1250_eager(
-        Q,
-        qrope,
-        KV,
-        kvrope,
-        qo_indptr,
-        kv_indptr,
-        kv_page_indices,
-        split_indptr,
-        sink,
-        max_seqlen_q,
-        softmax_scale,
-        out_16_nosplit,
-        num_kv_splits,
-        splitData,
-        splitLse,
-        output,
-        valid_split_count,
-        use_valid_split_count_reduce,
-        kv_last_page_lens,
+    ``splitData`` / ``splitLse`` are write-only scratch (no init needed; empty
+    splits are never read back). The final bf16 result lands in ``output``."""
+    nsplit = int(num_kv_splits)
+    found = get_mla_v4_fused_kernel(Q, KV, max_seqlen_q, nsplit)
+    if found is None:
+        raise RuntimeError(
+            f"mla_decode_v4_fused_asm_gfx1250: no fused variant for "
+            f"q_type:{dtype_str(Q)} kv_type:{dtype_str(KV)} "
+            f"gqa:{Q.size(1) // KV.size(2)} qSeqLen:{max_seqlen_q} "
+            f"num_kv_splits:{nsplit} (supported 2..{MLA_V4_FUSED_MAX_SPLITS})"
+        )
+    cfg, co_path = found
+
+    if sink is None or sink.data_ptr() == 0:
+        raise ValueError("mla_decode_v4_fused_asm_gfx1250: `sink` must not be NULL")
+    if not (Q.is_contiguous() and KV.is_contiguous()):
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: only support Q/KV.is_contiguous()"
+        )
+    if not (qrope.is_contiguous() and kvrope.is_contiguous()):
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: only support "
+            "qrope/kvrope.is_contiguous()"
+        )
+    if KV.size(2) != 1:
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: only support num_kv_heads==1"
+        )
+    if Q.size(2) != KV.size(3):
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: Q head_size must equal KV "
+            "head_size (= dim_qk_packed)"
+        )
+
+    num_seqs = qo_indptr.shape[0] - 1
+    num_heads = Q.size(1)
+    v_head_dim = output.size(-1)
+    total_q = num_seqs * max_seqlen_q
+    if output.dtype != torch.bfloat16 or not output.is_contiguous():
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: `output` must be contiguous bf16"
+        )
+    if output.numel() < total_q * num_heads * v_head_dim:
+        raise ValueError(
+            "mla_decode_v4_fused_asm_gfx1250: `output` smaller than "
+            "[total_q, num_heads, v_head_dim]"
+        )
+    need_data = total_q * nsplit * mla_v4_fused_slot_f32(num_heads, v_head_dim)
+    if (
+        splitData.dtype != torch.float32
+        or not splitData.is_contiguous()
+        or splitData.numel() < need_data
+    ):
+        raise ValueError(
+            f"mla_decode_v4_fused_asm_gfx1250: `splitData` must be contiguous "
+            f"fp32 with >= {need_data} elements "
+            f"([total_q, nsplit, (num_heads+1)*v_head_dim]), got "
+            f"{splitData.dtype} numel={splitData.numel()}"
+        )
+    need_lse = total_q * nsplit * num_heads
+    if (
+        splitLse.dtype != torch.float32
+        or not splitLse.is_contiguous()
+        or splitLse.numel() < need_lse
+    ):
+        raise ValueError(
+            f"mla_decode_v4_fused_asm_gfx1250: `splitLse` must be contiguous "
+            f"fp32 with >= {need_lse} elements"
+        )
+
+    func = get_function(co_path, cfg["knl_name"])
+    sub_Q = int(cfg["sub_Q"])
+
+    args = MlaV4KernelArgsPreload()
+    args.ptr_R = splitData.data_ptr()
+    args.ptr_Q = Q.data_ptr()
+    args.ptr_KV = KV.data_ptr()
+    args.ptr_LTP = kv_indptr.data_ptr()
+    args.ptr_LTL = (
+        kv_last_page_lens.data_ptr() if kv_last_page_lens is not None else None
+    )
+    args.ptr_QTP = qo_indptr.data_ptr()
+    args.ptr_QROPE = qrope.data_ptr()
+    args.ptr_KVROPE = kvrope.data_ptr()
+    args.scalar_f = 1.0 / math.sqrt(float(_KV4_DIM_NOPE + _KV4_DIM_ROPE))
+    args.s_gqa_ratio = num_heads * max_seqlen_q
+    args.s_kv_split = nsplit
+    args.s_total_kv = KV.size(0) * KV.size(1)
+    args.out_16_nosplit = 0
+    args.ptr_LSE = splitLse.data_ptr()
+    args.ptr_LTD = kv_page_indices.data_ptr()
+    args.ptr_valid_split = output.data_ptr()
+    args.s_use_valid_split = 0
+    args.ptr_sink = sink.data_ptr()
+
+    gdx = (num_heads * max_seqlen_q + sub_Q - 1) // sub_Q
+    launch_co_cluster(
+        func,
+        (nsplit * gdx, num_seqs, 1),
+        (4 * get_warp_size(), 1, 1),
+        args,
+        cluster_dim=(nsplit, 1, 1),
     )
 
 
-# Pure in-place op (writes splitData/splitLse/output/valid_split_count), so the
-# default no-op fake in register_asm_custom_op suffices — no fake_impl needed.
-mla_decode_v4_asm_gfx1250_compiled = register_asm_custom_op(
-    "mla_decode_v4_asm_gfx1250",
-    _mla_decode_v4_asm_gfx1250_op,
-    mutates_args=["splitData", "splitLse", "output", "valid_split_count"],
+mla_decode_v4_fused_asm_gfx1250 = register_asm_custom_op(
+    "mla_decode_v4_fused_asm_gfx1250",
+    mla_decode_v4_fused_asm_gfx1250_eager,
+    mutates_args=["splitData", "splitLse", "output"],
 )
-
-
-def mla_decode_v4_asm_gfx1250(
-    Q,
-    qrope,
-    KV,
-    kvrope,
-    qo_indptr,
-    kv_indptr,
-    kv_page_indices,
-    split_indptr,
-    sink,
-    max_seqlen_q,
-    softmax_scale,
-    out_16_nosplit,
-    num_kv_splits,
-    splitData,
-    splitLse,
-    output,
-    valid_split_count=None,
-    use_valid_split_count_reduce=0,
-    kv_last_page_lens=None,
-):
-    """gfx1250 v4 nm decode stage1 launch — always via the registered custom op.
-
-    Signature-compatible drop-in for the raw launcher, so callers (aiter/mla.py)
-    need no change. It ALWAYS routes through the custom op
-    ``torch.ops.aiter.mla_decode_v4_asm_gfx1250``: in eager it dispatches
-    straight to the ctypes launcher, and under ``torch.compile`` /
-    ``torch.export`` it becomes ONE opaque, ``fullgraph=True``-safe graph node.
-    This is the idiomatic "just wrap it as a custom op" pattern — one code path
-    for eager + traced, no ``is_compiling()`` branch to keep in sync. The launch
-    always runs on torch's current stream (as compiled/traced graphs require).
-
-    The op reorders the mutated buffers (``splitData`` / ``splitLse`` /
-    ``output`` / ``valid_split_count``) ahead of the SymInt scalars, as required
-    by torch's auto-functionalization (see ``_mla_decode_v4_asm_gfx1250_op``).
-    ``valid_split_count`` is an optional mutated tensor (``Tensor(a!)?``), so
-    ``None`` is accepted (null scratch ptr) in eager and under compile alike —
-    no separate fallback path is needed.
-    """
-    torch.ops.aiter.mla_decode_v4_asm_gfx1250(
-        Q,
-        qrope,
-        KV,
-        kvrope,
-        qo_indptr,
-        kv_indptr,
-        kv_page_indices,
-        split_indptr,
-        sink,
-        splitData,
-        splitLse,
-        output,
-        valid_split_count,
-        max_seqlen_q,
-        softmax_scale,
-        int(out_16_nosplit),
-        int(num_kv_splits),
-        int(use_valid_split_count_reduce),
-        kv_last_page_lens,
-    )
