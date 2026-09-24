@@ -83,6 +83,26 @@ _PACK_CACHE_3D_3X3X3 = _LRUPackCache()
 _PACK_CACHE_3D_WINOGRAD_HW = _LRUPackCache()
 
 
+_WINOGRAD_F4X3_FILTER_MATRIX = (
+    (1.0 / 4, 0.0, 0.0),
+    (-1.0 / 6, -1.0 / 6, -1.0 / 6),
+    (-1.0 / 6, 1.0 / 6, -1.0 / 6),
+    (1.0 / 24, 1.0 / 12, 1.0 / 6),
+    (1.0 / 24, -1.0 / 12, 1.0 / 6),
+    (0.0, 0.0, 1.0),
+)
+
+
+def _transform_winograd_filter_f4x3(weight: torch.Tensor) -> torch.Tensor:
+    """Apply ``G @ weight @ G.T`` to every trailing 3x3 filter plane."""
+    matrix = torch.tensor(
+        _WINOGRAD_F4X3_FILTER_MATRIX,
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    return torch.einsum("ij,...jl,lm->...im", matrix, weight.float(), matrix.t())
+
+
 def clear_conv2d_weight_pack_caches() -> None:
     """Release cached Conv2D weight packs, primarily for synthetic sweeps."""
     _PACK_CACHE.clear()
@@ -181,22 +201,7 @@ def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
     K_out, C, R, S = w_oihw.shape
     assert R == 3 and S == 3
     C_pad = ((C + block_c - 1) // block_c) * block_c
-    # G matrix (6x3)
-    G = torch.tensor(
-        [
-            [1.0 / 4, 0.0, 0.0],
-            [-1.0 / 6, -1.0 / 6, -1.0 / 6],
-            [-1.0 / 6, 1.0 / 6, -1.0 / 6],
-            [1.0 / 24, 1.0 / 12, 1.0 / 6],
-            [1.0 / 24, -1.0 / 12, 1.0 / 6],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=torch.float32,
-        device=w_oihw.device,
-    )
-
-    g = w_oihw.float()  # [K_out, C, 3, 3]
-    u = torch.einsum("ij,kcjl,lm->kcim", G, g, G.t())
+    u = _transform_winograd_filter_f4x3(w_oihw)
     u = u.reshape(K_out, C, 36).permute(2, 0, 1).contiguous()
     if C_pad != C:
         pad = torch.zeros(
@@ -308,19 +313,7 @@ def prepack_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_
     if (T, R, S) != (3, 3, 3):
         raise ValueError(f"Winograd prepack requires 3x3x3, got {(T, R, S)}")
     C_pad = ((C + block_c - 1) // block_c) * block_c
-    G = torch.tensor(
-        [
-            [1.0 / 4, 0.0, 0.0],
-            [-1.0 / 6, -1.0 / 6, -1.0 / 6],
-            [-1.0 / 6, 1.0 / 6, -1.0 / 6],
-            [1.0 / 24, 1.0 / 12, 1.0 / 6],
-            [1.0 / 24, -1.0 / 12, 1.0 / 6],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=torch.float32,
-        device=w_oidhw.device,
-    )
-    transformed = torch.einsum("ij,kctjl,lm->kctim", G, w_oidhw.float(), G.t())
+    transformed = _transform_winograd_filter_f4x3(w_oidhw)
     transformed = transformed.reshape(K_out, C, 3, 36).permute(2, 3, 0, 1).contiguous()
     if C_pad != C:
         transformed = torch.cat(
