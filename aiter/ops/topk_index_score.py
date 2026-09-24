@@ -215,8 +215,8 @@ def _check_devices(*tensors) -> None:
     for n, t in named:
         if not t.is_cuda:
             raise ValueError(
-                "topk_index_score_decode: %s is on %s; every tensor must be a "
-                "CUDA tensor because they are forwarded as raw pointers" % (n, t.device)
+                "topk_index_score_decode: {} is on {}; every tensor must be a "
+                "CUDA tensor because they are forwarded as raw pointers".format(n, t.device)
             )
     devs = {t.device for _, t in named}
     if len(devs) != 1:
