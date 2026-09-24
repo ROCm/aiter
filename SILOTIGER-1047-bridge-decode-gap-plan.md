@@ -43,7 +43,7 @@ Stage then one-line commit when that is the ticket convention.
 - [x] 2. AMD-matched decode V publication (`ds_write_b64` ×4) + inverse PV reads
 - [x] 3. Cut leftover permute / bpermute / extra waits that AMD decode does not emit
 - [x] 4. Waitcnt / barrier schedule toward AMD’s decode mix
-- [ ] 5. Split-count specializations (`ns64` at M=1, `ns32` at M=8)
+- [x] 5. Split-count specializations (`ns64` at M=1, `ns32` at M=8)
 - [ ] 6. Stop: decode split matches or exceeds Live AMD at M=1 and M=8
 
 ## Locked decisions
@@ -160,7 +160,7 @@ captures (2026-09-23) under `/tmp/k2_amd_lowering_compare/`:
 | | AMD M=1 | AMD M=8 | AMD M=512 | FlyDSL decode HEAD |
 |--|--:|--:|--:|--:|
 | BLOCK_N / threads / splits | 16 / 256 / **64** | 16 / 256 / **32** | 64 / 128 / 1 | 16 / 256 / **32** |
-| Split WGs | **128** | **512** | 1024 | 64 (M=1) / 512 (M=8) |
+| Split WGs | **128** | **512** | 1024 | **128 (M=1 ns64) / 512 (M=8 ns32)** |
 | LDS B | 8192 | 8192 | 32768 | 8192 |
 | VGPR | 106 | 106 | 245 | 108 |
 | Static inst | 1002 | 1017 | 2374 | 1070 |
@@ -602,18 +602,59 @@ Live AMD already uses **one tile body** and **two split counts**:
 launches **half** AMD’s waves. Parent DNR against 64 splits was on
 the old body. Re-measure only after phases 1–4.
 
-- [ ] Add an `ns64` compile of the **same** decode tile; do not fork
+- [x] Add an `ns64` compile of the **same** decode tile; do not fork
       math. Dispatch: 64 when `M * Hk ≤ 4`, 32 otherwise (decode
       BN16 band).
-- [ ] Measure M=1 `ns32` vs `ns64` and M=8 `ns32` vs `ns64` (split,
+- [x] Measure M=1 `ns32` vs `ns64` and M=8 `ns32` vs `ns64` (split,
       merge, total). Expect M=1 to need 64 to match AMD’s grid;
       M=8 should stay 32 (AMD does; extra splits add merge).
-- [ ] Merge cost is a check, not a rewrite. If `ns64` wins the
+- [x] Merge cost is a check, not a rewrite. If `ns64` wins the
       split and loses the wrapper only because merge got worse,
       record it; merge work is a follow-on, not phases 1–4.
-- [ ] **Done when:** launch policy matches AMD’s decode band, or a
+- [x] **Done when:** launch policy matches AMD’s decode band, or a
       dated measurement shows `ns32` already matches AMD split at
       both M (then leave dispatch).
+
+Kept (2026-09-24). `_launch_config` now matches live AMD: `ns64`
+when `rows * Hk ≤ 4`, `ns32` for the rest of the BN16 band. Same
+tile body; `_plan(..., n_splits)` already compiles a distinct
+HSACO. Prefill `M=512` stays `ns1`. Oracle decode+prefill: **2
+passed**. Prefill ISA sha still `64ee586155fc6a63`.
+
+**Kernel-trace** (GPU 6, `CACHE=1` after fill, 40 timed iters;
+dumps `tickets/1047/tmp/k2_decode_ns/`):
+
+| | split µs | merge µs | split+merge | grid (threads x y z) |
+|--|--:|--:|--:|--|
+| FlyDSL M=1 ns32 | 11.040 | 3.640 | 14.680 | 256×2×**32** (64 WGs) |
+| FlyDSL M=1 ns64 | **7.800** | 12.360 | 20.160 | 256×2×**64** (128 WGs) |
+| AMD M=1 | **6.440** | 3.500 | 9.940 | 256×2×64 (128 WGs) |
+| FlyDSL M=8 ns32 | **12.820** | 3.720 | 16.540 | 2048×2×**32** (512 WGs) |
+| FlyDSL M=8 ns64 | 13.860 | 11.120 | 24.980 | 2048×2×**64** (1024 WGs) |
+| AMD M=8 | **10.440** | 2.880 | 13.320 | 2048×2×32 (512 WGs) |
+
+M=1 `ns64` cuts split **11.04 → 7.80 µs** (1.71× AMD → **1.21×**).
+Merge goes **3.64 → 12.36 µs** (64 live lanes, loop of 64). M=8
+`ns64` loses both split and merge; leave M=8 at 32.
+
+**Wall** (five-run median, interleaved `CACHE=0`; policy ns64/ns32;
+not a keep-gate) vs phase 4 ns32/ns32 19.57 / 19.98 / 158.88:
+
+| M | FlyDSL | AMD wrapper |
+|--:|--:|--:|
+| 1 | 20.43 | 37.18 |
+| 8 | 20.46 | 37.51 |
+| 512 | 159.31 | 202.11 |
+
+Wrapper M=1 is slightly slower than ns32 because merge ate the
+split win. Split is the campaign bar; merge is a follow-on, not a
+revert of `ns64`. `ns32` does **not** match AMD split at M=1, so
+dispatch stays AMD-matched.
+
+**Compile specialization.** Merge folds `n_splits` into the lane
+mask (`lane < n_splits`) and the loop-carried split scan; split
+tile bounds also fold. Two HSACOs (`ns32` / `ns64`), not one
+runtime split count. Phase 6.
 
 ### 6. Stop: decode split matches or exceeds Live AMD
 
@@ -679,9 +720,14 @@ item.
       `shuffle_idx` (now `ballot`); the remaining 8 are alpha +
       epilogue `l_final` because overlay C is token-major and the
       store is 4 heads.
-- [ ] Whether M=1 still needs `ns64` after the tile matches AMD, or
-      the current 32-split grid becomes enough (phase 5).
-- [ ] Whether one `ns*` HSACO with a runtime split count is enough,
+- [x] Whether M=1 still needs `ns64` after the tile matches AMD, or
+      the current 32-split grid becomes enough (phase 5). **Needs
+      ns64.** M=1 split 11.04 → 7.80 µs vs AMD 6.44; ns32 is still
+      1.71×. Merge 3.64 → 12.36 is a follow-on, not a reason to
+      keep half AMD’s waves.
+- [x] Whether one `ns*` HSACO with a runtime split count is enough,
       or Triton-style constexpr `NUM_SPLITS` must remain a compile
       specialization because merge `BLOCK_SPLITS` and split tile
-      bounds fold (phase 5).
+      bounds fold (phase 5). **Compile specialization.** Merge
+      folds `n_splits` into `lane < n_splits` and the split scan;
+      `_plan` already keys the HSACO on `n_splits`.
