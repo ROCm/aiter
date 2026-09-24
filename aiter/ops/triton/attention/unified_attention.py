@@ -214,15 +214,6 @@ def unified_attention(
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
         )
-        # Tile staging is LDS-bound: pages up to 128 are validated on gfx942
-        # (the tuned SHUF entries and the BS-agnostic M16/stages-1 fallback
-        # both fit 64 KiB LDS at TILE_SIZE=128). Larger pages would force a
-        # single K or V tile past the LDS budget with no tuned entry to
-        # compensate, so reject instead of launching an unvalidated config.
-        assert block_size <= 128, (
-            "Unified Attention with pre-shuffled KV cache supports pages up to "
-            f"128 on this target; got block_size={block_size}"
-        )
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
@@ -462,6 +453,19 @@ def _unified_attention_2d_triton(params: _UAParams):
         assert (
             params.block_size >= 32
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+    if params.shuffled_kv_cache:
+        # TILE_SIZE is pinned to block_size below, so the page is the tile:
+        # on gfx942, pages up to 128 are hardware-validated (the tuned SHUF
+        # entries and the BS-agnostic M16/stages-1 fallback both fit 64 KiB
+        # LDS at TILE_SIZE=128); a larger page forces a single K or V tile
+        # past the LDS budget with no tuned entry to compensate. gfx1250's
+        # tables carry their own BS_GEQ_256 entries and take the gluon path,
+        # which does not come through here.
+        assert params.block_size <= 128, (
+            "Unified Attention 2D Triton path with pre-shuffled KV cache "
+            f"supports pages up to 128 on this target; got block_size="
+            f"{params.block_size}"
+        )
 
     config = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
