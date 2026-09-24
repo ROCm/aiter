@@ -121,8 +121,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int64_t K,               // padded contraction dim consumed by the packed layout
      const char* kernelName,
      float alpha,
+     aiter_tensor_t* bias,    // optional bias:[N] bf16, folded into the store epilogue
      hipStream_t stream),
-    (A, B, A_scale, B_scale, out, K, kernelName, alpha, stream))
+    (A, B, A_scale, B_scale, out, K, kernelName, alpha, bias, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
     AITER_CHECK(alpha == 1.0f, __func__, " only alpha=1.0 is supported");
@@ -189,10 +190,33 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 __func__,
                 " each tensor must fit within the kernel's 2 GiB buffer-address range");
 
+    // The bias rides in ptr_C and its byte length in stride_C1, exactly as the A6W6 path
+    // does and as a4w4 already did, so the kernarg segment is unchanged and only the two
+    // stores below are new. A length of zero bounds-kills the kernel's eight bias loads
+    // into zeros, so a BIAS=1 code object is correct on an unbiased call -- but it still
+    // issues and waits on them, which is why the unbiased kernels remain the default and
+    // the _bias siblings are selected only when a bias is actually present.
+    unsigned int bias_bytes = 0;
+    if(bias != nullptr)
+    {
+        AITER_CHECK(bias->dtype() == AITER_DTYPE_bf16,
+                    __func__,
+                    " bias must be BFloat16 to match the output");
+        AITER_CHECK(bias->dim() == 1 && bias->is_contiguous(),
+                    __func__,
+                    " bias must be a contiguous 1D tensor");
+        AITER_CHECK(bias->numel() <= Ndim, __func__, " bias length must not exceed N");
+        AITER_CHECK(bias->device_id == A->device_id,
+                    __func__,
+                    " bias must be on the same GPU as the operands");
+        bias_bytes = static_cast<unsigned int>(bias->numel() * 2);
+    }
+
     KernelArgs args{};
     size_t arg_size     = sizeof(args);
     args.ptr_D          = out->ptr;
-    args.ptr_C          = nullptr;
+    args.ptr_C          = bias != nullptr ? bias->ptr : nullptr;
+    args.stride_C1      = bias_bytes;
     args.ptr_A          = A->ptr;
     args.ptr_B          = B->ptr;
     args.alpha          = alpha;

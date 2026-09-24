@@ -119,6 +119,56 @@ def quant_mxfp4_gemm_hip_out(
     _launch_quant_mxfp4_gemm_hip_out(input, packed, packed_scale, round_mode_int)
 
 
+# Kernels that fold a row-broadcast bias into their store epilogue. Only the locally
+# generated 16x16x128 `_bias` siblings do; upstream's four MFMA32 objects have no bias
+# epilogue at all and *ignore* the bias slots rather than rejecting them, so the check at
+# the entry point is the only thing standing between a mis-tuned row and a silently
+# unbiased result. Same contract, and same reasoning, as _BIAS_CAPABLE_KERNELS in
+# gemm_op_a6w6.
+_BIAS_CAPABLE_KERNELS = frozenset(
+    {
+        "aiter_a6w4_m32_s0_a4_nt_bias",
+        "aiter_a6w4_m32_s0_a4_t_bias",
+        "aiter_a6w4_m32_s3_a4_t_bias",
+        "aiter_a6w4_m32_s3_a5_t_bias",
+        "aiter_a6w4_stnt_allk_bias",
+        "aiter_a6w4_stnt_bias",
+        "aiter_a6w4_swz0_bias",
+    }
+)
+
+# The unbiased kernel each bias-capable one was built from, so a call that turns out to
+# carry a bias can be routed to the sibling without the tuner having to know about both.
+_BIAS_SIBLING = {
+    _MFMA32_SMALL_KERNEL: "aiter_a6w4_m32_s0_a4_nt_bias",
+    _MFMA32_SWZ0_KERNEL: "aiter_a6w4_m32_s0_a4_t_bias",
+    _MFMA32_GROUPED_KERNEL: "aiter_a6w4_m32_s3_a4_t_bias",
+    _MFMA32_LONG_K_KERNEL: "aiter_a6w4_m32_s3_a5_t_bias",
+    "aiter_a6w4_stnt_allk": "aiter_a6w4_stnt_allk_bias",
+    "aiter_a6w4_stnt": "aiter_a6w4_stnt_bias",
+    "aiter_a6w4_swz0": "aiter_a6w4_swz0_bias",
+}
+
+
+def _default_gemm_a6w4_bias_kernel(M: int, N: int, K: int) -> str:
+    """Pick a bias-capable kernel for a shape whose tuned choice has no bias epilogue.
+
+    Upstream's four MFMA32 objects have none, so a tuned row naming one cannot serve a
+    biased call. Rather than drop the bias or refuse, fall back to the locally generated
+    16x16x128 family, which does. Only the swizzle bound has to be respected -- a grouped
+    kernel launched outside its raster bounds is incorrect, not merely slow.
+    """
+    padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
+    if padM <= _GROUPED_SWIZZLE_MAX_M and padN <= _GROUPED_SWIZZLE_MAX_N:
+        # 65536 and 16384 are the swizzle_max_K the manifest records for the two, i.e.
+        # SWZTH * 128 for SWZTH of 512 and 128.
+        if padK <= 65536:
+            return "aiter_a6w4_stnt_allk_bias"
+        if padK <= 16384:
+            return "aiter_a6w4_stnt_bias"
+    return "aiter_a6w4_swz0_bias"
+
+
 def _default_gemm_a6w4_kernel(M: int, N: int, K: int) -> str:
     """Choose a safe kernel when no shape-tuned A6W4 record is available."""
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
@@ -430,6 +480,7 @@ def _gemm_a6w4_asm(
     K: int,
     kernelName: str,
     alpha: float,
+    bias: Tensor | None,
 ) -> None: ...
 
 
@@ -442,6 +493,7 @@ def gemm_a6w4_asm(
     K: int,
     kernelName: str | None = None,
     alpha: float = 1.0,
+    bias: Tensor | None = None,
 ) -> Tensor:
     """Launch A6W4 on physical GEMM-layout buffers.
 
@@ -456,7 +508,16 @@ def gemm_a6w4_asm(
     if out.ndim != 2:
         raise ValueError(f"gemm_a6w4_asm expects a 2D output, got {out.ndim}D")
     kernelName = kernelName or _default_gemm_a6w4_kernel(*out.shape, K)
-    _gemm_a6w4_asm(A, B, A_scale, B_scale, out, K, kernelName, alpha)
+    # A kernel with no bias epilogue ignores the bias slots rather than rejecting them, so
+    # refusing here is the only thing between a mis-tuned row and a silently unbiased
+    # result -- the same contract gemm_a6w6_asm enforces.
+    if bias is not None and kernelName not in _BIAS_CAPABLE_KERNELS:
+        raise ValueError(
+            f"gemm_a6w4 kernel {kernelName!r} has no bias epilogue, so the bias would be "
+            f"silently dropped. Pass bias=None, or select a bias-capable kernel: "
+            f"{sorted(_BIAS_CAPABLE_KERNELS)}"
+        )
+    _gemm_a6w4_asm(A, B, A_scale, B_scale, out, K, kernelName, alpha, bias)
     return out
 
 
@@ -471,10 +532,20 @@ def gemm_a6w4(
     dtype: torch.dtype = torch.bfloat16,
     alpha: float = 1.0,
     kernelName: str | None = None,
+    bias: Tensor | None = None,
 ) -> Tensor:
     """Run MXFP6 activations by MXFP4 weights and return logical ``[M, N]``.
 
     The returned slice is non-contiguous when ``N`` requires physical padding.
+
+    ``bias`` is an optional bf16 ``[N]`` vector added in the GEMM's store epilogue, which
+    costs nothing measurable and saves a separate elementwise pass over the output, which
+    is the whole reason A6W4 has one. It needs no
+    padding to match a padded N: the kernel bounds-checks it and reads zeros on the padding
+    columns, which are sliced away.
+
+    A bias switches the selection to the bias-capable sibling of whichever kernel the tuner
+    picked, because the unbiased objects would drop it silently.
     """
     if dtype != torch.bfloat16:
         raise ValueError(f"gemm_a6w4 only supports torch.bfloat16, got {dtype}")
@@ -488,6 +559,10 @@ def gemm_a6w4(
     if padK > _MAX_KERNEL_K:
         raise ValueError(f"gemm_a6w4 padded K is outside the int32 kernel ABI: {padK}")
     selected_kernel = _select_gemm_a6w4_kernel(M, N, K, kernelName, device=A.device)
+    if bias is not None and selected_kernel not in _BIAS_CAPABLE_KERNELS:
+        selected_kernel = _BIAS_SIBLING.get(
+            selected_kernel, _default_gemm_a6w4_bias_kernel(M, N, K)
+        )
     padM, padN = _ceil(M, _TILE), _ceil(N, _TILE)
     if padM * padN * torch.bfloat16.itemsize > _MAX_BUFFER_BYTES:
         raise ValueError("gemm_a6w4 output exceeds the kernel's 2 GiB address range")
@@ -501,6 +576,7 @@ def gemm_a6w4(
         padK,
         kernelName=selected_kernel,
         alpha=alpha,
+        bias=bias,
     )
     return out[:M, :N]
 
