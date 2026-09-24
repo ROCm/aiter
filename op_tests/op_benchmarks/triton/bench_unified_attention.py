@@ -306,9 +306,9 @@ def run_benchmark(custom, args):
         if args.test:
             fn()
             ref_output = ref_paged_attn(
-                query=inputs["query"],
-                key_cache=inputs["key_cache"],
-                value_cache=inputs["value_cache"],
+                query=q_tensor,
+                key_cache=k_tensor,
+                value_cache=v_tensor,
                 query_lens=inputs["query_lens"],
                 kv_lens=inputs["kv_lens"],
                 block_tables=inputs["block_tables"],
