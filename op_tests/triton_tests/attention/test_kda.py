@@ -18,8 +18,18 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 arch = get_arch()
 
 pytestmark = pytest.mark.skipif(
-    arch != "gfx1250", reason=f"KDA gluon decode is gfx1250 only, got {arch}"
+    arch not in ("gfx950", "gfx1250"),
+    reason=f"KDA gluon decode needs gfx950/gfx1250, got {arch}",
 )
+# gfx950 runs the vLLM decode path only: V-first state, head_dim 128, no spec
+# decoding, cache_state_updates or tiling knobs
+gfx1250_only = pytest.mark.skipif(arch != "gfx1250", reason="gfx1250-only feature")
+
+
+def skip_on_gfx950(D=128, spec=False):
+    if arch == "gfx950" and (D != 128 or spec):
+        pytest.skip("gfx950 KDA decode needs head_dim 128 and no spec decoding")
+
 
 DEVICE = "cuda"
 RATIO = 0.005
@@ -172,6 +182,8 @@ def get_config(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True, params=["snapshots", "cache_state_updates"])
 def kda_store_mode(request, monkeypatch):
     """Run the suite twice: as-is, then routed through the cached-update path."""
+    if request.param == "cache_state_updates" and arch != "gfx1250":
+        pytest.skip("cache_state_updates is gfx1250 only")
     if request.param == "snapshots":
         yield request.param
         return
@@ -244,6 +256,7 @@ def kda_store_mode(request, monkeypatch):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_fused_recurrent(B, T, H, HV, D, scale, use_qk_l2norm_in_kernel, dtype):
+    skip_on_gfx950(D=D)
     q, k, v = make_qkv(B, T, H, HV, D, dtype)
     g = F.logsigmoid(torch.randn(B, T, HV, D, dtype=torch.float32, device=DEVICE))
     beta = torch.randn(B, T, HV, dtype=torch.float32, device=DEVICE).sigmoid()
@@ -287,6 +300,7 @@ def test_fused_recurrent(B, T, H, HV, D, scale, use_qk_l2norm_in_kernel, dtype):
 )
 def test_fused_recurrent_long_sequence(B, T, H, HV, D, scale):
     """Training-length sequences, as fla validates its recurrent oracle at."""
+    skip_on_gfx950(D=D)
     q, k, v = make_qkv(B, T, H, HV, D, torch.float32)
     q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
     g = F.logsigmoid(torch.randn(B, T, HV, D, dtype=torch.float32, device=DEVICE))
@@ -342,6 +356,7 @@ def test_fused_recurrent_beta_sigmoid_in_kernel(allow_neg_eigval, T):
 )
 def test_fused_recurrent_gate_in_kernel(B, T, H, HV, D, has_dt_bias, safe_gate):
     """In-kernel gate chain matches the torch gate applied beforehand."""
+    skip_on_gfx950(D=D)
     q, k, v = make_qkv(B, T, H, HV, D, torch.float32)
     g_raw = torch.randn(B, T, HV, D, dtype=torch.float32, device=DEVICE)
     beta = torch.rand(B, T, HV, dtype=torch.float32, device=DEVICE).sigmoid()
@@ -422,6 +437,7 @@ def test_fused_recurrent_varlen(lens):
 @pytest.mark.parametrize("spec", [False, True])
 def test_fused_recurrent_vllm_decode(B, T, spec):
     """Continuous batching with paged state, poisoning untouched slots."""
+    skip_on_gfx950(spec=spec)
     H, D = 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
 
@@ -549,6 +565,7 @@ def _cached_vs_snapshot(B, T, H, HV, D, accepted_rounds, **kw):
     ), "kernel wrote outside its slots"
 
 
+@gfx1250_only
 @pytest.mark.parametrize("T", [1, 4, 8])
 @pytest.mark.parametrize("pattern", ["one", "all", "perseq"])
 def test_cache_state_updates_matches_snapshots(T, pattern):
@@ -562,6 +579,7 @@ def test_cache_state_updates_matches_snapshots(T, pattern):
     _cached_vs_snapshot(B, T, 4, 4, 128, [acc])
 
 
+@gfx1250_only
 def test_cache_state_updates_multi_round():
     """Four chained verifier rounds must never drift from snapshot mode."""
     B, T = 3, 6
@@ -573,6 +591,7 @@ def test_cache_state_updates_multi_round():
     _cached_vs_snapshot(B, T, 4, 4, 128, rounds)
 
 
+@gfx1250_only
 @pytest.mark.parametrize(
     ("gate", "beta_headwise", "dtype", "H", "HV"),
     [
@@ -590,6 +609,7 @@ def test_cache_state_updates_variants(gate, beta_headwise, dtype, H, HV):
     )
 
 
+@gfx1250_only
 @pytest.mark.parametrize(
     ("BV", "num_warps", "SK", "num_buffers", "use_tdm_load", "use_tdm_fused_load"),
     [
@@ -624,6 +644,7 @@ def test_cache_state_updates_tiling(
     _cached_vs_snapshot(4, 4, 4, 4, 128, [acc])
 
 
+@gfx1250_only
 @pytest.mark.parametrize("BV, num_warps", [(32, 4), (32, 2), (64, 2), (128, 4)])
 def test_cache_state_updates_k_first(BV, num_warps, get_config):
     """[K, V] layout must still be bitwise-exact vs snapshots."""
@@ -632,6 +653,7 @@ def test_cache_state_updates_k_first(BV, num_warps, get_config):
     _cached_vs_snapshot(4, 4, 4, 4, 128, [acc], state_v_first=False)
 
 
+@gfx1250_only
 def test_cache_state_updates_vs_reference():
     """Two cached-update launches checked against the pure-torch recurrence."""
     B, T, H, D = 4, 6, 4, 128
@@ -685,6 +707,7 @@ def test_cache_state_updates_vs_reference():
     assert torch.equal(pool[untouched], base[untouched]), "wrote outside slots"
 
 
+@gfx1250_only
 def test_cache_state_updates_varlen():
     """Unequal sequence lengths: per-sequence record counts and acceptance."""
     lens, H, D = [3, 1, 4], 4, 128
@@ -729,6 +752,7 @@ def test_cache_state_updates_varlen():
     assert torch.equal(results[True][1][untouched], base[untouched])
 
 
+@gfx1250_only
 def test_cache_state_updates_guards():
     """The wrapper must reject configurations the record layout cannot support."""
     B, T, H, D = 2, 2, 2, 128
@@ -1073,6 +1097,7 @@ def test_paged_state_out():
         assert_close(f"ht[{n}]", ref_ht[0], snaps[e - 1])
 
 
+@gfx1250_only
 @pytest.mark.parametrize("T", [1, 4])
 @pytest.mark.parametrize("BV", [32, 128])
 def test_state_v_first_matches_k_first(T, BV, get_config):
@@ -1105,6 +1130,7 @@ def test_state_v_first_matches_k_first(T, BV, get_config):
     assert_close("ht", ht_kv, ht_vk.transpose(-1, -2), 1e-4)
 
 
+@gfx1250_only
 @pytest.mark.parametrize("T", [1, 3])
 def test_k_first_against_oracle(T):
     """[K, V] is the reference's own default layout, so no transpose is needed."""
@@ -1126,6 +1152,7 @@ def test_k_first_against_oracle(T):
     assert_close("ht", ref_ht, ht)
 
 
+@gfx1250_only
 def test_k_first_paged():
     B, T, H, D = 2, 3, 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
@@ -1304,6 +1331,7 @@ SK_CONFIGS = [
 ]
 
 
+@gfx1250_only
 @pytest.mark.parametrize("BV, SK, num_warps", SK_CONFIGS)
 @pytest.mark.parametrize("state_v_first", [True, False])
 def test_sk_equivalence(BV, SK, num_warps, state_v_first, get_config):
@@ -1406,7 +1434,9 @@ def test_fused_conv_rms_gate(N, T, H):
         shp = lambda t: t.view(N, 1, *t.shape[1:])
         paged = {"ssm_state_indices": idx}
     else:
-        view = lambda off: mixed.as_strided((1, TT, H, D), (TT * 3 * lp, 3 * lp, D, 1), off)
+        view = lambda off: mixed.as_strided(
+            (1, TT, H, D), (TT * 3 * lp, 3 * lp, D, 1), off
+        )
         shp = lambda t: t[None]
         paged = {
             "ssm_state_indices": idx[:, None].expand(N, T).contiguous(),
@@ -1447,7 +1477,8 @@ def test_fused_conv_rms_gate(N, T, H):
         cs2[idx.long()] = torch.cat([h[..., 1:], x[rows, :, None]], -1).to(cs.dtype)
     y = y * torch.sigmoid(y)
     q2, k2, v2 = (
-        shp(y[:, i * lp : (i + 1) * lp].reshape(TT, H, D).contiguous()) for i in range(3)
+        shp(y[:, i * lp : (i + 1) * lp].reshape(TT, H, D).contiguous())
+        for i in range(3)
     )
     o2, _ = fused_recurrent_kda(q=q2, k=k2, v=v2, initial_state=S2, **kw)
     ob = o2.to(torch.bfloat16).float()
@@ -1462,7 +1493,9 @@ def test_fused_recurrent_kda_packed_decode():
     N, H, D, W, NS, pad = 16, 24, 128, 4, 40, 16
     lp = H * D
     torch.manual_seed(3)
-    projected = torch.randn(N, 4 * lp + D + H + pad, dtype=torch.bfloat16, device=DEVICE)
+    projected = torch.randn(
+        N, 4 * lp + D + H + pad, dtype=torch.bfloat16, device=DEVICE
+    )
     mixed, g2, _, beta = projected.split([3 * lp, lp, D, H, pad], dim=-1)[:4]
     g2 = g2.view(N, H, D)
     g = torch.randn(N, H, D, dtype=torch.bfloat16, device=DEVICE) * 0.5

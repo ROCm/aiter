@@ -24,6 +24,10 @@ if _ARCH == "gfx1250":
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
     )
+elif _ARCH == "gfx950":
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.kda_decode import (
+        fused_recurrent_kda_packed_decode_kernel,
+    )
 
 
 def get_kda_config(
@@ -99,7 +103,7 @@ def fused_recurrent_kda(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Fused recurrent Kimi Delta Attention (KDA), gfx1250 Gluon decode path.
+    """Fused recurrent Kimi Delta Attention (KDA), gfx950/gfx1250 Gluon decode path.
 
     Per token: S = exp(g_t) * S, then S += beta_t * k_t (x) (v_t - S^T k_t),
     then o_t = S^T q_t. Requires triton >= 3.6.0 on gfx1250.
@@ -149,7 +153,7 @@ def fused_recurrent_kda(
     """
 
     if fused_recurrent_kda_packed_decode_kernel is None:
-        raise RuntimeError(f"kda gluon decode requires gfx1250 (found {_ARCH})")
+        raise RuntimeError(f"kda gluon decode requires gfx950/gfx1250 (found {_ARCH})")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError(
             "allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True"
@@ -307,11 +311,14 @@ def fused_recurrent_kda(
         sr = st[0] // row
         return sr, t.shape[0] * sr
 
+    state_dst = final_state
+    if state_dst is None and _ARCH == "gfx950":
+        n_dst = B * T if is_paged else N
+        state_dst = q.new_empty(n_dst, *state_shape, dtype=torch.float32)
     slot_rows_in, rows_in = _rows(initial_state)
     slot_rows_out, rows_out = (
-        (slot_rows_in, rows_in) if final_state is initial_state else _rows(final_state)
+        (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)
     )
-    assert num_buffers in (1, 2), "num_buffers: 1 sync, 2 register prefetch"
     if cache_state_updates:
         assert is_paged, "cache_state_updates requires ssm_state_indices"
         assert inplace_final_state, "cache_state_updates requires inplace_final_state"
@@ -336,7 +343,7 @@ def fused_recurrent_kda(
         dt_bias_ptr=dt_bias,
         o_ptr=out,
         state_ptr=initial_state,
-        state_out_ptr=final_state,
+        state_out_ptr=state_dst,
         cu_seqlens_ptr=cu_seqlens,
         state_indices_ptr=ssm_state_indices,
         num_accepted_ptr=num_accepted_tokens,
@@ -376,7 +383,7 @@ def fused_recurrent_kda(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
+        STORE_FINAL_STATE=state_dst is not None,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         HAS_DT_BIAS=dt_bias is not None,

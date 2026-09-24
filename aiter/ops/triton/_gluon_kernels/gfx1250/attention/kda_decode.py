@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT 
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
@@ -206,7 +206,9 @@ def _conv_qkv(
     cv = i_hv * V + fv
     q = _conv_token(q_p, hb, wb, cq * s_dim, cq, fk, mk, s_pos, LP)
     k = _conv_token(k_p, hb, wb, (LP + cq) * s_dim, W * LP + cq, fk, mk, s_pos, LP)
-    v = _conv_token(v_p, hb, wb, (2 * LP + cv) * s_dim, 2 * W * LP + cv, fv, mv, s_pos, LP)
+    v = _conv_token(
+        v_p, hb, wb, (2 * LP + cv) * s_dim, 2 * W * LP + cv, fv, mv, s_pos, LP
+    )
     q = gl.convert_layout(gl.sum(q, axis=0), K_LAYOUT)
     k = gl.convert_layout(gl.sum(k, axis=0), K_LAYOUT)
     return q, k, gl.convert_layout(gl.sum(v, axis=0), V_LAYOUT), gr, br
@@ -366,11 +368,13 @@ def fused_recurrent_kda_packed_decode_kernel(
         "per-tile (a, k, err) updates must fit in a state slot",
     )
     gl.static_assert(
-        (not (USE_CONV or USE_RMS_GATE)) or BV == V, "USE_CONV/USE_RMS_GATE need BV == V"
+        (not (USE_CONV or USE_RMS_GATE)) or BV == V,
+        "USE_CONV/USE_RMS_GATE need BV == V",
     )
     gl.static_assert((not USE_CONV) or W == 4, "USE_CONV needs W == 4")
     gl.static_assert(
-        (not (USE_CONV or USE_RMS_GATE)) or (NUM_BUFFERS == 2 and not USE_TDM_FUSED_LOAD),
+        (not (USE_CONV or USE_RMS_GATE))
+        or (NUM_BUFFERS == 2 and not USE_TDM_FUSED_LOAD),
         "USE_CONV/USE_RMS_GATE run on the register-prefetch path",
     )
     gl.static_assert((not USE_CONV) or USE_INITIAL_STATE, "USE_CONV needs a state slot")
@@ -533,15 +537,38 @@ def fused_recurrent_kda_packed_decode_kernel(
             slot = i_n
         if USE_CONV:
             FLATK: gl.constexpr = gl.BlockedLayout(
-                [1, (K * CR) // (32 * NUM_WARPS)], [1, 32], [CR, NUM_WARPS // CR], [1, 0]
+                [1, (K * CR) // (32 * NUM_WARPS)],
+                [1, 32],
+                [CR, NUM_WARPS // CR],
+                [1, 0],
             )
             FLATV: gl.constexpr = gl.BlockedLayout(
-                [1, (V * CR) // (32 * NUM_WARPS)], [1, 32], [CR, NUM_WARPS // CR], [1, 0]
+                [1, (V * CR) // (32 * NUM_WARPS)],
+                [1, 32],
+                [CR, NUM_WARPS // CR],
+                [1, 0],
             )
             hb = conv_state_ptr + slot.to(gl.int64) * stride_cs_slot
             nxt = _conv_qkv(
-                nxt, q_p, k_p, v_p, hb, conv_weight_ptr, i_h, i_hv, stride_cs_dim,
-                stride_cs_pos, H * K, W, CR, K, V, FLATK, FLATV, K_LAYOUT, V_LAYOUT,
+                nxt,
+                q_p,
+                k_p,
+                v_p,
+                hb,
+                conv_weight_ptr,
+                i_h,
+                i_hv,
+                stride_cs_dim,
+                stride_cs_pos,
+                H * K,
+                W,
+                CR,
+                K,
+                V,
+                FLATK,
+                FLATV,
+                K_LAYOUT,
+                V_LAYOUT,
             )
         row_in = _state_row(
             slot, stride_state_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
@@ -695,8 +722,25 @@ def fused_recurrent_kda_packed_decode_kernel(
                     )
                     if USE_CONV:
                         nxt = _conv_qkv(
-                            nxt, q_p, k_p, v_p, hb, conv_weight_ptr, i_h, i_hv, stride_cs_dim,
-                            stride_cs_pos, H * K, W, CR, K, V, FLATK, FLATV, K_LAYOUT, V_LAYOUT,
+                            nxt,
+                            q_p,
+                            k_p,
+                            v_p,
+                            hb,
+                            conv_weight_ptr,
+                            i_h,
+                            i_hv,
+                            stride_cs_dim,
+                            stride_cs_pos,
+                            H * K,
+                            W,
+                            CR,
+                            K,
+                            V,
+                            FLATK,
+                            FLATV,
+                            K_LAYOUT,
+                            V_LAYOUT,
                         )
                     if USE_RMS_GATE:
                         og_p += stride_og_token

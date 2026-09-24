@@ -30,17 +30,22 @@ K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
 K3_LOWER_BOUND = -5.0
 
 
-def make_inputs(B, T, H, D, dtype, device, paged, gate, num_accepted=0, fused=False, W=4):
+def make_inputs(
+    B, T, H, D, dtype, device, paged, gate, num_accepted=0, fused=False, W=4
+):
     """K3 serves `full_k3`: raw q/k/g/beta, gate chain and l2norm fused in."""
     total_T = B * T
     q = torch.rand(1, total_T, H, D, dtype=dtype, device=device)
     k = torch.rand(1, total_T, H, D, dtype=dtype, device=device)
     v = torch.rand(1, total_T, H, D, dtype=dtype, device=device)
-    beta = torch.rand(1, total_T, H, dtype=torch.float32, device=device)
+    beta = torch.rand(
+        1, total_T, H, dtype=dtype if fused else torch.float32, device=device
+    )
     cu_seqlens = torch.arange(0, total_T + 1, step=T, device=device).long()
 
     if gate:
-        g = torch.randn(1, total_T, H, D, dtype=torch.float32, device=device)
+        g_dtype = dtype if fused else torch.float32
+        g = torch.randn(1, total_T, H, D, dtype=g_dtype, device=device)
         A_log = torch.log(
             torch.empty(H, dtype=torch.float32, device=device).uniform_(1, 16)
         )
@@ -223,7 +228,15 @@ def benchmark(args):
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
         inputs = make_inputs(
-            B, T, H, D, dtype, args.device, args.paged, args.gate, args.num_accepted,
+            B,
+            T,
+            H,
+            D,
+            dtype,
+            args.device,
+            args.paged,
+            args.gate,
+            args.num_accepted,
             fused=args.fused,
         )
         shared = dict(
@@ -433,8 +446,8 @@ def parse_args():
 
 
 def run_bench(args):
-    if arch_info.get_arch() != "gfx1250":
-        sys.exit(f"KDA gluon decode is gfx1250 only, got {arch_info.get_arch()}")
+    if arch_info.get_arch() not in ("gfx950", "gfx1250"):
+        sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
     if "fla" in args.backends and not HAS_FLA:
         print("fla not importable -- dropping the upstream backend.")
         print("  PYTHONPATH=/path/to/flash-linear-attention to enable it")
