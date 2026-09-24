@@ -247,6 +247,21 @@ def _query_positions(m: int, seq_len: int, device) -> torch.Tensor:
     return torch.arange(seq_len - m, seq_len, device=device, dtype=dtypes.i32)
 
 
+def _selected_width(indices: torch.Tensor) -> float:
+    """Mean non-padding selection slots per row.
+
+    ``indices`` is always allocated ``index_width`` wide (2051 on both
+    families), but the indexer can only fill ``complete_blocks * r + tail``
+    of it, capped at the budget. Below ``L = 2048`` the remainder is ``-1``
+    padding: a quarter of the row is live at ``L = 512`` decode and an eighth
+    at ``M = 512`` prefill. Deriving FLOPS and bytes from ``indices.shape[1]``
+    therefore overstates the work by up to 8x on those rows. The kernels still
+    walk all ``index_width`` columns -- that part is faithful to serving -- so
+    only the *derived* columns need the live count.
+    """
+    return float((indices >= 0).sum().item()) / indices.shape[0]
+
+
 def _pack_family_a(k_bar, k, v, page_size, device):
     gen_i = torch.Generator(device=device)
     gen_i.manual_seed(1)
@@ -824,7 +839,8 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
         msg="4882 Triton GQA vs oracle",
     )
 
-    w = indices.shape[1]
+    w_alloc = indices.shape[1]
+    w = _selected_width(indices)
     flops = 4 * m * gqa.n_heads * gqa.head_dim * w
     nbytes = (
         m * gqa.n_heads * gqa.head_dim * 2 + 2 * w * gqa.kv_heads * gqa.head_dim
@@ -832,7 +848,8 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
     return {
         "gfx": get_gfx(),
         "n_blocks": n_blocks,
-        "width": w,
+        "width": w_alloc,
+        "valid%": 100.0 * w / w_alloc,
         "flydsl_k2 us": k2_us,
         "flydsl_k2 TFLOPS": flops / k2_us / 1e6,
         "flydsl_k2 TB/s": nbytes / k2_us / 1e6,
@@ -1257,7 +1274,7 @@ def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=0):
         msg="vllm_amd GQA vs oracle",
     )
 
-    w = idx.index_width
+    w = _selected_width(indices)
     flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
     bytes_select = (
@@ -1270,6 +1287,7 @@ def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=0):
         "gfx": get_gfx(),
         "vllm_pin": VLLM_AMD_QSA_PIN,
         "n_blocks": n_blocks,
+        "valid%": 100.0 * w / idx.index_width,
         "vllm_amd_select us": select_us,
         "vllm_amd_select TFLOPS": flops_select / select_us / 1e6,
         "vllm_amd_select TB/s": bytes_select / select_us / 1e6,
@@ -1365,7 +1383,7 @@ def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate=0):
         msg="4882 Triton GQA vs oracle",
     )
 
-    w = idx.index_width
+    w = _selected_width(indices)
     flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
     bytes_select = (
@@ -1378,6 +1396,7 @@ def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate=0):
         "gfx": get_gfx(),
         "aiter_4882_pin": AITER_4882_QSA_PIN,
         "n_blocks": n_blocks,
+        "valid%": 100.0 * w / idx.index_width,
         "4882_triton_select us": select_us,
         "4882_triton_select TFLOPS": flops_select / select_us / 1e6,
         "4882_triton_select TB/s": bytes_select / select_us / 1e6,
@@ -1484,7 +1503,7 @@ def _bench_qsa_family_b_4882(
     )
 
     tag = backend
-    w = idx.index_width
+    w = _selected_width(indices)
     flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
     bytes_select = (
@@ -1497,6 +1516,7 @@ def _bench_qsa_family_b_4882(
         "gfx": get_gfx(),
         "aiter_4882_pin": AITER_4882_QSA_PIN,
         "n_blocks": n_blocks,
+        "valid%": 100.0 * w / idx.index_width,
         f"4882_{tag}_select us": select_us,
         f"4882_{tag}_select TFLOPS": flops_select / select_us / 1e6,
         f"4882_{tag}_select TB/s": bytes_select / select_us / 1e6,
