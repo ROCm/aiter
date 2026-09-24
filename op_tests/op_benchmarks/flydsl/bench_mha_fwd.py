@@ -137,7 +137,7 @@ def _tflops(flop, ms):
 
 
 def _tbps(nbytes, ms):
-    return float("inf") if ms <= 0 else nbytes / ms / 1e6
+    return float("inf") if ms <= 0 else nbytes / ms / 1e9
 
 
 def _make_sink(nheads_q, device):
