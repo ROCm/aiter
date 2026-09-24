@@ -168,7 +168,7 @@ def compile_gemm2_a4w4_port(
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
     if use_scatter:
-        aStages = kStages
+        aStages = 3
         c_lds_bytes = 0
     else:
         c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
