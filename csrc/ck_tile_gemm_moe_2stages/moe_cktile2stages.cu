@@ -6,6 +6,7 @@
 #include "moe_cktile2stages_name_dispatch.h"
 #include "py_itfs_common.h"
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
+#include "aiter_enum.h"
 #include <cmath>
 
 template <typename ADataType,
@@ -242,7 +243,7 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       false>::dispatch(M, N, K, block_m);
             }
         }
-        else if(activation == 3 && !has_bias)
+        else if(activation == static_cast<int>(ActivationType::Relu2) && !has_bias)
         {
             if(stage == 1)
             {
