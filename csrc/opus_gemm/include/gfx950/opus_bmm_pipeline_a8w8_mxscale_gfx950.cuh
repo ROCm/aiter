@@ -210,6 +210,11 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         T::BLOCK_SIZE == 512 && T::B_M == 256 && T::B_N == 256 && T::B_K == 128 &&
         T::GROUP_M == 1 && T::GROUP_N == 32 && T::GROUP_K == 32 &&
         std::is_same_v<D_C, bf16_t>;
+    constexpr bool TUNE_MX128_PRELOAD =
+        PRELOAD_SFA_LDS && PRELOAD_SFB_LDS && !K1024_ONLY &&
+        T::BLOCK_SIZE == 512 && T::B_M == 256 && T::B_N == 256 && T::B_K == 128 &&
+        T::GROUP_M == 1 && T::GROUP_N == 128 && T::GROUP_K == 128 &&
+        std::is_same_v<D_C, bf16_t>;
     constexpr int GROUP_M = TUNE_MX32_PRELOAD ? 32 : 16;
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
@@ -228,6 +233,31 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     int col = (local / group_rows) * T::B_N;
 
     int batch_id = opus::block_id_z();
+    // Preserve each 32-M-tile panel's weight reuse, but interleave panels
+    // within adjacent batch pairs for this large B16 MX32 shape family.
+    // Complete panels make the transpose bijective even for an odd panel count.
+    if constexpr (TUNE_MX32_PRELOAD) {
+        if (kargs.n == 1024 && kargs.k == 4096 && kargs.m >= 16384 &&
+            (kargs.m % 8192) == 0 && opus::grid_size_z() == 16) {
+            const int panels = num_tiles_m / GROUP_M;
+            const int fused = (batch_id % 2) * panels + group_id;
+            batch_id = (batch_id / 2) * 2 + fused % 2;
+            row = ((fused / 2) * GROUP_M + local % GROUP_M) * T::B_M;
+        }
+    }
+
+    // Interleave complete M panels within adjacent batch chunks.
+    // Keep the existing panel reuse and guard partial panels explicitly.
+    if constexpr (TUNE_MX128_PRELOAD) {
+        if (kargs.n == 1024 && kargs.k == 4096 && kargs.m >= 16384 &&
+            (kargs.m % 4096) == 0 && opus::grid_size_z() == 16) {
+            const int panels = num_tiles_m / GROUP_M;
+            const int fused = (batch_id % 2) * panels + group_id;
+            batch_id = (batch_id / 2) * 2 + fused % 2;
+            row = ((fused / 2) * GROUP_M + local % GROUP_M) * T::B_M;
+        }
+    }
+
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 

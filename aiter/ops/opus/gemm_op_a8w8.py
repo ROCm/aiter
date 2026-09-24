@@ -463,17 +463,21 @@ def _launch_a8w8_mxscale_bmm(
     launch_y = Y.transpose(0, 1)
     launch_x_scale = x_scale.transpose(0, 1)
 
-    if instance is not None and workspace is None and split_k <= 1:
-        # The checked C++ entry owns the dynamic tensor contract.  Public
-        # routing already validated the immutable family/kid contract, so the
-        # common split-one path need not repeat the Python registry/planner.
+    if instance is not None and (workspace is not None or split_k <= 1):
+        # The checked C++ entry validates tensors and caller-owned workspace,
+        # including device, dtype, layout, capacity and alignment. Planning is
+        # only needed below when Python must allocate the workspace itself.
+        if workspace is not None and not isinstance(workspace, Tensor):
+            raise TypeError(
+                "opus_gemm_a8w8_mxscale_bmm_launch: workspace must be a Tensor"
+            )
         _launch_a8w8_backend(
             launch_x,
             WQ,
             launch_y,
             launch_x_scale,
             w_scale,
-            None,
+            workspace,
             _A8W8_MXSCALE_BMM_FAMILY,
             kid,
             max(1, split_k),

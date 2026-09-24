@@ -622,9 +622,17 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr int SFA_K_TILES_MAX  = SF_PANEL ? (SFA_K_MAX / T::B_K) : 1;
     constexpr int SF_SCALES_MAX    = SFA_K_TILES_MAX * T::SCALES_PER_BK;
     constexpr int SFA_ROWS         = T::B_M / T::GROUP_M;
+    // Scale reads trail the A/B register prefetch by one barrier. Keep
+    // one extra scale slot so a producer cannot overwrite scales still
+    // needed by a consumer after releasing the corresponding A/B slot.
+    constexpr int SF_RING_SLOTS = T::prefetch_k_iter + 1;
     constexpr int SF_LDS_ELEMS     =
         SF_PANEL ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX)
-                 : (SF_RING ? T::SF_RING_LDS : 1);
+                 : (SF_RING ? SF_RING_SLOTS * T::SF_RING_SLOT : 1);
+    static_assert(!SF_RING ||
+                  T::prefetch_k_iter * T::per_block_iter_lds_size + SF_LDS_ELEMS
+                      <= T::max_lds_size_per_wg,
+                  "scale ring lifetime padding exceeds the LDS budget");
     // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
     // only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS];
@@ -873,7 +881,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 constexpr int CHUNK = T::SF_RING_CHUNK;
                 constexpr int SPBK  = T::SCALES_PER_BK;
                 D_SF* slot = smem_sf
-                           + (issue_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
+                           + (issue_k % SF_RING_SLOTS) * T::SF_RING_SLOT;
                 // The LDS destination has to be wave-uniform: buffer_load_lds
                 // adds lane_id * size to it itself. So only the wave's share of
                 // the chunk goes in the pointer, and the lane term appears just
@@ -1022,7 +1030,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 // same barrier as its A/B. Flat (row, K byte) order, the layout
                 // the fill wrote.
                 D_SF* slot = smem_sf
-                           + (loop_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
+                           + (loop_k % SF_RING_SLOTS) * T::SF_RING_SLOT;
                 auto sm_a = make_smem(slot);
                 v_sfa = load<T::SF_LANE_LOAD_VEC>(sm_a, u_sfa_ring);
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
