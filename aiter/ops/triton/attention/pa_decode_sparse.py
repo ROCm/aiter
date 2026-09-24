@@ -25,9 +25,6 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_v4 as gluon_pa_decode_sparse_v4,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_v4_2buff as gluon_pa_decode_sparse_v4_2buff,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
@@ -97,7 +94,17 @@ _V4_PACKED_FP8_DTYPES = (torch.float8_e4m3fn, torch.uint8)
 _V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
 _V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE  # 7 quant groups
 _V4_SC_RAW = _V4_DIM_NOPE // _FP8_GROUP_SIZE + 1  # 7 real + 1 pad = 8
-_V4_REC_BYTES = _V4_ROW_BYTES + _V4_SC_RAW  # 584
+_V4_REC_BYTES = _V4_ROW_BYTES + _V4_SC_RAW  # 584, the packed record
+# The ALIGNED record is the same content padded to a 128-byte multiple, so
+# each token's scales sit inside it and every token starts 128-B aligned
+# (TDM then takes the direct global->L2->LDS path). 584 -> 640.
+#
+# Its first 512 bytes are byte-identical to an ATOM 2buff row --
+# 448 NoPE | 14 duplicated UE8M0 scales | 50 pad -- and [512, 640) is the 2buff
+# RoPE row, so the same packing serves Q and KV.
+_V4_REC_ALIGNED = ((_V4_REC_BYTES + 127) // 128) * 128
+# Where the RoPE half sits inside that record: after the 2buff row.
+_V4_ROPE_IN_REC = 512
 _V4_DATA_UNIT = 64
 _V4_SC_UNIT = _V4_SC_RAW
 
@@ -220,36 +227,23 @@ def pa_decode_sparse(
     if not q.is_cuda:
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
 
-    # A 3-D [nb, bs, 584] uint8 cache is vLLM's own fp8_ds_mla: one tensor, no
-    # companion RoPE plane. Upstream's sparse_mla_fwd calls this format
-    # "fp8_dsv4_mla" and classifies it the same way, by record width.
+    # An aligned record is 448 NoPE | 14 duplicated UE8M0 | 50 pad | 128 RoPE.
+    # Its first 512 bytes are byte-identical to an ATOM 2buff row and the last
+    # 128 are its RoPE row, so a one-tensor paged cache is simply sliced into
+    # the two buffers the 2buff kernel already reads -- no separate kernel.
     if (
         unified_kv_rope is None
         and unified_kv.dim() == 3
-        and unified_kv.shape[-1] == _V4_REC_BYTES
+        and unified_kv.shape[-1] == _V4_REC_ALIGNED
         and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
     ):
-        return _pa_decode_sparse_v4(
-            q,
-            unified_kv,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            softmax_scale,
-            q_rope=q_rope,
-            kv_scales=kv_scales,
-            num_warps=num_warps,
-            ctas_h=ctas_h,
-            q_tdm=q_tdm,
-            block_h=block_h,
-            kv_splits=kv_splits,
-            has_invalid=has_invalid,
-            skip_reduce=skip_reduce,
-            out=out,
-            extra_cache=extra_cache,
-            extra_indices=extra_indices,
-            extra_indptr=extra_indptr,
-        )
+        unified_kv, unified_kv_rope = _v4_split_aligned(unified_kv)
+        if extra_cache is not None:
+            extra_cache, extra_cache_rope = _v4_split_aligned(extra_cache)
+        else:
+            extra_cache_rope = None
+    else:
+        extra_cache_rope = None
 
     v4_2buff = unified_kv_rope is not None
     if v4_2buff:
@@ -271,6 +265,10 @@ def pa_decode_sparse(
             has_invalid=has_invalid,
             skip_reduce=skip_reduce,
             out=out,
+            extra_cache=extra_cache,
+            extra_cache_rope=extra_cache_rope,
+            extra_indices=extra_indices,
+            extra_indptr=extra_indptr,
         )
     if q_rope is not None:
         raise RuntimeError("q_rope requires unified_kv_rope (the DSv4 2buff path)")
@@ -902,6 +900,75 @@ def _pa_decode_sparse_gfx950_gluon(
     return out
 
 
+def _v4_split_aligned(cache: torch.Tensor):
+    """An aligned paged cache -> the two buffers the 2buff kernel reads.
+
+    ``[nb, block, 640]`` uint8 becomes ``[nb, block, 512]`` (the 2buff row:
+    NoPE, its duplicated scales and pad) and ``[nb, block, 64]`` bf16 (the RoPE
+    row). Both are VIEWS -- they keep the 640-byte record stride, which the
+    descriptors take as the row stride, so nothing is copied or repacked.
+    """
+    if cache.shape[-1] != _V4_REC_ALIGNED:
+        raise RuntimeError(
+            f"aligned cache records must be {_V4_REC_ALIGNED} B, got "
+            f"{cache.shape[-1]}"
+        )
+    u8 = cache.view(torch.uint8)
+    # The data half must arrive TYPED: the kernel feeds it to the scaled MMA as
+    # e4m3, and a uint8 tile is upcast down a different path entirely. Both
+    # slices keep the 640-byte record stride, so nothing is copied.
+    return (
+        u8[..., :_V4_DIM_QK].view(torch.float8_e4m3fn),
+        u8[..., _V4_ROPE_IN_REC:].view(torch.bfloat16),
+    )
+
+
+def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
+    """(rows, blk_rows, block_size) for a 2buff pool, flat or paged.
+
+    A flat ``[P, 512]`` pool is page size 1 with one row per page, so the slot
+    IS the row. A paged ``[nb, block, 512]`` view -- what a vLLM aligned cache
+    slices to -- is contiguous inside a page but jumps by the pooled block
+    stride across pages, so the kernel needs both the page size and the number
+    of record-rows that stride spans.
+    """
+    if kv.dim() == 2:
+        if kv.shape[1] != _V4_DIM_QK:
+            raise RuntimeError(
+                f"{name} must be [P, {_V4_DIM_QK}], got {tuple(kv.shape)}"
+            )
+        if rope.shape[0] != kv.shape[0]:
+            raise RuntimeError(f"{name} rope rows {rope.shape[0]} != {kv.shape[0]}")
+        return kv.shape[0], 1, 1
+
+    if kv.dim() != 3 or kv.shape[2] != _V4_DIM_QK:
+        raise RuntimeError(
+            f"{name} must be [P, {_V4_DIM_QK}] or [nb, block, {_V4_DIM_QK}], "
+            f"got {tuple(kv.shape)}"
+        )
+    nb, block_size, _ = kv.shape
+    row_stride = kv.stride(1)
+    blk_stride = kv.stride(0)
+    if rope.stride(1) != row_stride // 2:
+        raise RuntimeError(
+            f"{name}: rope row stride {rope.stride(1)} must be half the kv row "
+            f"stride {row_stride} -- both halves live in one record"
+        )
+    if blk_stride % row_stride:
+        raise RuntimeError(
+            f"{name} block stride {blk_stride} must be a multiple of the record "
+            f"stride {row_stride}"
+        )
+    if block_size & (block_size - 1):
+        raise RuntimeError(f"{name} page size {block_size} must be a power of two")
+    rows = (nb - 1) * (blk_stride // row_stride) + block_size
+    if rows > 2**31 - 1:
+        raise RuntimeError(
+            f"{name} spans {rows:,} descriptor rows, past the int32 bound"
+        )
+    return rows, blk_stride // row_stride, block_size
+
+
 def _pa_decode_sparse_v4_2buff(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -912,6 +979,10 @@ def _pa_decode_sparse_v4_2buff(
     softmax_scale: float,
     q_rope: torch.Tensor | None = None,
     kv_scales: torch.Tensor | None = None,
+    extra_cache: torch.Tensor | None = None,
+    extra_cache_rope: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
     num_warps: int | None = None,
     ctas_h: int = 1,
     q_tdm: bool = True,
@@ -945,18 +1016,38 @@ def _pa_decode_sparse_v4_2buff(
             "kv_scales must be None on the 2buff path: the E8M0 group scales are "
             "inline in bytes [448, 462) of every packed row"
         )
-    assert (
-        unified_kv.dim() == 2 and unified_kv.shape[-1] == _V4_DIM_QK
-    ), f"unified_kv must be [P, {_V4_DIM_QK}] packed fp8, got {tuple(unified_kv.shape)}"
     assert unified_kv.dtype in _V4_PACKED_FP8_DTYPES, (
         f"unified_kv must be {_V4_PACKED_FP8_DTYPES} (OCP e4m3 / raw bytes), "
         f"got {unified_kv.dtype}"
     )
-    assert (
-        unified_kv_rope.dim() == 2 and unified_kv_rope.shape[-1] == _V4_DIM_ROPE
-    ), f"unified_kv_rope must be [P, {_V4_DIM_ROPE}] bf16, got {tuple(unified_kv_rope.shape)}"
     assert unified_kv_rope.dtype == torch.bfloat16
-    assert unified_kv_rope.shape[0] == unified_kv.shape[0]
+    assert unified_kv_rope.shape[-1] == _V4_DIM_ROPE, (
+        f"unified_kv_rope must be [..., {_V4_DIM_ROPE}] bf16, got "
+        f"{tuple(unified_kv_rope.shape)}"
+    )
+    main_rows, main_blk_rows, main_block_size = _v4_2buff_geometry(
+        unified_kv, unified_kv_rope, "unified_kv"
+    )
+
+    has_extra = extra_cache is not None
+    if has_extra:
+        assert extra_cache_rope is not None, "extra_cache needs extra_cache_rope"
+        assert extra_indices is not None and extra_indptr is not None
+        assert extra_cache.dtype in _V4_PACKED_FP8_DTYPES
+        assert extra_cache_rope.dtype == torch.bfloat16
+        extra_rows, extra_blk_rows, extra_block_size = _v4_2buff_geometry(
+            extra_cache, extra_cache_rope, "extra_cache"
+        )
+        assert extra_indices.dtype == torch.int32 and extra_indices.is_contiguous()
+        assert extra_indptr.dtype == torch.int32 and extra_indptr.is_contiguous()
+    else:
+        # Aliases, not real work: the kernel never reads them under HAS_EXTRA
+        # = False, but the launch still has to typecheck.
+        extra_cache = unified_kv
+        extra_cache_rope = unified_kv_rope
+        extra_indices = kv_indices
+        extra_indptr = kv_indptr
+        extra_rows, extra_blk_rows, extra_block_size = main_rows, 1, 1
 
     if q_rope is None:
         raise RuntimeError(
@@ -985,6 +1076,7 @@ def _pa_decode_sparse_v4_2buff(
     # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
     # to e4m3 in-kernel.
     kv_u8 = unified_kv.view(torch.uint8)
+    extra_u8 = extra_cache.view(torch.uint8)
     q_u8 = q.view(torch.uint8)
 
     # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
@@ -1062,7 +1154,10 @@ def _pa_decode_sparse_v4_2buff(
         # ONE token has. kv_indices.shape[0] is every token's indices together,
         # so the ceiling never bound and splits were made with no work in them
         # -- and a dead split still costs the reduce a slab row.
-        avg_kv_len = max(1, kv_indices.shape[0] // max(1, T))
+        total_idx = kv_indices.shape[0] + (
+            extra_indices.shape[0] if has_extra else 0
+        )
+        avg_kv_len = max(1, total_idx // max(1, T))
         max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
@@ -1103,18 +1198,26 @@ def _pa_decode_sparse_v4_2buff(
         unified_kv_rope,
         kv_indices,
         kv_indptr,
+        extra_cache,
+        extra_u8,
+        extra_cache_rope,
+        extra_indices,
+        extra_indptr,
         m_partial,
         l_partial,
         acc_partial,
         attn_sink,
         out,
-        unified_kv.shape[0],
+        main_rows,
+        extra_rows,
+        main_blk_rows,
+        extra_blk_rows,
         q.stride(0),
         q.stride(1),
         q_rope.stride(0),
         q_rope.stride(1),
-        unified_kv.stride(0),
-        unified_kv_rope.stride(0),
+        unified_kv.stride(-2),
+        unified_kv_rope.stride(-2),
         mp_strides[0],
         mp_strides[1],
         mp_strides[2],
@@ -1143,6 +1246,9 @@ def _pa_decode_sparse_v4_2buff(
         Q_TDM=bool(q_tdm),
         USE_EXP2=USE_EXP2,
         CTAS_H=ctas_h,
+        MAIN_BLOCK_SIZE=main_block_size,
+        EXTRA_BLOCK_SIZE=extra_block_size,
+        HAS_EXTRA=has_extra,
         num_warps=attn_num_warps,
         num_stages=2,
         waves_per_eu=waves_per_eu,
@@ -1163,7 +1269,7 @@ def _pa_decode_sparse_v4_2buff(
         acc_partial,
         attn_sink,
         kv_indptr,
-        kv_indptr,
+        extra_indptr,
         kv_indices,
         out,
         m_partial.stride(0),
@@ -1186,511 +1292,12 @@ def _pa_decode_sparse_v4_2buff(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
-        HAS_EXTRA=False,
+        # The reduce counts a token's live segments in TILES, and with two
+        # streams that count is main_tiles + extra_tiles -- it has to see the
+        # extra stream's indptr or it scrubs the wrong segments.
+        HAS_EXTRA=has_extra,
         MAIN_IS_WINDOW=False,
         MAIN_BLOCK_SIZE_RED=1,
-        num_warps=reduce_num_warps,
-        waves_per_eu=reduce_waves_per_eu,
-    )
-    return out
-
-
-def v4_pack_q_2buff(q: torch.Tensor):
-    """``[..., 512]`` bf16 Q -> ``(packed [..., 512] fp8, rope [..., 64] bf16)``.
-
-    The Q form ``_pa_decode_sparse_v4`` reads on gfx1250 (a8w8):
-
-        [  0, 448)   NoPE, e4m3, one UE8M0 scale per 64-element group
-        [448, 462)   the 7 scale bytes, EACH WRITTEN TWICE
-        [462, 512)   zero
-
-    The duplication is not redundancy: the scaled-MMA blocks are 32 elements
-    wide while the quant group is 64, so the kernel reads each group's scale
-    twice.
-
-    RoPE is never quantized -- it leaves as a separate bf16 plane, which is why
-    this returns a pair.
-
-    Padding head slots must arrive already zeroed and stay zeroed: 0xFF is E8M0
-    NaN, and a NaN scale poisons a whole score row through ``0 * NaN``. An
-    all-zero head packs to an all-zero record here, scale bytes included.
-    """
-    if q.shape[-1] != _V4_DIM_QK:
-        raise RuntimeError(
-            f"q last dim must be {_V4_DIM_QK} (448 NoPE + 64 RoPE), got "
-            f"{q.shape[-1]}"
-        )
-    lead = q.shape[:-1]
-    nope = q[..., :_V4_DIM_NOPE].float()
-    rope = q[..., _V4_DIM_NOPE:].contiguous()
-
-    tiled = nope.reshape(*lead, _V4_NUM_TILES, _FP8_GROUP_SIZE)
-    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    amax = tiled.abs().amax(dim=-1)
-    # amax/fp8_max rounded UP to a power of two -- exactly what E8M0 stores.
-    scale = torch.pow(2.0, torch.clamp_min(amax / fp8_max, 1e-4).log2().ceil())
-    nope_fp8 = (tiled / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
-    # An all-zero group stores the 1e-4 floor's exponent (114) rather than 0.
-    # That is deliberate: it keeps this bit-identical to the reference packing
-    # the kernel's own tests use, and it is harmless -- the mantissa is zero, so
-    # the group dequantizes to zero whatever the exponent says. What must never
-    # appear is an UNWRITTEN scale byte: 0xFF is E8M0 NaN and a NaN scale
-    # poisons a whole score row through 0 * NaN.
-
-    packed = torch.zeros((*lead, _V4_DIM_QK), dtype=torch.uint8, device=q.device)
-    packed[..., :_V4_DIM_NOPE] = nope_fp8.reshape(*lead, _V4_DIM_NOPE).view(torch.uint8)
-    packed[..., _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES] = (
-        e8m0.repeat_interleave(2, dim=-1)
-    )
-    return packed.view(torch.float8_e4m3fn), rope
-
-
-def _v4_cache_geometry(cache: torch.Tensor, name: str):
-    """Validate one fp8_ds_mla paged cache and derive what the kernel needs.
-
-    Returns ``(nb, block_size, rows_data, rows_sc, blk_units_data,
-    blk_units_sc, contiguous_blocks)``. Both KV streams are the identical
-    record, so main and extra go through this unchanged.
-    """
-    if cache.dim() != 3:
-        raise RuntimeError(
-            f"{name} must be [nb, block_size, {_V4_REC_BYTES}] uint8, got "
-            f"{tuple(cache.shape)}"
-        )
-    nb, block_size, rec = cache.shape
-    if rec != _V4_REC_BYTES:
-        raise RuntimeError(
-            f"{name} records are {rec} B, expected {_V4_REC_BYTES} "
-            f"(448 fp8 NoPE | 128 B bf16 RoPE | 8 B UE8M0)"
-        )
-    if cache.dtype not in _V4_PACKED_FP8_DTYPES:
-        raise RuntimeError(f"{name} must be uint8/e4m3 bytes, got {cache.dtype}")
-    # Only the LAST TWO dims must be packed: a vLLM cache is a view into a
-    # shared allocation, so its block stride is larger than the block's own
-    # content -- shape (81887, 64, 584) with stride (1435968, 584, 1). That
-    # stride is passed to the kernel rather than assumed.
-    if cache.stride(2) != 1 or cache.stride(1) != rec:
-        raise RuntimeError(
-            f"{name} rows must be packed: expected stride (.., "
-            f"{rec}, 1), got {tuple(cache.stride())}"
-        )
-    # The descriptors count rows in 64-byte (data) and 8-byte (scale) units, so
-    # the BLOCK STRIDE has to be a multiple of both. block_size itself is
-    # unconstrained: DSV4-Pro's HCA layers page the compressed cache 2 tokens to
-    # a block, and that addresses fine as long as the stride lands right.
-    #
-    # For a contiguous cache the stride IS block_size*584, and since 584 = 8*73
-    # with 73 odd, this is the block_size % 8 it used to ask for -- so nothing
-    # is loosened there, only for a strided view.
-    blk_stride = cache.stride(0)
-    if blk_stride % _V4_DATA_UNIT or blk_stride % _V4_SC_UNIT:
-        raise RuntimeError(
-            f"{name} block stride {blk_stride} B must be a multiple of "
-            f"{_V4_DATA_UNIT} and {_V4_SC_UNIT} for the unit-strided descriptors"
-            + (
-                f" (the cache is contiguous at block_size={block_size}, so the "
-                f"stride is block_size*{_V4_REC_BYTES}; a contiguous cache needs "
-                f"block_size % 8 == 0)"
-                if blk_stride == block_size * _V4_REC_BYTES
-                else ""
-            )
-        )
-    total_bytes = (nb - 1) * blk_stride + block_size * _V4_REC_BYTES
-    return (
-        nb,
-        block_size,
-        total_bytes // _V4_DATA_UNIT,
-        total_bytes // _V4_SC_UNIT,
-        blk_stride // _V4_DATA_UNIT,
-        blk_stride // _V4_SC_UNIT,
-        blk_stride == block_size * _V4_REC_BYTES,
-    )
-
-
-def _pa_decode_sparse_v4(
-    q: torch.Tensor,
-    main_cache: torch.Tensor,
-    main_indices: torch.Tensor,
-    main_indptr: torch.Tensor,
-    attn_sink: torch.Tensor,
-    softmax_scale: float,
-    q_rope: torch.Tensor | None = None,
-    kv_scales: torch.Tensor | None = None,
-    num_warps: int | None = None,
-    ctas_h: int = 1,
-    q_tdm: bool = True,
-    block_h: int | None = None,
-    kv_splits: int | None = None,
-    has_invalid: bool = True,
-    skip_reduce: bool = False,
-    out: torch.Tensor | None = None,
-    extra_cache: torch.Tensor | None = None,
-    extra_indices: torch.Tensor | None = None,
-    extra_indptr: torch.Tensor | None = None,
-    block_k: int | None = None,
-    main_is_window: bool = False,
-):
-    """gfx1250 driver for the DSv4 unified paged cache (vLLM ``fp8_ds_mla``).
-
-    The cache vLLM allocates for DeepSeek-V4, handed over with no repack:
-
-      main_cache  [nb, block_size, 584] uint8, per block of block_size tokens
-        [0,      bs*576)         448 B fp8 NoPE | 128 B bf16 RoPE, per token
-        [bs*576, bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad, per token
-      q           [N, H, 512] fp8 packed    q_rope [N, H, 64] bf16
-
-    ``main_indices`` are GLOBAL slot ids (block * block_size + position) --
-    what both the sliding window and the sparse top-k produce; the kernel
-    gathers exactly those rows.
-
-    A SECOND stream may be attended over in the same pass by passing
-    ``extra_cache`` with its own ``extra_indices`` / ``extra_indptr``. vLLM's
-    decode needs this, and the naming is its own:
-
-      main_cache  = ``swa_k_cache``, the sliding-window keys
-      extra_cache = ``kv_cache``, the compressed keys the sparse top-k selects
-
-    They are two separate allocations holding the identical record, and may
-    differ in paged block size and in block stride. Both are attended in one
-    pass, so the softmax is over their union.
-
-    This is the format for a stock vLLM deployment. ``_pa_decode_sparse_v4_2buff``
-    is the ATOM/asm two-buffer pool; same math, different packing.
-
-    Returns ``[N, H, 512]`` bf16.
-    """
-    if DEVICE_ARCH != "gfx1250":
-        raise RuntimeError(
-            f"the DSv4 unified paged-cache path is gfx1250-only, got {DEVICE_ARCH}"
-        )
-    if kv_scales is not None:
-        raise RuntimeError(
-            "kv_scales must be None: the UE8M0 group scales are inside the cache"
-        )
-    (
-        nb,
-        main_block_size,
-        main_rows_data,
-        main_rows_sc,
-        main_blk_units_data,
-        main_blk_units_sc,
-        main_contig_blocks,
-    ) = _v4_cache_geometry(main_cache, "main_cache")
-
-    has_extra = extra_cache is not None
-    if has_extra:
-        if extra_indices is None or extra_indptr is None:
-            raise RuntimeError(
-                "extra_cache needs extra_indices and extra_indptr alongside it"
-            )
-        (
-            _,
-            extra_block_size,
-            extra_rows_data,
-            extra_rows_sc,
-            extra_blk_units_data,
-            extra_blk_units_sc,
-            extra_contig_blocks,
-        ) = _v4_cache_geometry(extra_cache, "extra_cache")
-        assert extra_indices.dtype == torch.int32 and extra_indices.is_contiguous()
-        assert extra_indptr.dtype == torch.int32 and extra_indptr.is_contiguous()
-        assert extra_indptr.shape == main_indptr.shape, (
-            f"extra_indptr {tuple(extra_indptr.shape)} must match main_indptr "
-            f"{tuple(main_indptr.shape)}: both are per-token offsets"
-        )
-    elif extra_indices is not None or extra_indptr is not None:
-        raise RuntimeError(
-            "extra_indices/extra_indptr were given without an extra_cache"
-        )
-
-    if q_rope is None:
-        raise RuntimeError("this path needs the packed fp8 Q: pass q_rope with q")
-    T, H, D = q.shape
-    assert D == _V4_DIM_QK, f"this path is fixed to D={_V4_DIM_QK}, got {D}"
-    assert q.dtype in _V4_PACKED_FP8_DTYPES, (
-        f"q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, got {q.dtype}"
-    )
-    assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
-    assert q_rope.is_contiguous()
-
-    assert main_indices.dtype == torch.int32 and main_indices.is_contiguous()
-    assert main_indptr.dtype == torch.int32 and main_indptr.is_contiguous()
-
-    _LOGGER.info(
-        f"PA_DECODE_SPARSE_V4 T={T} H={H} D={D} bs={main_block_size} "
-        f"total_indices={main_indices.shape[0]}"
-    )
-
-    out = _check_out(out, q, torch.bfloat16)
-
-    # The kernel reads the packed pool as raw bytes: the E8M0 scale bytes live
-    # inside the rows, and an fp8-typed tile would reinterpret them as e4m3
-    # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
-    # to e4m3 in-kernel.
-    # reshape(-1) would copy a non-contiguous cache; the descriptors only need
-    # the base pointer, and a dtype view keeps it because the last dim is packed.
-    main_u8 = main_cache.view(torch.uint8)
-    # Three views of the same bytes: the descriptors differ only in base offset,
-    # element type and the unit their row index counts in.
-    main_e4m3 = main_u8.view(torch.float8_e4m3fn)
-    main_bf16 = main_u8.view(torch.bfloat16)
-    if has_extra:
-        extra_u8 = extra_cache.view(torch.uint8)
-        extra_e4m3 = extra_u8.view(torch.float8_e4m3fn)
-        extra_bf16 = extra_u8.view(torch.bfloat16)
-    else:
-        # The kernel's extra arguments are dead under HAS_EXTRA=False, but they
-        # still have to typecheck, so they take the main stream's.
-        extra_u8, extra_e4m3, extra_bf16 = main_u8, main_e4m3, main_bf16
-        extra_indices, extra_indptr = main_indices, main_indptr
-        extra_block_size = main_block_size
-        extra_rows_data, extra_rows_sc = main_rows_data, main_rows_sc
-        extra_blk_units_data = main_blk_units_data
-        extra_blk_units_sc = main_blk_units_sc
-        extra_contig_blocks = main_contig_blocks
-    q_u8 = q.view(torch.uint8)
-
-    # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
-    if block_h is None:
-        if H >= 128:
-            block_h = 128
-        elif H >= 64:
-            if T >= 2048:
-                block_h = 64
-            elif T >= 32:
-                block_h = 32
-            else:
-                block_h = 16
-        elif H >= 32:
-            block_h = 32 if T >= 256 else 16
-        else:
-            block_h = triton.next_power_of_2(H)
-    else:
-        block_h = triton.next_power_of_2(block_h)
-    block_h = max(block_h, 16)
-
-    n_head_blocks = triton.cdiv(H, block_h)
-    h_padded = n_head_blocks * block_h
-    block_d = D
-
-    block_k_default = 16
-    waves_per_eu = 1
-    if block_h == 128:
-        # A 64-row KV tile: now that the Q operand is streamed from LDS one K
-        # step at a time instead of held in registers, the wider tile no longer
-        # overflows the register file, and the fatter iteration amortises the
-        # accumulator rescale and the barriers over twice the work -- 64.4us vs
-        # 69.9us at kv_len=384, T=512, H=128.
-        block_k_default = 64
-        attn_num_warps = 8
-        max_num_wg = 256
-        # The bf16 path asks for 2 waves/EU here; the dequant pushes this
-        # kernel's register demand past that, so requesting it only costs
-        # spills (measured ~4% on T=512, H=128, kv_len=384).
-        waves_per_eu = 1
-    elif block_h == 64:
-        attn_num_warps = 4
-        max_num_wg = 256
-    elif block_h == 32:
-        attn_num_warps = 2
-        max_num_wg = 512
-    else:
-        attn_num_warps = 1
-        max_num_wg = 1024
-    block_k = block_k_default if block_k is None else int(block_k)
-    # main_is_window promises MAIN_INDICES is a sliding WINDOW per token: a
-    # contiguous range of positions. Not one ascending run of slots -- the slots
-    # come from a block table, so they are contiguous only inside a page and the
-    # page order is the allocator's. The tiling is therefore aligned to the page
-    # grid, and each tile's base slot is read rather than extrapolated, which
-    # only holds while BLOCK_K divides the page.
-    #
-    # It says nothing about extra_indices: the top-k stream is genuinely
-    # scattered and keeps the gather path, in a second phase.
-    if main_is_window and main_block_size % block_k:
-        raise RuntimeError(
-            f"main_is_window needs block_k ({block_k}) to divide the cache's "
-            f"block_size ({main_block_size}), or a tile straddles two pages"
-        )
-    if ctas_h > 1:
-        # block_h is the CLUSTER tile: each CTA owns block_h // ctas_h heads,
-        # and warps follow the per-CTA tile (16 heads -> 1 warp). The per-CTA
-        # tile may not fall below the 16-row WMMA instruction tile -- without
-        # this the compiler dies with a bare "PassManager::run failed".
-        assert not (block_h % ctas_h), f"block_h {block_h} % ctas_h {ctas_h}"
-        assert block_h // ctas_h >= 16, (
-            f"ctas_h={ctas_h} would give {block_h // ctas_h} heads per CTA for "
-            f"block_h={block_h}; the WMMA tile is 16 rows, so ctas_h must be "
-            f"<= block_h // 16 ({block_h // 16})"
-        )
-        attn_num_warps = max(1, (block_h // ctas_h) // 16)
-    if num_warps is not None:
-        attn_num_warps = num_warps
-    # Q_IN_VGPR: keep the loop-invariant Q tile resident instead of re-reading
-    # it from LDS every K step. Gated on the warp count because that sets the
-    # VGPR budget -- num_warps 8 caps at 512/SIMD and the BLOCK_H=128 kernel
-    # already measures ~494, while num_warps <= 4 caps at 1024 against 737
-    # (BLOCK_H=16) / 604 (BLOCK_H=32), leaving room for the ~64 VGPR Q tile.
-    reduce_num_warps = 1
-    reduce_waves_per_eu = 4
-    USE_EXP2 = True
-
-    if kv_splits is None:
-        # PER TOKEN, not the total: the split is per token, so the ceiling is
-        # the tile count ONE token has. Splitting past it only makes segments
-        # that return immediately, and those still cost the reduce a slab row
-        # each. This previously read main_indices.shape[0] -- every token's
-        # indices together -- so the ceiling never bound and the workgroup term
-        # below won: 32 splits on a token with 9 tiles.
-        total_idx = main_indices.shape[0]
-        if has_extra:
-            total_idx += extra_indices.shape[0]
-        avg_kv_len = max(1, total_idx // max(1, T))
-        max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
-        kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
-        kv_splits = min(max_kv_splits, kv_splits)
-        # DOWN to a power of two, not up: KV_SPLITS is a constexpr tile extent,
-        # and rounding up puts back the dead segments the ceiling just removed.
-        kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
-
-    _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
-    _lds_cap = max(1, _lds_budget // (block_d * 4))
-    kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
-    if kv_splits > 8:
-        reduce_num_warps = 4
-        reduce_waves_per_eu = 1
-
-    if kv_splits == 1:
-        m_partial = l_partial = acc_partial = out  # unused inside the kernel
-        mp_strides = (0, 0, 0)
-        lp_strides = (0, 0, 0)
-        ap_strides = (0, 0, 0, 0)
-    else:
-        m_partial = torch.empty(
-            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
-        )
-        l_partial = torch.empty_like(m_partial)
-        acc_partial = torch.empty(
-            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
-        )
-        mp_strides = m_partial.stride()
-        lp_strides = l_partial.stride()
-        ap_strides = acc_partial.stride()
-
-    grid_attn = (T, n_head_blocks, kv_splits)
-    gluon_pa_decode_sparse_v4[grid_attn](
-        q,
-        q_u8,
-        q_rope,
-        main_u8,
-        main_e4m3,
-        main_bf16,
-        main_indices,
-        main_indptr,
-        extra_u8,
-        extra_e4m3,
-        extra_bf16,
-        extra_indices,
-        extra_indptr,
-        m_partial,
-        l_partial,
-        acc_partial,
-        attn_sink,
-        out,
-        nb * main_block_size,
-        q.stride(0),
-        q.stride(1),
-        q_rope.stride(0),
-        q_rope.stride(1),
-        main_rows_data,
-        main_rows_sc,
-        main_blk_units_data,
-        main_blk_units_sc,
-        extra_rows_data,
-        extra_rows_sc,
-        extra_blk_units_data,
-        extra_blk_units_sc,
-        mp_strides[0],
-        mp_strides[1],
-        mp_strides[2],
-        lp_strides[0],
-        lp_strides[1],
-        lp_strides[2],
-        ap_strides[0],
-        ap_strides[1],
-        ap_strides[2],
-        ap_strides[3],
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H,
-        D,
-        kv_splits,
-        float(softmax_scale),
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        NOPE_DIM=_V4_DIM_NOPE,
-        ROPE_DIM=_V4_DIM_ROPE,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        MAIN_BLOCK_SIZE=main_block_size,
-        EXTRA_BLOCK_SIZE=extra_block_size,
-        Q_IN_VGPR=(attn_num_warps <= 4),
-        HAS_INVALID=bool(has_invalid),
-        Q_TDM=bool(q_tdm),
-        USE_EXP2=USE_EXP2,
-        CTAS_H=ctas_h,
-        MAIN_CONTIG_BLOCKS=main_contig_blocks,
-        EXTRA_CONTIG_BLOCKS=extra_contig_blocks,
-        HAS_EXTRA=has_extra,
-        MAIN_IS_WINDOW=bool(main_is_window),
-        num_warps=attn_num_warps,
-        num_stages=2,
-        waves_per_eu=waves_per_eu,
-        num_ctas=ctas_h,
-    )
-
-    if kv_splits == 1:
-        return out
-
-    if skip_reduce:
-        return acc_partial, m_partial, l_partial
-
-    block_h_reduce = 1
-    grid_reduce = (T, triton.cdiv(H, block_h_reduce))
-    gluon_pa_decode_sparse_reduce[grid_reduce](
-        m_partial,
-        l_partial,
-        acc_partial,
-        attn_sink,
-        main_indptr,
-        extra_indptr,
-        main_indices,
-        out,
-        m_partial.stride(0),
-        m_partial.stride(1),
-        m_partial.stride(2),
-        l_partial.stride(0),
-        l_partial.stride(1),
-        l_partial.stride(2),
-        acc_partial.stride(0),
-        acc_partial.stride(1),
-        acc_partial.stride(2),
-        acc_partial.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H,
-        D,
-        kv_splits,
-        BLOCK_H=block_h_reduce,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        USE_EXP2=USE_EXP2,
-        HAS_EXTRA=has_extra,
-        MAIN_IS_WINDOW=bool(main_is_window),
-        MAIN_BLOCK_SIZE_RED=main_block_size,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )

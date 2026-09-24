@@ -564,51 +564,44 @@ def test_pa_decode_sparse_v4_2buff_vs_asm(T, H, kv_len):
 
 
 # ---------------------------------------------------------------------------
-# DSv4 unified paged cache -- the layout vLLM's own allocator produces
-# (``fp8_ds_mla``), per paged block of ``block_size`` tokens:
-#   [0,       bs*576)         token data, 448 B fp8 NoPE | 128 B bf16 RoPE
-#   [bs*576,  bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad per token
-# Same content as the 2buff pool above, different packing: one tensor instead
-# of two, and each group scale stored ONCE rather than duplicated.
+# DSv4 unified paged cache -- the ALIGNED layout, per paged block of
+# ``block_size`` tokens, 640 B per token:
+#   [  0, 448)  fp8 NoPE
+#   [448, 462)  the 7 UE8M0 group scales, each stored TWICE
+#   [462, 512)  pad
+#   [512, 640)  bf16 RoPE
+# Bytes [0, 512) are exactly a 2buff row and [512, 640) its RoPE row, so this
+# is the same content as the 2buff pool above with the two halves interleaved
+# per token instead of held in separate tensors. 640 = 5 * 128 keeps every
+# token 128-B aligned, which is what puts TDM on its direct path and what makes
+# the descriptor's row index the slot index.
 # ---------------------------------------------------------------------------
-_V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
-_V4_REC_BYTES = _V4_ROW_BYTES + _V4_NUM_TILES + 1  # 584
+_V4_REC_ALIGNED = 640
 
 
 def v4_pack_unified(packed_2buff, rope, block_size):
-    """2buff row + RoPE plane -> ``[nb, block_size, 584]`` uint8.
+    """2buff row + RoPE plane -> ``[nb, block_size, 640]`` uint8.
 
-    Re-lays out the SAME bytes ``v4_pack_2buff`` produced, so a kernel reading
-    either format sees identical quantized values and the two are comparable
-    exactly, not merely within a tolerance.
+    A concatenation, not a re-packing: the aligned record holds the identical
+    bytes, so a kernel reading either form sees the same quantized values
+    exactly rather than within a tolerance.
     """
     u8 = packed_2buff.view(torch.uint8)
     p = u8.shape[0]
     assert p % block_size == 0, f"{p} rows is not a whole number of blocks"
     nb = p // block_size
-    device = u8.device
 
-    data = torch.cat(
+    rec = torch.cat(
         [
-            u8[:, : _V4_DIM_NOPE],
-            rope.reshape(p, _V4_DIM_ROPE).view(torch.uint8).reshape(p, 2 * _V4_DIM_ROPE),
+            u8[:, : _V4_DIM_QK],
+            rope.reshape(p, _V4_DIM_ROPE)
+            .view(torch.uint8)
+            .reshape(p, 2 * _V4_DIM_ROPE),
         ],
         dim=-1,
-    )  # [P, 576]
-    # 2buff stores each group's byte twice; the unified trailer stores it once.
-    scales = torch.zeros(p, _V4_NUM_TILES + 1, dtype=torch.uint8, device=device)
-    scales[:, :_V4_NUM_TILES] = u8[
-        :, _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES : 2
-    ]
-
-    cache = torch.empty(nb, block_size * _V4_REC_BYTES, dtype=torch.uint8, device=device)
-    cache[:, : block_size * _V4_ROW_BYTES] = data.reshape(
-        nb, block_size * _V4_ROW_BYTES
-    )
-    cache[:, block_size * _V4_ROW_BYTES :] = scales.reshape(
-        nb, block_size * (_V4_NUM_TILES + 1)
-    )
-    return cache.reshape(nb, block_size, _V4_REC_BYTES)
+    )  # [P, 640]
+    assert rec.shape[1] == _V4_REC_ALIGNED
+    return rec.reshape(nb, block_size, _V4_REC_ALIGNED).contiguous()
 
 
 @pytest.mark.parametrize("T", [1, 32, 512])
@@ -732,25 +725,29 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256):
         cache = (torch.randn(nb, block, D, device=device) * 0.4).to(torch.bfloat16)
         return cache, cache.reshape(nb * block, D).float()
 
-    # per token: [nope fp8 (1B) | rope bf16 (2B) | 8 UE8M0 scale bytes]
-    data_bytes = nope + rope * 2
-    scale_bytes = 8
-    row_bytes = data_bytes + scale_bytes
+    # per token, the ALIGNED record:
+    #   [  0, 448)  fp8 NoPE
+    #   [448, 462)  the 7 UE8M0 group scales, each stored TWICE
+    #   [462, 512)  pad
+    #   [512, 640)  bf16 RoPE
+    # The scales sit inside the record rather than in a per-block trailer,
+    # which is what lets one row index address a token's data AND its scales.
+    row_bytes = 640
+    sc_off = nope
+    rope_off = 512
     cache = torch.zeros(nb, block, row_bytes, dtype=torch.uint8, device=device)
-    flat = cache.view(nb, block * row_bytes)
-    data = flat[:, : block * data_bytes].view(nb, block, data_bytes)
-    scales_region = flat[:, block * data_bytes :].view(nb, block, scale_bytes)
     nope_fp8 = (torch.randn(nb, block, nope, device=device) * 0.4).to(
         torch.float8_e4m3fn
     )
-    data[:, :, :nope] = nope_fp8.view(torch.uint8)
+    cache[:, :, :nope] = nope_fp8.view(torch.uint8)
     rope_bf16 = (torch.randn(nb, block, rope, device=device) * 0.4).to(torch.bfloat16)
-    data[:, :, nope:data_bytes] = rope_bf16.view(torch.uint8).view(nb, block, rope * 2)
+    cache[:, :, rope_off:] = rope_bf16.view(torch.uint8).view(nb, block, rope * 2)
     num_groups = nope // 64
     exps = torch.randint(
         124, 130, (nb, block, num_groups), device=device, dtype=torch.uint8
     )
-    scales_region[:, :, :num_groups] = exps
+    # duplicated: the MMA reads one scale per 32 columns, the quant group is 64
+    cache[:, :, sc_off : sc_off + 2 * num_groups] = exps.repeat_interleave(2, dim=2)
     scales = torch.exp2(exps.float() - 127.0).repeat_interleave(64, dim=2)
     kv_deq = torch.cat([nope_fp8.float() * scales, rope_bf16.float()], dim=2)
     return cache, kv_deq.reshape(nb * block, D)
@@ -768,10 +765,11 @@ def widen_to_int32_overflow(cache, kv_deq):
     itemsize = cache.element_size()
     pitch = triton.cdiv(2**31, max(1, nb - 1) * itemsize)
     pitch = max(pitch, block * row)
-    # gfx950 views the packed cache as bfloat16, so the stride must be even;
-    # gfx1250's data descriptor counts 64-BYTE rows, so round up to that. The
-    # stronger alignment satisfies both.
-    pitch = ((pitch + 63) // 64) * 64
+    # gfx950 views the packed cache as bfloat16, so the stride must be even.
+    # gfx1250 addresses a token by ROW, so the block pitch has to be a whole
+    # number of records -- which is what the vLLM KV spec's alignment=640
+    # guarantees for a real pool. Rounding to the record satisfies both.
+    pitch = ((pitch + row - 1) // row) * row
     pool = torch.empty(
         pitch * (nb - 1) + block * row, dtype=cache.dtype, device=cache.device
     )
@@ -828,7 +826,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
                                     strided_cache, page_size):
     """SWA (main) + top-k (extra) attended in one pass, on gfx950 and gfx1250.
 
-    Both backends read the SAME cache -- ``[nb, block, 584]`` uint8, 448 B fp8
+    Both backends read the SAME cache -- ``[nb, block, 640]`` uint8, 448 B fp8
     NoPE | 128 B bf16 RoPE per token then a per-block trailer of 8 UE8M0 scale
     bytes -- so one construction and one reference serve both.
 
@@ -843,7 +841,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
     dequantizes it for the reference, so a8w8's Q quantization is accounted for
     instead of being absorbed by the tolerance.
 
-    The bf16 block cache is likewise gfx950-only; gfx1250 reads the 584-byte
+    The bf16 block cache is likewise gfx950-only; gfx1250 reads the aligned
     fp8 record only.
     """
     if not torch.cuda.is_available():
@@ -852,7 +850,7 @@ def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
     if arch not in ("gfx950", "gfx1250"):
         pytest.skip("the extra_* two-stream path is gfx950/gfx1250 only")
     if arch == "gfx1250" and dtype == "bf16":
-        pytest.skip("gfx1250's paged path reads the 584-byte fp8 record only")
+        pytest.skip("gfx1250's paged path reads the aligned fp8 record only")
     if strided_cache:
         # The pool has to span >2 GiB for the offsets to overflow, so pin the
         # regression to one shape -- the fp8 production format at the largest T

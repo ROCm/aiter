@@ -5,6 +5,8 @@ import pytest
 import torch
 
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
+    fused_deepseek_v4_mxfp8_quant_q_pack,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned,
     fused_dual_rmsnorm_mxfp8_quant,
     fused_flatten_mxfp8_quant,
     fused_rms_mxfp8_quant,
@@ -437,3 +439,276 @@ def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
         atol=1,
         rtol=0,
     )
+
+
+# =========================================================================== #
+# DSv4 a8w8 producer kernels: the Q pack, and the fused Q+KV producer.
+#
+# References are torch implementations of the FORMAT, written from its
+# definition rather than paraphrased from the kernels, so a layout mistake
+# shows up as a byte difference rather than cancelling out.
+#
+# The aligned record, per token, 640 B:
+#
+#     [  0, 448)  NoPE, e4m3, one UE8M0 scale per 64-element group
+#     [448, 462)  those 7 scale bytes, EACH WRITTEN TWICE
+#     [462, 512)  pad
+#     [512, 640)  RoPE, bf16, never quantized
+#
+# Bytes [0, 512) are also exactly a Q row. The duplication is not redundancy:
+# the decode kernel's scaled-MMA blocks are 32 elements wide while the quant
+# group is 64, so each group's scale is read twice.
+#
+# Two tests per kernel, not one. The second covers the API contract -- what the
+# kernel REFUSES and what it returns -- which asserts on exceptions and shapes
+# rather than values, and must not be dragged through the numerical
+# parametrization that would re-run it for every shape.
+# =========================================================================== #
+_NOPE, _ROPE, _QK = 448, 64, 512
+_GROUP = 64
+_NUM_TILES = _NOPE // _GROUP  # 7
+_REC, _SC_IN_REC, _ROPE_IN_REC = 640, 448, 512
+
+# One ULP of bf16 is a relative 2**-8; the bound is 2**-7 to cover a rounding
+# that crosses a binade, with an absolute floor so values near zero are not
+# judged on a relative scale.
+_ULP = dict(rtol=2**-7, atol=1e-5)
+_EXACT = dict(rtol=0, atol=0)
+
+
+def _skip_without_fp8():
+    if not arch_info.is_fp8_avail():
+        pytest.skip("FP8 not supported on this arch")
+
+
+# --------------------------------------------------------------------------- #
+# references
+# --------------------------------------------------------------------------- #
+def torch_pack_q_ref(q: torch.Tensor):
+    """The torch implementation the Q-pack kernel replaced, kept verbatim."""
+    lead = q.shape[:-1]
+    nope = q[..., :_NOPE].float()
+    rope = q[..., _NOPE:].contiguous()
+    tiled = nope.reshape(*lead, _NUM_TILES, _GROUP)
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    # amax/fp8_max rounded UP to a power of two, exactly as E8M0 stores it
+    scale = torch.pow(
+        2.0, torch.clamp_min(tiled.abs().amax(dim=-1) / fp8_max, 1e-4).log2().ceil()
+    )
+    nope_fp8 = (tiled / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
+    packed = torch.zeros((*lead, _QK), dtype=torch.uint8, device=q.device)
+    packed[..., :_NOPE] = nope_fp8.reshape(*lead, _NOPE).view(torch.uint8)
+    packed[..., _NOPE : _NOPE + 2 * _NUM_TILES] = e8m0.repeat_interleave(2, dim=-1)
+    return packed.view(torch.float8_e4m3fn), rope
+
+
+def torch_qnorm_rope_ref(q, positions, cos_sin, eps, padded_heads, apply_norm):
+    """``[T, H, 512]`` bf16 -> the padded, normed, rotated Q, in fp32."""
+    t, h, _ = q.shape
+    x = q.float()
+    if apply_norm:
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    half = _ROPE // 2
+    cs = cos_sin[positions.long()]
+    cos, sin = cs[:, :half], cs[:, half:]
+    e, o = x[..., _NOPE::2], x[..., _NOPE + 1 :: 2]
+    ye = e * cos[:, None, :] - o * sin[:, None, :]
+    yo = e * sin[:, None, :] + o * cos[:, None, :]
+    out = x.clone()
+    out[..., _NOPE::2], out[..., _NOPE + 1 :: 2] = ye, yo
+    padded = torch.zeros(t, padded_heads, _QK, dtype=torch.float32, device=q.device)
+    padded[:, :h] = out
+    return padded
+
+
+def torch_kv_record_ref(kv, positions, cos_sin):
+    """``[T, 512]`` bf16 -> ``[T, 640]`` uint8, the aligned record, pad zero.
+
+    The KV side clamps the ABSMAX before dividing, where the Q side clamps the
+    ratio. That asymmetry is inherited from the .cu producer this replaces, so
+    the reference reproduces it rather than tidying it.
+    """
+    t = kv.shape[0]
+    half = _ROPE // 2
+    cs = cos_sin[positions.long()]
+    cos, sin = cs[:, :half], cs[:, half:]
+    e, o = kv[:, _NOPE::2].float(), kv[:, _NOPE + 1 :: 2].float()
+    ye, yo = e * cos - o * sin, e * sin + o * cos
+    rope = torch.empty(t, _ROPE, dtype=torch.float32, device=kv.device)
+    rope[:, 0::2], rope[:, 1::2] = ye, yo
+
+    nope = kv[:, :_NOPE].float().reshape(t, _NUM_TILES, _GROUP)
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    amax = torch.clamp_min(nope.abs().amax(-1), 1e-4)
+    scale = torch.pow(2.0, (amax / fp8_max).log2().ceil())
+    q8 = torch.clamp(nope / scale.unsqueeze(-1), -fp8_max, fp8_max).to(
+        torch.float8_e4m3fn
+    )
+    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 255).to(torch.uint8)
+
+    rec = torch.zeros(t, _REC, dtype=torch.uint8, device=kv.device)
+    rec[:, :_NOPE] = q8.reshape(t, _NOPE).view(torch.uint8)
+    rec[:, _SC_IN_REC : _SC_IN_REC + 2 * _NUM_TILES] = e8m0.repeat_interleave(2, dim=-1)
+    rec[:, _ROPE_IN_REC:] = rope.to(torch.bfloat16).view(torch.uint8)
+    return rec
+
+
+def _make_inputs(T, H, padded_heads, nb, block, seed=0):
+    torch.manual_seed(seed)
+    dev = "cuda"
+    q = (torch.randn(T, H, _QK, device=dev) * 0.125).to(torch.bfloat16)
+    kv = (torch.randn(T, _QK, device=dev) * 0.4).to(torch.bfloat16)
+    # 0xCD, not zero: a record the kernel fails to write shows up as garbage
+    # rather than silently matching a zeroed reference.
+    cache = torch.full((nb, block, _REC), 0xCD, dtype=torch.uint8, device=dev)
+    slot = torch.randperm(nb * block, device=dev, dtype=torch.int32)[:T]
+    positions = torch.randint(0, 128, (T,), device=dev, dtype=torch.int64)
+    cos_sin = torch.randn(256, _ROPE, device=dev, dtype=torch.float32)
+    return q, kv, cache, slot, positions, cos_sin
+
+
+# --------------------------------------------------------------------------- #
+# fused_deepseek_v4_mxfp8_quant_q_pack
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("T,H", [(1, 16), (4, 32), (64, 16), (512, 128)])
+@pytest.mark.parametrize("mag", [0.0, 1e-3, 1.0, 1e3])
+def test_fused_deepseek_v4_mxfp8_quant_q_pack(T, H, mag):
+    """Byte-for-byte against the reference, plus the format's invariants.
+
+    Exact, not close-to: the packing is integer work once the exponent is
+    chosen, so any difference is a bug rather than rounding. The magnitude
+    sweep is what exercises the exponent path, and ``mag = 0`` is the padded /
+    empty head: its scale bytes must carry the 1e-4 floor exponent, never 0xFF,
+    which is E8M0 NaN -- the decode kernel multiplies a masked score by it and
+    0 * NaN would poison the row.
+    """
+    _skip_without_fp8()
+    torch.manual_seed(0)
+    q = (torch.randn(T, H, _QK, device="cuda") * mag).to(torch.bfloat16)
+    got_p, got_r = fused_deepseek_v4_mxfp8_quant_q_pack(q)
+    exp_p, exp_r = torch_pack_q_ref(q)
+
+    u8, exp_u8 = got_p.view(torch.uint8), exp_p.view(torch.uint8)
+    torch.testing.assert_close(u8, exp_u8, **_EXACT)
+    torch.testing.assert_close(got_r, exp_r, **_EXACT)
+
+    sc = u8[..., _NOPE : _NOPE + 2 * _NUM_TILES]
+    assert (sc != 0xFF).all(), "a scale byte is E8M0 NaN"
+    # each group's scale appears twice, adjacently -- the operand layout the
+    # decode kernel indexes
+    torch.testing.assert_close(sc[..., 0::2], sc[..., 1::2], **_EXACT)
+    assert (u8[..., _NOPE + 2 * _NUM_TILES :] == 0).all(), "tail not zeroed"
+
+
+def test_fused_deepseek_v4_mxfp8_quant_q_pack_contract():
+    """A row that is not 448 NoPE + 64 RoPE is refused, not silently reshaped."""
+    _skip_without_fp8()
+    q = torch.zeros(2, 4, 256, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="448 NoPE"):
+        fused_deepseek_v4_mxfp8_quant_q_pack(q)
+
+
+# --------------------------------------------------------------------------- #
+# fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("T,H,padded", [(1, 16, 16), (8, 16, 32), (37, 128, 128)])
+@pytest.mark.parametrize("apply_norm", [False, True])
+def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+    T, H, padded, apply_norm
+):
+    """Q, its pack, and the KV record, against per-side references.
+
+    With the norm OFF both sides do the identical arithmetic, so everything the
+    LAYOUT determines is compared exactly. Only the rotated half gets a one-ULP
+    bound, because ``a*cos - b*sin`` may or may not contract into an FMA and
+    that is not this kernel's choice. With the norm ON the reduction order for
+    sum(x*x) differs from torch's as well, so every value moves in its last
+    bits and the whole comparison relaxes to one ULP -- and the pack, whose
+    exponent could tip at a boundary, is checked by dequantizing instead.
+
+    Also covers the two behaviours that have no reference of their own: a
+    padded head slot must be zero-filled, and ``slot == -1`` must leave its
+    record untouched.
+    """
+    _skip_without_fp8()
+    q, kv, cache, slot, pos, cs = _make_inputs(T, H, padded, nb=4, block=64)
+    slot[1::2] = -1  # every other token has no cache row; token 0 stays live
+    # (odd indices, so the T=1 case still exercises a real insert)
+    before = cache.clone()
+
+    q_out, q_packed, q_rope = (
+        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+            q, kv, cache, slot, pos, cs, 64, 1e-6, padded, apply_q_norm=apply_norm
+        )
+    )
+
+    want_f32 = torch_qnorm_rope_ref(q, pos, cs, 1e-6, padded, apply_norm)
+    want_q = want_f32.to(torch.bfloat16)
+    nope_tol = _ULP if apply_norm else _EXACT
+    torch.testing.assert_close(q_out[..., :_NOPE], want_q[..., :_NOPE], **nope_tol)
+    torch.testing.assert_close(q_out[..., _NOPE:], want_q[..., _NOPE:], **_ULP)
+
+    # padded slots: zero everywhere, so no 0xFF reaches the decode kernel
+    assert (q_packed.view(torch.uint8)[:, H:] == 0).all()
+    assert (q_rope[:, H:] == 0).all()
+
+    if apply_norm:
+        # dequantized, since a last-bit difference in Q can tip an exponent
+        u8 = q_packed.view(torch.uint8)[:, :H]
+        nope = (
+            u8[..., :_NOPE]
+            .view(torch.float8_e4m3fn)
+            .float()
+            .reshape(T, H, _NUM_TILES, _GROUP)
+        )
+        exps = u8[..., _NOPE : _NOPE + 2 * _NUM_TILES : 2].to(torch.int32)
+        deq = (nope * torch.pow(2.0, (exps - 127).float()).unsqueeze(-1)).reshape(
+            T, H, _NOPE
+        )
+        ref = want_q[:, :H, :_NOPE].float()
+        rel = (deq - ref).norm() / ref.norm()
+        # a UE8M0 scale rounded UP to a power of two costs up to a mantissa
+        # bit, which puts e4m3's RMS in the low percent
+        assert rel < 4e-2, f"packed Q drifts from the Q it came from: {rel:.2e}"
+    else:
+        exp_p, exp_r = torch_pack_q_ref(want_f32[:, :H])
+        torch.testing.assert_close(
+            q_packed.view(torch.uint8)[:, :H], exp_p.view(torch.uint8), **_EXACT
+        )
+        torch.testing.assert_close(q_rope[:, :H], exp_r.to(torch.bfloat16), **_ULP)
+
+    rows = cache.reshape(-1, _REC)
+    live = slot >= 0
+    got = rows[slot[live].long()]
+    want_kv = torch_kv_record_ref(kv, pos, cs)[live]
+    torch.testing.assert_close(got[:, :_NOPE], want_kv[:, :_NOPE], **_EXACT)
+    sl = slice(_SC_IN_REC, _SC_IN_REC + 2 * _NUM_TILES)
+    torch.testing.assert_close(got[:, sl], want_kv[:, sl], **_EXACT)
+    torch.testing.assert_close(
+        got[:, _ROPE_IN_REC:].view(torch.bfloat16),
+        want_kv[:, _ROPE_IN_REC:].view(torch.bfloat16),
+        **_ULP,
+    )
+
+    untouched = torch.ones(rows.shape[0], dtype=torch.bool, device=cache.device)
+    untouched[slot[live].long()] = False
+    torch.testing.assert_close(
+        rows[untouched], before.reshape(-1, _REC)[untouched], **_EXACT
+    )
+
+
+def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_contract():
+    """What it returns without the pack, and what it refuses."""
+    _skip_without_fp8()
+    q, kv, cache, slot, pos, cs = _make_inputs(4, 16, 16, nb=2, block=64)
+    out = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+        q, kv, cache, slot, pos, cs, 64, 1e-6, 16, pack_q=False
+    )
+    assert isinstance(out, torch.Tensor) and out.shape == (4, 16, _QK)
+
+    bad = torch.zeros(2, 64, 584, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="640"):
+        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+            q, kv, bad, slot, pos, cs, 64, 1e-6, 16
+        )

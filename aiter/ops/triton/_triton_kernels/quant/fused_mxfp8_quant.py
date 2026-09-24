@@ -287,3 +287,229 @@ def _fused_flatten_mxfp8_quant_kernel(
         scale_flat,
         mask=block_scale_offs < n2_groups,
     )
+
+
+@triton.jit
+def _fused_deepseek_v4_mxfp8_quant_q_pack_kernel(
+    q_ptr, packed_ptr, rope_ptr, fp8_max,
+    NOPE: tl.constexpr, ROPE: tl.constexpr, QK: tl.constexpr,
+    GROUP: tl.constexpr, NUM_TILES: tl.constexpr,
+):
+    """One program per (token, head) row of Q.
+
+    Writes the packed record the gfx1250 kernel reads:
+      [0, 448)   NoPE e4m3, one UE8M0 scale per 64-element group
+      [448, 462) the 7 scale bytes, EACH WRITTEN TWICE
+      [462, 512) zero
+    plus the RoPE plane, which is never quantized.
+    """
+    row = tl.program_id(0)
+    src = q_ptr + row * QK
+    dst = packed_ptr + row * QK
+
+    for g in tl.static_range(NUM_TILES):
+        off = g * GROUP + tl.arange(0, GROUP)
+        x = tl.load(src + off).to(tl.float32)
+        # clamp the RATIO, matching the reference packing the kernel's own
+        # tests use -- flooring amax instead would shift the stored exponent
+        # for all-zero groups
+        amax = tl.max(tl.abs(x), axis=0)
+        ratio = tl.maximum(amax / fp8_max, 1e-4)
+        exponent = tl.ceil(tl.log2(ratio))
+        scale = tl.exp2(exponent)
+        f8 = (x / scale).to(tl.float8e4nv)
+        tl.store(dst + off, f8.to(tl.uint8, bitcast=True))
+        # the scaled-MMA blocks are 32 elements wide while the quant group is
+        # 64, so the kernel reads each group's scale twice
+        enc = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 254.0).to(tl.uint8)
+        tl.store(dst + NOPE + 2 * g, enc)
+        tl.store(dst + NOPE + 2 * g + 1, enc)
+
+    # [462, 512): zero, so no stale byte reaches the MMA
+    tail = tl.arange(0, QK)
+    tl.store(dst + tail, tl.zeros((QK,), dtype=tl.uint8),
+             mask=tail >= NOPE + 2 * NUM_TILES)
+
+    r = tl.arange(0, ROPE)
+    tl.store(rope_ptr + row * ROPE + r, tl.load(src + NOPE + r))
+
+
+# ---------------------------------------------------------------------------
+# DSv4 decode producer, fused
+# ---------------------------------------------------------------------------
+# Everything the model does to Q and KV between the projections and the sparse
+# decode, in one launch:
+#
+#   Q   RMSNorm (no weight) -> GPT-J RoPE -> bf16 out, and the UE8M0 fp8 pack
+#       taken off the SAME registers rather than from a second pass over Q
+#   KV  GPT-J RoPE -> UE8M0 quant -> insert into the paged ALIGNED cache
+#
+# The two are different work on different tensors, so they are dispatched by
+# head slot rather than fused arithmetically: grid dim 1 runs
+# [0, padded_heads) for Q and one extra slot for KV. That is the same shape of
+# dispatch the .cu producer uses, except the .cu gives each (token, slot) a
+# WARP and 16 elements per lane where this gives it a whole program -- a
+# difference worth measuring, not assuming.
+#
+# ALIGNED cache record, 640 B per token:
+#     [  0, 448)  NoPE fp8 e4m3
+#     [448, 462)  the 7 UE8M0 scales, EACH WRITTEN TWICE
+#     [462, 512)  pad
+#     [512, 640)  RoPE bf16
+#
+# Bytes [0, 512) are byte-identical to an ATOM 2buff row, which is why the
+# packed Q rows above and these KV rows share one packing.
+
+
+@triton.jit
+def _v4_rope_pair(x_even, x_odd, cos, sin):
+    return x_even * cos - x_odd * sin, x_even * sin + x_odd * cos
+
+
+@triton.jit
+def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel(
+    q_in_ptr,  # [T, num_heads_q, HEAD] bf16
+    q_out_ptr,  # [T, padded_heads, HEAD] bf16
+    q_packed_ptr,  # [T, padded_heads, HEAD] uint8 (the 2buff row)
+    q_rope_ptr,  # [T, padded_heads, ROPE] bf16
+    kv_in_ptr,  # [T, HEAD] bf16
+    kv_cache_ptr,  # [nb, block, REC] uint8
+    kv_slot_ptr,  # [T] int, -1 to skip
+    pos_ptr,  # [T]
+    cs_ptr,  # [max_pos, ROPE] fp32, cos || sin
+    kv_block_stride,
+    kv_cache_block_size,
+    eps,
+    fp8_max,
+    num_heads_q: tl.constexpr,
+    padded_heads: tl.constexpr,
+    HEAD: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    GROUP: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    REC: tl.constexpr,
+    SC_OFF: tl.constexpr,
+    ROPE_OFF: tl.constexpr,
+    APPLY_NORM: tl.constexpr,
+    PACK_Q: tl.constexpr,
+    USE_FNUZ: tl.constexpr,
+):
+    """One program per (token, slot); slot == padded_heads is the KV row.
+
+    Padding slots zero-fill every Q output. That is a correctness requirement,
+    not tidiness: an unwritten scale byte of 0xFF is E8M0 NaN, and the decode
+    kernel multiplies a masked score by it, so 0 * NaN would poison the row.
+    """
+    tok = tl.program_id(0)
+    h = tl.program_id(1)
+    d = tl.arange(0, HEAD)
+    half: tl.constexpr = ROPE // 2
+    p = tl.arange(0, ROPE // 2)
+
+    pos = tl.load(pos_ptr + tok)
+    cos = tl.load(cs_ptr + pos * ROPE + p)
+    sin = tl.load(cs_ptr + pos * ROPE + half + p)
+
+    # ---- KV: RoPE, quantize, write one aligned record ---------------------
+    if h == padded_heads:
+        slot = tl.load(kv_slot_ptr + tok)
+        if slot == -1:
+            return
+        blk = slot // kv_cache_block_size
+        pos_in_blk = slot % kv_cache_block_size
+        # int64: blk * block_stride exceeds 2^31 on a production-sized pool
+        rec = kv_cache_ptr + blk.to(tl.int64) * kv_block_stride + pos_in_blk * REC
+        row = kv_in_ptr + tok * HEAD
+
+        for g in tl.static_range(NUM_TILES):
+            off = g * GROUP + tl.arange(0, GROUP)
+            x = tl.load(row + off).to(tl.float32)
+            amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+            exponent = tl.ceil(tl.log2(amax / fp8_max))
+            scale = tl.exp2(exponent)
+            xs = tl.clamp(x / scale, -fp8_max, fp8_max)
+            if USE_FNUZ:
+                f8 = xs.to(tl.float8e4b8)
+            else:
+                f8 = xs.to(tl.float8e4nv)
+            tl.store(rec + off, f8.to(tl.uint8, bitcast=True))
+            enc = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0).to(tl.uint8)
+            # both copies: one scale per 32 columns, one quant group per 64
+            tl.store(rec + SC_OFF + 2 * g, enc)
+            tl.store(rec + SC_OFF + 2 * g + 1, enc)
+
+        xe = tl.load(row + NOPE + 2 * p).to(tl.float32)
+        xo = tl.load(row + NOPE + 2 * p + 1).to(tl.float32)
+        ye, yo = _v4_rope_pair(xe, xo, cos, sin)
+        rope_out = (rec + ROPE_OFF).to(tl.pointer_type(tl.bfloat16))
+        tl.store(rope_out + 2 * p, ye.to(tl.bfloat16))
+        tl.store(rope_out + 2 * p + 1, yo.to(tl.bfloat16))
+        return
+
+    # ---- Q: padding slot --------------------------------------------------
+    dst = q_out_ptr + (tok * padded_heads + h) * HEAD
+    if h >= num_heads_q:
+        tl.store(dst + d, tl.zeros((HEAD,), dtype=tl.bfloat16))
+        if PACK_Q:
+            pdst = q_packed_ptr + (tok * padded_heads + h) * HEAD
+            tl.store(pdst + d, tl.zeros((HEAD,), dtype=tl.uint8))
+            r0 = tl.arange(0, ROPE)
+            tl.store(
+                q_rope_ptr + (tok * padded_heads + h) * ROPE + r0,
+                tl.zeros((ROPE,), dtype=tl.bfloat16),
+            )
+        return
+
+    # ---- Q: live head -----------------------------------------------------
+    base = q_in_ptr + (tok * num_heads_q + h) * HEAD
+    # RMSNorm over the whole head, no weight -- one scale for both halves
+    inv = 1.0
+    if APPLY_NORM:
+        xf = tl.load(base + d).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(xf * xf, axis=0) / HEAD + eps)
+
+    xe = tl.load(base + NOPE + 2 * p).to(tl.float32) * inv
+    xo = tl.load(base + NOPE + 2 * p + 1).to(tl.float32) * inv
+    ye, yo = _v4_rope_pair(xe, xo, cos, sin)
+
+    # bf16 Q out. arange must be a power of two, so the 512-wide range is
+    # masked down to the NoPE half rather than sized to it.
+    nope_m = d < NOPE
+    tl.store(
+        dst + d,
+        (tl.load(base + d, mask=nope_m, other=0.0).to(tl.float32) * inv).to(
+            tl.bfloat16
+        ),
+        mask=nope_m,
+    )
+    tl.store(dst + NOPE + 2 * p, ye.to(tl.bfloat16))
+    tl.store(dst + NOPE + 2 * p + 1, yo.to(tl.bfloat16))
+
+    if PACK_Q:
+        pdst = q_packed_ptr + (tok * padded_heads + h) * HEAD
+        for g in tl.static_range(NUM_TILES):
+            off = g * GROUP + tl.arange(0, GROUP)
+            # the NoPE half is normed but NOT rotated, so re-read and scale
+            x = tl.load(base + off).to(tl.float32) * inv
+            amax = tl.max(tl.abs(x), axis=0)
+            # clamp the RATIO, which is what the reference packing does
+            exponent = tl.ceil(tl.log2(tl.maximum(amax / fp8_max, 1e-4)))
+            xs = x / tl.exp2(exponent)
+            if USE_FNUZ:
+                f8 = xs.to(tl.float8e4b8)
+            else:
+                f8 = xs.to(tl.float8e4nv)
+            tl.store(pdst + off, f8.to(tl.uint8, bitcast=True))
+            enc = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 254.0).to(tl.uint8)
+            tl.store(pdst + NOPE + 2 * g, enc)
+            tl.store(pdst + NOPE + 2 * g + 1, enc)
+        tl.store(
+            pdst + d,
+            tl.zeros((HEAD,), dtype=tl.uint8),
+            mask=d >= NOPE + 2 * NUM_TILES,
+        )
+        # the RoPE plane is never quantized
+        rdst = q_rope_ptr + (tok * padded_heads + h) * ROPE
+        tl.store(rdst + 2 * p, ye.to(tl.bfloat16))
+        tl.store(rdst + 2 * p + 1, yo.to(tl.bfloat16))

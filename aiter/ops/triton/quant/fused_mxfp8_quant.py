@@ -5,18 +5,33 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel,
+    _fused_deepseek_v4_mxfp8_quant_q_pack_kernel,
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
 )
 
 __all__ = [
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned",
+    "fused_deepseek_v4_mxfp8_quant_q_pack",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
     "fused_rms_mxfp8_quant",
 ]
 
 _QUANT_BLOCK_SIZE = 32
+
+# DSv4 a8w8 Q operand: 448 NoPE (UE8M0 fp8, 64-element groups) + 64 RoPE
+# (bf16, never quantized). The decode kernel reads the scale bytes inline,
+# each duplicated, because its scaled-MMA blocks are half the quant group.
+_V4_DIM_NOPE = 448
+_V4_DIM_ROPE = 64
+_V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE
+_FP8_GROUP_SIZE = 64
+_V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE
+
+
 
 
 def fused_rms_mxfp8_quant(
@@ -215,3 +230,144 @@ def fused_flatten_mxfp8_quant(
     )
 
     return out, out_scales
+
+
+def fused_deepseek_v4_mxfp8_quant_q_pack(q: torch.Tensor):
+    """``[..., 512]`` bf16 Q -> ``(packed [..., 512] fp8, rope [..., 64] bf16)``.
+
+    The Q form ``_pa_decode_sparse_v4`` reads on gfx1250 (a8w8). RoPE is never
+    quantized, which is why this returns a pair.
+
+    A zeroed (padding) head packs to zero data with the 1e-4 floor's exponent in
+    its scale bytes -- harmless, since a zero mantissa dequantizes to zero
+    whatever the exponent says. What must never appear is an UNWRITTEN scale
+    byte: 0xFF is E8M0 NaN and a NaN scale poisons a whole score row through
+    ``0 * NaN``.
+    """
+    if q.shape[-1] != _V4_DIM_QK:
+        raise RuntimeError(
+            f"q last dim must be {_V4_DIM_QK} (448 NoPE + 64 RoPE), got "
+            f"{q.shape[-1]}"
+        )
+    q = q.contiguous()
+    lead = q.shape[:-1]
+    rows = 1
+    for d in lead:
+        rows *= d
+    packed = torch.empty((*lead, _V4_DIM_QK), dtype=torch.uint8, device=q.device)
+    rope = torch.empty((*lead, _V4_DIM_ROPE), dtype=q.dtype, device=q.device)
+    _fused_deepseek_v4_mxfp8_quant_q_pack_kernel[(rows,)](
+        q, packed, rope, float(torch.finfo(torch.float8_e4m3fn).max),
+        _V4_DIM_NOPE, _V4_DIM_ROPE, _V4_DIM_QK, _FP8_GROUP_SIZE, _V4_NUM_TILES,
+        num_warps=4,
+    )
+    return packed.view(torch.float8_e4m3fn), rope
+
+
+# The ALIGNED paged KV record. 640 = 5 * 128, so every token starts on a
+# 128-byte boundary and TDM reads it on the direct global->L2->LDS path.
+_V4_REC_ALIGNED = 640
+_V4_SC_IN_REC = _V4_DIM_NOPE  # 448
+_V4_ROPE_IN_REC = 512  # the 2buff row is 512 B; RoPE follows it
+
+
+def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_block_size: int,
+    eps: float,
+    padded_heads: int,
+    apply_q_norm: bool = True,
+    pack_q: bool = True,
+    use_fnuz: bool = False,
+):
+    """The whole DSv4 decode producer in one launch.
+
+    Q gets RMSNorm (no weight) then GPT-J RoPE, and -- when ``pack_q`` -- the
+    UE8M0 fp8 pack off the same registers, so packing costs no second pass.
+    KV gets RoPE, UE8M0 quant and an insert into the aligned paged cache.
+
+    Args:
+        q: ``[T, H, 512]`` bf16.
+        kv: ``[T, 512]`` bf16, the compressed KV for these tokens.
+        kv_cache: ``[nb, block, 640]`` uint8, or any view whose dim-0 stride is
+            the block stride -- a per-layer view of a pooled allocation is one.
+        kv_slot_mapping: ``[T]``, ``-1`` for a token with no cache slot.
+        positions: ``[T]`` RoPE positions, shared by Q and KV.
+        cos_sin_cache: ``[max_pos, 64]`` fp32, laid out cos || sin.
+        padded_heads: the head count the decode kernel expects; slots at or
+            past ``H`` are zero-filled.
+
+    Returns:
+        ``q_bf16`` when ``pack_q`` is False, else
+        ``(q_bf16, q_packed, q_rope)``.
+    """
+    t, h, dim = q.shape
+    if dim != _V4_DIM_QK:
+        raise RuntimeError(f"q must be [T, H, {_V4_DIM_QK}], got {tuple(q.shape)}")
+    if padded_heads < h:
+        raise RuntimeError(f"padded_heads {padded_heads} < H {h}")
+    if kv.dim() != 2 or kv.shape != (t, _V4_DIM_QK):
+        raise RuntimeError(
+            f"kv must be [{t}, {_V4_DIM_QK}], got {tuple(kv.shape)}"
+        )
+    if kv_cache.shape[-1] != _V4_REC_ALIGNED:
+        raise RuntimeError(
+            f"kv_cache records must be {_V4_REC_ALIGNED} B, got "
+            f"{kv_cache.shape[-1]}"
+        )
+    q = q.contiguous()
+    kv = kv.contiguous()
+
+    q_out = torch.empty(t, padded_heads, dim, dtype=q.dtype, device=q.device)
+    if pack_q:
+        q_packed = torch.empty(
+            t, padded_heads, dim, dtype=torch.uint8, device=q.device
+        )
+        q_rope = torch.empty(
+            t, padded_heads, _V4_DIM_ROPE, dtype=q.dtype, device=q.device
+        )
+    else:
+        # unused under PACK_Q=False, but the launch still has to typecheck
+        q_packed = q_rope = q_out
+
+    fp8_max = 224.0 if use_fnuz else float(torch.finfo(torch.float8_e4m3fn).max)
+    # One extra slot along dim 1 carries the KV row for the token.
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel[
+        (t, padded_heads + 1)
+    ](
+        q,
+        q_out,
+        q_packed,
+        q_rope,
+        kv,
+        kv_cache,
+        kv_slot_mapping,
+        positions,
+        cos_sin_cache,
+        kv_cache.stride(0),
+        kv_cache_block_size,
+        float(eps),
+        fp8_max,
+        h,
+        padded_heads,
+        _V4_DIM_QK,
+        _V4_DIM_NOPE,
+        _V4_DIM_ROPE,
+        _FP8_GROUP_SIZE,
+        _V4_NUM_TILES,
+        _V4_REC_ALIGNED,
+        _V4_SC_IN_REC,
+        _V4_ROPE_IN_REC,
+        bool(apply_q_norm),
+        bool(pack_q),
+        bool(use_fnuz),
+        num_warps=4,
+    )
+    if pack_q:
+        return q_out, q_packed.view(torch.float8_e4m3fn), q_rope
+    return q_out
