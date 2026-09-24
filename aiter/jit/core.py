@@ -382,6 +382,18 @@ class AITER_CONFIG:
                 continue
 
             df = pd.read_csv(path)
+            if (
+                merge_name == "batched_gemm_a8w8_blockscale_mxscale_tuned"
+                and "groupSize" not in df.columns
+            ):
+                # Before MX32 support, every raw-weight MXScale row used GS128.
+                # Normalize before merging so old and new tables share a key.
+                logger.warning(
+                    "Legacy MXFP8 BMM tuned CSV %s has no groupSize; "
+                    "assuming groupSize=128",
+                    path,
+                )
+                df["groupSize"] = 128
             source_pairs.append((path, df))
 
         if not source_pairs:
@@ -434,6 +446,11 @@ class AITER_CONFIG:
                 keys.append("cu_num")
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
+            if (
+                merge_name == "batched_gemm_a8w8_blockscale_mxscale_tuned"
+                and "groupSize" not in keys
+            ):
+                keys.append("groupSize")
             dedup_keys = keys + ["_tag"] if has_tag else keys
             # Only key on columns actually present in the merged frame. Most
             # families carry cu_num, but some (e.g. the mxscale batched-GEMM

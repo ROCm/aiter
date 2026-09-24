@@ -56,6 +56,9 @@ opus_bmm_a8w8_mxscale_exact_dispatch(int kid)
 // dispatched with a scale shape nobody checked against its own blocks.
 static std::pair<int, int> opus_bmm_mxscale_kid_groups(int kid)
 {
+  // This lookup precedes common tensor checks. On a thread's first raw call,
+  // enable catchable exceptions before an unknown kid can reach AITER_CHECK.
+  aiter_detail::g_aiter_can_throw = true;
   static const std::unordered_map<int, std::pair<int, int>> kGroups = {
       GENERATE_BMM_MXSCALE_KID_GROUPS
   };

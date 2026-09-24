@@ -181,7 +181,11 @@ def _get_mxscale_bmm_launchers():
 def _load_mxscale_bmm_tuned(
     libtype: str | None = None, bpreshuffle: bool = False
 ) -> dict:
-    """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
+    """Load raw-weight policy rows or the separate GS128 preshuffled table."""
+    if not bpreshuffle:
+        from .opus.policy import _load_mxscale_bmm_tuned as load_raw
+
+        return load_raw(libtype)
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
@@ -202,6 +206,7 @@ def lookup_mxscale_bmm_config(
     *,
     libtype: str | None = None,
     bpreshuffle: bool = False,
+    group_size: int = 128,
 ):
     """Exact tuned row for this shape, else one at a padded M.
 
@@ -222,6 +227,12 @@ def lookup_mxscale_bmm_config(
     instead of named fields, so a backend gets its own kernel identifier
     reported without this layer knowing which column holds it.
     """
+    if not bpreshuffle:
+        from .opus.policy import lookup_mxscale_bmm_config as lookup_raw
+
+        return lookup_raw(b, m, n, k, group_size=group_size, libtype=libtype)
+    if group_size != 128:
+        raise ValueError("preshuffled MXFP8 BMM only supports group_size=128")
     gfx = get_gfx()
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
@@ -261,8 +272,9 @@ def _get_mxscale_bmm_launch_plan(
     m: int,
     n: int,
     k: int,
+    group_size: int = 128,
 ) -> tuple[int, int]:
-    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k)
+    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k, group_size=group_size)
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -271,6 +283,7 @@ def _batched_gemm_a8w8_mxscale_impl(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    group_size: int = 128,
 ) -> Tensor:
     # This body executes behind the public custom-op boundary, so real eager
     # tensors carry concrete integer dimensions here.  Avoid four redundant
@@ -278,7 +291,7 @@ def _batched_gemm_a8w8_mxscale_impl(
     m, g, k = x.shape
     n = wo_a.shape[1]
     raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
-    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k)
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, group_size)
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:
@@ -317,6 +330,7 @@ def _batched_gemm_a8w8_mxscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    group_size: int = 128,
 ) -> Tensor:
     return torch.empty(
         (x.shape[0], x.shape[1], wo_a.shape[1]),
@@ -332,9 +346,17 @@ def batched_gemm_a8w8_mxscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    group_size: int = 128,
 ) -> Tensor:
-    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``."""
-    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``.
+
+    ``group_size`` selects 128 (default) or 32 element scale blocks. Provide
+    ``x_scale[M,G,ceil(K/group_size)]`` and
+    ``w_scale[G,ceil(N/group_size),ceil(K/group_size)]`` in E8M0 format.
+    """
+    return _batched_gemm_a8w8_mxscale_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype, group_size=group_size
+    )
 
 
 # Same family, preshuffled weight.
