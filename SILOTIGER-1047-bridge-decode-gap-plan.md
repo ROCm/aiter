@@ -41,7 +41,7 @@ Stage then one-line commit when that is the ticket convention.
 - [x] 0. Decode baseline: ISA / PMC / ATT vs Live AMD M=1 and M=8
 - [x] 1. AMD-matched decode K LDS map + inverse QK reads
 - [x] 2. AMD-matched decode V publication (`ds_write_b64` ×4) + inverse PV reads
-- [ ] 3. Cut leftover permute / bpermute / extra waits that AMD decode does not emit
+- [x] 3. Cut leftover permute / bpermute / extra waits that AMD decode does not emit
 - [ ] 4. Waitcnt / barrier schedule toward AMD’s decode mix
 - [ ] 5. Split-count specializations (`ns64` at M=1, `ns32` at M=8)
 - [ ] 6. Stop: decode split matches or exceeds Live AMD at M=1 and M=8
@@ -477,15 +477,52 @@ versus AMD **0 / 0**, and **106 `s_waitcnt`** versus **33–34**. After
 the maps are right, remove packing that exists only because the old
 generic TV copies needed it.
 
-- [ ] Identify each `v_perm` / `ds_bpermute` cluster in the decode
+- [x] Identify each `v_perm` / `ds_bpermute` cluster in the decode
       ISA and delete the FlyDSL that produces it if AMD’s fragment
       map does not need it (softmax shuffles may remain).
-- [ ] Do not add permute to “fix” a wrong map; go back to phase 1/2.
-- [ ] Oracle + ISA line. Keep if permute/bpermute/wait counts fall
+- [x] Do not add permute to “fix” a wrong map; go back to phase 1/2.
+- [x] Oracle + ISA line. Keep if permute/bpermute/wait counts fall
       toward AMD even if wrapper µs is flat.
-- [ ] **Done when:** decode ISA has no `ds_bpermute` and `v_perm` is
+- [x] **Done when:** decode ISA has no `ds_bpermute` and `v_perm` is
       near AMD (ideally 0), or a dated note explains the leftover
       (e.g. softmax pack that AMD does in SALU).
+
+Kept (2026-09-24). Decode-only: Q OOB heads are a packed `cndmask`
+(`q_live.select(q_vec, 0)`), not a per-element f32 round-trip, and
+token-live for softmax is `ballot` + bit test, not `shuffle_idx`.
+Dropped the unused `m_final` `shuffle_idx` pack (already DCE on
+prefill). Prefill ISA sha still `64ee586155fc6a63`. Oracle
+decode+prefill: **2 passed**.
+
+**ISA** (`tickets/1047/tmp/k2_decode_perm_isa/launch/22_final_isa.s`)
+vs phase 2:
+
+| | phase 2 | phase 3 | AMD decode |
+|--|--:|--:|--:|
+| `v_perm` | 34 | **2** | 0 |
+| `ds_bpermute` | 12 | **8** | 0 |
+| `s_waitcnt` | 103 | 108 | 33 |
+| K32 / K16 | 8 / 4 | 8 / 4 | 8 / 4 |
+| `ds_write_b64` / tr16 | 4 / 4 | 4 / 4 | 4 / 4 |
+
+The 32 Q-load `v_perm` and 4 live-mask `ds_bpermute` are gone.
+Leftover **2 `v_perm`** pack four softmax P bf16 into PV-A; leftover
+**8 `ds_bpermute`** are `shuffle_idx(alpha)` (4) and epilogue
+`l_final` dens (4). Overlay QK C is token-major in-lane while PV C /
+store is 4 heads, so those gathers stay; AMD’s `Q@K` C is already
+head-major and uses SALU/`permlane` instead. Not a map bug.
+
+**Wall** (five-run median, interleaved; not a keep-gate) vs phase 2
+rerun 19.22 / 19.40 / 155.98:
+
+| M | phase 3 FlyDSL | AMD wrapper |
+|--:|--:|--:|
+| 1 | 20.53 | 37.69 |
+| 8 | 21.05 | 38.10 |
+| 512 | 156.21 | 199.72 |
+
+**Kernel-trace M=1 split:** **10.381 µs** vs phase 2 **9.893 / 10.503**
+vs AMD **6.391**. Waitcnt did not fall (phase 4).
 
 ### 4. Waitcnt / barrier schedule toward AMD’s decode mix
 
@@ -577,8 +614,13 @@ item.
       `buffer_load_dwordx4`. FlyDSL authors the same: lo/hi 4 of
       each gather with `UniversalCopy64b`. Not a 64-bit TV tile and
       not `write2st64`.
-- [ ] Whether leftover FlyDSL `v_perm` is softmax/epilogue or K/V
-      packing (phase 3).
+- [x] Whether leftover FlyDSL `v_perm` is softmax/epilogue or K/V
+      packing (phase 3). **Q packing, not K/V maps.** 32 of 34
+      `v_perm` were the Q f32 round-trip; those are gone. The last 2
+      pack P for PV-A. 4 of 12 `ds_bpermute` were token-live
+      `shuffle_idx` (now `ballot`); the remaining 8 are alpha +
+      epilogue `l_final` because overlay C is token-major and the
+      store is 4 heads.
 - [ ] Whether M=1 still needs `ns64` after the tile matches AMD, or
       the current 32-split grid becomes enough (phase 5).
 - [ ] Whether one `ns*` HSACO with a runtime split count is enough,
