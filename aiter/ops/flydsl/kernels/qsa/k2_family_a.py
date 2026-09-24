@@ -836,16 +836,12 @@ def build_qsa_k2_family_a_module(
 
         for di in range_constexpr(2):
             d = tid + Int32(di * 128)
-            start = fx.Int64(0)
-            stop = fx.Int64(n_splits)
-            step = fx.Int64(1)
-            for split64, state in range(start, stop, step, init=[zero_f]):
-                s = Int32(split64)
-                acc = Float32(state[0])
-                part = Float32(partial_out[s, row, head, d])
-                merged = yield [acc + weights[s] * part]
+            merged = zero_f
+            for s in range_constexpr(n_splits):
+                part = Float32(partial_out[Int32(s), row, head, d])
+                merged = merged + weights[Int32(s)] * part
             den_f = denominator[0]
-            value = (den_f > zero_f).select(Float32(merged) / den_f, zero_f)
+            value = (den_f > zero_f).select(merged / den_f, zero_f)
             out[row, head, d] = value.to(BFloat16)
 
     @flyc.jit
