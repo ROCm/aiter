@@ -296,12 +296,9 @@ def _generate_transformer_qkv(
     d_head_v: int,
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Realistic LLM activations: RMS-norm + per-channel log-normal scales + a Q/K term shared per
-    # token + V outlier dims/tokens. Returns fp32 q/k/v.
-    #
-    # The shared term correlates q_i with k_i at the same index, which shows up as self-affinity
-    # (diagonal logit 1.41 against 0.00 off it), not as a component shared across tokens: the
-    # token-common mode here stays near 0.02, where dumped video models run 0.13-0.42.
+    # Realistic LLM activations: RMS-norm, per-channel log-normal scales, a per-token shared Q/K
+    # term, and V outlier dims/tokens. The shared term gives self-affinity, not a token-common
+    # mode: that stays near 0.02 here, against 0.13-0.42 on dumped video models. Returns fp32.
     q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
     k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
     v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
@@ -345,11 +342,9 @@ def _generate_transformer_qkv(
     return q, k, v
 
 
-# Calibrated against dumped Wan, HunyuanVideo 1.5 and Flux2 attention. Those three agree closely
-# despite different architectures and sequence lengths, which is what makes them a target worth
-# fitting: shared components of 0.37-0.57 (Q), 0.37-0.47 (K) and 0.31-0.36 (V), cancellation
-# 2.4-2.8, logit spread 2.0-2.6, amax/RMS near 7 on Q/K, and V carrying outlier channels and
-# tokens on top (amax/RMS 8.8-25.2, peak token norm 2.9-9.1x the mean).
+# Calibrated against dumped Wan, HunyuanVideo 1.5 and Flux2 attention, which agree closely despite
+# differing architectures: shared components 0.37-0.57 (Q), 0.37-0.47 (K), 0.31-0.36 (V),
+# cancellation 2.4-2.8, logit spread 2.0-2.6, amax/RMS near 7 on Q/K and 8.8-25.2 on V.
 _DIFFUSION_RHO_Q = 0.45
 _DIFFUSION_RHO_K = 0.40
 _DIFFUSION_RHO_V = 0.34
@@ -451,11 +446,9 @@ def generate_test_tensors(
     distribution: str,
     hadamard_rotate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # "dump:<path>": replay Q/K/V captured from a real model. Every synthetic distribution here
-    # is far easier to quantize than a real trace: matching a trace's common modes, diffuseness,
-    # cancellation, logit spread and amax/RMS still leaves it roughly 10x too optimistic at the
-    # same sequence length, so whatever drives real error is not any of those. Replaying the
-    # capture sidesteps having to know what it is.
+    # "dump:<path>": replay Q/K/V captured from a real model. Every synthetic distribution here is
+    # ~10x too optimistic even when matched on common mode, diffuseness, cancellation, logit
+    # spread and amax/RMS, so replaying sidesteps having to know what actually drives real error.
     if distribution.startswith("dump:"):
         sample = torch.load(
             distribution[len("dump:") :], map_location=device, weights_only=False
@@ -514,25 +507,9 @@ def generate_test_tensors(
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "underflow":
-        # Reproduces the fp8 underflow tile-skip regression on the microbench.
-        #
-        # A strong "hotspot" in the first KV tile (keys [0:128]) establishes a
-        # high frozen softmax max. Every later KV tile then sits far below the
-        # e4m3 round-to-zero floor (~2^-11 of the max ≈ 7.62 nats), so the
-        # kernel's underflow tile-skip path fires on those tiles. A per-query-row
-        # jitter on the hotspot strength makes the all-underflow condition
-        # row-dependent, so the two anti-phase co-resident wave groups (which own
-        # different query-row blocks) disagree on which tiles to skip. The
-        # shared-VALU lockstep barrier then eats the saving while the extra
-        # underflow compare is still paid on every no-mask tile -> net slowdown,
-        # matching the observed model-level result.
-        #
-        # Tunables (env):
-        #   AITER_UNDERFLOW_GAP    max hotspot logit in nats (default 16.0)
-        #   AITER_UNDERFLOW_JITTER per-row hotspot factor ~ U[jitter, 1]
-        #                          (default 0.4 -> asymmetric/realistic regression;
-        #                           set 1.0 for the symmetric best-case where every
-        #                           later tile underflows for both partner waves)
+        # Reproduces the fp8 underflow tile-skip regression: a hotspot in the first KV tile sets a
+        # high frozen max, so later tiles fall below the e4m3 round-to-zero floor and the skip path
+        # fires. Per-row jitter makes partner waves disagree on which tiles to skip, eating it.
         gap = float(os.environ.get("AITER_UNDERFLOW_GAP", "16.0"))
         jitter = float(os.environ.get("AITER_UNDERFLOW_JITTER", "0.4"))
         jitter = min(max(jitter, 0.0), 1.0)
@@ -572,15 +549,9 @@ def generate_test_tensors(
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "latepeak":
-        # ADVERSARIAL TRIPWIRE for the frozen-max rollback (added 2026-06-14 after the black-video
-        # regression). Mirrors `underflow` but places the high-norm "attention sink" hotspot in the
-        # LAST KV tile instead of the first. With a frozen-max rollback that seeds from tile 0, the
-        # seed is LOW and the late hotspot's logit blows far past it -> the Schraudolph u32-cvt
-        # saturates to 0xFFFFFFFF (NaN bits) -> corrupt P -> NaN/black. The exact (proper running
-        # max) path is immune (S - m_new <= 0 always). Random transformer/normal/underflow never
-        # produce a late-tile outlier, so this is the structured input cosine-on-random missed.
-        #   AITER_LATEPEAK_GAP : late-peak logit in nats (default 40.0 -> well past the cvt
-        #                        saturation at scale_log2e*(S-seed) > 128 for 1/sqrt(d) scaling)
+        # Tripwire for the frozen-max rollback: the sink sits in the LAST KV tile, so a seed taken
+        # from tile 0 is low and the late logit saturates the Schraudolph u32 cvt to NaN bits.
+        # Random distributions never produce a late-tile outlier, so cosine-on-random missed it.
         gap = float(
             os.environ.get(
                 "AITER_LATEPEAK_GAP", os.environ.get("AITER_LATESINK_GAP", "40.0")
@@ -608,19 +579,9 @@ def generate_test_tensors(
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "maxstair":
-        # Frozen-max rollback stress: make every 128-token KV tile establish a new row max, with
-        # alternating 128-query-row groups above and below the rollback threshold. This keeps
-        # freeze-max active for half the rows while stressing rollback in the other half.
-        # Build in the post-Hadamard domain so MXFP6 quantization preserves each tile step.
-        #
-        # Tunables (env):
-        #   AITER_MAXSTAIR_STEP       score increase in kernel log2 units per KV tile
-        #                              (default 12.0; rollback threshold is about 8.87).
-        #   AITER_MAXSTAIR_LOW_FACTOR alternate 128-query-row groups between factors 1 and this
-        #                              value (default 0.5: half the rows roll back). Set 1.0 for
-        #                              the less representative every-row/every-tile rollback mode.
-        #                              Values below ~0.74 with the default step keep low groups
-        #                              below the threshold and stress paired-wave disagreement.
+        # Frozen-max rollback stress: every 128-token KV tile sets a new row max, with alternating
+        # query-row groups above and below the rollback threshold (about 8.87 in kernel log2
+        # units). Built post-Hadamard so MXFP6 quantization preserves each tile step.
         step = float(os.environ.get("AITER_MAXSTAIR_STEP", "12.0"))
         low_factor = float(os.environ.get("AITER_MAXSTAIR_LOW_FACTOR", "0.5"))
         if step <= 0:
@@ -686,12 +647,9 @@ def generate_test_tensors(
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "kcommon":
-        # Diffusion activations plus a large direction shared by every key. Softmax is
-        # shift-invariant in such a component, so it changes no output, but per-tensor Q/K
-        # quantization noise scales with the magnitude of q.k rather than with its spread across
-        # keys. It is invisible to n_eff, cancellation and logit spread while multiplying
-        # quantized-row error, and it is the one axis no other distribution here covers. Real
-        # models reach 0.47; this pushes far past that to stress the MHA v4 K-smoothing gate.
+        # Diffusion activations plus a large shared-K direction. Softmax is shift-invariant in it
+        # so output is unchanged, but per-tensor Q/K quantization noise scales with |q.k| rather
+        # than its spread. Real models reach 0.47; this goes further to stress the K-smoothing gate.
         q, k, v = _generate_diffusion_qkv(
             batch, hq, hk, sq, sk, d_head, d_head_v, device
         )
@@ -701,11 +659,9 @@ def generate_test_tensors(
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "padded":
-        # Ulysses-style head padding. Models whose head count does not divide the sequence-parallel
-        # degree are padded up with empty heads, so a shard can hold (batch, head) slices that are
-        # entirely zero in Q, K and V. Z-Image does exactly this: rank 7 of its captures has 4 of 8
-        # heads empty. That is not a corner case, and it found a NaN in the per-channel FP8 V
-        # quantizer, which divides by a zero amax, that no other distribution here reaches.
+        # Ulysses head padding: a shard can hold (batch, head) slices entirely zero in Q, K and V.
+        # Z-Image rank 7 has 4 of 8 heads empty. Found a NaN in the per-channel FP8 V quantizer,
+        # which divides by a zero amax.
         q, k, v = _generate_diffusion_qkv(
             batch, hq, hk, sq, sk, d_head, d_head_v, device
         )
@@ -1706,10 +1662,9 @@ def make_reference_output(
     )
     ref = args.ref
 
-    # The torch reference (attention_ref) materializes a full [b, hq, sq, sk] fp32 scores tensor and
-    # softmaxes it; past ~32 GiB that path becomes numerically UNRELIABLE -- the cosine collapses
-    # even for a correct kernel (measured ~0.45 at sq=sk=75520, while sq=sk=32768 ~21 GiB is fine).
-    # Warn and point the user at --ref aiter_bf16, which streams the scores and stays accurate.
+    # attention_ref materializes a full [b, hq, sq, sk] fp32 scores tensor; past ~32 GiB it becomes
+    # numerically unreliable and cosine collapses even for a correct kernel (~0.45 at sq=sk=75520,
+    # while 32768 is fine). Point the user at --ref aiter_bf16, which streams the scores instead.
     if ref == "torch":
         b_, sq_, hq_, _ = q_bshd.shape
         sk_ = k_bshd.shape[1]
