@@ -38,8 +38,8 @@ Stage then one-line commit when that is the ticket convention.
 
 ## Progress
 
-- [ ] 0. Decode baseline: ISA / PMC / ATT vs Live AMD M=1 and M=8
-- [ ] 1. AMD-matched decode K LDS map + inverse QK reads
+- [x] 0. Decode baseline: ISA / PMC / ATT vs Live AMD M=1 and M=8
+- [x] 1. AMD-matched decode K LDS map + inverse QK reads
 - [ ] 2. AMD-matched decode V publication (`ds_write_b64` ×4) + inverse PV reads
 - [ ] 3. Cut leftover permute / bpermute / extra waits that AMD decode does not emit
 - [ ] 4. Waitcnt / barrier schedule toward AMD’s decode mix
@@ -227,20 +227,104 @@ explicitly reopens it for an AMD-matched body:
 Snapshot HEAD before changing the decode branch. Do not edit the
 kernel in this phase.
 
-- [ ] Dump FlyDSL decode ISA (`FLYDSL_DUMP_IR=1`, `CACHE=0`) for
+- [x] Dump FlyDSL decode ISA (`FLYDSL_DUMP_IR=1`, `CACHE=0`) for
       `bn16_blk256_ns32`. Compare opcode mix to
       `/tmp/k2_amd_lowering_compare/{m1,m8}/kernel.s` (or a fresh
       Live AMD capture on GPU 6).
-- [ ] Record five-run wrapper medians `M=1/8/512` vs live AMD.
+- [x] Record five-run wrapper medians `M=1/8/512` vs live AMD.
       Optional: rocprof split vs merge so wrapper is not the only
       number.
-- [ ] PMC M=1 (and M=8 if cheap) per-wave + totals vs
+- [x] PMC M=1 (and M=8 if cheap) per-wave + totals vs
       `tickets/1047/tmp/k2_overlay_pmc/`.
-- [ ] ATT M=8 vs `tickets/1047/tmp/k2_overlay_att/att_amd_m8/` and
+- [x] ATT M=8 vs `tickets/1047/tmp/k2_overlay_att/att_amd_m8/` and
       `att_flydsl_m8/`. Confirm stall mix is still waitcnt-dominated.
-- [ ] **Done when:** the table in **Target Live AMD decode lowering**
+- [x] **Done when:** the table in **Target Live AMD decode lowering**
       is pasted as a dated HEAD row under this phase, with paths to
       dumps. No kernel diff.
+
+Measured 2026-09-24 on GPU 6 / gfx950, `flydsl_venv`, `CACHE=0` for
+ISA + wrapper, `CACHE=1` after fill for PMC/ktrace. No kernel diff.
+Dumps: `tickets/1047/tmp/k2_decode_baseline/`
+(`isa_flydsl_m1/launch/22_final_isa.s`, `amd_m{1,8}_split.s`,
+`pmc_{flydsl,amd}_m{1,8}/`, `ktrace_{flydsl,amd}_m{1,8}/`).
+ATT reused from overlay (`tickets/1047/tmp/k2_overlay_att/att_*_m8/`);
+the decode HSACO name is still
+`qsa_k2_family_a_port_split_ps16_bn16_blk256_ns32_qkk32`.
+
+**HEAD opcode mix** (static ISA; AMD LDS/VGPR from this session’s
+rocprof dispatch when `.amdhsa_*` is missing):
+
+| | AMD M=1 | AMD M=8 | FlyDSL decode HEAD |
+|--|--:|--:|--:|
+| BLOCK_N / threads / splits | 16 / 256 / **64** | 16 / 256 / **32** | 16 / 256 / **32** |
+| Split WGs | **128** | **512** | **64** / **512** |
+| LDS B | 8192 | 8192 | 8192 |
+| VGPR / SGPR | 108 / 80 | 108 / 80 | 108 / 54 (ISA) / 64 (rocprof) |
+| Static inst | 1002 | 1017 | 1070 |
+| `buffer_load_dwordx4` / `dword` | 6 / 12 | 6 / 12 | **12 / 0** |
+| `ds_write_b128` / `b64` / `b32` | **4 / 4 / 0** | 4 / 4 / 0 | **4 / 0 / 2** |
+| `ds_read_b128` / `tr16` | 16 / 4 | 16 / 4 | 16 / 4 |
+| K32 / K16 MFMA | 8 / 4 | 8 / 4 | 8 / 4 |
+| `s_waitcnt` / `s_barrier` | **33 / 5** | 34 / 5 | **106 / 5** |
+| `v_perm` / `ds_bpermute` | **0 / 0** | 0 / 0 | **34 / 12** |
+
+**Wrapper** (CUDA-event five-run median, warmup 10 then 5×200 iters,
+interleaved). Prefill is the sanity row. AMD **decode wrapper** this
+session is inflated vs the retained 9.93 / 13.30 µs; **do not use it
+as the split bar**. Kernel-trace below is the decode split number.
+
+| M | FlyDSL µs | AMD µs |
+|--:|--:|--:|
+| 1 | 19.78 | 37.27 |
+| 8 | 20.01 | 37.53 |
+| 512 | 155.81 | 199.68 |
+
+**Kernel-trace split vs merge** (`rocprofv3 --kernel-trace --stats`,
+warmup 5 + 40 timed; mean of timed dispatches):
+
+| M | Kernel | FlyDSL µs | AMD µs | ratio |
+|--:|--|--:|--:|--:|
+| 1 | split | **11.674** | **6.406** | **1.82×** |
+| 1 | merge | 3.633 | 3.550 | 1.02× |
+| 1 | split+merge | 15.307 | 9.956 | 1.54× |
+| 8 | split | **14.959** | **10.525** | **1.42×** |
+| 8 | merge | 3.623 | 3.027 | 1.20× |
+| 8 | split+merge | 18.582 | 13.552 | 1.37× |
+
+AMD split times match the older rocprof keep-gate (~6.8 / ~11.2 µs).
+Merge is already near parity. The decode gap is the split kernel.
+
+**PMC last split dispatch** (sum of SQ instances; per wave in
+parentheses):
+
+| | FlyDSL M=1 | AMD M=1 | FlyDSL M=8 | AMD M=8 |
+|--|--:|--:|--:|--:|
+| waves | 256 | **512** | 2048 | 2048 |
+| WGs | 64 | 128 | 512 | 512 |
+| busy | 2903.5 | 769.6 | 452.6 | 306.2 |
+| conflict | **1257.8** | **80.6** | **1257.8** | 161.2 |
+| wait-LDS | 345.2 | 49.8 | 812.6 | 149.7 |
+| MFMA | 48.4 (tot **12384**) | 24.2 (tot **12384**) | 48.4 (tot 99072) | 48.4 (tot 99072) |
+| VALU | 814.9 | 640.7 | 814.9 | 983.3 |
+| VMEM | 49.2 | 39.2 | 49.2 | 71.5 |
+
+M=1 MFMA **totals match**; FlyDSL’s 2× MFMA/wave is the 32-vs-64
+split grid. Conflict/wave is still **15.6×** AMD at M=1 and **7.8×**
+at M=8. That is the first physical miss for phases 1–2.
+
+**ATT M=8 stall mix** (overlay traces; decode body unchanged):
+
+| | AMD | FlyDSL |
+|--|--:|--:|
+| total stall / latency | 99,704 / 146,168 | 182,776 / 240,456 (1.65× lat) |
+| stall `s_waitcnt` | 64.7% | **73.0%** |
+| stall `s_barrier` | 5.8% | 8.5% |
+| top waits | `vmcnt(3/5/1)` | `lgkmcnt(0)`, `vmcnt(0/1/7)` |
+| dynamic `v_perm` / `bpermute` hits | 0 / 0 | 832 / 160 |
+| dynamic `ds_write_b64` hits | 128 | 0 |
+
+Waitcnt still dominates FlyDSL decode. Phase 1 starts from this
+opcode/conflict gap, not from wrapper µs.
 
 ### 1. AMD-matched decode K LDS map + inverse QK reads
 
@@ -251,15 +335,66 @@ Port the **decode-sized** inverse (BN16, 4 waves, one 16-token
 subtile), behind `decode_tr_pv`. Do not copy prefill’s 16-store
 ladder or V `write2st64` map.
 
-- [ ] Emit 4× `ds_write_b128` whose addresses match AMD decode K
+- [x] Emit 4× `ds_write_b128` whose addresses match AMD decode K
       (byte-level, not “also XOR”).
-- [ ] QK A reads inverse that map with 16× `ds_read_b128` and the
+- [x] QK A reads inverse that map with 16× `ds_read_b128` and the
       existing 8× K32 gemm. No extra `v_perm` on the K path if AMD
       has none.
-- [ ] Oracle decode+prefill. Record wall / ISA / PMC. Keep if the
+- [x] Oracle decode+prefill. Record wall / ISA / PMC. Keep if the
       K opcode line moved toward AMD and `err=0`.
-- [ ] **Done when:** decode K store/read mix is AMD’s 4 write-b128 /
+- [x] **Done when:** decode K store/read mix is AMD’s 4 write-b128 /
       16 read-b128, prefill ISA unchanged.
+
+Kept (2026-09-24). Decode K stores now use Live AMD’s 256-thread
+byte map, behind `decode_tr_pv` only:
+
+`(tid*16) ^ ((tid & 0xe0)>>1)` and `(that ^ 0x80) + 4096`.
+
+QK A is the inverse via `amd_decode_k_elem` / `load_amd_k8`. Prefill
+stays on `amd_k_elem`. Oracle decode+prefill: **2 passed**. Prefill
+ISA sha matches the st64-imm keeper (`64ee586155fc6a63`).
+
+**ISA** (`tickets/1047/tmp/k2_decode_kmap_isa/launch/22_final_isa.s`)
+vs phase-0 HEAD:
+
+| | HEAD | phase 1 | AMD decode |
+|--|--:|--:|--:|
+| `ds_write_b128` | 4 | 4 (K pair now `offset:4096`) | 4 (`offset:4096`) |
+| `ds_read_b128` | 16 | 16 | 16 |
+| K32 / K16 | 8 / 4 | 8 / 4 | 8 / 4 |
+| `s_waitcnt` | 106 | **102** | 33 |
+| `v_bitop3` | 9 | **5** | 6 |
+| `v_perm` / `bpermute` | 34 / 12 | 34 / 12 | 0 / 0 |
+
+K publication is the AMD `offset:4096` pair. Overlay QK still reads
+8 D-chunks as 4+4 `offset:4096` (AMD’s extra 8 QK reads use
+`offset:256` because its C map is `[M,N]`, not `K@Q^T`). V overlay
+is unchanged (`ds_write_b32`, plus the pre-existing `offset:256`
+b128 pair).
+
+**Wall** (five-run median, interleaved; not a keep-gate) vs phase 0:
+
+| M | phase 0 FlyDSL | phase 1 FlyDSL | AMD wrapper |
+|--:|--:|--:|--:|
+| 1 | 19.78 | **19.22** | 36.58 |
+| 8 | 20.01 | **19.35** | 36.69 |
+| 512 | 155.81 | 156.30 | 199.82 |
+
+**Kernel-trace M=1 split:** **10.459 µs** vs phase 0 **11.674 µs**
+vs AMD **6.406 µs**. Merge still ~3.65 µs.
+
+**PMC M=1** (`tickets/1047/tmp/k2_decode_kmap/pmc_flydsl_m1/`) per
+wave vs phase 0:
+
+| | phase 0 | phase 1 | AMD |
+|--|--:|--:|--:|
+| conflict | 1257.8 | **677.2** | 80.6 |
+| wait-LDS | 345.2 | **206.5** | 49.8 |
+| busy | 2903.5 | 2715.6 | 769.6 |
+| MFMA tot | 12384 | 12384 | 12384 |
+
+Conflict/wave almost halved. Still 8.4× AMD; phase 2 is V
+publication.
 
 ### 2. AMD-matched decode V publication + inverse PV reads
 
@@ -373,9 +508,13 @@ Leave these open until the named phase produces evidence. When
 resolved, move the answer into **Locked decisions** and check the
 item.
 
-- [ ] Whether AMD decode K XOR is the same byte formula as prefill
+- [x] Whether AMD decode K XOR is the same byte formula as prefill
       `amd_k_elem` scaled to 16 tokens / 4 waves, or a distinct
-      decode map (phase 1).
+      decode map (phase 1). **Distinct.** Prefill uses
+      `(tid*16)^((tid&0x60)>>1)` plus `group/quarter` * 2048/8192
+      into 32 KiB. Decode uses `(tid*16)^((tid&0xe0)>>1)` and
+      `(that^0x80)+4096` into 8 KiB. Do not reuse `amd_k_elem` on
+      decode.
 - [ ] Whether AMD’s 4 `ds_write_b64` are one 8×bf16 vector split in
       the compiler or an authored 64-bit TV copy (phase 2).
 - [ ] Whether leftover FlyDSL `v_perm` is softmax/epilogue or K/V
