@@ -281,7 +281,7 @@ def mla_decode_v4_asm_gfx1250_eager(
     # ---- launch geometry (mirror asm_mla_v4.cu) ----------------------------
     #   gdx = ceil(gqa*max_seqlen_q / sub_Q), gdy = num_seqs, gdz = num_kv_splits
     #   block = 4 * warp_size
-    block_dim = 4 * get_warp_size()
+    block_dim = 4 * get_warp_size(Q.device)
     q_seq_lens_internal = gqa_ratio * max_seqlen_q
     gdx = (q_seq_lens_internal + sub_Q - 1) // sub_Q
     gdy = num_seqs
@@ -491,7 +491,7 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
         launch_co_cluster(
             func,
             (nsplit * gdx, num_seqs, 1),
-            (4 * get_warp_size(), 1, 1),
+            (4 * get_warp_size(Q.device), 1, 1),
             args,
             cluster_dim=(nsplit, 1, 1),
         )
