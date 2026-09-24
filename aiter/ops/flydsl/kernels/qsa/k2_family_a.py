@@ -23,7 +23,15 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import BFloat16, Float32, Int32, const_expr, gpu, range_constexpr
+from flydsl.expr import (
+    BFloat16,
+    Float32,
+    Int32,
+    Int64,
+    const_expr,
+    gpu,
+    range_constexpr,
+)
 from flydsl.expr import math as fxmath
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
@@ -347,15 +355,24 @@ def build_qsa_k2_family_a_module(
             q_frag = fx.make_fragment_like(q_src)
             fx.copy(g_copy, q_src, q_frag)
             q_vec = fx.Vector(fx.memref_load_vec(q_frag))
-            q_regs.append(
-                fx.Vector.from_elements(
-                    [
-                        q_live.select(q_vec[i].to(Float32), Float32(0.0)).to(BFloat16)
-                        for i in range_constexpr(qk_vec)
-                    ],
-                    BFloat16,
+            if const_expr(decode_tr_pv):
+                # Packed cndmask. The per-element f32 round-trip packed with
+                # v_perm; AMD zeros OOB heads at the load mask instead.
+                q_regs.append(
+                    q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
                 )
-            )
+            else:
+                q_regs.append(
+                    fx.Vector.from_elements(
+                        [
+                            q_live.select(q_vec[i].to(Float32), Float32(0.0)).to(
+                                BFloat16
+                            )
+                            for i in range_constexpr(qk_vec)
+                        ],
+                        BFloat16,
+                    )
+                )
 
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
         init_acc.append(Float32(float("-inf")))
@@ -580,14 +597,21 @@ def build_qsa_k2_family_a_module(
             tile_max = _neg_inf()
             scores = []
             score_lives = []
+            live_bits = Int64(0)
+            if const_expr(decode_tr_pv):
+                live_bits = Int64(fx.rocdl.ballot(Int64.ir_type, live))
             for ng in range_constexpr(n_subtiles):
                 sc = []
                 lives = []
                 for i in range_constexpr(4):
                     n = Int32(ng * 16) + lane_kg * Int32(4) + Int32(i)
-                    score_live = (
-                        gpu.shuffle_idx(live.select(one, zero), n, Int32(64)) != zero
-                    )
+                    if const_expr(decode_tr_pv):
+                        score_live = ((live_bits >> Int64(n)) & Int64(1)) != Int64(0)
+                    else:
+                        score_live = (
+                            gpu.shuffle_idx(live.select(one, zero), n, Int32(64))
+                            != zero
+                        )
                     score = qk_accs[ng][i] * softmax_scale_log2
                     score = score_live.select(score, _neg_inf())
                     sc.append(score)
@@ -696,13 +720,6 @@ def build_qsa_k2_family_a_module(
         m_final = Float32(results[out_chunks])
         l_final = Float32(results[out_chunks + 1])
         h0 = lane_kg * Int32(4)
-        fx.Vector.from_elements(
-            [
-                gpu.shuffle_idx(m_final, h0 + Int32(i), Int32(64))
-                for i in range_constexpr(4)
-            ],
-            Float32,
-        )
         l4 = fx.Vector.from_elements(
             [
                 gpu.shuffle_idx(l_final, h0 + Int32(i), Int32(64))
