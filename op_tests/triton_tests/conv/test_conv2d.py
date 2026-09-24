@@ -38,12 +38,16 @@ import torch
 import torch.nn.functional as F
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
+from aiter.ops.triton.conv import _prepack as conv_prepack
+from aiter.ops.triton.conv._prepack import clear_conv2d_weight_pack_caches
 from aiter.ops.triton.utils import conv_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
+    CONV2D_WEIGHT_PACK_CACHE_NAMES,
     ORDERED_METHODS,
     TestSuite,
+    assert_weight_pack_cache_clear_is_scoped,
     dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
@@ -155,6 +159,15 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
         assert y.is_contiguous(), (
             f"expected contiguous output, got strides={y.stride()}"
         )
+
+
+def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
+    assert_weight_pack_cache_clear_is_scoped(
+        monkeypatch,
+        conv_prepack,
+        clear_conv2d_weight_pack_caches,
+        CONV2D_WEIGHT_PACK_CACHE_NAMES,
+    )
 
 
 # -- Configuration lookup and routing (no kernel launches) -------------------
