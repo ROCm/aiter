@@ -16,6 +16,7 @@ _gemm_group32_repr = make_kernel_repr(
         "BLOCK_SIZE_K",
         "GROUP_N",
         "SPLITK_BLOCK_SIZE",
+        "FUSED_SPLITS",
         "N_FIRST",
         "N",
         "K",
@@ -29,11 +30,52 @@ _gemm_group32_packed_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "K_PACK",
+        "SPLITK_BLOCK_SIZE",
+        "FUSED_SPLITS",
         "N",
         "K",
         "LAUNCH_OPTIONS",
     ],
 )
+
+
+@triton.jit
+def _tile_on_xcd(N: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SPLITS: tl.constexpr):
+    """(pid_m, pid_n, tile, split) of a 1D grid, all splits of a tile on one XCD.
+
+    CTAs go to XCDs by pid % 8, a multiple of every gfx950 XCD count.
+    """
+    pid = tl.program_id(0)
+    tile = (pid // 8 // SPLITS) * 8 + pid % 8
+    grid_n: tl.constexpr = (N + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    return tile // grid_n, tile % grid_n, tile, pid // 8 % SPLITS
+
+
+@triton.jit
+def _sum_splits_on_xcd(
+    partial, c_ptrs, mask, slot, counter, split, SPLITS: tl.constexpr
+):
+    """The tile's last CTA to arrive sums its splits in split order.
+
+    The splits share one XCD's L2, so a completed store is visible without an
+    agent-scope release and its L2 writeback.
+    """
+    BM: tl.constexpr = partial.shape[0]
+    BN: tl.constexpr = partial.shape[1]
+    local = tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :]
+    tl.store(slot + split * BM * BN + local, partial)
+    # debug_barrier is a bare s_barrier: drain this wave's stores first.
+    tl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0)", "=v,v", [split], dtype=tl.int32, is_pure=False, pack=1
+    )
+    tl.debug_barrier()
+    if tl.atomic_add(counter, 1, sem="acq_rel", scope="cta") == SPLITS - 1:
+        total = tl.zeros((BM, BN), tl.float32)
+        for s in tl.static_range(SPLITS):
+            # .cv skips this CU's L1, which never saw the other splits.
+            total += tl.load(slot + s * BM * BN + local, cache_modifier=".cv")
+        tl.store(c_ptrs, total.to(c_ptrs.dtype.element_ty), mask)
+        tl.store(counter, 0)
 
 
 @triton.jit(repr=_gemm_group32_repr, do_not_specialize=["M"])
@@ -43,6 +85,8 @@ def _gemm_a8w8_blockscale_group32_kernel(
     a_scale_ptr,
     b_scale_ptr,
     c_ptr,
+    ws_ptr,
+    cnt_ptr,
     # Runtime, not constexpr: M is the token count, and specializing on it
     # recompiles the kernel for every prefill chunk length.
     M,
@@ -55,18 +99,28 @@ def _gemm_a8w8_blockscale_group32_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     LAUNCH_OPTIONS: tl.constexpr,
     N_FIRST: tl.constexpr = False,
+    FUSED_SPLITS: tl.constexpr = 1,
 ):
     """E4M3 x E4M3 with E8M0 group scales, on the CDNA4 microscaling MFMA.
 
     A tile spans BLOCK_SIZE_K/32 scale groups. Below a K tile of 64,
     dot_scaled lowers to slower BF16 emulation instead of microscaling MFMA.
+    FUSED_SPLITS > 1 sums split-K partials in this launch on a 1D grid;
+    otherwise c_ptr takes one FP32 partial per program_id(2).
     """
     tl.static_assert(BLOCK_SIZE_K >= 64 and BLOCK_SIZE_K % 32 == 0)
-    # The first grid dimension advances fastest. N-first traversal reuses A;
-    # M-first traversal reuses B. The wrapper swaps the launch dimensions.
-    row = tl.program_id(1 if N_FIRST else 0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    col = tl.program_id(0 if N_FIRST else 1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    split = tl.program_id(2)
+    if FUSED_SPLITS > 1:
+        pid_m, pid_n, tile, split = _tile_on_xcd(N, BLOCK_SIZE_N, FUSED_SPLITS)
+        if pid_m * BLOCK_SIZE_M >= M:
+            return
+    else:
+        # The first grid dimension advances fastest. N-first traversal reuses
+        # A; M-first traversal reuses B. The wrapper swaps the launch dimensions.
+        pid_m = tl.program_id(1 if N_FIRST else 0)
+        pid_n = tl.program_id(0 if N_FIRST else 1)
+        split = tl.program_id(2)
+    row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    col = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     groups: tl.constexpr = K // 32
     ks = tl.arange(0, BLOCK_SIZE_K)
     gs = tl.arange(0, BLOCK_SIZE_K // 32)
@@ -106,11 +160,19 @@ def _gemm_a8w8_blockscale_group32_kernel(
         accumulator = tl.dot_scaled(
             a, a_code, "e4m3", b.T, b_code, "e4m3", acc=accumulator
         )
-    tl.store(
-        c_ptr + split * M * N + row[:, None] * N + col[None, :],
-        accumulator,
-        rows & cols[None, :],
-    )
+    c_ptrs = c_ptr + row[:, None] * N + col[None, :]
+    if FUSED_SPLITS > 1:
+        _sum_splits_on_xcd(
+            accumulator,
+            c_ptrs,
+            rows & cols[None, :],
+            ws_ptr + tile * (FUSED_SPLITS * BLOCK_SIZE_M * BLOCK_SIZE_N),
+            cnt_ptr + tile,
+            split,
+            FUSED_SPLITS,
+        )
+    else:
+        tl.store(c_ptrs + split * M * N, accumulator, rows & cols[None, :])
 
 
 @triton.jit(repr=_gemm_group32_packed_repr, do_not_specialize=["M"])
@@ -120,6 +182,8 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
     a_scale_ptr,
     b_scale_ptr,
     c_ptr,
+    ws_ptr,
+    cnt_ptr,
     M,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -128,30 +192,42 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     K_PACK: tl.constexpr,
     LAUNCH_OPTIONS: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr = 0,
+    FUSED_SPLITS: tl.constexpr = 1,
 ):
     """Small-M group32 GEMM with K panels packed into MFMA rows/columns.
 
     Each packed row/column retains its own E8M0 scales. Only matching panel
     pairs contribute to the output; cross-panel products are discarded. One
-    CTA owns the full K reduction, so no partial buffer or second launch is
-    needed. BLOCK_SIZE_M is an unpacked token tile, independent of runtime M.
+    CTA owns the K reduction, or with FUSED_SPLITS > 1 one SPLITK_BLOCK_SIZE
+    of it, summed in this launch. BLOCK_SIZE_M is an unpacked token tile,
+    independent of runtime M.
     """
     tl.static_assert(K_PACK == 1 or K_PACK == 2 or K_PACK == 4)
     tl.static_assert(BLOCK_SIZE_M * K_PACK >= 16)
     tl.static_assert(BLOCK_SIZE_K >= 128 and BLOCK_SIZE_K % 32 == 0)
-    rows = (
-        tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M * K_PACK) // K_PACK
-    )
+    STEP: tl.constexpr = BLOCK_SIZE_K * K_PACK
+    if FUSED_SPLITS > 1:
+        tl.static_assert(SPLITK_BLOCK_SIZE % STEP == 0)
+        pid_m, pid_n, tile, split = _tile_on_xcd(N, BLOCK_SIZE_N, FUSED_SPLITS)
+        if pid_m * BLOCK_SIZE_M >= M:
+            return
+        start = split * SPLITK_BLOCK_SIZE
+        stop = tl.minimum(start + SPLITK_BLOCK_SIZE, K)
+    else:
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        start = 0
+        stop = K
+    rows = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M * K_PACK) // K_PACK
     a_panel = tl.arange(0, BLOCK_SIZE_M * K_PACK) % K_PACK
-    cols = (
-        tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N * K_PACK) // K_PACK
-    )
+    cols = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N * K_PACK) // K_PACK
     b_panel = tl.arange(0, BLOCK_SIZE_N * K_PACK) % K_PACK
     ks = tl.arange(0, BLOCK_SIZE_K)
     gs = tl.arange(0, BLOCK_SIZE_K // 32)
     groups: tl.constexpr = K // 32
     accumulator = tl.zeros((BLOCK_SIZE_M * K_PACK, BLOCK_SIZE_N * K_PACK), tl.float32)
-    for base in range(0, K, BLOCK_SIZE_K * K_PACK):
+    for base in range(start, stop, STEP):
         ak = base + a_panel[:, None] * BLOCK_SIZE_K + ks[None, :]
         bk = base + b_panel[:, None] * BLOCK_SIZE_K + ks[None, :]
         a = tl.load(
@@ -187,13 +263,22 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
         pair[None, None, :, None] == pair[None, None, None, :], panels, 0.0
     )
     output = tl.sum(tl.sum(diagonal, 3), 2)
-    row = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    col = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    tl.store(
-        c_ptr + row[:, None] * N + col[None, :],
-        output,
-        (row[:, None] < M) & (col[None, :] < N),
-    )
+    row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    col = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + row[:, None] * N + col[None, :]
+    mask = (row[:, None] < M) & (col[None, :] < N)
+    if FUSED_SPLITS > 1:
+        _sum_splits_on_xcd(
+            output,
+            c_ptrs,
+            mask,
+            ws_ptr + tile * (FUSED_SPLITS * BLOCK_SIZE_M * BLOCK_SIZE_N),
+            cnt_ptr + tile,
+            split,
+            FUSED_SPLITS,
+        )
+    else:
+        tl.store(c_ptrs, output, mask)
 
 
 def _get_config(M: int, N: int, K: int):

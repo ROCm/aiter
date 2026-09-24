@@ -11,6 +11,7 @@ if not torch.cuda.is_available():
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
+from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale_group32 as group32_op
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
     gemm_a8w8_blockscale_group32,
 )
@@ -291,3 +292,142 @@ def test_public_small_n_scale_layouts(n, group_n, raw_views):
     torch.testing.assert_close(
         actual.double(), expected, rtol=3e-5, atol=5e-5 * expected.abs().max().item()
     )
+
+
+_FUSED_TILE = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 256,
+    "num_warps": 2,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "NUM_KSPLIT": 5,
+    "N_FIRST": False,
+    "REDUCE_BLOCK_SIZE_M": 32,
+    "REDUCE_BLOCK_SIZE_N": 32,
+    "FUSED_SPLITK": True,
+}
+_FUSED_PACKED = dict(
+    _FUSED_TILE,
+    packed={
+        "BLOCK_SIZE_M": 8,
+        "BLOCK_SIZE_N": 16,
+        "BLOCK_SIZE_K": 256,
+        "K_PACK": 2,
+        "NUM_KSPLIT": 5,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+    },
+)
+_FUSED = {"tile": _FUSED_TILE, "packed": _FUSED_PACKED}
+
+
+def _assert_matches_reference(actual, x, w, xs, ws, dtype, weight_group_rows=32):
+    expected = run_torch(x, w, xs, ws, weight_group_rows)
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(dtype).float(),
+        rtol=(
+            0.016
+            if dtype == torch.bfloat16
+            else 0.002 if dtype == torch.float16 else 3e-5
+        ),
+        atol=5e-5 * expected.abs().max().item(),
+    )
+
+
+@pytest.mark.parametrize("variant", ["tile", "packed"])
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 512, 5120), (3, 2053, 1280), (16, 1152, 5120), (37, 5120, 2304)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_split_k_matches_reference(variant, m, n, k, dtype):
+    x, w, xs, ws = generate_inputs(m, n, k)
+    actual = gemm_a8w8_blockscale_group32(
+        x, w, xs, ws, dtype=dtype, config=_FUSED[variant]
+    )
+    _assert_matches_reference(actual, x, w, xs, ws, dtype)
+
+
+def test_fused_split_k_row_scales():
+    x, w, xs, ws = generate_inputs(5, 2053, 1280, weight_group_rows=1)
+    actual = gemm_a8w8_blockscale_group32(
+        x, w, xs, ws, weight_group_rows=1, dtype=torch.float32, config=_FUSED_TILE
+    )
+    _assert_matches_reference(actual, x, w, xs, ws, torch.float32, 1)
+
+
+@pytest.mark.parametrize("variant", ["tile", "packed"])
+def test_fused_split_k_is_deterministic_and_rezeroes_counters(variant):
+    x, w, xs, ws = generate_inputs(4, 1152, 5120)
+    run = lambda: gemm_a8w8_blockscale_group32(
+        x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+    )
+    first = run()
+    # A stale counter or an early partial read would change a later sum.
+    assert all(torch.equal(first, run()) for _ in range(50))
+    torch.cuda.synchronize()
+    assert not group32_op._split_counters(x.device).any()
+
+
+@pytest.mark.parametrize("variant", ["tile", "packed"])
+def test_fused_split_k_graph_replay_on_warmed_stream(variant):
+    x, w, xs, ws = generate_inputs(6, 1152, 5120)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        gemm_a8w8_blockscale_group32(
+            x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+        )
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = gemm_a8w8_blockscale_group32(
+            x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+        )
+    for factor in (2, 0.5):
+        x.copy_((x.float() * factor).to(x.dtype))
+        xs.view(torch.uint8).add_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_matches_reference(actual, x, w, xs, ws, torch.float32)
+
+
+@pytest.mark.parametrize("variant", ["tile", "packed"])
+def test_fused_split_k_first_use_inside_capture(variant):
+    # Before torch 2.10 counters cannot be allocated mid-capture: runs unfused.
+    x, w, xs, ws = generate_inputs(6, 1152, 5120)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gemm_a8w8_blockscale_group32(
+            x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_matches_reference(actual, x, w, xs, ws, torch.float32)
+
+
+@pytest.mark.parametrize("variant", ["tile", "packed"])
+def test_fused_split_k_concurrent_streams(variant):
+    inputs = [generate_inputs(m, 1152, 5120) for m in (3, 5)]
+    expected = [
+        gemm_a8w8_blockscale_group32(*t, dtype=torch.float32, config=_FUSED[variant])
+        for t in inputs
+    ]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream() for _ in inputs]
+    outputs = [[], []]
+    # Unsynchronized interleaving keeps both streams' reductions in flight.
+    for _ in range(40):
+        for i, (stream, operands) in enumerate(zip(streams, inputs)):
+            with torch.cuda.stream(stream):
+                outputs[i].append(
+                    gemm_a8w8_blockscale_group32(
+                        *operands, dtype=torch.float32, config=_FUSED[variant]
+                    )
+                )
+    torch.cuda.synchronize()
+    for want, got in zip(expected, outputs):
+        assert all(torch.equal(want, y) for y in got)

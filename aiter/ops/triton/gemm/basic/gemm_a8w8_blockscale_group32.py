@@ -13,6 +13,45 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale_group32 im
     _gemm_a8w8_blockscale_group32_packed_kernel,
     _get_config,
 )
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
+
+# One arrival counter per output tile of a fused split-K launch.
+_SPLIT_COUNTERS = 1 << 16
+_split_counters_by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _split_counters(device: torch.device) -> torch.Tensor | None:
+    """Zeroed arrival counters per (device, stream), as for the a16w16 split-K
+    semaphores; kernels re-zero what they use. None when a stream's first use
+    falls inside a capture that cannot allocate outside the graph pool."""
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    counters = _split_counters_by_stream.get(key)
+    if counters is None:
+        if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
+            return None
+        with persistent_alloc(device):
+            counters = torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
+        _split_counters_by_stream[key] = counters
+    return counters
+
+
+def _split_k_partition(k: int, splits: int, step: int) -> tuple[int, int]:
+    """Partition size rounded up to whole steps, and the non-empty count."""
+    part = -(-k // splits)
+    size = -(-part // step) * step
+    return size, -(-k // size)
+
+
+def _fused_workspace(y, tiles, splits, block_m, block_n):
+    """(grid, partials, counters) for fused split-K, or None to run unfused."""
+    assert tiles <= _SPLIT_COUNTERS, "Too many output tiles for fused split-K"
+    counters = _split_counters(y.device)
+    if counters is None:
+        return None
+    partials = torch.empty(
+        tiles * splits * block_m * block_n, dtype=torch.float32, device=y.device
+    )
+    return (-(-tiles // 8) * 8 * splits,), partials, counters
 
 
 def gemm_a8w8_blockscale_group32(
@@ -39,7 +78,9 @@ def gemm_a8w8_blockscale_group32(
     None uses NUM_KSPLIT and the optional packed-K variant from the tuning table.
     config optionally overrides the table, following the Triton GEMM interface.
     Explicit partitions are rounded to whole K tiles, then empty partitions
-    are removed. Split-K uses the shared AITER reduction without atomics.
+    are removed. Split-K uses the shared AITER reduction without atomics;
+    a table FUSED_SPLITK (or packed NUM_KSPLIT) instead sums each tile's
+    partitions within the launch, on one XCD.
 
     This backend requires gfx950 microscaling MFMA. Small M is limited by
     weight bandwidth and occupancy; packing K panels fills MFMA rows without
@@ -103,22 +144,38 @@ def gemm_a8w8_blockscale_group32(
     launch_repr = tuple(launch_options.items())
     if packed is not None:
         block_m, block_n = packed["BLOCK_SIZE_M"], packed["BLOCK_SIZE_N"]
-        _gemm_a8w8_blockscale_group32_packed_kernel[
-            (-(-M // block_m), -(-N // block_n))
-        ](
+        block_k, k_pack = packed["BLOCK_SIZE_K"], packed["K_PACK"]
+        grid_m, grid_n = -(-M // block_m), -(-N // block_n)
+        split_k_size, num_splits = _split_k_partition(
+            K, packed.get("NUM_KSPLIT", 1), block_k * k_pack
+        )
+        workspace = None
+        if num_splits > 1:
+            workspace = _fused_workspace(
+                y, grid_m * grid_n, num_splits, block_m, block_n
+            )
+        if workspace is None:
+            workspace = (grid_m, grid_n), y, y
+            split_k_size, num_splits = 0, 1
+        grid, partials, counters = workspace
+        _gemm_a8w8_blockscale_group32_packed_kernel[grid](
             x,
             w,
             x_scale,
             w_scale,
             y,
+            partials,
+            counters,
             M,
             N,
             K,
             block_m,
             block_n,
-            packed["BLOCK_SIZE_K"],
-            packed["K_PACK"],
+            block_k,
+            k_pack,
             LAUNCH_OPTIONS=launch_repr,
+            SPLITK_BLOCK_SIZE=split_k_size,
+            FUSED_SPLITS=num_splits,
             **launch_options,
         )
         return y
@@ -128,22 +185,32 @@ def gemm_a8w8_blockscale_group32(
     block_k = config["BLOCK_SIZE_K"]
     n_first = config["N_FIRST"]
     grid_m, grid_n = -(-M // block_m), -(-N // block_n)
+    fused = split_k is None and config.get("FUSED_SPLITK", False)
     split_k = config["NUM_KSPLIT"] if split_k is None else split_k
-    split_k_size = -(-K // split_k)
-    split_k_size = -(-split_k_size // block_k) * block_k
-    num_splits = -(-K // split_k_size)
-    partial = (
-        y
-        if num_splits == 1
-        else torch.empty((num_splits, M, N), dtype=torch.float32, device=x.device)
-    )
-    grid = (grid_n, grid_m, num_splits) if n_first else (grid_m, grid_n, num_splits)
+    split_k_size, num_splits = _split_k_partition(K, split_k, block_k)
+    workspace = None
+    if fused and num_splits > 1:
+        workspace = _fused_workspace(y, grid_m * grid_n, num_splits, block_m, block_n)
+    if workspace is not None:
+        grid, partials, counters = workspace
+        out, fused_splits = y, num_splits
+    else:
+        out = (
+            y
+            if num_splits == 1
+            else torch.empty((num_splits, M, N), dtype=torch.float32, device=x.device)
+        )
+        grid = (grid_n, grid_m, num_splits) if n_first else (grid_m, grid_n, num_splits)
+        partials = counters = out
+        fused_splits = 1
     _gemm_a8w8_blockscale_group32_kernel[grid](
         x,
         w,
         x_scale,
         w_scale,
-        partial,
+        out,
+        partials,
+        counters,
         M,
         N,
         K,
@@ -154,13 +221,14 @@ def gemm_a8w8_blockscale_group32(
         block_k,
         N_FIRST=n_first,
         LAUNCH_OPTIONS=launch_repr,
+        FUSED_SPLITS=fused_splits,
         **launch_options,
     )
-    if num_splits > 1:
+    if fused_splits == 1 and num_splits > 1:
         reduce_m = config["REDUCE_BLOCK_SIZE_M"]
         reduce_n = config["REDUCE_BLOCK_SIZE_N"]
         _gemm_splitk_reduce_kernel[(-(-M // reduce_m), -(-N // reduce_n))](
-            partial,
+            out,
             y,
             None,
             M,
