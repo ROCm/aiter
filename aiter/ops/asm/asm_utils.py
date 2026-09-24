@@ -28,6 +28,7 @@ import ctypes
 import functools
 import glob
 import os
+from typing import ClassVar
 
 import torch
 
@@ -57,19 +58,23 @@ HIP_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION = 4
 
 
 class _HIPClusterDim(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_uint), ("y", ctypes.c_uint), ("z", ctypes.c_uint)]
+    _fields_: ClassVar = [
+        ("x", ctypes.c_uint),
+        ("y", ctypes.c_uint),
+        ("z", ctypes.c_uint),
+    ]
 
 
 class _HIPLaunchAttrVal(ctypes.Union):
     # hipLaunchAttributeValue is a 64-byte union.
-    _fields_ = [
+    _fields_: ClassVar = [
         ("clusterDim", _HIPClusterDim),
         ("_pad", ctypes.c_ubyte * 64),
     ]
 
 
 class _HIPLaunchAttr(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar = [
         ("id", ctypes.c_int),
         ("_align", ctypes.c_ubyte * 4),
         ("val", _HIPLaunchAttrVal),
@@ -78,7 +83,7 @@ class _HIPLaunchAttr(ctypes.Structure):
 
 class _HIPLaunchConfig(ctypes.Structure):
     # HIP_LAUNCH_CONFIG: 7 x uint32, stream, attrs pointer, numAttrs.
-    _fields_ = [
+    _fields_: ClassVar = [
         ("gridDimX", ctypes.c_uint),
         ("gridDimY", ctypes.c_uint),
         ("gridDimZ", ctypes.c_uint),
