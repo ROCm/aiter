@@ -724,15 +724,6 @@ def _in_bands(bands, width: int, num_rows: int) -> bool:
     return any(
         min_width <= width
         and (max_width is None or width <= max_width)
-        and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in bands
-    )
-
-
-def _in_row_bands(bands, width: int, num_rows: int) -> bool:
-    return any(
-        min_width <= width
-        and (max_width is None or width <= max_width)
         and min_rows <= num_rows <= max_rows
         for min_width, max_width, min_rows, max_rows in bands
     )
@@ -762,12 +753,19 @@ def _decode_backend(
     """
     if indices_only and adaptive_width is not None:  # adaptive emits no values
         per_k = _ADAPTIVE_BANDS.get((arch, cu_count), {}).get(stable, {})
-        if _in_row_bands(per_k.get(k, ()), adaptive_width, num_rows):
+        if _in_bands(per_k.get(k, ()), adaptive_width, num_rows):
             return BACKEND_ADAPTIVE
     if (
         arch in _FLYDSL_TOPK_DECODE_GATES
         and k in _FLYDSL_TOPK_DECODE_KS
-        and _in_bands(_FLYDSL_TOPK_DECODE_GATES[arch][stable], width, num_rows)
+        and _in_bands(
+            (
+                (lo, hi, 1, rows)
+                for lo, hi, rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
+            ),
+            width,
+            num_rows,
+        )
     ):
         return BACKEND_CHUNKED
     return BACKEND_UPSTREAM

@@ -138,9 +138,7 @@ SMEM_META_SHORT_FRONT_COUNT = 6
 SMEM_META_SHORT_BACK_COUNT = 7
 
 
-# The early stop is on for every card measured, so it has no shape term to fit.
-# The environment variable exists for an A/B; the second name is the one the
-# first harnesses used and is read so an old script cannot silently mean "on".
+# The legacy name is still read so an old A/B script cannot silently mean "on".
 EARLY_STOP_DEFAULT = True
 EARLY_STOP_ENV = "FLYDSL_TOPK_ADAPTIVE_ES"
 _EARLY_STOP_ENV_LEGACY = "FLYDSL_TOPK_COMPACT_ES"
@@ -157,49 +155,31 @@ def early_stop_default() -> bool:
 
 # --- the host-side rule -----------------------------------------------------
 #
-# Everything below decides, from the batch shape alone, how wide to launch and
-# which path to run. It lives beside the kernel because every number here was
-# measured against it: a caller that picks them differently gets a different
-# kernel than the one the measurements describe. `decode_adaptive_config` is the
-# single entry point, and the pieces are split only so each carries its reason.
+# Everything below picks the launch width and path from the batch shape alone.
+# Every number was measured against this kernel, so callers take them from
+# `decode_adaptive_config` rather than choosing their own.
 
 PARTS_CAP = 32
-# A row shorter than this reads its candidates from the row rather than from the
-# buffer. The floor cannot be fitted on its own -- a compacted pass reads a slice
-# of the buffer and an uncompacted one a slice of the row, and those two do not
-# want the same number of parts -- so it was swept jointly with the width table.
+# A row shorter than this reads its candidates from the row, not the buffer.
+# Fitted jointly with `MEASURED_PARTS`; neither can be re-fitted alone.
 COMPACT_MIN = ((32, 262144), (1, 1048576))
 
 COMPACT_SLICE = 40960
-"""How long a part's own slice has to be before compacting it pays, past 32 rows.
+"""Past 32 rows, the slice length a part needs before compacting it pays.
 
-`COMPACT_MIN` is a floor on the row, fitted where a row had six or seven
-workgroups. Past 32 rows a row has at most four and usually one, so the floor has
-to move onto the slice: compaction saves each part two re-reads of its own slice,
-which makes seq/parts the quantity and not seq.
-
-Landing on `SHORT_MAX_CAP` is the same hardware fact from a third direction --
-about 40K elements is as long a run as one workgroup will scan before it would
-rather pay to avoid scanning it twice.
+There a row has at most four parts, so the floor moves from the row
+(`COMPACT_MIN`) onto each part's slice.
 """
 
-# parts = sqrt(c2 * seq / (c1 * rows)) -- only the ratio decides a width. Fitted
-# against a forced-width ladder over all 36 cells with `poll_then_acquire` on,
-# which is what makes an extra participant cheap enough to want width at all.
+# parts = sqrt(c2 * seq / (c1 * rows)); only the ratio decides a width. Fitted
+# with `poll_then_acquire` on.
 PARTS_C1 = {False: 187.979e-3, True: 153.875e-3}
 PARTS_C2 = {False: 1.87979e-3, True: 464.695e-6}
 
-# The measured argmin width for every grid cell that reaches the multi-block path,
-# read at every admitted k though fitted at 2048. Off the grid the square root
-# below runs, and it is a poor fallback at narrow rows.
-#
-# A table and not a closed form because two cells with the same seq/rows have
-# stable optima two rungs apart in opposite directions, and because the good
-# widths at narrow rows form a floor one rung wide that no smooth model reproduces.
-#
-# Every row at 32 rows by 32K is on the short tier, so that entry decides only the
-# launch width; leaving it at 2 keeps the fallback from raising it and recompiling.
-# The ladder and every per-cell number behind it live in the PR description.
+# The measured best width per (rows, seq), read at every admitted k. A table
+# because no smooth model reproduces it; off the grid the square root above runs,
+# which is poor at narrow rows. (32, 32768) only sets the launch width, since its
+# rows are all short-tier; keep it, or the fallback widens and recompiles.
 MEASURED_PARTS = {
     (1, 32768): 8,
     (1, 65536): 16,
@@ -232,26 +212,17 @@ MEASURED_PARTS = {
     (32, 262144): 6,
     (32, 1048576): 7,
 }
-# The k the table above was fitted at. It no longer gates the lookup -- the table
-# is read at every admitted k -- and survives only as `decode_adaptive_config`'s
-# default k.
+# Only `decode_adaptive_config`'s default k; the table is read at every k.
 MEASURED_PARTS_K = 2048
 
 WIDE_SPLIT_WORK = 28416
-"""How much work a split has to take off a row's critical path to pay for itself.
+"""Elements a split must take off a row's critical path to pay for its barrier.
 
-Splitting a row G ways removes seq*(G-1)/G elements from its critical path and
-adds one barrier, so the crossover sits where that product is constant, and the
-measured crossovers at two and four parts agree on this value.
-
-Landing on SHORT_MAX_BASE is a coincidence worth naming rather than relying on:
-both say a row barrier costs about what 28K elements cost, measured from two
-directions -- whether a barrier is worth taking at all, and whether a second is.
+Splitting G ways removes seq*(G-1)/G; below this, past 32 rows, the row runs alone.
 """
 
-# The CU count every table in this file was fitted at. It is the default rather
-# than a device read because the caller knows which device the row will run on and
-# this module must not import the one that answers that; pass `decode_cu_count`.
+# The CU count the tables were fitted at. A default, not a device read: the
+# caller knows the device, so pass `decode_cu_count`.
 FITTED_CU = 256
 
 
@@ -260,21 +231,10 @@ def decode_adaptive_grid(
 ) -> int:
     """The launch width, from the batch size and the width the row wants.
 
-    The odd width is deliberate: it shifts every row's starting XCD by one so a
-    narrowed row stays balanced across all eight while its parts remain
-    contiguous. Contiguity is load-bearing -- a row's parts must be co-resident to
-    clear the spin barrier -- so do not reorder the grid to close the dead blocks.
-    A row that wants the whole grid is not narrowing and keeps the full even width.
-
-    Overshooting the CU count is the expensive direction, because a row deferred to
-    a second wave holds its resident parts spinning. `cu_count` is the only device
-    input here, so passing the real one ports the tables rather than refitting
-    them.
-
-    Passing `seq` is not optional in practice; it is defaulted only for callers
-    older than the wide-split rule, and without it a short row past 32 rows takes a
-    split that costs up to 1.18x. Past 256 rows a row always runs alone, which is
-    also what keeps co-residency from binding as the batch grows.
+    A narrowed width is odd so each row starts on the next XCD while its parts stay
+    contiguous. Do not reorder the grid: a row's parts must be co-resident to clear
+    the spin barrier, and overshooting `cu_count` leaves them spinning. Always pass
+    `seq`; without it a short row past 32 rows takes a split it should not.
     """
     widest = min(32, cu_count // max(1, rows))
     if widest < 2:
@@ -303,17 +263,9 @@ def decode_compact_compacts(
 ) -> bool:
     """Whether the passes behind the first read candidates back from the buffer.
 
-    Two floors, because the grid has two regimes: up to 32 rows a row chooses its
-    width and the floor is `COMPACT_MIN` on the row; past 32 it takes a share of one
-    wave and the floor moves onto the part's slice, `COMPACT_SLICE`.
-
-    The short tier keeps no candidate buffer, hence the `short_max` test -- it is
-    redundant against `COMPACT_MIN` but not against the slice rule, which at one
-    part crosses below any tier threshold.
-
-    `decode_adaptive_want` must keep reading `decode_compact_uses_buffer` rather than
-    this: the width table was fitted against that floor, and asking the slice rule
-    there moves widths no measurement has visited.
+    `COMPACT_MIN` on the row up to 32 rows, `COMPACT_SLICE` on each part past it;
+    the short tier keeps no buffer. `decode_adaptive_want` must keep reading
+    `decode_compact_uses_buffer` instead, the floor the width table was fitted on.
     """
     if seq <= short_max:
         return False
@@ -328,9 +280,7 @@ def decode_adaptive_want(rows: int, seq: int) -> int:
         return MEASURED_PARTS[(rows, seq)]
     compact = decode_compact_uses_buffer(rows, seq)
     ratio = PARTS_C2[compact] / PARTS_C1[compact]
-    # Floored at two because the caps reject one at no cost: a row short enough to
-    # want a single workgroup is already on the short tier, and the spare
-    # workgroup returns immediately.
+    # Floored at two: a row that wants one workgroup is already on the short tier.
     return max(2, min(PARTS_CAP, round(math.sqrt(ratio * seq / rows))))
 
 
@@ -352,21 +302,16 @@ def _next_pow2(n: int) -> int:
 def decode_adaptive_short_max(rows: int) -> int:
     """The length below which a row runs on the single-workgroup short tier.
 
-    Deliberately not the dispatcher's rule, which climbs six times as steeply
-    because it was fitted against the ancestor tiered kernel's multi-block path.
-    The two must not be reconciled until that one is re-measured. k does not enter
-    here: the measured crossover moves under 800 elements across k.
+    Not the dispatcher's rule, which was fitted on another kernel; do not reconcile
+    the two without re-measuring. k does not enter: the crossover barely moves.
     """
     return min(SHORT_MAX_CAP, SHORT_MAX_BASE + _next_pow2(rows) * SHORT_MAX_SLOPE)
 
 
 def decode_adaptive_certificate(seq: int, parts: int) -> bool:
-    """Whether pass 0 should settle its digit from the histogram's own total.
+    """Whether pass 0 settles its digit from the histogram's own total.
 
-    It trades the arrival counter for an uncached re-read of the merged histogram.
-    The saving grows with how many parts contend for the counter's cache line; the
-    cost is a fixed 2048-bin read. Hence the two-part test: long rows always, 32K
-    only once the grid is wide enough to have contention worth removing.
+    Trades the contended arrival counter for a fixed 2048-bin uncached re-read.
     """
     if seq >= 65536:
         return True
@@ -386,18 +331,9 @@ def decode_adaptive_config(
 ) -> dict:
     """Everything `create_topk_per_row_decode_adaptive_kernel` needs for a shape.
 
-    Returns the keyword arguments for the factory plus `parts`, `grid` and
-    `compact`, which the caller needs for the workspace size and for reporting.
-
-    Pass `cu_count` for the device that will run this, from `decode_cu_count`; the
-    default is the count every table here was fitted at.
-
-    The caps are floored at two even when the grid gives a row a single
-    workgroup, because they are upper bounds: the tier takes
-    `min(blocks_per_row, cap)`, so a floor of two still leaves one active part on
-    a one-wide grid, while a cap of one is rejected outright as a cooperating tier
-    that cannot cooperate. Without the floor every batch past 256 rows raised
-    instead of running, which is a shape a decode batch arrives in.
+    Returns the factory's keyword arguments plus `parts`, `grid` and `compact`.
+    Pass `cu_count` for the device that will run it. The caps stay at least two
+    even on a one-wide grid: they are upper bounds, and a cap of one is rejected.
     """
     parts = decode_adaptive_parts(rows, seq, cu_count)
     grid = decode_adaptive_grid(rows, decode_adaptive_want(rows, seq), seq, cu_count)
@@ -410,25 +346,19 @@ def decode_adaptive_config(
     kw = {
         "blocks_per_row": grid,
         "bits_per_pass": 11,
-        # A build whose rows all fit the short tier says so, rather than leaving
-        # "auto" to work it out per row. At one part "auto" cannot: `active_parts`
-        # is then a compile-time one, so the cooperating path folds away and a
-        # long row has nowhere to go but the single-workgroup tier.
+        # Not "auto" when every row fits: at one part the cooperating path folds
+        # away at compile time and "auto" has nowhere to send a long row.
         "tier_mode": "short" if seq <= short_max else "auto",
         "tiered_mid_cap": max(2, parts),
         "tiered_long_cap": max(2, parts),
         "tiered_short_max": short_max,
         "ordered": ordered,
-        # Poll the barrier with monotonic loads and take one acquire once the token
-        # lands. Two thirds of what an extra participant cost was the acquire every
-        # waiting workgroup issued on every unsuccessful poll.
+        # Poll with monotonic loads, then one acquire once the token lands.
         "poll_then_acquire": True,
     }
     if early_stop is None:
         early_stop = early_stop_default()
-    # Three builds cannot reach it, and asking anyway only splits the JIT cache:
-    # `ordered` and `compact` are dropped by the factory, and an all-short build
-    # never runs the pass it replaces.
+    # Left out where the build cannot reach it, which would only split the JIT cache.
     if early_stop and not ordered and not compact and kw["tier_mode"] != "short":
         kw["early_stop"] = True
     if decode_adaptive_certificate(seq, parts):
@@ -437,9 +367,7 @@ def decode_adaptive_config(
         kw["compact"] = True
         kw["compact_cap_mult"] = compact_cap_mult
         kw["compact_fill_vecs"] = COMPACT_FILL_VECS
-        # Publishing the append carry from wave 0 between the fill scan's two
-        # barriers lets each tile drop its closing barrier: three to two. The scan
-        # itself measures as noise and is carried because the carry is built on it.
+        # The early carry drops one barrier per fill tile and is built on the scan.
         kw["compact_fast_scan"] = True
         kw["compact_early_carry"] = True
     return {"kw": kw, "grid": grid, "parts": parts, "compact": compact}
