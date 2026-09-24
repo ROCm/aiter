@@ -33,6 +33,77 @@ DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 DIRECT_BLOCK32_CTA_LIMIT = 1024
 
 
+def default_varctx_parallel_unit_num(
+    batch_size: int,
+    max_seq_len: int,
+    next_n: int = 1,
+    block_k: int = 256,
+) -> int:
+    """Return the tuned gfx950 persistent-grid size without reading the GPU.
+
+    Context lengths stay device-side so graph replay never synchronizes with
+    the host. The tables use process-level medians from batch/context sweeps on
+    a 256-CU MI355X. Callers can still pass an explicit ``parallel_unit_num``
+    to override them.
+    """
+    if batch_size < 1 or max_seq_len < 1 or next_n < 1 or block_k < 1:
+        raise ValueError(
+            "batch_size, max_seq_len, next_n, and block_k must all be positive; "
+            f"got {batch_size=}, {max_seq_len=}, {next_n=}, {block_k=}."
+        )
+
+    rows = batch_size * next_n
+    if rows <= 1:
+        row_bucket = 0
+    elif rows <= 2:
+        row_bucket = 1
+    elif rows <= 4:
+        row_bucket = 2
+    elif rows <= 8:
+        row_bucket = 3
+    elif rows <= 16:
+        row_bucket = 4
+    elif rows <= 32:
+        row_bucket = 5
+    else:
+        row_bucket = 6
+
+    if block_k == 64:
+        # One-wave decode geometry. In particular, the AgenticX 8K/1K,
+        # concurrency-16 workload reaches about 64 flattened rows and 2.3K
+        # compressed tokens, whose measured optimum is 3072 CTAs rather than
+        # the old fixed 576-CTA cap.
+        if max_seq_len <= 256:
+            targets = (64, 128, 256, 256, 128, 128, 256)
+        elif max_seq_len <= 1024:
+            targets = (128, 128, 256, 256, 384, 512, 1536)
+        elif max_seq_len <= 2048:
+            targets = (128, 128, 256, 256, 576, 1024, 2048)
+        elif max_seq_len <= 4096:
+            targets = (128, 128, 256, 512, 1024, 2048, 3072)
+        elif max_seq_len <= 16384:
+            targets = (256, 512, 1536, 2048, 2048, 3072, 3072)
+        elif max_seq_len <= 65536:
+            targets = (1536, 2048, 2048, 3072, 3072, 3072, 3072)
+        else:
+            targets = (3072, 2048, 4096, 4096, 4096, 4096, 4096)
+
+        target = max(rows, targets[row_bucket])
+        return ((target + next_n - 1) // next_n) * next_n
+
+    if max_seq_len <= 16384:
+        targets = (64, 96, 256, 256, 512, 512, 512)
+    elif max_seq_len <= 49152:
+        targets = (128, 256, 256, 512, 1024, 1024, 2048)
+    elif max_seq_len <= 98304:
+        targets = (256, 512, 1024, 1280, 1536, 1536, 2048)
+    else:
+        targets = (256, 512, 1280, 1280, 2048, 2048, 4096)
+
+    target = max(rows, targets[row_bucket])
+    return ((target + next_n - 1) // next_n) * next_n
+
+
 def _default_decode_config(
     batch_size, next_n, heads, head_dim, max_seq_len, kv_block_size
 ):
@@ -124,8 +195,9 @@ def compute_varctx_schedule(
 ):
     B = context_lens.shape[0]
     if parallel_unit_num is None:
-        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
-        parallel_unit_num = B * next_n * chunks_per_seq
+        parallel_unit_num = default_varctx_parallel_unit_num(
+            B, max_seq_len, next_n=next_n, block_k=block_k
+        )
     P = parallel_unit_num
     if P % next_n != 0:
         raise ValueError(f"parallel_unit_num={P} must be a multiple of next_n={next_n}")
@@ -145,6 +217,11 @@ def compute_varctx_schedule(
     if cta_info_out is None:
         cta_info = torch.empty(P, 4, dtype=torch.int32, device=dev)
     else:
+        if cta_info_out.shape[0] < P or cta_info_out.shape[1:] != (4,):
+            raise ValueError(
+                f"cta_info_out must have shape (at least {P}, 4), "
+                f"got {tuple(cta_info_out.shape)}."
+            )
         cta_info = cta_info_out
     safe_out = torch.empty(1, dtype=torch.int32, device=dev)
     BLOCK_B = triton.next_power_of_2(max(int(B), 1))
