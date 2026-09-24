@@ -1133,6 +1133,27 @@ def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
     return (mean * gate.unsqueeze(-1)).contiguous()
 
 
+def _restore_k_mean_in_lse(
+    lse: Optional[Tensor],  # noqa: UP045
+    q: Tensor,
+    k_mean: Optional[Tensor],  # noqa: UP045
+    softmax_scale: Optional[float],  # noqa: UP045
+) -> Optional[Tensor]:  # noqa: UP045
+    """Undo K smoothing in the exported LSE.
+
+    Smoothing runs the kernel against ``k - k_mean``, which shifts every score in the call by the
+    per-query constant ``q @ k_mean``. Output is unaffected because a shift shared by all keys
+    cancels in the softmax, but the LSE inherits it. Ring attention weights each chunk by
+    ``exp(lse)`` and derives a separate ``k_mean`` per chunk, so leaving the shift in mis-weights
+    the chunks against one another.
+    """
+    if lse is None or k_mean is None:
+        return lse
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    lse += torch.einsum("bshd,bhd->bhs", q, k_mean.to(q.dtype)).float() * scale
+    return lse
+
+
 def _validate_mha_v4_raw_inputs(
     q: Tensor,
     k: Tensor,
@@ -1240,6 +1261,8 @@ def mha_v4(
     # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose
     # quantizer is still Triton and so needs a materialised K.
     k_mean = _k_mean(k, recipe.kind)
+    # INT8 materialises the subtraction below and drops k_mean, so keep it for the LSE correction.
+    k_mean_lse = k_mean
     if k_mean is not None and recipe.kind is _RawRecipeKind.INT8_FP8:
         k = (k.float() - k_mean.unsqueeze(1)).to(k.dtype)
         k_mean = None
@@ -1311,7 +1334,9 @@ def mha_v4(
                 lse_out,
             )
             if return_lse:
-                return out, lse_out
+                return out, _restore_k_mean_in_lse(
+                    lse_out, q, k_mean_lse, softmax_scale
+                )
             return out
         k_view = mxfp4_k_view(k_quantized, k_descale)
         v_view = mxfp4_v_view(v_quantized, v_descale, k.shape[1])
@@ -1354,7 +1379,9 @@ def mha_v4(
                 lse_out,
             )
             if return_lse:
-                return out, lse_out
+                return out, _restore_k_mean_in_lse(
+                    lse_out, q, k_mean_lse, softmax_scale
+                )
             return out
         k_view, k_descale_view = mxfp6_k_view(
             k_quantized, k_descale, q.shape[0], k.shape[1], k.shape[2]
@@ -1370,7 +1397,7 @@ def mha_v4(
     else:
         raise AssertionError(f"unhandled MHA v4 raw recipe: {recipe.kind!r}")
 
-    return mha_v4_packed(
+    result = mha_v4_packed(
         q_quantized,
         k_quantized,
         v_quantized,
@@ -1390,3 +1417,9 @@ def mha_v4(
         seqlens_k=seqlens_k,
         **packed_lut,
     )
+    if return_lse:
+        packed_out, packed_lse = result
+        return packed_out, _restore_k_mean_in_lse(
+            packed_lse, q, k_mean_lse, softmax_scale
+        )
+    return result

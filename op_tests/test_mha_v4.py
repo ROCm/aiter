@@ -625,6 +625,63 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     )
 
 
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 FP8 recipe validation",
+)
+@pytest.mark.parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
+def test_mha_v4_lse_survives_k_common_mode(recipe):
+    """K smoothing must not leak into the exported LSE.
+
+    Smoothing runs the kernel against k - k_mean, shifting every score by the per-query constant
+    q @ k_mean. Output cannot see it -- a shift shared by all keys cancels in the softmax -- so
+    only the LSE carries it. Chunked consumers weight each chunk by exp(lse) and derive their own
+    k_mean per chunk, so an uncorrected shift mis-weights the chunks; ring attention lost a third
+    of its output norm this way while every output test stayed green.
+    """
+    torch.manual_seed(17)
+    q = torch.randn((1, 1024, 4, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(q)
+    base_k = torch.randn_like(q)
+    direction = torch.randn((1, 1, 4, 128), device="cuda", dtype=torch.bfloat16)
+
+    if recipe == "fp8":
+        formats = (native_fp8_format(),) * 3
+        scale_modes = {}
+    elif recipe == "mxfp8":
+        formats = (native_fp8_format(),) * 3
+        scale_modes = {
+            "q_scale_mode": AttentionScaleMode.E8M0_PER_1X32,
+            "k_scale_mode": AttentionScaleMode.E8M0_PER_1X32,
+            "v_scale_mode": AttentionScaleMode.F32_PER_TENSOR,
+        }
+    else:
+        formats = (AttentionFormat.MXFP4,) * 3
+        scale_modes = {}
+
+    softmax_scale = q.shape[-1] ** -0.5
+    errors = []
+    for common in (0.0, 16.0):
+        k = base_k + common * direction
+        scores = (
+            q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
+        ) * softmax_scale
+        reference = torch.logsumexp(scores, dim=-1)
+        _, lse = mha_v4(
+            q, k, v, *formats, return_lse=True, softmax_scale=softmax_scale, **scale_modes
+        )
+        errors.append((lse.float() - reference).abs().max().item())
+
+    assert _k_mean(base_k + 16.0 * direction, _RawRecipeKind.FP8).abs().max() > 0, (
+        "K smoothing did not engage, so this case cannot detect the leak"
+    )
+    assert errors[1] < errors[0] + 0.5, (
+        f"{recipe} LSE degrades under a shared K direction: "
+        f"{errors[0]:.4f} -> {errors[1]:.4f} nats; is the k_mean shift still "
+        "added back into the LSE?"
+    )
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
 @pytest.mark.parametrize("case", ["random", "zero", "powers", "extreme"])
 def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
