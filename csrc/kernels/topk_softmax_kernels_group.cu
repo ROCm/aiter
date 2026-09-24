@@ -318,8 +318,6 @@ template <>
 __forceinline__ __device__ float dtype2acctype<__half>(__half x) { return __half2float(x); }
 template <>
 __forceinline__ __device__ float dtype2acctype<__hip_bfloat16>(__hip_bfloat16 x) { return __bfloat162float(x); }
-template <>
-__forceinline__ __device__ float dtype2acctype<hip_bfloat16>(hip_bfloat16 x) { return static_cast<float>(x); }
 
 template <typename DTYPE_I,
           typename f32vec,
