@@ -49,9 +49,9 @@ def _setup(batch, ctx, heads, max_q, seed=0):
     for i in range(0, num_pages, 4096):
         n = min(4096, num_pages - i)
         k[i : i + n] = (torch.randn(n, BLOCK_SIZE, HEAD_DIM, device=DEV) / 4).to(FP8)
-    block_table = torch.arange(
-        batch * max_blk, device=DEV, dtype=torch.int32
-    ).view(batch, max_blk)
+    block_table = torch.arange(batch * max_blk, device=DEV, dtype=torch.int32).view(
+        batch, max_blk
+    )
     seq = torch.full((batch,), ctx, device=DEV, dtype=torch.int32)
     score = torch.full(
         (heads, total_q, max_blk), -float("inf"), device=DEV, dtype=torch.float32
@@ -99,8 +99,14 @@ def ref_index_scores(q, k, block_table, seq_lens, max_q, max_blk):
 @perftest()
 def run_port(q, k, score, block_table, seq_lens, max_q, ctx):
     topk_index_score_decode(
-        q, k, score, block_table, seq_lens, SM_SCALE,
-        query_len=max_q, max_seq_len=ctx,
+        q,
+        k,
+        score,
+        block_table,
+        seq_lens,
+        SM_SCALE,
+        query_len=max_q,
+        max_seq_len=ctx,
     )
     return score
 
@@ -133,13 +139,12 @@ def _must_refuse(fn):
     try:
         fn()
     except (ValueError, RuntimeError) as e:
-        return True, "%s: %s" % (type(e).__name__, str(e)[:110])
+        return True, f"{type(e).__name__}: {str(e)[:110]}"
     return False, "NO REFUSAL -- accepted something it documents as unsupported"
 
 
 def test_aux_k_legs():
-    """D08 / rule A3 (review): both compiled cache-policy legs, for every cell.
-    """
+    """D08 / rule A3 (review): both compiled cache-policy legs, for every cell."""
     if not torch.cuda.is_available():
         return
     for heads, max_q in OPUS_CERTIFIED_CELLS:
@@ -149,23 +154,29 @@ def test_aux_k_legs():
         for aux in (0, 3):
             buf = torch.full_like(score, -float("inf"))
             topk_index_score_decode(
-                q, k, buf, bt, seq, SM_SCALE, query_len=max_q,
-                max_seq_len=2048, aux_k=aux,
+                q,
+                k,
+                buf,
+                bt,
+                seq,
+                SM_SCALE,
+                query_len=max_q,
+                max_seq_len=2048,
+                aux_k=aux,
             )
             torch.cuda.synchronize()
             out[aux] = buf.clone()
             a = torch.nan_to_num(buf, neginf=NEG)
             b = torch.nan_to_num(ref, neginf=NEG)
-            assert torch.allclose(a, b, rtol=1e-2, atol=1e-2), (
-                "cell (%d,%d) aux_k=%d does not match the reference"
-                % (heads, max_q, aux)
-            )
+            assert torch.allclose(
+                a, b, rtol=1e-2, atol=1e-2
+            ), f"cell ({heads},{max_q}) aux_k={aux} does not match the reference"
         # The two legs differ only in a cache hint, so they must agree BIT for
         # bit with each other even though neither is compared bitwise to torch.
-        assert torch.equal(
-            out[0].view(torch.int32), out[3].view(torch.int32)
-        ), "cell (%d,%d): aux_k 0 and 3 disagree bitwise, so the cache policy " \
-           "is changing the result" % (heads, max_q)
+        assert torch.equal(out[0].view(torch.int32), out[3].view(torch.int32)), (
+            f"cell ({heads},{max_q}): aux_k 0 and 3 disagree bitwise, so the cache "
+            "policy is changing the result"
+        )
 
 
 def test_refusals():
@@ -187,15 +198,27 @@ def test_refusals():
     case(
         "bf16 key cache (ATOM default for MiniMax-M3 -- must route, not crash)",
         lambda: topk_index_score_decode(
-            q, k.to(torch.bfloat16), score, bt, seq, SM_SCALE,
-            query_len=1, max_seq_len=1024,
+            q,
+            k.to(torch.bfloat16),
+            score,
+            bt,
+            seq,
+            SM_SCALE,
+            query_len=1,
+            max_seq_len=1024,
         ),
     )
     case(
         "fp16 score buffer",
         lambda: topk_index_score_decode(
-            q, k, score.to(torch.float16), bt, seq, SM_SCALE,
-            query_len=1, max_seq_len=1024,
+            q,
+            k,
+            score.to(torch.float16),
+            bt,
+            seq,
+            SM_SCALE,
+            query_len=1,
+            max_seq_len=1024,
         ),
     )
     case(
@@ -217,9 +240,14 @@ def test_refusals():
     case(
         "score strided along the block axis",
         lambda: topk_index_score_decode(
-            q, k,
+            q,
+            k,
             torch.full((1, 1, 16, 2), -float("inf"), device=DEV)[..., 0],
-            bt, seq, SM_SCALE, query_len=1, max_seq_len=1024,
+            bt,
+            seq,
+            SM_SCALE,
+            query_len=1,
+            max_seq_len=1024,
         ),
     )
 
@@ -241,9 +269,14 @@ def test_refusals():
     case(
         "expanded score view (heads alias one output element)",
         lambda: topk_index_score_decode(
-            _setup(1, 1024, 4, 1)[0], k,
+            _setup(1, 1024, 4, 1)[0],
+            k,
             torch.empty(1, 1, 8, dtype=torch.float32, device=DEV).expand(4, 1, 8),
-            bt, seq, SM_SCALE, query_len=1, max_seq_len=1024,
+            bt,
+            seq,
+            SM_SCALE,
+            query_len=1,
+            max_seq_len=1024,
         ),
     )
     case(
@@ -265,9 +298,7 @@ def test_refusals():
     df = pd.DataFrame(cases)
     print(df)
     bad = [c for c in cases if not c["refused"]]
-    assert not bad, "these were ACCEPTED and must not be: %s" % [
-        c["case"] for c in bad
-    ]
+    assert not bad, f"these were ACCEPTED and must not be: {[c['case'] for c in bad]}"
     return cases
 
 
@@ -277,22 +308,21 @@ def test_supported_predicate():
     Two copies of a rule need a check that executes both, or they drift: this is
     the check.
     """
-    q, k, bt, seq, score, _ = _tiny()
+    q, k, _, _, score, _ = _tiny()
     ok, reason = topk_index_score_decode_supported(
         q, k, score, query_len=1, max_seq_len=1024
     )
-    assert ok, "predicate refuses a case the entry accepts: %s" % reason
+    assert ok, f"predicate refuses a case the entry accepts: {reason}"
     ok_bf16, reason_bf16 = topk_index_score_decode_supported(
         q, k.to(torch.bfloat16), score, query_len=1, max_seq_len=1024
     )
     assert not ok_bf16, "predicate accepts bf16 K while the entry refuses it"
-    print("supported(): fp8 K -> True; bf16 K -> False (%s)" % reason_bf16)
+    print(f"supported(): fp8 K -> True; bf16 K -> False ({reason_bf16})")
     return True
 
 
 def test_index_score():
-    """The collectable correctness entry point: no arguments, so pytest runs it.
-    """
+    """The collectable correctness entry point: no arguments, so pytest runs it."""
     if not torch.cuda.is_available():
         return
     for heads, max_q in OPUS_CERTIFIED_CELLS:
@@ -304,9 +334,9 @@ def test_index_score():
         torch.cuda.synchronize()
         a = torch.nan_to_num(score, neginf=NEG)
         b = torch.nan_to_num(ref, neginf=NEG)
-        assert torch.allclose(a, b, rtol=1e-2, atol=1e-2), (
-            "cell (%d,%d) does not match the torch reference" % (heads, max_q)
-        )
+        assert torch.allclose(
+            a, b, rtol=1e-2, atol=1e-2
+        ), f"cell ({heads},{max_q}) does not match the torch reference"
 
 
 l_batch = [1, 8, 40]
@@ -320,7 +350,9 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--batch", type=int, nargs="*", default=None)
     parser.add_argument("-c", "--ctx", type=int, nargs="*", default=None)
     parser.add_argument(
-        "--cells", type=str, default=None,
+        "--cells",
+        type=str,
+        default=None,
         help="comma-separated HxQ pairs, e.g. 1x1,1x4; default = the certified set",
     )
     args = parser.parse_args()
@@ -337,8 +369,8 @@ if __name__ == "__main__":
         print("no GPU; nothing to test")
         sys.exit(0)
 
-    print("certified cells: %s" % (OPUS_CERTIFIED_CELLS,))
-    print("built cells    : %s" % (OPUS_BUILT_CELLS,))
+    print(f"certified cells: {OPUS_CERTIFIED_CELLS}")
+    print(f"built cells    : {OPUS_BUILT_CELLS}")
     test_supported_predicate()
     test_refusals()
     test_aux_k_legs()

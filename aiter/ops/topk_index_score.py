@@ -56,8 +56,7 @@ def _ptr(t) -> int:
 
 
 def _addressed_span(t) -> int:
-    """Elements a view can ADDRESS from its base pointer: 1 + sum((n-1)*stride).
-    """
+    """Elements a view can ADDRESS from its base pointer: 1 + sum((n-1)*stride)."""
     if t is None or t.numel() == 0:
         return 0
     return 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
@@ -123,8 +122,7 @@ _cert_receipts = None
 
 @contextlib.contextmanager
 def certification_bypass_n16(acknowledgement):
-    """Scoped, acknowledged bypass of N16 -- for certification harnesses ONLY.
-    """
+    """Scoped, acknowledged bypass of N16 -- for certification harnesses ONLY."""
     global _cert_receipts
     if acknowledgement != _CERT_ACK:
         raise ValueError(
@@ -142,6 +140,7 @@ def certification_bypass_n16(acknowledgement):
         yield _cert_receipts
     finally:
         _cert_receipts = None
+
 
 # Tuning table: bucket -> AUX_K, deliberately EMPTY. The surface-wide result is
 # carried by OPUS_AUX_K_DEFAULT; a bucket here would be a second place to look.
@@ -168,8 +167,7 @@ def _resident_workgroups(device) -> int:
 
 
 def _grid_lever(max_blk: int, batch: int, capacity: int) -> tuple[int, int]:
-    """Chunk count and chunk size for the block axis.
-    """
+    """Chunk count and chunk size for the block axis."""
     if _in_llc_band(max_blk, batch):
         chunk_blocks = min(OPUS_LLC_BAND_CHUNK_BLOCKS, max(1, max_blk))
     else:
@@ -179,8 +177,7 @@ def _grid_lever(max_blk: int, batch: int, capacity: int) -> tuple[int, int]:
 
 
 def _in_llc_band(max_blk: int, batch: int) -> bool:
-    """Is the index-K working set inside the last-level-cache band?
-    """
+    """Is the index-K working set inside the last-level-cache band?"""
     if not OPUS_LLC_BAND_ENABLED:
         return False
     mib = batch * max_blk * OPUS_INDEX_K_PAGE_BYTES / (1024.0 * 1024.0)
@@ -188,10 +185,8 @@ def _in_llc_band(max_blk: int, batch: int) -> bool:
 
 
 def _aux_k_for(num_idx_heads: int, query_len: int, batch: int, max_blk: int) -> int:
-    """AUX_K for a bucket: the tuning table if it has an entry, else
-    """
-    pinned = _OPUS_AUX_TUNING_TABLE.get(
-        (num_idx_heads, query_len, batch, max_blk))
+    """AUX_K for a bucket: the tuning table if it has an entry, else"""
+    pinned = _OPUS_AUX_TUNING_TABLE.get((num_idx_heads, query_len, batch, max_blk))
     if pinned is not None:
         return pinned
     # The banded arm changes BOTH knobs together. They were fitted together and
@@ -209,27 +204,25 @@ def _fp8_e4m3fnuz():
 
 
 def _check_devices(*tensors) -> None:
-    """D02 (review): every tensor is forwarded as a raw data_ptr, so nothing
-    """
+    """D02 (review): every tensor is forwarded as a raw data_ptr, so nothing"""
     named = [(n, t) for n, t in tensors if t is not None]
     for n, t in named:
         if not t.is_cuda:
             raise ValueError(
-                "topk_index_score_decode: {} is on {}; every tensor must be a "
-                "CUDA tensor because they are forwarded as raw pointers".format(n, t.device)
+                f"topk_index_score_decode: {n} is on {t.device}; every tensor must be a "
+                "CUDA tensor because they are forwarded as raw pointers"
             )
     devs = {t.device for _, t in named}
     if len(devs) != 1:
         raise ValueError(
-            "topk_index_score_decode: tensors span more than one device (%s); "
-            "the launch takes one stream and cannot straddle them"
-            % sorted(str(d) for d in devs)
+            f"topk_index_score_decode: tensors span more than one device "
+            f"({sorted(str(d) for d in devs)}); the launch takes one stream "
+            "and cannot straddle them"
         )
 
 
 def _check_dtypes(q_idx, key_cache_idx, score) -> None:
-    """Dtype routing. Every arm either accepts or raises -- the space is covered.
-    """
+    """Dtype routing. Every arm either accepts or raises -- the space is covered."""
     fnuz = _fp8_e4m3fnuz()
     if q_idx.dtype != torch.bfloat16:
         if q_idx.dtype == torch.float8_e4m3fn or (
@@ -269,6 +262,7 @@ def _check_dtypes(q_idx, key_cache_idx, score) -> None:
             f"topk_index_score_decode: score must be fp32, got {score.dtype}"
         )
 
+
 def topk_index_score_decode_supported(
     q_idx,
     key_cache_idx,
@@ -276,19 +270,19 @@ def topk_index_score_decode_supported(
     query_len: int = 1,
     max_seq_len: int = 0,
 ):
-    """Can this operator serve these inputs? Returns ``(bool, reason)``.
-    """
+    """Can this operator serve these inputs? Returns ``(bool, reason)``."""
     fnuz = _fp8_e4m3fnuz()
     if getattr(q_idx, "dtype", None) != torch.bfloat16:
         return False, "q_idx must be bf16 (this operator never quantises Q)"
     if key_cache_idx.dtype == torch.bfloat16:
-        return False, ("bf16 key_cache_idx is not supported (ledger D0); use "
-                       "the Triton index-score path, which serves both dtypes")
+        return False, (
+            "bf16 key_cache_idx is not supported (ledger D0); use "
+            "the Triton index-score path, which serves both dtypes"
+        )
     if key_cache_idx.dtype != torch.float8_e4m3fn:
         if fnuz is not None and key_cache_idx.dtype == fnuz:
             return False, "key_cache_idx is float8_e4m3fnuz; built for e4m3fn only"
-        return False, "key_cache_idx must be float8_e4m3fn, got %s" % (
-            key_cache_idx.dtype,)
+        return False, f"key_cache_idx must be float8_e4m3fn, got {key_cache_idx.dtype}"
     if score.dtype != torch.float32:
         return False, "score must be fp32"
     if q_idx.dim() != 3 or key_cache_idx.dim() != 3 or score.dim() != 3:
@@ -304,30 +298,36 @@ def topk_index_score_decode_supported(
     if _addressed_span(score) * score.element_size() >= 2**32:
         return False, "score exceeds the 32-bit buffer-descriptor extent"
     # D02 mirrored: every tensor is forwarded as a raw pointer.
-    for _n, _t in (("q_idx", q_idx), ("key_cache_idx", key_cache_idx),
-                   ("score", score)):
+    for _n, _t in (
+        ("q_idx", q_idx),
+        ("key_cache_idx", key_cache_idx),
+        ("score", score),
+    ):
         if not _t.is_cuda:
-            return False, "%s is on %s; every tensor must be a CUDA tensor" % (
-                _n, _t.device)
+            return False, f"{_n} is on {_t.device}; every tensor must be a CUDA tensor"
     if len({q_idx.device, key_cache_idx.device, score.device}) != 1:
         return False, "tensors span more than one device"
     total_q, num_idx_heads, head_dim = q_idx.shape
     block_size = key_cache_idx.size(1)
     if head_dim != OPUS_HEAD_DIM or block_size != OPUS_BLOCK_SIZE:
-        return False, "built for head_dim %d and block_size %d, got %d and %d" % (
-            OPUS_HEAD_DIM, OPUS_BLOCK_SIZE, head_dim, block_size)
+        return False, (
+            f"built for head_dim {OPUS_HEAD_DIM} and block_size {OPUS_BLOCK_SIZE}, "
+            f"got {head_dim} and {block_size}"
+        )
     if key_cache_idx.size(2) != head_dim:
         return False, "key_cache_idx head dim must match q_idx"
     if query_len < 1 or total_q % query_len != 0:
         return False, "q_idx rows must be a positive multiple of query_len"
     if num_idx_heads * query_len > OPUS_MFMA_COLS:
-        return False, "num_idx_heads * query_len exceeds the %d MFMA columns" % (
-            OPUS_MFMA_COLS,)
+        return (
+            False,
+            f"num_idx_heads * query_len exceeds the {OPUS_MFMA_COLS} MFMA columns",
+        )
     cell = (num_idx_heads, query_len)
     if cell not in OPUS_BUILT_CELLS:
-        return False, "no build for (num_idx_heads, query_len) = %s" % (cell,)
+        return False, f"no build for (num_idx_heads, query_len) = {cell}"
     if cell not in OPUS_CERTIFIED_CELLS:
-        return False, "cell %s is built but not certified (N16)" % (cell,)
+        return False, f"cell {cell} is built but not certified (N16)"
     if max_seq_len < 1:
         return False, "max_seq_len is required so the grid is fixed at capture"
     # D07 / rule A3 (review, upheld at YELLOW): the core rejects a mismatched
@@ -335,15 +335,17 @@ def topk_index_score_decode_supported(
     # it answered "supported" for a case the core then raised on -- the exact
     # failure it exists to prevent.
     if score.size(0) != num_idx_heads or score.size(1) != total_q:
-        return False, "score must be [num_idx_heads, total_q, S], got %s for " \
-                      "num_idx_heads=%d total_q=%d" % (
-                          tuple(score.shape), num_idx_heads, total_q)
+        return False, (
+            f"score must be [num_idx_heads, total_q, S], got {tuple(score.shape)} "
+            f"for num_idx_heads={num_idx_heads} total_q={total_q}"
+        )
     if key_cache_idx.size(0) < 1:
         return False, "key_cache_idx holds no pages"
     max_blk = math.ceil(max_seq_len / block_size)
     if score.size(2) < max_blk:
-        return False, "score width is below cdiv(max_seq_len, %d)" % block_size
+        return False, f"score width is below cdiv(max_seq_len, {block_size})"
     return True, "supported"
+
 
 def topk_index_score_decode(
     q_idx,
@@ -383,8 +385,11 @@ def topk_index_score_decode(
     """
     _check_dtypes(q_idx, key_cache_idx, score)
     _check_devices(
-        ("q_idx", q_idx), ("key_cache_idx", key_cache_idx), ("score", score),
-        ("block_table", block_table), ("seq_lens", seq_lens),
+        ("q_idx", q_idx),
+        ("key_cache_idx", key_cache_idx),
+        ("score", score),
+        ("block_table", block_table),
+        ("seq_lens", seq_lens),
     )
 
     if q_idx.dim() != 3 or key_cache_idx.dim() != 3 or score.dim() != 3:
@@ -407,8 +412,8 @@ def topk_index_score_decode(
     if score.stride(0) == 0 or score.stride(1) == 0:
         raise ValueError(
             "topk_index_score_decode: score has a zero stride on the head or row "
-            "axis (strides %s), so different outputs alias one element; pass a "
-            "materialised tensor rather than an expanded view" % (score.stride(),)
+            f"axis (strides {score.stride()}), so different outputs alias one element; "
+            "pass a materialised tensor rather than an expanded view"
         )
     # D01 (review): the addressed span is forwarded as the buffer-descriptor
     # extent and the kernel narrows span*4 to 32 bits, so a span at or past
@@ -418,9 +423,9 @@ def topk_index_score_decode(
     _span_bytes = _addressed_span(score) * score.element_size()
     if _span_bytes >= 2**32:
         raise ValueError(
-            "topk_index_score_decode: score spans %d bytes, which does not fit "
+            f"topk_index_score_decode: score spans {_span_bytes} bytes, which does not fit "
             "the 32-bit buffer-descriptor extent the kernel uses; the limit is "
-            "%d bytes" % (_span_bytes, 2**32 - 1)
+            f"{2**32 - 1} bytes"
         )
     if block_table.dtype != torch.int32 or seq_lens.dtype != torch.int32:
         raise ValueError(
@@ -431,9 +436,7 @@ def topk_index_score_decode(
         # indexes it by request, so a strided or multi-dim seq_lens would be
         # read at the wrong offsets. Same class as the span defect above:
         # refused rather than mis-addressed.
-        raise ValueError(
-            "topk_index_score_decode: seq_lens must be 1-D and contiguous"
-        )
+        raise ValueError("topk_index_score_decode: seq_lens must be 1-D and contiguous")
     if block_table.dim() != 2 or block_table.stride(1) != 1:
         raise ValueError(
             "topk_index_score_decode: block_table must be 2-D with contiguous rows"
@@ -540,8 +543,13 @@ def topk_index_score_decode(
         # hook, so the certification record can name exactly which evidence was
         # produced under bypass.
         _cert_receipts.append(
-            {"cell": list(cell), "aux_k": aux_k, "bypassed_gate": "N16",
-             "batch": num_reqs, "max_blk": max_blk}
+            {
+                "cell": list(cell),
+                "aux_k": aux_k,
+                "bypassed_gate": "N16",
+                "batch": num_reqs,
+                "max_blk": max_blk,
+            }
         )
 
     _topk_index_score_raw(
