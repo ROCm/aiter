@@ -256,6 +256,7 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
+    nonatomic=False,
     reduce_store_cache_modifier=None,
     resolved_input_rows=(),
     output_n_base=0,
@@ -636,12 +637,105 @@ def gemm2_body_v2(
             **kw,
         )
 
-    g2_interleave = const_expr(g2_kstatic and g2_bf16_lds and output_width is None)
+    g2_interleave = const_expr(
+        g2_kstatic and g2_bf16_lds and not nonatomic and output_width is None
+    )
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
 
-    if const_expr(g2_kstatic):
+    if const_expr(nonatomic):
+        KT = K_TILES_MAX
+        a_all_resident = const_expr((aStages if g2_apre else kStages) >= KT)
+
+        if const_expr(a_all_resident):
+            sa = [load_a_scale_tile(fx.Int32(S)) for S in range_constexpr(KT)]
+            b = [make_bq_fragments() for _ in range_constexpr(KT)]
+            bs = []
+            for S in range_constexpr(KT):
+                bsf = make_scale_fragments(nPairs)
+                issue_bscale_into(bsf, scale_chunk_tile(fx.Int32(S)))
+                bs.append(bsf)
+            issue_b_load_into(b[0], None, fx.Int32(0))
+            gpu.barrier()
+            nDsPerTile = kMChunks * kHalves
+            nBPerTile = numAccN * kHalves
+            nMfmaPerTile = numAccN * kScaleSubBlocks * 2 * kHalves
+            nNextB = (KT - 1) * nBPerTile
+            for n in range_constexpr(nDsPerTile):
+                rocdl.sched_dsrd(2)
+                if const_expr(n < nNextB):
+                    rocdl.sched_vmem(1)
+            for _ in range_constexpr(KT * nMfmaPerTile):
+                rocdl.sched_dsrd(2)
+                rocdl.sched_mfma(1)
+            for S in range_constexpr(KT):
+                issue_a_ds_read(fx.Int32(S % aStages))
+                if const_expr(S + 1 < KT):
+                    issue_b_load_into(b[S + 1], None, fx.Int32(S + 1))
+                mfma_cluster(b[S], bs[S], sa[S], fx.Int32(S))
+        else:
+            sa = [load_a_scale_tile(fx.Int32(S)) for S in range_constexpr(KT)]
+            bs = []
+            for S in range_constexpr(KT):
+                bsf = make_scale_fragments(nPairs)
+                issue_bscale_into(bsf, scale_chunk_tile(fx.Int32(S)))
+                bs.append(bsf)
+            cur_bqf = make_bq_fragments()
+            nxt_bqf = make_bq_fragments()
+            issue_b_load_into(cur_bqf, None, fx.Int32(0))
+            nDsPerTile = kMChunks * kHalves
+            nBPerTile = numAccN * kHalves
+            nMfmaPerJ = kHalves if is_bm16 else kScaleSubBlocks * 2 * kHalves
+            nMfmaPerTile = numAccN * nMfmaPerJ
+            rows_per_call = 64 // (KH_TILE_A // 16)
+            rows_per_wave = BM // 4
+            nA = 1 if rows_per_wave < rows_per_call else rows_per_wave // rows_per_call
+            nDsPerGroup = max(1, (nDsPerTile + numAccN - 1) // numAccN)
+            nDsGroups = (nDsPerTile + nDsPerGroup - 1) // nDsPerGroup
+            nMfmaPerVmem = 4
+            nPrologueVmem = kStages * nA + KT * (kScaleSubBlocks + nPairs) + nBPerTile
+            nVmem0 = nPrologueVmem + (nBPerTile if const_expr(KT > 1) else 0)
+            nVmemPerDs0 = max(1, (nVmem0 + nDsPerTile - 1) // nDsPerTile)
+            fenced = -1
+            issued = kStages - 1
+            for kt in range_constexpr(KT):
+                prefetch_a = const_expr(kt + kStages < KT)
+                if const_expr(kt > fenced):
+                    gpu.barrier()
+                    fenced = issued
+                if const_expr(kt == 0):
+                    for _ in range_constexpr(nDsPerTile):
+                        rocdl.sched_vmem(nVmemPerDs0)
+                        rocdl.sched_dsrd(1)
+                else:
+                    nAVmem = nA if const_expr(kt - 1 + kStages < KT) else 0
+                    nBVmem = nBPerTile if const_expr(kt + 1 < KT) else 0
+                    for _ in range_constexpr(nAVmem + nBVmem):
+                        rocdl.sched_mfma(nMfmaPerVmem)
+                        rocdl.sched_vmem(1)
+                    nMfmaLeft = max(
+                        1,
+                        (nMfmaPerTile - nMfmaPerVmem * (nAVmem + nBVmem)) // nDsGroups,
+                    )
+                    for _ in range_constexpr(nDsGroups):
+                        rocdl.sched_mfma(nMfmaLeft)
+                        rocdl.sched_dsrd(nDsPerGroup)
+                if const_expr(kt + 1 < KT):
+                    issue_b_load_into(nxt_bqf, None, fx.Int32(kt + 1))
+                issue_a_ds_read(fx.Int32(kt % aStages))
+                if prefetch_a:
+                    if const_expr(a_slot_alias):
+                        gpu.barrier()
+                        fenced = issued
+                    issue_a_load_lds(
+                        fx.Int32((kt + kStages) % aStages),
+                        fx.Int32(kt + kStages),
+                    )
+                    issued = kt + kStages
+                mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
+                cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
+    elif const_expr(g2_kstatic):
         KT = K_TILES_MAX
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(numAccN):
@@ -826,7 +920,19 @@ def gemm2_body_v2(
             results = yield yield_carry()
         store_carry(results)
 
-    if const_expr(g2_interleave):
+    if const_expr(nonatomic):
+        nonatomic_bf16_epilog(
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            arg_out,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT_rt,
+            BN,
+            kMChunks,
+        )
+    elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
         _epilog(None, lds_ready=True)
@@ -1268,3 +1374,18 @@ def atomic_bf16_epilog(
                 store_one_mr(mr)
 
         store_if_valid(token_id, route_slot, mr)
+
+
+def nonatomic_bf16_epilog(
+    accm, arg_out, m_row, n_block_idx, wave, lane, N_OUT, BN, kMChunks
+):
+    numAccN = (BN // 4) // 16
+    row_base = m_row + (lane // 16) * 4
+    gn_base = n_block_idx * BN + wave * (BN // 4) + (lane % 16)
+    out_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(numAccN):
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                bf = Vec.from_elements([vec[v]], Float32).to(BFloat16)
+                out_ptr[(row_base + i * 16 + v) * N_OUT + gn_base + J * 16] = bf[0]

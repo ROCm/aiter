@@ -2537,6 +2537,7 @@ def _mxfp4_a4w4_stage2_fw(
             topk_weights=topk_weights,
             bias2=bias2,
             block_m=block_m,
+            reverse_sorted=reverse_sorted,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -2609,6 +2610,7 @@ def _flydsl_v2_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     topk_weights=None,
+    reverse_sorted=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -2638,7 +2640,19 @@ def _flydsl_v2_stage2_wrapper(
     _defer_w = _s2_fp8_inter and _kstatic
     _fp8_scale_blk = None
     _fp8_pitch_align = None
-    if epilog == "reduce":
+    if epilog == "scatter":
+        if reverse_sorted is None or sorted_weights is None:
+            raise ValueError(
+                "epilog='scatter' FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
+            )
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "epilog='scatter' FlyDSL GEMM2 does not support expert-parallel"
+            )
+        target = torch.empty(
+            (max_sorted, model_dim_runtime), dtype=out.dtype, device=out.device
+        )
+    elif epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
                 FP8OUT_PITCH_ALIGN,
@@ -2708,6 +2722,18 @@ def _flydsl_v2_stage2_wrapper(
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
     )
+    if epilog == "scatter":
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=target,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            out=out,
+            NE=num_experts,
+            TOPK=topk,
+            D_HIDDEN=model_dim_runtime,
+            MB=bm,
+        )
+        return out
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
@@ -3420,9 +3446,11 @@ def get_2stage_cfgs(
             )
         _s1_fp8q = is_opus1 or (is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1])
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
+        v2_scatter = False
         if flydsl_v2_stage2_cfg is not None:
             stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
             _fuse_quant = flydsl_v2_stage2_cfg["a_dtype"]
+            v2_scatter = flydsl_v2_stage2_cfg["epilog"] == "scatter"
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -3433,6 +3461,7 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
+            output_aux=AUX_SORT_OPUS if v2_scatter else False,
             **route_bucket_metadata,
         )
     if (
