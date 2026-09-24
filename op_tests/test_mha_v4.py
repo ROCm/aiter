@@ -1798,5 +1798,39 @@ def test_mha_v4_rejects_unusable_seqlens_k():
         )
 
 
+@pytest.mark.parametrize(
+    "formats",
+    [
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.INT8, AttentionFormat.INT8, None),
+        (None, None, None),
+    ],
+)
+def test_mha_v4_rejects_seqlens_k_on_recipes_that_ignore_it(formats):
+    """Only the BF16 Q/K objects read the slot; the rest must fail, not silently pad-attend.
+
+    MXFP4 and MXFP6 matter most: they return through their own launchers, which never forward
+    seqlens_k, so a missing gate here is invisible rather than merely unsupported.
+    """
+    q_format, k_format, v_format = formats
+    fp8 = native_fp8_format()
+    q_format = q_format or fp8
+    k_format = k_format or fp8
+    v_format = v_format or fp8
+    q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="per-batch key lengths"):
+        mha_v4(
+            q,
+            q,
+            q,
+            q_format,
+            k_format,
+            v_format,
+            seqlens_k=torch.full((2,), 128, device="cuda", dtype=torch.int32),
+        )
+
+
 if __name__ == "__main__":
     main()

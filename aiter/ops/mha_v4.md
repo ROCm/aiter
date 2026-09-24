@@ -10,7 +10,8 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Dense and sorted block-sparse inference.
 - GFX950 LDS-staged sparse recipes support up to 8,192 KV tiles per sequence.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- Per-batch key lengths on dense via `seqlens_k`; sorted sparse rejects it.
+- Per-batch key lengths via `seqlens_k`, on the dense GFX950 `BF16 Q/K` rows only. Every other
+  recipe, architecture, and the sorted-sparse path reject it.
 - No backward, dropout, RNG state, LSE, causal, or Q-side varlen support yet.
 
 Supported recipes. Every recipe is available in both dense and sorted-sparse mode with the same

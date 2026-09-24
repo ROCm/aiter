@@ -783,6 +783,27 @@ _LSE_CAPABLE_QV = frozenset(
     }
 )
 
+# (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
+# carries the load, but only these objects were rebuilt with it; the rest would silently attend
+# over the full padded key length, so they are rejected rather than left to return a wrong answer.
+_VARLEN_CAPABLE_QV = frozenset(
+    {
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
+    }
+)
+
+
+def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
+    """Reject per-batch key lengths on rows whose code object ignores them."""
+    arch = get_gfx()
+    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+        raise NotImplementedError(
+            f"MHA v4 per-batch key lengths are not implemented for "
+            f"Q={q_format.name} V={v_format.name} on {arch} yet"
+        )
+
 
 def mha_v4_packed(
     q: Tensor,
@@ -876,6 +897,7 @@ def mha_v4_packed(
             raise NotImplementedError(
                 "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
             )
+        _check_varlen_capable(q_format, v_format)
         if seqlens_k.dtype != torch.int32 or seqlens_k.device != q.device:
             raise ValueError(
                 "seqlens_k must be an int32 tensor on the same device as Q"
@@ -1194,6 +1216,14 @@ def mha_v4(
                 f"MHA v4 LSE is not implemented for Q={q_format.name} "
                 f"V={v_format.name} yet"
             )
+    # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
+    # own launchers, which never forward seqlens_k.
+    if seqlens_k is not None:
+        if block_mask is not None:
+            raise NotImplementedError(
+                "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
+            )
+        _check_varlen_capable(q_format, v_format)
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None
     recipe = _resolve_raw_recipe(
