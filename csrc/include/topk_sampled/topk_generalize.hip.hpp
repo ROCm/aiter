@@ -137,7 +137,13 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     const int nwaves  = blockDim.x / WAVE_SIZE;
     const uint64_t lt = (1ull << lane) - 1ull;
 
-    __shared__ uint64_t wbuf[WSTAGE_WAVES * WSTAGE_CAP];
+    // Dynamic, not static: the staging buffer needs WSTAGE_CAP entries per wave,
+    // so a 1024-thread block wants sixteen waves' worth and a 512-thread block
+    // eight. As a compile-time constant that has to be the larger of the two, and
+    // then every 512-thread block reserves 40 KB it cannot use -- measured at 7 to
+    // 14% (m=4096 n=131072 goes 540.1 to 615.2us with WSTAGE_WAVES forced to 16).
+    // Sized at launch instead, each block reserves exactly what its width needs.
+    extern __shared__ uint64_t wbuf[];
     uint64_t* buf      = wbuf + (size_t)wid * WSTAGE_CAP;
     uint64_t* row_base = cand_pack + (size_t)row * cap;
     (void)nwaves;
