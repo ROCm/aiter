@@ -68,8 +68,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 f"{reuse_from.device}, this group is on {self.device}"
             )
             self.pynccl_comm = reuse_from.pynccl_comm
+            # Borrowed, not owned: both all-reduce slots can hold IPC inboxes
+            # opened against every peer, and the group they were built for still
+            # uses them, so destroy() here must not close them.
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
+            self._owns_ar_comms = False
             self.symm_mem_comm = reuse_from.symm_mem_comm
             return
 
@@ -101,6 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
+        self._owns_ar_comms = True
         self.symm_mem_comm = None
         # if use_torch_symm_mem and current_platform.is_cuda():
         #     self.symm_mem_comm = SymmMemCommunicator(
@@ -193,8 +198,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        # always try quick reduce first, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
+        # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
+        # for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -901,10 +906,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def destroy(self):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
-        if self.qr_comm is not None:
-            self.qr_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
+        # Closed rather than merely dropped: either slot may hold IPC inboxes
+        # opened against every peer, and those handles have to be released
+        # before the process group goes away. Dropping the reference defers that
+        # to garbage collection, which can land after the group is gone. A
+        # borrowed pair belongs to the group it was built for, which closes it.
+        for name in ("qr_comm", "ca_comm"):
+            comm = getattr(self, name, None)
+            if comm is not None:
+                if self._owns_ar_comms:
+                    comm.close()
+                setattr(self, name, None)
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()
             self._all2all_manager = None
