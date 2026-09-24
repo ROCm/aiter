@@ -548,16 +548,19 @@ def _launch_winograd_f4x3(
     padding,
     activation,
     layout="nchw",
+    block_k=64,
+    x_blocked=None,
 ):
-    """Launch Winograd F(4x4,3x3) pipeline: input transform -> batched GEMM -> output transform."""
+    """Launch Winograd F(4x4,3x3), optionally from a packed NCHWc input."""
     ph, pw = padding
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
     T = N * tile_H * tile_W
 
-    input_dtype = x.dtype
-    V = torch.empty((36, T, C_pad), device=x.device, dtype=input_dtype)
-    M = torch.empty((36, T, K_out), device=x.device, dtype=torch.float32)
+    cblocked = x_blocked is not None
+    x_in = x_blocked if cblocked else x
+    V = torch.empty((36, T, C_pad), device=x_in.device, dtype=x_in.dtype)
+    M = torch.empty((36, T, K_out), device=x_in.device, dtype=torch.float32)
 
     shape_key = format_shape_key(
         N=N,
@@ -578,23 +581,40 @@ def _launch_winograd_f4x3(
     gemm_config = _get_config_wino_gemm(shape_key=shape_key, M=T)
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
-    # 1. Input transform
-    _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
-        x,
-        V,
-        N,
-        C,
-        C_pad,
-        H,
-        W_in,
-        tile_H,
-        tile_W,
-        T,
-        ph,
-        pw,
-        LAYOUT=layout,
-        **input_config,
-    )
+    if cblocked:
+        _winograd_f4x3_cblocked_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
+            x_in,
+            V,
+            N,
+            C,
+            C_pad,
+            H,
+            W_in,
+            tile_H,
+            tile_W,
+            T,
+            ph,
+            pw,
+            block_k,
+            **input_config,
+        )
+    else:
+        _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
+            x_in,
+            V,
+            N,
+            C,
+            C_pad,
+            H,
+            W_in,
+            tile_H,
+            tile_W,
+            T,
+            ph,
+            pw,
+            LAYOUT=layout,
+            **input_config,
+        )
 
     # 2. Batched GEMM
     _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
@@ -621,100 +641,7 @@ def _launch_winograd_f4x3(
         T,
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
-        LAYOUT=layout,
-        **output_config,
-    )
-
-
-def _launch_winograd_f4x3_cblocked(
-    x_blocked,
-    C_pad_blocked,
-    U,
-    bias_fp32,
-    y,
-    N,
-    C,
-    H,
-    W_in,
-    K_out,
-    P,
-    Q,
-    C_pad,
-    padding,
-    activation,
-    block_k,
-):
-    """Launch Winograd F(4x4,3x3) with a materialized NCHWc input."""
-    ph, pw = padding
-    tile_H = (P + 3) // 4
-    tile_W = (Q + 3) // 4
-    T = N * tile_H * tile_W
-
-    Cb = block_k
-    input_dtype = x_blocked.dtype
-    V = torch.empty((36, T, C_pad), device=x_blocked.device, dtype=input_dtype)
-    M = torch.empty((36, T, K_out), device=x_blocked.device, dtype=torch.float32)
-
-    shape_key = format_shape_key(
-        N=N,
-        C=C,
-        H=H,
-        W=W_in,
-        K=K_out,
-        R=3,
-        S=3,
-        sh=1,
-        sw=1,
-        ph=ph,
-        pw=pw,
-        dh=1,
-        dw=1,
-    )
-    input_config = _get_config_wino_input(shape_key=shape_key, M=T)
-    gemm_config = _get_config_wino_gemm(shape_key=shape_key, M=T)
-    output_config = _get_config_wino_output(shape_key=shape_key, M=T)
-
-    # 1. Cblocked input transform
-    _winograd_f4x3_cblocked_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
-        x_blocked,
-        V,
-        N,
-        C,
-        C_pad,
-        H,
-        W_in,
-        tile_H,
-        tile_W,
-        T,
-        ph,
-        pw,
-        Cb,
-        **input_config,
-    )
-
-    _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
-        V,
-        U,
-        M,
-        T,
-        K_out,
-        C_pad,
-        **gemm_config,
-    )
-
-    _winograd_f4x3_output_transform_kernel[_make_wino_output_grid(T, K_out)](
-        M,
-        bias_fp32,
-        y,
-        N,
-        K_out,
-        P,
-        Q,
-        tile_H,
-        tile_W,
-        T,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
+        LAYOUT="nchw" if cblocked else layout,
         **output_config,
     )
 

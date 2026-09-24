@@ -13,7 +13,6 @@ from aiter.ops.triton.conv._launch import (
     _launch_3x3_nhwc,
     _launch_general,
     _launch_winograd_f4x3,
-    _launch_winograd_f4x3_cblocked,
 )
 from aiter.ops.triton.conv._prepack import (
     get_or_make_weight_pack,
@@ -288,17 +287,15 @@ def conv2d_winograd_f4x3_cblocked(
     bias = _prep_bias(bias)
     U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw, block_k)
     if x_blocked is None:
-        x_blocked, C_pad_blocked = prepack_nchw_to_cblocked(x, block_k)
+        x_blocked, _ = prepack_nchw_to_cblocked(x, block_k)
     else:
         if x_blocked.ndim != 5:
             raise ValueError(
                 "conv2d_winograd_f4x3_cblocked requires a 5-D NCHWc "
                 f"x_blocked tensor, got {x_blocked.ndim}-D"
             )
-        C_pad_blocked = x_blocked.shape[-1] * x_blocked.shape[1]
-    _launch_winograd_f4x3_cblocked(
-        x_blocked,
-        C_pad_blocked,
+    _launch_winograd_f4x3(
+        x,
         U,
         bias,
         y,
@@ -312,7 +309,8 @@ def conv2d_winograd_f4x3_cblocked(
         C_pad,
         padding,
         activation,
-        block_k,
+        block_k=block_k,
+        x_blocked=x_blocked,
     )
     return y
 
