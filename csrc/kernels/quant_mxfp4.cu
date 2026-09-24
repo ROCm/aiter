@@ -96,8 +96,6 @@ template <>
 __forceinline__ __device__ float mxfp4_to_float<__half>(__half x) { return __half2float(x); }
 template <>
 __forceinline__ __device__ float mxfp4_to_float<__hip_bfloat16>(__hip_bfloat16 x) { return __bfloat162float(x); }
-template <>
-__forceinline__ __device__ float mxfp4_to_float<hip_bfloat16>(hip_bfloat16 x) { return static_cast<float>(x); }
 
 template <typename float_type, MxScaleRoundMode rmode, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
 __global__ __launch_bounds__(kBlockThreads)
