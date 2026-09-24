@@ -713,6 +713,6 @@ def sparse_mla_fwd(
         ADAPTIVE_SPLITS=num_splits > 1,
         lse_ptr=lse,
         HAS_LSE=return_lse,
-        num_warps=1,
+        num_warps=4,
     )
     return out, (lse if return_lse else None)
