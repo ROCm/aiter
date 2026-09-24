@@ -46,21 +46,41 @@ WORKLOADS = {
 # Configs and budgets for regression testing, so the metadata buffers don't grow
 # unexpectedly. max_gib is the current size rounded up.
 SERVING_CONFIGS = {
-    "dsv3_tp8_16k_budget": dict(
-        batch_size=256, total_qlen=16384, num_head_k=16, v_head_dim=512, max_gib=3.25
-    ),
-    "dsv3_tp8_16k_budget_1k_seqs": dict(
-        batch_size=1024, total_qlen=16384, num_head_k=16, v_head_dim=512, max_gib=9.5
-    ),
-    "dsv3_tp4_16k_budget": dict(
-        batch_size=128, total_qlen=16384, num_head_k=32, v_head_dim=512, max_gib=4.25
-    ),
-    "kimi_k25_tp8_16k_budget": dict(
-        batch_size=256, total_qlen=16384, num_head_k=16, v_head_dim=128, max_gib=0.85
-    ),
-    "kimi_k25_tp8_16k_budget_1k_seqs": dict(
-        batch_size=1024, total_qlen=16384, num_head_k=16, v_head_dim=128, max_gib=2.5
-    ),
+    "dsv3_tp8_16k_budget": {
+        "batch_size": 256,
+        "total_qlen": 16384,
+        "num_head_k": 16,
+        "v_head_dim": 512,
+        "max_gib": 3.25,
+    },
+    "dsv3_tp8_16k_budget_1k_seqs": {
+        "batch_size": 1024,
+        "total_qlen": 16384,
+        "num_head_k": 16,
+        "v_head_dim": 512,
+        "max_gib": 9.5,
+    },
+    "dsv3_tp4_16k_budget": {
+        "batch_size": 128,
+        "total_qlen": 16384,
+        "num_head_k": 32,
+        "v_head_dim": 512,
+        "max_gib": 4.25,
+    },
+    "kimi_k25_tp8_16k_budget": {
+        "batch_size": 256,
+        "total_qlen": 16384,
+        "num_head_k": 16,
+        "v_head_dim": 128,
+        "max_gib": 0.85,
+    },
+    "kimi_k25_tp8_16k_budget_1k_seqs": {
+        "batch_size": 1024,
+        "total_qlen": 16384,
+        "num_head_k": 16,
+        "v_head_dim": 128,
+        "max_gib": 2.5,
+    },
 }
 SERVING_QLEN_GRANULARITY = 256
 
@@ -133,7 +153,7 @@ def test_serving_config_partial_pool_fits_in_the_memory_budget(config):
     budget = cfg["max_gib"] * 1024**3
     bounded = _partial_pool_bytes(cfg, total_qlen=cfg["total_qlen"])
     assert bounded <= budget, (
-        f"{config}: partial pool is {bounded / 1024 ** 3:.2f} GiB, over the "
+        f"{config}: partial pool is {bounded / 1024**3:.2f} GiB, over the "
         f"{cfg['max_gib']:.2f} GiB this config is expected to cost"
     )
     # without a budget the same config is the OOM that motivated total_qlen
