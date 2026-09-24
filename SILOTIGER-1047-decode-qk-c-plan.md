@@ -3,9 +3,10 @@
 Close the **remaining** family A FlyDSL overlay decode gap after the
 K/V-map campaign. Physical decode K/V publication is already AMD-class
 (conflict and wait-LDS now **better** than Live AMD). Split still trails
-**~21–23%** because overlay QK C is token-major (`K @ Q^T`) and LDS
-reads serialize on reused destinations. Merge at `ns64` is a second,
-wrapper-visible hole.
+**~21–23%** because overlay keeps PV as P-as-A/V-as-B (vector of heads
+per D lane), while Live AMD swaps PV to V-as-A/P-as-B (vector of D per
+head lane), and because LDS reads serialize on reused destinations.
+Merge at `ns64` is a second, wrapper-visible hole.
 
 Parent: [SILOTIGER-1040](https://amd.atlassian.net/browse/SILOTIGER-1040).
 Ticket: [SILOTIGER-1047](https://amd.atlassian.net/browse/SILOTIGER-1047).
@@ -49,8 +50,8 @@ Stage then one-line commit when that is the ticket convention.
 ## Progress
 
 - [x] 0. Pin remaining split sites from `k2_decode_final` (no kernel edit)
-- [ ] 1. Head-major decode QK C (decode-only; keep overlay LDS)
-- [ ] 2. Drop leftover `v_perm` / `ds_bpermute` that exist only for token-major C
+- [x] 1. Head-major decode QK C (miss: requires forbidden fragment transpose)
+- [x] 2. AMD-matched decode PV: V-as-A / P-as-B + D-vector output
 - [ ] 3. Overlap QK/PV LDS reads (compiler dests, not named-dest burst)
 - [ ] 4. `ns64` merge: vectorized `BLOCK_SPLITS`-style scan
 - [ ] 5. Stop: decode split ≤ Live AMD at M=1 and M=8
@@ -101,15 +102,18 @@ ISA leftover vs AMD decode (`tickets/1047/tmp/k2_decode_final/isa_m{1,8}/`):
 | split `s_waitcnt` / `s_barrier` | 32 / 4 | 33–34 / 5 |
 | `v_perm` / `ds_bpermute` | **2 / 8** | **0 / 0** |
 | VGPR | 113 | 106 |
-| QK C layout | token-major (`K @ Q^T`) | head-major (`Q @ K`) |
+| QK C layout | token vector / head lane (`K @ Q^T`) | **same** (`K @ Q^T` in ISA) |
+| PV / output C layout | P-as-A/V-as-B; head vector / D lane | V-as-A/P-as-B; D vector / head lane |
 | QK/PV LDS dests | reused `v[96:99]` / `v[98:99]` + `lgkmcnt(0)` | distinct dests + `offset:256` / `lgkmcnt(1)` |
 
 The 8 `ds_bpermute` are `shuffle_idx(alpha)` ×4 and epilogue
-`shuffle_idx(l_final)` ×4: overlay C lives on **token** lanes, PV
-accumulators and the store live on **head** lanes. The 2 `v_perm`
-pack four softmax P bf16 into PV-A. AMD’s C is already head-major, so
-those gathers do not exist. Direct permute/wait folklore was tried in
-the map campaign (phases 3–4) and did not close the split gap.
+`shuffle_idx(l_final)` ×4: overlay QK/softmax has one head per lane,
+but its PV accumulator/store has four heads in each VGPR vector at a
+fixed D lane. The 2 `v_perm` pack four token probabilities into PV-A.
+AMD keeps the same QK token-vector/head-lane fragment, then swaps PV
+and its output ownership so alpha/l stay on the head lane. Direct
+permute/wait folklore was tried in the map campaign (phases 3–4) and
+did not close the split gap.
 
 ## Locked decisions
 
@@ -164,8 +168,9 @@ apply. Prefill DNR and map-campaign DNR still apply.
 - **Family A GQA, live AMD is the success bar.** `err=0` vs the
   oracle (`checkAllclose` `1e-2`).
 - **No 3% keep-gate on wall clock.** A step that is oracle-correct
-  **and** moves QK C toward AMD’s head-major fragment (or merge toward
-  AMD’s `BLOCK_SPLITS` load) is kept even if wrapper µs is flat.
+  **and** moves PV/output ownership toward AMD’s V-as-A/P-as-B
+  fragment (or merge toward AMD’s `BLOCK_SPLITS` load) is kept even
+  if wrapper µs is flat.
 - **Prefill is frozen.** All experiments stay behind
   `const_expr(decode_tr_pv)` (`use_k32 and block_n == 16`). Do not
   edit BN64 `amd_k_elem` / `write2st64` / tr16-immediate lattice.
@@ -175,22 +180,23 @@ apply. Prefill DNR and map-campaign DNR still apply.
   `rows * Hk ≤ 4`, `ns32` otherwise.
 - **Do not chase extra MFMA.** Stay 8× K32 QK + 4× K16 PV.
 - **Overlay LDS contract stays.** One MMA scratch (K then V), 8 KiB,
-  softmax m/l in registers, **no C/P/metadata LDS**. What this
-  campaign **does** reopen for decode is the **register** QK C map:
-  `K @ Q^T` was kept so C could feed PV-A without a P-LDS. Phase 6 of
-  the map campaign showed that bargain is the leftover split cost.
-  A decode-only `Q @ K` (or equivalent head-major C) is in scope **if
-  it does not bring C/P LDS back**.
+  softmax m/l in registers, **no C/P/metadata LDS**. Phase 1 tested
+  reopening the register QK C map and proved it cannot feed PV without
+  a forbidden cross-lane transpose. Keep `K @ Q^T`; the viable
+  decode-only register change is PV/output ownership, not QK C.
 
 ### Target Live AMD decode dataflow
 
-Live AMD (`qsa_vllm_amd.py` `_qsa_sparse_paged_gqa_splitk`) compiles
-`Q @ K` so QK C is `[M, N]` head-major. Softmax and PV-A are already
-in that layout; Q stages through LDS (the extra 2 `ds_write_b128` /
-8 `ds_read_b128`). Overlay keeps Q in registers. Matching AMD does
-**not** require Q LDS; it requires C’s **lane ownership** to match
-PV-A / store (4 heads), so `shuffle_idx(alpha)` and `l_final` dens
-go away.
+Live AMD source (`qsa_vllm_amd.py`
+`_qsa_sparse_paged_gqa_splitk`) says `Q @ K`, but gfx950 ISA emits K
+as MFMA source A and Q as source B: token-vector/head-lane QK C, the
+same orientation as overlay. Q stages through LDS (the extra 2
+`ds_write_b128` / 8 `ds_read_b128`); overlay keeps Q in registers.
+The material difference is the next dot: AMD emits V-as-A/P-as-B and
+therefore D-vector/head-lane output, while overlay emits
+P-as-A/V-as-B and head-vector/D-lane output. Matching AMD does **not**
+require Q LDS or a QK transpose; it requires a decode-only PV/output
+state remap so `alpha` and `l_final` stay on their head lane.
 
 Merge: AMD `BLOCK_SPLITS = next_power_of_2(NUM_SPLITS)` and a masked
 vector load of split LSEs / partials (`qsa_vllm_amd.py` ~426–433).
@@ -390,33 +396,168 @@ the same lanes that own PV-A and the 4-head store, like AMD `Q @ K`.
       `alpha` onto head lanes.
 - [ ] PV-A must consume that C (or a cheap in-register pack that is
       not 2× `v_perm` + 8× `bpermute`). No P-LDS.
-- [ ] Oracle decode+prefill. Record ktrace split/merge, ISA C
+- [x] Oracle decode+prefill. Record ktrace split/merge, ISA C
       comments, `v_perm` / `bpermute` counts, busy/wave. Keep if C
       ownership moved toward AMD even if split µs is flat.
-- [ ] **Done when:** decode QK C is head-major in-lane (documented
+- [x] **Done when:** decode QK C is head-major in-lane (documented
       against AMD `[M,N]`), prefill ISA sha still the st64-imm
       keeper (`64ee586155fc6a63`), **or** a dated miss shows that
       `Q @ K` cannot feed PV-A without P-LDS — then stop and do not
       silently restore C/P LDS.
 
-If phase 1 is a miss, do **not** proceed to pretend-permute cleanup.
-Record DNR and skip to phase 4 only if split is still ~1.2× and merge
-is the serving-visible hole; otherwise stop the campaign.
+**Attempted; blocked by the hardware fragment map (2026-09-24).**
+No kernel keep and no ISA/perf re-profile: the proposed QK orientation
+cannot feed either PV operand without the cross-lane transpose this
+phase forbids. Focused unchanged-HEAD decode+prefill oracle:
+**2 passed** (`CACHE=0`, GPU 6). Prefill is therefore still the
+st64-imm keeper; no source changed, so its retained ISA sha remains
+`64ee586155fc6a63`.
 
-### 2. Drop leftover `v_perm` / `ds_bpermute`
+The phase premise that Live AMD has a head-major QK C was wrong.
+`amd_m8_split.s` 390–431 issues K from LDS as QK source 0 and Q from
+LDS as source 1:
 
-Only after phase 1’s C map is real.
+```
+ds_read_b128 v[74:77], v25                  ; K
+ds_read_b128 v[82:85], v25 offset:256       ; K, next D half
+v_mfma_f32_16x16x32_bf16 v[74:77],
+    v[74:77], v[42:45], 0                   ; K @ Q^T
+```
 
-- [ ] Delete decode `shuffle_idx(alpha)` / `shuffle_idx(l_final)` if
-      head-major C made them dead. Delete the 2 `v_perm` P pack if
-      PV-A already holds packed bf16.
-- [ ] Do not add permute to “fix” a wrong C map; go back to phase 1.
-- [ ] Oracle + ISA. Keep if `v_perm`/`ds_bpermute` fall toward AMD
-      0/0 even if wrapper µs is flat.
-- [ ] **Done when:** decode ISA has no `ds_bpermute` and `v_perm` is
-      0, or a dated note explains a leftover that AMD also emits
-      (`v_permlane*` for the softmax tree is allowed; `ds_bpermute`
-      is not).
+That is the same mathematical orientation as overlay (`load_amd_k8`
+as A, `q_regs` as B), not source-level Triton `Q @ K`. AMD's later
+PV is what swaps:
+
+```
+v_mfma_f32_16x16x16_bf16 v[12:15],
+    v[80:81], v[40:41], v[12:15]            ; V as A, P as B
+```
+
+FlyDSL's gfx950 MFMA layouts make the constraint explicit
+(`/workspaces/FlyDSL/lib/Dialect/FlyROCDL/CDNA4/MmaAtom.cpp`):
+
+- A/B: `X = lane%16`, `K = 4*(lane/16)+val` for K16.
+- C: `N = lane%16`, `M = 4*(lane/16)+val`.
+
+For current `K @ Q^T`, C has `N=head` on `lane%16` and four
+`M=token` values in the VGPR. Reinterpreted as PV-A
+`P[head,token]`, that is already exactly the A/B fragment map:
+`head=lane%16`, `token=4*(lane/16)+val`. Only bf16 conversion and
+packing are needed.
+
+For proposed `Q @ K`, C instead has `N=token` on `lane%16` and four
+`M=head` values in the VGPR. PV-A needs those coordinates transposed
+back to `head=lane%16`, token-in-VGPR. PV-B needs the same physical
+`N=head`, K=token map. A local vector permutation cannot exchange
+`lane%16` with `(lane/16,val)`; it requires one of:
+
+1. C/P LDS via `make_tiled_copy_C` then an A/B-matched read;
+2. `ds_bpermute` / `shuffle_idx` cross-lane transpose; or
+3. a compiler-generated equivalent cross-lane network.
+
+`TiledCopy.retile` is only a tensor view/partition operation; it
+does not move values between lanes. The only supported C-to-operand
+route found in the pinned FlyDSL API is an actual copy, which would
+violate the one-scratch/no-C/P-LDS contract or restore the permutes
+this campaign is meant to remove.
+
+Therefore the first three implementation boxes stay unchecked.
+This is the dated miss allowed by the phase's done condition. Do not
+try the direct operand swap: it changes C coordinates while the
+softmax/PV consumers still interpret the old fragment and is
+numerically wrong.
+
+**Consequence.** Retain `K @ Q^T`; the actionable AMD difference is
+the second dot. Phase 2 therefore replaces the invalid pretend-QK
+cleanup with a decode-only V-as-A/P-as-B PV and output-state remap.
+
+### 2. AMD-matched decode PV: V-as-A / P-as-B + D-vector output
+
+Live AMD consumes the existing token-vector/head-lane softmax
+fragment as PV-B, reads V as PV-A, and leaves output C as four D
+values on one head lane. Match that behind `decode_tr_pv`; prefill
+keeps P-as-A/V-as-B.
+
+- [x] Swap decode PV operands only: tr16 V fragment as A, packed P
+      as B. Keep 4× K16.
+- [x] Remap loop-carried O and epilogue to
+      `head=lane_m`, `D=d_base+lane_kg*4+i`; alpha/l remain scalar
+      on the head lane. Remove `shuffle_idx(alpha)` and
+      `shuffle_idx(l_final)`.
+- [x] Pack four P values with two `v_cvt_pk_bf16_f32` into the
+      MFMA-B fragment; no `v_perm`, no P-LDS.
+- [x] Oracle decode+prefill; record ISA, split/merge ktrace, wrapper,
+      and PMC.
+- [x] **Done when:** decode emits V-as-A/P-as-B, output is
+      D-vector/head-on-lane, `v_perm` / `ds_bpermute` are 0 / 0,
+      prefill ISA is unchanged.
+
+**Kept (2026-09-24).** Decode-only changes in
+`k2_family_a.py`: `pv_mfma(v_vec, p_vec, acc)`; scalar alpha splats
+over four D accumulators; direct head-lane output stores; packed
+P-B via two `cvt_pk_bf16_f32`. No C/P LDS and the same 8 KiB overlay.
+Focused decode+prefill oracle: **2 passed** (`CACHE=0`, GPU 6).
+Prefill ISA sha is unchanged:
+`64ee586155fc6a634edb8dfa5b71d835b5bdbe480b40a65d8a49191da653ae0c`.
+
+**Decode ISA** (`tickets/1047/tmp/k2_decode_pv/isa_m8_pack/launch/22_final_isa.s`)
+vs phase-6 map-campaign final:
+
+| split body | before | PV swap | AMD decode |
+|--|--:|--:|--:|
+| K32 / K16 MFMA | 8 / 4 | 8 / 4 | 8 / 4 |
+| PV operands | P / V | **V / P** | V / P |
+| `ds_bpermute` / `v_perm` | 8 / 2 | **0 / 0** | 0 / 0 |
+| `v_cvt_pk_bf16_f32` | 4 | **2** | 2 |
+| tr16 | 4 | 4 | 4 |
+| split waitcnt / barriers | 32 / 4 | 33 / 4 | 33–34 / 5 |
+| VGPR | 113 | **102** | 106 |
+| static instructions (same parser) | 664 | **584** | 1017 |
+| global stores | 17 | **5** | — |
+
+The four K16 lines are now `v_mfma …, v[90:91], v[84:85]`: tr16 V
+first, packed P second. The remaining AMD static-instruction excess
+includes Q LDS staging; lower static count is not itself a target.
+
+**Same-process kernel trace** (`CACHE=0`, five timed interleaved
+dispatches; `tickets/1047/tmp/k2_decode_pv/ktrace_pack/`):
+
+| M | FlyDSL split | AMD split | ratio | FlyDSL merge | AMD merge |
+|--:|--:|--:|--:|--:|--:|
+| 1 (`ns64`) | **7.360 µs** | **6.401 µs** | **1.15×** | 12.160 | 3.560 |
+| 8 (`ns32`) | **12.040 µs** | **10.400 µs** | **1.16×** | 3.640 | 2.920 |
+
+The final map campaign was 1.21× / 1.23×; PV ownership closes about
+half of the remaining relative split gap. The phase-5 40-dispatch
+absolute reference was 7.80 / 12.82 µs vs AMD 6.44 / 10.44 µs.
+Success is still not met at either M. M=1 merge remains the
+wrapper-visible follow-on.
+
+**Wrapper** (five-run median, interleaved, `CACHE=0`; not a
+keep-gate):
+
+| M | FlyDSL µs | AMD µs |
+|--:|--:|--:|
+| 1 | **19.512** | 36.432 |
+| 8 | **19.123** | 36.706 |
+| 512 | **155.993** | 199.671 |
+
+AMD decode wrapper remains inflated; use split trace as the decode
+bar. Prefill's lower wall number is run-to-run noise: its ISA hash is
+identical.
+
+**PMC last split dispatch** (SE totals summed; per wave):
+
+| M | waves | busy/w | wait-LDS/w | conflict/w | MFMA total |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 512 | 1017.3 | 42.6 | 48.4 | 12,384 |
+| 8 | 2,048 | 411.8 | 137.7 | 96.8 | 99,072 |
+
+Conflict and MFMA totals are unchanged. One-dispatch busy/wait
+counters are slightly above phase 6 (965.5/36.5 and 399.9/129.6)
+despite the repeated kernel-trace win; do not infer a wait regression
+from that noisy sample. Phase 3 still owns physical LDS destination
+overlap.
 
 ### 3. Overlap QK/PV LDS reads (compiler dests)
 
@@ -477,9 +618,13 @@ had FlyDSL merge **12.28 µs** vs AMD **6.04 µs** at `ns64`, while
 
 ## Open questions (resolve into locks; do not guess in code)
 
-- [ ] Whether decode `Q @ K` can feed PV-A without P-LDS or a
-      bpermute transpose of P (phase 1). If no, this campaign’s
-      split lever is gone; do not smuggle C/P LDS back.
+- [x] Whether decode `Q @ K` can feed PV-A without P-LDS or a
+      bpermute transpose of P (phase 1). **No.** CDNA4 C has
+      `N=lane%16`, `M=4*(lane/16)+val`; swapping QK makes token the
+      lane coordinate and head the VGPR coordinate, while either PV
+      operand needs head on the lane and token in the VGPR. That is
+      a cross-lane transpose. Live AMD does not swap QK in ISA; it
+      swaps PV to V-as-A/P-as-B. Do not smuggle C/P LDS back.
 - [ ] Whether FlyDSL can color successive LDS-read dests without
       inline-asm (phase 3). If no, document compiler work as out of
       ticket and live with `lgkmcnt(0)`.

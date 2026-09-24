@@ -638,21 +638,41 @@ def build_qsa_k2_family_a_module(
                         _exp2(scores[ng][i] - m_new), Float32(0.0)
                     )
                     p_sum = p_sum + p
-                    probs.append(p.to(BFloat16))
-                p_vecs.append(fx.Vector.from_elements(probs, BFloat16))
+                    if const_expr(decode_tr_pv):
+                        probs.append(p)
+                    else:
+                        probs.append(p.to(BFloat16))
+                if const_expr(decode_tr_pv):
+                    # Pack P as the MFMA-B fragment directly. Building four
+                    # scalar bf16 elements made LLVM add two v_perm ops.
+                    p_lo = fx.rocdl.cvt_pk_bf16_f32(probs[0], probs[1])
+                    p_hi = fx.rocdl.cvt_pk_bf16_f32(probs[2], probs[3])
+                    p_vecs.append(
+                        fx.Vector.from_elements(
+                            [Int32(p_lo), Int32(p_hi)], Int32
+                        ).bitcast(BFloat16)
+                    )
+                else:
+                    p_vecs.append(fx.Vector.from_elements(probs, BFloat16))
             p_peer = p_sum.shuffle_xor(Int32(32), Int32(64))
             p_sum = p_sum + p_peer
             p_peer = p_sum.shuffle_xor(Int32(16), Int32(64))
             p_sum = p_sum + p_peer
             l_new = l_prev * alpha + p_sum
             h0 = lane_kg * Int32(4)
-            alpha4 = fx.Vector.from_elements(
-                [
-                    gpu.shuffle_idx(alpha, h0 + Int32(i), Int32(64))
-                    for i in range_constexpr(4)
-                ],
-                Float32,
-            )
+            if const_expr(decode_tr_pv):
+                # Decode matches live AMD's second dot: V is MFMA A and P is
+                # B, so output C is four D values on the head lane. Alpha is
+                # already scalar on that lane; no head gather is required.
+                alpha4 = fx.Vector.from_elements([alpha], Float32).broadcast_to(4)
+            else:
+                alpha4 = fx.Vector.from_elements(
+                    [
+                        gpu.shuffle_idx(alpha, h0 + Int32(i), Int32(64))
+                        for i in range_constexpr(4)
+                    ],
+                    Float32,
+                )
             next_acc = []
             for c in range_constexpr(out_chunks):
                 d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
@@ -717,33 +737,56 @@ def build_qsa_k2_family_a_module(
                         v_vec = fx.Vector(fx.memref_load_vec(v_ops[ng]))
                     else:
                         v_vec = v_ops[ng]
-                    acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
+                    if const_expr(decode_tr_pv):
+                        # V @ P^T: A owns D rows and B owns query heads. The
+                        # resulting C fragment is D-in-vector/head-on-lane.
+                        acc4 = pv_mfma(v_vec, p_vecs[ng], acc4)
+                    else:
+                        acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
             results = yield next_acc + [m_new, l_new]
 
         m_final = Float32(results[out_chunks])
         l_final = Float32(results[out_chunks + 1])
-        h0 = lane_kg * Int32(4)
-        l4 = fx.Vector.from_elements(
-            [
-                gpu.shuffle_idx(l_final, h0 + Int32(i), Int32(64))
-                for i in range_constexpr(4)
-            ],
-            Float32,
-        )
-        for i in range_constexpr(4):
-            local_head = lane_kg * Int32(4) + Int32(i)
-            if local_head < Int32(_GROUP):
-                head = kv_h * Int32(_GROUP) + local_head
-                den = l4[i]
-                has = den > Float32(0.0)
+        if const_expr(decode_tr_pv):
+            # PV C now keeps one query head on lane_m and four contiguous D
+            # rows in each VGPR vector. Store that fragment directly.
+            if lane_m < Int32(_GROUP):
+                head = kv_h * Int32(_GROUP) + lane_m
+                has = l_final > Float32(0.0)
                 for c in range_constexpr(out_chunks):
-                    d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
-                    value = has.select(fx.Vector(results[c])[i] / den, Float32(0.0))
-                    if n_splits == 1:
-                        out[row, head, d] = value.to(BFloat16)
-                    else:
-                        partial_out[split, row, head, d] = value
+                    d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
+                    for i in range_constexpr(4):
+                        d = d_base + lane_kg * Int32(4) + Int32(i)
+                        value = has.select(
+                            fx.Vector(results[c])[i] / l_final, Float32(0.0)
+                        )
+                        if n_splits == 1:
+                            out[row, head, d] = value.to(BFloat16)
+                        else:
+                            partial_out[split, row, head, d] = value
+        else:
+            h0 = lane_kg * Int32(4)
+            l4 = fx.Vector.from_elements(
+                [
+                    gpu.shuffle_idx(l_final, h0 + Int32(i), Int32(64))
+                    for i in range_constexpr(4)
+                ],
+                Float32,
+            )
+            for i in range_constexpr(4):
+                local_head = lane_kg * Int32(4) + Int32(i)
+                if local_head < Int32(_GROUP):
+                    head = kv_h * Int32(_GROUP) + local_head
+                    den = l4[i]
+                    has = den > Float32(0.0)
+                    for c in range_constexpr(out_chunks):
+                        d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
+                        value = has.select(fx.Vector(results[c])[i] / den, Float32(0.0))
+                        if n_splits == 1:
+                            out[row, head, d] = value.to(BFloat16)
+                        else:
+                            partial_out[split, row, head, d] = value
         if n_splits > 1 and lane_kg == zero and lane_m < Int32(_GROUP):
             head = kv_h * Int32(_GROUP) + lane_m
             den = l_final
