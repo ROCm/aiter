@@ -161,6 +161,23 @@ _SAMPLED_MIN_ROWS = 1
 _PLAIN_MANY_ROWS = 256
 _PLAIN_MANY_ROWS_BAND = (8192, 65536)
 _PLAIN_MIN_K = 1024
+# The report's k=2048 sweep exposes additional plain regions that the generic
+# many-row rule cannot express.  On the 4K triplet, plain beat stream in all
+# 36 measured cells through 2048 rows (1.083x geomean, 4.02% minimum time
+# reduction).  Across the report's 8K/16K/32K triplets it beat decode in all
+# 72 measured cells through 128 rows (1.42x--2.41x geomean by width band).
+#
+# Do not interpolate the latter result blindly: paired tests at N=12288 found
+# decode 8.25% and 5.86% faster at 32 and 128 rows.  One/eight-row endpoints
+# still favored plain throughout the band, while every tested row count
+# favored plain from N=20000 upward.  Encode those measured regions and keep
+# them exact-k=2048 rather than extrapolating to the selector's other k.
+_PLAIN_K2048_4K_BAND = (4096, 4098)
+_PLAIN_K2048_4K_MAX_ROWS = 2048
+_PLAIN_K2048_TINY_BAND = (8192, 32770)
+_PLAIN_K2048_TINY_MAX_ROWS = 8
+_PLAIN_K2048_SHORT_BANDS = ((8192, 8194), (16384, 16386), (20000, 32770))
+_PLAIN_K2048_SHORT_MAX_ROWS = 128
 
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
@@ -510,6 +527,17 @@ def _sampled_takes(rows: int, width: int, k: int) -> bool:
 
 def _plain_takes(rows: int, width: int, k: int) -> bool:
     """Enough rows for the row-scaling selector, on a width it is tuned for."""
+    if k == 2048:
+        four_k_lo, four_k_hi = _PLAIN_K2048_4K_BAND
+        if rows <= _PLAIN_K2048_4K_MAX_ROWS and four_k_lo <= width <= four_k_hi:
+            return True
+        tiny_lo, tiny_hi = _PLAIN_K2048_TINY_BAND
+        if rows <= _PLAIN_K2048_TINY_MAX_ROWS and tiny_lo <= width <= tiny_hi:
+            return True
+        if rows <= _PLAIN_K2048_SHORT_MAX_ROWS:
+            for short_lo, short_hi in _PLAIN_K2048_SHORT_BANDS:
+                if short_lo <= width <= short_hi:
+                    return True
     lo, hi = _PLAIN_MANY_ROWS_BAND
     return rows >= _PLAIN_MANY_ROWS and k >= _PLAIN_MIN_K and lo <= width <= hi
 
