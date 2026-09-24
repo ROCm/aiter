@@ -175,6 +175,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_quick_reduce_scatter": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/quick_reduce_scatter_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quick_reduce_scatter.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_custom": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_pybind.cu'",
