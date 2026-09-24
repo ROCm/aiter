@@ -1602,7 +1602,11 @@ def main():
         type=int,
         nargs="*",
         default=[512, 2048, 8192, 32768],
-        help="context length L in tokens (32k default; pass 131072 for 128k)",
+        help="context length L in tokens (32k default; pass 131072 for 128k).\n"
+        "Bar shapes are budget-saturated: decode M in {1,8} at L=32768,\n"
+        "prefill M=512 at L=8192. L=512 is a fast smoke row -- only ~25%%\n"
+        "of the 2051 selection slots are live there (12.5%% at M=512), so\n"
+        "it measures the masked path more than the gather. See valid%%.",
     )
     parser.add_argument(
         "-p",
