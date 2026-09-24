@@ -2164,17 +2164,6 @@ void relu2(const aiter_tensor_t& out,   // [..., d]
         return;
     }
     LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(aiter::relu2_kernel);
-    AITER_CHECK(out.is_gpu() && input.is_gpu(),
-                "relu2: input and out must be GPU tensors");
-    AITER_CHECK(out.is_contiguous() && input.is_contiguous(),
-                "relu2: input and out must be contiguous");
-    AITER_CHECK(out.numel() == input.numel(),
-                "relu2: out.numel must match input.numel");
-    AITER_CHECK(out.dtype() == input.dtype(),
-                "relu2: out dtype must match input dtype");
-    AITER_CHECK(out.device_id == input.device_id,
-                "relu2: input and out must be on the same device");
-    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::relu2_kernel);
 }
 
 } // namespace aiter
