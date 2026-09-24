@@ -1,0 +1,1 @@
+gfx,cu_num,N,C,D,H,W,K,kT,kH,kW,stride_d,stride_h,stride_w,pad_d,pad_h,pad_w,dil_d,dil_h,dil_w,groups,bias,libtype,tile_m,tile_n,wave_m,wave_n,wgm,splitK,us,kernelName,err_ratio,tflops,bw

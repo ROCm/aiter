@@ -54,8 +54,10 @@ def chunk_delta_attn_tuned_config_shortlist(
     published = (table.get(kernel_name) or {}).get("candidates")
     if not published:
         logger.warning(
-            f"No tuned Triton schedules for kernel '{kernel_name}' in "
-            f"'{cfg_dir}/DEFAULT.json'; using fallback {fallback}"
+            "No tuned Triton schedules for kernel '%s' in '%s/DEFAULT.json'; using fallback %s",
+            kernel_name,
+            cfg_dir,
+            fallback,
         )
         return fallback
     return [

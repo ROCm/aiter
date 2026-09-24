@@ -110,6 +110,16 @@ AITER_CONFIG_GEMM_A6W6 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W4_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A6W4_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a6w4_asm_tuned_gemm.csv"
+)
+
+AITER_CONFIG_GEMM_A4W6_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A4W6_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a4w6_asm_tuned_gemm.csv"
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -188,6 +198,14 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -196,6 +214,15 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
+
+# Head shapes to AOT-compile the gfx950 FlyDSL FP8 flash-attention forward for
+# (aiter/aot/flydsl/fmha_fp8.py). Per-model rows live under model_configs/
+# (*_fmha_fp8_aot.csv) and get merged into this canonical file, which ships
+# header-only like chunk_gdn_h_opt_tuned.csv.
+AITER_CONFIG_FMHA_FP8_AOT = os.getenv(
+    "AITER_CONFIG_FMHA_FP8_AOT",
+    f"{AITER_ROOT_DIR}/aiter/configs/fmha_fp8_aot.csv",
 )
 
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
@@ -219,6 +246,22 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A6W6",
             AITER_CONFIG_GEMM_A6W6,
             "a6w6_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W4_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W4_ASM",
+            AITER_CONFIG_GEMM_A6W4_ASM,
+            "a6w4_asm_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W6_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W6_ASM",
+            AITER_CONFIG_GEMM_A4W6_ASM,
+            "a4w6_asm_tuned_gemm",
         )
 
     @property
@@ -310,11 +353,25 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_FMHA_FP8_AOT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMHA_FP8_AOT",
+            AITER_CONFIG_FMHA_FP8_AOT,
+            "fmha_fp8_aot",
         )
 
     @property
@@ -482,7 +539,7 @@ class AITER_CONFIG:
     # process-lifetime singleton, so the retained reference is not a leak.
     @functools.lru_cache(maxsize=20)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
-        config_env_file = os.getenv(env_name)
+        config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 
