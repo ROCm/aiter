@@ -89,14 +89,6 @@ def fused_conv_recurrent_norm_kernel(
                 conv_weight_ptr + cw_q + o_k * stride_cw_ch + j * stride_cw_width
             ).to(tl.float32)
         b_q = b_q * tl.sigmoid(b_q)
-        for j in tl.static_range(W - 2):
-            tl.store(
-                p_csq + j * stride_cs_pos, tl.load(p_csq + (j + 1) * stride_cs_pos)
-            )
-        tl.store(
-            p_csq + (W - 2) * stride_cs_pos,
-            b_x_q.to(p_csq.dtype.element_ty),
-        )
 
         # ========== Conv1d K ==========
         b_x_k = tl.load(p_x + k_off + o_k).to(tl.float32)
@@ -109,14 +101,6 @@ def fused_conv_recurrent_norm_kernel(
                 conv_weight_ptr + cw_k + o_k * stride_cw_ch + j * stride_cw_width
             ).to(tl.float32)
         b_k = b_k * tl.sigmoid(b_k)
-        for j in tl.static_range(W - 2):
-            tl.store(
-                p_csk + j * stride_cs_pos, tl.load(p_csk + (j + 1) * stride_cs_pos)
-            )
-        tl.store(
-            p_csk + (W - 2) * stride_cs_pos,
-            b_x_k.to(p_csk.dtype.element_ty),
-        )
 
         # ========== Conv1d V ==========
         b_x_v = tl.load(p_x + v_off + o_v).to(tl.float32)
@@ -129,6 +113,24 @@ def fused_conv_recurrent_norm_kernel(
                 conv_weight_ptr + cw_v + o_v * stride_cw_ch + j * stride_cw_width
             ).to(tl.float32)
         b_v = b_v * tl.sigmoid(b_v)
+
+        tl.debug_barrier()
+        for j in tl.static_range(W - 2):
+            tl.store(
+                p_csq + j * stride_cs_pos, tl.load(p_csq + (j + 1) * stride_cs_pos)
+            )
+        tl.store(
+            p_csq + (W - 2) * stride_cs_pos,
+            b_x_q.to(p_csq.dtype.element_ty),
+        )
+        for j in tl.static_range(W - 2):
+            tl.store(
+                p_csk + j * stride_cs_pos, tl.load(p_csk + (j + 1) * stride_cs_pos)
+            )
+        tl.store(
+            p_csk + (W - 2) * stride_cs_pos,
+            b_x_k.to(p_csk.dtype.element_ty),
+        )
         for j in tl.static_range(W - 2):
             tl.store(
                 p_csv + j * stride_cs_pos, tl.load(p_csv + (j + 1) * stride_cs_pos)
@@ -137,6 +139,7 @@ def fused_conv_recurrent_norm_kernel(
             p_csv + (W - 2) * stride_cs_pos,
             b_x_v.to(p_csv.dtype.element_ty),
         )
+        tl.debug_barrier()
 
         # ========== QK L2 Norm + Decay + Beta ==========
         b_q = b_q * tl.math.rsqrt(tl.sum(b_q * b_q) + 1e-6) * qk_scale
