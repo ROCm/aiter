@@ -203,7 +203,7 @@ def build_qsa_k2_family_a_module(
             fx.make_layout((1, vec), (vec, 1)),
         )
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
-        v64_store = fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
+        fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
         q_buf = fx.rocdl.make_buffer_tensor(q)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
@@ -231,7 +231,7 @@ def build_qsa_k2_family_a_module(
             (fx.rocdl.cdna4.LDSReadTrans16_64b() if use_k32 else fx.UniversalCopy64b()),
             BFloat16,
         )
-        pv_b_copy = fx.make_tiled_copy_B(pv_b_atom, pv_wave_mma).get_slice(lane)
+        fx.make_tiled_copy_B(pv_b_atom, pv_wave_mma).get_slice(lane)
 
         def qk_mfma(a_vec, b_vec, c_vec):
             qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
