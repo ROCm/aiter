@@ -1046,6 +1046,14 @@ st64-imm HEAD **159.41 µs** went **174.14 µs** (``M=512 +9.2%``,
 keep-gate 3% / ≤154.63). Extra live dest VGPRs serialize QK. Kernel
 restored.
 
+**Do not retry** overlay decode QK/PV named-dest burst (eight
+``load_amd_k8`` or four tr16 live at once) or an extra
+``s_waitcnt vmcnt(0)`` before V overlay. GPU 6 / gfx950 stayed exact;
+decode ISA still reused ``v[96:99]`` / ``v[98:99]``. Split-only
+``s_waitcnt`` is already **32** vs AMD **33** (whole-file ~108 is the
+merge ``vmcnt(31)`` ladder). Kernel restored. Inline-asm dest pins
+stay parent DNR.
+
 - [ ] Family B: group 5, `D=128`, width 2051 — vs #4882 Triton **and** Gluon.
 - [ ] gfx942 and gfx950; gfx950 uses extra LDS vs the live `num_stages=1` path.
 - [ ] Decode (`M=1..8`) and prefill instantiations are **not** forced into one

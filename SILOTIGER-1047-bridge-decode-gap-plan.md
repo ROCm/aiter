@@ -42,7 +42,7 @@ Stage then one-line commit when that is the ticket convention.
 - [x] 1. AMD-matched decode K LDS map + inverse QK reads
 - [x] 2. AMD-matched decode V publication (`ds_write_b64` ×4) + inverse PV reads
 - [x] 3. Cut leftover permute / bpermute / extra waits that AMD decode does not emit
-- [ ] 4. Waitcnt / barrier schedule toward AMD’s decode mix
+- [x] 4. Waitcnt / barrier schedule toward AMD’s decode mix
 - [ ] 5. Split-count specializations (`ns64` at M=1, `ns32` at M=8)
 - [ ] 6. Stop: decode split matches or exceeds Live AMD at M=1 and M=8
 
@@ -168,7 +168,7 @@ captures (2026-09-23) under `/tmp/k2_amd_lowering_compare/`:
 | `ds_write_b128` / `b64` / `write2st64` | **4 / 4 / 0** | 4 / 4 / 0 | 20 / 0 / 16 | **4 / 0 / 0** |
 | `ds_read_b128` / `tr16` | **16 / 4** | 16 / 4 | 40 / 32 | 16 / 4 |
 | K32 / K16 MFMA | **8 / 4** | 8 / 4 | 48 / 0 | 8 / 4 |
-| `s_waitcnt` / `s_barrier` | **33 / 5** | 34 / 5 | 102 / 5 | **106 / 5** |
+| `s_waitcnt` / `s_barrier` | **33 / 5** | 34 / 5 | 102 / 5 | **32 / 4 split** (whole-file ~108 includes merge) |
 | `v_perm` / `ds_bpermute` | **0 / 0** | 0 / 0 | 0 / 0 | **34 / 12** |
 
 M=1 vs M=8 opcode-sequence similarity is **~0.97**; decode vs prefill
@@ -194,9 +194,9 @@ is the first material opcode miss.
   MFMA/wave was 2.00× AMD only because AMD launches 2× waves at M=1;
   totals matched (12384).
 - **Primary decode counters to watch:** LDS bank conflict/wave (HEAD
-  ~1258 vs AMD ~81, **15.6×**), `s_waitcnt` static count (106 vs
-  33–34), wait-LDS/wave (~109 vs ~50). MFMA totals should stay
-  matched.
+  ~1258 vs AMD ~81, **15.6×**), `s_waitcnt` static count (**split**
+  32 vs AMD 33–34; whole-file ~108 is merge’s `vmcnt(31)` ladder),
+  wait-LDS/wave (~109 vs ~50). MFMA totals should stay matched.
 
 ### Do not reopen (decode)
 
@@ -530,16 +530,69 @@ AMD decode: **33–34 waitcnt**, **5 barriers**, wait-stall is VM-heavy
 (`vmcnt(3/5/1)`), not a deep prefill-style `vmcnt(31)` ladder. FlyDSL
 HEAD is waitcnt-dominated (~73% of M=8 ATT stalls).
 
-- [ ] Place `lgkmcnt` / `vmcnt` next to the AMD decode sites: after
+- [x] Place `lgkmcnt` / `vmcnt` next to the AMD decode sites: after
       K publish, after V overlay, before QK/PV uses. Do not hoist V
       loads across K-publish (inherited DNR).
-- [ ] Keep 5 barriers if that is still AMD’s count; do not add a
+- [x] Keep 5 barriers if that is still AMD’s count; do not add a
       sixth to paper over a map bug.
-- [ ] Oracle + ATT/PMC. Conflict and wait-LDS should fall with the
+- [x] Oracle + ATT/PMC. Conflict and wait-LDS should fall with the
       maps; this phase is for remaining schedule.
-- [ ] **Done when:** static waitcnt is in AMD’s band (tens, not
+- [x] **Done when:** static waitcnt is in AMD’s band (tens, not
       ~100) or further cuts require compiler dest-pinning that is
       documented as blocked.
+
+Kept as **measurement + dest-pinning blocked** (2026-09-24). No
+kernel keep: extra `vmcnt(0)` and bursting QK A / PV B into named
+dests were tried and reverted. Prefill ISA sha still
+`64ee586155fc6a63`. Oracle decode+prefill: **2 passed**.
+
+**Count split only.** Phase 0–3 `s_waitcnt ~106–108` mixed the merge
+kernel’s `vmcnt(31)` ladder (from `qsa_k2_family_a_port_merge`,
+`k2_decode_perm_isa/launch/22_final_isa.s` ~line 735+). Split body
+(through `.LBB0_6`) is **32 waitcnt / 4 barriers** vs AMD split
+**33 / 5**. Whole-file FlyDSL stays ~108 because merge is unchanged.
+
+**AMD sites already present on overlay decode**
+(`k2_decode_perm_isa/launch/22_final_isa.s` tile loop):
+
+| Site | FlyDSL split | AMD split |
+|--|--|--|
+| K VMEM vs K LDS | `vmcnt(3)` then `vmcnt(2)` around the two `ds_write_b128` | `vmcnt(2)` / `vmcnt(1)` |
+| K publish | `lgkmcnt(0)` + `s_barrier` | same |
+| QK A | first pair `lgkmcnt(1)`, then **`lgkmcnt(0)` on reused `v[96:99]`** | `lgkmcnt(1)` + `offset:256` second dest |
+| K-read vs V overlay | `s_barrier` (compiler may sit it before the last K32) + `vmcnt(0)` | `s_barrier` then V `ds_write_b64` |
+| V publish | `lgkmcnt(0)` + `s_barrier` | same |
+| PV tr16 | `lgkmcnt(0)` on reused `v[98:99]`, 4 addr VGPRs | `lgkmcnt(3..0)`, one addr + 128/256/384 |
+
+V `buffer_load_dwordx4` already issues with K (same cluster as AMD)
+and stays in flight across K-publish (`vmcnt(3/2)` only waits K).
+That is not the inherited hoist-V-before-K-publish DNR (that DNR was
+waiting VMEM behind the K LDS barrier). Do not add a 5th split
+barrier: AMD’s extra one is Q LDS publish; overlay Q lives in
+registers.
+
+**Dest-pinning blocked.** Bursting eight QK `load_amd_k8` and four
+tr16 into distinct Python dests still lowered to `v[96:99]` /
+`v[98:99]` (`tickets/1047/tmp/k2_decode_waitcnt_isa/`). An authored
+`s_waitcnt vmcnt(0)` before V overlay duplicated the compiler’s
+wait (32→33 split waitcnt). Inline-asm dest constraints remain the
+parent prefill DNR and are not reopened here.
+
+**Wall** (five-run median, interleaved `CACHE=0`; not a keep-gate):
+
+| M | FlyDSL | AMD wrapper |
+|--:|--:|--:|
+| 1 | 19.57 | 37.62 |
+| 8 | 19.98 | 37.42 |
+| 512 | 158.88 | 201.71 |
+
+Kernel-trace / PMC from phase 3 still apply (no ISA keep): M=1 split
+**10.381 µs** vs AMD **6.391 µs**. Remaining split gap is occupancy
+(phase 5 `ns64` at M=1) plus overlay QK C still token-major (no
+AMD `offset:256` dual dest), not a missing waitcnt.
+
+Leftover mix vs AMD: **20 `lgkmcnt(0)` vs 9**, **4 barriers vs 5**.
+Static split waitcnt is in AMD’s tens. Phase 5.
 
 ### 5. Split-count specializations (`ns64` at M=1, `ns32` at M=8)
 
@@ -580,7 +633,12 @@ the old body. Re-measure only after phases 1–4.
 Paste misses here **and** in `SILOTIGER-1047-plan.md`. Inherited DNR
 is not repeated unless a decode retry is proposed.
 
-_(empty until a phase misses)_
+- Overlay decode QK/PV **named-dest burst** (eight `load_amd_k8` or
+  four tr16 live at once) or an extra `s_waitcnt vmcnt(0)` before V
+  overlay, hoping for AMD `lgkmcnt(1)` / fewer waits. GPU 6 / gfx950
+  stayed exact; ISA still reused `v[96:99]` / `v[98:99]` and the
+  extra vmcnt duplicated the compiler. Kernel restored. Inline-asm
+  dest pins are parent DNR.
 
 ## Non-goals (do not pull into this plan)
 
