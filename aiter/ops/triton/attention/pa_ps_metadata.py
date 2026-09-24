@@ -58,6 +58,9 @@ def plan_pa_ps_metadata(
     backend. Supports GQA8/16, max_qlen 1..4 and page16; causal masking stays
     in attention. max_partitions caps each request's splits. work_overhead is
     the positive per-task cost in 256-token tile units (config default: 1).
+    Single-chunk batches split queries into independent work when all expanded
+    tasks fit the persistent TG budget. KV partitions and reduction maps stay
+    unchanged, including the max_qlen-spaced partial layout.
 
     Returns the six existing PA metadata tensors plus reusable workspace.
     Allocate outside graph capture, then pass plan to refresh on the current
@@ -116,7 +119,7 @@ def plan_pa_ps_metadata(
                 *metadata,
                 torch.empty((batch,), dtype=torch.int64, device=device),
                 torch.empty((chunks,), dtype=torch.int64, device=device),
-                torch.empty((batch, 4), dtype=torch.int64, device=device),
+                torch.empty((batch, 5), dtype=torch.int64, device=device),
                 torch.empty((chunks, 3), dtype=torch.int64, device=device),
                 num_heads_per_head_k,
                 num_heads_k,
@@ -128,7 +131,7 @@ def plan_pa_ps_metadata(
                 config["num_warps"],
             )
         if (
-            plan.sequence_info.shape != (batch, 4)
+            plan.sequence_info.shape != (batch, 5)
             or plan.sequence_info.device != device
             or plan.num_heads_per_head_k != num_heads_per_head_k
             or plan.num_heads_k != num_heads_k
@@ -156,6 +159,7 @@ def plan_pa_ps_metadata(
             )
         _pa_ps_sequence_scan[(chunks,)](
             context_lengths,
+            qo_indptr,
             plan.tile_prefix,
             plan.tile_totals,
             plan.sequence_info,
@@ -163,6 +167,7 @@ def plan_pa_ps_metadata(
             batch,
             groups,
             max_parts,
+            max_qlen,
             plan.work_overhead,
             chunks,
             block_chunks,
@@ -206,6 +211,7 @@ def plan_pa_ps_metadata(
             num_cu,
             groups,
             chunks,
+            max_qlen > 1 and chunks == 1,
             plan.work_overhead,
             (batch - 1).bit_length(),
             max_parts.bit_length(),
