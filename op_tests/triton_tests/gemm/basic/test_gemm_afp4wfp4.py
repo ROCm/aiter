@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import copy
 import functools
 
 import pytest
@@ -18,12 +17,11 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 
-requires_native_fp4 = pytest.mark.skipif(
+pytestmark = pytest.mark.skipif(
     not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
 )
 
@@ -137,18 +135,6 @@ def get_x_vals():
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 8192, 4096)]
     x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
-    if DEVICE_ARCH == "gfx1151":
-        # Keep shared shapes that fit the emulated FP4 path's test budget.
-        x_vals = [(m, n, k) for m, n, k in x_vals if max(m, n, k) <= 1024]
-        # Tail masking and both sides of the M=16/128 default-config boundaries.
-        x_vals += [
-            (1, 1, 32),
-            (3, 37, 96),
-            (17, 65, 160),
-            (128, 256, 1024),
-            (129, 129, 288),
-            (512, 256, 512),
-        ]
     return x_vals
 
 
@@ -203,18 +189,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("shuffle_weight_scales", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
-@pytest.mark.parametrize(
-    "impl,dtype,layout",
-    (
-        [
-            ("gfx1151", dtype, layout)
-            for dtype in (torch.float32, torch.float16, torch.bfloat16)
-            for layout in ("TN", "NT")
-        ]
-        if DEVICE_ARCH == "gfx1151"
-        else [(impl, torch.bfloat16, "TN") for impl in ("triton", "gluon")]
-    ),
-)
+@pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
     M: int,
     N: int,
@@ -223,16 +198,10 @@ def test_gemm_afp4_wfp4(
     shuffle_weight_scales,
     skip_reduce,
     impl,
-    dtype,
-    layout,
 ):
-    if impl == "gfx1151":
-        if shuffle_weight_scales:
-            pytest.skip("gfx1151 only supports unshuffled Triton FP4 GEMM.")
-    elif not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
     if impl == "gluon" and not arch_info.is_gluon_avail():
         pytest.skip("Gluon implementation is not supported on this GPU.")
+    dtype = torch.bfloat16
     # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
     if impl == "gluon":
         pytest.skip("Gluon tests temporarily disabled.")
@@ -265,15 +234,13 @@ def test_gemm_afp4_wfp4(
         N,
         K,
         dtype,
-        layout=layout,
+        layout="TN",
         output=output,
         shuffle_scales_fg=shuffle_weight_scales,
         shuffle_weight_fg=shuffle_weight_scales,
     )
 
-    torch_out = run_torch(
-        x, w, x_scales, w_scales, torch.float32 if impl == "gfx1151" else dtype
-    )
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if shuffle_weight_scales:
         triton_out = gemm_afp4wfp4_preshuffle(
@@ -286,7 +253,7 @@ def test_gemm_afp4_wfp4(
             skip_reduce=skip_reduce,
         )
     else:
-        if impl in ("triton", "gfx1151"):
+        if impl == "triton":
             fn = triton_gemm_afp4wfp4
         elif impl == "gluon":
             fn = functools.partial(triton_gemm_afp4wfp4, backend="gluon")
@@ -305,17 +272,10 @@ def test_gemm_afp4_wfp4(
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
 
-    if impl == "gfx1151":
-        if y is not None:
-            assert triton_out.data_ptr() == y.data_ptr()
-        rtol = {torch.float32: 1e-4, torch.float16: 1e-3, torch.bfloat16: 1e-2}[dtype]
-        torch.testing.assert_close(triton_out.float(), torch_out, atol=0.002, rtol=rtol)
-    else:
-        triton.testing.assert_close(torch_out, triton_out)
+    triton.testing.assert_close(torch_out, triton_out)
 
 
 @pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
-@requires_native_fp4
 def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
     dtype = torch.bfloat16
     (
@@ -363,7 +323,6 @@ def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])  # "NN", "NT"
 @pytest.mark.parametrize("output", [True, False])
-@requires_native_fp4
 def test_gemm_mxfp4_preshuffled_gfx1250(
     M: int,
     N: int,
@@ -417,76 +376,3 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     )
 
     triton.testing.assert_close(torch_out, triton_out)
-
-
-requires_gfx1151 = pytest.mark.skipif(
-    DEVICE_ARCH != "gfx1151", reason="gfx1151 FP4 GEMM regression tests"
-)
-
-
-@pytest.mark.parametrize("m", [17, 32])
-@pytest.mark.parametrize("skip_reduce", [False, True])
-@requires_gfx1151
-def test_gfx1151_fp4_splitk(m, skip_reduce):
-    x, w, _, xs, ws, *_ = generate_gemm_afp4wfp4_inputs(
-        m, 129, 1024, torch.float32, output=False
-    )
-    args = (x, w, xs, ws)
-    config, is_tuned = get_gemm_config("GEMM-AFP4WFP4", m, 129, 1024)
-    assert is_tuned
-    assert config["NUM_KSPLIT"] > 1
-    # Exercise the wrapper's normal resolution of the checked-in config.
-    actual = triton_gemm_afp4wfp4(*args, dtype=torch.float32, skip_reduce=skip_reduce)
-    if skip_reduce:
-        assert actual.shape == (config["NUM_KSPLIT"], m, 129)
-        actual = actual.sum(0)
-    torch.testing.assert_close(
-        actual, run_torch(*args, torch.float32), atol=0.002, rtol=1e-4
-    )
-
-
-@requires_gfx1151
-def test_gfx1151_fp4_graph_and_config_reuse():
-    x, w, _, xs, ws, *_ = generate_gemm_afp4wfp4_inputs(
-        16, 128, 512, torch.float32, output=False
-    )
-    args = (x, w, xs, ws)
-    config, _ = get_gemm_config("GEMM-AFP4WFP4", 16, 128, 512)
-    before = copy.deepcopy(config)
-    for _ in range(3):
-        expected = triton_gemm_afp4wfp4(*args, config=config)
-    assert config == before
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        result = triton_gemm_afp4wfp4(*args, config=config)
-    args[0].zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(result) == 0
-    assert torch.count_nonzero(expected) > 0
-
-
-@pytest.mark.parametrize("scale", [100, 112, 127, 140, 150])
-@requires_gfx1151
-def test_gfx1151_fp4_scale_range(scale):
-    x, w, _, xs, ws, *_ = generate_gemm_afp4wfp4_inputs(
-        3, 37, 96, torch.float32, output=False
-    )
-    args = (x, w, xs, ws)
-    args[2].fill_(scale)
-    args[3].fill_(127)
-    expected = run_torch(*args, torch.float32)
-    actual = triton_gemm_afp4wfp4(*args, dtype=torch.float32)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=1e-4)
-
-
-@requires_gfx1151
-def test_gfx1151_fp4_zero_operand():
-    x, w, _, xs, ws, *_ = generate_gemm_afp4wfp4_inputs(
-        17, 65, 160, torch.float32, output=False
-    )
-    args = (x, w, xs, ws)
-    args[0].zero_()
-    actual = triton_gemm_afp4wfp4(*args, dtype=torch.float32)
-    assert torch.count_nonzero(actual) == 0
