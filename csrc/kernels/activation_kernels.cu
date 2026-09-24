@@ -2075,6 +2075,12 @@ __device__ __forceinline__ float relu2_kernel(const T& x)
 void relu2(const aiter_tensor_t& out,   // [..., d]
            const aiter_tensor_t& input) // [..., d]
 {
+    AITER_CHECK(out.dtype() == input.dtype(),
+                "relu2: out and input dtype must match");
+    AITER_CHECK(out.device_id == input.device_id,
+                "relu2: out and input must be on the same device");
+    AITER_CHECK(out.numel() == input.numel(),
+                "relu2: out and input must have the same number of elements");
     LAUNCH_ACTIVATION_KERNEL_VEC(aiter::relu2_kernel);
 }
 
