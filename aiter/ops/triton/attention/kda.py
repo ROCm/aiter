@@ -124,7 +124,8 @@ def fused_recurrent_kda(
         state_v_first: state slab layout, [V, K] (True, default) or [K, V].
         cu_seqlens: [N + 1] varlen offsets; requires B == 1 with all tokens
             flattened into T.
-        ssm_state_indices: [N, T] (or flat) per-token state slot table
+        ssm_state_indices: [N, T] per-token state slot table; a flat [N] table
+            requires one token per sequence.
         num_accepted_tokens: [N] accepted-token counts for speculative
         use_qk_l2norm_in_kernel: l2-normalize q and k rows in-kernel.
         use_gate_in_kernel: fuse the KDA gate chain
@@ -215,6 +216,10 @@ def fused_recurrent_kda(
     if use_gate_in_kernel:
         assert A_log is not None, "use_gate_in_kernel requires A_log"
         assert A_log.numel() == HV, "A_log must be [HV]"
+    else:
+        assert (
+            A_log is None and dt_bias is None and lower_bound is None
+        ), "A_log, dt_bias and lower_bound require use_gate_in_kernel=True"
     if dt_bias is not None:
         assert dt_bias.numel() == HV * K, "dt_bias must be [HV, K]"
     assert A_log is None or A_log.is_contiguous(), "A_log must be contiguous"
@@ -255,6 +260,9 @@ def fused_recurrent_kda(
         assert (
             num_accepted_tokens is None or num_accepted_tokens.is_contiguous()
         ), "num_accepted_tokens must be contiguous"
+        assert (
+            ssm_state_indices.ndim > 1 or B * T == N
+        ), "a flat ssm_state_indices requires one token per sequence; pass [N, T]"
         stride_indices_seq = (
             ssm_state_indices.stride(0) if ssm_state_indices.ndim > 1 else 1
         )

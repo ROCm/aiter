@@ -443,7 +443,7 @@ def fused_recurrent_kda_packed_decode_kernel(
 
     if PAD_SLOT_GUARD:
         if IS_SPEC_DECODING:
-            pad_seed = gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1
+            pad_seed = gl.maximum(gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1, 0)
         else:
             pad_seed = 0
         pad_slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + pad_seed).to(
@@ -572,7 +572,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
-                seed = gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1
+                seed = gl.maximum(gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1, 0)
             else:
                 seed = 0
             if CACHE_STATE_UPDATES:
