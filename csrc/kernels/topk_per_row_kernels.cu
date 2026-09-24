@@ -2507,6 +2507,22 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     const int64_t batch_id = blockIdx.x;
     const IdxT row_len     = static_cast<IdxT>(len);
 
+    auto clear_wide_histogram = [&]() {
+        if constexpr(num_buckets == BlockSize * 4)
+        {
+            using Vec4 = __attribute__((__ext_vector_type__(4))) IdxT;
+            Vec4 const zero = {0, 0, 0, 0};
+            reinterpret_cast<Vec4*>(histogram)[threadIdx.x] = zero;
+        }
+        else
+        {
+            for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+            {
+                histogram[i] = 0;
+            }
+        }
+    };
+
     if(threadIdx.x == 0)
     {
         counter.k              = k;
@@ -2519,10 +2535,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         candidate_count        = 0;
         candidate_overflow     = 0;
     }
-    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-    {
-        histogram[i] = 0;
-    }
+    clear_wide_histogram();
 
     in += batch_id * len;
     out_idx += batch_id * k;
@@ -2560,14 +2573,12 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     __syncthreads();
     choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
         &counter, histogram, wave_sums, k, pass0_start_bit);
-    __syncthreads();
 
     // Pass 1: emit the definite winners, stage the crossing bucket and build
     // the middle-12 histogram, all from the same registers.
-    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-    {
-        histogram[i] = 0;
-    }
+    // Clear the counts while the crossing thread publishes `counter`; the
+    // retained barrier below serves both operations.
+    clear_wide_histogram();
     __syncthreads();
 
     auto const high_prefix = counter.kth_value_bits;
@@ -2635,10 +2646,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             counter.out_back_cnt = 0;
         }
         IdxT const pass2_k = counter.k;
-        for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-        {
-            histogram[i] = 0;
-        }
+        clear_wide_histogram();
         __syncthreads();
 
         auto const pass1_prefix = counter.kth_value_bits;
