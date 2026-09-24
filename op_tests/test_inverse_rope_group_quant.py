@@ -23,7 +23,7 @@ import aiter
 from aiter import dtypes
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.inverse_rope_group_quant import (
     SCALE_LAYOUTS,
     scale_shape,
@@ -945,7 +945,7 @@ def main():
         # process rather than raising, so assert the python-level guard
         # instead: that is the only thing standing between a caller passing
         # a legal-looking string and a core dump.
-        is_cdna = get_gfx().startswith("gfx9")
+        is_cdna = get_gfx_runtime().startswith("gfx9")
         if (scale_layout == "mfma_tile" and not is_cdna) or (
             scale_layout == "n32k4" and is_cdna
         ):
