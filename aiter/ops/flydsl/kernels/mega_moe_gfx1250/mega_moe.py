@@ -989,9 +989,7 @@ class MegaMoEGfx1250:
         self._begin_compact_step(
             self._compact_recv_bound(token_count, recv_token_bound)
         )
-        self._launch_compact_plan_async(
-            topk_ids, token_count, self._compact_slot
-        )
+        self._launch_compact_plan_async(topk_ids, token_count, self._compact_slot)
 
     def _prefetch_next_compact_plan(
         self,
