@@ -3574,9 +3574,17 @@ def get_2stage_cfgs(
             has_bias=True,
             stage2_has_bias=True,
         )
-    swiglu_mxfp4_bf16_cktile = (
+    mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and (
+            activation == ActivationType.Swiglu
+            # SiLU is verified on the gate/up-interleaved weights only
+            or (
+                activation == ActivationType.Silu
+                and dtype == dtypes.bf16
+                and gate_mode is GateMode.INTERLEAVE
+            )
+        )
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
@@ -3747,14 +3755,13 @@ def get_2stage_cfgs(
         and q_dtype_w in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
-        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
+        and (ksplit > 1 or mxfp4_bf16_cktile)
     ):
-        # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
-        # keeping the generic preshuffled fp4 weights. CK2stages has no
-        # heuristic kernel for that A16W4 combination, so use CK-Tile.
+        # CK2stages has no A16W4 heuristic for SiLU or SwiGLU. CK-Tile
+        # supports both layouts through its split-K post-activation path.
         # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
         # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
-        _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
+        _min_split_k = 2 if mxfp4_bf16_cktile else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
@@ -3766,7 +3773,9 @@ def get_2stage_cfgs(
                 split_k=_split_k,
                 dtype=dtype,
                 post_activation_layout=(
-                    "standard" if swiglu_mxfp4_bf16_cktile else "auto"
+                    "standard"
+                    if mxfp4_bf16_cktile and activation == ActivationType.Swiglu
+                    else "auto"
                 ),
             ),
             functools.partial(
@@ -4169,7 +4178,12 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper) or (
+        stage1_func is cktile_moe_stage1
+        and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and w1.dtype == dtypes.fp4x2
+    ):
         # Hand these two the caller's limit unchanged. They clamp silu whenever a
         # finite limit is configured (runtime_swiglu_limit in moe_kernels.py), and
         # the torch reference does the same, so normalizing non-Swiglu to None
@@ -4920,6 +4934,7 @@ def cktile_moe_stage1(
     dtype=torch.bfloat16,
     kernel_name="",
     post_activation_layout="auto",
+    swiglu_limit=0.0,
 ):
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
@@ -5011,6 +5026,7 @@ def cktile_moe_stage1(
                     num_valid_ids,
                     token_num,
                     topk,
+                    swiglu_limit=swiglu_limit,
                 )
             elif activation == ActivationType.Gelu:
                 NLane = 16
