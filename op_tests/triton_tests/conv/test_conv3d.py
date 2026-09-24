@@ -1154,7 +1154,7 @@ def test_prepack_launcher_uses_complete_3d_key(monkeypatch):
         "_get_config_prepack_3d",
         lambda **kwargs: seen.append(kwargs) or {},
     )
-    monkeypatch.setattr(conv_launch, "_ncdhw_to_cblocked_kernel", kernel)
+    monkeypatch.setattr(conv_launch, "_ncx_to_cblocked_kernel", kernel)
 
     conv_launch._launch_ncdhw_to_cblocked(
         torch.empty(1), torch.empty(1), 2, 65, 3, 5, 7, 128, 64

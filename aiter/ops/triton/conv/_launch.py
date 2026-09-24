@@ -75,17 +75,14 @@ from aiter.ops.triton._triton_kernels.conv.conv_general import (
 from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _get_config as _get_config_general,
 )
-from aiter.ops.triton._triton_kernels.conv.ncdhw_to_cblocked import (
-    _get_config as _get_config_prepack_3d,
-)
-from aiter.ops.triton._triton_kernels.conv.ncdhw_to_cblocked import (
-    _ncdhw_to_cblocked_kernel,
-)
-from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
+from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
     _get_config as _get_config_prepack,
 )
-from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
-    _nchw_to_cblocked_kernel,
+from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
+    _get_config_3d as _get_config_prepack_3d,
+)
+from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
+    _ncx_to_cblocked_kernel,
 )
 from aiter.ops.triton.conv._utils import _winograd_transform_storage_dtype
 from aiter.ops.triton.utils.conv_config_utils import (
@@ -159,7 +156,7 @@ def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
             N,
         )
 
-    _nchw_to_cblocked_kernel[grid](
+    _ncx_to_cblocked_kernel[grid](
         x,
         x_blocked,
         C,
@@ -740,7 +737,7 @@ def _launch_ncdhw_to_cblocked(x, x_blocked, N, C, D, H, W, C_pad, block_c):
             N,
         )
 
-    _ncdhw_to_cblocked_kernel[grid](
+    _ncx_to_cblocked_kernel[grid](
         x,
         x_blocked,
         C,
