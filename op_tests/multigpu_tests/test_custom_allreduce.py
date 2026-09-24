@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import logging
@@ -255,7 +255,8 @@ def _car_max_bytes() -> int:
 
 def gen_sizes(dtype) -> list[int]:
     """Element counts to sweep: [1024, 2048, 4096] then 7168*k / 8192*k for
-    k = 1, 2, 4, 8, ... up to the largest size custom_all_reduce serves."""
+    k = 1, 2, 4, 8, ... plus the flattened (1023/1024/1025, 512) tail cases,
+    up to the largest size custom_all_reduce serves."""
     itemsize = torch.empty(0, dtype=dtype).element_size()
     max_numel = _car_max_bytes() // itemsize
     sizes = [n for n in (1024, 2048, 4096) if n <= max_numel]
@@ -270,7 +271,10 @@ def gen_sizes(dtype) -> list[int]:
         if not added:
             break
         k *= 2
-    return sizes
+    # Include partial tiles around the aligned 1024x512 case. Flattening the
+    # contiguous inputs preserves the kernel dispatch and reported tail shape.
+    sizes.extend(n for n in (1023 * 512, 1024 * 512, 1025 * 512) if n <= max_numel)
+    return sorted(set(sizes))
 
 
 l_dtype = ["bf16", "fp16", "fp32"]
