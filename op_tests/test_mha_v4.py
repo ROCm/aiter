@@ -702,13 +702,19 @@ def test_mha_v4_lse_survives_k_common_mode(recipe):
         ) * softmax_scale
         reference = torch.logsumexp(scores, dim=-1)
         _, lse = mha_v4(
-            q, k, v, *formats, return_lse=True, softmax_scale=softmax_scale, **scale_modes
+            q,
+            k,
+            v,
+            *formats,
+            return_lse=True,
+            softmax_scale=softmax_scale,
+            **scale_modes,
         )
         errors.append((lse.float() - reference).abs().max().item())
 
-    assert _k_mean(base_k + 16.0 * direction, _RawRecipeKind.FP8).abs().max() > 0, (
-        "K smoothing did not engage, so this case cannot detect the leak"
-    )
+    assert (
+        _k_mean(base_k + 16.0 * direction, _RawRecipeKind.FP8).abs().max() > 0
+    ), "K smoothing did not engage, so this case cannot detect the leak"
     assert errors[1] < errors[0] + 0.5, (
         f"{recipe} LSE degrades under a shared K direction: "
         f"{errors[0]:.4f} -> {errors[1]:.4f} nats; is the k_mean shift still "
