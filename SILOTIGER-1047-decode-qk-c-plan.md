@@ -52,8 +52,8 @@ Stage then one-line commit when that is the ticket convention.
 - [x] 0. Pin remaining split sites from `k2_decode_final` (no kernel edit)
 - [x] 1. Head-major decode QK C (miss: requires forbidden fragment transpose)
 - [x] 2. AMD-matched decode PV: V-as-A / P-as-B + D-vector output
-- [ ] 3. Overlap QK/PV LDS reads (compiler dests, not named-dest burst)
-- [ ] 4. `ns64` merge: vectorized `BLOCK_SPLITS`-style scan
+- [x] 3. Overlap QK/PV LDS reads (blocked: LLVM coalesces dests; no coloring API)
+- [x] 4. `ns64` merge: vectorized `BLOCK_SPLITS`-style scan (miss; restored)
 - [ ] 5. Stop: decode split ≤ Live AMD at M=1 and M=8
 
 ## Why the map campaign is not the leftover
@@ -226,6 +226,11 @@ Inherited unless a later lock here explicitly reopens it:
 - Overlay decode QK/PV **named-dest burst** (eight `load_amd_k8` or
   four tr16 live at once) or an extra `s_waitcnt vmcnt(0)` before V
   overlay. ISA still reused `v[96:99]` / `v[98:99]`. Kernel restored.
+- Two live QK A rmem fragments gemm'd in place, or four live tr16
+  rmem dests gemm'd in place, hoping LLVM will leave `lgkmcnt(1)`
+  dests. Decode ISA still reuses the second K dest and one tr16 dest
+  after the first pair (phase 3). Kernel restored. Inline-asm dest
+  pins remain DNR. Compiling a dest-coloring pass is out of ticket.
 - Inline-asm dest pins / `=&v` constraints (parent prefill DNR).
 - Prefill `write2st64` / packed K32 PV / `amd_k_elem` on decode.
 - Hoist V `buffer_load` before K-publish `lgkmcnt(0)` / `s_barrier`.
@@ -574,11 +579,50 @@ already has a distinct dest. Kernel-side bursting is DNR.
       next dest; PV tr16 uses one addr + 128/256/384 (or four dests
       that are actually distinct). ATT `lgkmcnt(0)` share should
       fall toward AMD’s ~7%.
-- [ ] If the compiler cannot color those dests in this ticket,
+- [x] If the compiler cannot color those dests in this ticket,
       document blocked and skip. Do not retry phase-4 named-dest
       burst.
-- [ ] **Done when:** decode QK/PV dests overlap like AMD, or
+- [x] **Done when:** decode QK/PV dests overlap like AMD, or
       blocked-with-evidence.
+
+**Blocked (2026-09-24).** FlyDSL has no dest-coloring API (no copy-atom
+field, `make_rmem_tensor` flag, or skill-documented VGPR pin other than
+inline-asm, which is DNR). The supported in-kernel pattern is gemm from
+live register fragments.
+
+Tried behind `decode_tr_pv` only, then restored:
+
+1. Two QK A rmem fragments (`k_a0`/`k_a1`), issue step `ks+2` into the
+   just-consumed dest, `fx.gemm` in place (no Vector round-trip).
+2. Four PV tr16 rmem dests issued before the four K16, `fx.gemm` from
+   those dests (not eight `load_amd_k8` and not the named-dest burst).
+
+Focused decode+prefill oracle: **2 passed** (`CACHE=0`, GPU 6) on the
+experiment binary. Prefill ISA sha stayed the st64-imm keeper
+`64ee586155fc6a63`. Kernel restored to the phase-2 PV keep, so those
+oracles still apply to HEAD.
+
+Decode ISA
+(`tickets/1047/tmp/k2_decode_qk/isa_phase3/qsa_k2_family_a_port_split_ps16_bn16_blk256_ns1_qkk32/22_final_isa.s`)
+is the same dest coloring the first pair already had after phase 2:
+
+```
+ds_read_b128 v[84:87], v62
+ds_read_b128 v[88:91], v63
+s_waitcnt lgkmcnt(1)
+v_mfma … v[84:87], v[84:87], v[2:5], 0    ; C overwrites dest 0
+s_waitcnt lgkmcnt(0)
+v_mfma … v[84:87], v[88:91], …
+ds_read_b128 v[88:91], v64                 ; remaining 6 reuse dest 1
+```
+
+PV is still one dest: four `ds_read_b64_tr_b16 v[90:91]` each followed
+by `lgkmcnt(0)`. No `offset:128/256/384` dual-issue. LLVM coalesces
+those SSA vectors even when Python keeps distinct rmem objects live
+across gemm. A dest-coloring or waitcnt-overlap pass in FlyDSL/LLVM is
+out of this ticket. Live with `lgkmcnt(0)` on reused dests. Do not
+retry bursting or inline-asm pins. Phase 4 owns `ns64` merge, not
+another split wait tweak.
 
 ### 4. `ns64` merge: vectorized `BLOCK_SPLITS`-style scan
 
@@ -586,15 +630,53 @@ Split can win at M=1 and still lose the wrapper: phase-5/6 ktrace
 had FlyDSL merge **12.28 µs** vs AMD **6.04 µs** at `ns64`, while
 `ns32` merge is already faster than AMD.
 
-- [ ] Keep 128-thread merge. Specialize `ns64` so split LSE/partial
+- [x] Keep 128-thread merge. Specialize `ns64` so split LSE/partial
       loads match AMD’s masked `arange(0, BLOCK_SPLITS)` gather, not
       a 64-trip `range` over `partial_out[s]`.
-- [ ] Do not unroll ns32 (parent DNR). Do not 256-thread merge. Do
+- [x] Do not unroll ns32 (parent DNR). Do not 256-thread merge. Do
       not BF16 partials.
-- [ ] Measure M=1 ns64 **and** M=8 ns32 (ns32 must not regress).
-- [ ] **Done when:** M=1 merge is in AMD’s band (~6 µs on this
+- [x] Measure M=1 ns64 **and** M=8 ns32 (ns32 must not regress).
+- [x] **Done when:** M=1 merge is in AMD’s band (~6 µs on this
       machine’s same-session traces) or a dated miss shows the
       ladder is compiler VMEM scheduling, not the loop shape.
+
+**Miss; restored (2026-09-24).** Kept the 128-thread launch and
+specialized only `n_splits == 64`. Each lane owned one split, each
+wave owned 128 D values, and `BufferCopy128b` loaded four contiguous
+partials before an in-wave split reduction. `ns32` stayed on the
+original merge; no 256-thread launch, BF16 partial, or ns32 unroll.
+
+Focused decode+prefill oracle: **2 passed** (`CACHE=0`, GPU 6).
+The ns64 experiment was numerically correct, but the tensor shape does
+not lower like Triton's whole `BLOCK_SPLITS × HEAD_DIM` program:
+
+- constexpr 32 D-chunks produced 32 copied reduction bodies
+  (**3,727 merge ISA lines**) and ~42 µs wrapper, so it was replaced
+  by a runtime chunk loop;
+- the runtime loop produced **242 merge ISA lines**, 24 VGPR, one
+  `buffer_load_dwordx4` in the loop, and removed every
+  `s_waitcnt vmcnt(31)`;
+- LLVM then put **`vmcnt(0)` before each vector's wave reduction**.
+  The loop has 24 `ds_swizzle` plus 12 `v_permlane` sites and cannot
+  overlap the next partial load through the reduction dependency.
+
+Same-process five-dispatch kernel trace (`CACHE=0`;
+`tickets/1047/tmp/k2_decode_qk/ktrace_phase4_loop/`):
+
+| M | kernel | FlyDSL | AMD |
+|--:|--|--:|--:|
+| 1 (`ns64`) | split | 7.560 µs | 6.400 µs |
+| 1 (`ns64`) | merge | **16.440 µs** | **3.600 µs** |
+| 8 (`ns32`, unchanged) | split | 12.361 µs | 10.520 µs |
+| 8 (`ns32`, unchanged) | merge | 3.800 µs | 2.920 µs |
+
+The retained phase-2 ns64 merge was 12.160 µs, so vectorizing by
+split made it **35% slower** even though it removed the `vmcnt(31)`
+ladder. Kernel restored. The ladder comes from the 64-trip scalar
+accumulation, but removing it in FlyDSL trades pipelined VMEM for
+`vmcnt(0)` + six cross-lane reductions per dwordx4. Matching Triton's
+global tensor scheduling needs compiler-level fusion/scheduling, not
+another Python loop shape. Do not retry this gather in this ticket.
 
 ### 5. Stop: decode split ≤ Live AMD at M=1 and M=8
 
@@ -625,12 +707,19 @@ had FlyDSL merge **12.28 µs** vs AMD **6.04 µs** at `ns64`, while
       operand needs head on the lane and token in the VGPR. That is
       a cross-lane transpose. Live AMD does not swap QK in ISA; it
       swaps PV to V-as-A/P-as-B. Do not smuggle C/P LDS back.
-- [ ] Whether FlyDSL can color successive LDS-read dests without
-      inline-asm (phase 3). If no, document compiler work as out of
-      ticket and live with `lgkmcnt(0)`.
-- [ ] Whether the merge `vmcnt(31)` ladder is the 64-trip `range` or
+- [x] Whether FlyDSL can color successive LDS-read dests without
+      inline-asm (phase 3). **No.** There is no dest-coloring API.
+      Two live QK A rmem fragments and four live tr16 rmem dests,
+      gemm'd in place, still lower to one extra K dest plus one tr16
+      dest after the opening `lgkmcnt(1)` pair. LLVM coalesces the
+      rest. Compiler work is out of ticket; live with `lgkmcnt(0)`.
+- [x] Whether the merge `vmcnt(31)` ladder is the 64-trip `range` or
       LLVM serializing 64-bit partial loads even after a vectorized
-      gather (phase 4).
+      gather (phase 4). **The scalar range creates the ladder.** A
+      split-lane dwordx4 gather removes it, but LLVM serializes each
+      vector at `vmcnt(0)` before six cross-lane reductions; ns64
+      merge regresses 12.160 → 16.440 µs. Whole-tensor Triton-style
+      scheduling requires compiler work. Kernel restored.
 - [x] Whether leftover FlyDSL `vmcnt(0)` (25% of ATT stall) is V
       overlay waiting the in-flight K/V gathers, or softmax/epilogue
       VMEM (phase 0). **Neither.** ATT 27,880 is `indices`
