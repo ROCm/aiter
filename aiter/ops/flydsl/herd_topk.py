@@ -3,8 +3,6 @@
 
 """HERD routing orchestration with FlyDSL candidate selection + finalize."""
 
-from functools import cache
-
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
@@ -19,20 +17,6 @@ _HERD_MAX_TOKENS = 128
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
-
-
-@cache
-def _get_k3_candidate_workspace(
-    device: torch.device,
-    stream_id: int,
-    kp1: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep graph-stable K3 candidate scratch isolated by device and stream."""
-    del stream_id
-    return (
-        torch.empty((_HERD_MAX_TOKENS, kp1), dtype=torch.int32, device=device),
-        torch.empty((_HERD_MAX_TOKENS, kp1), dtype=torch.float32, device=device),
-    )
 
 
 def _run_sigmoid_candidate(
@@ -222,12 +206,9 @@ def herd_topk_gating(
         gating_output if gating_output.is_contiguous() else gating_output.contiguous()
     )
     kp1 = topk + 1
+    candidate_ids = torch.empty((rows, kp1), dtype=torch.int32, device=device)
+    candidate_values = torch.empty((rows, kp1), dtype=torch.float32, device=device)
     if profile == "kimi_k3":
-        candidate_ids, candidate_values = _get_k3_candidate_workspace(
-            device,
-            stream.cuda_stream,
-            kp1,
-        )
         _run_sigmoid_candidate(
             packed_gating,
             correction_bias,
@@ -255,8 +236,6 @@ def herd_topk_gating(
         )
         return
 
-    candidate_ids = torch.empty((rows, kp1), dtype=torch.int32, device=device)
-    candidate_values = torch.empty((rows, kp1), dtype=torch.float32, device=device)
     from ..topk import topk_gating_fwd
 
     topk_gating_fwd(
