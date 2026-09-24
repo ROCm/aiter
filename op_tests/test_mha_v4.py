@@ -4,6 +4,9 @@
 import argparse
 import itertools
 import math
+import subprocess
+import sys
+import textwrap
 
 import pandas as pd
 import pytest
@@ -523,6 +526,37 @@ def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
 
     with pytest.raises(ValueError, match="requires contiguous hd128 input"):
         quantize_fp8_rotated(value)
+
+
+@pytest.mark.parametrize(
+    "quantize",
+    [
+        "quantize_fp8_rotated",
+        "quantize_mxfp8_k",
+        "quantize_mxfp4_k",
+        "quantize_mxfp6_k",
+    ],
+)
+def test_mha_v4_k_quantizers_reject_an_off_device_mean(quantize):
+    """A host mean reached the kernel as a device pointer and faulted the GPU.
+
+    Out of process because these checks abort rather than raise, as every AITER_CHECK in that
+    translation unit does. All four quantizers share one validator, so all four are covered.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import {quantize} as quantize
+
+        value = torch.randn((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+        quantize(value, torch.zeros((1, 2, 128), dtype=torch.float32))
+        torch.cuda.synchronize()
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, timeout=1800
+    )
+
+    assert finished.returncode != 0
+    assert "same GPU as input" in finished.stderr, finished.stderr[-2000:]
 
 
 @pytest.mark.skipif(

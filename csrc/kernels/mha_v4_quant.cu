@@ -836,6 +836,8 @@ static const float* check_k_mean(const aiter_tensor_t& mean,
 {
     if(mean.numel() == 0)
         return nullptr;
+    AITER_CHECK(mean.is_gpu() && mean.device_id == input.device_id,
+                "K mean must be on the same GPU as input");
     AITER_CHECK(mean.dtype() == AITER_DTYPE_fp32, "K mean must be fp32");
     AITER_CHECK(mean.is_contiguous(), "K mean must be contiguous");
     AITER_CHECK(mean.dim() == 3 && mean.size(2) == kHeadDim,
