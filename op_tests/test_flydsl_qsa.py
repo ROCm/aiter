@@ -16,7 +16,10 @@ Usage::
 
     pytest -q op_tests/test_flydsl_qsa.py
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
-    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --rotate 1 0
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --rotate 0 1
+
+Perf rows default to cold weights (``--rotate 0``); pass ``--rotate 1`` to
+reproduce the older hot-cache 1047 tables.
 """
 
 from __future__ import annotations
@@ -72,12 +75,15 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 def _time(fn, *args, rotate, **kwargs):
     """Time ``fn`` under one cache policy for every candidate in the row.
 
-    ``rotate`` is ``run_perftest`` ``num_rotate_args``: ``1`` reuses one
-    buffer set (hot; default, matches existing 1047 tables), ``0`` auto-sizes
-    extra copies from L2, ``N>1`` uses that many copies. Callers must pass
-    paged caches as ``*args`` so deepcopy clones them -- a zero-arg closure
-    cannot rotate closed-over tensors. HIP-graph replay is not combined with
-    rotation.
+    ``rotate`` is ``run_perftest`` ``num_rotate_args``: ``0`` (the default)
+    auto-sizes extra copies from L2 so each timed call sees cold weights,
+    ``1`` reuses one buffer set (hot; the older 1047 tables), ``N>1`` uses
+    that many copies. Cold is the default because hot reuse credits a
+    backend for inter-iteration L2 residency that serving never has -- on
+    ``M=8`` decode it flatters live AMD by ~36% and K2 by ~12%. Callers must
+    pass paged caches as ``*args`` so deepcopy clones them -- a zero-arg
+    closure cannot rotate closed-over tensors. HIP-graph replay is not
+    combined with rotation.
     """
     return run_perftest(fn, *args, num_rotate_args=rotate, **kwargs)
 
@@ -256,7 +262,7 @@ def _pack_family_a(k_bar, k, v, page_size, device):
 
 
 @benchmark()
-def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate=1):
+def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate=0):
     """Paged family A tensors + block tables; oracle on gather vs dense.
 
     No competitor kernel. ``paged_gather`` is the only timed candidate (copy
@@ -616,7 +622,7 @@ def test_k2_family_a_prefill_matches_oracle():
 
 
 @benchmark()
-def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
+def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
@@ -717,7 +723,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=1):
 
 
 @benchmark()
-def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=1):
+def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K2 vs oracle GQA; us vs live AMD and #4882 Triton.
 
     3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
@@ -1066,7 +1072,7 @@ def test_k1_family_b_set_equality_published_indexer_point():
 
 
 @benchmark()
-def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=1):
+def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=0):
     """Family B FlyDSL K1 vs oracle set equality; us vs #4882 select.
 
     2e/2f: emit on ``n_blocks <= 512``. Longer rows use family A's MFMA
@@ -1170,7 +1176,7 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=1):
 
 
 @benchmark()
-def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=1):
+def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=0):
     """Live AMD path (vLLM Triton MQA + HIP top-k + Triton GQA) vs the oracle.
 
     Indexer chain and sparse GQA are timed separately. Oracle is not timed.
@@ -1276,7 +1282,7 @@ def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=1):
 
 
 @benchmark()
-def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate=1):
+def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate=0):
     """#4882 portable Triton QSA vs the oracle. Gluon is not launched.
 
     Indexer chain and sparse GQA are timed separately. Oracle is not timed.
@@ -1392,7 +1398,7 @@ def _family_b_indexer(index_heads):
 
 
 def _bench_qsa_family_b_4882(
-    m, seq_len, page_size, dtype, index_heads, backend, rotate=1
+    m, seq_len, page_size, dtype, index_heads, backend, rotate=0
 ):
     """Family B #4882 vs oracle. ``backend`` is ``triton`` or ``gluon``."""
     idx = _family_b_indexer(index_heads)
@@ -1503,7 +1509,7 @@ def _bench_qsa_family_b_4882(
 
 
 @benchmark()
-def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads, rotate=1):
+def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads, rotate=0):
     """#4882 portable Triton QSA vs the oracle on family B shapes.
 
     Separate table from family A Triton and from family B Gluon. Oracle is
@@ -1515,7 +1521,7 @@ def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads, ro
 
 
 @benchmark()
-def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads, rotate=1):
+def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads, rotate=0):
     """#4882 gfx950 Gluon QSA vs the oracle on family B (Gluon-validated) shapes.
 
     Family A GQA (group 12 / D=256) is not launched here. Oracle is not timed.
@@ -1590,10 +1596,11 @@ def main():
         "--rotate",
         type=int,
         nargs="*",
-        default=[1],
+        default=[0],
         help="run_perftest num_rotate_args (copies of timed tensors).\n"
-        "1 = hot cache (default; matches existing 1047 tables).\n"
-        "0 = auto-size from L2. N>1 = that many copies.\n"
+        "0 = cold cache (default; auto-size copies from L2, matches serving).\n"
+        "1 = hot cache, one reused buffer set (older 1047 tables).\n"
+        "N>1 = that many copies.\n"
         "Same value on every named backend in a row. Not combined with HIP graphs.",
     )
     args = parser.parse_args()
