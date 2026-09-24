@@ -312,6 +312,16 @@ def query_block_scale(
     )
 
 
+def _plain_block_scale(input: Tensor) -> Tensor:
+    """One E8M0 scale per 32-element block, without the gather padding.
+
+    Used where the consumer addresses scales within the logical sequence, and by the fakes, which
+    only have to agree on shape and dtype.
+    """
+    batch, sequence, heads, head_dim = input.shape
+    return input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
 def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     """Rotate and quantize hd128 BSHD Q to MXFP8 data and E8M0 block scales."""
@@ -327,10 +337,7 @@ def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
 @quantize_mxfp8_q.register_fake
 def _quantize_mxfp8_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     del multiplier
-    batch, sequence, heads, head_dim = input.shape
-    return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+    return input.new_empty(input.shape, dtype=dtypes.fp8), _plain_block_scale(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_k", mutates_args=())
@@ -338,11 +345,9 @@ def quantize_mxfp8_k(
     input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
     """Rotate and quantize hd128 BSHD K to MXFP8 data and E8M0 block scales."""
-    batch, sequence, heads, head_dim = _validate_bshd_hd128(
-        input, "MXFP8 K quantization"
-    )
+    _validate_bshd_hd128(input, "MXFP8 K quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    scale = _plain_block_scale(input)
     rotate_activation_mxfp8_quant(quantized, scale, input, 1.0, _or_empty(input, mean))
     return quantized, scale
 
@@ -351,10 +356,7 @@ def quantize_mxfp8_k(
 def _quantize_mxfp8_k_fake(
     input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
-    batch, sequence, heads, head_dim = input.shape
-    return input.new_empty(input.shape, dtype=dtypes.fp8), input.new_empty(
-        (batch, sequence, heads, head_dim // 32), dtype=torch.uint8
-    )
+    return input.new_empty(input.shape, dtype=dtypes.fp8), _plain_block_scale(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp4", mutates_args=())
@@ -375,7 +377,7 @@ def _quantize_mxfp4_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
-    ), input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    ), _plain_block_scale(input)
 
 
 def mxfp4_k_raw_buffer_size(batch: int, sequence: int, heads: int) -> int:
@@ -502,7 +504,7 @@ def _quantize_mxfp6_q_fake(input: Tensor, multiplier: float) -> tuple[Tensor, Te
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
-    ), input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    ), _plain_block_scale(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp6_k_raw", mutates_args=())
