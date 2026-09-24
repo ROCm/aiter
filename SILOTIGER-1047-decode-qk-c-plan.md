@@ -48,7 +48,7 @@ Stage then one-line commit when that is the ticket convention.
 
 ## Progress
 
-- [ ] 0. Pin remaining split sites from `k2_decode_final` (no kernel edit)
+- [x] 0. Pin remaining split sites from `k2_decode_final` (no kernel edit)
 - [ ] 1. Head-major decode QK C (decode-only; keep overlay LDS)
 - [ ] 2. Drop leftover `v_perm` / `ds_bpermute` that exist only for token-major C
 - [ ] 3. Overlap QK/PV LDS reads (compiler dests, not named-dest burst)
@@ -240,19 +240,142 @@ Inherited unless a later lock here explicitly reopens it:
 No kernel edit. Annotate the decode ISA so phase 1 edits the right
 FlyDSL, not wait folklore.
 
-- [ ] On `isa_m8/launch/22_final_isa.s` (split body through the tile
+- [x] On `isa_m8/launch/22_final_isa.s` (split body through the tile
       loop, not merge): mark (a) 8 QK `ds_read_b128` into reused
       `v[96:99]`, (b) 4 tr16 into reused `v[98:99]`, (c) 4+4
       `ds_bpermute` around softmax/epilogue, (d) 2 `v_perm` P-pack,
       (e) the hot `vmcnt(0)` that ATT attributed 27,880 stall.
-- [ ] Cross-check AMD decode ISA
+- [x] Cross-check AMD decode ISA
       (`tickets/1047/tmp/k2_decode_baseline/amd_m8_split.s`): QK reads
       use a second dest + `offset:256` and `lgkmcnt(1)`; softmax has
       `v_permlane*` and **no** `ds_bpermute`.
-- [ ] Write the mapping “FlyDSL construct → ISA cluster” under this
+- [x] Write the mapping “FlyDSL construct → ISA cluster” under this
       phase (Q as MMA B, `shuffle_idx(alpha)`, `Vector.from_elements`
       P pack, `load_amd_k8` dest reuse).
-- [ ] **Done when:** that map is pasted here. No kernel diff.
+- [x] **Done when:** that map is pasted here. No kernel diff.
+
+Measured 2026-09-24 from existing dumps (no kernel edit, no re-profile).
+Split body is `.LBB0_5`–`.LBB0_6` in
+`tickets/1047/tmp/k2_decode_final/isa_m8/launch/22_final_isa.s`
+(`ns32`; M=1 `isa_m1` is the same tile with `ns64` tile bounds).
+ATT M=8 CU-0:
+`tickets/1047/tmp/k2_decode_final/att_flydsl_m8/stats_ui_output_agent_53955_dispatch_138.csv`.
+Kernel text base in that sample is vaddr **7680**.
+
+**(a) QK A — 8× `ds_read_b128`, dest reuse after the first pair**
+(`isa_m8` 354–378). First pair *does* use two dests + `lgkmcnt(1)`:
+
+```
+ds_read_b128 v[92:95], v69
+ds_read_b128 v[96:99], v70
+s_waitcnt lgkmcnt(1)
+v_mfma … v[92:95], v[92:95], v[2:5], 0          ; C overwrites dest 0
+s_waitcnt lgkmcnt(0)
+v_mfma … v[92:95], v[96:99], v[6:9], v[92:95]
+```
+
+The remaining **6** reads all land in **`v[96:99]`** (addrs `v71`,
+`v72`, then `v81`/`v82`/`v83`/`v84` `offset:4096`) and each is
+`lgkmcnt(0)` before the matching K32. C stays `v[92:95]` (4×f32).
+Q is MMA **B**, live in `v[2:5]…v[42:45]` from the prologue 8×
+`buffer_load_dwordx4` (lines 86–93). That is `K @ Q^T`: A = K from
+LDS, B = Q from registers.
+
+AMD (`amd_m8_split.s` 390–415) issues **paired** K reads
+`ds_read_b128 dest0, vN` + `ds_read_b128 dest1, vN offset:256`, waits
+**`lgkmcnt(1)`**, and keeps those dests live so the `offset:256` half
+can MFMA after V overlay starts. AMD B is Q from LDS (`v[42:45]` …),
+A is K; C is `v[74:77]`. Same 8× K32, different dest coloring and
+`offset:256` dual-issue, not overlay’s `offset:4096` D-chunk split.
+
+**(b) PV B — 4× `ds_read_b64_tr_b16` into reused `v[98:99]`**
+(`isa_m8` 469–483). One addr VGPR per read (`v75`–`v78`), every
+`lgkmcnt(0)`:
+
+```
+ds_read_b64_tr_b16 v[98:99], v75
+s_waitcnt lgkmcnt(0)
+v_mfma_f32_16x16x16_bf16 v[22:25], v[92:93], v[98:99], …
+```
+
+P is MMA **A** (`v[92:93]`); V-tr16 is **B**. AMD (`amd_m8_split.s`
+425–486) uses **one** addr + `offset:128/256/384`, four dests
+`v[80:81]`…`v[86:87]`, waits `lgkmcnt(3..0)`, and has **V as A /
+P as B**. Overlay swapped the PV operands relative to AMD.
+
+**(c) 4+4 `ds_bpermute`**
+
+| Site | ISA | FlyDSL |
+|--|--|--|
+| Tile softmax | 429–432 `ds_bpermute v[92:95], v{65,66,60,64}, v112` | `shuffle_idx(alpha, h0+i)` ×4. `v112` is `exp2(m_prev-m_new)` on the token-owner lane; `v60/64/65/66` are byte addrs for the four head lanes (`lane_kg*4`). Feeds `v_pk_mul` of PV acc (`v[22:25]` …) before V overlay stores. |
+| Epilogue | 504–507 `.LBB0_6` `ds_bpermute v[5:2], v{60,64,65,66}, v90` | `shuffle_idx(l_final, h0+i)` ×4. `v90` is `l_new`; dens onto head lanes for the store/LSE. |
+
+ATT stall on `ds_bpermute` is only **968** (0.5%). The cost is the
+layout that requires them, not the opcode latency.
+
+**(d) 2× `v_perm` P-pack** (`isa_m8` 462–467, `s24 = 0x5040100`):
+
+```
+v_cvt_pk_bf16_f32 v92, v96, s0
+v_cvt_pk_bf16_f32 v93, v94, s0
+v_perm_b32 v93, v93, v92, s24
+v_cvt_pk_bf16_f32 v92, v91, s0
+v_cvt_pk_bf16_f32 v97, v95, s0
+v_perm_b32 v92, v97, v92, s24    ; P in v[92:93] for PV-A
+```
+
+Four token-major softmax lanes packed into the PV-A fragment.
+AMD (`amd_m8_split.s` 469–470) is `v_cvt_pk_bf16_f32 v40, v76, v75`
++ `v41, v77, v78` — **no** `v_perm`, **no** `ds_bpermute`. Softmax
+tree is `v_permlane32/16_swap` on C itself (445–451), which overlay
+already has (411, 420) for tile max / `p_sum`.
+
+**(e) Hot `vmcnt(0)` is index / page-table, not V overlay.**
+
+ATT `hit=32` tile-loop waits (8 sampled waves × 4 tiles):
+
+| ATT vaddr | stall | ISA | Producer |
+|--|--:|--|--|
+| **9168** | **27,880** | 305 `s_waitcnt vmcnt(0)` after `global_load_dword v73` (301) | **`indices[row, col]`** |
+| **9248** | **14,104** | 319 `s_waitcnt vmcnt(0)` after `global_load_dword v92` (316) | **`page_table[req, logical_page]`** |
+| 9392 | 22,000 | 340 `s_waitcnt vmcnt(3)` | first K `buffer_load` before `ds_write_b128` |
+| 9652 | **128** | 379 `s_waitcnt vmcnt(0)` after last K32 | V overlay `cndmask` of `v[104:107]` — **already cheap**; K/V gathers hid under QK |
+
+Prologue `vmcnt(0)` vaddr 8972 / ISA 265 (stall 1,952, hit=8) is the
+last Q `cndmask` (`q_live.select`), not the tile.
+
+Do **not** author another V-overlay wait to chase the 27,880 number.
+That wait is pointer-chasing two scalar dword loads per tile, in
+series, before any K/V gather issues (332–335). AMD still has a
+`vmcnt(0)` immediately before V `ds_write_b64` (417), but its ATT
+`vmcnt(0)` share is 0.4% because the expensive waits are
+`vmcnt(3/5/1)` on overlapping K/V/Q traffic.
+
+**AMD extra overlap overlay does not have:** last 4 K32 MFMA run
+*after* V `ds_write_b64` and *with* the four tr16 already in flight
+(`amd_m8_split.s` 418–431). Overlay takes `s_barrier` (377) then the
+last K32 then `vmcnt(0)` then softmax then V stores (448–451) then
+another barrier (468) then tr16. That is the overlay K-then-V
+contract plus C still living in `v[92:95]` (same regs as the first
+K LDS dest). Phase 1’s head-major C is the lever; do not split that
+barrier as a schedule tweak (inherited DNR).
+
+**FlyDSL construct → ISA cluster**
+
+| FlyDSL (`k2_family_a.py`, `decode_tr_pv`) | ISA cluster |
+|--|--|
+| `q_regs[ks]` as QK **B** (`qk_mfma(a_vec, q_regs[ks], acc4)`) | Prologue `buffer_load_dwordx4 v[2:5]…v[38:41]`; B operands `v[2:5]…v[42:45]` on the 8 K32 |
+| `load_amd_k8` / QK **A** (8 D-chunks, 4+4 `offset:4096`) | 354–375 `ds_read_b128`; dest0 `v[92:95]` then reused `v[96:99]`; `lgkmcnt(1)` once, then 7× `lgkmcnt(0)` |
+| QK C token-major `acc4` | `v[92:95]` 4×f32; scaled at 384–400 (`v_mul_f32 s21`) |
+| `gpu.shuffle_idx(alpha, h0+i)` | 429–432 `ds_bpermute` from `v112` |
+| `Vector.from_elements` + pack P to PV-A | 462–467 `cvt_pk` + 2× `v_perm_b32` → `v[92:93]` |
+| `copy_atom_call(pv_b_atom)` / `amd_decode_v_pack` | 469–481 4× `ds_read_b64_tr_b16 v[98:99], v75…v78` |
+| `pv_mfma(p_vecs[ng], v_vec, acc4)` P as A, V as B | 471–483 K16 into `v[22:25]…v[46:49]` |
+| `gpu.shuffle_idx(l_final, h0+i)` | 504–507 `ds_bpermute` from `v90` |
+| `indices[row, safe_col]` then `page_table[…]` | 301+305 then 316+319; **ATT 27,880 + 14,104 `vmcnt(0)`** |
+
+Phase 1 edits the Q-as-B / C-in-`v[92:95]` / `shuffle_idx(alpha)`
+row, not the index `vmcnt(0)` and not another `load_amd_k8` burst.
 
 ### 1. Head-major decode QK C (decode-only)
 
@@ -363,7 +486,9 @@ had FlyDSL merge **12.28 µs** vs AMD **6.04 µs** at `ns64`, while
 - [ ] Whether the merge `vmcnt(31)` ladder is the 64-trip `range` or
       LLVM serializing 64-bit partial loads even after a vectorized
       gather (phase 4).
-- [ ] Whether leftover FlyDSL `vmcnt(0)` (25% of ATT stall) is V
+- [x] Whether leftover FlyDSL `vmcnt(0)` (25% of ATT stall) is V
       overlay waiting the in-flight K/V gathers, or softmax/epilogue
-      VMEM. Phase 0 must name the ISA site before anyone authors
-      another wait.
+      VMEM (phase 0). **Neither.** ATT 27,880 is `indices`
+      `global_load_dword` (ISA 305); 14,104 is `page_table`
+      `global_load_dword` (ISA 319). V-overlay `vmcnt(0)` (ISA 379)
+      is 128 stall. Do not author a VMEM wait to chase that number.
