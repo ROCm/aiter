@@ -455,8 +455,6 @@ def topk_index_score_decode(
             "topk_index_score_decode: score must be [num_idx_heads, total_q, S]"
         )
 
-    if query_len < 1:
-        raise ValueError("topk_index_score_decode: query_len must be >= 1")
     if total_q % query_len != 0:
         raise ValueError(
             f"topk_index_score_decode: q_idx rows {total_q} not a multiple of "
@@ -464,21 +462,12 @@ def topk_index_score_decode(
         )
     num_reqs = total_q // query_len
 
-    if num_idx_heads * query_len > OPUS_MFMA_COLS:
-        raise ValueError(
-            f"topk_index_score_decode: num_idx_heads * query_len = "
-            f"{num_idx_heads * query_len} exceeds the {OPUS_MFMA_COLS} MFMA columns"
-        )
-
+    # query_len >= 1, num_idx_heads * query_len <= 16 and "is this cell built"
+    # are NOT re-checked here. The C entry checks all three before it can reach a
+    # launch, and it is reachable directly through ctypes, so its copy is the one
+    # that has to exist. topk_index_score_decode_supported() keeps them so a
+    # caller can still ASK without raising.
     cell = (num_idx_heads, query_len)
-    if cell not in OPUS_BUILT_CELLS:
-        # N15 lives here: H = 2 is in the INCUMBENT's table and not in this
-        # path's, and no bf16-Q implementation exists for it. An honest refusal,
-        # not a silent route onto a neighbouring cell.
-        raise ValueError(
-            f"topk_index_score_decode: no build for (num_idx_heads, query_len) = "
-            f"{cell}; built cells are {OPUS_BUILT_CELLS}"
-        )
     cert_token = 0
     if cell not in OPUS_CERTIFIED_CELLS:
         # N16. The cell IS built -- that is what keeps the gap visible -- but it
@@ -508,6 +497,10 @@ def topk_index_score_decode(
     if num_reqs == 0:
         return score
 
+    # KEPT even though the C entry would also reject it, via num_chunks == 0.
+    # Omitting max_seq_len is the likeliest caller mistake here, and the C
+    # message ("batch/num_chunks/chunk_blocks must be positive") would send a
+    # reader to look at the wrong thing.
     if max_seq_len < 1:
         raise ValueError(
             "topk_index_score_decode: pass max_seq_len so the launch dimensions "
@@ -535,11 +528,8 @@ def topk_index_score_decode(
 
     if aux_k is None:
         aux_k = _aux_k_for(num_idx_heads, query_len, num_reqs, max_blk)
-    if aux_k not in OPUS_AUX_K_BUILT:
-        raise ValueError(
-            f"topk_index_score_decode: aux_k {aux_k} is not built; the tuned axis "
-            f"carries {OPUS_AUX_K_BUILT}"
-        )
+    # aux_k is not re-checked here: the C entry rejects anything outside the
+    # built set, and it is the layer a ctypes caller cannot bypass.
 
     num_chunks, chunk_blocks = _grid_lever(
         max_blk, num_reqs, _resident_workgroups(q_idx.device)
