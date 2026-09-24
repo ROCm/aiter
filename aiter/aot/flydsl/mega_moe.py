@@ -26,6 +26,12 @@ DEFAULT_QUANTS = ("a8w4", "a4w4")
 # Keep all three in the default AOT job set so the service never falls back to
 # an online compile merely because EPLB changes the physical expert count.
 DEFAULT_EXPERTS_PER_RANKS = (48, 52, 56)
+# Kimi-K3 deployment profile (EP8 / epr112, topk16, d3584 / i3072).  Added to
+# the default AOT job set so K3 serving never falls back to an online compile.
+K3_EXPERTS_PER_RANKS = (112,)
+K3_TOPK = 16
+K3_MODEL_DIM = 3584
+K3_INTER_DIM = 3072
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -98,6 +104,34 @@ def default_jobs(
         for rank in range(world_size)
         for stage in (1, 2)
     ]
+
+
+def production_jobs(
+    mtprs=DEFAULT_MTPRS,
+    *,
+    quants=DEFAULT_QUANTS,
+    world_size=WORLD_SIZE,
+    swiglu_limit=SWIGLU_LIMIT,
+):
+    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+
+    Used by the default build so both profiles are AOT-covered and neither
+    triggers an online JIT compile at serving time.
+    """
+    jobs = default_jobs(
+        mtprs, quants=quants, world_size=world_size, swiglu_limit=swiglu_limit
+    )
+    jobs += default_jobs(
+        mtprs,
+        K3_EXPERTS_PER_RANKS,
+        quants=quants,
+        world_size=world_size,
+        topk=K3_TOPK,
+        model_dim=K3_MODEL_DIM,
+        inter_dim=K3_INTER_DIM,
+        swiglu_limit=swiglu_limit,
+    )
+    return jobs
 
 
 def _tensor(shape, dtype):
@@ -492,16 +526,31 @@ def main():
         default=list(DEFAULT_QUANTS),
     )
     args = parser.parse_args()
-    jobs = default_jobs(
-        tuple(args.mtpr),
-        tuple(args.experts_per_rank),
-        quants=tuple(args.quant),
-        world_size=args.world_size,
-        topk=args.topk,
-        model_dim=args.model_dim,
-        inter_dim=args.inter_dim,
-        swiglu_limit=args.swiglu_limit,
+    default_shape = (
+        list(args.experts_per_rank) == list(DEFAULT_EXPERTS_PER_RANKS)
+        and args.topk == TOPK
+        and args.model_dim == MODEL_DIM
+        and args.inter_dim == INTER_DIM
     )
+    if default_shape:
+        # Default build ships both V4-Pro and Kimi-K3 so neither JITs online.
+        jobs = production_jobs(
+            tuple(args.mtpr),
+            quants=tuple(args.quant),
+            world_size=args.world_size,
+            swiglu_limit=args.swiglu_limit,
+        )
+    else:
+        jobs = default_jobs(
+            tuple(args.mtpr),
+            tuple(args.experts_per_rank),
+            quants=tuple(args.quant),
+            world_size=args.world_size,
+            topk=args.topk,
+            model_dim=args.model_dim,
+            inter_dim=args.inter_dim,
+            swiglu_limit=args.swiglu_limit,
+        )
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(f"Compiled: {len(results) - failed} ok, {failed} failed")

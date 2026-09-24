@@ -65,7 +65,7 @@ NETWORKS = {
     # SwiGLU activation while the K3 activation integration remains separate.
     "kimi_k3_route": {
         "model_dim": 3584,
-        "inter_dim": 512,
+        "inter_dim": 3072,
         "experts": 896,
         "topk": 16,
         "swiglu_limit": 10.0,

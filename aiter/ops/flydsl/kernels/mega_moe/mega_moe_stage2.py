@@ -412,7 +412,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             packed_pair = pair_config[
                 active_parity * fx.Int32(npes) + fx.Int32(rank)
             ]
-            fx.rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             pair_enabled = (packed_pair & fx.Int32(1 << 16)) != fx.Int32(0)
             skip_a = packed_pair & fx.Int32(0xFF)
             skip_b = packed_pair.shrui(fx.Int32(8)) & fx.Int32(0xFF)

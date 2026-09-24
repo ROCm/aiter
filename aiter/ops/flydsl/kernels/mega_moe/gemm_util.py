@@ -32,8 +32,7 @@ def _load_row_map_subgroup(row_map_rsrc, row_index, lane, subgroup_width):
 
 def wait_lds_barrier(vmcnt=63):
     """Drain LDS writes and optionally older VMEM while preserving newer loads."""
-    waitcnt = (vmcnt & 0xF) | ((vmcnt & 0x30) << 10) | (7 << 4)
-    fx.rocdl.s_waitcnt(waitcnt)
+    fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=0)
     fx.barrier()
 
 

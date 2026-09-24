@@ -319,7 +319,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         packed_pair = pair_config[
             active_parity * fx.Int32(npes) + fx.Int32(rank)
         ]
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         # Every lane loads the same entry; broadcasting a lane-0 SSA value
         # after divergent control flow can select the wrong experts.
         pair_a_lane = packed_pair & fx.Int32(0xFF)

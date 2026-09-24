@@ -183,7 +183,7 @@ def compile_mega_moe_prepare(
                 hist_rsrc = ptr_buf_tensor(local_hist, fx.Int32)
                 for segment in range(tid, total_segments, block_threads):
                     hist_rsrc[segment] = fx.Int32(0)
-                fx.rocdl.s_waitcnt(0)
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 fx.barrier()
                 if tid == fx.Int32(0):
                     comm_ops.store_i32_system(

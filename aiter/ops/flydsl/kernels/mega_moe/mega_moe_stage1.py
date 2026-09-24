@@ -13,6 +13,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
+from ..kernels_common import ceildiv
 from ..tensor_shim import (
     _preload_compiled,
     _run_compiled,
@@ -46,10 +47,6 @@ class _Stage1KernelSpec:
         self.grid_x = int(grid_x)
         self.block_x = int(block_x)
         self.waves_per_eu_hint = int(waves_per_eu_hint)
-
-
-def ceildiv(a, b):
-    return (a + b - 1) // b
 
 
 def _validate_fixed_slot_geometry(
@@ -374,13 +371,13 @@ def compile_mega_moe_stage1(
                     for destination in range_constexpr(fz_npes):
                         group_done_rsrc[fx.Int32(destination)] = fx.Int32(0)
                 if tid == fx.Int32(0):
-                    fx.rocdl.s_waitcnt(0)
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                     comm_ops.fence_agent_release()
                     parity_rsrc[fx.Int32(0)] = next_parity
-                    fx.rocdl.s_waitcnt(0)
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                     comm_ops.fence_agent_release()
                     comm_ops.store_i32_system(gate_addr, fx.Int32(0), gate_epoch)
-                fx.rocdl.s_waitcnt(0)
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 fx.barrier()
             else:
                 if tid == fx.Int32(0):
@@ -575,7 +572,14 @@ def compile_mega_moe_stage1(
                 if work < total_work:
                     if const_expr(fixed_slot_dispatch):
                         fx.barrier()
-                    elif not use_ready_order:
+                    else:
+                        # Both the sequential and the ready-order compact paths
+                        # must wait for the tile to be published and acquire
+                        # before reading its per-tile metadata.  The ready-order
+                        # path previously skipped this, so a consumer could read
+                        # tile_input_base (and the other per-tile metadata) before
+                        # the planner's store was visible, feeding a stale/garbage
+                        # row into the A-scale gather and faulting under skew.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
                         fx.barrier()

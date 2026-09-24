@@ -34,6 +34,7 @@ INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
 R1_EXPERTS_PER_RANK = 32
+KIMI_K3_EXPERTS_PER_RANK = 112
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
@@ -412,7 +413,11 @@ def _apply_a4_tuning(
     """Apply only A4W4 configurations validated on MI355X.
 
     The unsafe BS8192 DCU/grid/chunk overrides are intentionally excluded.
+
+    Kimi-K3's 112 experts per rank must not inherit R1/V4-Pro A4W4 knobs.
     """
+    if experts_per_rank == KIMI_K3_EXPERTS_PER_RANK:
+        return config
     if mtpr <= FIXED_SLOT_MAX_MTPR:
         if bucket == 4:
             config = _replace_config(config, stage1={"grid_mult": 4})
@@ -679,6 +684,66 @@ def select_mega_moe_config(
         desired_p2p = p2p_quant
     if desired_p2p != config.p2p_quant:
         config = replace(config, p2p_quant=desired_p2p)
+    if experts_per_rank == KIMI_K3_EXPERTS_PER_RANK:
+        # Measured on gfx950 a8w4 at inter_dim 3072.  Candidates were scored as
+        # the mean of their uniform and zipf ratios so neither distribution was
+        # traded for the other, and each was repeated before being taken: at
+        # this effect size a single run does not separate a win from the drift
+        # between sittings.  The zipf side was also checked across several
+        # --seed values, since the seed picks which experts are hot and which
+        # rank owns them, and a knob can look like a win at one placement and a
+        # loss at another.
+        #
+        # The generic Stage1 path hands every bucket num_dispatch_cu=32, sized
+        # for R1-scale ranks of 32 experts.  With 112 experts per rank the
+        # dispatch carries 3.5x the work and 32 CUs starve it.  160 through the
+        # middle, 96 at the ends: bs=1 cannot fill 160, and from 2048 up the
+        # extra CUs cost more in scheduling than they return.
+        config = _replace_config(
+            config,
+            stage1={"num_dispatch_cu": 96 if bucket == 1 or bucket >= 2048 else 160},
+        )
+        # Stage2 pays again on top of the dispatch change, unlike R1 where the
+        # two collided: they act on different phases, so the gains compose.
+        #
+        # The winner jumps rather than trending -- 192 at 2048/4096, 256 from
+        # 8192 -- and 224 is actively harmful up there, consistently across
+        # three buckets.  Nothing below 2048 is touched; the sweep there was
+        # within noise.
+        if bucket >= 2048:
+            config = _replace_config(
+                config,
+                stage2={"persist_cu": 192 if bucket <= 4096 else 256},
+            )
+        # Stage2 is roughly a third of e2e at this inter_dim, against a sixth
+        # at the 512 these rules were first written for, and the BN128 tile the
+        # generic path picks leaves throughput on the table.
+        #
+        # This is deliberately not the deep-A path the BN256 rule earlier in
+        # selection turns on: deep_a_pipeline measured inside noise at 4096 and
+        # fails to build at 8192, and that rule runs before this branch so it
+        # does not see the BN256 set here.
+        if bucket >= 4096:
+            config = _replace_config(
+                config,
+                stage2={"block_n": 256, "b2stage": True},
+            )
+        elif 256 <= bucket <= 2048:
+            # These buckets run Stage1 with sort_block_m 64 but take the M tile
+            # the generic path picks, 32, so each Stage2 tile covers half a
+            # sort block; widening it to fill the block is the largest single
+            # win in this branch.
+            #
+            # 4096 up already runs block_m 64 off the generic path.  Below 256
+            # sort_block_m is 32, which caps block_m there -- raising
+            # sort_block_m to lift that cap measured worse, since a small batch
+            # leaves most experts with a handful of tokens and doubling the
+            # sort padding doubles what gets computed on padding.
+            config = _replace_config(
+                config,
+                stage2={"block_m": 64, "block_n": 256, "b2stage": True},
+            )
+
     if a_dtype == ACTIVATION_FP4:
         config = _apply_a4_tuning(
             config,

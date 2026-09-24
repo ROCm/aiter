@@ -96,7 +96,7 @@ def _load_fanout_pair(
     # ``packed`` controls route classification, destination offsets, and the
     # producer task mapping. Keep the VMEM dependency explicit before those
     # values cross lane/control-flow boundaries.
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
     pair_a = packed & fx.Int32(0xFF)
     pair_b = (packed >> fx.Int32(8)) & fx.Int32(0xFF)
@@ -440,7 +440,7 @@ def _publish_tile_range(
                     comm_ops.atomic_add_system(remote_queue_tail, fx.Int32(1))
                 )
                 ptr_buf_tensor(remote_queue, fx.Int32)[ready_slot] = tile
-                fx.rocdl.s_waitcnt(0)
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 comm_ops.fence_system_release()
                 comm_ops.store_i32_system(remote_queue_epoch, ready_slot, payload_epoch)
 
@@ -552,7 +552,7 @@ def emit_direct_fixed_slot_payload(
                 ptr_buf_tensor(remote_weights, fx.Int32)[payload_row] = weight_bits
                 ptr_buf_tensor(remote_srcmap, fx.Int32)[payload_row] = source_encoding
 
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.fence_system_release()
@@ -659,7 +659,7 @@ def emit_direct_fixed_slot_finalize(
             work_tail[fx.Int32(0)] = ready_work
             max_expert_tiles_buffer[fx.Int32(0)] = max_expert_tiles
 
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         comm_ops.fence_system_release()
         for source in range(lane, fz_npes, 64):
             remote_ready = plan_ready_table[source]
@@ -703,7 +703,7 @@ def _derive_allgather_offsets(
             destination_tile_m_lane = ptr_buf_tensor(
                 destination_ready_rows, fx.Int32
             )[fx.Int32(0)]
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         destination_tile_m = fx.Int32(
             fx.rocdl.readfirstlane(T.i32, destination_tile_m_lane)
         )
@@ -726,7 +726,7 @@ def _derive_allgather_offsets(
                     cache_modifier=2,
                 )
             )
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         group_count_lane = fx.Int32(0)
         group_source_prefix_lane = fx.Int32(0)
         for source in range_constexpr(npes):
@@ -767,7 +767,7 @@ def _derive_allgather_offsets(
                         cache_modifier=2,
                     )
                 )
-            fx.rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             normal_count = fx.Int32(0)
             normal_source_prefix = fx.Int32(0)
             group_count = group_member.select(
@@ -959,7 +959,7 @@ def _derive_next_fanout_pairs(
                 next_parity * fx.Int32(npes) + fx.Int32(destination),
                 packed,
             )
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     comm_ops.fence_agent_release()
 
 
@@ -1030,7 +1030,7 @@ def emit_dispatch_plan(
             group_phase_base + fx.Int32(group_blocks),
         )
         comm_ops.fence_agent_acquire()
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     comm_ops.fence_agent_acquire()
 
@@ -1044,7 +1044,7 @@ def emit_dispatch_plan(
                 fx.Int32(group_block * total_segments) + segment
             ]
         local_hist[segment] = segment_count
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
 
     if warp == fx.Int32(0):
@@ -1059,7 +1059,7 @@ def emit_dispatch_plan(
             payload_chunk_rows=payload_chunk_rows,
             dispatch_blocks=dispatch_blocks,
         )
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     comm_ops.fence_agent_release()
 
@@ -1075,7 +1075,7 @@ def emit_dispatch_plan(
             remote_count_matrix[fx.Int32(fz_rank * total_segments) + segment] = (
                 count
             )
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
 
     # Warp 0 plans local experts after all source matrices arrive.
@@ -1323,13 +1323,13 @@ def emit_dispatch_plan(
         if lane == fx.Int32(0):
             num_valid_buffer[fx.Int32(0)] = row_carry
             max_expert_tiles_buffer[fx.Int32(0)] = max_expert_tiles
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         comm_ops.fence_system_release()
         for source in range(lane, fz_npes, 64):
             remote_ready = plan_ready_table[source]
             ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             comm_ops.store_i32_system(remote_ready, ready_index, expected)
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     elif warp == fx.Int32(1):
         # Build the global-expert exclusive prefix cooperatively.
         pairs_per_lane = (total_segments + 63) // 64
@@ -1360,13 +1360,13 @@ def emit_dispatch_plan(
                     block_hist[block_index] = block_prefix
                     block_prefix = block_prefix + block_count
             source_prefix = source_prefix + lane_counts[item]
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         comm_ops.fence_agent_release()
 
     # All compact offsets are derived locally from the exchanged histogram.
     # The prepare kernel owns this single synchronization edge; MegaStage1
     # never recounts or regroups routes.
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     # Warp 0 observes COUNT_DONE and performs the system acquire above, but
     # every warp participates in the deterministic offset derivation below.
@@ -1383,13 +1383,13 @@ def emit_dispatch_plan(
         total_experts=fz_total_experts,
         total_segments=total_segments,
     )
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.fence_system_release()
         comm_ops.store_i32_system(a_pair_ready, parity, expected)
 
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.wait_i32_until_equals(
@@ -1493,13 +1493,13 @@ def emit_dispatch_group(
         if active_route:
             route_segment[route] = cached_segment
 
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     for segment in range(tid, count_segments, block_threads):
         block_count = fx.ptr_load(count_scratch + fx.Int64(segment))
         block_index = producer_slot * fx.Int32(count_segments) + segment
         block_hist[block_index] = block_count
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.fence_agent_release()
@@ -1514,7 +1514,7 @@ def emit_dispatch_group(
         block_index = producer_slot * fx.Int32(count_segments) + segment
         block_base = block_hist[block_index]
         fx.ptr_store(block_base, count_scratch + fx.Int64(segment))
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     for token_batch in range(
         token_batch0, i32_cur_tok, token_stride
@@ -1543,7 +1543,7 @@ def emit_dispatch_group(
             pair_entry = shared_group.select(group_entry, route)
             pair_order[position] = pair_entry
 
-    fx.rocdl.s_waitcnt(0)
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.fence_agent_release()
@@ -1862,7 +1862,7 @@ def emit_dispatch_payload(
             )
 
         if chunk_active:
-            fx.rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             fx.barrier()
             if tid == fx.Int32(0):
                 if group_task:
