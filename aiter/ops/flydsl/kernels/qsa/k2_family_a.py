@@ -383,29 +383,44 @@ def build_qsa_k2_family_a_module(
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
         init_acc.append(Float32(float("-inf")))
         init_acc.append(Float32(0.0))
-        n_tiles = tile_end - tile_start
-        start = fx.Int64(0)
-        stop = fx.Int64(n_tiles)
-        step = fx.Int64(1)
-        for tile64, state in range(start, stop, step, init=init_acc):
-            gpu.barrier()
-            base = col_start + Int32(tile64) * Int32(block_n)
-            col = tid % Int32(block_n)
-            chunk_owner = _idiv(tid, Int32(block_n))
-            col_i = base + col
+        col = tid % Int32(block_n)
+        chunk_owner = _idiv(tid, Int32(block_n))
+
+        def tile_column(tile_i32):
+            """This lane's column in ``tile_i32``, clamped to stay in bounds.
+
+            Tiles past the split's last one clamp to ``col_start`` and report
+            ``in_col`` false, so prefetching past the end is safe and masks off.
+            """
+            col_i = col_start + tile_i32 * Int32(block_n) + col
             in_col = col_i < col_end
-            safe_col = in_col.select(col_i, col_start)
-            tok = indices[row, safe_col]
-            token_live = valid_req & in_col & (tok >= zero)
+            return in_col.select(col_i, col_start), in_col
+
+        def load_index(tile_i32):
+            """Issue a tile's index load. Not consumed by the caller."""
+            safe_col, _in_col = tile_column(tile_i32)
+            return indices[row, safe_col]
+
+        def logical_page_of(tok):
             safe_tok = (tok >= zero).select(tok, zero)
-            logical_page = _idiv(safe_tok, page)
-            page_off_i = safe_tok - logical_page * page
-            table_live = logical_page < table_width
-            safe_logical_page = table_live.select(logical_page, zero)
-            phys = page_table[safe_req, safe_logical_page]
+            lp = _idiv(safe_tok, page)
+            return lp, safe_tok - lp * page
+
+        def load_page(tok):
+            """Issue a tile's page-table load. Not consumed by the caller."""
+            lp, _off = logical_page_of(tok)
+            return page_table[safe_req, (lp < table_width).select(lp, zero)]
+
+        def resolve(tok, tile_i32, phys):
+            """Rebuild a tile's masks once its page load has landed."""
+            _sc, in_col = tile_column(tile_i32)
+            lp, page_off_i = logical_page_of(tok)
             phys_live = (phys >= zero) & (phys < n_cache_blocks)
-            live = token_live & table_live & phys_live
-            safe_phys = phys_live.select(phys, zero)
+            live = valid_req & in_col & (tok >= zero) & (lp < table_width) & phys_live
+            return phys_live.select(phys, zero), page_off_i, live
+
+        def tile_body(safe_phys, page_off_i, live, state):
+            gpu.barrier()
 
             v_frags = []
             if const_expr(decode_tr_pv):
@@ -746,7 +761,33 @@ def build_qsa_k2_family_a_module(
                     else:
                         acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
-            results = yield next_acc + [m_new, l_new]
+            return next_acc + [m_new, l_new]
+
+        # Software-pipelined address resolution. Each iteration issues the
+        # index two tiles ahead and the page one tile ahead; neither is read
+        # in the iteration that issues it, so both round trips are covered by
+        # a whole tile body instead of stalling in front of the K/V gather.
+        # The three carried registers ride behind the accumulator so the
+        # epilogue's ``results`` indices are unchanged.
+        tok0 = load_index(Int32(0))
+        tok1 = load_index(Int32(1))
+        phys0 = load_page(tok0)
+        n_tiles = tile_end - tile_start
+        for tile64, state in range(
+            fx.Int64(0),
+            fx.Int64(n_tiles),
+            fx.Int64(1),
+            init=init_acc + [tok0, tok1, phys0],
+        ):
+            t = Int32(tile64)
+            tok_cur = Int32(state[out_chunks + 2])
+            tok_n1 = Int32(state[out_chunks + 3])
+            phys_cur = Int32(state[out_chunks + 4])
+            tok_n2 = load_index(t + Int32(2))
+            phys_n1 = load_page(tok_n1)
+            safe_phys, page_off_i, live = resolve(tok_cur, t, phys_cur)
+            acc = tile_body(safe_phys, page_off_i, live, state)
+            results = yield acc + [tok_n1, tok_n2, phys_n1]
 
         m_final = Float32(results[out_chunks])
         l_final = Float32(results[out_chunks + 1])
