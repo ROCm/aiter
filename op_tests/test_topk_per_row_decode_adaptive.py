@@ -230,6 +230,22 @@ def _planted(lens, width, k, device):
     return x
 
 
+def _tied(rows, width, device):
+    """Logits on a coarse grid, so every row ties across its k-th value."""
+    x = (torch.randn(rows, width, device=device) * 8).round() / 8
+    return x + 0.0  # the kernel ranks -0.0 below +0.0; leave only one zero
+
+
+def _stable_indices(logits, k):
+    """The stable contract: ties go to the smaller index, output ascending."""
+    kth = torch.topk(logits, k, dim=1).values[:, -1:]
+    above = logits > kth
+    at = logits == kth
+    room = k - above.sum(dim=1, keepdim=True)
+    keep = above | (at & (at.cumsum(dim=1, dtype=torch.int32) <= room))
+    return keep.nonzero()[:, 1].view(-1, k).to(torch.int32)
+
+
 def _this_card():
     """Read arch and CU count exactly as the gate does, so a test cannot check
     one table row while the call under it takes another."""
@@ -329,17 +345,25 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
 
     torch.manual_seed(0)
     bad = []
+    checks = 0
     # Planted first, because a known answer is what shows an indexing mistake;
-    # the random pass supplements it with values no pattern put there.
-    for (width, rows, k, stable), planted in itertools.product(cells, (True, False)):
+    # the random pass supplements it with values no pattern put there, and the
+    # tied pass holds a stable call to the one index its contract names.
+    for (width, rows, k, stable), kind in itertools.product(
+        cells, ("planted", "random", "tied")
+    ):
+        if kind == "tied" and not stable:
+            continue
+        checks += 1
         # Every row is as long as the buffer here, so the bound is the width.
         want = topk._decode_backend(arch, cu_count, stable, width, rows, k, True, width)
         # float32: the FlyDSL decode path takes no other dtype.
-        logits = (
-            _planted([width] * rows, width, k, "cuda")
-            if planted
-            else torch.randn(rows, width, dtype=torch.float32, device="cuda")
-        )
+        if kind == "planted":
+            logits = _planted([width] * rows, width, k, "cuda")
+        elif kind == "random":
+            logits = torch.randn(rows, width, dtype=torch.float32, device="cuda")
+        else:
+            logits = _tied(rows, width, "cuda")
         seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
         out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
 
@@ -373,26 +397,30 @@ def test_the_kernel_the_table_names_is_the_one_that_launches(monkeypatch):
         # the first name recorded is the one that was dispatched to.
         ran = launched[0] if launched else topk.BACKEND_UPSTREAM
 
-        # Compare selected values, not indices: a row of this many float32
-        # samples carries ties, and either index of a tied pair is a correct
-        # answer, so an index comparison reports a right kernel as wrong.
-        want_values = torch.sort(torch.topk(logits, k, dim=1).values, dim=1).values
-        got_values = torch.sort(logits.gather(1, out.long()), dim=1).values
+        # Random float32 rows carry ties, and outside the stable contract either
+        # index of a tied pair is correct, so those compare selected values. The
+        # stable contract names one index per tie, so the tied pass compares indices.
+        if kind == "tied":
+            right = torch.equal(out, _stable_indices(logits, k))
+        else:
+            want_values = torch.sort(torch.topk(logits, k, dim=1).values, dim=1).values
+            got_values = torch.sort(logits.gather(1, out.long()), dim=1).values
+            right = torch.equal(got_values, want_values)
 
         expect_ran = declined_runs if got == topk.BACKEND_UPSTREAM else got
-        if got != want or ran != expect_ran or not torch.equal(got_values, want_values):
+        if got != want or ran != expect_ran or not right:
             bad.append(
-                f"width={width} rows={rows} k={k} stable={stable} "
-                f"{'planted' if planted else 'random'}: "
+                f"width={width} rows={rows} k={k} stable={stable} {kind}: "
                 f"gate said {got!r} (table says {want!r}), "
                 f"{ran!r} launched (expected {expect_ran!r}), "
-                f"values {'match' if torch.equal(got_values, want_values) else 'WRONG'}"
+                f"{'indices' if kind == 'tied' else 'values'} "
+                f"{'match' if right else 'WRONG'}"
             )
 
-        del logits, seq_lens, out, want_values, got_values
+        del logits, seq_lens, out
         torch.cuda.empty_cache()
 
-    assert not bad, f"{2 * len(cells)} checks, {len(bad)} bad:\n" + "\n".join(bad)
+    assert not bad, f"{checks} checks, {len(bad)} bad:\n" + "\n".join(bad)
 
 
 # --------------------------------------------------------------------------
