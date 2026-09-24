@@ -93,6 +93,24 @@ def check_support(dtype, kv_dtype, nhead):
     return not (dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942")
 
 
+def check_fold_seqlen_indptr_cuda_graph_capture():
+    """_fold_seqlen_indptr must be capturable into a CUDA graph (see PR desc)."""
+    indptr = torch.zeros(9, dtype=torch.int32, device="cuda")
+    indptr[1:] = torch.cumsum(
+        torch.randint(0, 4096, (8,), dtype=torch.int32, device="cuda"), dim=0
+    )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        aiter.mla._fold_seqlen_indptr(indptr, 3)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        aiter.mla._fold_seqlen_indptr(indptr, 3)
+
+
 def init_3buffer_kv_cache(
     num_page: int,
     page_size: int,
@@ -656,6 +674,13 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
             and max_seqlen_q <= 6
         )
+        or (
+            get_gfx() == "gfx950"
+            and is_fp8_q
+            and is_fp8_kvc
+            and nheads == 12
+            and nheads * max_seqlen_q <= 128
+        )
     ):
         # Natively support cases
         pass
@@ -1152,16 +1177,8 @@ def test_mla(
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    if os.environ.get("DS32_DENSE_KV"):
-        assert not varlen, "DS32_DENSE_KV requires uniform seqlen (drop --varlen)"
-        pages_per_batch = int(kv_block_nums[0].item())
-        num_page = pages_per_batch
-        kv_indices = (
-            torch.arange(num_page, dtype=torch.int).repeat(batch_size).contiguous()
-        )
-    else:
-        num_page = kv_indptr[-1].item()
-        kv_indices = torch.randperm(num_page, dtype=torch.int)
+    num_page = kv_indptr[-1].item()
+    kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     # max_seqlen_kv = seq_lens_kv.max().item()
@@ -2080,3 +2097,7 @@ for nhead, decode_qlen in args.nhead:
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
     df_md = df.to_markdown(index=False)
     aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
+
+if __name__ == "__main__":
+    check_fold_seqlen_indptr_cuda_graph_capture()
+    aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
