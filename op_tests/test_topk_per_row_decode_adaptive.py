@@ -643,3 +643,7 @@ def test_every_row_is_read_whole_whatever_its_stride(monkeypatch, stride_of):
         torch.cuda.empty_cache()
 
     assert not bad, f"{len(cells)} cells, {len(bad)} bad:\n" + "\n".join(bad)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
