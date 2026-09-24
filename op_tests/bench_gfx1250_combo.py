@@ -136,10 +136,11 @@ are the ones that survive their own crashes.
 ``--ops`` accepts any op, including one held out of a suite's defaults because
 it is broken on the current arch, so it can be re-checked on a newer image.
 
-The ``mori_ep`` op runs the EPv2 benchmark from ``${MORI:-/app/mori}`` as the
-image provides it -- this script never updates or installs mori. Environment
-variables select backend, token tiers, eager/graph modes, EP size, dispatch
-dtype, and correctness checking:
+The ``mori_ep`` op runs the EPv2 benchmark script from
+``${MORI:-/app/mori}``, but imports the installed Mori package. The source tree
+therefore only supplies tests and never shadows the wheel's compiled extensions.
+Environment variables select backend, token tiers, eager/graph modes, EP size,
+dispatch dtype, and correctness checking:
 
     TOKENS=512 MODES=graph \
       python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep
@@ -152,7 +153,8 @@ unchecked rather than verified; the table label says so.
 
 The ``mhc`` op runs:
 
-    python3 op_tests/test_mhc.py -n 7168 -m 512 --fuse_rmsnorm
+    python3 op_tests/test_mhc.py -n 7168 -m 512 --fuse_rmsnorm \
+      --res_shuffle --w_preshuffle_bf16
 
 The ``qk_norm`` op runs both DSv4 phases:
 
@@ -1637,6 +1639,8 @@ def run_mhc(args):
                 "-m",
                 *map(str, tokens),
                 "--fuse_rmsnorm",
+                "--res_shuffle",
+                "--w_preshuffle_bf16",
                 "--data-init",
                 *data_inits,
                 "--seed",
@@ -1736,12 +1740,11 @@ def run_score_qk(args):
 def run_mori_ep(args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
     _unused_scale_init(args, "mori_ep")
-    # Runs whatever mori the image provides; keeping it current is the image's
-    # job. Updating it from here moved the measurement target between runs and
-    # needed a dev ROCm toolchain the pip-wheel images do not ship.
+    # The checkout supplies the benchmark script, while imports intentionally
+    # resolve to the installed wheel. Adding mori/python to PYTHONPATH would
+    # shadow that wheel with an unbuilt source tree and lose mori.cco.cco.
     mori = os.environ.get("MORI", "/app/mori")
     env = _without_smi(os.environ)
-    env["PYTHONPATH"] = f"{mori}/python:{mori}"
     env["MORI_SOCKET_IFNAME"] = "lo"
     env["GLOO_SOCKET_IFNAME"] = "lo"
     env["PYTHONUNBUFFERED"] = "1"
@@ -2215,8 +2218,8 @@ DSV4_OPS = [
     "mega_moe",
     # mori's own EPv2 bench, not an aiter kernel, but it is the dispatch and
     # combine either MoE path pays for -- the sweep is incomplete without the
-    # two all2all legs beside the GEMMs. Reads the mori tree the image ships
-    # (MORI=/app/mori); keeping that tree current is the image's job.
+    # two all2all legs beside the GEMMs. Reads the benchmark from MORI=/app/mori
+    # while exercising the installed package and its compiled extensions.
     "mori_ep",
     "moe",
     # "a8w8_blockscale" stays out of the default sweep, but NOT because the op is
