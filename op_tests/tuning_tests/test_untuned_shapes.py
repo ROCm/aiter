@@ -31,10 +31,12 @@ class TestUntunedShapes(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         untuned_shapes._ENABLED = None
+        untuned_shapes._MISSING_DIR_WARNING_EMITTED = False
         untuned_shapes._SEEN.clear()
 
     def tearDown(self):
         untuned_shapes._ENABLED = None
+        untuned_shapes._MISSING_DIR_WARNING_EMITTED = False
         untuned_shapes._SEEN.clear()
 
     def _path(self, name="a8w8_tuned_gemm.csv"):
@@ -42,7 +44,10 @@ class TestUntunedShapes(unittest.TestCase):
 
     def test_model_directory_uses_a_process_shard_per_family(self):
         model_dir = os.path.join(self.tempdir.name, "tuning", "glm-5.2")
-        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_DIR": model_dir}):
+        with mock.patch.dict(
+            os.environ,
+            {"AITER_TUNE_GEMM_DIR": model_dir, "AITER_TUNE_GEMM_SHARD_ID": "pod-7"},
+        ):
             paths = [
                 untuned_shapes.untuned_path_for(name)
                 for name in (
@@ -57,7 +62,7 @@ class TestUntunedShapes(unittest.TestCase):
             [
                 os.path.join(
                     model_dir,
-                    f"{name.replace('_tuned_', '_untuned_')[:-4]}.{os.getpid()}.csv",
+                    f"{name.replace('_tuned_', '_untuned_')[:-4]}.pod-7.csv",
                 )
                 for name in (
                     "a8w8_tuned_gemm.csv",
@@ -68,18 +73,24 @@ class TestUntunedShapes(unittest.TestCase):
             ],
         )
 
-    def test_default_destination_is_not_the_package(self):
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(
-                untuned_shapes.os, "getcwd", return_value=self.tempdir.name
-            ),
+    def test_missing_directory_disables_recording(self):
+        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM": "1"}, clear=True):
+            untuned_shapes._ENABLED = None
+            self.assertFalse(untuned_shapes.enabled())
+            with self.assertRaisesRegex(ValueError, "AITER_TUNE_GEMM_DIR"):
+                untuned_shapes.untuned_path_for("bf16_tuned_gemm.csv")
+
+    def test_shard_id_uses_explicit_value_or_hostname_and_pid(self):
+        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_SHARD_ID": "rank/0"}):
+            self.assertTrue(self._path().endswith("a8w8_untuned_gemm.rank_0.csv"))
+        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_SHARD_ID": ""}), mock.patch.object(
+            untuned_shapes.socket, "gethostname", return_value="worker-a"
         ):
-            path = untuned_shapes.untuned_path_for("bf16_tuned_gemm.csv")
-        self.assertEqual(
-            path,
-            os.path.join(self.tempdir.name, f"bf16_untuned_gemm.{os.getpid()}.csv"),
-        )
+            self.assertTrue(
+                self._path().endswith(
+                    f"a8w8_untuned_gemm.worker-a.{os.getpid()}.csv"
+                )
+            )
 
     def test_same_process_deduplicates_rows(self):
         row = {"M": 1, "N": 2, "K": 3}
@@ -87,6 +98,18 @@ class TestUntunedShapes(unittest.TestCase):
         untuned_shapes.record("a8w8_tuned_gemm.csv", row)
         with open(self._path()) as file:
             self.assertEqual(file.read(), "M,N,K\n1,2,3\n")
+
+    def test_model_run_directories_are_isolated(self):
+        first = os.path.join(self.tempdir.name, "glm-5.2")
+        second = os.path.join(self.tempdir.name, "qwen-3.5")
+        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_DIR": first}):
+            untuned_shapes.record("a8w8_tuned_gemm.csv", {"M": 1, "N": 2, "K": 3})
+        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_DIR": second}):
+            untuned_shapes.record("a8w8_tuned_gemm.csv", {"M": 4, "N": 5, "K": 6})
+        with open(os.path.join(first, os.listdir(first)[0])) as file:
+            self.assertEqual(file.read(), "M,N,K\n1,2,3\n")
+        with open(os.path.join(second, os.listdir(second)[0])) as file:
+            self.assertEqual(file.read(), "M,N,K\n4,5,6\n")
 
     def test_short_write_finishes_the_local_row(self):
         path = self._path()
@@ -191,6 +214,89 @@ class TestCachedLookupMissRecording(unittest.TestCase):
             gemm_op_a4w4.get_GEMM_config,
             (1, 2, 3),
         )
+
+
+class TestCompiledGraphRecording(unittest.TestCase):
+    """Exercise the public custom op, not only the Python config lookup."""
+
+    def test_compile_and_graph_capture_record_each_shape_once(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is required")
+        if not torch.cuda.is_available():
+            self.skipTest("a CUDA/HIP GPU is required")
+
+        from aiter.ops import gemm_op_a8w8
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "AITER_TUNE_GEMM": "1",
+                "AITER_TUNE_GEMM_DIR": directory,
+                "AITER_TUNE_GEMM_SHARD_ID": "capture-test",
+            },
+        ):
+            untuned_shapes._ENABLED = None
+            untuned_shapes._SEEN.clear()
+            gemm_op_a8w8._get_GEMM_config_with_quant_type_cached.cache_clear()
+            gemm_op_a8w8._log_quant_type_miss_once.cache_clear()
+
+            # Exercise dispatch/tracing without building a CK module.  The
+            # unmocked public lookup still records its miss before this fake
+            # kernel is reached.
+            def fake_kernel(xq, wq, x_scale, w_scale, out, bias, split_k):
+                return out
+
+            def run(m):
+                xq = torch.empty((m, 8), dtype=torch.int8, device="cuda")
+                wq = torch.empty((8, 8), dtype=torch.int8, device="cuda")
+                x_scale = torch.ones((m, 1), dtype=torch.float32, device="cuda")
+                w_scale = torch.ones((8, 1), dtype=torch.float32, device="cuda")
+                return xq, wq, x_scale, w_scale
+
+            def rows():
+                path = untuned_shapes.untuned_path_for("a8w8_tuned_gemm.csv")
+                with open(path) as file:
+                    return file.read().splitlines()
+
+            with (
+                mock.patch.object(gemm_op_a8w8, "gemm_a8w8_ck", side_effect=fake_kernel),
+                mock.patch.object(gemm_op_a8w8, "_ck_a8w8_supported", return_value=True),
+                mock.patch.object(gemm_op_a8w8, "get_gfx", return_value="gfx950"),
+                mock.patch.object(gemm_op_a8w8, "get_cu_num", return_value=304),
+            ):
+                compiled = torch.compile(gemm_op_a8w8.gemm_a8w8, fullgraph=True)
+                inputs = run(1)
+                compiled(*inputs)
+                torch.cuda.synchronize()
+                self.assertEqual(rows(), ["M,N,K,q_dtype_w", "1,8,8,torch.int8"])
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    compiled(*inputs)
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertEqual(rows(), ["M,N,K,q_dtype_w", "1,8,8,torch.int8"])
+
+                # A fresh compiled graph with a new static shape records its
+                # warmup/capture miss, while replay remains side-effect free.
+                second = torch.compile(gemm_op_a8w8.gemm_a8w8, fullgraph=True)
+                second_inputs = run(2)
+                second(*second_inputs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    second(*second_inputs)
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertEqual(
+                    rows(),
+                    [
+                        "M,N,K,q_dtype_w",
+                        "1,8,8,torch.int8",
+                        "2,8,8,torch.int8",
+                    ],
+                )
 
 
 if __name__ == "__main__":

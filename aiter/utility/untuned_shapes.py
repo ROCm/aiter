@@ -2,27 +2,40 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Record untuned GEMM shapes in process-local CSV shards.
 
-Set ``AITER_TUNE_GEMM=1`` to enable recording. ``AITER_TUNE_GEMM_DIR`` selects
-the output directory (for example ``/tuning/glm-5.2``); otherwise shards are
-written below the current working directory, never inside the installed package.
-Tuners already de-duplicate their inputs, so a later merge of ``*.pid.csv``
-shards avoids interprocess coordination in dispatch paths.
+Set ``AITER_TUNE_GEMM=1`` and ``AITER_TUNE_GEMM_DIR=/tuning/<model-or-run>``
+to enable recording. A directory is mandatory: recording model-unscoped shapes
+in a process working directory makes later merges ambiguous. Each worker writes
+``<family>_untuned_gemm.<shard-id>.csv``. Set ``AITER_TUNE_GEMM_SHARD_ID`` to a
+rank or pod ID; otherwise the hostname and PID provide the worker identifier.
+Tuners already de-duplicate their inputs, so a later merge of shards avoids
+interprocess coordination in dispatch paths.
 """
 
 import os
+import re
+import socket
 import threading
 
 from aiter import logger
 
 _ENABLED = None
+_MISSING_DIR_WARNING_EMITTED = False
 _LOCK = threading.Lock()
 _SEEN: dict[str, set[tuple[str, ...]]] = {}
 
 
 def enabled() -> bool:
-    global _ENABLED
+    global _ENABLED, _MISSING_DIR_WARNING_EMITTED
     if _ENABLED is None:
         _ENABLED = os.environ.get("AITER_TUNE_GEMM", "0") not in ("0", "", "false")
+        if _ENABLED and not os.environ.get("AITER_TUNE_GEMM_DIR"):
+            if not _MISSING_DIR_WARNING_EMITTED:
+                logger.warning(
+                    "[AITER_TUNE_GEMM] recording is disabled: set "
+                    "AITER_TUNE_GEMM_DIR to a model- or run-specific directory"
+                )
+                _MISSING_DIR_WARNING_EMITTED = True
+            _ENABLED = False
     return _ENABLED
 
 
@@ -32,8 +45,18 @@ def untuned_path_for(tuned_file: str) -> str:
     if base == os.path.basename(tuned_file):
         base = "untuned_" + base
     stem, extension = os.path.splitext(base)
-    out_dir = os.environ.get("AITER_TUNE_GEMM_DIR") or os.getcwd()
-    return os.path.join(out_dir, f"{stem}.{os.getpid()}{extension}")
+    out_dir = os.environ.get("AITER_TUNE_GEMM_DIR")
+    if not out_dir:
+        raise ValueError("AITER_TUNE_GEMM_DIR is required when recording untuned GEMMs")
+    shard_id = os.environ.get("AITER_TUNE_GEMM_SHARD_ID")
+    if not shard_id:
+        shard_id = f"{socket.gethostname()}.{os.getpid()}"
+    # Keep the ID one filename component even when it comes from a pod name or
+    # another external launcher value.
+    shard_id = re.sub(r"[^A-Za-z0-9_.-]", "_", shard_id)
+    if not shard_id or shard_id in {".", ".."}:
+        raise ValueError("AITER_TUNE_GEMM_SHARD_ID must contain a filename-safe value")
+    return os.path.join(out_dir, f"{stem}.{shard_id}{extension}")
 
 
 def _write_all(fd: int, data: bytes) -> None:
