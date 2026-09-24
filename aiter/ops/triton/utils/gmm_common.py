@@ -244,7 +244,9 @@ def gen_group_sizes(
 
     if num_unused_tokens > 0:
         _LOGGER.debug(
-            f"Group sizes generation: dropped {num_unused_tokens} token{'s' if num_unused_tokens > 1 else ''}.",
+            "Group sizes generation: dropped %d token%s.",
+            num_unused_tokens,
+            "s" if num_unused_tokens > 1 else "",
         )
 
     if unused_experts_prob > 0:
@@ -271,7 +273,9 @@ def gen_group_sizes(
 
     if num_unused_experts > 0:
         _LOGGER.debug(
-            f"Group sizes generation: dropped {num_unused_experts} expert{'s' if num_unused_experts > 1 else ''}.",
+            "Group sizes generation: dropped %d expert%s.",
+            num_unused_experts,
+            "s" if num_unused_experts > 1 else "",
         )
 
     group_sizes = torch.bincount(

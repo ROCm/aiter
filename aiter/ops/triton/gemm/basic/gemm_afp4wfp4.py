@@ -147,7 +147,11 @@ def gemm_afp4wfp4_(
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
     _LOGGER.info(
-        f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        "GEMM_AFP4WFP4: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scales.shape),
+        tuple(w_scales.shape),
     )
 
     assert backend in (
@@ -319,8 +323,8 @@ def gemm_afp4wfp4(
         # This entry point takes w as (N, K//2) row-major. gfx1250's gluon MXFP4
         # kernel takes preshuffled weights, so it cannot serve it.
         _LOGGER.info(
-            f"GEMM_AFP4WFP4: no gluon kernel for unshuffled weights on {arch}, "
-            "using triton"
+            "GEMM_AFP4WFP4: no gluon kernel for unshuffled weights on %s, using triton",
+            arch,
         )
         backend = "triton"
 
