@@ -512,7 +512,12 @@ def test_mla_v4_nm(
         "kv_indptr": inputs["kv_indptr"],
         "kv_page_indices": inputs["kv_page_indices"],
         "kv_last_page_lens": inputs["kv_last_page_lens"],
-        "split_indptr": split_indptr,
+        # Let the qh32 wrapper synthesize its uniform map so the default
+        # dispatch can select the fused path. Other variants retain the
+        # explicit map used by their existing coverage.
+        "split_indptr": (
+            None if (gqa_ratio, q_seq_logical) == (32, 1) else split_indptr
+        ),
         "max_seqlen_q": inputs["max_seqlen_q"],
         "sink": inputs["sink"],
         "sm_scale": sm_scale,
