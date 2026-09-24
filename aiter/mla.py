@@ -14,7 +14,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.asm.mla_decode_v4 import (
     get_mla_v4_fused_kernel,
     mla_decode_v4_asm_gfx1250,
@@ -1745,6 +1745,7 @@ def mla_decode_fwd_v4_nm(
 
     """
     require_gfx1250_asm("mla_decode_v4_asm")
+    runtime_gfx = get_gfx_runtime()
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)
@@ -1942,7 +1943,7 @@ def mla_decode_fwd_v4_nm(
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    if get_gfx() == "gfx1250":
+    if runtime_gfx == "gfx1250":
         mla_decode_v4_asm_gfx1250(
             q,
             qrope,
@@ -2000,7 +2001,7 @@ def mla_decode_fwd_v4_nm(
         # ragged rebuild). Other archs keep the original mgc=64 for the gqa16/8
         # single-token tile.
         if max_seqlen_q == 1 and num_heads in (8, 16):
-            mgc = 32 if get_gfx() == "gfx950" else 64
+            mgc = 32 if runtime_gfx == "gfx950" else 64
         else:
             mgc = 16
 

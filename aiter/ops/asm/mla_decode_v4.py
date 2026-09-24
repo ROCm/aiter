@@ -35,8 +35,8 @@ import os
 
 import torch
 
-from aiter.jit.core import get_asm_dir
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import AITER_ASM_DIR
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.asm.asm_utils import (
     dtype_str,
     get_function,
@@ -99,7 +99,7 @@ assert ctypes.sizeof(MlaV4KernelArgsPreload) == 120, ctypes.sizeof(
 
 def _mla_v4_csv_path(csv_name: str = _MLA_V4_CSV) -> str:
     """Path to a shipped gfx1250 v4 kernel registry (default ``mla_v4_asm.csv``)."""
-    return os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, csv_name)
+    return os.path.join(AITER_ASM_DIR, get_gfx_runtime(), _MLA_V4_SUBDIR, csv_name)
 
 
 def _find_kernel_cfg(csv_name, q_type, kv_type, gqa, ps, prefill, causal, qseqlen, lse):
@@ -169,6 +169,12 @@ def mla_decode_v4_asm_gfx1250_eager(
     This is the raw launcher: lowest host overhead, but opaque to TorchDynamo.
     Prefer the :func:`mla_decode_v4_asm_gfx1250` dispatcher, which routes to the
     ``torch.compile``-safe custom op while tracing and here otherwise."""
+    runtime_gfx = get_gfx_runtime()
+    if runtime_gfx != "gfx1250":
+        raise RuntimeError(
+            "mla_decode_v4_asm_gfx1250 is only supported on gfx1250, "
+            f"got {runtime_gfx}"
+        )
     del softmax_scale  # kernel hardcodes 1/sqrt(512)
     del split_indptr  # not part of the compact preload kernarg
 
@@ -216,7 +222,7 @@ def mla_decode_v4_asm_gfx1250_eager(
         q_type, kv_type, gqa_ratio, ps, prefill, causal, max_seqlen_q, lse_flag
     )
     sub_Q = int(cfg["sub_Q"])
-    co_path = os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, cfg["co_name"])
+    co_path = os.path.join(AITER_ASM_DIR, runtime_gfx, _MLA_V4_SUBDIR, cfg["co_name"])
     func = get_function(co_path, cfg["knl_name"])
 
     # ---- pack the 120-byte preload kernarg ---------------------------------
@@ -314,7 +320,9 @@ def _fused_co_for(q_type, kv_type, gqa, qseqlen):
     cfg = _find_kernel_cfg(_MLA_V4_FUSED_CSV, q_type, kv_type, gqa, 0, 0, 0, qseqlen, 0)
     if cfg is None:
         return None
-    co_path = os.path.join(get_asm_dir(), _MLA_V4_SUBDIR, cfg["co_name"])
+    co_path = os.path.join(
+        AITER_ASM_DIR, get_gfx_runtime(), _MLA_V4_SUBDIR, cfg["co_name"]
+    )
     if not os.path.isfile(co_path):
         return None
     return cfg, co_path
@@ -326,7 +334,7 @@ def get_mla_v4_fused_kernel(Q, KV, max_seqlen_q, num_kv_splits):
     ``[2, MLA_V4_FUSED_MAX_SPLITS]``, no shipped variant / .co, or disabled
     via ``AITER_MLA_V4_FUSED=0``). Callers fall back to stage1 + stage2 on
     None."""
-    if get_gfx() != "gfx1250":
+    if get_gfx_runtime() != "gfx1250":
         return None
     nsplit = int(num_kv_splits)
     if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):
