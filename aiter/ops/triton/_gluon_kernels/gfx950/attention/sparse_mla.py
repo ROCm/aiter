@@ -2280,6 +2280,11 @@ def _sparse_mla(
         )
 
 
+@gluon.constexpr_function
+def _next_pow2(n):
+    return 1 << (n - 1).bit_length()
+
+
 _sparse_mla_reduce_repr = make_kernel_repr(
     "_sparse_mla_reduce",
     ["BLOCK_M", "HEAD_SIZE", "NUM_SPLITS"],
@@ -2320,106 +2325,75 @@ def _sparse_mla_reduce(
     query_idx = gl.program_id(0)
     pid_h = gl.program_id(1)
 
-    # Lay the 64 lanes out so a small BLOCK_M spends them on the head dim.
-    TPW0: gl.constexpr = min(8, BLOCK_M)
-    TPW1: gl.constexpr = 64 // TPW0
-    BLK: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[TPW0, TPW1],
+    # Splits run along dim 0 of one [SPLITS_PAD, HEAD_SIZE] tile, so every
+    # split's partial is loaded at once and summed across lanes: one memory
+    # round trip per head, where walking the splits paid one per split.
+    SPLITS_PAD: gl.constexpr = _next_pow2(NUM_SPLITS)
+    TS: gl.constexpr = min(8, SPLITS_PAD)
+    TILE: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[SPLITS_PAD // TS, 8],
+        threads_per_warp=[TS, 64 // TS],
         warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )
-    row_l: gl.constexpr = gl.SliceLayout(1, BLK)  # [BLOCK_M]
-
-    h_off = pid_h * BLOCK_M
-    offs_m = gl.arange(0, BLOCK_M, layout=row_l)
-    h = h_off + offs_m
-    head_mask = h < num_heads
-    offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, BLK))
+    split_l: gl.constexpr = gl.SliceLayout(1, TILE)  # [SPLITS_PAD]
+    dim_l: gl.constexpr = gl.SliceLayout(0, TILE)  # [HEAD_SIZE]
+    offs_s = gl.arange(0, SPLITS_PAD, layout=split_l)
+    offs_d = gl.arange(0, HEAD_SIZE, layout=dim_l)
+    split_ok = offs_s < NUM_SPLITS
 
     neg_inf = float("-inf")
-    # Deliberately NOT bounded by the per-query split count: that would make
-    # these dynamic loops and lose the static unroll
-    m_final = gl.full([BLOCK_M], neg_inf, gl.float32, layout=row_l)
-    # pass 1: global max over splits
-    for s in range(NUM_SPLITS):
-        base = query_idx * pm_stride0 + s * pm_stride_s
+    for mi in gl.static_range(BLOCK_M):
+        h = pid_h * BLOCK_M + mi
+        live = split_ok & (h < num_heads)
+        stat_off = query_idx * pm_stride0 + offs_s * pm_stride_s + h
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-        )
-        m_final = _max2(m_final, m_s)  # m_s already in base-2 exponent domain
-    if HAS_SINK:
-        sink = gl.amd.cdna4.buffer_load(
-            ptr=attn_sink_ptr,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-            cache=".cg",
-        ).to(gl.float32)
-        scaled_sink = sink * RCP_LN2
-        m_final = _max2(m_final, scaled_sink)  # lift sink to base-2
-
-    # pass 2: weighted sums
-    l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)
-    acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=BLK)
-    for s in range(NUM_SPLITS):
-        base = query_idx * pm_stride0 + s * pm_stride_s
-        m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-            cache=".cg",
+            ptr=part_m_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
         )
         l_s = gl.amd.cdna4.buffer_load(
-            ptr=part_l_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=0.0,
-            cache=".cg",
+            ptr=part_l_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
         )
-        w = gl.exp2(m_s - m_final)
-        l_final = l_final + w * l_s
-        a_base = query_idx * pa_stride0 + s * pa_stride_s
-        a_off = (a_base + h[:, None] * pa_stride_h + offs_d[None, :]).to(gl.int32)
-        # split's part_acc can be uninitialized, so mask the load
-        if ADAPTIVE_SPLITS:
-            acc_mask = head_mask[:, None] & (m_s > neg_inf)[:, None]
-        else:
-            acc_mask = head_mask[:, None]
+        # Issued before the weights exist: nothing in the address depends on them.
+        a_off = (
+            query_idx * pa_stride0
+            + offs_s[:, None] * pa_stride_s
+            + h * pa_stride_h
+            + offs_d[None, :]
+        ).to(gl.int32)
         acc_s = gl.amd.cdna4.buffer_load(
             ptr=part_acc_ptr,
             offsets=a_off,
-            mask=acc_mask,
+            mask=live[:, None],
             other=0.0,
             cache=".cg",
         )
-        acc = acc + w[:, None] * acc_s.to(gl.float32)
 
-    if HAS_SINK:
-        l_final = l_final + gl.exp2(scaled_sink - m_final)
+        m_final = gl.max(m_s, axis=0)  # base-2 exponent domain
+        if HAS_SINK:
+            scaled_sink = gl.load(attn_sink_ptr + h).to(gl.float32) * RCP_LN2
+            m_final = _max2(m_final, scaled_sink)
+        # A split the adaptive count left unused keeps m = -inf and an
+        # uninitialized part_acc, so it must add exactly zero, not 0 * garbage.
+        used = m_s > neg_inf
+        w = gl.where(used, gl.exp2(m_s - m_final), 0.0)
+        l_final = gl.sum(w * l_s, axis=0)
+        if HAS_SINK:
+            l_final = l_final + gl.exp2(scaled_sink - m_final)
+        part = gl.where(used[:, None], w[:, None] * acc_s.to(gl.float32), 0.0)
+        acc = gl.sum(part, axis=0)
 
-    if HAS_LSE:
-        # Same base-2 -> natural conversion as the no-split epilogue.
+        if HAS_LSE:
+            gl.store(
+                lse_ptr + query_idx * num_heads + h,
+                (m_final + gl.log2(l_final)) * LN2,
+                mask=h < num_heads,
+            )
+        # One reciprocal per row instead of a per-element f32 divide.
+        out = acc * (1.0 / l_final)
+        o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
         gl.amd.cdna4.buffer_store(
-            (m_final + gl.log2(l_final)) * LN2,
-            ptr=lse_ptr + query_idx * num_heads,
-            offsets=h.to(gl.int32),
-            mask=head_mask,
+            out.to(out_ptr.dtype.element_ty),
+            ptr=out_ptr,
+            offsets=o_off,
+            mask=(offs_d < HEAD_SIZE) & (h < num_heads),
         )
-
-    # One reciprocal per row instead of a per-element f32 divide.
-    one_over_l = 1.0 / l_final
-    out = acc * one_over_l[:, None]
-    o_off = (query_idx * out_stride0 + h[:, None] * out_stride1 + offs_d[None, :]).to(
-        gl.int32
-    )
-    gl.amd.cdna4.buffer_store(
-        out.to(out_ptr.dtype.element_ty),
-        ptr=out_ptr,
-        offsets=o_off,
-        mask=head_mask[:, None],
-    )

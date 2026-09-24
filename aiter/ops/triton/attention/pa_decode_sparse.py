@@ -775,6 +775,6 @@ def _pa_decode_sparse_gfx950_gluon(
         NUM_SPLITS=grid_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=adaptive_splits,
-        num_warps=1,
+        num_warps=4,
     )
     return out
