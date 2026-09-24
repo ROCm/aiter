@@ -2006,6 +2006,39 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_gfx1201_sage_attention": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_attention.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_attention_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-std=c++17'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_gfx1201_norm_rope_prepare": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_norm_rope_prepare.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_norm_rope_prepare_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-std=c++17'",
+            "'-ffp-contract=off'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_decode_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
