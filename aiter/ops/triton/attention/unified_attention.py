@@ -214,6 +214,15 @@ def unified_attention(
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
         )
+        # Tile staging is LDS-bound: pages up to 128 are validated on gfx942
+        # (the tuned SHUF entries and the BS-agnostic M16/stages-1 fallback
+        # both fit 64 KiB LDS at TILE_SIZE=128). Larger pages would force a
+        # single K or V tile past the LDS budget with no tuned entry to
+        # compensate, so reject instead of launching an unvalidated config.
+        assert block_size <= 128, (
+            "Unified Attention with pre-shuffled KV cache supports pages up to "
+            f"128 on this target; got block_size={block_size}"
+        )
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
