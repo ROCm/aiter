@@ -199,12 +199,11 @@ python -m op_tests.op_benchmarks.triton.bench_conv3d --model ti2v
 
 The available Conv3D databases are `wan22-a14b-vae`, `ltx25-conv-vae`,
 `vision-patch-embed`, and `wan22-ti2v-5b-vae`. VAE sweeps report per-shape
-results, mean/median/aggregate throughput, layer winners, and call-count-weighted
-encoder/decoder totals when the trace provides those counts. Pass
-`--miopen-solvers` to add MIOpen solver names and a solver summary. The benchmark
-always calls the production `conv3d` router unless `--method` explicitly forces
-another supported path. `--batch-size N` overrides the batch dimension across a
-model sweep.
+results, mean/median/aggregate performance, layer winners, and call-count-
+weighted encoder/decoder totals when the trace provides those counts. The
+benchmark always calls the production `conv3d` router unless `--method`
+explicitly forces another supported path. `--batch-size N` overrides the batch
+dimension across a model sweep.
 
 The LTX trace uses the documented 121-frame 544×960 workload (latent
 `[1,128,16,17,30]`). The Wan TI2V trace uses 121 frames at 704×1280 (latent
@@ -216,20 +215,17 @@ As with Conv2D, `--smoke` selects a compact edge-case sweep instead of a model:
 
 ```bash
 python -m op_tests.op_benchmarks.triton.bench_conv3d --smoke
-python -m op_tests.op_benchmarks.triton.bench_conv3d --model ltx25 --miopen-solvers
+python -m op_tests.op_benchmarks.triton.bench_conv3d --model ltx25
 python -m op_tests.op_benchmarks.triton.bench_conv3d --model ti2v --batch-size 2
 ```
 
-For a single shape, provide all nine dimension flags. Depth, height, and width
-parameters are independent, matching the Conv2D single-shape interface with the
-additional depth axis:
+For a single shape, provide the nine NCDHW/OIDHW dimensions. Depth, height, and
+width parameters remain independent:
 
 ```bash
 python -m op_tests.op_benchmarks.triton.bench_conv3d \
-  --N 1 --C 64 --D 4 --H 16 --W 16 --K 128 --T 1 --R 1 --S 1 \
-  --stride-d 1 --stride-h 1 --stride-w 1 \
-  --pad-d 0 --pad-h 0 --pad-w 0 \
-  --dilation-d 1 --dilation-h 1 --dilation-w 1
+  --shape 1 64 4 16 16 128 1 1 1 \
+  --stride 1 1 1 --padding 0 0 0 --dilation 1 1 1
 ```
 
 Conv2D cross-axis flags:
@@ -253,14 +249,17 @@ Conv3D cross-axis flags:
 --dtype {fp16,bf16}                           # default fp16
 --layout {ncdhw,ndhwc}                        # default ncdhw
 --method {auto,general,1x1x1,cblocked,ndhwc_3x3x3,winograd,winograd_cblocked}
---metric {time,throughput}                    # default throughput
+--metric {time,throughput,bandwidth}          # default throughput
 --activation {none,relu,relu6,gelu}           # default none
 --no-bias                                     # bench the bias=None code path
---miopen-solvers                              # detect MIOpen solver names (sweep mode)
---show-kernel-name                            # include routed kernel name in single-shape output
 --model MODEL                                 # select a model workload by name substring
 --smoke                                       # use the edge-case sweep
 --batch-size N                                # override N for every swept shape
+--shape N C D H W K T R S                     # benchmark one shape
+--stride SD SH SW                             # single-shape stride
+--padding PD PH PW                            # single-shape padding
+--dilation DD DH DW                           # single-shape dilation
+-o, --output                                  # save results as CSV
 ```
 
 ---
