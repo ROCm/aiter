@@ -134,6 +134,10 @@ _BIAS_CAPABLE_KERNELS = frozenset(
         "aiter_a6w4_stnt_allk_bias",
         "aiter_a6w4_stnt_bias",
         "aiter_a6w4_swz0_bias",
+        "aiter_a6w4_dfp6_d3_s0_bias",
+        "aiter_a6w4_dfp6_d3_s3_bias",
+        "aiter_a6w4_dfp6_d4_s0_bias",
+        "aiter_a6w4_dfp6_d4_s3_bias",
     }
 )
 
@@ -144,6 +148,10 @@ _BIAS_SIBLING = {
     _MFMA32_SWZ0_KERNEL: "aiter_a6w4_m32_s0_a4_t_bias",
     _MFMA32_GROUPED_KERNEL: "aiter_a6w4_m32_s3_a4_t_bias",
     _MFMA32_LONG_K_KERNEL: "aiter_a6w4_m32_s3_a5_t_bias",
+    "aiter_a6w4_dfp6_d3_s0": "aiter_a6w4_dfp6_d3_s0_bias",
+    "aiter_a6w4_dfp6_d3_s3": "aiter_a6w4_dfp6_d3_s3_bias",
+    "aiter_a6w4_dfp6_d4_s0": "aiter_a6w4_dfp6_d4_s0_bias",
+    "aiter_a6w4_dfp6_d4_s3": "aiter_a6w4_dfp6_d4_s3_bias",
     "aiter_a6w4_stnt_allk": "aiter_a6w4_stnt_allk_bias",
     "aiter_a6w4_stnt": "aiter_a6w4_stnt_bias",
     "aiter_a6w4_swz0": "aiter_a6w4_swz0_bias",
