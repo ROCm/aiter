@@ -407,6 +407,7 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec \
             -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
+            -e ATOM_INFER_STUCK_POLLS=150 \
             atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
