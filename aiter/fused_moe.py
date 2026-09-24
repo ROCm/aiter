@@ -3189,6 +3189,8 @@ def get_2stage_cfgs(
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
             )
+        elif is_ep:
+            reject_reason = "the MXMOE output_aux sort drops expert_mask"
         if reject_reason is not None:
             cfg = None
             logger.warning(
@@ -3669,8 +3671,10 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
+    # The fallback's layout GEMM2 writes bf16 only, and its output_aux sort drops expert_mask.
     _mxmoe_fallback_ok = (
-        dtype in [dtypes.bf16, dtypes.fp16]
+        dtype == dtypes.bf16
+        and not is_ep
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Situv2
         and q_dtype_a == dtypes.fp4x2

@@ -121,7 +121,7 @@ def _gemm1_body(
     k_split = (
         a_dtype == "fp4"
         and not inline_quant
-        and BM in (128, 160)
+        and BM == 128
         and BN == 256
         and num_waves == 4
         and kMChunks > 1
@@ -1489,7 +1489,7 @@ def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits
 
 
 def default_epi_splits(BM, BN, k_wave=1, num_waves=4):
-    if BN == 256 and num_waves == 4 and k_wave == 1 and BM in (128, 160):
+    if BN == 256 and num_waves == 4 and k_wave == 1 and BM == 128:
         return 2
     return 1
 
