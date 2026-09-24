@@ -503,9 +503,9 @@ class QuickAllReduceInt4:
     * ``"auto"`` (default) -- ``uncached`` on hosts with xGMI peer links,
       ``finegrained`` on PCIe-attached hosts. Decided from the KFD topology.
     * ``"uncached"`` -- correct everywhere, but peer writes collapse on PCIe.
-    * ``"finegrained"`` -- device-coherent, full PCIe rate. Cacheable, so the
-      peer stores are emitted ``sc0 sc1`` to write through rather than parking
-      in the writer's L2.
+    * ``"finegrained"`` -- device-coherent, full PCIe rate. Cacheable, so each
+      publish writes the payload back from the writer's L2 with a release fence
+      before the flag goes out write-through (``sc0 sc1``).
 
     ``min_bytes`` is the payload below which ``allreduce`` refuses to run,
     defaulting to ``MIN_PAYLOAD_BYTES``. ``compile_and_launch`` is deliberately

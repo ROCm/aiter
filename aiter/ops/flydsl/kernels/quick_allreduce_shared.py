@@ -7,15 +7,13 @@ Tile geometry, the inbox cache-policy table, the peer store/load primitives and
 the LDS staging factory.
 
 The mesh, ring and one-shot kernels all build on this module, and they must
-agree byte for byte on what it defines. ``quick_allreduce_1stage`` uses it
+agree byte for byte on what it defines. ``one_shot_allreduce`` uses it
 *without* the codec, which is why the two are separate modules.
 """
 
 import logging
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -38,6 +36,11 @@ QUAD_LANES = 4
 QUADS_PER_WAVE = WAVE // QUAD_LANES
 # Wire/inbox addresses are byte pointers; tile math is in i32 slots.
 I32_BYTES = 4
+# The 64 B handshake sector is written as 8 lanes × 8 B: one colour-bearing
+# store per destination. 8 B per lane because it is the widest store the
+# backend performs atomically.
+FLAG_LANES = 8
+FLAG_I32_PER_LANE = 2
 
 # Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the
 # backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
@@ -54,21 +57,22 @@ _CM_SC1 = 16
 # any cache, so every peer sees the payload as soon as `vmcnt(0)` retires and
 # the release needs nothing beyond that.
 #
-# A fine-grained inbox is cacheable, which cuts both ways. Letting the payload
-# land in the writer's L2 is exactly what makes it fast on PCIe: the L2 coalesces
-# this kernel's 64 B destination-interleaved stores into large bursts, worth 30x
-# at prefill sizes (227 us against 6708 us at 14 MiB on MI350P). But `nt` is only
-# a non-temporal *hint* -- it does not write through -- so a payload store can
-# still be parked in L2 after `vmcnt(0)` while a peer spins on a flag it cannot
-# see. That stall clears only when unrelated traffic evicts the line, so its cost
-# scales inversely with how busy the kernel is: invisible at 448 blocks,
-# 5.3 seconds at 1 block.
 #
-# So keep the payload cacheable and make the *release* explicit: write back L2
-# after the payload drains, then publish the flag write-through so the peer's
-# spin observes it immediately. Forcing the payload itself write-through
-# (`sc0 sc1` on every store) also fixes visibility, but defeats the coalescing
-# and gives back the entire bandwidth win.
+# ``payload`` and ``flag`` are keyword arguments for ``fx.generic_store``, as
+# ``(name, value)`` tuples rather than dicts: the kernel factories capture them,
+# and FlyDSL folds a captured tuple into its compile-cache key but silently
+# leaves a dict out. On gfx942/gfx950 they lower to:
+#
+#   _ST_PLAIN   global_store_*
+#   _ST_NT      global_store_* ... nt
+#   _ST_SYSTEM  global_store_* ... sc0 sc1   (a relaxed system-scope atomic)
+#
+# ``release`` is the sync scope of the release fence that precedes the flag, or
+# None for none. At agent scope the fence is ``buffer_wbl2 sc1`` followed by
+# ``s_waitcnt vmcnt(0)``. The peers are other agents, so the memory model asks
+# for system scope (``buffer_wbl2 sc0 sc1``); agent scope is what has always
+# shipped and is kept until the two are measured against each other.
+#
 # ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
 # consecutive quads; see the layouts in the kernel body.
 #
@@ -76,18 +80,23 @@ _CM_SC1 = 16
 # part of the same policy because it is the other half of the same decision: the
 # more the writer is allowed to cache, the harder the reader has to work to
 # avoid a stale line.
+_ST_PLAIN = ()
+_ST_NT = (("nontemporal", True),)
+_ST_SYSTEM = (("memory_order", fx.AtomicOrdering.Monotonic),)
+_RELEASE_SCOPE = rocdl.SyncScope.AgentOneAs
+
 _INBOX_POLICY = {
     "uncached": {
-        "payload": "nt",
-        "flag": "nt",
-        "writeback": None,
+        "payload": _ST_NT,
+        "flag": _ST_NT,
+        "release": None,
         "fanout": "sector",
         "recv": _CM_NT,
     },
     "finegrained": {
-        "payload": "nt",
-        "flag": "sc0 sc1 nt",
-        "writeback": "buffer_wbl2 sc1",
+        "payload": _ST_NT,
+        "flag": _ST_SYSTEM,
+        "release": _RELEASE_SCOPE,
         "fanout": "peer",
         "recv": _CM_NT,
     },
@@ -96,15 +105,15 @@ _INBOX_POLICY = {
     # combined with its neighbours before going out on the wire.
     #
     # The payload stores are plain (no `nt`) so lines stay dirty in L2;
-    # `buffer_wbl2` at the publish point is what puts them on the wire;
+    # the release fence at the publish point is what puts them on the wire;
     # the flag goes out write-through so the peer's spin sees it after the
     # payload; and the reader must bypass both its caches (`sc0 sc1`) rather
     # than trust `nt`, which is only a hint and can be answered from a stale
     # line.
     "default": {
-        "payload": "",
-        "flag": "sc0 sc1",
-        "writeback": "buffer_wbl2 sc1",
+        "payload": _ST_PLAIN,
+        "flag": _ST_SYSTEM,
+        "release": _RELEASE_SCOPE,
         "fanout": "peer",
         "recv": _CM_SC0 | _CM_SC1,
     },
@@ -118,7 +127,7 @@ def has_release_fence(inbox_memory: str) -> bool:
     Callers use it to decide how hard to work at batching publishes: with a
     fence they are expensive, without one they are nearly free.
     """
-    return _INBOX_POLICY[inbox_memory]["writeback"] is not None
+    return _INBOX_POLICY[inbox_memory]["release"] is not None
 
 
 def _i32_to_bytes(i32_off):
@@ -143,6 +152,14 @@ def _to_sgpr_i64(addr):
     return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
 
 
+def _global_ptr(addr_i64, elem_ty, alignment):
+    """A global-address-space pointer at a raw byte address."""
+    ptr_ty = fx.PointerType.get(
+        elem_ty, address_space=fx.AddressSpace.Global, alignment=alignment
+    )
+    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+
+
 def _store_v4i32_peer(addr_i64, data, policy):
     """Store 16 B to a peer through a per-lane global address.
 
@@ -152,37 +169,59 @@ def _store_v4i32_peer(addr_i64, data, policy):
     time). A flat global store takes the address from a vector register,
     so all destinations issue together.
 
-    *policy* is the cache-policy suffix for the inbox memory type; see
-    ``_INBOX_POLICY``. Not yet applied natively -- ``fx.ptr_store`` has no
-    cache-policy flag, so this stays inline asm.
+    *policy* is the inbox's ``payload`` entry in ``_INBOX_POLICY``: plain or
+    ``nt``. Every wire offset is a multiple of 16 B, hence the alignment.
 
-    A batched variant lives in
-    ``quick_allreduce_1stage._store_v4i32_peer_multi``, its only consumer.
-    Both emit ``global_store_dwordx4 ... {policy}``, so a change to that
-    encoding has to be made in both places.
-
-    The trailing ``s_nop 1`` is not optional. A VMEM store of more than 64 bits
-    needs wait states before a VALU may overwrite its data VGPRs -- two on
-    gfx940 and later. LLVM's hazard recognizer inserts them after a real store,
-    but it cannot see into inline asm, so it treats the data as dead the
-    instant the asm "executes" and will recycle those VGPRs on the very next
-    instruction. The store then ships whatever was written there:
-
-        global_store_dwordx4 v[8:9], v[4:7], off nt
-        v_add_u32_e32        v4, 0x490, v10        ; clobbers dword 0
-
-    It depends entirely on register allocation. The mesh at a 256-thread block
-    never hit it; the same kernel at 128 threads with the peer-major fanout
-    corrupted two dwords in every packet's fourth sector.
+    A native store, so the backend sees it. That matters beyond the cache
+    bits: a VMEM store of more than 64 bits needs two wait states (gfx940 and
+    later) before a VALU may overwrite its data VGPRs, and LLVM's hazard
+    recognizer only inserts them after a store it can see.
     """
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-    llvm.InlineAsmOp(
-        None,
-        [ptr, as_ir_value(data)],
-        f"global_store_dwordx4 $0, $1, off {policy}\n\ts_nop 1",
-        "v,v",
-        has_side_effects=True,
+    fx.generic_store(_global_ptr(addr_i64, T.i32, 16), data, **dict(policy))
+
+
+def _flag_word(color):
+    """One flag lane's 8 B: *color* twice, so the sector's first i32 is it."""
+    return fx.Vector.from_elements([color, color], fx.Int32).bitcast(fx.Int64)[0]
+
+
+def _store_flag_peer(addr_i64, color, policy):
+    """Write one lane's share of a peer's 64 B handshake sector.
+
+    *policy* is the inbox's ``flag`` entry in ``_INBOX_POLICY``. On a cacheable
+    inbox it is a relaxed system-scope atomic store, which the backend emits
+    ``sc0 sc1`` (write-through) without the ``vmcnt(0)`` a volatile store would
+    add after every flag. Atomic stores stop at 64 bits, which is why a sector
+    takes ``FLAG_LANES`` lanes of 8 B rather than four of 16 B.
+    """
+    fx.generic_store(_global_ptr(addr_i64, T.i64, 8), _flag_word(color), **dict(policy))
+
+
+def _release_inbox(scope):
+    """Release fence over global memory: publish everything stored before it.
+
+    At ``agent-one-as`` the backend emits ``buffer_wbl2 sc1`` followed by
+    ``s_waitcnt vmcnt(0)``: the L2 writeback that a cacheable inbox needs
+    before its flag goes out. ``one-as`` scopes it to global memory, so it does
+    not wait on ``lgkmcnt``.
+    """
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope=scope)
+
+
+def _load_flag(addr_i64):
+    """Poll one handshake flag: a relaxed system-scope atomic i32 load.
+
+    The backend emits ``global_load_dword ... sc0 sc1``, fetched past L1 and L2
+    every time, so a spin loop needs no fence in its body and no retry can see
+    a stale line.
+
+    A global load takes a per-lane address, so lanes spinning on different
+    sources issue together.
+    """
+    return fx.generic_load(
+        _global_ptr(addr_i64, T.i32, 4),
+        dtype=fx.Int32,
+        memory_order=fx.AtomicOrdering.Monotonic,
     )
 
 
@@ -199,21 +238,6 @@ def _load_i32_nt(rsrc, elem_off, cache_modifier=_CM_NT):
             rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=cache_modifier
         )
     )
-
-
-def _load_i32_uncached(rsrc):
-    """One i32 that cannot be answered from this device's caches.
-
-    ``sc0 sc1`` is what LLVM itself emits for a system-scope load, and it is
-    what makes a spin loop safe without a fence in the loop body: the value
-    is fetched past L1 and L2 every time, so no retry can see a stale line.
-    ``sc1`` alone would only bypass L2.
-    """
-    val = buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC0 | _CM_SC1
-    )
-    rocdl.s_waitcnt(vmcnt=0)
-    return fx.Int32(val)
 
 
 def _acquire_inbox():
@@ -236,7 +260,7 @@ def _acquire_inbox():
     payload read that follows, and that needs it exactly once. See
     :func:`quick_allreduce_int4.make_quick_allreduce_int4_kernel._wait_release`.
     """
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="one-as")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=rocdl.SyncScope.OneAs)
 
 
 def make_pack_storage(n_i32: int):

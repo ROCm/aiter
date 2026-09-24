@@ -26,7 +26,6 @@ A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
@@ -49,14 +48,20 @@ from .quick_allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
+    _RELEASE_SCOPE,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
     _acquire_inbox,
     _i32_to_bytes,
+    _load_flag,
+    _release_inbox,
+    _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
     make_pack_storage,
@@ -132,9 +137,8 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 def _load_i32_at(rsrc, elem_off, cache_modifier):
     """One i32 from *rsrc* at an element offset, drained before it is read.
 
-    ``quick_allreduce_shared._load_i32_uncached`` does the same but hardcodes offset 0,
-    which would force a fresh per-call descriptor here; the ring always has the
-    inbox descriptor in hand and only the offset varies.
+    The ring always has the inbox descriptor in hand and only the offset
+    varies, so its payload reads go through the one shared descriptor.
     """
     val = buffer_ops.buffer_load(
         rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=cache_modifier
@@ -208,7 +212,7 @@ def make_quick_allreduce_int4_ring_kernel(
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
-    release_writeback = policy["writeback"]
+    release_scope = policy["release"]
     # policy["fanout"] is not consulted: it picks which axis of a (peer, sector)
     # fanout runs fastest across quads, and a ring has no peer axis. Sectors run
     # fastest by construction, which is the "peer" (PCIe-favourable) answer.
@@ -493,22 +497,23 @@ def make_quick_allreduce_int4_ring_kernel(
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if const_expr(release_writeback is not None):
-                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
-                rocdl.s_waitcnt(vmcnt=0)
-            if quad_id == fx.Int32(0):
-                vec_idx = fx.Int32(release_i32_off[step]) + lane_in_quad * fx.Int32(4)
-                v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                byte_off = _i32_to_bytes(_slot_i32(step, fx.Int32(0)) + vec_idx)
-                _store_v4i32_peer(next_base + byte_off, v4, flag_policy)
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
+            if tid < fx.Int32(FLAG_LANES):
+                elem = (
+                    _slot_i32(step, fx.Int32(0))
+                    + fx.Int32(release_i32_off[step])
+                    + tid * fx.Int32(FLAG_I32_PER_LANE)
+                )
+                _store_flag_peer(next_base + _i32_to_bytes(elem), color, flag_policy)
 
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
             One source, so one thread spins where the mesh needs one per
-            peer. ``buffer_inv sc1`` between attempts is not optional: without
-            it the load can be answered forever from a stale line, which is a
-            hang rather than a slowdown.
+            peer. The poll must bypass the caches (``_load_flag`` is ``sc0
+            sc1``): a load answered from a stale line would spin forever, which
+            is a hang rather than a slowdown.
 
             One colour covers all ``2(N-1)`` slots of a super-tile group. That is
             safe without extra sequencing because the ring's own dependency
@@ -518,23 +523,21 @@ def make_quick_allreduce_int4_ring_kernel(
             transitively requires us to have completed op ``N`` -- i.e. to be
             past the read we are blocked on.
 
-            Spins on the one shared ``self_rsrc`` descriptor at an element
-            offset, rather than building a fresh descriptor from
-            ``self_base + elem*4``. The mesh can afford the latter because
-            its ``elem`` depends on ``tid`` (one spinner per source rank) and the
-            resulting waterfall is genuine. Here there is exactly one source, so
-            a per-call descriptor is a *uniform* value that LLVM cannot prove
-            uniform: it sources all four descriptor dwords from VGPRs and
-            serializes the wave around them, num_records included.
+            Polls through a global address rather than a buffer descriptor:
+            a descriptor built from ``self_base + elem*4`` would be a uniform
+            value LLVM cannot prove uniform, sourcing all four descriptor
+            dwords from VGPRs and serializing the wave around them.
             """
             if tid == fx.Int32(0):
-                elem = _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
+                flag = self_base + _i32_to_bytes(
+                    _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
+                )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
                 # fence is needed in the loop; the acquire below covers the
                 # payload reads, once, after the join.
-                current = _load_i32_at(self_rsrc, elem, _RECV_POLICY)
+                current = _load_flag(flag)
                 while current != color:
-                    current = _load_i32_at(self_rsrc, elem, _RECV_POLICY)
+                    current = _load_flag(flag)
             gpu.barrier()
             # Unconditional, *after* the join, and not just inside the spin.
             # Only `tid == 0` spins, so an acquire inside the loop would cover
@@ -556,8 +559,7 @@ def make_quick_allreduce_int4_ring_kernel(
             # here sits directly on top of dirty output lines, and discarding
             # them silently loses whole chunks.
             rocdl.s_waitcnt(vmcnt=0)
-            llvm.InlineAsmOp(None, [], "buffer_wbl2 sc1", "", has_side_effects=True)
-            rocdl.s_waitcnt(vmcnt=0)
+            _release_inbox(_RELEASE_SCOPE)
             _acquire_inbox()
 
         def _op_substep(k, tile, sub):
@@ -759,7 +761,7 @@ def make_quick_allreduce_int4_ring_kernel(
         "ag_codec": ag_codec,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
-        "release_writeback": release_writeback,
+        "release_scope": release_scope,
         "rank_atoms": rank_atoms,
         "steps": steps,
         "grid": grid,

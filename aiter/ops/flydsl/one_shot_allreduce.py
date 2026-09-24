@@ -25,7 +25,6 @@ from .kernels.one_shot_allreduce import (
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
     DEFAULT_SKIP_SELF,
-    DEFAULT_SPIN_SLEEP,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
     make_one_shot_allreduce_kernel,
@@ -100,7 +99,6 @@ class OneShotAllReduce:
         max_bytes: int | None = None,
         link: str | None = None,
         probe: str = "full",
-        spin_sleep: int = DEFAULT_SPIN_SLEEP,
         skip_self: bool | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
@@ -158,7 +156,6 @@ class OneShotAllReduce:
             max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
         self.probe = probe
-        self.spin_sleep = int(spin_sleep)
 
         # ``skip_self``: None means "whatever the rung says".
         ss = None if skip_self is None else bool(skip_self)
@@ -210,7 +207,6 @@ class OneShotAllReduce:
                         fanout=key[2],
                         block=key[3],
                         probe=probe,
-                        spin_sleep=int(spin_sleep),
                         skip_self=key[4],
                         rank=self.rank,
                     )

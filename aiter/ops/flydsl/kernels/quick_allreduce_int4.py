@@ -28,7 +28,6 @@ Two tuning knobs besides the super-tile:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
@@ -54,6 +53,8 @@ from .quick_allreduce_shared import (
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
@@ -61,8 +62,10 @@ from .quick_allreduce_shared import (
     WORLD,
     _acquire_inbox,
     _i32_to_bytes,
+    _load_flag,
     _load_i32_nt,
-    _load_i32_uncached,
+    _release_inbox,
+    _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
     make_pack_storage,
@@ -204,7 +207,7 @@ def make_quick_allreduce_int4_kernel(
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
-    release_writeback = policy["writeback"]
+    release_scope = policy["release"]
     recv_policy = policy["recv"]
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
@@ -522,34 +525,38 @@ def make_quick_allreduce_int4_kernel(
             can move after the color store, and neither can be dropped.
 
             On a cacheable inbox retiring the stores is not enough -- they
-            can be sitting in this XCD's L2. ``buffer_wbl2`` after the join
-            writes them back, and its own ``vmcnt(0)`` waits for that to
-            land before the flag goes out. Every workgroup issues its own:
-            L2 is per-XCD, so one workgroup's writeback says nothing about
-            a workgroup on another die.
+            can be sitting in this XCD's L2. The release fence after the join
+            writes them back (``buffer_wbl2``) and waits for that to land
+            before the flag goes out. Every workgroup issues its own: L2 is
+            per-XCD.
+
+            ``FLAG_LANES`` lanes per destination, 8 B each, so at most 64
+            lanes: the whole handshake is one store instruction from wave 0.
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if const_expr(release_writeback is not None):
-                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
-                rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
             limit = fx.Int32(n_push)
-            safe = (quad_id < limit).select(quad_id, fx.Int32(0))
-            if quad_id < limit:
-                vec_idx = fx.Int32(release_i32_off) + lane_in_quad * fx.Int32(4)
-                v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                byte_off = _i32_to_bytes(
-                    _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
+            dest = tid // fx.Int32(FLAG_LANES)
+            safe = (dest < limit).select(dest, fx.Int32(0))
+            if dest < limit:
+                elem = (
+                    _sub_tile_i32(phase, inbox_src, fx.Int32(0))
+                    + fx.Int32(release_i32_off)
+                    + (tid % fx.Int32(FLAG_LANES)) * fx.Int32(FLAG_I32_PER_LANE)
                 )
-                _store_v4i32_peer(_push_base(safe) + byte_off, v4, flag_policy)
+                _store_flag_peer(
+                    _push_base(safe) + _i32_to_bytes(elem), color, flag_policy
+                )
 
-        def _wait_flag(flag_rsrc, color):
-            # No fence in the loop body: _load_i32_uncached carries `sc0 sc1`,
-            # so a retry cannot be served from a stale line. The acquire the
+        def _wait_flag(flag, color):
+            # No fence in the loop body: _load_flag carries `sc0 sc1`, so a
+            # retry cannot be served from a stale line. The acquire the
             # payload reads need is in _wait_release, once, after the join.
-            current = _load_i32_uncached(flag_rsrc)
+            current = _load_flag(flag)
             while current != color:
-                current = _load_i32_uncached(flag_rsrc)
+                current = _load_flag(flag)
 
         def _wait_release(phase, color):
             # Lane ``t`` watches one source. Without skip_self that is source
@@ -563,12 +570,7 @@ def make_quick_allreduce_int4_kernel(
                 elem = _sub_tile_i32(phase, spin_src, fx.Int32(0)) + fx.Int32(
                     release_i32_off
                 )
-                _wait_flag(
-                    buffer_ops.create_buffer_resource_from_addr(
-                        peer_vec[rank] + _i32_to_bytes(elem)
-                    ),
-                    color,
-                )
+                _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
             gpu.barrier()
             # Unconditional and after the join. Only `tid < n_push` spun,
             # so scoping the acquire to the spin would leave the other waves
@@ -780,7 +782,7 @@ def make_quick_allreduce_int4_kernel(
         "codec": codec,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
-        "release_writeback": release_writeback,
+        "release_scope": release_scope,
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": block,
