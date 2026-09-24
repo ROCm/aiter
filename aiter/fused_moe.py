@@ -610,7 +610,20 @@ def moe_sorting(
     flat=False,
     output_aux=False,
     output=None,
+    use_tiled_sort: bool = False,
 ):
+    if use_tiled_sort:
+        from aiter.ops.triton.moe_sorting_tiled import try_m3_tiled_sort
+
+        tiled_result = try_m3_tiled_sort(
+            topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype,
+            block_size, expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens, dispatch_policy=dispatch_policy,
+            return_local_topk_ids=return_local_topk_ids, accumulate=accumulate,
+            flat=flat, output_aux=output_aux,
+        )
+        if tiled_result is not None:
+            return tiled_result
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
@@ -849,6 +862,7 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    use_tiled_sort: bool = False,
 ):
     if (
         any(
@@ -939,6 +953,7 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        use_tiled_sort=use_tiled_sort,
     )
 
 
@@ -981,6 +996,7 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    use_tiled_sort: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1042,6 +1058,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    use_tiled_sort: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1085,6 +1102,7 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        use_tiled_sort=use_tiled_sort,
     )
 
 
@@ -1119,6 +1137,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    use_tiled_sort: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1429,6 +1448,18 @@ def _fused_moe_impl(
 
     sort_m_indices = None
     sort_reverse_sorted = None
+    # Explicit call-site opt-in; metadata/kernel selection is unchanged.
+    use_tiled_sort = (
+        use_tiled_sort
+        and E == global_E == 129
+        and model_dim == 6144
+        and inter_dim == 768
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.fp4x2
+        and quant_type == QuantType.per_1x32
+        and not metadata.run_1stage
+        and stage2_scatter is None
+    )
     if metadata.output_aux:
         # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
         # not thread expert_mask into moe_sorting below -- EP masking would be
@@ -1454,6 +1485,7 @@ def _fused_moe_impl(
             accumulate=_atomic,
             output_aux=metadata.output_aux,
             output=output,
+            use_tiled_sort=use_tiled_sort,
         )
         (
             sorted_ids,
@@ -1480,6 +1512,7 @@ def _fused_moe_impl(
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
             output=None if metadata.flat else output,
+            use_tiled_sort=use_tiled_sort,
         )
         if need_local_topk_ids:
             (
