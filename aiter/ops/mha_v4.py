@@ -1285,6 +1285,9 @@ def mha_v4(
         "lut_start": lut_start,
         "lut_count": lut_count,
     }
+    # Set by the two recipes that reach the kernel through their own custom op instead of calling
+    # mha_v4_packed directly; the shared tail below runs it.
+    launch = None
     if recipe.kind == _RawRecipeKind.BF16:
         q_quantized, q_descale = q, q
         k_quantized, k_descale = k, k
@@ -1319,8 +1322,8 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
         v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
-            lse_out = _empty_lse(q, return_lse)
-            _launch_mxfp4_coalesced(
+            launch = functools.partial(
+                _launch_mxfp4_coalesced,
                 q_quantized,
                 q_descale,
                 k_quantized,
@@ -1331,17 +1334,12 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
-                lse_out,
             )
-            if return_lse:
-                return out, _restore_k_mean_in_lse(
-                    lse_out, q, k_mean_lse, softmax_scale
-                )
-            return out
-        k_view = mxfp4_k_view(k_quantized, k_descale)
-        v_view = mxfp4_v_view(v_quantized, v_descale, k.shape[1])
-        k_quantized = k_view
-        v_quantized = v_view
+        else:
+            k_view = mxfp4_k_view(k_quantized, k_descale)
+            v_view = mxfp4_v_view(v_quantized, v_descale, k.shape[1])
+            k_quantized = k_view
+            v_quantized = v_view
     elif recipe.kind == _RawRecipeKind.MXFP6:
         if softmax_scale is None:
             softmax_scale = 128**-0.5
@@ -1354,8 +1352,8 @@ def mha_v4(
         else:
             v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
-            lse_out = _empty_lse(q, return_lse)
-            _launch_mxfp6(
+            launch = functools.partial(
+                _launch_mxfp6,
                 q_quantized,
                 q_descale,
                 k_quantized,
@@ -1368,26 +1366,28 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
-                lse_out,
             )
-            if return_lse:
-                return out, _restore_k_mean_in_lse(
-                    lse_out, q, k_mean_lse, softmax_scale
-                )
-            return out
-        k_view, k_descale_view = mxfp6_k_view(
-            k_quantized, k_descale, q.shape[0], k.shape[1], k.shape[2]
-        )
-        v_view = (
-            v_quantized
-            if v_format != AttentionFormat.MXFP4
-            else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
-        )
-        k_quantized = k_view
-        k_descale = k_descale_view
-        v_quantized = v_view
+        else:
+            k_view, k_descale_view = mxfp6_k_view(
+                k_quantized, k_descale, q.shape[0], k.shape[1], k.shape[2]
+            )
+            v_view = (
+                v_quantized
+                if v_format != AttentionFormat.MXFP4
+                else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
+            )
+            k_quantized = k_view
+            k_descale = k_descale_view
+            v_quantized = v_view
     else:
         raise AssertionError(f"unhandled MHA v4 raw recipe: {recipe.kind!r}")
+
+    if launch is not None:
+        lse_out = _empty_lse(q, return_lse)
+        launch(lse_out)
+        if return_lse:
+            return out, _restore_k_mean_in_lse(lse_out, q, k_mean_lse, softmax_scale)
+        return out
 
     result = mha_v4_packed(
         q_quantized,
