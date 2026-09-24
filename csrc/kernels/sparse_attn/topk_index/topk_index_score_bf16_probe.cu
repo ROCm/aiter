@@ -39,29 +39,11 @@ opus_decode_index_score_bf16_kernel(const opus_decode_score_args a)
 }
 
 template <int H, int Q, int AUX_K>
-void launch_bf16_probe(OPUS_IDX_SCORE_PARAMS)
+void launch_bf16_probe(const opus_decode_score_args& a, int num_chunks, hipStream_t stream)
 {
+    const int batch = a.batch;
     if(batch <= 0 || num_chunks <= 0)
         return;
-    opus_decode_score_args a{};
-    a.q_ptr         = q_idx;
-    a.ik_ptr        = key_cache_idx;
-    a.score_ptr     = score;
-    a.bt_ptr        = block_table;
-    a.seq_lens_ptr  = seq_lens;
-    a.q_numel       = q_numel;
-    a.ik_numel      = key_cache_numel;
-    a.score_numel   = score_numel;
-    a.bt_numel      = block_table_numel;
-    a.batch         = batch;
-    a.chunk_blocks  = chunk_blocks;
-    a.stride_q_n    = stride_q_n;
-    a.stride_q_h    = stride_q_h;
-    a.stride_ik_blk = stride_ik_blk;
-    a.stride_s_h    = stride_s_h;
-    a.stride_s_b    = stride_s_b;
-    a.stride_bt_b   = stride_bt_b;
-    a.sm_scale      = sm_scale;
     dim3 grid((unsigned)batch, (unsigned)num_chunks, 1);
     dim3 block((unsigned)(kOpusNumWarps * kOpusWarpSize), 1, 1);
     opus_decode_index_score_bf16_kernel<H, Q, AUX_K><<<grid, block, 0, stream>>>(a);
@@ -74,7 +56,7 @@ void launch_bf16_probe(OPUS_IDX_SCORE_PARAMS)
 #define OPUS_BF16_PROBE_DISPATCH(H, Q, A)                                       \
     if(num_idx_heads == (H) && query_len == (Q) && aux_k == (A))                \
     {                                                                           \
-        aiter::sparse_attn::launch_bf16_probe<H, Q, A>(OPUS_IDX_SCORE_ARGS);    \
+        aiter::sparse_attn::launch_bf16_probe<H, Q, A>(a, num_chunks, stream);  \
         return;                                                                 \
     }
 
@@ -126,13 +108,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(topk_index_score_bf16_probe,
                                      aux_k,
                                      stream))
 {
-    // Types MUST match OPUS_IDX_SCORE_PARAMS exactly: score is float*, and the
-    // block table / seq_lens are const int*, not void*.
-    const void* q_idx         = reinterpret_cast<const void*>(q_idx_ptr);
-    const void* key_cache_idx = reinterpret_cast<const void*>(key_cache_idx_ptr);
-    float* score              = reinterpret_cast<float*>(score_ptr);
-    const int* block_table    = reinterpret_cast<const int*>(block_table_ptr);
-    const int* seq_lens       = reinterpret_cast<const int*>(seq_lens_ptr);
+    aiter::sparse_attn::opus_decode_score_args a{};
+    a.q_ptr         = reinterpret_cast<const void*>(q_idx_ptr);
+    a.ik_ptr        = reinterpret_cast<const void*>(key_cache_idx_ptr);
+    a.score_ptr     = reinterpret_cast<float*>(score_ptr);
+    a.bt_ptr        = reinterpret_cast<const int*>(block_table_ptr);
+    a.seq_lens_ptr  = reinterpret_cast<const int*>(seq_lens_ptr);
+    a.q_numel       = q_numel;
+    a.ik_numel      = key_cache_numel;
+    a.score_numel   = score_numel;
+    a.bt_numel      = block_table_numel;
+    a.batch         = batch;
+    a.chunk_blocks  = chunk_blocks;
+    a.stride_q_n    = stride_q_n;
+    a.stride_q_h    = stride_q_h;
+    a.stride_ik_blk = stride_ik_blk;
+    a.stride_s_h    = stride_s_h;
+    a.stride_s_b    = stride_s_b;
+    a.stride_bt_b   = stride_bt_b;
+    a.sm_scale      = sm_scale;
 
     AITER_CHECK(batch > 0 && num_chunks > 0 && chunk_blocks > 0,
                 "opus bf16 probe: bad launch geometry");

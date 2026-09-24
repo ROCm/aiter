@@ -57,7 +57,7 @@ inline bool opus_idx_score_arch_supported()
 #define OPUS_IDX_SCORE_DISPATCH(H, Q, A)                                        \
     if(num_idx_heads == (H) && query_len == (Q) && aux_k == (A))                \
     {                                                                           \
-        aiter::sparse_attn::OPUS_IDX_SCORE_FN(H, Q, A)(OPUS_IDX_SCORE_ARGS);    \
+        aiter::sparse_attn::OPUS_IDX_SCORE_FN(H, Q, A)(a, num_chunks, stream);  \
         return;                                                                 \
     }
 
@@ -209,11 +209,27 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(topk_index_score_decode,
                 ") has no per-cell bitwise evidence at the accepted config; "
                 "phase-1 Tier-2 evidence covers (1, 4) only");
 
-    const auto* q_idx         = reinterpret_cast<const void*>(q_idx_ptr);
-    const auto* key_cache_idx = reinterpret_cast<const void*>(key_cache_idx_ptr);
-    auto* score               = reinterpret_cast<float*>(score_ptr);
-    const auto* block_table   = reinterpret_cast<const int*>(block_table_ptr);
-    const auto* seq_lens      = reinterpret_cast<const int*>(seq_lens_ptr);
+    // Everything the kernel reads, assembled ONCE. num_chunks is grid geometry,
+    // not kernel state, so it rides beside the struct rather than inside it.
+    aiter::sparse_attn::opus_decode_score_args a{};
+    a.q_ptr         = reinterpret_cast<const void*>(q_idx_ptr);
+    a.ik_ptr        = reinterpret_cast<const void*>(key_cache_idx_ptr);
+    a.score_ptr     = reinterpret_cast<float*>(score_ptr);
+    a.bt_ptr        = reinterpret_cast<const int*>(block_table_ptr);
+    a.seq_lens_ptr  = reinterpret_cast<const int*>(seq_lens_ptr);
+    a.q_numel       = q_numel;
+    a.ik_numel      = key_cache_numel;
+    a.score_numel   = score_numel;
+    a.bt_numel      = block_table_numel;
+    a.batch         = batch;
+    a.chunk_blocks  = chunk_blocks;
+    a.stride_q_n    = stride_q_n;
+    a.stride_q_h    = stride_q_h;
+    a.stride_ik_blk = stride_ik_blk;
+    a.stride_s_h    = stride_s_h;
+    a.stride_s_b    = stride_s_b;
+    a.stride_bt_b   = stride_bt_b;
+    a.sm_scale      = sm_scale;
 
     // C4 -- the instantiation table. Fail closed on anything Python let through.
     OPUS_IDX_SCORE_TABLE(OPUS_IDX_SCORE_DISPATCH)

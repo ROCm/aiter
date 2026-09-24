@@ -18,22 +18,11 @@
 #define OPUS_IDX_HEAD_DIM 128
 #define OPUS_IDX_BLOCK_SIZE 128
 
-// Launcher signature. It carries sm_scale (ledger D1: the frozen contract takes
-// it and applies sm_scale*log2e in-kernel) and whole-tensor element counts,
-// which become the buffer-descriptor extents -- that is what buys the hardware
-// bounds check the page offset relies on (invariant I3).
-#define OPUS_IDX_SCORE_PARAMS                                                                 \
-    const void *q_idx, const void *key_cache_idx, float *score, const int *block_table,       \
-        const int *seq_lens, long long q_numel, long long key_cache_numel,                    \
-        long long score_numel, long long block_table_numel, int batch, int num_chunks,        \
-        int chunk_blocks, long long stride_q_n, long long stride_q_h, long long stride_ik_blk, \
-        long long stride_s_h, long long stride_s_b, long long stride_bt_b, float sm_scale,    \
-        hipStream_t stream
-
-#define OPUS_IDX_SCORE_ARGS                                                                    \
-    q_idx, key_cache_idx, score, block_table, seq_lens, q_numel, key_cache_numel, score_numel, \
-        block_table_numel, batch, num_chunks, chunk_blocks, stride_q_n, stride_q_h,            \
-        stride_ik_blk, stride_s_h, stride_s_b, stride_bt_b, sm_scale, stream
+// The launcher takes the struct the kernel already takes, plus the one value
+// that is grid geometry rather than kernel state. It used to take 20 loose
+// parameters through a macro pair -- one list of types, one of names -- and
+// then reassemble the struct here; two parallel lists that had to be edited
+// together, and did drift twice.
 
 namespace aiter {
 namespace sparse_attn {
@@ -62,33 +51,16 @@ __global__ __launch_bounds__(kOpusNumWarps* kOpusWarpSize, 2) void opus_decode_i
 // caller's capture-time constants; this launcher reads no device tensor and
 // allocates nothing, so the grid is fixed at capture (cudagraph-safe).
 template <int H, int Q, int AUX_K>
-void launch_opus_decode_index_score(OPUS_IDX_SCORE_PARAMS)
+void launch_opus_decode_index_score(const opus_decode_score_args& a,
+                                    int num_chunks,
+                                    hipStream_t stream)
 {
+    const int batch = a.batch;
     // G4: no zero-extent grid may be captured. The entry point also rejects
     // num_reqs == 0 earlier; this is the defense-in-depth layer, matching the
     // incumbent's convention of re-checking across layers.
     if(batch <= 0 || num_chunks <= 0)
         return;
-
-    opus_decode_score_args a{};
-    a.q_ptr         = q_idx;
-    a.ik_ptr        = key_cache_idx;
-    a.score_ptr     = score;
-    a.bt_ptr        = block_table;
-    a.seq_lens_ptr  = seq_lens;
-    a.q_numel       = q_numel;
-    a.ik_numel      = key_cache_numel;
-    a.score_numel   = score_numel;
-    a.bt_numel      = block_table_numel;
-    a.batch         = batch;
-    a.chunk_blocks  = chunk_blocks;
-    a.stride_q_n    = stride_q_n;
-    a.stride_q_h    = stride_q_h;
-    a.stride_ik_blk = stride_ik_blk;
-    a.stride_s_h    = stride_s_h;
-    a.stride_s_b    = stride_s_b;
-    a.stride_bt_b   = stride_bt_b;
-    a.sm_scale      = sm_scale;
 
     dim3 grid((unsigned)batch, (unsigned)num_chunks, 1);
     dim3 block((unsigned)(kOpusNumWarps * kOpusWarpSize), 1, 1);
@@ -119,12 +91,16 @@ constexpr bool opus_idx_score_cell_certified(int H, int Q) {
 // ---------------------------------------------------------------------------
 #define OPUS_IDX_SCORE_FN(H, Q, A) opus_idx_score_h##H##_q##Q##_aux##A
 
-#define OPUS_IDX_SCORE_DECLARE(H, Q, A) void OPUS_IDX_SCORE_FN(H, Q, A)(OPUS_IDX_SCORE_PARAMS);
+#define OPUS_IDX_SCORE_SIG(H, Q, A) \
+    void OPUS_IDX_SCORE_FN(H, Q, A)( \
+        const opus_decode_score_args& a, int num_chunks, hipStream_t stream)
+
+#define OPUS_IDX_SCORE_DECLARE(H, Q, A) OPUS_IDX_SCORE_SIG(H, Q, A);
 
 #define OPUS_IDX_SCORE_DEFINE(H, Q, A)                                  \
-    void OPUS_IDX_SCORE_FN(H, Q, A)(OPUS_IDX_SCORE_PARAMS)              \
+    OPUS_IDX_SCORE_SIG(H, Q, A)                                         \
     {                                                                   \
-        launch_opus_decode_index_score<H, Q, A>(OPUS_IDX_SCORE_ARGS);    \
+        launch_opus_decode_index_score<H, Q, A>(a, num_chunks, stream); \
     }
 
 // ---------------------------------------------------------------------------
