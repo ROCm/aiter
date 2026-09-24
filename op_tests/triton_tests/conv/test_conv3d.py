@@ -24,7 +24,6 @@ from aiter.ops.triton.conv import _launch as conv_launch
 from aiter.ops.triton.conv import _prepack as conv_prepack
 from aiter.ops.triton.conv import conv3d as conv3d_module
 from aiter.ops.triton.conv._prepack import (
-    clear_conv2d_weight_pack_caches,
     clear_conv3d_weight_pack_caches,
     prepack_ncdhw_to_cblocked,
     prepack_oidhw_to_3x3x3,
@@ -55,8 +54,10 @@ from aiter.ops.triton.utils.conv_config_utils import (
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,
+    CONV3D_WEIGHT_PACK_CACHE_NAMES,
     _winograd_tolerances,
     apply_activation,
+    assert_weight_pack_cache_clear_is_scoped,
     dynamic_conv_tolerances,
 )
 
@@ -480,48 +481,13 @@ def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
     ), "least-recently-used entry was not evicted"
 
 
-@pytest.mark.parametrize(
-    "clear_caches,cleared_names,preserved_names",
-    [
-        (
-            clear_conv2d_weight_pack_caches,
-            ("_PACK_CACHE", "_PACK_CACHE_3x3", "_PACK_CACHE_WINOGRAD_F4X3"),
-            (
-                "_PACK_CACHE_3D_GENERAL",
-                "_PACK_CACHE_3D_3X3X3",
-                "_PACK_CACHE_3D_WINOGRAD_HW",
-            ),
-        ),
-        (
-            clear_conv3d_weight_pack_caches,
-            (
-                "_PACK_CACHE_3D_GENERAL",
-                "_PACK_CACHE_3D_3X3X3",
-                "_PACK_CACHE_3D_WINOGRAD_HW",
-            ),
-            ("_PACK_CACHE", "_PACK_CACHE_3x3", "_PACK_CACHE_WINOGRAD_F4X3"),
-        ),
-    ],
-    ids=["conv2d", "conv3d"],
-)
-def test_weight_pack_cache_clear_is_dimension_specific(
-    monkeypatch, clear_caches, cleared_names, preserved_names
-):
-    caches = {}
-    for name in (*cleared_names, *preserved_names):
-        cache = conv_prepack._LRUPackCache(maxsize=1)
-        cache.put(name, object(), object())
-        monkeypatch.setattr(conv_prepack, name, cache)
-        caches[name] = cache
-
-    clear_caches()
-
-    assert all(
-        not caches[name]._d for name in cleared_names
-    ), f"expected caches to be cleared: {cleared_names}"
-    assert all(
-        caches[name]._d for name in preserved_names
-    ), f"expected caches to be preserved: {preserved_names}"
+def test_conv3d_weight_pack_cache_clear_is_scoped(monkeypatch):
+    assert_weight_pack_cache_clear_is_scoped(
+        monkeypatch,
+        conv_prepack,
+        clear_conv3d_weight_pack_caches,
+        CONV3D_WEIGHT_PACK_CACHE_NAMES,
+    )
 
 
 def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeypatch):
