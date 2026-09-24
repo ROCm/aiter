@@ -65,6 +65,7 @@ def _job_key(job: dict) -> tuple:
             job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
+            bool(job.get("use_valid_token_count", False) and job["epilog"] == "atomic"),
         )
     if job["stage"] == 1:
         return (
@@ -207,32 +208,37 @@ def parse_csv(csv_path: str):
                     and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
                 enable_bias_options = [False, True] if bias_supported else [False]
+                count_options = (
+                    (False, True) if v2_g2["epilog"] == "atomic" else (False,)
+                )
                 for enable_bias in enable_bias_options:
-                    _add(
-                        {
-                            "stage": 2,
-                            "v2_stage2": True,
-                            "kernel_name": kn2,
-                            "BM": bm,
-                            "BN": v2_g2["tile_n"],
-                            "BK": v2_g2["tile_k"],
-                            "use_nt": v2_g2["use_nt"],
-                            "NE": expert,
-                            "N_OUT": model_dim,
-                            "epilog": v2_g2["epilog"],
-                            "D_INTER": v2_d_inter,
-                            "topk": topk,
-                            "SBM": v2_g2["sort_block_m"] or bm,
-                            "persist": v2_g2["persist"],
-                            "cu_num": int(row.get("cu_num", "0") or "0"),
-                            "a_dtype": v2_g2["a_dtype"],
-                            "b_dtype": v2_g2["b_dtype"],
-                            "out_dtype": out_dtype,
-                            "enable_bias": enable_bias,
-                            "g2_spart": v2_g2["spart"],
-                            "g2_bf16_lds": v2_g2["bf16_lds"],
-                        }
-                    )
+                    for use_valid_token_count in count_options:
+                        _add(
+                            {
+                                "stage": 2,
+                                "v2_stage2": True,
+                                "kernel_name": kn2,
+                                "BM": bm,
+                                "BN": v2_g2["tile_n"],
+                                "BK": v2_g2["tile_k"],
+                                "use_nt": v2_g2["use_nt"],
+                                "NE": expert,
+                                "N_OUT": model_dim,
+                                "epilog": v2_g2["epilog"],
+                                "D_INTER": v2_d_inter,
+                                "topk": topk,
+                                "SBM": v2_g2["sort_block_m"] or bm,
+                                "persist": v2_g2["persist"],
+                                "cu_num": int(row.get("cu_num", "0") or "0"),
+                                "a_dtype": v2_g2["a_dtype"],
+                                "b_dtype": v2_g2["b_dtype"],
+                                "out_dtype": out_dtype,
+                                "enable_bias": enable_bias,
+                                "use_valid_token_count": use_valid_token_count,
+                                "g2_spart": v2_g2["spart"],
+                                "g2_bf16_lds": v2_g2["bf16_lds"],
+                            }
+                        )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 # An _f4out row falls back to the plain kernel whenever the
@@ -414,6 +420,9 @@ def _compile_v2_stage2(job):
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
         bias=bias if job.get("enable_bias", False) else None,
+        use_valid_token_count=bool(
+            job.get("use_valid_token_count", False) and job["epilog"] == "atomic"
+        ),
         stream=0,
     )
     if job["epilog"] == "reduce":
