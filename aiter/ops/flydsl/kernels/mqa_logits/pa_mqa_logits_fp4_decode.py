@@ -34,6 +34,7 @@ def compile_pa_mqa_logits_fp4_decode(
     mfma_m=32,
     scalar_weights=False,
     direct_global=False,
+    clean_logits=True,
     direct_chunks=0,
     max_seq_len=0,
 ):
@@ -200,10 +201,15 @@ def compile_pa_mqa_logits_fp4_decode(
             fx.Int64(batch) * fx.Int64(block_table_stride * 4),
             block_table_stride * 4,
         )
+        out_size = (
+            fx.Int32(max_seq_len * 4)
+            if const_expr(direct_global and clean_logits)
+            else visible * fx.Int32(4)
+        )
         out_rsrc = resource(
             out,
             fx.Int64(row) * fx.Int64(out_stride) * fx.Int64(4),
-            visible * fx.Int32(4),
+            out_size,
         )
         mfma = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(
@@ -217,6 +223,7 @@ def compile_pa_mqa_logits_fp4_decode(
             )
         )
         zero = fx.Vector.filled(acc_elements, 0.0, fx.Float32)
+        neg_inf = fx.Float32(float("-inf"))
 
         def lds_load4(offset):
             reg = fx.make_rmem_tensor(4, fx.Int32)
@@ -572,6 +579,13 @@ def compile_pa_mqa_logits_fp4_decode(
                             )
 
             if const_expr(direct_global):
+
+                def store_direct(value, token_local):
+                    token = start * fx.Int32(block_k) + token_local
+                    if const_expr(clean_logits):
+                        value = (token < visible).select(value, neg_inf)
+                    buffer_ops.buffer_store(value, out_rsrc, token)
+
                 direct_totals = []
                 for frag in range_constexpr(fragments):
                     fragment = token_wave * fx.Int32(fragments) + fx.Int32(frag)
@@ -712,10 +726,8 @@ def compile_pa_mqa_logits_fp4_decode(
                                 )
                                 fx.copy(copy_float, reg, view)
                         else:
-                            buffer_ops.buffer_store(
-                                total * weight_scale,
-                                out_rsrc,
-                                start * fx.Int32(block_k) + token_local + token_offset,
+                            store_direct(
+                                total * weight_scale, token_local + token_offset
                             )
 
                 if const_expr(head_waves > 1):
@@ -750,11 +762,7 @@ def compile_pa_mqa_logits_fp4_decode(
                                     total = total + lds_load1(offset).bitcast(
                                         fx.Float32
                                     )
-                                buffer_ops.buffer_store(
-                                    total * weight_scale,
-                                    out_rsrc,
-                                    start * fx.Int32(block_k) + token_local,
-                                )
+                                store_direct(total * weight_scale, token_local)
             else:
                 issue_stage(fx.Int32(0), fx.Int32(0))
                 rocdl.s_waitcnt(vmcnt=0)
@@ -786,8 +794,27 @@ def compile_pa_mqa_logits_fp4_decode(
                 last = count - fx.Int32(1)
                 compute_stage(last, results)
 
-        if (count > fx.Int32(0)) & (start * fx.Int32(block_k) < context):
-            run_active()
+        active = (count > fx.Int32(0)) & (start * fx.Int32(block_k) < context)
+        if const_expr(direct_global and clean_logits):
+            if active:
+                run_active()
+            else:
+                # The direct grid covers the full output width. Let inactive
+                # CTAs clear their own chunk so the public op retains complete
+                # `-inf` tail semantics without a separate tensor-wide fill.
+                if head_wave == fx.Int32(0):
+                    if const_expr(block_k == 64):
+                        token_local = lane
+                        writer = fx.Boolean(True)
+                    else:
+                        token_local = lane_m
+                        writer = lane < fx.Int32(block_k)
+                    if writer:
+                        token = start * fx.Int32(block_k) + token_local
+                        buffer_ops.buffer_store(neg_inf, out_rsrc, token)
+        else:
+            if active:
+                run_active()
 
     @flyc.jit
     def launch(

@@ -15,6 +15,8 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
     _i32_buffer,
@@ -696,6 +698,7 @@ def flydsl_pa_mqa_logits_fp4(
     out: torch.Tensor | None = None,
     cta_info: torch.Tensor | None = None,
     total_ctas: int | None = None,
+    clean_logits: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
@@ -705,7 +708,9 @@ def flydsl_pa_mqa_logits_fp4(
     LDS pipeline. Without an external schedule, work intervals are derived from
     ``context_lens`` on the device. ``parallel_unit_num`` optionally limits the
     direct grid; external schedules retain their original
-    ``[row, chunk_start, chunk_count, context_len]`` ABI.
+    ``[row, chunk_start, chunk_count, context_len]`` ABI. Set ``clean_logits``
+    to false when the consumer masks columns using ``context_lens``; this
+    matches the production FP8 scorer contract and avoids writing the tail.
     """
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
@@ -758,16 +763,6 @@ def flydsl_pa_mqa_logits_fp4(
         cta_info = context_lens.to(dtype=torch.int32)
         total_ctas = batch_size * next_n * direct_chunks
 
-    if out is None:
-        out = torch.full(
-            (batch_size * next_n, max_seq_len),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q_fp4.device,
-        )
-    elif schedule_internal:
-        out.fill_(float("-inf"))
-
     from .pa_mqa_logits_fp4_decode import compile_pa_mqa_logits_fp4_decode
 
     head_waves = min(num_warps, 4, triton.next_power_of_2(triton.cdiv(heads, 32)))
@@ -787,6 +782,18 @@ def flydsl_pa_mqa_logits_fp4(
         scalar_weights = heads == 128 or total_ctas >= 128
     else:
         scalar_weights = total_ctas >= 768
+
+    if out is None:
+        out = torch.empty(
+            (batch_size * next_n, max_seq_len),
+            dtype=torch.float32,
+            device=q_fp4.device,
+        )
+        if clean_logits and not direct_global:
+            out.fill_(float("-inf"))
+    elif clean_logits and schedule_internal and not direct_global:
+        out.fill_(float("-inf"))
+
     launcher, _ = compile_pa_mqa_logits_fp4_decode(
         block_k=block_k,
         kv_block_size=kv_block_size,
@@ -797,6 +804,7 @@ def flydsl_pa_mqa_logits_fp4(
         head_waves=head_waves,
         scalar_weights=scalar_weights,
         direct_global=direct_global,
+        clean_logits=clean_logits,
         next_n=next_n,
         heads=heads,
         head_dim=head_dim,
@@ -807,7 +815,8 @@ def flydsl_pa_mqa_logits_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    launcher(
+    _run_compiled(
+        launcher,
         out,
         q_fp4,
         q_scale,

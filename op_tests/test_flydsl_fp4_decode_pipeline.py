@@ -132,9 +132,166 @@ def test_decode_pipeline(shape, mode, monkeypatch):
     assert torch.all(storage[:, 513:] == 71.0)
 
 
-@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5])
-def test_decode_graph_updates_context(next_n):
+def test_decode_reuses_compiled_launcher_with_new_tensors(monkeypatch):
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_decode import (
+        compile_pa_mqa_logits_fp4_decode,
+    )
+
+    compile_pa_mqa_logits_fp4_decode.cache_clear()
+    cases = [make_case(64, 128, 1, 64, seed=seed) for seed in (43, 44)]
+    for data, _, _ in cases:
+        rows = data["q_fp4"].shape[0]
+        block, waves = decode._default_decode_config(3, 1, 64, 128, 513, 64)
+        _, info, total = decode.compute_varctx_schedule(
+            data["context_lens"], block, rows, 513
+        )
+        data.update(
+            block_k=block,
+            num_warps=waves,
+            cta_info=info,
+            total_ctas=total,
+        )
+    launches = []
+    run_compiled = decode._run_compiled
+
+    def tracked_run_compiled(launcher, *args):
+        compiled_before = getattr(launcher, "_cf", None)
+        run_compiled(launcher, *args)
+        launches.append((launcher, compiled_before, getattr(launcher, "_cf", None)))
+
+    monkeypatch.setattr(decode, "_run_compiled", tracked_run_compiled)
+    for data, expected, storage in cases:
+        actual = decode.flydsl_pa_mqa_logits_fp4(**data)
+        torch.testing.assert_close(actual, expected(), rtol=1e-4, atol=5e-4)
+        assert torch.all(storage[:, 513:] == 71.0)
+
+    assert launches[0][0] is launches[1][0]
+    assert launches[0][1] is None
+    assert launches[0][2] is not None
+    assert launches[1][1] is launches[0][2]
+    assert launches[1][2] is launches[0][2]
+
+
+@pytest.mark.parametrize(
+    ("block_k", "num_warps"), [(None, None), (64, 2)], ids=["auto", "block64"]
+)
+def test_decode_direct_clears_caller_output_outside_context(block_k, num_warps):
+    data, expected, storage = make_case(64, 128, 1, 64)
+    data.update(block_k=block_k, num_warps=num_warps)
+    output = data["out"]
+    output.fill_(71.0)
+
+    actual = decode.flydsl_pa_mqa_logits_fp4(**data)
+    torch.testing.assert_close(actual, expected(), rtol=1e-4, atol=5e-4)
+    assert torch.all(storage[:, 513:] == 71.0)
+
+
+def test_decode_direct_can_leave_masked_tail_untouched():
+    data, expected, storage = make_case(64, 128, 1, 64)
+    output = data["out"]
+    output.fill_(71.0)
+    data["clean_logits"] = False
+
+    actual = decode.flydsl_pa_mqa_logits_fp4(**data)
+    reference_output = expected()
+    for row, length in enumerate(data["context_lens"].tolist()):
+        torch.testing.assert_close(
+            actual[row, :length], reference_output[row, :length], rtol=1e-4, atol=5e-4
+        )
+        assert torch.all(actual[row, length:] == 71.0)
+    assert torch.all(storage[:, 513:] == 71.0)
+
+
+def test_prefill_schedule_does_not_read_back_gpu_count(monkeypatch):
+    rows = 4
+    launch_ctas = 8
+    row_to_batch = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), 256, dtype=torch.int32, device="cuda")
+
+    # Compile before replacing Tensor.item so the assertion covers the steady
+    # schedule path rather than unrelated compiler setup.
+    prefill.compute_prefill_schedule(
+        row_to_batch, starts, ends, 256, launch_ctas, 256
+    )
+    torch.cuda.synchronize()
+
+    def fail_item(*args, **kwargs):
+        raise AssertionError("compute_prefill_schedule must not read a GPU scalar")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+    _, info, actual_launch_ctas = prefill.compute_prefill_schedule(
+        row_to_batch, starts, ends, 256, launch_ctas, 256
+    )
+    torch.cuda.synchronize()
+
+    assert actual_launch_ctas == launch_ctas
+    assert info.shape == (launch_ctas * prefill.ROWS_PER_CTA, prefill.CTA_INFO_WIDTH)
+
+
+def test_prefill_reuses_compiled_launcher_with_new_tensors(monkeypatch):
+    prefill.compile_pa_mqa_logits_fp4_prefill.cache_clear()
+    cases = [make_case(64, 128, 1, 64, seed=seed) for seed in (45, 46)]
+    launches = []
+    run_compiled = prefill._run_compiled
+
+    def tracked_run_compiled(launcher, *args):
+        compiled_before = getattr(launcher, "_cf", None)
+        run_compiled(launcher, *args)
+        launches.append((launcher, compiled_before, getattr(launcher, "_cf", None)))
+
+    monkeypatch.setattr(prefill, "_run_compiled", tracked_run_compiled)
+    for data, expected, storage in cases:
+        q_fp4 = data["q_fp4"].squeeze(1)
+        q_scale = data["q_scale"].squeeze(1)
+        rows = q_fp4.shape[0]
+        row_to_batch = torch.arange(rows, dtype=torch.int32, device="cuda")
+        starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        ends = data["context_lens"]
+        _, info, n_ctas = prefill.compute_prefill_schedule(
+            row_to_batch, starts, ends, 256, max(512, rows), data["max_seq_len"]
+        )
+        actual = prefill.flydsl_pa_mqa_logits_fp4_prefill(
+            q_fp4,
+            q_scale,
+            data["kv_cache"],
+            data["kv_scale"],
+            data["block_tables"],
+            data["weights"],
+            row_to_batch,
+            starts,
+            ends,
+            data["max_seq_len"],
+            weight_scale=data["weight_scale"],
+            out=data["out"],
+            cta_info=info,
+            n_ctas=n_ctas,
+        )
+        torch.testing.assert_close(actual, expected(), rtol=1e-4, atol=5e-4)
+        assert torch.all(storage[:, 513:] == 71.0)
+
+    assert launches[0][0] is launches[1][0]
+    assert launches[0][1] is None
+    assert launches[0][2] is not None
+    assert launches[1][1] is launches[0][2]
+    assert launches[1][2] is launches[0][2]
+
+
+@pytest.mark.parametrize(
+    ("next_n", "block_k", "num_warps"),
+    [
+        (1, None, None),
+        (1, 64, 2),
+        (2, None, None),
+        (3, None, None),
+        (4, None, None),
+        (5, None, None),
+    ],
+    ids=["n1-auto", "n1-block64", "n2", "n3", "n4", "n5"],
+)
+def test_decode_graph_updates_context(next_n, block_k, num_warps):
     data, expected, storage = make_case(64, 128, next_n, 64)
+    data.update(block_k=block_k, num_warps=num_warps)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):

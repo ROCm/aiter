@@ -20,6 +20,7 @@ from flydsl.expr.typing import Float4E2M1FN, Int32, T
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -62,8 +63,9 @@ def compute_prefill_schedule(
     """Build a four-row-per-CTA schedule for ragged prefill.
 
     Rows must be grouped by batch. ``parallel_unit_num`` remains the logical
-    one-row CTA budget used to choose the chunk split size. The returned
-    ``n_ctas`` is the physical four-wave CTA count.
+    one-row CTA budget used to choose the chunk split size and is also the
+    fixed physical launch bound. Slots past the device-computed CTA count are
+    marked inactive, avoiding a GPU-to-CPU synchronization on every schedule.
     """
     device = local_ends.device
     P = parallel_unit_num
@@ -80,8 +82,7 @@ def compute_prefill_schedule(
 
     s_max = max(1, (max_seq_len + block_k - 1) // block_k)
     plan = _row_plan(row_to_batch, local_ends, block_k, P, s_max)
-    n_ctas = int(plan.total_splits.item())
-    record_count = n_ctas * ROWS_PER_CTA
+    record_count = P * ROWS_PER_CTA
 
     if cta_info_out is None:
         cta_info = torch.empty(
@@ -94,25 +95,25 @@ def compute_prefill_schedule(
                 f"cta_info_out has room for {cta_info.numel() // CTA_INFO_WIDTH} "
                 f"records, but {record_count} are required."
             )
-    if n_ctas:
-        block_p = 256
-        _prefill_cta_info_kernel[(triton.cdiv(n_ctas, block_p),)](
-            plan.incl,
-            plan.excl,
-            plan.chunks,
-            row_to_batch,
-            local_starts,
-            local_ends,
-            plan.safe,
-            cta_info,
-            T,
-            n_ctas,
-            BLOCK_P=block_p,
-            ROWS_PER_CTA=ROWS_PER_CTA,
-            BLOCK_K=DEFAULT_BLOCK_K,
-            INFO_WIDTH=CTA_INFO_WIDTH,
-        )
-    return plan.safe, cta_info, n_ctas
+    block_p = 256
+    _prefill_cta_info_kernel[(triton.cdiv(P, block_p),)](
+        plan.incl,
+        plan.excl,
+        plan.chunks,
+        row_to_batch,
+        local_starts,
+        local_ends,
+        plan.safe,
+        plan.total_splits,
+        cta_info,
+        T,
+        P,
+        BLOCK_P=block_p,
+        ROWS_PER_CTA=ROWS_PER_CTA,
+        BLOCK_K=DEFAULT_BLOCK_K,
+        INFO_WIDTH=CTA_INFO_WIDTH,
+    )
+    return plan.safe, cta_info, P
 
 
 class _RowPlan(NamedTuple):
@@ -128,7 +129,6 @@ class _RowPlan(NamedTuple):
     total_splits: torch.Tensor  # [1] physical CTA count
 
 
-_ROW_PLAN_BLOCK_FLOOR = 4096
 _ROW_PLAN_MAX_ROWS = 16384
 
 _I32_PER_16B = 4
@@ -158,9 +158,12 @@ def _row_plan(rb, le, block_k, P, s_max) -> _RowPlan:
         P,
         block_k,
         s_max,
-        BLOCK_T=(
-            _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
-        ),
+        # One masked launch shape avoids a separate JIT specialization when a
+        # serving batch crosses the old 4K-row threshold.
+        BLOCK_T=_ROW_PLAN_MAX_ROWS,
+        # Keep both binary-search bounds dynamic. Random prompt lengths change
+        # these values even when the data layout is identical; specializing
+        # either loop caused a fresh multi-second Triton compile.
         SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
         ROW_SEARCH_STEPS=max(1, (T - 1).bit_length() + 1),
         ROWS_PER_CTA=ROWS_PER_CTA,
@@ -168,7 +171,15 @@ def _row_plan(rb, le, block_k, P, s_max) -> _RowPlan:
     return plan
 
 
-@triton.jit(do_not_specialize=["T", "P"])
+@triton.jit(
+    do_not_specialize=[
+        "T",
+        "P",
+        "s_max",
+        "SEARCH_STEPS",
+        "ROW_SEARCH_STEPS",
+    ]
+)
 def _prefill_row_plan_kernel(
     rb_ptr,
     le_ptr,  # [T] int32 local_ends
@@ -182,8 +193,8 @@ def _prefill_row_plan_kernel(
     block_k,
     s_max,
     BLOCK_T: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
-    ROW_SEARCH_STEPS: tl.constexpr,
+    SEARCH_STEPS,
+    ROW_SEARCH_STEPS,
     ROWS_PER_CTA: tl.constexpr,
 ):
     """Choose the row split and prefix-sum four-row physical CTAs."""
@@ -195,7 +206,7 @@ def _prefill_row_plan_kernel(
 
     lo = 1
     hi = s_max
-    for _ in tl.static_range(SEARCH_STEPS):
+    for _ in range(SEARCH_STEPS):
         mid = (lo + hi) // 2
         feasible = tl.sum((row_chunks + mid - 1) // mid, axis=0) <= P
         active = lo < hi
@@ -207,7 +218,7 @@ def _prefill_row_plan_kernel(
     batch = tl.load(rb_ptr + t, mask=mask, other=2147483647)
     row_lo = tl.zeros([BLOCK_T], tl.int32)
     row_hi = tl.where(mask, t, 0)
-    for _ in tl.static_range(ROW_SEARCH_STEPS):
+    for _ in range(ROW_SEARCH_STEPS):
         mid = (row_lo + row_hi) // 2
         mid_batch = tl.load(
             rb_ptr + tl.minimum(mid, T - 1), mask=mask, other=2147483647
@@ -254,6 +265,7 @@ def _prefill_cta_info_kernel(
     ls_ptr,  # [T] int32 local_starts
     le_ptr,  # [T] int32 local_ends
     safe_ptr,  # [1] int32
+    total_splits_ptr,  # [1] int32 physical CTA count
     cta_info_ptr,  # [P * ROWS_PER_CTA, 6] int32
     T,
     P,
@@ -265,8 +277,10 @@ def _prefill_cta_info_kernel(
     """Map each physical CTA to four same-batch query rows."""
     pid = tl.program_id(0)
     safe = tl.load(safe_ptr)
+    total_splits = tl.load(total_splits_ptr)
     slot = pid * BLOCK_P + tl.arange(0, BLOCK_P)
     smask = slot < P
+    slot_active = smask & (slot < total_splits)
 
     lo = tl.zeros([BLOCK_P], tl.int32)
     hi = tl.full([BLOCK_P], T, tl.int32)
@@ -289,7 +303,7 @@ def _prefill_cta_info_kernel(
 
     lane = tl.arange(0, ROWS_PER_CTA)
     row = leader[:, None] + lane[None, :]
-    row_in_range = smask[:, None] & (row < T)
+    row_in_range = slot_active[:, None] & (row < T)
     row_batch = tl.load(rb_ptr + tl.minimum(row, T - 1), mask=row_in_range, other=-1)
     row_start = tl.load(ls_ptr + tl.minimum(row, T - 1), mask=row_in_range, other=0)
     row_end = tl.load(le_ptr + tl.minimum(row, T - 1), mask=row_in_range, other=0)
@@ -303,12 +317,24 @@ def _prefill_cta_info_kernel(
 
     record = slot[:, None] * ROWS_PER_CTA + lane[None, :]
     base = record * INFO_WIDTH
-    tl.store(cta_info_ptr + base + 0, encoded_row, mask=smask[:, None])
-    tl.store(cta_info_ptr + base + 1, batch[:, None], mask=smask[:, None])
-    tl.store(cta_info_ptr + base + 2, start[:, None], mask=smask[:, None])
-    tl.store(cta_info_ptr + base + 3, count[:, None], mask=smask[:, None])
-    tl.store(cta_info_ptr + base + 4, row_start, mask=smask[:, None])
-    tl.store(cta_info_ptr + base + 5, row_end, mask=smask[:, None])
+    # Padding CTAs execute one safe dummy chunk from batch/row zero. Their rows
+    # are encoded as inactive, so buffer stores are suppressed by
+    # NON_WRITER_ELEMENT_OFFSET. Keeping a positive uniform count also
+    # preserves the barrier contract of the four-wave compute kernel.
+    stored_row = tl.where(slot_active[:, None], encoded_row, -1)
+    stored_batch = tl.where(slot_active, batch, 0)
+    stored_start = tl.where(slot_active, start, 0)
+    stored_count = tl.where(slot_active, count, 1)
+    stored_row_start = tl.where(slot_active[:, None], row_start, 0)
+    stored_row_end = tl.where(slot_active[:, None], row_end, 0)
+    tl.store(cta_info_ptr + base + 0, stored_row, mask=smask[:, None])
+    tl.store(
+        cta_info_ptr + base + 1, stored_batch[:, None], mask=smask[:, None]
+    )
+    tl.store(cta_info_ptr + base + 2, stored_start[:, None], mask=smask[:, None])
+    tl.store(cta_info_ptr + base + 3, stored_count[:, None], mask=smask[:, None])
+    tl.store(cta_info_ptr + base + 4, stored_row_start, mask=smask[:, None])
+    tl.store(cta_info_ptr + base + 5, stored_row_end, mask=smask[:, None])
 
 
 # Kernel
@@ -964,7 +990,8 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         stream = torch.cuda.current_stream()
 
     if n_ctas:
-        launcher(
+        _run_compiled(
+            launcher,
             out,
             q_fp4,
             q_scale,
