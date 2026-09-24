@@ -884,6 +884,21 @@ def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
 
 
+def test_schedule_out_too_small_raises():
+    """A CUDA graph that captured the launch reads the buffer it was given, so a
+    buffer too small for the schedule has to fail, not be swapped for a fresh
+    one; without a buffer the schedule is allocated."""
+    st = _make_case(32, 6, 32, 128, [8192] * 32, 64)
+    args = (st["cl"], 6, 32, 128, 64, 1)
+    sched = build_schedule(*args, max_model_len=st["mml"])
+    assert sched is not None and sched.numel() > 4
+    out = torch.empty(sched.numel(), dtype=torch.int32, device=st["dev"])
+    assert build_schedule(*args, out=out, max_model_len=st["mml"]).data_ptr() == (
+        out.data_ptr())
+    with pytest.raises(ValueError, match="int32 words"):
+        build_schedule(*args, out=out[:4], max_model_len=st["mml"])
+
+
 @pytest.mark.parametrize("shape", [(32, 1, [8192]), (128, 1, [4096]),
                                    (32, 6, [8192])],
                          ids=lambda s: f"b{s[0]}_n{s[1]}")

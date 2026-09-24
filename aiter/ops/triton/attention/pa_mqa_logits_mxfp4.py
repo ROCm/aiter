@@ -363,6 +363,11 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
 
     row_ends only affects balance here. Pass the same gather flag the launch
     uses, or the slot counts are read as key positions.
+
+    out is written in place and a view of it returned, so a CUDA graph that
+    captured the launch replays against the same buffer; one too small raises
+    rather than being swapped for a fresh one the graph never sees. Without
+    out the schedule is allocated here.
     """
     plan = select_config(num_heads, head_size, next_n, page_size, preshuffle)
     row_blocks, block_m = plan["row_blocks"], plan["block_m"]
@@ -412,9 +417,14 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     # The varlen search is one ALIGN_W x ALIGN_B predicate matrix per program
     if varlen and align_w * align_b > 1 << 20:
         return None
-    if out is None or out.numel() < num_ctas * 4:
+    if out is None:
         out = torch.empty(num_ctas * 4, dtype=torch.int32,
                           device=context_lens.device)
+    elif out.numel() < num_ctas * 4:
+        raise ValueError(
+            f"out holds {out.numel()} int32 words, the schedule needs "
+            f"{num_ctas * 4} (4 per workgroup, at most "
+            f"4 * max(target_wgs, SCHED_SLOT_CAP))")
     # Slice indices one program writes. The grid follows the slices a unit can
     # own, not the slot count, which is what keeps the redone reductions cheap.
     SCHED_BLOCK_S = 4
