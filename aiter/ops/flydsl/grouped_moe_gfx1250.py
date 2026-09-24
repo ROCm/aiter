@@ -634,7 +634,10 @@ def _grouped_a8w4_tdm_moe(
         _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
         if _plan_align:
             tile_m = min(int(tile_m), _plan_align)
-            tile_m2 = min(int(tile_m2), _plan_align)
+            # psum holds each expert's unpadded end, so a gemm2 tile narrower
+            # than the alignment can start in an expert's padding, map to the
+            # next expert, and scatter stale ep_rowmap rows into live slots.
+            tile_m2 = _plan_align
             if _plan_align % tile_m or _plan_align % tile_m2:
                 raise ValueError(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
