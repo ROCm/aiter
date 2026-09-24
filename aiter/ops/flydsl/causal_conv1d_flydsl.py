@@ -3,7 +3,7 @@
 """FlyDSL prefill causal-conv1d kernel with fused split q/k/v output."""
 
 import functools
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -531,13 +531,22 @@ def causal_conv1d_split_qkv_flydsl_fn(
 
 
 def causal_conv1d_prefill_flydsl_fn(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor], query_start_loc: torch.Tensor,
-    seq_lens_cpu: Sequence[int], cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu", pad_slot_id: Optional[int] = -1,
-    validate_data: bool = False, *, block: int = 128, tokens: int = 16,
-    prefetch: int = 16, channels_per_thread: Optional[int] = None,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: Sequence[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int | None = -1,
+    validate_data: bool = False,
+    *,
+    block: int = 128,
+    tokens: int = 16,
+    prefetch: int = 16,
+    channels_per_thread: int | None = None,
 ) -> torch.Tensor:
     """``causal_conv1d_fn`` contract: returns the output, updates ``conv_states``.
 
@@ -569,27 +578,52 @@ def causal_conv1d_prefill_flydsl_fn(
         raise ValueError("expected a GPU BF16/FP16/FP32 tensor")
     if 1 not in x.stride() or 1 not in weight.stride():
         raise ValueError("input and weight need at least one unit-stride axis")
-    tensors = [weight, query_start_loc, bias, conv_states, cache_indices, has_initial_state]
+    tensors = [
+        weight,
+        query_start_loc,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+    ]
     if any(t is not None and t.device != x.device for t in tensors):
         raise ValueError("all tensors must be on the input device")
-    if weight.dtype != x.dtype or (conv_states is not None and conv_states.dtype != x.dtype):
+    if weight.dtype != x.dtype or (
+        conv_states is not None and conv_states.dtype != x.dtype
+    ):
         raise ValueError("input, weight, and state must have matching dtype")
     if query_start_loc.shape != (batch + 1,) or not query_start_loc.is_contiguous():
         raise ValueError("query_start_loc must be contiguous [batch+1]")
     if query_start_loc.dtype not in (torch.int32, torch.int64):
         raise ValueError("query_start_loc must contain integers")
-    for name, tensor in (("cache_indices", cache_indices), ("has_initial_state", has_initial_state)):
-        if tensor is not None and (tensor.shape != (batch,) or not tensor.is_contiguous()):
+    for name, tensor in (
+        ("cache_indices", cache_indices),
+        ("has_initial_state", has_initial_state),
+    ):
+        if tensor is not None and (
+            tensor.shape != (batch,) or not tensor.is_contiguous()
+        ):
             raise ValueError(f"{name} must be contiguous [batch]")
-    if cache_indices is not None and cache_indices.dtype not in (torch.int32, torch.int64):
+    if cache_indices is not None and cache_indices.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
         raise ValueError("cache_indices must contain integers")
     if bias is not None and (bias.shape != (dim,) or not bias.is_contiguous()):
         raise ValueError("bias must be contiguous [channels]")
-    if conv_states is not None and (conv_states.ndim != 3 or conv_states.shape[1] != dim or conv_states.shape[2] < width - 1):
+    if conv_states is not None and (
+        conv_states.ndim != 3
+        or conv_states.shape[1] != dim
+        or conv_states.shape[2] < width - 1
+    ):
         raise ValueError("state must be [slots,channels,at_least_width-1]")
     if conv_states is not None and 1 not in conv_states.stride():
         raise ValueError("state needs at least one unit-stride axis")
-    if conv_states is not None and cache_indices is None and conv_states.shape[0] < batch:
+    if (
+        conv_states is not None
+        and cache_indices is None
+        and conv_states.shape[0] < batch
+    ):
         raise ValueError("state needs at least batch slots without cache_indices")
     if has_initial_state is not None and conv_states is None:
         raise ValueError("initial history requires conv_states")
@@ -603,9 +637,17 @@ def causal_conv1d_prefill_flydsl_fn(
         if starts != expected:
             raise ValueError("GPU offsets do not match CPU sequence lengths")
         if conv_states is not None:
-            slots = list(range(batch)) if cache_indices is None else cache_indices.cpu().tolist()
-            active = [s for s, n in zip(slots, seq_lens_cpu) if s != pad_slot_id and n > 0]
-            if len(set(active)) != len(active) or any(s < 0 or s >= conv_states.shape[0] for s in active):
+            slots = (
+                list(range(batch))
+                if cache_indices is None
+                else cache_indices.cpu().tolist()
+            )
+            active = [
+                s for s, n in zip(slots, seq_lens_cpu) if s != pad_slot_id and n > 0
+            ]
+            if len(set(active)) != len(active) or any(
+                s < 0 or s >= conv_states.shape[0] for s in active
+            ):
                 raise ValueError("active cache indices must be unique and in bounds")
     out = torch.empty_like(x)
     max_len = max(seq_lens_cpu, default=0)
@@ -613,32 +655,71 @@ def causal_conv1d_prefill_flydsl_fn(
         return out
     lanes = channels_per_thread
     if lanes is None:
-        lanes = 2 if (dim % 2 == 0 and x.stride(0) == 1
-                      and x.dtype in (torch.bfloat16, torch.float16)
-                      and total >= 8192) else 1
+        lanes = (
+            2
+            if (
+                dim % 2 == 0
+                and x.stride(0) == 1
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and total >= 8192
+            )
+            else 1
+        )
     ss = conv_states.stride() if conv_states is not None else (0, 0, 0)
-    def span(t: Optional[torch.Tensor]) -> int:
-        return 1 if t is None else 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
-    launch = create_causal_conv1d_prefill_kernel(dim, width, x.stride(), weight.stride(), ss, out.stride(),
-                    bias is not None, conv_states is not None, cache_indices is not None,
-                    has_initial_state is not None, activation in (True, "silu", "swish"),
-                    pad_slot_id, block, tokens, x.dtype, prefetch, lanes)
+
+    def span(t: torch.Tensor | None) -> int:
+        return (
+            1
+            if t is None
+            else 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+        )
+
+    launch = create_causal_conv1d_prefill_kernel(
+        dim,
+        width,
+        x.stride(),
+        weight.stride(),
+        ss,
+        out.stride(),
+        bias is not None,
+        conv_states is not None,
+        cache_indices is not None,
+        has_initial_state is not None,
+        activation in (True, "silu", "swish"),
+        pad_slot_id,
+        block,
+        tokens,
+        x.dtype,
+        prefetch,
+        lanes,
+    )
     # Absent optional pointers are never dereferenced by the specialized kernel.
-    args = (x, weight, bias if bias is not None else x,
-            conv_states if conv_states is not None else x, query_start_loc,
-            cache_indices if cache_indices is not None else query_start_loc,
-            has_initial_state if has_initial_state is not None else query_start_loc, out)
+    args = (
+        x,
+        weight,
+        bias if bias is not None else x,
+        conv_states if conv_states is not None else x,
+        query_start_loc,
+        cache_indices if cache_indices is not None else query_start_loc,
+        has_initial_state if has_initial_state is not None else query_start_loc,
+        out,
+    )
     runtime = (batch, max_len, *(span(t) for t in (x, weight, conv_states, out)))
     with torch.cuda.device(x.device):
         stream = torch.cuda.current_stream(x.device)
         compiled = getattr(launch, "_compiled", None)
         # FlyDSL specializes dtype, rank, and the first unit-stride axis.
         # Sizes are dynamic; physical indexing strides remain in _build's key.
-        key = (x.device.index, tuple((t.dtype, t.ndim, t.stride().index(1)) for t in args))
+        key = (
+            x.device.index,
+            tuple((t.dtype, t.ndim, t.stride().index(1)) for t in args),
+        )
         if compiled is None:
             launch._compiled = {}
         if key not in launch._compiled:
-            launch._compiled[key] = flyc.compile(launch, *args, *runtime, fx.Stream(stream))
+            launch._compiled[key] = flyc.compile(
+                launch, *args, *runtime, fx.Stream(stream)
+            )
         else:
             launch._compiled[key](*args, *runtime, fx.Stream(stream))
     return out

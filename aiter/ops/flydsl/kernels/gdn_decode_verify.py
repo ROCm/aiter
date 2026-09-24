@@ -9,6 +9,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 
+_DEFAULT_STREAM = fx.Stream(None)
+
 KDIM = 128
 HALF = 8
 
@@ -254,7 +256,8 @@ def create_gdn_decode_verify_kernel(
                     fx.BFloat16,
                 )
 
-            if const_expr(cache_states):
+            # Keep compile-time and runtime branches separate for FlyDSL.
+            if const_expr(cache_states):  # noqa: SIM102
                 if cslot >= 0:
                     for i in range_constexpr(VITER):
                         for j in range_constexpr(NHALF):
@@ -265,7 +268,8 @@ def create_gdn_decode_verify_kernel(
                                 fx.BFloat16,
                             )
 
-        if const_expr(update_state):
+        # Keep compile-time and runtime branches separate for FlyDSL.
+        if const_expr(update_state):  # noqa: SIM102
             if slot >= 0:
                 for i in range_constexpr(VITER):
                     for j in range_constexpr(NHALF):
@@ -292,7 +296,7 @@ def create_gdn_decode_verify_kernel(
         icache: fx.Tensor,
         icache_idx: fx.Tensor,
         n: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = _DEFAULT_STREAM,
     ):
         kernel(
             q, k, v, a, b, A_log, dt_bias, state, indices, out, cu, icache, icache_idx

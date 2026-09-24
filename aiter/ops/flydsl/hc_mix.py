@@ -19,7 +19,11 @@ def pack_hc_weights(down, up, hc=4):
     """Pack contiguous [R,K] and [HC*HS,R] weights; call after weight loading."""
     if down.ndim != 2 or up.ndim != 2:
         raise ValueError("HC weights must be matrices")
-    if down.dtype != torch.bfloat16 or up.dtype != down.dtype or down.device != up.device:
+    if (
+        down.dtype != torch.bfloat16
+        or up.dtype != down.dtype
+        or down.device != up.device
+    ):
         raise ValueError("HC weights must be BF16 on the same device")
     r, k = down.shape
     if hc != 4 or k <= 0 or r <= 0 or k % 64 or r % 32 or up.shape != (k, r):
@@ -27,7 +31,9 @@ def pack_hc_weights(down, up, hc=4):
 
     def pack(w):
         n, kk = w.shape
-        return w.reshape(n // 16, 16, kk // 32, 4, 8).permute(0, 2, 3, 1, 4).contiguous()
+        return (
+            w.reshape(n // 16, 16, kk // 32, 4, 8).permute(0, 2, 3, 1, 4).contiguous()
+        )
 
     interleaved = up.reshape(hc, k // hc, r).permute(1, 0, 2).reshape(k, r)
     return pack(down), pack(interleaved)
@@ -102,19 +108,23 @@ def _hc_project(
         row = lane // 16 * 4 + i
         col = nt * 16 + lane % 16
         if const_expr(UP):
-            xv = _load(
-                x, row * N + (col % 4) * (N // 4) + col // 4, 1, fx.BFloat16
-            )[0].to(fx.Float32)
+            xv = _load(x, row * N + (col % 4) * (N // 4) + col // 4, 1, fx.BFloat16)[
+                0
+            ].to(fx.Float32)
             value = xv / (fx.Float32(1.0) + math.exp(-acc[i]))
             # Four adjacent lanes hold the four branches of one hidden unit.
             # Keep the whole wave active until both shuffles have completed.
             for shift in range_constexpr(2):
-                peer = gpu.shuffle(value, fx.Int32(1 << shift), fx.Int32(64), mode="xor")
+                peer = gpu.shuffle(
+                    value, fx.Int32(1 << shift), fx.Int32(64), mode="xor"
+                )
                 value = value + fx.Float32(peer)
             if (row < M) & (lane % 4 == 0):
                 _store(
-                    out, row * (N // 4) + col // 4,
-                    (value * fx.Float32(0.25)).to(fx.BFloat16), fx.BFloat16,
+                    out,
+                    row * (N // 4) + col // 4,
+                    (value * fx.Float32(0.25)).to(fx.BFloat16),
+                    fx.BFloat16,
                 )
         else:
             if row < M:
@@ -123,8 +133,11 @@ def _hc_project(
 
 @flyc.kernel
 def _hc_reduce_silu(
-    P: fx.Tensor, T: fx.Tensor,
-    M: fx.Constexpr[int], R: fx.Constexpr[int], S: fx.Constexpr[int],
+    P: fx.Tensor,
+    T: fx.Tensor,
+    M: fx.Constexpr[int],
+    R: fx.Constexpr[int],
+    S: fx.Constexpr[int],
 ):
     idx = gpu.block_id("x") * 256 + gpu.thread_id("x")
     p = fx.rocdl.make_buffer_tensor(P, max_size=False)
@@ -143,10 +156,18 @@ def _hc_reduce_silu(
 
 @flyc.jit
 def _launch(
-    X: fx.Tensor, D: fx.Tensor, U: fx.Tensor,
-    P: fx.Tensor, T: fx.Tensor, O: fx.Tensor,
-    M: fx.Constexpr[int], K: fx.Constexpr[int], R: fx.Constexpr[int],
-    S: fx.Constexpr[int], W: fx.Constexpr[int], stream: fx.Stream,
+    X: fx.Tensor,
+    D: fx.Tensor,
+    U: fx.Tensor,
+    P: fx.Tensor,
+    T: fx.Tensor,
+    O: fx.Tensor,
+    M: fx.Constexpr[int],
+    K: fx.Constexpr[int],
+    R: fx.Constexpr[int],
+    S: fx.Constexpr[int],
+    W: fx.Constexpr[int],
+    stream: fx.Stream,
 ):
     _hc_project(X, D, X, P, M, R, K, S, False, 1).launch(
         grid=(R // 16, S), block=(64,), stream=stream
@@ -197,20 +218,35 @@ def hc_mix(x, down_packed, up_packed, *, split_k=None, up_waves=4):
         raise ValueError("Unsupported HC mix input shape/dtype/layout")
     for w in (down_packed, up_packed):
         if (
-            w.device != x.device or w.dtype != x.dtype
-            or not w.is_contiguous() or w.data_ptr() % 16
+            w.device != x.device
+            or w.dtype != x.dtype
+            or not w.is_contiguous()
+            or w.data_ptr() % 16
         ):
             raise ValueError("Packed weights must match input device and dtype")
-    if (
-        down_packed.shape != (r // 16, k // 32, 4, 16, 8)
-        or up_packed.shape != (k // 16, r // 32, 4, 16, 8)
+    if down_packed.shape != (r // 16, k // 32, 4, 16, 8) or up_packed.shape != (
+        k // 16,
+        r // 32,
+        4,
+        16,
+        8,
     ):
         raise ValueError("Invalid packed HC weight shape")
     p = torch.empty((split_k, m, r), device=x.device, dtype=torch.float32)
     t = torch.empty((m, r), device=x.device, dtype=x.dtype)
     out = torch.empty((m, k // 4), device=x.device, dtype=x.dtype)
     _launch(
-        x, down_packed, up_packed, p, t, out, m, k, r, split_k, up_waves,
+        x,
+        down_packed,
+        up_packed,
+        p,
+        t,
+        out,
+        m,
+        k,
+        r,
+        split_k,
+        up_waves,
         torch.cuda.current_stream(x.device),
     )
     return out

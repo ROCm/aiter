@@ -25,10 +25,10 @@ from .kernels.gdr_decode import (
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
+    "flydsl_gdn_decode_varlen",
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
     "flydsl_gdr_mtp_sglang",
-    "flydsl_gdn_decode_varlen",
 ]
 
 
@@ -1070,6 +1070,7 @@ def flydsl_gdr_mtp_sglang(
         disable_state_update=disable_state_update,
         stream=stream,
     )
+
 
 _GDN_VARLEN_VITER4_MIN_DRAFT = 4
 _GDN_VARLEN_VITER4_BLOCKS_PER_CU = 1.5
