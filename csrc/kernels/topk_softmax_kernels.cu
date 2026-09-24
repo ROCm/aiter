@@ -753,8 +753,6 @@ template <>
 __forceinline__ __device__ float dtype2acctype<__half>(__half x) { return __half2float(x); }
 template <>
 __forceinline__ __device__ float dtype2acctype<__hip_bfloat16>(__hip_bfloat16 x) { return __bfloat162float(x); }
-template <>
-__forceinline__ __device__ float dtype2acctype<hip_bfloat16>(hip_bfloat16 x) { return static_cast<float>(x); }
 
 template <typename T>
 __forceinline__ __device__ T acctype2dtype(float x) { return x; }
@@ -762,8 +760,6 @@ template <>
 __forceinline__ __device__ __half acctype2dtype<__half>(float x) { return __float2half(x); }
 template <>
 __forceinline__ __device__ __hip_bfloat16 acctype2dtype<__hip_bfloat16>(float x) { return __float2bfloat16(x); }
-template <>
-__forceinline__ __device__ hip_bfloat16 acctype2dtype<hip_bfloat16>(float x) { return hip_bfloat16(x); }
 
 template <typename scalar_t, int TOPK>
 __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
