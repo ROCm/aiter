@@ -124,6 +124,7 @@ def launch_gemm_a8w4_tdm(
     row_major_ascale: Constexpr[int] = 0,
     a_row_stride_bytes: Constexpr[int] = 0,
     a_scale_row_stride_bytes: Constexpr[int] = 0,
+    m_align: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -193,6 +194,7 @@ def launch_gemm_a8w4_tdm(
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
         ep_quant_bits,
+        m_align,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -332,12 +334,13 @@ def launch_gemm_a8w4_tdm(
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
+    _malign = f"_ma{m_align}" if m_align else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_as_prologue}"
-        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
+        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}{_malign}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -425,6 +428,16 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+        if const_expr(m_align):
+            # tile_map holds unpadded expert ends while experts start on
+            # m_align boundaries; a tile narrower than m_align can start in the
+            # previous expert's padding, which the bisect hands to this expert.
+            prev = (expert > 0).select(expert - 1, 0)
+            start = (tile_map[prev] + (m_align - 1)) // m_align * m_align
+            start = (expert > 0).select(start, 0)
+            in_expert = blk_m >= start
+            has_work = has_work & in_expert
+            expert = in_expert.select(expert, n_experts)
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
