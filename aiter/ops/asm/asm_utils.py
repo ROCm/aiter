@@ -44,6 +44,17 @@ def get_warp_size() -> int:
         return 32  # gfx1250 (RDNA-family) is wave32
 
 
+def get_gfx_from_device(device=None) -> str:
+    """Return the architecture of a live torch device.
+
+    This ASM-local runtime query intentionally ignores build-target environment
+    variables. Passing an input tensor's device also makes dispatch correct on
+    mixed-architecture hosts and compile-safe under ``torch.compile``.
+    """
+    props = torch.cuda.get_device_properties(device)
+    return props.gcnArchName.split(":", 1)[0].lower()
+
+
 # ---------------------------------------------------------------------------
 # HIP runtime binding (ctypes). torch owns device memory; we only module-load
 # and launch. Bind the SAME libamdhip64 torch already mapped, to avoid ROCR
@@ -204,18 +215,20 @@ def get_function(co_path, symbol):
     """Load ``co_path`` once (process-cached) and resolve ``symbol`` to a
     function handle (also cached). Mirrors the ``AiterAsmKernel`` /
     ``SynchronizedCache`` behaviour of the C++ dispatcher: a given .co is mapped
-    exactly once and reused across launches.
+    once per device context and reused across launches.
     """
     hip = _get_hip()
-    module = _module_cache.get(co_path)
+    device = torch.cuda.current_device()
+    module_key = (device, co_path)
+    module = _module_cache.get(module_key)
     if module is None:
         module = ctypes.c_void_p()
         hip_check(
             hip.hipModuleLoad(ctypes.byref(module), co_path.encode()),
             "hipModuleLoad",
         )
-        _module_cache[co_path] = module
-    key = (co_path, symbol)
+        _module_cache[module_key] = module
+    key = (device, co_path, symbol)
     func = _func_cache.get(key)
     if func is None:
         func = ctypes.c_void_p()

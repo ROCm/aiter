@@ -14,9 +14,10 @@ import aiter
 from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.asm.asm_utils import get_gfx_from_device
 from aiter.ops.asm.mla_decode_v4 import (
-    get_mla_v4_fused_kernel,
+    is_mla_v4_fused_eligible,
     mla_decode_v4_asm_gfx1250,
     mla_decode_v4_fused_asm_gfx1250,
     mla_v4_fused_slot_f32,
@@ -1745,7 +1746,7 @@ def mla_decode_fwd_v4_nm(
 
     """
     require_gfx1250_asm("mla_decode_v4_asm")
-    runtime_gfx = get_gfx_runtime()
+    runtime_gfx = get_gfx_from_device(q.device)
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)
@@ -1845,11 +1846,11 @@ def mla_decode_fwd_v4_nm(
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
 
     fused = (
-        get_mla_v4_fused_kernel(q, kv_buffer, max_seqlen_q, num_kv_splits)
+        is_mla_v4_fused_eligible(q, kv_buffer, max_seqlen_q, num_kv_splits)
         if fused_split_map_is_uniform
-        else None
+        else False
     )
-    if fused is not None:
+    if fused:
         slot = mla_v4_fused_slot_f32(num_heads, v_head_dim)
         fused_logits_shape = (total_q, num_kv_splits, slot)
         if logits is not None and tuple(logits.shape) == fused_logits_shape:
