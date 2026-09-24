@@ -72,7 +72,6 @@ def _topk_softmax_fused_shared_gate(
     topk_indices: Tensor,
     token_expert_indices: Tensor,
     gating_output: Tensor,
-    softmax_workspace: Tensor,
     need_renorm: bool,
     num_shared_experts: int,
     shared_expert_scoring_func: str,
@@ -101,23 +100,13 @@ def topk_softmax_fused_shared_gate(
     #   sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
     # (scale applied AFTER sigmoid) and the shared id (shared_expert_base + s) is
     # written by the kernel. Output buffers are width topk + num_shared_experts.
-    num_routing_experts = gating_output.shape[-1]
-    num_tokens = gating_output.numel() // num_routing_experts
-    is_pow_2 = (
-        num_routing_experts != 0
-        and (num_routing_experts & (num_routing_experts - 1)) == 0
-    )
-    needs_workspace = (not is_pow_2) or num_routing_experts > 256
-    workspace_size = num_tokens * num_routing_experts if needs_workspace else 0
-    softmax_workspace = torch.empty(
-        workspace_size, dtype=dtypes.fp32, device=gating_output.device
-    )
+    # No softmax_workspace: the fused op supports only power-of-2 num_experts <= 512
+    # (non-power-of-2 is rejected), so the two-pass path that needed it never runs.
     _topk_softmax_fused_shared_gate(
         topk_weights,
         topk_indices,
         token_expert_indices,
         gating_output,
-        softmax_workspace,
         need_renorm,
         num_shared_experts,
         shared_expert_scoring_func,

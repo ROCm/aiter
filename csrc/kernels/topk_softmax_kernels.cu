@@ -1273,7 +1273,6 @@ void topkGatingSoftmaxFusedGateKernelLauncher(const DTYPE* gating_output,
                                      float* topk_weights,
                                      int* topk_indicies,
                                      int* token_expert_indices,
-                                     float* softmax_workspace,
                                      const int num_tokens,
                                      const int num_experts,
                                      const int num_shared_experts,
@@ -1411,7 +1410,6 @@ void topk_softmax_fused_shared_gate(
     const aiter_tensor_t& topk_indices,          // [num_tokens, topk + num_shared_experts]
     const aiter_tensor_t& token_expert_indices,  // [num_tokens, topk]  (written stride = topk)
     const aiter_tensor_t& gating_output,         // [num_tokens, num_experts]  routed only
-    const aiter_tensor_t& softmax_workspace,
     bool need_renorm,
     int num_shared_experts,
     const std::string& shared_expert_scoring_func,
@@ -1493,8 +1491,12 @@ void topk_softmax_fused_shared_gate(
     AITER_CHECK(shared_expert_base >= 0,
                 "fuse-gate requires shared_expert_base >= 0");
 
-    // Workspace (softmax_workspace) is sized/allocated on the Python side; only the
-    // non-power-of-2 / >256-expert path actually reads it.
+    // An empty batch would make the launcher compute num_blocks == 0 and fail the grid
+    // launch. The output tensors are already zero-width in M, so treat M == 0 as a
+    // no-op after the input validation above.
+    if(num_tokens == 0)
+        return;
+
     HipDeviceGuard device_guard(gating_output.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
@@ -1513,7 +1515,6 @@ void topk_softmax_fused_shared_gate(
             reinterpret_cast<float*>(topk_weights.data_ptr()),
             reinterpret_cast<int*>(topk_indices.data_ptr()),
             reinterpret_cast<int*>(token_expert_indices.data_ptr()),
-            reinterpret_cast<float*>(softmax_workspace.data_ptr()),
             num_tokens,
             num_routing_experts,  // Only routing experts for softmax
             num_shared_experts,   // Number of shared experts to process with sigmoid

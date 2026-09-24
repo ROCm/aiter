@@ -1380,7 +1380,6 @@ namespace py = pybind11;
           py::arg("topk_indices"),                                             \
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
-          py::arg("softmax_workspace"),                                        \
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts"),                                       \
           py::arg("shared_expert_scoring_func"),                               \
