@@ -13,10 +13,6 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,aiter_a6w4_m32_s0_a4_t_bias,a6w4_m32_s0_a4_t_bias.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_m32_s3_a4_t_bias,a6w4_m32_s3_a4_t_bias.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_m32_s3_a5_t_bias,a6w4_m32_s3_a5_t_bias.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,aiter_a6w4_dfp6_d1_s0,a6w4_dfp6_d1_s0.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_dfp6_d1_s3,a6w4_dfp6_d1_s3.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,aiter_a6w4_dfp6_d2_s0,a6w4_dfp6_d2_s0.co
-256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_dfp6_d2_s3,a6w4_dfp6_d2_s3.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,aiter_a6w4_dfp6_d3_s0,a6w4_dfp6_d3_s0.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_dfp6_d3_s3,a6w4_dfp6_d3_s3.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,aiter_a6w4_dfp6_d4_s0,a6w4_dfp6_d4_s0.co
