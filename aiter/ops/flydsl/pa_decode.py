@@ -8,6 +8,12 @@ OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA specialization details.
 """
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from types import MappingProxyType
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -22,6 +28,121 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+_DEFAULT_TUNED_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "configs"
+    / "model_configs"
+    / "flydsl_pa_decode_tuned.csv"
+)
+# Global head counts and tensor-parallel metadata describe the model, while
+# these fields describe the work performed by one device. Conflicting model
+# records for the same local problem cannot select a runtime recommendation.
+_TUNED_SHAPE_FIELDS = (
+    "batch_size",
+    "context_length",
+    "query_length",
+    "num_query_heads",
+    "num_kv_heads",
+    "query_group_size",
+    "head_dim",
+    "page_size",
+    "query_dtype",
+    "per_token_kv",
+    "trans_v",
+    "sliding_window",
+    "softmax_scale",
+)
+
+
+@dataclass(frozen=True)
+class PADecodeTunedResults:
+    """Validated CSV recommendations, indexed by device-local static geometry."""
+
+    budgets: Mapping[tuple, int]
+
+    def lookup_budget(self, shape: Mapping, architecture: str, num_cu: int):
+        """Return a budget or None using host metadata, without files or GPU reads.
+
+        ``shape`` can be built with ``pa_decode_tuning.make_shape``. Its exact
+        context bound must be supplied by the caller; per-sequence lengths and
+        model-global head/TP metadata do not participate in runtime matching.
+        Pass the same bound to ``pa_decode(max_context_length=...)`` when using
+        the selected budget with block tables that have extra padding.
+        """
+        try:
+            key = (
+                architecture,
+                num_cu,
+                *(shape[field] for field in _TUNED_SHAPE_FIELDS),
+            )
+            return self.budgets.get(key)
+        except (KeyError, TypeError):
+            return None
+
+
+@lru_cache(maxsize=16)
+def _load_tuned_results_cached(path: str, best: bool, required: bool):
+    if not required and not Path(path).is_file():
+        return PADecodeTunedResults(MappingProxyType({}))
+
+    # Keep CSV parsing, source hashing and candidate validation out of decode's
+    # hot path and leave the legacy static/explicit-plan paths independent.
+    from . import pa_decode_tuning as tuning
+
+    data = tuning.load_results(path)
+    sources = tuning.source_identity()
+    budgets = {}
+    conflicts = set()
+    for record in data["records"]:
+        key = record["key"]
+        if key["sources"] != sources:
+            continue
+        # Validate each record once instead of revalidating the complete table
+        # for every key. Preserve all accuracy, timing and provenance gates.
+        budget = tuning.lookup_budget(
+            {"schema_version": data["schema_version"], "records": [record]},
+            key,
+            best=best,
+        )
+        if budget is None:
+            continue
+        problem = (
+            key["architecture"],
+            key["num_cu"],
+            *(key["shape"][field] for field in _TUNED_SHAPE_FIELDS),
+        )
+        if problem in budgets and budgets[problem] != budget:
+            conflicts.add(problem)
+        budgets[problem] = budget
+    for problem in conflicts:
+        budgets.pop(problem, None)
+    return PADecodeTunedResults(MappingProxyType(budgets))
+
+
+def load_tuned_results(
+    tuned_file: str | Path | None = None, *, best: bool = False, reload: bool = False
+) -> PADecodeTunedResults:
+    """Load and cache PA workgroup-budget recommendations from a tuning CSV.
+
+    The default is ``aiter/configs/model_configs/flydsl_pa_decode_tuned.csv``;
+    an absent default provides no recommendations. An explicit missing file or
+    a malformed CSV raises an error. Stale sources, failed records, unmatched
+    shapes and conflicting local recommendations do not provide a budget.
+
+    By default select the smallest budget reaching 97% of the best measured
+    performance; ``best=True`` selects the fastest valid candidate. Call once
+    before capture, and use ``reload=True`` after replacing a file or sources.
+    The returned index is immutable and can also be used to prepare an explicit
+    ``plan_pa_decode(..., workgroup_budget=results.lookup_budget(shape, arch, cu))``.
+    """
+    if reload:
+        _load_tuned_results_cached.cache_clear()
+    # absolute() is lexical: cached calls do not stat or open the file.
+    path = str(
+        Path(_DEFAULT_TUNED_FILE if tuned_file is None else tuned_file).absolute()
+    )
+    return _load_tuned_results_cached(path, best, tuned_file is not None)
 
 
 def get_recommended_splits(
@@ -201,7 +322,7 @@ def pa_decode(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_length: int,
-    max_context_partition_num: int,
+    max_context_partition_num: int | None = None,
     context_partition_size: int = 256,
     compute_type: torch.dtype = torch.bfloat16,
     query_scale: torch.Tensor = None,
@@ -214,6 +335,8 @@ def pa_decode(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
+    tuned_file: str | Path | None = None,
+    max_context_length: int | None = None,
 ) -> None:
     """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
 
@@ -223,8 +346,23 @@ def pa_decode(
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
-    query_length=1. Positive ``sliding_window`` requires ``work_plan`` and
-    includes each query's own position; 0 and -1 disable it.
+    query_length=1. Positive ``sliding_window`` requires a supplied or automatic
+    work plan and includes each query's own position; 0 and -1 disable it.
+
+    Omit ``max_context_partition_num`` and ``work_plan`` for automatic planning.
+    This mode loads ``tuned_file`` (or the default tuning CSV) and matches the
+    host-provided ``max_context_length`` and local tensor geometry. No length
+    hint, no matching valid recommendation, or sinks uses a budget of twice the
+    device CU count. A hint is the declared context bound, including MTP tokens;
+    block-table capacity is not used as a substitute and GPU lengths are not read
+    back. The tuner currently measures attention without sinks.
+
+    Automatic planning allocates and refreshes metadata on each eager call. For
+    graph capture or preallocated scratch, load recommendations and build a plan
+    beforehand, then pass ``work_plan``. An explicit plan takes precedence over
+    tuning and supplies the partition cap when omitted. An explicit integer cap
+    without a plan retains static execution and cannot be combined with
+    ``tuned_file``.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -237,10 +375,27 @@ def pa_decode(
     query_length. Planned scratch is [KV heads, capacity, query rows (, D)];
     static scratch uses the per-sequence layouts shown in the signature.
 
+    For planned execution, ``max_context_length`` also selects the scheduling
+    bound, rounded up to whole pages as in tuning. This keeps the selected
+    specialization independent of extra block-table padding. Callers must ensure
+    every GPU context length is at most ``max_context_length`` when supplying it.
+
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
+    auto_plan = work_plan is None and max_context_partition_num is None
+    if work_plan is None and not auto_plan and tuned_file is not None:
+        raise ValueError(
+            "tuned_file requires automatic planning: omit max_context_partition_num "
+            "or pass an explicit work_plan"
+        )
+    if auto_plan and any(
+        scratch is not None for scratch in (exp_sums, max_logits, temporary_output)
+    ):
+        raise ValueError(
+            "preallocated scratch requires an explicit work_plan or partition count"
+        )
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
             "pa_decode only supports context_partition_size=256, "
@@ -257,7 +412,7 @@ def pa_decode(
     if sliding_window < -1:
         raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
-    if sliding_window > 0 and work_plan is None:
+    if sliding_window > 0 and work_plan is None and not auto_plan:
         raise ValueError("positive sliding_window requires work_plan")
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
@@ -265,6 +420,7 @@ def pa_decode(
         raise ValueError(f"query_length must be positive, got {query_length}")
     if (
         work_plan is None
+        and not auto_plan
         and not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS
     ):
         raise ValueError(
@@ -305,6 +461,14 @@ def pa_decode(
     total_q_rows, num_q_heads, head_dim = query.shape
     if query.device.type != "cuda":
         raise ValueError(f"query must be on a CUDA device, got {query.device}")
+    if auto_plan:
+        with torch.cuda.device(query.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "automatic PA planning is unavailable during graph capture; "
+                    "call load_tuned_results and plan_pa_decode before capture, "
+                    "then pass work_plan"
+                )
     if num_q_heads < 1:
         raise ValueError(f"query must contain at least one head, got {num_q_heads}")
     if total_q_rows != num_seqs * query_length:
@@ -546,10 +710,60 @@ def pa_decode(
                 f"got {scale.device}"
             )
 
+    schedule_context_length = int(max_blocks_per_seq) * int(block_size)
+    if max_context_length is not None:
+        if (
+            isinstance(max_context_length, bool)
+            or not isinstance(max_context_length, int)
+            or not 0 <= max_context_length <= max_blocks_per_seq * block_size
+        ):
+            raise ValueError(
+                "max_context_length must be a nonnegative host integer within "
+                "block-table capacity"
+            )
+        if auto_plan or work_plan is not None:
+            schedule_context_length = (
+                (max_context_length + block_size - 1) // block_size * block_size
+            )
+    if auto_plan:
+        recommendations = load_tuned_results(tuned_file)
+        device_info = torch.cuda.get_device_properties(dev)
+        num_cu = device_info.multi_processor_count
+        budget = None
+        if max_context_length is not None and sinks is None:
+            shape = {
+                "batch_size": num_seqs,
+                "context_length": max_context_length,
+                "query_length": query_length,
+                "num_query_heads": num_q_heads,
+                "num_kv_heads": num_kv_heads,
+                "query_group_size": query_group_size,
+                "head_dim": head_dim,
+                "page_size": block_size,
+                "query_dtype": (
+                    "bfloat16" if query.dtype == torch.bfloat16 else "float16"
+                ),
+                "per_token_kv": per_token_kv,
+                "trans_v": trans_v,
+                "sliding_window": sliding_window,
+                "softmax_scale": softmax_scale,
+            }
+            budget = recommendations.lookup_budget(
+                shape, device_info.gcnArchName.split(":")[0], num_cu
+            )
+        work_plan = plan_pa_decode(
+            context_lengths,
+            num_kv_heads,
+            workgroup_budget=budget,
+            sliding_window=sliding_window,
+            query_length=query_length,
+        )
     num_partitions = max_context_partition_num
     if work_plan is not None:
         if not isinstance(work_plan, PADecodePlan):
             raise TypeError("work_plan must be a PADecodePlan")
+        if num_partitions is None:
+            num_partitions = work_plan.max_partitions
         work_plan.validate(num_seqs, num_kv_heads, dev)
         if work_plan.max_partitions != num_partitions:
             raise ValueError(
@@ -590,7 +804,7 @@ def pa_decode(
             kv_buffer_u32=kv_buffer_u32,
             use_work_plan=work_plan is not None,
             work_capacity=work_plan.capacity if work_plan is not None else None,
-            max_context_length=int(max_blocks_per_seq) * int(block_size),
+            max_context_length=schedule_context_length,
             sliding_window=sliding_window,
             use_sinks=use_direct_sinks,
             sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",

@@ -5,7 +5,9 @@
 
 CPU-only: --help, --list-models, --dry-run, model/shape/key/selection helpers.
 Torch and the native PA implementation are imported only by the GPU runner.
-This module is deliberately not imported by the runtime selector.
+Results use one lossless CSV with run, record and candidate rows. Readable
+columns mirror canonical JSON payload cells containing the complete metadata;
+loading validates both and restores the in-memory result dictionary.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import copy
 import csv
 import hashlib
 import importlib
+import io
 import itertools
 import json
 import math
@@ -27,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+CSV_VERSION = 1
 ATOL = RTOL = 0.005
 NEAR_BEST = 0.97
 DEFAULT_BUDGETS = (128, 256, 512, 1024, 2048, 4096)
@@ -89,6 +93,44 @@ BENCHMARK_FIELDS = (
     "lengths",
     "lengths_sha256",
     "input_generator",
+)
+CSV_FIELDS = (
+    "csv_version",
+    "row_type",
+    "record_index",
+    "candidate_index",
+    "child_count",
+    "run_status",
+    "key_sha256",
+    "shape_status",
+    "architecture",
+    "num_cu",
+    "kv_dtype",
+    *STATIC_SHAPE_FIELDS,
+    "benchmark_length_mode",
+    "benchmark_lengths_sha256",
+    "benchmark_seed",
+    "workgroup_budget",
+    "launch_budget",
+    "capacity",
+    "budget_aliases",
+    "is_baseline",
+    "status",
+    "plan_unchanged",
+    "sample_count",
+    "eager_passed",
+    "graph_passed",
+    "post_timing_passed",
+    "median_us",
+    "min_us",
+    "max_us",
+    "unique_kv_tb_s",
+    "baseline_speedup",
+    "best_budget",
+    "conservative_budget",
+    "is_best",
+    "is_conservative",
+    "payload_json",
 )
 
 
@@ -486,14 +528,204 @@ def _validate_results(data):
         seen.add(digest)
 
 
-def load_results(path):
-    """Load and validate an offline result; importing the GPU runtime is unnecessary."""
-    data = json.loads(Path(path).read_text())
-    try:
-        _validate_results(data)
-    except (KeyError, TypeError, AttributeError) as exc:
-        raise ValueError("Malformed tuning-result schema") from exc
+def _csv_cell(value):
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else canonical(value)
+
+
+def _csv_row(
+    kind,
+    payload,
+    *,
+    run,
+    record=None,
+    record_index=None,
+    candidate_index=None,
+    child_count=None,
+):
+    """Project readable columns from the same payload used by the loader."""
+    row = dict.fromkeys(CSV_FIELDS, "")
+    row.update(
+        csv_version=CSV_VERSION,
+        row_type=kind,
+        record_index=record_index,
+        candidate_index=candidate_index,
+        child_count=child_count,
+        run_status=run.get("status"),
+        status=payload.get("status"),
+        payload_json=canonical(payload),
+    )
+    if kind == "record":
+        record = payload
+    if record is not None:
+        key, benchmark = record["key"], record["benchmark_input"]
+        selection = record.get("selection")
+        selection = selection if isinstance(selection, dict) else {}
+        row.update({name: key["shape"][name] for name in STATIC_SHAPE_FIELDS})
+        row.update(
+            key_sha256=record["key_sha256"],
+            shape_status=record.get("status"),
+            architecture=key["architecture"],
+            num_cu=key["num_cu"],
+            kv_dtype=key["kv_dtype"],
+            benchmark_length_mode=benchmark["length_mode"],
+            benchmark_lengths_sha256=benchmark["lengths_sha256"],
+            benchmark_seed=benchmark["seed"],
+            best_budget=selection.get("best_budget"),
+            conservative_budget=selection.get("conservative_budget"),
+        )
+        if kind == "candidate":
+            row.update(
+                {
+                    name: payload.get(name)
+                    for name in (
+                        "workgroup_budget",
+                        "launch_budget",
+                        "capacity",
+                        "budget_aliases",
+                        "is_baseline",
+                        "plan_unchanged",
+                        "median_us",
+                        "min_us",
+                        "max_us",
+                        "unique_kv_tb_s",
+                        "baseline_speedup",
+                    )
+                }
+            )
+            samples, accuracy = payload.get("samples_us"), payload.get("accuracy")
+            row["sample_count"] = len(samples) if isinstance(samples, list) else None
+            for stage in ACCURACY_STAGES:
+                check = accuracy.get(stage) if isinstance(accuracy, dict) else None
+                row[stage + "_passed"] = (
+                    check.get("passed") if isinstance(check, dict) else None
+                )
+            capacity = payload.get("capacity")
+            row["is_best"] = capacity is not None and capacity == selection.get(
+                "best_capacity"
+            )
+            row["is_conservative"] = capacity is not None and capacity == selection.get(
+                "conservative_capacity"
+            )
+    return {name: _csv_cell(value) for name, value in row.items()}
+
+
+def _csv_rows(data):
+    yield _csv_row(
+        "run",
+        {key: value for key, value in data.items() if key != "records"},
+        run=data,
+        child_count=len(data["records"]),
+    )
+    for record_index, record in enumerate(data["records"]):
+        candidates = record["candidates"]
+        if not isinstance(candidates, list):
+            raise TypeError("Tuning candidates must be a list")
+        yield _csv_row(
+            "record",
+            {key: value for key, value in record.items() if key != "candidates"},
+            run=data,
+            record_index=record_index,
+            child_count=len(candidates),
+        )
+        for candidate_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                raise TypeError("Each tuning candidate must be an object")
+            yield _csv_row(
+                "candidate",
+                candidate,
+                run=data,
+                record=record,
+                record_index=record_index,
+                candidate_index=candidate_index,
+            )
+
+
+def _write_results_csv(stream, data):
+    _validate_results(data)
+    writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(_csv_rows(data))
+
+
+def _csv_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("Duplicate JSON object keys in tuning CSV payload")
+    return result
+
+
+def _read_results_csv(stream):
+    reader = csv.DictReader(stream, strict=True)
+    if reader.fieldnames != list(CSV_FIELDS):
+        raise ValueError("Unsupported tuning CSV header")
+    data = None
+
+    def read_row(kind, *, record=None, record_index=None, candidate_index=None):
+        row = next(reader, None)
+        if row is None:
+            raise ValueError("Incomplete tuning CSV hierarchy")
+        if set(row) != set(CSV_FIELDS) or any(value is None for value in row.values()):
+            raise ValueError("Malformed tuning CSV row width")
+        payload = json.loads(row["payload_json"], object_pairs_hook=_csv_object)
+        if not isinstance(payload, dict):
+            raise TypeError("Tuning CSV payload must be an object")
+        reserved = {"run": "records", "record": "candidates"}.get(kind)
+        if reserved is not None and reserved in payload:
+            raise ValueError("Child data must use separate tuning CSV rows")
+        count = None
+        if kind != "candidate":
+            value = row["child_count"]
+            if not value.isascii() or not value.isdecimal():
+                raise ValueError("Tuning CSV child_count must be a nonnegative integer")
+            count = int(value)
+        # Accept JSON whitespace/key ordering, while rejecting duplicate keys,
+        # nonfinite values, and disagreement in any readable or hierarchy column.
+        row["payload_json"] = canonical(payload)
+        expected = _csv_row(
+            kind,
+            record_index=record_index,
+            candidate_index=candidate_index,
+            child_count=count,
+            payload=payload,
+            run=payload if kind == "run" else data,
+            record=record,
+        )
+        if row != expected:
+            raise ValueError("Tuning CSV columns disagree with payload or hierarchy")
+        return payload, count
+
+    data, record_count = read_row("run")
+    data["records"] = []
+    for record_index in range(record_count):
+        record, candidate_count = read_row("record", record_index=record_index)
+        record["candidates"] = []
+        for candidate_index in range(candidate_count):
+            candidate, _ = read_row(
+                "candidate",
+                record=record,
+                record_index=record_index,
+                candidate_index=candidate_index,
+            )
+            record["candidates"].append(candidate)
+        data["records"].append(record)
+    if next(reader, None) is not None:
+        raise ValueError("Unexpected rows after the tuning CSV hierarchy")
+    _validate_results(data)
     return data
+
+
+def load_results(path):
+    """Load lossless CSV without GPU imports; restore the original result schema."""
+    path = Path(path)
+    # Long sample/context arrays can exceed the csv module's 128 KiB default.
+    csv.field_size_limit(max(csv.field_size_limit(), path.stat().st_size))
+    try:
+        with path.open(newline="", encoding="utf-8-sig") as stream:
+            return _read_results_csv(stream)
+    except (csv.Error, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError("Malformed tuning-result CSV") from exc
 
 
 def lookup_budget(data, key, *, best=False):
@@ -548,16 +780,21 @@ def lookup_budget(data, key, *, best=False):
 
 
 def save_results(path, data, *, overwrite=False):
-    _validate_results(data)
-    payload = json.dumps(data, indent=2, allow_nan=False) + "\n"
+    """Save all tuning data as CSV; create exclusively or replace atomically."""
     path = Path(path)
+    if path.suffix.lower() != ".csv":
+        raise ValueError("Tuning results require a .csv output path")
+    with io.StringIO(newline="") as buffer:
+        _write_results_csv(buffer, data)
+        payload = buffer.getvalue()
     if not overwrite:
-        with path.open("x", encoding="utf-8") as stream:
+        with path.open("x", newline="", encoding="utf-8") as stream:
             stream.write(payload)
         return
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
+        newline="",
         dir=path.parent,
         prefix=f".{path.name}.",
         delete=False,
@@ -572,85 +809,8 @@ def save_results(path, data, *, overwrite=False):
 
 
 def save_csv(path, data, *, overwrite=False):
-    _validate_results(data)
-    fields = (
-        "key_sha256",
-        "shape_status",
-        "architecture",
-        "num_cu",
-        "batch_size",
-        "context_length",
-        "benchmark_length_mode",
-        "benchmark_lengths_sha256",
-        "benchmark_seed",
-        "num_query_heads",
-        "num_kv_heads",
-        "query_group_size",
-        "head_dim",
-        "global_num_query_heads",
-        "global_num_kv_heads",
-        "tp_size",
-        "kv_replication_factor",
-        "query_length",
-        "page_size",
-        "query_dtype",
-        "kv_dtype",
-        "per_token_kv",
-        "trans_v",
-        "sliding_window",
-        "workgroup_budget",
-        "budget_aliases",
-        "capacity",
-        "is_baseline",
-        "status",
-        "median_us",
-        "min_us",
-        "max_us",
-        "unique_kv_tb_s",
-        "baseline_speedup",
-        "is_best",
-        "is_conservative",
-        "accuracy_json",
-        "errors_json",
-        "key_json",
-        "benchmark_input_json",
-        "source_paths_json",
-    )
-    with Path(path).open(
-        "w" if overwrite else "x", newline="", encoding="utf-8"
-    ) as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        for record in data["records"]:
-            key, selection = record["key"], record.get("selection") or {}
-            for candidate in record["candidates"]:
-                benchmark_shape = {**key["shape"], **record["benchmark_input"]}
-                row = {k: benchmark_shape.get(k) for k in fields}
-                row.update({k: candidate.get(k) for k in fields if k in candidate})
-                row.update(
-                    key_sha256=record["key_sha256"],
-                    shape_status=record["status"],
-                    architecture=key["architecture"],
-                    num_cu=key["num_cu"],
-                    kv_dtype=key["kv_dtype"],
-                    budget_aliases=canonical(candidate["budget_aliases"]),
-                    is_best=candidate["capacity"] == selection.get("best_capacity"),
-                    is_conservative=candidate["capacity"]
-                    == selection.get("conservative_capacity"),
-                    accuracy_json=canonical(candidate.get("accuracy", {})),
-                    errors_json=canonical(
-                        candidate.get("errors", []) + record.get("errors", [])
-                    ),
-                    key_json=canonical(key),
-                    benchmark_input_json=canonical(record["benchmark_input"]),
-                    benchmark_length_mode=record["benchmark_input"]["length_mode"],
-                    benchmark_lengths_sha256=record["benchmark_input"][
-                        "lengths_sha256"
-                    ],
-                    benchmark_seed=record["benchmark_input"]["seed"],
-                    source_paths_json=canonical(record.get("source_paths", {})),
-                )
-                writer.writerow(row)
+    """Compatibility entry point for the same lossless CSV result format."""
+    save_results(path, data, overwrite=overwrite)
 
 
 def _make_inputs(torch, shape, device, fp8):
@@ -1183,21 +1343,20 @@ def main(argv=None):
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--architecture", choices=("gfx942", "gfx950"))
     parser.add_argument("--num-cu", type=int)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--csv", type=Path)
+    result_output = parser.add_mutually_exclusive_group()
+    result_output.add_argument(
+        "--output", type=Path, help="Complete tuning results in a new .csv file"
+    )
+    result_output.add_argument(
+        "--csv", dest="output", type=Path, help="Alias for --output"
+    )
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.list_models:
-        print(
-            json.dumps(
-                {
-                    n: {"Hq": v[0], "Hkv": v[1], "D": v[2], "description": v[3]}
-                    for n, v in PRESETS.items()
-                },
-                indent=2,
-            )
-        )
+        writer = csv.writer(sys.stdout, lineterminator="\n")
+        writer.writerow(("model", "Hq", "Hkv", "D", "description"))
+        writer.writerows((name, *values) for name, values in PRESETS.items())
         return 0
     try:
         if args.shape is not None and len(args.shape) != 3:
@@ -1264,15 +1423,15 @@ def main(argv=None):
                 raise ValueError(
                     "GPU tuning requires --output; existing files are never overwritten"
                 )
-            args.output = args.output.resolve()
-            args.csv = args.csv or args.output.with_suffix(".csv")
-            args.csv = args.csv.resolve()
-            if args.output == args.csv or args.output.exists() or args.csv.exists():
-                raise FileExistsError("Output/CSV must be distinct new paths")
-            if not args.output.parent.is_dir() or not args.csv.parent.is_dir():
+            if args.output.suffix.lower() != ".csv":
+                raise ValueError("Tuning results require a .csv output path")
+            if args.output.exists() or args.output.is_symlink():
+                raise FileExistsError("Output CSV must be a new path")
+            if not args.output.parent.is_dir():
                 raise FileNotFoundError(
-                    "Output/CSV parent directories must already exist"
+                    "Output CSV parent directory must already exist"
                 )
+            args.output = args.output.resolve()
             torch, pa, info = _load_gpu(args)
         candidates = args.budgets or list(DEFAULT_BUDGETS)
         if args.budget_cu is not None:
@@ -1295,14 +1454,9 @@ def main(argv=None):
         ]
     except (OSError, ValueError, TypeError, RuntimeError, ImportError) as exc:
         parser.error(str(exc))
-    if args.dry_run:
-        print(
-            json.dumps({"dry_run": True, "shapes": preview}, indent=2, allow_nan=False)
-        )
-        return 0
     data = {
         "schema_version": SCHEMA_VERSION,
-        "status": "RUNNING",
+        "status": "DRY_RUN" if args.dry_run else "RUNNING",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "device": info,
         "scope": "Synthetic attention shapes, not model inference; logical unique-KV bandwidth, not HBM traffic",
@@ -1320,6 +1474,21 @@ def main(argv=None):
         },
         "records": [],
     }
+    if args.dry_run:
+        data["dry_run"] = True
+        for record, shape in zip(preview, shapes):
+            record.update(
+                key_sha256=fingerprint(record["key"]),
+                status="NOT_RUN",
+                selection=None,
+                errors=[],
+                unique_kv_bytes=unique_kv_bytes(shape),
+            )
+            for candidate in record["candidates"]:
+                candidate["status"] = "NOT_RUN"
+            data["records"].append(record)
+        _write_results_csv(sys.stdout, data)
+        return 0
     save_results(args.output, data)
     try:
         for index, shape in enumerate(shapes, 1):
@@ -1350,7 +1519,6 @@ def main(argv=None):
             else "COMPLETE_WITH_FAILURES"
         )
         save_results(args.output, data, overwrite=True)
-        save_csv(args.csv, data)
     return 0 if data["status"] == "COMPLETE" else 1
 
 
