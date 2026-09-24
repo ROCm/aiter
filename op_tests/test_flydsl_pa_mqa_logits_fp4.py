@@ -14,6 +14,9 @@ import random
 import torch
 
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+    default_varctx_parallel_unit_num,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -131,23 +134,22 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .contiguous()
         .view(batch * t_blocks, k_tiles, 4, kv_block_size, 16)
     )
-    # KVS_NTPW: nt-bytes packed together for the kernel's packed dword load
-    # (4 ubyte → 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
-    # 0..KVS_NTPW-1 are adjacent so one thread dword-loads all 4 nts.
+    # Interleave four equally sized token groups so a warp's four scale bytes
+    # can be reconstructed from one dword per half-page.
     assert kv_block_size % KVS_NTPW == 0
-    kv_e8m0_perm = (
-        kv_e8m0.view(batch, t_blocks, kv_block_size, k_tiles, 4)
-        .permute(0, 1, 3, 4, 2)
-        .contiguous()
-        .view(batch * t_blocks, k_tiles, 4, kv_block_size)
-        # Interleave 4 nts per token group: split [kv_block_size] into
-        # (NTPW=4, T_per_nt), transpose to (T, NTPW) so 4 consecutive bytes
-        # per T cover nts 0..3 → 1 dword load.
-        .view(batch * t_blocks, k_tiles, 4, KVS_NTPW, kv_block_size // KVS_NTPW)
-        .transpose(-1, -2)
-        .contiguous()
-        .view(batch * t_blocks, k_tiles, 4, kv_block_size)
+    scale_group_size = kv_block_size // KVS_NTPW
+    kv_e8m0_perm = torch.empty(
+        batch * t_blocks,
+        k_tiles,
+        4,
+        kv_block_size,
+        dtype=torch.uint8,
+        device=dev,
     )
+    token = torch.arange(kv_block_size, device=dev)
+    sflat = (token % scale_group_size) * KVS_NTPW + token // scale_group_size
+    source = kv_e8m0.view(batch * t_blocks, kv_block_size, k_tiles, 4)
+    kv_e8m0_perm[:, :, :, sflat] = source.permute(0, 2, 3, 1)
 
     phys_flat = block_tables.reshape(-1).long()
     kv_cache = torch.zeros(
@@ -468,9 +470,8 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped
     # (their out stays -inf -> NaN cosine). For an explicit value grow the grid
-    # so every (batch, next_n) gets at least one slot; when None, let the
-    # scheduler auto-derive a cudagraph-safe grid (= batch*next_n*ceil(t_max/
-    # block_k)), which already satisfies both constraints.
+    # so every (batch, next_n) gets at least one slot; when None, use the tuned
+    # cudagraph-safe gfx950 grid, which already satisfies both constraints.
     if parallel_unit_num is not None:
         parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
     safe, cta_info, total_ctas = compute_varctx_schedule(
@@ -643,6 +644,27 @@ def _print_perf_summary():
     print()
 
 
+def test_default_varctx_parallel_unit_num():
+    expected = {
+        8192: (64, 96, 256, 256, 512, 512),
+        32768: (128, 256, 256, 512, 1024, 2048),
+        65536: (256, 512, 1024, 1280, 1536, 2048),
+        131072: (256, 512, 1280, 1280, 2048, 4096),
+    }
+    batches = (1, 2, 4, 8, 16, 64)
+    for context, targets in expected.items():
+        actual = tuple(
+            default_varctx_parallel_unit_num(batch, context) for batch in batches
+        )
+        assert actual == targets, f"{context=}: {actual=} != {targets=}"
+
+    # MTP rows share the same tuning buckets; the launch grid remains a
+    # multiple of next_n and can never drop a row.
+    for next_n in (2, 3, 5):
+        ctas = default_varctx_parallel_unit_num(3, 131072, next_n=next_n)
+        assert ctas >= 3 * next_n and ctas % next_n == 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MQA Logits (Q FP4, KV FP4) decode Test + Benchmark (gfx950)",
@@ -673,8 +695,7 @@ def main():
         "--parallel_unit_num",
         type=int,
         default=None,
-        help="target CTA count for host schedule "
-        "(default: auto = batch*next_n*ceil(max_seq_len/block_k))",
+        help="target CTA count for host schedule (default: tuned gfx950 auto grid)",
     )
     parser.add_argument(
         "--next_n",
@@ -695,6 +716,7 @@ def main():
         help=f"Per-head dim (multiple of 128). Default {DEFAULT_HEAD_DIM}.",
     )
     args = parser.parse_args()
+    test_default_varctx_parallel_unit_num()
 
     if get_arch() != "gfx950":
         print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
@@ -742,6 +764,21 @@ def main():
 
             traceback.print_exc()
             raise
+
+    if args.batch == 0 and args.ctx == 0:
+        test_pa_mqa_logits_fp4_qfp4_kvfp4(
+            batch=2,
+            max_ctx=512,
+            heads=64,
+            kv_block_size=128,
+            block_k=256,
+            num_iters=args.num_iters,
+            num_warmup=args.num_warmup,
+            num_warps=args.num_warps,
+            parallel_unit_num=args.parallel_unit_num,
+            head_dim=args.head_dim,
+            bench=False,
+        )
 
     if _PERF_SUMMARY:
         _print_perf_summary()
