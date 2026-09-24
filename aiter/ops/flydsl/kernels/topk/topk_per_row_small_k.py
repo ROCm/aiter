@@ -350,7 +350,7 @@ def build_topk_per_row_small_k_module(
                     live = col < row_len
                     value = loaded[j]
                     if const_expr(score_mode == "sigmoid_bias"):
-                        value = unbiased[j] + Float32(bias[col])
+                        value = unbiased[j] + Float32(bias[live.select(col, zero)])
                     if const_expr(forced_blocks):
                         value = (live & (col < init_blocks)).select(
                             Float32(_INIT_PIN), value
