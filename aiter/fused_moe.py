@@ -2981,6 +2981,24 @@ def get_2stage_cfgs(
         doweight_stage1=doweight_stage1,
         gate_mode=gate_mode,
     )
+    if activation == ActivationType.Relu2:
+        if use_g1u1:
+            raise NotImplementedError(
+                "ActivationType.Relu2 is gate-only (non-gated) and does not "
+                "support use_g1u1=True; pass use_g1u1=False."
+            )
+        if doweight_stage1:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile stage1 instances are generated "
+                "with MulRoutedWeight=False; doweight_stage1=True is not "
+                "supported and would silently drop routed weights."
+            )
+        if has_stage1_bias or has_stage2_bias:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile path does not support "
+                "per-expert bias (has_stage1_bias/has_stage2_bias); the "
+                "returned metadata hardcodes has_bias=False."
+            )
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
     # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
     # without a `gfx` column are backfilled from cu_num at load time via
@@ -3680,11 +3698,6 @@ def get_2stage_cfgs(
         and is_shuffled
         and cktile_mxfp4_ok
     )
-    if activation == ActivationType.Relu2 and use_g1u1:
-        raise NotImplementedError(
-            "ActivationType.Relu2 is gate-only (non-gated) and does not "
-            "support use_g1u1=True; pass use_g1u1=False."
-        )
     if (
         activation == ActivationType.Relu2
         and not use_g1u1
