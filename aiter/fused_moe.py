@@ -3497,7 +3497,7 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a == dtypes.bf16
         and dtype == dtypes.bf16
-        and is_shuffled
+        and bool(opus_weights_shuffled)
         and get_gfx() in ("gfx942", "gfx950")
     ):
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
