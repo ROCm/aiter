@@ -284,12 +284,11 @@ aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
   conv_3x3.py                            Conv2D direct/cblocked/NHWC 3x3 kernels
   conv_general.py                        General Conv2D kernel
   conv_3x3_winograd_f4x3.py              Conv2D Winograd transforms and GEMM
-  nchw_to_cblocked.py                    Fused NCHW-to-NCHWc layout kernel
+  ncx_to_cblocked.py                     Shared NCHW/NCDHW blocked-layout kernel
   conv3d_1x1x1.py                        Conv3D 1x1x1 kernel
   conv3d_3x3x3.py                        Conv3D cblocked/NDHWC 3x3x3 kernels
   conv3d_general.py                      General Conv3D kernel
   conv3d_winograd_hw_f4x3.py             Conv3D H/W Winograd transforms and GEMM
-  ncdhw_to_cblocked.py                   Fused NCDHW-to-NCDHWc pack
 
 aiter/ops/triton/configs/<arch>/triton/conv/
   <kernel>/DEFAULT.json                  Per-architecture launch parameters
