@@ -2159,6 +2159,10 @@ void relu2(const aiter_tensor_t& out,   // [..., d]
                 "relu2: out and input must be on the same device");
     AITER_CHECK(out.numel() == input.numel(),
                 "relu2: out and input must have the same number of elements");
+    if(input.numel() == 0)
+    {
+        return;
+    }
     LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(aiter::relu2_kernel);
 }
 
