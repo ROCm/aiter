@@ -84,6 +84,18 @@ static void pa_mqa_logits_mxfp4_check_shapes_mfma(aiter_tensor_t& q,
     AITER_CHECK(kv_block_size == Traits::PAGE_SIZE,
                 "compiled for kv_block_size=", (int)Traits::PAGE_SIZE, ", got ", kv_block_size);
 
+    // block_tables is indexed per KV TILE, not per page: the kernel reads pages_per_tile page ids
+    // at (chunk_start + tile_idx) * pages_per_tile, so a row must hold ceil(max_seq_len / KV_TILE)
+    // tiles' worth of pages. Its size(1) is otherwise taken as an unvalidated stride below; a
+    // caller sizing by ceil(max_seq_len / PAGE) reads up to pages_per_tile - 1 int32 past each row.
+    const int     pages_per_tile = Traits::KV_TILE_SIZE / Traits::PAGE_SIZE;
+    const int64_t bt_tiles       = (max_seq_len + Traits::KV_TILE_SIZE - 1) / Traits::KV_TILE_SIZE;
+    const int64_t bt_cols        = bt_tiles * pages_per_tile;
+    AITER_CHECK(block_tables.size(1) >= bt_cols,
+                "block_tables is sized in KV TILES of ", (int)Traits::KV_TILE_SIZE, " tokens (",
+                pages_per_tile, " pages each); max_seq_len=", max_seq_len, " needs ", bt_cols,
+                " columns, got ", block_tables.size(1));
+
     AITER_CHECK(q.dtype() == AITER_DTYPE_fp4x2 || q.dtype() == AITER_DTYPE_u8,
                 "q must be fp4x2 (E2M1, 2/byte) or u8 bytes");
     AITER_CHECK(kv_cache.dtype() == AITER_DTYPE_fp4x2 || kv_cache.dtype() == AITER_DTYPE_u8,
@@ -471,6 +483,12 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
                     "cu_tiles must be contiguous int32");
     AITER_CHECK(local_ends.dtype() == AITER_DTYPE_i32 && local_ends.is_contiguous(),
                 "local_ends must be contiguous int32");
+    // local_ends is per ROW and every tile reads its window from it (at the identity cut, tile t
+    // IS row t, so num_tiles is the row count). A short array -- e.g. an oversized total_q against
+    // a real-length local_ends -- is a device out-of-bounds read in emit_fast; raise here instead.
+    AITER_CHECK(static_cast<int64_t>(local_ends.numel()) >= num_tiles,
+                "local_ends is per row; every tile reads it, so need at least num_tiles=",
+                num_tiles, " entries, got ", local_ends.numel());
     AITER_CHECK(cta_info.dtype() == AITER_DTYPE_i32 && cta_info.is_contiguous(),
                 "cta_info must be contiguous int32");
     AITER_CHECK(num_tiles >= 0, "num_tiles must be >= 0, got ", num_tiles);
@@ -509,15 +527,19 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
     const int* p_ls = nullptr;
     if(local_starts.numel() > 0)
     {
-        AITER_CHECK(local_starts.dtype() == AITER_DTYPE_i32 && local_starts.is_contiguous(),
-                    "local_starts, when given, must be contiguous int32");
+        AITER_CHECK(local_starts.dtype() == AITER_DTYPE_i32 && local_starts.is_contiguous() &&
+                        static_cast<int64_t>(local_starts.numel()) >= num_tiles,
+                    "local_starts, when given, must be contiguous int32 with at least num_tiles=",
+                    num_tiles, " entries, got ", local_starts.numel());
         p_ls = reinterpret_cast<const int*>(local_starts.data_ptr());
     }
     const int* p_rb = nullptr;
     if(row_to_batch.numel() > 0)
     {
-        AITER_CHECK(row_to_batch.dtype() == AITER_DTYPE_i32 && row_to_batch.is_contiguous(),
-                    "row_to_batch, when given, must be contiguous int32");
+        AITER_CHECK(row_to_batch.dtype() == AITER_DTYPE_i32 && row_to_batch.is_contiguous() &&
+                        static_cast<int64_t>(row_to_batch.numel()) >= num_tiles,
+                    "row_to_batch, when given, must be contiguous int32 with at least num_tiles=",
+                    num_tiles, " entries, got ", row_to_batch.numel());
         p_rb = reinterpret_cast<const int*>(row_to_batch.data_ptr());
     }
 
