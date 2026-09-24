@@ -448,11 +448,24 @@ _BASE_CASES = [
         "causal": True,
         "desc": "odd long-context, causal",
     },
+    # 1024 WGs (4 waves at 1 WG/CU) each running a single KV tile, so the row is
+    # almost entirely per-WG prologue + epilogue. Pair it with sk=2048 at the same
+    # grid to separate the fixed cost from the steady state.
+    {
+        "layout": "bshd",
+        "B": 4,
+        "sq": 8192,
+        "sk": 128,
+        "Hq": 8,
+        "desc": "1024 WGs x 1 KV tile, per-WG fixed cost",
+    },
 ]
 
 # Replay every base shape at each supported (D_qk, D_v) pair, set explicitly on each.
 # New pairs are APPENDED so existing case ids never shift: with N = len(_BASE_CASES),
 # 128/128 = [0, N), 192/128 = [N, 2N), 256/128 = [2N, 3N), 64/64 = [3N, 4N).
+# A new _BASE_CASE is likewise appended, which keeps the 128/128 ids but shifts the
+# three blocks above it by one per case added.
 # 64/64 is the GPT-OSS-120b geometry (head_dim 64 for Q, K and V).
 _HDIM_PAIRS = ((128, 128), (192, 128), (256, 128), (64, 64))
 CASES = [
