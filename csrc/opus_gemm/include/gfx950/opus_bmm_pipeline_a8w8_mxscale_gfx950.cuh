@@ -203,7 +203,14 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // of GROUP_M m-tiles across all n-tiles before advancing, iterating m-tiles
     // fastest within the panel. This keeps each B[n_tile] (~1 MiB weights) hot in
     // L2 across the panel's GROUP_M reuses, recovering high-G / large-M throughput.
-    constexpr int GROUP_M = 16;
+    // Keep the traversal and entry-copy tuning local to BF16 MX32 kid9158.
+    // GROUP_M below is a workgroup traversal group, not the quantization group.
+    constexpr bool TUNE_MX32_PRELOAD =
+        PRELOAD_SFA_LDS && PRELOAD_SFB_LDS && !K1024_ONLY &&
+        T::BLOCK_SIZE == 512 && T::B_M == 256 && T::B_N == 256 && T::B_K == 128 &&
+        T::GROUP_M == 1 && T::GROUP_N == 32 && T::GROUP_K == 32 &&
+        std::is_same_v<D_C, bf16_t>;
+    constexpr int GROUP_M = TUNE_MX32_PRELOAD ? 32 : 16;
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
     const int tiles_per_group = GROUP_M * num_tiles_n;
@@ -686,7 +693,18 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     };
 
     if constexpr (PRELOAD_SFA_LDS) {
-        sfa_fill_window(0, opus::bool_constant<false>{});
+        if constexpr (TUNE_MX32_PRELOAD && SFA_ASYNC_REFILL_OK) {
+            // The initial 96-column panel is contiguous in LDS: three 16B
+            // passes bypass the temporary VGPRs and their dependent stores.
+            // sfa_async_fill waits for VM completion; the shared publication
+            // barrier below still orders both scale panels before their reads.
+            if (kargs.k == 4096 && (kargs.stride_sfa & 15) == 0)
+                sfa_async_fill(0, number<16>{});
+            else
+                sfa_fill_window(0, opus::bool_constant<false>{});
+        } else {
+            sfa_fill_window(0, opus::bool_constant<false>{});
+        }
     }
 
     // Land the B scale fetched above; its latency is already spent by now.
