@@ -81,7 +81,7 @@ class FusedTpMegaMoe:
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        self.ctrl = torch.zeros(CTRL_INTS + 16 + 256 * 1024, dtype=torch.int32, device=self.device)
         # Per-route GEMM2 rows (weighted, bf16); the comm waves reduce them.
         self.routes = torch.empty(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
@@ -106,7 +106,11 @@ class FusedTpMegaMoe:
         self._args: dict = {}
         # E4M3 route rows (the split path's FP8 stage-2 route-out numerics):
         # half the GEMM2 -> ReduceScatter traffic, split-level accuracy.
-        self.route_fp8 = os.environ.get("AITER_MEGAMOE_ROUTE_FP8", "0") == "1"
+        # AITER_MEGAMOE_ROUTE_FP8=0 keeps bf16 routes (~10x lower error).
+        self.route_fp8 = os.environ.get("AITER_MEGAMOE_ROUTE_FP8", "1") == "1"
+        # E4M3 ReduceScatter wire format: half the xGMI bytes, error vs torch
+        # ~0.038 (split path: 0.034-0.044); AITER_MEGAMOE_RS_FP8=0: bf16.
+        self.rs_fp8 = os.environ.get("AITER_MEGAMOE_RS_FP8", "1") == "1"
 
     # -- work schedule -----------------------------------------------------
     def _pieces(self, rem: int) -> int:
@@ -165,6 +169,7 @@ class FusedTpMegaMoe:
             situ_linear_beta=self.situ[1],
             npieces=self._npieces,
             route_fp8=self.route_fp8,
+            rs_fp8=self.rs_fp8,
             agr=self.agr,
             tp=self.tp,
         )

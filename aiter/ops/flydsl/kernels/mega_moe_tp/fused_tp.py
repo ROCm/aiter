@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os as _os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -69,10 +70,17 @@ FLAG_AGC = FLAG_AGM + MAX_TP * 32
 NCHA_MAX = 64
 NCTA_MAX = 256
 FLAG_INTS = FLAG_AGC + NCHA_MAX * MAX_TP * NCTA_MAX
-CTRL_CNT = 64  # ctrl ints: [0] epoch [1] ag_arrive [2] fin; counters at 64
+CTRL_CNT = (
+    64  # ctrl ints: [0] epoch [2] fin [32 + x] XCD x's L2 dropped; counters at 64
+)
+CTRL_XF = 32
+N_XCD = 8  # workgroups are dealt round-robin over the XCDs
 CTRL_LRDY = CTRL_CNT + 2 * NCK_MAX
 LRDY_STRIDE = 32  # polled flags live on their own 128 B lines
-CTRL_INTS = CTRL_LRDY + NCK_MAX * LRDY_STRIDE
+# ReduceScatter push slices are taken from a per-chunk counter; launches
+# alternate between two banks and a chunk's publisher zeroes the idle bank.
+CTRL_GRAB = CTRL_LRDY + NCK_MAX * LRDY_STRIDE
+CTRL_INTS = CTRL_GRAB + 2 * NCK_MAX * LRDY_STRIDE
 
 NW = 4  # compute waves
 NCOMM = 2  # comm wave + loader wave
@@ -195,6 +203,7 @@ def compile_fused_tp(
     situ_linear_beta: float = 1.0,
     npieces: int = 0,
     route_fp8: bool = False,
+    rs_fp8: bool = False,
     agr: int = 1,
     tp: int = MAX_TP,
 ):
@@ -218,15 +227,21 @@ def compile_fused_tp(
     # halves the GEMM2 -> ReduceScatter traffic. fp8 layout per region: all
     # rows' H data bytes, then all rows' H/32 scale bytes.
     FP8R = bool(route_fp8)
+    # ReduceScatter partial rows on the wire: bf16, or (rs_fp8) E4M3 with one
+    # E8M0 per 32 columns -- half the xGMI bytes, where large batches are
+    # bandwidth bound.
+    RSF8 = bool(rs_fp8)
     # Tokens per push batch. With more than two pieces per split expert the
     # partial-row offsets the push keeps live push it past 256 VGPRs (spills),
     # so it takes half the batch.
     TB = max(1, (RED_INFLIGHT // 2 if NPC > 2 else RED_INFLIGHT) // TOPK)
     ROW_B = H + H // 32 if FP8R else 2 * H
     name = (
+        "dev" + "".join(_os.environ.get(k, "0") for k in ("XP_NOCW", "XP_V1", "XP_V2", "XP_V3")) +
         f"mega_moe_tp_fused_h{H}_i{I}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
         + (f"_p{NPC}" if NPC > 1 else "")
         + ("_r8" if route_fp8 else "")
+        + ("_s8" if rs_fp8 else "")
         + f"_ag{agr}_tp{tp}"
     )
 
@@ -350,6 +365,12 @@ def compile_fused_tp(
 
     def g_ld_i32(addr):
         return i32(_llvm.LoadOp(T.i32, gptr(addr), alignment=4).res)
+
+    def _now():
+        return fx.Int64(_llvm.inline_asm(T.i64, [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True))
+
+    def _paddr(a, slot):
+        return fx.Int64(a["ctrl"]) + fx.Int64(CTRL_INTS * 4 + 64) + fx.Int64(i32(gpu.block_id("x"))) * fx.Int64(4096) + fx.Int64(i32(slot)) * fx.Int64(8)
 
     def fence(ordering, scope):
         _llvm.FenceOp(ordering, syncscope=scope)
@@ -834,8 +855,9 @@ def compile_fused_tp(
                         )
                     rocdl.sched_barrier(0)
                     cc = cidx % i32(NCH)
-                    if cidx < i32(NCH):
-                        ag_wait_chunk(L, lane, a, a["epoch"], cc, r0, rows)
+                    if const_expr(_os.environ.get("XP_NOCW", "0") != "1"):
+                        if cidx < i32(NCH):
+                            ag_wait_chunk(L, lane, a, a["epoch"], cc, r0, rows)
                     abase = L + i32(L_A) + b * i32(RG * ACB)
                     for j in range_constexpr(NA_ROWOPS):
                         dma16(abase + i32(j * 1024), rx, arow[j], cc * i32(ACB))
@@ -1118,9 +1140,49 @@ def compile_fused_tp(
                 gemm2(L, tid, a, expert, ks0, r0, rows, signal, 1, pidx)
 
     @traced
+    def _drop_stale(tid, a):
+        if tid < i32(64):
+            asm("buffer_inv sc0")
+        bid = i32(gpu.block_id("x"))
+        if (tid < i32(64)) & (bid < i32(N_XCD)):
+            fence(_llvm.AtomicOrdering.acquire, "one-as")
+            if tid == i32(0):
+                g_st_sys(
+                    fx.Int64(a["ctrl"]) + fx.Int64((CTRL_XF + bid) * 4), a["epoch"]
+                )
+
+    @traced
+    def _stale_dropped(tid, a):
+        """This XCD's L2 no longer holds the previous launch's arena lines."""
+        if tid == i32(0):
+            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            spin_sys_ge(
+                fx.Int64(a["ctrl"]) + fx.Int64((i32(CTRL_XF) + x) * i32(4)), a["epoch"]
+            )
+
+    @traced
+    def _pacc(a, tid, slot, dt):
+        if tid == i32(0):
+            _llvm.AtomicRMWOp(_llvm.AtomicBinOp.add, gptr(_paddr(a, slot)), _u(dt), _llvm.AtomicOrdering.monotonic, syncscope="agent")
+
+    @traced
+    def _pacc_lane(a, lane, slot, dt, on):
+        if (lane == i32(0)) & on:
+            _llvm.AtomicRMWOp(_llvm.AtomicBinOp.add, gptr(_paddr(a, slot)), _u(dt), _llvm.AtomicOrdering.monotonic, syncscope="agent")
+
+    @traced
+    def _pst_lane(a, lane, slot, t):
+        if lane == i32(0):
+            _llvm.StoreOp(_u(t), gptr(_paddr(a, slot)), alignment=8)
+
+    def pchunk(a, lane, cidx, k):
+        _pst_lane(a, lane, i32(16 + k) + cidx * i32(6), _now())
+
+    @traced
     def compute_units(L, tid, a):
         lane = tid % i32(64)
         ag_wait_meta(a, tid, a["epoch"])
+        _stale_dropped(tid, a)
         cbar(L, tid)
         bid = gpu.block_id("x")
         ub = g_ld_i32(fx.Int64(a["cta_units"]) + fx.Int64(bid) * fx.Int64(4))
@@ -1133,7 +1195,9 @@ def compile_fused_tp(
             expert = g_ld_i32(ubase)
             i0 = g_ld_i32(ubase + fx.Int64(4))
             icnt = g_ld_i32(ubase + fx.Int64(8))
+            tg = _now()
             R = gather_routes(L, tid, a["ids"], a["tw"], a["ttot"], expert)
+            _pacc(a, tid, 9, _now() - tg)
             if tid == i32(0):
                 lds_st(L, L_CTL + C_UROWS * 4, R)
                 lds_st_rel(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
@@ -1162,11 +1226,28 @@ def compile_fused_tp(
             + fx.Int64((i32(FLAG_RDY) + cidx * i32(MAX_TP) + rank_p) * i32(4))
         )
 
+    def grab_slot(a, epoch, cidx, bank_off):
+        bank = (epoch + i32(bank_off)) & i32(1)
+        return fx.Int64(a["ctrl"]) + fx.Int64(
+            (i32(CTRL_GRAB) + (bank * i32(NCK_MAX) + cidx) * i32(LRDY_STRIDE)) * i32(4)
+        )
+
     @traced
-    def push_chunk(tid, a, epoch, cidx):
+    def grab(lane, addr):
+        # every lane issues the atomic (only lane 0 adds): a lane-0 branch
+        # here miscompiles inside push_chunk's dynamic while loop
+        return uni(g_add_agent(addr, (lane == i32(0)).select(i32(1), i32(0))))
+
+    @traced
+    def push_chunk(L, tid, a, epoch, cidx):
+        """Push units of the chunk's token rows (unit u: tokens u, u + ns, ...)
+        until none is left: CTAs whose waves are free take more, so slow CTAs
+        do not hold the chunk."""
         lane = tid % i32(64)
-        nblk = gpu.grid_dim.x
         ttot = a["ttot"]
+        nblk = gpu.grid_dim.x
+        ns = fx.min(i32(2) * i32(nblk), (ttot + i32(TB - 1)) // i32(TB))
+        gslot = grab_slot(a, epoch, cidx, 0)
         c0 = cidx * i32(CW)
         routes_bytes = route_region_bytes(ttot)
         r_routes = rsrc(a["routes"], routes_bytes)
@@ -1174,78 +1255,95 @@ def compile_fused_tp(
         pr_bytes = i32(NPC - 1) * routes_bytes
         r_pr = rsrc(a["proutes"], pr_bytes)
         ids_base = peer_sel(a, a["rank"]) + fx.Int64(a["off_ids"])
-        for t0_ in range(i32(gpu.block_id("x")), ttot, i32(nblk) * i32(TB)):
-            t0 = i32(t0_)
-            d = []
-            for b in range_constexpr(TB):
-                t = fx.min(t0 + i32(b) * i32(nblk), ttot - i32(1))
-                row = []
-                for k in range_constexpr(TOPK):
-                    kv = []
-                    for j in range_constexpr(VPL):
-                        v = fx.min(lane + i32(j * 64), i32(CW // 8 - 1))
-                        kv.append(
-                            route_load(
-                                r_routes,
-                                i32(0),
-                                ttot,
-                                t * i32(TOPK) + i32(k),
-                                c0 + v * i32(8),
-                            )
-                        )
-                    row.append(kv)
-                d.append(row)
-            for b in range_constexpr(TB):
-                t_raw = t0 + i32(b) * i32(nblk)
-                t = fx.min(t_raw, ttot - i32(1))
-                owner = t // a["m"]
-                orow = t - owner * a["m"]
-                dst = (
-                    peer_sel(a, owner)
-                    + fx.Int64(a["off_part"])
-                    + fx.Int64(((a["rank"] * a["mmax"] + orow) * i32(H) + c0) * i32(2))
-                )
-                r_dst = rsrc(dst)
-                for j in range_constexpr(VPL):
-                    v = lane + i32(j * 64)
-                    acc = [fx.Float32(0.0)] * 8
+        on = cidx < i32(4)
+        tq = _now()
+        u = grab(lane, gslot)
+        tq2 = _now()
+        _pacc_lane(a, lane, 100, tq2 - tq, on)
+        n = i32(0)
+        while u < ns:
+            for t0_ in range(u, ttot, ns * i32(TB)):
+                t0 = i32(t0_)
+                d = []
+                for b in range_constexpr(TB):
+                    t = fx.min(t0 + i32(b) * ns, ttot - i32(1))
+                    row = []
                     for k in range_constexpr(TOPK):
-                        vals = route_decode(d[b][k][j])
-                        acc = [x + y for x, y in zip(acc, vals)]
-                    live = (t_raw < ttot) & (v < i32(CW // 8))
-                    if const_expr(NPC > 1):
-                        # routes to a split expert also carry pieces 1.. partials
-                        eids = [
-                            g_ld_i32(
-                                ids_base + fx.Int64((t * i32(TOPK) + i32(k)) * i32(4))
+                        kv = []
+                        for j in range_constexpr(VPL):
+                            v = fx.min(lane + i32(j * 64), i32(CW // 8 - 1))
+                            kv.append(
+                                route_load(
+                                    r_routes,
+                                    i32(0),
+                                    ttot,
+                                    t * i32(TOPK) + i32(k),
+                                    c0 + v * i32(8),
+                                )
                             )
-                            for k in range(TOPK)
-                        ]
-                        hit = eids[0] >= a["piece_e0"]
-                        for k in range_constexpr(1, TOPK):
-                            hit = hit | (eids[k] >= a["piece_e0"])
-                        _push_split_token(
-                            a,
-                            r_dst,
-                            r_pr,
-                            v,
-                            acc,
-                            live,
-                            hit,
-                            eids,
-                            t,
-                            c0,
-                            routes_bytes,
-                            pr_bytes,
-                        )
-                    else:
-                        _push_store(r_dst, v, pack_bf16x8(acc), live)
+                        row.append(kv)
+                    d.append(row)
+                for b in range_constexpr(TB):
+                    t_raw = t0 + i32(b) * ns
+                    t = fx.min(t_raw, ttot - i32(1))
+                    owner = t // a["m"]
+                    orow = t - owner * a["m"]
+                    r_dst = rsrc(peer_sel(a, owner) + fx.Int64(a["off_part"]))
+                    pd = (a["rank"] * a["mmax"] + orow, c0)
+                    for j in range_constexpr(VPL):
+                        v = lane + i32(j * 64)
+                        acc = [fx.Float32(0.0)] * 8
+                        for k in range_constexpr(TOPK):
+                            vals = route_decode(d[b][k][j])
+                            acc = [x + y for x, y in zip(acc, vals)]
+                        live = (t_raw < ttot) & (v < i32(CW // 8))
+                        if const_expr(NPC > 1):
+                            # routes to a split expert also carry pieces 1.. partials
+                            eids = [
+                                g_ld_i32(
+                                    ids_base
+                                    + fx.Int64((t * i32(TOPK) + i32(k)) * i32(4))
+                                )
+                                for k in range(TOPK)
+                            ]
+                            hit = eids[0] >= a["piece_e0"]
+                            for k in range_constexpr(1, TOPK):
+                                hit = hit | (eids[k] >= a["piece_e0"])
+                            _push_split_token(
+                                a,
+                                r_dst,
+                                pd,
+                                r_pr,
+                                v,
+                                acc,
+                                live,
+                                hit,
+                                eids,
+                                t,
+                                c0,
+                                routes_bytes,
+                                pr_bytes,
+                            )
+                        else:
+                            _push_store(a, r_dst, pd, v, acc, live)
+            n = n + i32(1)
+            tq3 = _now()
+            _pacc_lane(a, lane, 101, tq3 - tq2, on)
+            u = grab(lane, gslot)
+            tq2 = _now()
+            _pacc_lane(a, lane, 100, tq2 - tq3, on)
+        tq4 = _now()
         wait_vm(0)
-        _push_done(a, lane, epoch, cidx, nblk)
+        tq5 = _now()
+        _pacc_lane(a, lane, 102, tq5 - tq4, on)
+        _push_done(a, lane, epoch, cidx, ns, n)
+        _pacc_lane(a, lane, 103, _now() - tq5, on)
+        _pacc_lane(a, lane, 104, fx.Int64(n), on)
+        _pacc_lane(a, lane, 105, fx.Int64(1), on)
 
     @traced
     def _push_split_token(
-        a, r_dst, r_pr, v, acc, live, hit, eids, t, c0, rbytes, prbytes
+        a, r_dst, pd, r_pr, v, acc, live, hit, eids, t, c0, rbytes, prbytes
     ):
         """Push one token's row, adding split pieces' partials only when the
         token routes to a split expert (uniform per token, and rare)."""
@@ -1265,24 +1363,57 @@ def compile_fused_tp(
                     )
                     vals = route_decode(ld)
                     tot = [x + y for x, y in zip(tot, vals)]
-            _push_store(r_dst, v, pack_bf16x8(tot), live)
+            _push_store(a, r_dst, pd, v, tot, live)
         else:
-            _push_store(r_dst, v, pack_bf16x8(acc), live)
+            _push_store(a, r_dst, pd, v, acc, live)
+
+    def part_offs(a, prow, col):
+        """Byte offsets of columns [col, col+8) of partial row prow in the
+        receive area: E4M3 rows, then one E8M0 per 32 columns (RSF8), or bf16."""
+        if RSF8:
+            soff = a["tp"] * a["mmax"] * i32(H) + prow * i32(H // 32) + col // i32(32)
+            return prow * i32(H) + col, soff
+        return (prow * i32(H) + col) * i32(2), None
 
     @traced
-    def _push_store(r_dst, v, o, ok):
-        if ok:
-            bst(o, r_dst, v * i32(16), 0, AUX_SYS)
+    def _push_store(a, r_dst, pd, v, acc, ok):
+        doff, soff = part_offs(a, pd[0], pd[1] + v * i32(8))
+        if const_expr(RSF8):
+            # a 32-column MX block spans 4 adjacent lanes
+            am = _fabs_f32(acc[0])
+            for j in range_constexpr(1, 8):
+                am = am.maximumf(_fabs_f32(acc[j]))
+            am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
+            am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
+            e8, qs = _e8m0_from_amax(am, max_norm=448.0)
+            o = fx.Vector.from_elements(
+                [fp8x4_pack(acc[0:4], qs), fp8x4_pack(acc[4:8], qs)], fx.Int32
+            )
+            # four blocks' scales in one dword, from the first lane of 16
+            e = (fx.Int32(e8) & i32(0xFF)).bitcast(fx.Float32)
+            sc = fx.Int32(e8) & i32(0xFF)
+            for k in range_constexpr(1, 4):
+                sc = sc | (
+                    e.shuffle_xor(i32(4 * k), i32(64)).bitcast(fx.Int32) << i32(8 * k)
+                )
+            if ok:
+                bst(o, r_dst, doff, 0, AUX_SYS)
+                if (v & i32(15)) == i32(0):
+                    bst(sc, r_dst, soff, 0, AUX_SYS)
+        else:
+            if ok:
+                bst(pack_bf16x8(acc), r_dst, doff, 0, AUX_SYS)
 
     @traced
-    def _push_done(a, lane, epoch, cidx, nblk):
-        if lane == i32(0):
+    def _push_done(a, lane, epoch, cidx, ns, n):
+        if (lane == i32(0)) & (n > i32(0)):
             cnt_addr = fx.Int64(a["ctrl"]) + fx.Int64(
                 (i32(CTRL_CNT + NCK_MAX) + cidx) * i32(4)
             )
-            old = g_add_agent(cnt_addr, 1)
-            if old == i32(nblk) - i32(1):
+            old = g_add_agent(cnt_addr, n)
+            if old + n == ns:
                 g_st_sys(cnt_addr, i32(0))
+                g_st_sys(grab_slot(a, epoch, cidx, 1), i32(0))
                 for p in range_constexpr(MAX_TP):
                     if i32(p) < a["tp"]:
                         g_st_sys(
@@ -1304,16 +1435,16 @@ def compile_fused_tp(
                 acc = [fx.Float32(0.0)] * 8
                 for p in range_constexpr(MAX_TP):
                     pc = fx.min(i32(p), a["tp"] - i32(1))
-                    vals = bf16x8_to_f32(
-                        bld(
-                            r_recv,
-                            ((pc * a["mmax"] + row) * i32(H) + c0 + vc * i32(8))
-                            * i32(2),
-                            0,
-                            V4I,
-                            AUX_SYS,
+                    doff, soff = part_offs(a, pc * a["mmax"] + row, c0 + vc * i32(8))
+                    if const_expr(RSF8):
+                        vals = route_decode(
+                            (
+                                bld(r_recv, doff, 0, V2I, AUX_SYS),
+                                bld(r_recv, soff, 0, T.i8, AUX_SYS),
+                            )
                         )
-                    )
+                    else:
+                        vals = bf16x8_to_f32(bld(r_recv, doff, 0, V4I, AUX_SYS))
                     live = i32(p) < a["tp"]
                     acc = [
                         x + live.select(y, fx.Float32(0.0)) for x, y in zip(acc, vals)
@@ -1363,10 +1494,14 @@ def compile_fused_tp(
         w = tid // i32(64)
         cr = claim(L, lane, w, C_LRED, 0, a, epoch)
         if cr >= i32(0):
-            push_chunk(tid, a, epoch, cr)
+            pchunk(a, lane, cr, 2)
+            push_chunk(L, tid, a, epoch, cr)
+            pchunk(a, lane, cr, 3)
         cp = claim(L, lane, w, C_PULL, 1, a, epoch)
         if cp >= i32(0):
+            pchunk(a, lane, cp, 4)
             final_chunk(tid, a, cp)
+            pchunk(a, lane, cp, 5)
         return ((cr >= i32(0)) | (cp >= i32(0))).select(i32(1), i32(0))
 
     @traced
@@ -1393,6 +1528,7 @@ def compile_fused_tp(
     @traced
     def _signal_one(a, lane, epoch, nblk, cidx):
         cnt_addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(CTRL_CNT) + cidx) * i32(4))
+        pchunk(a, lane, cidx, 0)
         old = g_add_agent(cnt_addr, 1)
         if old == i32(nblk) - i32(1):
             g_st_sys(cnt_addr, i32(0))
@@ -1741,6 +1877,8 @@ def compile_fused_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
+            if tid == i32(0):
+                _llvm.StoreOp(_u(_now()), gptr(_paddr(a, 3)), alignment=8)
             comm_help(L, tid, a, epoch)
         else:
             if tid < i32(NT + 64):
@@ -1827,14 +1965,18 @@ def compile_fused_tp(
             "piece_e0": piece_e0,
             "ttot": tp * m,
         }
+        if tid == i32(0):
+            _llvm.StoreOp(_u(_now()), gptr(_paddr(a, 0)), alignment=8)
         init_lds(L, tid, a)
         gpu.barrier()
         epoch = lds_ld_i32(L, L_CTL + C_EPOCH * 4)
         a["epoch"] = epoch
-        # Drop stale cached copies of the arena (previous launch) once per CTA:
-        # every later arena read happens only after its data's flag is up.
-        if tid < i32(64):
-            fence(_llvm.AtomicOrdering.acquire, "one-as")
+        # Drop stale cached copies of the arena (previous launch). Every later
+        # arena read happens only after its data's flag is up, so doing it at
+        # the start suffices. Each CU drops its own L1; each XCD's L2 is dropped
+        # once, by its first workgroup -- 256 L2 invalidations back to back
+        # stall every XCD's memory traffic for ~20 us.
+        _drop_stale(tid, a)
         if (tid >= i32(NT)) & (tid < i32(NT + 64)):
             _ag_send_meta(tid % i32(64), a)
         ag_quant(L, tid, a)
@@ -1850,6 +1992,8 @@ def compile_fused_tp(
         roles(L, tid, a, epoch)
         gpu.barrier()
         finish(tid, a, epoch)
+        if tid == i32(0):
+            _llvm.StoreOp(_u(_now()), gptr(_paddr(a, 5)), alignment=8)
 
     @flyc.jit
     def launch(
