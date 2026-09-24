@@ -268,8 +268,28 @@ def build_qsa_k2_family_a_module(
             byte_offset = base_bytes + group * Int32(2048) + quarter * Int32(8192)
             return _idiv(byte_offset, Int32(2))
 
+        def amd_decode_k_elem(n_tok, d0):
+            # Live AMD decode K (BN16 / 256 threads / 8 KiB): two 128-bit
+            # stores per thread. Physical bytes are
+            # ``(tid*16) ^ ((tid & 0xe0)>>1)`` and that value ``^ 0x80 + 4096``.
+            # Gather maps token ``tid%16`` and D-chunks ``tid//16`` / ``+16``.
+            d_chunk = _idiv(d0, Int32(8))
+            store_tid = (d_chunk % Int32(16)) * Int32(16) + n_tok
+            base_bytes = store_tid * Int32(16)
+            base_bytes = base_bytes ^ _idiv(store_tid & Int32(0xE0), Int32(2))
+            hi = d_chunk >= Int32(16)
+            byte_offset = hi.select(
+                (base_bytes ^ Int32(0x80)) + Int32(4096), base_bytes
+            )
+            return _idiv(byte_offset, Int32(2))
+
         def load_amd_k8(n_tok, d0):
-            src = fx.make_view(k_arr.ptr + amd_k_elem(n_tok, d0), fx.make_layout(8, 1))
+            off = (
+                amd_decode_k_elem(n_tok, d0)
+                if const_expr(decode_tr_pv)
+                else amd_k_elem(n_tok, d0)
+            )
+            src = fx.make_view(k_arr.ptr + off, fx.make_layout(8, 1))
             frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
             fx.copy_atom_call(lds_copy, src, frag)
             return fx.Vector(fx.memref_load_vec(frag))
@@ -364,7 +384,19 @@ def build_qsa_k2_family_a_module(
                     fx.Vector(fx.memref_load_vec(k_frags[gr])),
                     fx.Vector.filled(vec, 0.0, BFloat16),
                 )
-                if const_expr(use_k32) and const_expr(not decode_tr_pv):
+                if const_expr(decode_tr_pv):
+                    base_bytes = tid * Int32(16)
+                    base_bytes = base_bytes ^ _idiv(tid & Int32(0xE0), Int32(2))
+                    if const_expr(gr != 0):
+                        base_bytes = (base_bytes ^ Int32(0x80)) + Int32(4096)
+                    k_dst = fx.make_view(
+                        k_arr.ptr + _idiv(base_bytes, Int32(2)),
+                        fx.make_layout(8, 1),
+                    )
+                    k_store_frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
+                    fx.memref_store_vec(k_vec, k_store_frag)
+                    fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                elif const_expr(use_k32):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     k_dst = fx.make_view(
                         k_arr.ptr + amd_k_elem(col, d_chunk * Int32(8)),
@@ -407,7 +439,7 @@ def build_qsa_k2_family_a_module(
             for ng in range_constexpr(n_subtiles):
                 n0 = Int32(ng * 16)
                 acc4 = fx.Vector.filled(4, 0.0, Float32)
-                if const_expr(use_k32) and const_expr(not decode_tr_pv):
+                if const_expr(use_k32):
                     n_tok = n0 + lane_m
                     a_vec = load_amd_k8(n_tok, lane_kg * Int32(8))
                     for ks in range_constexpr(qk_steps):
