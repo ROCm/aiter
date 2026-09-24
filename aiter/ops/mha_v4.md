@@ -12,7 +12,8 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Grouped-query ratios `1, 2, 4, 8, 16`.
 - Per-batch key lengths via `seqlens_k`, on the dense GFX950 `BF16 Q/K` rows only. Every other
   recipe, architecture, and the sorted-sparse path reject it.
-- Log-sum-exp via `return_lse`, on the dense rows; sorted sparse rejects it.
+- Log-sum-exp via `return_lse`, on the dense GFX950 rows. Sorted sparse rejects it, and so does
+  GFX942 until its exported value is measured.
 - No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
 Supported recipes. Every recipe is available in both dense and sorted-sparse mode with the same

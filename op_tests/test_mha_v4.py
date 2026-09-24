@@ -14,6 +14,7 @@ import torch
 import torch._dynamo
 
 import aiter
+import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
@@ -1095,6 +1096,22 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     error = (lse - reference).abs()
     assert error.max().item() < 0.25, error.max().item()
     assert error.mean().item() < 0.05, error.mean().item()
+
+
+def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
+    """gfx942 carries the epilogue, but its exported value has never been measured.
+
+    A wrong LSE passes every output test, because O never reads it, so presence of the store is
+    not evidence of correctness. Drop the gate once MI300 is compared against torch.logsumexp.
+    """
+    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx942")
+    q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
+
+    with pytest.raises(NotImplementedError, match="not validated on gfx942"):
+        mha_v4(q, q, q, *formats, return_lse=True)
+
+    assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
 
 
 @pytest.mark.parametrize(

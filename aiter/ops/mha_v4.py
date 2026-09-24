@@ -783,6 +783,22 @@ _LSE_CAPABLE_QV = frozenset(
     }
 )
 
+
+def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
+    """Reject LSE where the exported value has not been measured."""
+    arch = get_gfx()
+    if arch != "gfx950":
+        # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
+        # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
+        # passing every output test says nothing about it. Lift this once MI300 is measured.
+        raise NotImplementedError(f"MHA v4 LSE is not validated on {arch} yet")
+    if (q_format, v_format) not in _LSE_CAPABLE_QV:
+        raise NotImplementedError(
+            f"MHA v4 LSE is not implemented for Q={q_format.name} "
+            f"V={v_format.name} yet"
+        )
+
+
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
 # carries the load, but only these objects were rebuilt with it; the rest would silently attend
 # over the full padded key length, so they are rejected rather than left to return a wrong answer.
@@ -844,11 +860,7 @@ def mha_v4_packed(
             raise NotImplementedError(
                 "MHA v4 does not produce LSE on the sorted-sparse path yet"
             )
-        if (q_format, v_format) not in _LSE_CAPABLE_QV:
-            raise NotImplementedError(
-                f"MHA v4 LSE is not implemented for Q={q_format.name} "
-                f"V={v_format.name} yet"
-            )
+        _check_lse_capable(q_format, v_format)
     _validate_pack_contract(v_format, v_pack)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
@@ -1232,11 +1244,7 @@ def mha_v4(
             raise NotImplementedError(
                 "MHA v4 does not produce LSE on the sorted-sparse path yet"
             )
-        if (q_format, v_format) not in _LSE_CAPABLE_QV:
-            raise NotImplementedError(
-                f"MHA v4 LSE is not implemented for Q={q_format.name} "
-                f"V={v_format.name} yet"
-            )
+        _check_lse_capable(q_format, v_format)
     # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
     # own launchers, which never forward seqlens_k.
     if seqlens_k is not None:
