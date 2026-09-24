@@ -1101,11 +1101,6 @@ def flydsl_gdn_decode_varlen(
     suppressed final write-back (EAGLE target-verify commits the accepted prefix
     itself).
 
-    q/k/v and the state pool are bf16; ``a``/``b``/``A_log``/``dt_bias`` may be
-    bf16 or fp32. ``head_k_dim`` must be 128. Every sequence must have the same
-    length -- speculative decode always does, and the token loop is unrolled on
-    it. Raises on anything unsupported rather than silently degrading.
-
     Returns ``out`` shaped ``[1, T, num_v_heads, head_v_dim]``.
     """
     B, T, Hg, K = k.shape
@@ -1116,13 +1111,7 @@ def flydsl_gdn_decode_varlen(
         raise ValueError(f"head_k_dim must be 128, got {K}")
     if HV % Hg:
         raise ValueError(f"num_v_heads {HV} must be a multiple of num_k_heads {Hg}")
-    # The kernel addresses these as ``tok * <x>_token_stride + head * D + d``,
-    # so it needs head-major contiguity *within* a token but the token stride is
-    # a free parameter. Requiring full contiguity here would reject the layout a
-    # fused QKV projection actually produces: a server that splits one
-    # ``[1, T, (Hg + Hg + HV) * D]`` buffer hands over three views whose token
-    # stride is the fused width (Qwen3.8-Flash-Next: 10240 = (16+16+48)*128),
-    # not the per-tensor width. Those views are exactly what the kernel handles.
+
     for name, t_, dim in (("q", q, K), ("k", k, K), ("v", v, V)):
         if t_.dtype != torch.bfloat16:
             raise ValueError(f"{name} must be bf16, got {t_.dtype}")
@@ -1141,10 +1130,6 @@ def flydsl_gdn_decode_varlen(
     if state.stride()[1:] != (V * K, K, 1):
         raise ValueError("state pool inner dims must be contiguous [HV, V, K]")
 
-    # Host-side arithmetic only: this runs inside CUDA-graph capture, where a
-    # device->host sync (.item()/.tolist()) raises
-    # hipErrorStreamCaptureUnsupported. T // n is how the caller derives the
-    # draft-token count in the first place.
     n = cu_seqlens.numel() - 1
     if n <= 0 or T % n:
         raise ValueError(f"ragged batch: T={T} is not divisible by n={n}")
