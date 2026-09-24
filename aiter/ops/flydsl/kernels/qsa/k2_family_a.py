@@ -216,7 +216,7 @@ def build_qsa_k2_family_a_module(
         )
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
         fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
-        q_buf = fx.rocdl.make_buffer_tensor(q)
+        q_buf = fx.rocdl.make_buffer_tensor(q, max_size=False)
         k_buf = fx.rocdl.make_buffer_tensor(k_cache)
         v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
