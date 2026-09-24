@@ -119,7 +119,9 @@ GQA in: BF16 `q` `[M, 24, 256]`, paged `k`/`v` `[..., 2, 256]`, `indices`, softm
 
 GQA out: BF16 `o` `[M, 24, 256]` (pre-`o_proj`).
 
-`M` is flattened tokens. Decode `1..8` and prefill 512 / 2048 / 8192 plus at least one long-context length (32k or 128k) so indexer scaling is visible. gfx942 and gfx950.
+`M` is flattened tokens. Decode `1..8` and prefill 512 / 2048 / 8192 **tokens** — prefill moves `M` and `L` together — plus at least one long-context length (32k or 128k) so indexer scaling is visible. gfx942 and gfx950.
+
+The harness sweeps `M` and `L` as independent axes and takes the cross-product, so it also emits decode rows at short `L`, which nothing above asks for. **K2's bar is the budget-saturated points: decode `M∈{1,8}` at `L=32768`, prefill `M=512` at `L=8192`.** Below `L=2048` the 2051-wide selection is mostly `-1` padding — a quarter live at `L=512` decode, an eighth at `M=512` prefill — so the kernel spends most of its tiles on masked columns that all clamp to page 0 and stay cached. Those rows measure the masked path, not the gather, and they disagree with the saturated verdict: ±5% at decode, and inverted at prefill (K2/AMD is 0.82× at `L=512` but 1.42× at `L=8192`). Keep them as fast smoke rows; the bench reports `valid%` so the dilution is visible in the table. `M=512 L=512` is a genuine 512-token prefill and is on the list above on its own merits.
 
 ## Correctness
 

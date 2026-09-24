@@ -23,6 +23,12 @@ and do-not-retry live there). Prefill overlay campaign:
 available; prefer split vs split when rocprof is run). Retained
 mixed-gate medians after st64-imm prefill (2026-09-23): FlyDSL decode
 **20.02 / 19.99** µs vs AMD **9.93 / 13.30** µs (~2.02× / ~1.50×).
+
+> **Bar re-pointed (2026-09-24).** `L=512` is ~25% live selection at
+> decode and ~12.5% at `M=512` prefill; it measures the masked path
+> more than the gather. Current bar is decode `M∈{1,8}` at `L=32768`
+> and prefill `M=512` at `L=8192`; see `SILOTIGER-1047.md`. Numbers
+> below are left as recorded.
 Prefill FlyDSL **159.41** µs vs AMD **202.80 / 211.55** µs is already
 ahead and is **not** this campaign’s bar.
 

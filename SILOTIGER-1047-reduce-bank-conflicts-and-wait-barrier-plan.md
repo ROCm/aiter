@@ -10,6 +10,13 @@ campaign.
 Parent: [SILOTIGER-1040](https://amd.atlassian.net/browse/SILOTIGER-1040).
 Ticket: [SILOTIGER-1047](https://amd.atlassian.net/browse/SILOTIGER-1047).
 
+> **Bar re-pointed (2026-09-24).** This closed campaign ran at `L=512`
+> only. `L=512` is ~25% live selection at decode and ~12.5% at `M=512`
+> prefill, so it measures the masked path more than the gather.
+> Current bar is decode `M∈{1,8}` at `L=32768` and prefill `M=512` at
+> `L=8192`; see `SILOTIGER-1047.md`. Numbers below are left as
+> recorded.
+
 **Bar:** width-2051 `L=512` family A GQA on GPU 6 / gfx950 vs live
 `qsa_sparse_paged_attention`. Headline is split-kernel wall clock
 (`M=1` / `M=8` / `M=512`). Kernel-trace baseline (45 launches):

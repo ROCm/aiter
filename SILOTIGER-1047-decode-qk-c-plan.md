@@ -28,6 +28,17 @@ and `M=8` (kernel-trace, interleaved, same process). Wrapper is
 recorded; at `M=1` it is currently merge-dominated and is **not** the
 split keep signal.
 
+> **Bar re-pointed (2026-09-24).** This campaign ran entirely at
+> `L=512`, as did every other 1047 campaign — 47 recorded experiments,
+> one non-`L=512` line in the whole plan file and it is about K1. At
+> `L=512` only ~25% of the 2051 selection slots are live at decode and
+> ~12.5% at `M=512` prefill, so the kernel spends most tiles on masked
+> columns that clamp to page 0 and stay cached. The bar is now decode
+> `M∈{1,8}` at `L=32768` and prefill `M=512` at `L=8192`; see
+> `SILOTIGER-1047.md`. Numbers below are left exactly as recorded. The
+> split ratio turns out to travel well (see the re-pointed table in
+> §4), so this campaign's split conclusions stand.
+
 Same-session five-dispatch kernel trace, 2026-09-24, GPU 6, `CACHE=0`
 (`tickets/1047/tmp/k2_decode_final/ktrace_same_session/`):
 
@@ -713,6 +724,33 @@ Full `op_tests/test_flydsl_qsa.py`: **18 passed**.
 So the `ns64` merge "Done when" bar is met, and the phase-4 DNR should
 be read narrowly: do not retry the **vectorized `BLOCK_SPLITS`
 gather**. It does not cover making the split scan constexpr.
+
+**Re-pointed bar, measured (2026-09-24).** One kernel trace per shape
+— at a fixed `M` every `L` shares the same grid, so a multi-`L` replay
+cannot be split back apart by grid and any table built that way mixes
+context lengths. Twelve interleaved rounds, median of the last twelve
+dispatches, GPU 6, FlyDSL without the `f9fa2cbb` C-pin:
+
+| shape | FlyDSL split | AMD split | split | FlyDSL merge | AMD merge | merge |
+|:--|--:|--:|--:|--:|--:|--:|
+| `M=1` `L=512` (smoke) | 8.10 | 6.32 | 1.28× | 3.64 | 3.54 | 1.03× |
+| `M=8` `L=512` (smoke) | 14.24 | 11.30 | 1.26× | 3.74 | 3.76 | 0.99× |
+| **`M=1` `L=32768`** | **7.94** | **6.56** | **1.21×** | 3.72 | 3.56 | 1.04× |
+| **`M=8` `L=32768`** | **16.46** | **13.18** | **1.25×** | 3.62 | 3.02 | 1.20× |
+| `M=512` `L=512` (smoke) | 167.30 | 211.54 | 0.79× | — | — | — |
+| **`M=512` `L=8192`** | **342.48** | **251.28** | **1.36×** | — | — | — |
+
+Two readings. The **split** ratio travels: 1.28×/1.26× at `L=512`
+versus 1.21×/1.25× at `L=32768`, so the split conclusions of this
+campaign and the two before it are not invalidated by the bad shape
+choice. **Prefill inverts**: 0.79× at `L=512` is a 21% win and 1.36×
+at `L=8192` is a 36% loss, on the same kernel. Prefill at `L≥2048` is
+now the largest deficit anywhere in the sweep and has never had a bar.
+
+Merge is at **parity**, not ahead: 1.03× / 0.99× / 1.04×, and 1.20× at
+`M=8` `L=32768`. The `range_constexpr` fix moved it from ~3.5× behind
+to level, which is the win; it did not overtake AMD. `M=512` runs
+`n_splits == 1` and launches no merge.
 
 ### 5. Stop: decode split ≤ Live AMD at M=1 and M=8
 

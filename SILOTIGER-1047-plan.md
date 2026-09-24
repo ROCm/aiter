@@ -109,8 +109,19 @@ them.
   `num_stages=1` on the vLLM AMD path). Do not union decode GEMV and prefill
   MFMA in one instantiation if that costs occupancy.
 - **Shapes in the harness.** `M` is flattened tokens. Decode `1..8` and prefill
-  512 / 2048 / 8192 plus at least one long-context length (**32k or 128k**) so
-  indexer scaling is visible. Both archs.
+  512 / 2048 / 8192 **tokens** (prefill moves `M` and `L` together), plus at
+  least one long-context length (**32k or 128k**) so indexer scaling is
+  visible. Both archs.
+- **Bar shapes (2026-09-24).** `--batch` and `--seq` are independent axes and
+  the sweep is their cross-product, so it also emits decode rows at short `L`
+  that the line above never asked for. **Judge K2 at the budget-saturated
+  points: decode `M∈{1,8}` at `L=32768`, prefill `M=512` at `L=8192`.** Below
+  `L=2048` the 2051-wide selection is mostly `-1` padding (25% live at `L=512`
+  decode, 12.5% at `M=512` prefill), the kernel burns most tiles on masked
+  columns that clamp to page 0 and stay cached, and the K2/AMD verdict differs
+  from the saturated one by ±5% at decode and inverts at prefill. `L=512` rows
+  stay in the sweep as fast smoke rows; `valid%` in the bench output shows the
+  dilution.
 - **Correctness.** Independent fp32 oracle: block-causal ReLU-sum scores, exact
   top-512 (tie-break documented), expand+tail, then standard GQA on those
   positions. Cross-check vs vLLM Triton `qsa.py` and vs #4882 on shared shapes.
