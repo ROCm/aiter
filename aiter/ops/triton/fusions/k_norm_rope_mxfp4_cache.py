@@ -49,8 +49,8 @@ def k_norm_rope_mxfp4_cache(
             n_per_tile tokens with its values as [d_per_tile-byte chunk,
             token, byte] and its e8m0 scales as [scale % scale_lanes, token,
             scale // scale_lanes]. paged_mxfp4_mqa_logits reads
-            preshuffle_cache()'s order: cache_format()'s n_per_tile and
-            d_per_tile, and 64 // n_per_tile scale lanes.
+            cache_format()'s n_per_tile and d_per_tile, with
+            64 // n_per_tile scale lanes.
     """
     _LOGGER.info(
         "K_NORM_ROPE_MXFP4_CACHE: k=%s kv_cache=%s compress_ratio=%d shuffle=%s",
