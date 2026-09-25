@@ -182,6 +182,37 @@ def test_packed_cache_arch_gate(arch):
             smd._check_packed_arch(arch)
 
 
+def test_lds_budget_gfx950_is_unchecked():
+    """gfx950 is left to the launcher; the 64 KB table is gfx942-only."""
+    smd._check_lds_budget("gfx950", 64, 2048, 64)
+
+
+@pytest.mark.parametrize(
+    "kv_lora_rank, rope, need",
+    [
+        (512, 0, None),
+        (512, 64, None),
+        (1000, 0, None),  # exactly 64 KB
+        (1008, 0, 66048),
+        (1024, 0, 67072),
+        (1024, 64, 71680),
+        (2048, 0, 132608),
+    ],
+)
+def test_lds_budget_gfx942_boundary(kv_lora_rank, rope, need):
+    """CPU-only: the gfx942 64 KB guard, including the measured rejects.
+
+    The GPU suite only launches the default 512/64 geometry. These are the
+    rope-free and separated-rope points from the OutOfResources sweep.
+    """
+    block_k = smd._arch_block_k("gfx942")
+    if need is None:
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope)
+        return
+    with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope)
+
+
 def test_ds_mla_format():
     _skip_unless_supported()
     _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
