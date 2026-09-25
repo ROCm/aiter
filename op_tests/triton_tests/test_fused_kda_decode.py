@@ -138,7 +138,11 @@ def _make_inputs(batch, Hloc, D, W=4, dtype=torch.bfloat16):
         )
         * 0.01,
         "norm_weight": torch.ones(D, dtype=dtype, device=device),
-        "ssm_state_indices": torch.arange(batch, dtype=torch.int32, device=device),
+        # Slot 0 is vLLM's NULL_BLOCK_ID. The kernel skips it, so real cache
+        # slots in this test start at 1. num_slots is batch + 2.
+        "ssm_state_indices": torch.arange(
+            1, batch + 1, dtype=torch.int32, device=device
+        ),
         "cu_seqlens": torch.arange(batch + 1, dtype=torch.int64, device=device),
     }
 
@@ -267,6 +271,44 @@ def test_fused_kda_decode_pad_slot():
     assert torch.equal(
         inp["conv_state"], conv_before
     ), "Conv state modified for PAD_SLOT_ID"
+
+
+def test_fused_kda_decode_skips_null_slot():
+    """vLLM NULL_BLOCK_ID (0) is skipped without modifying state or output."""
+    torch.manual_seed(42)
+    batch, Hloc, D = 1, 2, 128
+    inp = _make_inputs(batch, Hloc, D)
+
+    ssm_before = inp["ssm_state"].clone()
+    conv_before = inp["conv_state"].clone()
+    inp["ssm_state_indices"] = torch.zeros(batch, dtype=torch.int32, device=device)
+    out = torch.zeros(batch, Hloc * D, dtype=torch.bfloat16, device=device)
+
+    fused_kda_decode(
+        inp["mixed_qkv"],
+        inp["conv_state"],
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        D,
+        Hloc,
+        -5.0,
+        out=out,
+    )
+
+    assert torch.equal(inp["ssm_state"], ssm_before), "SSM state modified for NULL slot"
+    assert torch.equal(
+        inp["conv_state"], conv_before
+    ), "Conv state modified for NULL slot"
+    assert torch.equal(out, torch.zeros_like(out)), "Output written for NULL slot"
 
 
 SPEC_D = 128
