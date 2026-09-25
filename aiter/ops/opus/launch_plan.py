@@ -15,6 +15,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX942_EVEN_LOOP_SPLITK_TAGS,
     GFX942_MAX_AUTO_SPLIT_K,
     GFX942_MIN_ITERS_PER_SPLIT,
+    OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     SPLITK_KIDS,
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
@@ -454,17 +455,20 @@ _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
 
+# Derived, not restated. This used to be a second hand-kept copy of the tag list
+# in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
+# preshuffled-B families were added: get_kernel_instance consults the catalog's
+# copy first and rejected every preshuffled kid as "no registered OPUS kernel",
+# so adding the tags here alone changed nothing and the failure pointed at a
+# missing kernel rather than a missing list entry.
+#
+# Union across arches: this set is only used to answer "is this kid an MXFP8
+# BMM kernel at all", and the arch check has already happened in
+# get_kernel_instance by the time it is consulted.
 _A8W8_MXSCALE_BMM_TAGS = frozenset(
-    {
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        "a8w8_mxscale_bmm_fused",
-        "a8w8_mxscale_bmm_minterleave",
-        "a8w8_mxscale_bmm_mouter",
-        "a8w8_mxscale_bmm_mouter_tunable",
-        "a8w8_mxscale_bmm_pipeline",
-        "a8w8_mxscale_bmm_wave8n2",
-        "a8w8_mxscale_bmm_wave4m2_selfload",
-    }
+    tag
+    for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
+    for tag in arch_families.get(_A8W8_MXSCALE_BMM_FAMILY, ())
 )
 _A8W8_MXSCALE_BMM_WORKSPACE_TAGS = frozenset(
     {

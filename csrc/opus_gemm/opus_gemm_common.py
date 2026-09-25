@@ -3837,6 +3837,14 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         ),
         "a8w8": frozenset({"a8w8"}),
         "a8w8_blockscale": frozenset({"a8w8_scale"}),
+        # Keep in step with _A8W8_MXSCALE_BMM_TAGS in aiter/ops/opus/launch_plan.py.
+        # They are two hand-maintained copies of the same list and both are
+        # consulted, this one first: get_kernel_instance rejects a kid whose tag
+        # is missing here before the plan builder ever checks its own copy. A tag
+        # added to only one of them therefore looks like "no registered OPUS
+        # kernel", which reads as a missing kernel rather than a missing list
+        # entry -- that is exactly how all 133 preshuffled rows were dropped
+        # while the kids were present in kernels_list the whole time.
         "a8w8_mxscale_bmm": frozenset(
             {
                 "a8w8_mxscale_bmm_flatmm_splitk",
@@ -3847,6 +3855,15 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_pipeline",
                 "a8w8_mxscale_bmm_wave8n2",
                 "a8w8_mxscale_bmm_wave4m2_selfload",
+                # The preshuffled-B families: unreachable upstream, where gfx950
+                # preshuffle is off, but every row of the preshuffled tuned table
+                # names one.
+                "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+                "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+                "a8w8_mxscale_bmm_bpreshuffle_blds",
+                "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+                "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+                "a8w8_mxscale_bmm_pipeline_bpreshuffle",
             }
         ),
         "a8w8_blockscale_bpreshuffle": frozenset(),

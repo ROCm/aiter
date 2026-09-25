@@ -316,6 +316,13 @@ struct opus_gemm_scale_splitk_kargs_gfx950 {
     int stride_c;
     int stride_c_batch;
     unsigned long counter_offset_bytes;
+
+    // M-tiles one workgroup walks, for the persistent (M-outer) schedule only;
+    // every other kernel on this kargs leaves it zero and never reads it. It is
+    // a field rather than gridDim.x / num_tiles_n because there is no grid-size
+    // accessor in opus.hpp and the device TUs compile under __HIPCC_RTC__, where
+    // gridDim is not declared.
+    int m_per_wg;
 };
 
 // 4-wave warp-specialized fp8/e8m0 flatmm split-K traits.
