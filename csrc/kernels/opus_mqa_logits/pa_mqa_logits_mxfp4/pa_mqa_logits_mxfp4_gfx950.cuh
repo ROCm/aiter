@@ -4,9 +4,9 @@
 
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 // Host pass: empty stub so the __device_stub__ symbol resolves for the launcher.
-namespace opus_logits {
+namespace opus_logits::gfx950 {
 template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
-__global__ void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs) {}
+__global__ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs) {}
 }
 #else
 #include <opus/opus.hpp>
@@ -17,7 +17,7 @@ __global__ void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs) {}
 #define OPUS_LOGITS_MIN_WAVES 2
 #endif
 
-namespace opus_logits {
+namespace opus_logits::gfx950 {
 
 using opus::operator""_I;
 
@@ -170,7 +170,7 @@ __device__ inline auto make_layout_w(int lane_div_32) {
 // Grid: one CTA per schedule slot (grid.x == kargs.num_ctas).
 template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
 __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES)
-void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs kargs) {
+void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     static_assert(SCHED == mqa_logits_sched::Table,
                   "this target compiles the schedule-table mapping and nothing else");
     // ---- data-type aliases ----
@@ -372,8 +372,6 @@ void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs kargs) {
         });
     };
 
-    if (tile_count <= 0) return;
-
     auto compute_phase = [&](kv_nt_t (&kv_c)[NTPW][KT], int& kvs_c, sfrag (&acc_c)[NTPW],
                              kv_nt_t (&kv_p)[NTPW][KT], int& kvs_p, sfrag (&acc_p)[NTPW],
                              int& pg_c, int pf_tile, opus::vector_t<float, NTPW>& out_cur) {
@@ -470,5 +468,5 @@ void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs kargs) {
     }
 }
 
-} // namespace opus_logits
+} // namespace opus_logits::gfx950
 #endif

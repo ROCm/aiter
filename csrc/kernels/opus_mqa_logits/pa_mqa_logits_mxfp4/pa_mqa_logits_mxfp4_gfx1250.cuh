@@ -15,20 +15,17 @@ propagating it. See optCompilerConfig.json's flags_extra_hip for this module."
 // Both halves of the guard are load-bearing: the host pass reports warp size 64 and would
 // silently build the wave64 fragment layout with every byte count still matching.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx1250__)
-namespace opus_logits {
-namespace qshare {
+namespace opus_logits::gfx1250 {
 template <class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
-__global__ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs)
+__global__ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs)
 {
 }
-} // namespace qshare
-} // namespace opus_logits
+} // namespace opus_logits::gfx1250
 #else
 #include <opus/opus.hpp>
 #include <bit>   // std::bit_cast -- see permlane_head_reduce for why not __builtin_bit_cast
 
-namespace opus_logits {
-namespace qshare {
+namespace opus_logits::gfx1250 {
 
 // "+s" on purpose: the read-only form is a memory clobber and demotes indexed s_loads. Never
 // pin a pointer: the asm divergence spreads to every derived address and costs occupancy.
@@ -55,7 +52,7 @@ __device__ inline float permlane_head_reduce(float v) {
 // Grid: one CTA per SCHEDULE SLOT (grid.x == kargs.num_ctas).
 template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
 __global__ __launch_bounds__(T::BLOCK_SIZE, T::WAVES_PER_EU)
-void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
+void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     static_assert(SCHED == mqa_logits_sched::Table,
                   "this target compiles the schedule-table mapping and nothing else. Decode needs "
                   "no separate mapping: a decode table is one whose tiles carry a zero start.");
@@ -354,6 +351,5 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
     }
 }
 
-} // namespace qshare
-} // namespace opus_logits
+} // namespace opus_logits::gfx1250
 #endif

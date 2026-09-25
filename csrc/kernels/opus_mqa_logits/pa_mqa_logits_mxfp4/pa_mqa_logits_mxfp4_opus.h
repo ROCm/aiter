@@ -10,6 +10,8 @@
 //   shared : q [T,H,D/2] u8, weights [T,H] bf16, out [T,max_seq_len] fp32.
 //
 // Both arches share the kargs and the per-tile schedule; fwd_sched dispatches by runtime arch.
+// Namespaces: opus_logits holds the shared schedule; opus_logits::gfx950 / ::gfx1250 each hold
+// that arch's pa_mqa_logits_mxfp4_traits and pa_mqa_logits_mxfp4_kernel.
 // gfx950 runs at q_per_block == 1, so a tile is one row.
 //
 // Passing one arch's scale arrays to the other is SILENT: the byte counts match, only the
@@ -158,12 +160,13 @@ enum class mqa_logits_sched {
 
 // -- gfx950 traits (MFMA 32x32x64) ----------------------------------------------------
 // No D_DATA: opus::fp4_t is device-only and this struct must stay host-compilable.
+namespace opus_logits::gfx950 {
 template<int KV_TILE_SIZE_ = 256,
          int PAGE_SIZE_    = 64,
          int HEAD_DIM_     = 128,
          int N_HEADS_      = 64,
          int NUM_WARPS_    = 4>
-struct opus_mqa_logits_fp4_mfma_traits {
+struct pa_mqa_logits_mxfp4_traits {
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;  // block_k
     static constexpr int PAGE_SIZE    = PAGE_SIZE_;     // kv_block_size
     static constexpr int HEAD_DIM     = HEAD_DIM_;
@@ -285,18 +288,20 @@ struct opus_mqa_logits_fp4_mfma_traits {
     static_assert(Q_ROW_BYTES == N_HEADS * HEAD_DIM * ELEM_BITS / 8, "q preshuffle must be size-preserving");
     static_assert(W_ROW_ELEMS == N_HEADS, "weight preshuffle must be size-preserving");
 };
+}  // namespace opus_logits::gfx950
 
 // -- gfx1250 traits (WMMA 32x16x128) --------------------------------------------------
 // Natural kv_cache layout. KV_TILE_SIZE sizes the accumulator (ACC_VGPR), which sets waves per
 // SIMD (3 at 64, 1 at 128). The caller's `cta_resident` must be re-tuned if it changes: a stale
 // value silently under-fills the GPU.
+namespace opus_logits::gfx1250 {
 template<int Q_PER_BLOCK_  = 4,
          int LDS_STAGES_   = 2,
          int KV_TILE_SIZE_ = 64,
          int PAGE_SIZE_    = 64,
          int HEAD_DIM_     = 128,
          int N_HEADS_      = 64>
-struct opus_mqa_logits_fp4_qshare_traits {
+struct pa_mqa_logits_mxfp4_traits {
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;  // block_k
     static constexpr int PAGE_SIZE    = PAGE_SIZE_;     // kv_block_size
     static constexpr int HEAD_DIM     = HEAD_DIM_;
@@ -589,6 +594,7 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static_assert(KV_PAGE_BYTES == PAGE_SIZE * HEAD_DIM * ELEM_BITS / 8, "kv must be size-preserving");
     static_assert(Q_PER_BLOCK >= 1, "Q_PER_BLOCK must be positive");
 };
+}  // namespace opus_logits::gfx1250
 
 
 // -- device bodies, one per arch. Each self-stubs on the wrong arch, so both launch symbols

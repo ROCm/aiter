@@ -15,10 +15,12 @@
 
 // Compiled configs. gfx950: KV tile 256 (4-wave) or 64 (1-wave), q_per_block 1.
 // gfx1250: q_per_block 4 or 1, KV tile 64 (one page).
-using mqa_logits_fp4_traits_4wave  = opus_mqa_logits_fp4_mfma_traits<256, 64, 128, 64, 4>;
-using mqa_logits_fp4_traits_1wave  = opus_mqa_logits_fp4_mfma_traits<64, 64, 128, 64, 1>;
-using mqa_logits_traits_qlen4_kv64 = opus_mqa_logits_fp4_qshare_traits<4, 2, 64>;
-using mqa_logits_traits_qlen1_kv64 = opus_mqa_logits_fp4_qshare_traits<1, 2, 64>;
+using mqa_logits_fp4_traits_4wave =
+    opus_logits::gfx950::pa_mqa_logits_mxfp4_traits<256, 64, 128, 64, 4>;
+using mqa_logits_fp4_traits_1wave =
+    opus_logits::gfx950::pa_mqa_logits_mxfp4_traits<64, 64, 128, 64, 1>;
+using mqa_logits_traits_qlen4_kv64 = opus_logits::gfx1250::pa_mqa_logits_mxfp4_traits<4, 2, 64>;
+using mqa_logits_traits_qlen1_kv64 = opus_logits::gfx1250::pa_mqa_logits_mxfp4_traits<1, 2, 64>;
 
 // ══ shape check + launch, one template for both arches ══════════════════════════════════════
 // The kernel strides every input by compile-time constants and reads no runtime stride, so a
@@ -191,11 +193,12 @@ static void pa_mqa_logits_mxfp4_launch_sched(aiter_tensor_t& q,
     const dim3 grid(static_cast<unsigned>(num_ctas));   // one CTA per schedule slot
     const dim3 block(Traits::BLOCK_SIZE);
     if constexpr(Traits::READS_ROW_WINDOWS)
-        opus_logits::qshare::
-            mqa_logits_mxfp4_32x16x128_qshare_kernel<Traits, opus_logits::mqa_logits_sched::Table>
+        opus_logits::gfx1250::
+            pa_mqa_logits_mxfp4_kernel<Traits, opus_logits::mqa_logits_sched::Table>
             <<<grid, block, 0, stream>>>(kargs);
     else
-        opus_logits::pa_mqa_logits_mxfp4_mfma_kernel<Traits, opus_logits::mqa_logits_sched::Table>
+        opus_logits::gfx950::
+            pa_mqa_logits_mxfp4_kernel<Traits, opus_logits::mqa_logits_sched::Table>
             <<<grid, block, 0, stream>>>(kargs);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
