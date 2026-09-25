@@ -26,7 +26,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.utility import dtypes as aiter_dtypes
@@ -78,10 +77,11 @@ def rms_reduce_add(x, lane, broadcast_half=True):
     v = x
     for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
         off = RMS_GROUP // (2 << sh_exp)
-        peer = v.shuffle_xor(off, RMS_GROUP)
-        v = v.addf(peer, fastmath=fx.FastMathFlags.fast)
+        peer = gpu.shuffle_xor(v, off, RMS_GROUP)
+        with fx.arith.fastmath(fx.FastMathFlags.fast):
+            v = v + peer
     if const_expr(WAVE > RMS_GROUP and broadcast_half):
-        other_half = v.shuffle_xor(RMS_GROUP, WAVE)
+        other_half = gpu.shuffle_xor(v, RMS_GROUP, WAVE)
         return (lane < RMS_GROUP).select(v, other_half)
     return v
 
@@ -268,7 +268,7 @@ def _build_q_kernel(
 
             # The partner lane's columns complete this lane's NEOX pairs.
             peer = [
-                own[i].shuffle_xor(PARTNER_XOR, RMS_GROUP)
+                gpu.shuffle_xor(own[i], PARTNER_XOR, RMS_GROUP)
                 for i in range_constexpr(PROD_VEC_SIZE)
             ]
 
@@ -423,11 +423,18 @@ def _build_kv_kernel(
             )
         )
         layout_tx_wave_lane = fx.make_layout((WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1))
+        layout_tx_compute_pair_lane = fx.make_layout(
+            (COMPUTE_GROUPS_PER_BLOCK, COMPUTE_GROUP),
+            stride=(COMPUTE_GROUP, 1),
+        )
         # Two logical ownership maps of D are used:
         #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
         #  * NEOX pairs: active lanes own strided columns in [0, D/2), with
         #    [pair, half] kept as one value mode.
         layout_rms_values = fx.make_layout(PROD_VEC_SIZE, stride=1)
+        layout_pair_lane = fx.make_layout(
+            (PAIR_LANES, PAIRS_PER_LANE), stride=(1, PAIR_LANES)
+        )
         layout_pair_tv = fx.make_layout(
             (PAIR_LANES, (PAIRS_PER_LANE, 2)),
             stride=(1, (PAIR_LANES, HALF)),
@@ -480,7 +487,7 @@ def _build_kv_kernel(
                         )
             for sh_exp in range_constexpr(_LOG2_WAVE):
                 off = WAVE // (2 << sh_exp)
-                peer_valid = mapping_valid.shuffle_xor(off, WAVE)
+                peer_valid = gpu.shuffle_xor(mapping_valid, off, WAVE)
                 mapping_valid = mapping_valid & peer_valid
             return mapping_valid
 
@@ -496,7 +503,9 @@ def _build_kv_kernel(
             s0 = _fp8_clamp(v0 * scale)
             s1 = _fp8_clamp(v1 * scale)
 
-            packed = fx.Int32(fx.rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, fx.Int32(0), 0))
+            packed = fx.Int32(
+                fx.rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, s0, s1, fx.Int32(0), 0)
+            )
             byte0 = packed.to(fx.Int8)
             byte1 = (packed >> 8).to(fx.Int8)
             return byte0, byte1
@@ -521,10 +530,11 @@ def _build_kv_kernel(
         # The final logical page may be partial, so guard token-sized inputs
         # and outputs. Phase 2 sends partial pages through the scatter path.
         coord_wl = fx.idx2crd(t, layout_tx_wave_lane)
-        wid = fx.Int32(fx.get(coord_wl, 0))
-        lane = fx.Int32(fx.get(coord_wl, 1))
-        compute_group = t // COMPUTE_GROUP
-        pair_lane = t % PAIR_LANES
+        wid = fx.Int32(fx.get_(coord_wl, 0).unpack())
+        lane = fx.Int32(fx.get_(coord_wl, 1).unpack())
+        coord_compute_pair_lane = fx.idx2crd(t, layout_tx_compute_pair_lane)
+        compute_group = fx.Int32(fx.get_(coord_compute_pair_lane, 0).unpack())
+        pair_lane = fx.Int32(fx.get_(coord_compute_pair_lane, 1).unpack())
 
         # Partition phase-1 tensors by their RMS and NEOX-pair ownership,
         # then retain only this thread's pair lane across all token rows.
@@ -538,9 +548,6 @@ def _build_kv_kernel(
         w_lane_pairs = fx.slice(weight_pair_view, lane_coord)
         k_lds_lane_pairs = fx.slice(k_lds_pair_view, (None, lane_coord))
         v_lds_lane_pairs = fx.slice(v_lds_pair_view, (None, lane_coord))
-        lane_pair_cols = [
-            pair_lane + p * PAIR_LANES for p in range_constexpr(PAIRS_PER_LANE)
-        ]
         if const_expr(emit_flat_kv):
             k_out_pair_view = fx.composition(
                 k_out, fx.make_tile(None, None, layout_pair_tv)
@@ -591,7 +598,9 @@ def _build_kv_kernel(
                         else None
                     )
                     for p in range_constexpr(PAIRS_PER_LANE):
-                        col = lane_pair_cols[p]
+                        col = fx.Int32(
+                            fx.crd2idx((pair_lane, p), layout_pair_lane).unpack()
+                        )
                         k0 = fx.Float32(k_pairs[p, 0])
                         k1 = fx.Float32(k_pairs[p, 1])
                         w0 = fx.Float32(w_lane_pairs[p, 0])
@@ -669,8 +678,8 @@ def _build_kv_kernel(
                 r = t + KV_THREADS * it
                 if r < K_TOTAL_RUNS:
                     coord_k_run = fx.idx2crd(r, layout_k_runs)
-                    chunk_k = fx.get(coord_k_run, 0)
-                    block_off = fx.get(coord_k_run, 1)
+                    chunk_k = fx.get_(coord_k_run, 0).unpack()
+                    block_off = fx.get_(coord_k_run, 1).unpack()
                     src_k = fx.slice(k_lds_runs, (block_off, chunk_k, None))
                     dst_k = fx.slice(k_cache_block, (head, chunk_k, block_off, None))
                     reg_k = fx.make_rmem_tensor(layout_run, CACHE_FX_TYPE)
@@ -682,8 +691,8 @@ def _build_kv_kernel(
                 r = t + KV_THREADS * it
                 if r < V_TOTAL_RUNS:
                     coord_v_run = fx.idx2crd(r, layout_v_runs)
-                    tile = fx.get(coord_v_run, 0)
-                    d = fx.get(coord_v_run, 1)
+                    tile = fx.get_(coord_v_run, 0).unpack()
+                    d = fx.get_(coord_v_run, 1).unpack()
                     vals = [v_lds_view[tile * x + j, d] for j in range_constexpr(x)]
                     vec_x = fx.Vector.from_elements(vals, CACHE_FX_TYPE)
                     dst_v = fx.slice(v_cache_block, (head, tile, d, None))
@@ -696,8 +705,8 @@ def _build_kv_kernel(
                 elem = t + KV_THREADS * it
                 if elem < SCATTER_ELEMS:
                     coord_stage = fx.idx2crd(elem, layout_stage)
-                    token_local = fx.get(coord_stage, 0)
-                    d = fx.get(coord_stage, 1)
+                    token_local = fx.get_(coord_stage, 0).unpack()
+                    d = fx.get_(coord_stage, 1).unpack()
                     tok = tok0 + fx.Int32(token_local)
                     if tok < num_tokens:
                         slot = slot_mapping[tok]
