@@ -40,6 +40,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
     ),
+    "flydsl_conv_implicit": (".conv_kernels", "flydsl_conv_implicit"),
     "flydsl_flash_attn_fp8_func": (
         ".kernels.flash_attn_func_fp8_gfx950",
         "flydsl_flash_attn_fp8_func",
@@ -110,6 +111,7 @@ __all__ = [
     "GateMode",
     "QuickAllReduceInt4",
     "compute_varqlen_windows",
+    "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",

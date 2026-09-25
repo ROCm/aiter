@@ -198,6 +198,14 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -206,6 +214,15 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
+
+# Head shapes to AOT-compile the gfx950 FlyDSL FP8 flash-attention forward for
+# (aiter/aot/flydsl/fmha_fp8.py). Per-model rows live under model_configs/
+# (*_fmha_fp8_aot.csv) and get merged into this canonical file, which ships
+# header-only like chunk_gdn_h_opt_tuned.csv.
+AITER_CONFIG_FMHA_FP8_AOT = os.getenv(
+    "AITER_CONFIG_FMHA_FP8_AOT",
+    f"{AITER_ROOT_DIR}/aiter/configs/fmha_fp8_aot.csv",
 )
 
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
@@ -336,11 +353,25 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_FMHA_FP8_AOT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMHA_FP8_AOT",
+            AITER_CONFIG_FMHA_FP8_AOT,
+            "fmha_fp8_aot",
         )
 
     @property
