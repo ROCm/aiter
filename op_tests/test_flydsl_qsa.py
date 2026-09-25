@@ -47,7 +47,7 @@ from aiter.ops.flydsl.qsa import (
     qsa_expand_tail,
     qsa_indexer_scores,
     qsa_k1_block_ids,
-    qsa_k2_family_a,
+    qsa_k2,
     qsa_oracle,
     qsa_sparse_gqa,
     qsa_topk_blocks,
@@ -591,7 +591,7 @@ def test_k2_family_a_decode_matches_oracle():
     v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
     assert torch.equal(kv_table, kv_table_v)
     ref = qsa_sparse_gqa(q, k, v, indices)
-    out = qsa_k2_family_a(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    out = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
     err = checkAllclose(
         ref.to(dtypes.fp32),
         out.to(dtypes.fp32),
@@ -627,7 +627,7 @@ def test_k2_family_a_prefill_matches_oracle():
     v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
     assert torch.equal(kv_table, kv_table_v)
     ref = qsa_sparse_gqa(q, k, v, indices)
-    out = qsa_k2_family_a(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    out = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
     err = checkAllclose(
         ref.to(dtypes.fp32),
         out.to(dtypes.fp32),
@@ -789,7 +789,7 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
     indices = ref.indices.contiguous()
 
     out, k2_us = _time(
-        qsa_k2_family_a,
+        qsa_k2,
         q_gqa,
         k_cache,
         v_cache,
