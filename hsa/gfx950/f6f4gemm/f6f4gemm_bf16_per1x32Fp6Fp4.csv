@@ -21,3 +21,12 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_dfp6_d3_s3_bias,a6w4_dfp6_d3_s3_bias.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,0,0,0,aiter_a6w4_dfp6_d4_s0_bias,a6w4_dfp6_d4_s0_bias.co
 256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,6144,aiter_a6w4_dfp6_d4_s3_bias,a6w4_dfp6_d4_s3_bias.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d1,a6w4_stnt_allk_d1.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d2,a6w4_stnt_allk_d2.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d2_bias,a6w4_stnt_allk_d2_bias.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,16384,aiter_a6w4_stnt_d2,a6w4_stnt_d2.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,16384,aiter_a6w4_stnt_d2_bias,a6w4_stnt_d2_bias.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d2_w0,a6w4_stnt_allk_d2_w0.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d2_w14,a6w4_stnt_allk_d2_w14.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d3,a6w4_stnt_allk_d3.co
+256,256,256,0,0,mxfp6_mxfp4_c0_256_padk2,131072,16384,65536,aiter_a6w4_stnt_allk_d3_bias,a6w4_stnt_allk_d3_bias.co
