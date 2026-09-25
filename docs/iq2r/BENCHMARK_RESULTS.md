@@ -1,6 +1,6 @@
 ## Current MXFP4 vs IQ2R benchmark results
 
-Snapshot: 2026-09-25T22:27:19.761708+00:00.
+Snapshot: 2026-09-25T22:54:14.977017+00:00.
 
 E197 uses the frozen unguarded E180 r8 MXFP4 baseline, unchanged official ATOM benchmark client and workload. This is a later baseline collection on the same node; fresh bookends around the IQ2R run are still required. Only fully validated, zero-failure points have throughput values.
 
@@ -22,14 +22,14 @@ E197 uses the frozen unguarded E180 r8 MXFP4 baseline, unchanged official ATOM b
 
 | C | Existing MXFP4 A / B tok/s | New MXFP4 tok/s | IQ2R r8 tok/s | IQ2R vs new baseline | New collection status |
 |---:|---:|---:|---:|---:|---|
-| 1 | — / — | — | 77.14 | — | running |
-| 2 | — / — | — | 150.12 | — | pending |
-| 4 | — / — | — | 284.58 | — | pending |
-| 8 | — / — | — | 478.93 | — | pending |
-| 16 | — / — | — | 741.55 | — | pending |
-| 32 | — / — | — | 1022.59 | — | pending |
-| 64 | — / — | — | 1296.99 | — | pending |
-| 128 | — / — | — | 1593.88 | — | pending |
+| 1 | — / — | 74.48 | 77.14 | +3.57% | 10 / 0 requests; native pass |
+| 2 | — / — | 146.39 | 150.12 | +2.55% | 20 / 0 requests; native pass |
+| 4 | — / — | 296.91 | 284.58 | -4.15% | 40 / 0 requests; native pass |
+| 8 | — / — | 510.50 | 478.93 | -6.19% | 80 / 0 requests; native pass |
+| 16 | — / — | 841.10 | 741.55 | -11.84% | 160 / 0 requests; native pass |
+| 32 | — / — | 1164.83 | 1022.59 | -12.21% | 320 / 0 requests; native pass |
+| 64 | — / — | 1545.03 | 1296.99 | -16.05% | 640 / 0 requests; native pass |
+| 128 | — / — | — | 1593.88 | — | running |
 | 256 | — / — | — | 1840.95 | — | pending |
 
 New-baseline ratios use identical input/output length arrays (SHA-256 verified) but a later run. They are provisional, not final bookend-qualified gains.
