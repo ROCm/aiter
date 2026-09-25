@@ -4,10 +4,6 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
-    gluon_dynamic_mxfp8_quant_kernel_gfx1250,
-)
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_blockscale_kernel,
     _dynamic_mxfp4_quant_kernel,
@@ -25,8 +21,8 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
+    lookup_config,
     resolve_config_dir,
-    select_tuned_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -56,19 +52,17 @@ _LOGGER = AiterTritonLogger()
 def _mxfp4_gfx1250_config(M: int, N: int) -> dict:
     """
     Tuned launch config for dynamic_mxfp4_quant, resolved from
-    configs/gfx1250/gluon/quant/quant_mxfp4/DEFAULT.json's default+rules tree
-    (see config_utils.select_tuned_config), tuned by a benchmark sweep on
-    gfx1250. Also used, unchanged, as the plain-Triton fallback kernel's
-    launch config on every other arch -- always resolved against the gfx1250
-    config tree regardless of the arch actually running. BLOCK_SIZE_M/
-    BLOCK_SIZE_N are shape-derived, not tunable via JSON, at the M <= 32 and
-    N <= 1024 edges (BLOCK_SIZE_N must stay a multiple of 32).
+    configs/gfx1250/gluon/quant/mxfp4/DEFAULT.json's bucket-key table
+    (see config_utils.lookup_config), tuned by a benchmark sweep on gfx1250.
+    Also used, unchanged, as the plain-Triton fallback kernel's launch config
+    on every other arch -- always resolved against the gfx1250 config tree
+    regardless of the arch actually running. BLOCK_SIZE_M/BLOCK_SIZE_N are
+    shape-derived, not tunable via JSON, at the M <= 32 and N <= 1024 edges
+    (BLOCK_SIZE_N must stay a multiple of 32).
     """
-    cfg_dir = resolve_config_dir(
-        "quant", "QUANT-MXFP4", backend="gluon", arch="gfx1250"
-    )
+    cfg_dir = resolve_config_dir("quant", "MXFP4", backend="gluon", arch="gfx1250")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    cfg = select_tuned_config(tuned, M=M, N=N)
+    cfg = lookup_config(tuned, ("M", "N"), M=M, N=N)
     if M <= 32:
         cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
         cfg["BLOCK_SIZE_N"] = 4096 // cfg["BLOCK_SIZE_M"]
@@ -102,17 +96,17 @@ def _mxfp8_small_m_block_size_n(block_size_m: int, K: int) -> int:
 def _mxfp8_gfx1250_config(M: int, K: int) -> dict:
     """
     Tuned launch config for dynamic_mxfp8_quant's gfx1250 gluon path. For
-    M > 32, resolved from configs/gfx1250/gluon/quant/quant_mxfp8/DEFAULT.json's
-    default+rules tree (see config_utils.select_tuned_config), tuned by a
-    benchmark sweep. NUM_BUFFERS defaults to 2 (double-buffered/prefetching
-    loads+stores); some rules pin it to 1 (no prefetch, fully synchronous
+    M > 32, resolved from configs/gfx1250/gluon/quant/mxfp8/DEFAULT.json's
+    bucket-key table (see config_utils.lookup_config), tuned by a benchmark
+    sweep. NUM_BUFFERS defaults to 2 (double-buffered/prefetching
+    loads+stores); some buckets pin it to 1 (no prefetch, fully synchronous
     per-tile) -- empirically found to be both faster and required for
     correctness there. For M <= 32, BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived
     instead of JSON-tuned (see _MXFP8_SMALL_M_BLOCK_SIZE_N above).
     """
-    cfg_dir = resolve_config_dir("quant", "QUANT-MXFP8", backend="gluon")
+    cfg_dir = resolve_config_dir("quant", "MXFP8", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    cfg = select_tuned_config(tuned, M=M, K=K)
+    cfg = lookup_config(tuned, ("M", "K"), M=M, K=K)
     if M <= 32:
         cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
         cfg["BLOCK_SIZE_N"] = _mxfp8_small_m_block_size_n(cfg["BLOCK_SIZE_M"], K)
@@ -368,6 +362,10 @@ def dynamic_mxfp4_quant(
     even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
     if arch_info.get_arch() == "gfx1250":
+        from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+            gluon_dynamic_mxfp4_quant_kernel_gfx1250,
+        )
+
         gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
             x,
             x_fp4,
@@ -524,6 +522,10 @@ def dynamic_mxfp8_quant(
         and x2d.dtype in (torch.bfloat16, torch.float16)
         and quant_dtype == torch.float8_e4m3fn
     ):
+        from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+            gluon_dynamic_mxfp8_quant_kernel_gfx1250,
+        )
+
         cfg = _mxfp8_gfx1250_config(M, K)
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]

@@ -11,6 +11,7 @@ The per-family loaders build on this module and keep their own files:
 """
 
 import functools
+import itertools
 import json
 import os
 import re
@@ -152,31 +153,69 @@ def resolve_config_dir(
     return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
 
 
-_COND_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)_(leq|lt|geq|gt|eq)$")
-_COND_OPS = {
-    "leq": lambda value, bound: value <= bound,
-    "lt": lambda value, bound: value < bound,
-    "geq": lambda value, bound: value >= bound,
-    "gt": lambda value, bound: value > bound,
-    "eq": lambda value, bound: value == bound,
-}
+def _axis_of(component: str) -> str:
+    """``M_LEQ_32`` -> ``M``."""
+    return component.split("_", 1)[0]
 
 
-def select_tuned_config(tuned: dict, **variables) -> dict:
-    """Resolve a launch config from a JSON ``{"default": {...}, "rules":
-    [{"if": {"<var>_<op>": <bound>, ...}, "set": {...}}, ...]}`` tree. Each
-    rule fires when all its conditions hold against ``variables`` (``<op>``
-    is one of leq/lt/geq/gt/eq); rules apply in list order and merge via
-    ``dict.update``, so list rules smallest-bound-first. Returns a fresh,
-    mutable dict.
+def _bound_of(component: str) -> int:
+    return int(component.rsplit("_", 1)[1])
+
+
+def _candidates(axis: str, value, parts: set) -> list:
+    """Components of ``axis`` matching ``value``, most specific first: LEQ
+    bounds ascending, then GEQ bounds descending, then ``"any"``."""
+    leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound_of)
+    geq = sorted(
+        (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound_of, reverse=True
+    )
+    return (
+        [c for c in leq if value <= _bound_of(c)]
+        + [c for c in geq if value >= _bound_of(c)]
+        + ["any"]
+    )
+
+
+def _canonical(key: str, axes: tuple) -> tuple:
+    """Expand a bucket key to one slot per axis, ``"any"`` where it says nothing."""
+    slot = dict.fromkeys(axes, "any")
+    if key != "any":
+        for part in key.split("."):
+            slot[_axis_of(part)] = part
+    return tuple(slot[a] for a in axes)
+
+
+@functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
+def _bucket_index(keys: tuple, axes: tuple) -> tuple:
+    """Build ``(slots -> key, LEQ/GEQ components declared per axis)``, cached
+    on the key names (all it depends on)."""
+    parts = {a: set() for a in axes}
+    for key in keys:
+        if key != "any":
+            for part in key.split("."):
+                parts[_axis_of(part)].add(part)
+    return {_canonical(k, axes): k for k in keys}, parts
+
+
+def lookup_config(table: dict, axes: tuple, **values) -> dict:
+    """Resolve a launch config from a flat table keyed by composite bucket
+    keys, e.g. ``{"M_LEQ_32": {...}, "M_GEQ_33.N_LEQ_1024": {...}, "any": {...}}``.
+    Each key lists only the axes that matter for that bucket, joined by '.';
+    a bucket's value is a complete config, not a patch on a default -- exactly
+    one bucket wins, so there is no rule-stacking to replay.
+
+    Axes are matched in the order given by ``axes`` (the leftmost wins when
+    more than one key could apply): for each axis, candidates are tried LEQ
+    bounds ascending, then GEQ bounds descending, then the shared ``"any"``
+    fallback -- every table needs one. Returns a fresh, mutable dict.
     """
-    config = dict(tuned["default"])
-    for rule in tuned.get("rules", ()):
-        conditions = rule.get("if", {})
-        if all(
-            _COND_OPS[match.group(2)](variables[match.group(1)], bound)
-            for cond_key, bound in conditions.items()
-            for match in [_COND_RE.fullmatch(cond_key)]
-        ):
-            config.update(rule["set"])
-    return config
+    index, parts = _bucket_index(tuple(table), axes)
+    per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]
+    for slots in itertools.product(*per_axis):
+        if slots in index:
+            return dict(table[index[slots]])
+    raise KeyError(
+        "no entry for "
+        + " ".join(f"{a}={values[a]!r}" for a in axes)
+        + f"; every table needs an 'any' entry (keys: {sorted(table)[:8]})"
+    )
