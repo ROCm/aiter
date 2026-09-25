@@ -1901,7 +1901,9 @@ def _normalize_mxfp4_activation_params(
         situ_beta = 1.0 if beta is None else float(beta)
         situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
     normalized_swiglu_limit = (
-        swiglu_limit if activation == ActivationType.Swiglu else None
+        swiglu_limit
+        if activation in (ActivationType.Silu, ActivationType.Swiglu)
+        else None
     )
     return situ_beta, situ_linear_beta, normalized_swiglu_limit
 
@@ -2422,14 +2424,11 @@ def _mxfp4_a4w4_stage1_fw(
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     runtime_situ_beta = float(situ_beta)
     runtime_situ_linear_beta = float(situ_linear_beta)
-    # swiglu_limit reaches the kernel as a scalar closure value, so it lands in
-    # FlyDSL's disk-cache key (see the note in mxfp4_gemm1.py), yet
-    # _activation_mul_batch only consumes it for swiglu -- silu and situv2 ignore
-    # it entirely. Pin the other activations to the default so a caller's limit
-    # cannot fork the cache into entries whose generated code is identical.
-    runtime_swiglu_limit = 7.0
-    if p1["act"] == "swiglu" and swiglu_limit is not None:
-        runtime_swiglu_limit = float(swiglu_limit)
+    # Match generic FlyDSL v1/v2 semantics. MXMOE captures this value in the
+    # compiled kernel closure; +inf represents an unclamped SiLU.
+    runtime_swiglu_limit = _get_flydsl_moe_kernels().runtime_swiglu_limit(
+        swiglu_limit, p1["act"]
+    )
     if not p1.get("enable_bias", False) and bias1 is not None:
         raise ValueError(
             "MXMOE bias presence does not match the cache-safe kernel name"
@@ -3170,9 +3169,7 @@ def get_2stage_cfgs(
                 f"activation {configured_act!r} does not match runtime "
                 f"{expected_act!r}"
             )
-        elif swiglu_limit and expected_act != "swiglu":
-            # MXMOE's _activation_mul_batch consumes the limit for swiglu only;
-            # zero is the existing no-clamp sentinel on non-SwiGLU paths.
+        elif swiglu_limit and expected_act not in ("silu", "swiglu"):
             reject_reason = (
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
