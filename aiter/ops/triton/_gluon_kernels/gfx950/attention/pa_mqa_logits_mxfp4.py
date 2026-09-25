@@ -147,7 +147,8 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
 
 
 
-@triton.jit
+# ends arrives as a row slice, so its alignment moves; it is read once per row
+@triton.jit(do_not_specialize_on_alignment=["ends_ptr"])
 def _prepare_candidates_kernel(
     ids_ptr, ends_ptr, bt_ptr, pos_ptr, cu_ptr, voff_ptr, soff_ptr,
     stride_ids, stride_bt,
@@ -1103,7 +1104,14 @@ _repr = make_kernel_repr("_pa_mqa_logits_mxfp4_kernel",
                           "HAS_KV_SPLIT", "FOLD_ASM", "RELU_ADD"])
 
 
-@gluon.jit(repr=_repr)
+# These move with the batch and with where a workspace slice starts, and none
+# reaches the generated code, so specializing only recompiled it. A gl.int32
+# equal to 1 is not folded either, which is why the ints drop both checks.
+@gluon.jit(repr=_repr,
+           do_not_specialize=["next_n", "batch", "num_kv_splits",
+                              "stride_logits_s", "stride_bs_s"],
+           do_not_specialize_on_alignment=["sched_ptr", "context_lens_ptr",
+                                           "gather_v_ptr", "gather_s_ptr"])
 def _pa_mqa_logits_mxfp4_kernel(
     Q_ptr,             # uint8 [B, NEXT_N, H, D//2]  packed e2m1
     q_scales_ptr,      # uint8 [B, NEXT_N, H, D//32] e8m0
@@ -1357,7 +1365,10 @@ def _pa_mqa_logits_mxfp4_kernel(
                 mask=own & (tid == 0))
 
 
-@triton.jit
+# batch and the slot counts change every step and their alignment never reaches
+# the code. next_n keeps its specialization: it folds at 1 here.
+@triton.jit(do_not_specialize_on_alignment=["batch", "num_ctas", "num_units",
+                                            "max_tiles"])
 def _pa_mqa_logits_mxfp4_sched_kernel(
     context_lens_ptr, row_ends_ptr, query_start_loc_ptr, sched_ptr, batch, next_n,
     num_ctas, num_units, max_tiles,
