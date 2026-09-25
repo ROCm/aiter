@@ -185,16 +185,35 @@ def softplus(x):
     return tl.where(x < 20.0, tl.log(1.0 + tl.exp(x)), x)
 
 
-def input_guard(fn: Callable) -> Callable:
-    """Ensure all tensor arguments are contiguous before kernel launch."""
+def input_guard(fn: Callable | None = None, *, skip: tuple[str, ...] = ()) -> Callable:
+    """Ensure tensor arguments are contiguous before kernel launch.
 
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        args = tuple(a.contiguous() if isinstance(a, torch.Tensor) else a for a in args)
-        kwargs = {
-            k: v.contiguous() if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
-        return fn(*args, **kwargs)
+    ``skip`` names keyword arguments that keep their original storage. The
+    paged ``state_cache`` is one: each slot's ``[H, V, K]`` plane is dense,
+    but ``stride(0)`` may be padded, and packing the pool would copy it and
+    write a clone instead of the live cache. Those tensors must be indexed
+    with their own strides.
+    """
+    skip_keys = frozenset(skip)
 
-    return wrapper
+    def decorator(inner: Callable) -> Callable:
+        @functools.wraps(inner)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            args = tuple(
+                a.contiguous() if isinstance(a, torch.Tensor) else a for a in args
+            )
+            kwargs = {
+                k: (
+                    v
+                    if k in skip_keys or not isinstance(v, torch.Tensor)
+                    else v.contiguous()
+                )
+                for k, v in kwargs.items()
+            }
+            return inner(*args, **kwargs)
+
+        return wrapper
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator
