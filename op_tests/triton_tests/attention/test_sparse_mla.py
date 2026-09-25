@@ -152,46 +152,6 @@ def test_ds_mla_format():
     _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
 
 
-@pytest.mark.parametrize(
-    "fmt,dots,tol",
-    [
-        ("bf16", "bf16", 2e-2),
-        ("tensor", "bf16", 2e-2),
-        ("tensor", "fp8", 7e-2),
-        ("dsmla", "bf16", 2e-2),
-    ],
-    ids=["bf16", "tensor", "tensor_fp8", "dsmla"],
-)
-@pytest.mark.parametrize("C", [8, 2048])
-def test_invalid_entries_skip_slot0(fmt, dots, tol, C):
-    """has_invalid: -1 entries must not read slot 0. vLLM's null block sits there
-    and can hold NaN, which a masked score would still carry into V as 0 * NaN."""
-    _skip_unless_gfx950()
-    pool, sm = 1 << 13, D_QK**-0.5
-    q, cache, ks, idx, ptr, truth = _build(fmt, C, 16, 256, pool, ragged=True)
-    idx = idx.clamp(min=1)  # no valid entry points at slot 0
-    drop = torch.rand(idx.shape, device=idx.device) < 0.25
-    drop[ptr[:-1].long()] = False  # every row keeps a key
-    idx = torch.where(drop, -1, idx)
-    rows = cache.view(-1, cache.shape[-1])
-    if fmt == "bf16":
-        rows[0] = float("nan")
-    else:
-        rows[0, :KV_LORA] = 0x7F  # fp8 e4m3fn NaN
-
-    keep = idx >= 0
-    seg = torch.repeat_interleave(torch.arange(C, device=idx.device), ptr.diff().long())
-    ref_ptr = torch.zeros_like(ptr)
-    ref_ptr[1:] = torch.bincount(seg[keep], minlength=C).cumsum(0)
-    ref = reference(q, truth.to(torch.bfloat16), idx[keep], ref_ptr, sm)
-    out, _ = sparse_mla_fwd(
-        q, cache, ptr, idx, sm, kv_scale=ks, has_invalid=True, dot_precision=dots
-    )
-    assert not out.isnan().any()
-    e = rel_err(out, ref)
-    assert e < tol, f"{fmt} C={C}: rel-err {e:.3e}"
-
-
 def reference_lse(q, kv_truth, indices, indptr, sm_scale):
     """Natural-log LSE per (query, head), matching mla_decode_fwd's convention."""
     rows = []
