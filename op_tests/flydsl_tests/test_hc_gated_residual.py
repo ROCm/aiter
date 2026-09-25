@@ -53,7 +53,7 @@ def _check(ref, out, label, atol=0.06, rtol=0.05, max_err_ratio=0.03):
         _FAILURES.append(label)
 
 
-def _make_inputs(tokens, *, with_inject=True, seed=0):
+def _make_inputs(tokens, *, with_inject=True, full_norm=False, seed=0):
     torch.manual_seed(seed)
     hidden = HC * HS
 
@@ -64,7 +64,9 @@ def _make_inputs(tokens, *, with_inject=True, seed=0):
         "residual": _rand(tokens, hidden),
         "block_output": _rand(tokens, HS),
         "injection": _rand(tokens, HC),
-        "norm_weight": _rand(HS, scale=0.1),
+        # full_norm -> [hidden] (per-stream-per-channel weight); else the shared
+        # [stream_dim]. The [hidden] form exercises the w_len==hidden codegen branch.
+        "norm_weight": _rand(hidden if full_norm else HS, scale=0.1),
         "w_down": _rand(LOWRANK, hidden, scale=hidden**-0.5),
         "w_up": _rand(hidden, LOWRANK, scale=LOWRANK**-0.5),
         "w_inject": _rand(HC, hidden, scale=hidden**-0.5) if with_inject else None,
@@ -159,20 +161,41 @@ def test_final_mixer_no_inject(tokens, fold_w):
     _check(x_ref.to(x.dtype), x, f"final_mixer[{tag}][M={tokens}] x")
 
 
-def test_decode(tokens):
-    """Decode M (fused-K2 + fold_w): skinny GEMV on gfx942, padded fused on
-    gfx950 -- both at non-tile-multiple M vs the oracle."""
+def test_decode(tokens, fold_w):
+    """Decode M vs the oracle, both weight modes. ``fold_w=True`` takes the skinny
+    GEMV two-stage on gfx942 (padded fused on gfx950); ``fold_w=False`` is *not*
+    skinny (the skinny down assumes the folded weight) -- it exercises the padded
+    low-M tail of the split-K/decouple path instead."""
+    tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, seed=7)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
         inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
         inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS,
-        w_down_merged=_merged(inp, True), fold_w=True,
+        w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
-    _check(r2_ref.to(r2.dtype), r2, f"decode[M={tokens}] r2", atol=0.05, rtol=0.02)
-    _check(x_ref.to(x.dtype), x, f"decode[M={tokens}] x")
-    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"decode[M={tokens}] inj", atol=0.05)
+    _check(r2_ref.to(r2.dtype), r2, f"decode[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(x_ref.to(x.dtype), x, f"decode[{tag}][M={tokens}] x")
+    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"decode[{tag}][M={tokens}] inj", atol=0.05)
+
+
+def test_full_norm_weight(tokens, fold_w):
+    """Full-width norm_weight ([hidden]) instead of the shared [stream_dim] -- covers
+    the ``w_len==hidden`` branch in the down norm_A, K2, and the skinny up-GEMV
+    (``shared_w=False``), which the [stream_dim] inputs never reach."""
+    tag = "fold" if fold_w else "nofold"
+    inp = _make_inputs(tokens, full_norm=True, seed=5)
+    r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
+        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
+        inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS,
+        w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
+    )
+    torch.cuda.synchronize()
+    r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+    _check(r2_ref.to(r2.dtype), r2, f"fullw[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(x_ref.to(x.dtype), x, f"fullw[{tag}][M={tokens}] x")
+    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"fullw[{tag}][M={tokens}] inj", atol=0.05)
 
 
 parser = argparse.ArgumentParser(
@@ -183,8 +206,8 @@ parser.add_argument(
     help="tile-aligned token counts (spans split-K <3072 and decouple >=3072).",
 )
 parser.add_argument(
-    "--decode-tokens", type=int, nargs="+", default=[1, 3, 8, 32],
-    help="small (decode) token counts for the fused-K2 skinny/tail-path check.",
+    "--decode-tokens", type=int, nargs="+", default=[1, 3, 4, 5, 8, 32],
+    help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
 )
 args = parser.parse_args()
 
@@ -201,7 +224,16 @@ for m in args.tokens:
     test_combine(m)
 test_combine(64)  # extra tile-aligned combine size
 for m in args.decode_tokens:
-    test_decode(m)
+    for fold_w in (False, True):  # C1: cover the non-skinny nofold tail at decode M
+        test_decode(m, fold_w)
+    # C2: final mixer (w_inject=None -> n_pad=lowrank) at decode/small M -- covers
+    # the skinny/tail need_inj=False path and the n_pad divisor fallbacks at tiny M.
+    test_final_mixer_no_inject(m, True)
+# Full-width norm_weight ([hidden]): decode/skinny (M=3, fold) + split-K/K2 (M=512,
+# both modes) -- the w_len==hidden branch the shared [stream_dim] inputs never hit.
+for m in (3, 512):
+    for fold_w in (False, True):
+        test_full_norm_weight(m, fold_w)
 
 if _FAILURES:
     print(f"\n{len(_FAILURES)} check(s) FAILED: {_FAILURES}")

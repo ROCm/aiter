@@ -715,6 +715,10 @@ def _build_down_gemv_partial(
         rr = [rrms_g.load(m * hc_count + stream, vec_size=1) for m in range_constexpr(m_rows)]
         acc = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
         k_base = stream * stream_dim + sk * kslice + lane
+        # MMA-free scalar GEMV: lanes stride the K-slice with 1-element bf16 loads
+        # (coalesced across the wave). Intentional -- decode M<=DECODE_MAX_M is
+        # launch/latency-bound, not bandwidth-bound, so we skip MMA/tiled-copy and
+        # wide vector loads; revisit vec_size>1 only if decode turns bandwidth-bound.
         for i in range_constexpr(iters):
             kk = k_base + i * WAVE
             wd = fx.BFloat16(wdn_g.load(n * hidden + kk, vec_size=1)).to(fx.Float32)
@@ -802,6 +806,9 @@ def _build_up_gate_mix_gemv(
 
         w_shared = w_g.load(c, vec_size=1) if shared_w else None
         xacc = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
+        # MMA-free scalar GEMV (see _build_down_gemv_partial): lane-strided 1-element
+        # bf16 dot over lowrank, wave-reduced. Intentional for decode M<=DECODE_MAX_M
+        # (launch-bound); no MMA/tiled-copy or wide vector loads here.
         for s in range_constexpr(hc_count):
             n = s * stream_dim + c
             g = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
@@ -892,14 +899,27 @@ def flydsl_k1k2_skinny_decode(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """MMA-free skinny GEMV two-stage for decode M (combine+RMS -> down GEMV ->
     reduce/silu -> up GEMV + gated mean). No 64-row tile padding; ``xn`` never
-    materialized. ``w_down_merged`` must be the fold_w weight. Returns the op
-    contract ``(r2, block_input, inj_next)``.
+    materialized. Returns the op contract ``(r2, block_input, inj_next)``.
+
+    CONTRACT: ``w_down_merged`` MUST be the ``(1+w)``-folded merged weight (see
+    :func:`op.fold_norm_weight`). The down GEMV bakes that in -- it forms
+    ``xn = r2*rrms`` with **no** ``(1+w)`` multiply -- so passing an unfolded merged
+    weight here produces silently wrong output (no shape/dtype tripwire catches it).
+    The op only routes here when ``fold_w=True``; do not call it directly otherwise.
     """
     from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import _build_reduce_silu
 
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
+    # Can't verify "folded" numerically (no unfolded ref here), but pin the
+    # checkable half of the contract so a wrong-tensor call fails loudly.
+    assert w_down_merged.dtype == torch.bfloat16 and w_down_merged.is_contiguous(), (
+        "skinny decode needs a bf16 contiguous merged down weight"
+    )
+    assert w_down_merged.shape == (n_pad, hidden), (
+        f"w_down_merged {tuple(w_down_merged.shape)} must be (n_pad, {hidden})"
+    )
     w = norm_weight.reshape(-1).float().contiguous()
     if stream is None:
         stream = torch.cuda.current_stream()

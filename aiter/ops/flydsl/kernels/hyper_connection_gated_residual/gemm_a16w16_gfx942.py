@@ -1,6 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""TEMPORARY, HC-internal gfx942/CDNA3 bf16 a16w16 GEMM.
+
+A near-verbatim copy of the gfx950 reference (``kernels/gemm_a16w16_gfx950.py``)
+with the three CDNA3 adaptations only: 32-bit ``buffer_load...lds`` async DMA (no
+128-bit async on CDNA3), the ``16x16x16`` bf16 MFMA shape, and the 64 KB LDS
+budget. It lives *inside* the ``hyper_connection_gated_residual`` package on
+purpose: it is consumed **only** by this kernel's K1 and must NOT be imported
+elsewhere. It will be deleted once a proper standalone bf16 gfx942 GEMM lands
+under ``kernels/`` for general use (that is the file others should build on).
+"""
+
 import functools
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +22,7 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
-from .gemm_a16w16_gfx950_utils import (
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -24,7 +35,7 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
-from .kernels_common import run_cached
+from aiter.ops.flydsl.kernels.kernels_common import run_cached
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
