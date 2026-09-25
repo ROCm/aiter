@@ -567,3 +567,42 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("has_invalid", [False, True])
+@pytest.mark.parametrize("T", [13, 2437])
+def test_pa_decode_sparse_global_gather(T, has_invalid):
+    """A pool past 2 GiB takes the 64-bit gathers, where the launcher unpeels
+    the tile loop without has_invalid. T=2437 takes the prefill config."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
+    if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
+        pytest.skip("needs ~3 GiB free for the >2 GiB strided pool")
+
+    device = "cuda"
+    H, D = 16, 512
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    softmax_scale = float(D) ** -0.5
+
+    lens = torch.randint(1, 300, (T,), device=device)
+    cache, deq = make_packed_cache(int(lens.sum()), D, "fp8")
+    cache, deq = widen_to_int32_overflow(cache, deq)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    indptr[1:] = lens.cumsum(0)
+    idx = torch.randperm(int(lens.sum()), device=device).to(torch.int32)
+    if has_invalid:
+        drop = torch.rand(idx.shape, device=device) < 0.2
+        drop[indptr[:-1].long()] = False  # every row keeps a key
+        idx[drop] = -1
+
+    ref = pa_decode_sparse_reference(
+        q, deq.to(q.dtype), idx, indptr, attn_sink, softmax_scale
+    )
+    out = pa_decode_sparse(
+        q, cache, idx, indptr, attn_sink, softmax_scale, has_invalid=has_invalid
+    )
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
