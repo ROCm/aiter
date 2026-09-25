@@ -9,6 +9,7 @@ the JIT path hits the cache instead of compiling again.
 | --- | --- | --- |
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
 | `gemm.py` | `GEMM` | GEMM kernels |
+| `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
@@ -43,6 +44,9 @@ python -m aiter.aot.flydsl.moe
 
 # GEMM
 python -m aiter.aot.flydsl.gemm
+
+# conv3d
+python -m aiter.aot.flydsl.conv
 
 # grouped MoE (gfx1250)
 python -m aiter.aot.flydsl.grouped_moe
@@ -96,7 +100,7 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `cu_num`). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)

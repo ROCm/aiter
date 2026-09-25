@@ -135,6 +135,13 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
 
+# Native E8M0 group32 scales have a different operand contract from the
+# FP32 128x128 blockscale family, so shape-identical rows must stay separate.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -196,6 +203,14 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
+)
+
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
@@ -279,6 +294,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
+            "a8w8_blockscale_group32_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
@@ -342,6 +365,12 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
         )
 
     @property
