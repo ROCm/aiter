@@ -77,7 +77,7 @@ def gather_paged_cache(
     return cache[physical, offset]
 
 
-def gather_qsa_family_a_caches(
+def gather_qsa_caches(
     index_cache: torch.Tensor,
     index_table: torch.Tensor,
     k_cache: torch.Tensor,
@@ -86,7 +86,7 @@ def gather_qsa_family_a_caches(
     n_blocks: int,
     seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Unpack family A indexer K and GQA K/V to dense tensors for the oracle."""
+    """Unpack paged indexer K and GQA K/V to dense tensors for the oracle."""
     k_bar = gather_paged_cache(index_cache, index_table, n_blocks)[:, 0, :]
     k = gather_paged_cache(k_cache, kv_table, seq_len)
     v = gather_paged_cache(v_cache, kv_table, seq_len)

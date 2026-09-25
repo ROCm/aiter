@@ -34,15 +34,11 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
+from aiter.ops.flydsl.kernels.qsa import k2 as k2_kernel
 from aiter.ops.flydsl.qsa import (
-    FAMILY_A_GQA,
-    FAMILY_A_INDEXER,
-    FAMILY_A_SCORE_SCALE,
-    FAMILY_B_GQA,
-    FAMILY_B_INDEXER,
-    FAMILY_B_INDEXER_H8,
     gather_paged_cache,
-    gather_qsa_family_a_caches,
+    gather_qsa_caches,
     pack_paged_cache,
     qsa_expand_tail,
     qsa_indexer_scores,
@@ -67,6 +63,14 @@ from aiter.ops.triton.attention.qsa_vllm_amd import (
     qsa_sparse_paged_attention,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from op_tests.qsa_shapes import (
+    FAMILY_A_GQA,
+    FAMILY_A_INDEXER,
+    FAMILY_A_SCORE_SCALE,
+    FAMILY_B_GQA,
+    FAMILY_B_INDEXER,
+    FAMILY_B_INDEXER_H8,
+)
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 
@@ -228,6 +232,30 @@ def test_family_b_shape_constants():
     assert FAMILY_A_GQA.group_size == 12
 
 
+def test_kernel_constants_cover_every_family():
+    """The kernels declare their own shape constants, not a model registry.
+
+    Head count aside, nothing downstream re-derives the block budget or the
+    compress ratio from the caller's tensors, so a family drifting on those
+    axes would slip past the dispatch gate and be silently mis-served.
+    """
+    for spec in (FAMILY_A_INDEXER, FAMILY_B_INDEXER, FAMILY_B_INDEXER_H8):
+        assert spec.n_heads in k1_kernel._SCORE_HEADS
+        assert (
+            spec.kv_heads,
+            spec.head_dim,
+            spec.compress_ratio,
+            spec.block_budget,
+        ) == (k1_kernel._KV_HEADS, k1_kernel._D, k1_kernel._R, k1_kernel._K)
+    assert k1_kernel._SCORE_SCALE == FAMILY_A_SCORE_SCALE
+    # K2's launch policy is fitted per shape, so only family A is claimed.
+    assert (
+        FAMILY_A_GQA.n_heads,
+        FAMILY_A_GQA.kv_heads,
+        FAMILY_A_GQA.head_dim,
+    ) in k2_kernel._TUNED_SHAPES
+
+
 def test_paged_roundtrip_tiny():
     """Shuffled pages still gather back to dense (CPU, no kernel)."""
     dense = torch.arange(48, dtype=dtypes.fp32).view(6, 2, 4)
@@ -304,7 +332,7 @@ def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate=0):
     assert k_cache.shape[-1] == gqa.head_dim
 
     (k_bar_g, k_g, v_g), us = _time(
-        gather_qsa_family_a_caches,
+        gather_qsa_caches,
         index_cache,
         index_table,
         k_cache,
