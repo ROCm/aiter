@@ -1098,6 +1098,63 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     assert error.mean().item() < 0.05, error.mean().item()
 
 
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "max_spread"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
+        (AttentionFormat.BF16, AttentionFormat.FP8, 0.05),
+        (AttentionFormat.INT8, AttentionFormat.FP8, 0.05),
+        (AttentionFormat.FP8, AttentionFormat.FP8, 0.75),
+        (AttentionFormat.FP8, AttentionFormat.MXFP6, 0.75),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, 0.35),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35),
+    ],
+)
+def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_spread):
+    """Ring weights each chunk by exp(lse), so only a bias identical across chunks cancels.
+
+    The absolute bias is allowed to be nonzero and the test above already bounds it; what this
+    one pins is that it does not move from chunk to chunk. Keys escalate along the sequence on
+    purpose: random ones keep every row diffuse, the frozen-max conversion gate never trips, and
+    a rollback missing from the exported max is then invisible. With this input the recipes span
+    0.00 to 0.24 nats, while that defect measured 4.55.
+    """
+    torch.manual_seed(31)
+    batch, sequence, heads, head_dim, chunks = 1, 2048, 5, 128, 4
+    query = torch.randn(
+        (batch, sequence, heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(query)
+    ramp = torch.linspace(1.0, 6.0, sequence, device="cuda", dtype=torch.float32)
+    key = (torch.randn_like(query).float() * ramp.view(1, -1, 1, 1)).to(torch.bfloat16)
+    softmax_scale = head_dim**-0.5
+
+    span = sequence // chunks
+    biases = []
+    for start in range(0, sequence, span):
+        key_chunk = key[:, start : start + span]
+        _, lse = mha_v4(
+            query,
+            key_chunk,
+            value[:, start : start + span],
+            q_format,
+            q_format,
+            v_format,
+            softmax_scale=softmax_scale,
+            return_lse=True,
+        )
+        scores = query.float().permute(0, 2, 1, 3) @ key_chunk.float().permute(
+            0, 2, 3, 1
+        )
+        reference = torch.logsumexp(scores * softmax_scale, dim=-1)
+        biases.append((lse.float() - reference).mean().item())
+
+    spread = max(biases) - min(biases)
+    assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
+
+
 def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
     """gfx942 carries the epilogue, but its exported value has never been measured.
 
