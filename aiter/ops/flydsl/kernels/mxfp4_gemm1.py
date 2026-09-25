@@ -1634,8 +1634,6 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_bn{BN}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
-        # Nested on purpose: at swizzle 0 the round-robin below is never emitted,
-        # so the count cannot change the kernel and does not belong in the name.
         if num_xcds != 8:
             name_suffix += f"_nxcd{num_xcds}"
     if num_waves == 2:
