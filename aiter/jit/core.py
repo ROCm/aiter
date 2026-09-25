@@ -135,6 +135,13 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
 
+# Native E8M0 group32 scales have a different operand contract from the
+# FP32 128x128 blockscale family, so shape-identical rows must stay separate.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -284,6 +291,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
             "a8w8_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
+            "a8w8_blockscale_group32_tuned_gemm",
         )
 
     @property
