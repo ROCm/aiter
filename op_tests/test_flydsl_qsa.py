@@ -46,8 +46,7 @@ from aiter.ops.flydsl.qsa import (
     pack_paged_cache,
     qsa_expand_tail,
     qsa_indexer_scores,
-    qsa_k1_family_a_block_ids,
-    qsa_k1_family_b_block_ids,
+    qsa_k1_block_ids,
     qsa_k2_family_a,
     qsa_oracle,
     qsa_sparse_gqa,
@@ -423,13 +422,14 @@ def test_k1_family_a_set_equality_short_decode():
         score_scale=FAMILY_A_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_a_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
         token_to_req,
         qpos,
         slen,
+        heads=(4,),
     )
     if _set_mismatch_ratio(ref_ids, got) != 0.0:
         raise AssertionError("K1 block-id set diverged from the oracle")
@@ -466,13 +466,14 @@ def test_k1_family_a_set_equality_two_tiles():
         score_scale=FAMILY_A_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_a_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
         token_to_req,
         qpos,
         slen,
+        heads=(4,),
     )
     if _set_mismatch_ratio(ref_ids, got) != 0.0:
         raise AssertionError("K1 two-tile block-id set diverged from the oracle")
@@ -509,13 +510,14 @@ def test_k1_family_a_set_equality_wide_stream():
         score_scale=FAMILY_A_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_a_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
         token_to_req,
         qpos,
         slen,
+        heads=(4,),
     )
     if _set_mismatch_ratio(ref_ids, got) != 0.0:
         raise AssertionError("K1 wide-row block-id set diverged from the oracle")
@@ -552,13 +554,14 @@ def test_k1_family_a_set_equality_prefill():
         score_scale=FAMILY_A_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_a_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
         token_to_req,
         qpos,
         slen,
+        heads=(4,),
     )
     if _set_mismatch_ratio(ref_ids, got) != 0.0:
         raise AssertionError("K1 prefill block-id set diverged from the oracle")
@@ -677,7 +680,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
     block_ids, k1_us = _time(
-        qsa_k1_family_a_block_ids,
+        qsa_k1_block_ids,
         q_indexer,
         index_cache,
         index_table,
@@ -685,6 +688,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
         qpos,
         slen,
         rotate=rotate,
+        heads=(4,),
     )
     k1_err = _set_mismatch_ratio(ref_ids, block_ids)
 
@@ -895,7 +899,7 @@ def test_k1_family_b_set_equality_short_decode():
         score_scale=idx.head_dim**-0.5,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_b_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -937,7 +941,7 @@ def test_k1_family_b_set_equality_short_decode_h8():
         score_scale=idx.head_dim**-0.5,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_b_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -980,7 +984,7 @@ def test_k1_family_b_set_equality_two_tiles():
         score_scale=idx.head_dim**-0.5,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_b_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -1025,7 +1029,7 @@ def test_k1_family_b_set_equality_two_tiles_h8():
         score_scale=idx.head_dim**-0.5,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_b_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -1074,7 +1078,7 @@ def test_k1_family_b_set_equality_published_indexer_point():
         score_scale=idx.head_dim**-0.5,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_family_b_block_ids(
+    got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -1127,7 +1131,7 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=0):
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
     block_ids, k1_us = _time(
-        qsa_k1_family_b_block_ids,
+        qsa_k1_block_ids,
         q_indexer,
         index_cache,
         index_table,

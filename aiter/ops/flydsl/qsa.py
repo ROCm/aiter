@@ -52,8 +52,7 @@ from .kernels.qsa import (
     qsa_topk_blocks,
     qsa_visible_blocks,
 )
-from .kernels.qsa.k1_family_a import qsa_k1_family_a_block_ids
-from .kernels.qsa.k1_family_b import qsa_k1_family_b_block_ids
+from .kernels.qsa.k1 import qsa_k1_block_ids
 from .kernels.qsa.k2_family_a import qsa_k2_family_a
 
 __all__ = [
@@ -71,8 +70,7 @@ __all__ = [
     "pack_paged_cache",
     "qsa_expand_tail",
     "qsa_indexer_scores",
-    "qsa_k1_family_a_block_ids",
-    "qsa_k1_family_b_block_ids",
+    "qsa_k1_block_ids",
     "qsa_k2_family_a",
     "qsa_oracle",
     "qsa_sparse_gqa",
