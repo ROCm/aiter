@@ -786,6 +786,8 @@ def test_cache_state_updates_guards():
 @pytest.mark.parametrize("BV, num_warps", [(32, 1), (64, 2), (128, 4), (64, 1)])
 def test_tiling_equivalence(BV, num_warps, get_config):
     """BV / num_warps must not change results."""
+    if arch == "gfx950" and BV != 128:
+        pytest.skip("gfx950 KDA decode needs BV == V == K")
     get_config(BV=BV, num_warps=num_warps)
     B, T, H, D = 2, 4, 4, 128
     q, k, v = make_qkv(B, T, H, H, D, torch.float32)
@@ -972,6 +974,8 @@ def test_beta_headwise(T):
 @pytest.mark.parametrize("use_tdm_fused_load", [False, True])
 def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load, get_config):
     """Operand prefetch mode and load/store paths must not change results (paged)."""
+    if arch == "gfx950" and (use_tdm_store or use_tdm_fused_load):
+        pytest.skip("TDM load/store is gfx1250-only")
     get_config(
         num_buffers=num_buffers,
         use_tdm_store=use_tdm_store,
@@ -1358,6 +1362,7 @@ def test_sk_equivalence(BV, SK, num_warps, state_v_first, get_config):
     assert_close("ht", ref_ht, ht.transpose(-1, -2) if state_v_first else ht)
 
 
+@gfx1250_only
 @pytest.mark.parametrize("SK", [2, 4, 8])
 def test_sk_paged(SK, get_config):
     """SK on the paged snapshot path, where the LDS staging layout also changes."""

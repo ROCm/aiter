@@ -187,7 +187,6 @@ def fused_recurrent_kda_packed_decode_kernel(
     FLAT: gl.constexpr = gl.BlockedLayout(
         [1, (4 * K) // (64 * NUM_WARPS)], [1, 64], [4, NUM_WARPS // 4], [1, 0]
     )
-    SMEM: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     SMEM1: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     LP: gl.constexpr = H * K
 
@@ -282,8 +281,7 @@ def fused_recurrent_kda_packed_decode_kernel(
         hb = conv_state_ptr + slot.to(gl.int64) * stride_cs_slot
     else:
         hb = conv_state_ptr
-    xch = gl.allocate_shared_memory(gl.float32, [4, K], SMEM)
-    x_rows = xch._reinterpret(gl.float32, [4, K], SMEM1)
+    qkav_smem = gl.allocate_shared_memory(gl.float32, [4 * K], SMEM1)
     obuf = gl.allocate_shared_memory(gl.float32, [V], SMEM1)
     if USE_RMS_GATE:
         sbuf = gl.allocate_shared_memory(gl.float32, [RC], SMEM1)
@@ -338,10 +336,10 @@ def fused_recurrent_kda_packed_decode_kernel(
             b = sigmoid(b)
             if ALLOW_NEG_EIGVAL:
                 b = b * 2.0
-        xch.store(y)
-        qv = x_rows.index(0).load(K_LAYOUT)
-        kv = x_rows.index(1).load(K_LAYOUT)
-        a = x_rows.index(2).load(K_LAYOUT)
+        qkav_smem.store(gl.reshape(y, [4 * K]))
+        qv = qkav_smem.slice(0, K).load(K_LAYOUT)
+        kv = qkav_smem.slice(K, K).load(K_LAYOUT)
+        a = qkav_smem.slice(2 * K, K).load(K_LAYOUT)
         qk = gl.sum(qv * kv, axis=0)
         if USE_QK_L2NORM_IN_KERNEL:
             rq = gl.rsqrt(gl.sum(qv * qv, axis=0) + 1e-6) * scale
@@ -367,7 +365,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                 bufs = bufs[1:] + (nxt,)
             else:
                 bufs = bufs[1:]
-            vv = x_rows.index(3).gather(rows + i, 0)
+            vv = qkav_smem.slice(3 * K, K).gather(rows + i, 0)
             if IS_BETA_HEADWISE:
                 b = gl.load(b_p + rows + i).to(gl.float32)
                 if APPLY_BETA_SIGMOID:
