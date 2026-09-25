@@ -647,7 +647,9 @@ def _pa_decode_sparse_gfx950_gluon(
         prefill_kw["GATHER_CACHE"] = ""
         if main_fmt == extra_fmt == "fp8_dsv4_mla":
             prefill_kw.update(
-                IDX_PREFETCH=True,
+                # Over 64-bit gathers the prefetched ids and the has_invalid redirect
+                # together spill the tile loop.
+                IDX_PREFETCH=use_buffer_load or not has_invalid,
                 SLOT_U32=max(s0, s1) < (1 << 24),
                 KV_LDS_PAD=16,
             )
