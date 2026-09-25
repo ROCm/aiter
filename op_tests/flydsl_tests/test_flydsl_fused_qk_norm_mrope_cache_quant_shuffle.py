@@ -304,8 +304,8 @@ def main() -> None:
         args.gemma_norm,
         args.return_kv,
     )
-    case_count = 0
-    for case_count, case in enumerate(sweep, start=1):
+
+    for case in sweep:
         (
             num_tokens,
             num_q_heads,
