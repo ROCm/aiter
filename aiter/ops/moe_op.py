@@ -125,6 +125,21 @@ def fmoe(
 
 
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_g1u1_bf16_small_m(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    topk_ids: Tensor,
+    topk_weights: Tensor,
+    act_workspace: Tensor,
+    topk: int,
+    gate_is_shuffled: bool,
+    down_is_shuffled: bool,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_int8_g1u0(
     out: Tensor,
     input: Tensor,
