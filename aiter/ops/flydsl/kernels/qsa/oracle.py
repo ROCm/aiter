@@ -60,7 +60,7 @@ def qsa_indexer_scores(
     """``I_ib = score_scale * sum_h ReLU(dot(q[h], k_bar[b]))`` for complete blocks.
 
     Args:
-        q: ``[M, H, D]`` (indexer heads; family A is 4 x 128).
+        q: ``[M, H, D]`` (indexer heads; typically 4 x 128).
         k_bar: ``[n_blocks, D]`` mean-pooled compressed keys (one KV head).
         score_scale: optional ``1/sqrt(D)``; must not change argmax.
     """
@@ -116,7 +116,7 @@ def qsa_expand_tail(
 ) -> torch.Tensor:
     """Expand selected blocks to token ids and append the incomplete tail.
 
-    Output width is ``token_topk + compress_ratio - 1`` (family A: 2051).
+    Output width is ``token_topk + compress_ratio - 1`` (2051 at k=512, r=4).
     """
     if token_topk % compress_ratio:
         raise ValueError("token_topk must be divisible by compress_ratio")
