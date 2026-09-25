@@ -39,12 +39,14 @@ def get_config(
     #       config in the dictionary.
     assert "default" in config_dict[gmm_type], "Default configuration is absent."
     # Optional per-arch shape rules; the first matching rule selects a named config.
+    # Rows are averaged over groups (M / G) because group_sizes lives on the
+    # device and reading it here would force a host sync.
     if not accumulate:
         for rule in config_dict[gmm_type].get("dispatch", []):
             if (
                 K >= rule.get("min_K", 0)
                 and N >= rule.get("min_N", 0)
-                and M >= rule.get("min_rows_per_group", 0) * G
+                and M >= rule.get("min_avg_rows_per_group", 0) * G
             ):
                 return config_dict[gmm_type][rule["config"]]
     key = "accumulate" if accumulate else "default"

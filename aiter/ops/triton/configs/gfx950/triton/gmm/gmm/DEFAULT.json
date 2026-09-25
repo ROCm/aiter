@@ -25,7 +25,7 @@
                 "config": "large_kn",
                 "min_K": 4096,
                 "min_N": 4096,
-                "min_rows_per_group": 256
+                "min_avg_rows_per_group": 256
             }
         ]
     },

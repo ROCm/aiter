@@ -136,6 +136,10 @@ exactly one home; there is no facade or re-export layer.
 Attention and GMM kernels have no family module: they call
 `resolve_config_dir()` + `load_config_json()` directly from their kernel file,
 which is fine for a single `DEFAULT.json` read with no selection logic.
+GMM adds one small exception: an optional per-variant `"dispatch"` list of
+`{"config", "min_K", "min_N", "min_avg_rows_per_group"}` rules, first match
+wins, skipped for `accumulate=True`, falling back to `"default"` (see
+`aiter/ops/triton/README.md`). Thresholds live in the JSON, never in Python.
 
 Adding a family module is the right move only when a family grows real
 selection logic (bucket walks, specialized-file discovery, fallbacks). Until
