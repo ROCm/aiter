@@ -398,6 +398,22 @@ Ensure your PR:
 * [ ] Updates documentation if needed
 * [ ] Includes performance benchmarks (for kernel changes)
 * [ ] Has a clear, descriptive title
+* [ ] Changes one kernel backend (see below)
+
+### One Backend Per PR
+
+A PR changes kernels of one backend only: Triton/Gluon, HIP, ASM, CK, OPUS or
+FlyDSL. Each backend has its own owners, tests and CI jobs, and a PR that mixes
+two waits on both. If the title automation puts two backend tags on your PR,
+split it.
+
+Work that spans backends becomes one PR per backend. When one part cannot
+merge without the other -- a kernel in one backend and the dispatch change in
+another, say -- open them as
+[stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs):
+the second PR's branch starts from the first one's and targets it instead of
+`main`, so each is reviewed on its own and they merge in order. `gh stack`
+does the bookkeeping; from a fork, set the base branch by hand.
 
 ### PR Title Format
 
