@@ -2885,8 +2885,11 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     // the fast path, overshoot overflows it, and near the cut one bucket is
     // already several hundred elements wide.
     IdxT const stage_target = k + k / 4;
-    IdxT sample_k = static_cast<IdxT>((static_cast<int64_t>(stage_target) * sample_len) /
-                                      static_cast<int64_t>(row_len));
+    // This specialization is gated to k=2048 and len<=32770, while sample_len
+    // is capped at 2048.  The largest numerator is therefore 5,242,880, so
+    // signed 32-bit arithmetic is exact.  Keeping it in IdxT avoids lowering
+    // this one quotient to a long software i64 division sequence on gfx950.
+    IdxT sample_k = static_cast<IdxT>((stage_target * sample_len) / row_len);
     if(sample_k < 1) sample_k = 1;
     if(sample_k > sample_len) sample_k = sample_len;
     choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
