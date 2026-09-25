@@ -1459,6 +1459,7 @@ __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
     constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
     static_assert(BlockSize % WARP_SIZE == 0);
     constexpr int waves = BlockSize / WARP_SIZE;
+    static_assert(waves <= 16);
     constexpr bool wide = (num_buckets == BlockSize * 4);
     constexpr int items_per_thread = wide ? 4 : 1;
     static_assert(wide || num_buckets <= BlockSize,
@@ -1490,16 +1491,18 @@ __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
     IdxT const x = static_cast<IdxT>(wave_inclusive_sum_dpp(static_cast<int>(sum)));
     if(lane == WARP_SIZE - 1) wave_sums[wave] = x;
     __syncthreads();
-    if(static_cast<int>(threadIdx.x) < waves)
+    // Wave 0 scans the at-most-16 wave totals under a full Wave64 EXEC mask.
+    // Lanes outside the first 16-lane DPP row carry zero and are not stored.
+    // This keeps the second-level scan on VALU instead of lowering four
+    // __shfl_up operations to ds_bpermute plus LDS waits.
+    if(wave == 0)
     {
-        IdxT t = wave_sums[threadIdx.x];
-#pragma unroll
-        for(int off = 1; off < waves; off <<= 1)
-        {
-            IdxT const y = static_cast<IdxT>(__shfl_up(static_cast<int>(t), off, WARP_SIZE));
-            if(static_cast<int>(threadIdx.x) >= off) t += y;
-        }
-        wave_sums[threadIdx.x] = t;
+        int t = lane < waves ? static_cast<int>(wave_sums[lane]) : 0;
+        t = dpp_add<0x111, 0xf, 0xf>(t); // row_shr:1
+        t = dpp_add<0x112, 0xf, 0xf>(t); // row_shr:2
+        t = dpp_add<0x114, 0xf, 0xe>(t); // row_shr:4
+        t = dpp_add<0x118, 0xf, 0xc>(t); // row_shr:8
+        if(lane < waves) wave_sums[lane] = static_cast<IdxT>(t);
     }
     __syncthreads();
 
