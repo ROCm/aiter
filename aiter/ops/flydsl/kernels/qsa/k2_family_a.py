@@ -129,6 +129,16 @@ def build_qsa_k2_family_a_module(
     d_chunks = _D // vec
     col_owners = block_threads // block_n
     gather_rounds = d_chunks // col_owners
+    # Every gather round in flight costs 4 VGPRs. BN64 owns only two threads
+    # per column, so it runs 16 rounds and holding them all pins 64 registers
+    # for K and another 64 for the V prefetch that stays live across QK. Four
+    # rounds in flight is enough to keep the memory pipe fed on the long
+    # prefill shapes and measured best there; BN16 decode already runs two
+    # rounds total, so it stays a single chunk and is structurally unchanged.
+    gather_chunk = next(
+        c for c in range(min(gather_rounds, 4), 0, -1) if gather_rounds % c == 0
+    )
+    n_gather_chunks = gather_rounds // gather_chunk
     gather_span = col_owners * vec
     token_major_v = use_k32 and block_n == 16
     decode_tr_pv = token_major_v
@@ -438,11 +448,15 @@ def build_qsa_k2_family_a_module(
         def tile_body(safe_phys, page_off_i, live, state):
             gpu.barrier()
 
+            # One V address view for every gather path below. It has to live
+            # at function scope: the frontend does not leak names assigned
+            # inside a const_expr branch out to later code.
+            v_row = fx.logical_divide(
+                fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
+            )
+
             v_frags = []
             if const_expr(decode_tr_pv):
-                v_row = fx.logical_divide(
-                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
-                )
                 for gr in range_constexpr(gather_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
@@ -453,63 +467,71 @@ def build_qsa_k2_family_a_module(
             k_row = fx.logical_divide(
                 fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
             )
-            k_frags = []
-            for gr in range_constexpr(gather_rounds):
-                d_chunk = chunk_owner + Int32(gr * col_owners)
-                k_src = fx.slice(k_row, (None, d_chunk))
-                k_frag = fx.make_fragment_like(k_src)
-                fx.copy(g_copy, k_src, k_frag)
-                k_frags.append(k_frag)
-            for gr in range_constexpr(gather_rounds):
-                k_vec = live.select(
-                    fx.Vector(fx.memref_load_vec(k_frags[gr])),
-                    fx.Vector.filled(vec, 0.0, BFloat16),
-                )
-                if const_expr(decode_tr_pv):
-                    base_bytes = tid * Int32(16)
-                    base_bytes = base_bytes ^ _idiv(tid & Int32(0xE0), Int32(2))
-                    if const_expr(gr != 0):
-                        base_bytes = (base_bytes ^ Int32(0x80)) + Int32(4096)
-                    k_dst = fx.make_view(
-                        k_arr.ptr + _idiv(base_bytes, Int32(2)),
-                        fx.make_layout(8, 1),
-                    )
-                    k_store_frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
-                    fx.memref_store_vec(k_vec, k_store_frag)
-                    fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
-                elif const_expr(use_k32):
+            for gc in range_constexpr(n_gather_chunks):
+                k_frags = []
+                for j in range_constexpr(gather_chunk):
+                    gr = gc * gather_chunk + j
                     d_chunk = chunk_owner + Int32(gr * col_owners)
-                    k_dst = fx.make_view(
-                        k_arr.ptr + amd_k_elem(col, d_chunk * Int32(8)),
-                        fx.make_layout(8, 1),
+                    k_src = fx.slice(k_row, (None, d_chunk))
+                    k_frag = fx.make_fragment_like(k_src)
+                    fx.copy(g_copy, k_src, k_frag)
+                    k_frags.append(k_frag)
+                for j in range_constexpr(gather_chunk):
+                    gr = gc * gather_chunk + j
+                    k_vec = live.select(
+                        fx.Vector(fx.memref_load_vec(k_frags[j])),
+                        fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    k_store_frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
-                    fx.memref_store_vec(k_vec, k_store_frag)
-                    fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
-                else:
-                    k_tile = make_k_lds_view(
-                        k_arr,
-                        Int32(gr * gather_span),
-                        (block_n, gather_span),
-                    )
-                    k_dst = kv_store.partition_D(k_tile)
-                    k_store_frag = fx.make_fragment_like(k_dst)
-                    fx.memref_store_vec(k_vec, k_store_frag)
-                    fx.copy(lds_copy, k_store_frag, k_dst)
+                    if const_expr(decode_tr_pv):
+                        base_bytes = tid * Int32(16)
+                        base_bytes = base_bytes ^ _idiv(tid & Int32(0xE0), Int32(2))
+                        if const_expr(gr != 0):
+                            base_bytes = (base_bytes ^ Int32(0x80)) + Int32(4096)
+                        k_dst = fx.make_view(
+                            k_arr.ptr + _idiv(base_bytes, Int32(2)),
+                            fx.make_layout(8, 1),
+                        )
+                        k_store_frag = fx.make_rmem_tensor(
+                            fx.make_layout(8, 1), BFloat16
+                        )
+                        fx.memref_store_vec(k_vec, k_store_frag)
+                        fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                    elif const_expr(use_k32):
+                        d_chunk = chunk_owner + Int32(gr * col_owners)
+                        k_dst = fx.make_view(
+                            k_arr.ptr + amd_k_elem(col, d_chunk * Int32(8)),
+                            fx.make_layout(8, 1),
+                        )
+                        k_store_frag = fx.make_rmem_tensor(
+                            fx.make_layout(8, 1), BFloat16
+                        )
+                        fx.memref_store_vec(k_vec, k_store_frag)
+                        fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                    else:
+                        k_tile = make_k_lds_view(
+                            k_arr,
+                            Int32(gr * gather_span),
+                            (block_n, gather_span),
+                        )
+                        k_dst = kv_store.partition_D(k_tile)
+                        k_store_frag = fx.make_fragment_like(k_dst)
+                        fx.memref_store_vec(k_vec, k_store_frag)
+                        fx.copy(lds_copy, k_store_frag, k_dst)
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
             else:
                 gpu.barrier()
 
+            # Only the first chunk is issued ahead of QK. That is enough to
+            # cover the QK MFMA block with global latency; the later chunks
+            # overlap each other's LDS stores instead of all sitting live in
+            # registers across QK.
             v_frags_pf = []
             if const_expr(use_k32) and const_expr(not decode_tr_pv):
-                v_row_pf = fx.logical_divide(
-                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
-                )
-                for gr in range_constexpr(gather_rounds):
+                for gr in range_constexpr(gather_chunk):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
-                    v_src = fx.slice(v_row_pf, (None, d_chunk))
+                    v_src = fx.slice(v_row, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(g_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
@@ -610,25 +632,38 @@ def build_qsa_k2_family_a_module(
                     + _idiv(col, Int32(32)) * Int32(32 * _D)
                 )
                 store_addr = store_elem * Int32(2)
-                for gr in range_constexpr(gather_rounds):
-                    v_vec = live.select(
-                        fx.Vector(fx.memref_load_vec(v_frags_pf[gr])),
-                        fx.Vector.filled(vec, 0.0, BFloat16),
-                    )
-                    lo = fx.Vector.from_elements(
-                        [v_vec[i] for i in range_constexpr(4)], BFloat16
-                    ).bitcast(fx.Int64)[0]
-                    hi = fx.Vector.from_elements(
-                        [v_vec[i + 4] for i in range_constexpr(4)], BFloat16
-                    ).bitcast(fx.Int64)[0]
-                    # One base VGPR; round gr is +gr st64 (512 B) and hi is
-                    # +16 st64 (8192 B), matching AMD's offset0/offset1 pairs.
-                    _ds_write2st64_b64(store_addr, lo, hi, offset0=gr, offset1=gr + 16)
+                for gc in range_constexpr(n_gather_chunks):
+                    if const_expr(gc == 0):
+                        v_chunk = v_frags_pf
+                    else:
+                        v_chunk = []
+                        for j in range_constexpr(gather_chunk):
+                            d_chunk = chunk_owner + Int32(
+                                (gc * gather_chunk + j) * col_owners
+                            )
+                            v_src = fx.slice(v_row, (None, d_chunk))
+                            v_frag = fx.make_fragment_like(v_src)
+                            fx.copy(g_copy, v_src, v_frag)
+                            v_chunk.append(v_frag)
+                    for j in range_constexpr(gather_chunk):
+                        gr = gc * gather_chunk + j
+                        v_vec = live.select(
+                            fx.Vector(fx.memref_load_vec(v_chunk[j])),
+                            fx.Vector.filled(vec, 0.0, BFloat16),
+                        )
+                        lo = fx.Vector.from_elements(
+                            [v_vec[i] for i in range_constexpr(4)], BFloat16
+                        ).bitcast(fx.Int64)[0]
+                        hi = fx.Vector.from_elements(
+                            [v_vec[i + 4] for i in range_constexpr(4)], BFloat16
+                        ).bitcast(fx.Int64)[0]
+                        # One base VGPR; round gr is +gr st64 (512 B) and hi
+                        # is +16 st64 (8192 B), matching AMD's offset pairs.
+                        _ds_write2st64_b64(
+                            store_addr, lo, hi, offset0=gr, offset1=gr + 16
+                        )
                 gpu.barrier()
             elif const_expr(not use_k32):
-                v_row = fx.logical_divide(
-                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
-                )
                 for gr in range_constexpr(gather_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
