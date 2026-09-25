@@ -52,15 +52,14 @@ def _build_up_gate_mix_norm(
     _skip_norm: bool = False,
     _skip_gemm: bool = False,
 ):
-    """K2 (SILOTIGER-1042 milestone 3): up-GEMM + gated mean that re-forms ``xn``
-    on-the-fly from ``r2`` + ``rrms`` instead of reading a materialized ``xn``.
+    """K2: up-GEMM + gated mean that re-forms ``xn`` on-the-fly from ``r2`` +
+    ``rrms`` instead of reading a materialized ``xn``.
 
-    Identical to :func:`_build_up_gate_mix` except the gated-mean multiply builds
-    ``xn = r2 * rrms[m, s] * (1 + w[c])`` in registers (matching the reference's
-    normalize-then-bf16-round order) right where the base kernel loaded ``xn``.
-    This lets K2 consume K1's stored ``r2`` (+ the tiny per-stream ``rrms``)
-    directly -- the ``xn`` HBM round-trip and the interim norm-rebuild launch of
-    the milestone-2 tail both disappear.
+    The gated-mean multiply builds ``xn = r2 * rrms[m, s] * (1 + w[c])`` in
+    registers (the reference's normalize-then-bf16-round order) right where a plain
+    up-GEMM would load ``xn``. This lets K2 consume K1's stored ``r2`` (+ the tiny
+    per-stream ``rrms``) directly -- so the ``xn`` HBM round-trip never happens and
+    no separate norm-rebuild launch is needed.
     """
     hidden = hc_count * stream_dim
     inv_hc = 1.0 / hc_count
@@ -177,7 +176,7 @@ def _build_up_gate_mix_norm(
                     r2_g.load(g_m * hidden + col, vec_size=VEC)
                 ).to(fx.Float32)
                 # Measurement-only: skip the rrms*(1+w) reform + bf16 round to
-                # isolate the K2 normalize tax (see §6.9's K1 _skip_norm).
+                # isolate the K2 normalize tax (mirrors K1's _skip_norm).
                 xn_vec = r2_vec
                 if not _skip_norm:
                     rr = fx.Float32(rrms_g.load(g_m * hc_count + s, vec_size=1))

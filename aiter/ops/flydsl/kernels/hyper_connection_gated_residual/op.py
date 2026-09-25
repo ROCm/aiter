@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Two-stage Gated-Residual ``combine_and_mix`` op (SILOTIGER-1042).
+"""Two-stage Gated-Residual ``combine_and_mix`` op.
 
 The shipped, fully-fused two-stage kernel: ``K1`` = combine + grouped-RMSNorm +
 down GEMM (:func:`~.k1.flydsl_k1_combine_norm_down`), ``K2`` = silu + up GEMM +

@@ -4,7 +4,7 @@
 # Do NOT add `from __future__ import annotations`: PEP 563 stringifies the
 # annotations and defeats flydsl's runtime-arg detection in the JIT cache key.
 
-"""K1 of the two-stage Gated-Residual kernel (SILOTIGER-1042): combine +
+"""K1 of the two-stage Gated-Residual kernel: combine +
 grouped-RMSNorm + down GEMM, fused so ``xn`` never touches HBM.
 
 :func:`flydsl_k1_combine_norm_down` is the entry point. A high-occupancy
@@ -17,7 +17,7 @@ GEMM then re-forms
 *inside the A-load* (never materializing ``xn``) and contracts it against the
 merged ``[n_pad, hidden]`` down+inject weight, emitting the packed
 ``silu'd bottleneck | raw injection`` output. The K reduction is dispatched by
-token count (``§6.3``/``§6.4``): split-K partials at small/mid M
+token count: split-K partials at small/mid M
 (:func:`_build_down_norm_partial_pipe`), a decoupled async-LDS pipeline at large
 M (:func:`_build_down_norm_pipe`), and an MMA-free GEMV two-stage at decode M on
 non-gfx950 (:func:`flydsl_k1k2_skinny_decode`).
@@ -71,19 +71,18 @@ def _build_down_norm_pipe(
 
     ``_skip_norm`` is a measurement-only switch (produces wrong output): it drops
     the A-transform so the kernel is a plain GEMM+epilogue, isolating the
-    normalization tax (§6.8) as the delta vs the normal path.
+    normalization tax as the delta vs the normal path.
 
-    The GEMM half of the *decoupled* large-M path (§6.4): a high-occupancy
+    The GEMM half of the *decoupled* large-M path: a high-occupancy
     ``_build_combine_rms`` prologue emits ``r2`` + ``rrms`` separately, then this
     kernel forms ``xn = r2*rrms*(1+w)`` in the A-load and reduces the full K with
-    the vendored ``gemm_a16w16_gfx950`` async global->LDS staged pipeline. It is
-    ``_build_k1_pipe`` minus the fused combine/RMS prologue and the ``y`` panel
-    (only ``r2`` and ``B`` are staged) -- so the memory-bound RMS reduction no
-    longer runs pinned to this kernel's low (LDS-limited) occupancy, and ``xn`` is
-    still never materialized.
+    the aiter ``gemm_a16w16_gfx950`` async global->LDS staged pipeline. Only
+    ``r2`` and ``B`` (the weight) are staged in LDS -- so the memory-bound RMS
+    reduction no longer runs pinned to this kernel's low (LDS-limited) occupancy,
+    and ``xn`` is still never materialized.
 
-    N-tiled (§6.7): the ``[n_pad]`` output width is split into ``n_pad//block_n``
-    column blocks over ``grid.y``, mirroring ``down_inject_best``'s ``block_n=64``.
+    N-tiled: the ``[n_pad]`` output width is split into ``n_pad//block_n``
+    column blocks over ``grid.y`` (a 64-wide N tile).
     Small B tiles shrink the LDS panel (higher occupancy) and give more workgroups
     -- the mid-M ~1.85x the full-width (block_n=n_pad) tile left on the table.
     """
@@ -98,7 +97,7 @@ def _build_down_norm_pipe(
         make_gemm_ab_load_context,
         make_gemm_ab_lds_layouts,
     )
-    else:  # gfx950/CDNA4 -> vendored aiter GEMM (rides upstream)
+    else:  # gfx950/CDNA4 -> aiter GEMM (rides upstream)
         from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
         GEMM_A16W16_DTYPE_BF16,
         AsyncLoadTile,
@@ -126,7 +125,7 @@ def _build_down_norm_pipe(
     k_tiles = hidden // block_k
     w_stage_iters = w_len // block_threads
     k_group = mma_k // 4
-    # Stage this M-tile's rrms ([block_m, hc]) in LDS once (§6.7): the A-transform
+    # Stage this M-tile's rrms ([block_m, hc]) in LDS once: the A-transform
     # otherwise re-loads rrms from global for every fragment element on every
     # k-tile. Only when the tile divides the workgroup evenly (it does for the
     # decouple's block_m=64, hc=4, 256 threads); else fall back to per-element.
@@ -266,10 +265,10 @@ def _build_down_norm_pipe(
 
         def transform(kt):
             # frag_A holds the r2 tile; normalize into xn: widen, * rrms * (1+w),
-            # re-round to bf16 (matching _build_down_norm.norm_A). The per-element
-            # rrms/w gathers fill a scale *fragment* (A's layout), so the normalize
+            # re-round to bf16 (the reference's normalize-then-quantize order). The
+            # per-element rrms/w gathers fill a scale *fragment* (A's layout), so the normalize
             # is one packed vector multiply va*scale instead of a_elems scalar muls
-            # -- the down GEMM is VALU-bound on this (§6.7e).
+            # -- the down GEMM is VALU-bound on this.
             va = frag_A.load().to(fx.Float32)
             scales = []
             for i in range_constexpr(a_elems):
@@ -393,7 +392,7 @@ def _build_down_norm_partial_pipe(
     mma_k: int,
     fold_w: bool = False,
 ):
-    """Async-LDS pipelined split-K partial (§6.7c): the decouple pipe body, but
+    """Async-LDS pipelined split-K partial: the decouple pipe body, but
     each ``grid.y`` workgroup reduces a disjoint K-slice and writes a raw f32
     partial ``[split_k*M, n_pad]`` (SiLU deferred to the reduce). Combines split-K
     parallelism (mid-M fill) with the async global->LDS pipeline + N-tile +
@@ -408,7 +407,7 @@ def _build_down_norm_partial_pipe(
         make_gemm_ab_load_context,
         make_gemm_ab_lds_layouts,
     )
-    else:  # gfx950/CDNA4 -> vendored aiter GEMM (rides upstream)
+    else:  # gfx950/CDNA4 -> aiter GEMM (rides upstream)
         from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
         GEMM_A16W16_DTYPE_BF16,
         AsyncLoadTile,
@@ -574,7 +573,7 @@ def _build_down_norm_partial_pipe(
         scale_frag = fx.make_fragment_like(frag_A, fx.Float32)
 
         def transform(gkt):
-            # Vectorized normalize (§6.7e): fill a scale fragment, one packed
+            # Vectorized normalize: fill a scale fragment, one packed
             # va*scale multiply instead of per-element scalar muls.
             va = frag_A.load().to(fx.Float32)
             scales = []
@@ -683,7 +682,7 @@ def _build_down_gemv_partial(
     Unlike the MMA partial this does **no 64-row tile padding**: it runs the true
     ``m_rows`` rows (M held in registers), so decode M=1 does 1 row of work, not 64.
     Writes a raw f32 partial ``[hc_count*split_k_per_stream * m_rows, n_pad]``; the
-    shared :func:`down_silu._build_reduce_silu` sums the ``hc_count*spk`` blocks and
+    shared :func:`common._build_reduce_silu` sums the ``hc_count*spk`` blocks and
     applies ``silu(down/nr)`` (inject columns kept raw).
     """
     assert n_pad % waves_per_block == 0, (
@@ -884,7 +883,7 @@ def _decode_reduce_params(total: int):
 
 
 # Decode skinny path holds m_rows accumulators per lane, so the GEMV bodies spill
-# for m_rows >= 8 (rocprofv3: down_gemv M=8 ~134us, M=32 ~514us -- §13.13). It only
+# for m_rows >= 8 (rocprofv3: down_gemv M=8 ~134us, M=32 ~514us). It only
 # wins at very small M (M<=4: ~17-26us, ~1.4-1.8x vs Triton); above that the padded
 # split-K/pipe path is far better, so gate the skinny decode at 4.
 DECODE_MAX_M = 4
@@ -1061,15 +1060,15 @@ def _build_down_norm_partial(
 ):
     """Split-K partial down+inject GEMM with the norm folded into the A-load.
 
-    Forks :func:`_build_down_norm`: ``split_k`` workgroups per token block
-    (``grid.y``) each reduce a disjoint K-slice of the ``hidden`` contraction,
-    forming ``xn = r2 * rrms * (1+w)`` in registers per k-tile, and write a raw
-    f32 partial ``[split_k*M, n_pad]``. SiLU / inject-split is deferred to the
-    cross-K reduction (:func:`down_silu._build_reduce_silu`), which must follow the
-    full reduction. This is the parallelism lever K1 lacked: it multiplies the
-    workgroup count by ``split_k`` so the machine fills at small/mid M.
+    Split-K partial: ``split_k`` workgroups per token block (``grid.y``) each
+    reduce a disjoint K-slice of the ``hidden`` contraction, forming
+    ``xn = r2 * rrms * (1+w)`` in registers per k-tile, and write a raw f32 partial
+    ``[split_k*M, n_pad]``. SiLU / inject-split is deferred to the cross-K reduction
+    (:func:`common._build_reduce_silu`), which must follow the full reduction. This
+    is the parallelism lever K1 lacked: it multiplies the workgroup count by
+    ``split_k`` so the machine fills at small/mid M.
 
-    N-tiled + LDS-rrms (§6.7a): the ``[n_pad]`` width is split into
+    N-tiled + LDS-rrms: the ``[n_pad]`` width is split into
     ``n_pad//block_n`` column blocks over ``grid.z``, and this M-tile's ``rrms``
     is staged in LDS once instead of a per-element global load in ``norm_A``.
     """
@@ -1228,14 +1227,14 @@ def _build_down_norm_partial(
 
 
 def _k1_auto_split_k(tokens: int, block_m: int, k_tiles: int) -> int:
-    """Split-K factor from the token grid (§6.3, measured on the shipped shape).
+    """Split-K factor from the token grid (measured on the shipped shape).
 
     Split-K only helps while the ``M/block_m`` token grid can't fill the CUs. The
     swept optimum (``_tune_splitk.py`` / ``_bench_decouple.py``, block_m=64) is:
     aim for ~256 workgroups (``split_k ~= 256/grid_m``, capped at 16), snapped
     down to a divisor of ``k_tiles``; and once the plain grid is large enough
     (``grid_m >= 48``, i.e. ~3072+ tokens at block_m=64) split-K's extra partials
-    traffic loses to the *decoupled pipelined* path (return 1 -> §6.4), which
+    traffic loses to the *decoupled pipelined* path (return 1), which
     beats both the fused pipe and split-K there. E.g. block_m=64: 256->16,
     512->16, 1024->16, 2048->8, 4096->1 (decouple), 8192->1 (decouple).
     """
@@ -1278,21 +1277,21 @@ def flydsl_k1_combine_norm_down(
     use_tuned: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused K1 (SILOTIGER-1042): combine + grouped-RMSNorm + down.
+    """Fused K1: combine + grouped-RMSNorm + down.
 
     Combines ``block_output`` (gated by ``injection``) into ``residual``, forms
     the normalized ``xn`` in-flight (never materialized), and returns the packed
     down+inject output.
 
     ``split_k`` (default ``"auto"``) trades the single-launch fusion for the
-    parallelism the fused body lacks at small/mid M (§6.3): a combine+RMS
+    parallelism the fused body lacks at small/mid M: a combine+RMS
     prologue emits ``r2`` + ``rrms``, ``split_k`` workgroups per token block each
     reduce a K-slice of a down-norm GEMM (``xn`` re-formed in the A-load, still
     never materialized), and a reduction sums the partials + SiLU. This is
     ~3-6x faster at M<=2048 but, because the f32 K-reduction order differs, is
     oracle-accurate rather than bit-exact vs the single-workgroup body. ``"auto"``
     uses split-K where it wins (small/mid M) and the decoupled async-LDS pipe
-    (``split_k=1``, §6.4) elsewhere; explicit ``split_k>1``/``1`` force those
+    (``split_k=1``) elsewhere; explicit ``split_k>1``/``1`` force those
     paths. The bit-exact monolithic pipe (``split_k=0``) is not implemented in
     this package.
 
@@ -1300,28 +1299,27 @@ def flydsl_k1_combine_norm_down(
     be stored per the contract); ``out`` is the packed ``[M, n_pad]`` with
     columns ``[0, lowrank)`` the SiLU'd bottleneck and ``[lowrank, lowrank+hc)``
     the raw next-injection logits (slice with
-    :func:`~...down_silu.split_down_inject`).
+    :func:`~...common.split_down_inject`).
     """
     assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
     assert block_output.dtype == torch.bfloat16 and block_output.is_contiguous()
     assert injection.dtype == torch.bfloat16 and injection.is_contiguous()
     assert w_dn_merged.dtype == torch.bfloat16 and w_dn_merged.is_contiguous()
     tokens, hidden = residual.shape
-    # Default tile height. The async-LDS pipeline (stages>=2, §6.2) needs
+    # Default tile height. The async-LDS pipeline (stages>=2) needs
     # block_m*block_k >= block_threads*async_vec (block_m>=32 here) for the async
     # loads to be whole-thread-covered, and pipe@32 beats the non-pipe body at
     # every M, so the pipe default is 32. The rolled single-buffer fallback
     # (stages<2) keeps the token-adaptive height (block_m=16 wins for small/mid
-    # M, 32 for large; crossover between 4096 and 8192 tokens -- SILOTIGER-1042
-    # §5e). An explicit block_m always wins.
+    # M, 32 for large; crossover between 4096 and 8192 tokens). An explicit block_m always wins.
     if block_m is None:
         block_m = 32 if stages >= 2 else (16 if tokens <= 4096 else 32)
-    # Tail path (SILOTIGER-1042 low-M): when the true token count is not a tile
+    # Tail path (low-M): when the true token count is not a tile
     # multiple, the GEMM stages run over a padded row count ``gemm_tokens`` while
     # the combine prologue still reads only the true ``tokens`` input rows (it is
     # one-workgroup-per-token, no block_m constraint) and writes r2/rrms[:tokens];
     # the zeroed pad rows [tokens:gemm_tokens] flow through down/K2 producing
-    # discardable zero output. Removes the caller-side pad memcpy (§ low-M Phase 1).
+    # discardable zero output. Removes the caller-side pad memcpy.
     assert gemm_pad is None or gemm_pad >= tokens, "gemm_pad must be >= tokens"
     gemm_tokens = tokens if gemm_pad is None else gemm_pad
     # Data-driven config (tuned_configs.json "k1" table): fill any dimension the
@@ -1330,7 +1328,7 @@ def flydsl_k1_combine_norm_down(
     # on gemm_tokens so a padded low-M tail resolves like its padded size.
     arch = arch_name(residual.device)
     plan = k1_plan(arch, gemm_tokens) if use_tuned else None
-    # gfx942 (§13.9): the vendored async-LDS pipe now lowers on CDNA3 via the
+    # gfx942: the aiter async-LDS pipe now lowers on CDNA3 via the
     # 32-bit buffer_load...lds DMA (gemm_a16w16_gfx950 async width is arch-aware),
     # so the decouple/monolithic *pipe* is enabled (it wins at large M, 8192 K1
     # 711->602us). But the mid-M *split-K* partial still uses the register-prefetch
@@ -1361,7 +1359,7 @@ def flydsl_k1_combine_norm_down(
         _plan_sk_block_m = plan.get("sk_block_m")
     if block_k is None:
         block_k = 64
-    # Resolve split-K (§6.3). Split-K trades the single-launch fusion for the
+    # Resolve split-K. Split-K trades the single-launch fusion for the
     # parallelism the fused body lacks at small/mid M: a combine+RMS prologue
     # emits r2 + rrms, then `split_k` workgroups per token block each reduce a
     # K-slice of a down-norm GEMM (xn re-formed in the A-load from r2+rrms, so xn
@@ -1369,7 +1367,7 @@ def flydsl_k1_combine_norm_down(
     # bit-exact vs the single-workgroup body (f32 reduction order differs) --
     # validated against the oracle -- so it is opt-in (default off).
     k_tiles = hidden // block_k
-    # Split-K partial tile height (§6.3 sweep), independent of the pipe's
+    # Split-K partial tile height, independent of the pipe's
     # block_m: block_m=64 wins at M>=1024 (and stretches the split-K advantage
     # out to 4096), but tiny M wants more/smaller blocks so 32 wins at M<=512.
     # Fall back to divisibility-preserving values when 64/32 don't tile tokens.
@@ -1386,7 +1384,7 @@ def flydsl_k1_combine_norm_down(
         split_k = _k1_auto_split_k(gemm_tokens, sk_block_m, k_tiles)
     use_splitk = isinstance(split_k, int) and split_k > 1
     # split_k == 1 (explicit): decoupled path -- high-occupancy combine+RMS
-    # prologue (r2+rrms) + a *pipelined* down-norm GEMM (§6.4). Decouples the
+    # prologue (r2+rrms) + a *pipelined* down-norm GEMM. Decouples the
     # memory-bound prologue from the low-occupancy GEMM without the un-pipelined
     # partial's penalty. xn is still never materialized.
     use_decouple = isinstance(split_k, int) and split_k == 1
@@ -1443,7 +1441,7 @@ def flydsl_k1_combine_norm_down(
             split_k * gemm_tokens, n_pad, dtype=torch.float32, device=residual.device
         )
         prologue = _build_combine_rms(hc_count, stream_dim, float(eps))
-        # N-tile the split-K partial (§6.7a) only where it pays: at M>=1024
+        # N-tile the split-K partial only where it pays: at M>=1024
         # (sk_block_m=64, so LDS-rrms is active and the extra n-blocks don't
         # over-subscribe). Tiny M keeps the full-width tile (block_n=n_pad).
         # A tuned/explicit block_n comes from the with-inject shape (n_pad=384); it
@@ -1455,7 +1453,7 @@ def flydsl_k1_combine_norm_down(
             sk_bn = 128
         else:
             sk_bn = n_pad
-        # Wave layout: m_waves=2,n_waves=2 (§6.7d joint sweep) is ~20-26% faster
+        # Wave layout: m_waves=2,n_waves=2 (joint sweep) is ~20-26% faster
         # than the default 1x4 for the pipelined split-K partial at mid M.
         _sk_mw = dn_m_waves if dn_m_waves is not None else 2
         _sk_nw = dn_n_waves if dn_n_waves is not None else 2
@@ -1482,7 +1480,7 @@ def flydsl_k1_combine_norm_down(
     if use_decouple:
         rrms = _rrms_buf()
         prologue = _build_combine_rms(hc_count, stream_dim, float(eps))
-        # N-tile the down GEMM (§6.7): block_n=64 (down_inject_best-style) shrinks
+        # N-tile the down GEMM: a 64-wide block_n shrinks
         # the B panel (higher occupancy) + adds workgroups -- a mid-M win. But at
         # large M the 6x n-blocks over-subscribe and re-read the A(r2) tile, so
         # widen block_n and raise block_m there to keep the workgroup count sane.
@@ -1490,7 +1488,7 @@ def flydsl_k1_combine_norm_down(
         # Swept optimum for the decouple regime (grid_m>=48, i.e. ~4096+ tokens):
         # block_n=128 (3 n-tiles) + block_m=64 balances the workgroup count against
         # the per-n-tile A(r2) re-read -- beats both the full-width tile (bn=n_pad)
-        # and the over-subscribed bn64 at every decouple size (§6.7).
+        # and the over-subscribed bn64 at every decouple size.
         _dn_bn = dn_block_n
         _dn_bm = dn_block_m
         if _dn_bn is None:
@@ -1501,7 +1499,7 @@ def flydsl_k1_combine_norm_down(
             _dn_bn = 64 if n_pad % 64 == 0 else n_pad
         if _dn_bm is None:
             _dn_bm = 64 if gemm_tokens % 64 == 0 else block_m
-        # Wave layout: the joint sweep (§6.7d) found m_waves=2,n_waves=2 (same 256
+        # Wave layout: the joint sweep found m_waves=2,n_waves=2 (same 256
         # threads, more balanced MMA tiling than the default 1x4) is ~10% faster
         # for the decouple down at large M -- a cross-dimension interaction the
         # per-dimension tuning missed. dn_m/n_waves override for tuning.

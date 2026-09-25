@@ -84,7 +84,7 @@ def k1_plan(arch: str, tokens: int):
     is valid. ``_us`` is provenance only.
 
     Unlike the other tables this does **not** extrapolate below its smallest
-    tuned token: the low/mid-M split-K heuristic is already tuned (§6.7d) and must
+    tuned token: the low/mid-M split-K heuristic is already tuned and must
     not be overwritten by a nearest-snap onto a large-M decouple entry. Below the
     tuned range this returns ``None`` (kernel keeps its heuristic).
     """

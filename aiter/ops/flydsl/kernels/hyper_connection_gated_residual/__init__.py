@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Two-stage Gated-Residual (Hyper-Connections) ``combine_and_mix`` (SILOTIGER-1042).
+"""Two-stage Gated-Residual (Hyper-Connections) ``combine_and_mix``.
 
 The shipped, fully-fused two-stage kernel and its shared numerical reference.
 ``K1`` fuses combine + grouped-RMSNorm + down; ``K2`` fuses silu + up + gated
 mean and re-forms ``xn`` from ``r2`` on the fly, so ``xn``/``gate`` never touch
-HBM (5 launches -> 2).
+HBM -- cutting the 5-launch path down to the K1+K2 pair (modulo K1's
+split-K/decouple reduce).
 """
 
 from .op import (

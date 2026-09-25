@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Per-architecture MFMA selection for the Gated-Residual GEMM bodies.
+"""Shared building blocks for the two-stage Gated-Residual (K1/K2) kernels.
 
-The combine-and-mix GEMMs are tall-and-skinny (down: contraction 10240 into 336
-outputs; up: 320 contraction into 10240 outputs), so the matrix-core shape and
-the wave tiling matter and differ by ASIC. Keeping them in one place lets the
-kernel bodies stay architecture-agnostic and lets gfx942 drop in later without
-touching kernel logic.
+Holds what both stages depend on: (1) the per-architecture bf16 MFMA shape +
+K-permutation layout (:class:`MfmaConfig`, :func:`mfma_bf16`, :func:`ab_k_perm`)
+that keep the GEMM bodies architecture-agnostic, and (2) the small weight/epilogue
+helpers -- the merged down+inject weight pack/slice (:func:`merge_down_inject`,
+:func:`split_down_inject`) and the split-K cross-reduction + SiLU epilogue
+(:func:`_build_reduce_silu`).
 
-gfx950 (CDNA4) uses the bf16 ``16x16x32`` matrix core; gfx942 (CDNA3) exposes
-``16x16x16`` for bf16. Both accumulate in float32. The ``k_group`` field is
-``mma_k // 4`` — the per-instruction K packing the tiled-MMA layout expects.
+The GEMMs are tall-and-skinny -- down contracts the full hidden (10240) into the
+~320-wide low-rank bottleneck; up contracts the 320 bottleneck back into 10240 --
+so the matrix-core shape and wave tiling matter and differ by ASIC. gfx950 (CDNA4)
+uses the bf16 ``16x16x32`` matrix core; gfx942 (CDNA3) exposes ``16x16x16``. Both
+accumulate in float32. The ``k_group`` field is ``mma_k // 4`` -- the
+per-instruction K packing the tiled-MMA layout expects.
 """
 
 from dataclasses import dataclass
