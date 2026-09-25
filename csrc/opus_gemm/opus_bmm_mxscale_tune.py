@@ -95,9 +95,39 @@ for _p in (_HERE, _OPTESTS):
 from opus_gemm_common import (
     _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF,
     _opus_sf_shuf_sub,
+    BMM_MXSCALE_KID_OFFSET,
+    MX32_KID_STRIDE,
     a8w8_mxscale_bmm_kernel_lists,
     bmm_mxscale_global_kid,
 )
+
+# The quantisation block is a property of the kid, not of the shape: a 32-block
+# kid needs 32-block scales and its tuned row is meaningless for a 128 one. So
+# it is read off the instance here rather than taken from the module constant.
+_KID_INSTANCE = {
+    kid: inst for family in a8w8_mxscale_bmm_kernel_lists for kid, inst in family.items()
+}
+# Local ids resolve too, for the reason spelled out where _CODEGEN_BMM does the
+# same. This one is load-bearing beyond convenience: the MX twin sweep tests
+# `mirror + MX32_KID_STRIDE in _KID_INSTANCE` with a local mirror, so on a tree
+# carrying the 8000 offset the membership test was false for every twin and the
+# sweep silently added none of them. The tuner then started, found no GROUP_K=32
+# candidate for any shape, and wrote an empty table.
+for _k, _v in list(_KID_INSTANCE.items()):
+    _loc = _k - BMM_MXSCALE_KID_OFFSET
+    if _loc >= 0 and _loc not in _KID_INSTANCE:
+        _KID_INSTANCE[_loc] = _v
+
+
+def _kid_group(kid):
+    # _TUNE_POLICY is keyed on global ids, so take the id as given and only fall
+    # back to globalising a local one.
+    inst = _KID_INSTANCE.get(kid) or _KID_INSTANCE[bmm_mxscale_global_kid(kid)]
+    assert inst.GROUP_N == inst.GROUP_K, (
+        f"kid {kid} quantises N and K on different blocks "
+        f"({inst.GROUP_N}/{inst.GROUP_K}); the tuned schema carries one groupSize"
+    )
+    return inst.GROUP_K
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -115,6 +145,21 @@ for _fam in a8w8_mxscale_bmm_kernel_lists:
             _kid not in _CODEGEN_BMM
         ), f"bmm kid {_kid} collides across codegen families; disambiguate by name"
         _CODEGEN_BMM[_kid] = _inst
+
+# Local ids resolve too, because two id spaces meet here. The codegen keys this
+# catalogue on the globalised id -- BMM_MXSCALE_KID_OFFSET puts every BMM kid in
+# the 8000 band, and MX32_KID_STRIDE puts its GROUP_K=32 twin 1000 above that --
+# while _TUNE_POLICY below and the tuned CSVs are written in the upstream local
+# id, which is what a person reads in a log. The two spaces cannot collide: the
+# locals run 0..1653 and the globals start at 8000.
+#
+# Without this the tuner does not start at all on a tree carrying the offset:
+# the first policy lookup raises KeyError 149. _kid_group already worked around
+# it one call site at a time; doing it once here covers the rest.
+for _kid, _inst in list(_CODEGEN_BMM.items()):
+    _local = _kid - BMM_MXSCALE_KID_OFFSET
+    if _local >= 0 and _local not in _CODEGEN_BMM:
+        _CODEGEN_BMM[_local] = _inst
 
 # Split-K sweep for the flatmm_splitk family. Small-M / few-tile shapes (the G16
 # wo_a decode: 16 batch * n1024 * k4096) underfill the CUs at splitK=1, so split-K
@@ -448,6 +493,46 @@ _SHUF_POLICY = {kid: _TUNE_POLICY[plain] for kid, plain in _SHUF_TWIN_OF.items()
 
 # What the tune loop iterates. _applicable is what decides which pool sees which,
 # so a shuffled kid is invisible to "all"/"preb"/"rowb"/"subok".
+# Placed before _CANDIDATE_KIDS, which is a tuple snapshot: adding twins to
+# _TUNE_POLICY after that point leaves them in the policy and out of the
+# sweep, which is a table with no 32 rows and no error to say why.
+# Every mirror in the policy above sweeps its GROUP_K=32 twin on the same split-K
+# factors. Derived rather than listed: the twins are generated from the 128
+# tables, so a literal list would go stale exactly when a twin is added, and the
+# one thing worse than an untuned kid is a kid nobody noticed was untuned.
+#
+# groupSize is part of the tuned key, so a twin competes only against other 32
+# kids for its shape and gets its own winning row.
+_TUNE_POLICY.update({
+    twin: factors
+    for mirror, factors in list(_TUNE_POLICY.items())
+    if (twin := mirror + MX32_KID_STRIDE) in _KID_INSTANCE
+})
+
+# Globalised here, once, and this is the boundary the whole file depends on.
+#
+# Two id spaces meet in the tuner. _TUNE_POLICY and _SHUF_POLICY are written in
+# the upstream local id, which is what a person reads in a log; everything
+# downstream -- the codegen catalogue, the C++ dispatcher's exact-kid registry,
+# and the tuned CSV the runtime reads -- is keyed on the globalised id, which
+# policy.py treats as canonical and only upgrades a local id into as legacy.
+#
+# Converting at this one boundary rather than tolerating both spaces at each
+# lookup is deliberate. Tolerating them is what let a run get all the way to the
+# GPU and still do nothing: the aliases made every Python lookup succeed, the
+# candidates were generated and their data built, and then the kid handed to the
+# kernel was still local, so the dispatcher rejected each one with "unknown
+# exact OPUS a8w8_mxscale_bmm kid 1171" and the sweep measured nothing for 76
+# minutes. One conversion at the edge cannot leave a call site behind.
+def _globalise_policy(policy):
+    return {
+        (bmm_mxscale_global_kid(k) if k < BMM_MXSCALE_KID_OFFSET else k): v
+        for k, v in policy.items()
+    }
+
+
+_TUNE_POLICY = _globalise_policy(_TUNE_POLICY)
+_SHUF_POLICY = _globalise_policy(_SHUF_POLICY)
 _CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
 assert len(set(_CANDIDATE_KIDS)) == len(_CANDIDATE_KIDS), (
     "a kid is in both _TUNE_POLICY and _SHUF_POLICY; it would be benched twice "
@@ -482,6 +567,8 @@ _dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
 assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
 
 # Only the flatmm_splitk (non-direct) and minterleave launchers honor splitK>1.
+
+
 # Only non-direct flatmm split-K launchers are swept with splitK>1.
 # Any other family sweeping it is a policy bug, so fail loudly at import.
 for _kid, _sks in _TUNE_POLICY.items():
@@ -817,10 +904,11 @@ def gen_bmm_mxscale_data(
     the answer toward "shuffle buys nothing" by construction.
     """
     torch.manual_seed(seed)
+    group = _kid_group(kernel_id)
     O_bf16 = _gen_varied((batch, m, k), k, device)
     W_bf16 = _gen_varied((batch, n, k), k, device)
-    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
-    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group)
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
 
     workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
@@ -829,7 +917,7 @@ def gen_bmm_mxscale_data(
         if workspace_numel
         else None
     )
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group).transpose(0, 1).to(out_dtype)
     # The preshuffled-B kids read B through the (16,16) MFMA-fragment layout that
     # a serving stack bakes into the weight offline. It is a permutation, so the
     # reference above covers both forms. Building it here rather than in the bench
@@ -840,11 +928,25 @@ def gen_bmm_mxscale_data(
     # otherwise add a bogus row offset. Tensor.__deepcopy__ copies the storage and
     # restores size/stride/offset, so this view survives run_perftest's rotation
     # without materialising m copies of the slab.
-    _slab = shuffle_scale_a(xs_mx, k, SHUF_SUB)
-    xs_sh = _slab.as_strided((m, batch, _slab.shape[1]), (0, _slab.shape[1], 1))
-    # Kept 3-D with the N-block axis in the middle so stride(0) is the per-batch
-    # slab, the only term the shuffled path reads.
-    ws_sh = shuffle_scale_b(ws_mx, n, k).view(batch, n // 128, -1)
+    # Only for a 128-block candidate. The shuffled scale layout is defined on
+    # that block -- opus_sf_shuf_geom's dword pairs two 128-blocks of K, and
+    # shuffle_scale_a enforces K//128 on the input -- so a GROUP_K=32 kid, whose
+    # scale tensor is four times as wide, cannot be handed to it: it raises
+    # "a_scale must be (..., rows, K//128)". That killed every 32 candidate in
+    # data generation, before any kernel ran.
+    #
+    # Nothing is lost by skipping it. No 32 kid reads these: the twin sweep does
+    # not twin shuffle_scale kids, precisely because their scales come
+    # pre-laid-out from the quantiser rather than in the caller's layout. The
+    # plain tensors stand in so the tuple the bench unpacks keeps its shape.
+    if group == 128:
+        _slab = shuffle_scale_a(xs_mx, k, SHUF_SUB)
+        xs_sh = _slab.as_strided((m, batch, _slab.shape[1]), (0, _slab.shape[1], 1))
+        # Kept 3-D with the N-block axis in the middle so stride(0) is the
+        # per-batch slab, the only term the shuffled path reads.
+        ws_sh = shuffle_scale_b(ws_mx, n, k).view(batch, n // 128, -1)
+    else:
+        xs_sh, ws_sh = xs_mx, ws_mx
     return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref, W_sh, xs_sh, ws_sh)
 
 
@@ -875,8 +977,14 @@ def run_bmm_mxscale_bench(
         sfa, sfb = xs_sh, ws_sh
     else:
         sfa, sfb = xs_mx, ws_mx
+    # A and its scale are generated batch-major -- (batch, M, K) -- because that
+    # is the order run_torch wants for the reference, but the launcher takes A as
+    # [M, batch, K] and Y is already built that way. Without the transpose the
+    # launcher reads M where batch belongs, and the shape it then rejects is B's:
+    # "wo_a must have shape [batch,N,K]", 159 times in one batch, with every
+    # candidate scoring errRatio 1.0 because nothing was written.
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
-        O_mx, Wb, Y, sfa, sfb,
+        O_mx.transpose(0, 1), Wb, Y, sfa.transpose(0, 1), sfb,
         workspace=workspace, kid=kernelId, split_k=splitK,
     )
     return Y
@@ -902,7 +1010,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
-    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k"]
+    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "groupSize"]
     RESULTS: ClassVar[list[str]] = [
         "libtype",
         "kernelId",
@@ -925,8 +1033,9 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             self.RESULTS,
             description="Tune opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a)",
         )
-        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV).
-        self.sort_keys = ["gfx", "b", "n", "m", "k"]
+        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV),
+        # then groupSize, so a shape's 32 and 128 rows land next to each other.
+        self.sort_keys = ["gfx", "b", "n", "m", "k", "groupSize"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -937,7 +1046,11 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         info, time, _err = results
         if time == self.INVALID_TIME:
             return 0, 0
-        _gfx, b, m, n, k = info[0]
+        # info[0] is the key tuple, and the tuned schema gained groupSize, so it
+        # carries six fields now. Unpacking five names off it raised for every
+        # single candidate, which is why the sweep reported "tune 0 shapes".
+        shape = dict(zip(self.keys, info[0]))
+        b, m, n, k = (int(shape[name]) for name in ("b", "m", "n", "k"))
         us_s = time * 1e-6
         tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
         # fp8 A + fp8 W + bf16 out.
@@ -1009,6 +1122,13 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             type=_intlist,
             default=[4096],
             help="comma list of K (default 4096)",
+        )
+        self.parser.add_argument(
+            "--groupSize",
+            type=_intlist,
+            default=None,
+            help="only tune kids with these quantisation block sizes "
+            "(e.g. 32); default is every group in the policy",
         )
         self.parser.add_argument(
             "--apply",
@@ -1266,7 +1386,6 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             m = int(untunedf.loc[i, "m"])
             n = int(untunedf.loc[i, "n"])
             k = int(untunedf.loc[i, "k"])
-            info_keys = (gfx, b, m, n, k)
             # Per shape, not per sweep: the graph is a win only where the
             # eager per-dispatch floor is a material fraction of the kernel.
             # Whatever this resolves to, it is the same for every candidate on
@@ -1280,6 +1399,12 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
             n_cand = 0
             for kid in _CANDIDATE_KIDS:
+                # Per kid, not per shape: the block size is the kid's, and each
+                # block size deserves its own winning row.
+                group = _kid_group(kid)
+                if args.groupSize and group not in args.groupSize:
+                    continue
+                info_keys = (gfx, b, m, n, k, group)
                 for sk in _applicable(kid, b, m, n, k, args.pool):
                     info = (info_keys, kid, sk, "")
                     task.append(

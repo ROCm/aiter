@@ -557,6 +557,12 @@ _BMM_M_ALIGN_TILES = {
 # previously empty 8000 band.  The low digits intentionally preserve the
 # upstream id for tuning/debug correlation.
 BMM_MXSCALE_KID_OFFSET = 8000
+# A GROUP_N=GROUP_K=32 kid is its 128 mirror's id plus this, which keeps the low
+# digits the way the 8000 globalisation does: local 321 and 1321 become global
+# 8321 and 9321, so a pair is recognisable on sight in a log or a tuned CSV.
+# Declared here rather than beside the flatmm twins because the preshuffled
+# families twin as well, and they are built earlier in the file.
+MX32_KID_STRIDE = 1000
 
 
 def bmm_mxscale_global_kid(upstream_kid: int) -> int:
@@ -663,11 +669,14 @@ a8w8_scale_kernels_list = {
 def _a8w8_mxscale_bmm_flatmm_splitk(
     bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
     shuffle_scale=False,
+    quant_block=128,
 ):
+    # quant_block is GROUP_N and GROUP_K together: A and B quantise on the same
+    # block, either DSv4's 128 or MX's 32. GROUP_M stays 1 (per token) for both.
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
         256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
-        1, 128, 128, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
+        1, quant_block, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
         wg_per_cu, splitk_workspace_dtype="fp32_t",
     )
     inst.name_root = "opus_bmm"
@@ -965,7 +974,8 @@ _bmm_flatmm_local.update({
 
 def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=False,
                                           preload_sf=False, shuffle_scale=False,
-                                          tilen=False, sf_shuf_in_lds=False):
+                                          tilen=False, sf_shuf_in_lds=False,
+                                          quant_block=128):
     """Preshuffled B bypassing LDS, on the flatmm producer/consumer split.
 
     Same kernel, launcher and tile geometry as the plain flatmm split-K family
@@ -986,7 +996,10 @@ def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=
         t_m, t_n,       # T_M, T_N (4-wave warp-spec; tileN=1,2 / tileM=2,1)
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, DSv4's 128 or MX's
+        # 32. The traits this family derives from carry the 32 path, so the only
+        # thing that made these 128-only was the literal.
+        1, quant_block, quant_block,
         ("a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen" if tilen
          else "a8w8_mxscale_bmm_bpreshuffle_bdirect"),
         ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
@@ -1113,7 +1126,7 @@ _bmm_bpre_bdirect_local.update({
 
 def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=False,
                                        preload_sf=False, shuffle_scale=False,
-                                       sf_shuf_in_lds=False):
+                                       sf_shuf_in_lds=False, quant_block=128):
     """Preshuffled B that still goes through LDS: bdirect with B's path put back.
 
     Same traits family as bdirect with B_DIRECT_REG left false, so the producer
@@ -1167,7 +1180,8 @@ def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=Fal
         t_m, t_n,       # T_M, T_N
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, 128 or MX's 32.
+        1, quant_block, quant_block,
         "a8w8_mxscale_bmm_bpreshuffle_blds",
         ["fp32_t"],
         wg_per_cu,
@@ -1443,6 +1457,131 @@ _bmm_bpre_bdirect_tilen_local = {
     for kid, (bm, bn, bk, wg, pre)
     in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILEN_TILES.items()
 }
+
+
+# ---- GROUP_N == GROUP_K == 32 twins for the preshuffled-B families -----------
+#
+# These three derive their traits from the plain flatmm split-K family, which
+# already carries the 32 path, so what kept them 128-only was the literal GROUP
+# triple in their constructors and the absence of these instantiations -- not
+# anything in the kernel.
+#
+# Read back off the instances rather than restated from the tile tables. The
+# three families have seven tables between them plus several one-off kids, and a
+# twin generated from the instance cannot drift from its mirror's geometry or go
+# stale when a tile is added to any of them.
+#
+# shuffle_scale is skipped, and so is its LDS-staged form. Those kids do not take
+# scales in the caller's layout at all: they read the pre-laid-out words that
+# opus_sf_shuf_geom describes, whose dword pairs two 128-blocks of K. A 32 twin
+# would need the quantiser that produces that layout to emit a different one,
+# which is a decision about the layout rather than about the block size.
+def _mx32_twins(local, ctor, skip=frozenset(), **ctor_kwargs):
+    """{mirror + MX32_KID_STRIDE: the same tile at quant_block=32}.
+
+    `skip` holds mirrors whose twin clang 22 cannot compile, the same defect
+    _MX32_CLANG_REGCLASS_SKIP covers for the split-K family, plus any whose twin
+    is held out for returning wrong answers.
+
+    OPUS_MX32_UNSKIP=231,232 puts named mirrors back. It exists so a held-out
+    twin can be run under a diagnostic without editing the catalogue, which is
+    the only way to measure one -- and it is opt-in precisely because these kids
+    are held out for being wrong rather than for being slow.
+    """
+    unskip = {
+        int(x) for x in os.environ.get("OPUS_MX32_UNSKIP", "").replace(",", " ").split()
+    }
+    twins = {}
+    for kid, inst in local.items():
+        if kid in skip and kid not in unskip:
+            continue
+        if inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False):
+            continue
+        twins[kid + MX32_KID_STRIDE] = ctor(
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            prefetch_scale=inst.prefetch_scale,
+            preload_sf=inst.preload_sf,
+            quant_block=32,
+            **ctor_kwargs,
+        )
+    return twins
+
+
+_bmm_bpre_bdirect_local.update(
+    _mx32_twins(_bmm_bpre_bdirect_local, _a8w8_mxscale_bmm_bpreshuffle_bdirect)
+)
+_bmm_bpre_blds_local.update(
+    # 235 is 256x32x256x128 at WG_PER_CU=1, the widest N tile in the family at
+    # the tightest register budget, and its 32 twin is the one kernel on this
+    # branch clang 22 rejects with "operand has incorrect register class". Same
+    # shape of failure as the three the split-K family holds out, and the same
+    # cause: GROUP_K=32 widens v_sfb (B_N=256 over GROUP_N=32 is eight groups)
+    # and adds the lane's block index. Mirror 235 itself compiles.
+    #
+    # 231 and 232 compile and return wrong answers, which is worse, so they are
+    # held out. They are 256x128x128x128 2x1 at WG_PER_CU=1, without and with
+    # scaleprefetch.
+    #
+    # The failure is an accumulation, not an addressing one. In every 128-column
+    # tile, the four columns with n % 4 == 1 and n < 16 -- so the first N
+    # subtile, every fourth column -- hold exactly one K tile's contribution out
+    # of the K/B_K the kernel should sum. Measured, not inferred: with both
+    # operands constant and both scales unit, so that every output element is
+    # arithmetically the same number, the ratio to the reference on those
+    # columns is 0.25 at K=512 (4 tiles) and 0.03125 at K=4096 (32). The earlier
+    # note here guessed at "an e8m0 byte read outside its row"; that is wrong.
+    #
+    # What the experiments rule out, each against its own control:
+    #   * scale values. Forcing A's and B's scales to 1.0 on both the kernel and
+    #     the reference leaves the same four columns wrong.
+    #   * which element is fetched. Forcing both operands to a constant leaves
+    #     them wrong too, and reading the wrong element of a constant tensor
+    #     cannot differ from reading the right one.
+    #   * the compiler. Baseline, -greedy-reverse-local-assignment=0,
+    #     -enable-noalias-to-md-conversion=0 and -O2 all produce bit-identical
+    #     output, which a register-allocation defect would not.
+    #   * prefetch depth. 8231 and 9231 both solve to 4; the ring slot this
+    #     branch charges a non-preload GROUP_K=32 kid for does not change it.
+    #   * SF_USE_RING gating. It is only ever read to derive SF_PANEL/SF_RING.
+    #   * LDS layout. smem_a and smem_b are separate arrays and both sized the
+    #     same as the 128 mirror's.
+    #   * the opsel pack. Forcing this tile down the broadcast pack instead --
+    #     arithmetically the same thing at COM_REP_K == 1, and what the correct
+    #     229 already uses -- leaves it wrong, with 229 and the mirror still
+    #     clean under that build. So the defect is in what the two packs share.
+    #   * the MFMA stream itself. The 32 and 128 listings both hold 288
+    #     v_mfma_scale, of which the same 32 take a literal 0 as their C operand
+    #     and they are the first 32 in program order, i.e. the opening K tile's
+    #     initialisation in both.
+    #
+    # Not yet resolved, and the open question is which of two readings of the
+    # footprint is right: the main accumulate does not use mfma_adaptor_swap_ab
+    # (only the split-N store's mma_c1 does), so column n maps to lane % 16 and
+    # the four bad columns are four lanes' whole accumulators rather than one
+    # register of every lane. Those point at different things -- a lane-indexed
+    # address versus the slice arithmetic -- and the slice indices are all
+    # compile-time constants, which a per-lane footprint argues against.
+    #
+    # What is left is the intersection, and the catalogue holds exactly three
+    # kids in it -- 229, 231, 232, all this tile: blds, GROUP_K=32, prefetch
+    # depth 4, COM_REP_M=4, and the global scale path. 229 is the one with
+    # preload_sf, it takes the ring instead, and it is correct to 0.0015. The
+    # split-K family's 9137 is the same geometry without B_PRESHUFFLE and is
+    # correct to 0.0014. The other non-preload twins at B_N=128 (233, 247, 251,
+    # 252) are correct and differ only in lacking B_M=128.
+    #
+    # Mirrors 231 and 232 are correct and keep their rows. So is the rest of the
+    # 128 path: all 97 GROUP_K=128 kids that take row-major scales pass at
+    # g2/m16/n1024/k4096, which is what checks the merge's unconditional
+    # SFB_PER_WAVE against the tilen families it changed codegen for. The other
+    # 34 need pre-laid-out scales and cannot be fed by that harness at all.
+    _mx32_twins(_bmm_bpre_blds_local, _a8w8_mxscale_bmm_bpreshuffle_blds,
+                skip=frozenset({235, 231, 232}))
+)
+_bmm_bpre_bdirect_tilen_local.update(
+    _mx32_twins(_bmm_bpre_bdirect_tilen_local,
+                _a8w8_mxscale_bmm_bpreshuffle_bdirect, tilen=True)
+)
 
 
 def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
@@ -2298,6 +2437,45 @@ _bmm_bpre_wavetm1_local.update({
 # the whole effect and the rest of the way buys nothing -- so the difference
 # between the two conventions is not what the reference kernel's better M scaling
 # comes from.
+
+
+# Every flatmm_splitk tile again at GROUP_N == GROUP_K == 32, the MX block.
+#
+# Derived from the 128 tables rather than restated, so a tile added above cannot
+# silently lack its MX twin and the two can never drift apart in geometry: a
+# pair differs in nothing but the quantisation granularity, which is what makes
+# them comparable. The kernel name carries the GROUP triple, so a twin reads
+# ..._1x32x32_... and neither it nor its tuned rows can be mistaken for the
+# 128 kid it mirrors.
+#
+# The kid is the mirror's plus MX32_KID_STRIDE (declared with the 8000 offset,
+# since the preshuffled families twin above too).
+# Three tiles get no twin: clang 22 fails them with "operand has incorrect
+# register class", the same ROCm 7.2.4 defect the kid326 workspace note below
+# already works around. All three are WG_PER_CU=1 kernels on the largest tiles,
+# where the register budget is tightest, and GROUP_K=32 adds just enough --
+# a wider v_sfb and the lane's block index -- to cross the line. Their 128
+# twins compile; nothing here is wrong with the tile itself.
+_MX32_CLANG_REGCLASS_SKIP = frozenset({128, 139, 256})
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, direct, prefetch, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+    if kid not in _MX32_CLANG_REGCLASS_SKIP
+})
+# The PRELOAD_SF_LDS tiles get MX twins too, and they take the scale ring rather
+# than the whole-split panel -- the traits pick that from GROUP_K (SF_USE_RING),
+# so nothing here says which. The panel could not serve them: its rows cost
+# SFA_K_MAX/GROUP_K bytes each, 64 at 128 and 256 at 32, and the large tiles
+# asked for 168,960 to 185,344 bytes of a CU's 163,840. The ring is at most
+# 11,264 and is a function of prefetch_k_iter rather than of K.
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, preload_sf=True, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
 
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
