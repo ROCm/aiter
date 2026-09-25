@@ -1934,8 +1934,7 @@ def gemm_a8w8_mxfp8(
         _mxfp8fp4_gemm_validate(
             A, B, kernelName or None, "mxfp8", int(bool(a_preshuffle)), splitk
         )
-    allocate = torch.zeros if splitk > 1 else torch.empty
-    out = allocate(
+    out = torch.empty(
         (splitk, M, N) if splitk > 1 else (M, N), dtype=dtype, device=A.device
     )
     _mxfp8_mxfp8_gemm_asm(
