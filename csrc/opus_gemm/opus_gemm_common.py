@@ -2655,8 +2655,25 @@ _bmm_wave4m2_local = {
 # repeat across families and are deduped downstream by launcher NAME (see
 # gen_instances.py). Single source of truth for both consumers there: the codegen
 # kdict merge and the BMM int-kid tune-lookup emitter.
+# Kids that read their scales in a layout the quantiser has to produce -- the
+# shuffle_scale words (with or without the LDS panel) and the host M-packed A
+# panel. Nothing upstream emits those layouts yet, and no tuned row uses these
+# kids, so they stay defined but are not built; set this to True to put all
+# of them back into the catalogue, the codegen and the tuner.
+BMM_BUILD_RELAID_SCALE_KIDS = False
+
+
+def _relaid_scale(inst):
+    return bool(inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False)
+                or inst.mpack_sfa)
+
+
 def _globalize_bmm_kids(kernels):
-    return {bmm_mxscale_global_kid(kid): inst for kid, inst in kernels.items()}
+    return {
+        bmm_mxscale_global_kid(kid): inst
+        for kid, inst in kernels.items()
+        if BMM_BUILD_RELAID_SCALE_KIDS or not _relaid_scale(inst)
+    }
 
 
 a8w8_mxscale_bmm_flatmm_splitk_kernels_list = _globalize_bmm_kids(_bmm_flatmm_local)
