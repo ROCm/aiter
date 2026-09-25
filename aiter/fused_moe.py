@@ -931,6 +931,9 @@ def fused_moe(
             stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+        ep_combine_quant=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         ep_source_token_map=scatter_source_map,
         output=output,
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
@@ -972,6 +975,7 @@ def fused_moe_fake(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
@@ -1032,6 +1036,7 @@ def fused_moe_(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
@@ -1047,6 +1052,7 @@ def fused_moe_(
             max_tokens_per_rank=ep_max_tokens_per_rank,
             world_size=ep_world_size,
             source_token_map=ep_source_token_map,
+            combine_quant_bits=int(ep_combine_quant),
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -2624,6 +2630,10 @@ def _flydsl_stage2_fp8_enabled():
     return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
+def _opus_stage2_fp8_enabled():
+    return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3339,6 +3349,15 @@ def get_2stage_cfgs(
         )
     else:
         block_m = cfg["block_m"]
+        nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
+        if nt_override != -1:
+            use_non_temporal_load = bool(nt_override)
+        elif "nt" in cfg:
+            try:
+                use_non_temporal_load = bool(int(float(cfg["nt"])))
+            except (TypeError, ValueError):
+                # blank or malformed column: keep the pre-column behaviour
+                use_non_temporal_load = False
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
             ksplit = cfg["ksplit"]
         else:
@@ -4218,6 +4237,8 @@ def fused_moe_2stages(
         )
         if uses_flydsl_v2_stage2:
             extra_stage2_args["topk_weights"] = topk_weights
+    if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
+        extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
