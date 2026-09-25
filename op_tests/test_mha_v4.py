@@ -1814,7 +1814,12 @@ def run_torch_mha_v4(q, k, v, softmax_scale):
 
 @benchmark()
 def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
-    """Benchmark the public dense BF16 MHA v4 path against a Torch reference."""
+    """Benchmark every dense MHA v4 recipe against one Torch reference.
+
+    All recipes are timed side by side because they differ only in how Q/K/V are quantized, so
+    the interesting number is what each costs at the same shape and what it costs in accuracy.
+    The quantized rows time their quantizers too, since that is what mha_v4 runs per call.
+    """
     head_dim = 128
     softmax_scale = head_dim**-0.5
     torch.manual_seed(batch + sequence_q + sequence_k + heads)
@@ -1822,29 +1827,48 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
     k = torch.randn((batch, sequence_k, heads, head_dim), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
     reference = run_torch_mha_v4(q, k, v, softmax_scale)
-    candidates = {
-        "mha_v4": lambda: mha_v4(
-            q,
-            k,
-            v,
-            AttentionFormat.BF16,
-            AttentionFormat.BF16,
-            AttentionFormat.BF16,
-            softmax_scale=softmax_scale,
-        )
+
+    fp8 = native_fp8_format()
+    recipes = {
+        "bf16": (AttentionFormat.BF16, AttentionFormat.BF16),
+        "bf16fp8": (AttentionFormat.BF16, fp8),
+        "i8fp8": (AttentionFormat.INT8, fp8),
+        "fp8": (fp8, fp8),
+        "f8f6": (fp8, AttentionFormat.MXFP6),
+        "f6f8": (AttentionFormat.MXFP6_E2M3, fp8),
+        "mxfp6": (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
+        "f6f4": (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
+        "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
     }
+    candidates = {
+        name: (
+            lambda q_format=q_format, v_format=v_format: mha_v4(
+                q,
+                k,
+                v,
+                q_format,
+                q_format,
+                v_format,
+                softmax_scale=softmax_scale,
+            )
+        )
+        for name, (q_format, v_format) in recipes.items()
+    }
+
     flops = 4 * batch * heads * sequence_q * sequence_k * head_dim
     elements = batch * heads * head_dim * (sequence_q * 2 + sequence_k * 2)
     nbytes = elements * q.element_size()
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
         output, us = run_perftest(candidate)
+        # Quantized recipes are expected to land well outside a bitwise bound; the err column is
+        # what carries their accuracy, so compare loosely and let the number speak.
         err = checkAllclose(
             reference,
             output.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=2e-2,
-            msg=f"{name}: dense BF16",
+            rtol=1e-1,
+            atol=1e-1,
+            msg=f"{name}: dense",
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
@@ -1856,18 +1880,18 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
 def main():
     if get_gfx() != "gfx950":
         aiter.logger.warning(
-            "MHA v4 BF16 benchmark unsupported on %s; skipping", get_gfx()
+            "MHA v4 dense benchmark unsupported on %s; skipping", get_gfx()
         )
         return
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Benchmark dense BF16 MHA v4",
+        description="Benchmark the dense MHA v4 recipes",
     )
     parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1])
-    parser.add_argument("--sequence-q", type=int, nargs="*", default=[128, 256])
-    parser.add_argument("--sequence-k", type=int, nargs="*", default=[128, 256])
-    parser.add_argument("--heads", type=int, nargs="*", default=[2, 8])
+    parser.add_argument("--sequence-q", type=int, nargs="*", default=[1024])
+    parser.add_argument("--sequence-k", type=int, nargs="*", default=[1024, 4096])
+    parser.add_argument("--heads", type=int, nargs="*", default=[8])
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
@@ -1878,13 +1902,13 @@ def main():
         args.batch, args.sequence_q, args.sequence_k, args.heads, args.dtype
     ):
         if dtype != dtypes.bf16:
-            aiter.logger.warning("MHA v4 BF16 benchmark skips dtype %s", dtype)
+            aiter.logger.warning("MHA v4 dense benchmark skips dtype %s", dtype)
             continue
         rows.append(benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype))
     if rows:
         frame = pd.DataFrame(rows)
         aiter.logger.info(
-            "MHA v4 dense BF16 summary (markdown):\n%s",
+            "MHA v4 dense summary (markdown):\n%s",
             frame.to_markdown(index=False),
         )
 

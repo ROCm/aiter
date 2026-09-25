@@ -7,15 +7,20 @@ Split out of test_mha_v4.py, which had grown past 2600 lines with the sparse cas
 one contiguous block of it. Absorbs the former test_mha_v4_sparse_tile_scaling.py.
 """
 
+import argparse
+import itertools
 import os
 import subprocess
 import sys
 from typing import NamedTuple
 
+import pandas as pd
 import pytest
 import torch
 import torch._dynamo
 
+import aiter
+from aiter import dtypes
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
@@ -32,6 +37,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_fp8_rotated,
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
 @pytest.fixture(autouse=True)
@@ -1251,3 +1257,137 @@ def test_mha_v4_sparse_all_true_lut_matches_dense_bitwise(recipe_name):
             f"{recipe_name}: all-true LUT differs from dense at {tiles} tiles "
             f"(cosine {_cosine(sparse, dense):.7f})"
         )
+
+
+_SPARSE_BENCH_GFX = ["gfx950"]
+_SPARSE_BENCH_Q_TILE = 256
+
+
+def run_torch_mha_v4_sparse(q, k, v, block_mask, softmax_scale, kv_tile):
+    """Masked dense attention in FP32: the KV blocks a LUT row drops never reach the softmax."""
+    scores = (
+        torch.matmul(
+            q.transpose(1, 2).float(), k.transpose(1, 2).float().transpose(-1, -2)
+        )
+        * softmax_scale
+    )
+    keep = block_mask.repeat_interleave(_SPARSE_BENCH_Q_TILE, dim=2)[
+        :, :, : q.shape[1], :
+    ].repeat_interleave(kv_tile, dim=3)[..., : k.shape[1]]
+    scores = scores.masked_fill(~keep, float("-inf"))
+    return torch.matmul(
+        torch.softmax(scores, dim=-1), v.transpose(1, 2).float()
+    ).transpose(1, 2)
+
+
+@benchmark()
+def benchmark_mha_v4_sparse(batch, sequence_q, sequence_k, heads, density, dtype):
+    """Benchmark the sorted block-sparse BF16 path against masked Torch attention."""
+    head_dim = 128
+    kv_tile = mha_v4_kv_tile()
+    softmax_scale = head_dim**-0.5
+    torch.manual_seed(batch + sequence_q + sequence_k + heads)
+    q = torch.randn((batch, sequence_q, heads, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((batch, sequence_k, heads, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+
+    q_tiles = (sequence_q + _SPARSE_BENCH_Q_TILE - 1) // _SPARSE_BENCH_Q_TILE
+    kv_tiles = (sequence_k + kv_tile - 1) // kv_tile
+    keep = max(1, round(kv_tiles * density))
+    block_mask = torch.zeros(
+        (batch, heads, q_tiles, kv_tiles), device="cuda", dtype=torch.bool
+    )
+    # Keep the first `keep` tiles of every row: a fixed prefix makes the selected count exact, so
+    # the FLOP and byte counts below describe the work the kernel really did.
+    block_mask[..., :keep] = True
+    reference = run_torch_mha_v4_sparse(q, k, v, block_mask, softmax_scale, kv_tile)
+
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
+    candidates = {
+        "sparse": lambda: mha_v4(
+            q, k, v, *formats, softmax_scale=softmax_scale, block_mask=block_mask
+        )
+    }
+    if keep == kv_tiles:
+        # Dense reads every tile, so it only answers the same question as the reference when the
+        # mask selects everything; at lower density it would be fast and wrong.
+        candidates["dense"] = lambda: mha_v4(
+            q, k, v, *formats, softmax_scale=softmax_scale
+        )
+
+    visited_k = keep * kv_tile
+    flops = 4 * batch * heads * sequence_q * visited_k * head_dim
+    elements = batch * heads * head_dim * (sequence_q * 2 + visited_k * 2)
+    nbytes = elements * q.element_size()
+
+    ret = {"gfx": get_gfx(), "kv_tiles": kv_tiles, "kept": keep}
+    for name, candidate in candidates.items():
+        output, us = run_perftest(candidate)
+        err = checkAllclose(
+            reference,
+            output.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{name}: block-sparse BF16",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() not in _SPARSE_BENCH_GFX:
+        aiter.logger.warning(
+            "MHA v4 block-sparse benchmark unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark sorted block-sparse BF16 MHA v4",
+    )
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1])
+    parser.add_argument("--sequence-q", type=int, nargs="*", default=[256, 512])
+    parser.add_argument("--sequence-k", type=int, nargs="*", default=[1024, 2048])
+    parser.add_argument("--heads", type=int, nargs="*", default=[8])
+    parser.add_argument(
+        "--density",
+        type=float,
+        nargs="*",
+        default=[0.25, 0.5, 1.0],
+        help="fraction of KV tiles each LUT row selects",
+    )
+    parser.add_argument(
+        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for batch, sequence_q, sequence_k, heads, density, dtype in itertools.product(
+        args.batch,
+        args.sequence_q,
+        args.sequence_k,
+        args.heads,
+        args.density,
+        args.dtype,
+    ):
+        if dtype != dtypes.bf16:
+            aiter.logger.warning("MHA v4 sparse benchmark skips dtype %s", dtype)
+            continue
+        rows.append(
+            benchmark_mha_v4_sparse(
+                batch, sequence_q, sequence_k, heads, density, dtype
+            )
+        )
+    if rows:
+        frame = pd.DataFrame(rows)
+        aiter.logger.info(
+            "MHA v4 block-sparse BF16 summary (markdown):\n%s",
+            frame.to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()
