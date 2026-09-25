@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K1: short-context emit or unfused score + top-512.
+"""FlyDSL QSA K1: short-context emit or unfused score + top-512.
 
 When ``n_columns <= 512``, every visible block is selected and the emit
 kernel writes its id without scoring. Longer rows use independent
@@ -10,7 +10,11 @@ buffer, and a per-row selector. Rows narrower than 32768 columns use the
 stable decode radix; wider rows use streaming radix with ``tie='low'``.
 Single-request prefill batches 16 rows per scorer workgroup; decode and
 multi-request inputs keep the one-row scorer. BLOCK_N=32 is the measured
-default for both. Family B long rows reuse these scorers with ``H`` 4 or 8.
+default for both.
+
+One module serves both families: their indexer specs are the same value,
+so the only contract that differs is the accepted head count, which callers
+pin through ``heads`` -- ``(4,)`` for family A, ``(4, 8)`` for family B.
 """
 
 from functools import lru_cache
@@ -21,7 +25,12 @@ import torch
 from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_INDEXER, FAMILY_A_SCORE_SCALE
+from aiter.ops.flydsl.kernels.qsa.shapes import (
+    FAMILY_A_INDEXER,
+    FAMILY_A_SCORE_SCALE,
+    FAMILY_B_INDEXER,
+    FAMILY_B_INDEXER_H8,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.topk_select import topk_select
@@ -31,9 +40,27 @@ _K = FAMILY_A_INDEXER.block_budget
 _H = FAMILY_A_INDEXER.n_heads
 _D = FAMILY_A_INDEXER.head_dim
 _R = FAMILY_A_INDEXER.compress_ratio
-_VEC = 8
+_KV_HEADS = FAMILY_A_INDEXER.kv_heads
 _STREAM_SELECT_MIN_COLUMNS = 32768
 _SCORE_HEADS = (4, 8)
+_SCORE_SCALE = FAMILY_A_SCORE_SCALE
+
+
+def _spec_fits(spec) -> bool:
+    """Whether a K1 indexer spec agrees with this module bar its head count."""
+    return spec.n_heads in _SCORE_HEADS and (
+        spec.kv_heads,
+        spec.head_dim,
+        spec.compress_ratio,
+        spec.block_budget,
+    ) == (_KV_HEADS, _D, _R, _K)
+
+
+# The head count is the only axis this module treats as variable. Nothing
+# downstream re-derives the block budget or compress ratio from the caller's
+# tensors, so a spec drifting in those would go unnoticed at the gate.
+if not all(map(_spec_fits, (FAMILY_A_INDEXER, FAMILY_B_INDEXER, FAMILY_B_INDEXER_H8))):
+    raise ValueError("QSA K1 indexer specs diverged; they no longer share a module")
 
 
 def _idiv(a, b):
@@ -44,18 +71,18 @@ def _neg_inf():
     return Float32(float("-inf"))
 
 
-def build_qsa_k1_family_a_module(page_size: int):
+def build_qsa_k1_emit_module(page_size: int):
+    """Build the short-context emit kernel. It never reads Q or K."""
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
     if _K % _BLOCK_THREADS:
         raise ValueError("block budget must be a multiple of block threads")
 
     @flyc.kernel(
-        name="qsa_k1_family_a_emit_"
-        + kernel_signature(ps=page_size, k=_K, blk=_BLOCK_THREADS),
+        name="qsa_k1_emit_" + kernel_signature(ps=page_size, k=_K, blk=_BLOCK_THREADS),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
-    def qsa_k1_family_a_kernel(
+    def qsa_k1_emit_kernel(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -84,7 +111,7 @@ def build_qsa_k1_family_a_module(page_size: int):
         block_ids[row, tid] = take.select(tid, neg_one)
 
     @flyc.jit
-    def launch_qsa_k1_family_a(
+    def launch_qsa_k1_emit(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -98,7 +125,7 @@ def build_qsa_k1_family_a_module(page_size: int):
         rows: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_family_a_kernel(
+        qsa_k1_emit_kernel(
             q,
             k_cache,
             page_table,
@@ -115,10 +142,10 @@ def build_qsa_k1_family_a_module(page_size: int):
             stream=stream,
         )
 
-    return launch_qsa_k1_family_a
+    return launch_qsa_k1_emit
 
 
-def build_qsa_k1_family_a_scores_module(
+def build_qsa_k1_scores_module(
     page_size: int,
     use_k32: bool,
     block_n: int,
@@ -152,7 +179,7 @@ def build_qsa_k1_family_a_scores_module(
         c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
-        name="qsa_k1_family_a_scores_"
+        name="qsa_k1_scores_"
         + kernel_signature(
             ps=page_size,
             bn=block_n,
@@ -163,7 +190,7 @@ def build_qsa_k1_family_a_scores_module(
         ),
         known_block_size=[block_threads, 1, 1],
     )
-    def qsa_k1_family_a_scores_kernel(
+    def qsa_k1_scores_kernel(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -300,7 +327,7 @@ def build_qsa_k1_family_a_scores_module(
                     scores[row, out_col] = live.select(score * score_scale, _neg_inf())
 
     @flyc.jit
-    def launch_qsa_k1_family_a_scores(
+    def launch_qsa_k1_scores(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -316,7 +343,7 @@ def build_qsa_k1_family_a_scores_module(
         tiles: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_family_a_scores_kernel(
+        qsa_k1_scores_kernel(
             q,
             k_cache,
             page_table,
@@ -334,10 +361,10 @@ def build_qsa_k1_family_a_scores_module(
             stream=stream,
         )
 
-    return launch_qsa_k1_family_a_scores
+    return launch_qsa_k1_scores
 
 
-def build_qsa_k1_family_a_prefill_scores_module(
+def build_qsa_k1_prefill_scores_module(
     page_size: int,
     use_k32: bool,
     n_heads: int = _H,
@@ -373,7 +400,7 @@ def build_qsa_k1_family_a_prefill_scores_module(
         c: fx.Array[Float32, n_heads * n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
-        name="qsa_k1_family_a_prefill_scores_"
+        name="qsa_k1_prefill_scores_"
         + kernel_signature(
             ps=page_size,
             bm=block_m,
@@ -385,7 +412,7 @@ def build_qsa_k1_family_a_prefill_scores_module(
         ),
         known_block_size=[block_threads, 1, 1],
     )
-    def qsa_k1_family_a_prefill_scores_kernel(
+    def qsa_k1_prefill_scores_kernel(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -545,7 +572,7 @@ def build_qsa_k1_family_a_prefill_scores_module(
                         )
 
     @flyc.jit
-    def launch_qsa_k1_family_a_prefill_scores(
+    def launch_qsa_k1_prefill_scores(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -561,7 +588,7 @@ def build_qsa_k1_family_a_prefill_scores_module(
         tiles: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_family_a_prefill_scores_kernel(
+        qsa_k1_prefill_scores_kernel(
             q,
             k_cache,
             page_table,
@@ -579,22 +606,22 @@ def build_qsa_k1_family_a_prefill_scores_module(
             stream=stream,
         )
 
-    return launch_qsa_k1_family_a_prefill_scores
+    return launch_qsa_k1_prefill_scores
 
 
 @lru_cache(maxsize=8)
-def _plan(page_size: int):
-    return build_qsa_k1_family_a_module(page_size)
+def _emit_plan(page_size: int):
+    return build_qsa_k1_emit_module(page_size)
 
 
 @lru_cache(maxsize=16)
 def _scores_plan(page_size: int, use_k32: bool, block_n: int, n_heads: int = _H):
-    return build_qsa_k1_family_a_scores_module(page_size, use_k32, block_n, n_heads)
+    return build_qsa_k1_scores_module(page_size, use_k32, block_n, n_heads)
 
 
 @lru_cache(maxsize=8)
 def _prefill_scores_plan(page_size: int, use_k32: bool, n_heads: int = _H):
-    return build_qsa_k1_family_a_prefill_scores_module(page_size, use_k32, n_heads)
+    return build_qsa_k1_prefill_scores_module(page_size, use_k32, n_heads)
 
 
 def qsa_k1_score_and_select(
@@ -687,24 +714,28 @@ def qsa_k1_score_and_select(
     return out
 
 
-def qsa_k1_family_a_serves(
+def qsa_k1_serves(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
+    heads: tuple[int, ...] = _SCORE_HEADS,
 ) -> str | None:
-    """Why this K1 kernel cannot serve these tensors, or None if it can."""
-    idx = FAMILY_A_INDEXER
+    """Why this K1 kernel cannot serve these tensors, or None if it can.
+
+    ``heads`` narrows the accepted indexer head count. Family A pins it to
+    ``(4,)``; family B admits ``(4, 8)``. Every other check holds for both.
+    """
+    if not heads or any(h not in _SCORE_HEADS for h in heads):
+        raise ValueError(f"heads must be a non-empty subset of {_SCORE_HEADS}")
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         return f"q and k_cache must be bfloat16, got {q.dtype} and {k_cache.dtype}"
-    if q.dim() != 3 or q.shape[1] != idx.n_heads or q.shape[2] != idx.head_dim:
-        return f"q must be [M, {idx.n_heads}, {idx.head_dim}], got {tuple(q.shape)}"
+    if q.dim() != 3 or q.shape[1] not in heads or q.shape[2] != _D:
+        allowed = "|".join(str(h) for h in heads)
+        return f"q must be [M, {allowed}, {_D}], got {tuple(q.shape)}"
     if k_cache.dim() != 4:
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
-    if k_cache.shape[2] != idx.kv_heads or k_cache.shape[3] != idx.head_dim:
-        return (
-            f"k_cache KV/D must be ({idx.kv_heads}, {idx.head_dim}), "
-            f"got {k_cache.shape[2:]}"
-        )
+    if k_cache.shape[2] != _KV_HEADS or k_cache.shape[3] != _D:
+        return f"k_cache KV/D must be ({_KV_HEADS}, {_D}), got {k_cache.shape[2:]}"
     if page_table.dim() != 2 or page_table.dtype != torch.int32:
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
@@ -712,7 +743,7 @@ def qsa_k1_family_a_serves(
     return None
 
 
-def qsa_k1_family_a_block_ids(
+def qsa_k1_block_ids(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -720,19 +751,23 @@ def qsa_k1_family_a_block_ids(
     query_positions: torch.Tensor,
     context_lens: torch.Tensor,
     out: torch.Tensor | None = None,
-    score_scale: float = FAMILY_A_SCORE_SCALE,
+    score_scale: float = _SCORE_SCALE,
+    heads: tuple[int, ...] = _SCORE_HEADS,
 ) -> torch.Tensor:
-    """Write family A indexer ``block_ids [M, 512]`` from paged compressed K.
+    """Write indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Rows no wider than 512 use the fused emit path. Longer rows materialize
     scores with a BLOCK_N=32 MFMA writer; single-request prefill batches 16
     query rows while other inputs use one row per workgroup. Selection is the
     stable decode radix below 32768 columns and streaming radix
     (``tie='low'``) at or above that width. Expand+tail is still separate.
+
+    ``heads`` is the accepted head count. Family A callers pass ``(4,)`` to
+    keep their contract narrow; family B takes the ``(4, 8)`` default.
     """
-    reason = qsa_k1_family_a_serves(q, k_cache, page_table)
+    reason = qsa_k1_serves(q, k_cache, page_table, heads)
     if reason is not None:
-        raise ValueError(f"[FlyDSL qsa_k1_family_a] {reason}")
+        raise ValueError(f"[FlyDSL qsa_k1] {reason}")
     m = q.shape[0]
     if token_to_req.shape != (m,) or token_to_req.dtype != torch.int32:
         raise ValueError(f"token_to_req must be int32 [{m}]")
@@ -761,7 +796,7 @@ def qsa_k1_family_a_block_ids(
     n_columns = page_table.shape[1] * page_size
     if n_columns <= _K:
         _run_compiled(
-            _plan(page_size),
+            _emit_plan(page_size),
             q,
             k_cache,
             page_table,
@@ -786,6 +821,6 @@ def qsa_k1_family_a_block_ids(
             out,
             int(n_columns),
             float(score_scale),
-            _H,
+            int(q.shape[1]),
         )
     return out
