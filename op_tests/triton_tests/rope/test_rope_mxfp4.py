@@ -9,10 +9,8 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     unshuffle_scales,
     unshuffle_values,
 )
-from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_cache import (
-    indexer_k_norm_rope_mxfp4_cache,
-    indexer_q_rope_mxfp4_quant,
-)
+from aiter.ops.triton.fusions.k_norm_rope_mxfp4_cache import k_norm_rope_mxfp4_cache
+from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
 
 HEAD_SIZE, ROPE_DIM, SCALE_GROUP = 128, 64, 32
 _MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -21,14 +19,14 @@ DEV = "cuda"
 
 def _e2m1(x):
     """fp32 -> e2m1 code: nearest magnitude, ties to the even code, saturating;
-    the sign bit follows x < 0."""
+    the sign bit is x's, so -0.0 packs as 8."""
     mag = torch.tensor(_MAG, device=x.device)
     d = (x.abs().unsqueeze(-1) - mag).abs()
     ties = d == d.min(dim=-1, keepdim=True).values
     codes = torch.arange(8, device=x.device)
     # A tie is between two adjacent codes, one of them even: prefer it.
     code = torch.where(ties, codes % 2 * 8 + codes, 99).argmin(dim=-1).to(torch.uint8)
-    return torch.where(x < 0, code | 8, code)
+    return torch.where(torch.signbit(x), code | 8, code)
 
 
 def _quantize(x):
@@ -137,7 +135,7 @@ def test_k_cache_layout(num_heads, page_size, ratio):
         (0, _shuffle(num_heads, page_size, scale_mode=0)),
     ):
         _, cache = _paged_pool(c["num_pages"], page_size, 512, fill=0xAA)
-        indexer_k_norm_rope_mxfp4_cache(
+        k_norm_rope_mxfp4_cache(
             c["k"],
             c["positions"],
             c["cos_sin"],
@@ -169,7 +167,7 @@ def test_k_cache_matches_reference(ratio, page_size):
     fp32 log2 at a power-of-two amax. The natural order takes any page size."""
     c = _k_case(512, page_size, ratio, seed=ratio)
     _, cache = _paged_pool(c["num_pages"], page_size, 0, fill=0)
-    indexer_k_norm_rope_mxfp4_cache(
+    k_norm_rope_mxfp4_cache(
         c["k"], c["positions"], c["cos_sin"], c["w"], 1e-6, cache, c["slots"], ratio
     )
     vals, scales = _read_back(cache, page_size)
@@ -198,7 +196,7 @@ def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
     c = _k_case(8, 64, 1, seed=0)
     _, cache = _paged_pool(c["num_pages"], 64, 0, fill=0xAA)
     with pytest.raises(ValueError, match="does not tile"):
-        indexer_k_norm_rope_mxfp4_cache(
+        k_norm_rope_mxfp4_cache(
             c["k"],
             c["positions"],
             c["cos_sin"],
@@ -211,15 +209,20 @@ def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
     assert (cache == 0xAA).all()
 
 
-def test_q_quant_matches_reference():
-    gen = torch.Generator().manual_seed(0)
-    t, h = 64, 32
-    q = (torch.randn(t, h, HEAD_SIZE, generator=gen) * 3).bfloat16().to(DEV)
+@pytest.mark.parametrize(
+    "num_tokens, num_heads, with_weights",
+    [(64, 20, False), (1000, 64, True), (4200, 64, True)],
+)
+def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
+    gen = torch.Generator().manual_seed(num_heads)
+    t, h = num_tokens, num_heads
+    q = (torch.randn(t, h + 3, HEAD_SIZE, generator=gen) * 3).bfloat16().to(DEV)
+    q = q[:, :h]
     positions = torch.randint(0, 4096, (t,), generator=gen).to(DEV)
     cos_sin = _cos_sin(4096, gen)
     weights = torch.randn(t, h, generator=gen).bfloat16().to(DEV)
-    q_packed, q_scale, w_out = indexer_q_rope_mxfp4_quant(
-        positions, q, cos_sin, weights, 0.25, 0.125
+    q_packed, q_scale, w_out = q_rope_mxfp4_quant(
+        q, positions, cos_sin, weights if with_weights else None, 0.25 * 0.125
     )
 
     cs = cos_sin[positions][:, None]
@@ -231,7 +234,12 @@ def test_q_quant_matches_reference():
     assert (q_packed[..., :nope] == ref_v[..., :nope]).all()
     assert (q_packed == ref_v).float().mean() > 0.995
     assert (q_scale == ref_s).float().mean() > 0.995
-    torch.testing.assert_close(w_out, weights.float() * 0.25 * 0.125, rtol=0, atol=0)
+    if with_weights:
+        torch.testing.assert_close(
+            w_out, weights.float() * 0.25 * 0.125, rtol=0, atol=0
+        )
+    else:
+        assert w_out is None
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
@@ -252,7 +260,7 @@ def test_round_trip_through_logits(page_size):
     w = torch.ones(HEAD_SIZE, dtype=torch.bfloat16, device=DEV)
     _, cache = _paged_pool(num_pages, page_size, 256, fill=0)
     shuffle = _shuffle(num_heads, page_size)
-    indexer_k_norm_rope_mxfp4_cache(
+    k_norm_rope_mxfp4_cache(
         k,
         positions,
         cos_sin,
@@ -270,9 +278,7 @@ def test_round_trip_through_logits(page_size):
     )
     q_pos = (ctx - next_n + torch.arange(next_n)).repeat(batch).to(DEV)
     weights = torch.randn(batch * next_n, num_heads, generator=gen).to(DEV)
-    q_packed, q_scale, w_out = indexer_q_rope_mxfp4_quant(
-        q_pos, q, cos_sin, weights, 1.0, 1.0
-    )
+    q_packed, q_scale, w_out = q_rope_mxfp4_quant(q, q_pos, cos_sin, weights)
     ctx_lens = torch.full((batch,), ctx, dtype=torch.int32, device=DEV)
     logits = paged_mxfp4_mqa_logits(
         q_packed.view(batch, next_n, num_heads, -1),
