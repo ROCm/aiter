@@ -30,6 +30,11 @@ on:
         required: false
         default: true
         type: boolean
+      run_ds_v4_2p1d_tp8:
+        description: "Run DeepSeek-V4-Pro 2P+1D TP8 / DPA / MTP ATOMesh nightly cases"
+        required: false
+        default: false
+        type: boolean
       log_root:
         description: "Root directory for ATOMesh logs"
         required: false
@@ -47,11 +52,6 @@ on:
         default: ""
       conc_list:
         description: "Concurrency list for the smoke benchmark"
-        required: false
-        type: string
-        default: "16"
-      eval_conc_list:
-        description: "Concurrency list for GSM8K eval; empty uses benchmark concurrency"
         required: false
         type: string
         default: "16"
@@ -78,6 +78,10 @@ env:
   GLM_OSL_DEFAULT: "1024"
   GLM_CONC_LIST_DEFAULT: "16"
   GLM_EVAL_CONC_LIST_DEFAULT: "16"
+  DSV4_2P1D_ISL_LIST_DEFAULT: "8192"
+  DSV4_2P1D_OSL_DEFAULT: "1024"
+  DSV4_2P1D_CONC_LIST_DEFAULT: "16"
+  DSV4_2P1D_EVAL_CONC_LIST_DEFAULT: "128"
   ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
   ATOMESH_SLURM_ACCOUNT: ""
   ATOMESH_SLURM_PARTITION: ""
@@ -121,6 +125,7 @@ jobs:
           # Include GLM in scheduled runs; workflow_dispatch can disable it for
           # targeted DeepSeek-only debugging.
           run_glm = bool_input("run_glm_5_2_fp8", True)
+          run_dsv4_2p1d = bool_input("run_ds_v4_2p1d_tp8", False)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
@@ -146,13 +151,15 @@ jobs:
           print("ISL_LIST=" + os.environ["ISL_LIST_DEFAULT"])
           print("OSL=" + os.environ["OSL_DEFAULT"])
           print("CONC_LIST=" + value("conc_list", "CONC_LIST_DEFAULT"))
-          eval_conc = inputs.get("eval_conc_list", "")
-          if eval_conc in ("", None):
-              eval_conc = os.environ["DEEPSEEK_EVAL_CONC_LIST_DEFAULT"]
-          print(f"EVAL_CONC_LIST={eval_conc}")
+          print(f"EVAL_CONC_LIST={os.environ['DEEPSEEK_EVAL_CONC_LIST_DEFAULT']}")
           print(f"GLM_OSL={os.environ['GLM_OSL_DEFAULT']}")
           print(f"GLM_CONC_LIST={os.environ['GLM_CONC_LIST_DEFAULT']}")
           print(f"GLM_EVAL_CONC_LIST={os.environ['GLM_EVAL_CONC_LIST_DEFAULT']}")
+          print(f"RUN_DS_V4_2P1D_TP8={str(run_dsv4_2p1d).lower()}")
+          print(f"DSV4_2P1D_ISL_LIST={os.environ['DSV4_2P1D_ISL_LIST_DEFAULT']}")
+          print(f"DSV4_2P1D_OSL={os.environ['DSV4_2P1D_OSL_DEFAULT']}")
+          print(f"DSV4_2P1D_CONC_LIST={os.environ['DSV4_2P1D_CONC_LIST_DEFAULT']}")
+          print(f"DSV4_2P1D_EVAL_CONC_LIST={os.environ['DSV4_2P1D_EVAL_CONC_LIST_DEFAULT']}")
           PY
 
       - name: Checkout ATOM source
@@ -427,6 +434,25 @@ jobs:
                       "run_eval": True,
                   }
               )
+          if os.environ.get("RUN_DS_V4_2P1D_TP8", "false") == "true":
+              for case, topology in (
+                  ("ds-v4-2p1d-tp8", "2p1d"),
+                  ("ds-v4-2p1d-dpa-tp8", "2p1d_dpa"),
+                  ("ds-v4-2p1d-tp8-mtp3", "2p1d_mtp3"),
+                  ("ds-v4-2p1d-dpa-tp8-mtp1", "2p1d_dpa_mtp1"),
+              ):
+                  requested.append(
+                      {
+                          "model": "DeepSeek-V4-Pro",
+                          "case": case,
+                          "topology": topology,
+                          "isl": os.environ["DSV4_2P1D_ISL_LIST"],
+                          "osl": os.environ["DSV4_2P1D_OSL"],
+                          "conc": os.environ["DSV4_2P1D_CONC_LIST"],
+                          "eval_conc": os.environ["DSV4_2P1D_EVAL_CONC_LIST"],
+                          "run_eval": True,
+                      }
+                  )
 
           node_pool = [
               node.strip()
@@ -454,7 +480,10 @@ jobs:
 
               cell = matches[0]
               conc = parse_int_list(cfg["conc"])
-              cell["isl"] = isl
+              if "isl" in cfg:
+                  cell["isl"] = parse_int_list(cfg["isl"])
+              else:
+                  cell["isl"] = isl
               cell["osl"] = int(cfg["osl"])
               cell["concurrency"] = conc
               cell["concurrency_x"] = "x".join(str(value) for value in conc)
@@ -464,7 +493,8 @@ jobs:
               cell["runner"]["slurm_account"] = ""
               cell["runner"]["slurm_partition"] = ""
               cell["runner"]["log_root"] = os.environ["ATOMESH_LOG_ROOT"]
-              if cfg["model"] == "DeepSeek-V4-Pro":
+              # 1P1D DeepSeek smoke strips --enable-tbo; keep it for 2P1D DPA/MTP.
+              if cfg["model"] == "DeepSeek-V4-Pro" and cfg["topology"] == "1p1d":
                   for role in ("prefill", "decode"):
                       service_role = cell.setdefault("service", {}).setdefault(role, {})
                       extra_args = service_role.get("extra_args", "")
