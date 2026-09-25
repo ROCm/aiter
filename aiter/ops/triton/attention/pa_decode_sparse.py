@@ -662,10 +662,11 @@ def _pa_decode_sparse_gfx950_gluon(
     if one_wg_per_cu:
         waves_per_eu = 1
 
-    # At 256 VGPRs the peeled last tile spills around the tile loop: heavily for
-    # the 64-bit gathers, and on buffer loads at prefill. Decode on buffer loads
-    # is faster peeled.
-    unpeel = num_queries >= _PREFILL_MIN_ROWS if use_buffer_load else True
+    # Unpeeled is faster at prefill and, on the 64-bit gathers, unless split-K
+    # leaves each program a few tiles. Decode on buffer loads is faster peeled.
+    row_tiles = max(avg_main, avg_extra) / BLOCK_K
+    short_splits = num_splits > 1 and row_tiles <= 4 * num_splits
+    unpeel = num_queries >= _PREFILL_MIN_ROWS if use_buffer_load else not short_splits
 
     main_splits = num_splits
     if has_extra and avg_main > 0:

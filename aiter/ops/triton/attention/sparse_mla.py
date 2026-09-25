@@ -669,8 +669,6 @@ def sparse_mla_fwd(
         EXTRA_USE_BUFFER_LOAD=use_buffer_load,
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
-        # The peeled last tile costs the 64-bit gathers; buffer loads are faster peeled.
-        UNPEEL=not use_buffer_load,
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         GATHER_CACHE="",
