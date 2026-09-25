@@ -12,9 +12,10 @@ Single-request prefill batches 16 rows per scorer workgroup; decode and
 multi-request inputs keep the one-row scorer. BLOCK_N=32 is the measured
 default for both.
 
-One module serves both families: their indexer specs are the same value,
-so the only contract that differs is the accepted head count, which callers
-pin through ``heads`` -- ``(4,)`` for family A, ``(4, 8)`` for family B.
+Every shape this serves shares one indexer contract, so the only thing that
+varies is the accepted head count. Callers pin it through ``heads``: pass
+``(4,)`` for the narrow contract, or take the ``(4, 8)`` default. ``H=8``
+is a second compile of the same scorers.
 """
 
 from functools import lru_cache
@@ -25,42 +26,25 @@ import torch
 from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from aiter.ops.flydsl.kernels.qsa.shapes import (
-    FAMILY_A_INDEXER,
-    FAMILY_A_SCORE_SCALE,
-    FAMILY_B_INDEXER,
-    FAMILY_B_INDEXER_H8,
-)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.topk_select import topk_select
 
+# The indexer contract this module implements, rather than any one model's
+# numbers: a budget of _K compressed blocks, _KV_HEADS head of _D elements,
+# and _R raw tokens per compressed block. The emit kernel bakes _K into its
+# launch shape and the scorers bake _D into their LDS tile, so these are the
+# kernel's own constants. The test suite asserts they still cover every
+# shape we validate against.
 _BLOCK_THREADS = 512
-_K = FAMILY_A_INDEXER.block_budget
-_H = FAMILY_A_INDEXER.n_heads
-_D = FAMILY_A_INDEXER.head_dim
-_R = FAMILY_A_INDEXER.compress_ratio
-_KV_HEADS = FAMILY_A_INDEXER.kv_heads
+_K = 512
+_H = 4
+_D = 128
+_R = 4
+_KV_HEADS = 1
 _STREAM_SELECT_MIN_COLUMNS = 32768
 _SCORE_HEADS = (4, 8)
-_SCORE_SCALE = FAMILY_A_SCORE_SCALE
-
-
-def _spec_fits(spec) -> bool:
-    """Whether a K1 indexer spec agrees with this module bar its head count."""
-    return spec.n_heads in _SCORE_HEADS and (
-        spec.kv_heads,
-        spec.head_dim,
-        spec.compress_ratio,
-        spec.block_budget,
-    ) == (_KV_HEADS, _D, _R, _K)
-
-
-# The head count is the only axis this module treats as variable. Nothing
-# downstream re-derives the block budget or compress ratio from the caller's
-# tensors, so a spec drifting in those would go unnoticed at the gate.
-if not all(map(_spec_fits, (FAMILY_A_INDEXER, FAMILY_B_INDEXER, FAMILY_B_INDEXER_H8))):
-    raise ValueError("QSA K1 indexer specs diverged; they no longer share a module")
+_SCORE_SCALE = _D**-0.5
 
 
 def _idiv(a, b):
@@ -638,7 +622,7 @@ def qsa_k1_score_and_select(
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
-    ``n_heads`` is 4 (family A and family B) or 8 (family B). Selection is
+    ``n_heads`` is 4 or 8, each a separate compile. Selection is the
     stable decode radix below 32768 columns and streaming radix
     (``tie='low'``) at or above that width.
     """
@@ -722,8 +706,8 @@ def qsa_k1_serves(
 ) -> str | None:
     """Why this K1 kernel cannot serve these tensors, or None if it can.
 
-    ``heads`` narrows the accepted indexer head count. Family A pins it to
-    ``(4,)``; family B admits ``(4, 8)``. Every other check holds for both.
+    ``heads`` narrows the accepted indexer head count; pass ``(4,)`` to
+    reject the 8-head variant. Every other check is the same either way.
     """
     if not heads or any(h not in _SCORE_HEADS for h in heads):
         raise ValueError(f"heads must be a non-empty subset of {_SCORE_HEADS}")
@@ -762,8 +746,8 @@ def qsa_k1_block_ids(
     stable decode radix below 32768 columns and streaming radix
     (``tie='low'``) at or above that width. Expand+tail is still separate.
 
-    ``heads`` is the accepted head count. Family A callers pass ``(4,)`` to
-    keep their contract narrow; family B takes the ``(4, 8)`` default.
+    ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
+    narrow; the ``(4, 8)`` default also admits the 8-head indexer.
     """
     reason = qsa_k1_serves(q, k_cache, page_table, heads)
     if reason is not None:
