@@ -208,7 +208,7 @@ def _prepare_candidates_kernel(
     """
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, K)
-    ids = tl.load(ids_ptr + row * stride_ids + cols)
+    ids = tl.load(ids_ptr + row * stride_ids + cols, cache_modifier=".cg")
     end = tl.load(ends_ptr + row)
     nblocks = (end + C - 1) // C
 
