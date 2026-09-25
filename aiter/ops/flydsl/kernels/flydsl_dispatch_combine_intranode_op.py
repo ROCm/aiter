@@ -19,6 +19,7 @@ from mori.shmem import mori_shmem_create_tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
+from ..communication_ops_host_utils import build_p2p_table
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
@@ -357,14 +358,6 @@ class FlyDSLDispatchCombineConfig:
         return self.scale_dim * self.scale_type_size
 
 
-def build_p2p_table(t, rank, npes, dev):
-    """i64[npes] table of intra-node P2P pointers to ``t`` on every peer (self incl.)."""
-    tbl = torch.zeros(npes, dtype=torch.int64, device=dev)
-    for pe in range(npes):
-        tbl[pe] = ms.shmem_ptr_p2p(t.data_ptr(), rank, pe)
-    return tbl
-
-
 class FlyDSLDispatchGroupMajorOp:
     """Own expert-major dispatch buffers and metadata for fused stage1."""
 
@@ -562,7 +555,6 @@ class FlyDSLDispatchGroupMajorOp:
 
 
 class FlyDSLDispatchCombineIntraNodeOp:
-
     def __init__(self, config):
         self.cfg = config
         self._check_config()
