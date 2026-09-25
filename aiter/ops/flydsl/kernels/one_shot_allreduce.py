@@ -21,8 +21,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from . import buffer_ops
-
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
 from .quick_allreduce_shared import (
@@ -33,8 +31,13 @@ from .quick_allreduce_shared import (
     FLAG_LANES,
     SUPPORTED_WORLDS,
     _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
     _i32_to_bytes,
     _load_flag,
+    _load_peers,
+    _payload_io,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
@@ -160,15 +163,6 @@ DEFAULT_FANOUT = "peer"
 DEFAULT_SKIP_SELF = False
 
 
-def _load_v4i32_at(rsrc, elem_off, policy):
-    """One 16 B atom from a buffer descriptor, at an i32 element offset."""
-    return fx.Vector(
-        buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=4, dtype=T.i32, cache_modifier=policy
-        )
-    )
-
-
 def _atom_bf16_to_f32(atom_i32):
     """16 B of bf16 (8 values) -> 8 f32. bf16 is the high half of f32, so this
     is a widening move, not a conversion -- exact, no rounding."""
@@ -258,44 +252,14 @@ def make_one_shot_allreduce_kernel(
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        hbm_layout = fx.make_layout(
-            (num_tiles, atoms, block * ATOM_I32),
-            (tile_i32, block * ATOM_I32, 1),
-        )
-        hbm_row_layout = fx.make_layout((1, block * ATOM_I32), (block * ATOM_I32, 1))
-        hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-        hbm_copy = fx.make_tiled_copy_tv(
-            hbm_copy_atom,
-            fx.make_layout((1, block), (1, 1)),
-            fx.make_layout((1, ATOM_I32), (1, 1)),
-        ).get_slice(tid)
-        color_layout = fx.make_layout((grid,), (1,))
-
-        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
-        peers = [
-            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
-            for i in range(world_size)
-        ]
+        peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
-        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(peer_vec[rank])
+        inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 16)
+
+        _load_payload, _store_payload = _payload_io(
+            inp_ptr, out_ptr, nbytes, num_tiles, atoms, block, tid
         )
-
-        hbm_i32_ptr = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=16
-        )
-
-        def _payload_tensor(ptr):
-            # num_records_bytes is the live payload, so a partial last tile
-            # reads 0 and stores are dropped rather than faulting.
-            view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
-            return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
-            )
-
-        in_buf = _payload_tensor(inp_ptr)
-        out_buf = _payload_tensor(out_ptr)
-        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+        _load_color, _store_color = _color_io(colors_ptr, bid)
 
         def _slot_i32(parity, src):
             """i32 offset of the wire slot ``[parity][bid][src]``.
@@ -311,37 +275,13 @@ def make_one_shot_allreduce_kernel(
                 + src * fx.Int32(wire_tile_i32)
             )
 
-        def _hbm_atom_row(buf, tile, atom):
-            return fx.make_view(
-                fx.get_iter(fx.slice(buf, (tile, atom, None))), hbm_row_layout
-            )
-
-        def _load_color():
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            return fx.Int32(
-                buffer_ops.buffer_load(color_rsrc, off, vec_width=1, dtype=T.i32)
-            )
-
-        def _store_color(color):
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            buffer_ops.buffer_store(color, color_rsrc, off)
-
         def _load_tile(tile):
             """This thread's 16 B of each atom of *tile*, as raw i32x4."""
-            out = []
-            for atom in range_constexpr(atoms):
-                src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
-                frag = fx.make_fragment_like(src)
-                fx.copy(hbm_copy_atom, src, frag)
-                out.append(fx.Vector(frag.load()))
-            return out
+            return [_load_payload(tile, atom) for atom in range_constexpr(atoms)]
 
         def _store_tile(tile, vals):
             for atom in range_constexpr(atoms):
-                dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
-                frag = fx.make_fragment_like(dst)
-                frag.store(vals[atom])
-                fx.copy(hbm_copy_atom, frag, dst)
+                _store_payload(tile, atom, vals[atom])
 
         def _fanout(parity, my_atoms):
             """Push this thread's atoms into every peer's slot for this rank.
@@ -457,7 +397,7 @@ def make_one_shot_allreduce_kernel(
                             + tid * fx.Int32(ATOM_I32)
                         )
                         v = _atom_bf16_to_f32(
-                            _load_v4i32_at(self_rsrc, elem, _RECV_POLICY)
+                            _buffer_load(inbox, elem, ATOM_I32, fx.Int32, _RECV_POLICY)
                         )
                     acc = v if acc is None else acc + v
                 outs.append(_atom_f32_to_bf16(acc))

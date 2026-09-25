@@ -29,7 +29,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from . import buffer_ops
 from .quick_allreduce_codec import (
     GROUP,
     SUPPORTED_BLOCKS,
@@ -58,8 +57,13 @@ from .quick_allreduce_shared import (
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
     _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
     _i32_to_bytes,
     _load_flag,
+    _load_peers,
+    _payload_io,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
@@ -111,9 +115,7 @@ RING_ST_LADDER = {
 
 def ring_st_ladder(world_size: int, link: str = "pcie"):
     """Rungs for *(link, world_size)*, or the PCIe TP4 shape for an unlisted one."""
-    return RING_ST_LADDER.get(
-        (str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)]
-    )
+    return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
 
 
 # Wire formats accepted per lap.
@@ -134,17 +136,16 @@ AG_CODECS = ("int4", "int6", "fp16")
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 
-def _load_i32_at(rsrc, elem_off, cache_modifier):
-    """One i32 from *rsrc* at an element offset, drained before it is read.
+def _load_i32_at(ptr, elem_off, cache_modifier):
+    """One i32 from the buffer pointer *ptr* at an element offset, drained
+    before it is read.
 
-    The ring always has the inbox descriptor in hand and only the offset
+    The ring always has the inbox pointer in hand and only the offset
     varies, so its payload reads go through the one shared descriptor.
     """
-    val = buffer_ops.buffer_load(
-        rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=cache_modifier
-    )
+    val = _buffer_load(ptr, elem_off, 1, fx.Int32, cache_modifier)[0]
     rocdl.s_waitcnt(vmcnt=0)
-    return fx.Int32(val)
+    return val
 
 
 def ring_steps(world_size: int) -> int:
@@ -226,7 +227,6 @@ def make_quick_allreduce_int4_ring_kernel(
     rs = codecs[rs_codec]
     ag = codecs[ag_codec]
     tile_bytes = block * ATOMS * 16
-    tile_i32 = tile_bytes // 4
     # Quads of 4 lanes; one quad writes one 64 B fabric sector.
     quads_per_block = block // QUAD_LANES
     # Which codec each wire slot carries. Ops 1..N-1 fill the reduce-scatter
@@ -293,19 +293,7 @@ def make_quick_allreduce_int4_ring_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        hbm_layout = fx.make_layout(
-            (num_tiles, ATOMS, block * 4),
-            (tile_i32, block * 4, 1),
-        )
-        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-        hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-        hbm_copy = fx.make_tiled_copy_tv(
-            hbm_copy_atom,
-            fx.make_layout((1, block), (1, 1)),
-            fx.make_layout((1, 4), (1, 1)),
-        ).get_slice(tid)
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
-        color_layout = fx.make_layout((grid,), (1,))
 
         # One allocation, one view per codec.
         lds = fx.SharedAllocator().allocate(PackStorage).peek()
@@ -317,39 +305,32 @@ def make_quick_allreduce_int4_ring_kernel(
             for c in ({rs.name: rs, ag.name: ag}).values()
         }
 
-        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
-        peers = [
-            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
-            for i in range(world_size)
-        ]
+        peers = _load_peers(peer_ptrs, world_size)
         # A ring only ever names two of the peers, and ``rank`` is compile-time,
         # so both are plain Python indices into the loaded pointers. The
         # mesh packs these into an fx.Vector because its fanout selects a
         # peer with a *runtime* lane-dependent index; doing that here would put
         # a dynamic extract in front of a constant and get the wrong element.
-        self_base = fx.Int64(peers[rank])
-        next_base = fx.Int64(peers[nxt])
+        self_base = peers[rank]
+        next_base = peers[nxt]
         # Bounded on purpose. Every ring access is in range by construction,
         # so an out-of-range one is a bug -- and with num_records set the
         # hardware returns zero instead of faulting, which turns a
         # process-killing page fault into a wrong SQNR you can bisect.
-        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(self_base), num_records_bytes=inbox_bytes
+        inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4, inbox_bytes)
+
+        _load_atom, _store_atom = _payload_io(
+            inp_ptr,
+            out_ptr,
+            nbytes,
+            num_tiles,
+            ATOMS,
+            block,
+            tid,
+            decode=_atom_bf16_to_f16,
+            encode=_atom_f16_to_bf16,
         )
-
-        hbm_i32_ptr = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=16
-        )
-
-        def _payload_tensor(ptr):
-            view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
-            return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
-            )
-
-        in_buf = _payload_tensor(inp_ptr)
-        out_buf = _payload_tensor(out_ptr)
-        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+        _load_color, _store_color = _color_io(colors_ptr, bid)
 
         def _slot_i32(step, sub):
             """i32 offset of (*step*, this block, *sub*) inside the inbox.
@@ -371,22 +352,6 @@ def make_quick_allreduce_int4_ring_kernel(
                 + sub * fx.Int32(payload_i32[step])
             )
 
-        def _hbm_atom_row(buf, tile, atom):
-            return fx.make_view(
-                fx.get_iter(fx.slice(buf, (tile, atom, None))),
-                hbm_row_layout,
-            )
-
-        def _load_color():
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            return fx.Int32(
-                buffer_ops.buffer_load(color_rsrc, off, vec_width=1, dtype=T.i32)
-            )
-
-        def _store_color(color):
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            buffer_ops.buffer_store(color, color_rsrc, off)
-
         def _load_chunk_atoms(tile, chunk):
             """This rank's own bf16 data for *chunk*, as fp16 register atoms.
 
@@ -395,23 +360,13 @@ def make_quick_allreduce_int4_ring_kernel(
             exactly once -- so total HBM traffic matches the mesh's single
             bulk load, with far fewer values live across the spin-waits.
             """
-            out = []
-            for j in range_constexpr(rank_atoms):
-                src = hbm_copy.partition_S(
-                    _hbm_atom_row(in_buf, tile, chunk * rank_atoms + j)
-                )
-                frag = fx.make_fragment_like(src)
-                fx.copy(hbm_copy_atom, src, frag)
-                out.append(_atom_bf16_to_f16(fx.Vector(frag.load())))
-            return out
+            return [
+                _load_atom(tile, chunk * rank_atoms + j)
+                for j in range_constexpr(rank_atoms)
+            ]
 
         def _store_chunk_atom(tile, chunk, j, value):
-            dst = hbm_copy.partition_D(
-                _hbm_atom_row(out_buf, tile, chunk * rank_atoms + j)
-            )
-            frag = fx.make_fragment_like(dst)
-            frag.store(_atom_f16_to_bf16(value))
-            fx.copy(hbm_copy_atom, frag, dst)
+            _store_atom(tile, chunk * rank_atoms + j, value)
 
         def _lds_write_packet(codec, j, words, scale_word, is_leader):
             """Stage one packet of *codec* into the row this hop will send."""
@@ -439,7 +394,7 @@ def make_quick_allreduce_int4_ring_kernel(
             base = _slot_i32(step, sub) + fx.Int32(j * codec.rank_tile_i32)
 
             def _get(off):
-                return _load_i32_at(self_rsrc, base + off, _RECV_POLICY)
+                return _load_i32_at(inbox, base + off, _RECV_POLICY)
 
             return _codec_load(codec, _get, tid, scale_slot)
 

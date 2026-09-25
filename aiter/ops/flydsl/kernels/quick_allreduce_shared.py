@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Transport assets shared by every quick-allreduce schedule.
+"""Transport assets shared by every quick-allreduce/one-shot-all-reduce implementations.
 
 Tile geometry, the inbox cache-policy table, the peer store/load primitives and
 the LDS staging factory.
-
-The mesh, ring and one-shot kernels all build on this module, and they must
-agree byte for byte on what it defines. ``one_shot_allreduce`` uses it
-*without* the codec, which is why the two are separate modules.
 """
 
 import logging
@@ -16,8 +12,6 @@ import logging
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T, as_ir_value
-
-from . import buffer_ops
 
 logger = logging.getLogger("aiter")
 
@@ -120,11 +114,7 @@ FANOUT_ORDERS = ("sector", "peer")
 
 
 def has_release_fence(inbox_memory: str) -> bool:
-    """Whether this inbox type needs an L2 writeback at every publish.
-
-    Callers use it to decide how hard to work at batching publishes: with a
-    fence they are expensive, without one they are nearly free.
-    """
+    """Whether this inbox type needs an L2 writeback at every publish."""
     return _INBOX_POLICY[inbox_memory]["release"] is not None
 
 
@@ -133,20 +123,7 @@ def _i32_to_bytes(i32_off):
 
 
 def _to_sgpr_i64(addr):
-    """Copy a wave-uniform i64 from vector to scalar registers.
-
-    Buffer loads/stores need the descriptor in scalar registers. After
-    ``peers[rank]``, every lane holds the same pointer, but it sits in a
-    vector register, so LLVM cannot prove that. It then serializes the
-    wave: one lane at a time, copy that lane's pointer to a scalar
-    register, mask to that lane, issue the load, repeat. ``readfirstlane``
-    copies lane 0's value into a scalar register once so the whole wave
-    issues a single buffer op.
-
-    Do this at the inbox descriptor, not on the peer list: fanout stores
-    use a different peer per lane, so those addresses must stay in vector
-    registers. ``T.i64`` is the result type ``readfirstlane`` requires.
-    """
+    """Copy a wave-uniform i64 from vector to scalar registers."""
     return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
 
 
@@ -161,19 +138,8 @@ def _global_ptr(addr_i64, elem_ty, alignment):
 def _store_v4i32_peer(addr_i64, data, policy):
     """Store 16 B to a peer through a per-lane global address.
 
-    One instruction here sends 16 B to a different GPU in each lane of a
-    4-wide group. A buffer-descriptor store wants the descriptor in scalar
-    registers, so LLVM would serialize those lanes (one destination at a
-    time). A flat global store takes the address from a vector register,
-    so all destinations issue together.
-
     *policy* is the inbox's ``payload`` entry in ``_INBOX_POLICY``: plain or
     ``nt``. Every wire offset is a multiple of 16 B, hence the alignment.
-
-    A native store, so the backend sees it. That matters beyond the cache
-    bits: a VMEM store of more than 64 bits needs two wait states (gfx940 and
-    later) before a VALU may overwrite its data VGPRs, and LLVM's hazard
-    recognizer only inserts them after a store it can see.
     """
     fx.generic_store(_global_ptr(addr_i64, T.i32, 16), data, **dict(policy))
 
@@ -196,13 +162,7 @@ def _store_flag_peer(addr_i64, color, policy):
 
 
 def _release_inbox(scope):
-    """Release fence over global memory: publish everything stored before it.
-
-    At system scope (``one-as``) the backend emits ``buffer_wbl2 sc0 sc1``
-    followed by ``s_waitcnt vmcnt(0)``: the L2 writeback that a cacheable inbox
-    needs before its flag goes out. ``one-as`` scopes it to global memory, so it
-    does not wait on ``lgkmcnt``.
-    """
+    """Release fence over global memory: publish everything stored before it."""
     fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope=scope)
 
 
@@ -223,52 +183,114 @@ def _load_flag(addr_i64):
     )
 
 
-def _load_i32_nt(rsrc, elem_off, cache_modifier=_CM_NT):
-    """Load one i32 from the inbox under the policy's receive modifier.
+def _buffer_ptr(addr_i64, elem_ty, alignment, num_records_bytes=None):
+    """A buffer-descriptor pointer at a raw global byte address.
 
-    Defaults to ``nt`` -- correct when the inbox memory cannot hold a stale
-    line in the first place. A cacheable (coarse-grained) inbox must pass
-    ``_CM_SC0 | _CM_SC1`` instead, because ``nt`` is a reuse *hint* and does
-    not stop this load being answered from the reader's own L1/L2.
+    Without *num_records_bytes* the descriptor spans 4 GiB unchecked; with
+    it, a load past the end returns 0 and a store is dropped. *addr_i64* must
+    sit in scalar registers, see :func:`_to_sgpr_i64`.
     """
-    return fx.Int32(
-        buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=cache_modifier
-        )
+    return rocdl.make_buffer_ptr(
+        _global_ptr(addr_i64, elem_ty, alignment), num_records_bytes=num_records_bytes
     )
 
 
-def _acquire_inbox():
-    """Acquire fence over global memory, system scope.
+def _buffer_load(ptr, elem_off, n, dtype, cache_modifier=0):
+    """*n* consecutive elements of a buffer pointer, at an element offset.
 
-    Replaces a raw ``buffer_inv sc1`` asm. On gfx950 the memory legalizer
-    lowers this to ``s_waitcnt vmcnt(0)`` + ``buffer_inv sc0 sc1``, so the
-    encoding comes from the target rather than from a string in this file.
-    ``one-as`` scopes it to global memory, which is why it does not also
-    wait on ``lgkmcnt``.
-
-    System scope, not agent. The data being acquired was written by another
-    GPU, and another GPU is a different agent: agent scope lowers to
-    ``buffer_inv sc1``, which clears L2 but leaves the vector L1 holding
-    whatever it had. That is what the old asm did.
-
-    Call this **once, after the workgroup joins** -- not inside a spin loop.
-    A flag load that carries ``sc0 sc1`` can never be answered from a stale
-    line, so the retry loop needs no fence of its own; what needs one is the
-    payload read that follows, and that needs it exactly once. See
-    :func:`quick_allreduce_int4.make_quick_allreduce_int4_kernel._wait_release`.
+    *cache_modifier* is ``_CM_*`` bits. An inbox read passes the policy's
+    ``recv`` entry: ``nt`` is enough where the inbox memory cannot hold a
+    stale line in the first place, but a cacheable (coarse-grained) inbox
+    needs ``_CM_SC0 | _CM_SC1``, because ``nt`` is a reuse *hint* and does
+    not stop the load being answered from the reader's own L1/L2.
     """
+    atom = fx.make_copy_atom(rocdl.BufferCopy(n * dtype.width, cache_modifier), dtype)
+    reg = fx.make_rmem_tensor(n, dtype)
+    fx.copy(atom, fx.make_view(ptr + elem_off, fx.make_layout(n, 1)), reg)
+    return fx.Vector(fx.memref_load_vec(reg))
+
+
+def _buffer_store(ptr, elem_off, vec):
+    """Store the vector *vec* to a buffer pointer, at an element offset."""
+    atom = fx.make_copy_atom(rocdl.BufferCopy(vec.numel * vec.dtype.width), vec.dtype)
+    reg = fx.make_rmem_tensor(vec.numel, vec.dtype)
+    fx.memref_store_vec(vec, reg)
+    fx.copy(atom, reg, fx.make_view(ptr + elem_off, fx.make_layout(vec.numel, 1)))
+
+
+def _load_peers(peer_ptrs, world_size):
+    """The ``world_size`` inbox base addresses from the device-side peer table."""
+    table = _buffer_ptr(peer_ptrs, T.i64, 8)
+    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(world_size)]
+
+
+def _color_io(colors_ptr, bid):
+    """``(load, store)`` for this workgroup's colour, one i32 per block."""
+    colors = _buffer_ptr(colors_ptr, T.i32, 4)
+
+    def load():
+        return _buffer_load(colors, bid, 1, fx.Int32)[0]
+
+    def store(color):
+        _buffer_store(colors, bid, fx.Vector.from_elements([color], fx.Int32))
+
+    return load, store
+
+
+def _payload_io(
+    inp_ptr, out_ptr, nbytes, num_tiles, atoms, block, tid, decode=None, encode=None
+):
+    """``(load, store)`` for this thread's 16 B of one payload atom.
+
+    The payload is ``(num_tiles, atoms, block * 4)`` i32 and thread *tid*
+    owns i32 ``[4 * tid, 4 * tid + 4)`` of every atom row. ``load(tile,
+    atom)`` reads it from *inp_ptr* as i32x4, passed through *decode* if
+    given; ``store(tile, atom, vec)`` writes ``encode(vec)`` to *out_ptr*.
+    Both tensors are bounded by *nbytes*, the live payload, so a partial last
+    tile reads 0 and its stores are dropped rather than faulting.
+    """
+    row_i32 = block * 4
+    layout = fx.make_layout((num_tiles, atoms, row_i32), (atoms * row_i32, row_i32, 1))
+    row_layout = fx.make_layout((1, row_i32), (row_i32, 1))
+    copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
+    thr_copy = fx.make_tiled_copy_tv(
+        copy_atom,
+        fx.make_layout((1, block), (1, 1)),
+        fx.make_layout((1, 4), (1, 1)),
+    ).get_slice(tid)
+
+    def _tensor(addr):
+        view = fx.make_view(_global_ptr(addr, T.i32, 16), layout)
+        return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=nbytes)
+
+    inp, out = _tensor(inp_ptr), _tensor(out_ptr)
+
+    def _row(buf, tile, atom):
+        return fx.make_view(fx.get_iter(fx.slice(buf, (tile, atom, None))), row_layout)
+
+    def load(tile, atom):
+        src = thr_copy.partition_S(_row(inp, tile, atom))
+        frag = fx.make_fragment_like(src)
+        fx.copy(copy_atom, src, frag)
+        vec = fx.Vector(frag.load())
+        return vec if decode is None else decode(vec)
+
+    def store(tile, atom, vec):
+        dst = thr_copy.partition_D(_row(out, tile, atom))
+        frag = fx.make_fragment_like(dst)
+        frag.store(vec if encode is None else encode(vec))
+        fx.copy(copy_atom, frag, dst)
+
+    return load, store
+
+
+def _acquire_inbox():
+    """Acquire fence over global memory, system scope."""
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=rocdl.SyncScope.OneAs)
 
 
 def make_pack_storage(n_i32: int):
-    """LDS staging for *n_i32* packed words, 16 B aligned.
-
-    A factory rather than one struct because the two schedules need different
-    sizes: the mesh stages every destination's packet (``ATOMS`` rows), while
-    the ring stages one destination's (``rank_atoms`` rows) and its row stride
-    depends on which codec that hop carries.
-    """
+    """LDS staging for *n_i32* packed words, 16 B aligned."""
 
     @fx.struct
     class PackStorage:

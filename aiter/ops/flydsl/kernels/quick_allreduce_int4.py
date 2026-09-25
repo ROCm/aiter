@@ -18,11 +18,11 @@ and one-shot schedules share byte for byte.
 
 Two tuning knobs besides the super-tile:
 
-* ``block`` -- threads per workgroup. It sets the tile (``block * ATOMS * 16 B``), 
+* ``block`` -- threads per workgroup. It sets the tile (``block * ATOMS * 16 B``),
   hence how many blocks a payload gets and how many flags it costs.
-* ``skip_self`` -- drop this rank's round trip through its own inbox: 
+* ``skip_self`` -- drop this rank's round trip through its own inbox:
   its reduce-scatter share is added from registers, and its reduced chunk
-  is decoded from the same packet it sends. It needs the rank at trace time, ´
+  is decoded from the same packet it sends. It needs the rank at trace time,
   which costs one binary per rank.
 """
 
@@ -31,7 +31,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from . import buffer_ops
 from .quick_allreduce_codec import (
     SUPER_TILES,
     SUPPORTED_BLOCKS,
@@ -61,9 +60,13 @@ from .quick_allreduce_shared import (
     TILE_BYTES,
     WORLD,
     _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
     _i32_to_bytes,
     _load_flag,
-    _load_i32_nt,
+    _load_peers,
+    _payload_io,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
@@ -168,6 +171,8 @@ MESH_ST_LADDER = {
 def mesh_st_ladder(world_size: int, link: str = "pcie"):
     """Rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
     return MESH_ST_LADDER.get((str(link), int(world_size)), ())
+
+
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "fp16")
 
@@ -202,7 +207,6 @@ def make_quick_allreduce_int4_kernel(
         )
     c = codecs_for_block(block)[codec]
     tile_bytes = block * ATOMS * 16
-    tile_i32 = tile_bytes // 4
     quads_per_block = block // QUAD_LANES
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
@@ -281,27 +285,12 @@ def make_quick_allreduce_int4_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        pack_layout = fx.make_layout(
-            (pack_rows, c.rank_tile_i32), (c.rank_tile_i32, 1)
-        )
+        pack_layout = fx.make_layout((pack_rows, c.rank_tile_i32), (c.rank_tile_i32, 1))
         # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
         # start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
-        # Remote NT fanout stays explicit global_store_dwordx4 nt.
-        hbm_layout = fx.make_layout(
-            (num_tiles, ATOMS, block * 4),
-            (tile_i32, block * 4, 1),
-        )
-        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-        hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-        hbm_copy = fx.make_tiled_copy_tv(
-            hbm_copy_atom,
-            fx.make_layout((1, block), (1, 1)),
-            fx.make_layout((1, 4), (1, 1)),
-        ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
-        color_layout = fx.make_layout((grid,), (1,))
         wire_slot_layout = fx.make_layout(
             (PHASES, grid, world_size, super_tile),
             (
@@ -316,41 +305,30 @@ def make_quick_allreduce_int4_kernel(
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
 
-        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
-        peers = [
-            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
-            for i in range(world_size)
-        ]
+        peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
-        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(peer_vec[rank])
-        )
+        inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
+
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
 
-            base = fx.Int64(peers[push_peers[0]])
+            base = peers[push_peers[0]]
             for i in range_constexpr(1, n_push):
-                base = (j == fx.Int32(i)).select(fx.Int64(peers[push_peers[i]]), base)
+                base = (j == fx.Int32(i)).select(peers[push_peers[i]], base)
             return base
-        # inp/out are a 3-D i32 tensor consumed by TiledCopy (BufferCopy128b).
-        # That API needs a FlyDSL buffer-backed tensor (layout + descriptor),
-        # not a raw descriptor. create_buffer_resource_from_addr is the
-        # scalar-offset buffer_load/store path used for the peer-pointer
-        # table, IPC inbox, and color flags. num_records_bytes is the live
-        # tensor size so a partial last tile is out-of-range safe.
-        hbm_i32_ptr = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=16
+
+        _load_atom, _store_atom = _payload_io(
+            inp_ptr,
+            out_ptr,
+            nbytes,
+            num_tiles,
+            ATOMS,
+            block,
+            tid,
+            decode=_atom_bf16_to_f16,
+            encode=_atom_f16_to_bf16,
         )
-
-        def _payload_tensor(ptr):
-            view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
-            return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
-            )
-
-        in_buf = _payload_tensor(inp_ptr)
-        out_buf = _payload_tensor(out_ptr)
-        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+        _load_color, _store_color = _color_io(colors_ptr, bid)
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -361,36 +339,8 @@ def make_quick_allreduce_int4_kernel(
             )
             return fx.Int32(flags_i32) + slot
 
-        def _hbm_atom_row(buf, tile, atom):
-            return fx.make_view(
-                fx.get_iter(fx.slice(buf, (tile, atom, None))),
-                hbm_row_layout,
-            )
-
-        def _load_color():
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            return fx.Int32(
-                buffer_ops.buffer_load(color_rsrc, off, vec_width=1, dtype=T.i32)
-            )
-
-        def _store_color(color):
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            buffer_ops.buffer_store(color, color_rsrc, off)
-
         def _load_tile_atoms(tile):
             return [_load_atom(tile, atom) for atom in range_constexpr(ATOMS)]
-
-        def _load_atom(tile, atom):
-            src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
-            frag = fx.make_fragment_like(src)
-            fx.copy(hbm_copy_atom, src, frag)
-            return _atom_bf16_to_f16(fx.Vector(frag.load()))
-
-        def _store_atom(tile, atom, value):
-            dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
-            frag = fx.make_fragment_like(dst)
-            frag.store(_atom_f16_to_bf16(value))
-            fx.copy(hbm_copy_atom, frag, dst)
 
         def _store_tile_atoms(tile, atoms):
             """Store a gathered tile; ``None`` marks atoms already stored."""
@@ -469,13 +419,13 @@ def make_quick_allreduce_int4_kernel(
 
             One quad per (destination, sector) of a stripe; leftover quads sit
             idle. Which axis runs fastest across consecutive quads is a fabric
-            question. 
+            question.
                 - "sector": consecutive quads target consecutive peers of
-                  one sector, so a single store instruction hits every GPU 
-                  -- ideal on xGMI, whose native packet is exactly the 64 B 
+                  one sector, so a single store instruction hits every GPU
+                  -- ideal on xGMI, whose native packet is exactly the 64 B
                   a quad writes.
-                - "peer": consecutive quads walk the sectors of one peer, 
-                  giving each destination a ``64 * width`` B contiguous run 
+                - "peer": consecutive quads walk the sectors of one peer,
+                  giving each destination a ``64 * width`` B contiguous run
                   -- ideal on PCIe.
             """
             for k in range_constexpr(rank_atoms):
@@ -585,7 +535,7 @@ def make_quick_allreduce_int4_kernel(
                 base = base + fx.Int32(k * c.rank_tile_i32)
 
             def _get(off):
-                return _load_i32_nt(self_rsrc, base + off, recv_policy)
+                return _buffer_load(inbox, base + off, 1, fx.Int32, recv_policy)[0]
 
             words, word = _codec_load(c, _get, tid, scale_slot)
             return words, _scale_from_word(c, word, pair_in_slot)
