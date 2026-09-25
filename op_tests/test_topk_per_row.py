@@ -485,6 +485,15 @@ def test_top_k_per_row_decode_bounded(
     }
 
 
+def adaptive_band_cells(card):
+    """One bounded cell per band `card` ships, at the band's smallest corner, with
+    each k group's members taken in turn across its bands."""
+    for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
+        for ks, bands in per_group.items():
+            for i, (min_width, _, min_rows, _) in enumerate(bands):
+                yield min_rows, min_width, ks[i % len(ks)], stable
+
+
 def test_decode_bound_gate():
     """Host-side rules of the decode gate, checked for every card the adaptive
     table carries; no kernel runs."""
@@ -715,13 +724,9 @@ assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
 card = (get_gfx(), topk._decode_cu_count(torch.cuda.current_device()))
 if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     torch.manual_seed(0)
-    df = []
-    for m in _BOUNDED_BATCH:
-        for k in [k for k in args.top_k if k in _BOUNDED_KS]:
-            for stable in (False, True):
-                df.append(
-                    test_top_k_per_row_decode_bounded(m, _BOUNDED_CONTEXT, k, stable)
-                )
+    # The table picks these shapes and k, not the command line: every band this
+    # card ships runs once, at a corner small enough to allocate here.
+    df = [test_top_k_per_row_decode_bounded(*c) for c in adaptive_band_cells(card)]
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("topk_per_row_decode bounded summary (markdown):\n%s", df_md)
