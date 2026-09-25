@@ -49,6 +49,12 @@ _K_STRIDE = _D + 8
 _HEAD_PAD = 16
 # 256 CUs on MI355X times the four BN32 prefill workgroups each keeps resident.
 _PREFILL_WGS = 256 * 4
+# Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
+# rather than per lane, so this is free to move between 128 and 256. BN16 is a
+# single subtile, so qk_split never engages and every wave recomputes the whole
+# QK; halving the waves halves that duplication. It costs 42 VGPRs of extra PV
+# accumulator per wave and still wins by 1-12%, more as L and M grow.
+_DECODE_THREADS = 128
 _DEFAULT_SCALE = _D**-0.5
 _LSE_EMPTY = -1.0e20
 _LOG2E = 1.4426950408889634
@@ -86,9 +92,9 @@ def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
     # Live AMD: base_programs <= 4 -> 64 splits / 128 WGs; 4 < base < 32
     # -> 32 splits / 512 WGs. Same BN16 / 4-wave tile in both bands.
     if base_programs <= 4:
-        block_n, target_splits, threads = 16, 64, 256
+        block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
-        block_n, target_splits, threads = 16, 32, 256
+        block_n, target_splits, threads = 16, 32, _DECODE_THREADS
     # Prefill runs BN32 rather than AMD's BN64. Halving the tile halves the
     # live gather and QK state, which drops the kernel from 204 to 122 VGPRs
     # and all but removes its instruction-issue stalls. Occupancy is not the
@@ -347,52 +353,41 @@ def build_qsa_k2_family_a_module(
             return _idiv(byte_offset, Int32(2))
 
         def amd_decode_k_elem(n_tok, d0):
-            # Live AMD decode K (BN16 / 256 threads / 8 KiB): two 128-bit
-            # stores per thread. Physical bytes are
-            # ``(tid*16) ^ ((tid & 0xe0)>>1)`` and that value ``^ 0x80 + 4096``.
-            # Gather maps token ``tid%16`` and D-chunks ``tid//16`` / ``+16``.
-            d_chunk = _idiv(d0, Int32(8))
-            store_tid = (d_chunk % Int32(16)) * Int32(16) + n_tok
-            base_bytes = store_tid * Int32(16)
-            base_bytes = base_bytes ^ _idiv(store_tid & Int32(0xE0), Int32(2))
-            hi = d_chunk >= Int32(16)
-            byte_offset = hi.select(
-                (base_bytes ^ Int32(0x80)) + Int32(4096), base_bytes
-            )
-            return _idiv(byte_offset, Int32(2))
+            # Live AMD decode K (BN16, 8 KiB): one 16-byte unit per
+            # (token, D-chunk), token-major, rotated by ``i ^ (i >> 5)``.
+            # The published 0xe0 mask and the 0x80/+4096 second-round terms
+            # are that one rotation seen through a 256-thread gather; in
+            # flattened form the image depends only on the tile, so any lane
+            # count that tiles ``block_n`` fills the same LDS bytes.
+            flat = _idiv(d0, Int32(8)) * Int32(block_n) + n_tok
+            return (flat ^ _idiv(flat, Int32(block_n * 2))) * Int32(8)
 
         def amd_decode_v_pack(n_tok, d0):
-            # Live AMD decode V (BN16 / 256 threads / 8 KiB): four 64-bit
-            # stores per thread, the compiler split of two 8xbf16 gathers.
-            # Bytes are ``A``, ``A^8``, ``(A^64)+4096``, ``(A^0x48)+4096``
-            # with ``A = (tid*16) ^ ((tid & 0xe0)>>2)``.
+            # Live AMD decode V (BN16, 8 KiB): the same flattening at 8-byte
+            # granularity with the half-chunk as the fastest axis, rotated by
+            # ``i ^ (i >> 6)``. Reproduces the published ``A``, ``A^8``,
+            # ``(A^64)+4096``, ``(A^0x48)+4096`` quartet at 256 threads.
             d_chunk = _idiv(d0, Int32(8))
-            store_tid = (d_chunk % Int32(16)) * Int32(16) + n_tok
-            base_bytes = store_tid * Int32(16)
-            base_bytes = base_bytes ^ _idiv(store_tid & Int32(0xE0), Int32(4))
-            hi = d_chunk >= Int32(16)
-            half = (d0 % Int32(8)) >= Int32(4)
-            lo_addr = half.select(base_bytes ^ Int32(8), base_bytes)
-            hi_addr = half.select(
-                (base_bytes ^ Int32(0x48)) + Int32(4096),
-                (base_bytes ^ Int32(64)) + Int32(4096),
-            )
-            return _idiv(hi.select(hi_addr, lo_addr), Int32(2))
+            half = _idiv(d0 % Int32(8), Int32(4))
+            vflat = (d_chunk * Int32(block_n) + n_tok) * Int32(2) + half
+            return (vflat ^ _idiv(vflat, Int32(block_n * 4))) * Int32(4)
 
-        def load_amd_k8(n_tok, d0):
-            off = (
+        def amd_k_off(n_tok, d0):
+            return (
                 amd_decode_k_elem(n_tok, d0)
                 if const_expr(decode_tr_pv)
                 else amd_k_elem(n_tok, d0)
             )
-            src = fx.make_view(k_arr.ptr + off, fx.make_layout(8, 1))
+
+        def load_amd_k8(n_tok, d0):
+            src = fx.make_view(k_arr.ptr + amd_k_off(n_tok, d0), fx.make_layout(8, 1))
             frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
             fx.copy_atom_call(lds_copy, src, frag)
             return fx.Vector(fx.memref_load_vec(frag))
 
-        def store_amd_v4(byte_addr, vec4):
+        def store_amd_v4(elem_off, vec4):
             dst = fx.make_view(
-                k_arr.ptr + _idiv(byte_addr, Int32(2)),
+                k_arr.ptr + elem_off,
                 fx.make_layout(4, 1),
             )
             frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
@@ -520,24 +515,10 @@ def build_qsa_k2_family_a_module(
                         fx.Vector(fx.memref_load_vec(k_frags[j])),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    if const_expr(decode_tr_pv):
-                        base_bytes = tid * Int32(16)
-                        base_bytes = base_bytes ^ _idiv(tid & Int32(0xE0), Int32(2))
-                        if const_expr(gr != 0):
-                            base_bytes = (base_bytes ^ Int32(0x80)) + Int32(4096)
-                        k_dst = fx.make_view(
-                            k_arr.ptr + _idiv(base_bytes, Int32(2)),
-                            fx.make_layout(8, 1),
-                        )
-                        k_store_frag = fx.make_rmem_tensor(
-                            fx.make_layout(8, 1), BFloat16
-                        )
-                        fx.memref_store_vec(k_vec, k_store_frag)
-                        fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
-                    elif const_expr(use_k32):
+                    if const_expr(use_k32):
                         d_chunk = chunk_owner + Int32(gr * col_owners)
                         k_dst = fx.make_view(
-                            k_arr.ptr + amd_k_elem(col, d_chunk * Int32(8)),
+                            k_arr.ptr + amd_k_off(col, d_chunk * Int32(8)),
                             fx.make_layout(8, 1),
                         )
                         k_store_frag = fx.make_rmem_tensor(
@@ -649,13 +630,9 @@ def build_qsa_k2_family_a_module(
                         fx.Vector(fx.memref_load_vec(v_frags[gr])),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    base_bytes = tid * Int32(16)
-                    base_bytes = base_bytes ^ _idiv(tid & Int32(0xE0), Int32(4))
-                    a0 = base_bytes
-                    a1 = base_bytes ^ Int32(8)
-                    if const_expr(gr != 0):
-                        a0 = (base_bytes ^ Int32(64)) + Int32(4096)
-                        a1 = (base_bytes ^ Int32(0x48)) + Int32(4096)
+                    d0 = (chunk_owner + Int32(gr * col_owners)) * Int32(8)
+                    a0 = amd_decode_v_pack(col, d0)
+                    a1 = amd_decode_v_pack(col, d0 + Int32(4))
                     lo = fx.Vector.from_elements(
                         [v_vec[i] for i in range_constexpr(4)], BFloat16
                     )
