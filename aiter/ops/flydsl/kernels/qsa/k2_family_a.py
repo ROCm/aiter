@@ -132,6 +132,17 @@ def build_qsa_k2_family_a_module(
     gather_span = col_owners * vec
     token_major_v = use_k32 and block_n == 16
     decode_tr_pv = token_major_v
+    # PV splits the output dimension across waves, so every wave needs the
+    # whole score tile and by default every wave recomputes all of QK. When
+    # the token subtiles divide across waves each wave can instead compute
+    # its own share and trade scores through LDS, which removes
+    # (num_waves - 1) / num_waves of the QK MFMA. Scores are exchanged
+    # pre-softmax so the existing per-wave max and sum reductions still see
+    # all block_n tokens and need no cross-wave reduction.
+    qk_split = not decode_tr_pv and num_waves > 1 and n_subtiles % num_waves == 0
+    qk_sub_per_wave = n_subtiles // num_waves if qk_split else n_subtiles
+    # One 4-wide f32 C fragment per lane per subtile.
+    qk_score_slots = n_subtiles * 64 * 4 if qk_split else 1
 
     def make_k_lds_view(k_arr, offset, shape):
         # gfx950 XOR on stride D. Prefill V overlay reuses this map;
@@ -153,6 +164,7 @@ def build_qsa_k2_family_a_module(
         @fx.struct
         class SharedStorage:
             kv: fx.Array[BFloat16, block_n * _D, 16]
+            scores: fx.Array[Float32, qk_score_slots, 16]
 
         _k_field, _v_field = "kv", "kv"
     else:
@@ -160,6 +172,7 @@ def build_qsa_k2_family_a_module(
         @fx.struct
         class SharedStorage:
             kv: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
+            scores: fx.Array[Float32, qk_score_slots, 16]
 
         _k_field, _v_field = "kv", "kv"
 
@@ -224,6 +237,9 @@ def build_qsa_k2_family_a_module(
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_arr = getattr(storage, _k_field)
+        score_arr = storage.scores
+        score_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
+        score_layout = fx.make_layout(4, 1)
         v_lds = getattr(storage, _v_field).view(
             fx.make_layout(
                 (block_n, _K_STRIDE if not use_k32 else _D),
@@ -500,9 +516,12 @@ def build_qsa_k2_family_a_module(
 
             # Compute K @ Q^T. The transposed QK C map is token-major in each
             # lane and can feed PV A without a P-LDS or bpermute transpose.
-            qk_accs = []
-            for ng in range_constexpr(n_subtiles):
-                n0 = Int32(ng * 16)
+            qk_local = []
+            for ngl in range_constexpr(qk_sub_per_wave):
+                if const_expr(qk_split):
+                    n0 = (wave * Int32(qk_sub_per_wave) + Int32(ngl)) * Int32(16)
+                else:
+                    n0 = Int32(ngl * 16)
                 acc4 = fx.Vector.filled(4, 0.0, Float32)
                 if const_expr(use_k32):
                     n_tok = n0 + lane_m
@@ -539,7 +558,24 @@ def build_qsa_k2_family_a_module(
                         fx.Vector(q_regs[qk_steps - 1]),
                         acc4,
                     )
-                qk_accs.append(acc4)
+                qk_local.append(acc4)
+
+            if const_expr(qk_split):
+                # Publish this wave's subtiles. The two barriers already in
+                # the V path separate this write from the read below, so the
+                # exchange costs no extra synchronization.
+                for ngl in range_constexpr(qk_sub_per_wave):
+                    ng_rt = wave * Int32(qk_sub_per_wave) + Int32(ngl)
+                    sc_frag = fx.make_rmem_tensor(score_layout, Float32)
+                    fx.memref_store_vec(qk_local[ngl], sc_frag)
+                    fx.copy_atom_call(
+                        score_copy,
+                        sc_frag,
+                        fx.make_view(
+                            score_arr.ptr + ng_rt * Int32(256) + lane * Int32(4),
+                            score_layout,
+                        ),
+                    )
 
             # K and V share one MMA scratch. All waves must finish their K
             # reads before any lane overlays that storage with V.
@@ -612,6 +648,22 @@ def build_qsa_k2_family_a_module(
                     fx.memref_store_vec(v_vec, v_store_frag)
                     fx.copy(lds_copy, v_store_frag, v_dst)
                 gpu.barrier()
+
+            if const_expr(qk_split):
+                qk_accs = []
+                for ng in range_constexpr(n_subtiles):
+                    sc_frag = fx.make_rmem_tensor(score_layout, Float32)
+                    fx.copy_atom_call(
+                        score_copy,
+                        fx.make_view(
+                            score_arr.ptr + Int32(ng * 256) + lane * Int32(4),
+                            score_layout,
+                        ),
+                        sc_frag,
+                    )
+                    qk_accs.append(fx.Vector(fx.memref_load_vec(sc_frag)))
+            else:
+                qk_accs = qk_local
 
             m_prev = Float32(state[out_chunks])
             l_prev = Float32(state[out_chunks + 1])
