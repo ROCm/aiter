@@ -38,6 +38,15 @@ def get_config(
     # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
     #       config in the dictionary.
     assert "default" in config_dict[gmm_type], "Default configuration is absent."
+    # Optional per-arch shape rules; the first matching rule selects a named config.
+    if not accumulate:
+        for rule in config_dict[gmm_type].get("dispatch", []):
+            if (
+                K >= rule.get("min_K", 0)
+                and N >= rule.get("min_N", 0)
+                and M >= rule.get("min_rows_per_group", 0) * G
+            ):
+                return config_dict[gmm_type][rule["config"]]
     key = "accumulate" if accumulate else "default"
     return config_dict[gmm_type][key]
 

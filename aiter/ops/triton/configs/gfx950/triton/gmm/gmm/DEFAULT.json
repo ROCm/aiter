@@ -8,7 +8,26 @@
             "GRID_DIM": 256,
             "num_warps": 4,
             "num_stages": 2
-        }
+        },
+        "large_kn": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 256,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16
+        },
+        "dispatch": [
+            {
+                "config": "large_kn",
+                "min_K": 4096,
+                "min_N": 4096,
+                "min_rows_per_group": 256
+            }
+        ]
     },
     "ptgmm": {
         "default": {
