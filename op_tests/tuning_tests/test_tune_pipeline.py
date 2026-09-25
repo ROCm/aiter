@@ -9,6 +9,7 @@ Runs each tuner on small shapes, verifies CSV output, and tests
 
 import csv
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -654,11 +655,9 @@ class TestTunePipeline(unittest.TestCase):
 
         Not _run_one: a shape where nothing beats auto-select correctly writes
         no row, so the check is that every shape reached an answer and every
-        row written was proven, not that there is a row per shape. The tuner
-        exits non-zero when a shape is left without an answer or a written row
-        fails its fresh-process proof. The field is one sampled Triton tile
-        plus the defaults and incumbent the tuner always adds, to keep it
-        within a few minutes.
+        row written was proven, not that there is a row per shape. The field
+        is one sampled Triton tile plus the defaults and incumbent the tuner
+        always adds, to keep it within a few minutes.
         """
         from aiter.ops.mha_fwd_policy import (
             MHA_FWD_PROBLEM_KEY_FIELDS,
@@ -701,6 +700,8 @@ class TestTunePipeline(unittest.TestCase):
                     "triton",
                     "--candidate-sample",
                     "1",
+                    "--finalist-rounds",
+                    "1",
                 ],
                 timeout=900,
                 mp=1,
@@ -709,8 +710,13 @@ class TestTunePipeline(unittest.TestCase):
                 print(f"\n=== mha_fwd STDOUT ===\n{result.stdout[-2000:]}")
                 print(f"\n=== mha_fwd STDERR ===\n{result.stderr[-2000:]}")
             self.assertEqual(result.returncode, 0, "mha_fwd tuner failed")
-            written = pd.read_csv(tuned) if os.path.exists(tuned) else pd.DataFrame()
-        self.assertLessEqual(len(written), 1, written)
+            with open(f"{tuned}.evidence.json", encoding="utf-8") as file:
+                evidence = json.load(file)
+        outcomes = [entry["outcome"] for entry in evidence["outcomes"]]
+        self.assertEqual(len(outcomes), 1, evidence["outcomes"])
+        self.assertIn(outcomes[0], ("published", "retained"), evidence["outcomes"])
+        for proof in evidence["selection_proofs"]:
+            self.assertEqual(proof["status"], "verified", proof)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
