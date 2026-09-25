@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# Ported from
+# https://github.com/vllm-project/vllm/blob/main/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+
 import triton
 import triton.language as tl
 
