@@ -959,13 +959,5 @@ def _get_config(
         # recovers performance and is numerically verified for these dims, but
         # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
         return fwd_cfg["small_head"]
-    elif (
-        head_dim_v is not None
-        and 64 < head_dim_v <= 128
-        and dtype in (torch.float16, torch.bfloat16)
-        and "mid_head" in fwd_cfg
-    ):
-        # 128x128 tiles run out of LDS above d128, so larger heads keep "default".
-        return fwd_cfg["mid_head"]
     else:
         return fwd_cfg["default"]
