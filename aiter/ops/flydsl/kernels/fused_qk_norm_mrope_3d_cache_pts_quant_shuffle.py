@@ -953,7 +953,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"sum(mrope_section_)={sum(mrope_section_)} must equal "
             f"head_size//2={head_size // 2}"
         )
-    if (block_size % x != 0) or (block_size == 0):
+    if (block_size % x != 0) or (block_size <= 0):
         raise ValueError(f"block_size ({block_size}) must be a multiple of x ({x})")
     if (head_size * block_size) % 16 != 0:
         raise ValueError(
