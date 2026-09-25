@@ -352,6 +352,20 @@ def test_fused_split_k_matches_reference(variant, m, n, k, dtype):
     _assert_matches_reference(actual, x, w, xs, ws, dtype)
 
 
+@pytest.mark.parametrize("variant", ["tile", "packed"])
+@pytest.mark.parametrize("m,n,k", [(3, 2053, 1280), (37, 5120, 2336)])
+def test_weight_cache_modifier_keeps_results(variant, m, n, k):
+    x, w, xs, ws = generate_inputs(m, n, k)
+    config = _FUSED[variant]
+    cached = dict(config, cache_modifier=".cg")
+    if variant == "packed":
+        cached["packed"] = dict(config["packed"], cache_modifier=".cg")
+    run = gemm_a8w8_blockscale_group32
+    expected = run(x, w, xs, ws, dtype=torch.float32, config=config)
+    actual = run(x, w, xs, ws, dtype=torch.float32, config=cached)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_fused_split_k_row_scales():
     x, w, xs, ws = generate_inputs(5, 2053, 1280, weight_group_rows=1)
     actual = gemm_a8w8_blockscale_group32(

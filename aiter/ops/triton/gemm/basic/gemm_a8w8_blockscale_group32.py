@@ -80,7 +80,8 @@ def gemm_a8w8_blockscale_group32(
     Explicit partitions are rounded to whole K tiles, then empty partitions
     are removed. Split-K uses the shared AITER reduction without atomics;
     a table FUSED_SPLITK (or packed NUM_KSPLIT) instead sums each tile's
-    partitions within the launch, on one XCD.
+    partitions within the launch, on one XCD. A table cache_modifier applies
+    to the weight loads.
 
     This backend requires gfx950 microscaling MFMA. Small M is limited by
     weight bandwidth and occupancy; packing K panels fills MFMA rows without
@@ -176,6 +177,7 @@ def gemm_a8w8_blockscale_group32(
             LAUNCH_OPTIONS=launch_repr,
             SPLITK_BLOCK_SIZE=split_k_size,
             FUSED_SPLITS=num_splits,
+            B_CACHE_MODIFIER=packed.get("cache_modifier"),
             **launch_options,
         )
         return y
@@ -222,6 +224,7 @@ def gemm_a8w8_blockscale_group32(
         N_FIRST=n_first,
         LAUNCH_OPTIONS=launch_repr,
         FUSED_SPLITS=fused_splits,
+        B_CACHE_MODIFIER=config.get("cache_modifier"),
         **launch_options,
     )
     if fused_splits == 1 and num_splits > 1:

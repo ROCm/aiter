@@ -18,6 +18,7 @@ _gemm_group32_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "FUSED_SPLITS",
         "N_FIRST",
+        "B_CACHE_MODIFIER",
         "N",
         "K",
         "LAUNCH_OPTIONS",
@@ -32,6 +33,7 @@ _gemm_group32_packed_repr = make_kernel_repr(
         "K_PACK",
         "SPLITK_BLOCK_SIZE",
         "FUSED_SPLITS",
+        "B_CACHE_MODIFIER",
         "N",
         "K",
         "LAUNCH_OPTIONS",
@@ -100,6 +102,7 @@ def _gemm_a8w8_blockscale_group32_kernel(
     LAUNCH_OPTIONS: tl.constexpr,
     N_FIRST: tl.constexpr = False,
     FUSED_SPLITS: tl.constexpr = 1,
+    B_CACHE_MODIFIER: tl.constexpr = None,
 ):
     """E4M3 x E4M3 with E8M0 group scales, on the CDNA4 microscaling MFMA.
 
@@ -107,6 +110,7 @@ def _gemm_a8w8_blockscale_group32_kernel(
     dot_scaled lowers to slower BF16 emulation instead of microscaling MFMA.
     FUSED_SPLITS > 1 sums split-K partials in this launch on a 1D grid;
     otherwise c_ptr takes one FP32 partial per program_id(2).
+    B_CACHE_MODIFIER applies to the weight and weight-scale loads.
     """
     tl.static_assert(BLOCK_SIZE_K >= 64 and BLOCK_SIZE_K % 32 == 0)
     if FUSED_SPLITS > 1:
@@ -122,57 +126,59 @@ def _gemm_a8w8_blockscale_group32_kernel(
     row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     col = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     groups: tl.constexpr = K // 32
-    ks = tl.arange(0, BLOCK_SIZE_K)
-    gs = tl.arange(0, BLOCK_SIZE_K // 32)
+    ks = split * SPLITK_BLOCK_SIZE + tl.arange(0, BLOCK_SIZE_K)
+    gs = split * SPLITK_BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE_K // 32)
     rows = row[:, None] < M
-    cols = col < N
+    cols = col[:, None] < N
+    a_ptrs = a_ptr + row[:, None] * K + ks[None, :]
+    b_ptrs = b_ptr + col[:, None] * K + ks[None, :]
+    as_ptrs = a_scale_ptr + row[:, None] * groups + gs[None, :]
     # One scale row per GROUP_N output columns, so the column index is
     # divided rather than the grid expanded.
-    bs_row = (col[:, None] // GROUP_N) * groups
+    bs_ptrs = b_scale_ptr + (col[:, None] // GROUP_N) * groups + gs[None, :]
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32)
-    start = split * SPLITK_BLOCK_SIZE
-    for base in range(start, tl.minimum(start + SPLITK_BLOCK_SIZE, K), BLOCK_SIZE_K):
-        offs = base + ks
-        span = base // 32 + gs
-        live = offs < K
-        held = span < groups
-        a = tl.load(
-            a_ptr + row[:, None] * K + offs[None, :], rows & live[None, :], other=0.0
-        )
-        b = tl.load(
-            b_ptr + col[:, None] * K + offs[None, :],
-            cols[:, None] & live[None, :],
-            other=0.0,
-        )
-        a_code = tl.load(
-            a_scale_ptr + row[:, None] * groups + span[None, :],
-            rows & held[None, :],
-            other=127,
-        )
-        b_code = tl.load(
-            b_scale_ptr + bs_row + span[None, :],
-            cols[:, None] & held[None, :],
-            other=127,
-        )
+    # A constexpr trip count lets the pipeliner schedule statically. Only a
+    # last split with fewer K tiles than the others stops early, at K.
+    LAST: tl.constexpr = K - (K - 1) // SPLITK_BLOCK_SIZE * SPLITK_BLOCK_SIZE
+    if (LAST + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K == SPLITK_BLOCK_SIZE // BLOCK_SIZE_K:
+        span = SPLITK_BLOCK_SIZE
+    else:
+        span = tl.minimum(SPLITK_BLOCK_SIZE, K - split * SPLITK_BLOCK_SIZE)
+    for i in range(0, span, BLOCK_SIZE_K):
+        # K masks only when K has a partial tile.
+        a_mask, b_mask, as_mask, bs_mask = rows, cols, rows, cols
+        if K % BLOCK_SIZE_K != 0:
+            live = (ks + i < K)[None, :]
+            held = (gs + i // 32 < groups)[None, :]
+            a_mask, b_mask = rows & live, cols & live
+            as_mask, bs_mask = rows & held, cols & held
+        a = tl.load(a_ptrs, a_mask, other=0.0)
+        b = tl.load(b_ptrs, b_mask, other=0.0, cache_modifier=B_CACHE_MODIFIER)
+        a_code = tl.load(as_ptrs, as_mask, other=127)
+        b_code = tl.load(bs_ptrs, bs_mask, other=127, cache_modifier=B_CACHE_MODIFIER)
         # acc= leaves the sum in the matrix core's registers: one rounding per
         # tile instead of two, and no separate vector add.
         accumulator = tl.dot_scaled(
             a, a_code, "e4m3", b.T, b_code, "e4m3", acc=accumulator
         )
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+        as_ptrs += BLOCK_SIZE_K // 32
+        bs_ptrs += BLOCK_SIZE_K // 32
     c_ptrs = c_ptr + row[:, None] * N + col[None, :]
     if FUSED_SPLITS > 1:
         _sum_splits_on_xcd(
             accumulator,
             c_ptrs,
-            rows & cols[None, :],
+            rows & cols.T,
             ws_ptr + tile * (FUSED_SPLITS * BLOCK_SIZE_M * BLOCK_SIZE_N),
             cnt_ptr + tile,
             split,
             FUSED_SPLITS,
         )
     else:
-        tl.store(c_ptrs + split * M * N, accumulator, rows & cols[None, :])
+        tl.store(c_ptrs + split * M * N, accumulator, rows & cols.T)
 
 
 @triton.jit(repr=_gemm_group32_packed_repr, do_not_specialize=["M"])
@@ -194,6 +200,7 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
     LAUNCH_OPTIONS: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr = 0,
     FUSED_SPLITS: tl.constexpr = 1,
+    B_CACHE_MODIFIER: tl.constexpr = None,
 ):
     """Small-M group32 GEMM with K panels packed into MFMA rows/columns.
 
@@ -201,7 +208,8 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
     pairs contribute to the output; cross-panel products are discarded. One
     CTA owns the K reduction, or with FUSED_SPLITS > 1 one SPLITK_BLOCK_SIZE
     of it, summed in this launch. BLOCK_SIZE_M is an unpacked token tile,
-    independent of runtime M.
+    independent of runtime M. B_CACHE_MODIFIER applies to the weight and
+    weight-scale loads.
     """
     tl.static_assert(K_PACK == 1 or K_PACK == 2 or K_PACK == 4)
     tl.static_assert(BLOCK_SIZE_M * K_PACK >= 16)
@@ -239,6 +247,7 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
             b_ptr + cols[:, None] * K + bk,
             (cols[:, None] < N) & (bk < K),
             other=0.0,
+            cache_modifier=B_CACHE_MODIFIER,
         )
         ag = base // 32 + a_panel[:, None] * (BLOCK_SIZE_K // 32) + gs[None, :]
         bg = base // 32 + b_panel[:, None] * (BLOCK_SIZE_K // 32) + gs[None, :]
@@ -251,6 +260,7 @@ def _gemm_a8w8_blockscale_group32_packed_kernel(
             b_scale_ptr + (cols[:, None] // 32) * groups + bg,
             (cols[:, None] < N) & (bg < groups),
             other=127,
+            cache_modifier=B_CACHE_MODIFIER,
         )
         accumulator = tl.dot_scaled(
             a, a_code, "e4m3", b.T, b_code, "e4m3", acc=accumulator
