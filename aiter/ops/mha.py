@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import csv
+import functools
+import json
+import math
 import os
 from typing import Any
 
 import torch
 from torch import Generator, Tensor
 
+from .. import logger
 from ..jit.core import (
+    AITER_CONFIGS,
+    AITER_LOG_TUNED_CONFIG,
     AITER_META_DIR,
     CK_DIR,
     ENABLE_CK,
@@ -15,13 +22,275 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import (
+    TUNING_HARDWARE_FIELDS,
+    get_cu_num,
+    get_gfx,
+    get_tuning_hardware,
+)
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .mha_fwd_policy import (
+    HD192_SPLITKV_MIN_SPLITS,
+    MHA_FWD_BACKENDS,
+    MHA_FWD_FAMILY,
+    MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_TUNING_KEY_FIELDS,
+    MhaFwdPlan,
+    MhaFwdProblem,
+    canonical_backend_config,
+    csv_scalar,
+    parse_backend_config,
+)
+
+_MHA_FWD_RECORDED_SELECTIONS: set[tuple[str, int, str]] = set()
+
+
+@functools.lru_cache(maxsize=8)
+def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], dict[str, Any]]:
+    table: dict[tuple[str, ...], dict[str, Any]] = {}
+    if not os.path.isfile(path):
+        return table
+    with open(path, encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        fieldnames = tuple(reader.fieldnames or ())
+        missing = [
+            field for field in MHA_FWD_RUNTIME_CSV_FIELDS if field not in fieldnames
+        ]
+        if missing:
+            raise ValueError(f"{path} is missing MHA runtime columns: {missing}")
+        extra = [
+            field for field in fieldnames if field not in MHA_FWD_RUNTIME_CSV_FIELDS
+        ]
+        if extra:
+            raise ValueError(
+                f"{path} contains non-runtime MHA columns: {extra}; "
+                "the rest of the measurement evidence is stored separately"
+            )
+        for line, row in enumerate(reader, start=2):
+            backend = str(row.get("backend", "")).strip()
+            try:
+                num_splits = int(row.get("num_splits", 0) or 0)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line}: invalid num_splits") from exc
+            try:
+                us = _tuned_row_latency(row)
+                backend_config = parse_backend_config(row.get("backend_config", ""))
+                problem = MhaFwdProblem.from_mapping(row)
+                plan = MhaFwdPlan(
+                    backend=backend,
+                    num_splits=num_splits,
+                    backend_config=backend_config,
+                )
+                plan.validate_for(problem)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line}: {exc}") from exc
+            key = problem.key()
+            if key in table:
+                raise ValueError(f"{path}:{line}: duplicate exact MHA tuning key {key}")
+            table[key] = {
+                "backend": backend,
+                "num_splits": num_splits,
+                "backend_config": backend_config,
+                "us": us,
+            }
+    return table
+
+
+def _tuned_row_latency(row: dict[str, str]) -> float | None:
+    """The measured latency a tuned row carries, if it carries one.
+
+    Evidence rather than dispatch input, so a blank is allowed: a row
+    hand-written to pin a backend is still a valid row. A value that is
+    present must be a real latency, because a nonsense one means the row came
+    out of something other than a tuning run.
+    """
+
+    raw = str(row.get("us", "")).strip()
+    if not raw:
+        return None
+    try:
+        us = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid us {raw!r}") from exc
+    if not math.isfinite(us) or us <= 0.0:
+        raise ValueError(f"invalid us {raw!r}: not a positive, finite latency")
+    return us
+
+
+@functools.lru_cache(maxsize=4)
+def _mha_fwd_tuned_hardware(path: str) -> frozenset[tuple[str, ...]]:
+    span = len(TUNING_HARDWARE_FIELDS)
+    return frozenset(key[:span] for key in _load_mha_fwd_tuning_table(path))
+
+
+def _mha_fwd_tuning_key(
+    *,
+    mode: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    causal: bool,
+    window_size: tuple[int, ...],
+    dropout_p: float,
+    logits_soft_cap: float,
+    how_v3_bf16_cvt: int,
+    return_lse: bool,
+    return_attn_probs: bool,
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    sink_ptr: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    cu_seqlens_q_padded: torch.Tensor | None,
+    cu_seqlens_k_padded: torch.Tensor | None,
+) -> tuple[str, ...]:
+    device_id = q.device.index if q.device.index is not None else 0
+    values = {
+        **get_tuning_hardware(device_id),
+        "mode": mode,
+        "batch": batch,
+        "total_q": q.shape[0] if mode == "varlen" else batch * q.shape[1],
+        "total_k": k.shape[0] if mode == "varlen" else batch * k.shape[1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+        "min_seqlen_q": min_seqlen_q,
+        "nhead_q": q.shape[-2],
+        "nhead_k": k.shape[-2],
+        "hdim_q": q.shape[-1],
+        "hdim_v": v.shape[-1],
+        "dtype": str(q.dtype).removeprefix("torch."),
+        "causal": causal,
+        "window_left": window_size[0],
+        "window_right": window_size[1],
+        "sink_size": window_size[2] if len(window_size) > 2 else 0,
+        "dropout_p": dropout_p,
+        "logits_soft_cap": logits_soft_cap,
+        "how_v3_bf16_cvt": how_v3_bf16_cvt,
+        "return_lse": return_lse,
+        "return_attn_probs": return_attn_probs,
+        "has_bias": bias is not None,
+        "has_alibi": alibi_slopes is not None,
+        "has_sink": sink_ptr is not None,
+        "has_block_table": block_table is not None,
+        "has_q_descale": q_descale is not None,
+        "has_physical_padding": (
+            cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
+        ),
+        "is_grad": torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)),
+    }
+    return tuple(csv_scalar(values[field]) for field in MHA_FWD_TUNING_KEY_FIELDS)
+
+
+@torch._dynamo.assume_constant_result
+def _mha_fwd_plan_for_key(
+    key: tuple[str, ...], prefix: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Read the table for one already-derived key.
+
+    Constant-folded under torch.compile: it reads the filesystem, and its
+    result depends only on its arguments, which the caller has specialized on.
+    """
+
+    path = os.path.abspath(AITER_CONFIGS.AITER_CONFIG_MHA_FWD_FILE)
+    if prefix not in _mha_fwd_tuned_hardware(path):
+        return None
+    plan = _load_mha_fwd_tuning_table(path).get(key)
+    if plan is not None and AITER_LOG_TUNED_CONFIG:
+        logger.info("MHA fwd matched a tuned row on %s in %s: %s", prefix, path, plan)
+    return plan
+
+
+def _get_mha_fwd_tuned_plan(**key_args) -> dict[str, Any] | None:
+    q = key_args["q"]
+    device_id = q.device.index if q.device.index is not None else 0
+    hardware = get_tuning_hardware(device_id)
+    # The kernel gates below test the built arch, so a row keyed on the running
+    # arch is only safe to apply when the two agree.
+    if hardware["gfx"] != get_gfx():
+        return None
+    prefix = tuple(csv_scalar(hardware[field]) for field in TUNING_HARDWARE_FIELDS)
+    # Deriving the key here rather than inside the constant-folded read is what
+    # keeps the lookup honest under torch.compile: dynamo specializes on the
+    # sizes this reads, so a second shape recompiles and looks itself up
+    # instead of inheriting the first shape's row.
+    return _mha_fwd_plan_for_key(_mha_fwd_tuning_key(**key_args), prefix)
+
+
+def lookup_mha_fwd_tile_config(backend: str, **key_args) -> dict[str, Any] | None:
+    """Return CSV tiles when the exact row's backend matches, else None."""
+
+    window_size = key_args.get("window_size", (-1, -1))
+    padded = tuple(window_size) if window_size is not None else (-1, -1)
+    if len(padded) < 3:
+        padded = (*padded, 0)
+    plan = _get_mha_fwd_tuned_plan(
+        **{
+            "min_seqlen_q": 0,
+            "logits_soft_cap": 0.0,
+            "how_v3_bf16_cvt": 1,
+            "return_lse": False,
+            "return_attn_probs": False,
+            "bias": None,
+            "alibi_slopes": None,
+            "sink_ptr": None,
+            "block_table": None,
+            "q_descale": None,
+            "cu_seqlens_q_padded": None,
+            "cu_seqlens_k_padded": None,
+            **key_args,
+            "window_size": padded,
+        }
+    )
+    if plan is None or plan.get("backend") != backend:
+        return None
+    config = plan.get("backend_config")
+    return dict(config) if isinstance(config, dict) else None
+
+
+def _record_mha_fwd_selection(
+    backend: str,
+    num_splits: int = 0,
+    backend_config: Any = None,
+) -> None:
+    """Append the actual public-path selection when a proof file is requested."""
+
+    path = os.getenv("AITER_SELECTION_PROOF_FILE", "").strip()
+    if not path:
+        return
+    config_json = (
+        backend_config
+        if isinstance(backend_config, str)
+        else canonical_backend_config(backend_config)
+    )
+    identity = (backend, int(num_splits), config_json)
+    if identity in _MHA_FWD_RECORDED_SELECTIONS:
+        return
+    _MHA_FWD_RECORDED_SELECTIONS.add(identity)
+    payload = json.dumps(
+        {
+            "family": MHA_FWD_FAMILY,
+            "backend": backend,
+            "num_splits": int(num_splits),
+            "backend_config": config_json,
+            "pid": os.getpid(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, f"{payload}\n".encode())
+    finally:
+        os.close(descriptor)
 
 
 def _fmha_kv_byte_extent_ge_u32(
@@ -2936,6 +3205,9 @@ def _flash_attn_varlen_forward(
     out: torch.Tensor | None = None,
     zero_tensors: bool = False,
     sink_ptr: Tensor | None = None,
+    num_splits: int = 0,
+    selected_backend: str | None = None,
+    backend_config: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
@@ -3067,7 +3339,11 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+    if (
+        selected_backend in (None, "opus")
+        and can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen()
+    ):
+        _record_mha_fwd_selection("opus")
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
@@ -3093,7 +3369,11 @@ def _flash_attn_varlen_forward(
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_fwd_with_sink_varlen_asm():
+    elif (
+        selected_backend in (None, "asm_v3")
+        and can_impl_fmha_fwd_with_sink_varlen_asm()
+    ):
+        _record_mha_fwd_selection("asm_v3", num_splits)
         # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
         # requires dense packing (the wrapper calls `.contiguous()` defensively)
         # and carries no strides.  softmax_scale is forwarded as-is (the kernel
@@ -3120,7 +3400,40 @@ def _flash_attn_varlen_forward(
         softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_v3_fwd():
+    elif selected_backend in (None, "asm_v3") and can_impl_fmha_v3_fwd():
+        # A forced split count that the kernel contract cannot serve is a
+        # hard error in C++, so screen the call here first: a tuned row is a
+        # performance hint, and auto-select is the right answer for the rest.
+        force_splits = int(num_splits) >= HD192_SPLITKV_MIN_SPLITS
+        if force_splits:
+            unsupported = [
+                name
+                for name, holds in (
+                    ("causal", not causal),
+                    ("window_size_left", window_size_left == -1),
+                    ("window_size_right", window_size_right == -1),
+                    ("how_v3_bf16_cvt", how_v3_bf16_cvt == 1),
+                    ("block_table", block_table is None),
+                    ("q_descale", q_descale is None),
+                    ("return_softmax", not return_softmax),
+                    ("cu_seqlens_q_padded", cu_seqlens_q_padded is None),
+                    ("cu_seqlens_k_padded", cu_seqlens_k_padded is None),
+                    ("batch_size", batch_size == 1),
+                    ("nhead_k", nhead_q == nhead_k),
+                )
+                if not holds
+            ]
+            if unsupported:
+                logger.warning(
+                    "tuned num_splits=%d cannot be honored for this call: the "
+                    "gfx942 hd192 split-KV kernel does not support %s; "
+                    "letting C++ select the split count",
+                    int(num_splits),
+                    ", ".join(unsupported),
+                )
+                force_splits = False
+        split_request = int(num_splits) if force_splits else 0
+        _record_mha_fwd_selection("asm_v3", split_request)
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
@@ -3150,9 +3463,20 @@ def _flash_attn_varlen_forward(
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
-            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+            split_request,
         )
     else:
+        if selected_backend not in (None, "ck"):
+            # A tuned row is a performance hint, not a correctness contract:
+            # honoring it is impossible here, so run the call rather than fail
+            # it.
+            logger.warning(
+                "tuned MHA backend %r cannot be honored for this call; "
+                "falling back to ck",
+                selected_backend,
+            )
+        _record_mha_fwd_selection("ck")
+
         # Input validation for padded cumulative arrays if provided
         def _validate(name: str, t: torch.Tensor):
             assert t.dim() == 1, f"{name} must be 1D"
@@ -3484,6 +3808,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: bool | None = True,
         how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
+        num_splits: int = 0,
+        selected_backend: str | None = None,
+        backend_config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3524,6 +3851,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_table=block_table,
             out=out,
             sink_ptr=sink_ptr,
+            num_splits=num_splits,
+            selected_backend=selected_backend,
+            backend_config=backend_config,
         )
         if is_grad:
             assert return_lse
@@ -3628,6 +3958,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # sink_ptr (fwd-only sink scores; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
+        # num_splits (forward dispatch only)
+        # selected_backend (forward dispatch only)
+        # backend_config (forward dispatch only)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
         return (
             dq,  # q
@@ -3656,6 +3989,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # num_splits
+            None,  # selected_backend
+            None,  # backend_config
         )
 
 
@@ -3748,6 +4084,37 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    tuned_plan = _get_mha_fwd_tuned_plan(
+        mode="varlen",
+        q=q,
+        k=k,
+        v=v,
+        batch=cu_seqlens_q.numel() - 1,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_q=min_seqlen_q,
+        causal=causal,
+        window_size=window_size,
+        dropout_p=dropout_p,
+        logits_soft_cap=logits_soft_cap,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink_ptr=sink_ptr,
+        block_table=block_table,
+        q_descale=None,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
+    )
+    tuned_backend = tuned_plan["backend"] if tuned_plan is not None else None
+    num_splits = int(tuned_plan["num_splits"]) if tuned_plan is not None else 0
+    backend_config = (
+        tuned_plan.get("backend_config") if tuned_plan is not None else None
+    )
+    if tuned_backend is not None and tuned_backend not in MHA_FWD_BACKENDS:
+        raise ValueError(f"unknown tuned MHA backend {tuned_backend!r}")
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3788,7 +4155,10 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if (
+        tuned_backend in (None, "asm_v3")
+        and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm()
+    ):
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3816,12 +4186,17 @@ def flash_attn_varlen_func(
             True,
             how_v3_bf16_cvt,
             sink_ptr,
+            num_splits,
+            tuned_backend,
+            backend_config,
         )
 
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
-    if len(window_size) < 3 or window_size[2] == 0:
+    if tuned_backend in (None, "flydsl") and (
+        len(window_size) < 3 or window_size[2] == 0
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
@@ -3846,14 +4221,29 @@ def flash_attn_varlen_func(
             sink=sink_ptr,
         )
         if _flydsl_result is not None:
+            _record_mha_fwd_selection("flydsl")
             return _flydsl_result
+        if tuned_backend == "flydsl":
+            # FlyDSL screens things the tuning key does not carry, such as the
+            # layout of out, so a row can name it for a call it then declines.
+            # Same rule as every other backend here: a tuned row is a
+            # performance hint, so run the call rather than fail it.
+            logger.warning(
+                "tuned MHA backend 'flydsl' declined this call; "
+                "falling back to untuned dispatch"
+            )
 
-    if not ENABLE_CK:
+    if tuned_backend in ("triton", "gluon") or (
+        not ENABLE_CK and tuned_backend in (None, "ck")
+    ):
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
 
-        return flash_attn_varlen_func_triton(
+        triton_backend = (
+            tuned_backend if tuned_backend in ("triton", "gluon") else "triton"
+        )
+        result = flash_attn_varlen_func_triton(
             q=q,
             k=k,
             v=v,
@@ -3873,7 +4263,11 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            config=parse_backend_config(backend_config),
+            backend=triton_backend,
         )
+        _record_mha_fwd_selection(triton_backend, 0, backend_config)
+        return result
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -3901,6 +4295,9 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        num_splits,
+        tuned_backend,
+        backend_config,
     )
 
 

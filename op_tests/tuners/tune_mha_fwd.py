@@ -1,0 +1,1386 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Exhaustive, correctness-gated tuner for packed-varlen MHA forward.
+
+The input CSV is a workload catalogue, the optional profile CSV is the
+measurement record, and the output CSV is the exact-key runtime dispatch
+artifact: backend, num_splits, and backend_config for the winning candidate.
+
+Shapes that already have a row are skipped unless --all is given. To re-tune
+without replacing a row that is still as good, use --all --compare
+--update_improved, which times the public operator before and after tuning.
+"""
+
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+from pathlib import Path
+from typing import Any, ClassVar
+
+import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
+import pandas as pd
+import torch
+
+from aiter import logger
+from aiter.jit.core import AITER_CONFIG_MHA_FWD
+from aiter.jit.utils.chip_info import get_gpu_model
+from aiter.ops.mha import (
+    _load_mha_fwd_tuning_table,
+    flash_attn_varlen_func,
+    fmha_fwd_bf16_opus_varlen_fwd,
+    fmha_v3_varlen_fwd,
+    mha_varlen_fwd,
+)
+from aiter.ops.mha_fwd_policy import (
+    MHA_FWD_BACKENDS,
+    MHA_FWD_CANDIDATE_FIELDS,
+    MHA_FWD_CONFIG_ENV,
+    MHA_FWD_ERROR_ATOL,
+    MHA_FWD_ERROR_METRIC,
+    MHA_FWD_ERROR_RTOL,
+    MHA_FWD_INDIFFERENCE_DELTA,
+    MHA_FWD_MAX_ERROR_RATIO,
+    MHA_FWD_METRIC_FIELDS,
+    MHA_FWD_PROBLEM_KEY_FIELDS,
+    MHA_FWD_RUNTIME_CSV_FIELDS,
+    MHA_FWD_SAMPLE_SEED,
+    MHA_FWD_TASK_TIMEOUT_S,
+    MHA_FWD_TILE_CONFIG_BACKENDS,
+    MHA_FWD_TUNING_KEY_FIELDS,
+    MHA_FWD_UNTUNED_CSV,
+    MhaFwdCandidate,
+    MhaFwdProblem,
+    as_bool,
+    canonical_backend_config,
+    enumerate_mha_fwd_candidates,
+    parse_backend_config,
+)
+from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.mp_tuner import mp_tuner
+
+UNTUNED_FIELDS = MHA_FWD_PROBLEM_KEY_FIELDS
+RESULT_FIELDS = (*MHA_FWD_CANDIDATE_FIELDS, *MHA_FWD_METRIC_FIELDS)
+BOOL_FIELDS = (
+    "causal",
+    "return_lse",
+    "return_attn_probs",
+    "has_bias",
+    "has_alibi",
+    "has_sink",
+    "has_block_table",
+    "has_q_descale",
+    "has_physical_padding",
+    "is_grad",
+)
+
+
+def _balanced_lengths(total: int, batch: int, maximum: int) -> list[int]:
+    if batch < 1 or maximum < 1:
+        raise ValueError("batch and max sequence lengths must be positive")
+    if total < maximum or total > batch * maximum:
+        raise ValueError(
+            f"total={total} cannot have batch={batch} and maximum={maximum}"
+        )
+    lengths = [maximum]
+    remaining = total - maximum
+    for index in range(1, batch):
+        slots = batch - index
+        length = min(maximum, (remaining + slots - 1) // slots)
+        lengths.append(length)
+        remaining -= length
+    if remaining != 0 or max(lengths) != maximum:
+        raise ValueError("failed to construct the requested packed-varlen shape")
+    return lengths
+
+
+def _prefix_sum(lengths: list[int], device) -> torch.Tensor:
+    values = [0]
+    for length in lengths:
+        values.append(values[-1] + length)
+    return torch.tensor(values, dtype=torch.int32, device=device)
+
+
+def generate_data(
+    batch,
+    total_q,
+    total_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    nhead_q,
+    nhead_k,
+    hdim_q,
+    hdim_v,
+    dtype,
+    seed,
+    device="cuda",
+):
+    dtype_obj = getattr(torch, str(dtype))
+    q_lengths = _balanced_lengths(int(total_q), int(batch), int(max_seqlen_q))
+    k_lengths = _balanced_lengths(int(total_k), int(batch), int(max_seqlen_k))
+    element_size = torch.empty((), dtype=dtype_obj).element_size()
+    input_bytes = element_size * (
+        int(total_q) * int(nhead_q) * int(hdim_q)
+        + int(total_k) * int(nhead_k) * (int(hdim_q) + int(hdim_v))
+    )
+    output_bytes = element_size * int(total_q) * int(nhead_q) * int(hdim_v)
+    split_scratch = 8 * output_bytes + 8 * int(total_q) * int(nhead_q) * 4
+    required = input_bytes + 2 * output_bytes + split_scratch
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if required > int(free_bytes * 0.85):
+        raise torch.cuda.OutOfMemoryError(
+            f"MHA shape needs about {required / 2**30:.2f} GiB before backend workspace; "
+            f"only {free_bytes / 2**30:.2f} GiB is free"
+        )
+
+    generator = torch.Generator(device=device).manual_seed(int(seed))
+    q = torch.randn(
+        (int(total_q), int(nhead_q), int(hdim_q)),
+        dtype=dtype_obj,
+        device=device,
+        generator=generator,
+    )
+    k = torch.randn(
+        (int(total_k), int(nhead_k), int(hdim_q)),
+        dtype=dtype_obj,
+        device=device,
+        generator=generator,
+    )
+    v = torch.randn(
+        (int(total_k), int(nhead_k), int(hdim_v)),
+        dtype=dtype_obj,
+        device=device,
+        generator=generator,
+    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_q": _prefix_sum(q_lengths, device),
+        "cu_k": _prefix_sum(k_lengths, device),
+    }
+
+
+def _chunked_reference(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    softmax_scale,
+    causal,
+    window_left,
+    window_right,
+    return_lse,
+):
+    """Bounded-memory fp32 oracle; score storage stays below roughly 64 MiB."""
+    output = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device)
+    lse = (
+        torch.empty((q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    q_offsets = cu_q.cpu().tolist()
+    k_offsets = cu_k.cpu().tolist()
+    groups = q.shape[1] // k.shape[1]
+    for batch_index in range(len(q_offsets) - 1):
+        q_begin, q_end = q_offsets[batch_index : batch_index + 2]
+        k_begin, k_end = k_offsets[batch_index : batch_index + 2]
+        q_seq = q[q_begin:q_end]
+        k_seq = k[k_begin:k_end].float()
+        v_seq = v[k_begin:k_end].float()
+        sq, sk, heads = q_seq.shape[0], k_seq.shape[0], q_seq.shape[1]
+        rows = max(1, (64 << 20) // max(4, 4 * heads * sk))
+        key_positions = torch.arange(sk, device=q.device)
+        offset = sk - sq
+        for row_begin in range(0, sq, rows):
+            row_end = min(sq, row_begin + rows)
+            q_chunk = (
+                q_seq[row_begin:row_end]
+                .float()
+                .reshape(row_end - row_begin, k_seq.shape[1], groups, q_seq.shape[-1])
+            )
+            scores = torch.einsum("qhgd,khd->hgqk", q_chunk, k_seq).reshape(
+                heads, row_end - row_begin, sk
+            )
+            scores.mul_(float(softmax_scale))
+            query_positions = torch.arange(
+                row_begin, row_end, device=q.device
+            ).unsqueeze(1)
+            if causal:
+                scores.masked_fill_(
+                    key_positions > query_positions + offset, float("-inf")
+                )
+            if int(window_left) >= 0:
+                scores.masked_fill_(
+                    key_positions < query_positions + offset - int(window_left),
+                    float("-inf"),
+                )
+            if int(window_right) >= 0:
+                scores.masked_fill_(
+                    key_positions > query_positions + offset + int(window_right),
+                    float("-inf"),
+                )
+            probabilities = torch.softmax(scores, dim=-1)
+            probabilities.nan_to_num_(nan=0.0)
+            out = torch.einsum(
+                "hgqk,khd->qhgd",
+                probabilities.reshape(k_seq.shape[1], groups, row_end - row_begin, sk),
+                v_seq,
+            ).reshape(row_end - row_begin, heads, v_seq.shape[-1])
+            output[q_begin + row_begin : q_begin + row_end].copy_(out.to(q.dtype))
+            if lse is not None:
+                lse[:, q_begin + row_begin : q_begin + row_end] = torch.logsumexp(
+                    scores, dim=-1
+                )
+    return (output, lse) if lse is not None else output
+
+
+def _normalize_result(result, return_lse, total_q, nhead_q):
+    if not return_lse:
+        return result[0] if isinstance(result, tuple) else result
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError("candidate did not return the requested LSE")
+    out, lse = result[:2]
+    if tuple(lse.shape) == (int(total_q), int(nhead_q)):
+        lse = lse.transpose(0, 1).contiguous()
+    if tuple(lse.shape) != (int(nhead_q), int(total_q)):
+        raise RuntimeError(f"unexpected varlen LSE shape {tuple(lse.shape)}")
+    return out, lse
+
+
+def _run_candidate(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    backend,
+    num_splits,
+    config,
+    max_seqlen_q,
+    max_seqlen_k,
+    min_seqlen_q,
+    dropout_p,
+    softmax_scale,
+    logits_soft_cap,
+    how_v3_bf16_cvt,
+    causal,
+    window_left,
+    window_right,
+    return_lse,
+):
+    if backend == "asm_v3":
+        out, lse, _, _ = fmha_v3_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            int(min_seqlen_q),
+            float(dropout_p),
+            float(softmax_scale),
+            float(logits_soft_cap),
+            False,
+            bool(causal),
+            int(window_left),
+            int(window_right),
+            bool(return_lse),
+            False,
+            int(how_v3_bf16_cvt),
+            num_splits=int(num_splits),
+        )
+        return _normalize_result((out, lse), return_lse, q.shape[0], q.shape[1])
+    if backend == "ck":
+        out, lse, _, _ = mha_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            int(min_seqlen_q),
+            float(dropout_p),
+            float(softmax_scale),
+            float(logits_soft_cap),
+            False,
+            bool(causal),
+            int(window_left),
+            int(window_right),
+            0,
+            bool(return_lse),
+            False,
+        )
+        return _normalize_result((out, lse), return_lse, q.shape[0], q.shape[1])
+    if backend in ("triton", "gluon"):
+        from aiter.ops.triton.attention.mha import flash_attn_varlen_func
+
+        result = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            dropout_p=float(dropout_p),
+            softmax_scale=float(softmax_scale),
+            causal=bool(causal),
+            window_size=(int(window_left), int(window_right)),
+            return_lse=bool(return_lse),
+            config=config,
+            backend=backend,
+        )
+        return _normalize_result(result, return_lse, q.shape[0], q.shape[1])
+    if backend == "flydsl":
+        from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+
+        out = flydsl_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            softmax_scale=float(softmax_scale),
+            causal=bool(causal),
+            window_size=(int(window_left), int(window_right), 0),
+            return_lse=bool(return_lse),
+        )
+        if out is None:
+            raise RuntimeError("FlyDSL rejected this MHA problem")
+        return _normalize_result(out, return_lse, q.shape[0], q.shape[1])
+    if backend == "opus":
+        result = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=float(softmax_scale),
+            causal=bool(causal),
+            seqstart_q=cu_q,
+            seqstart_k=cu_k,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            return_lse=bool(return_lse),
+        )
+        return _normalize_result(result, return_lse, q.shape[0], q.shape[1])
+    raise ValueError(f"unknown backend {backend!r}")
+
+
+class MhaFwdTuner(TunerCommon):
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **TunerCommon.ARG_DEFAULTS,
+        "tune_file": AITER_CONFIG_MHA_FWD,
+        "untune_file": f"aiter/configs/{MHA_FWD_UNTUNED_CSV}",
+        "batch": 8,
+        "errRatio": MHA_FWD_MAX_ERROR_RATIO,
+        "timeout": MHA_FWD_TASK_TIMEOUT_S,
+        "config_env_name": MHA_FWD_CONFIG_ENV,
+    }
+    # errRatio is the fraction of output elements outside these tolerances.
+    ERROR_METRIC = MHA_FWD_ERROR_METRIC
+    ERROR_RTOL = MHA_FWD_ERROR_RTOL
+    ERROR_ATOL = MHA_FWD_ERROR_ATOL
+
+    def __init__(self):
+        super().__init__(
+            "MhaFwdTuner",
+            list(MHA_FWD_TUNING_KEY_FIELDS),
+            list(RESULT_FIELDS),
+            "Exhaustively tune packed-varlen MHA forward. Shapes that already "
+            "have a row are skipped unless --all is given; --all --compare "
+            "--update_improved re-tunes them and replaces a row only if the "
+            "public operator got faster by at least --min_improvement_pct.",
+        )
+        self._args = None
+        self._tuned_before: set[tuple] = set()
+        self._last_results = pd.DataFrame(columns=self.columns)
+        self._selection_proofs: list[dict[str, Any]] = []
+        self._incumbents_by_key: dict[tuple, set[tuple[str, str]]] = {}
+        self._autoselect_by_key: dict[tuple, dict[str, Any] | None] = {}
+
+    def _setup_specific_arguments(self):
+        self.parser.add_argument(
+            "--candidate-sample",
+            type=int,
+            default=None,
+            help=(
+                "draw a seeded sample of this many catalogue entries instead of "
+                "the whole catalogue. The sample is fixed by seed, so two runs "
+                "measure the same field; each tile backend's shipped default "
+                "and the auto-select incumbent are measured whatever it draws"
+            ),
+        )
+        self.parser.add_argument(
+            "--backends",
+            default="",
+            help=(
+                "comma-separated backends to measure (default: all). A control "
+                "for comparing contracts, not a tuning mode: the winner is the "
+                "fastest of what was allowed to run"
+            ),
+        )
+
+    def _setup_common_arguments(self):
+        super()._setup_common_arguments()
+        defaults = self.get_arg_defaults()
+        self.parser.set_defaults(
+            verbose=False,
+            splitK=False,
+            shape_grouped=True,
+            sort=False,
+            errRatio=defaults["errRatio"],
+            batch=defaults["batch"],
+            all=False,
+        )
+
+    def getKernelName(self, kernel_id):
+        return str(kernel_id)
+
+    def calculate(self, result, inbpe=2, outbpe=2):
+        info, us, _ = result
+        key = dict(zip(MHA_FWD_TUNING_KEY_FIELDS, info[0]))
+        flop = (
+            2
+            * int(key["nhead_q"])
+            * int(key["total_q"])
+            * int(key["total_k"])
+            * (int(key["hdim_q"]) + int(key["hdim_v"]))
+            / max(1, int(key["batch"]))
+        )
+        return 0.0 if us <= 0 or not math.isfinite(us) else flop / us / 1e6
+
+    def pre_process(self, args):
+        if not args.untune_file or not os.path.isfile(args.untune_file):
+            raise FileNotFoundError(f"MHA problem CSV not found: {args.untune_file}")
+        frame = pd.read_csv(args.untune_file)
+        missing = [field for field in UNTUNED_FIELDS if field not in frame.columns]
+        if missing:
+            raise ValueError(f"MHA problem CSV is missing columns: {missing}")
+        if (frame["mode"].astype(str) != "varlen").any():
+            raise ValueError("the forward tuner currently accepts mode=varlen rows")
+        unsupported = [
+            "return_attn_probs",
+            "has_bias",
+            "has_alibi",
+            "has_sink",
+            "has_block_table",
+            "has_q_descale",
+            "has_physical_padding",
+            "is_grad",
+        ]
+        frame = frame.assign(
+            **{field: frame[field].map(as_bool).astype(int) for field in BOOL_FIELDS}
+        )
+        if frame[unsupported].astype(bool).any(axis=None):
+            raise ValueError(
+                "this tuner input schema cannot synthesize bias/alibi/sink/paging/"
+                "quantization/physical-padding/training payloads"
+            )
+        if (frame["dropout_p"].astype(float) != 0.0).any():
+            raise ValueError("dropout tuning requires a reproducible dropout mask")
+        if (frame["logits_soft_cap"].astype(float) != 0.0).any():
+            raise ValueError(
+                "the enumerated Triton/FlyDSL paths require logits_soft_cap=0"
+            )
+        if (frame["sink_size"].astype(int) != 0).any():
+            raise ValueError("sink-token tuning requires explicit sink-token payloads")
+        if (frame["how_v3_bf16_cvt"].astype(int) != 1).any():
+            raise ValueError("only how_v3_bf16_cvt=1 is reproducibly enumerable")
+        frame = frame.copy()
+        hardware = {
+            "gfx": self.get_gfx(),
+            "gpu_model": get_gpu_model(torch.cuda.current_device()),
+            "cu_num": self.get_cu_num(),
+        }
+        for field, live_value in hardware.items():
+            if field in frame.columns:
+                mismatched = (
+                    frame[field].astype(str).str.lower() != str(live_value).lower()
+                )
+                if mismatched.any():
+                    raise ValueError(
+                        f"workload catalogue {field} does not match the tuning GPU "
+                        f"({live_value})"
+                    )
+            frame[field] = pd.Series(live_value, index=frame.index)
+        self.untunedf = frame[list(MHA_FWD_TUNING_KEY_FIELDS)].drop_duplicates()
+        if os.path.exists(args.tune_file):
+            self.tunedf = pd.read_csv(args.tune_file)
+        else:
+            self.tunedf = pd.DataFrame(columns=MHA_FWD_RUNTIME_CSV_FIELDS)
+        self._args = args
+        self._tuned_before = self._tuned_keys(self.tunedf, args.tune_file)
+        if not args.all:
+            skipped = pd.Series(
+                [
+                    self.lookup_key(row) in self._tuned_before
+                    for _, row in self.untunedf.iterrows()
+                ],
+                index=self.untunedf.index,
+                dtype=bool,
+            )
+            if skipped.any():
+                logger.info(
+                    "skipping %d shapes that already have a row in %s; "
+                    "pass --all to re-tune them",
+                    int(skipped.sum()),
+                    args.tune_file,
+                )
+                if args.verbose:
+                    print(self.untunedf[skipped])
+            self.untunedf = self.untunedf[~skipped].reset_index(drop=True)
+
+    @classmethod
+    def _tuned_keys(cls, frame: pd.DataFrame, path: str) -> set[tuple]:
+        """The lookup keys a tuned table already has rows for.
+
+        Keyed through the problem rather than the raw cells, the way dispatch
+        reads the table: a row written as bf16 or GFX950 still names the shape
+        it describes.
+        """
+        if frame.empty:
+            return set()
+        missing = [
+            field for field in MHA_FWD_TUNING_KEY_FIELDS if field not in frame.columns
+        ]
+        if missing:
+            raise ValueError(f"{path} is missing MHA key columns: {missing}")
+        keys = set()
+        for line, row in enumerate(frame.to_dict("records"), start=2):
+            try:
+                keys.add(cls.lookup_key(row))
+            except (KeyError, TypeError, ValueError) as error:
+                logger.warning(
+                    "%s:%d does not parse as a problem (%s); its shape is "
+                    "tuned as if it had no row",
+                    path,
+                    line,
+                    error,
+                )
+        return keys
+
+    @staticmethod
+    def lookup_key(row) -> tuple[str, ...]:
+        """The key dispatch derives for this catalogue row.
+
+        MHA publishes under the shape it measured, so this is the catalogue
+        key in canonical spelling; a family whose runtime quantizes a
+        dimension would map it here instead.
+        """
+        return MhaFwdProblem.from_mapping(
+            {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
+        ).key()
+
+    @staticmethod
+    def _problem_and_candidate(info):
+        key, backend, num_splits, backend_config = info
+        problem = MhaFwdProblem.from_mapping(dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key)))
+        candidate = MhaFwdCandidate(
+            backend,
+            int(num_splits),
+            json.loads(backend_config) if backend_config else None,
+        )
+        return problem, candidate
+
+    @staticmethod
+    def _atomic_write_csv(frame: pd.DataFrame, path: str) -> None:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        os.close(descriptor)
+        try:
+            frame.to_csv(temporary, index=False)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def tune(self, untunedf, tunedf, args):
+        all_infos, task_by_info = self._plan_candidates(untunedf, args)
+        return self._tune_by_screening(args, all_infos, task_by_info)
+
+    def _plan_candidates(self, untunedf, args):
+        """Every candidate of every shape, and the mp_tuner task measuring it."""
+        all_infos = []
+        task_by_info = {}
+        for row_index, row in untunedf.iterrows():
+            problem = MhaFwdProblem.from_mapping(
+                {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
+            )
+            key = self.lookup_key(row)
+            softmax_scale = int(row.hdim_q) ** -0.5
+            candidates = self.candidate_field(row, key, args)
+            print(
+                f"tuning MHA row {row_index}: {len(candidates)} candidates for {key}",
+                flush=True,
+            )
+            launch_tail = self._launch_args(row, softmax_scale)
+            gen_args = (
+                int(row.batch),
+                int(row.total_q),
+                int(row.total_k),
+                int(row.max_seqlen_q),
+                int(row.max_seqlen_k),
+                int(row.nhead_q),
+                int(row.nhead_k),
+                int(row.hdim_q),
+                int(row.hdim_v),
+                problem.dtype,
+                zlib.crc32(",".join(map(str, key)).encode("utf-8")),
+            )
+            for candidate in candidates:
+                info = (
+                    key,
+                    candidate.backend,
+                    candidate.num_splits,
+                    candidate.config_json,
+                )
+                all_infos.append(info)
+                config = (
+                    dict(candidate.backend_config)
+                    if candidate.backend_config is not None
+                    else None
+                )
+                # In the order mp_tuner's work_group unpacks a task.
+                task_by_info[info] = (
+                    info,
+                    generate_data,
+                    gen_args,
+                    _run_candidate,
+                    (
+                        ["q", "k", "v", "cu_q", "cu_k"],
+                        candidate.backend,
+                        candidate.num_splits,
+                        config,
+                        *launch_tail,
+                    ),
+                    {
+                        # Without these run_perftest times with its own
+                        # defaults and --warmup/--iters silently do nothing.
+                        "num_warmup": args.warmup,
+                        "num_iters": args.iters,
+                        "use_cuda_event": True,
+                    },
+                    _chunked_reference,
+                    (
+                        ["q", "k", "v", "cu_q", "cu_k"],
+                        softmax_scale,
+                        bool(row.causal),
+                        int(row.window_left),
+                        int(row.window_right),
+                        bool(row.return_lse),
+                    ),
+                    {},
+                    None,
+                    self.ERROR_RTOL,
+                    self.ERROR_ATOL,
+                )
+
+        return all_infos, task_by_info
+
+    def candidate_field(self, row, key, args) -> tuple[MhaFwdCandidate, ...]:
+        """Every candidate measured for one shape.
+
+        The catalogue, optionally sampled, plus what the shape runs today.
+        Measuring the incumbents in the same sweep, on the same GPU, is what
+        lets the run tell an improvement from a reordering of noise, so they
+        are entered whatever the sample drew.
+        """
+        candidates = list(
+            enumerate_mha_fwd_candidates(str(row.gfx), self._restricted_backends())
+        )
+        sample = getattr(args, "candidate_sample", None)
+        if sample is not None and sample < len(candidates):
+            candidates = random.Random(MHA_FWD_SAMPLE_SEED).sample(candidates, sample)
+        autoselect = self._resolve_autoselect(row)
+        self._autoselect_by_key[key] = autoselect
+        incumbents = self._incumbent_candidates(autoselect)
+        known = {candidate.identity for candidate in candidates}
+        for extra in (*self._shipped_tile_candidates(row), *incumbents):
+            if extra.identity not in known:
+                candidates.append(extra)
+                known.add(extra.identity)
+        self._incumbents_by_key[key] = {
+            (candidate.backend, canonical_backend_config(candidate.backend_config))
+            for candidate in incumbents
+        }
+        return tuple(candidates)
+
+    @staticmethod
+    def _launch_args(row, softmax_scale) -> tuple:
+        """Everything _run_candidate needs after the five tensors and the plan."""
+        return (
+            int(row.max_seqlen_q),
+            int(row.max_seqlen_k),
+            int(row.min_seqlen_q),
+            float(row.dropout_p),
+            softmax_scale,
+            float(row.logits_soft_cap),
+            int(row.how_v3_bf16_cvt),
+            bool(row.causal),
+            int(row.window_left),
+            int(row.window_right),
+            bool(row.return_lse),
+        )
+
+    def _tune_by_screening(self, args, all_infos, task_by_info):
+        """Measure every candidate once, correctness-gated, one shape per group.
+
+        A shape's candidates share one worker, so its inputs and reference are
+        built once. A candidate that faults the worker costs the whole shape
+        its measurements; the shape is then reported as failed and no row is
+        written for it.
+        """
+        if not all_infos:
+            return []
+        group_sizes: dict[tuple, int] = {}
+        for info in all_infos:
+            group_sizes[info[0]] = group_sizes.get(info[0], 0) + 1
+        return mp_tuner(
+            [task_by_info[info] for info in all_infos],
+            [(size, ()) for size in group_sizes.values()],
+            args.mp,
+            False,
+            True,
+            args.errRatio,
+            timeout=args.timeout,
+            verbose=args.verbose,
+        )
+
+    def result_to_df(self, results):
+        rows = []
+        err_limit = getattr(self._args, "errRatio", self.ARG_DEFAULTS["errRatio"])
+        for result in results:
+            info, us, err_ratio = result[:3]
+            if len(result) > 3:
+                status = result[3]
+            elif not (us > 0 and math.isfinite(us)):
+                status = "crash"
+            elif err_ratio > err_limit:
+                status = "mismatch"
+            else:
+                status = "ok"
+            key, backend, num_splits, backend_config = info
+            row = dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key))
+            samples = (
+                (float(us),) if status == "ok" and us > 0 and math.isfinite(us) else ()
+            )
+            row.update(
+                {
+                    "backend": backend,
+                    "num_splits": num_splits,
+                    "backend_config": backend_config,
+                    "us": us,
+                    "errRatio": err_ratio,
+                    "status": status,
+                    "detail": (
+                        ""
+                        if status == "ok"
+                        else (
+                            str(result[4])
+                            if len(result) > 4 and result[4]
+                            else f"candidate {status} with no diagnostic recorded"
+                        )
+                    ),
+                    "samples_us": json.dumps(samples, separators=(",", ":")),
+                    "tflops": self.calculate((info, us, err_ratio)),
+                }
+            )
+            rows.append(row)
+        return pd.DataFrame(rows, columns=self.columns)
+
+    def post_process(self, rets, args, topk=-1, fast_mode=False):
+        resultdf = self.result_to_df(rets)
+        self._last_results = resultdf.copy()
+        if args.profile_file:
+            if os.path.exists(args.profile_file):
+                old = pd.read_csv(args.profile_file)
+                resultdf_for_profile = pd.concat([old, resultdf], ignore_index=True)
+            else:
+                resultdf_for_profile = resultdf
+            dedup = [
+                *MHA_FWD_TUNING_KEY_FIELDS,
+                *MHA_FWD_CANDIDATE_FIELDS,
+            ]
+            resultdf_for_profile = resultdf_for_profile.drop_duplicates(
+                subset=dedup, keep="last"
+            )
+            self._atomic_write_csv(resultdf_for_profile, args.profile_file)
+
+        winners = []
+        retained = []
+        failures = []
+        for key, group in resultdf.groupby(
+            list(MHA_FWD_TUNING_KEY_FIELDS), dropna=False
+        ):
+            valid = group[
+                (group["status"] == "ok")
+                & (group["us"] > 0)
+                & (group["errRatio"] <= args.errRatio)
+            ].sort_values("us")
+            if valid.empty:
+                failed = group.iloc[0].copy()
+                failed["status"] = "crash"
+                failed["detail"] = "no correctness-gated candidate completed"
+                failures.append(failed)
+                continue
+            winner = self._gate_against_incumbent(key, valid)
+            # None means auto-select already does as well as anything measured,
+            # and no row is how a shape reaches auto-select.
+            if winner is not None:
+                winners.append(winner)
+                continue
+            if (
+                self.lookup_key(dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key)))
+                in self._tuned_before
+            ):
+                logger.warning(
+                    "%s is best left on auto-select, but its existing row in %s "
+                    "still overrides it; delete that row to return the shape to "
+                    "auto-select",
+                    key,
+                    args.tune_file,
+                )
+            # The shape is settled, not missing, so it counts as covered; it is
+            # kept out of winnerdf so no runtime row is written for it.
+            kept = valid.iloc[0].copy()
+            kept["status"] = "retained"
+            kept["detail"] = "incumbent retained: no challenger cleared the margin"
+            retained.append(kept)
+
+        winnerdf = pd.DataFrame(winners, columns=self.columns)
+        covered = pd.DataFrame([*winners, *retained], columns=self.columns)
+        failuredf = pd.DataFrame(failures, columns=self.columns)
+        if not covered.empty:
+            self.success = (
+                covered.copy()
+                if self.success.empty
+                else pd.concat([self.success, covered], ignore_index=True)
+            )
+        if not failuredf.empty:
+            self.failed = (
+                failuredf.copy()
+                if self.failed.empty
+                else pd.concat([self.failed, failuredf], ignore_index=True)
+            )
+        return winnerdf
+
+    def result_to_csv(self, resultdf, file, concat=False):
+        if resultdf is None or resultdf.empty:
+            runtime = pd.DataFrame(columns=MHA_FWD_RUNTIME_CSV_FIELDS)
+        else:
+            runtime = resultdf.loc[:, list(MHA_FWD_RUNTIME_CSV_FIELDS)].copy()
+            runtime.loc[:, "backend_config"] = runtime["backend_config"].fillna("")
+        if os.path.exists(file):
+            old = pd.read_csv(file)
+            if old.empty:
+                old = pd.DataFrame(columns=MHA_FWD_RUNTIME_CSV_FIELDS)
+            else:
+                missing = [
+                    column
+                    for column in MHA_FWD_RUNTIME_CSV_FIELDS
+                    if column not in old.columns
+                ]
+                if missing:
+                    raise ValueError(
+                        f"{file} is missing MHA runtime columns: {missing}"
+                    )
+                old = old[list(MHA_FWD_RUNTIME_CSV_FIELDS)]
+        else:
+            old = pd.DataFrame(columns=MHA_FWD_RUNTIME_CSV_FIELDS)
+        combined = (
+            runtime.copy()
+            if old.empty
+            else (
+                old.copy()
+                if runtime.empty
+                else pd.concat([old, runtime], ignore_index=True)
+            )
+        )
+        combined = combined.drop_duplicates(
+            subset=list(MHA_FWD_TUNING_KEY_FIELDS), keep="last"
+        )
+        combined = combined.sort_values(list(MHA_FWD_TUNING_KEY_FIELDS))
+        self._atomic_write_csv(combined, file)
+
+        self._selection_proofs.extend(
+            self._run_fresh_probe(row, file) for _, row in runtime.iterrows()
+        )
+        failed_proofs = [
+            proof for proof in self._selection_proofs if proof["status"] != "verified"
+        ]
+        if failed_proofs:
+            proof_failures = resultdf.copy()
+            proof_failures["status"] = "crash"
+            proof_failures["detail"] = "fresh-process selection proof failed"
+            self.failed = (
+                proof_failures.copy()
+                if self.failed.empty
+                else pd.concat([self.failed, proof_failures], ignore_index=True)
+            )
+
+    def sortResults(self, tune_file, issorted, values):
+        if not os.path.exists(tune_file):
+            return
+        frame = pd.read_csv(tune_file)
+        frame = frame.drop_duplicates(
+            subset=list(MHA_FWD_TUNING_KEY_FIELDS), keep="last"
+        )
+        if issorted:
+            frame = frame.sort_values(list(MHA_FWD_TUNING_KEY_FIELDS))
+        self._atomic_write_csv(frame[list(MHA_FWD_RUNTIME_CSV_FIELDS)], tune_file)
+
+    def _gate_against_incumbent(self, key, valid):
+        """The row to publish, or None to leave the shape on auto-select.
+
+        Publishing a winner that sits inside measurement noise of the
+        incumbent buys nothing and risks shipping a regression a contended
+        sweep happened to rank first, so a winner has to beat the incumbent by
+        more than the indifference delta.
+        """
+        fastest = valid.iloc[0].copy()
+        incumbents = self._incumbents_by_key.get(key, set())
+        if (fastest["backend"], fastest["backend_config"]) in incumbents:
+            fastest["detail"] = "incumbent retained: nothing measured beat it"
+            return fastest
+
+        measured = valid[
+            valid.apply(
+                lambda r: (r["backend"], r["backend_config"]) in incumbents, axis=1
+            )
+        ]
+        if measured.empty:
+            return self._gate_against_autoselect(key, fastest)
+
+        incumbent = measured.iloc[0]
+        margin = (float(incumbent["us"]) - float(fastest["us"])) / float(
+            incumbent["us"]
+        )
+        delta = MHA_FWD_INDIFFERENCE_DELTA
+        if margin <= delta:
+            kept = incumbent.copy()
+            kept["detail"] = (
+                f"incumbent retained: winner was {margin:+.2%} against the "
+                f"{delta:.2%} indifference delta"
+            )
+            return kept
+        fastest["detail"] = (
+            f"beat incumbent by {margin:.2%} against the {delta:.2%} "
+            "indifference delta"
+        )
+        return fastest
+
+    def _gate_against_autoselect(self, key, fastest):
+        """Gate a winner against an incumbent that was probed but not measured.
+
+        asm_v3 leaves its split count to C++, which reports 0, and 0 is not a
+        legal candidate split, so the shipped configuration cannot be entered
+        in the field and is timed by the fresh probe instead.
+
+        Returning None writes no row, which is how a shape reaches auto-select
+        in the first place.
+        """
+        selection = self._autoselect_by_key.get(key)
+        latency = None if selection is None else selection.get("latency_us")
+        if not latency or float(latency) <= 0:
+            fastest["detail"] = "incumbent not measured; improvement unverified"
+            return fastest
+
+        latency = float(latency)
+        backend = selection["identity"][0]
+        margin = (latency - float(fastest["us"])) / latency
+        delta = MHA_FWD_INDIFFERENCE_DELTA
+        if margin <= delta:
+            print(
+                f"leaving {key} on auto-select: {backend} at {latency:.1f} us "
+                f"was not beaten by {delta:.2%}",
+                flush=True,
+            )
+            return None
+        fastest["detail"] = (
+            f"beat auto-select {backend} by {margin:.2%} against the "
+            f"{delta:.2%} indifference delta"
+        )
+        return fastest
+
+    def _incumbent_candidates(self, selection) -> list[MhaFwdCandidate]:
+        """The configuration the shipped dispatch resolves for this shape today.
+
+        A run that never measures the configuration already in use cannot tell
+        an improvement from a regression, so the incumbent is measured in the
+        same sweep on the same GPU as its challengers.
+
+        Dispatch itself is asked, with the tuned table emptied so the answer
+        is today's auto-select rather than a row an earlier run published.
+        Restating the selection rules here would let them drift from the ones
+        that actually run, and picking a fixed backend would compare against
+        a kernel this shape never reaches.
+
+        An auto-select the catalogue cannot name yields no candidate: asm_v3
+        leaves its split count to C++, which reports 0, and 0 is not a legal
+        candidate split. The probe latency recorded beside it becomes the bar
+        instead, so the shape is still gated rather than waved through.
+        """
+        if selection is None:
+            return []
+        backend, num_splits, config_json = selection["identity"]
+        try:
+            return [
+                MhaFwdCandidate(
+                    backend=backend,
+                    num_splits=num_splits,
+                    backend_config=parse_backend_config(config_json),
+                )
+            ]
+        except ValueError as error:
+            logger.info(
+                "dispatch resolves %r for this shape, which the catalogue "
+                "cannot name (%s); gating against the probe latency instead",
+                backend,
+                error,
+            )
+            return []
+
+    def _resolve_autoselect(self, row) -> dict[str, Any] | None:
+        """Identify and time what dispatch does for this shape with no tuned row.
+
+        The probe runs the public operator in a fresh process against an empty
+        tuned table, so both the identity and the latency come from the path a
+        caller on this branch would take today. This is the floor a row has to
+        clear to be worth publishing at all, which is a separate question from
+        which candidate is fastest.
+        """
+        descriptor, empty_table = tempfile.mkstemp(
+            prefix="mha-autoselect-", suffix=".csv"
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(",".join(MHA_FWD_RUNTIME_CSV_FIELDS) + "\n")
+            proof = self._run_fresh_probe(row, empty_table)
+        finally:
+            os.unlink(empty_table)
+        if proof["status"] != "verified":
+            logger.warning(
+                "could not establish what dispatch does for this shape "
+                "(%s); its winner will be published as unverified",
+                proof.get("stderr", "").strip().splitlines()[-1:] or "no detail",
+            )
+            return None
+        return self._selection_from_proof(proof)
+
+    @staticmethod
+    def _selection_from_proof(proof) -> dict[str, Any] | None:
+        """The candidate identity and latency a verified probe observed."""
+        observed = proof["observed"]
+        backend = observed.get("backend")
+        if backend not in MHA_FWD_BACKENDS:
+            return None
+        return {
+            "identity": (
+                backend,
+                int(observed.get("num_splits") or 0),
+                observed.get("backend_config") or "",
+            ),
+            "latency_us": proof.get("latency_us"),
+        }
+
+    def _shipped_tile_candidates(self, row) -> list[MhaFwdCandidate]:
+        """The tile dicts the dict-config kernels resolve for this shape today.
+
+        These are measured whatever dispatch currently prefers, so that a
+        sampled field still contains each tile backend's shipped default
+        rather than only the tiles the sample happened to draw.
+
+        ``has_pe`` follows the head dims the way the kernel wrappers derive
+        it, because the resolvers return a different tile shape for an
+        asymmetric head dim and hardcoding it would inject a default this
+        shape never launches.
+        """
+        import torch
+
+        dtype = getattr(torch, str(row.dtype), torch.bfloat16)
+        has_pe = int(row.hdim_q) - int(row.hdim_v) > 0
+
+        shipped = []
+        for backend in sorted(MHA_FWD_TILE_CONFIG_BACKENDS):
+            try:
+                if backend == "gluon":
+                    from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+                        _get_config as resolve,
+                    )
+
+                    config = resolve(is_fp8=False, has_pe=has_pe)
+                else:
+                    from aiter.ops.triton._triton_kernels.attention.mha import (
+                        _get_config as resolve,
+                    )
+
+                    config = resolve(
+                        float(row.dropout_p) > 0,
+                        dtype,
+                        has_pe=has_pe,
+                        head_dim_v=int(row.hdim_v),
+                    )
+            except Exception as error:  # noqa: BLE001 - no default is an outcome
+                logger.debug("no %s default for this shape: %s", backend, error)
+                continue
+            if not isinstance(config, dict):
+                continue
+            shipped.append(
+                MhaFwdCandidate(
+                    backend=backend, num_splits=0, backend_config=dict(config)
+                )
+            )
+        return shipped
+
+    def _restricted_backends(self) -> list[str] | None:
+        """Backends this run is allowed to measure, or None for all of them."""
+        value = (getattr(self._args, "backends", "") or "").strip()
+        return [name.strip() for name in value.split(",") if name.strip()] or None
+
+    def _run_fresh_probe(self, row, config_file: str) -> dict[str, Any]:
+        descriptor, proof_path = tempfile.mkstemp(
+            prefix="mha-selection-", suffix=".jsonl"
+        )
+        os.close(descriptor)
+        os.unlink(proof_path)
+        problem = {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
+        problem["_proof_warmup"] = int(self._args.warmup)
+        problem["_proof_iters"] = int(self._args.iters)
+        # Run the child as a module from the repository root, not as a file
+        # path. Executing a path puts op_tests/tuners/ on sys.path instead of
+        # the root, and "import aiter" then resolves to whatever copy is
+        # installed in site-packages -- so the probe either dies on aiter.jit
+        # or, worse, silently proves a claim about a different checkout than
+        # the one being tuned.
+        repository_root = Path(__file__).parents[2]
+        environment = os.environ.copy()
+        environment.update(
+            {
+                MHA_FWD_CONFIG_ENV: os.path.abspath(config_file),
+                "AITER_GPU_MODEL": str(row["gpu_model"]),
+                "AITER_SELECTION_PROOF_FILE": proof_path,
+                "AITER_MHA_FWD_PROBE_PROBLEM": json.dumps(problem),
+                "PYTHONPATH": os.pathsep.join(
+                    [str(repository_root), os.environ.get("PYTHONPATH", "")]
+                ).rstrip(os.pathsep),
+            }
+        )
+        started = time.time()
+        expected = (
+            {
+                "backend": str(row["backend"]),
+                "num_splits": int(row["num_splits"]),
+                "backend_config": (
+                    str(row["backend_config"])
+                    if "backend_config" in row and pd.notna(row["backend_config"])
+                    else ""
+                ),
+            }
+            if "backend" in row and pd.notna(row["backend"])
+            else None
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "op_tests.tuners.tune_mha_fwd",
+                    "--_selection_probe",
+                ],
+                cwd=str(repository_root),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=int(self._args.timeout),
+                check=False,
+            )
+            records = []
+            if os.path.exists(proof_path):
+                with open(proof_path, encoding="utf-8") as file:
+                    records = [json.loads(line) for line in file if line.strip()]
+            selected = records[-1] if records else {}
+            observed = {
+                "backend": selected.get("backend"),
+                "num_splits": selected.get("num_splits"),
+                "backend_config": selected.get("backend_config", ""),
+            }
+            probe_line = next(
+                (
+                    line.removeprefix("MHA_PROBE_RESULT=")
+                    for line in completed.stdout.splitlines()
+                    if line.startswith("MHA_PROBE_RESULT=")
+                ),
+                "",
+            )
+            probe_result = json.loads(probe_line) if probe_line else {}
+            verified = (
+                completed.returncode == 0
+                and (expected is None or observed == expected)
+                and probe_result.get("correctness") == "ok"
+            )
+            return {
+                "status": "verified" if verified else "failed",
+                "expected": expected,
+                "observed": observed,
+                "latency_us": probe_result.get("latency_us"),
+                "correctness": probe_result.get("correctness", "failed"),
+                "returncode": completed.returncode,
+                "elapsed_s": time.time() - started,
+                "stderr": completed.stderr[-4000:],
+            }
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            return {
+                "status": "failed",
+                "expected": expected,
+                "error": str(exc),
+                "elapsed_s": time.time() - started,
+            }
+        finally:
+            if os.path.exists(proof_path):
+                os.unlink(proof_path)
+
+    def _clear_op_caches(self):
+        _load_mha_fwd_tuning_table.cache_clear()
+
+    def run_config(self, args):
+        config_file = os.environ.get(MHA_FWD_CONFIG_ENV, args.tune_file)
+        results = []
+        for _, row in self.untunedf.iterrows():
+            proof = self._run_fresh_probe(row, config_file)
+            results.append(
+                {
+                    "shape": str(
+                        tuple(row[field] for field in MHA_FWD_PROBLEM_KEY_FIELDS)
+                    ),
+                    "e2e_us": proof.get("latency_us", float("inf")),
+                    "status": "ok" if proof["status"] == "verified" else "error",
+                }
+            )
+        return results
+
+
+def _selection_probe() -> int:
+    """Fresh-process public-operator correctness, timing, and dispatch probe."""
+
+    raw_problem = os.environ.get("AITER_MHA_FWD_PROBE_PROBLEM", "")
+    if not raw_problem:
+        raise RuntimeError("AITER_MHA_FWD_PROBE_PROBLEM is required")
+    row = json.loads(raw_problem)
+    problem = MhaFwdProblem.from_mapping(row)
+    data = generate_data(
+        problem.batch,
+        problem.total_q,
+        problem.total_k,
+        problem.max_seqlen_q,
+        problem.max_seqlen_k,
+        problem.nhead_q,
+        problem.nhead_k,
+        problem.hdim_q,
+        problem.hdim_v,
+        problem.dtype,
+        zlib.crc32(",".join(problem.key()).encode("utf-8")),
+    )
+    softmax_scale = problem.hdim_q**-0.5
+    reference = _chunked_reference(
+        data["q"],
+        data["k"],
+        data["v"],
+        data["cu_q"],
+        data["cu_k"],
+        softmax_scale,
+        problem.causal,
+        problem.window_left,
+        problem.window_right,
+        problem.return_lse,
+    )
+
+    def invoke():
+        return _normalize_result(
+            flash_attn_varlen_func(
+                data["q"],
+                data["k"],
+                data["v"],
+                data["cu_q"],
+                data["cu_k"],
+                problem.max_seqlen_q,
+                problem.max_seqlen_k,
+                min_seqlen_q=problem.min_seqlen_q,
+                dropout_p=problem.dropout_p,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=problem.logits_soft_cap,
+                causal=problem.causal,
+                window_size=(
+                    problem.window_left,
+                    problem.window_right,
+                    problem.sink_size,
+                ),
+                return_lse=problem.return_lse,
+                return_attn_probs=problem.return_attn_probs,
+                how_v3_bf16_cvt=problem.how_v3_bf16_cvt,
+            ),
+            problem.return_lse,
+            problem.total_q,
+            problem.nhead_q,
+        )
+
+    observed = invoke()
+    reference_items = reference if isinstance(reference, tuple) else (reference,)
+    observed_items = observed if isinstance(observed, tuple) else (observed,)
+    if len(reference_items) != len(observed_items):
+        raise AssertionError("public MHA result structure differs from reference")
+    for expected, actual in zip(reference_items, observed_items):
+        torch.testing.assert_close(
+            actual, expected, rtol=MhaFwdTuner.ERROR_RTOL, atol=MhaFwdTuner.ERROR_ATOL
+        )
+
+    warmup = max(0, int(row.get("_proof_warmup", 5)))
+    iterations = max(1, int(row.get("_proof_iters", 101)))
+    for _ in range(warmup):
+        invoke()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        invoke()
+    end.record()
+    end.synchronize()
+    latency_us = float(start.elapsed_time(end) * 1000.0 / iterations)
+    print(
+        "MHA_PROBE_RESULT="
+        + json.dumps(
+            {
+                "correctness": "ok",
+                "latency_us": latency_us,
+                "iterations": iterations,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--_selection_probe"]:
+        raise SystemExit(_selection_probe())
+    tuner = MhaFwdTuner()
+    tuner.run(tuner.parse_args(), False)
