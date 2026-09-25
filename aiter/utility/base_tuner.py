@@ -16,6 +16,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
+from aiter.utility.tuning_policy import COMPARE_MIN_IMPROVEMENT_PCT, DEFAULT_MEASUREMENT
 
 INVALID_TIME = -1
 
@@ -46,19 +47,15 @@ class TunerCommon:
         "verbose": False,
         "tune_file": "",
         "untune_file": "",
-        "errRatio": 0.05,
+        "errRatio": DEFAULT_MEASUREMENT.err_ratio,
         "batch": 100,
         "profile_file": "",  # for all results
-        # Per-task watchdog (seconds). A worker killed by a GPU memory-access
-        # fault leaves its in-flight task unresolvable; with no timeout the whole
-        # run hangs. A generous default lets the existing reaping path drop the
-        # lost task and restart the pool, while staying comfortably above any
-        # legitimate shape-group tuning time so healthy tasks are never falsely
-        # reaped. Override with --timeout for tighter/looser bounds.
-        "timeout": 1800,
-        "warmup": 5,  # 5 warmup iters for profiling
-        "iters": 101,  # 101 run iters for profiling
-        "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
+        # Override with --timeout for tighter/looser bounds.
+        "timeout": DEFAULT_MEASUREMENT.timeout,
+        "warmup": DEFAULT_MEASUREMENT.warmup,
+        "iters": DEFAULT_MEASUREMENT.iters,
+        # only write shapes improved by >= N%
+        "min_improvement_pct": COMPARE_MIN_IMPROVEMENT_PCT,
     }
     dtype2bpe_dict: ClassVar[dict[str, Any]] = {
         dtypes.fp16: 2,
@@ -243,7 +240,7 @@ class TunerCommon:
             "--min_improvement_pct",
             dest="min_improvement_pct",
             type=float,
-            default=defaults.get("min_improvement_pct", 3.0),
+            default=defaults.get("min_improvement_pct", COMPARE_MIN_IMPROVEMENT_PCT),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
 
