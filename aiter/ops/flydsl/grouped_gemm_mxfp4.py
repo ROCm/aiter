@@ -53,6 +53,25 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
 
 
+def _select_cluster_m(m_tiles: int, cluster_n: int) -> int:
+    """Selects four M rows when they form complete 4x4 clusters."""
+    env_cluster_m = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_M")
+    if env_cluster_m is not None:
+        try:
+            requested_cluster_m = int(env_cluster_m)
+        except ValueError as exc:
+            raise ValueError(
+                "AITER_FLYDSL_MXFP4_CLUSTER_M must be 1 or 4"
+            ) from exc
+        if requested_cluster_m not in (1, 4):
+            raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_M must be 1 or 4")
+        if requested_cluster_m == 1:
+            return 1
+    if cluster_n != 4:
+        return 1
+    return 4 if m_tiles > 0 and m_tiles % 4 == 0 else 1
+
+
 def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     """Selects the CSV value or falls back to the environment setting."""
     if csv_num_waves in (1, 2, 4):
@@ -172,12 +191,19 @@ def flydsl_grouped_gemm_a8w4_masked(
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
     n_tiles = (N + tile_n - 1) // tile_n
+    m_tiles = (contiguous_m + tile_m - 1) // tile_m
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    cluster_m = _select_cluster_m(m_tiles, cluster_n)
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
     if cluster_n > 1 and n_tiles % cluster_n:
         raise ValueError(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
+        )
+    if cluster_m > 1 and m_tiles % cluster_m:
+        raise ValueError(
+            f"[grouped-moe tdm] cluster_m={cluster_m} needs m_tiles={m_tiles} "
+            f"(contiguous_m={contiguous_m}, tile_m={tile_m}) to be an exact multiple"
         )
     enable_ep_scatter = stage2_scatter is not None
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
@@ -237,6 +263,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
+        cluster_m,
         _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
         enable_ep_scatter=int(enable_ep_scatter),

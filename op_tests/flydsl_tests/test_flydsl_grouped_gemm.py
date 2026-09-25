@@ -150,6 +150,7 @@ def _print_cycle_profile(realtime_mhz: float) -> None:
     torch.cuda.synchronize()
     work_cycles = {}
     no_work_cycles = {}
+    multicast_masks = {}
     all_wave_counts = {}
     for entry in _CYCLE_PROFILE_RECORDS.values():
         records = entry["cycles"].view(torch.int64).cpu()
@@ -168,6 +169,12 @@ def _print_cycle_profile(realtime_mhz: float) -> None:
                 total = int(record[3] - record[0])
                 realtime_ticks = int(record[6] - record[5])
                 if int(record[4]):
+                    mask_pair = (
+                        int(record[7]) & 0xFFFF,
+                        int(record[8]) & 0xFFFF,
+                    )
+                    multicast_masks.setdefault(stage, {}).setdefault(mask_pair, 0)
+                    multicast_masks[stage][mask_pair] += 1
                     work_cycles.setdefault(stage, []).append(
                         (
                             int(record[1] - record[0]),
@@ -214,6 +221,19 @@ def _print_cycle_profile(realtime_mhz: float) -> None:
                     "est_shader_mhz",
                 ),
                 work_rows,
+            ),
+            flush=True,
+        )
+    if multicast_masks:
+        mask_rows = [
+            (stage, f"0x{a_mask:04x}", f"0x{b_mask:04x}", count)
+            for stage, masks in multicast_masks.items()
+            for (a_mask, b_mask), count in sorted(masks.items())
+        ]
+        print(
+            "\n[cycle profile: multicast masks]\n"
+            + _format_cycle_table(
+                ("gemm", "a_mask", "b_mask", "wave_records"), mask_rows
             ),
             flush=True,
         )
