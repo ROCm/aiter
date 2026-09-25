@@ -3,10 +3,14 @@
 
 """Correctness and timing for the exact one-shot (1-stage) all-reduce (``OneShotAllReduce``).
 
-``python3`` this file runs two sweeps, each ending in a markdown table. Both
-drive the engine as production does -- no tuning knob pinned, so it walks
-``ONESHOT_LADDER`` and picks a rung by payload size -- unless ``--atoms``,
-``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self`` pin one.
+``python3`` this file runs three sweeps, each ending in a markdown table. A
+default run drives the engine as production does -- no tuning knob pinned, so
+it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
+derived from ``allreduce_policy``: at every world size, both ends of each
+rung's slice of the window the policy routes to the one-shot. Next to it, a
+few spot checks run pinned configurations no shipped rung uses, one world size
+each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self``
+pin a configuration instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -15,18 +19,27 @@ matters more than the first:
 2. The result is **bit-identical on every rank**. The kernel accumulates in a
    fixed rank order for exactly this reason, and an SQNR check cannot see an
    ordering bug -- both answers would be equally "accurate".
-3. It is timed with ``run_perftest``. One row captures the all-reduce into a
-   CUDA graph and replays it, checking 1 and 2 after every replay.
+3. It is timed with ``run_perftest``. One row per world size captures the
+   all-reduce into a CUDA graph and replays it, checking 1 and 2 after every
+   replay.
+
+``test_one_shot_allreduce_coverage`` checks that those rows ran every rung the
+engine's own ``cfgs_for`` says the production window selects, so a retuned
+ladder or policy the payload derivation does not follow fails rather than
+silently leaving a rung untested.
 
 ``test_one_shot_allreduce_run_ahead`` makes repeated back-to-back calls under
 deliberate rank skew. The inbox is double-buffered by ``colour & 1`` and the
 safety argument depends on a straggler's read of call k finishing before
 anyone's push for call k+2; a quiescent test never exercises that.
 
-Every rank is a ``multiprocessing`` spawn worker; one spawn per world size runs
-both sweeps. OneShotAllReduce runs on gfx942/gfx950 at TP in {2, 4, 8}; other
-archs skip, and ``main()`` skips a world size when fewer GPUs are visible than
-TP.
+``--extended`` runs the spot-check configurations at every world size, and the
+spot-check shapes on the production engine too.
+
+Every rank is a ``multiprocessing`` spawn worker; one spawn per engine
+configuration and world size runs every sweep. OneShotAllReduce runs on
+gfx942/gfx950 at TP in {2, 4, 8}; other archs skip, and ``main()`` skips a
+world size when fewer GPUs are visible than TP.
 """
 
 from __future__ import annotations
@@ -52,7 +65,11 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.one_shot_allreduce import SUPPORTED_BLOCKS
+from aiter.ops.flydsl import allreduce_policy as fly_policy
+from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+    SUPPORTED_BLOCKS,
+    oneshot_ladder,
+)
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 
 try:
@@ -62,25 +79,55 @@ except (KeyError, RuntimeError):
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 HIDDEN = 7168
-# m x HIDDEN spans 14 KiB to 224 KiB. m = 1, 3, 5 end in a partial last tile
-# and m = 8, 16 on an exact multiple at every rung's tile width, and the range
-# crosses the PCIe ladder's rung boundaries at 48 KiB (TP4) and 96 KiB (TP2,
-# TP4), so switching rungs mid-stream is exercised. The narrow shapes reach the
-# sub-tile, single-block corner HIDDEN cannot.
-SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [(1, 1024), (1, 2048), (1, 3072)]
 
-# (tp, tokens, hidden) captured into a CUDA graph. Each replay advances the
-# device-side colour and alternates the inbox parity slot, so only repeated
-# replays show the captured launch advancing that state rather than freezing it.
-GRAPH_CASES = ((8, 5, HIDDEN),)
+# Production payloads are derived from the dispatch policy
+# (``_production_payloads``) and laid out in rows of this many bf16. Every
+# ladder floor is a whole number of 2 KiB rows, and a row is under every rung's
+# tile, so the lowest payload is the sub-tile, single-block corner.
+ROW = 1024
+_ROW_BYTES = ROW * 2
+
+# Shapes for the spot checks. m x HIDDEN spans 14 KiB to 224 KiB. m = 1, 3, 5
+# end in a partial last tile and m = 8, 16 on an exact multiple at every rung's
+# tile width. The narrow shapes reach the sub-tile, single-block corner HIDDEN
+# cannot.
+SPOT_SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [
+    (1, 1024),
+    (1, 2048),
+    (1, 3072),
+]
+
+# Each replay advances the device-side colour and alternates the inbox parity
+# slot, so only repeated replays show the captured launch advancing that state
+# rather than freezing it.
 GRAPH_REPLAYS = 4
 
-# Pinned configurations a default run covers next to the shipped ladder, for
-# widths no shipped rung uses yet. Block 512 is the widest workgroup; at atoms=4
-# it is a 32 KiB tile, so every shape above is a single partial tile.
-EXTRA_CONFIGS = (
-    {"atoms": 1, "grid_cap": 64, "fanout": "peer", "block": 512, "skip_self": False},
-    {"atoms": 4, "grid_cap": 64, "fanout": "peer", "block": 512, "skip_self": True},
+# (tp, knobs): pinned configurations a default run spot-checks next to the
+# shipped ladder, one world size each, for widths no shipped rung uses yet.
+# Block 512 is the widest workgroup; at atoms=4 it is a 32 KiB tile, so every
+# spot shape is a single partial tile. ``--extended`` runs each at every world
+# size.
+SPOT_CONFIGS = (
+    (
+        4,
+        {
+            "atoms": 1,
+            "grid_cap": 64,
+            "fanout": "peer",
+            "block": 512,
+            "skip_self": False,
+        },
+    ),
+    (
+        2,
+        {
+            "atoms": 4,
+            "grid_cap": 64,
+            "fanout": "peer",
+            "block": 512,
+            "skip_self": True,
+        },
+    ),
 )
 
 RUN_AHEAD_M = 5
@@ -92,6 +139,27 @@ SQNR_FLOOR_DB = 45.0
 # spawn instead of leaving it to CI's per-file timeout. A full default run of
 # either FlyDSL all-reduce test takes a few minutes, JIT included.
 SPAWN_TIMEOUT_S = 600
+
+
+def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]]:
+    """Whole-row payloads covering the window the policy routes to the
+    one-shot, and that window, in bytes (inclusive).
+
+    The ladder picks a rung by floor alone, so each rung serves one contiguous
+    slice of the window; both ends of every slice are taken, which reaches
+    every rung and the largest payload each is asked to move.
+    """
+    policy = fly_policy.resolve_oneshot(link, tp)
+    lo, hi = policy.min_bytes, policy.max_bytes
+    ladder = oneshot_ladder(tp, link)
+    ends = [floor - 1 for floor, *_ in ladder[1:]] + [hi]
+    payloads = set()
+    for (floor, *_rung), end in zip(ladder, ends):
+        first = -(-max(lo, floor, 1) // _ROW_BYTES) * _ROW_BYTES
+        last = min(hi, end) // _ROW_BYTES * _ROW_BYTES
+        if first <= last:
+            payloads.update((first, last))
+    return sorted(payloads), (lo, hi)
 
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
@@ -151,11 +219,14 @@ def _run_rank(
     init_method: str,
     engine_kw: dict,
     cases: list[tuple],
+    window: tuple[int, int] | None = None,
 ) -> dict:
     """One rank of one spawn: every case, then the run-ahead loop.
 
     A case is ``(tokens, hidden, graph)``. The engine is built once, so every
-    case shares its compiled rungs and IPC inboxes.
+    case shares its compiled rungs and IPC inboxes. *window* is the payload
+    range production dispatch routes to this engine, if any; the result then
+    carries the rungs the engine itself says that range selects.
     """
     import torch.distributed as dist
 
@@ -181,6 +252,7 @@ def _run_rank(
     )
     warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
     eng.compile_and_launch(warm, torch.empty_like(warm))
+    production_cfgs = None if window is None else eng.cfgs_for(*window)
 
     rows = []
     try:
@@ -219,8 +291,10 @@ def _run_rank(
             # events in torch.profiler, so the default timer fails reducing an
             # empty trace.
             _, us = run_perftest(fn, use_cuda_event=True)
+            nbytes = inp.numel() * inp.element_size()
             res["us"] = float(us)
-            res["variant"] = eng.variant(inp.numel() * inp.element_size())
+            res["variant"] = eng.variant(nbytes)
+            res["cfg"] = eng._pick_cfg(nbytes)
             rows.append(res)
 
         # Run-ahead: many back-to-back calls with rank 0 deliberately late, so
@@ -249,10 +323,15 @@ def _run_rank(
         dist.barrier()
         eng.close()
         dist.destroy_process_group()
-    return {"rows": rows, "run_ahead": run_ahead}
+    return {"rows": rows, "run_ahead": run_ahead, "production_cfgs": production_cfgs}
 
 
-def _spawn(world_size: int, engine_kw: dict, cases: list[tuple]) -> list[dict]:
+def _spawn(
+    world_size: int,
+    engine_kw: dict,
+    cases: list[tuple],
+    window: tuple[int, int] | None = None,
+) -> list[dict]:
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -267,6 +346,7 @@ def _spawn(world_size: int, engine_kw: dict, cases: list[tuple]) -> list[dict]:
                     "init_method": init_method,
                     "engine_kw": engine_kw,
                     "cases": cases,
+                    "window": window,
                 },
             )
             for rank in range(world_size)
@@ -286,6 +366,9 @@ def _spawn(world_size: int, engine_kw: dict, cases: list[tuple]) -> list[dict]:
 # exactly one spawn. A spawn key is ``(tp, sorted engine kwargs)``; a case is
 # ``(tokens, hidden, graph)``.
 _CASES: dict[tuple, list[tuple]] = {}
+# Production dispatch window of an unpinned engine whose rung coverage is
+# checked, per spawn key.
+_WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, list[dict]] = {}
 _FAILURES: list[str] = []
 
@@ -313,7 +396,9 @@ def _key(tp: int, engine_kw: dict) -> tuple:
 
 def _ranks(key: tuple) -> list[dict]:
     if key not in _RESULTS:
-        _RESULTS[key] = _spawn(key[0], dict(key[1]), _CASES[key])
+        _RESULTS[key] = _spawn(
+            key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key)
+        )
     return _RESULTS[key]
 
 
@@ -399,9 +484,33 @@ def test_one_shot_allreduce_run_ahead(
     }
 
 
+@benchmark()
+def test_one_shot_allreduce_coverage(tp, window):
+    """Every rung production dispatch can select on this host ran on the
+    unpinned engine.
+
+    The engine's own ``cfgs_for`` is the reference, so a retuned ladder or
+    policy that ``_production_payloads`` does not follow fails here.
+    """
+    key = _key(tp, {})
+    ranks = _ranks(key)
+    production = set(ranks[0]["production_cfgs"])
+    ran = {row["cfg"] for row in ranks[0]["rows"]}
+    missing = sorted(production - ran)
+    _check(
+        f"tp={tp} coverage of {window}",
+        [f"production rungs never run: {missing}"] if missing else [],
+    )
+    return {
+        "gfx": ARCH,
+        "production_rungs": sorted(production),
+        "missing": missing,
+    }
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
-        df = pd.DataFrame(rows).drop(columns=list(KNOBS))
+        df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
         aiter.logger.info(
             "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
         )
@@ -438,8 +547,10 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=SHAPES,
-        help="(tokens, hidden) pairs.\n    e.g.: -s 1,7168 8,7168",
+        default=None,
+        help="(tokens, hidden) pairs, on every engine. Default: derived from\n"
+        "the dispatch policy for the shipped ladder, SPOT_SHAPES for the spot\n"
+        "checks.\n    e.g.: -s 1,7168 8,7168",
     )
     # Unset by default, so the engine walks the shipped ladder, which is what
     # production runs. Any value pins every rung to it.
@@ -462,6 +573,12 @@ def main():
         default=[None],
         choices=(0, 1, None),
         help="Pin skip_self off (0) or on (1).",
+    )
+    parser.add_argument(
+        "--extended",
+        action="store_true",
+        help="Run the spot-check configurations at every world size, and the\n"
+        "spot-check shapes on the shipped ladder too.",
     )
     args = parser.parse_args()
 
@@ -493,17 +610,36 @@ def main():
             args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
         )
     ]
-    # Nothing pinned on the command line: the shipped ladder, plus the widths it
-    # does not use yet.
-    if configs == [dict.fromkeys(KNOBS)]:
-        configs += [dict(c) for c in EXTRA_CONFIGS]
+    ladder = configs == [dict.fromkeys(KNOBS)]
+    given = None if args.mnk is None else [(int(t), int(h)) for t, h in args.mnk]
+    link = fly_policy.detect_link()
 
     # Register every row before running any, so each (tp, config) is one spawn.
-    shapes = [(int(t), int(h)) for t, h in args.mnk]
-    rows = []
+    # Each entry of ``spawns`` is ``(tp, knobs, shapes, graph)``.
+    spawns = []
+    coverage = []
     for tp, knobs in itertools.product(tps, configs):
+        payloads, window = _production_payloads(tp, link)
+        shapes = given or [(nbytes // _ROW_BYTES, ROW) for nbytes in payloads]
+        if given is None and args.extended:
+            shapes += [s for s in SPOT_SHAPES if s not in shapes]
+        spawns.append((tp, knobs, shapes, True))
+        if ladder and given is None:
+            _WINDOWS[_key(tp, {})] = window
+            coverage.append((tp, f"{window[0]}..{window[1]} B"))
+    # Nothing pinned on the command line: the shipped ladder, plus spot checks
+    # of the widths it does not use yet.
+    if ladder:
+        spot = [(tp, knobs) for tp, knobs in SPOT_CONFIGS if tp in tps]
+        if args.extended:
+            spot = [(tp, knobs) for tp in tps for _tp, knobs in SPOT_CONFIGS]
+        spawns += [(tp, dict(knobs), given or SPOT_SHAPES, False) for tp, knobs in spot]
+    rows = []
+    for tp, knobs, shapes, graph in spawns:
         cases = [(t, h, False) for t, h in shapes]
-        cases += [(t, h, True) for g_tp, t, h in GRAPH_CASES if g_tp == tp]
+        if graph:
+            # Captured at every world size, on the smallest shape.
+            cases.append((*shapes[0], True))
         _CASES[_key(tp, _engine_kw(**knobs))] = cases
         rows += [(tp, knobs, case) for case in cases]
 
@@ -516,12 +652,16 @@ def main():
             ],
         )
     _summarize(
+        "flydsl one-shot allreduce production rung coverage",
+        [test_one_shot_allreduce_coverage(tp, window) for tp, window in coverage],
+    )
+    _summarize(
         "flydsl one-shot allreduce run-ahead",
         [
             test_one_shot_allreduce_run_ahead(
                 RUN_AHEAD_M, HIDDEN, tp, RUN_AHEAD_ITERS, **knobs
             )
-            for tp, knobs in itertools.product(tps, configs)
+            for tp, knobs, _shapes, _graph in spawns
         ],
     )
 
