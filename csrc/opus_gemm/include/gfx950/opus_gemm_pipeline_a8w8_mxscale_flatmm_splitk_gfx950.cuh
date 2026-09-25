@@ -1116,7 +1116,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
     const int m_per_wg = kargs.split_k;
     int bid = opus::block_id_x();
-    constexpr int NUM_XCD = 8;
+    constexpr int NUM_XCD = T::NUM_XCD;
     int xcd_id = __builtin_amdgcn_readfirstlane(bid % NUM_XCD);
     int pos_xcd = __builtin_amdgcn_readfirstlane(bid / NUM_XCD);
     int tile_n_id = __builtin_amdgcn_readfirstlane(pos_xcd % num_tiles_n);
@@ -1455,7 +1455,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
     int bid = opus::block_id_x();
-    constexpr int NUM_XCD = 8;
+    constexpr int NUM_XCD = T::NUM_XCD;
     int xcd_id = __builtin_amdgcn_readfirstlane(bid % NUM_XCD);
     int pos_xcd = __builtin_amdgcn_readfirstlane(bid / NUM_XCD);
     int tile_n_id = __builtin_amdgcn_readfirstlane(pos_xcd % num_tiles_n);

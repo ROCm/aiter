@@ -47,6 +47,7 @@ template<int BLOCK_SIZE_,
         bool HAS_BIAS_ = false,
         typename D_BIAS_ = void,
         bool HAS_OOB_ = true,
+        int NUM_XCD_ = 8,
         int CACHECTL_A_ = 0,
         int CACHECTL_B_ = 17,
         int SWIZZLE_W_ = 8,
@@ -118,8 +119,8 @@ struct opus_gemm_a16w16_traits_gfx950 {
     static constexpr int CACHECTL_A = CACHECTL_A_;
     static constexpr int CACHECTL_B = CACHECTL_B_;
 
-    // HipKittens XCD swizzle parameters (Algorithm 1, MI350 = 8 XCDs)
-    static constexpr int NUM_XCD = 8;
+    // HipKittens XCD swizzle parameters (Algorithm 1).
+    static constexpr int NUM_XCD = NUM_XCD_;
     static constexpr int SWIZZLE_W = SWIZZLE_W_;
     static constexpr int SWIZZLE_C = SWIZZLE_C_;
 };
@@ -456,7 +457,7 @@ struct opus_flatmm_splitk_traits_gfx950 {
 // the split-barrier traits. Other (cachectl_a, cachectl_b) combos are
 // exposed as separate KIDs by the tuner.
 //
-// NUM_XCD is fixed to 8 (gfx950 = MI350); the swizzle is hard-wired to
+// The swizzle is hard-wired to
 // N-fast inside the persistent pipeline body and does NOT take SWIZZLE_W/C
 // parameters (those belong to the HipKittens split-barrier swizzle, which
 // is a different, orthogonal optimization).
@@ -468,7 +469,8 @@ template<int BLOCK_SIZE_,
         typename WAVE_,
         bool HAS_OOB_ = true,
         int CACHECTL_A_ = 0,
-        int CACHECTL_B_ = 17>
+        int CACHECTL_B_ = 17,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a16w16_persistent_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -532,9 +534,9 @@ struct opus_gemm_a16w16_persistent_traits_gfx950 {
     static constexpr int CACHECTL_A = CACHECTL_A_;
     static constexpr int CACHECTL_B = CACHECTL_B_;
 
-    // MI350 = 8 XCDs. Persistent swizzle uses N-fast within each XCD
+    // Persistent swizzle uses N-fast within each XCD
     // (see kargs.num_tiles_n / kargs.m_grp_per_xcd).
-    static constexpr int NUM_XCD = 8;
+    static constexpr int NUM_XCD = NUM_XCD_;
 };
 
 #ifndef OPUS_GEMM_PERSISTENT_KARGS_GFX950_DEFINED

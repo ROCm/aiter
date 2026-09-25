@@ -697,7 +697,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             k_inst = _opus_all_kernels.get(kid)
             if k_inst is None:
                 continue
-            if _opus_kid_rejects_shape(k_inst, M, N, K):
+            if _opus_kid_rejects_shape(k_inst, M, N, K, cu_num):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
