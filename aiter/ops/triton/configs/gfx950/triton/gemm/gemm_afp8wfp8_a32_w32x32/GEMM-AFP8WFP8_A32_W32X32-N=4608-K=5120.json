@@ -957,7 +957,7 @@
         "GROUP_SIZE_M": 1
     },
     "M_LEQ_1664": {
-        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "num_warps": 4,
@@ -1181,7 +1181,7 @@
         "FUSED_SPLITK": false
     },
     "M_LEQ_32768": {
-        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "num_warps": 4,

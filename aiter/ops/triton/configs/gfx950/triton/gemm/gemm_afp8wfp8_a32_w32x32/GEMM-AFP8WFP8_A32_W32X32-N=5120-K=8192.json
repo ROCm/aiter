@@ -890,7 +890,7 @@
         "FUSED_SPLITK": false
     },
     "M_LEQ_1344": {
-        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "num_warps": 4,
@@ -906,7 +906,7 @@
         "FUSED_SPLITK": false
     },
     "M_LEQ_1408": {
-        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "num_warps": 4,
@@ -922,7 +922,7 @@
         "FUSED_SPLITK": false
     },
     "M_LEQ_1472": {
-        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "num_warps": 4,

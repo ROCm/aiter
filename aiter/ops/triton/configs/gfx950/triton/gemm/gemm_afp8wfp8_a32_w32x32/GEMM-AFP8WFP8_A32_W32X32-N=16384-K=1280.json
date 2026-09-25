@@ -1136,7 +1136,7 @@
         "N_FIRST": false,
         "REDUCE_BLOCK_SIZE_M": 32,
         "REDUCE_BLOCK_SIZE_N": 32,
-        "GROUP_SIZE_M": 1,
+        "GROUP_SIZE_M": 8,
         "FUSED_SPLITK": false
     },
     "M_LEQ_8192": {
@@ -1168,7 +1168,7 @@
         "N_FIRST": false,
         "REDUCE_BLOCK_SIZE_M": 32,
         "REDUCE_BLOCK_SIZE_N": 32,
-        "GROUP_SIZE_M": 1,
+        "GROUP_SIZE_M": 8,
         "FUSED_SPLITK": false
     },
     "M_LEQ_12288": {
@@ -1184,7 +1184,7 @@
         "N_FIRST": false,
         "REDUCE_BLOCK_SIZE_M": 32,
         "REDUCE_BLOCK_SIZE_N": 32,
-        "GROUP_SIZE_M": 1,
+        "GROUP_SIZE_M": 8,
         "FUSED_SPLITK": false
     },
     "M_LEQ_14336": {
@@ -1200,7 +1200,7 @@
         "N_FIRST": false,
         "REDUCE_BLOCK_SIZE_M": 32,
         "REDUCE_BLOCK_SIZE_N": 32,
-        "GROUP_SIZE_M": 1,
+        "GROUP_SIZE_M": 8,
         "FUSED_SPLITK": false
     },
     "M_LEQ_16384": {
