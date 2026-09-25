@@ -276,13 +276,11 @@ def main() -> None:
     parser.add_argument(
         "--strided-positions", type=_str_to_bool, nargs="+", default=[False]
     )
-    # TODO: Strided caches are not supported by the HIP kernel, suppress until then
     parser.add_argument(
         "--strided-caches",
         type=_str_to_bool,
         nargs="+",
         default=[False],
-        help=argparse.SUPPRESS,
     )
     parser.add_argument("--gemma-norm", type=_str_to_bool, nargs="+", default=[False])
     parser.add_argument("--return-kv", type=_str_to_bool, nargs="+", default=[False])
