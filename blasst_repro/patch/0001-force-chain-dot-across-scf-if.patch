@@ -1,0 +1,65 @@
+diff --git a/include/triton/Tools/Sys/GetEnv.h b/include/triton/Tools/Sys/GetEnv.h
+index 76ea07eeb..21707ad7e 100644
+--- a/include/triton/Tools/Sys/GetEnv.h
++++ b/include/triton/Tools/Sys/GetEnv.h
+@@ -37,6 +37,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
+     "TRITON_HIP_USE_ASYNC_COPY",
+     "TRITON_HIP_USE_BLOCK_PINGPONG",
+     "TRITON_HIP_USE_COEXEC_SCHEDULER",
++    "TRITON_HIP_FORCE_CHAIN_DOT_ACROSS_IF",
+     "TRITON_HIP_USE_EXPERT_SCHEDULING",
+     "TRITON_HIP_USE_IN_THREAD_TRANSPOSE",
+     "TRITON_LLVM_DEBUG_ONLY",
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
+index 2fe681b17..f5c207db9 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
+@@ -10,6 +10,7 @@
+ #include "triton/Dialect/Triton/IR/Dialect.h"
+ #include "triton/Dialect/Triton/IR/Types.h"
+ #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
++#include "triton/Tools/Sys/GetEnv.h"
+ namespace tt = mlir::triton;
+ using mlir::triton::ModuleAxisInfoAnalysis;
+ using mlir::triton::amdgpu::ISAFamily;
+@@ -902,9 +903,29 @@ static Value resolveLoopBackedge(BlockArgument bbArg) {
+   return yieldOp.getOperand(iterArgIdx);
+ }
+ 
++// isChainDotHead/isChainDotTail normally require the two dots to sit in the
++// same MLIR region, so they can't see a chain-dot pattern where one dot is
++// nested inside an scf.if within the other dot's region (e.g. a P@V dot
++// wrapped in `if all_skip: ...`). When
++// TRITON_HIP_FORCE_CHAIN_DOT_ACROSS_IF is set, also accept regions related by
++// exactly one level of scf.if nesting, in either direction.
++static bool isSameOrAcrossOneIfLevel(Region *a, Region *b) {
++  if (a == b)
++    return true;
++  if (!mlir::triton::tools::getBoolEnv("TRITON_HIP_FORCE_CHAIN_DOT_ACROSS_IF"))
++    return false;
++  auto nestedViaIf = [](Region *inner, Region *outer) {
++    Operation *parentOp = inner->getParentOp();
++    return isa_and_nonnull<scf::IfOp>(parentOp) &&
++           parentOp->getParentRegion() == outer;
++  };
++  return nestedViaIf(a, b) || nestedViaIf(b, a);
++}
++
+ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
+   auto isInSameRegion = [&dotOp](Operation *op) {
+-    return op->getParentRegion() == dotOp->getParentRegion();
++    return isSameOrAcrossOneIfLevel(op->getParentRegion(),
++                                    dotOp->getParentRegion());
+   };
+   ForwardSliceOptions fwdOpt;
+   fwdOpt.filter = isInSameRegion;
+@@ -956,7 +977,8 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
+ 
+ bool isChainDotTail(tt::DotOpInterface dotOp) {
+   auto isInSameRegion = [&dotOp](Operation *op) {
+-    return op->getParentRegion() == dotOp->getParentRegion();
++    return isSameOrAcrossOneIfLevel(op->getParentRegion(),
++                                    dotOp->getParentRegion());
+   };
+   BackwardSliceOptions bwdOpt;
+   bwdOpt.omitBlockArguments = true;
