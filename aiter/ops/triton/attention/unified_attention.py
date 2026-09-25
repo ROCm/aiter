@@ -135,6 +135,8 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
+        # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
+        and not params.softcap
         and not params.use_qq_bias
         and not params.use_alibi_slopes
         and params.head_size <= 256
