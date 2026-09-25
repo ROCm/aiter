@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// MXFP4 paged MQA logits (OPUS) -- ONE module, ONE schedule, TWO arch-selected device bodies.
+// MXFP4 paged MQA logits (OPUS): one schedule, two arch-selected device bodies.
 //
 //   gfx950 : MFMA 32x32x64, wave64. Scales/kv PERMUTED:
 //            q_scale [T,2,32,4]   kv_cache [nb,4,PAGE,16]   kv_scale [nb,2,32,4]
@@ -9,27 +9,27 @@
 //            q_scale [T,H,4]      kv_cache [nb,PAGE,64]     kv_scale [nb,PAGE,4]
 //   shared : q [T,H,D/2] u8, weights [T,H] bf16, out [T,max_seq_len] fp32.
 //
-// Both arches take the SAME kernel args (opus_mqa_logits_kargs) and the SAME per-tile schedule
-// (build_tiles + build_sched); a `#if defined(__gfx950__)` / `#if defined(__gfx1250__)` version
-// macro selects which device body compiles, and fwd_sched dispatches by runtime arch. gfx950 is
-// driven at q_per_block == 1, so each "tile" is one row and the tile-union window is that row's
-// window -- exactly the per-row record its kernel already reads.
+// Both arches share the kargs and the per-tile schedule; fwd_sched dispatches by runtime arch.
+// gfx950 runs at q_per_block == 1, so a tile is one row.
 //
-// HANDING ONE ARCH THE OTHER'S ARRAYS IS SILENT: every fp4 scale layout has the same byte count,
-// so the launcher catches a wrong array and never a wrong permutation. Only a random-data
-// comparison against a dequantized reference does; the python entry points check the ndim.
+// Passing one arch's scale arrays to the other is SILENT: the byte counts match, only the
+// permutation differs. Only a comparison against a dequantized reference catches it.
 //
-// THE TWO THINGS THE CALLER OWES, neither checkable here (broken -> the CTA's waves disagree on
-// the trip count and DEADLOCK on the phase barrier; they do not answer wrong):
-//   1. the window rule is NON-DECREASING in the row index within a tile;
-//   2. the store is bounded by the WINDOW, not by max_seq_len -- a `local_ends` entry past
-//      out.size(1) writes past the row.
+// `num_rows` (the plan's total_q) is checked against every per-row array and q / weights / out.
+//
+// THE THINGS THE CALLER OWES (not checkable here):
+//   1. the window is non-decreasing in row index within a tile, else the CTA's waves disagree
+//      on the trip count and DEADLOCK on the phase barrier;
+//   2. the store is bounded by the window, not max_seq_len: local_ends past out.size(1)
+//      writes past the row;
+//   3. a row with no live sequence has an empty window (local_ends <= local_starts); only such
+//      a row may have a negative row_to_batch. Cells outside a row's window are never written.
 #pragma once
 #include "aiter_tensor.h"
 #include <cstdint>
 #include <cstddef>
 
-// ── public API: three ops for BOTH arches; the instance is named by (q_per_block, block_k) ──
+// -- public API: three ops for BOTH arches; the instance is named by (q_per_block, block_k) --
 void pa_mqa_logits_mxfp4_build_tiles(aiter_tensor_t& cu_seq_q,
                                      aiter_tensor_t& cu_tiles,
                                      int total_q,
@@ -42,11 +42,11 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
                                      aiter_tensor_t& row_to_batch,
                                      aiter_tensor_t& cta_info,
                                      int num_tiles,
+                                     int num_rows,
                                      int num_ctas,
                                      int cta_resident,
                                      int block_k,
-                                     // 1 is the IDENTITY cut -- a tile is a row -- and then
-                                     // `cu_tiles` is not read and may be empty.
+                                     // 1: a tile is a row; cu_tiles is unread, may be empty.
                                      int q_per_block);
 
 void pa_mqa_logits_mxfp4_fwd_sched(aiter_tensor_t& q,
@@ -68,31 +68,25 @@ void pa_mqa_logits_mxfp4_fwd_sched(aiter_tensor_t& q,
                                    int block_k);
 
 #ifdef PA_MQA_LOGITS_MXFP4_IMPL
-// ==== Implementation (compiled only in the .cu TU): kargs + schedule + traits + kernels. ====
+// ==== Implementation (compiled only in the .cu TU) ====
 
 #include <opus/dtypes.hpp>
 using bf16_t            = opus::dtypes::bf16;   // gfx1250 traits' per-head weight type
 using mqa_logits_bf16_t = __bf16;               // gfx950 traits' per-head weight type
 
-// The relu must be the IEEE-754-2019 `maximum`, which PROPAGATES NaN (a 0xFF E8M0 scale), not a
-// compare-and-select, which returns 0 for it. REQUIRES -fno-finite-math-only (the #error below
-// enforces it). gfx950's body inlines the same builtin; gfx1250's body uses this macro.
+// relu must PROPAGATE NaN (a 0xFF E8M0 scale), so it is IEEE-754-2019 `maximum`, not a
+// compare-and-select. Requires -fno-finite-math-only.
 #define OPUS_LOGITS_RELU(x) __builtin_elementwise_maximum((x), 0.0f)
 
-// ── shared record + kargs (byte-identical across arches) ─────────────────────────────
-// One 32-byte record per CTA slot, arriving in one `s_load_dwordx8` -- do not shrink it.
-// `chunk_count == 0` marks a surplus slot; a slot is 1..Q_PER_BLOCK rows, `group_rows` many.
-//
-// `chunk_start` is ABSOLUTE, a tile index into the sequence and not an offset from
-// `local_start`; the store's out-of-range proof depends on it.
-//
-// `local_start` / `local_end` are the tile's UNION window and set the LOOP BOUND, the only
-// thing they may set: the trip count fixes the barrier count, so anything per-row reaching it
-// deadlocks the CTA. The STORE MASK is separate and per row.
+// -- shared record + kargs -------------------------------------------------------------
+// One 32-byte record per CTA slot, loaded by one s_load_dwordx8.
+// local_start / local_end (the tile's union window) set ONLY the loop bound: the trip count
+// fixes the barrier count, so anything per-row reaching it deadlocks the CTA. The store mask
+// is per row.
 struct opus_mqa_cta_record {
     int row_id;       // FIRST packed query row of the tile
     int batch_id;     // block_tables row
-    int chunk_start;  // first KV tile (block_k units) this CTA covers, absolute
+    int chunk_start;  // first KV tile (block_k units), absolute, not relative to local_start
     int chunk_count;  // KV tiles it covers; 0 = surplus slot
     int local_start;  // the tile's UNION window start
     int local_end;    // the tile's UNION window end
@@ -103,44 +97,34 @@ static_assert(sizeof(opus_mqa_cta_record) == 32,
               "the record must stay one s_load_dwordx8");
 static_assert(alignof(opus_mqa_cta_record) == 4);
 
+// Scale / cache layouts differ per arch (see the table at the top). Not layout-compatible with
+// the opus-ops standalone kargs.
 struct opus_mqa_logits_kargs {
     const void* __restrict__ ptr_q;         // [total_tokens, H, D/2]                fp4 (E2M1)
-    const void* __restrict__ ptr_q_scale;   // [total_tokens, H, 4]                  e8m0
-    const void* __restrict__ ptr_kv;        // [num_blocks, PAGE, D/2]               fp4 (E2M1)
-    const void* __restrict__ ptr_kv_scale;  // [num_blocks, PAGE, 4]                 e8m0
+    const void* __restrict__ ptr_q_scale;   // [total_tokens, ...] e8m0, per-arch layout
+    const void* __restrict__ ptr_kv;        // [num_blocks, ...]   fp4, per-arch layout
+    const void* __restrict__ ptr_kv_scale;  // [num_blocks, ...]   e8m0, per-arch layout
     const int*  __restrict__ ptr_block_tables; // [batch, max_blocks_per_seq] int32
     const void* __restrict__ ptr_weights;   // [total_tokens, H] bf16
-    float* __restrict__ ptr_out;             // [total_tokens, max_seq_len] fp32
+    float* __restrict__ ptr_out;             // [total_tokens, >= max window] fp32
 
-    // PER-ROW window arrays, each [total_q] int32, read for the STORE MASK only -- the loop bound
-    // comes from the record's union. `ptr_local_starts` MAY BE NULL (every row starts at 0);
-    // `ptr_local_ends` may not, being the store's upper bound.
-    const int* __restrict__ ptr_row_to_batch;   // builder only; the record carries batch_id
+    // Per-row windows, [num_rows] int32, for the store mask. gfx1250 only: local_ends required,
+    // local_starts may be NULL (start 0). NULL on gfx950 (window comes off the record).
     const int* __restrict__ ptr_local_starts;
     const int* __restrict__ ptr_local_ends;
-    // Read by neither the kernel nor the schedule. `ptr_cu_seq_q` is the BATCH prefix sum and is
-    // an input to the tile cut, not to the launch.
-    const int* __restrict__ ptr_cu_seq_q;
-    int   split_kv;            // context splits per row (>= 1); unused here
-    int   num_rows;            // total query rows
-    int   num_batches;         // real batch count
 
-    int   max_seq_len;
-    int   stride_out_row;      // out row stride in elements (== max_seq_len for dense out)
+    int   num_rows;            // the schedule's row count; both kernels bound row_id by it
+    int   stride_out_row;      // out row stride in elements
     float weight_scale;
     int   block_k;             // KV tile size along seq_kv (== Traits::KV_TILE_SIZE)
-    int   kv_block_size;       // paged block (page) size (== Traits::PAGE_SIZE)
     int   max_blocks_per_seq;  // block_tables row stride
 
-    // APPENDED, not grouped with the pointers above: every field before this keeps the kernarg
-    // offset it has on gfx950, which the offsetof block below enforces.
     const opus_mqa_cta_record* __restrict__ ptr_cta_info;  // [num_ctas]
     int   num_ctas;            // grid.x of the launch; slots past the work idle
 };
 
-// A field reordered or retyped on either target fails here instead of producing a launcher that
-// reads the wrong dword.
-static_assert(sizeof(opus_mqa_logits_kargs)  == 144);   // 128 + the appended pair
+// Both kernels read these by offset; the gfx950 kernel's ISA is pinned against them.
+static_assert(sizeof(opus_mqa_logits_kargs)  == 112);
 static_assert(alignof(opus_mqa_logits_kargs) == 8);
 static_assert(offsetof(opus_mqa_logits_kargs, ptr_q             ) ==   0);
 static_assert(offsetof(opus_mqa_logits_kargs, ptr_q_scale       ) ==   8);
@@ -149,33 +133,22 @@ static_assert(offsetof(opus_mqa_logits_kargs, ptr_kv_scale      ) ==  24);
 static_assert(offsetof(opus_mqa_logits_kargs, ptr_block_tables  ) ==  32);
 static_assert(offsetof(opus_mqa_logits_kargs, ptr_weights       ) ==  40);
 static_assert(offsetof(opus_mqa_logits_kargs, ptr_out           ) ==  48);
-static_assert(offsetof(opus_mqa_logits_kargs, ptr_row_to_batch  ) ==  56);
-static_assert(offsetof(opus_mqa_logits_kargs, ptr_local_starts  ) ==  64);
-static_assert(offsetof(opus_mqa_logits_kargs, ptr_local_ends    ) ==  72);
-static_assert(offsetof(opus_mqa_logits_kargs, ptr_cu_seq_q      ) ==  80);
-static_assert(offsetof(opus_mqa_logits_kargs, split_kv          ) ==  88);
-static_assert(offsetof(opus_mqa_logits_kargs, num_rows          ) ==  92);
-static_assert(offsetof(opus_mqa_logits_kargs, num_batches       ) ==  96);
-static_assert(offsetof(opus_mqa_logits_kargs, max_seq_len       ) == 100);
-static_assert(offsetof(opus_mqa_logits_kargs, stride_out_row    ) == 104);
-static_assert(offsetof(opus_mqa_logits_kargs, weight_scale      ) == 108);
-static_assert(offsetof(opus_mqa_logits_kargs, block_k           ) == 112);
-static_assert(offsetof(opus_mqa_logits_kargs, kv_block_size     ) == 116);
-static_assert(offsetof(opus_mqa_logits_kargs, max_blocks_per_seq) == 120);
-static_assert(offsetof(opus_mqa_logits_kargs, ptr_cta_info      ) == 128);
-static_assert(offsetof(opus_mqa_logits_kargs, num_ctas          ) == 136);
+static_assert(offsetof(opus_mqa_logits_kargs, ptr_local_starts  ) ==  56);
+static_assert(offsetof(opus_mqa_logits_kargs, ptr_local_ends    ) ==  64);
+static_assert(offsetof(opus_mqa_logits_kargs, num_rows          ) ==  72);
+static_assert(offsetof(opus_mqa_logits_kargs, stride_out_row    ) ==  76);
+static_assert(offsetof(opus_mqa_logits_kargs, weight_scale      ) ==  80);
+static_assert(offsetof(opus_mqa_logits_kargs, block_k           ) ==  84);
+static_assert(offsetof(opus_mqa_logits_kargs, max_blocks_per_seq) ==  88);
+static_assert(offsetof(opus_mqa_logits_kargs, ptr_cta_info      ) ==  96);
+static_assert(offsetof(opus_mqa_logits_kargs, num_ctas          ) == 104);
 
-__host__ __device__ inline int ceil_div_i(int a, int b) { return (a + b - 1) / b; }
-
-// ── the schedule builder: split into its own file (arch-agnostic, shared) ──
+// -- the schedule builder (arch-agnostic) --
 #include "pa_mqa_logits_mxfp4_sched.cuh"
 
-// Kept here, after the builder, for the reason the ordering note above gives -- it belongs with
-// the ABI and cannot sit there.
 namespace opus_logits {
-// gfx950's two schedule-free modes are names only here; this target compiles `Table` and nothing
-// else. Prefill gave every tile one CTA whatever its window length, which is the load imbalance
-// the table exists to fix.
+// Only `Table` is implemented here (both kernels static_assert it); Prefill / Decode keep the
+// enum in sync with the opus-ops standalone build.
 enum class mqa_logits_sched {
     Prefill,
     Decode,
@@ -183,17 +156,14 @@ enum class mqa_logits_sched {
 };
 }
 
-// ── gfx950 traits (MFMA 32x32x64) ────────────────────────────────────────────────────
-// Traits for the MXFP4 paged MQA logits kernel on `mfma_scale_f32_32x32x64_f8f6f4`.
-//
-// D_DATA is deliberately not declared here: fp4 is opus::fp4_t, a device-side packed type,
-// and this struct must stay host-compilable. The kernel template aliases it.
+// -- gfx950 traits (MFMA 32x32x64) ----------------------------------------------------
+// No D_DATA: opus::fp4_t is device-only and this struct must stay host-compilable.
 template<int KV_TILE_SIZE_ = 256,
          int PAGE_SIZE_    = 64,
          int HEAD_DIM_     = 128,
          int N_HEADS_      = 64,
          int NUM_WARPS_    = 4>
-struct opus_mqa_logits_fp4_traits {
+struct opus_mqa_logits_fp4_mfma_traits {
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;  // block_k
     static constexpr int PAGE_SIZE    = PAGE_SIZE_;     // kv_block_size
     static constexpr int HEAD_DIM     = HEAD_DIM_;
@@ -203,7 +173,7 @@ struct opus_mqa_logits_fp4_traits {
     static constexpr int WARP_SIZE  = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
 
-    using D_WEIGHT = mqa_logits_bf16_t;   // per-head weights (standalone spells this bf16_t)
+    using D_WEIGHT = mqa_logits_bf16_t;   // per-head weights
     using D_ACC    = float;    // MFMA accumulator (C)
     using D_OUT    = float;    // output logits
     using D_SCALE  = int;      // E8M0 blockscale, packed as one int32 dword per lane
@@ -218,9 +188,8 @@ struct opus_mqa_logits_fp4_traits {
 
     // ---- derived tile counts ----
     static constexpr int M_TILES  = N_HEADS / MFMA_M;    // 2  (head tiles along M)
-    static constexpr int K_TILES  = HEAD_DIM / MFMA_K;   // 2  (outer K loop -- ACTIVE here)
+    static constexpr int K_TILES  = HEAD_DIM / MFMA_K;   // 2  (outer K loop)
     static constexpr int K_CHUNKS = MFMA_K / SCALE_BLOCK;// 2  (32-K scale blocks per k-tile)
-    // Scale blocks across a whole head row, i.e. what the host quantizer produces per row.
     static constexpr int SCALE_BLOCKS_ROW = HEAD_DIM / SCALE_BLOCK;  // 4 == K_TILES * K_CHUNKS
 
     static constexpr int N_TOTAL_TILES   = KV_TILE_SIZE / MFMA_N;      // 8 (bk=256) / 2 (bk=64)
@@ -228,40 +197,36 @@ struct opus_mqa_logits_fp4_traits {
     static constexpr int TILES_PER_BLOCK = PAGE_SIZE / MFMA_N;         // 2 (MFMA_N tiles per page)
     static constexpr int N_PHYS = (N_TILES + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK;  // 1
 
-    // ---- C fragment geometry (from the probe / opus mfma_adaptor) ----
+    // ---- C fragment geometry ----
     // C is [(rept_c<y>, grpm_c<p>, pack_c<y>), (grpn_c<p>)]: m = rept*8 + (L/32)*4 + pack.
     static constexpr int C_FRAG = MFMA_M * MFMA_N / WARP_SIZE;  // 16 floats per lane per m-tile
     static constexpr int GRPN_C = MFMA_N;                       // 32: n == lane % 32
     static constexpr int GRPM_C = WARP_SIZE / GRPN_C;           // 2:  M spread over 2 lane groups
     static constexpr int PACK_C = 4;                            // 16 B of f32 per contiguous run
     static constexpr int REPT_C = C_FRAG / PACK_C;              // 4
-    // Heads a single lane accumulates, across all m-tiles: M_TILES * C_FRAG = 32 of the 64.
-    // The other 32 live in the partner lane group and arrive via one permlane32 swap.
+    // A lane holds 32 of the 64 heads; the partner lane group's 32 arrive via one permlane32.
     static constexpr int HEADS_PER_LANE = M_TILES * C_FRAG;     // 32
 
     static constexpr int DWORDx4_BYTES = 16;
 
     // ---- per-lane payload ----
-    // A lane holds one contiguous 32-K block = 32 fp4 = 16 B. This is NOT the MFMA
-    // operand width: opus always passes 256-bit operands and fp4 reads only the low 16 B,
-    // so the kernel loads 16 B and fills the low half.
+    // A lane holds one 32-K block = 16 B: the low half of opus's 256-bit operand (fp4 reads
+    // only the low 16 B).
     static constexpr int KV_GRP_ELEMS = SCALE_BLOCK;                  // 32 fp4 per lane
     static constexpr int KV_GRP_BYTES = KV_GRP_ELEMS * ELEM_BITS / 8; // 16 bytes
     static constexpr int A_BYTES_PER_LANE = (MFMA_M * MFMA_K / WARP_SIZE) * ELEM_BITS / 8; // 16
 
     // ---- op_sel byte packing ----
-    // One scale dword per lane serves the whole (kt, tile) double loop, since the dword
-    // has 4 bytes and both products are 4:
-    //     A: byte index = kt * M_TILES + mi     B: byte index = kt * N_TILES + nt
+    // One scale dword per lane covers the (kt, tile) loop:
+    //     A: byte = kt * M_TILES + mi     B: byte = kt * N_TILES + nt
     static constexpr int QS_BYTES  = K_TILES * M_TILES;   // 4
     static constexpr int KVS_BYTES = K_TILES * N_TILES;   // 4
     static_assert(QS_BYTES == 4 && KVS_BYTES == 4,
                   "the op_sel byte packing assumes exactly 4 (kt, tile) pairs per dword");
 
-    // ── LAYOUTS ─────────────────────────────────────────────────────────────
+    // -- LAYOUTS -------------------------------------------------------------
     // ---- q: natural [T][head][D/2] (NO preshuffle) ----
-    // The stride_q_* below are vestigial (the natural make_layout_q does not use them); kept only
-    // so Q_ROW_BYTES stays the size of one query row (H * D/2 = 4096 B, unchanged by the ABI).
+    // stride_q_* are unused by the kernel; they only derive Q_ROW_BYTES.
     static constexpr int stride_q_m     = KV_GRP_BYTES;                    // 16
     static constexpr int stride_q_g     = MFMA_M * stride_q_m;             // 512
     static constexpr int stride_q_ktile = K_CHUNKS * stride_q_g;           // 1024
@@ -269,11 +234,8 @@ struct opus_mqa_logits_fp4_traits {
     static constexpr int Q_ROW_BYTES    = M_TILES * stride_q_mtile;        // 4096 == H * D/2
 
     // ---- kv_cache: [num_blocks][kt(K_TILES)][g(K_CHUNKS)][nt(TILES_PER_BLOCK)][m(MFMA_N)][16 B]
-    // holds KV[page token = nt*MFMA_N + m][K = (kt*K_CHUNKS + g)*32 : +32].
-    //
-    // Substituting b = kt*K_CHUNKS + g and o = nt*MFMA_N + m makes this the standard
-    // paged fp4 layout [num_blocks][b(4)][o(PAGE)][16 B], so callers need no fp4-specific
-    // kv writer. The static_assert below pins that equivalence.
+    // holds KV[page token = nt*MFMA_N + m][K = (kt*K_CHUNKS + g)*32 : +32], i.e. the standard
+    // paged fp4 layout [num_blocks][b(4)][o(PAGE)][16 B] (pinned by the static_assert below).
     static constexpr int stride_kv_m     = KV_GRP_BYTES;                      // 16
     static constexpr int stride_kv_ntile = MFMA_N * stride_kv_m;              // 512
     static constexpr int stride_kv_g     = TILES_PER_BLOCK * stride_kv_ntile; // 1024 == PAGE*16
@@ -285,7 +247,7 @@ struct opus_mqa_logits_fp4_traits {
 
     // ---- q_scale: [T][g(K_CHUNKS)][m(MFMA_N)][byte(QS_BYTES)] (e8m0) ----
     // byte (kt*M_TILES + mi) of lane L's dword = e8m0(head mi*32 + m, block kt*K_CHUNKS + g).
-    // In dwords: index = g*MFMA_N + m == L. One load per lane for the whole kernel.
+    // In dwords: index = g*MFMA_N + m == L; one load per lane.
     static constexpr int stride_qs_g_dw = MFMA_M;                          // 32 dwords
     static constexpr int QS_ROW_BYTES   = K_CHUNKS * MFMA_M * QS_BYTES;    // 256
 
@@ -294,8 +256,14 @@ struct opus_mqa_logits_fp4_traits {
     static constexpr int stride_kvs_g_dw  = MFMA_N;                        // 32 dwords
     static constexpr int stride_kvs_block = K_CHUNKS * MFMA_N * KVS_BYTES; // 256 bytes
 
+    // ---- byte counts the launcher checks (names shared with the gfx1250 traits) ----
+    static constexpr int KV_PAGE_BYTES  = stride_kv_block;                  // 4096
+    static constexpr int KVS_PAGE_BYTES = stride_kvs_block;                 // 256
+    static constexpr int PAGES_PER_TILE = KV_TILE_SIZE / PAGE_SIZE;         // 4 (bk=256) / 1
+    static constexpr bool READS_ROW_WINDOWS = false;
+
     // ---- weights: natural [T, H] bf16 ----
-    static constexpr int stride_w_lg   = HEADS_PER_LANE;                   // 32 bf16 (vestigial)
+    static constexpr int stride_w_lg   = HEADS_PER_LANE;                   // 32 bf16
     static constexpr int W_ROW_ELEMS   = GRPM_C * HEADS_PER_LANE;          // 64 == N_HEADS
 
     static_assert(ELEM_BITS == 4, "this traits set is fp4-only");
@@ -318,15 +286,10 @@ struct opus_mqa_logits_fp4_traits {
     static_assert(W_ROW_ELEMS == N_HEADS, "weight preshuffle must be size-preserving");
 };
 
-// ── gfx1250 traits (WMMA 32x16x128) ──────────────────────────────────────────────────
-// ONE kv_cache layout, the natural one: with no FlyDSL kernel on this target there is nothing
-// to be byte-compatible with, so the LDS address formulas below are that layout's, once.
-//
-// KV_TILE_SIZE = 64 is ONE PAGE, and it is the width the accumulator is sized by: N_TILES is
-// KV_TILE_SIZE / MMA_N, so the tile decides ACC_VGPR and ACC_VGPR decides how many waves the
-// allocator fits per SIMD. At 64 that is three, at 128 it is one. **The caller's
-// `cta_resident` follows that occupancy and has to be re-tuned when this number moves** -- a
-// stale value under-sizes the grid, the split cannot fill the part, and nothing reports it.
+// -- gfx1250 traits (WMMA 32x16x128) --------------------------------------------------
+// Natural kv_cache layout. KV_TILE_SIZE sizes the accumulator (ACC_VGPR), which sets waves per
+// SIMD (3 at 64, 1 at 128). The caller's `cta_resident` must be re-tuned if it changes: a stale
+// value silently under-fills the GPU.
 template<int Q_PER_BLOCK_  = 4,
          int LDS_STAGES_   = 2,
          int KV_TILE_SIZE_ = 64,
@@ -339,8 +302,8 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static constexpr int HEAD_DIM     = HEAD_DIM_;
     static constexpr int N_HEADS      = N_HEADS_;
 
-    // A CONSTANT, never `opus::get_warp_size()`: that returns 64 in the host pass, which would
-    // build the wave64 fragment layout with every byte count still matching.
+    // Constant, not opus::get_warp_size(): that returns 64 in the host pass, silently building
+    // the wave64 fragment layout.
     static constexpr int WAVE_SIZE   = 32;
     static constexpr int Q_PER_BLOCK = Q_PER_BLOCK_;               // query rows per CTA == waves
     static constexpr int NUM_WAVES   = Q_PER_BLOCK;
@@ -392,14 +355,12 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static constexpr int KV_PAGE_BYTES  = PAGE_SIZE * TOKEN_BYTES;    // 4096
     static constexpr int KVS_PAGE_BYTES = PAGE_SIZE * SCALE_BYTES_PER_DWORD;  // 256
     static constexpr int W_ROW_ELEMS    = N_HEADS;                    // natural [T, H] bf16
+    static constexpr bool READS_ROW_WINDOWS = true;
 
     static constexpr int KV_CHUNK_BYTES = PAGE_SIZE * KV_GRP_BYTES;   // 1024
 
-    // ── the ABI, as byte offsets within one row / one page ──
-    // `block` is the 32-element E8M0 block index, and it sits INSIDE the token: a token's 128 fp4
-    // elements are 64 contiguous bytes and block `b` is the 16 B at `b * 16`. LDS_BLOCK_BYTES below
-    // takes it from here rather than a literal at the read site -- reading the wrong 16 B is
-    // invisible in the resource report.
+    // -- the ABI, as byte offsets within one row / one page --
+    // `block` is the 32-element E8M0 block inside a token: the 16 B at `b * 16` of its 64 B.
     static constexpr int q_byte(int head, int block) {
         return head * TOKEN_BYTES + block * KV_GRP_BYTES;
     }
@@ -413,7 +374,7 @@ struct opus_mqa_logits_fp4_qshare_traits {
         return token * SCALE_BYTES_PER_DWORD;
     }
 
-    // ── the measured fragment maps, shared by the kernel and the op test's reference ──
+    // -- measured WMMA fragment maps (also used by the op test's reference) --
     static constexpr int lane_m0(int lane) { return lane % GRPN_C; }   // L % 16
     static constexpr int lane_g (int lane) { return lane / GRPN_C; }   // L / 16
 
@@ -469,9 +430,8 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static constexpr int scale_b_sel (int n_tile) { return n_tile % 2; }
     static constexpr int scale_b_lane(int n_tile, int n) { return scale_b_sel(n_tile) * GRPN_C + n; }
 
-    // ── LDS: the tile image, and the one padding policy that breaks the bank conflict ──
-    // TDM copies a page as it is, so the pad is the ONLY LDS-side freedom: WMMA fixes which lane
-    // reads which token, so the lane mapping cannot be rearranged instead.
+    // -- LDS tile image. TDM copies pages verbatim and WMMA fixes the lane->token map, so the
+    // padding is the only way to break the bank conflict. --
     static constexpr int LDS_PAD_INTERVAL = 128;
     static constexpr int LDS_PAD_AMOUNT   =  16;
     static constexpr int LDS_PAD_STRIDE = LDS_PAD_INTERVAL ? LDS_PAD_INTERVAL : 1;
@@ -557,11 +517,8 @@ struct opus_mqa_logits_fp4_qshare_traits {
                   "the natural layout's lanes are 64 B apart and do NOT tile the banks unpadded, "
                   "so this layout may not run the pad off: see the control above.");
 
-    // ── TDM. EVERY wave issues, and that is why the predicate is a compile-time constant and
-    // the steady loop keeps no branch for it: two issuing waves out of four showed up as an
-    // `s_cbranch_vccnz` per phase, splitting the loop into basic blocks. A page splits by
-    // CONTIGUOUS BYTES -- not by token or by K block -- and wave w takes piece (w % SPLIT) of
-    // page (w / SPLIT). ──
+    // -- TDM: every wave issues (keeps the steady loop branch-free). A page splits into
+    // contiguous byte pieces; wave w takes piece (w % SPLIT) of page (w / SPLIT). --
     static constexpr int TDM_ISSUE_WAVES = NUM_WAVES;
     static constexpr int TDM_PAGE_SPLIT  = TDM_ISSUE_WAVES / PAGES_PER_TILE;   // 4
     static constexpr int TDM_OPS_PER_TILE = 2 * TDM_ISSUE_WAVES;               // 8
@@ -588,7 +545,7 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static_assert(TDM_OPS_PER_ISSUING_WAVE <= TDM_INFLIGHT_PER_WAVE,
                   "one tile's share already exceeds a wave's TDM queue depth");
 
-    // ── pipeline depth: it follows from the stage count, not the other way round ──
+    // -- pipeline depth, derived from the stage count --
     static constexpr int TILES_IN_FLIGHT = LDS_STAGES - 1;
     static constexpr int ISSUE_LEAD      = TILES_IN_FLIGHT;   // phase t issues tile t + this
     static_assert(LDS_STAGES >= 2, "need at least a double buffer");
@@ -600,10 +557,8 @@ struct opus_mqa_logits_fp4_qshare_traits {
                   "descriptors MERGED, not a finer split.");
     static constexpr int TENSORCNT_KEEP = (TILES_IN_FLIGHT - 1) * TDM_OPS_PER_ISSUING_WAVE;
 
-    // ── the accumulator: TWO copies, ping-ponged, so tile t+1's WMMAs issue while tile t is
-    // reduced -- the two sets have no data dependency, so the scheduler may interleave a tile's
-    // WMMAs with the previous tile's relu, weight and permlane work. Its width is what sets
-    // occupancy: ACC_VGPR is M_TILES x N_TILES x C_FRAG per set, so the KV tile decides both. ──
+    // -- accumulator: two ping-ponged sets so tile t+1's WMMAs overlap tile t's reduction.
+    // ACC_VGPR scales with the KV tile and sets occupancy. --
     static constexpr int ACC_SETS = 2;
     static constexpr int ACC_VGPR_PER_SET = M_TILES * N_TILES * C_FRAG;   // 128
     static constexpr int ACC_VGPR = ACC_SETS * ACC_VGPR_PER_SET;          // 256
@@ -635,10 +590,9 @@ struct opus_mqa_logits_fp4_qshare_traits {
     static_assert(Q_PER_BLOCK >= 1, "Q_PER_BLOCK must be positive");
 };
 
-using logits_fp4_qshare_traits_4q = opus_mqa_logits_fp4_qshare_traits<4>;
 
-// ── device bodies: one file per arch, split out of this header. Each self-stubs on the
-// wrong arch, so both launch symbols resolve in this one TU. ─────────────────────────
+// -- device bodies, one per arch. Each self-stubs on the wrong arch, so both launch symbols
+// resolve in this one TU. --
 #include "pa_mqa_logits_mxfp4_gfx950.cuh"
 #include "pa_mqa_logits_mxfp4_gfx1250.cuh"
 

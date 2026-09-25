@@ -1553,6 +1553,7 @@ namespace py = pybind11;
           py::arg("row_to_batch"),                       \
           py::arg("cta_info"),                           \
           py::arg("num_tiles"),                          \
+          py::arg("num_rows"),                           \
           py::arg("num_ctas"),                           \
           py::arg("cta_resident"),                       \
           py::arg("block_k"),                            \

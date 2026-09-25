@@ -3,50 +3,28 @@
 
 """MXFP4 paged MQA logits (OPUS) -- correctness and perf, through the arch dispatcher.
 
-Emits five tables -- the corner cases, a causal prefill sweep, ATOM's two CSA-compressed
-prefill regimes (fresh, and chunked at PR #5332's shapes so the two PRs are comparable), and
-an MTP decode sweep -- as markdown for a reader and as one-line JSON records for a benchmark
-driver.
-
-Every launch goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``, the ONE module both arches
-build into, so the path under test is the path a caller gets, layout check included. This file
-runs on BOTH targets: it builds the NATURAL (3-D) scale/cache layouts on gfx1250 and the
-MFMA-permuted (4-D) ones on gfx950 (``_is_permuted`` / ``_scale_to_opus`` below), while the
-dequantized reference reads the natural E8M0 either way. The kernel INSTANCES differ per arch --
-gfx1250 packs up to four query rows per tile (``qlen4_kv64``, ``qlen1_kv64``), gfx950 runs one
-and adds a wider 256-token KV tile (``qlen1_kv64``, ``qlen1_kv256``) -- and ``_variants()``
-returns the right set. The two tile-cut probes
-(``assert_qshare_windows``, ``check_row_id_bound``) are gfx1250-only and gate on ``q_per_block``.
+Tables: corner cases, causal prefill, CSA prefill (fresh, and chunked at PR #5332's shapes),
+and MTP decode -- as markdown and as one-line JSON records for a benchmark driver. Every launch
+goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``. Inputs use the natural (3-D) layouts on
+gfx1250 and the MFMA-permuted (4-D) ones on gfx950; the reference always reads natural E8M0.
 
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py             # the full default sweep
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py -b 1 2      # a quick subset
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py \\
         --data-init constant uniform --scale-init constant auto   # two paired init regimes
 
-DATA AND SCALE ARE TWO INDEPENDENT AXES, not "sample the data then derive the scale by
-quantizing it". The reference dequantizes whatever ``(nibbles, E8M0)`` pair comes out, which is
-defined for any pair, so nothing downstream needs the two to be consistent -- and the exponents
-are then a property of the SCALE axis alone.
+Data and scale are independent axes: the reference dequantizes any ``(nibbles, E8M0)`` pair, so
+the exponent spread is set by ``--scale-init`` alone. The spread is what lets a misrouted scale
+show: if rows 16 apart (one lane half) share an exponent, a wrong ``b_scale_sel`` reads a right
+value. ``correctness_blindness`` skips the correctness sweep for an init pair that cannot fail.
 
-THAT MATTERS BECAUSE THE SPREAD IS LOAD-BEARING. Where neighbouring KV tokens carry the same
-exponent, a scale routed to the WRONG token reads one that happens to be right: a deliberately
-misrouted ``b_scale_sel`` passed the standalone suite at ``cos = 0.999952`` on flat-magnitude
-data and only failed at 0.396 once the exponents spread. ``b_scale_sel`` misroutes across a
-lane HALF, so the number that matters is how often rows 16 apart disagree -- a spread periodic
-in 16 would be as blind as none. ``scale_spread`` measures both, and ``correctness_blindness``
-SKIPS the correctness sweep with the reason in the table for a pair that cannot judge, because
-a probe that cannot fail gets quoted as evidence.
-
-There is no second implementation to cross-check against on this target -- gfx1250 has no
-FlyDSL fp4 MQA-logits kernel -- so the dequantized fp32 reference is the only judge. It runs
-over the same quantized values the kernel sees, so ``err`` is expected at ~1e-6 (fp32
-accumulation order), not at fp4 resolution. The K-permutation and scale-routing probes a
-reference cannot give live in the opus-ops standalone harness.
+The fp32 reference shares this file's view of the scale layout, so on gfx950 the corner cases
+also get an independent FlyDSL cross-check built from the same natural bytes (``vs flydsl``).
 """
 
 import argparse
-import functools
 import itertools
+import math
 import random
 from dataclasses import dataclass
 
@@ -64,7 +42,10 @@ from aiter.benchmark_data_init import (
 )
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.opus._arch import GFX950, _device_arch
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+    _default_variant,
+    _launch,
     pa_mqa_logits_mxfp4,
     pa_mqa_logits_mxfp4_block_table_width,
     pa_mqa_logits_mxfp4_plan,
@@ -76,9 +57,6 @@ from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
 dev = "cuda"
 
-# BOTH targets of the one module. build_inputs picks the layout per arch (`_is_permuted`); the
-# dispatcher checks it. The perf/correctness code never names an arch -- only the layout builder
-# and the two gfx1250-only tile-cut probes do, and those gate on `q_per_block`.
 SUPPORTED_GFX = ["gfx1250", "gfx950"]
 
 HEADS = 64
@@ -88,9 +66,7 @@ SCALE_BLOCK = 32  # E8M0 block
 WEIGHT_SCALE = 1.5
 BLOCKS_ROW = HEAD_DIM // SCALE_BLOCK  # 4 natural E8M0 blocks per row
 
-# gfx950 MFMA-permuted scale geometry, used only when `_is_permuted()`. A lane's 4 E8M0 bytes
-# land in one aligned dword indexed [.., g(K_CHUNKS), m(MFMA_N), byte]; the shuffle is a pure
-# permutation of the natural array, so the reference (which reads the natural E8M0) is unmoved.
+# gfx950 MFMA-permuted scale geometry: a lane's 4 E8M0 bytes in one dword, [.., g, m, byte].
 MFMA_N = 32
 K_TILES = HEAD_DIM // 64  # 2  (MFMA_K = 64)
 K_CHUNKS = 64 // SCALE_BLOCK  # 2  (32-K chunks per k-tile)
@@ -98,60 +74,39 @@ SCALE_BYTES = 4  # K_TILES * n_tiles per lane dword
 
 CSA_RATIO = 4  # ATOM's compression ratio: row n sees floor((pos + 1) / 4)
 
-# Decode: a fixed 32 concurrent sequences, and the windows below are COMPRESSED column counts
-# rather than raw context -- the CSA divide is already applied. A long row scans 25000 columns,
-# which at ratio 4 stands for roughly 100k raw tokens; a short row scans 100.
+# Decode windows are COMPRESSED column counts: 25000 at ratio 4 is ~100k raw tokens.
 DECODE_SEQS = 32
 DECODE_WIN_LONG = 25000
 DECODE_WIN_SHORT = 100
 
-# Window ends around the KV_TILE = 64 boundary, plus the 1-tile and 2-tile pipeline corners --
-# which is where the accumulator ping-pong's peeled first phase and its epilogue run ALONE,
-# rather than as the steady loop's two halves.
+# Window ends around the 64-token tile edges; 1-2 tile windows run the pipeline's peeled
+# prologue and epilogue without a steady-state loop.
 TILE_EDGE_ENDS = (1, 63, 64, 65, 127, 128, 129, 191, 255, 256, 257, 383, 384, 385)
 PREFILL_TOTAL_QLEN = 16384
 PREFILL_QMIN = 800
 N_COS_SAMPLE = 8
 
-# Not a command-line knob on purpose: readings taken at different iteration counts are not
-# comparable on this kernel, so the budget is pinned here.
+# Pinned, not a flag: readings at different iteration counts are not comparable.
 PERF_ITERS = 50
 PERF_WARMUP = 10
 
-# Per-row / per-page byte counts for the traffic denominator. ALL NATURAL on this target, so
-# each is just the product -- no permutation and no padding, unlike the gfx950 sibling.
+# Per-row / per-page byte counts for the traffic denominator (the gfx950 layout only permutes).
 Q_ROW_BYTES = HEADS * HEAD_DIM // 2  # 4096: one packed fp4 query row
 QS_ROW_BYTES = HEADS * BLOCKS_ROW  # 256: its E8M0 scales, [H, 4]
 W_ROW_BYTES = HEADS * 2  # 128: bf16 per-head weights
 KV_PAGE_BYTES = KV_BLOCK_SIZE * HEAD_DIM // 2  # 4096: one packed fp4 page
 KVS_PAGE_BYTES = KV_BLOCK_SIZE * BLOCKS_ROW  # 256: its E8M0 scales, [PAGE, 4]
 
-# `fill_fp4`'s `constant` fills the packed BYTE and its own default is 0, which would make
-# `--data-init constant` the same vacuous all-zero buffer as `zero`. 0x22 is both nibbles at
-# 0x2 = 1.0, so with constant scales and constant weights every in-window cell lands on exactly
-# HEADS * HEAD_DIM * WEIGHT_SCALE = 12288 -- the standalone harness's DIAG=2 probe.
+# `fill_fp4`'s constant fills the packed byte and defaults to 0 (same as `zero`). 0x22 is two
+# 1.0 nibbles, so an all-constant run puts every in-window cell at HEADS*HEAD_DIM*1.5 = 12288.
 FP4_CONSTANT_BYTE = 0x22
 
-# How often rows 16 apart must carry DIFFERENT exponents for a misrouted `b_scale_sel` to be
-# visible at all. Not a tolerance -- below this the correctness sweep does not run.
+# Minimum fraction of rows 16 apart with different exponents; below it the sweep is skipped.
 MISROUTE_DISAGREE_MIN = 0.2
 
-# The fp32 reassociation bound, as a fraction of the checked cells' own magnitude RANGE.
-#
-# A logit is a signed sum over 64 heads, so a cell the weights cancel to near zero still
-# carries the rounding of terms as large as the row's biggest logit: the error scales with the
-# TERMS and not with the result. A constant `atol` cannot express that, and the 1e-2 this
-# replaces was written for values running to ~1e4 -- it went silently too tight once the scale
-# axis moved to the library's pow2_binomial spread and the range reached ~4.5e5.
-#
-# Measured on the 25000-column decode shape, which is where the tail shows up: 4 cells in
-# 200000 land outside a constant 1e-2, every one of them cancelled to |ref| 204..1210 inside a
-# row whose largest logit is 451775, worst delta 0.109 -- 2.4e-7 of the range. Identical to the
-# last bit with the chunk split forced off, so this is the reference and the kernel summing the
-# same 64 terms in different orders, not a kernel result.
-#
-# 1e-6 is that with margin and still ~1000x tighter than the bug class this suite exists to
-# catch: a misrouted scale moves a cell by a FACTOR OF TWO, not by 0.09% of the median cell.
+# fp32 reassociation bound, relative to the checked cells' max |ref|. A logit is a signed sum
+# over 64 heads, so a cancelled cell still carries rounding from terms as large as the row's
+# biggest logit (seen: 2.4e-7 of range). A misrouted scale moves a cell by 2x, far above this.
 REASSOC_ATOL_REL = 1e-6
 
 
@@ -164,28 +119,16 @@ def fill_nibbles(rows, data_init, gen):
 
 
 def fill_exponents(shape, scale_init, gen):
-    """E8M0 on-wire bytes at the library's own pow2 spread.
-
-    ``benchmark_data_init`` offers a narrower ``n`` for a reference that cannot follow the
-    default's 2^-11..2^10, and narrowing is the wrong lever here: it would cost teeth (n=10
-    spreads 18 exponents with rows 16 apart disagreeing 88.8%, against 8 and 78.0% at n=3) to
-    buy back the fp32 headroom ``REASSOC_ATOL_REL`` already accounts for. The default stays.
-    """
+    """E8M0 on-wire bytes at the library's default (widest) pow2 spread; a narrower one would
+    blunt the misroute check, and ``REASSOC_ATOL_REL`` already covers the fp32 range."""
     return fill_scale_e8m0(shape, scale_init, gen, device=dev)
 
 
 def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
     """``[..., d/2]`` packed e2m1 + ``[..., d/block]`` E8M0 -> ``[..., d]`` fp32.
 
-    Defined for ANY pair, which is what lets the two init axes stay independent: nothing here
-    assumes the exponents were derived by quantizing these nibbles.
-
-    BOTH decodes come from ``aiter.utility.fp4_utils`` rather than from arithmetic here, so the
-    reference cannot drift from what ``fill_fp4`` / ``fill_scale_e8m0`` write. That matters at
-    the two E8M0 encodings a plain ``2^(byte - 127)`` gets wrong: ``0xFF`` is the NaN sentinel,
-    which the kernel propagates through the relu, where the power would give +inf. Neither
-    generator emits it today -- ``pow2_binomial`` spans bytes 116..137 -- so this is about the
-    reference staying canonical rather than about a case the suite currently reaches.
+    Defined for any pair. Both decodes come from ``aiter.utility.fp4_utils`` so the reference
+    stays canonical, e.g. E8M0 ``0xFF`` decodes to NaN rather than +inf.
     """
     *prefix, d_half = packed.shape
     d = d_half * 2
@@ -195,18 +138,15 @@ def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
 
 
 # ── per-arch scale/cache layout ───────────────────────────────────────────────
-@functools.cache
 def _is_permuted() -> bool:
-    """True on gfx950 (MFMA-permuted 4-D scales + 4-chunk kv_cache), False on gfx1250 (natural
-    3-D). Lazy for the same reason as ``_variants``: the arch probe inits HIP at import, which
-    ``main()``'s gate is meant to run before."""
-    return get_gfx() == "gfx950"
+    """True on gfx950 (MFMA-permuted layouts), False on gfx1250 (natural). Queried per call on
+    the current device, never at import (the probe inits HIP before ``main()``'s arch gate)."""
+    return _device_arch(torch.cuda.current_device()) == GFX950
 
 
 def _scale_to_opus(e8_nat, rows_per_group):
     """``[rows, 4]`` natural E8M0 -> ``[rows/rpg, K_CHUNKS, MFMA_N, SCALE_BYTES]``, gfx950's
-    layout. ``rows_per_group`` is ``MFMA_N * n_tiles``: 64 heads per query row for q_scale, 64
-    page tokens per block for kv_scale. A pure permutation -- no byte dropped or duplicated.
+    layout; a pure permutation. ``rows_per_group``: 64 heads (q_scale) or 64 page tokens (kv).
     """
     n_tiles = rows_per_group // MFMA_N
     groups = e8_nat.shape[0] // rows_per_group
@@ -230,29 +170,21 @@ class Inputs:
     kv_dq: torch.Tensor  # [bs, t_max, D] dequantized
     block_tables: torch.Tensor
     max_seq_len: int
+    q_e8: torch.Tensor  # [T*H, 4] natural E8M0, the source of every q_scale layout
+    kv_e8: torch.Tensor  # [nb*PAGE, 4] natural E8M0, the source of every kv_scale layout
 
 
 def pages_for(max_end):
-    """Pages per sequence, rounded so a CTA never indexes past the table.
-
-    Rounded to a whole KV TILE and not to a page: a CTA covers its window in whole tiles and
-    reads ``block_tables`` at every page of the last one, even where the window stops inside
-    it.
+    """Pages per sequence, rounded up to a whole KV tile of the widest compiled variant, since a
+    CTA reads ``block_tables`` for every page of its last tile. Uses the op's own sizing helper.
     """
-    # Sized for EVERY compiled variant, not just the one this shape will pick: a test holds one
-    # block_tables per case and the plan chooses from the shape. That is what the op's own
-    # sizing helper is for, and open-coding the rounding is how it drifts.
     return pa_mqa_logits_mxfp4_block_table_width(
         max(max_end, 1), kv_block_size=KV_BLOCK_SIZE
     )
 
 
 def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
-    """Every buffer from ONE seeded generator, so a ``--seed`` reproduces the case bit for bit.
-
-    The nibbles and the exponents are drawn separately and never reconciled -- see the module
-    docstring for why that is the point rather than a shortcut.
-    """
+    """Every buffer from one seeded generator; nibbles and exponents are drawn independently."""
     gen = make_generator(seed, device=dev)
     mbps = pages_for(max_end)
     t_max = mbps * KV_BLOCK_SIZE
@@ -260,8 +192,7 @@ def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
 
     permuted = _is_permuted()
 
-    # --- KV. The reference always reads the NATURAL (kv_packed, kv_e8); the kernel reads the
-    # arch's own scale/cache layout, both pure reshapes/permutations of the same bytes. ---
+    # --- KV: the reference reads natural (kv_packed, kv_e8); the kernel the arch's layout. ---
     kv_packed = fill_nibbles(bs * t_max, data_init, gen)
     kv_e8 = fill_exponents((bs * t_max, BLOCKS_ROW), scale_init, gen)
     kv_dq = fp4_dequant(kv_packed, kv_e8).reshape(bs, t_max, HEAD_DIM)
@@ -308,6 +239,8 @@ def build_inputs(bs, max_end, total_tokens, seed, data_init, scale_init):
         kv_dq=kv_dq,
         block_tables=block_tables,
         max_seq_len=t_max,
+        q_e8=q_e8,
+        kv_e8=kv_e8,
     )
 
 
@@ -328,13 +261,8 @@ def ref_rows(inp, rows, rb, ls, le):
 
 
 def check_rows(out, ref, msg):
-    """``checkAllclose`` over the in-window cells of the sampled rows, concatenated into one
-    flat pair because every row has a different window. Returns the MISMATCH RATIO.
-
-    ``atol`` is taken from the checked cells' own range rather than fixed, for the reason
-    ``REASSOC_ATOL_REL`` gives: the cells that need it are the ones the 64-head sum cancels,
-    and what bounds their error is the size of the TERMS, which no constant can know.
-    """
+    """Mismatch ratio over the sampled rows' in-window cells; ``atol`` scales with their range
+    (see ``REASSOC_ATOL_REL``)."""
     got, want = [], []
     for r, (s, e, vals) in ref.items():
         if vals is None:
@@ -349,12 +277,8 @@ def check_rows(out, ref, msg):
 
 
 def roofline_bytes(rb, le, total_q, n_logits):
-    """Bytes a launch must move at least once -- NOT one K vector per output logit.
-
-    The per-logit count is meaningless here: every query row of a batch scores against the same
-    KV pages, so on a long-context shape it implies a ~14000x reuse factor and reports a figure
-    above the card's HBM peak. Counting each page once makes this a lower bound on real
-    traffic, which is a reading that can be held against a hardware limit."""
+    """Lower bound on bytes moved: each KV page once per batch, not one K vector per logit
+    (rows of a batch share pages, so per-logit counting exceeds HBM peak)."""
     if rb.numel() == 0:
         return 0
     ends = torch.zeros(int(rb.max().item()) + 1, dtype=torch.int64, device=rb.device)
@@ -368,21 +292,16 @@ def roofline_bytes(rb, le, total_q, n_logits):
 
 
 def oob_is_neginf(out, ls, le):
-    """Every cell outside ``[local_start, local_end)`` must be left at the -inf pre-fill.
-
-    Not redundant with ``check_rows``: this is what caught a store path writing ``own_start``
-    columns BELOW every window while the cosine stayed clean."""
+    """Every cell outside ``[local_start, local_end)`` must keep its -inf pre-fill; catches
+    stray stores that leave the in-window values correct."""
     col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
     inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
     return bool(torch.isneginf(out[~inside]).all().item())
 
 
 def window_is_written(out, ls, le):
-    """Every cell inside ``[local_start, local_end)`` must have been stored to.
-
-    ``check_rows`` sees a dropped token too, but only on the rows it sampled. This scans every
-    row, which is what makes it the check that catches a ``num_groups`` short of the tail.
-    """
+    """Every cell inside ``[local_start, local_end)`` was stored, over all rows (``check_rows``
+    only samples), so a dropped tail tile shows."""
     col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
     inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
     return bool(torch.isfinite(out[inside]).all().item())
@@ -396,50 +315,101 @@ def sample_rows(total, le, n=N_COS_SAMPLE, seed=0):
     return sorted(rng.sample(nonempty, min(n, len(nonempty))))
 
 
-# ── correctness ───────────────────────────────────────────────────────────────
-@functools.cache
-def _variants():
-    """The kernel instances this build compiled, looked up LAZILY.
+# ── gfx950 second opinion: FlyDSL, on its own layout ─────────────────────────
+# FlyDSL's preshuffle is a different permutation (16-row MFMA tiles), built from the natural
+# `q_e8` / `kv_e8`, so a layout bug shared by `_scale_to_opus` and the kernel cannot pass both.
+FLY_MFMA_M = 16
+FLY_KVS_NTPW = 4
 
-    Never at module scope: the probe reads the device's properties, so it initializes the HIP
-    context at IMPORT and raises outright on an arch ``main()`` is meant to skip -- and CI
-    discovers every ``op_tests/test_*.py`` on the other shards. The gate has to run first.
+
+def _q_scale_flydsl(e8_nat, total_tokens):
+    """``[T*H, 4]`` -> FlyDSL's ``[T, D/128, 4, 16, QS_PAD]``."""
+    m_tiles = HEADS // FLY_MFMA_M
+    qs_pad = ((m_tiles + 3) // 4) * 4
+    qe = (
+        e8_nat.reshape(total_tokens, m_tiles, FLY_MFMA_M, HEAD_DIM // 128, 4)
+        .permute(0, 3, 4, 2, 1)  # [T, K_TILES_16, 4, 16, M_TILES]
+        .contiguous()
+    )
+    return torch.nn.functional.pad(qe, (0, qs_pad - m_tiles)).contiguous()
+
+
+def _kv_scale_flydsl(e8_nat, num_blocks):
+    """``[nb*PAGE, 4]`` -> FlyDSL's ``[nb, 1, 4, PAGE]``, token o at ``(o%16)*4 + o//16``."""
+    o = torch.arange(KV_BLOCK_SIZE, device=e8_nat.device)
+    sflat = (o % FLY_MFMA_M) * FLY_KVS_NTPW + (o // FLY_MFMA_M)
+    out = torch.zeros(
+        num_blocks, 1, 4, KV_BLOCK_SIZE, dtype=torch.uint8, device=e8_nat.device
+    )
+    out[:, 0, :, sflat] = e8_nat.reshape(num_blocks, KV_BLOCK_SIZE, 4).permute(0, 2, 1)
+    return out.contiguous()
+
+
+def flydsl_cross_check(inp, out, rb, ls, le, variant):
+    """Mismatch ratio of ``out`` against FlyDSL over every in-window cell, or NaN when skipped:
+    off gfx950, FlyDSL not importable, or any window start not a multiple of 4 (FlyDSL at
+    ``num_warps = 1`` drops the leading unaligned cells).
     """
+    if not _is_permuted() or bool((ls % 4 != 0).any().item()):
+        return float("nan")
+    try:
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+            compute_prefill_schedule,
+            flydsl_pa_mqa_logits_fp4_prefill,
+        )
+    except Exception as e:  # noqa: BLE001 -- any import failure means "no second opinion"
+        aiter.logger.warning("FlyDSL cross-check unavailable: %s: %s", type(e).__name__, e)
+        return float("nan")
+    total_q = int(rb.numel())
+    num_blocks = inp.block_tables.numel()
+    msl = inp.max_seq_len
+    _, cta, n_ctas = compute_prefill_schedule(rb, ls, le, variant.block_k, total_q, msl)
+    fly = torch.full((total_q, msl), float("-inf"), dtype=torch.float32, device=dev)
+    flydsl_pa_mqa_logits_fp4_prefill(
+        inp.q_packed, _q_scale_flydsl(inp.q_e8, total_q),
+        inp.kv_cache.view(-1, 1, 4, KV_BLOCK_SIZE, 16),
+        _kv_scale_flydsl(inp.kv_e8, num_blocks), inp.block_tables, inp.weights,
+        rb, ls, le, msl,
+        weight_scale=WEIGHT_SCALE, block_k=variant.block_k, kv_block_size=KV_BLOCK_SIZE,
+        num_warps=4 if variant.block_k == 256 else 1,
+        out=fly, cta_info=cta, n_ctas=n_ctas,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    col = torch.arange(msl, device=dev).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    want, got = fly[inside].float(), out[inside].float()
+    if want.numel() == 0:
+        return float("nan")
+    atol = max(1e-2, REASSOC_ATOL_REL * float(want.abs().max()))
+    return checkAllclose(
+        want, got, rtol=2e-5, atol=atol, msg="vs flydsl", printLog=False
+    )
+
+
+# ── correctness ───────────────────────────────────────────────────────────────
+def _variants():
+    """Compiled instances for the current device. Looked up lazily, never at import: the probe
+    inits HIP and raises on arches ``main()`` is meant to skip on other CI shards."""
     return pa_mqa_logits_mxfp4_variants()
 
 
 def _qpb_max():
-    """The widest ``Q_PER_BLOCK`` compiled. ``_g4`` replicates rows by it so a group's rows
-    share a window exactly on the widest instance; a narrower one cuts the same data finer,
-    which is a regime the cases want covered rather than avoided."""
+    """The widest compiled ``Q_PER_BLOCK`` (the row replication factor of ``_g4``)."""
     return max((v.q_per_block for v in _variants()), default=4)
 
 
 def _resolve_variant(name):
-    """The perf decode sweep names instances by the shared ``qlen{Q}_kv{K}`` convention. Both
-    arches compile ``qlen1_kv64``, so it resolves natively on each; a name the running arch did
-    NOT compile (gfx1250's ``qlen4_kv64`` on gfx950, or gfx950's ``qlen1_kv256`` on gfx1250)
-    falls back to its default (``None``), so one shape list drives both targets."""
+    """``name`` if this arch compiled it, else ``None`` (the op default), so one decode shape
+    list drives both targets."""
     if name is None:
         return None
     return name if name in {v.name for v in _variants()} else None
 
 
 def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends, q_per_block):
-    """Check the one condition the schedule takes on faith: within a tile the window rule is
-    NON-DECREASING, so the union is the first row's start and the LAST row's end -- two loads
-    instead of a reduction. A violation makes the builder compute a union that is not one, so
-    rows whose window reaches past it are scored short.
-
-    Host-side and synchronising, which is why it lives here and not in the op: it is worth three
-    device-to-host copies in a correctness sweep and nothing in a hot path.
-
-    ``q_per_block`` must be THIS plan's instance and never the widest one the build compiled:
-    the one-row instance cuts every tile to a single row, so a bound taken from the widest
-    would be satisfied by anything and the span check would stop checking.
-
-    "A tile is contiguous rows of one batch" is not checked, because the tile cut inside
-    ``pa_mqa_logits_mxfp4_plan`` is what produces the array and guarantees it.
+    """Assert windows are non-decreasing within each tile, which the schedule assumes so a
+    tile's union is first start .. last end. Host-side (syncs), so it lives in the test.
+    ``q_per_block`` must be this plan's instance, or the span check is vacuous.
     """
     ct = cu_tiles[: num_tiles + 1].tolist()
     ls = local_starts.tolist()
@@ -466,23 +436,17 @@ def run_one(inp, qlens, rb, ls, le, label, seed, variant, check_windows=True):
     cu = torch.tensor(
         [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
     )
-    # The buffers carry the instance, so allocating them is the only way to run a case on
-    # something other than what the plan's own `total_q // batch` rule would choose. It is also
-    # the only path in this file that touches `plan_buffers` at all.
+    # The buffers carry the instance, which is how a case pins one instead of the plan's pick.
     buffers = pa_mqa_logits_mxfp4_plan_buffers(
         dev, total_q, len(qlens), variant=variant
     )
-    # `local_starts` is passed because these cases carry non-zero window starts; ATOM's paths do
-    # not and leave it None. `row_to_batch` is passed because `block_tables` here is per
-    # SEQUENCE -- leaving it None would make the kernel read the table by query row.
+    # Non-zero window starts need `local_starts`; `row_to_batch` because block_tables is per
+    # sequence, not per query row.
     plan = pa_mqa_logits_mxfp4_plan(
         cu, le, buffers=buffers, total_q=total_q, local_starts=ls, row_to_batch=rb
     )
     if check_windows and plan.variant.q_per_block > 1:
-        # The condition the kernel cannot check. Host-side and synchronising, so it runs in the
-        # correctness path only -- and it is worth running, because breaking it DEADLOCKS the
-        # CTA rather than returning a wrong answer. Only a tile WIDER than one row can violate it,
-        # so it is moot at q_per_block == 1 (gfx950, and gfx1250's one-row instance).
+        # Unchecked by the kernel, and a violation deadlocks the CTA; moot at one row per tile.
         assert_qshare_windows(
             plan.cu_tiles, plan.num_tiles, ls, le, plan.variant.q_per_block
         )
@@ -498,11 +462,13 @@ def run_one(inp, qlens, rb, ls, le, label, seed, variant, check_windows=True):
     err = check_rows(out, ref_rows(inp, rows, rb, ls, le), f"{label}")
     oob = oob_is_neginf(out, ls, le)
     wr = window_is_written(out, ls, le)
+    fly = flydsl_cross_check(inp, out, rb, ls, le, plan.variant)
+    fly_ok = math.isnan(fly) or fly == 0
     return {
         "case": label, "variant": plan.variant.name,
         "rows": total_q, "tiles": plan.num_tiles, "ctas": plan.num_ctas,
-        "max_win": int(le.max()), "err": err, "oob -inf": oob,
-        "window written": wr, "pass": err == 0 and oob and wr,
+        "max_win": int(le.max()), "err": err, "vs flydsl": fly, "oob -inf": oob,
+        "window written": wr, "pass": err == 0 and oob and wr and fly_ok,
     }  # fmt: skip
 
 
@@ -530,9 +496,8 @@ def check_prefill(windows_per_batch, seed, label, data_init, scale_init, variant
 
 
 def _g4(windows_per_batch):
-    """Replicate each row ``_qpb_max()`` times so a group's rows share a window exactly -- the
-    EASY regime. The CSA rules below are the hard one, where adjacent rows of a group differ by
-    a column and the loop bound has to be their union."""
+    """Replicate each row ``_qpb_max()`` times so a tile's rows share one window (the easy
+    regime; the CSA rules below make adjacent rows differ)."""
     return [[r for r in b for _ in range(_qpb_max())] for b in windows_per_batch]
 
 
@@ -547,54 +512,35 @@ def _csa_chunked(qlen, kvlen):
     return [(0, kvlen - (qlen - 1 - n) // CSA_RATIO) for n in range(qlen)]
 
 
-# A `cu_seq_q` claiming more rows than `q` holds. 14 against 10 puts BOTH of the kernel's
-# row_id clauses on the path: the cut is [0,4) [4,8) [8,12) [12,14), so tile 2 straddles the
-# real row count (the per-wave clause) and tile 3 is past it entirely (the CTA-uniform one).
+# `cu_seq_q` claims 14 rows over a 10-row `q`: at 4 rows per tile the cut [8,12) straddles the
+# bound (per-wave clause) and [12,14) is past it (CTA-uniform clause).
 ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS, ROWID_WIN = 10, 14, 200
+ROWID_CU = (0, 4, 8, ROWID_CLAIMED_ROWS)
 
 
 def check_row_id_bound(data_init, scale_init, seed, variant):
-    """The one caller inconsistency the kernel has to survive rather than diagnose.
-
-    ``cu_seq_q[batch]`` is device data, so no launcher check can compare it against
-    ``q.shape[0]`` -- reading it host-side is the sync this whole design exists to avoid.
-    Unbounded, the chain ``cu_seq_q -> cu_tiles -> rec.row_id -> row_id`` puts a CTA's reads
-    past ``q`` / ``q_scale`` / ``weights`` and its WRITES past ``out``. The kernel bounds
-    ``row_id`` against ``num_rows`` instead, so the surplus rows are dropped and the real ones
-    stay right.
-
-    THIS CASE IS THE ONLY THING THAT WALKS THAT PATH -- every other case here builds
-    ``cu_seq_q`` and ``q`` from one ``qlens``, so the rows always agree.
-
-    **What gives it teeth is the oversized `out`, not the hope of a fault.** With a
-    right-sized one the unbounded kernel overruns by 4 KB, which the caching allocator usually
-    absorbs: no fault, no wrong answer in the rows that are checked, and the probe passes while
-    establishing nothing. So `out` is allocated for all ``claimed`` rows and the surplus ones
-    are required to stay at their -inf pre-fill. That is the same `row_id` the overrun would
-    have used, so it tests the bound and not a symptom.
-
-    Both clauses need a tile WIDER than one row, so only the qshare instances put the per-wave
-    half on the path; at one row per CTA the cut is `[0,1) .. [13,14)`, no tile straddles
-    ``real`` and the CTA-uniform clause is the only one that can fire. Run on both anyway --
-    the CTA-uniform half is the one that bounds the store, and it is the whole probe there.
+    """Device-side ``cu_seq_q`` claims more rows than ``q`` holds (host checks all pass); the
+    kernel must bound ``row_id`` by ``num_rows`` and drop the surplus. The oversized ``out``
+    gives it teeth: surplus rows must stay -inf, where a right-sized one would absorb the
+    overrun silently. Only multi-row tiles read ``cu_seq_q``; at one row it is a control.
     """
     real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
-    inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
+    bs = len(ROWID_CU) - 1
+    inp = build_inputs(bs, ROWID_WIN, real, seed, data_init, scale_init)
 
     def t(v):
         return torch.tensor(v, dtype=torch.int32, device=dev)
 
-    # The window arrays describe `claimed` rows; `q` holds `real`. Every launcher check passes:
-    # num_rows is q.shape[0], local_ends is longer than it, and out is longer still.
-    rb = torch.zeros(claimed, dtype=torch.int32, device=dev)
+    # Windows and `out` cover `claimed` rows; `q` and `total_q` hold `real`.
+    rb = t([b for b in range(bs) for _ in range(ROWID_CU[b + 1] - ROWID_CU[b])])
     ls = torch.zeros(claimed, dtype=torch.int32, device=dev)
     le = t([ROWID_WIN] * claimed)
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, bs, variant=variant)
     plan = pa_mqa_logits_mxfp4_plan(
-        t([0, claimed]),
+        t(list(ROWID_CU)),
         le,
         buffers=buffers,
-        total_q=claimed,
+        total_q=real,
         local_starts=ls,
         row_to_batch=rb,
     )
@@ -608,12 +554,11 @@ def check_row_id_bound(data_init, scale_init, seed, variant):
     )  # fmt: skip
     torch.cuda.synchronize()
 
-    # Scored over the rows `q` actually holds -- the surplus ones have no Q to be right about.
     rows = list(range(real))
     err = check_rows(out, ref_rows(inp, rows, rb, ls, le), "row_id bound")
     oob = oob_is_neginf(out[:real], ls[:real], le[:real])
     wr = window_is_written(out[:real], ls[:real], le[:real])
-    # The clause that fails without the kernel's bound: rows past `q` were never scheduled.
+    # Fails without the kernel's bound: rows past `q` must stay untouched.
     untouched = bool(torch.isneginf(out[real:]).all().item())
     ret = {
         "data_init": data_init, "scale_init": scale_init, "seed": seed,
@@ -628,16 +573,163 @@ def check_row_id_bound(data_init, scale_init, seed, variant):
     return ret
 
 
+def check_raw_row_guard(data_init, scale_init, seed, variant):
+    """Kernel row bound on both arches: a raw ``_launch`` of a 14-row schedule over a 10-row
+    ``q`` with ``num_rows = 10`` must leave rows 10..13 of the oversized ``out`` at -inf.
+    Unreachable through the public op, which passes the plan's own row count.
+    """
+    real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
+    inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
+
+    def t(v):
+        return torch.tensor(v, dtype=torch.int32, device=dev)
+
+    rb = torch.zeros(claimed, dtype=torch.int32, device=dev)
+    ls = torch.zeros(claimed, dtype=torch.int32, device=dev)
+    le = t([ROWID_WIN] * claimed)
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
+    plan = pa_mqa_logits_mxfp4_plan(
+        t([0, claimed]), le, buffers=buffers, total_q=claimed, local_starts=ls, row_to_batch=rb
+    )
+    out = torch.full(
+        (claimed, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+    _launch(
+        plan.variant, inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+        inp.weights, plan.local_ends, plan.cta_info, plan.num_ctas, real, inp.max_seq_len,
+        local_starts=plan.local_starts, weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
+        out=out,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    err = check_rows(out, ref_rows(inp, list(range(real)), rb, ls, le), "raw row guard")
+    oob = oob_is_neginf(out[:real], ls[:real], le[:real])
+    wr = window_is_written(out[:real], ls[:real], le[:real])
+    untouched = bool(torch.isneginf(out[real:]).all().item())
+    ret = {
+        "data_init": data_init, "scale_init": scale_init, "seed": seed,
+        "case": f"raw launch: cta_info {claimed} rows, num_rows {real}",
+        "variant": plan.variant.name, "rows": real,
+        "tiles": plan.num_tiles, "ctas": plan.num_ctas, "max_win": ROWID_WIN,
+        "err": err, "oob -inf": oob and untouched, "window written": wr,
+        "pass": err == 0 and oob and untouched and wr,
+    }  # fmt: skip
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
+
+
+def check_row_count_raises(data_init, scale_init, seed, variant):
+    """Host-visible row mismatches must raise before any kernel runs: a plan for 14 rows over a
+    10-row ``q`` (checked in C++ ``fwd_sched``), and ``local_ends`` shorter than ``total_q``
+    (checked in ``build_sched``).
+    """
+    real, claimed = ROWID_REAL_ROWS, ROWID_CLAIMED_ROWS
+    inp = build_inputs(1, ROWID_WIN, real, seed, data_init, scale_init)
+
+    def t(v):
+        return torch.tensor(v, dtype=torch.int32, device=dev)
+
+    def raises(fn, needle):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- AITER_CHECK surfaces as RuntimeError
+            return needle in str(e)
+        return False
+
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
+    le = t([ROWID_WIN] * claimed)
+    plan = pa_mqa_logits_mxfp4_plan(
+        t([0, claimed]), le, buffers=buffers, total_q=claimed,
+        row_to_batch=torch.zeros(claimed, dtype=torch.int32, device=dev),
+    )  # fmt: skip
+    q_short = raises(
+        lambda: pa_mqa_logits_mxfp4(
+            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+            inp.weights, plan, inp.max_seq_len,
+            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
+        ),
+        "num_rows",
+    )  # fmt: skip
+    ends_short = raises(
+        lambda: pa_mqa_logits_mxfp4_plan(
+            t([0, claimed]), t([ROWID_WIN] * real), buffers=buffers, total_q=claimed
+        ),
+        "local_ends",
+    )
+    torch.cuda.synchronize()
+    del inp
+    torch.cuda.empty_cache()
+    return {
+        "data_init": data_init, "scale_init": scale_init, "seed": seed,
+        "case": f"host raises: plan {claimed} > q {real}, local_ends {real} < total_q {claimed}",
+        "variant": variant if isinstance(variant, str) else variant.name,
+        "rows": claimed, "pass": q_short and ends_short,
+    }  # fmt: skip
+
+
+# ATOM's cudagraph decode metadata: batch padded to the captured size, `cu_seq_q` flat over
+# the pad tail, pad rows with `row_to_batch = -1` and empty windows. Contexts cross tile edges.
+ATOM_REAL_CTX = (300, 70, 129, 1, 257)
+ATOM_PAD_SEQS = 8
+
+
+def check_atom_decode(data_init, scale_init, seed, variant, mtp, pad_seqs):
+    """One ATOM-shaped decode: live sequences of ``mtp`` rows padded to ``pad_seqs``. Pad rows
+    must stay -inf (pre-filled only to make that visible). ``pad_seqs == live`` leaves surplus
+    tiles at ``r0 == total_q``, one past the end of ``row_to_batch``.
+    """
+    live = len(ATOM_REAL_CTX)
+    total_q = pad_seqs * mtp
+    real_q = live * mtp
+    inp = build_inputs(live, max(ATOM_REAL_CTX), total_q, seed, data_init, scale_init)
+
+    def t(v):
+        return torch.tensor(v, dtype=torch.int32, device=dev)
+
+    # MTP tail-causal: row j of a sequence sees `ctx - (mtp - 1 - j)`.
+    rb = t([b for b in range(live) for _ in range(mtp)] + [-1] * (total_q - real_q))
+    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
+    le = t(
+        [max(c - (mtp - 1 - j), 0) for c in ATOM_REAL_CTX for j in range(mtp)]
+        + [0] * (total_q - real_q)
+    )
+    cu = t([b * mtp for b in range(live + 1)] + [real_q] * (pad_seqs - live))
+    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, pad_seqs, variant=variant)
+    plan = pa_mqa_logits_mxfp4_plan(
+        cu, le, buffers=buffers, total_q=total_q, row_to_batch=rb
+    )
+    out = torch.full(
+        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+    pa_mqa_logits_mxfp4(
+        inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+        inp.weights, plan, inp.max_seq_len,
+        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    rows = [r for r in range(real_q) if int(le[r]) > 0]
+    err = check_rows(out, ref_rows(inp, rows, rb, ls, le), "atom decode")
+    # Over EVERY row, pad rows included: an empty window leaves the whole row at -inf.
+    oob = oob_is_neginf(out, ls, le)
+    wr = window_is_written(out, ls, le)
+    ret = {
+        "data_init": data_init, "scale_init": scale_init, "seed": seed,
+        "case": f"atom decode mtp={mtp} {live}/{pad_seqs} seqs", "variant": plan.variant.name,
+        "rows": total_q, "tiles": plan.num_tiles, "ctas": plan.num_ctas,
+        "max_win": int(le.max()), "err": err, "oob -inf": oob, "window written": wr,
+        "pass": err == 0 and oob and wr,
+    }  # fmt: skip
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
+
+
 def run_corner(data_init, scale_init, seed):
-    """The cases the qshare contract is made of: short groups at every residue mod
-    the widest Q_PER_BLOCK, windows not starting at 0, the KV_TILE = 64 neighbourhood, every
-    window start mod 128, and both ATOM CSA regimes where a group's rows differ by a column.
-
-    Every case runs on every compiled instance, so the count below is the case list times
-    ``len(_variants())``.
-
-    The per-case seeds below are OFFSETS from ``--seed``: the cases stay distinct from one
-    another while the whole sweep moves with the flag.
+    """Corner cases (short groups, offset starts, tile edges, starts mod 128, CSA regimes) on
+    every compiled instance, plus the row-count probes and ATOM decode. Case seeds are offsets
+    from ``--seed``.
     """
     cases = [
         (_g4([[(0, 50), (0, 120), (0, 200)], [(0, 40), (0, 100)]]), 0, "ragged/2b"),
@@ -666,43 +758,41 @@ def run_corner(data_init, scale_init, seed):
             "csa mixed",
         ),
     ]
-    # EVERY compiled instance, and not the one the plan would pick on its own. The default rule
-    # is `total_q // batch` and no case above has fewer than two rows per sequence -- the
-    # shortest is `csa short groups` at 8 rows over 4 batches -- so left to itself this suite
-    # builds the qshare instance 14 times and the one-row instance never. The probes' coverage
-    # is stated in TILE units, so it has to be re-established per instance rather than
-    # inherited: a tile is four rows for one of them and one row for the other.
+    # Every compiled instance, pinned: left to the plan, these shapes would never pick one-row.
     variants = _variants()
     if not variants:
         raise RuntimeError(
             "no compiled kernel instances to run the corner suite on; an empty sweep reports "
             "`pass` having tested nothing"
         )
-    # `check_row_id_bound` walks the gfx1250 cu_seq_q -> cu_tiles -> row_id overrun path and its
-    # tile straddle -- a gfx1250-only guarantee. gfx950 cuts one row per tile and its callers
-    # build cu_seq_q from the same qlens as q, so that path is never taken; skip it there.
+    # The cu_seq_q probe is gfx1250-only (only its tile cut reads cu_seq_q); the others run on both.
     row_id = (
         []
         if _is_permuted()
         else [check_row_id_bound(data_init, scale_init, seed + 70, v) for v in variants]
-    )
+    ) + [
+        check(data_init, scale_init, seed + 72, v)
+        for check in (check_row_count_raises, check_raw_row_guard)
+        for v in variants
+    ]
+    atom = [
+        check_atom_decode(data_init, scale_init, seed + 90 + mtp, v, mtp, pad)
+        for v in variants
+        for mtp, pad in ((1, ATOM_PAD_SEQS), (2, ATOM_PAD_SEQS), (2, len(ATOM_REAL_CTX)))
+    ]
     return [
         check_prefill(w, seed + case_seed, label, data_init, scale_init, v)
         for v in variants
         for w, case_seed, label in cases
-    ] + row_id
+    ] + row_id + atom
 
 
 SPREAD_PROBE_ROWS = 4096
 
 
 def scale_spread(scale_init, seed=0, rows=SPREAD_PROBE_ROWS):
-    """What a ``--scale-init`` can see, measured on the array the sweep would actually build.
-
-    Returns ``(distinct exponents, fraction of rows 16 apart that disagree)``. The second is
-    the one that decides: ``b_scale_sel`` misroutes across a lane HALF, so a spread periodic in
-    16 hides a misroute as completely as a flat one.
-    """
+    """``(distinct exponents, fraction of rows 16 apart that disagree)`` for a ``--scale-init``.
+    The second decides: a lane-half misroute is invisible to a spread periodic in 16."""
     e8 = fill_exponents(
         (rows, BLOCKS_ROW), scale_init, make_generator(seed, device=dev)
     )
@@ -713,14 +803,8 @@ def scale_spread(scale_init, seed=0, rows=SPREAD_PROBE_ROWS):
 
 
 def correctness_blindness(data_init, scale_init):
-    """Why this init pair cannot judge a wrong answer, or ``None`` when it can.
-
-    There is no second implementation on this target, so the dequantized reference is the only
-    judge and it shares this file's understanding of the layout. That leaves two ways for the
-    sweep to pass while establishing nothing, and both are properties of the INIT PAIR rather
-    than of the kernel -- so they skip the sweep with the reason in the table instead of
-    passing it.
-    """
+    """Why this init pair cannot catch a wrong answer (all-zero data, or too little exponent
+    spread), or ``None`` when it can. Such pairs are skipped with the reason, not passed."""
     if data_init == "zero":
         return "data-init zero makes every fp4 nibble 0, so the reference agrees with anything"
     distinct, disagree = scale_spread(scale_init)
@@ -735,14 +819,9 @@ def correctness_blindness(data_init, scale_init):
 
 # ── NaN E8M0 scale propagation ────────────────────────────────────────────────
 def poison_kv_rows(kv_scale, block_tables, row_in_seq):
-    """A copy of ``kv_scale`` with KV row ``row_in_seq`` of EVERY batch set to 0xFF (E8M0 NaN).
-
-    Every batch, because the block tables differ per batch and poisoning only batch 0's would
-    leave the others as an untested control. Poisoned by MARKING in the NATURAL layout and pushing
-    the mark through the arch's own permutation (``_scale_to_opus`` on gfx950, identity on
-    gfx1250), rather than by computing where those bytes land -- the permutation is the thing
-    under test's own ABI, so rederiving it here would let the test and the kernel agree on a wrong
-    offset.
+    """A copy of ``kv_scale`` with KV row ``row_in_seq`` of every batch set to 0xFF (E8M0 NaN).
+    The mark is set in the natural layout and pushed through the arch's layout transform rather
+    than by computing byte offsets by hand.
     """
     nb = block_tables.numel()  # one entry per (batch, page)
     mark = torch.zeros(nb * KV_BLOCK_SIZE, BLOCKS_ROW, dtype=torch.uint8, device=dev)
@@ -757,14 +836,13 @@ def poison_kv_rows(kv_scale, block_tables, row_in_seq):
 
 
 def check_nan_scale(entry, bs, next_n, ends, seed, variant, label, kv_row=0):
-    """A NaN E8M0 scale must reach the logits of every row that attends its KV row, and nowhere
-    else. E8M0 0xFF is NaN and an E2M1 nibble cannot encode one, so a NaN scale is the only way a
-    non-finite value enters this kernel -- and the relu decides whether it comes out again. The
-    kernel promises the IEEE ``maximum`` that PROPAGATES it (not a NaN-swallowing select), and
-    only under ``-fno-finite-math-only``. Asserted as an exact SET, so NaN smeared too far fails.
+    """A NaN E8M0 scale must reach exactly the in-window cells at its KV row: the relu must
+    propagate NaN, not swallow it. Asserted as an exact set, so over-smearing also fails.
     """
     total_q = bs * next_n
-    assert len(ends) == total_q
+    # Raised, not asserted, so `python -O` keeps it.
+    if len(ends) != total_q:
+        raise ValueError(f"{label}: {len(ends)} window ends for {total_q} rows")
     inp = build_inputs(bs, max(max(ends), 1), total_q, seed, "norm", "auto")
 
     def t(v):
@@ -776,9 +854,7 @@ def check_nan_scale(entry, bs, next_n, ends, seed, variant, label, kv_row=0):
     cu = t([0] + list(itertools.accumulate([next_n] * bs)))
     kvs = poison_kv_rows(inp.kv_scale, inp.block_tables, kv_row)
 
-    # `entry` is which TABLE this is: prefill hands the builder the window starts, decode leaves
-    # them None. Both are zero here so the schedules coincide -- what differs is the builder's
-    # `local_starts` branch, which reads the array instead of assuming 0.
+    # Prefill passes (zero) `local_starts`, decode passes None: same schedule, different branch.
     buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, bs, variant=variant)
     plan = pa_mqa_logits_mxfp4_plan(
         cu,
@@ -809,20 +885,20 @@ def check_nan_scale(entry, bs, next_n, ends, seed, variant, label, kv_row=0):
 
 
 def run_nan_scale(seed):
-    """:func:`check_nan_scale` over both entry points and every compiled instance.
-
-    Separate from :func:`run_corner` because its pass condition is the opposite one: these cases
-    REQUIRE non-finite in-window cells, so ``window_is_written`` -- which every corner case asserts
-    -- is deliberately false here.
-    """
+    """:func:`check_nan_scale` over both entry points and every compiled instance. Separate from
+    :func:`run_corner` because these cases require non-finite in-window cells."""
     oks = []
     for v in _variants():
         # Ragged windows, all containing KV row 0.
         oks.append(check_nan_scale("prefill", 2, 3, [50, 120, 200, 40, 100, 180],
                                    seed + 80, v, "prefill, nan at kv row 0"))  # fmt: skip
-        # A window that EXCLUDES the poisoned row -- the control that says the NaN is not smeared.
+        # KV row 2: only row 3's window [0,3) holds it; rows 1-2 end at or before it.
         oks.append(check_nan_scale("prefill", 1, 4, [0, 1, 2, 3],
                                    seed + 81, v, "prefill, nan at kv row 2", kv_row=2))  # fmt: skip
+        # Control: no window holds the poisoned row, so any non-finite cell fails.
+        oks.append(check_nan_scale("prefill", 1, 4, [1, 2, 2, 2],
+                                   seed + 83, v, "prefill, nan outside every window",
+                                   kv_row=2))  # fmt: skip
         # Decode, where a window spans several KV splits and only one holds the row.
         oks.append(check_nan_scale("decode", 2, 4,
                                    [200, 201, 202, 203, v.block_k * 2 + 1] + [130] * 3,
@@ -847,12 +923,8 @@ def gen_prefill_qlens(bs, total=PREFILL_TOTAL_QLEN, qmin=PREFILL_QMIN, seed=0):
 
 
 def tail_causal_windows(qlens, ctxs):
-    """The MTP tail-causal windows, in packed (b, n) row order.
-
-    Batch ``b``'s ``n``-th row sees ``[0, ctx[b] - (qlen[b] - 1 - n))``, plain causal when
-    ``qlen == ctx``. The harness's rule, not the kernel's: the schedule takes whatever windows
-    it is handed, and a compressed cache's ``floor((pos+1)/R)`` is not expressible here.
-    """
+    """MTP tail-causal windows in packed (b, n) order: row n of batch b sees
+    ``[0, ctx[b] - (qlen[b] - 1 - n))``; plain causal when ``qlen == ctx``."""
     rb, ls, le = [], [], []
     for b, (q, c) in enumerate(zip(qlens, ctxs)):
         for n in range(q):
@@ -867,12 +939,8 @@ def tail_causal_windows(qlens, ctxs):
 
 
 def score(fn, inp, rb, ls, le, total_q, n_logits, seed):
-    """Time the launch, then score it against the sampled-row reference.
-
-    Scoring runs AFTER the timed region and frees its temporaries: the reference materializes a
-    ``[heads, window]`` score matrix per sampled row -- ~1 GB on the longest shape -- and the
-    caching allocator charges that churn to whatever is timed next, worth 4-9% here. An
-    agreement check in FRONT of a timed region is the same mistake."""
+    """Time the launch, then score it. Scoring runs after timing and frees its temporaries:
+    the reference's ~1 GB of allocator churn would otherwise skew the next timing."""
     flops = 2 * HEADS * HEAD_DIM * n_logits
     nbytes = roofline_bytes(rb, le, total_q, n_logits)
     out, us = run_perftest(fn, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP)
@@ -890,11 +958,8 @@ def score(fn, inp, rb, ls, le, total_q, n_logits, seed):
 
 @benchmark()
 def test_prefill_causal(bs, data_init, scale_init, seed):
-    """One causal prefill shape: 16384 query rows split across ``bs`` batches, ctx == qlen.
-
-    The qlen split is seeded by ``bs`` rather than by ``--seed``, so the SHAPE is a function of
-    the sweep point alone and two seeds stay comparable; ``--seed`` moves the data only.
-    """
+    """Causal prefill: 16384 rows split across ``bs`` batches, ctx == qlen. The split is seeded
+    by ``bs`` so ``--seed`` moves only the data."""
     qlens = gen_prefill_qlens(bs, seed=bs)
     total_q = sum(qlens)
     inp = build_inputs(bs, max(qlens), total_q, seed, data_init, scale_init)
@@ -902,8 +967,7 @@ def test_prefill_causal(bs, data_init, scale_init, seed):
         [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
     )
     rb, ls, le = tail_causal_windows(qlens, qlens)
-    # Per FORWARD against a per-layer kernel, so built OUTSIDE the timed region: `run_perftest`
-    # sums every CUDA event in it, so a metadata kernel left inside lands in the reported time.
+    # The plan is per forward, so it is built outside the timed region.
     plan = pa_mqa_logits_mxfp4_plan(
         cu, le, total_q=total_q, local_starts=ls, row_to_batch=rb
     )
@@ -911,10 +975,7 @@ def test_prefill_causal(bs, data_init, scale_init, seed):
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
 
-    # Bound as DEFAULTS, not captured: this is rebuilt per shape over a name the sweep reuses,
-    # so late binding would read the next shape's buffers. The plan is passed IN because
-    # `run_perftest` sums every CUDA event in the region, so a builder left inside the timed
-    # call lands in the reported time.
+    # Bound as defaults, not closed over, to avoid late binding across shapes.
     def ours(inp=inp, plan=plan, out=out):
         return pa_mqa_logits_mxfp4(
             inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
@@ -925,8 +986,7 @@ def test_prefill_causal(bs, data_init, scale_init, seed):
     n_logits = int((le - ls).clamp(min=0).sum().item())
     ret = {
         "gfx": get_gfx(),
-        # Whatever the op settled on its own: these rows pass no `variant`, which is the other
-        # half of the decode table's coverage and the only place the DEFAULT is exercised.
+        # The op's own default instance (no `variant` passed).
         "variant": plan.variant.name,
         "total_q": total_q,
         "tiles": plan.num_tiles,
@@ -940,14 +1000,9 @@ def test_prefill_causal(bs, data_init, scale_init, seed):
     return ret
 
 
-def run_windowed_case(per_batch, data_init, scale_init, seed):
-    """Launch and score one prefill case from explicit per-row ``(start, end)`` windows.
-
-    The shared half of the two CSA regimes -- they differ only in how ``per_batch`` is built.
-    The window rule is an INPUT either way and is never derived: ``tail_causal_windows`` is the
-    other shape this harness builds and it cannot express a CSA one, since
-    ``floor((x - d) / R) != floor(x / R) - d``.
-    """
+def run_windowed_case(per_batch, data_init, scale_init, seed, variant=None):
+    """Launch and score one prefill case from explicit per-row ``(start, end)`` windows, on the
+    op's default instance or on ``variant``. Shared by the two CSA regimes."""
     bs = len(per_batch)
     qlens = [len(w) for w in per_batch]
     total_q = sum(qlens)
@@ -961,10 +1016,14 @@ def run_windowed_case(per_batch, data_init, scale_init, seed):
     ls = t([s for w in per_batch for (s, _) in w])
     le = t([e for w in per_batch for (_, e) in w])
     cu = t([0] + list(itertools.accumulate(qlens)))
-    # Per FORWARD against a per-layer kernel, so built OUTSIDE the timed region: `run_perftest`
-    # sums every CUDA event in it, so a metadata kernel left inside lands in the reported time.
+    # Built outside the timed region, as in `test_prefill_causal`.
+    buffers = (
+        None
+        if variant is None
+        else pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, bs, variant=variant)
+    )
     plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, total_q=total_q, local_starts=ls, row_to_batch=rb
+        cu, le, buffers=buffers, total_q=total_q, local_starts=ls, row_to_batch=rb
     )
     out = torch.full(
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
@@ -980,7 +1039,6 @@ def run_windowed_case(per_batch, data_init, scale_init, seed):
     n_logits = int((le - ls).clamp(min=0).sum().item())
     ret = {
         "gfx": get_gfx(),
-        # As in `test_prefill_causal`: the op's own default, passed no `variant`.
         "variant": plan.variant.name,
         "total_q": total_q,
         "tiles": plan.num_tiles,
@@ -998,56 +1056,35 @@ def run_windowed_case(per_batch, data_init, scale_init, seed):
 
 @benchmark()
 def test_prefill_fresh(bs, qlen, data_init, scale_init, seed):
-    """Fresh CSA prefill: the sequence starts empty, so row n sees ``(n + 1) // CSA_RATIO``.
-
-    ``bs`` sequences of ``qlen`` rows each, which is where a group's four rows differ by a
-    column rather than sharing one.
-    """
+    """Fresh CSA prefill: ``bs`` empty sequences of ``qlen`` rows, row n sees
+    ``(n + 1) // CSA_RATIO``."""
     return run_windowed_case(
         [_csa_fresh(qlen) for _ in range(bs)], data_init, scale_init, seed
     )
 
 
 @benchmark()
-def test_prefill_chunked(bs, kvlen, data_init, scale_init, seed):
-    """Chunked CSA prefill at PR #5332's shapes, so the two PRs' tables are comparable.
-
-    A sequence ends this forward with ``kvlen`` COMPRESSED rows committed and this chunk is its
-    tail, so row n of a ``qlen``-row sequence sees ``kvlen - (qlen - 1 - n) // CSA_RATIO``.
-    ``kvlen = 25000`` stands for roughly a 100k-raw-token context.
-
-    ``PREFILL_TOTAL_QLEN`` rows split RAGGEDLY across ``bs`` by ``gen_prefill_qlens`` -- the
-    generator ``test_prefill_causal`` already uses, and the one #5332's own sweep uses. That is
-    what makes the shapes identical rather than merely similar: it reproduces #5332's
-    ``n_logits`` and ``min_win`` to the digit (376053760 / 20905 at bs=1, 392830720 / 22945 at
-    bs=2), where an even split lands 256 logits away at bs=2 and 1.3M away at bs=4.
+def test_prefill_chunked(bs, kvlen, variant, data_init, scale_init, seed):
+    """Chunked CSA prefill at PR #5332's shapes: ``PREFILL_TOTAL_QLEN`` rows split raggedly by
+    ``gen_prefill_qlens``, each chunk the tail of ``kvlen`` compressed rows, so row n sees
+    ``kvlen - (qlen - 1 - n) // CSA_RATIO``. ``variant`` None means the op default.
     """
     return run_windowed_case(
         [_csa_chunked(q, kvlen) for q in gen_prefill_qlens(bs, seed=bs)],
         data_init,
         scale_init,
         seed,
+        variant,
     )
 
 
 @benchmark()
 def test_decode(mtp, seqs, n_long, variant, data_init, scale_init, seed):
-    """MTP decode over ``seqs`` sequences, ``n_long`` of them long, on ``variant``.
-
-    ``mtp`` is the query rows per sequence -- ``next_n`` in the schedule's own tables -- so the
-    row count is ``seqs * mtp`` and the tile count is ``seqs * ceil(mtp/QPB)``. Within one
-    ``(mtp, seqs)`` the tile count is therefore CONSTANT across the ragged shapes, which is what
-    makes them a clean read on load balance: same rows, same tiles, only the work per tile moves.
-
-    Every row of a sequence takes that sequence's whole window. The tail-causal alternative --
-    row ``j`` ending at ``ctx - (mtp - 1 - j)`` -- would read the same here, because the loop
-    bound is the TILE's union and that is the last row's end either way; the per-row ends only
-    move the store mask, by three columns out of 25000.
-
-    ``variant`` is the kernel instance, or ``None`` for the op's own default. It is a per-shape
-    CHOICE made by the driver and never inferred here -- see ``decode_shapes``.
+    """MTP decode: ``seqs`` sequences of ``mtp`` rows, ``n_long`` with the long window, on
+    ``variant`` (None = op default). Tile count is fixed per ``(mtp, seqs)``, so the ragged
+    shapes isolate load balance. Every row takes its sequence's whole window.
     """
-    variant = _resolve_variant(variant)  # gfx1250 names; the arch default elsewhere
+    variant = _resolve_variant(variant)  # the arch default if not compiled here
     n_short = seqs - n_long
     ctxs = [DECODE_WIN_LONG] * n_long + [DECODE_WIN_SHORT] * n_short
     qlens = [mtp] * seqs
@@ -1061,8 +1098,7 @@ def test_decode(mtp, seqs, n_long, variant, data_init, scale_init, seed):
     ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
     le = t([ctxs[b] for b in range(seqs) for _ in range(mtp)])
     cu = t([0] + list(itertools.accumulate(qlens)))
-    # `local_starts` stays None rather than an array of zeros, because that is the call ATOM
-    # makes on this path and a per-row start load is not part of it.
+    # `local_starts` stays None, as in ATOM's decode call.
     buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, seqs, variant=variant)
     plan = pa_mqa_logits_mxfp4_plan(
         cu, le, buffers=buffers, total_q=total_q, row_to_batch=rb
@@ -1097,23 +1133,15 @@ def test_decode(mtp, seqs, n_long, variant, data_init, scale_init, seed):
 
 
 def summarize(name, rows):
-    """One result table, twice: markdown to read and one-line JSON to forward.
-
-    The JSON is what a combined benchmark driver validates and re-renders; the markdown is what
-    makes a standalone run readable. A driver keeps only the JSON lines, so emitting both costs
-    nothing there.
-    """
+    """One result table as markdown (to read) and one-line JSON (for a benchmark driver)."""
     df = pd.DataFrame(rows)
     aiter.logger.info("%s (markdown):\n%s", name, df.to_markdown(index=False))
     print_json_table(name, df)
 
 
 def init_pairs(data_init, scale_init):
-    """Pair the two axes POSITION-WISE, a length-1 side broadcasting.
-
-    Paired and not crossed, because that is the rule the combined driver applies on its side;
-    crossing here would turn one requested pair into four cases and quietly quadruple a sweep.
-    """
+    """Pair the two axes position-wise (not crossed, matching the benchmark driver); a length-1
+    side broadcasts."""
     data, scale = list(data_init), list(scale_init)
     if len(data) == 1:
         data *= len(scale)
@@ -1127,14 +1155,11 @@ def init_pairs(data_init, scale_init):
 
 
 def main():
-    # Whole-op arch gate, here rather than inside the @benchmark fns: CI discovers every
-    # op_tests/test_*.py and runs it on the other shards too, where the wrapper's own arch
-    # check would raise and fail the shard. Positive allow-list, so an unknown new card skips.
+    # Arch gate before anything touches the device: CI runs this file on every shard.
     if get_gfx() not in SUPPORTED_GFX:
         why = f"built for {'/'.join(SUPPORTED_GFX)}, skipped on {get_gfx()}"
         aiter.logger.warning("MXFP4 MQA logits: %s", why)
-        # Still a table: a driver that recognises none at all reports a broken extractor
-        # rather than a skip, and the two want different answers from whoever reads it.
+        # Still emit a table, so a driver sees a skip rather than a broken extractor.
         summarize("pa_mqa_logits_mxfp4 (not run)", [{"err_msg": why}])
         return
 
@@ -1149,10 +1174,7 @@ def main():
     parser.add_argument(
         "--no-verify", action="store_true", help="skip the correctness sweep, perf only"
     )
-    # Hand-rolled rather than `add_data_init_args`, whose --scale-init offers the four FLOAT
-    # scale dists. These scales are E8M0 on the wire, so the choices have to be
-    # E8M0_SCALE_DISTS or a driver passing the MX default `auto` is rejected by argparse
-    # before the test runs at all.
+    # Not `add_data_init_args`: its --scale-init offers float dists, not E8M0_SCALE_DISTS.
     parser.add_argument(
         "--data-init", nargs="+", choices=list(DATA_DISTS), default=["norm"],
         help="DATA init for the fp4 nibbles and the weights, paired position-wise\n"
@@ -1185,9 +1207,7 @@ def main():
             continue
         blind = correctness_blindness(data_init, scale_init)
         if blind is not None:
-            # Its OWN table, not a row in the one below. A skip shares none of that table's
-            # columns, and one NaN turns every bool column in it into a float -- so `pass`
-            # would reach a reader as 1.0 rather than true.
+            # Own table: a skip row would NaN-fill and turn the bool columns into floats.
             not_judged.append(
                 {
                     "data_init": data_init,
@@ -1205,8 +1225,7 @@ def main():
     if corner:
         summarize("pa_mqa_logits_mxfp4 corner", corner)
 
-    # NaN E8M0 propagation: its own pass condition (REQUIRES non-finite in-window cells), and its
-    # own random data -- independent of the init-pair sweep above.
+    # NaN E8M0 propagation, on its own data, independent of the init pairs.
     if not args.no_verify:
         ok = run_nan_scale(args.seed) and ok
 
@@ -1229,35 +1248,24 @@ def main():
         ],
     )
 
-    # PR #5332's three chunked rows: PREFILL_TOTAL_QLEN rows raggedly split across bs, every
-    # sequence carrying 25000 committed compressed rows.
+    # PR #5332's chunked shapes, on the default and every other compiled instance (gfx950's
+    # `qlen1_kv256` is aimed at these long windows).
     chunked_shapes = [(1, 25000), (2, 25000), (4, 25000)]
+    default = _default_variant(_device_arch(torch.cuda.current_device()))
+    chunked_variants = [None] + [v.name for v in _variants() if v.name != default]
     summarize(
         f"pa_mqa_logits_mxfp4 prefill chunked (csa ratio {CSA_RATIO}, #5332 shapes)",
         [
-            test_prefill_chunked(bs, kvlen, data_init, scale_init, args.seed)
+            test_prefill_chunked(bs, kvlen, v, data_init, scale_init, args.seed)
             for data_init, scale_init in pairs
+            for v in chunked_variants
             for bs, kvlen in chunked_shapes
         ],
     )
 
-    # (mtp, seqs, n_long, variant).
-    #
-    # **MTP = 1 carries the batch sweep, because it is the regime the framework runs.** At one
-    # row per sequence `rows == seqs == TILES`, so `seqs` IS the tile count and the schedule has
-    # to spread 1..128 tiles over 3072 CTAs -- the axis it lives or dies on, and the one MTP > 1
-    # cannot be read on, because packing four rows into a tile hides it. Its two ragged rows hold
-    # the tile count and move only the long fraction, for the same reason the mtp = 4 ones do.
-    #
-    # The MTP > 1 rows stay at `DECODE_SEQS`: two uniform ones extend the row count from the
-    # mtp = 1 anchor, and the last three hold mtp = 4 and 128 rows so the uniform mtp = 4 line is
-    # their same-row-count anchor.
-    #
-    # **The variant is a per-shape CHOICE, not a rule.** The op defaults every shape to the
-    # four-row instance and infers nothing, so `mtp = 1` -- where that instance masks three of
-    # its four waves off -- names the one-row instance here, which is what a caller that knows
-    # its own regime does. Left to the default those rows read about twice the time, and the
-    # `variant` column is what makes the choice visible in the table rather than implied.
+    # (mtp, seqs, n_long, variant). MTP = 1 carries the batch sweep: there `seqs` is the tile
+    # count. Ragged rows hold the tile count and move only the long fraction. mtp = 1 names the
+    # one-row instance explicitly; the op default (four-row on gfx1250) would idle 3 of 4 waves.
     decode_shapes = [
         (1, 1, 1, "qlen1_kv64"),
         (1, 8, 8, "qlen1_kv64"),
@@ -1265,6 +1273,9 @@ def main():
         (1, 128, 128, "qlen1_kv64"),
         (1, DECODE_SEQS, 4, "qlen1_kv64"),
         (1, 128, 16, "qlen1_kv64"),
+        # gfx950-only instance; gfx1250 falls back to its default (`_resolve_variant`).
+        (1, DECODE_SEQS, DECODE_SEQS, "qlen1_kv256"),
+        (1, 128, 16, "qlen1_kv256"),
         (4, DECODE_SEQS, DECODE_SEQS, None),
         (8, DECODE_SEQS, DECODE_SEQS, None),
         (4, DECODE_SEQS, 16, None),

@@ -1,41 +1,24 @@
 #pragma once
-// The per-tile schedule builder (build_tiles + build_sched and their sched_detail
-// helpers), shared by BOTH arches and arch-agnostic (int-only device code, NOT under a
-// `#if __gfxNNN__` guard). Split out of pa_mqa_logits_mxfp4_opus.h, which includes it under
-// PA_MQA_LOGITS_MXFP4_IMPL after the kargs/record ABI it uses; NOT standalone.
-//
-// The KEEP-FIRST / two-space-brace markers below are load-bearing: an out-of-tree equivalence
-// check locates this block by them (its path now points here rather than the opus header).
+// Device-side schedule builder (build_tiles + build_sched), shared by gfx950 and gfx1250:
+// arch-agnostic int-only code. Included by pa_mqa_logits_mxfp4_opus.h under
+// PA_MQA_LOGITS_MXFP4_IMPL after the kargs/record ABI it uses; not standalone.
 
-// ── the schedule builder ──
-// KEEP THIS BLOCK FIRST AMONG THE `namespace opus_logits` BLOCKS AND ITS CLOSING BRACE
-// SPELLED WITH TWO SPACES: the out-of-tree equivalence check against its opus-ops twin locates
-// it by those two strings, which is why the `mqa_logits_sched` enum sits after the builder.
+// Keep this opening line and the two-space closing brace byte-identical: an out-of-tree check
+// locates the block by them.
 namespace opus_logits {
 
 constexpr int SCHED_BUILD_BLOCK      = 256;
 constexpr int SCHED_BUILD_BLOCK_WIDE = 1024;
 
-// `resident` is the CTAs the part holds at once and is REQUIRED on both of these, with no
-// default: it is PER INSTANCE -- it follows the accumulator width, hence the KV tile, hence the
-// occupancy -- so a file-scope constant could only ever be right for one of them, and a default
-// is how one gets launched with another's grid. It reaches both as an argument.
+// `resident` (CTAs the part holds at once) is per instance -- it follows the KV tile, hence
+// occupancy -- so it is always passed explicitly, never defaulted.
 
-// The CTA count the split aims at: a WHOLE NUMBER OF ROUNDS. One CTA per tile leaves the last
-// round `resident - (nz mod resident)` CTAs empty, and that tail is not small -- 1025 tiles is
-// four full rounds and one straggler. 0 means do not split.
+// Split target: a whole number of rounds, so the last round is not left mostly empty.
+// 0 means do not split.
 __host__ __device__ inline int sched_target(int nz_tiles, int resident) {
     if (resident <= 0) return 0;
     if (nz_tiles <= resident) return resident;
     return ((nz_tiles + resident - 1) / resident) * resident;
-}
-
-// The GRID: the tile count rounded to a whole number of rounds, one round as the floor, and a
-// host constant so a captured graph replays at one shape. Deliberately tight -- a surplus
-// slot's CTA still reads a 32-byte record nobody else touches.
-__host__ __device__ inline int sched_slots(int num_tiles, int resident) {
-    const int n = num_tiles > resident ? num_tiles : resident;
-    return (n + resident - 1) / resident * resident;
 }
 
 constexpr int SCHED_BUILD_MAX_BLOCKS = 256;
@@ -53,7 +36,7 @@ struct sched_build_plan {
     int blocks;  // workgroups for the emit; 1 means the single-workgroup kernel
 };
 
-// How to launch, given the shape. Both hosts call this so neither can drift on the policy.
+// Launch policy, shared by both hosts.
 __host__ inline sched_build_plan sched_plan(int num_tiles, int num_ctas) {
     sched_build_plan p{SCHED_BUILD_BLOCK, 1};
     if (num_tiles < 512) return p;                 // narrow, one workgroup
@@ -67,25 +50,23 @@ __host__ inline sched_build_plan sched_plan(int num_tiles, int num_ctas) {
 
 namespace sched_detail {
 
-__device__ inline void sync_block() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
-}
+// Every barrier here must be a full __syncthreads(), not a bare s_barrier: threads hand values
+// through LDS (reductions, scan, general_emit staging) AND global memory (settle_safe reads back
+// cta_info records other threads' emit_fast stored). A bare s_barrier fences neither.
 
 template<int BLOCK, bool IS_MAX>
 __device__ inline int block_reduce(int v, int* s, int tid) {
     s[tid] = v;
-    sync_block();
+    __syncthreads();
     for (int off = BLOCK / 2; off > 0; off >>= 1) {
         if (tid < off) {
             const int o = s[tid + off];
             s[tid] = IS_MAX ? (o > s[tid] ? o : s[tid]) : (s[tid] + o);
         }
-        sync_block();
+        __syncthreads();
     }
     const int r = s[0];
-    sync_block();
+    __syncthreads();
     return r;
 }
 
@@ -95,7 +76,7 @@ __device__ inline void block_reduce_stats(int vmax, int vsum, int vnz, int* s, i
     s[tid]             = vmax;
     s[BLOCK + tid]     = vsum;
     s[2 * BLOCK + tid] = vnz;
-    sync_block();
+    __syncthreads();
     for (int off = BLOCK / 2; off > 0; off >>= 1) {
         if (tid < off) {
             const int om = s[tid + off];
@@ -103,32 +84,32 @@ __device__ inline void block_reduce_stats(int vmax, int vsum, int vnz, int* s, i
             s[BLOCK + tid]     += s[BLOCK + tid + off];
             s[2 * BLOCK + tid] += s[2 * BLOCK + tid + off];
         }
-        sync_block();
+        __syncthreads();
     }
     omax = s[0];
     osum = s[BLOCK];
     onz  = s[2 * BLOCK];
-    sync_block();
+    __syncthreads();
 }
 
 template<int BLOCK>
 __device__ inline int block_scan_excl(int v, int* s, int tid, int& total) {
     s[tid] = v;
-    sync_block();
+    __syncthreads();
     for (int off = 1; off < BLOCK; off <<= 1) {
         const int add = (tid >= off) ? s[tid - off] : 0;
-        sync_block();
+        __syncthreads();
         s[tid] += add;
-        sync_block();
+        __syncthreads();
     }
     total = s[BLOCK - 1];
     const int incl = s[tid];
-    sync_block();
+    __syncthreads();
     return incl - v;
 }
 
-// A tile's window is the UNION of its rows', and with a NON-DECREASING rule that is the first
-// row's start and the LAST row's end. That contract is the caller's; nothing here checks it.
+// A tile's window is the union of its rows'; the caller guarantees a non-decreasing window rule,
+// so that is the first row's start and the last row's end. Not checked here.
 __device__ inline int tile_union_end(const int* __restrict__ local_ends, int r0, int r1) {
     return r1 > r0 ? local_ends[r1 - 1] : 0;
 }
@@ -136,16 +117,13 @@ __device__ inline int tile_union_start(const int* __restrict__ local_starts, int
     return (local_starts && r1 > r0) ? local_starts[r0] : 0;
 }
 
-// Tile `t`'s row bound, and the one place the cut is read. A NULL `cu_tiles` is the IDENTITY
-// cut -- `q_per_block == 1`, where a tile IS a row. The predicate is a loop-invariant scalar,
-// unlike the one the next comment is about.
+// Tile t's first row. NULL cu_tiles is the identity cut (q_per_block == 1: a tile is a row).
 __device__ inline int tile_row(const int* __restrict__ cu_tiles, int t) {
     return cu_tiles ? cu_tiles[t] : t;
 }
 
-// BRANCHLESS ON PURPOSE. An `if (e <= 0) return 0;` here reads naturally and costs 38% at 16384
-// tiles on the gfx950 sibling: the callers are latency-bound strided walks, and a branch on the
-// value just loaded serializes what was a pipelined stream.
+// Branchless on purpose: callers are latency-bound strided walks, and a branch on the
+// just-loaded value serializes them.
 __device__ inline int tile_kv_tiles(const int* __restrict__ cu_tiles,
                                     const int* __restrict__ local_starts,
                                     const int* __restrict__ local_ends,
@@ -158,17 +136,15 @@ __device__ inline int tile_kv_tiles(const int* __restrict__ cu_tiles,
     return end > first ? end - first : 0;
 }
 
-// Read back out of the table `emit_fast` already wrote, rather than recomputed: with per-row
-// windows the count needs a DEPENDENT global load. Safe only before `general_emit` writes its
-// first slot -- **`general_emit` may NOT do this**, since it writes slots while reading tiles
-// from the same array and a split makes those ranges overlap.
-__device__ inline int tile_kv_tiles_cached(const opus_mqa_cta_record* __restrict__ cta_info,
-                                           int t) {
+// Reads the count emit_fast stored (recomputing needs a dependent global load). Valid only
+// before general_emit writes: general_emit must not use it, as its slot writes overlap the tiles
+// it reads. Not __restrict__ (nor in settle_safe): it aliases emit_fast's stores.
+__device__ inline int tile_kv_tiles_cached(const opus_mqa_cta_record* cta_info, int t) {
     return cta_info[t].chunk_count;
 }
 
-// One strided walk that reduces AND emits: the one-CTA-per-tile record does not depend on the
-// reduction, so it is written speculatively and overwritten only if a tile needs splitting.
+// Reduces and emits in one walk: the one-CTA-per-tile record is written speculatively and
+// overwritten only if splitting is needed.
 __device__ inline void emit_fast(const int* __restrict__ cu_tiles,
                                  const int* __restrict__ local_starts,
                                  const int* __restrict__ local_ends,
@@ -184,7 +160,8 @@ __device__ inline void emit_fast(const int* __restrict__ cu_tiles,
         const int r1    = tile_row(cu_tiles, t + 1);
         const int e     = tile_union_end(local_ends, r0, r1);
         const int s     = tile_union_start(local_starts, r0, r1);
-        const int b     = row_to_batch ? row_to_batch[r0] : r0;
+        // r1 > r0 guard: an empty surplus tile has r0 == cu_seq_q[batch], past row_to_batch.
+        const int b     = (row_to_batch && r1 > r0) ? row_to_batch[r0] : r0;
         const int first = s / block_k;
         const int end   = e > 0 ? ((e + block_k - 1) / block_k) : 0;
         const int n     = end > first ? end - first : 0;
@@ -203,8 +180,7 @@ __device__ inline void emit_fast(const int* __restrict__ cu_tiles,
     }
 }
 
-// Surplus slots. MARKED, not left stale: the table is reused in place across cudagraph replays,
-// so a slot that carried work last forward must not carry it again this one.
+// Surplus slots are marked empty, not left stale: the table is reused across cudagraph replays.
 __device__ inline void mark_surplus(opus_mqa_cta_record* __restrict__ cta_info,
                                     int first_slot, int num_ctas, int stride) {
     for (int slot = first_slot; slot < num_ctas; slot += stride) {
@@ -215,7 +191,7 @@ __device__ inline void mark_surplus(opus_mqa_cta_record* __restrict__ cta_info,
 }
 
 template<int BLOCK>
-__device__ inline int settle_safe(const opus_mqa_cta_record* __restrict__ cta_info,
+__device__ inline int settle_safe(const opus_mqa_cta_record* cta_info,
                                   int num_tiles, int num_ctas,
                                   int safe, int max_tiles, int nz_tiles, int* smem, int tid) {
     if (nz_tiles >= num_ctas) return max_tiles;
@@ -260,12 +236,12 @@ __device__ inline int general_emit(const int* __restrict__ cu_tiles,
         const int r1 = (t < num_tiles) ? tile_row(cu_tiles, t + 1) : 0;
         s_excl[tid]  = excl;
         s_tiles[tid] = tiles;
-        s_batch[tid] = (t < num_tiles) ? (row_to_batch ? row_to_batch[r0] : r0) : 0;
+        s_batch[tid] = (row_to_batch && r1 > r0) ? row_to_batch[r0] : r0;   // as in emit_fast
         s_end[tid]   = tile_union_end(local_ends, r0, r1);
         s_ls[tid]    = tile_union_start(local_starts, r0, r1);
         s_row[tid]   = r0;
         s_rows[tid]  = r1 - r0;
-        sync_block();
+        __syncthreads();
 
         for (int j = tid; j < block_total; j += BLOCK) {
             int lo = 0, hi = BLOCK;
@@ -277,11 +253,12 @@ __device__ inline int general_emit(const int* __restrict__ cu_tiles,
             const int i  = j - s_excl[tl];
             const int slot = carry + j;
             if (slot < num_ctas) {      // cannot fire while num_ctas >= the schedule's need
-                // EVEN split: `safe` decides HOW MANY chunks a tile gets and must not also decide their size.
-                // A phase costs the longest chunk, so 96 + 32 is the same CTA count as 64 + 64 and 44% slower.
-                const int n  = s_tiles[tl];
-                const int nc = (n + safe - 1) / safe;   // >= 1: a zero-chunk tile emits no slot
-                const int q  = n / nc, r = n % nc;
+                // Even split: safe sets the chunk count, not the size (a phase costs the
+                // longest chunk). n >= 1 because the search picks the last tile at each excl
+                // value; guarded anyway against a divide by zero.
+                const int n       = s_tiles[tl];
+                const int nchunks = n > 0 ? (n + safe - 1) / safe : 1;
+                const int q = n / nchunks, r = n % nchunks;
                 opus_mqa_cta_record rec{};
                 rec.row_id      = s_row[tl];
                 rec.batch_id    = s_batch[tl];
@@ -294,7 +271,7 @@ __device__ inline int general_emit(const int* __restrict__ cu_tiles,
             }
         }
         carry += block_total;
-        sync_block();
+        __syncthreads();
     }
     return carry;
 }
@@ -335,19 +312,10 @@ __device__ inline void settle_and_emit(const int* __restrict__ cu_tiles,
 constexpr int GROUPS_BUILD_BLOCK     = 256;
 constexpr int GROUPS_BUILD_MAX_BATCH = 2048;   // 8 KB of LDS for the per-batch offsets
 
-// Tiles the cut can produce, from the STATIC shapes alone -- which is what keeps the launch
-// cudagraph-safe. Never short, because a sum of per-batch roundings is at least the rounding of
-// the sum; the slack is at most `batch - 1` tiles, each of which gets an empty record.
-__host__ __device__ inline int max_tiles_for(int total_q, int batch, int qpb) {
-    return (total_q + batch * (qpb - 1)) / qpb;
-}
-
-// Cut each batch's rows into runs of at most `qpb` and write the tile boundaries. NOT reached
-// at `qpb == 1`, where a tile is a row and the schedule takes that mapping from `tile_row`.
-//
-// **THIS RETIRES A CONTRACT THE CALLER CANNOT SAFELY BREAK.** "A tile is contiguous rows of
-// ONE batch" gives no wrong answer when violated -- the CTA's waves disagree about the trip
-// count and DEADLOCK on the phase barrier. One workgroup, so the scan in it caps the batch.
+// Cut each batch's rows into tiles of at most qpb rows (unused at qpb == 1; see tile_row).
+// Contract: a tile is contiguous rows of ONE batch. Breaking it deadlocks: the CTA's waves
+// disagree on the trip count at the phase barrier. One workgroup, so GROUPS_BUILD_MAX_BATCH
+// caps the batch.
 __global__ __launch_bounds__(GROUPS_BUILD_BLOCK)
 void mqa_logits_build_tiles(const int* __restrict__ cu_seq_q,
                             int* __restrict__ cu_tiles,
@@ -357,14 +325,14 @@ void mqa_logits_build_tiles(const int* __restrict__ cu_seq_q,
 
     for (int b = tid; b < batch; b += GROUPS_BUILD_BLOCK)
         g_off[b] = (cu_seq_q[b + 1] - cu_seq_q[b] + qpb - 1) / qpb;
-    sched_detail::sync_block();
+    __syncthreads();
 
     if (tid == 0) {
         int acc = 0;
         for (int b = 0; b < batch; ++b) { const int c = g_off[b]; g_off[b] = acc; acc += c; }
         g_off[batch] = acc;
     }
-    sched_detail::sync_block();
+    __syncthreads();
 
     const int num_tiles = g_off[batch];
     const int end_row   = cu_seq_q[batch];

@@ -1,28 +1,18 @@
 #pragma once
 // gfx950 wave64 (MFMA 32x32x64) device body for the MXFP4 MQA-logits kernel.
-// Included by pa_mqa_logits_mxfp4_opus.h under PA_MQA_LOGITS_MXFP4_IMPL; NOT standalone --
-// it uses opus_mqa_logits_kargs / mqa_logits_sched / the traits defined there first.
+// Not standalone: included by pa_mqa_logits_mxfp4_opus.h, which defines the kargs and traits.
 
-// ── gfx950 device body (real under __gfx950__, host/other-arch stub otherwise) ───────
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 // Host pass: empty stub so the __device_stub__ symbol resolves for the launcher.
 namespace opus_logits {
-template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Prefill>
-__global__ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs) {}
+template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
+__global__ void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs) {}
 }
 #else
-// ============================================================================
-// Device kernel. Two things here are load-bearing and easy to "clean up" into a
-// silent regression:
-//  - `pin_sgpr` keeps the kernarg prologue at 2 scalar round trips on Decode and 3 on
-//    Prefill. Removing it, or using the volatile form, costs occupancy with no warning.
-//  - `permlane_head_reduce` must use std::bit_cast, not __builtin_bit_cast.
-// ============================================================================
 #include <opus/opus.hpp>
-#include <bit>   // std::bit_cast -- see permlane_head_reduce* for why not __builtin_bit_cast
+#include <bit>   // std::bit_cast, required by permlane_head_reduce*
 
-// Minimum waves/SIMD hint for __launch_bounds__; the kernel measures at occupancy 2. Raising
-// it does not buy occupancy, it only constrains the register allocator.
+// __launch_bounds__ min waves/SIMD; raising it only constrains the register allocator.
 #ifndef OPUS_LOGITS_MIN_WAVES
 #define OPUS_LOGITS_MIN_WAVES 2
 #endif
@@ -31,7 +21,7 @@ namespace opus_logits {
 
 using opus::operator""_I;
 
-// ─── scheduling helpers (separate symbols so the TUs cannot ODR-clash) ──────
+// ─── scheduling helpers ─────────────────────────────────────────────────────
 constexpr int VALU_MASK = 0x02;   // v_max / v_add / v_pk_fma ... (no MFMA/TRANS/mem)
 constexpr int MFMA_MASK = 0x08;   // v_mfma_*
 
@@ -43,28 +33,21 @@ __device__ inline void sched_mfma_pairs() {
     });
 }
 
-// Force `v` into a scalar register here. The constraint choice is load-bearing: the
-// read-only form is a memory clobber and demotes the indexed s_loads to
-// global_load + v_readfirstlane, and pinning a pointer makes every derived address
-// divergent. Both cost occupancy, silently.
+// Keep `v` in an SGPR. Must be the "+s" write form: the read-only form is a memory clobber
+// that demotes s_loads to global_load + v_readfirstlane. Losing the pin costs occupancy silently.
 template<class X>
 __device__ inline void pin_sgpr(X& v) { asm("" : "+s"(v)); }
 
-// Sum a per-lane value across the GRPM_C = 2 lane groups. M spreads over 2 groups of 32,
-// so one lane^32 butterfly finishes the reduction.
-//
-// std::bit_cast is REQUIRED, not stylistic: __builtin_bit_cast on these operands
-// miscompiled the swap to `v + v`, which is invisible under uniform data. The builtin
-// returns the PAIR of swapped registers, so the reduction is r[0] + r[1].
+// Sum across the two 32-lane groups (one lane^32 butterfly).
+// std::bit_cast is required: __builtin_bit_cast here miscompiles the swap to `v + v`
+// (invisible under uniform data). The builtin returns both swapped registers: r[0] + r[1].
 __device__ inline float permlane_head_reduce(float v) {
     opus::u32_t uv = std::bit_cast<opus::u32_t>(v);
     opus::vector_t<opus::u32_t, 2> r = __builtin_amdgcn_permlane32_swap(uv, uv, false, false);
     return std::bit_cast<float>(r[0]) + std::bit_cast<float>(r[1]);   // v[L] + v[L^32]
 }
 
-// Two independent lane^32 reductions. With the builtin the compiler schedules both swaps and their
-// hazards itself, so this no longer needs the hand-interleaved inline-asm chains -- it just issues
-// two swaps and lets the scheduler overlap them.
+// Two independent lane^32 reductions; the scheduler overlaps the swaps and their hazards.
 __device__ inline void permlane_head_reduce2(float& o0, float& o1, float v0, float v1) {
     opus::vector_t<opus::u32_t, 2> r0 = __builtin_amdgcn_permlane32_swap(
         std::bit_cast<opus::u32_t>(v0), std::bit_cast<opus::u32_t>(v0), false, false);
@@ -74,10 +57,9 @@ __device__ inline void permlane_head_reduce2(float& o0, float& o1, float v0, flo
     o1 = std::bit_cast<float>(r1[0]) + std::bit_cast<float>(r1[1]);
 }
 
-// KV partition, BYTE strides. kv_cache is [num_blocks][kt][g][nt][m][16 B]; lane L reads
-// the 16 B holding K[(kt*K_CHUNKS + g)*32 : +32] of page token nt*MFMA_N + m, with
-// g = L/32 and m = L%32. Do not swap g and nt to make a lane's address linear: it breaks
-// the standard paged layout for no measurable gain.
+// KV partition, byte strides. kv_cache is [num_blocks][kt][g][nt][m][16 B]; lane L reads
+// K[(kt*K_CHUNKS + g)*32 : +32] of page token nt*MFMA_N + m, g = L/32, m = L%32.
+// Do not swap g and nt: it breaks the standard paged layout for no gain.
 template<class T>
 __device__ inline auto make_layout_kv(int lane_mod_32, int lane_div_32) {
     constexpr auto shape = opus::make_tuple(
@@ -97,11 +79,9 @@ __device__ inline auto make_layout_kv(int lane_mod_32, int lane_div_32) {
         opus::unfold_p_coord(dim, opus::make_tuple(lane_mod_32, lane_div_32)));
 }
 
-// Q: natural [T][head][D/2]. Lane L reads 16 B at
-// head(mi*MFMA_M + L%32)*64 + (kt*K_CHUNKS + L/32)*16, i.e. the 64 lanes touch MFMA_M
-// distinct 64 B rows using half of each. Un-coalesced by design: Q is a stationary
-// operand loaded once in the prologue, so the cost is amortized over the whole KV loop
-// and the ABI stays a plain per-head memcpy.
+// Q: natural [T][head][D/2]; lane L reads 16 B at
+// head(mi*MFMA_M + L%32)*64 + (kt*K_CHUNKS + L/32)*16. Un-coalesced by design: Q is loaded
+// once in the prologue, so the cost is amortized and the layout stays natural.
 template<class T>
 __device__ inline auto make_layout_q(int lane_mod_32, int lane_div_32) {
     constexpr int Q_ROW_NAT = T::HEAD_DIM * T::ELEM_BITS / 8;   // 64 B per natural head row
@@ -127,8 +107,7 @@ __device__ inline auto make_layout_q(int lane_mod_32, int lane_div_32) {
 }
 
 // ─── Scale word (q_scale / kv_scale): one dword at index == lane ────────────
-// The 4 bytes pack the (kt, mi) pairs for A and the (kt, nt) pairs for B; MFMA op_sel picks the
-// byte. Trailing size-1 y-dim provides the single load issue.
+// The 4 bytes pack (kt, mi) for A / (kt, nt) for B; MFMA op_sel picks the byte.
 template<class T>
 __device__ inline auto make_layout_scale(int lane_id) {
     constexpr auto shape = opus::make_tuple(
@@ -162,9 +141,8 @@ __device__ inline auto make_layout_bt(int warp_id) {
         opus::unfold_p_coord(dim, opus::make_tuple(warp_id)));
 }
 
-// Weights: natural [T, H] bf16. Lane (lg = lane/32) gathers its C-fragment heads at
-// head = lg*PACK_C + mi*MFMA_M + rept*(PACK_C*GRPM_C) + pack; the lg*PACK_C term sits
-// between rept and pack, so this is MT*REPT_C = 8 loads of PACK_C bf16. Prologue-only.
+// Weights: natural [T, H] bf16. Lane group lg = lane/32 gathers C-fragment heads at
+// lg*PACK_C + mi*MFMA_M + rept*(PACK_C*GRPM_C) + pack: MT*REPT_C = 8 loads of PACK_C bf16.
 template<class T, int PACK_W>
 __device__ inline auto make_layout_w(int lane_div_32) {
     constexpr int REPT_C = T::C_FRAG / T::PACK_C;   // 4
@@ -189,11 +167,12 @@ __device__ inline auto make_layout_w(int lane_div_32) {
 }
 
 // ─── kernel ────────────────────────────────────────────────────────────────
-// SCHED (mqa_logits_sched): Prefill = 1D grid, per-row window arrays;
-//                           Decode  = 3D grid (batch, next_n_max, split_kv), inline MTP windows.
-template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Prefill>
+// Grid: one CTA per schedule slot (grid.x == kargs.num_ctas).
+template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
 __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES)
-void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
+void pa_mqa_logits_mxfp4_mfma_kernel(opus_mqa_logits_kargs kargs) {
+    static_assert(SCHED == mqa_logits_sched::Table,
+                  "this target compiles the schedule-table mapping and nothing else");
     // ---- data-type aliases ----
     using D_DATA   = opus::fp4_t;              // MFMA A/B element (E2M1); opus picks format code 4
     using D_BYTE   = uint8_t;                  // gmem scalar: fp4 is addressed in bytes
@@ -208,13 +187,12 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     constexpr int KT      = T::K_TILES;            // 2  (the outer K loop)
     constexpr int PAGE    = T::PAGE_SIZE;          // 64
     constexpr int PACK_W  = 4;                     // natural weights: PACK_C-wide (8 B) load issues
-    // VALU ops to hint into one MFMA's shadow. The exact constant does not matter measurably;
-    // what matters is that each MFMA group has recently-produced VALU work to chew on.
+    // VALU ops hinted into each MFMA's shadow; the exact value is not sensitive.
     constexpr int MFMA_VALU_COEXEC = 8;
 
-    // ---- kernel arguments: one scalar round trip ----
-    // Read and pinned ahead of the early-exit branches so the loads cannot sink past them.
-    // Worth several percent on decode, nothing on prefill. Losing the pins is silent.
+    // ---- kernel arguments ----
+    // Read and pinned ahead of the early exits so the loads stay one scalar round trip and
+    // cannot sink past them. Losing the pins is silent.
     const void* p_q        = kargs.ptr_q;
     const void* p_q_scale  = kargs.ptr_q_scale;
     const void* p_kv       = kargs.ptr_kv;
@@ -226,18 +204,13 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     float weight_scale = kargs.weight_scale;
     int   block_k = kargs.block_k;
     int   max_blk = kargs.max_blocks_per_seq;
+    int   num_rows = kargs.num_rows;   // the row bound below; its only use
     pin_sgpr(p_q); pin_sgpr(p_q_scale); pin_sgpr(p_kv); pin_sgpr(p_kv_scale);
     pin_sgpr(p_bt); pin_sgpr(p_weights); pin_sgpr(p_out);
     pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(block_k); pin_sgpr(max_blk);
+    pin_sgpr(num_rows);
 
-    // Deliberately NOT pinned: pinning a pointer propagates LLVM's inline-asm divergence into
-    // every address derived from it and costs occupancy (9.3 item 3).
-    const int* p_row_to_batch = kargs.ptr_row_to_batch;
-    const int* p_local_starts = kargs.ptr_local_starts;
-    const int* p_local_ends   = kargs.ptr_local_ends;
-    const int* p_cu_seq_q     = kargs.ptr_cu_seq_q;
-    int split_kv = kargs.split_kv;
-    if constexpr(SCHED == mqa_logits_sched::Decode) { pin_sgpr(split_kv); }
+    // Do not pin: a pinned pointer makes every derived address divergent (occupancy loss).
     const opus_mqa_cta_record* p_cta_info = kargs.ptr_cta_info;
 
     const int tid = opus::thread_id_x();
@@ -248,27 +221,13 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
 
     // ---- per-CTA assignment (uniform across block) ----
     int row_id, batch_id, chunk_start, tile_count, local_start, local_end;
-    constexpr int kv_tile_size = T::KV_TILE_SIZE;
-    if constexpr(SCHED == mqa_logits_sched::Prefill) {
-        const int query_row = opus::block_id_x();
-        // Do NOT hoist the reads below behind a clamped index: a conditional index is enough for
-        // LLVM to call it divergent, which turns three s_loads into global_load +
-        // v_readfirstlane. The branch is cheaper (9.3).
-        if(query_row >= kargs.num_rows) return;
-        row_id      = query_row;
-        batch_id    = p_row_to_batch[query_row];
-        local_start = p_local_starts[query_row];
-        local_end   = p_local_ends[query_row];
-        pin_sgpr(batch_id);
-        const int first_kv_tile = local_start / kv_tile_size;
-        const int end_kv_tile   = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
-        chunk_start = first_kv_tile;
-        tile_count  = end_kv_tile - first_kv_tile;
-    } else if constexpr(SCHED == mqa_logits_sched::Table) {
-        // The whole assignment in one `s_load_dwordx8` off a blockIdx-uniform address.
+    {
+        // One s_load_dwordx8 off a blockIdx-uniform address.
         const opus_mqa_cta_record rec = p_cta_info[opus::block_id_x()];
-        // Surplus slot; CTA-uniform, so this cannot deadlock.
-        if(rec.chunk_count <= 0) return;
+        // Surplus slot or out-of-range row. CTA-uniform, so the early return cannot deadlock.
+        // The row bound is a failure mode, not correctness (the host already guarantees it): a
+        // mismatched cta_info drops rows instead of reading past q and writing past out.
+        if(rec.chunk_count <= 0 || rec.row_id >= num_rows) return;
         row_id      = rec.row_id;
         batch_id    = rec.batch_id;
         local_start = rec.local_start;
@@ -276,32 +235,6 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         chunk_start = rec.chunk_start;
         tile_count  = rec.chunk_count;
         pin_sgpr(batch_id); pin_sgpr(local_start); pin_sgpr(local_end);
-    } else {
-        const int num_splits = split_kv;
-        const int batch      = opus::block_id_x();
-        const int mtp_pos    = opus::block_id_y();
-        const int split_idx  = opus::block_id_z();
-        // grid.x is padded up to a whole number of XCDs by the host driving this mode, so
-        // batch can exceed num_batches; cu_seq_q has only num_batches+1 entries and this must
-        // precede every load below.
-        if(batch >= kargs.num_batches) return;
-        int q_start = p_cu_seq_q[batch];
-        int q_next  = p_cu_seq_q[batch + 1];
-        const int qlen = q_next - q_start;
-        if(mtp_pos >= qlen) return;
-        row_id      = q_start + mtp_pos;
-        batch_id    = batch;
-        local_start = 0;
-        // Depends on q_start, so it is a second scalar round trip. A [batch, next_n_max]
-        // window array would address off blockIdx and issue with the cu_seq_q loads.
-        local_end   = p_local_ends[row_id];
-        pin_sgpr(local_end);
-        const int window_tiles    = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
-        const int tiles_per_split = window_tiles / num_splits;
-        const int remainder       = window_tiles - tiles_per_split * num_splits;
-        const int my_first_tile   = split_idx * tiles_per_split + (split_idx < remainder ? split_idx : remainder);
-        chunk_start = my_first_tile;
-        tile_count  = (my_first_tile < window_tiles) ? (tiles_per_split + (split_idx < remainder ? 1 : 0)) : 0;
     }
 
     // ---- GEMM object (scaled fp4 32x32x64) ----
@@ -333,8 +266,8 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     auto g_out = opus::make_gmem(out_base, out_bytes);
 
     // ---- Q / scale / weight partitions (loads deferred to the prologue) ----
-    // q_a[mi][kt]: MT * KT operands, each 16 B of payload in the low half of a 256-bit register.
-    // Zero-initialized so the hardware-ignored high half is never undefined (7.2).
+    // q_a[mi][kt]: 16 B payload in the low half of a 256-bit operand; zeroed so the ignored
+    // high half is never undefined.
     auto u_q = make_layout_q<T>(lane_mod_32, lane_div_32);
     typename Mma::vtype_a q_a[MT][KT]{};
 
@@ -348,8 +281,7 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     auto u_kvs = make_layout_scale<T>(lane_id);
     auto u_bt      = make_layout_bt<T>(warp_id);
     const int tok_lane_base = warp_id * (NTPW * T::MFMA_N) + lane_mod_32;
-    // Only lane group 0 stores: after the head reduction lanes L and L^32 hold the same logit,
-    // so the partner group is pushed out of bounds and masked by g_out's num_records.
+    // Lanes L and L^32 hold the same logit; lane group 1 is biased out of bounds and masked.
     const int lane_bias = (lane_div_32 != 0) ? -(chunk_start + tile_count) * block_k : 0;
     constexpr int pages_per_tile = T::KV_TILE_SIZE / PAGE;
 
@@ -398,10 +330,8 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     auto relu_nt = [&](sfrag& accs) {
         opus::static_for<MT * EC>([&](auto ic) {
             constexpr int i = ic.value;
-            // IEEE-754-2019 `maximum`, which propagates NaN. The ternary
-            // `x > 0.f ? x : 0.f` is a select that turns a NaN logit into 0, and the
-            // indexer's KV scale pool does carry 0xFF (NaN) e8m0 bytes.
-            // Needs `-fno-finite-math-only` or `-ffast-math` folds it back.
+            // NaN-propagating max (a `x > 0 ? x : 0` select maps NaN to 0, and the KV scale
+            // pool carries 0xFF e8m0 bytes). Needs -fno-finite-math-only.
             accs[i] = __builtin_elementwise_maximum(accs[i], 0.0f);
         });
     };
@@ -424,8 +354,7 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
                 });
             });
         });
-        // NTPW == 2 (traits static_assert): do both lane^32 reductions interleaved so the two
-        // permlane chains fill each other's hazard slots instead of padding with s_nop.
+        // Both reductions together so the permlane chains fill each other's hazard slots.
         static_assert(NTPW == 2, "permlane_head_reduce2 assumes NTPW == 2");
         float ts0 = acc[0][0] + acc[0][1];
         float ts1 = acc[1][0] + acc[1][1];
@@ -443,7 +372,6 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         });
     };
 
-    // Empty assignment (0 tiles): nothing to load/compute/store (uniform across the block).
     if (tile_count <= 0) return;
 
     auto compute_phase = [&](kv_nt_t (&kv_c)[NTPW][KT], int& kvs_c, sfrag (&acc_c)[NTPW],
@@ -463,8 +391,7 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         __builtin_amdgcn_sched_barrier(0);
         reduce_all(acc_c[0], acc_c[1], out_cur);
     };
-    // do_store pinned between two barriers so the scheduler cannot sink the stores into the
-    // surrounding MFMA groups, which would undo the interleaving above.
+    // Barriers keep the stores from sinking into the MFMA groups and breaking the interleave.
     auto fenced_store = [&](opus::vector_t<float, NTPW>& out_v, int t) {
         __builtin_amdgcn_sched_barrier(0);
         do_store(out_v, t);
@@ -474,13 +401,12 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     // Zero-initialized: fp4 fills only the low 16 B of each 256-bit operand.
     kv_nt_t kvA[NTPW][KT]{}, kvB[NTPW][KT]{};
     int     kvsA, kvsB;
-    sfrag   accA[NTPW], accB[NTPW];   // both token-tile fragments per buffer (the whole-tile lead)
+    sfrag   accA[NTPW], accB[NTPW];   // both token-tile fragments per buffer
     int     pgA, pgB;
     opus::vector_t<float, NTPW> outA, outB;
 
-    // ---- prologue: Q + q_scale + weights, then chunk-0 -> kvA, chunk-1 -> kvB ----
-    // Q is read straight from global with no LDS staging and hence no s_barrier.
-    {   // MT * KT back-to-back 16 B loads -> the low half of each (mi, kt) A operand.
+    // ---- prologue: Q (direct from global, no LDS) + q_scale + weights, then KV tiles 0/1 ----
+    {   // MT * KT 16 B loads -> low half of each (mi, kt) A operand.
         auto vq = opus::load<T::KV_GRP_BYTES>(g_q, u_q);
         auto* q16 = reinterpret_cast<opus::vector_t<D_BYTE, T::KV_GRP_BYTES>*>(&vq);
         opus::static_for<MT>([&](auto mic) {
@@ -493,7 +419,7 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         });
     }
     q_scale = opus::load<1>(g_qs, u_qs)[0];
-    {   // MT * (C_FRAG / PACK_W) issues; the preshuffle puts them in C-fragment order already.
+    {   // MT * (C_FRAG / PACK_W) issues, already in C-fragment order.
         auto v_w = opus::load<PACK_W>(g_w, u_w);
         auto* wp = reinterpret_cast<opus::vector_t<D_WEIGHT, PACK_W>*>(&v_w);
         opus::static_for<MT>([&](auto mic) {
@@ -509,8 +435,8 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         });
     }
 
-    // Whole-tile lead: precompute BOTH token-tile fragments of tile 0 into accA, so phase 0 can
-    // open by reloading kvA. tile 1 is staged into kvB for that phase's partner gemms.
+    // Whole-tile lead: tile 0 is fully computed into accA so phase 0 can reload kvA at once;
+    // tile 1 is staged in kvB for that phase's gemms.
     issue_ks(kvA, kvsA, load_page_id(clamp_tile(0)));
     issue_ks(kvB, kvsB, load_page_id(clamp_tile(1)));
     pgA = load_page_id(clamp_tile(2));
@@ -519,14 +445,12 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     pgB = load_page_id(clamp_tile(3));
     __builtin_amdgcn_sched_barrier(0);
 
-    // ---- PEELED phase 0 (chunk 0 -> outA) ----
+    // ---- peeled phase 0 ----
     compute_phase(kvA, kvsA, accA, kvB, kvsB, accB, pgA, 2, outA);
     __builtin_amdgcn_sched_barrier(0);
 
-    // Each phase stores its own result as soon as reduce_all has it, so the loop body ends with
-    // a compute rather than with the out stores. Lagging the stores by a phase puts them last,
-    // where the next iteration's first MFMA overwrites the registers they read; that WAR pins the
-    // loop-head s_waitcnt tighter than the KV dependency needs. Do not reintroduce it.
+    // Each phase stores its own result immediately. Do not lag stores by a phase: at the loop
+    // tail their WAR with the next MFMA tightens the loop-head s_waitcnt beyond the KV need.
     fenced_store(outA, 0);
     if (tile_count >= 2) {
         compute_phase(kvB, kvsB, accB, kvA, kvsA, accA, pgB, 3, outB);
@@ -540,11 +464,10 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         compute_phase(kvB, kvsB, accB, kvA, kvsA, accA, pgB, t + 3, outB);
         fenced_store(outB, t + 1);
     }
-    if (t < tile_count) {   // t == tile_count-1 here, so this is the last chunk
+    if (t < tile_count) {   // last chunk
         compute_phase(kvA, kvsA, accA, kvB, kvsB, accB, pgA, t + 2, outA);
         fenced_store(outA, t);
     }
-    // no epilogue store: every chunk was stored by the phase that computed it
 }
 
 } // namespace opus_logits
