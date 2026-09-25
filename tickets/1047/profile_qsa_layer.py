@@ -18,11 +18,11 @@ import time
 import torch
 
 from aiter import dtypes
-from aiter.ops.flydsl.qsa import FAMILY_A_GQA, FAMILY_A_INDEXER
 from aiter.ops.triton.attention.qsa_vllm_amd import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_attention,
 )
+from op_tests.qsa_shapes import FAMILY_A_GQA, FAMILY_A_INDEXER
 from op_tests.test_flydsl_qsa import _pack_family_a, _query_positions
 
 

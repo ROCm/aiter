@@ -12,32 +12,20 @@ from .oracle import (
 )
 from .paged import (
     gather_paged_cache,
-    gather_qsa_family_a_caches,
+    gather_qsa_caches,
     pack_paged_cache,
 )
 from .shapes import (
-    FAMILY_A_GQA,
-    FAMILY_A_INDEXER,
-    FAMILY_A_SCORE_SCALE,
-    FAMILY_B_GQA,
-    FAMILY_B_INDEXER,
-    FAMILY_B_INDEXER_H8,
     QsaGqaSpec,
     QsaIndexerSpec,
 )
 
 __all__ = [
-    "FAMILY_A_GQA",
-    "FAMILY_A_INDEXER",
-    "FAMILY_A_SCORE_SCALE",
-    "FAMILY_B_GQA",
-    "FAMILY_B_INDEXER",
-    "FAMILY_B_INDEXER_H8",
     "QsaGqaSpec",
     "QsaIndexerSpec",
     "QsaOracleResult",
     "gather_paged_cache",
-    "gather_qsa_family_a_caches",
+    "gather_qsa_caches",
     "pack_paged_cache",
     "qsa_expand_tail",
     "qsa_indexer_scores",
