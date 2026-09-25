@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
-from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale_group32 as group32_op
+from aiter.ops.triton.gemm.basic import gemm_afp8wfp8 as afp8wfp8_op
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
     gemm_a8w8_blockscale_group32,
 )
@@ -38,7 +38,7 @@ def generate_inputs(m, n, k, weight_group_rows=32):
 
 def run_torch(x, weight, xs, ws, weight_group_rows=32):
     # FP64 is independent of the MFMA's internal block accumulation and of
-    # either implementation's K reduction order.
+    # the kernel's K reduction order.
     a = x.double() * xs.double().repeat_interleave(32, -1)
     b = weight.double() * ws.double().repeat_interleave(weight_group_rows, 0)[
         : weight.shape[0]
@@ -91,7 +91,7 @@ def test_group32_projection_panel_scales_and_tails(m, n, k, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_tuned_variants_use_production_config(m, packed, dtype):
     n, k = 8192, 1280
-    config, tuned = get_gemm_config("GEMM-A8W8_BLOCKSCALE_GROUP32", m, n, k)
+    config, tuned = get_gemm_config("GEMM-AFP8WFP8_A32_W32X32", m, n, k)
     assert tuned
     assert ("packed" in config) == packed
     if not packed:
@@ -298,6 +298,8 @@ _FUSED_TILE = {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 256,
+    "GROUP_SIZE_M": 1,
+    "cache_modifier": "",
     "num_warps": 2,
     "num_stages": 2,
     "waves_per_eu": 0,
@@ -315,6 +317,7 @@ _FUSED_PACKED = dict(
         "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 256,
         "K_PACK": 2,
+        "cache_modifier": "",
         "NUM_KSPLIT": 5,
         "num_warps": 2,
         "num_stages": 2,
@@ -384,7 +387,7 @@ def test_fused_split_k_is_deterministic_and_rezeroes_counters(variant):
     # A stale counter or an early partial read would change a later sum.
     assert all(torch.equal(first, run()) for _ in range(50))
     torch.cuda.synchronize()
-    assert not group32_op._split_counters(x.device).any()
+    assert not afp8wfp8_op._split_counters(x.device).any()
 
 
 @pytest.mark.parametrize("variant", ["tile", "packed"])

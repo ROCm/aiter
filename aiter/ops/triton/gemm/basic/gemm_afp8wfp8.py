@@ -138,8 +138,7 @@ def gemm_afp8wfp8(
     config family. An explicit ``split_k`` overrides the configured count;
     partitions are aligned to whole kernel steps. ``skip_reduce`` disables
     fused reduction and returns FP32 partials when more than one split remains.
-    Packed execution and fused reduction require gfx950. The original group32
-    entry point remains available for correctness/performance comparisons.
+    Packed execution and fused reduction require gfx950.
     """
     assert x.ndim == w.ndim == 2, "Expected matrix operands"
     M, K = x.shape

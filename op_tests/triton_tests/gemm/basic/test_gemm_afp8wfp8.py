@@ -13,9 +13,6 @@ if __name__ == "__main__":
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
-    gemm_a8w8_blockscale_group32,
-)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
@@ -538,7 +535,7 @@ def test_split_k_skip_reduce_and_override(packed, b_group, splits):
 
 @pytest.mark.parametrize("rows", [1, 32])
 @pytest.mark.usefixtures("_require_gfx950")
-def test_matches_group32_kernel(rows):
+def test_compact_scales_with_uint8_operands(rows):
     x, w, xs, ws, expected = _compact_scale_inputs(3, 131, 1152, 32, (rows, 32))
     config = _execution_config()
     actual = gemm_afp8wfp8(
@@ -552,18 +549,7 @@ def test_matches_group32_kernel(rows):
         w_scale_group_size=(rows, 32),
         split_k=3,
     )
-    legacy = gemm_a8w8_blockscale_group32(
-        x,
-        w,
-        xs,
-        ws,
-        dtype=torch.float32,
-        config=config,
-        weight_group_rows=rows,
-        split_k=3,
-    )
     _assert_compact_scale_close(actual, expected)
-    _assert_compact_scale_close(actual, legacy)
 
 
 @pytest.mark.parametrize("packed", [False, True])
