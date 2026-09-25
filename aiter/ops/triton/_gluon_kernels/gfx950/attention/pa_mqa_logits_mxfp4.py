@@ -182,29 +182,18 @@ def _prepare_candidates_kernel(
     bt_ptr,
     pos_ptr,
     cu_ptr,
-    voff_ptr,
-    soff_ptr,
+    slots_ptr,
     stride_ids,
     stride_bt,
     K: tl.constexpr,
     C: tl.constexpr,
     PAGE: tl.constexpr,
-    NPT: tl.constexpr,
-    HEAD_BYTES: tl.constexpr,
-    NUM_SCALES: tl.constexpr,
-    KV_STRIDE: tl.constexpr,
-    KVS_STRIDE: tl.constexpr,
-    KW: tl.constexpr,
-    SU: tl.constexpr,
-    TOK_STRIDE: tl.constexpr,
-    OFF64: tl.constexpr,
 ):
     """Ranked block ids -> the walk's candidate list, one row per program.
 
     The rank emits by score. Position order puts the causal-edge block last,
     where cu trims it, and lets one request's rows walk the same pages
-    together, which is what prefill gains from. Everything after the sort must
-    stay in step with the tests' block_offsets.
+    together, which is what prefill gains from.
     """
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, K)
@@ -225,16 +214,8 @@ def _prepare_candidates_kernel(
     tail = tl.minimum(C, end - max_id * C)
     tl.store(cu_ptr + row, tl.where(n_valid > 0, (n_valid - 1) * C + tail, 0))
 
-    page = pos // PAGE
-    t0 = pos % PAGE
-    pid = tl.load(bt_ptr + row * stride_bt + page).to(tl.int64)
-    bn = (t0 % NPT) * KW + (t0 // NPT) * (NPT * HEAD_BYTES)
-    bs = (t0 % NPT) * TOK_STRIDE + (t0 // NPT) * (NPT * NUM_SCALES)
-    v = (pid * KV_STRIDE + bn) // KW
-    sc = (pid * KVS_STRIDE + bs) // SU
-    # i32 while it reaches; a pool past 4 GiB of scale bytes needs the width
-    tl.store(voff_ptr + row * K + cols, v if OFF64 else v.to(tl.int32))
-    tl.store(soff_ptr + row * K + cols, sc if OFF64 else sc.to(tl.int32))
+    page = tl.load(bt_ptr + row * stride_bt + pos // PAGE)
+    tl.store(slots_ptr + row * K + cols, page * PAGE + pos % PAGE)
 
 
 @gluon.jit
@@ -348,6 +329,8 @@ class Config:
     VARLEN: gl.constexpr
     GATHER: gl.constexpr
     GATHER_BLOCK: gl.constexpr
+    GATHER_SHIFT: gl.constexpr
+    GROUP_SHIFT: gl.constexpr
     GATHER_PIPE: gl.constexpr
     BSCORE: gl.constexpr
     STORE_LOGITS: gl.constexpr
@@ -436,6 +419,12 @@ class Config:
         # an iteration early, the way PAGE_PIPE reads the block table.
         self.GATHER = gl.constexpr(GATHER)
         self.GATHER_BLOCK = gl.constexpr(GATHER_BLOCK)
+        # A candidate slot splits into page, block in page and block in
+        # shuffle group with these, as a position does with PAGE_SHIFT.
+        self.GATHER_SHIFT = gl.constexpr((GATHER_BLOCK - 1).bit_length())
+        self.GROUP_SHIFT = gl.constexpr(
+            (max(MFMA_NONK_DIM // GATHER_BLOCK, 1) - 1).bit_length()
+        )
         self.GATHER_PIPE = gl.constexpr(GATHER_PIPE)
         # A per-row max over every BSCORE_BLOCK columns, so the indexer's block
         # scores cost a reduce in the walk rather than a second pass:
@@ -565,8 +554,7 @@ class KVState:
     last_page_row: gl.tensor
     val_offsets: gl.tensor
     scale_offsets: gl.tensor
-    gv_ptr: gl.tensor
-    gs_ptr: gl.tensor
+    slots_ptr: gl.tensor
     last_blk: gl.tensor
 
     @gluon.constexpr_function
@@ -579,8 +567,7 @@ class KVState:
         last_page_row,
         val_offsets,
         scale_offsets,
-        gv_ptr,
-        gs_ptr,
+        slots_ptr,
         last_blk,
     ):
         self.cfg = cfg
@@ -590,8 +577,7 @@ class KVState:
         self.last_page_row = last_page_row
         self.val_offsets = val_offsets
         self.scale_offsets = scale_offsets
-        self.gv_ptr = gv_ptr
-        self.gs_ptr = gs_ptr
+        self.slots_ptr = slots_ptr
         self.last_blk = last_blk
 
     @gluon.jit
@@ -601,8 +587,7 @@ class KVState:
         kv_scales_ptr,
         blk_ptr,
         last_page_row,
-        gv_ptr,
-        gs_ptr,
+        slots_ptr,
         last_blk,
         val_layout: gl.constexpr,
     ):
@@ -642,23 +627,19 @@ class KVState:
             last_page_row,
             val,
             sc,
-            gv_ptr,
-            gs_ptr,
+            slots_ptr,
             last_blk,
         )
 
     @gluon.jit
-    def gather_base(self, tile_pos, base_ptr, layout: gl.constexpr, AXIS: gl.constexpr):
-        """This tile's per-column base offset.
+    def gather_slots(self, tile_pos, layout: gl.constexpr, AXIS: gl.constexpr):
+        """Each column's candidate slot: page * PAGE_SIZE + offset of its
+        block's first token, so the walk carries no block -> block table ->
+        page chain.
 
-        One int32 per candidate block, already holding the page address plus
-        the block's own offset inside its page, so the walk carries no
-        block -> position -> block table -> page chain: one load and one
-        broadcast add.
-
-        `tile_pos` is a slot index here, not a KV position, the walk is over
-        the compact candidate list and the store columns are compact too.
-        Clamped rather than masked, store mask handles the rest
+        `tile_pos` indexes the compact candidate list, not the context, and
+        the store columns are compact too. Clamped rather than masked; the
+        store mask handles the rest.
         """
         cols = gl.arange(0, self.cfg.BLOCK_KV, layout=gl.SliceLayout(AXIS, layout))
         # Split so the tile term stays scalar
@@ -668,18 +649,13 @@ class KVState:
         )
         # Buffer, not pointer: the row base is scalar and folds into the
         # descriptor, so the per-column term stays i32
-        return gl.amd.cdna4.buffer_load(ptr=base_ptr, offsets=blk)
+        return gl.amd.cdna4.buffer_load(ptr=self.slots_ptr, offsets=blk)
 
     @gluon.jit
-    def gather_scale_base(self, tile_pos):
-        """The scale stream's per-column base in the wide load's index space.
-
-        The preshuffled scale tile is read as [N_HI, S_LO, N_PER_TILE, S_HI]
-        rather than [BLOCK_KV, NUM_SCALES] (see _load_scales_wide), so its
-        candidate index has to be built on that shape: the token is
-        b0 * N_PER_TILE + b2, and the block it belongs to is that over
-        GATHER_BLOCK. Broadcast over the two scale axes
-        """
+    def gather_scale_slots(self, tile_pos):
+        """gather_slots on the wide scale load's [N_HI, S_LO, N_PER_TILE, S_HI]
+        index space (see _load_scales_wide): the token is b0 * N_PER_TILE + b2,
+        broadcast over the two scale axes."""
         cfg: gl.constexpr = self.cfg
         S_LO: gl.constexpr = WARP_SIZE // cfg.N_PER_TILE
         S_HI: gl.constexpr = cfg.NUM_SCALES // S_LO
@@ -696,8 +672,32 @@ class KVState:
             + (b0 * cfg.N_PER_TILE + b2) // cfg.GATHER_BLOCK,
             self.last_blk,
         )
-        # A buffer load, for the reason gather_base gives.
-        return gl.amd.cdna4.buffer_load(ptr=self.gs_ptr, offsets=blk)
+        return gl.amd.cdna4.buffer_load(ptr=self.slots_ptr, offsets=blk)
+
+    @gluon.jit
+    def slot_base(
+        self,
+        slot,
+        PAGE_STRIDE: gl.constexpr,
+        TOKEN_STEP: gl.constexpr,
+        GROUP_STEP: gl.constexpr,
+    ):
+        """A stream's byte offset for the block starting at `slot`. Worked in
+        block units, so the alignment the loads need stays provable."""
+        cfg: gl.constexpr = self.cfg
+        page = slot >> cfg.PAGE_SHIFT
+        blk = (slot & cfg.PAGE_MASK) >> cfg.GATHER_SHIFT
+        if cfg.PRESHUFFLE:
+            in_group: gl.constexpr = cfg.N_PER_TILE // cfg.GATHER_BLOCK
+            off = (blk & (in_group - 1)) * (cfg.GATHER_BLOCK * TOKEN_STEP) + (
+                blk >> cfg.GROUP_SHIFT
+            ) * GROUP_STEP
+        else:
+            off = blk * (cfg.GATHER_BLOCK * TOKEN_STEP)
+        if cfg.USE_BUFFER_LOAD:
+            return page * PAGE_STRIDE + off
+        else:
+            return page.to(gl.int64) * PAGE_STRIDE + off
 
     @gluon.jit
     def gather_tok(self, tile_pos, val_layout: gl.constexpr):
@@ -707,22 +707,32 @@ class KVState:
         dependent memory load standing directly in front of every KV address in
         the tile. GATHER_PIPE is what lets the walk issue it an iteration early.
         """
-        if self.cfg.GATHER:
+        cfg: gl.constexpr = self.cfg
+        if cfg.GATHER:
+            S_HI: gl.constexpr = cfg.NUM_SCALES // (WARP_SIZE // cfg.N_PER_TILE)
+            if cfg.PRESHUFFLE:
+                V_STEP: gl.constexpr = cfg.D_PER_TILE
+                S_STEP: gl.constexpr = S_HI if cfg.SCALE_MODE == 1 else 1
+            else:
+                V_STEP: gl.constexpr = cfg.HEAD_BYTES
+                S_STEP: gl.constexpr = cfg.NUM_SCALES
+            vals = self.slot_base(
+                self.gather_slots(tile_pos, val_layout, 0),
+                cfg.KV_PAGE_STRIDE,
+                V_STEP,
+                cfg.N_PER_TILE * cfg.HEAD_BYTES,
+            )
             # The scale base has to be built on whichever index space its load
             # uses: the four-dimensional one for the wide mode-1 read, the
             # plain [BLOCK_KV, NUM_SCALES] one otherwise.
-            if self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
-                return (
-                    self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
-                    self.gather_scale_base(tile_pos),
-                )
+            if cfg.PRESHUFFLE and cfg.SCALE_MODE == 1:
+                slots = self.gather_scale_slots(tile_pos)
             else:
-                return (
-                    self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
-                    self.gather_base(
-                        tile_pos, self.gs_ptr, self.cfg.kv_scale_layout, 1
-                    ),
-                )
+                slots = self.gather_slots(tile_pos, cfg.kv_scale_layout, 1)
+            scales = self.slot_base(
+                slots, cfg.KVS_PAGE_STRIDE, S_STEP, cfg.N_PER_TILE * cfg.NUM_SCALES
+            )
+            return vals, scales
         else:
             return tile_pos * 0, tile_pos * 0
 
@@ -771,18 +781,7 @@ class KVState:
         """
         if self.cfg.GATHER:
             # A per-column page, so the whole address goes in the offsets.
-            # U is the value stream's D_PER_TILE move: the list is stored in
-            # units of U so the multiply hands the 2-byte alignment back, and
-            # without it each scale run splits into two buffer_load_ubyte.
-            U: gl.constexpr = (
-                2
-                if (self.cfg.GATHER_BLOCK % 2 == 0 and self.cfg.NUM_SCALES % 2 == 0)
-                else 1
-            )
-            if self.cfg.USE_BUFFER_LOAD:
-                gs = gtok[1] * U
-            else:
-                gs = gtok[1].to(gl.int64) * U
+            gs = gtok[1]
             if self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
                 return _load_scales_wide(self.cfg, self.kv_scales_ptr, gs)
             elif self.cfg.USE_BUFFER_LOAD:
@@ -882,7 +881,7 @@ class RegLoader:
 
     @gluon.jit
     def initialize(
-        cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+        cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, slots_ptr, last_blk
     ):
         return RegLoader(
             KVState.initialize(
@@ -891,8 +890,7 @@ class RegLoader:
                 kv_scales_ptr,
                 blk_ptr,
                 last_page_row,
-                gv_ptr,
-                gs_ptr,
+                slots_ptr,
                 last_blk,
                 cfg.dot_b,
             )
@@ -914,21 +912,15 @@ class RegLoader:
     def values(self, tile_pos, page, gtok):
         cfg: gl.constexpr = self.st.cfg
         if cfg.GATHER:
-            # An offset arriving from memory carries no provable alignment, and
-            # Triton then emits one buffer_load_ubyte per byte. Storing the list
-            # in D_PER_TILE units and multiplying back hands the divisibility
-            # over.
             if cfg.USE_BUFFER_LOAD:
                 return gl.amd.cdna4.buffer_load(
                     ptr=self.st.KV_ptr,
-                    offsets=self.st.val_offsets + (gtok[0] * cfg.D_PER_TILE)[None, :],
+                    offsets=self.st.val_offsets + gtok[0][None, :],
                     cache=cfg.KV_CACHE,
                 )
             else:
                 return gl.load(
-                    self.st.KV_ptr
-                    + self.st.val_offsets
-                    + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :],
+                    self.st.KV_ptr + self.st.val_offsets + gtok[0][None, :],
                     cache_modifier=cfg.KV_CACHE,
                 )
         else:
@@ -958,7 +950,7 @@ class LDSLoader:
 
     @gluon.jit
     def initialize(
-        cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+        cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, slots_ptr, last_blk
     ):
         st = KVState.initialize(
             cfg,
@@ -966,8 +958,7 @@ class LDSLoader:
             kv_scales_ptr,
             blk_ptr,
             last_page_row,
-            gv_ptr,
-            gs_ptr,
+            slots_ptr,
             last_blk,
             cfg.blocked_kv,
         )
@@ -1000,13 +991,7 @@ class LDSLoader:
         cfg: gl.constexpr = self.st.cfg
         dest = self.kv_shared.index(buffer_id)
         if cfg.GATHER:
-            if cfg.USE_BUFFER_LOAD:
-                offsets = self.st.val_offsets + (gtok[0] * cfg.D_PER_TILE)[None, :]
-            else:
-                offsets = (
-                    self.st.val_offsets
-                    + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :]
-                )
+            offsets = self.st.val_offsets + gtok[0][None, :]
         else:
             offsets = self.st.val_offsets + self.st.page_off(
                 tile_pos, page, cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES
@@ -1401,8 +1386,7 @@ _repr = make_kernel_repr(
     do_not_specialize_on_alignment=[
         "sched_ptr",
         "context_lens_ptr",
-        "gather_v_ptr",
-        "gather_s_ptr",
+        "slots_ptr",
     ],
 )
 def _pa_mqa_logits_mxfp4_kernel(
@@ -1417,8 +1401,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     # candidate slot count under GATHER; None unless HAS_ROW_ENDS
     block_table_ptr,  # int32 [B, stride_blk_b]
     sched_ptr,  # int32 [grid, 4] descriptors; unused unless DYNAMIC
-    gather_v_ptr,  # int32 [B*NEXT_N, blocks] resolved value offsets
-    gather_s_ptr,  # int32 [B*NEXT_N, blocks] resolved scale byte offsets
+    slots_ptr,  # int32 [B*NEXT_N, blocks] slot of each candidate block's first token
     block_scores_ptr,  # fp32  [B * NEXT_N, ceil(max_model_len / BSCORE_BLOCK)]
     # per-row block maxima; None unless BSCORE
     logits_ptr,  # fp32  [B * NEXT_N, max_model_len]; None under
@@ -1681,18 +1664,29 @@ def _pa_mqa_logits_mxfp4_kernel(
 
     # The candidate list is per query row
     g_base = w_row.to(gl.int64) * stride_gather_r
-    gv_ptr = gather_v_ptr + g_base
-    gs_ptr = gather_s_ptr + g_base
+    row_slots_ptr = slots_ptr + g_base
     last_blk = gl.maximum((block_end + GATHER_BLOCK - 1) // GATHER_BLOCK - 1, 0)
 
     if PRESHUFFLE:
         loader = RegLoader.initialize(
-            cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+            cfg,
+            KV_ptr,
+            kv_scales_ptr,
+            blk_ptr,
+            last_page_row,
+            row_slots_ptr,
+            last_blk,
         )
         _loop_with_reg(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
     else:
         loader = LDSLoader.initialize(
-            cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+            cfg,
+            KV_ptr,
+            kv_scales_ptr,
+            blk_ptr,
+            last_page_row,
+            row_slots_ptr,
+            last_blk,
         )
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
 

@@ -256,23 +256,6 @@ def cache_strides(kv_cache, head_size, kv_scale_cache=None):
     return page_size, kv_cache.stride(0), kv_scale_cache.stride(0)
 
 
-def offset_dtype(num_pages, kv_stride, kvs_stride, s_unit):
-    """int32 while both resolved streams still reach the cache. Values are
-    stored in K_WIDTH units and scales in s_unit, so the scales bind first."""
-    fits = (
-        num_pages * kv_stride <= 2**31 * K_WIDTH
-        and num_pages * kvs_stride <= 2**31 * s_unit
-    )
-    return torch.int32 if fits else torch.int64
-
-
-def gather_s_unit(block, num_scales):
-    """The scale list's unit in e8m0 bytes. Two when every resolved offset is
-    even, so the kernel's * U hands the 2-byte alignment back to the vectorizer.
-    The kernel derives the same U; the two must agree."""
-    return 2 if (block % 2 == 0 and num_scales % 2 == 0) else 1
-
-
 def build_candidate_gather(
     candidates,
     ends,
@@ -282,19 +265,16 @@ def build_candidate_gather(
     head_size,
     block=CANDIDATE_BLOCK,
     kv_scale_cache=None,
-    scale_mode=SCALE_MODE_WIDE,
-    offsets=None,
 ):
     """Ranked block ids -> (gather, row_ends), in one launch.
 
     candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
     ends:        [B * NEXT_N] int32 exclusive per-row key bound
     block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row
-    offsets:     resolved-offset width; None picks it from the cache's span
 
-    The sort, the slot count and the resolve in one launch, so a layer group
-    can build the pool once and hand it to every consumer. The tests'
-    build_gather is the reference for the resolve.
+    Returns the sorted block starts (positions) and the slot of each one
+    (page * page_size + offset), which is all the walk reads, so a layer group
+    can build the pool once and hand it to every consumer.
     """
     rows, k = candidates.shape
     assert k & (k - 1) == 0, "the sort needs a power-of-two candidate count"
@@ -306,50 +286,30 @@ def build_candidate_gather(
         else (8 if k >= 2048 else 4)
     )
     assert block_table.shape[0] == rows and block_table.stride(1) == 1
-    n_per_tile = mfma_nonk_dim(num_heads, head_size)
-    page_size, kv_stride, kvs_stride = cache_strides(
-        kv_cache, head_size, kv_scale_cache
-    )
-    assert page_size % block == 0 and block <= n_per_tile
-    num_scales = head_size // SCALE_GROUP
-    s_lo = 64 // n_per_tile
-    dev = candidates.device
-    s_unit = gather_s_unit(block, num_scales)
-    fits = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride, s_unit)
-    if offsets is None:
-        offsets = fits
+    page_size = cache_strides(kv_cache, head_size, kv_scale_cache)[0]
+    assert page_size % block == 0 and block <= mfma_nonk_dim(num_heads, head_size)
     assert (
-        offsets == torch.int64 or fits == torch.int32
-    ), "i32 offsets do not reach this cache; pass offsets=torch.int64"
+        kv_cache.shape[0] * page_size < 2**31
+    ), "the pool holds more tokens than int32 slots address"
+    dev = candidates.device
     pos = torch.empty((rows, k), dtype=torch.int32, device=dev)
     cu = torch.empty((rows,), dtype=torch.int32, device=dev)
-    voff = torch.empty((rows, k), dtype=offsets, device=dev)
-    soff = torch.empty((rows, k), dtype=offsets, device=dev)
+    slots = torch.empty((rows, k), dtype=torch.int32, device=dev)
     _prepare_candidates_kernel[(rows,)](
         candidates,
         ends,
         block_table,
         pos,
         cu,
-        voff,
-        soff,
+        slots,
         candidates.stride(0),
         block_table.stride(0),
         k,
         block,
         page_size,
-        n_per_tile,
-        head_size // 2,
-        num_scales,
-        kv_stride,
-        kvs_stride,
-        K_WIDTH,
-        s_unit,
-        (num_scales // s_lo) if scale_mode == SCALE_MODE_WIDE else 1,
-        OFF64=offsets == torch.int64,
         num_warps=num_warps,
     )
-    return {"voff": voff, "soff": soff, "block": block, "positions": pos}, cu
+    return {"slots": slots, "block": block, "positions": pos}, cu
 
 
 def build_schedule(
@@ -697,18 +657,13 @@ def paged_mxfp4_mqa_logits(
                 head_size,
                 cand_block,
                 kv_scale_cache,
-                scale_mode,
             )
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:
-        g_voff, g_soff = gather["voff"], gather["soff"]
-        assert g_voff.dtype == g_soff.dtype, "both streams take one width"
-        assert g_voff.dtype in (torch.int32, torch.int64), g_voff.dtype
-        assert g_voff.shape == g_soff.shape, (g_voff.shape, g_soff.shape)
-        assert g_voff.stride(1) == 1 and g_soff.stride(1) == 1
-        assert g_voff.stride(0) == g_soff.stride(0)
-        assert g_voff.shape[0] == total_rows, g_voff.shape
+        g_slots = gather["slots"]
+        assert g_slots.dtype == torch.int32 and g_slots.stride(1) == 1
+        assert g_slots.shape[0] == total_rows, g_slots.shape
         assert row_ends is not None, (
             "the gather takes its walk length from row_ends, read as the row's "
             "count of valid candidate slots"
@@ -768,12 +723,10 @@ def paged_mxfp4_mqa_logits(
         assert (
             gather_block <= n_per_tile
         ), "a candidate block must sit inside one shuffle group"
-        # Two limits, not one. The list reaches 2**31 of its own unit, but the
-        # buffer path multiplies it back to bytes in i32, so it caps at 2 GiB.
-        use_buffer_load = (
-            gather["voff"].dtype == torch.int32
-            and num_pages * max(kv_page_stride, kvs_page_stride) < 2**31
-        )
+        assert (
+            num_pages * page_size < 2**31
+        ), "the pool holds more tokens than int32 slots address"
+        use_buffer_load = num_pages * max(kv_page_stride, kvs_page_stride) < 2**31
 
     # The two that need the batch, which select_config does not see.
     # Varlen's grid is one unit per row block plus a spare per sequence, not
@@ -833,8 +786,7 @@ def paged_mxfp4_mqa_logits(
         query_start_loc_ptr=query_start_loc,
         block_table_ptr=block_table,
         sched_ptr=schedule,
-        gather_v_ptr=g_voff if gather_on else schedule,
-        gather_s_ptr=g_soff if gather_on else schedule,
+        slots_ptr=g_slots if gather_on else schedule,
         # None specializes to a constexpr, so neither reaches the kernarg
         # segment with the reduce off.
         block_scores_ptr=block_scores if bscore_on else None,
@@ -850,7 +802,7 @@ def paged_mxfp4_mqa_logits(
         stride_logits_s=logits.stride(0) if logits is not None else 0,
         stride_logits_k=logits.stride(1) if logits is not None else 0,
         stride_blk_b=block_table.stride(0),
-        stride_gather_r=g_voff.stride(0) if gather_on else 0,
+        stride_gather_r=g_slots.stride(0) if gather_on else 0,
         stride_bs_s=block_scores.stride(0) if bscore_on else None,
         max_blocks=block_table.shape[1],
         NUM_HEADS=num_heads,

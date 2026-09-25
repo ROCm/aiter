@@ -4,14 +4,11 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
-    K_WIDTH,
     build_candidate_gather,
     build_schedule,
     cache_format,
     cache_strides,
-    gather_s_unit,
     mfma_nonk_dim,
-    offset_dtype,
     paged_mxfp4_mqa_logits,
 )
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import preshuffle_cache
@@ -115,113 +112,18 @@ def row_ends_for(kind, ctx_lens, next_n, ratio=2, device="cuda"):
     return torch.tensor(ends, dtype=torch.int32, device=device)
 
 
-def block_offsets(
-    pos0,
-    block_table,
-    page_size,
-    head_size,
-    n_per_tile,
-    kv_stride,
-    kvs_stride,
-    block,
-    preshuffle=1,
-    scale_mode=1,
-    dtype=torch.int32,
-):
-    """Resolved (value, scale) offsets for the candidate blocks starting at pos0.
-
-    pos0 is [R, K] int64 block-aligned KV positions and block_table is
-    [R, max_blocks], one row per query row. The block -> byte map is not linear
-    in the block index, since a shuffle group is 32 tokens, so a stride times
-    the block index gives plausible garbage.
-    """
-    head_bytes = head_size // 2
-    num_scales = head_size // SCALE_GROUP
-    s_lo = 64 // n_per_tile
-    s_hi = num_scales // s_lo
-
-    page = pos0 // page_size
-    t0 = pos0 % page_size
-    pid = torch.gather(block_table.long(), 1, page).long()
-
-    if preshuffle:
-        bn = (t0 % n_per_tile) * K_WIDTH + (t0 // n_per_tile) * (
-            n_per_tile * head_bytes
-        )
-        # Mode 1 puts the token at stride s_hi inside a group, mode 0 at 1.
-        tok_stride = s_hi if scale_mode == 1 else 1
-        bs = (t0 % n_per_tile) * tok_stride + (t0 // n_per_tile) * (
-            n_per_tile * num_scales
-        )
-    else:
-        bn = t0 * head_bytes
-        bs = t0 * num_scales
-
-    # Stored in K_WIDTH and s_unit units so the kernel's multiply hands the
-    # alignment back. From a block-aligned start every in-page term is a
-    # multiple of both, which leaves only the page strides to check.
-    s_unit = gather_s_unit(block, num_scales)
-    assert kv_stride % K_WIDTH == 0, "value page stride must be k_width aligned"
-    assert kvs_stride % s_unit == 0, "scale page stride must be unit aligned"
-    voff = pid * kv_stride + bn
-    soff = pid * kvs_stride + bs
-    return (voff // K_WIDTH).to(dtype), (soff // s_unit).to(dtype)
-
-
-def build_gather(
-    positions,
-    block_table,
-    kv_cache,
-    num_heads,
-    head_size,
-    block=8,
-    kv_scale_cache=None,
-    preshuffle=1,
-    scale_mode=1,
-    dtype=None,
-):
+def build_gather(positions, block_table, kv_cache, num_heads, head_size, block=8):
     """[R, K] int64 block-start positions -> the launcher's candidates= dict.
 
     The torch reference for build_candidate_gather's resolve. positions[r] must
     be sorted, unique, block-aligned and causally legal for row r, and none of
     that is checked. The launch's row_ends counts row r's real slots.
     """
-    n_per_tile = mfma_nonk_dim(num_heads, head_size)
-    page_size, kv_stride, kvs_stride = cache_strides(
-        kv_cache, head_size, kv_scale_cache
-    )
-    assert page_size % block == 0 and block <= n_per_tile
-    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
-    fits = offset_dtype(
-        kv_cache.shape[0],
-        kv_stride,
-        kvs_stride,
-        gather_s_unit(block, head_size // SCALE_GROUP),
-    )
-    if dtype is None:
-        dtype = fits
-    assert (
-        dtype == torch.int64 or fits == torch.int32
-    ), "i32 offsets do not reach this cache; pass dtype=torch.int64"
-    voff, soff = block_offsets(
-        positions,
-        block_table,
-        page_size,
-        head_size,
-        n_per_tile,
-        kv_stride,
-        kvs_stride,
-        block,
-        preshuffle,
-        scale_mode,
-        dtype,
-    )
-    return {
-        "voff": voff.contiguous(),
-        "soff": soff.contiguous(),
-        "block": block,
-        "positions": positions,
-    }
+    page_size = cache_strides(kv_cache, head_size)[0]
+    assert page_size % block == 0 and block <= mfma_nonk_dim(num_heads, head_size)
+    page = torch.gather(block_table.long(), 1, positions // page_size)
+    slots = page * page_size + positions % page_size
+    return {"slots": slots.to(torch.int32), "block": block, "positions": positions}
 
 
 def _make_case(
@@ -457,7 +359,6 @@ def _gather_run(
         num_heads,
         head_size,
         block,
-        preshuffle=preshuffle,
     )
     out = paged_mxfp4_mqa_logits(
         st["q4"],
@@ -1061,8 +962,7 @@ def test_candidate_gather(num_heads, block):
     pos_r, cu_r = _expand_ref(ids, ends, block)
     ref = build_gather(pos_r, bt, st["cache"], num_heads, 128, block)
     got, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads, 128, block)
-    assert torch.equal(got["voff"], ref["voff"]), "value offsets differ"
-    assert torch.equal(got["soff"], ref["soff"]), "scale offsets differ"
+    assert torch.equal(got["slots"], ref["slots"]), "slots differ"
     assert torch.equal(got["positions"].long(), pos_r) and torch.equal(cu, cu_r)
 
 
@@ -1132,68 +1032,27 @@ def test_strided_pages(num_heads, page_size, pad):
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
 
 
-@pytest.mark.parametrize("num_heads", [32, 64])
-@pytest.mark.parametrize("block", [8, 32])
-def test_gather_offsets_i64(num_heads, block):
-    """A 64-bit candidate list, for a pool past the i32 reach, walks the same."""
-    rows, K = 4, 128
-    st = _make_case(1, rows, num_heads, 128, [4096], 64)
-    g = torch.Generator(device=st["dev"]).manual_seed(11)
-    ids = (
-        torch.rand(rows, st["ctx"][0] // block, generator=g, device=st["dev"])
-        .argsort(1)[:, :K]
-        .to(torch.int32)
-    )
-    ends = _row_ends(st["ctx"], rows, None)
-    bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
-
-    out = []
-    for width in (torch.int32, torch.int64):
-        meta, cu = build_candidate_gather(
-            ids, ends, bt, st["cache"], num_heads, 128, block, offsets=width
-        )
-        assert meta["voff"].dtype == width and meta["soff"].dtype == width
-        out.append(
-            paged_mxfp4_mqa_logits(
-                st["q4"],
-                st["q4s"],
-                st["cache"],
-                st["weights"],
-                st["cl"],
-                st["block_table"],
-                K * block,
-                use_gather=True,
-                candidates=meta,
-                row_ends=cu,
-                candidate_block_size=block,
-            )
-        )
-    torch.cuda.synchronize()
-    assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
-
-
-def test_gather_span_window():
-    """A pool between 2 and 4 GiB: the i32 list still reaches, but the buffer
-    path would not -- it multiplies the list back to bytes in i32."""
+@pytest.mark.parametrize("gib", [3, 5])
+def test_gather_far_pages(gib):
+    """Pages past the buffer ops' 2 GiB reach, and past 4 GiB, walk the same as
+    pages at the start of the pool."""
     rows, block, K, page_size = 4, 8, 64, 64
     page_bytes = page_size * (64 + 4)
-    st = _make_case(
-        1, rows, 32, 128, [2048], page_size, page_offset=2**31 // page_bytes + 512
-    )
-    g = torch.Generator(device=st["dev"]).manual_seed(13)
-    ids = (
-        torch.rand(rows, st["ctx"][0] // block, generator=g, device=st["dev"])
-        .argsort(1)[:, :K]
-        .to(torch.int32)
-    )
-    ends = _row_ends(st["ctx"], rows, None)
-    bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
-
+    free, _ = torch.cuda.mem_get_info()
+    if free < (gib + 2) * 2**30:
+        pytest.skip(f"needs about {gib + 2} GiB free")
     out = []
-    for width in (None, torch.int64):
-        meta, cu = build_candidate_gather(
-            ids, ends, bt, st["cache"], 32, 128, block, offsets=width
+    for page_offset in (0, gib * 2**30 // page_bytes):
+        st = _make_case(1, rows, 32, 128, [2048], page_size, page_offset=page_offset)
+        g = torch.Generator(device=st["dev"]).manual_seed(13)
+        ids = (
+            torch.rand(rows, st["ctx"][0] // block, generator=g, device=st["dev"])
+            .argsort(1)[:, :K]
+            .to(torch.int32)
         )
+        ends = _row_ends(st["ctx"], rows, None)
+        bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
+        meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], 32, 128, block)
         out.append(
             paged_mxfp4_mqa_logits(
                 st["q4"],
@@ -1209,22 +1068,21 @@ def test_gather_span_window():
                 candidate_block_size=block,
             )
         )
+        del st
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
 
-def test_gather_rejects_short_offsets():
-    """Pinning i32 on a cache it cannot reach is an assert, not a truncation."""
+def test_gather_rejects_a_pool_past_the_slot_reach():
+    """Slots are int32: a pool holding more tokens is an assert, not a wrap."""
     rows, block, K = 2, 8, 32
-    # meta: the guard reads the cache's shape and strides, never its bytes
-    cache = torch.empty(2_000_000, 64, 1, 68, dtype=torch.uint8, device="meta")
+    # meta: the guard reads the cache's shape, never its bytes
+    cache = torch.empty(2**31 // 64, 64, 1, 68, dtype=torch.uint8, device="meta")
     ids = torch.zeros(rows, K, dtype=torch.int32, device="cuda")
     ends = torch.full((rows,), 512, dtype=torch.int32, device="cuda")
     bt = torch.zeros(rows, 16, dtype=torch.int32, device="cuda")
-    with pytest.raises(AssertionError, match="do not reach"):
-        build_candidate_gather(
-            ids, ends, bt, cache, 32, 128, block, offsets=torch.int32
-        )
+    with pytest.raises(AssertionError, match="int32 slots"):
+        build_candidate_gather(ids, ends, bt, cache, 32, 128, block)
 
 
 VARLEN_SHAPES = [
