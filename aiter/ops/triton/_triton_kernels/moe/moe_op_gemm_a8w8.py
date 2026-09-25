@@ -379,24 +379,35 @@ def _moe_gemm_a8w8(
             # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] → a_sc_full: [BLOCK_M, BLOCK_K]
             # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K], w layout is [K, N] so we need
             # b_sc_full transposed: [BLOCK_K, BLOCK_N]
-            a_sc_full = tl.reshape(
-                tl.broadcast_to(
-                    a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                ),
-                (BLOCK_M, BLOCK_K),
-            )
-            b_sc_t = tl.reshape(
-                tl.broadcast_to(
-                    b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                ),
-                (BLOCK_N, BLOCK_K),
-            )
-            b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
-            acc += tl.dot(
-                a_f32 * a_sc_full,
-                b_f32 * b_sc_full,
-                input_precision="ieee",
-            )
+            if MX_SCALE_BLOCK_K == 1:
+                # One scale per operand per K-step, so it is constant across
+                # the dot: scaling the result is equivalent to scaling the
+                # operands, and the MFMA stays FP8 instead of being promoted
+                # to FP32.
+                acc += (
+                    tl.dot(x, w, input_precision="ieee")
+                    * tl.sum(a_sc, axis=1)[:, None]
+                    * tl.sum(b_sc, axis=1)[None, :]
+                )
+            else:
+                a_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_M, BLOCK_K),
+                )
+                b_sc_t = tl.reshape(
+                    tl.broadcast_to(
+                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
+                acc += tl.dot(
+                    a_f32 * a_sc_full,
+                    b_f32 * b_sc_full,
+                    input_precision="ieee",
+                )
         else:
             acc = tl.dot_scaled(
                 x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
@@ -444,23 +455,33 @@ def _moe_gemm_a8w8(
             b_f32 = w.to(tl.float32)
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            a_sc_full = tl.reshape(
-                tl.broadcast_to(
-                    a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                ),
-                (BLOCK_M, BLOCK_K),
-            )
-            b_sc_full = tl.reshape(
-                tl.broadcast_to(
-                    b_sc[:, None, :], (BLOCK_N, MX_PACK_DIVISOR, MX_SCALE_BLOCK_K)
-                ),
-                (BLOCK_N, BLOCK_K),
-            )
-            acc += tl.dot(
-                a_f32 * a_sc_full,
-                tl.trans(b_f32 * b_sc_full),
-                input_precision="ieee",
-            )
+            if MX_SCALE_BLOCK_K == 1:
+                acc += (
+                    tl.dot(x, w, input_precision="ieee")
+                    * tl.sum(a_sc, axis=1)[:, None]
+                    * tl.sum(b_sc, axis=1)[None, :]
+                )
+            else:
+                a_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_M, BLOCK_K),
+                )
+                # Broadcasts on axis 1 where the EVEN_K branch uses axis 2;
+                # at most one can be right. Unreachable while the wrapper pins
+                # BLOCK_K == MX_PACK_DIVISOR, so left as-is.
+                b_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        b_sc[:, None, :], (BLOCK_N, MX_PACK_DIVISOR, MX_SCALE_BLOCK_K)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+                acc += tl.dot(
+                    a_f32 * a_sc_full,
+                    tl.trans(b_f32 * b_sc_full),
+                    input_precision="ieee",
+                )
         else:
             acc = tl.dot_scaled(
                 x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
