@@ -640,6 +640,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
@@ -662,6 +664,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
