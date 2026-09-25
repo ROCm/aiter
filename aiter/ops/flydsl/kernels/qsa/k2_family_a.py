@@ -47,6 +47,8 @@ _D = FAMILY_A_GQA.head_dim
 # on 128-bit stores. D=256 makes n*D a multiple of 32 banks otherwise.
 _K_STRIDE = _D + 8
 _HEAD_PAD = 16
+# 256 CUs on MI355X times the four BN32 prefill workgroups each keeps resident.
+_PREFILL_WGS = 256 * 4
 _DEFAULT_SCALE = _D**-0.5
 _LSE_EMPTY = -1.0e20
 _LOG2E = 1.4426950408889634
@@ -92,12 +94,13 @@ def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
     # and all but removes its instruction-issue stalls. Occupancy is not the
     # reason: the grid is unchanged, so the extra residency headroom BN32
     # unlocks goes unused at these shapes.
-    elif base_programs <= 256:
-        block_n, target_splits, threads = 32, 8, 128
-    elif base_programs <= 512:
-        block_n, target_splits, threads = 32, 4, 128
+    #
+    # Split so the grid lands on the four workgroups per CU that the BN32
+    # K-plus-V LDS footprint keeps resident. Splitting past that point buys
+    # no extra parallelism and still pays merge and address-chase duplication.
     else:
-        block_n, target_splits, threads = 32, 1, 128
+        block_n, threads = 32, 128
+        target_splits = max(1, _PREFILL_WGS // base_programs)
 
     tiles = max(1, (n_sel + block_n - 1) // block_n)
     max_useful_splits = 1 << (tiles.bit_length() - 1)
@@ -163,6 +166,15 @@ def build_qsa_k2_family_a_module(
     k_quarter_stride = k_group_radix * k_group_slot
     token_major_v = use_k32 and block_n == 16
     decode_tr_pv = token_major_v
+    # Prefill gives V its own LDS region instead of overlaying the K tile.
+    # Overlaying costs a barrier per tile to drain every wave's QK reads
+    # before the first V store, which stalls the V gather behind QK. BN32
+    # leaves enough LDS to just pay for the second region. Decode keeps the
+    # overlay: its tile is a quarter the size and it uses a different V map.
+    split_kv_lds = use_k32 and not token_major_v
+    v_elem_off = block_n * _D if split_kv_lds else 0
+    v_pf_rounds = gather_rounds if split_kv_lds else gather_chunk
+    v_pf_chunks = v_pf_rounds // gather_chunk
     # PV splits the output dimension across waves, so every wave needs the
     # whole score tile and by default every wave recomputes all of QK. When
     # the token subtiles divide across waves each wave can instead compute
@@ -194,7 +206,7 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            kv: fx.Array[BFloat16, block_n * _D, 16]
+            kv: fx.Array[BFloat16, block_n * _D + v_elem_off, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
 
         _k_field, _v_field = "kv", "kv"
@@ -549,13 +561,15 @@ def build_qsa_k2_family_a_module(
             else:
                 gpu.barrier()
 
-            # Only the first chunk is issued ahead of QK. That is enough to
-            # cover the QK MFMA block with global latency; the later chunks
-            # overlap each other's LDS stores instead of all sitting live in
-            # registers across QK.
+            # V rounds issued ahead of QK, so their latency lands under the
+            # MFMA block. Every round in flight costs 4 VGPRs, so when V
+            # overlays K the prefetch is one chunk deep; with a separate V
+            # region there is no aliasing barrier to sit behind and the whole
+            # gather can ride across QK, which is where the memory-level
+            # parallelism comes from.
             v_frags_pf = []
             if const_expr(use_k32) and const_expr(not decode_tr_pv):
-                for gr in range_constexpr(gather_chunk):
+                for gr in range_constexpr(v_pf_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
@@ -625,9 +639,10 @@ def build_qsa_k2_family_a_module(
                         ),
                     )
 
-            # K and V share one MMA scratch. All waves must finish their K
-            # reads before any lane overlays that storage with V.
-            gpu.barrier()
+            if const_expr(not split_kv_lds):
+                # K and V share one MMA scratch, so every wave must finish
+                # its QK reads before any lane overlays that storage with V.
+                gpu.barrier()
             if const_expr(decode_tr_pv):
                 for gr in range_constexpr(gather_rounds):
                     v_vec = live.select(
@@ -657,10 +672,11 @@ def build_qsa_k2_family_a_module(
                     + chunk_owner * Int32(128)
                     + _idiv(col, Int32(32)) * Int32(32 * _D)
                 )
-                store_addr = store_elem * Int32(2)
+                store_addr = Int32((store_elem + Int32(v_elem_off)) * Int32(2))
                 for gc in range_constexpr(n_gather_chunks):
-                    if const_expr(gc == 0):
-                        v_chunk = v_frags_pf
+                    if const_expr(gc < v_pf_chunks):
+                        base = gc * gather_chunk
+                        v_chunk = v_frags_pf[base : base + gather_chunk]
                     else:
                         v_chunk = []
                         for j in range_constexpr(gather_chunk):
@@ -844,7 +860,8 @@ def build_qsa_k2_family_a_module(
                             )
                             src_d = d_base + (lane_m % Int32(4)) * Int32(4)
                             src_off = (
-                                src_d % Int32(4)
+                                Int32(v_elem_off)
+                                + src_d % Int32(4)
                                 + (src_n % Int32(32)) * Int32(4)
                                 + _idiv(src_d, Int32(8)) * Int32(128)
                                 + (_idiv(src_d, Int32(4)) % Int32(2)) * Int32(16 * _D)
