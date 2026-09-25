@@ -7,10 +7,8 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
-from flydsl.expr.arith import ArithValue
-from flydsl.expr.typing import Int32, T
+from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.typing import Int32
 
 from .gemm_decode_common import (
     MFMA_K,
@@ -30,7 +28,6 @@ from .gemm_decode_common import (
     masked_bf16_vector,
     mfma_4x4x4_bf16,
     padded_row_coordinates,
-    raw,
     reduce_mfma_scalar,
     wave_lane_coordinates,
 )
@@ -114,7 +111,7 @@ def _load_tail_a_vectors(
         values = []
         for row in range_constexpr(m):
             valid = k_base < fx.Int32(k)
-            safe_k = ArithValue(raw(valid)).select(k_base, fx.Int32(k))
+            safe_k = valid.select(k_base, fx.Int32(k))
             values.append(
                 load_vector(
                     a_smem,
@@ -156,8 +153,8 @@ def _compute_column_tile(
     for column in range_constexpr(columns):
         column_coord = logical_columns[column]
         valid = column_coord < fx.Int32(geometry.n)
-        safe_columns.append(ArithValue(raw(valid)).select(column_coord, fx.Int32(0)))
-    accumulator_zero = arith.constant_vector(0.0, T.vec(4, T.f32))
+        safe_columns.append(valid.select(column_coord, fx.Int32(0)))
+    accumulator_zero = fx.Vector.filled(4, 0.0, fx.Float32)
     accumulators = [
         [accumulator_zero for _ in range_constexpr(columns)]
         for _ in range_constexpr(geometry.m)
@@ -517,14 +514,6 @@ def _make_block_kernel(
             turn = fx.Int32(0)
             while turn < runtime_persistent_turns:
                 column_base = first_column + turn * column_stride
-                # Keep staged-A reads inside the runtime persistent-N loop.
-                llvm_dialect.inline_asm(
-                    None,
-                    [],
-                    "",
-                    "~{memory}",
-                    has_side_effects=True,
-                )
                 if column_base < fx.Int32(n):
                     reduced, logical_columns = _compute_column_tile(
                         config=config,
