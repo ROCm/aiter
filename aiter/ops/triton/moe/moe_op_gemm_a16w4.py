@@ -7,11 +7,11 @@ from functools import lru_cache
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_swizzle,
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle_pipelined import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_swizzle_pipelined as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
