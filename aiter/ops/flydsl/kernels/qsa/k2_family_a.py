@@ -141,9 +141,13 @@ def build_qsa_k2_family_a_module(
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
     # Each thread walks every split for its own D element, so the unrolled
-    # load chain is n_splits * (_D / threads) deep. Past ~128 the scheduler
-    # serializes it, so widen the workgroup instead of deepening the chain.
-    merge_threads = 128 if n_splits <= 64 else 256
+    # load chain is n_splits * (_D / merge_threads) deep. Past ~128 the
+    # scheduler serializes it, so widen the workgroup instead of deepening the
+    # chain -- but stop at one element per thread, past which the extra
+    # threads own no D and the merge would write nothing.
+    merge_threads = min(128, _D)
+    while merge_threads < _D and n_splits * (_D // merge_threads) > 128:
+        merge_threads *= 2
     if _HQ != _HK * _GROUP:
         raise ValueError("family A GQA head counts do not form groups")
 
