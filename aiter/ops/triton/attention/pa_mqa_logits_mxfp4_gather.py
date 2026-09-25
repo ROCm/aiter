@@ -190,9 +190,12 @@ def build_gather(
         scale_mode,
         dtype,
     )
-    return dict(
-        voff=voff.contiguous(), soff=soff.contiguous(), block=block, positions=positions
-    )
+    return {
+        "voff": voff.contiguous(),
+        "soff": soff.contiguous(),
+        "block": block,
+        "positions": positions,
+    }
 
 
 def expand(positions, block=8):

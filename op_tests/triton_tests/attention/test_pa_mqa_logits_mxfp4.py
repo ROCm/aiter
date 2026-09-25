@@ -4,15 +4,11 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
+    build_candidate_gather,
+    build_schedule,
     cache_format,
     paged_mxfp4_mqa_logits,
     preshuffle_cache,
-    unshuffle_scales,
-    unshuffle_values,
-)
-from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
-    build_candidate_gather,
-    build_schedule,
 )
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import build_gather
 
@@ -160,7 +156,7 @@ def _make_case(
     cache = torch.zeros(num_pages, page_size, 1, hb + ns, dtype=torch.uint8, device=dev)
     v_used = kv4.reshape(used, page_size, hb)
     s_used = kv4s.reshape(used, page_size, ns)
-    fmt = cache_format(num_heads, head_size, page_size)
+    cache_format(num_heads, head_size, page_size)  # validates the geometry
     if preshuffle:
         sv, ss = preshuffle_cache(v_used, s_used, num_heads, head_size)
     else:
@@ -171,20 +167,20 @@ def _make_case(
     flat[phys, page_size * hb :] = ss.reshape(used, -1)
     del v_used, s_used, sv, ss, flat
 
-    return dict(
-        q4=q4,
-        q4s=q4s,
-        kv4=kv4,
-        kv4s=kv4s,
-        cache=cache,
-        weights=weights,
-        block_table=block_table,
-        ctx=ctx,
-        cl=torch.tensor(ctx, dtype=torch.int32, device=dev),
-        mml=per_seq * page_size,
-        num_pages=num_pages,
-        dev=dev,
-    )
+    return {
+        "q4": q4,
+        "q4s": q4s,
+        "kv4": kv4,
+        "kv4s": kv4s,
+        "cache": cache,
+        "weights": weights,
+        "block_table": block_table,
+        "ctx": ctx,
+        "cl": torch.tensor(ctx, dtype=torch.int32, device=dev),
+        "mml": per_seq * page_size,
+        "num_pages": num_pages,
+        "dev": dev,
+    }
 
 
 def run_case(

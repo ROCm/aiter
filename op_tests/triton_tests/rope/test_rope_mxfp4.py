@@ -109,15 +109,15 @@ def _k_case(num_tokens, page_size, ratio, seed):
     slots = torch.randperm(num_pages * page_size, generator=gen)[:num_tokens]
     slots[::7] = -1
     positions = torch.randint(0, 4096, (num_tokens,), generator=gen)
-    return dict(
-        k=torch.randn(num_tokens, HEAD_SIZE, generator=gen).bfloat16().to(DEV),
-        positions=positions.to(DEV),
-        slots=slots.to(DEV),
-        w=(1 + 0.1 * torch.randn(HEAD_SIZE, generator=gen)).bfloat16().to(DEV),
-        cos_sin=_cos_sin(4096, gen),
-        num_pages=num_pages,
-        ratio=ratio,
-    )
+    return {
+        "k": torch.randn(num_tokens, HEAD_SIZE, generator=gen).bfloat16().to(DEV),
+        "positions": positions.to(DEV),
+        "slots": slots.to(DEV),
+        "w": (1 + 0.1 * torch.randn(HEAD_SIZE, generator=gen)).bfloat16().to(DEV),
+        "cos_sin": _cos_sin(4096, gen),
+        "num_pages": num_pages,
+        "ratio": ratio,
+    }
 
 
 @pytest.mark.parametrize("num_heads", [16, 32, 64])

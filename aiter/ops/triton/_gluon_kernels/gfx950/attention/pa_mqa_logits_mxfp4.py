@@ -7,12 +7,13 @@ logits[b*next_n + n, t] = sum_h relu(q[b, n, h, :] . kv[t, :]) * w[b*next_n + n,
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.common_utils import strip_annotate
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
 
 # gl.constexpr, not plain ints: a @gluon.jit body can only read globals that
 # are already constexpr.
@@ -1580,7 +1581,8 @@ def _pa_mqa_logits_mxfp4_kernel(
     if VARLEN:
         q_start = gl.load(query_start_loc_ptr + batch_id)
         rows = gl.load(query_start_loc_ptr + batch_id + 1) - q_start
-        if not DYNAMIC:
+        # Kept apart from the runtime test so the DYNAMIC build emits none of it
+        if not DYNAMIC:  # noqa: SIM102
             # the spare unit, and any the bound over-provisioned
             if row_block * BLOCK_M >= rows:
                 return

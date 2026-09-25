@@ -8,14 +8,14 @@ import functools
 
 import torch
 import triton
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_mqa_logits_mxfp4 import (
     _pa_mqa_logits_mxfp4_kernel,
     _pa_mqa_logits_mxfp4_sched_kernel,
     _prepare_candidates_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 SCALE_GROUP = 32
 K_WIDTH = 16
@@ -68,9 +68,9 @@ def cache_format(num_heads: int, head_size: int, page_size: int) -> dict:
         )
     if page_size % bkv:
         raise ValueError(
-            f"page_size {page_size} must be a multiple of BLOCK_KV " f"({bkv})"
+            f"page_size {page_size} must be a multiple of BLOCK_KV ({bkv})"
         )
-    return dict(n_per_tile=npt, d_per_tile=K_WIDTH, block_kv=bkv)
+    return {"n_per_tile": npt, "d_per_tile": K_WIDTH, "block_kv": bkv}
 
 
 def preshuffle_values(
@@ -262,11 +262,13 @@ def _kv_splits(
     # A second wave that is only part filled costs a whole wave of latency for
     # a fraction of the work, so drop back to one. Not worth it once the launch
     # is tall enough to hide the tail, or if it would leave the machine idle.
-    if by_occupancy < by_balance < CAP_ENGAGE * by_occupancy:
-        if tile_q * by_balance < 2 * target_wgs:
-            whole = max(1, target_wgs // tile_q)
-            if whole * tile_q >= 0.9 * target_wgs:
-                by_balance = by_occupancy = whole
+    if (
+        by_occupancy < by_balance < CAP_ENGAGE * by_occupancy
+        and tile_q * by_balance < 2 * target_wgs
+    ):
+        whole = max(1, target_wgs // tile_q)
+        if whole * tile_q >= 0.9 * target_wgs:
+            by_balance = by_occupancy = whole
     return max(1, min(max(by_occupancy, by_balance), by_length))
 
 
@@ -287,17 +289,17 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle, clean_lo
         # Register path. One warp: with no KV tile in LDS a second warp has no
         # producer/consumer to help with, only its barriers.
         block_m = min(plan_block_m(num_heads, next_n), next_n)
-        cfg = dict(
-            num_warps=1,
-            num_buffers=1,
-            waves_per_eu=3 if (compute_chunk or wide_decode) else 2,
+        cfg = {
+            "num_warps": 1,
+            "num_buffers": 1,
+            "waves_per_eu": 3 if (compute_chunk or wide_decode) else 2,
             # A second KV tile in flight
-            depth=2 if (wide_decode or (next_n == 1 and split_page)) else 1,
+            "depth": 2 if (wide_decode or (next_n == 1 and split_page)) else 1,
             # Two KV tiles per body. Speculative decode has the registers for
             # it; a wide chunk does not
-            unroll=2 if (spec_rows and block_m <= 6) else 1,
-            fold_asm=1 if (compute_chunk or spec_rows or num_heads > 32) else 0,
-        )
+            "unroll": 2 if (spec_rows and block_m <= 6) else 1,
+            "fold_asm": 1 if (compute_chunk or spec_rows or num_heads > 32) else 0,
+        }
     else:
         # LDS path, for an unshuffled cache
         block_m = min(2 if (num_heads <= 32 and next_n >= 2) else 1, next_n)
@@ -307,15 +309,15 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle, clean_lo
             waves_per_eu = 3
         else:
             waves_per_eu = 4
-        cfg = dict(
-            num_warps=2 if (num_heads > 32 and next_n > 1) else 1,
-            num_buffers=2,
-            waves_per_eu=waves_per_eu,
-            depth=1,
+        cfg = {
+            "num_warps": 2 if (num_heads > 32 and next_n > 1) else 1,
+            "num_buffers": 2,
+            "waves_per_eu": waves_per_eu,
+            "depth": 1,
             # One row, which is what lets UNROLL be 2.
-            unroll=2 if block_m == 1 else 1,
-            fold_asm=1 if num_heads <= 32 else 0,
-        )
+            "unroll": 2 if block_m == 1 else 1,
+            "fold_asm": 1 if num_heads <= 32 else 0,
+        }
 
     cfg.update(
         block_m=block_m,
@@ -441,7 +443,7 @@ def build_candidate_gather(
         OFF64=offsets == torch.int64,
         num_warps=num_warps,
     )
-    return dict(voff=voff, soff=soff, block=block, positions=pos), cu
+    return {"voff": voff, "soff": soff, "block": block, "positions": pos}, cu
 
 
 def build_schedule(
@@ -750,9 +752,9 @@ def paged_mxfp4_mqa_logits(
         block_scores = _alloc((max_model_len + cand_block - 1) // cand_block)
     if logits is not None:
         # A buffer store addresses the row through a 32-bit record count.
-        assert max_model_len * 4 < 2**31, (
-            f"max_model_len {max_model_len} exceeds what a buffer store can " "address"
-        )
+        assert (
+            max_model_len * 4 < 2**31
+        ), f"max_model_len {max_model_len} exceeds what a buffer store can address"
 
     assert (
         use_gather or candidates is None

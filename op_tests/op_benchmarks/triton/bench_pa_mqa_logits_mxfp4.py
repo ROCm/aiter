@@ -17,20 +17,18 @@ decode step, or the chunk width on a chunked-prefill step.
 import argparse
 import itertools
 
-
 import torch
-from aiter.benchmark_reporting import print_json_table
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.test_common import run_perftest
 
+from aiter.benchmark_reporting import print_json_table
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     IDEAL_PAGE_SIZE,
-    cache_format,
     pack_cache,
     paged_mxfp4_mqa_logits,
     plan_block_m,
     preshuffle_cache,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_common import run_perftest
 
 SCALE_GROUP = 32
 
@@ -93,16 +91,16 @@ def build(
         if clean
         else torch.empty(shape, dtype=torch.float32, device=dev)
     )
-    return dict(
-        q=q,
-        qs=qs,
-        kv_cache=kv_cache,
-        weights=weights,
-        ctx_lens=ctx_lens,
-        block_table=block_table,
-        out=out,
-        max_model_len=max_model_len,
-    )
+    return {
+        "q": q,
+        "qs": qs,
+        "kv_cache": kv_cache,
+        "weights": weights,
+        "ctx_lens": ctx_lens,
+        "block_table": block_table,
+        "out": out,
+        "max_model_len": max_model_len,
+    }
 
 
 def run_benchmark(args):
@@ -126,7 +124,7 @@ def run_benchmark(args):
                     args.clean_logits,
                 )
             except torch.OutOfMemoryError:
-                rows.append(dict(shape=name, heads=heads, err_msg="OOM"))
+                rows.append({"shape": name, "heads": heads, "err_msg": "OOM"})
                 torch.cuda.empty_cache()
                 continue
 
@@ -158,19 +156,19 @@ def run_benchmark(args):
             passes = (next_n + block_m - 1) // block_m
 
             rows.append(
-                dict(
-                    heads=heads,
-                    shape=name,
-                    preshuffle=int(args.preshuffle),
-                    clean=int(args.clean_logits),
-                    us=round(us, 1),
-                    tflops=round(flop / us / 1e6, 1),
-                    uniq_tbs=round((tokens * per_token + store) / us * 1e-6, 2),
-                    issued_tbs=round(
+                {
+                    "heads": heads,
+                    "shape": name,
+                    "preshuffle": int(args.preshuffle),
+                    "clean": int(args.clean_logits),
+                    "us": round(us, 1),
+                    "tflops": round(flop / us / 1e6, 1),
+                    "uniq_tbs": round((tokens * per_token + store) / us * 1e-6, 2),
+                    "issued_tbs": round(
                         (passes * tokens * per_token + store) / us * 1e-6, 2
                     ),
-                    kv_passes=passes,
-                )
+                    "kv_passes": passes,
+                }
             )
             del d
             torch.cuda.empty_cache()
