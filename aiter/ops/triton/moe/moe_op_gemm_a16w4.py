@@ -225,6 +225,7 @@ def moe_gemm_a16w4(
     unpadded_N=None,
     unpadded_K=None,
     backend: str | None = None,
+    expert_map=None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -332,6 +333,11 @@ def moe_gemm_a16w4(
         config["split_k"],
         x.device,
     )
+    # Expert parallelism: the triton kernel early-returns for experts not on this
+    # rank, leaving their output regions unwritten; zero them so combine is correct.
+    if expert_map is not None:
+        assert backend == "triton", "expert_map (EP) is only supported on the triton backend"
+        y.zero_()
     stride_bias = None if bias is None else bias.stride(0)
 
     # moe metadata
@@ -427,6 +433,7 @@ def moe_gemm_a16w4(
             expt_token_offs_raw,
             expt_hist_sum,
             expt_block_pid_map,
+            expert_map,
             grid_m,
             grid_n,
             apply_swiglu_matmul,
@@ -435,6 +442,7 @@ def moe_gemm_a16w4(
             reduction_n_matmul,
             swiglu_add_residual,
             routing_data.n_expts_act,
+            expert_map is not None,
             config["block_m"],
             config["block_n"],
             config["block_k"],
