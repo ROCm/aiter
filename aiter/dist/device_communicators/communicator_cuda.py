@@ -35,9 +35,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
         reuse_from: "CudaCommunicator | None" = None,
+        skip_mori_shmem_init: bool = False,
     ):
         self._all2all_manager = None
         self._all2all_manager_created = False
+        # Read when the all2all manager is lazily built; see MoriAll2AllManager.
+        self.skip_mori_shmem_init = skip_mori_shmem_init
 
         super().__init__(cpu_group, device, device_group, unique_name)
         from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
@@ -164,7 +167,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             elif self.all2all_backend == "mori":
                 from .all2all import MoriAll2AllManager
 
-                self._all2all_manager = MoriAll2AllManager(self.cpu_group)
+                self._all2all_manager = MoriAll2AllManager(
+                    self.cpu_group, skip_shmem_init=self.skip_mori_shmem_init
+                )
             elif self.all2all_backend == "flydsl":
                 from .all2all import FlyDSLAll2AllManager
 

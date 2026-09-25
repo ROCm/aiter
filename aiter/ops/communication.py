@@ -29,6 +29,7 @@ def init_dist_env(
     data_parallel_rank: int = 0,
     decode_context_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
+    skip_mori_shmem_init: bool = False,
 ):
     pipeline_model_parallel_size = 1
     # world_size is TP x PP x PCP (PCP is an independent dimension that grows
@@ -55,6 +56,7 @@ def init_dist_env(
         decode_context_model_parallel_size=decode_context_parallel_size,
         data_parallel_size=data_parallel_size,
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
+        skip_mori_shmem_init=skip_mori_shmem_init,
     )
 
     # No per-rank signal/input-buffer registration here. An earlier version
