@@ -1225,3 +1225,83 @@ def test_flash_attn_func_opus_d192_v128(
     _run_opus_batch_case(
         batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, 192, 128, causal
     )
+
+
+_RDNA = ("gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1200", "gfx1201")
+_GFX12 = ("gfx1200", "gfx1201")
+
+
+@pytest.mark.skipif(get_gfx() not in _RDNA, reason="CK hdim-80 pad-up is an RDNA check")
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+def test_flash_attn_hdim80_rdna(dtype):
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 4, 80, dtype=dtype, device="cuda")
+    k = torch.randn(1, 128, 4, 80, dtype=dtype, device="cuda")
+    v = torch.randn(1, 128, 4, 80, dtype=dtype, device="cuda")
+    ref, _ = run_torch(q, k, v, causal=False)
+    out = aiter.flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
+    pt, _ = run_torch(q, k, v, causal=False, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (pt - ref).abs().max().item(), 0.01)
+    max_diff = (out - ref).abs().max().item()
+    assert max_diff <= out_tol, f"hdim80 max_diff={max_diff} tol={out_tol}"
+
+
+@pytest.mark.skipif(get_gfx() not in _GFX12, reason="receipt-100 fp8bf16 is gfx12")
+def test_flash_attn_fp8bf16_hdim64_gfx12():
+    from aiter import per_tensor_quant
+    from aiter.test_mha_common import attention_ref
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 8, 2, 64, dtype=dtypes.bf16, device="cuda")
+    k = torch.randn(1, 8, 2, 64, dtype=dtypes.bf16, device="cuda")
+    v = torch.randn(1, 8, 2, 64, dtype=dtypes.bf16, device="cuda")
+    q8, qs = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+    k8, ks = per_tensor_quant(k, quant_dtype=dtypes.fp8)
+    v8, vs = per_tensor_quant(v, quant_dtype=dtypes.fp8)
+    ref, _, _ = attention_ref(
+        q8.float() * qs,
+        k8.float() * ks,
+        v8.float() * vs,
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        causal=False,
+        upcast=True,
+    )
+    out = aiter.flash_attn_fp8_pertensor_func(q8, k8, v8, qs, ks, vs)
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    assert max_diff < 0.055, f"fp8bf16 hdim64 max_diff={max_diff}"
+
+
+@pytest.mark.skipif(get_gfx() not in _GFX12, reason="receipt-100 fp8bf16 is gfx12")
+def test_flash_attn_fp8bf16_gqa_gfx12():
+    from aiter import per_tensor_quant
+    from aiter.test_mha_common import attention_ref
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 8, 128, dtype=dtypes.bf16, device="cuda")
+    k = torch.randn(1, 128, 2, 128, dtype=dtypes.bf16, device="cuda")
+    v = torch.randn(1, 128, 2, 128, dtype=dtypes.bf16, device="cuda")
+    q8, qs = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+    k8, ks = per_tensor_quant(k, quant_dtype=dtypes.fp8)
+    v8, vs = per_tensor_quant(v, quant_dtype=dtypes.fp8)
+    ref, _, _ = attention_ref(
+        q8.float() * qs,
+        k8.float() * ks,
+        v8.float() * vs,
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        causal=True,
+        upcast=True,
+    )
+    out = aiter.flash_attn_fp8_pertensor_func(q8, k8, v8, qs, ks, vs, causal=True)
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    # gfx1201, seed 0. Looser than the 0.055 warehouse bound because per-tensor
+    # quantization noise scales with the GQA broadcast, not because of a
+    # gfx12/GQA kernel defect.
+    assert max_diff < 0.07, f"fp8bf16 GQA max_diff={max_diff}"

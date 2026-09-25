@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
+import os  # noqa: I001
 from typing import Any
 
 import torch
@@ -15,7 +15,18 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+
+# Must stay below the ..jit.core import above: core.py does
+# sys.path.insert(0, <aiter/jit/utils>), which is what makes this flat import
+# resolvable. Importing it as ..jit.utils.build_targets instead would load a
+# second copy of the module (chip_info.py and mha_recipes.py import it flat),
+# giving two distinct copies of every symbol. Do not let isort reorder this.
+from build_targets import (
+    ck_fmha_batch_prefill_gen_targets,
+    ck_fmha_factory_key,
+    ck_fmha_targets,
+)
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
@@ -35,6 +46,42 @@ def _fmha_kv_byte_extent_ge_u32(
     k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
     v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
     return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
+
+
+def _check_fp8_factory(gfx: str, dtype) -> None:
+    # gfx is always the live device: get_gfx_runtime(), passed in by both the
+    # public fp8 API and the compile_ops gen_func lookup. compile_ops calls
+    # gen_func on every invocation, so this sits on the hot path.
+    key = ck_fmha_factory_key(gfx)
+    if key in ("gfx11", "gfx115") and dtype == dtypes.fp8:
+        raise NotImplementedError(
+            f"CK fmha_fwd has no fp8 factory on {gfx} (CK target {key})"
+        )
+
+
+def _check_batch_prefill_arch(gfx: str) -> None:
+    """Reject non-gfx9 batch_prefill before CK's api-only stub TORCH_CHECKs.
+
+    Always called with get_gfx_runtime() (live device), from both
+    mha_batch_prefill_func and the compile_ops gen_func lookup. compile_ops
+    calls gen_func on every invocation, so this must never read GPU_ARCHS.
+    """
+    key = ck_fmha_factory_key(gfx)
+    if not key.startswith("gfx9"):
+        raise NotImplementedError(
+            f"mha_batch_prefill is gfx9-only; not supported on {gfx} "
+            f"(CK target {key or 'unmapped'})"
+        )
+
+
+def _fmha_gen_cmd(
+    api: str, receipt: int, filter_pattern: str, targets: str | None = None
+) -> str:
+    targets = ck_fmha_targets() if targets is None else targets
+    return (
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d {api} "
+        f"--receipt {receipt} --filter {filter_pattern} --targets {targets} --output_dir {{}}"
+    )
 
 
 def cmdGenFunc_mha_fwd(
@@ -115,14 +162,19 @@ def cmdGenFunc_mha_fwd(
         md_name += "_pertensor"
         filter += "_pertensor*"
 
-    blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
-    ]
+    blob_gen_cmd = [_fmha_gen_cmd("fwd", 100, filter)]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
+
+
+def _cmdGenFunc_mha_fwd_lookup(q, *args, **kwargs):
+    # compile_ops calls gen_func on every invocation (md_name lookup).
+    # Gate on the live device so GPU_ARCHS last-token cannot reject a
+    # gfx12/gfx9 card that has an fp8 factory.
+    _check_fp8_factory(get_gfx_runtime(), q.dtype)
+    return cmdGenFunc_mha_fwd(q, *args, **kwargs)
 
 
 def common_mha_fwd_fake_tensors(
@@ -213,7 +265,7 @@ def gen_mha_fwd_fake_tensors(
 @compile_ops(
     "module_mha_fwd",
     fc_name="mha_fwd",
-    gen_func=cmdGenFunc_mha_fwd,
+    gen_func=_cmdGenFunc_mha_fwd_lookup,
     gen_fake=gen_mha_fwd_fake_tensors,
 )
 def mha_fwd(
@@ -943,18 +995,19 @@ def cmdGenFunc_mha_varlen_fwd(
         md_name += "_pagedkv"
         filter_fwd_splitkv2 += "_pagedkv*"
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
-        blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
-        ]
-        blob_gen_cmd.append(
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
-        )
+        blob_gen_cmd = [_fmha_gen_cmd("fwd", 200, '" "')]
+        blob_gen_cmd.append(_fmha_gen_cmd("fwd_splitkv", 200, filter_fwd_splitkv))
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
+
+
+def _cmdGenFunc_mha_varlen_fwd_lookup(q, *args, **kwargs):
+    # compile_ops calls gen_func on every invocation (md_name lookup).
+    # Gate on the live device.
+    _check_fp8_factory(get_gfx_runtime(), q.dtype)
+    return cmdGenFunc_mha_varlen_fwd(q, *args, **kwargs)
 
 
 def gen_mha_varlen_fwd_fake_tensor(
@@ -1024,7 +1077,7 @@ def gen_mha_varlen_fwd_fake_tensor(
 @compile_ops(
     "module_mha_varlen_fwd",
     fc_name="mha_varlen_fwd",
-    gen_func=cmdGenFunc_mha_varlen_fwd,
+    gen_func=_cmdGenFunc_mha_varlen_fwd_lookup,
     gen_fake=gen_mha_varlen_fwd_fake_tensor,
 )
 def mha_varlen_fwd(
@@ -1236,8 +1289,7 @@ def cmdGenFunc_mha_bwd(
     filter = f"{filter1}@{filter2}@{filter3}"
 
     blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        _fmha_gen_cmd("bwd", 300, filter),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
@@ -1494,8 +1546,7 @@ def cmdGenFunc_mha_varlen_bwd(
     filter = f"{filter1}@{filter2}@{filter3}"
 
     blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        _fmha_gen_cmd("bwd", 400, filter),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
@@ -1615,13 +1666,22 @@ def cmdGenFunc_mha_batch_prefill(
         md_name += "_nsink"
         filter_fwd += "_nsink*"
     blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
-        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        _fmha_gen_cmd(
+            "batch_prefill", 200, filter_fwd, ck_fmha_batch_prefill_gen_targets()
+        )
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
+
+
+def _cmdGenFunc_mha_batch_prefill_lookup(*args, **kwargs):
+    # compile_ops calls gen_func on every invocation (md_name lookup), not
+    # only on cache miss. Gate on the live device so GPU_ARCHS last-token
+    # cannot reject a gfx9 card (B2).
+    _check_batch_prefill_arch(get_gfx_runtime())
+    return cmdGenFunc_mha_batch_prefill(*args, **kwargs)
 
 
 def gen_mha_varlen_bwd_fake_tensors_common(
@@ -3984,7 +4044,7 @@ def mha_batch_prefill_fake_tensors(
 @compile_ops(
     "module_mha_batch_prefill",
     fc_name="mha_batch_prefill",
-    gen_func=cmdGenFunc_mha_batch_prefill,
+    gen_func=_cmdGenFunc_mha_batch_prefill_lookup,
     gen_fake=mha_batch_prefill_fake_tensors,
 )
 def mha_batch_prefill(
@@ -4121,6 +4181,7 @@ def mha_batch_prefill_func(
     sink_ptr=None,
     sink_size: int = 0,
 ):
+    _check_batch_prefill_arch(get_gfx_runtime())
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if sink_ptr is not None:
@@ -4225,6 +4286,7 @@ def flash_attn_fp8_pertensor_func(
             v_descale=v_descale,
             window_size=(window_size[0], window_size[1]),
         )
+    _check_fp8_factory(get_gfx_runtime(), q.dtype)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(3)
@@ -4295,6 +4357,7 @@ def flash_attn_varlen_fp8_pertensor_func(
             v_descale=v_descale,
             window_size=(window_size[0], window_size[1]),
         )
+    _check_fp8_factory(get_gfx_runtime(), q.dtype)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
