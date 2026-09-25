@@ -20,8 +20,8 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v2_wo_dot_reduce_kernel,
     _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
