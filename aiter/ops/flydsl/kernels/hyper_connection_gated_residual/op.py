@@ -10,8 +10,9 @@ stored ``r2`` inside K2 so it never touches HBM. Collapses today's 5 launches to
 2 (modulo K1's split-K/decouple reduce).
 
 Three ticket entry points -- ``combine`` (write-only ``R2``), ``mix`` (no pending
-combine), and ``combine_and_mix`` -- all backed by the fused path. The composed
-milestone-1 / interim fused-K1 fallbacks live in the legacy package only.
+combine), and ``combine_and_mix`` -- all backed by the fused path. Only the fused
+two-stage ships here; the earlier composed / interim fused-K1 variants are not
+part of this package.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import torch
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .common import merge_down_inject, split_down_inject
+from .common import arch_name, merge_down_inject, split_down_inject
 from .k1 import (
     DECODE_MAX_M,
     _build_combine_rms,
@@ -108,7 +109,7 @@ def _k1_then_k2(
     # Gated to fold_w (the GEMV down assumes the folded weight), non-gfx950
     # (gfx950 has the async-LDS pipe + native tail), and M<=DECODE_MAX_M.
     if fold_w and 1 <= tokens <= DECODE_MAX_M:
-        arch = torch.cuda.get_device_properties(residual.device).gcnArchName.split(":")[0]
+        arch = arch_name(residual.device)
         if arch != "gfx950":
             return flydsl_k1k2_skinny_decode(
                 residual, block_output, injection, norm_weight, w_up,

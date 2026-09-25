@@ -32,7 +32,7 @@ from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.act import _sigmoid_f32
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
-from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import ab_k_perm, mfma_bf16
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import ab_k_perm, arch_name, mfma_bf16
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import up_gate_mix_config
 
 
@@ -269,7 +269,7 @@ def flydsl_up_gate_mix_norm(
     w_len = w.numel()
     assert w_len in (stream_dim, hidden)
 
-    arch = torch.cuda.get_device_properties(lora.device).gcnArchName.split(":")[0]
+    arch = arch_name(lora.device)
     tuned = up_gate_mix_config(arch, tokens)
     block_m, block_n, m_waves, n_waves = _resolve_up_gate_cfg(
         tuned, tokens, block_m, block_n, m_waves, n_waves,

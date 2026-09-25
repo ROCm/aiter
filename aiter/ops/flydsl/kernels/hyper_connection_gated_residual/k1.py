@@ -41,7 +41,7 @@ from flydsl.expr import math as fmath
 
 from aiter.ops.flydsl.kernels.act import _sigmoid_f32
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
-from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import ab_k_perm, mfma_bf16
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import ab_k_perm, arch_name, mfma_bf16
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import k1_plan
 
 WAVE = 64
@@ -89,8 +89,8 @@ def _build_down_norm_pipe(
     """
     assert n_pad % block_n == 0, f"n_pad={n_pad} must be a multiple of block_n={block_n}"
     n_cblocks = n_pad // block_n
-    if mma_k == 16:  # gfx942/CDNA3 -> local adapted GEMM
-        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    if mma_k == 16:  # gfx942/CDNA3 -> HC-internal adapted GEMM (see package copy)
+        from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.gemm_a16w16_gfx942 import (
         GEMM_A16W16_DTYPE_BF16,
         AsyncLoadTile,
         async_load_to_lds,
@@ -395,8 +395,8 @@ def _build_down_norm_partial_pipe(
     parallelism (mid-M fill) with the async global->LDS pipeline + N-tile +
     LDS-rrms + fold_w -- replacing the register-prefetch ``_build_down_norm_partial``.
     """
-    if mma_k == 16:  # gfx942/CDNA3 -> local adapted GEMM
-        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    if mma_k == 16:  # gfx942/CDNA3 -> HC-internal adapted GEMM (see package copy)
+        from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.gemm_a16w16_gfx942 import (
         GEMM_A16W16_DTYPE_BF16,
         AsyncLoadTile,
         async_load_to_lds,
@@ -851,12 +851,21 @@ def _build_up_gate_mix_gemv(
 
 
 def _decode_reduce_params(total: int):
-    """(block_threads, vec) with ``bt*vec | total`` for the tiny decode reduce."""
+    """(block_threads, vec) with ``bt*vec | total`` for the tiny decode reduce.
+
+    ``total = tokens * n_pad`` and ``n_pad`` is 64-padded, so ``total`` is always a
+    multiple of 64 -- the ``bt=16, vec=4`` (=64) candidate therefore always
+    divides it, guaranteeing a vectorized path. This matters for the final mixer
+    (``n_pad=lowrank=320=64*5``): with only ``bt>=64`` candidates the search would
+    fall to ``vec=1``, which the vectorized reduce kernel cannot emit (it can't
+    wrap a scalar load in a Vector). The sub-wavefront blocks are fine here -- the
+    decode reduce is a tiny one-shot elementwise pass.
+    """
     for vec in (4, 2, 1):
-        for bt in (256, 192, 128, 64):
+        for bt in (256, 192, 128, 64, 32, 16):
             if bt * vec <= total and total % (bt * vec) == 0:
                 return bt, vec
-    return 64, 1
+    return 16, 1
 
 
 # Decode skinny path holds m_rows accumulators per lane, so the GEMV bodies spill
@@ -1249,10 +1258,11 @@ def flydsl_k1_combine_norm_down(
     reduce a K-slice of a down-norm GEMM (``xn`` re-formed in the A-load, still
     never materialized), and a reduction sums the partials + SiLU. This is
     ~3-6x faster at M<=2048 but, because the f32 K-reduction order differs, is
-    oracle-accurate rather than bit-exact vs the single-workgroup body. Pass
-    ``split_k=0`` to force the bit-exact fused pipe/rolled path (``stages>=2``
-    selects the async-LDS pipeline, ``§6.2``); ``"auto"`` uses split-K only where
-    it wins and the bit-exact pipe elsewhere.
+    oracle-accurate rather than bit-exact vs the single-workgroup body. ``"auto"``
+    uses split-K where it wins (small/mid M) and the decoupled async-LDS pipe
+    (``split_k=1``, §6.4) elsewhere; explicit ``split_k>1``/``1`` force those
+    paths. The bit-exact monolithic pipe (``split_k=0``) is not implemented in
+    this package.
 
     Returns ``(r2, out)``: ``r2`` is the combined residual ``[M, hidden]`` (must
     be stored per the contract); ``out`` is the packed ``[M, n_pad]`` with
@@ -1286,7 +1296,7 @@ def flydsl_k1_combine_norm_down(
     # caller left unset -- precedence explicit arg > tuned plan > heuristic. An
     # absent entry -> plan is None -> pure heuristic (behavior-preserving). Keyed
     # on gemm_tokens so a padded low-M tail resolves like its padded size.
-    arch = torch.cuda.get_device_properties(residual.device).gcnArchName.split(":")[0]
+    arch = arch_name(residual.device)
     plan = k1_plan(arch, gemm_tokens) if use_tuned else None
     # gfx942 (§13.9): the vendored async-LDS pipe now lowers on CDNA3 via the
     # 32-bit buffer_load...lds DMA (gemm_a16w16_gfx950 async width is arch-aware),
@@ -1295,7 +1305,13 @@ def flydsl_k1_combine_norm_down(
     # body (``_build_down_norm_partial``): the 32-bit split-K pipe's 4x load count
     # loses to it there (2048: 182 vs 237us). So only the split-K partial builder
     # is arch-gated; decouple/monolithic use the pipe on both archs.
-    _gfx942_regp_partial = arch != "gfx950" and not os.environ.get("GR_FORCE_PIPE")
+    #
+    # gfx950/CDNA4 (128-bit async DMA) is the only arch that prefers the split-K
+    # pipe; gfx942 is the only other supported arch (see common.mfma_bf16), so gate
+    # explicitly on gfx942 rather than "!= gfx950" -- a future arch then defaults
+    # to the pipe consciously, not by omission. Set GR_FORCE_PIPE=1 to force the
+    # split-K pipe on gfx942 (A/B testing the 32-bit pipe vs the register body).
+    _gfx942_regp_partial = arch == "gfx942" and not os.environ.get("GR_FORCE_PIPE")
     _plan_sk_block_m = None
     if plan is not None:
         if split_k == "auto":
@@ -1469,12 +1485,11 @@ def flydsl_k1_combine_norm_down(
         _run_compiled(downpipe, r2_out, rrms, w, w_dn_merged, out, fx_stream)
         return r2_out, out
 
-    # Clean package: only the auto split-K / decouple paths ship. "auto" always
-    # resolves split_k to >=1, so one of the two branches above returned. The
-    # bit-exact monolithic K1 (_build_k1 / _build_k1_pipe, reached via explicit
-    # split_k=0) lives in the legacy package only.
+    # Only the auto split-K / decouple paths ship here. "auto" always resolves
+    # split_k to >=1, so one of the two branches above returned. The bit-exact
+    # monolithic K1 (split_k=0) is not implemented in this package.
     raise AssertionError(
-        f"split_k={split_k!r} resolved to neither split-K nor decouple; the "
-        "clean two-stage package supports split_k='auto'/1/>1 only "
-        "(bit-exact split_k=0 is legacy-only)"
+        f"split_k={split_k!r} resolved to neither split-K nor decouple; this "
+        "two-stage package supports split_k='auto'/1/>1 only "
+        "(bit-exact split_k=0 is not implemented here)"
     )

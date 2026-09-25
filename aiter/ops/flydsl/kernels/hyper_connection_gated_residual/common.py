@@ -46,10 +46,22 @@ _MFMA_BF16 = {
 }
 
 
+def arch_name(device=None) -> str:
+    """Normalized GCN arch string (e.g. ``"gfx942"``) used as the routing key.
+
+    Prefers the tensor's own ``device`` when given (correct under multi-GPU or a
+    non-current device); falls back to the live device otherwise. Centralizes the
+    ``gcnArchName`` parsing so every kernel keys off the same value.
+    """
+    if device is not None:
+        return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    return get_gfx()
+
+
 def mfma_bf16(arch: str | None = None) -> MfmaConfig:
     """bf16 MFMA shape for ``arch`` (defaults to the live device)."""
     if arch is None:
-        arch = get_gfx()
+        arch = arch_name()
     try:
         return _MFMA_BF16[arch]
     except KeyError as exc:
