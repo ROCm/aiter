@@ -211,6 +211,8 @@ def pa_decode(
     """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
 
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
+    gfx950 Qlen8/GQA16/page64 full attention also supports Dqk192/V128 via
+    the optimized MiMo wave schedule.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     ALiBi and externally quantized queries are unsupported.
 
@@ -305,6 +307,46 @@ def pa_decode(
             f"query.shape[0] ({total_q_rows}) must equal "
             f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
         )
+
+    # Reuse the downstream Qlen8 wave kernels for the exact MiMo full-attention
+    # geometry. Keep SWA, sinks, per-token scales and other shapes on the
+    # existing dispatcher; the optimized path has its own strict validation.
+    if (
+        query_length == 8
+        and sliding_window == 0
+        and sinks is None
+        and work_plan is None
+        and num_q_heads == 16
+        and head_dim in (128, 192)
+        and output.shape == (num_seqs * 8, 16, 128)
+        and key_cache.shape[1] == 1
+        and key_cache.shape[-2:] == (64, 16)
+        and key_cache.dtype == torch.float8_e4m3fn
+        and value_cache.shape == (key_cache.shape[0], 1, 4, 128, 16)
+        and compute_type == key_cache.dtype
+        and isinstance(key_scale, torch.Tensor)
+        and isinstance(value_scale, torch.Tensor)
+        and key_scale.numel() == value_scale.numel() == 1
+        and 1 <= max_context_partition_num <= 64
+    ):
+        from .pa_decode_mimo import pa_decode_mimo_fp8_qlen8
+
+        return pa_decode_mimo_fp8_qlen8(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            softmax_scale,
+            max_context_partition_num,
+            key_scale,
+            value_scale,
+            max_logits,
+            exp_sums,
+            temporary_output,
+        )
+
     if output.shape != query.shape:
         raise ValueError(
             f"output shape {tuple(output.shape)} must match "
