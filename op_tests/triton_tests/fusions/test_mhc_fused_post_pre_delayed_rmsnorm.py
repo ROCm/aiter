@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the fused delayed mHC seam (``mhc_post_pre_delayed``)."""
+"""Tests for the fused delayed mHC seam (``mhc_fused_post_pre_delayed_rmsnorm``)."""
 
 import pytest
 import torch
 
-from aiter.ops.triton.fusions.mhc_post_pre_delayed import mhc_post_pre_delayed
+from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
+    mhc_fused_post_pre_delayed_rmsnorm,
+)
 
 # rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, sinkhorn_repeat
 ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
 
 
-def ref_post_pre_delayed(
+def ref_mhc_fused_post_pre_delayed_rmsnorm(
     residual,
     fn,
     hc_scale,
@@ -86,7 +88,7 @@ def make_inputs(T, H, device="cuda", seed=0):
 # identity_pre: pre_mix=None, as at the draft model's entry seam
 @pytest.mark.parametrize("mode", ["post", "no_post", "identity_pre"])
 @pytest.mark.parametrize("T", [1, 100, 384, 16384])
-def test_mhc_post_pre_delayed(T, mode):
+def test_mhc_fused_post_pre_delayed_rmsnorm(T, mode):
     residual, y, fn, hc_scale, hc_base, post, comb, pre, w = make_inputs(T, 5120)
     kw = {"norm_weight": w}
     if mode != "no_post":
@@ -96,10 +98,10 @@ def test_mhc_post_pre_delayed(T, mode):
         ref_pre = torch.zeros_like(pre)
         ref_pre[:, 0] = 1
         pre = None
-    R, post_o, comb_o, li, pre_o = mhc_post_pre_delayed(
+    R, post_o, comb_o, li, pre_o = mhc_fused_post_pre_delayed_rmsnorm(
         residual, fn, hc_scale, hc_base, *ARGS, pre_mix=pre, **kw
     )
-    ref = ref_post_pre_delayed(
+    ref = ref_mhc_fused_post_pre_delayed_rmsnorm(
         residual, fn, hc_scale, hc_base, *ARGS, pre_mix=ref_pre, **kw
     )
     torch.testing.assert_close(R, ref[0])
@@ -110,9 +112,9 @@ def test_mhc_post_pre_delayed(T, mode):
         torch.testing.assert_close(out, expected, atol=5e-4, rtol=1e-3)
 
 
-def test_mhc_post_pre_delayed_empty():
+def test_mhc_fused_post_pre_delayed_rmsnorm_empty():
     residual, y, fn, hc_scale, hc_base, post, comb, pre, w = make_inputs(0, 5120)
-    R, _, _, li, pre_o = mhc_post_pre_delayed(
+    R, _, _, li, pre_o = mhc_fused_post_pre_delayed_rmsnorm(
         residual,
         fn,
         hc_scale,

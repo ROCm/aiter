@@ -42,14 +42,14 @@ def _split4(v):
     return v0, v1, v2, v3
 
 
-_mhc_post_pre_delayed_main_kernel_repr = make_kernel_repr(
-    "_mhc_post_pre_delayed_main_kernel",
+_mhc_fused_post_pre_delayed_rmsnorm_main_kernel_repr = make_kernel_repr(
+    "_mhc_fused_post_pre_delayed_rmsnorm_main_kernel",
     ["H", "BLOCK_M", "TILE_K", "NUM_KSPLIT", "HAS_POST"],
 )
 
 
-@triton.jit(repr=_mhc_post_pre_delayed_main_kernel_repr)
-def _mhc_post_pre_delayed_main_kernel(
+@triton.jit(repr=_mhc_fused_post_pre_delayed_rmsnorm_main_kernel_repr)
+def _mhc_fused_post_pre_delayed_rmsnorm_main_kernel(
     residual_ptr,  # (T, 4, H) bf16 residual entering the seam
     x_ptr,  # (T, H) bf16 sub-layer output                   [HAS_POST]
     post_mix_ptr,  # (T, 4) fp32 post gate from the previous seam  [HAS_POST]
@@ -211,14 +211,14 @@ def _mhc_post_pre_delayed_main_kernel(
     )
 
 
-_mhc_post_pre_delayed_reduce_kernel_repr = make_kernel_repr(
-    "_mhc_post_pre_delayed_reduce_kernel",
+_mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel_repr = make_kernel_repr(
+    "_mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel",
     ["H", "NUM_KSPLIT", "NUM_SINKHORN_ITERS", "BLOCK_C"],
 )
 
 
-@triton.jit(repr=_mhc_post_pre_delayed_reduce_kernel_repr)
-def _mhc_post_pre_delayed_reduce_kernel(
+@triton.jit(repr=_mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel_repr)
+def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     partial_ptr,  # (T, NUM_KSPLIT, 32) fp32
     scale_ptr,  # (3,) fp32
     base_ptr,  # (24,) fp32

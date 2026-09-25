@@ -8,14 +8,16 @@ RMSNorm in two Triton launches. See the kernel module for the math and structure
 import torch
 import triton
 
-from aiter.ops.mhc import get_mhc_fused_post_pre_config
-from aiter.ops.triton._triton_kernels.fusions.mhc_post_pre_delayed import (
-    _mhc_post_pre_delayed_main_kernel,
-    _mhc_post_pre_delayed_reduce_kernel,
+from aiter.ops.triton._triton_kernels.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
+    _mhc_fused_post_pre_delayed_rmsnorm_main_kernel,
+    _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel,
+)
+from aiter.ops.triton.utils.mhc_config_utils import (
+    get_mhc_fused_post_pre_delayed_rmsnorm_config,
 )
 
 
-def mhc_post_pre_delayed(
+def mhc_fused_post_pre_delayed_rmsnorm(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -25,7 +27,7 @@ def mhc_post_pre_delayed(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    pre_mix: torch.Tensor,
+    pre_mix: torch.Tensor | None,
     sublayer_out: torch.Tensor | None = None,
     post_layer_mix: torch.Tensor | None = None,
     comb_res_mix: torch.Tensor | None = None,
@@ -33,6 +35,7 @@ def mhc_post_pre_delayed(
     norm_eps: float = 1e-6,
     *,
     residual_out: torch.Tensor | None = None,
+    config: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused delayed mHC seam.
 
@@ -49,6 +52,8 @@ def mhc_post_pre_delayed(
             otherwise ``residual`` is projected as is and returned.
         norm_weight: (H,) RMSNorm weight applied to the collapse; norm_eps its epsilon.
         residual_out: optional (T, 4, H) bf16 buffer for the new residual.
+        config: optional launch config dict; loaded from the per-arch tuned configs
+            (``get_mhc_fused_post_pre_delayed_rmsnorm_config``) when ``None``.
 
     Returns:
         (residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
@@ -63,8 +68,16 @@ def mhc_post_pre_delayed(
     assert n == 4, f"the fused seam kernel is specialised for hc_mult=4, got {n}"
     assert fn.shape == (24, 4 * H) and fn.dtype == torch.float32 and fn.is_contiguous()
     assert hc_scale.shape == (3,) and hc_base.shape == (24,)
+    assert hc_scale.dtype == hc_base.dtype == torch.float32
+    assert hc_scale.is_contiguous() and hc_base.is_contiguous()
     assert norm_weight is not None and norm_weight.shape == (H,)
     device = residual.device
+    optional = (pre_mix, sublayer_out, post_layer_mix, comb_res_mix, residual_out)
+    assert all(
+        t.device == device
+        for t in (fn, hc_scale, hc_base, norm_weight, *optional)
+        if t is not None
+    ), "all tensors must be on the same device"
     if pre_mix is None:
         pre_mix = torch.zeros(T, 4, dtype=torch.float32, device=device)
         pre_mix[:, 0] = 1.0
@@ -96,11 +109,15 @@ def mhc_post_pre_delayed(
     if T == 0:
         return residual_out, post_out, comb_out, layer_input, next_pre
 
-    split_k = get_mhc_fused_post_pre_config(T, H)[0]
-    block_m, tile_k = 16, 32
-    partial = torch.empty(T, split_k, 32, dtype=torch.float32, device=device)
+    if config is None:
+        config = get_mhc_fused_post_pre_delayed_rmsnorm_config(T)
+    partial = torch.empty(
+        T, config["NUM_KSPLIT"], 32, dtype=torch.float32, device=device
+    )
 
-    _mhc_post_pre_delayed_main_kernel[(triton.cdiv(T, block_m), split_k)](
+    _mhc_fused_post_pre_delayed_rmsnorm_main_kernel[
+        (triton.cdiv(T, config["BLOCK_M"]), config["NUM_KSPLIT"])
+    ](
         residual,
         sublayer_out,
         post_2d,
@@ -112,15 +129,15 @@ def mhc_post_pre_delayed(
         partial,
         T,
         H=H,
-        BLOCK_M=block_m,
-        TILE_K=tile_k,
-        NUM_KSPLIT=split_k,
+        BLOCK_M=config["BLOCK_M"],
+        TILE_K=config["TILE_K"],
+        NUM_KSPLIT=config["NUM_KSPLIT"],
         HAS_POST=has_post,
-        num_warps=2,
-        num_stages=3,
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
     )
 
-    _mhc_post_pre_delayed_reduce_kernel[(T,)](
+    _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel[(T,)](
         partial,
         hc_scale,
         hc_base,
@@ -135,9 +152,9 @@ def mhc_post_pre_delayed(
         hc_post_mult_value,
         norm_eps,
         H=H,
-        NUM_KSPLIT=split_k,
+        NUM_KSPLIT=config["NUM_KSPLIT"],
         NUM_SINKHORN_ITERS=int(sinkhorn_repeat),
-        BLOCK_C=1024,
-        num_warps=1,
+        BLOCK_C=config["BLOCK_C"],
+        num_warps=config["reduce_num_warps"],
     )
     return residual_out, post_out, comb_out, layer_input, next_pre
