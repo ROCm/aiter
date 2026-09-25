@@ -301,7 +301,7 @@ def build_candidate_gather(
     # One program per row, so the warps are what fills the machine when the
     # rows do not. Above that they only cost occupancy.
     num_warps = (
-        (1 if k <= 1024 else 2)
+        (1 if k <= 1024 else 4)
         if rows >= 4 * get_num_sms()
         else (8 if k >= 2048 else 4)
     )
@@ -321,7 +321,7 @@ def build_candidate_gather(
     assert (
         offsets == torch.int64 or fits == torch.int32
     ), "i32 offsets do not reach this cache; pass offsets=torch.int64"
-    pos = torch.empty((rows, k), dtype=torch.int64, device=dev)
+    pos = torch.empty((rows, k), dtype=torch.int32, device=dev)
     cu = torch.empty((rows,), dtype=torch.int32, device=dev)
     voff = torch.empty((rows, k), dtype=offsets, device=dev)
     soff = torch.empty((rows, k), dtype=offsets, device=dev)

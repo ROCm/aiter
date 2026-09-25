@@ -217,8 +217,8 @@ def _prepare_candidates_kernel(
 
     # Padding repeats the last legal block, so a short row still walks blocks
     # it owns and row_ends drops the slots.
-    last = ((nblocks - 1) * C).to(tl.int64)
-    pos = tl.where(key == 0x7FFFFFFF, last, key.to(tl.int64) * C)
+    last = (nblocks - 1) * C
+    pos = tl.where(key == 0x7FFFFFFF, last, key * C)
     tl.store(pos_ptr + row * K + cols, pos)
     tail = tl.minimum(C, end - max_id * C)
     tl.store(cu_ptr + row, tl.where(n_valid > 0, (n_valid - 1) * C + tail, 0))

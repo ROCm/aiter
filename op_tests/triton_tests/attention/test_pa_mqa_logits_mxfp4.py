@@ -1063,7 +1063,7 @@ def test_candidate_gather(num_heads, block):
     got, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads, 128, block)
     assert torch.equal(got["voff"], ref["voff"]), "value offsets differ"
     assert torch.equal(got["soff"], ref["soff"]), "scale offsets differ"
-    assert torch.equal(got["positions"], pos_r) and torch.equal(cu, cu_r)
+    assert torch.equal(got["positions"].long(), pos_r) and torch.equal(cu, cu_r)
 
 
 @pytest.mark.parametrize("num_heads", [32, 64])
