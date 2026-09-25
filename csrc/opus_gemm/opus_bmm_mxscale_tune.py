@@ -253,6 +253,11 @@ _TUNE_POLICY = {
     202: [1],
     203: [1],
     205: [1],
+    # The banded wave8 tiles (kid401/402 = 175/348 + band 4; kid404 = 202 +
+    # band 4); they only win at m512-2048.
+    401: [1],
+    402: [1],
+    404: [1],
     # bdirect, B straight to registers with no LDS hop: the 16x32 and 64x32
     # last-mile tiles, and the 128x128 tile that owns the mid band.
     171: [1],

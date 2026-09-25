@@ -1738,6 +1738,12 @@ _bmm_bpre_wave8n4_local = {
 _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES = {
     #   (B_M, B_N, B_K, WG_PER_CU, XCD_WGM)     twin of
     346: (256, 256, 128, 1, 4),               # kid194 + FlyDSL's band height
+    # The same band on the other 2x4 tiles the tuned table gives mid M. Worth
+    # 3-13% at m512-2048 with cold weights, where the grid is about one
+    # workgroup per CU; noise elsewhere. kid168 and kid349 + band 4 won no
+    # cold-cache cell and are not built.
+    401: (128, 64,  256, 1, 4),               # kid175 + band 4
+    402: (128, 128, 256, 1, 4),               # kid348 + band 4
     # 347: (256, 256, 128, 1, 2),             # kid194 + half of it; noise, see above
 }
 _bmm_bpre_wave8n4_local.update({
@@ -2206,6 +2212,7 @@ _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_XCD_TILES = {
     # is kept. The 1x8 form at band 4 (kid207) loses to this 1x4 one at every M
     # past 1024, same as kid202 does to kid203.
     205: (256, 128, 256, 128, 1, 4),   # = kid203 + FlyDSL's band height; best here
+    404: (512, 128, 256, 128, 1, 4),   # = kid202 (1x8) + band 4
 }
 _bmm_bpre_wavetm1_local.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
