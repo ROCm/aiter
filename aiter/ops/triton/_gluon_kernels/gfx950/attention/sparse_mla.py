@@ -113,6 +113,7 @@ def _scale_load(
     W_FULL: gl.constexpr,
     MASKED: gl.constexpr,
     OTHER: gl.constexpr,
+    CACHE: gl.constexpr = _CG,
 ):
     """Gather the NG per-group scales of each token and broadcast to W_FULL
     columns. Indexing the full row with offs // GROUP would build a
@@ -132,26 +133,26 @@ def _scale_load(
                 offsets=rows.to(gl.int32)[:, None] + cols[None, :],
                 mask=m,
                 other=OTHER,
-                cache=".cg",
+                cache=CACHE,
             )
         else:
             sc = gl.load(
                 (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
                 mask=m,
                 other=OTHER,
-                cache_modifier=".cg",
+                cache_modifier=CACHE,
             )
     else:
         if USE_BUFFER_LOAD:
             sc = gl.amd.cdna4.buffer_load(
                 ptr=ptr,
                 offsets=rows.to(gl.int32)[:, None] + cols[None, :],
-                cache=".cg",
+                cache=CACHE,
             )
         else:
             sc = gl.load(
                 (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
-                cache_modifier=".cg",
+                cache_modifier=CACHE,
             )
     wide = gl.expand_dims(sc, 2).broadcast_to([sc.shape[0], NG, W_FULL // NG])
     return gl.convert_layout(
@@ -1017,6 +1018,7 @@ def _gather_full(
                 cfg.KV_DIM,
                 False,
                 0.0,
+                CACHE=cfg.GATHER_CACHE,
             )
         else:
             sc = _cache_load(
@@ -1065,6 +1067,7 @@ def _gather_full(
                 cfg.KV_DIM,
                 False,
                 127,
+                CACHE=cfg.GATHER_CACHE,
             )
         else:
             sc = _cache_load(
@@ -1378,6 +1381,7 @@ def _decode_tile(
                     cfg.KV_DIM,
                     True,
                     127,
+                    CACHE=cfg.GATHER_CACHE,
                 )
             else:
                 exps = _cache_load(
@@ -1427,6 +1431,7 @@ def _decode_tile(
                     cfg.KV_DIM,
                     False,
                     127,
+                    CACHE=cfg.GATHER_CACHE,
                 )
             else:
                 exps = _cache_load(
