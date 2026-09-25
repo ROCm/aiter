@@ -63,8 +63,10 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
 
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
-# fp8 dots need OCP e4m3 MFMA; CDNA3's is fnuz-only and reads OCP as garbage.
-FP8_DOT_ARCHS = ("gfx950",)
+# The kernel reads every fp8 byte, in q, the cache and the dot operands, as OCP
+# e4m3, which is gfx950's native fp8. gfx942's is fnuz, and the kernel does not
+# decode it yet, so gfx942 takes bf16 q and a bf16 cache only.
+FP8_ARCHS = ("gfx950",)
 
 # The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
 # reach the kernel below: they route to pa_decode_sparse, whose packed driver is
@@ -93,10 +95,36 @@ def _check_packed_arch(arch: str) -> None:
     which says nothing about the arch being the reason.
     """
     if arch not in PACKED_ARCHS:
+        flat = "bf16, fp8_scalar or fp8_dsv32_mla" if arch in FP8_ARCHS else "bf16"
         raise ValueError(
             f"the fp8_dsv4_mla and fp8_g64 caches and the SWA+top-k two-loop are "
             f"{'/'.join(PACKED_ARCHS)}-only and have no implementation on {arch}. "
-            f"The flat bf16, fp8_scalar and fp8_dsv32_mla caches do run on {arch}."
+            f"Use the flat {flat} cache there."
+        )
+
+
+def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
+    """fp8 q and caches only where OCP e4m3 is the native fp8.
+
+    A cache arrives as bytes, usually behind a uint8 view, so a gfx942 cache in
+    its native fnuz cannot be told apart from OCP here. Read as OCP it comes out
+    2x too large, and NaN wherever the quantizer saturated at 240.
+    """
+    if arch in FP8_ARCHS:
+        return
+    got = [
+        what
+        for what, is_fp8 in (
+            (f"q is {q_dtype}", q_dtype.itemsize == 1),
+            (f"the cache is {fmt}", fmt != "bf16"),
+        )
+        if is_fp8
+    ]
+    if got:
+        raise ValueError(
+            f"sparse_mla_fwd takes bf16 q and a bf16 cache on {arch}, but "
+            f"{' and '.join(got)}. The kernel reads fp8 as OCP e4m3, and {arch}'s "
+            "native fp8 is fnuz, which it does not decode yet."
         )
 
 
@@ -200,12 +228,11 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
         )
     if dot_precision == "bf16":
         return False
-    if arch not in FP8_DOT_ARCHS:
+    if arch not in FP8_ARCHS:
         raise ValueError(
-            f"dot_precision='fp8' is not supported on {arch}: the fp8 matrix "
-            "core there reads the fnuz encoding, so OCP e4m3 code points come "
-            "out wrong. Use dot_precision='bf16', which dequantizes the tile "
-            "on its way into LDS and works with every cache format."
+            f"dot_precision='fp8' is not supported on {arch}: the kernel feeds the "
+            f"matrix core OCP e4m3, and {arch}'s decodes fnuz. Use "
+            "dot_precision='bf16'."
         )
     if fmt == "fp8_dsv32_mla":
         raise ValueError(
@@ -438,7 +465,9 @@ def sparse_mla_fwd(
 
     Supported KV cache formats. The format is inferred from kv_buffer's shape,
     dtype and kv_scale; each row gives what the caller has to pass. R is the
-    QK width, kv_lora_rank + qk_rope_head_dim.
+    QK width, kv_lora_rank + qk_rope_head_dim. Every fp8 format, like fp8 q, is
+    gfx950-only: the kernel reads fp8 as OCP e4m3, and gfx942's native fp8 is
+    fnuz.
 
         format         kv_buffer                     kv_scale        geometry args
         bf16           [slots, R], [nb, block, R],   None            as the model
@@ -575,6 +604,7 @@ def sparse_mla_fwd(
         )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
+    _check_fp8_arch(arch, fmt, q.dtype)
     lds_limited = arch == "gfx942"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
