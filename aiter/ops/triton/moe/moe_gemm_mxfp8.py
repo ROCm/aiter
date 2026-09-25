@@ -22,6 +22,7 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import _moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_utils import group_sizes_to_expt_tensors
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.shuffle import moe_weight_kn
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 __all__ = ["moe_gemm_mxfp8"]
@@ -30,16 +31,6 @@ _LOGGER = AiterTritonLogger()
 
 # Tile values must come from configs/<arch>/triton/moe/mxfp8_fnuz/DEFAULT.json.
 _MXFP8_FALLBACK = triton.Config({}, num_warps=4, num_stages=1)
-
-
-def _is_kn_contiguous(t: torch.Tensor) -> bool:
-    return t.stride(1) == 1 and t.stride(2) == t.shape[1]
-
-
-def _as_kn(t: torch.Tensor) -> torch.Tensor:
-    """Transpose to KN, copying only when the source is not already K-major."""
-    t_kn = t.permute(0, 2, 1)
-    return t_kn if _is_kn_contiguous(t) else t_kn.contiguous()
 
 
 def moe_gemm_mxfp8(
@@ -121,8 +112,8 @@ def moe_gemm_mxfp8(
     # _moe_gemm_a8w8 wants KN. Expert weights are static after load, so a
     # caller storing them K-major already gets a view instead of a per-call
     # copy of the whole tensor (2.4-7.9 ms on gfx942 at Hy4 shapes).
-    rhs_kn = _as_kn(rhs)
-    w_scale_kn = _as_kn(w_scale)
+    rhs_kn = moe_weight_kn(rhs)
+    w_scale_kn = moe_weight_kn(w_scale)
     bias_stride = N if bias is not None else 0
 
     _moe_gemm_a8w8[(grid_m * grid_n,)](

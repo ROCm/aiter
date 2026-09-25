@@ -79,6 +79,18 @@ def moe_weight_decode_view(w: torch.Tensor) -> torch.Tensor:
     return w_u8.view(E, N // 16, K * 16).transpose(-1, -2)
 
 
+def moe_weight_kn(w: torch.Tensor) -> torch.Tensor:
+    """``(E, N, K)`` -> K-major storage, same logical shape.
+
+    ``_moe_gemm_a8w8`` reads the weight and its MX scales K-major. Callers that
+    already store them that way (converting once at load time rather than on
+    every call) get a free view; anything else is copied as before.
+    """
+    w_kn = w.permute(0, 2, 1)
+    already_kn = w.stride(1) == 1 and w.stride(2) == w.shape[1]
+    return w_kn if already_kn else w_kn.contiguous()
+
+
 # =============================================================================
 # SCALES
 # =============================================================================
