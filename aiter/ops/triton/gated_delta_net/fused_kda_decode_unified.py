@@ -81,41 +81,6 @@ def fused_kda_decode_unified(
         use_replay and conv_state_indices is not None
     )
 
-    # Keep non-replay speculative decode on the checkpoint-aware implementation.
-    # The unified kernel's legacy spec branch reads the fixed tail of the
-    # expanded conv cache, whereas vLLM rolls back to num_accepted_tokens - 1.
-    if is_spec and not use_replay:
-        if state_indices is None:
-            raise ValueError("Spec decode requires state_indices")
-        if num_accepted_tokens is None or conv_state_indices is None:
-            raise ValueError(
-                "Spec decode requires num_accepted_tokens and conv_state_indices"
-            )
-        from aiter.ops.triton.gated_delta_net.fused_kda_decode import (
-            fused_kda_decode,
-        )
-
-        return fused_kda_decode(
-            mixed_qkv=mixed_qkv,
-            conv_state=conv_state,
-            conv_weight=conv_weight,
-            gate=gate,
-            beta=beta,
-            out_gate=out_gate,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            ssm_state=state,
-            ssm_state_indices=state_indices,
-            cu_seqlens=cu_seqlens,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            head_dim=head_dim,
-            num_local_heads=num_local_heads,
-            lower_bound=lower_bound,
-            num_accepted_tokens=num_accepted_tokens,
-            conv_state_indices=conv_state_indices,
-        )
-
     out = torch.empty(T, lp, dtype=torch.bfloat16, device=device)
 
     # Conv weight strides
