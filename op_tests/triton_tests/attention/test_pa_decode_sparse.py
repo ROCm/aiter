@@ -606,3 +606,54 @@ def test_pa_decode_sparse_global_gather(T, has_invalid):
         q, cache, idx, indptr, attn_sink, softmax_scale, has_invalid=has_invalid
     )
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_sms", [256, 128, 64, 32])
+def test_decode_num_splits_occ_bounds(monkeypatch, num_sms):
+    """The gfx950 split-K count must stay inside every bound it is built from.
+
+    ``num_sms`` is patched rather than read from the device, so the bounds are
+    checked at the partitioned CU counts too and the body needs no allocation.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    from aiter.ops.triton.attention import pa_decode_sparse as mod
+
+    monkeypatch.setattr(mod, "get_num_sms", lambda: num_sms)
+    block_k, swa = 64, 128
+    for heads_blocks in (1, 2, 4):
+        for num_queries in (1, 6, 36, 48, 96, 126, 150, 192, 252, 512, 1024):
+            for topk in (64, 512, 1024, 2048, 8192):
+                n = mod._decode_num_splits_occ(
+                    num_queries, heads_blocks, swa, topk, block_k
+                )
+                tiles = max(
+                    1, triton.cdiv(swa, block_k), triton.cdiv(topk, block_k)
+                )
+                base_wg = max(1, num_queries * heads_blocks)
+                cta_cap = max(1, (2 * num_sms) // base_wg)
+                wave_cap = 1 << max(0, (num_sms // base_wg).bit_length() - 1)
+                where = f"cu={num_sms} q={num_queries} hb={heads_blocks} topk={topk}"
+
+                assert 1 <= n <= tiles, f"{where}: {n} splits over {tiles} tiles"
+                assert n <= cta_cap, f"{where}: {n} splits exceeds cta_cap {cta_cap}"
+                assert n <= mod._MAX_SPLITS, f"{where}: {n} splits over _MAX_SPLITS"
+                # Each split carries a fixed cost, so leave it >= 4 tiles of work
+                # unless another bound forbids that many.
+                assert n >= min(tiles // 4, cta_cap, tiles, mod._MAX_SPLITS), (
+                    f"{where}: {n} splits leaves "
+                    f"{triton.cdiv(tiles, n)} tiles per workgroup"
+                )
+                # Below one workgroup per CU the launch stays inside one wave,
+                # unless the tile floor is what is holding the count up.
+                if base_wg < num_sms and tiles // 4 <= wave_cap:
+                    assert base_wg * n <= num_sms, (
+                        f"{where}: {base_wg * n} workgroups over {num_sms} CUs"
+                    )
+                # More KV per query must never buy fewer splits.
+                if topk > 64:
+                    prev = mod._decode_num_splits_occ(
+                        num_queries, heads_blocks, swa, topk // 2, block_k
+                    )
+                    assert n >= prev, f"{where}: {n} splits < {prev} at half the top-k"

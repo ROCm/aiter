@@ -463,7 +463,14 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     if base_wg >= num_sms:
         # Already at least one workgroup per CU without splitting
         return max(1, min(cta_cap, tiles // 4))
-    return max(1, min(cta_cap, tiles, _MAX_SPLITS))
+    # Two more ceilings. wave_cap: stop at one workgroup per CU -- cta_cap allows two,
+    # which at 48 queries on 256 CUs picks 8 splits and measures 16 % slower than 4.
+    # Rounded down to a power of two: ragged counts measured slower at equal occupancy,
+    # and powers of two are already what _launch_splits pads up to.
+    # tiles // 4: but never below the floor the branch above already uses, so a workgroup
+    # keeps >= 4 KV tiles to amortise its per-split cost. Without it, -43 % at top-k 2048.
+    wave_cap = 1 << max(0, (num_sms // base_wg).bit_length() - 1)
+    return max(1, min(cta_cap, tiles, _MAX_SPLITS, max(wave_cap, tiles // 4)))
 
 
 def _launch_splits(num_splits):
