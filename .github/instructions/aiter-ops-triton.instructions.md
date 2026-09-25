@@ -396,18 +396,18 @@ All weight/scale pre-shuffle helpers are unified in
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from
   `aiter.ops.triton.utils.shuffle`.
-- A GEMM also ships a tuning case. The tuner
-  (`aiter/ops/triton/utils/_triton/tuning/`) runs each GEMM through a case in
-  `gemm_cases.py` and answers the wrapper's own `get_gemm_config()` lookup with
-  every candidate, sweeping the keys of the family's `DEFAULT.json` for the
-  arch and backend being tuned. Flag:
+- A GEMM also ships a tuning case. `utils/_triton/tuning/tune_gemm.py` runs a
+  GEMM through its case in `gemm_cases.py`, tries every config where the
+  wrapper reads its own through `get_gemm_config()`, and keeps the fastest;
+  the keys it tries are the keys of the family's `DEFAULT.json` for the arch
+  and backend being tuned. Flag:
   - A new public GEMM wrapper under `gemm/` with no case in `gemm_cases.py`,
     or a case not named after the wrapper.
-  - A case that passes `config=` to the wrapper (the tuner can only override
-    the lookup), or that drops the wrapper's `backend` argument when the
-    wrapper has one (that backend becomes untunable).
+  - A case that passes `config=` to the wrapper (the script can only replace
+    what the lookup returns), or that drops the wrapper's `backend` argument
+    when the wrapper has one (that backend becomes untunable).
   - A GEMM family whose `DEFAULT.json` keys differ from the config keys the
-    kernel reads: a key the kernel ignores gets swept for nothing, and a key
+    kernel reads: a key the kernel ignores is tried for nothing, and a key
     missing from `DEFAULT.json` is never tuned and never written.
   - A new backend or arch path in a GEMM wrapper that resolves its config
     without `get_gemm_config()`: that path cannot be tuned.

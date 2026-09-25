@@ -309,11 +309,11 @@ depend on a benchmark.
   caches, not tuning configs — never check them in or migrate them.
 
 For adding a config, seeding a new arch, and the per-family key schemes, follow
-`configs/CLAUDE.md` (§5 and §6). To tune a GEMM family on any arch and backend,
-see `utils/_triton/tuning/README.md`: the scripts answer the wrapper's own
-`get_gemm_config()` lookup with each candidate and sweep the keys of the
-family's `DEFAULT.json`, so those keys must be exactly the ones the kernel
-reads.
+`configs/CLAUDE.md` (§5 and §6). To tune a GEMM on any arch and backend, run
+`utils/_triton/tuning/tune_gemm.py` (see its README): it tries every config
+where the wrapper reads its own through `get_gemm_config()`, and keeps the
+fastest. The keys it tries are the keys of the family's `DEFAULT.json`, so
+those must be exactly the ones the kernel reads.
 
 ---
 
@@ -477,4 +477,5 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
   kernel + wrapper + test + benchmark.
 - GEMM wrappers: a tuning case in `utils/_triton/tuning/gemm_cases.py` (see
   its README), and each `DEFAULT.json` of the family lists exactly the config
-  keys the kernel reads, since those are the keys the tuner sweeps and writes.
+  keys the kernel reads, since those are the keys `tune_gemm.py` tries and
+  writes.

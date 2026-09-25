@@ -1,51 +1,39 @@
-"""Tuning cases: how to build inputs for a GEMM and run it once.
+"""One tuning case per GEMM: how to build its inputs and run it once.
 
-A case is a function named after the wrapper it runs. It takes ``M`` plus the
-op's other shape dims (``N``, ``K``, ``B``, ...), builds the inputs, and
-returns a zero-argument callable that runs the op. The callable never passes
-``config=``: the tuner answers the op's own ``get_gemm_config()`` lookup, which
-is also how it learns the config family, the backend and where the tuned file
-goes. So every arch and backend the wrapper supports is tunable through the
-same case. A case that takes ``backend`` can be pinned to one with
-``--backend``; otherwise the wrapper picks, as it does in production.
+A case is a function named after the wrapper it runs. It takes the op's shape
+dims (M, N, K, ...), builds the inputs the way the unit test does, and returns
+a callable that runs the op. It never passes config=: tune_gemm.py answers the
+op's own get_gemm_config() lookup, which is how it learns the config family,
+the backend and where the tuned file goes. So every arch and backend the
+wrapper supports is tuned through the same case.
 
-The keys the tuner sweeps are the keys of the family's ``DEFAULT.json`` for
-the arch and backend being tuned. ``space`` narrows keys the op constrains, so
-the sweep does not try values that can never work. ``kernels`` are substrings
-of the op's kernel names; only kernels whose names contain one are timed.
+Take `backend=None` and pass `**backend_kwarg(backend)` when the wrapper has a
+backend argument, so --backend can pick one. `space=` on the decorator pins
+keys the kernel constrains (blockscale kernels need BLOCK_SIZE_K=128), so the
+sweep does not try values that can only fail.
 
-Imports stay inside each case, so listing the cases imports nothing heavy.
+Imports stay inside each case, so listing the cases imports no kernels.
 """
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+CASES = {}
 
 
-@dataclass(frozen=True)
-class GemmCase:
-    make_fn: Callable[..., Callable[[], object]]
-    space: Mapping[str, Sequence[object]]
-    kernels: tuple[str, ...]
-
-
-CASES: dict[str, GemmCase] = {}
-
-
-def gemm_case(space=None, kernels=("gemm",)):
-    def register(make_fn):
-        CASES[make_fn.__name__] = GemmCase(make_fn, dict(space or {}), kernels)
-        return make_fn
+def gemm_case(space=None):
+    def register(case):
+        case.space = dict(space or {})
+        CASES[case.__name__] = case
+        return case
 
     return register
 
 
-def _backend(backend):
-    """Pass ``backend`` only when asked for, so each wrapper keeps its default."""
+def backend_kwarg(backend):
+    """Pass backend only when asked for, so the wrapper keeps its own default."""
     return {} if backend is None else {"backend": backend}
 
 
 # Blockscale kernels read one scale per 128-wide block of K.
-_BLOCKSCALE_K = {"BLOCK_SIZE_K": [128]}
+BLOCKSCALE = {"BLOCK_SIZE_K": [128]}
 
 
 @gemm_case()
@@ -61,7 +49,7 @@ def gemm_a16w16(M, N, K, backend=None):
     x, w, bias, _, y = generate_gemm_a16w16_inputs(
         M, N, K, dtype, output=True, bias=True
     )
-    return lambda: op(x, w, bias, dtype, y, **_backend(backend))
+    return lambda: op(x, w, bias, dtype, y, **backend_kwarg(backend))
 
 
 @gemm_case()
@@ -101,7 +89,7 @@ def gemm_a16w16_gated(M, N, K):
     return lambda: op(x, w, dtype, y)
 
 
-@gemm_case(space=_BLOCKSCALE_K)
+@gemm_case(space=BLOCKSCALE)
 def gemm_a16w8_blockscale(M, N, K):
     import torch
 
@@ -119,7 +107,7 @@ def gemm_a16w8_blockscale(M, N, K):
     return lambda: op(x, w, w_scale, dtype, y, prequant=False)
 
 
-@gemm_case(space=_BLOCKSCALE_K)
+@gemm_case(space=BLOCKSCALE)
 def gemm_a16w8_blockscale_preshuffle(M, N, K):
     import torch
 
@@ -168,10 +156,10 @@ def gemm_a8w8(M, N, K, backend=None):
     x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
         M, N, K, in_dtype=e4m3_type, out_dtype=dtype, layout="TN", output=True
     )
-    return lambda: op(x, w, x_scale, w_scale, None, dtype, y, **_backend(backend))
+    return lambda: op(x, w, x_scale, w_scale, None, dtype, y, **backend_kwarg(backend))
 
 
-@gemm_case(space=_BLOCKSCALE_K)
+@gemm_case(space=BLOCKSCALE)
 def gemm_a8w8_blockscale(M, N, K, backend=None):
     import torch
 
@@ -186,10 +174,10 @@ def gemm_a8w8_blockscale(M, N, K, backend=None):
     x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M, N, K, 128, 128, dtype=dtype, layout="TN", output=True, shuffle=False
     )
-    return lambda: op(x, w, x_scale, w_scale, dtype, y, **_backend(backend))
+    return lambda: op(x, w, x_scale, w_scale, dtype, y, **backend_kwarg(backend))
 
 
-@gemm_case(space=_BLOCKSCALE_K)
+@gemm_case(space=BLOCKSCALE)
 def gemm_a8w8_blockscale_preshuffle(M, N, K, backend=None):
     import torch
 
@@ -204,7 +192,7 @@ def gemm_a8w8_blockscale_preshuffle(M, N, K, backend=None):
     x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M, N, K, 128, 128, dtype=dtype, layout="TN", output=True, shuffle=True
     )
-    return lambda: op(x, w, x_scale, w_scale, dtype, y, **_backend(backend))
+    return lambda: op(x, w, x_scale, w_scale, dtype, y, **backend_kwarg(backend))
 
 
 @gemm_case()
@@ -256,7 +244,7 @@ def gemm_afp4wfp4(M, N, K, backend=None):
     x, _, w, _, _, x_scales, w_scales, _, y = generate_gemm_afp4wfp4_inputs(
         M, N, K, dtype, output=True, shuffle_scales_fg=False, shuffle_weight_fg=False
     )
-    return lambda: op(x, w, x_scales, w_scales, dtype, y, **_backend(backend))
+    return lambda: op(x, w, x_scales, w_scales, dtype, y, **backend_kwarg(backend))
 
 
 @gemm_case()
@@ -312,7 +300,7 @@ def gemm_afp8wfp8_preshuffle(M, N, K, backend=None):
 
     dtype = torch.bfloat16
     x, _, w, _, x_scales, w_scales = generate_inputs(M, N, K, shuffle=True)
-    return lambda: op(x, w, x_scales, w_scales, dtype=dtype, **_backend(backend))
+    return lambda: op(x, w, x_scales, w_scales, dtype=dtype, **backend_kwarg(backend))
 
 
 @gemm_case()
@@ -328,4 +316,4 @@ def batched_gemm_bf16(M, N, K, B, backend=None):
 
     dtype = torch.bfloat16
     x, w, bias, y = generate_batched_gemm_a16w16_inputs(B, M, N, K, dtype, output=True)
-    return lambda: op(x, w, bias, dtype, YQ=y, **_backend(backend))
+    return lambda: op(x, w, bias, dtype, YQ=y, **backend_kwarg(backend))
