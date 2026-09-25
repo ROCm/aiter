@@ -952,7 +952,9 @@ def top_k_per_row_decode(
         max_row_len=max_row_len,
     )
     if backend != BACKEND_UPSTREAM:
-        return flydsl_top_k_per_row_decode(
+        from .flydsl.topk.topk_per_row import _decode_with_backend
+
+        return _decode_with_backend(
             logits,
             next_n,
             seqLens,
@@ -963,8 +965,8 @@ def top_k_per_row_decode(
             k,
             stable,
             values,
-            backend=backend,
-            max_row_len=max_row_len,
+            backend,
+            max_row_len,
         )
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
@@ -1142,7 +1144,6 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
-    backend: str | None = None,
     max_row_len: int | None = None,
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
@@ -1168,7 +1169,6 @@ def flydsl_top_k_per_row_decode(
         k,
         stable,
         values,
-        backend,
         max_row_len,
     )
 

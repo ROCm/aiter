@@ -468,20 +468,49 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
-    backend: str | None = None,
     max_row_len: int | None = None,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
-
-    `backend` is the gate's answer and None asks the gate, which is what admits
-    the adaptive kernel. An `upstream` answer still runs the chunked pair here,
-    because this host owns no other kernel to fall back to.
 
     `max_row_len` bounds `seq_lens` from the host, and is a guarantee rather
     than a hint -- `aiter.ops.topk.top_k_per_row_decode` documents what it
     costs to get wrong.
     """
+    _decode_with_backend(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        values,
+        None,
+        max_row_len,
+    )
 
+
+def _decode_with_backend(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None,
+    backend: str | None,
+    max_row_len: int | None,
+) -> None:
+    """Run the decode on `backend`, which must be the gate's answer or None to ask it.
+
+    An `upstream` answer still runs the chunked pair here, because this host
+    owns no other kernel to fall back to.
+    """
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
     )
