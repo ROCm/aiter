@@ -14,20 +14,91 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
-from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
-from .config import _WAVE_SIZE, _select_dispatch_config
-from .dispatch import _make_dispatch
+from .combine import (
+    CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
+)
+from .combine import (
+    COMBINE_LDS_BUDGET,
+    _make_combine_fused_reduce,
+    _make_combine_fused_sync,
+    combine_reduce_lds_bytes,
+)
+from .config import _DISPATCH_COMPACT, _WAVE_SIZE, _select_dispatch_config
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
+from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
-# "flydsl": per-lane vec4 payload copies. "tdm": the same arena protocol with
-# the payload and the metadata moved by the gfx1250 Tensor Data Mover. "mori":
-# mori's HIP/JIT kernel through its EpDispatchPlan.
-_DISPATCH_BACKENDS = ("flydsl", "tdm", "mori")
+# "flydsl": AITER's FlyDSL/TDM dispatch. "mori": mori's HIP/JIT kernel through
+# its EpDispatchPlan.
+_DISPATCH_BACKENDS = ("flydsl", "mori")
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
+
+# "mxfp8" is what the mega_moe v2 path calls "fp8_blockwise_1x32" (kernels/
+# flydsl_dispatch_combine_intranode_op.py); that path has no fp4.
+_COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
+_COMBINE_QUANT_BITS = {"none": 0, "mxfp8": 8, "mxfp4": 4}
+# Preferred lane tile for the TDM combine: T tokens x C chunks per block
+# iteration, which the reduce turns into T*C*256/16 lanes -- so the quantized
+# path runs a wider block than the bf16 one. A ceiling, not the answer:
+# `_combine_tile` walks these down until the tile fits a given topk.
+_COMBINE_TOKENS_PER_BLOCK = 16
+_COMBINE_CHUNKS_PER_ITER = 1
+# The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
+# row, so a small C makes that load pull a whole cache line per row for a
+# handful of bytes.
+_COMBINE_QUANT_TOKENS_PER_BLOCK = 8
+_COMBINE_QUANT_CHUNKS_PER_ITER = 4
+
+
+def _combine_tile(*, topk, hidden_dim, quant_bits):
+    """(tokens_per_block, chunks_per_iter) for the reduce, widest that fits.
+
+    C has to divide the hidden chunk count, since the reduce has no tail path
+    along hidden, and 2*topk, so the tile's T*topk rows spread evenly over the
+    block's T*C/2 warps.
+
+    T then takes the tile as high as the LDS budget allows, since trips per block
+    is what keeps the prefetch pipeline fed. LDS grows as T*topk, so a large topk
+    trades height away: topk=8 on the mxfp8 wire needs 164KB at the preferred
+    T=8 and lands on T=7.
+    """
+    n_chunks = hidden_dim // _COMBINE_CHUNK_ELEMS
+    max_chunks, max_toks = (
+        (_COMBINE_QUANT_CHUNKS_PER_ITER, _COMBINE_QUANT_TOKENS_PER_BLOCK)
+        if quant_bits
+        else (_COMBINE_CHUNKS_PER_ITER, _COMBINE_TOKENS_PER_BLOCK)
+    )
+    for chunks in range(max_chunks, 0, -1):
+        if n_chunks % chunks or (2 * topk) % chunks:
+            continue
+        for toks in range(max_toks, 0, -1):
+            lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
+            if lanes % _WAVE_SIZE:
+                continue
+            # The tile's copies pass the block's warp count to a TDM atom, which
+            # takes only a power of two.
+            warps = lanes // _WAVE_SIZE
+            if warps & (warps - 1):
+                continue
+            if (
+                combine_reduce_lds_bytes(
+                    experts_per_token=topk,
+                    quant_bits=quant_bits,
+                    tokens_per_block=toks,
+                    chunks_per_iter=chunks,
+                )
+                <= COMBINE_LDS_BUDGET
+            ):
+                return toks, chunks
+    raise ValueError(
+        f"no combine reduce tile fits the {COMBINE_LDS_BUDGET // 1024}KB LDS "
+        f"budget for topk={topk}, hidden_dim={hidden_dim}, "
+        f"combine_quant_bits={quant_bits}"
+    )
+
 
 # mori's C++ EpArgs offset stems -> this package's arena region names. All eight
 # are bound when a plan is built even though mori's dispatch dereferences only the
@@ -48,21 +119,8 @@ _MORI_REGION_NAMES = {
 
 
 def read_dispatch_wire_env() -> str:
-    """$MEGA_DISPATCH_WIRE, and a loud death for the name it replaced.
-
-    Not a fallback: an env var that is silently ignored sends a run that asked
-    for fp4 down the bf16 path and reports nothing, which is the one failure
-    mode a wire benchmark cannot survive.
-    """
-    stale, current = os.environ.get("MEGA_WIRE"), os.environ.get("MEGA_DISPATCH_WIRE")
-    if stale is not None and current != stale:
-        raise RuntimeError(
-            "MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE (combine gets its own "
-            f"wire); found MEGA_WIRE={stale!r} with MEGA_DISPATCH_WIRE="
-            f"{current!r}. Update the launch script rather than relying on the "
-            "old name -- it is no longer read."
-        )
-    return current or "bf16"
+    """$MEGA_DISPATCH_WIRE, defaulting to bf16."""
+    return os.environ.get("MEGA_DISPATCH_WIRE") or "bf16"
 
 
 @dataclass(frozen=True)
@@ -244,9 +302,7 @@ class MegaMoEConfig:
     max_tokens_per_rank: int
     experts_per_rank: int
     topk: int
-    # Dispatch (stage1) knobs. They live here because this package has no
-    # stage1 config yet -- dispatch and gemm1 are not fused. When that fusion
-    # lands they move together into whatever config it brings.
+    # Dispatch (stage1) knobs.
     dispatch_block_num: int | None = None
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
@@ -260,10 +316,12 @@ class MegaMoEConfig:
     # fp8, a4w4 -> fp4). It is not a free choice: the receiver hands the payload
     # to the grouped GEMM as-is, so a mismatch is a width error, not a slow path.
     dispatch_wire: str = "bf16"
-    # None reads $AITER_TDM_COMPACT_PLAN; an explicit value wins over it, for a
-    # caller that drives the recv rows with its own expert GEMM and cannot read
-    # the compact layout.
-    compact_plan_override: bool | None = None
+    # Fuse stage-1 routing/layout planning with dispatch through the compact
+    # expert-row plan consumed directly by the grouped GEMM.
+    stage1_fused: bool = False
+    # What the combine reduce puts on the wire. Independent of dispatch_wire:
+    # combine moves post-expert tokens, so it picks its own payload format.
+    combine_quant: str = "none"
 
     def __post_init__(self):
         if self.dispatch_wire not in _DISPATCH_WIRES:
@@ -271,10 +329,13 @@ class MegaMoEConfig:
                 f"dispatch_wire must be one of {_DISPATCH_WIRES}, "
                 f"got {self.dispatch_wire!r}"
             )
-        if self.is_quant_dispatch_wire and self.dispatch_backend not in ("tdm", "mori"):
+        if self.is_quant_dispatch_wire and self.dispatch_backend not in (
+            "flydsl",
+            "mori",
+        ):
             raise ValueError(
                 f"dispatch_wire={self.dispatch_wire!r} requires "
-                "dispatch_backend='tdm' or 'mori' "
+                "dispatch_backend='flydsl' or 'mori' "
                 f"(got {self.dispatch_backend!r})"
             )
         if self.is_quant_dispatch_wire and self.hidden_dim % 32:
@@ -282,11 +343,28 @@ class MegaMoEConfig:
                 "one e8m0 scale covers 32 features, so a quantizing dispatch "
                 f"wire needs hidden_dim % 32 == 0, got {self.hidden_dim}"
             )
+        if self.combine_quant not in _COMBINE_QUANT_MODES:
+            raise ValueError(
+                f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
+                f"got {self.combine_quant!r}"
+            )
+        # Every wire, not just the quantized ones: the reduce tiles hidden in
+        # whole chunks and has no tail path.
+        if self.hidden_dim % _COMBINE_CHUNK_ELEMS:
+            raise ValueError(
+                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
+                f"element chunks with no tail path, so it needs hidden_dim % "
+                f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
+            )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
             raise ValueError(
                 f"dispatch_backend must be one of {_DISPATCH_BACKENDS}, "
                 f"got {self.dispatch_backend!r}"
             )
+        if self.stage1_fused and self.dispatch_backend != "flydsl":
+            raise ValueError("stage1_fused requires dispatch_backend='flydsl'")
+        if self.stage1_fused and not self.is_quant_dispatch_wire:
+            raise ValueError("stage1_fused requires an fp8 or fp4 dispatch wire")
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > _MAX_WORLD_SIZE:
@@ -312,7 +390,6 @@ class MegaMoEConfig:
             self.world_size,
             self.hidden_dim,
             self.topk,
-            tdm=self.dispatch_backend == "tdm",
         )
         if self.dispatch_block_num is None:
             self.dispatch_block_num = tuned["dispatch_block_num"]
@@ -324,19 +401,6 @@ class MegaMoEConfig:
     @property
     def max_recv(self) -> int:
         return self.world_size * self.max_tokens_per_rank
-
-    @property
-    def compact_plan(self) -> bool:
-        """Send-side compact dest rows; TDM default, disable with env=0."""
-        if self.dispatch_backend != "tdm" or not self.is_quant_dispatch_wire:
-            return False
-        if self.compact_plan_override is not None:
-            return self.compact_plan_override
-        return os.environ.get("AITER_TDM_COMPACT_PLAN", "1") in (
-            "1",
-            "true",
-            "True",
-        )
 
     def compact_row_cap(self, tile_m: int = 64) -> int:
         from .compact_plan import compact_row_capacity
@@ -377,8 +441,34 @@ class MegaMoEConfig:
         )
 
     @property
-    def combine_token_nbytes(self) -> int:
-        """Combine moves bf16 post-expert tokens, whatever the wire carried."""
+    def combine_quant_bits(self) -> int:
+        """Payload width of the quantized wire this instance OFFERS; 0 is none.
+
+        What a step actually runs on is forward()'s own ``combine_quant``; this
+        only says which format it may name.
+        """
+        return _COMBINE_QUANT_BITS[self.combine_quant]
+
+    @property
+    def combine_quant_bit_modes(self) -> tuple[int, ...]:
+        """Payload widths a step may pick, i.e. what to build a reduce for.
+
+        bf16 is always in, and is what a step gets unless it asks otherwise: a
+        quantized wire only pays off once there are enough tokens on it to
+        outweigh the per-token quant/dequant pair. Asking for none here keeps
+        bf16 the only one, so a model that never quantizes builds one reduce.
+        """
+        bits = self.combine_quant_bits
+        return (0,) if not bits else (0, bits)
+
+    def combine_wire_nbytes(self, quant_bits: int) -> int:
+        """What combine moves per token at ``quant_bits``: MX, or bf16 at 0."""
+        if quant_bits:
+            # A payload plane of MX bytes, then its e8m0 scale plane.
+            return (
+                self.hidden_dim * quant_bits // 8
+                + self.hidden_dim // _COMBINE_SCALE_BLOCK
+            )
         return self.hidden_dim * 2
 
     @property
@@ -402,7 +492,7 @@ class MegaMoEConfig:
         """
         if not self.is_quant_dispatch_wire:
             return 0
-        if self.dispatch_backend == "tdm":
+        if self.dispatch_backend == "flydsl":
             return _align_up(self.dispatch_scale_nbytes, 128)
         try:
             from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
@@ -417,12 +507,31 @@ class MegaMoEConfig:
 
         return scale_stride_bytes(self.dispatch_scale_nbytes)
 
-    @property
-    def combine_slot_stride_bytes(self) -> int:
+    def combine_slot_stride_for(self, quant_bits: int) -> int:
+        """Slot pitch on the ``quant_bits`` wire: the payload rounded up to a
+        power of two, so one row index addresses both peer and slot.
+
+        Tight per wire, not shared across them. The scatter writes and the
+        reduce reads one payload per slot at this pitch, so padding a quantized
+        slot out to the bf16 one would leave three quarters of every cache line
+        and TDM row untouched -- handing back most of what the narrower payload
+        just won. The arena is what absorbs the difference instead: it is cut to
+        the widest pitch (below) and a quantized wire packs into its front.
+        """
         stride = 1
-        while stride < self.combine_token_nbytes:
+        while stride < self.combine_wire_nbytes(quant_bits):
             stride <<= 1
         return stride
+
+    @property
+    def combine_slot_stride_bytes(self) -> int:
+        """The bf16 wire's pitch, and so the one the arena is SIZED for.
+
+        bf16 is the widest wire, so a staging region cut to this pitch holds a
+        step on any of them and the arena stops depending on which format a
+        step picks -- which is what lets one instance serve them all.
+        """
+        return self.combine_slot_stride_for(0)
 
 
 @dataclass
@@ -462,7 +571,8 @@ class MegaMoEGfx1250:
         situ_linear_beta: torch.Tensor | None = None,
         dispatch_backend: str | None = None,
         dispatch_wire: str | None = None,
-        compact_plan: bool | None = None,
+        stage1_fused: bool = False,
+        combine_quant: str | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -559,7 +669,12 @@ class MegaMoEGfx1250:
                     if dispatch_wire is not None
                     else read_dispatch_wire_env()
                 ),
-                compact_plan_override=compact_plan,
+                stage1_fused=bool(stage1_fused),
+                combine_quant=(
+                    combine_quant
+                    if combine_quant is not None
+                    else os.environ.get("MEGA_COMBINE_QUANT", "none")
+                ),
             ),
             communicator,
         )
@@ -581,6 +696,7 @@ class MegaMoEGfx1250:
         recv_token_bound: int | None = None,
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
+        combine_quant: str | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -596,7 +712,14 @@ class MegaMoEGfx1250:
         layer's compact plan on a side stream after this dispatch, so it overlaps
         the expert GEMM. The two plans use independent hist/done slots and local
         tok_map/psum buffers. Omit them to keep the plan sequential.
+
+        ``combine_quant`` picks this step's combine wire out of the formats the
+        constructor built a reduce for, so a caller can quantize the steps with
+        enough tokens on the wire to pay for it and leave the rest on bf16.
+        Omitting it means bf16 -- naming a format at construction only builds
+        it, each step still has to ask for it.
         """
+        combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
@@ -662,7 +785,9 @@ class MegaMoEGfx1250:
             # Compact cannot slice recv_x -- the rows are grouped per expert, not
             # token-major -- so the bound is spent on the geometry instead: it
             # picks the plan's alignment, the GEMM's tile and the GEMM's grid.
-            self._begin_compact_step(recv_token_bound)
+            self._begin_compact_step(
+                self._compact_recv_bound(token_count, recv_token_bound)
+            )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
         )
@@ -688,10 +813,14 @@ class MegaMoEGfx1250:
         if self.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
-        scatter = self._scatter_context(routing)
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import set_tdm_compact_plan
+        scatter = self._scatter_context(routing, combine_quant_bits)
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            set_flydsl_dispatch_context,
+        )
 
-        set_tdm_compact_plan(scatter if self._compact_plan else None)
+        set_flydsl_dispatch_context(
+            scatter if self._config.dispatch_backend == "flydsl" else None
+        )
         moe_ids = self._compact_dummy_ids if self._compact_plan else recv_ids
         moe_wts = self._compact_dummy_wts if self._compact_plan else recv_weights
         if (
@@ -729,8 +858,34 @@ class MegaMoEGfx1250:
                 **extra,
             )
         finally:
-            set_tdm_compact_plan(None)
-        return self._combine(routing)
+            set_flydsl_dispatch_context(None)
+        return self._combine(routing, combine_quant_bits)
+
+    def _resolve_combine_quant(self, combine_quant: str | None) -> int:
+        """This step's combine payload width, checked against what was built.
+
+        Unnamed means bf16. The constructor's ``combine_quant`` says which
+        formats exist, not which one runs: a quantized wire only pays off once
+        there are enough tokens on it to outweigh the per-token quant/dequant
+        pair, and that is a property of the step, so a step has to ask.
+        """
+        if combine_quant is None:
+            return 0
+        if combine_quant not in _COMBINE_QUANT_MODES:
+            raise ValueError(
+                f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
+                f"got {combine_quant!r}"
+            )
+        bits = _COMBINE_QUANT_BITS[combine_quant]
+        if bits not in self._combine_variants:
+            raise ValueError(
+                f"combine_quant={combine_quant!r} was not built: this MegaMoE "
+                f"was constructed with combine_quant="
+                f"{self._config.combine_quant!r}, which builds a reduce for "
+                f"{sorted(self._combine_variants)} bit widths only. Name the "
+                "format at construction to make it available per step."
+            )
+        return bits
 
     __call__ = forward
 
@@ -739,6 +894,19 @@ class MegaMoEGfx1250:
 
     def __exit__(self, *exc):
         self.close()
+
+    def _compact_recv_bound(
+        self, token_count: int, recv_token_bound: int | None
+    ) -> int:
+        """Static safe recv bound for this step.
+
+        Dispatch deduplicates a token's routes to the same peer, so one rank can
+        receive at most ``world_size * token_count`` rows. Use that exact bound
+        when the caller did not provide a tighter graph bucket.
+        """
+        inferred = int(self._config.world_size) * max(1, int(token_count))
+        bound = inferred if recv_token_bound is None else int(recv_token_bound)
+        return max(1, min(bound, int(self._config.max_recv)))
 
     def _compact_plan_for(self, align_m: int, slot: int | None = None):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
@@ -780,7 +948,11 @@ class MegaMoEGfx1250:
             self._compact_plan_launches[key] = launch
         return launch
 
-    def warmup_compact_plan(self, recv_token_bound: int | None = None) -> None:
+    def warmup_compact_plan(
+        self,
+        recv_token_bound: int | None = None,
+        token_count: int | None = None,
+    ) -> None:
         """Compile the compact plan this bound needs, before any graph capture.
 
         The plan is compiled per tile alignment and the alignment follows the
@@ -791,7 +963,12 @@ class MegaMoEGfx1250:
         """
         if not self._compact_plan:
             return
-        self._begin_compact_step(recv_token_bound)
+        tok = (
+            int(self._config.max_tokens_per_rank)
+            if token_count is None
+            else int(token_count)
+        )
+        self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
         for slot in range(self._COMPACT_PLAN_SLOTS):
             self._compact_plan_for(self._compact_step_align_m, slot)
 
@@ -808,10 +985,11 @@ class MegaMoEGfx1250:
         """
         if not self._compact_plan:
             return
-        self._begin_compact_step(recv_token_bound)
-        self._launch_compact_plan_async(
-            topk_ids, int(topk_ids.shape[0]), self._compact_slot
+        token_count = int(topk_ids.shape[0])
+        self._begin_compact_step(
+            self._compact_recv_bound(token_count, recv_token_bound)
         )
+        self._launch_compact_plan_async(topk_ids, token_count, self._compact_slot)
 
     def _prefetch_next_compact_plan(
         self,
@@ -824,8 +1002,11 @@ class MegaMoEGfx1250:
             self._compact_step_rows,
             self._compact_step_recv_bound,
         )
-        self._begin_compact_step(recv_token_bound)
-        self._launch_compact_plan_async(topk_ids, int(topk_ids.shape[0]), nxt)
+        token_count = int(topk_ids.shape[0])
+        self._begin_compact_step(
+            self._compact_recv_bound(token_count, recv_token_bound)
+        )
+        self._launch_compact_plan_async(topk_ids, token_count, nxt)
         (
             self._compact_step_align_m,
             self._compact_step_rows,
@@ -912,7 +1093,7 @@ class MegaMoEGfx1250:
         self._closed = False
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
-        self._compact_plan = config.compact_plan
+        self._compact_plan = config.stage1_fused
         self._compact_tile_m = _compact_gemm_align_m(
             config,
             activation=self.activation,
@@ -969,6 +1150,9 @@ class MegaMoEGfx1250:
                     ("compact_done", compact_done_nbytes()),
                 ]
             )
+        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+        # holds a step on any of them and a quantized one just packs into the
+        # front of it at its own pitch.
         arena_regions.append(
             (
                 "comb_inp",
@@ -1050,7 +1234,31 @@ class MegaMoEGfx1250:
             config.world_size, dtype=torch.int32, device=device
         )
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        # Points at the quant op's own scale rows, set per dispatch on a quantizing
+        # Quantized dispatch reuses fixed buffers across layers and graph
+        # replays. The public quant wrapper allocates both tensors on every call;
+        # keeping them here removes allocator/capture nodes from the stage-1
+        # critical path without changing the quant kernel or wire format.
+        self._dispatch_quant_payload = None
+        self._dispatch_quant_scales = None
+        if config.is_quant_dispatch_wire:
+            payload_cols = (
+                config.dispatch_token_nbytes
+                // config.dispatch_wire_spec.quant_dtype.itemsize
+            )
+            self._dispatch_quant_payload = torch.empty(
+                (config.max_tokens_per_rank, payload_cols),
+                dtype=config.dispatch_wire_spec.quant_dtype,
+                device=device,
+            )
+            self._dispatch_quant_scales = torch.empty(
+                (
+                    config.max_tokens_per_rank,
+                    config.dispatch_scale_nbytes,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            ).view(dtypes.fp8_e8m0)
+        # Points at the persistent scale rows, set per dispatch on a quantizing
         # wire; 0 (and unread) on bf16.
         self._dispatch_sent_scales_ptr = 0
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1066,11 +1274,7 @@ class MegaMoEGfx1250:
             # tuned buckets.
             config.schedule = _mori_dispatch_schedule(config)
         elif self._compact_plan:
-            # Compact dispatch has one warp load a token and fan it out to all
-            # final expert rows. Prefill needs enough token-owner warps to cover
-            # the input in one pass; the wider grid cuts dispatch roughly in
-            # half at 1K+ tokens, while its launch/synchronization overhead loses
-            # on decode and smaller prompt buckets.
+            # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
             blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
             warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
             if blocks_env is not None or warps_env is not None:
@@ -1078,15 +1282,11 @@ class MegaMoEGfx1250:
                 compact_warps = int(warps_env or "8")
                 config.schedule = ((None, compact_blocks, compact_warps),)
             else:
-                config.schedule = (
-                    (512, 64, 8),
-                    (None, 128, 16),
-                )
+                config.schedule = _DISPATCH_COMPACT
 
+        # A spec is (block, warp), plus route_parallel on the compact path.
         if config.schedule:
-            dispatch_specs = sorted(
-                {(block, warp) for _, block, warp in config.schedule}
-            )
+            dispatch_specs = sorted({tuple(entry[1:]) for entry in config.schedule})
         else:
             dispatch_specs = [
                 (
@@ -1097,44 +1297,31 @@ class MegaMoEGfx1250:
         self._dispatch_specs = dispatch_specs
         if config.dispatch_backend == "mori":
             self._dispatch_variants = self._build_mori_dispatch(config)
-        elif config.dispatch_backend == "tdm":
-            self._dispatch_variants = self._build_tdm_dispatch(config, device)
         else:
-            self._dispatch_variants = {
-                spec: _make_dispatch(
-                    rank=config.rank,
-                    npes=config.world_size,
-                    experts_per_rank=config.experts_per_rank,
-                    experts_per_token=config.topk,
-                    hidden_dim=config.hidden_dim,
-                    max_tok_per_rank=config.max_tokens_per_rank,
-                    max_recv=config.max_recv,
-                    off_tok_off=self._arena.offset("tok_off"),
-                    off_recv_num=self._arena.offset("recv_num"),
-                    off_tis=self._arena.offset("recv_to_src_token"),
-                    off_out_idx=self._arena.offset("out_idx"),
-                    off_out_wts=self._arena.offset("out_wts"),
-                    off_out_tok=self._arena.offset("disp_out"),
-                    block_num=spec[0],
-                    warp_num_per_block=spec[1],
-                )
-                for spec in dispatch_specs
-            }
+            self._dispatch_variants = self._build_tdm_dispatch(config, device)
 
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
-        # grid is unconstrained. 512x16 measured best-or-tied at every token count.
-        combine_specs = [(512, 16)]
-        self._combine_specs = combine_specs
-        self._combine_variants = {
-            spec: _make_combine_fused_reduce(
+        # grid is unconstrained. Both wires stage through LDS, so the block is
+        # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
+        # hence one build per width rather than one shared spec.
+        self._combine_variants = {}
+        for _bits in config.combine_quant_bit_modes:
+            _toks, _chunks = _combine_tile(
+                topk=config.topk,
+                hidden_dim=config.hidden_dim,
+                quant_bits=_bits,
+            )
+            _lanes = _toks * _chunks * _COMBINE_CHUNK_ELEMS // 16
+            self._combine_variants[_bits] = _make_combine_fused_reduce(
                 experts_per_token=config.topk,
                 hidden_dim=config.hidden_dim,
-                block_num=spec[0],
-                warp_num_per_block=spec[1],
-                slot_stride_nbytes=config.combine_slot_stride_bytes,
+                block_num=512,
+                warp_num_per_block=_lanes // _WAVE_SIZE,
+                slot_stride_nbytes=config.combine_slot_stride_for(_bits),
+                quant_bits=_bits,
+                tokens_per_block=_toks,
+                chunks_per_iter=_chunks,
             )
-            for spec in combine_specs
-        }
         self._combine_sync = _make_combine_fused_sync(
             rank=config.rank,
             npes=config.world_size,
@@ -1142,20 +1329,15 @@ class MegaMoEGfx1250:
         )
 
     def _build_tdm_dispatch(self, config: MegaMoEConfig, device) -> dict:
-        """The TDM dispatch, wearing `_make_dispatch`'s calling convention.
+        """Build FlyDSL TDM dispatch launchers keyed by (block, warp) spec.
 
-        It leaves the same arena state the vector dispatch does (disp_out rows
-        at slot*hidden, out_idx/out_wts at slot*topk+k, recv_to_src_token as
-        src_pe*max_tok+src_tok), so gemm1, the gemm2 P2P scatter and the fused
-        combine are untouched. Only the recv SLOT a token lands in changes:
-        slots are reserved one atomic per (block, peer) and handed out
-        block-local, so a test comparing arena contents slot-by-slot against
-        the vector dispatch will differ.
+        Arena layout is disp_out rows at slot*hidden, out_idx/out_wts at
+        slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok. Recv slots are
+        reserved one atomic per (block, peer) and handed out block-local.
 
-        The three staging arrays are this package's stand-in for the ``__device__``
-        BSS the HIP kernel keeps: FINALIZE gathers idx / weights / srcmap into a
-        peer-major destTokId SoA there so META can ship each block's reserved run
-        as a couple of contiguous TDM copies.
+        The staging arrays stand in for the HIP kernel's ``__device__`` BSS:
+        FINALIZE gathers idx / weights / srcmap into a peer-major destTokId SoA
+        so META can ship each block's reserved run as contiguous TDM copies.
         """
         payload_dim = config.dispatch_wire_elem_count
         elem_size = config.dispatch_wire_spec.recv_dtype.itemsize
@@ -1184,11 +1366,16 @@ class MegaMoEGfx1250:
                 )
         # On a quantized wire the metadata batch grew by a scale row while the
         # payload shrank, so the shared LDS tile is floored at the bf16 width.
-        slab_bytes = config.hidden_dim * 2 if config.is_quant_dispatch_wire else 0
-        # A vector-tuned spec can name more warps than the payload tiles fit;
-        # clamp the width but keep the tuned block count, which is what paces
-        # the grid barrier, and keep the caller's spec as the variant key so the
-        # runtime pick still resolves.
+        # Compact compiles the metadata batch away, so its tile is one wire row.
+        if self._compact_plan:
+            slab_bytes = self._compact_wire_row
+        elif config.is_quant_dispatch_wire:
+            slab_bytes = config.hidden_dim * 2
+        else:
+            slab_bytes = 0
+        # Clamp warp count to the LDS tile budget but keep the tuned block
+        # count, which is what paces the grid barrier, and keep the caller's
+        # spec as the variant key so the runtime pick still resolves.
         max_warps = tdm_max_warps(
             hidden_dim=payload_dim,
             hidden_elem_size=elem_size,
@@ -1237,7 +1424,8 @@ class MegaMoEGfx1250:
         built = {}
         variants = {}
         for spec in self._dispatch_specs:
-            geom = (spec[0], min(spec[1], max_warps))
+            route_parallel = len(spec) > 2 and bool(spec[2])
+            geom = (spec[0], min(spec[1], max_warps), route_parallel)
             if geom not in built:
                 built[geom] = _make_dispatch_tdm(
                     rank=config.rank,
@@ -1282,24 +1470,19 @@ class MegaMoEGfx1250:
                         self._arena.offset("ep_rowmap") if self._compact_plan else 0
                     ),
                     max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
+                    route_parallel=route_parallel,
                 )
             variants[spec] = make_variant(built[geom])
         self._tdm_stage_capacity = stg_cap
         return variants
 
     def _build_mori_dispatch(self, config: MegaMoEConfig) -> dict:
-        """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
+        """Build mori HIP/JIT dispatch launchers keyed by (block, warp) spec.
 
-        Only the kernel changes: mori leaves the same arena state this package's
-        own dispatch does (disp_out rows at slot*hidden, out_idx/out_wts at
-        slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok) and never
-        touches cross_device_barrier, so gemm1, the gemm2 P2P scatter and the
-        fused combine are untouched.
-
-        The recv SLOT a token lands in does change -- mori reserves a block's
-        slots with one atomic and hands them out block-local. Nothing indexes by
-        slot order, but a test comparing arena contents slot-by-slot against the
-        FlyDSL dispatch will differ.
+        Arena layout matches the FlyDSL TDM path (disp_out rows at slot*hidden,
+        out_idx/out_wts at slot*topk+k, recv_to_src_token as
+        src_pe*max_tok+src_tok). mori never touches cross_device_barrier.
+        Recv slots are reserved one atomic per block and handed out block-local.
         """
         try:
             from mori.ops.dispatch_combine_v2.ep_plans import EpDispatchPlan
@@ -1376,8 +1559,7 @@ class MegaMoEGfx1250:
                     # Read off self rather than through the variant's argument
                     # list: the list is shared with the FlyDSL dispatch, whose
                     # launcher is a traced @flyc.jit signature, and widening it
-                    # would put a dead kernarg on a path that can never carry
-                    # scales (fp8 requires dispatch_backend='mori').
+                    # would put a dead kernarg on the bf16-only launcher path.
                     scales_buf=self._dispatch_sent_scales_ptr,
                 )
 
@@ -1385,12 +1567,12 @@ class MegaMoEGfx1250:
 
         return {spec: make_variant(plan) for spec, plan in plans.items()}
 
-    def _select_dispatch(self, token_count: int) -> tuple[int, int]:
+    def _select_dispatch(self, token_count: int) -> tuple:
         if not self._config.schedule:
             return self._dispatch_specs[0]
-        for upper_bound, block, warp in self._config.schedule:
+        for upper_bound, *spec in self._config.schedule:
             if upper_bound is None or token_count <= upper_bound:
-                spec = (block, warp)
+                spec = tuple(spec)
                 return (
                     spec
                     if spec in self._dispatch_variants
@@ -1478,13 +1660,16 @@ class MegaMoEGfx1250:
             # copy on the far side. Destination-independent, so the bytes are the
             # same either way; the preshuffle cannot move with it, because its
             # destination is the grouped row the receiver assigns.
-            from aiter.ops.quant import per_1x32_mx_quant_hip
+            from aiter.ops.quant import dynamic_per_group_scaled_quant
 
-            payload, scale_rows = per_1x32_mx_quant_hip(
+            payload = self._dispatch_quant_payload[:token_count]
+            scale_rows = self._dispatch_quant_scales[:token_count]
+            dynamic_per_group_scaled_quant(
+                payload,
                 hidden_states,
-                quant_dtype=self._config.dispatch_wire_spec.quant_dtype,
-                scale_type=dtypes.fp8_e8m0,
-                shuffle=False,
+                scale_rows,
+                32,
+                shuffle_scale=False,
             )
             # Straight onto the wire; mori restrides these packed rows while it
             # stages them, so there is no repack here.
@@ -1527,11 +1712,13 @@ class MegaMoEGfx1250:
             routing,
         )
 
-    def _scatter_context(self, routing: Routing) -> Stage2ScatterContext:
+    def _scatter_context(
+        self, routing: Routing, combine_quant_bits: int
+    ) -> Stage2ScatterContext:
         return Stage2ScatterContext(
             arena_handle=self._arena.handle,
             combine_input_offset=self._arena.offset("comb_inp"),
-            slot_stride_bytes=self._config.combine_slot_stride_bytes,
+            slot_stride_bytes=self._config.combine_slot_stride_for(combine_quant_bits),
             max_tokens_per_rank=self._config.max_tokens_per_rank,
             world_size=self._config.world_size,
             source_token_map=routing.source_token_map,
@@ -1555,10 +1742,16 @@ class MegaMoEGfx1250:
             ),
             compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
             compact_rows=(self._compact_step_rows if self._compact_plan else 0),
+            combine_quant_bits=combine_quant_bits,
         )
 
-    def _combine(self, routing: Routing) -> torch.Tensor:
-        spec = self._combine_specs[0]
+    def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:
+        """Reduce the staged slots into this rank's tokens.
+
+        ``combine_quant_bits`` must match what the gemm2 epilogue packed the
+        slots as; it defaults to bf16, the wire a caller gets unless it asked
+        forward() for another.
+        """
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
         # stream; the kernel boundary gives the reduce its visibility.
@@ -1568,7 +1761,7 @@ class MegaMoEGfx1250:
             self._config.rank,
             stream,
         )
-        self._combine_variants[spec](
+        self._combine_variants[combine_quant_bits](
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
             routing.token_count,
