@@ -40,6 +40,21 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    dist.barrier()
+    torch.cuda.synchronize()
+
+
 def fused_ar_rmsnorm(
     tp_size,
     pp_size,
@@ -121,6 +136,7 @@ def fused_ar_rmsnorm(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -175,6 +191,7 @@ def get_acc_value_with_cudagraph(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -217,6 +234,7 @@ def get_acc_value_only(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -299,6 +317,7 @@ def split_ar_rmsnorm(
 
     # destroy
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -434,6 +453,7 @@ def fused_ar_rmsnorm_pad_stride(
     )
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -484,6 +504,7 @@ def fused_ar_rmsnorm_padded_input(
     )
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -712,6 +733,7 @@ def fused_ar_rmsnorm_gemma(
     )
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
@@ -877,6 +899,7 @@ def fused_ar_gemma_rmsnorm_quant(
         return dequant.cpu(), res_out.cpu(), out.dtype, tuple(scale_out.shape)
     finally:
         if dist.is_initialized():
+            barrier_before_teardown()
             destroy_model_parallel()
             destroy_distributed_environment()
             torch.cuda.empty_cache()

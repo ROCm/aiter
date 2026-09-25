@@ -30,6 +30,21 @@ ELEM_BYTES = 2  # bf16
 SIZES_MB = [128, 256, 512, 1024]
 
 
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    dist.barrier()
+    torch.cuda.synchronize()
+
+
 def _measure_per_iter_us(fn, num_warmup=NUM_WARMUP, num_iters=NUM_ITERS):
     """Return a list of per-iteration latencies (us) after warmup."""
     for _ in range(num_warmup):
@@ -94,6 +109,7 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
         results[size_mb] = (aiter_lats, rccl_lats)
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
