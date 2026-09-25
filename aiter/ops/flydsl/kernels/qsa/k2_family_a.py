@@ -87,12 +87,17 @@ def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
         block_n, target_splits, threads = 16, 64, 256
     elif base_programs < 32:
         block_n, target_splits, threads = 16, 32, 256
+    # Prefill runs BN32 rather than AMD's BN64. Halving the tile halves the
+    # live gather and QK state, which drops the kernel from 204 to 122 VGPRs
+    # and all but removes its instruction-issue stalls. Occupancy is not the
+    # reason: the grid is unchanged, so the extra residency headroom BN32
+    # unlocks goes unused at these shapes.
     elif base_programs <= 256:
-        block_n, target_splits, threads = 64, 8, 128
+        block_n, target_splits, threads = 32, 8, 128
     elif base_programs <= 512:
-        block_n, target_splits, threads = 64, 4, 128
+        block_n, target_splits, threads = 32, 4, 128
     else:
-        block_n, target_splits, threads = 64, 1, 128
+        block_n, target_splits, threads = 32, 1, 128
 
     tiles = max(1, (n_sel + block_n - 1) // block_n)
     max_useful_splits = 1 << (tiles.bit_length() - 1)
@@ -108,8 +113,8 @@ def build_qsa_k2_family_a_module(
 ):
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
-    if block_n not in (16, 64):
-        raise ValueError(f"BLOCK_N must be 16 or 64, got {block_n}")
+    if block_n not in (16, 32, 64):
+        raise ValueError(f"BLOCK_N must be 16, 32 or 64, got {block_n}")
     if block_threads not in (128, 256):
         raise ValueError(f"block_threads must be 128 or 256, got {block_threads}")
     if block_threads % 64 or block_threads % block_n:
@@ -147,6 +152,15 @@ def build_qsa_k2_family_a_module(
     # 32 tokens * 4 elements * 2 B = 256 B apart, a round advances by
     # col_owners chunks, and an st64 unit is 512 B.
     v_round_st64 = col_owners * 256 // 512
+    # K LDS image, following the live AMD prefill lowering. A dim chunk is
+    # split three ways: ``owner`` picks one of the col_owners threads sharing
+    # a token, and the rest splits into a quarter and a group whose radices
+    # multiply to gather_rounds. One group slot holds a 16 B vector for every
+    # thread, so the whole image is block_n * _D * 2 B for any launch shape.
+    k_quarter_radix = min(4, gather_rounds)
+    k_group_radix = gather_rounds // k_quarter_radix
+    k_group_slot = block_threads * 16
+    k_quarter_stride = k_group_radix * k_group_slot
     token_major_v = use_k32 and block_n == 16
     decode_tr_pv = token_major_v
     # PV splits the output dimension across waves, so every wave needs the
@@ -305,14 +319,19 @@ def build_qsa_k2_family_a_module(
             # token and one 8xbf16 vector; D chunks are permuted in 4x4
             # groups while bits 5:6 of tid XOR the 128-bit bank address.
             d_chunk = _idiv(d0, Int32(8))
-            owner = d_chunk % Int32(2)
-            store_tid = n_tok + owner * Int32(64)
-            group = _idiv(d_chunk, Int32(8))
-            quarter = _idiv(d_chunk, Int32(2)) % Int32(4)
+            owner = d_chunk % Int32(col_owners)
+            store_tid = n_tok + owner * Int32(block_n)
+            rest = _idiv(d_chunk, Int32(col_owners))
+            group = _idiv(rest, Int32(k_quarter_radix))
+            quarter = rest % Int32(k_quarter_radix)
             base_bytes = store_tid * Int32(16)
             base_bytes = base_bytes ^ _idiv(store_tid & Int32(0x60), Int32(2))
             base_bytes = base_bytes ^ (group * Int32(64))
-            byte_offset = base_bytes + group * Int32(2048) + quarter * Int32(8192)
+            byte_offset = (
+                base_bytes
+                + group * Int32(k_group_slot)
+                + quarter * Int32(k_quarter_stride)
+            )
             return _idiv(byte_offset, Int32(2))
 
         def amd_decode_k_elem(n_tok, d0):
