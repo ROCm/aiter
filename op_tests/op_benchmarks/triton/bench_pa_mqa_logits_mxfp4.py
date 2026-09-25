@@ -23,7 +23,6 @@ from aiter.benchmark_reporting import print_json_table
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     IDEAL_PAGE_SIZE,
     paged_mxfp4_mqa_logits,
-    plan_block_m,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import run_perftest
@@ -154,8 +153,6 @@ def run_benchmark(args):
             per_token = args.head_size // 2 + args.head_size // SCALE_GROUP
             flop = 2.0 * walked * heads * args.head_size
             store = walked * 4.0
-            block_m = min(_block_m(heads, next_n, args.preshuffle), next_n)
-            passes = (next_n + block_m - 1) // block_m
 
             rows.append(
                 {
@@ -166,10 +163,6 @@ def run_benchmark(args):
                     "us": round(us, 1),
                     "tflops": round(flop / us / 1e6, 1),
                     "uniq_tbs": round((tokens * per_token + store) / us * 1e-6, 2),
-                    "issued_tbs": round(
-                        (passes * tokens * per_token + store) / us * 1e-6, 2
-                    ),
-                    "kv_passes": passes,
                 }
             )
             del d
@@ -180,7 +173,7 @@ def run_benchmark(args):
     else:
         print(
             f"{'heads':>6}{'shape':>22}{'shuf':>6}{'us':>11}{'TF/s':>9}"
-            f"{'uniq TB/s':>11}{'iss TB/s':>10}{'rd':>4}"
+            f"{'uniq TB/s':>11}"
         )
         for r in rows:
             if r.get("err_msg"):
@@ -189,17 +182,8 @@ def run_benchmark(args):
             print(
                 f"{r['heads']:>6}{r['shape']:>22}{r['preshuffle']:>6}"
                 f"{r['us']:>11.1f}{r['tflops']:>9.0f}{r['uniq_tbs']:>11.2f}"
-                f"{r['issued_tbs']:>10.2f}{r['kv_passes']:>4}"
             )
     return rows
-
-
-def _block_m(heads, next_n, preshuffle):
-    return (
-        plan_block_m(heads, next_n)
-        if preshuffle
-        else (2 if (heads <= 32 and next_n >= 2) else 1)
-    )
 
 
 if __name__ == "__main__":
