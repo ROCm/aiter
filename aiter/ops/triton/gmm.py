@@ -60,21 +60,11 @@ def _get_gmm_tile_counter(device: torch.device, grid_dim: int) -> Tensor:
 
 
 def _cap_grid_dim_to_device(config: dict) -> dict:
-    """Clamp a tuned GRID_DIM to the CU count of the running device.
-
-    GRID_DIM is a persistent grid, and each arch's config carries that arch's
-    largest SKU. A smaller SKU of the same arch would launch CTAs it has no
-    cores for and start the work-stealing counter above its own parallelism.
-
-    Only applied to a config the caller did not override, so an explicit
-    grid_dim= stays exactly what was asked for.
-    """
+    """Clamp tuned persistent grids without mutating shared configs."""
     num_cus = get_num_sms()
     if num_cus <= 0 or config["GRID_DIM"] <= num_cus:
         return config
-    config = dict(config)
-    config["GRID_DIM"] = num_cus
-    return config
+    return dict(config, GRID_DIM=num_cus)
 
 
 def _gmm_grid(

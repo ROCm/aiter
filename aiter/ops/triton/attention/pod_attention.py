@@ -111,9 +111,8 @@ def pod_attention(
     qk_scale = sm_scale * 1.44269504
 
     # We assume the kernel functions fused by pod attention are persistent kernel functions
-    # Each CU gets 2 WGs -- one doing decode and one prefill -- so the caller passes
-    # 2x the CU count, and this halves it back to the per-CU slot count the kernel
-    # folds program ids by.
+    # The launch has two WGs per CU (decode and prefill); use the CU count
+    # to fold program IDs.
     total_wgs = total_programs // 2
 
     (

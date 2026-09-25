@@ -186,9 +186,8 @@ def reduce_scatter(
         block_m (int): Block size for M dimension. Default: 16
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
-        num_sms (int | None): CTAs for the persistent grid. Default: 256, which
-            is what this shipped with. Pass None to size it by the running
-            device instead.
+        num_sms (int | None): Persistent grid size. Default: 256.
+            None uses the current device's CU count.
 
     Returns:
         Tensor: Output shard of shape [M_shard, N] where M_shard = M // world_size

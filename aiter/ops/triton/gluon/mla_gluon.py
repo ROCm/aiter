@@ -934,8 +934,7 @@ def mla_gluon(
         assert (
             batch_size % 64 == 0
         ), f"mla_gluon[bh64] requires batch_size divisible by 64, got {batch_size}"
-        # cur_batch strides by NUM_XCDS, so a batch the die count does not
-        # divide loses its tail with nothing reported.
+        # cur_batch advances by NUM_XCDS; require complete batch groups.
         assert batch_size % NUM_XCDS == 0, (
             f"mla_gluon[bh64] requires batch_size divisible by the die count "
             f"{NUM_XCDS}, got {batch_size}"
@@ -958,10 +957,10 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # One-wave launch budget, independent of sequence length so CUDA Graph
-        # capture cannot freeze it; the kernels derive the per-batch partition
-        # from the runtime KV length. Head blocks and MTP qlen already consume
-        # part of the wave, so the budget divides by them too.
+        # One-wave launch budget, independent of sequence length so CUDA
+        # Graph capture cannot freeze it; the kernels derive the per-batch
+        # partition from the runtime KV length. Head blocks and MTP qlen already
+        # consume part of the wave, so the budget divides by them too.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
         NUM_KV_SPLITS = max(1, get_num_sms() // (batch_size * qlen * NUM_M_BLOCKS))
         assert (

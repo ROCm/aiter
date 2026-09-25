@@ -239,10 +239,7 @@ def pa_decode_sparse(
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
     # arches use the synchronous slot path, where 32 exposes memory latency.
-    # Workgroup budget in waves of the device, not a fixed count: a smaller
-    # block_h leaves more occupancy per CU, so the budget is a multiple of it.
-    # Uncapped, as in unified_attention and mla, which both take the live count
-    # times an occupancy factor.
+    # Scale the workgroup budget by CU count and occupancy.
     num_cus = max(1, get_num_sms())
     if use_gluon:
         block_k = 16

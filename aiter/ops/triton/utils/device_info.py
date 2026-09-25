@@ -12,15 +12,14 @@ def _num_sms_from_torch(device_id: int) -> int:
 
 
 def get_num_sms() -> int:
-    # Returns the Compute Unit count of the device this thread is bound to.
+    # Returns the Compute Unit count of the device.
     #
     # Prefer chip_info.get_cu_num(): it honors the CU_NUM env override and is the
     # same value the tuning dispatch keys (gfx, cu_num, M, N, K) are built from,
     # so grid/segment sizing stays consistent with the selected tuned configs.
-    # It is memoized there, and deliberately not memoized again here: AOT clears
-    # that cache after overriding CU_NUM, and a second copy would go stale.
+    # AOT clears chip_info's cache after CU_NUM overrides; do not cache again.
     # Fall back to torch's multi_processor_count when get_cu_num() is unavailable
-    # (e.g. rocminfo missing/unparseable, or agents that disagree on the count).
+    # (e.g. rocminfo missing/unparseable).
     try:
         from aiter.jit.utils.chip_info import get_cu_num
 
