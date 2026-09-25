@@ -11,6 +11,7 @@ The per-family loaders build on this module and keep their own files:
 """
 
 import functools
+import itertools
 import json
 import os
 import re
@@ -152,34 +153,93 @@ def resolve_config_dir(
     return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
 
 
-_COND_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)_(leq|lt|geq|gt|eq)$")
-_COND_OPS = {
-    "leq": lambda value, bound: value <= bound,
-    "lt": lambda value, bound: value < bound,
-    "geq": lambda value, bound: value >= bound,
-    "gt": lambda value, bound: value > bound,
-    "eq": lambda value, bound: value == bound,
-}
+_BUCKET_SEP = "."
+_BUCKET_COMPONENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)_(LEQ|GEQ)_(-?\d+)$")
 
 
-def select_tuned_config(tuned: dict, **variables) -> dict:
-    """Resolve a launch config from a JSON rule-tree instead of a hardcoded
-    if/else chain.
+def _bucket_axis(component: str) -> str:
+    return _BUCKET_COMPONENT_RE.fullmatch(component).group(1)
 
-    ``tuned`` is ``{"default": {...}, "rules": [{"if": {"<var>_<op>": <bound>,
-    ...}, "set": {...}}, ...]}``. Each rule fires when all its conditions
-    hold against ``variables`` (``<op>`` is one of leq/lt/geq/gt/eq); rules
-    are applied in list order and merged via ``dict.update``, so a JSON
-    author expresses a boundary walk by listing rules smallest-bound-first.
+
+def _bucket_bound(component: str) -> int:
+    return int(_BUCKET_COMPONENT_RE.fullmatch(component).group(3))
+
+
+def _bucket_canonical(key: str, axes: tuple) -> tuple:
+    """Expand a key to one slot per axis, ``any`` where it says nothing."""
+    slot = dict.fromkeys(axes, "any")
+    if key != "any":
+        for part in key.split(_BUCKET_SEP):
+            slot[_bucket_axis(part)] = part
+    return tuple(slot[a] for a in axes)
+
+
+@functools.lru_cache(maxsize=256)
+def _bucket_index(keys: tuple, axes: tuple) -> tuple:
+    """Build ``(slots -> key, components used per axis)``, cached on the key
+    names (all this depends on)."""
+    parts = {a: set() for a in axes}
+    for key in keys:
+        if key != "any":
+            for part in key.split(_BUCKET_SEP):
+                parts[_bucket_axis(part)].add(part)
+    return {_bucket_canonical(k, axes): k for k in keys}, parts
+
+
+def _bucket_candidates(axis: str, value, parts: set) -> list:
+    """Components of `axis` matching `value`, most specific first: LEQ bounds
+    ascending, then GEQ bounds descending, then the "any" catch-all."""
+    leq = sorted(
+        (
+            c
+            for c in parts
+            if c.startswith(f"{axis}_LEQ_") and value <= _bucket_bound(c)
+        ),
+        key=_bucket_bound,
+    )
+    geq = sorted(
+        (
+            c
+            for c in parts
+            if c.startswith(f"{axis}_GEQ_") and value >= _bucket_bound(c)
+        ),
+        key=_bucket_bound,
+        reverse=True,
+    )
+    return leq + geq + ["any"]
+
+
+def lookup_tuned_config(tuned: dict, **variables) -> dict:
+    """Resolve a launch config from a flat, range-keyed bucket table instead
+    of a rule-tree or a hardcoded if/else chain.
+
+    ``tuned`` is ``{"schema": [<axis>, ...], "<bucket key>": {...}, ...,
+    "any": {...}}``. A bucket key lists only the axes it constrains, joined
+    by ``'.'``, e.g. ``"M_GEQ_33.N_LEQ_16384"``; each config is a complete,
+    standalone dict -- exactly one bucket wins per call, there is no rule
+    stacking. ``"any"`` is the required catch-all.
+
+    Lookup walks the axes in the order ``"schema"`` lists them and takes the
+    first key that exists: LEQ bounds ascending, then GEQ bounds descending,
+    then ``"any"``. So the leftmost axis wins on a tie -- listing ``"M"``
+    before ``"N"`` is what makes an M-bucket outrank an N-bucket. This is the
+    same lookup ``unified_attention_utils`` uses for its (bool/enum-capable)
+    axes, generalized here to the plain numeric LEQ/GEQ case so other ops
+    (e.g. quant) can share it.
+
     Returns a fresh, mutable dict.
     """
-    config = dict(tuned["default"])
-    for rule in tuned.get("rules", ()):
-        conditions = rule.get("if", {})
-        if all(
-            _COND_OPS[match.group(2)](variables[match.group(1)], bound)
-            for cond_key, bound in conditions.items()
-            for match in [_COND_RE.fullmatch(cond_key)]
-        ):
-            config.update(rule["set"])
-    return config
+    axes = tuple(tuned["schema"])
+    table = {k: v for k, v in tuned.items() if k != "schema"}
+    if not axes:
+        return dict(table.get("any", next(iter(table.values()))))
+    index, parts = _bucket_index(tuple(table), axes)
+    per_axis = [_bucket_candidates(a, variables[a], parts[a]) for a in axes]
+    for slots in itertools.product(*per_axis):
+        if slots in index:
+            return dict(table[index[slots]])
+    raise KeyError(
+        "no entry for "
+        + " ".join(f"{a}={variables[a]!r}" for a in axes)
+        + f"; every table needs an 'any' entry (keys: {sorted(table)[:8]})"
+    )

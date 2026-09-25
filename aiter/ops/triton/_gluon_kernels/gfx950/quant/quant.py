@@ -5,6 +5,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @gluon.jit
 def _mxfp4_quant_op(
@@ -39,7 +41,13 @@ def _mxfp4_quant_op(
     return x_fp4, bs_e8m0
 
 
-@gluon.jit
+_gluon_dynamic_mxfp4_quant_kernel_gfx950_repr = make_kernel_repr(
+    "gluon_dynamic_mxfp4_quant_kernel_gfx950",
+    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER", "NUM_STAGES"],
+)
+
+
+@gluon.jit(repr=_gluon_dynamic_mxfp4_quant_kernel_gfx950_repr)
 def gluon_dynamic_mxfp4_quant_kernel_gfx950(
     x_ptr,
     x_fp4_ptr,
@@ -305,13 +313,19 @@ def _mxfp8_quant_op(
     return x_fp8, bs_e8m0
 
 
+_gluon_dynamic_mxfp8_quant_kernel_gfx950_repr = make_kernel_repr(
+    "gluon_dynamic_mxfp8_quant_kernel_gfx950",
+    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER"],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
         and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0,
     }
 )
-@gluon.jit
+@gluon.jit(repr=_gluon_dynamic_mxfp8_quant_kernel_gfx950_repr)
 def gluon_dynamic_mxfp8_quant_kernel_gfx950(
     x_ptr,
     x_fp8_ptr,

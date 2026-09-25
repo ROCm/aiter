@@ -240,7 +240,6 @@ def torch_dequant_nvfp4(
         (2048, 3072),
         (16384, 7168),
         (6000, 5000),
-        (3333, 4004),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

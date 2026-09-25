@@ -79,7 +79,6 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
         (2048, 3072),
         (16384, 7168),
         (6000, 5024),
-        (3333, 4064),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

@@ -4,10 +4,6 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx950,
-    gluon_dynamic_mxfp8_quant_kernel_gfx950,
-)
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
     _dynamic_mxfp8_quant_kernel,
@@ -24,8 +20,8 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
+    lookup_tuned_config,
     resolve_config_dir,
-    select_tuned_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -295,9 +291,13 @@ def dynamic_mxfp4_quant(
     # bf16 -- non-bf16 input, and any use_sr=True call (unsupported by the
     # Gluon kernel), falls through to the plain Triton path below.
     if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16 and not use_sr:
-        cfg_dir = resolve_config_dir("quant", "MXFP4_QUANT", backend="gluon")
+        from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+            gluon_dynamic_mxfp4_quant_kernel_gfx950,
+        )
+
+        cfg_dir = resolve_config_dir("quant", "MXFP4", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-        cfg = select_tuned_config(tuned, M=M, N=N)
+        cfg = lookup_tuned_config(tuned, M=M, N=N)
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
@@ -446,9 +446,13 @@ def dynamic_mxfp8_quant(
         and x.dtype == torch.bfloat16
         and quant_dtype == torch.float8_e4m3fn
     ):
-        cfg_dir = resolve_config_dir("quant", "MXFP8_QUANT", backend="gluon")
+        from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+            gluon_dynamic_mxfp8_quant_kernel_gfx950,
+        )
+
+        cfg_dir = resolve_config_dir("quant", "MXFP8", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-        cfg = select_tuned_config(tuned, M=M, K=K)
+        cfg = lookup_tuned_config(tuned, M=M, K=K)
 
         # Shape-derived; K<=1024's BLOCK_SIZE_M=8 must win when both apply.
         if M <= 32 and K > 1024:
