@@ -25,11 +25,8 @@ def remap_xcd_chunked(
 
 @triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
-    # The default stays only because many call sites still invoke this as a bare
-    # statement and discard the result, so the swizzle is already inert there.
-    # Anyone converting one of those to `pid = remap_xcd(...)` must pass the
-    # queried count as well: taking the default would silently swizzle for eight
-    # dies on a part that has four.
+    # Legacy callers discard the result and rely on the default. Callers using
+    # the remapped PID must pass the device's XCD count.
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
@@ -145,7 +142,7 @@ def remap_workgroup_spatial(
         NUM_BLOCKS        : number of sequence blocks along the Q dimension
         BATCH             : batch size
         NUM_QUERIES_PER_KV: Q heads per KV head (1 for MHA, >1 for GQA)
-        NUM_XCDS          : number of XCDs on the device, from get_num_xcds()
+        NUM_XCDS          : number of XCDs on the device
 
     Returns:
         off_q_head : Q head index for this workgroup

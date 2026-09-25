@@ -665,16 +665,14 @@ def test_mla(
         and batch_size in (64, 128, 256)
         and page_size == 1
     ):
-        # Mirror the wrapper: both terms come from the device, not a constant,
-        # so this picks the split count production picks on this part.
+        # Match the wrapper's device-dependent split count.
         num_xcds = get_num_xcds()
         base_grid = (
             num_xcds
             * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
             * (batch_size // num_xcds)
         )
-        num_cus = get_num_sms()
-        splits_needed = max(1, (num_cus + base_grid - 1) // base_grid)
+        splits_needed = max(1, (get_num_sms() + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
         # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
