@@ -403,45 +403,6 @@ def build_qsa_k2_family_a_module(
         col_start = tile_start * Int32(block_n)
         col_end_unclamped = tile_end * Int32(block_n)
         col_end = (col_end_unclamped < n_sel).select(col_end_unclamped, n_sel)
-
-        # Form Q as the B operand of K @ Q^T. This makes the QK C fragment
-        # token-major in registers, which is already the PV A fragment map.
-        q_live = lane_m < Int32(_GROUP)
-        q_regs = []
-        for ks in range_constexpr(qk_steps):
-            q_base = (row * Int32(_HQ) + kv_h * Int32(_GROUP)) * Int32(_D) + Int32(
-                ks * qk_k
-            )
-            q_tile = fx.make_view(
-                fx.get_iter(q_buf) + q_base,
-                fx.make_layout((16, qk_k), (_D, 1)),
-            )
-            q_src = qk_q_copy.partition_S(q_tile)
-            q_frag = fx.make_fragment_like(q_src)
-            fx.copy(g_copy, q_src, q_frag)
-            q_vec = fx.Vector(fx.memref_load_vec(q_frag))
-            if const_expr(decode_tr_pv):
-                # Packed cndmask. The per-element f32 round-trip packed with
-                # v_perm; AMD zeros OOB heads at the load mask instead.
-                q_regs.append(
-                    q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
-                )
-            else:
-                q_regs.append(
-                    fx.Vector.from_elements(
-                        [
-                            q_live.select(q_vec[i].to(Float32), Float32(0.0)).to(
-                                BFloat16
-                            )
-                            for i in range_constexpr(qk_vec)
-                        ],
-                        BFloat16,
-                    )
-                )
-
-        init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
-        init_acc.append(Float32(float("-inf")))
-        init_acc.append(Float32(0.0))
         col = tid % Int32(block_n)
         chunk_owner = _idiv(tid, Int32(block_n))
 
@@ -477,6 +438,68 @@ def build_qsa_k2_family_a_module(
             phys_live = (phys >= zero) & (phys < n_cache_blocks)
             live = valid_req & in_col & (tok >= zero) & (lp < table_width) & phys_live
             return phys_live.select(phys, zero), page_off_i, live
+
+        # The first tile's addresses are a three-deep dependent chain:
+        # token_to_req and indices, then page_table, then k_cache. Q depends on
+        # none of it, but masking Q needs Q's data, so leaving that wait ahead
+        # of the index loads stretched the chain by a whole round trip. Issue
+        # the indices first and let the Q block cover their latency.
+        tok0 = load_index(Int32(0))
+        tok1 = load_index(Int32(1))
+
+        # Form Q as the B operand of K @ Q^T. This makes the QK C fragment
+        # token-major in registers, which is already the PV A fragment map.
+        # Issue the loads, then the page-table load, then mask: the masking is
+        # the only prologue work long enough to cover a page-table round trip.
+        q_live = lane_m < Int32(_GROUP)
+        q_frags = []
+        for ks in range_constexpr(qk_steps):
+            q_base = (row * Int32(_HQ) + kv_h * Int32(_GROUP)) * Int32(_D) + Int32(
+                ks * qk_k
+            )
+            q_tile = fx.make_view(
+                fx.get_iter(q_buf) + q_base,
+                fx.make_layout((16, qk_k), (_D, 1)),
+            )
+            q_src = qk_q_copy.partition_S(q_tile)
+            q_frag = fx.make_fragment_like(q_src)
+            fx.copy(g_copy, q_src, q_frag)
+            q_frags.append(q_frag)
+
+        # Pin the masking below the loads. Left alone the scheduler sinks the
+        # index loads under the first Q wait to recycle Q's registers, which
+        # puts a whole round trip between them and the page-table load that
+        # needs them. Only VMEM reads may cross, so the page-table load still
+        # floats up to the moment its index lands. Decode only: prefill has
+        # enough tiles to hide the chain and loses 6% at L32768 if pinned.
+        if const_expr(decode_tr_pv):
+            fx.rocdl.sched_barrier("vmem_read")
+        phys0 = load_page(tok0)
+
+        q_regs = []
+        for ks in range_constexpr(qk_steps):
+            q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
+            if const_expr(decode_tr_pv):
+                # Packed cndmask. The per-element f32 round-trip packed with
+                # v_perm; AMD zeros OOB heads at the load mask instead.
+                q_regs.append(
+                    q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
+                )
+            else:
+                q_regs.append(
+                    fx.Vector.from_elements(
+                        [
+                            q_live.select(q_vec[i].to(Float32), Float32(0.0)).to(
+                                BFloat16
+                            )
+                            for i in range_constexpr(qk_vec)
+                        ],
+                        BFloat16,
+                    )
+                )
+        init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
+        init_acc.append(Float32(float("-inf")))
+        init_acc.append(Float32(0.0))
 
         def tile_body(safe_phys, page_off_i, live, state):
             gpu.barrier()
@@ -882,9 +905,6 @@ def build_qsa_k2_family_a_module(
         # a whole tile body instead of stalling in front of the K/V gather.
         # The three carried registers ride behind the accumulator so the
         # epilogue's ``results`` indices are unchanged.
-        tok0 = load_index(Int32(0))
-        tok1 = load_index(Int32(1))
-        phys0 = load_page(tok0)
         n_tiles = tile_end - tile_start
         for tile64, state in range(
             fx.Int64(0),
