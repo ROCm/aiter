@@ -477,13 +477,24 @@ class TestFailedGroupResults(unittest.TestCase):
         )
 
     def test_measured_candidates_survive_the_fault(self):
-        measured = {"cand-a": ("cand-a", 12.5, 0.0)}
-        results, to_publish = self._results(progress=measured)
+        measured = {"cand-a": ("cand-a", 12.5, 0.0, "ok", "")}
+        results, to_publish = self._results(progress=measured, return_status=True)
         self.assertEqual(results[0], measured["cand-a"])
         self.assertEqual([info for info, *_ in results], ["cand-a", "cand-b", "cand-c"])
         self.assertEqual([us for _, us, *_ in results[1:]], [float("inf")] * 2)
+        self.assertEqual([status for *_, status, _ in results[1:]], ["crash"] * 2)
         # cand-c is behind the fault and never ran, so a resume may retry it.
         self.assertEqual(to_publish, [results[1]])
+
+    def test_untyped_callers_never_see_a_partial_group(self):
+        # A caller without statuses picks the fastest finite result, so a
+        # surviving 12.5 us would be published as the winner of a search that
+        # stopped after one candidate.
+        measured = {"cand-a": ("cand-a", 12.5, 0.0)}
+        results, to_publish = self._results(progress=measured)
+        self.assertEqual([info for info, *_ in results], ["cand-a", "cand-b", "cand-c"])
+        self.assertEqual([us for _, us, *_ in results], [float("inf")] * 3)
+        self.assertEqual(to_publish, [results[0]])
 
     def test_without_progress_the_whole_group_fails(self):
         results, to_publish = self._results()

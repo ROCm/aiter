@@ -132,11 +132,16 @@ def _failed_group_results(
 ):
     """Stand-in results for a group the worker pool never returned.
 
-    Returns the results in task order plus the subset to checkpoint. A
-    candidate the worker already measured keeps its real result, so one GPU
-    fault costs the shape a single candidate rather than every timing taken
-    before it. Only the first unmeasured candidate is reported as failed; the
-    ones behind it never ran and stay eligible for a resume.
+    Returns the results in task order plus the subset to checkpoint. With
+    return_status, a candidate the worker already measured keeps its real
+    result, so one GPU fault costs the shape a single candidate rather than
+    every timing taken before it; the typed statuses tell the caller the group
+    is incomplete. Only the first unmeasured candidate is reported as failed;
+    the ones behind it never ran and stay eligible for a resume.
+
+    Without return_status a caller cannot tell a partial group from a complete
+    one and would publish the fastest survivor of a search that never finished,
+    so every candidate of the group is reported as failed.
     """
 
     group = tasks if shape_grouped and isinstance(tasks, list) else [tasks]
@@ -144,7 +149,7 @@ def _failed_group_results(
     to_publish = []
     for task in group:
         info = task[0] if len(task) > 0 else fallback_info
-        measured = progress_results.get(info)
+        measured = progress_results.get(info) if return_status else None
         if measured is not None:
             results.append(measured)
             continue
