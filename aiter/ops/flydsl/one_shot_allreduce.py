@@ -32,7 +32,8 @@ from .kernels.one_shot_allreduce import (
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _run_compiled
-from .quick_allreduce_int4 import (
+
+from .allreduce_shared import (
     _SUPPORTED_ARCHS,
     _cuda_index,
     _resolve_inbox_flags,
