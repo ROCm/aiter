@@ -6668,7 +6668,13 @@ class FhmoeTuner(FmoeTuner):
                     k_per_batch % k_wave != 0 or (k_per_batch // k_wave) % tile_k != 0
                 ):
                     continue
-                s1_names.append(kname + ("_fp8" if a_dtype == "fp8" else "_fp4"))
+                # Trailing _fp8/_fp4 (after _t): fused_moe fuses inter-stage quant
+                # into stage1; bare kname: quant after. Same as FmoeTuner.
+                fused = kname + ("_fp8" if a_dtype == "fp8" else "_fp4")
+                if k_batch > 1:
+                    s1_names.append(fused)
+                else:
+                    s1_names.extend((kname, fused))
             s2_names = []
             for kname, kparams in s2_all.items():
                 if kparams.get("tile_m") != block_m:
