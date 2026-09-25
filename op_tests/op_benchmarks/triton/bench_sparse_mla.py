@@ -20,7 +20,7 @@ from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
-from aiter.ops.triton.attention.sparse_mla import FP8_DOT_ARCHS, SUPPORTED_ARCHS
+from aiter.ops.triton.attention.sparse_mla import FP8_ARCHS, SUPPORTED_ARCHS
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -153,19 +153,19 @@ def run_benchmark(args):
         for tokens in args.num_tokens
     ]
 
-    # sparse_mla_fwd raises on fp8 dots where the arch lacks OCP e4m3, and
-    # triton's harness does not catch it, so drop the series instead.
+    # sparse_mla_fwd raises on fp8 where the arch's native fp8 is not OCP e4m3,
+    # and triton's harness does not catch it, so drop the series instead.
     dot_vals = ["bf16"]
     dot_names = ["bf16 dots"]
     dot_styles = [("green", "-")]
-    if arch_info.get_arch() in FP8_DOT_ARCHS:
+    if arch_info.get_arch() in FP8_ARCHS:
         dot_vals.append("fp8")
         dot_names.append("fp8 dots")
         dot_styles.append(("blue", "-"))
     else:
         print(
-            f"note: skipping the fp8-dot series, {arch_info.get_arch()} has "
-            "no OCP e4m3 matrix core"
+            f"note: skipping the fp8-dot series, {arch_info.get_arch()}'s native "
+            "fp8 is fnuz and the kernel reads OCP e4m3"
         )
 
     benchmark = triton.testing.Benchmark(
