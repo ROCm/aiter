@@ -40,17 +40,15 @@ from flydsl.expr import math as fxmath
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_GQA
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
 # GQA shapes whose launch policy has been measured, as
 # ``(n_q_heads, n_kv_heads, head_dim)``. The kernel body is shape-generic,
 # but the band table in ``_launch_config``, the prefill workgroup target and
 # the BLOCK_N choices are all fitted, so serving an untuned shape would be
-# correct and slow. Widen this only alongside a measurement.
-_TUNED_SHAPES = frozenset(
-    {(FAMILY_A_GQA.n_heads, FAMILY_A_GQA.kv_heads, FAMILY_A_GQA.head_dim)}
-)
+# correct and slow. Widen this only alongside a measurement; the test suite
+# asserts it still covers the shapes we validate against.
+_TUNED_SHAPES = frozenset({(24, 2, 256)})
 # 256 CUs on MI355X times the four BN32 prefill workgroups each keeps resident.
 _PREFILL_WGS = 256 * 4
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)

@@ -3,47 +3,29 @@
 
 """FlyDSL QSA public surface (SILOTIGER-1047).
 
-Phase 0: fp32 oracle + shared family A/B shapes.
-Phase 2d: family A FlyDSL K1 writes ``block_ids [M, 512]`` from paged
-compressed K. Rows up to 512 blocks use fused emit; longer rows use tiled
-BLOCK_N=32 BF16 MFMA scoring plus decode radix below 32768 columns and
-streaming radix at or above that width. Single-request prefill scores 16
-query rows per workgroup.
-Phase 2e/2f: family B FlyDSL K1 ``H`` 4 or 8 emit. Long rows reuse family
-A's MFMA scorer plus radix (``H=8`` is a second compile). Phase 2h: emit
-vs #4882 plus the published indexer point.
-Phase 3a: family A FlyDSL K2 decode sparse GQA (group 12, ``D=256``).
-Phase 3b: same ABI with split-K plus LSE merge for decode occupancy.
-Phase 3d: the live-AMD-shaped replacement uses separate BLOCK_N=16/four-wave
-decode and BLOCK_N=64/two-wave prefill specializations, log2 online softmax,
-FP32 split partials, a two-wave merge, and direct output when splits=1.
-Expand+tail and the sigmoid gate stay unfused.
+``qsa_k1_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
+compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
+use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix below
+32768 columns and streaming radix at or above that width. Single-request
+prefill scores 16 query rows per workgroup. The indexer head count is 4 or
+8, each a separate compile.
 
-Shapes (flattened tokens ``M``; activations BF16 unless noted):
+``qsa_k2`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the selected
+token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and an LSE
+merge; prefill runs BLOCK_N=32 two waves and writes output directly once the
+grid alone fills the machine. Softmax is online in log2 space and the split
+partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
-Family A -- Flash-Next production
-    Indexer: ``q [M, 4, 128]``, paged compressed ``k`` (1 KV head, D=128),
-    ``r=4``, top-512 blocks, expand+tail width 2051.
-    GQA: ``q [M, 24, 256]``, paged ``k/v [..., 2, 256]``, group 12, partial
-    RoPE 64, sigmoid gate (unfused in the oracle).
-
-Family B -- #4882 Gluon-parity
-    Indexer: ``H`` 4 or 8, ``D=128``.
-    GQA: ``q [M, 10, 128]``, 2 KV heads (group 5), selection width 2051.
+``qsa_oracle`` is the fp32 reference. The concrete shapes all of these are
+validated against are test fixtures in ``op_tests/qsa_shapes.py``.
 """
 
 from .kernels.qsa import (
-    FAMILY_A_GQA,
-    FAMILY_A_INDEXER,
-    FAMILY_A_SCORE_SCALE,
-    FAMILY_B_GQA,
-    FAMILY_B_INDEXER,
-    FAMILY_B_INDEXER_H8,
     QsaGqaSpec,
     QsaIndexerSpec,
     QsaOracleResult,
     gather_paged_cache,
-    gather_qsa_family_a_caches,
+    gather_qsa_caches,
     pack_paged_cache,
     qsa_expand_tail,
     qsa_indexer_scores,
@@ -56,17 +38,11 @@ from .kernels.qsa.k1 import qsa_k1_block_ids
 from .kernels.qsa.k2 import qsa_k2
 
 __all__ = [
-    "FAMILY_A_GQA",
-    "FAMILY_A_INDEXER",
-    "FAMILY_A_SCORE_SCALE",
-    "FAMILY_B_GQA",
-    "FAMILY_B_INDEXER",
-    "FAMILY_B_INDEXER_H8",
     "QsaGqaSpec",
     "QsaIndexerSpec",
     "QsaOracleResult",
     "gather_paged_cache",
-    "gather_qsa_family_a_caches",
+    "gather_qsa_caches",
     "pack_paged_cache",
     "qsa_expand_tail",
     "qsa_indexer_scores",
