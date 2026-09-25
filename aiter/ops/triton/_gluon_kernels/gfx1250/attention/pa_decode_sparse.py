@@ -1147,6 +1147,8 @@ def _v4_2buff_tile(
     extra_len,
     main_blk_rows,
     extra_blk_rows,
+    main_slots,
+    extra_slots,
     SLOT_BLOCKED_LAYOUT: gl.constexpr,
     valid_col_mma: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -1171,9 +1173,23 @@ def _v4_2buff_tile(
     else:
         jj = j
         n = main_len
-    ok = (jj * BLOCK_K + k_off) < n
-    if HAS_INVALID:
-        ok = ok & (slot_reg >= 0)
+    # Slot validity is a SAFETY INVARIANT here, not a caller hint -- the same
+    # convention the gluon gfx950 kernel uses (sparse_mla.py: `valid = in_range
+    # & (slot >= 0) & (slot < num_rows)`), and NOT gated on HAS_INVALID.
+    #
+    # A negative slot maps to a negative descriptor row, which addresses below
+    # the tensor base: that faults, where an out-of-range POSITIVE row would
+    # merely zero-fill against the descriptor's shape. vLLM's top-k builder
+    # writes -1 for invalid entries and still passes has_invalid=False, so the
+    # guarantee the flag implies does not hold. The upper bound matters more
+    # here than on gfx950 because the row mapping scales the block number by
+    # blk_rows, which on a pooled cache is ~37x the page size.
+    slot_hi = gl.where(is_main, main_slots, extra_slots) if HAS_EXTRA else main_slots
+    ok = (
+        ((jj * BLOCK_K + k_off) < n)
+        & (slot_reg >= 0)
+        & (slot_reg < slot_hi)
+    )
     safe = gl.where(ok, slot_reg, 0)
     if HAS_EXTRA:
         row = gl.where(
@@ -1339,6 +1355,8 @@ def _pa_decode_sparse_v4_2buff(
     extra_total_pages,
     main_blk_rows,  # record-rows the pooled block stride spans (runtime)
     extra_blk_rows,
+    main_slots,  # slot-space size, nb * page (runtime)
+    extra_slots,
     q_stride_t: gl.constexpr,
     q_stride_h: gl.constexpr,
     qr_stride_t: gl.constexpr,
@@ -1838,7 +1856,8 @@ def _pa_decode_sparse_v4_2buff(
     gl.amd.gfx1250.tdm.async_wait(1)
     cur_row, cur_is_main, cur_valid = _v4_2buff_tile(
         slot_bufs.index(0), tile_start, main_tiles, kv_len, extra_len,
-        main_blk_rows, extra_blk_rows, SLOT_BLOCKED_LAYOUT, valid_col_mma,
+        main_blk_rows, extra_blk_rows, main_slots, extra_slots,
+        SLOT_BLOCKED_LAYOUT, valid_col_mma,
         BLOCK_K, MAIN_BLOCK_SIZE, EXTRA_BLOCK_SIZE, HAS_INVALID, HAS_EXTRA,
     )
     _v4_2buff_gather(
@@ -1870,7 +1889,8 @@ def _pa_decode_sparse_v4_2buff(
         next_row, next_is_main, next_valid = _v4_2buff_tile(
             slot_bufs.index((i + 1) % NUM_SLOT_BUFFERS),
             tile_start + i + 1, main_tiles, kv_len, extra_len,
-            main_blk_rows, extra_blk_rows, SLOT_BLOCKED_LAYOUT, valid_col_mma,
+            main_blk_rows, extra_blk_rows, main_slots, extra_slots,
+            SLOT_BLOCKED_LAYOUT, valid_col_mma,
             BLOCK_K, MAIN_BLOCK_SIZE, EXTRA_BLOCK_SIZE, HAS_INVALID, HAS_EXTRA,
         )
         _v4_2buff_fetch_slots(
@@ -1977,10 +1997,18 @@ def _pa_decode_sparse_v4_2buff(
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
         if USE_EXP2:
-            alpha = gl.exp2(m_i - m_new)
+            # A tile with no valid key at all (every column a -1 sentinel or out
+            # of range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf)
+            # = NaN, and with l_i/acc still 0 it survives as 0*NaN and poisons the
+            # whole row. Treat such a tile as a no-op, as the gfx950 kernel does.
+            alpha = gl.where(
+                m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new)
+            )
             p = gl.exp2(scores - m_new[:, None])
         else:
-            alpha = gl.exp(m_i - m_new)
+            alpha = gl.where(
+                m_new == float("-inf"), 1.0, gl.exp(m_i - m_new)
+            )
             p = gl.exp(scores - m_new[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
@@ -2088,11 +2116,19 @@ def _pa_decode_sparse_v4_2buff(
     m_block = gl.max(scores, axis=1)
     m_new = gl.maximum(m_i, m_block)
     if USE_EXP2:
-        alpha = gl.exp2(m_i - m_new)
+        # A tile with no valid key at all (every column a -1 sentinel or out
+        # of range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf)
+        # = NaN, and with l_i/acc still 0 it survives as 0*NaN and poisons the
+        # whole row. Treat such a tile as a no-op, as the gfx950 kernel does.
+        alpha = gl.where(
+            m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new)
+        )
         p = gl.exp2(scores - m_new[:, None])
         p = gl.where(valid_col[None, :], p, 0.0)
     else:
-        alpha = gl.exp(m_i - m_new)
+        alpha = gl.where(
+            m_new == float("-inf"), 1.0, gl.exp(m_i - m_new)
+        )
         p = gl.exp(scores - m_new[:, None])
     l_new = l_i * alpha + gl.sum(p, axis=1)
 

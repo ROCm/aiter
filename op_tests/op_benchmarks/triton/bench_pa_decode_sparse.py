@@ -7,23 +7,28 @@ Providers
 ---------
 ``bf16``            a16w16: bf16 Q ``[T, H, 512]`` against a bf16 pool
                     ``[P, 512]``. The reference for what quantization buys.
-``v4_a8w8_2buff``   a8w8 over ATOM's two-buffer pool: 448 fp8 NoPE | 14 dup E8M0
-                    group scales | 50 pad, plus a bf16 ``[P, 64]`` RoPE plane,
-                    with the matching packed fp8 Q. Byte-for-byte the layout the
-                    MLA-v4 asm decode kernel reads.
-``asm``             the reference point for ``v4_a8w8_2buff``:
+``v4_a8w8``         the a8w8 sparse-MLA decode kernel. ONE kernel, whatever
+                    the pool: the aligned record's first 512 bytes are an ATOM
+                    2buff row (448 B fp8 NoPE | 14 B duplicated UE8M0 scales |
+                    50 B pad) and its last 128 are the bf16 RoPE row, so the
+                    driver reads either presentation as two views over the
+                    same bytes. ``--pool`` picks which:
+
+                      flat   ``[P, 512]`` fp8 + ``[P, 64]`` bf16 -- ATOM's own
+                             buffers, one stream. The like-for-like partner
+                             for ``asm``.
+                      paged  ``[nb, page, 640]`` uint8 -- what a stock vLLM
+                             deployment allocates, handed over with no repack,
+                             and the form that carries the second stream.
+                             (default)
+
+``asm``             the reference point for ``--pool flat``:
                     ``aiter.mla.mla_decode_fwd_v4_nm`` ->
                     ``_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE``. Reads
                     the exact same tensors (gfx1250 only, gqa in {16, 64, 128}).
-``v4_a8w8``         a8w8 over **vLLM's own paged layout**: ``[nb, page, 584]``
-                    uint8 fp8_ds_mla — 448 B fp8 NoPE | 128 B bf16 RoPE per
-                    token, then a per-block trailer of 8 UE8M0 scale bytes each.
-                    This is what a stock vLLM deployment allocates, handed over
-                    with no repack, so it is the layout that matters for
-                    serving.
 
-Same quantized bytes throughout: ``v4_a8w8`` and ``v4_a8w8_2buff`` are two
-layouts of one packing, so a difference between them is addressing, not
+Same quantized bytes throughout: ``--pool flat`` and ``--pool paged`` are two
+presentations of one packing, so a difference between them is addressing, not
 numerics.
 
 Index streams
@@ -107,7 +112,8 @@ wall-clocks the same as a large one.
       --shape 64 32 512 384 \
       --shape 512 128 512 136 \
       --shape 512 128 512 384 \
-      --providers v4_a8w8_2buff asm \
+      --providers v4_a8w8 asm \
+      --pool flat \
       --extra-len 0 \
       --metric time \
       --timer profiler
@@ -140,10 +146,7 @@ if not os.environ.get("AITER_BENCH_USE_INSTALLED"):
 import torch
 import triton
 
-from aiter.ops.triton.attention.pa_decode_sparse import (
-    _pa_decode_sparse_v4,
-    pa_decode_sparse,
-)
+from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
 
 # DSv4 MLA head geometry: one 512-wide latent per token, of which the last 64
@@ -159,13 +162,17 @@ NUM_TILES = NOPE_DIM // 64  # 7 E8M0 quant groups
 # + the gqa remap in csrc/py_itfs_cu/asm_mla_v4.cu).
 _ASM_SHIPPED_GQA = (16, 64, 128)
 
-ALL_PROVIDERS = ("bf16", "v4_a8w8_2buff", "asm", "v4_a8w8")
+ALL_PROVIDERS = ("bf16", "v4_a8w8", "asm")
 METRICS = ("time", "bandwidth", "throughput")
 # vLLM's fp8_ds_mla record: 448 B fp8 NoPE | 128 B bf16 RoPE | 8 B UE8M0
 # (7 real scales + 1 pad), and the scales live in a per-block trailer.
 V4_ROW_BYTES = NOPE_DIM + 2 * ROPE_DIM  # 576
 V4_SC_RAW = NUM_TILES + 1  # 8
-V4_REC_BYTES = V4_ROW_BYTES + V4_SC_RAW  # 584
+# The ALIGNED record: 448 NoPE | 14 duplicated E8M0 | 50 pad | 128 RoPE.
+# 640 = 5*128 keeps every token 128-B aligned, and its first 512 bytes are
+# byte-identical to a 2buff row.
+V4_REC_BYTES = 640
+V4_ROPE_IN_REC = 512
 DEFAULT_PAGE = 64  # what the DSv4 SWA cache uses
 
 # DSv4-Pro head counts: 128 Q heads total. Under DP-attention every rank keeps
@@ -213,40 +220,36 @@ def v4_pack_2buff(x_bf16):
 
 
 def v4_pack_unified(packed_2buff, rope, page):
-    """2buff row + RoPE plane -> ``[nb, page, 584]`` uint8, vLLM's fp8_ds_mla.
+    """2buff row + RoPE plane -> ``[nb, page, 640]`` uint8, the aligned record.
 
-    Re-lays out the SAME bytes ``v4_pack_2buff`` produced, so a kernel reading
-    either format sees identical quantized values. Mirrors
+    A concatenation, not a re-packing: the aligned record holds the identical
+    bytes with the RoPE row appended, so a kernel reading either form sees the
+    same quantized values exactly. Mirrors
     op_tests/triton_tests/attention/test_pa_decode_sparse.py.
     """
     u8 = packed_2buff.view(torch.uint8)
     p = u8.shape[0]
     assert p % page == 0, f"{p} rows is not a whole number of {page}-row pages"
     nb = p // page
-    data = torch.cat(
+    rec = torch.cat(
         [
-            u8[:, :NOPE_DIM],
+            u8[:, :HEAD_DIM],
             rope.reshape(p, ROPE_DIM).view(torch.uint8).reshape(p, 2 * ROPE_DIM),
         ],
         dim=-1,
-    )  # [P, 576]
-    # 2buff stores each group's scale byte twice; the unified trailer once.
-    scales = torch.zeros(p, V4_SC_RAW, dtype=torch.uint8, device=u8.device)
-    scales[:, :NUM_TILES] = u8[:, NOPE_DIM : NOPE_DIM + 2 * NUM_TILES : 2]
-    cache = torch.empty(nb, page * V4_REC_BYTES, dtype=torch.uint8, device=u8.device)
-    cache[:, : page * V4_ROW_BYTES] = data.reshape(nb, page * V4_ROW_BYTES)
-    cache[:, page * V4_ROW_BYTES :] = scales.reshape(nb, page * V4_SC_RAW)
-    return cache.reshape(nb, page, V4_REC_BYTES)
+    )  # [P, 640]
+    assert rec.shape[1] == V4_REC_BYTES
+    return rec.reshape(nb, page, V4_REC_BYTES).contiguous()
 
 
 def paged_cache(packed_2buff, rope, page):
     """``v4_pack_unified`` with a block stride the descriptors can address.
 
-    The data descriptor counts 64-byte rows, so the cache's stride(0) must be a
-    multiple of 64. A contiguous page-64 cache already is (64*584 = 37376). A
-    contiguous page-2 one is not (2*584 = 1168), and DSv4-Pro's HCA layers page
-    the compressed cache 2 tokens to a block -- so pad it into a wider stride,
-    which is also how vLLM's caches look: views into one shared allocation.
+    With the aligned record every descriptor indexes in whole records, so the
+    cache's stride(0) must be a multiple of 640 -- which a contiguous cache of
+    any page size already is. The padding below is kept because it is also how
+    vLLM's caches look: per-layer views into one shared allocation, where the
+    block stride is the all-layer per-block size rather than page*640.
     """
     cache = v4_pack_unified(packed_2buff, rope, page)
     nb, _, rec = cache.shape
@@ -321,7 +324,8 @@ _INPUT_CACHE = {}
 
 
 def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda",
-                 page=DEFAULT_PAGE, extra_len=0, extra_page=DEFAULT_PAGE):
+                 page=DEFAULT_PAGE, extra_len=0, extra_page=DEFAULT_PAGE,
+                 pool="paged"):
     """Inputs for one shape, memoized.
 
     perf_report calls the bench fn once per (shape, provider), so without the
@@ -389,6 +393,7 @@ def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda",
     _INPUT_CACHE[key] = {
         "extra": extra,
         "unified": unified,
+        "pool": pool,
         "page": page,
         "q": q,
         "kv": kv,
@@ -422,22 +427,6 @@ def _make_fn(provider, inp, T, H, D):
         fn = lambda: pa_decode_sparse(q, kv, ind, iptr, sink, scale, has_invalid=False)
         # gathered KV + Q read + output written
         return fn, n_idx * D * 2 + T * H * D * 2 + out_bytes
-
-    if provider == "v4_a8w8_2buff":
-        kvp, kvr = inp["kv_packed"], inp["kv_rope"]
-        fn = lambda: pa_decode_sparse(
-            inp["q_packed"],
-            kvp,
-            ind,
-            iptr,
-            sink,
-            scale,
-            has_invalid=False,
-            unified_kv_rope=kvr,
-            q_rope=inp["q_rope"],
-        )
-        kv_row = HEAD_DIM * 1 + ROPE_DIM * 2  # 512 B fp8 + 128 B bf16 RoPE
-        return fn, n_idx * kv_row + T * H * kv_row + out_bytes
 
     if provider == "asm":
         if arch_info.get_arch() != "gfx1250" or H not in _ASM_SHIPPED_GQA:
@@ -473,24 +462,32 @@ def _make_fn(provider, inp, T, H, D):
         return fn, n_idx * kv_row + T * H * kv_row + out_bytes
 
     if provider == "v4_a8w8":
-        # vLLM's own paged layout: [nb, page, 584] uint8, no companion RoPE
-        # plane. This is what a stock deployment allocates, and the only
-        # provider here that can attend over both streams in one pass.
-        unified, qp, qr = inp["unified"], inp["q_packed"], inp["q_rope"]
+        # One kernel, two presentations of the same bytes. `flat` hands over
+        # ATOM's two tensors directly; `paged` hands over vLLM's single tensor
+        # and the driver slices each 640-byte record into the same two views.
+        kv_row = HEAD_DIM * 1 + ROPE_DIM * 2
+        if inp.get("pool", "paged") == "flat":
+            fn = lambda: pa_decode_sparse(
+                inp["q_packed"], inp["kv_packed"], ind, iptr, sink, scale,
+                has_invalid=False, unified_kv_rope=inp["kv_rope"],
+                q_rope=inp["q_rope"],
+            )
+            return fn, n_idx * kv_row + T * H * kv_row + out_bytes
+
         x = inp["extra"]
-        kw = {}
-        if x is not None:
-            kw = {
+        kw = (
+            {
                 "extra_cache": x["cache"],
                 "extra_indices": x["indices"],
                 "extra_indptr": x["indptr"],
             }
-        fn = lambda: _pa_decode_sparse_v4(
-            qp, unified, ind, iptr, sink, scale,
-            q_rope=qr, has_invalid=False, block_k=inp.get("block_k"),
-            main_is_window=inp.get("main_is_window", False), **kw,
+            if x is not None
+            else {}
         )
-        kv_row = HEAD_DIM * 1 + ROPE_DIM * 2
+        fn = lambda: pa_decode_sparse(
+            inp["q_packed"], inp["unified"], ind, iptr, sink, scale,
+            q_rope=inp["q_rope"], has_invalid=False, **kw,
+        )
         keys = n_idx + (x["n_idx"] if x is not None else 0)
         return fn, keys * kv_row + T * H * kv_row + out_bytes
 
@@ -532,9 +529,11 @@ def _device_ms(fn, provider, iters=50):
 
 def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep,
              profile_dir=None, page=DEFAULT_PAGE, block_k=None, timer="wall",
-             extra_len=0, extra_page=DEFAULT_PAGE, main_is_window=False):
+             extra_len=0, extra_page=DEFAULT_PAGE, main_is_window=False,
+             pool="paged"):
     inp = build_inputs(T, H, D, kv_len, var_len=var_len, page=page,
-                       extra_len=extra_len, extra_page=extra_page)
+                       extra_len=extra_len, extra_page=extra_page,
+                       pool=pool)
     inp["block_k"] = block_k
     inp["main_is_window"] = main_is_window
     made = _make_fn(provider, inp, T, H, D)
@@ -641,6 +640,7 @@ def run_benchmark(args):
             f"{f'-x{args.extra_len}' if args.extra_len else ''}"
             f"{f'-k{args.block_k}' if args.block_k else ''}"
             f"{'-window' if args.main_is_window else ''}"
+            f"{'-flat' if args.pool == 'flat' else ''}"
             f"{'-cudagraph' if args.cudagraph else ''}"
             f"{'-varlen' if args.var_len else ''}"
         ),
@@ -666,6 +666,7 @@ def run_benchmark(args):
             extra_len,
             args.extra_page,
             args.main_is_window,
+            args.pool,
         )
 
     _bench.run(save_path="." if args.o else None, print_data=True)
@@ -721,6 +722,16 @@ def parse_args(argv=None):
         default=DEFAULT_PAGE,
         help="Page size of the top-k cache. 64 on CSA layers; DSv4-Pro's HCA "
         "layers page it **2**, which is why the 128+8 example passes it.",
+    )
+    p.add_argument(
+        "--pool",
+        choices=("paged", "flat"),
+        default="paged",
+        help="How the KV pool is presented to the ONE a8w8 kernel. 'paged' is "
+        "vLLM's [nb, page, 640] aligned record, which carries the second "
+        "stream; 'flat' is ATOM's [P, 512] + [P, 64] pair, one stream, and "
+        "the like-for-like partner for --providers asm. Same bytes either "
+        "way -- only the addressing differs.",
     )
     p.add_argument(
         "--page",

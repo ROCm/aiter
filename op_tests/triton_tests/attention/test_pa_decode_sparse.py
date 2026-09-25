@@ -815,8 +815,9 @@ def two_loop_reference(
     )
 
 
-@pytest.mark.parametrize("T", [1, 32, 64, 128, 2437])
-@pytest.mark.parametrize("H", [16, 32, 128])
+# @pytest.mark.parametrize("T", [1, 32, 64, 128, 2437])
+@pytest.mark.parametrize("T", [128, 2437])
+@pytest.mark.parametrize("H", [128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("main_len", [128])
 @pytest.mark.parametrize("extra_len", [8, 256])

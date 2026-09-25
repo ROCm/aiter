@@ -957,7 +957,7 @@ def _v4_split_aligned(cache: torch.Tensor):
 
 
 def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
-    """(rows, blk_rows, block_size) for a 2buff pool, flat or paged.
+    """(rows, blk_rows, block_size, num_slots) for a 2buff pool.
 
     A flat ``[P, 512]`` pool is page size 1 with one row per page, so the slot
     IS the row. A paged ``[nb, block, 512]`` view -- what a vLLM aligned cache
@@ -972,7 +972,7 @@ def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
             )
         if rope.shape[0] != kv.shape[0]:
             raise RuntimeError(f"{name} rope rows {rope.shape[0]} != {kv.shape[0]}")
-        return kv.shape[0], 1, 1
+        return kv.shape[0], 1, 1, kv.shape[0]
 
     if kv.dim() != 3 or kv.shape[2] != _V4_DIM_QK:
         raise RuntimeError(
@@ -999,7 +999,7 @@ def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
         raise RuntimeError(
             f"{name} spans {rows:,} descriptor rows, past the int32 bound"
         )
-    return rows, blk_stride // row_stride, block_size
+    return rows, blk_stride // row_stride, block_size, nb * block_size
 
 
 def _pa_decode_sparse_v4_2buff(
@@ -1058,7 +1058,7 @@ def _pa_decode_sparse_v4_2buff(
         f"unified_kv_rope must be [..., {_V4_DIM_ROPE}] bf16, got "
         f"{tuple(unified_kv_rope.shape)}"
     )
-    main_rows, main_blk_rows, main_block_size = _v4_2buff_geometry(
+    main_rows, main_blk_rows, main_block_size, main_slots = _v4_2buff_geometry(
         unified_kv, unified_kv_rope, "unified_kv"
     )
 
@@ -1068,9 +1068,12 @@ def _pa_decode_sparse_v4_2buff(
         assert extra_indices is not None and extra_indptr is not None
         assert extra_cache.dtype in _V4_PACKED_FP8_DTYPES
         assert extra_cache_rope.dtype == torch.bfloat16
-        extra_rows, extra_blk_rows, extra_block_size = _v4_2buff_geometry(
-            extra_cache, extra_cache_rope, "extra_cache"
-        )
+        (
+            extra_rows,
+            extra_blk_rows,
+            extra_block_size,
+            extra_slots,
+        ) = _v4_2buff_geometry(extra_cache, extra_cache_rope, "extra_cache")
         assert extra_indices.dtype == torch.int32 and extra_indices.is_contiguous()
         assert extra_indptr.dtype == torch.int32 and extra_indptr.is_contiguous()
     else:
@@ -1081,6 +1084,7 @@ def _pa_decode_sparse_v4_2buff(
         extra_indices = kv_indices
         extra_indptr = kv_indptr
         extra_rows, extra_blk_rows, extra_block_size = main_rows, 1, 1
+        extra_slots = main_slots
 
     if q_rope is None:
         raise RuntimeError(
@@ -1115,7 +1119,9 @@ def _pa_decode_sparse_v4_2buff(
     # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
     if block_h is None:
         if H >= 128:
-            block_h = 128
+            # [experimental]
+            # block_h = 128
+            block_h = 16
         elif H >= 64:
             if T >= 2048:
                 block_h = 64
@@ -1200,6 +1206,16 @@ def _pa_decode_sparse_v4_2buff(
     _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
     _lds_cap = max(1, _lds_budget // (block_d * 4))
     kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
+    # KV_SPLITS == 1 takes a different output path: the accumulators are
+    # reassembled in LDS and pushed out with tdm.async_store, rather than the
+    # reduce writing `out` from the partials. That path RACES -- ~0.3% of
+    # tokens corrupted at T=1024 and ~5.7% at T=2437, garbage magnitudes
+    # (~1e38), single-stream as well as two-stream, and the rate swings with
+    # any timing perturbation. Everything at 2+ splits is clean, so stay off
+    # it until that store is fixed. Cost is one reduce launch and the partial
+    # buffers; at the batch sizes that reach 1 split those are small next to
+    # the KV cache.
+    kv_splits = max(2, kv_splits)
     if kv_splits > 8:
         reduce_num_warps = 4
         reduce_waves_per_eu = 1
@@ -1245,6 +1261,8 @@ def _pa_decode_sparse_v4_2buff(
         extra_rows,
         main_blk_rows,
         extra_blk_rows,
+        main_slots,
+        extra_slots,
         q.stride(0),
         q.stride(1),
         q_rope.stride(0),
