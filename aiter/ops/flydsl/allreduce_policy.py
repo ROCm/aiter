@@ -220,6 +220,17 @@ def pick_quant_family(nbytes: int, policy: QuantPolicy) -> str:
     return "mesh" if nbytes <= policy.mesh_max else "ring"
 
 
+def quant_family_range(family: str, policy: QuantPolicy) -> tuple[int, int]:
+    """Payload bytes (inclusive) ``pick_quant_family`` sends to *family*."""
+    if family == "mesh":
+        return policy.floor + 1, min(policy.mesh_max, policy.max_bytes)
+    if family == "ring":
+        # The ring algorithm is beneficial for large messages, i.e., 
+        # it comes after the mesh with increasing message size.
+        return policy.mesh_max + 1, policy.max_bytes
+    raise ValueError(f"family must be 'mesh' or 'ring', got {family!r}")
+
+
 def quant_families_reachable(policy: QuantPolicy) -> tuple[str, ...]:
     """Quantized families a *policy* can ever select, in size order."""
     out = []

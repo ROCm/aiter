@@ -40,6 +40,7 @@ from .quick_allreduce_int4 import (
     _validate_ipc_process_group,
     has_xgmi_peer_links,
     kernel_symbol,
+    payload_probes,
 )
 
 logger = logging.getLogger("aiter")
@@ -328,26 +329,40 @@ class OneShotAllReduce:
         eng, spec = self._by_cfg[self._pick_cfg(live_bytes)]
         self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
 
-    def compile_and_launch(self, inp, out=None, stream=None) -> None:
-        """Eager-JIT every rung's binary and launch each of them once, for
-        real, against *inp*/*out*.
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple]:
+        """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
+        select, in build order."""
+        floors = [rung[0] for rung in self._ladder]
+        picked = {self._pick_cfg(n) for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
 
-        This runs every rung on the GPU -- ``out`` ends up holding whichever
-        rung ran last, and it is a real collective: every rank must call it
-        with the same shape. Used by ``bench_comm_allreduce.py`` and the
-        flydsl op tests to force a real warm launch (and, for the tests, to
-        exercise the launch path directly) before timing or correctness
-        checks begin.
+    def compile_and_launch(
+        self, inp, out=None, stream=None, *, payload_range=None
+    ) -> None:
+        """Eager-JIT rung binaries and launch each of them once, for real,
+        against *inp*/*out*.
 
-        ``CustomAllreduce`` also calls it once at init. Not for timing: the JIT
-        issues HIP calls, and leaving the first compile to the first real
-        all-reduce lets it land inside an active CUDA graph capture, where those
-        calls would be recorded rather than executed.
+        ``payload_range=(lo, hi)`` takes only the rungs ``allreduce`` would run
+        for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every one.
+        The ladder builds engines for the whole size range, while a dispatcher
+        routes only its own window here, so the rest never run.
+
+        ``out`` ends up holding whichever rung ran last, and this is a real
+        collective: every rank must call it with the same shape and range. Used
+        by ``bench_comm_allreduce.py`` and the flydsl op tests to force a real
+        warm launch (and, for the tests, to exercise the launch path directly)
+        before timing or correctness checks begin.
+
+        ``CustomAllreduce`` also calls it once at init, via ``warm_fly_engines``.
+        Not for timing: it keeps each rung's JIT compile and module load off the
+        first real all-reduce, which may be inside a CUDA graph capture.
         """
         if out is None:
             out = torch.empty_like(inp)
         live_bytes = self._check_payload(inp, out)
-        for eng, spec in self._by_cfg.values():
+        keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
+        for key in keys:
+            eng, spec = self._by_cfg[key]
             self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
 
     def variant(self, nbytes: int) -> str:

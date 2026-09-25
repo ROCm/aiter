@@ -32,7 +32,7 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
-from .quick_all_reduce import all_ranks_agree
+from .flydsl_utils import all_ranks_agree, warm_fly_engines
 from .rocm_version import get_rocm_version
 
 # Importing this pulls in flydsl, an optional dependency whose version is
@@ -957,7 +957,11 @@ class CustomAllreduce:
         self._init_fly_oneshot()
 
     def _init_fly_oneshot(self):
-        """Build the FlyDSL exact one-shot that fronts small plain all-reduces."""
+        """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
+        and compile the rungs it serves before any graph capture begins.
+
+        Not built at all when ``custom_all_reduce`` would route it no payload
+        (see ``_fly_oneshot_range``): its IPC inbox would go unused."""
 
         if self.disabled or not _FLY_IMPORT_OK or not fly_policy.enabled():
             return
@@ -975,17 +979,23 @@ class CustomAllreduce:
         link = fly_policy.detect_link()
         engine = None
         policy = None
+        payload_range = None
         ok = True
         try:
             policy = fly_policy.resolve_oneshot(link, self.world_size)
-            engine = OneShotAllReduce(
-                group=self.group,
-                device=self.device,
-                rank=self.rank,
-                world_size=self.world_size,
-                max_bytes=policy.max_bytes,
-                link=link,
-            )
+            payload_range = self._fly_oneshot_range(policy)
+            # The range comes from the policy table and env, identical on every
+            # rank, so all ranks skip together and no IPC exchange is left
+            # waiting on a peer.
+            if payload_range[0] <= payload_range[1]:
+                engine = OneShotAllReduce(
+                    group=self.group,
+                    device=self.device,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    max_bytes=policy.max_bytes,
+                    link=link,
+                )
         except Exception:  # noqa: BLE001
             logger.warning("FlyDSL one-shot disabled: init failed.", exc_info=True)
             ok = False
@@ -998,12 +1008,18 @@ class CustomAllreduce:
             _close_quietly(engine)
             return
 
+        if engine is None:
+            logger.info(
+                "FlyDSL one-shot not built: custom all-reduce routes it no "
+                "payload (%s / %s leave no overlap with its window).",
+                _CAR_MIN_SIZE_ENV,
+                _CAR_MAX_SIZE_ENV,
+            )
+            return
+
         ok = True
         try:
-            # Compile every rung now -- one call walks the whole ladder.
-            # TODO: Implement proper AOT compilation such that we don't need launch here.
-            warm = torch.zeros(2048, dtype=torch.bfloat16, device=self.device)
-            engine.compile_and_launch(warm)
+            warm_fly_engines(((engine, payload_range),), self.device)
         except Exception:  # noqa: BLE001
             logger.warning("FlyDSL one-shot disabled: warmup failed.", exc_info=True)
             ok = False
@@ -1026,6 +1042,19 @@ class CustomAllreduce:
             link,
             engine.inbox_bytes / 2**20,
         )
+
+    def _fly_oneshot_range(self, policy) -> tuple[int, int]:
+        """Payload bytes (inclusive) ``custom_all_reduce`` routes to the
+        one-shot: ``should_custom_ar`` on its decode path, then
+        ``_should_fly_oneshot``. Empty (``lo > hi``) when it routes none."""
+
+        if self._car_max_size <= 0 or not (
+            self.world_size == 2 or self.fully_connected
+        ):
+            return 1, 0
+        lo = max(policy.min_bytes, self._car_min_size + 1)
+        hi = min(policy.max_bytes, self._car_max_size)
+        return lo, hi
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares

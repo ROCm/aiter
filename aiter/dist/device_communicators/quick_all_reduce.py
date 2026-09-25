@@ -13,6 +13,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
+from .flydsl_utils import all_ranks_agree, warm_fly_engines
 
 logger = logging.getLogger(__name__)
 
@@ -74,14 +75,6 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
-
-
-def all_ranks_agree(ok: bool, group) -> bool:
-    """Whether *every* rank in *group* reports success."""
-
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
-    return bool(flag.item())
 
 
 def qr_exchange_handles(ptr, world_size, group):
@@ -211,7 +204,9 @@ class QuickAllReduce:
         self._init_fly_backend()
 
     def _init_fly_backend(self):
-        """Build the FlyDSL mesh/ring engines that will serve plain all-reduce."""
+        """Build the FlyDSL mesh/ring engines that will serve plain all-reduce,
+        and compile the binaries the policy routes to them before any graph
+        capture begins."""
 
         if not _FLY_IMPORT_OK or not fly_policy.enabled():
             return
@@ -256,6 +251,30 @@ class QuickAllReduce:
                 logger.warning(
                     "FlyDSL quick-reduce backend disabled: a peer rank failed to "
                     "build its engines."
+                )
+            self._close_fly_engines()
+            return
+
+        ok = True
+        try:
+            warm_fly_engines(
+                (
+                    (engine, fly_policy.quant_family_range(family, policy))
+                    for family, engine in self._fly_engines.items()
+                ),
+                self.device,
+            )
+        except Exception:
+            logger.warning(
+                "FlyDSL quick-reduce backend disabled: warmup failed.", exc_info=True
+            )
+            ok = False
+
+        if not all_ranks_agree(ok, self.group):
+            if ok:
+                logger.warning(
+                    "FlyDSL quick-reduce backend disabled: a peer rank failed to "
+                    "warm up."
                 )
             self._close_fly_engines()
             return
@@ -408,7 +427,8 @@ class QuickAllReduce:
         """Performs an out-of-place custom quick all reduce."""
         # quick allreduce doesn't require a separate graph mode,
         # as QR uses static IPC buffer. The same holds for the FlyDSL
-        # schedules, whose IPC inbox is likewise allocated once at init.
+        # schedules, whose IPC inbox is likewise allocated once at init
+        # and whose served binaries are compiled at init (warm_fly_engines).
         if out is None:
             out = torch.empty_like(inp)
         if self._should_fly(inp):

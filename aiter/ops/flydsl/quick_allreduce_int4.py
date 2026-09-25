@@ -392,6 +392,28 @@ def kernel_symbol(launch) -> str:
     return name.removeprefix("launch_")
 
 
+def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
+    """Payload sizes that between them select every config a ladder with rung
+    *floors* assigns to ``lo..hi`` bytes (inclusive); ``()`` if none fit.
+
+    Within one rung the choice is monotone in the payload -- a fixed config, or
+    a super-tile taken once the tile count reaches a threshold -- so the two
+    ends of each rung's slice of the range reach everything in it. Payloads are
+    whole multiples of 16 B, so the probes are too.
+    """
+    step = 16
+    lo = max(step, -(-int(lo) // step) * step)
+    hi = int(hi) // step * step
+    if lo > hi:
+        return ()
+    probes = {lo, hi}
+    for floor in floors:
+        first = -(-int(floor) // step) * step
+        if lo < first <= hi:
+            probes.update((first - step, first))
+    return tuple(sorted(probes))
+
+
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
 
@@ -890,22 +912,35 @@ class QuickAllReduceInt4:
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)
 
-    def compile_and_launch(self, inp, out=None, stream=None) -> None:
-        """Eager-JIT every engine's binary and launch each of them once, 
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int, bool]]:
+        """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
+        select, in build order."""
+        floors = [rung[0] for rung in self._ladder]
+        picked = {self._pick_cfg(n)[0] for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
+
+    def compile_and_launch(
+        self, inp, out=None, stream=None, *, payload_range=None
+    ) -> None:
+        """Eager-JIT engine binaries and launch each of them once, for real,
         against *inp*/*out*.
 
-        This runs every engine on the GPU -- ``out`` ends up holding whichever
-        one ran last, and it is a real collective: every rank must call it with
-        the same shape. Used by ``bench_comm_allreduce.py`` and the op tests to
-        force a real warm launch before timing or correctness checks begin.
-        Production never calls this: it tolerates the first real call paying a
-        JIT-compile cost instead.
+        ``payload_range=(lo, hi)`` takes only the binaries ``allreduce`` would
+        run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every
+        one. The ladder builds engines for the whole size range, while a
+        dispatcher routes only its own window here, so the rest never run.
+
+        ``out`` ends up holding whichever engine ran last, and this is a real
+        collective: every rank must call it with the same shape and range. Used
+        by ``bench_comm_allreduce.py`` and the op tests to force a real warm
+        launch before timing or correctness checks begin.
         """
         if out is None:
             out = torch.empty_like(inp)
         live_bytes = self._check_payload(inp, out)
-        for eng in self._by_cfg.values():
-            self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+        keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
+        for key in keys:
+            self._launch_eng(self._by_cfg[key], inp, out, stream, live_bytes=live_bytes)
 
     def close(self):
         engines = getattr(self, "_by_cfg", None)
