@@ -50,12 +50,12 @@ SUPPORTED_GFX = ["gfx950"]
 # kernel's answer. A hardcoded list that outlived two of its kids reported those
 # two at 1.41 relative error, which looks like a kernel bug and is not one.
 KIDS_BPRESHUFFLE = tuple(sorted(_preshuffled_kids()))
-KID_PLAIN = 320  # same tile, row-major B, broadcast scale pack
+KID_PLAIN = 8320  # same tile, row-major B, broadcast scale pack
 
 
 # Extra row-major kids to time alongside, e.g. whichever the tuner actually
-# ships for the shape under test (kid158 is the large-M pick on many of them).
-KIDS_PLAIN_EXTRA = (311, 321, 653, 325, 158)
+# ships for the shape under test (kid8158 is the large-M pick on many of them).
+KIDS_PLAIN_EXTRA = (8311, 8321, 8653, 8325, 8158)
 
 
 def _rel_err(y, ref):
@@ -173,14 +173,17 @@ def _check_tables():
     a tuning bug, not a dispatch bug -- catch it here rather than in a serving
     log.
     """
-    import aiter.ops.batched_gemm_op_a8w8 as bg
-    import aiter.ops.opus.gemm_op_a8w8 as bmm
+    from aiter.jit.core import AITER_CONFIGS
 
     gfx = get_gfx()
     ok = True
     for b_preshuffled in (False, True):
-        path = bg._mxscale_bmm_tuned_path(b_preshuffled)
-        rows = bg._load_mxscale_bmm_tuned(None, b_preshuffled)
+        path = (
+            AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+            if b_preshuffled
+            else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+        )
+        rows = policy._load_mxscale_bmm_tuned(None, b_preshuffled)
         # kernelId is only opus's to interpret, and the catalog behind the check
         # is this arch's.
         kids = {
@@ -188,8 +191,12 @@ def _check_tables():
             for key, row in rows.items()
             if key[0] == gfx and row.get("libtype") == "opus"
         }
-        bad_b = sorted(k for k in kids if not bmm._kid_takes_b_layout(k, b_preshuffled))
-        bad_sf = sorted(k for k in kids if not bmm._kid_takes_plain_scales(k))
+        bad_b = sorted(
+            k for k in kids if not policy.mxscale_bmm_kid_takes_b_layout(k, b_preshuffled)
+        )
+        bad_sf = sorted(
+            k for k in kids if not policy.mxscale_bmm_kid_takes_plain_scales(k)
+        )
         bad = bool(bad_b or bad_sf)
         ok &= not bad
         label = f"b_preshuffled={b_preshuffled!s:<5} -> {len(kids)} kid(s)"
@@ -220,13 +227,17 @@ def _check_dispatch():
     import aiter.ops.opus.gemm_op_a8w8 as bmm
 
     g, m, n, k = 2, 128, 1024, 4096
-    pre = bmm._mxscale_kid_pre_b()
+    # kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales)
+    table = policy._mxscale_bmm_kid_table()
+    pre = {kid: entry[1] for kid, entry in table.items()}
     kid_pre = next(
         kid
         for kid in KIDS_BPRESHUFFLE
-        if pre.get(kid) and bmm._kid_takes_plain_scales(kid)
+        if pre.get(kid) and policy.mxscale_bmm_kid_takes_plain_scales(kid)
     )
-    kid_host_scale = min(bmm._mxscale_kid_host_scale())
+    # Empty unless the catalogue builds the relaid-scale kids
+    # (BMM_BUILD_RELAID_SCALE_KIDS); their refusal case is skipped then.
+    host_scale_kids = sorted(kid for kid, entry in table.items() if entry[2])
 
     args = (
         torch.empty((m, g, k), dtype=dtypes.fp8, device="meta"),
@@ -251,6 +262,11 @@ def _check_dispatch():
             if b_preshuffled
             else bg._batched_gemm_a8w8_mxscale_impl
         )
+        # The row-major entry caches both the resolved launcher and the plan,
+        # which would otherwise keep the first case's spy and row.
+        caches = (bg._get_mxscale_bmm_launchers, bg._get_mxscale_bmm_launch_plan)
+        for c in caches:
+            c.cache_clear()
         with patch.object(
             bmm, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", _spy
         ), patch.object(
@@ -260,6 +276,9 @@ def _check_dispatch():
                 impl(*args)
             except ValueError as err:
                 return err
+            finally:
+                for c in caches:
+                    c.cache_clear()
         return seen["kid"]
 
     def _row(kid):
@@ -287,11 +306,17 @@ def _check_dispatch():
             True,
             lambda r: isinstance(r, ValueError),
         ),
-        (
-            f"tuned kid{kid_host_scale} (host-rearranged scales) + declared -> raises",
-            _row(kid_host_scale),
-            True,
-            lambda r: isinstance(r, ValueError),
+        *(
+            (
+                (
+                    f"tuned kid{host_scale_kids[0]} (host-rearranged scales) + declared -> raises",
+                    _row(host_scale_kids[0]),
+                    True,
+                    lambda r: isinstance(r, ValueError),
+                ),
+            )
+            if host_scale_kids
+            else ()
         ),
         (
             "no tuned row + declared preshuffled -> raises",
@@ -302,6 +327,8 @@ def _check_dispatch():
         ("no tuned row + row-major B -> heuristic", None, False, _row_major_kid),
     )
 
+    if not host_scale_kids:
+        print("  skip host-rearranged-scale refusal: no such kid is built", flush=True)
     ok = True
     for label, row, b_preshuffled, want in cases:
         got = _resolve(row, b_preshuffled)

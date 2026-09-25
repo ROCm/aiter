@@ -626,7 +626,14 @@ def _load_mxscale_bmm_tuned(
         logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
 
-    required = {"gfx", "b", "m", "n", "k", "groupSize", "kernelId", "splitK"}
+    if "groupSize" not in df.columns:
+        logger.warning(
+            "Legacy MXFP8 BMM tuned CSV %s has no groupSize; assuming groupSize=128",
+            path,
+        )
+        df["groupSize"] = 128
+
+    required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
@@ -843,6 +850,13 @@ def resolve_a8w8_mxscale_bmm_plan(
     if config is not None:
         try:
             kid = int(config["kernelId"])
+            if not (
+                mxscale_bmm_kid_takes_b_layout(kid, False)
+                and mxscale_bmm_kid_takes_plain_scales(kid)
+            ):
+                raise ValueError(
+                    f"kid {kid} wants a preshuffled B or host-rearranged scales"
+                )
             split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
             plan = _get_cached_a8w8_mxscale_bmm_plan(
                 get_gfx(),

@@ -273,14 +273,18 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     policy._load_mxscale_bmm_tuned.cache_clear()
     policy.lookup_mxscale_bmm_config.cache_clear()
     try:
-        rows = policy._load_mxscale_bmm_tuned(None)
-        assert rows[("gfx950", 3, 1, 1024, 4096)]["kernelId"] == 42
+        rows = policy._load_mxscale_bmm_tuned(None, False)
+        assert rows[("gfx950", 3, 1, 1024, 4096, 128)]["kernelId"] == 42
         assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
             8640,
             1,
         )
-        assert len(warnings) == 1
-        assert warnings[0][0].startswith("Skipping %d invalid OPUS row")
+        assert len(warnings) == 2
+        assert any("assuming groupSize=128" in warning[0] for warning in warnings)
+        assert any(
+            warning[0].startswith("Skipping %d invalid OPUS row")
+            for warning in warnings
+        )
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()

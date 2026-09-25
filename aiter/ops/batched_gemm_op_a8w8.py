@@ -284,7 +284,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     else:
         # Untuned shapes: opus carries a shape heuristic, the gfx1250 flydsl path
         # does not, so the arch picks the fallback.
-        libtype = "flydsl" if get_gfx() == "gfx1250" else _MXSCALE_BMM_DEFAULT_LIBTYPE
+        libtype = "flydsl" if get_gfx() == "gfx1250" else "opus"
 
     if libtype == "opus":
         from .opus.gemm_op_a8w8 import bmm_a8w8_mxscale_opus
