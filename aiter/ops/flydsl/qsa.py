@@ -53,7 +53,7 @@ from .kernels.qsa import (
     qsa_visible_blocks,
 )
 from .kernels.qsa.k1 import qsa_k1_block_ids
-from .kernels.qsa.k2_family_a import qsa_k2_family_a
+from .kernels.qsa.k2 import qsa_k2
 
 __all__ = [
     "FAMILY_A_GQA",
@@ -71,7 +71,7 @@ __all__ = [
     "qsa_expand_tail",
     "qsa_indexer_scores",
     "qsa_k1_block_ids",
-    "qsa_k2_family_a",
+    "qsa_k2",
     "qsa_oracle",
     "qsa_sparse_gqa",
     "qsa_topk_blocks",
