@@ -10,6 +10,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     _gep1,
     _global_base_ptr1,
@@ -28,9 +29,9 @@ from .utils import (
     make_b_loader,
 )
 
-# gfx950 CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
+# Fallback CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
 # not over-launch ~max_m_blocks empty CTAs.
-NUM_CU = 256
+DEFAULT_NUM_CU = 256
 
 
 # @flyc.jit is LOAD-BEARING: it AST-rewrites ``if token_id < i32_M`` into an scf.if.
@@ -435,16 +436,23 @@ def _gemm2_body_a16w4(
         )
 
 
-def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
+def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, num_cu=None):
     """Flattened launch grid for a16w4 gemm2.
 
     Non-persistent (default): one CTA per (m-block x n-block) tile over padded
-    ``max_m_blocks``. Persistent: cap to ``min(total_work, NUM_CU)`` CTAs (only when
-    padded work > ``NUM_CU*4``); each CTA loops over its real work-tiles.
+    ``max_m_blocks``. Persistent: cap to ``min(total_work, num_cu)`` CTAs (only when
+    padded work > ``num_cu*4``); each CTA loops over its real work-tiles.
+
+    The CU cap is set at launch and does not affect the kernel cache key.
     """
     total_work = int(max_m_blocks) * (N_OUT // TILE_N)
-    if persist and total_work > NUM_CU * 4:
-        return min(total_work, NUM_CU)
+    if persist and num_cu is None:
+        try:
+            num_cu = get_cu_num()
+        except Exception:  # noqa: BLE001
+            num_cu = DEFAULT_NUM_CU
+    if persist and total_work > num_cu * 4:
+        return min(total_work, num_cu)
     return total_work
 
 
@@ -458,6 +466,7 @@ def compile_gemm2_a16w4_port(
     TILE_N=256,
     TILE_K=256,
     xcd_swizzle=1,
+    num_xcds: int = 8,
     b_cache_mod=2,
     waves_per_eu=None,
     w_dtype="fp4",
@@ -472,9 +481,8 @@ def compile_gemm2_a16w4_port(
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
     ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
 
-    ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
-    balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
-    per-XCD L2 locality (group = xcd_swizzle m-blocks).
+    The launch index always round-robins across ``num_xcds`` XCDs.
+    ``xcd_swizzle`` (>0) also groups M blocks for L2 locality.
     """
     assert w_dtype in (
         "fp4",
@@ -520,6 +528,9 @@ def compile_gemm2_a16w4_port(
         _name += f"_bcm{b_cache_mod}"
     if xcd_swizzle > 0:
         _name += f"_xcd{xcd_swizzle}"
+    # Round-robin uses num_xcds even when xcd_swizzle is zero.
+    if num_xcds != 8:
+        _name += f"_nxcd{num_xcds}"
     if waves_per_eu:
         _name += f"_w{waves_per_eu}"
     if persist:
@@ -555,7 +566,7 @@ def compile_gemm2_a16w4_port(
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2 locality.
-        _NXCD = 8
+        _NXCD = num_xcds
         _xq = _udiv(bound, _NXCD)
         _xr = _umod(bound, _NXCD)
         _SW = xcd_swizzle
@@ -607,7 +618,7 @@ def compile_gemm2_a16w4_port(
             )
 
         if const_expr(persist):
-            # Persistent CU-limited grid (~NUM_CU CTAs): each CTA does tile bx_i32 then
+            # Persistent CU-limited grid: each CTA does tile bx_i32 then
             # strides by grid size over [0, bound); _xcd_np maps every visited index, so
             # each tile runs once (same mapping as non-persistent). Loop-top barrier
             # separates the prev tile's epilog LDS from the next tile's A-DMA.

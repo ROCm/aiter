@@ -299,9 +299,9 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
-def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
+def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm, num_xcds=8):
     """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse."""
-    NUM_XCDS = 8
+    NUM_XCDS = num_xcds
 
     wgid = fx.block_idx.x
     num_wg = num_pid_m * num_pid_n
@@ -331,6 +331,7 @@ def compile_fp8_gemm_8w(
     b_preshuffled: bool = False,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
 ):
     BLOCK_K = 128
 
@@ -362,6 +363,9 @@ def compile_fp8_gemm_8w(
         f"flydsl_{_layout_tag}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
         f"{waves_per_eu}x{xcd_swizzle}_k{K}"
     )
+    # The XCD count affects generated code only when swizzling is enabled.
+    if xcd_swizzle > 0 and num_xcds != 8:
+        _kname += f"_nxcd{num_xcds}"
 
     @fx.struct
     class SharedStorage:
@@ -404,7 +408,7 @@ def compile_fp8_gemm_8w(
         wave_n = wave_id % 4
         if const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
-                ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle
+                ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle, num_xcds=num_xcds
             )
         else:
             block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)

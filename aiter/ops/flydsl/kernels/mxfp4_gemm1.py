@@ -1364,6 +1364,7 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    num_xcds: int = 8,
 ):
     """Compile GEMM1 with expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
@@ -1459,6 +1460,9 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_bn{BN}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
+        # No XCD remapping is emitted when swizzling is disabled.
+        if num_xcds != 8:
+            name_suffix += f"_nxcd{num_xcds}"
     if num_waves == 2:
         name_suffix += "_w2"
     if k_wave > 1:
@@ -1499,7 +1503,7 @@ def compile_gemm1_a4w4_port(
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
 
-        NXCD = 8
+        NXCD = num_xcds
         xq = _udiv(bound, NXCD)
         xr = _umod(bound, NXCD)
 

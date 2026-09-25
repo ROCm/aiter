@@ -384,6 +384,7 @@ def compile_gemm1_a16w4_port(
     act="silu",
     b_cache_mod=2,
     xcd_swizzle=0,
+    num_xcds: int = 8,
     waves_per_eu=None,
     w_dtype="fp4",
     w_layout="standard",
@@ -475,6 +476,9 @@ def compile_gemm1_a16w4_port(
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    # The XCD count affects generated code only when swizzling is enabled.
+    if xcd_swizzle > 0 and num_xcds != 8:
+        _xcd_tag += f"_nxcd{num_xcds}"
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
@@ -513,7 +517,7 @@ def compile_gemm1_a16w4_port(
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # weight-load traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2
         # locality (group = xcd_swizzle m-blocks). No-op at 0.
-        _NXCD = 8
+        _NXCD = num_xcds
         _xq = _udiv(bound, _NXCD)
         _xr = _umod(bound, _NXCD)
         _SW = xcd_swizzle
