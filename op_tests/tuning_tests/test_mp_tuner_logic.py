@@ -13,6 +13,9 @@ Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 
 import importlib
 import multiprocessing as mp
+import os
+import subprocess
+import sys
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
@@ -368,6 +371,48 @@ class TestTaskStartTimeReset(unittest.TestCase):
         slots = [11.0, 22.0, 33.0]
         reset_start_times(slots, [0, 2])
         self.assertEqual(list(slots), [0, 22.0, 0])
+
+    def test_reset_clears_worker_pids(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        slots, pids = [11.0, 22.0], [101, 202]
+        tuner._reset_task_start_times(slots, [1], pids)
+        self.assertEqual(pids, [101, 0])
+
+
+class TestTaskWorkerExit(unittest.TestCase):
+
+    def test_exited_worker_is_detected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        worker_exited = getattr(tuner, "_task_worker_exited", None)
+        self.assertIsNotNone(
+            worker_exited,
+            "a task whose worker died (e.g. GPU fault) must not wait for the timeout",
+        )
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertTrue(worker_exited([proc.pid], 0))
+        self.assertFalse(worker_exited([os.getpid()], 0))
+        self.assertFalse(worker_exited([0], 0), "a queued task has no worker yet")
+
+    def test_worker_pid_recorded_when_task_starts(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 1)
+        pids = ctx.RawArray("i", 1)
+        pool = ctx.Pool(
+            1,
+            initializer=tuner._init_task_start_times,
+            initargs=(start_times, pids),
+        )
+        try:
+            worker_pid = pool.apply_async(
+                tuner._run_with_start_tracking, (0, os.getpid, ())
+            ).get(timeout=60)
+            self.assertEqual(pids[0], worker_pid)
+            self.assertGreater(start_times[0], 0)
+        finally:
+            pool.terminate()
+            pool.join()
 
 
 class TestWorkerErrorRatio(unittest.TestCase):
