@@ -363,8 +363,7 @@ def compile_fp8_gemm_8w(
         f"flydsl_{_layout_tag}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
         f"{waves_per_eu}x{xcd_swizzle}_k{K}"
     )
-    # Only when the swizzle is on: at 0 the round-robin below is never emitted,
-    # so the count cannot change the kernel and does not belong in the name.
+    # The XCD count affects generated code only when swizzling is enabled.
     if xcd_swizzle > 0 and num_xcds != 8:
         _kname += f"_nxcd{num_xcds}"
 

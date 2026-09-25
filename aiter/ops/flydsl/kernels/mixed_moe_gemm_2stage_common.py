@@ -252,8 +252,7 @@ def compile_mixed_moe_gemm1_common(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
-    # Only when the swizzle is on: at 0 the round-robin below is never emitted,
-    # so the count cannot change the kernel and does not belong in the name.
+    # The XCD count affects generated code only when swizzling is enabled.
     if xcd_swizzle > 0 and num_xcds != 8:
         xcd_tag += f"_nxcd{num_xcds}"
     v2out_tag = "_v2out" if v2_output_layout else ""
@@ -3466,8 +3465,7 @@ def compile_mixed_moe_gemm2_common(
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
-    # Only when the swizzle is on: at 0 the round-robin below is never emitted,
-    # so the count cannot change the kernel and does not belong in the name.
+    # The XCD count affects generated code only when swizzling is enabled.
     if xcd_swizzle > 0 and num_xcds != 8:
         xcd_tag += f"_nxcd{num_xcds}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""

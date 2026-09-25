@@ -29,9 +29,8 @@ from .utils import (
     make_b_loader,
 )
 
-# Fallback CU count for the persistent gemm2 grid cap, which keeps a high-expert
-# launch (E896) from over-launching ~max_m_blocks empty CTAs. Used only when the
-# caller names no count and the device cannot be asked.
+# Fallback CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
+# not over-launch ~max_m_blocks empty CTAs.
 DEFAULT_NUM_CU = 256
 
 
@@ -444,18 +443,15 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, num_cu=N
     ``max_m_blocks``. Persistent: cap to ``min(total_work, num_cu)`` CTAs (only when
     padded work > ``num_cu*4``); each CTA loops over its real work-tiles.
 
-    ``num_cu`` defaults to the running device's CU count. The grid is a host-side
-    launch decision, so it is not baked into the kernel and needs no cache key.
+    The CU cap is set at launch and does not affect the kernel cache key.
     """
     total_work = int(max_m_blocks) * (N_OUT // TILE_N)
-    if not persist:
-        return total_work
-    if num_cu is None:
+    if persist and num_cu is None:
         try:
             num_cu = get_cu_num()
         except Exception:  # noqa: BLE001
             num_cu = DEFAULT_NUM_CU
-    if total_work > num_cu * 4:
+    if persist and total_work > num_cu * 4:
         return min(total_work, num_cu)
     return total_work
 
@@ -485,9 +481,8 @@ def compile_gemm2_a16w4_port(
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
     ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
 
-    The launch index is bijectively round-robined across ``num_xcds`` XCDs to balance
-    per-XCD/HBM traffic (gemm2 is HBM-bound); ``xcd_swizzle`` (>0) adds an M-group
-    swizzle for per-XCD L2 locality (group = xcd_swizzle m-blocks).
+    The launch index always round-robins across ``num_xcds`` XCDs.
+    ``xcd_swizzle`` (>0) also groups M blocks for L2 locality.
     """
     assert w_dtype in (
         "fp4",
@@ -533,8 +528,7 @@ def compile_gemm2_a16w4_port(
         _name += f"_bcm{b_cache_mod}"
     if xcd_swizzle > 0:
         _name += f"_xcd{xcd_swizzle}"
-    # The round-robin below runs whatever xcd_swizzle is, so the count belongs in
-    # the cache key even at 0. Omitted at 8 to keep the names already on disk.
+    # Round-robin uses num_xcds even when xcd_swizzle is zero.
     if num_xcds != 8:
         _name += f"_nxcd{num_xcds}"
     if waves_per_eu:
@@ -624,7 +618,7 @@ def compile_gemm2_a16w4_port(
             )
 
         if const_expr(persist):
-            # Persistent CU-limited grid (~num_cu CTAs): each CTA does tile bx_i32 then
+            # Persistent CU-limited grid: each CTA does tile bx_i32 then
             # strides by grid size over [0, bound); _xcd_np maps every visited index, so
             # each tile runs once (same mapping as non-persistent). Loop-top barrier
             # separates the prev tile's epilog LDS from the next tile's A-DMA.

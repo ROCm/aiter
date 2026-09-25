@@ -476,8 +476,7 @@ def compile_gemm1_a16w4_port(
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
-    # Only when the swizzle is on: at 0 the round-robin below is never emitted,
-    # so the count cannot change the kernel and does not belong in the name.
+    # The XCD count affects generated code only when swizzling is enabled.
     if xcd_swizzle > 0 and num_xcds != 8:
         _xcd_tag += f"_nxcd{num_xcds}"
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
