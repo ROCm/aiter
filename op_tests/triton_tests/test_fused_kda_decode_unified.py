@@ -48,6 +48,8 @@ class _SpecKernelSpy:
     def __exit__(self, *exc):
         setattr(self._module, self._name, self._orig)
         return False
+
+
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
@@ -547,9 +549,7 @@ def test_optimized_fused_spec_decode_uses_real_cu_seqlens_with_padded_tokens():
 
     batch, Hloc, num_spec = 1, 2, 7
     inp = _make_inputs(batch, Hloc, num_spec=num_spec, full_spec_sequence=True)
-    inp["num_accepted_tokens"] = torch.tensor(
-        [4], dtype=torch.int32, device=DEVICE
-    )
+    inp["num_accepted_tokens"] = torch.tensor([4], dtype=torch.int32, device=DEVICE)
     ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
     ref = _ref_decode(
         inp["mixed_qkv"],
