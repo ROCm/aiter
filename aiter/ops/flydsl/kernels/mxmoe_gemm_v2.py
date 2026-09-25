@@ -36,8 +36,6 @@ from .mxfp4_gemm_common import (
 )
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
-STORE_CACHE_MODIFIER = 2
-
 _FP8_E8M0_SHIFT = 7
 
 _G2_EPI_LANES = 32
@@ -256,6 +254,7 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
+    g2_prefetch_ids=False,
     reduce_store_cache_modifier=None,
     resolved_input_rows=(),
     output_n_base=0,
@@ -636,7 +635,32 @@ def gemm2_body_v2(
             **kw,
         )
 
+    def load_epilog_ids():
+        EPI_LANES = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
+        EPI_ROWS = 256 // EPI_LANES
+        M_REPS = BM // EPI_ROWS
+        m_lane = fx.Int32(gpu.thread_id("x")) // EPI_LANES
+        stids = flat_buffer_view(
+            arg_stids, None, T.i32, align=4, elem_bytes=4, fold=False
+        )
+        load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
+        packed = []
+        for mr in range_constexpr(M_REPS):
+            sorted_pos = m_row + mr * EPI_ROWS + m_lane
+            frag = fx.make_rmem_tensor(1, Int32)
+            fx.copy(load_i32, stids[None, sorted_pos], frag)
+            packed.append(Vec(frag.load())[0])
+        return packed
+
     g2_interleave = const_expr(g2_kstatic and g2_bf16_lds and output_width is None)
+    g2_prefetch_ids = const_expr(
+        g2_prefetch_ids
+        and g2_interleave
+        and use_reduce
+        and route_out_fp8
+        and bool(g2_defer_weight)
+    )
+    prefetched_ids = None
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
@@ -710,6 +734,9 @@ def gemm2_body_v2(
                 rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                 gpu.barrier()
             rocdl.sched_barrier(0)
+            if const_expr(g2_prefetch_ids and kt == KT - 1):
+                prefetched_ids = load_epilog_ids()
+                rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
             mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt, interleave=_il)
             rocdl.s_setprio(0)
@@ -829,7 +856,7 @@ def gemm2_body_v2(
     if const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
-        _epilog(None, lds_ready=True)
+        _epilog(None, lds_ready=True, prefetched_ids=prefetched_ids)
     else:
         _epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)]
@@ -866,6 +893,7 @@ def atomic_bf16_epilog(
     emit_thunks=None,
     lds_ready=False,
     enable_bias=False,
+    prefetched_ids=None,
     output_n_base=0,
     output_width=None,
     reduce_store_cache_modifier=None,
@@ -921,7 +949,7 @@ def atomic_bf16_epilog(
         bias_f32 = flat_buffer(arg_bias, T.f32, 4)
     out_bf16 = flat_buffer(arg_out, T.bf16, 4)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
-    out_i8 = flat_buffer(arg_out, T.i8, 4)
+    out_i8_ptr = global_typed_ptr(arg_out, T.i8, align=1)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
@@ -933,8 +961,6 @@ def atomic_bf16_epilog(
         if reduce_store_cache_modifier is not None
         else None
     )
-    store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
-    store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(STORE_CACHE_MODIFIER), Int8)
 
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
@@ -952,11 +978,12 @@ def atomic_bf16_epilog(
     defer_w = bool(g2_defer_weight)
 
     # Prefetch sorted_token_ids / sorted_weights (invariant); latency overlaps stores+barriers.
-    packed = []
+    packed = [] if const_expr(prefetched_ids is None) else prefetched_ids
     weight = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + mr * EPI_ROWS + m_lane
-        packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
+        if const_expr(prefetched_ids is None):
+            packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
         if const_expr(not defer_w):
             weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
 
@@ -1140,22 +1167,17 @@ def atomic_bf16_epilog(
 
                 def emit_stores(output_col, words, e8m0, rg=rg):
                     row_val_off = row_base_addr + fx.Int64(output_col)
-                    packed_frag = fx.make_rmem_tensor(1, Int32)
                     for d in range_constexpr(len(words)):
-                        packed_frag.store(Vec(words[d]).bitcast(Int32))
-                        fx.copy(
-                            store_i32,
-                            packed_frag,
-                            out_i8[None, row_val_off + fx.Int64(4 * d)],
+                        fx.ptr_store(
+                            Vec(words[d]).bitcast(Int8),
+                            out_i8_ptr + (row_val_off + fx.Int64(4 * d)),
                         )
                     scale_off = (
                         row_base_addr
                         + fx.Int64(output_width)
                         + fx.Int64(_udiv(output_col, fx.Int32(g2_scale_blk)))
                     )
-                    scale_frag = fx.make_rmem_tensor(1, Int8)
-                    scale_frag.store(Vec.from_elements([e8m0.to(Int8)], Int8))
-                    fx.copy(store_i8, scale_frag, out_i8[None, scale_off])
+                    fx.ptr_store(e8m0.to(Int8), out_i8_ptr + scale_off)
 
                 @flyc.jit
                 def store_route_group_if_valid(col_lane8):
@@ -1199,18 +1221,8 @@ def atomic_bf16_epilog(
                 fx.copy(reduce_bf16x8, out_frag, out_bf16[None, out_off])
         else:
             for s in range_constexpr(BN // store_group_n):
-                # adjacent ee=0,1 contiguous -> one 2-wide load.
-                idx0 = row_in_block * BN + col_start + s * store_group_n
                 if const_expr(g2_bf16_lds):
-                    pk = Vec(
-                        lds_vec_load(
-                            lds_acc_base,
-                            idx0 * 2,
-                            Vec.make_type(store_vec, BFloat16),
-                            BFloat16,
-                            align=4,
-                        )
-                    )
+                    pk = lds_pre[mr][s]
                     if const_expr(enable_bias):
                         bias_col = n_block_idx * BN + col_start + s * store_group_n
                         bias0 = load_bias(bias_col)
@@ -1226,15 +1238,7 @@ def atomic_bf16_epilog(
                             Float32,
                         ).to(BFloat16)
                 else:
-                    v2 = Vec(
-                        lds_vec_load(
-                            lds_acc_base,
-                            idx0 * 4,
-                            Vec.make_type(store_vec, Float32),
-                            Float32,
-                            align=8,
-                        )
-                    )
+                    v2 = lds_pre[mr][s]
                     v0 = fx.Float32(v2[0])
                     v1 = fx.Float32(v2[1])
                     if const_expr(enable_bias):
@@ -1254,6 +1258,43 @@ def atomic_bf16_epilog(
                     fx.ptr_store(pk, out_bf16_ptr + out_off)
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
+
+    def lds_pk_load(mr, s):
+        # adjacent ee=0,1 contiguous -> one 2-wide load.
+        idx0 = (fx.Int32(mr * EPI_ROWS) + m_lane) * BN + col_start + s * store_group_n
+        if const_expr(g2_bf16_lds):
+            return Vec(
+                lds_vec_load(
+                    lds_acc_base,
+                    idx0 * 2,
+                    Vec.make_type(store_vec, BFloat16),
+                    BFloat16,
+                    align=4,
+                )
+            )
+        return Vec(
+            lds_vec_load(
+                lds_acc_base,
+                idx0 * 4,
+                Vec.make_type(store_vec, Float32),
+                Float32,
+                align=8,
+            )
+        )
+
+    # Read every row group's C from LDS before the per-row validity branches, so
+    # the LDS latency overlaps instead of serializing read -> wait -> store per row.
+    lds_pre = None
+    if const_expr(
+        not (use_reduce and route_out_fp8) and reduce_store_cache_modifier is None
+    ):
+        lds_pre = [
+            [lds_pk_load(mr, s) for s in range_constexpr(BN // store_group_n)]
+            for mr in range_constexpr(M_REPS)
+        ]
+
+    if const_expr(prefetched_ids is not None or (use_reduce and route_out_fp8)):
+        rocdl.s_waitcnt(vmcnt=0)
 
     for mr in range_constexpr(M_REPS):
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)

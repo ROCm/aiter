@@ -611,6 +611,11 @@ def test_triton_unified_attn(
             softcap=soft_cap,
             use_qq_bias=False,
             use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+            block_size=block_size,
+            k_width=16 // kv_dtype.itemsize,
         ),
         backend,
     )

@@ -15,6 +15,17 @@ relevant rule — reviewers may not know these conventions yet.
   dedicated PR. A new kernel's own PR still carries its wrapper, unit test and
   benchmark (see *Tests and benchmarks*); those belong to the kernel and are
   not separate concerns.
+- **One kernel backend per PR.** Flag a PR whose changed files belong to more
+  than one backend -- Triton/Gluon (`aiter/ops/triton/`, `aiter/aot/triton/`;
+  Triton and Gluon are one backend, so a PR mixing the two is fine), HIP
+  (`csrc/`), ASM (`hsa/`, `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS
+  (`aiter/ops/opus/`), FlyDSL (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`) --
+  and list the files of the other backend, so the author knows what to move.
+  Ask for one PR per backend. When the parts depend on each other, suggest
+  stacked pull requests (the second PR based on the first one's branch and
+  targeting it instead of `main`) rather than one combined PR. Tests and
+  benchmarks belong to the backend they exercise; wrappers outside those
+  paths, docs and CI files do not count as a backend.
 - Keep PRs small and easy to review: one concern each, as granular as the
   change allows. Flag a PR that solves two or three independent problems at
   once — a bug fix plus a refactor, a new op plus a cleanup, retuning plus an
