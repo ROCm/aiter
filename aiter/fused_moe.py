@@ -1767,6 +1767,9 @@ def use_nt(token, topk, e):
     return (token * topk // e) < 64
 
 
+_SUPPORTED_SPLIT_K = (2,)
+
+
 @functools.lru_cache(maxsize=2048)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
@@ -1787,9 +1790,8 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
         return 0
     tilek = 256
     split_max = (cu_num + tg_num - 1) // tg_num
-    # at least split = 2
-    for i in reversed(range(2, split_max + 1)):
-        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
+    for i in _SUPPORTED_SPLIT_K:
+        if i <= split_max and (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
             return i
     return 0
 
