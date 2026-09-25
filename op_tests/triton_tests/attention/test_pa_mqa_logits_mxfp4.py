@@ -13,8 +13,8 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     mfma_nonk_dim,
     offset_dtype,
     paged_mxfp4_mqa_logits,
+    preshuffle_cache,
 )
-from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import preshuffle_cache
 
 SCALE_GROUP = 32
 SEED = 0
