@@ -2790,6 +2790,15 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     const int64_t batch_id = blockIdx.x;
     const IdxT row_len     = static_cast<IdxT>(len);
 
+    auto clear_wide_histogram = [&]() {
+        static_assert(num_buckets == BlockSize * 4);
+        using Vec4 = __attribute__((__ext_vector_type__(4))) IdxT;
+        Vec4 const zero = {0, 0, 0, 0};
+        // A blocked 16-byte store covers all 4096 bins with one LDS
+        // instruction per thread instead of four strided dword stores.
+        reinterpret_cast<Vec4*>(histogram)[threadIdx.x] = zero;
+    };
+
     if(threadIdx.x == 0)
     {
         counter.k              = k;
@@ -2818,10 +2827,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     // the LDS-tail specialization instead of calling
     // filter_and_histogram_for_one_block(): that helper also declares the
     // compaction staging arrays, even though pass 0 cannot use them.
-    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-    {
-        histogram[i] = 0;
-    }
+    clear_wide_histogram();
     if(threadIdx.x == 0)
     {
         counter.filter_cnt = 0;
@@ -2941,10 +2947,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
 
     // Pass 1: build the middle-12 histogram, immediately emit high-prefix
     // winners, and retain only the crossing high-prefix bucket in LDS.
-    for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-    {
-        histogram[i] = 0;
-    }
+    clear_wide_histogram();
     if(threadIdx.x == 0)
     {
         candidate_count    = 0;
@@ -3046,10 +3049,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         __syncthreads();
 
         IdxT const pass2_k = counter.k;
-        for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-        {
-            histogram[i] = 0;
-        }
+        clear_wide_histogram();
         if(threadIdx.x == 0)
         {
             counter.filter_cnt = 0;
