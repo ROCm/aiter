@@ -755,9 +755,9 @@ def mla_decode_fwd(
             and page_size == 1
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and nhead in (16, 32, 64, 128)
-            and (nhead == 16 or max_seqlen_q == 1)
-            and cp_world_size == 1
+            and nhead in (16, 32, 64, 96, 128)
+            and (nhead in (16, 96) or max_seqlen_q == 1)
+            and (cp_world_size == 1 or g_kv_indptr is not None)
             and not intra_batch_mode
             and q_scale is not None
             and kv_scale is not None
@@ -918,7 +918,37 @@ def mla_decode_fwd(
             and (opus_is_fp8 or opus_is_bf16)
         )
 
-        if use_flydsl_ps1:
+        # Head counts with code objects exported from the FlyDSL PS1 kernel
+        # (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
+        # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT.
+        use_ps1_asm = (
+            use_flydsl_ps1
+            and nhead == 96
+            and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "1") == "1"
+        )
+        if use_ps1_asm:
+            aiter.mla_ps1_fp8_asm_fwd(
+                logits.view(-1, nhead, v_head_dim),
+                attn_lse.view(-1, nhead),
+                o,
+                final_lse,
+                q,
+                kv_buffer,
+                kv_indices,
+                work_indptr,
+                work_info_set,
+                sm_scale,
+                q_scale,
+                kv_scale,
+                max_seqlen_q,
+                causal,
+                qo_indptr,
+                kv_indptr,
+                g_kv_indptr,
+                cp_world_size,
+                cp_rank,
+            )
+        elif use_flydsl_ps1:
             from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
 
             flydsl_mla_pagesize1_fp8_fp8(
@@ -936,6 +966,11 @@ def mla_decode_fwd(
                 final_lse=final_lse,
                 max_seqlen_q=max_seqlen_q,
                 causal=causal,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
         elif use_opus and opus_is_fp8:
             aiter.opus_mla_decode_fp8_fwd(
