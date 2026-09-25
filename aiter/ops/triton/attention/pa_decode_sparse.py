@@ -1119,9 +1119,7 @@ def _pa_decode_sparse_v4_2buff(
     # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
     if block_h is None:
         if H >= 128:
-            # [experimental]
-            # block_h = 128
-            block_h = 16
+            block_h = 128
         elif H >= 64:
             if T >= 2048:
                 block_h = 64

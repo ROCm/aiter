@@ -1821,6 +1821,12 @@ def _pa_decode_sparse_v4_2buff(
         extra_slot_base = kv_indices_ptr
 
     k_offs_mma = gl.arange(0, BLOCK_K, layout=valid_col_mma)
+    # Carry a per-tile mask ONLY when a tile can be partial mid-sequence: with
+    # a second stream (the main stream's tail lands inside the tile sequence)
+    # or with invalid slots. Otherwise the last tile is the only partial one
+    # and the epilogue checks it, which keeps two BLOCK_K vectors from living
+    # across the loop -- see the note on the epilogue's valid_col.
+    MASK_TILE: gl.constexpr = HAS_INVALID or HAS_EXTRA
 
     rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=kv_rope_ptr,
@@ -1992,7 +1998,8 @@ def _pa_decode_sparse_v4_2buff(
         )
         scores = (scores + gl.convert_layout(scores_r, QK_WMMA_LAYOUT)) * qk_scale
 
-        scores = scores + gl.where(cur_valid, 0.0, float("-inf"))[None, :]
+        if MASK_TILE:
+            scores = scores + gl.where(cur_valid, 0.0, float("-inf"))[None, :]
 
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
@@ -2027,7 +2034,8 @@ def _pa_decode_sparse_v4_2buff(
 
         m_i = m_new
         l_i = l_new
-        cur_valid = next_valid
+        if MASK_TILE:
+            cur_valid = next_valid
 
     # ---- Epilogue: final (possibly partial) tile ----
     if CTAS_H > 1:
@@ -2035,9 +2043,15 @@ def _pa_decode_sparse_v4_2buff(
     gl.amd.gfx1250.tdm.async_wait(0)
     if CTAS_H > 1:
         gl.amd.gfx1250.cluster.wait()
-    # cur_valid already carries this tile's range check as well as its slot
-    # validity -- see _v4_2buff_tile -- so there is nothing left to intersect.
-    valid_col = cur_valid
+    # Under MASK_TILE, cur_valid already carries this tile's range check as
+    # well as its slot validity (see _v4_2buff_tile) and there is nothing left
+    # to intersect. Without it no mask was carried at all, so the epilogue does
+    # its own range check -- the last tile being the only partial one. Keeping
+    # cur_valid live across the loop instead costs 720 B of scratch and ~4x.
+    if MASK_TILE:
+        valid_col = cur_valid
+    else:
+        valid_col = (tile_end - 1) * BLOCK_K + k_offs_mma < kv_len
 
     final_idx = (num_iters - 1) % NUM_BUFFERS
     if Q_TDM:
