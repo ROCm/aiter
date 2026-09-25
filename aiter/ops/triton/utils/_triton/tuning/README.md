@@ -1,96 +1,166 @@
-# Triton GEMM tuning scripts
+# Triton and Gluon GEMM tuning scripts
 
-Run every command from this directory.
+Tunes any GEMM that has a case in `gemm_cases.py`, on any arch and either
+backend. Run every command from this directory, on the GPU you are tuning for.
 
 | File | What it does |
 | --- | --- |
-| `sweep_configs.py` | Profiles every candidate config for one `M N K` on one GPU and logs the runtimes to `screen-<harness>-<M>-<N>-<K>.log` |
-| `write_best_configs.py` | Picks the fastest config per `M` from those logs and writes `<arch>-<config name>-N=<N>-K=<K>.json` |
-| `verify_configs.py` | Profiles a harness with the configs installed in the config tree and prints the kernel name and runtime |
-| `parse_kernel_trace.py` | Reduces a `rocprofv3 --kernel-trace` CSV to the median kernel runtime per config; called by the scripts above |
-| `harness_<op>.py` | Runs `<op>` with each config given on its command line, or with the installed configs if none are given; the scripts above run it under `rocprofv3` |
-| `harness_template.py` | Starting point for a new harness |
-| `_utils.py` | Helpers shared by the harnesses and scripts |
+| `sweep_configs.py` | Profiles every candidate config for one GEMM at one shape and logs each runtime |
+| `write_best_configs.py` | Picks the fastest config per `M` from those logs and writes the config file |
+| `verify_configs.py` | Profiles a GEMM with the config the library resolves and shows which file it came from |
+| `gemm_cases.py` | One function per GEMM: builds the inputs and returns a callable that runs the op |
+| `_worker.py` | The process the scripts run under `rocprofv3` |
+| `parse_kernel_trace.py` | Reduces a `rocprofv3 --kernel-trace` CSV to median kernel runtimes |
+| `_utils.py` | Helpers shared by the three scripts |
 
-Profiling a single config: a harness takes `M N K` followed by the ten config values, in the order of `config_parms_key` in `_utils.py`:
+## How it works
 
-    rocprofv3 --kernel-trace -f csv -o res -- python3 harness_gemm_afp4wfp4.py 4 2112 7168 8 32 1024 1 2 1 1 16 0 7
-    python3 parse_kernel_trace.py res_kernel_trace.csv -k gemm
+The scripts never pass `config=` to a wrapper. They run the op the way
+production does and answer its own `get_gemm_config()` lookup with the
+candidate config instead of the JSON. That lookup also tells them everything
+else:
 
-**Running the sweep**
+- **what to tune**: the keys of the family's `DEFAULT.json` for this arch and
+  backend. Standard Triton keys (`BLOCK_SIZE_*`, `GROUP_SIZE_M`, `num_warps`,
+  `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`, `cache_modifier`,
+  `NUM_KSPLIT`) get the usual ranges, bounded by the shape; any other key
+  (Gluon tiles, buffer counts, kernel variants, ...) gets the values the
+  family's files for that backend already use, on any arch. `kpack` is only
+  tuned on gfx942 and dropped elsewhere (`configs/CLAUDE.md`). The config the
+  library resolves today runs as a candidate too, so a winner has to beat it.
+- **where the result goes**: the config family, the backend the wrapper
+  picked, the arch, and the exact file suffix the lookup tried
+  (`-N=..-K=..`, `-B=..-N=..-K=..`, or a fused op's custom suffix). The K in
+  AFP4WFP4 file names comes out as the logical K for free, because it is the K
+  the wrapper passes.
+- **which M buckets to write**: the M bounds that lookup searches (the
+  caller's `bounds=`, else the file's `M_BOUNDS`, else the standard bounds).
 
-Example 1: Tuning for A16W16 GEMM using default BLOCK_SIZE ranges using GPU 0, see sweep_configs.py for the default ranges
+Each candidate's output is compared with the output of the config the library
+resolves (relative L2 error above 5% disqualifies it), so a config that is fast
+because it is wrong never wins. A config that fails to compile, trips an
+assert, or produces a wrong result is logged and skipped; one that runs out of
+resources rules out every other config with the same tile sizes. If the
+profiled process crashes or hangs, only the config it was running is lost and
+the rest run again in a new process.
 
-    python3 sweep_configs.py \
-        64 8192 3584 0 \
-        harness_gemm_a16w16.py \
-        > example1.out
+## Sweeping
 
-Example 2: Background tuning for A8W8 GEMM blockscale using specific `BLOCK_SIZE_K` ranges using GPU 0 ~ 6, because A8W8 blockscale gemm requires only `BLOCK_SIZE_K=128`
+    python3 sweep_configs.py <op> <M> <DIM>=<int> ... [--gpu G] [--backend triton|gluon]
+
+`<op>` is a case name from `gemm_cases.py` (the wrapper's name), and the dims
+are the case's parameters after `M`. Results go to
+`sweeps/<op>/<arch>-<backend>/<dims>/M=<M>.jsonl`.
+
+Example 1: A16W16 GEMM with the default ranges on GPU 0
+
+    python3 sweep_configs.py gemm_a16w16 64 N=8192 K=3584 --gpu 0 > example1.out
+
+Example 2: A8W8 blockscale GEMM in the background, one M per GPU (the case
+already limits `BLOCK_SIZE_K` to the 128-wide scale blocks)
 
     N=2112
     K=7168
     for M_G in "8 0" "16 1" "32 2" "64 3" "128 4" "256 5" "8192 6"; do
         set -- $M_G
-        M=$1
-        G=$2
-        nohup python3 sweep_configs.py \
-            $M $N $K $G \
-            harness_gemm_a8w8_blockscale.py \
-            --block-size-k-range 128 \
-            > example2-M=$M-N=$N-K=$K-G=$G.out &
+        nohup python3 sweep_configs.py gemm_a8w8_blockscale $1 N=$N K=$K \
+            --gpu $2 > example2-M=$1-N=$N-K=$K.out &
     done
 
-Example 3: Background tuning for AFP4WFP4 GEMM. In this case `BLOCK_SIZE_M` has to meet the following requirements: `1) BLOCK_SIZE_M < 32 for M < 32, 2) BLOCK_SIZE_M >= 32 for M >= 32`. `BLOCK_SIZE_K` has to meet the following requirements: `BLOCK_SIZE_K >= 256`. If we still use the default settings, GEMM will give assertion errors, sweep_configs.py will skip those cases first time it hits assert errors and skip all other cases that shares the same BLOCK_SIZE. See the generated *.log files and terminal output (example3.out) for more details. It will take a few minutes for sweep_configs.py to skip through those failed configs, so if you want to save those few minutes, you have to set dedicated `--block-size-m-range` for each `M` to skip invalid `BLOCK_SIZE_M`. This example also enables verbose printout that shows the pre-pruned cases and the error messages that triggers exclusions of cases on-the-fly.
+Example 3: AFP4WFP4 preshuffle GEMM with the values tried for one key
+replaced, printing every skipped config and why
 
-    N=7168
-    K=2048
-    G=0
-    python3 sweep_configs.py \
-        64 $N $K $G \
-        harness_gemm_afp4wfp4_preshuffle.py \
-        --block-size-k-range 256 512 1024 \
-        --overwrite \
-        --verbose \
-        > example3.out
+    python3 sweep_configs.py gemm_afp4wfp4_preshuffle 64 N=7168 K=2048 \
+        --space BLOCK_SIZE_K=256,512,1024 --overwrite --verbose > example3.out
 
-**Writing the JSON config files**
+`--space KEY=V1,V2,...` replaces the values tried for a key (values are read
+as JSON: `null`, `true`, numbers; anything else is a string). Pinning every
+key to one value times just that config against the current one.
 
-`write_best_configs.py` prints the fastest config found for each `M` and names the JSON files after the config family the harness tunes, listed in `HARNESS_CONFIG_NAMES` at the top of the script (`--json-prefix` overrides it).
+Backends: a case that takes `backend` can be tuned on either one with
+`--backend`; without it the wrapper picks, as in production (for example
+gluon on gfx1250 for `gemm_a16w16`). The Gluon kernels on gfx950 are opt-in:
 
-Example 1:
+    python3 sweep_configs.py gemm_a8w8 16 N=1024 K=1024 --backend gluon
 
-    python3 write_best_configs.py harness_gemm_a16w16.py --n-list 8192 --k-list 3584
+Batched GEMMs take the batch as a dim:
 
-Example 2:
+    python3 sweep_configs.py batched_gemm_bf16 32 N=1024 K=4096 B=16
 
-    N=2112
-    K=7168
-    python3 write_best_configs.py harness_gemm_a8w8_blockscale.py --n-list $N --k-list $K
+## Writing the config file
 
-Example 3:
+    python3 write_best_configs.py <op> <DIM>=<int> ... [--install]
 
-    N=7168
-    K=2048
-    python3 write_best_configs.py harness_gemm_afp4wfp4_preshuffle.py --n-list $N --k-list $K
+Collects every `M` swept for that op and shape and writes one file, named and
+placed exactly where `get_gemm_config()` looks for it. Each tuned `M` goes in
+the smallest bucket that covers it and the largest tuned `M` becomes `"any"`
+(`--no-any` keeps it as a bucket). Tune at the bucket bounds.
 
-**Verifying the configs**
+    python3 write_best_configs.py gemm_a8w8_blockscale N=2112 K=7168
 
-To verify that your tuned JSON config files actually are performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into the config tree. Every family lives in one nested layout, `configs/<arch>/<backend>/<op>/<d_type>/` (`<path_to_aiter_root>/aiter/ops/triton/configs/CLAUDE.md` is the authoritative rulebook). Files there carry **no arch prefix** — the arch is the directory — and the default file is named exactly `DEFAULT.json`, so drop the arch prefix when copying:
+writes `tuned_configs/<arch>/<backend>/gemm/gemm_a8w8_blockscale/GEMM-A8W8_BLOCKSCALE-N=2112-K=7168.json`,
+mirroring the config tree; `--install` writes it into
+`aiter/ops/triton/configs/` directly. When logs from more than one arch or
+backend exist for the shape, pick one with `--arch` / `--backend`.
 
-    cp gfx950-GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json \
-        <path_to_aiter_root>/aiter/ops/triton/configs/gfx950/triton/gemm/gemm_afp4wfp4_preshuffled/GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json
+The family's `DEFAULT.json` has to exist for the arch and backend before
+anything resolves (`configs/CLAUDE.md`, section 6); the sweep stops and says so
+when it is missing.
 
-`<d_type>` is the config name lowercased with dashes folded to underscores (`GEMM-AFP4WFP4_PRESHUFFLED` → `gemm_afp4wfp4_preshuffled`), and `<backend>` is `triton` unless you tuned the gluon kernel — the two backends read separate directories and never fall back to each other.
+## Verifying
 
-Two gotchas: a family's `DEFAULT.json` must be in place before any specialized file resolves, and config reads are cached per path (including missing files), so restart the Python process after copying for the new files to be picked up.
+    python3 verify_configs.py gemm_a8w8_blockscale 32 N=2112 K=7168
 
-then, you can run, for example,
+prints the family and backend the op looked up, the file its config came from
+(the tuned file for the shape, or `DEFAULT.json`), the config, and the
+kernels' median runtime. Each run is a fresh process, so it sees files you
+just installed.
 
-    python3 verify_configs.py 32 2112 7168 harness_gemm_a8w8_blockscale_preshuffle.py
+## Adding a GEMM
 
-and check the kernel name (with config suffix) and runtime to see if both kernel name and runtime match those inside the JSON config files. If the kernel name and runtime do not match, it could be that your JSON file name is wrong. You have to go to the file where the kernel resides and check the `_get_config` function to check the `config_name` arguments.
+Every public GEMM wrapper needs a case in `gemm_cases.py`; that is all the
+tuning scripts need to tune it on every arch and backend it supports. A case is
+named after the wrapper, takes `M` plus the wrapper's other dims, and returns a
+callable that runs the op once:
 
-**Adding a harness**
+```python
+@gemm_case()
+def gemm_a8w8(M, N, K, backend=None):
+    import torch
 
-Copy `harness_template.py` to `harness_<op>.py`, fill in its three blocks, and add the harness to `HARNESS_CONFIG_NAMES` in `write_best_configs.py` with the `config_name` that the kernel's `_get_config` passes to `get_gemm_config`.
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as op
+    from aiter.ops.triton.utils.types import get_fp8_dtypes
+    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
+        generate_gemm_a8w8_inputs,
+    )
+
+    _, e4m3_type = get_fp8_dtypes()
+    dtype = torch.bfloat16
+    x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
+        M, N, K, in_dtype=e4m3_type, out_dtype=dtype, layout="TN", output=True
+    )
+    return lambda: op(x, w, x_scale, w_scale, None, dtype, y, **_backend(backend))
+```
+
+- Build inputs with the unit test's generator, and call the wrapper exactly as
+  a user would: no `config=`. Return the op's result, which the output check
+  compares.
+- Take `backend=None` and pass `**_backend(backend)` when the wrapper has a
+  `backend` argument.
+- Zero accumulated outputs inside the callable for atomic kernels.
+- `@gemm_case(space={"BLOCK_SIZE_K": [128]})` limits a key to the values the
+  kernel accepts, when others would only fail.
+- `@gemm_case(kernels=("_ff_",))` names the kernels to time when their names do
+  not contain `gemm`.
+
+And keep the family's config files honest:
+
+- `DEFAULT.json` for each arch and backend lists exactly the keys the kernel
+  reads: the sweep tunes those keys and writes nothing else.
+- The wrapper must look its config up through `get_gemm_config()` when no
+  `config` is passed (thin `_get_config()`, as `aiter/ops/triton/README.md`
+  asks). An op that never does, or that looks up more than one config per call
+  (a composite op), cannot be tuned this way; tune the ops it is built from.
+
+MOE GEMMs use dispatch tables instead of `get_gemm_config()` and are not
+covered by these scripts.

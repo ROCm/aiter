@@ -2,3 +2,5 @@
 *.log
 *.json
 .rocprofv3/
+sweeps/
+tuned_configs/

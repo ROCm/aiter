@@ -87,7 +87,7 @@ their tuned configs can be imported by a framework that is not PyTorch
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
   on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
-  harnesses, not importable library code.
+  scripts, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not
   require torch.
@@ -396,6 +396,21 @@ All weight/scale pre-shuffle helpers are unified in
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from
   `aiter.ops.triton.utils.shuffle`.
+- A GEMM also ships a tuning case. The tuner
+  (`aiter/ops/triton/utils/_triton/tuning/`) runs each GEMM through a case in
+  `gemm_cases.py` and answers the wrapper's own `get_gemm_config()` lookup with
+  every candidate, sweeping the keys of the family's `DEFAULT.json` for the
+  arch and backend being tuned. Flag:
+  - A new public GEMM wrapper under `gemm/` with no case in `gemm_cases.py`,
+    or a case not named after the wrapper.
+  - A case that passes `config=` to the wrapper (the tuner can only override
+    the lookup), or that drops the wrapper's `backend` argument when the
+    wrapper has one (that backend becomes untunable).
+  - A GEMM family whose `DEFAULT.json` keys differ from the config keys the
+    kernel reads: a key the kernel ignores gets swept for nothing, and a key
+    missing from `DEFAULT.json` is never tuned and never written.
+  - A new backend or arch path in a GEMM wrapper that resolves its config
+    without `get_gemm_config()`: that path cannot be tuned.
 
 ## Keeping this file and the README current
 

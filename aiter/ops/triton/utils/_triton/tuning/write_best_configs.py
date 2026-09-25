@@ -1,186 +1,155 @@
+"""Write the fastest config per M from sweep logs into a GEMM config file.
+
+    python3 write_best_configs.py <op> <DIM>=<int>... [--arch A] [--backend B]
+                                  [--install]
+
+Reads sweeps/<op>/<arch>-<backend>/<dims>/M=*.jsonl. Name and directory are
+the ones get_gemm_config() looks up for the shape, taken from the lookup the
+sweep recorded: the config family, the N/K (or B/N/K, or custom) suffix, the
+arch and the backend. Each tuned M goes in the smallest of the lookup's M
+bounds that covers it, and the largest tuned M becomes "any". Without
+--install the file lands under tuned_configs/, mirroring the config tree; with
+--install, in aiter/ops/triton/configs/ itself.
+"""
+
 import argparse
-import os
+import json
 import sys
+from pathlib import Path
 
 from _utils import (
-    config_parms_key,
-    read_screen_file,
+    CONFIGS_ROOT,
+    SWEEPS_DIR,
+    TUNED_DIR,
+    get_case,
+    parse_dims,
+    read_jsonl,
+    shape_tag,
+    tuned_filename,
 )
-
-from aiter.ops.triton.utils._triton import arch_info
-
-DEVICE_ARCH = arch_info.get_arch()
-
-# Config family each harness tunes: the config_name its kernel passes to
-# get_gemm_config(). Case and dashes vary between families, so the name cannot
-# be derived from the harness filename. Add an entry when adding a harness.
-HARNESS_CONFIG_NAMES = {
-    "harness_batched_gemm_bf16.py": "BATCHED_GEMM-A16W16",
-    "harness_gemm_a16w16.py": "GEMM-A16W16",
-    "harness_gemm_a16w16_atomic.py": "GEMM-A16W16-ATOMIC",
-    "harness_gemm_a16w16_gated.py": "GEMM-A16W16-gated",
-    "harness_gemm_a16w8_blockscale.py": "GEMM-A16W8_BLOCKSCALE",
-    "harness_gemm_a16w8_blockscale_preshuffle.py": "GEMM-A16W8_BLOCKSCALE_PRESHUFFLED",
-    "harness_gemm_a16wfp4.py": "GEMM-A16WFP4",
-    "harness_gemm_a8w8.py": "GEMM-A8W8",
-    "harness_gemm_a8w8_blockscale.py": "GEMM-A8W8_BLOCKSCALE",
-    "harness_gemm_a8w8_blockscale_preshuffle.py": "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED",
-    "harness_gemm_a8w8_per_token_scale.py": "GEMM-A8W8_PER_TOKEN_SCALE",
-    "harness_gemm_a8wfp4.py": "GEMM-A8WFP4",
-    "harness_gemm_afp4wfp4.py": "GEMM-AFP4WFP4",
-    # gemm_afp4wfp4_pre_quant is gemm_a16wfp4 with atomic_add=True.
-    "harness_gemm_afp4wfp4_pre_quant_atomic.py": "GEMM-A16WFP4",
-    "harness_gemm_afp4wfp4_preshuffle.py": "GEMM-AFP4WFP4_PRESHUFFLED",
-    "harness_gemm_afp8wfp8_preshuffle.py": "GEMM-AFP8WFP8_PRESHUFFLED",
-}
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("op", help="tuning case from gemm_cases.py, e.g. gemm_a8w8")
     parser.add_argument(
-        "--n-list", nargs="+", type=int, help="List of N dim", default=[]
+        "dims",
+        nargs="+",
+        metavar="DIM=INT",
+        help="the op's dims besides M: N=7168 K=2048",
+    )
+    parser.add_argument("--arch", help="use the logs swept on this arch, e.g. gfx950")
+    parser.add_argument(
+        "--backend", choices=("triton", "gluon"), help="use the logs of this backend"
     )
     parser.add_argument(
-        "--k-list", nargs="+", type=int, help="List of K dim", default=[]
+        "--no-any",
+        action="store_true",
+        help='keep the largest M as M_LEQ_<bound> instead of making it "any"',
     )
     parser.add_argument(
-        "--json-prefix",
-        type=str,
-        help="JSON filename prefix (default: <arch>-<config name of the harness>)",
-        default=None,
+        "--install",
+        action="store_true",
+        help="write into aiter/ops/triton/configs/ instead of tuned_configs/",
     )
-    parser.add_argument(
-        "--last-m-any",
-        action="store_false",
-        help='Set configs with largest M to "any"',
-        default=True,
-    )
-    parser.add_argument(
-        "--max-m",
-        type=int,
-        help="Maximum M to search for screen*.log files",
-        default=131072,
-    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    return args
+
+def find_logs(op, dims, arch, backend):
+    tag = shape_tag(op, dims)
+    dirs = [d for d in sorted((SWEEPS_DIR / op).glob(f"*/{tag}")) if d.is_dir()]
+    if arch:
+        dirs = [d for d in dirs if d.parent.name.startswith(f"{arch}-")]
+    if backend:
+        dirs = [d for d in dirs if d.parent.name.endswith(f"-{backend}")]
+    if not dirs:
+        sys.exit(f"no sweep logs match {SWEEPS_DIR / op}/<arch>-<backend>/{tag}")
+    if len(dirs) > 1:
+        found = ", ".join(d.parent.name for d in dirs)
+        sys.exit(f"logs for {found}; pick one with --arch / --backend")
+    return sorted(dirs[0].glob("M=*.jsonl"), key=lambda p: int(p.stem[2:]))
+
+
+def buckets_for(best, bounds, last_any):
+    """Bucket each tuned M's config under the smallest bound that covers it (the
+    larger M wins a shared bucket); the largest M's bucket becomes "any"."""
+    buckets, owner, notes = {}, {}, []
+    top = max(best)
+    for m in sorted(best):
+        bound = next((b for b in bounds if b >= m), None)
+        if bound is None:
+            if not (last_any and m == top):
+                notes.append(f'M={m} is above every M bound; only "any" can cover it')
+            continue
+        key = f"M_LEQ_{bound}"
+        if key in owner:
+            notes.append(f"M={owner[key]} and M={m} both fall in {key}; kept M={m}")
+        buckets[key], owner[key] = best[m], m
+    if last_any:
+        for key, m in owner.items():
+            if m == top:
+                del buckets[key]
+                break
+        buckets["any"] = best[top]
+    return buckets, notes
 
 
 def main():
     args = parse_args()
-    harness_filename = args.F
-    nlist = args.n_list
-    klist = args.k_list
-    config_json_file_prefix = args.json_prefix
-    last_m_any = args.last_m_any
-    max_m = args.max_m
+    dims = parse_dims(args.dims)
+    get_case(args.op, dims, None)
 
-    assert len(nlist) == len(klist), "Number of N and K must be the same"
-    assert len(nlist) > 0, "No N and K dim specified"
-
-    list_of_shapes = [(nlist[i], klist[i]) for i in range(len(nlist))]
-
-    if config_json_file_prefix is None:
-        config_name = HARNESS_CONFIG_NAMES.get(os.path.basename(harness_filename))
-        if config_name is None:
+    first, best, rows = None, {}, []
+    for path in find_logs(args.op, dims, args.arch, args.backend):
+        header, *results = read_jsonl(path)
+        if first is None:
+            first = header
+        elif (header["lookup"], header["arch"]) != (first["lookup"], first["arch"]):
             sys.exit(
-                f"No config name known for {harness_filename}: pass --json-prefix "
-                "or add it to HARNESS_CONFIG_NAMES"
+                f"{path} was swept for a different config lookup than M={first['M']}"
             )
-        config_json_file_prefix = f"{DEVICE_ARCH}-{config_name}"
-    print(f"Writing JSON configs to {config_json_file_prefix}-N=<N>-K=<K>.json")
-
-    for n, k in list_of_shapes:
-        print()
-        print(f"Parsing N={n}, K={k} tuning results generated by {harness_filename}...")
-        m = 1
-        mlist = []
-        m_config_map = {}
-        while m <= max_m:
-            screen_filename = f"screen-{harness_filename}-{m}-{n}-{k}.log"
-            if os.path.isfile(screen_filename):
-                print(f"\tFound {screen_filename}")
-                m_config_map[m] = f"M_LEQ_{m}"
-                mlist.append(m)
-            m *= 2
-        if last_m_any:
-            m_config_map[mlist[-1]] = "any"
-            print(f'Setting last M = {mlist[-1]} config name to "any"')
-            print()
-        print()
-        last_config_name = m_config_map[mlist[-1]]
-
-        if len(mlist) == 0:
+        ran = [r for r in results if "us" in r]
+        if not ran:
+            print(f"M={header['M']}: no config ran; skipped")
             continue
+        winner = min(ran, key=lambda r: r["us"])
+        best[header["M"]] = winner["config"]
+        rows.append(
+            (header["M"], winner["us"], header["baseline_us"], winner["config"])
+        )
+    if not best:
+        sys.exit("no results to write")
 
-        print("M\tN\tK\tTriton (us)\tconfig")
-        last_config_list = None
-        get_at_least_one_config = False
-        with open(f"{config_json_file_prefix}-N={n}-K={k}.json", "w") as fout:
-            fout.write("{\n")
+    lookup, family = first["lookup"], first["family"]
+    name = tuned_filename(lookup)
+    if name is None:
+        sys.exit(f"{args.op} looks up its config without N and K; nothing to name")
+    buckets, notes = buckets_for(best, family["bounds"], not args.no_any)
+    keys = family["keys"]
+    content = {
+        bucket: {key: config[key] for key in keys if key in config}
+        for bucket, config in buckets.items()
+    }
 
-            for m in mlist:
-                case_data = []
-                screen_filename = f"screen-{harness_filename}-{m}-{n}-{k}.log"
-                read_screen_file(screen_filename, case_data)
-                case_data = sorted(case_data, key=lambda x: x[0])
+    tree_dir = Path(family["config_dir"]).relative_to(family["configs_root"])
+    out_dir = (CONFIGS_ROOT if args.install else TUNED_DIR) / tree_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / name
+    existed = out.exists()
+    out.write_text(json.dumps(content, indent=4) + "\n")
 
-                if len(case_data) > 0:
-                    get_at_least_one_config = True
-                    triton_runtime = f"{case_data[0][0]:8.3f}"
-                    config_str = f"(config = {case_data[0][1]})"
-                else:
-                    triton_runtime = "     N/A"
-                    config_str = "Warning: your config files is not complete!"
-
-                print(f"{m}\t{n}\t{k}\t{triton_runtime}\t{config_str}")
-
-                if len(case_data) == 0:
-                    if last_config_list is None:
-                        continue
-                    config_list = last_config_list
-                else:
-                    config_list = case_data[0][1].split()
-                    last_config_list = config_list
-
-                config_name = m_config_map[m]
-
-                fout.write(f"""  "{config_name}": {{\n""")
-                for i_parms_key, parms_key in enumerate(config_parms_key):
-                    parm = config_list[i_parms_key]
-
-                    if parms_key == "cache_modifier":
-                        fout.write(
-                            """    "{}": {}""".format(
-                                parms_key,
-                                """".cg\"""" if parm == "0" else "null",
-                            )
-                        )
-                    else:
-                        fout.write(f"""    "{parms_key}": {parm}""")
-
-                    if i_parms_key != len(config_parms_key) - 1:
-                        fout.write(""",\n""")
-                    else:
-                        fout.write("""\n  }""")
-
-                if config_name == last_config_name:
-                    fout.write("\n")
-                else:
-                    fout.write(",\n")
-
-            fout.write("}\n")
-        if not get_at_least_one_config:
-            os.popen(f"rm {config_json_file_prefix}-N={n}-K={k}.json").read()
-            print("No file is created")
-        else:
-            print(f"{config_json_file_prefix}-N={n}-K={k}.json is created")
-
-    print(
-        "Warning! Please make sure the output JSON filenames are correct for each GEMM"
-    )
+    print("M\tbest (us)\tcurrent (us)\tconfig")
+    for m, us, baseline, config in rows:
+        current = f"{baseline:.3f}" if baseline is not None else "N/A"
+        print(f"{m}\t{us:.3f}\t\t{current}\t\t{config}")
+    for note in notes:
+        print(f"Note: {note}")
+    if "any" not in content:
+        print('Warning: no "any" bucket; M above the last bucket will raise KeyError')
+    print(f"{'Replaced' if existed else 'Wrote'} {out}")
+    if not args.install:
+        print(f"Install it with --install, or copy it into {CONFIGS_ROOT / tree_dir}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

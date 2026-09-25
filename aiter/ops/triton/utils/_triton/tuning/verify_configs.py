@@ -1,81 +1,67 @@
+"""Profile one GEMM with the config the library resolves, as production runs it.
+
+    python3 verify_configs.py <op> <M> <DIM>=<int>... [--gpu G] [--backend B]
+
+Prints the config family and backend the op looked up, the file the config
+came from (the tuned file for the shape, or DEFAULT.json when none matches),
+the config itself, and the kernels' median runtime. Each run is a fresh
+process, so it sees tuned files installed a moment ago.
+"""
+
 import argparse
 import os
-import subprocess
 import sys
+
+from _utils import describe_lookup, get_case, parse_dims, resolve_family, run_worker
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("op", help="tuning case from gemm_cases.py, e.g. gemm_a8w8")
     parser.add_argument("M", type=int, help="M dim")
-    parser.add_argument("N", type=int, help="N dim")
-    parser.add_argument("K", type=int, help="K dim")
-    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
-
-    args = parser.parse_args()
-    return args
+    parser.add_argument(
+        "dims", nargs="+", metavar="DIM=INT", help="the op's other dims: N=7168 K=2048"
+    )
+    parser.add_argument("--gpu", type=int, default=0, help="GPU to run on")
+    parser.add_argument(
+        "--backend",
+        choices=("triton", "gluon"),
+        help="backend to run, for ops that have both (default: the wrapper's pick)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=900, help="seconds for the profiled process"
+    )
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    M = args.M
-    N = args.N
-    K = args.K
-    harness_filename = args.F
+    dims = parse_dims(args.dims)
+    case = get_case(args.op, dims, args.backend)
+    spec = {
+        "op": args.op,
+        "M": args.M,
+        "dims": dims,
+        "backend": args.backend,
+        "candidates": None,
+    }
+    run = run_worker(spec, args.gpu, args.timeout, case.kernels)
+    lookup, family = resolve_family(run, args.op)
 
-    file_tag = f"{harness_filename}-{M}-{N}-{K}"
-    cmd = f"""rocprofv3 --kernel-trace -f csv -o verf_{file_tag} -- python3 {harness_filename} {M} {N} {K}"""
-    cmd = cmd.split(" ")
-
-    rocprof_filename = f"verf_{file_tag}_kernel_trace.csv"
-
-    if os.path.isfile(rocprof_filename):
-        process = subprocess.Popen(
-            ["rm", rocprof_filename],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        process.communicate()
-
-    env = os.environ.copy()
-    process = subprocess.Popen(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    stdout_data, stderr_data = process.communicate()
-
-    if process.returncode == 0:
-        if os.path.isfile(rocprof_filename):
-            cmd_parse = f"python3 parse_kernel_trace.py {rocprof_filename} -k gemm"
-            cmd_parse = cmd_parse.split(" ")
-            process = subprocess.Popen(
-                cmd_parse, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            stdout_data, stderr_data = process.communicate()
-            if process.returncode == 0:
-                prof_output = stdout_data.split("\n")
-                if prof_output[-1].strip() == "":
-                    prof_output.pop()
-
-                prof_output_i = 0
-                assert prof_output[prof_output_i] == "Kernel detected:"
-                prof_output_i += 1
-                while (
-                    prof_output_i < len(prof_output)
-                    and prof_output[prof_output_i] != "Kernel detected:"
-                ):
-                    print(prof_output[prof_output_i], flush=True)
-                    prof_output_i += 1
-            else:
-                for stderr_str in stderr_data:
-                    print(f"\t{stderr_str}")
-        else:
-            print(f"[Error]: {rocprof_filename} not found")
-    else:
-        stderr_data = stderr_data.split("\n")
-        print("[Error]: when running rocprof, error message:")
-        for stderr_str in stderr_data:
-            print(f"\t{stderr_str}")
+    tuned_file = family["tuned_file"]
+    source = tuned_file or os.path.join(family["config_dir"], "DEFAULT.json")
+    note = "tuned for this shape" if tuned_file else "no tuned file for this shape"
+    print(f"{args.op} M={args.M} on {family['arch']}: {describe_lookup(lookup)}")
+    print(f"File:    {os.path.relpath(source, family['configs_root'])} ({note})")
+    print(f"Config:  {run.record.get('config')}")
+    if run.record["error"] is not None:
+        sys.exit(f"Failed:  {run.record['error']}")
+    if run.segments and len(run.segments) > 1:
+        kernels, runtime = run.segments[1]
+        print(f"Kernels: {', '.join(kernels) or '(none matched)'}")
+        if runtime is not None:
+            print(f"Runtime: {runtime:.3f} (us)")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
