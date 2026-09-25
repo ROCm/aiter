@@ -50,7 +50,16 @@ def paged_attention_decode(
 ) -> None:
     """
     Paged attention decode with automatic V1/V2 dispatch and quantization support.
-    V1 for short sequences (<=8192), V2 with sequence partitioning for longer sequences.
+
+    V1/V2 selection: for scalar-scale bf16/fp16 KV caches, an arch-specific
+    PA-DECODE config (configs/<arch>/triton/attention/pa_decode/DEFAULT.json)
+    may define a rule: V1 only when the context fits in at most
+    ``v1_max_partitions`` partitions of ``_SEQ_PARTITION_SIZE`` tokens, V2
+    otherwise (on gfx950: V2 whenever the context spans more than one
+    partition). Without a rule (other arches, other KV dtypes, per-token
+    quantization) the fallback heuristic applies: V1 when max_seq_len <= 8192
+    and either there is one partition or num_seqs * num_q_heads > 512, V2
+    otherwise.
 
     Args:
         output (torch.Tensor): Pre-allocated output with shape (num_seqs, num_q_heads, head_dim).
