@@ -307,6 +307,10 @@ def _build_down_norm_pipe(
             load_b(stage, stage)
             load_a(stage, stage)
             rocdl.asyncmark()
+        # NOTE (api-stability): rocdl.sched_barrier / rocdl.s_barrier used in this
+        # mainloop are UNSTABLE FlyDSL APIs (not in fx.rocdl.__all__). Intentional:
+        # they order the async global->LDS DMAs against the MFMA in the software
+        # pipeline and have no stable wrapper. Revisit if a stable primitive appears.
         rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles - (stages - 1)
@@ -608,6 +612,10 @@ def _build_down_norm_partial_pipe(
             load_b(k_base + stage, stage)
             load_a(k_base + stage, stage)
             rocdl.asyncmark()
+        # NOTE (api-stability): rocdl.sched_barrier / rocdl.s_barrier used in this
+        # mainloop are UNSTABLE FlyDSL APIs (not in fx.rocdl.__all__). Intentional:
+        # they order the async global->LDS DMAs against the MFMA in the software
+        # pipeline and have no stable wrapper. Revisit if a stable primitive appears.
         rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles_local - (stages - 1)
@@ -1008,7 +1016,11 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float):
         for sh in range_constexpr(log2_wave):
             sq = sq + fx.gpu.shuffle_xor(sq, WAVE // (2 << sh), WAVE)
         rstd = fmath.rsqrt(sq * fx.Float32(inv_hs) + fx.Float32(eps))
-        # All lanes hold the reduced rstd; the redundant same-value writes agree.
+        # All lanes hold the same reduced rstd, so all 64 write the same value to the
+        # same address -- harmless (hardware coalesces the identical writes). A lane-0
+        # `if tid == 0:` guard was tried and reverted: a conditional store here needs
+        # a local @flyc.jit dispatch (frontend side-effect-branch rule) -- not worth
+        # it for one tiny [M, hc] f32 write.
         rrms_g.store(tok * hc_count + stream, rstd, vec_size=1)
 
     @flyc.jit

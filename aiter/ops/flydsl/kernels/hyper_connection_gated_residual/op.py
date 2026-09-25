@@ -75,7 +75,15 @@ def fold_norm_weight(
 
 
 def _resolve_merged(w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w):
-    """Merged (optionally (1+w)-folded) down weight; caller-supplied wins as-is."""
+    """Merged down weight; a caller-supplied ``w_down_merged`` is used as-is.
+
+    CONTRACT: when ``fold_w=True`` the merged weight MUST already have ``(1+w)``
+    folded in -- K1's down and the skinny decode both skip the affine and assume it
+    is baked into the weight. A caller passing ``fold_w=True`` with a *non-folded*
+    ``w_down_merged`` gets silently wrong output (the fold state cannot be detected
+    from the tensor). Build it with :func:`fold_norm_weight`, or pass
+    ``w_down_merged=None`` and let this fold it.
+    """
     if w_down_merged is not None:
         return w_down_merged  # caller owns the fold state (see fold_norm_weight)
     merged = merge_gr_two_stage_weight(w_down, w_inject, hc_count)
