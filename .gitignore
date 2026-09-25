@@ -25,6 +25,8 @@ aiter/install_mode
 *.so.*
 *.dylib
 *.dll
+!aiter/MK1/module_persistent_decoder.so
+!aiter/MK1/MK1_persistent_decoder_*.so
 build
 blob
 

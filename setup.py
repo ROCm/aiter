@@ -178,11 +178,11 @@ def prepare_packaging():
 
 
 if is_develop_mode():
-    packages = ["aiter"]
+    packages = ["aiter", "aiter.MK1"]
     write_install_mode()
 else:
     prepare_packaging()
-    packages = ["aiter_meta", "aiter"]
+    packages = ["aiter_meta", "aiter", "aiter.MK1"]
 
 
 def _is_metadata_only():
@@ -466,7 +466,7 @@ class ForcePlatlibDistribution(Distribution):
 
 
 if AITER_TRITON_ONLY:
-    install_requires = ["einops", "packaging", "psutil"]
+    install_requires = ["einops", "packaging", "psutil", "safetensors"]
 else:
     install_requires = [
         "pybind11>=3.0.1",
@@ -475,6 +475,7 @@ else:
         "einops",
         "psutil",
         "packaging",
+        "safetensors",
         FLYDSL_VERSION,
     ]
 
