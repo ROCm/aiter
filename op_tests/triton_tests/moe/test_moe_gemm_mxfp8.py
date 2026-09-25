@@ -107,3 +107,39 @@ def test_moe_gemm_mxfp8_empty_tokens():
     group_sizes = torch.zeros(E, dtype=torch.int32, device="cuda")
     out = moe_gemm_mxfp8(lhs, rhs, x_scale, w_scale, group_sizes, quant_block_size=qbs)
     assert out.shape == (0, N)
+
+
+@pytest.mark.parametrize("E, N, K", [(4, 256, 512), (2, 128, 1024)])
+def test_moe_gemm_mxfp8_matches_per_operand_scaling(E, N, K):
+    """Scaling the accumulator must equal scaling the operands.
+
+    With one E8M0 scale per operand per K-step the scale is constant across
+    each dot, so the kernel folds it into the accumulator and keeps the matmul
+    inputs in FP8. This asserts that identity against an fp32 reference that
+    scales the operands instead, using distinct non-uniform scales on both
+    sides so a transposed or wrongly broadcast scale cannot pass.
+    """
+    qbs = 32
+    lhs, rhs, x_scale, w_scale, group_sizes = _make_mxfp8_inputs(E, N, K, qbs)
+
+    # Vary both scale tensors along every axis; a uniform scale would hide a
+    # broadcast bug, and an M-major-only pattern would hide an axis swap.
+    m_total, k_blocks = x_scale.shape
+    rows = torch.arange(m_total, device="cuda")[:, None] % 5
+    cols = torch.arange(k_blocks, device="cuda")[None, :] % 3
+    x_scale = (_E8M0_BIAS + rows - cols).to(torch.uint8)
+
+    n_idx = torch.arange(N, device="cuda")[:, None] % 7
+    k_idx = torch.arange(k_blocks, device="cuda")[None, :] % 2
+    w_plane = (_E8M0_BIAS + n_idx - k_idx).to(torch.uint8)
+    w_scale = w_plane.expand(E, N, k_blocks).contiguous()
+
+    out = moe_gemm_mxfp8(lhs, rhs, x_scale, w_scale, group_sizes, quant_block_size=qbs)
+    ref = _mxfp8_reference(lhs, rhs, x_scale, w_scale, group_sizes, qbs, torch.bfloat16)
+
+    scale = ref.abs().max().clamp_min(1e-4)
+    err = (out.float() - ref.float()).abs().max()
+    assert err <= 0.2 * scale, (
+        f"accumulator-scaled result differs from operand-scaled reference: "
+        f"max err {err:.4f} > 0.2 * {scale:.4f}"
+    )

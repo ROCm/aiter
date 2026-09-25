@@ -371,25 +371,26 @@ def _moe_gemm_a8w8(
         if USE_FNUZ:
             # fnuz path (gfx942): manual E8M0→fp32, then tl.dot.
             # x_scales: [BLOCK_M, MX_SCALE_BLOCK_K], w_scales: [BLOCK_N, MX_SCALE_BLOCK_K]
-            a_f32 = x.to(tl.float32)
-            b_f32 = w.to(tl.float32)
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            # broadcast each block-scale across its MX_PACK_DIVISOR elements.
-            # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] → a_sc_full: [BLOCK_M, BLOCK_K]
-            # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K], w layout is [K, N] so we need
-            # b_sc_full transposed: [BLOCK_K, BLOCK_N]
             if MX_SCALE_BLOCK_K == 1:
-                # One scale per operand per K-step, so it is constant across
-                # the dot: scaling the result is equivalent to scaling the
-                # operands, and the MFMA stays FP8 instead of being promoted
-                # to FP32.
+                # One scale per operand per K-step, so it is constant across the
+                # dot: scaling the result is equivalent to scaling the operands,
+                # and the MFMA stays FP8 instead of being promoted to FP32.
+                # tl.sum over the length-1 scale axis is how the value is read;
+                # a_sc[:, 0] is rejected as an unsupported tensor index.
                 acc += (
                     tl.dot(x, w, input_precision="ieee")
                     * tl.sum(a_sc, axis=1)[:, None]
                     * tl.sum(b_sc, axis=1)[None, :]
                 )
             else:
+                # Broadcast each block-scale across its MX_PACK_DIVISOR elements.
+                # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] -> [BLOCK_M, BLOCK_K]
+                # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K]; w is [K, N], so b_sc_full
+                # is transposed to [BLOCK_K, BLOCK_N].
+                a_f32 = x.to(tl.float32)
+                b_f32 = w.to(tl.float32)
                 a_sc_full = tl.reshape(
                     tl.broadcast_to(
                         a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
@@ -451,17 +452,18 @@ def _moe_gemm_a8w8(
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
         if USE_FNUZ:
-            a_f32 = x.to(tl.float32)
-            b_f32 = w.to(tl.float32)
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             if MX_SCALE_BLOCK_K == 1:
+                # Same accumulator-side scaling as the EVEN_K branch above.
                 acc += (
                     tl.dot(x, w, input_precision="ieee")
                     * tl.sum(a_sc, axis=1)[:, None]
                     * tl.sum(b_sc, axis=1)[None, :]
                 )
             else:
+                a_f32 = x.to(tl.float32)
+                b_f32 = w.to(tl.float32)
                 a_sc_full = tl.reshape(
                     tl.broadcast_to(
                         a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
