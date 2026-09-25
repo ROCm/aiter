@@ -22,13 +22,15 @@ import torch
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     IDEAL_PAGE_SIZE,
-    pack_cache,
     paged_mxfp4_mqa_logits,
     plan_block_m,
-    preshuffle_cache,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import run_perftest
+from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import (
+    pack_cache,
+    preshuffle_cache,
+)
 
 SCALE_GROUP = 32
 

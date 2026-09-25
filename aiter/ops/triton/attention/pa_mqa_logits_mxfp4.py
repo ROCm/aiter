@@ -73,124 +73,6 @@ def cache_format(num_heads: int, head_size: int, page_size: int) -> dict:
     return {"n_per_tile": npt, "d_per_tile": K_WIDTH, "block_kv": bkv}
 
 
-def preshuffle_values(
-    x: torch.Tensor, n_per_tile: int, d_per_tile: int = K_WIDTH
-) -> torch.Tensor:
-    """[P, page, D//2] uint8 into dot-operand order, within each page."""
-    p, rows, d = x.shape
-    return (
-        x.reshape(p, rows // n_per_tile, n_per_tile, d // d_per_tile, d_per_tile)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .reshape(p, rows, d)
-    )
-
-
-def unshuffle_values(
-    x: torch.Tensor, n_per_tile: int, d_per_tile: int = K_WIDTH
-) -> torch.Tensor:
-    p, rows, d = x.shape
-    return (
-        x.reshape(p, rows // n_per_tile, d // d_per_tile, n_per_tile, d_per_tile)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .reshape(p, rows, d)
-    )
-
-
-def preshuffle_scales(
-    x: torch.Tensor, n_per_tile: int, scale_mode: int = SCALE_MODE_WIDE
-) -> torch.Tensor:
-    """[P, page, D//32] e8m0 into the order the scale load reads.
-
-    Mode 1, the default, groups one MFMA tile and puts the lane's run over the
-    scale axis innermost -- both from num_heads and head_size, so the order
-    carries no BLOCK_KV and no warp count -- and a whole tile is then one wide
-    run. Mode 0 puts the token axis innermost instead, which costs the dense
-    reader a byte-wide load per group and buys nothing; it exists so a candidate
-    gather can be priced against a storage order that is not the shipping one.
-
-    Both orders keep a token's scales at a constant stride inside a group, so
-    both are addressable by a gather finer than the group.
-    """
-    # Anything not 0 falls through to mode 1 here while the kernel reads
-    # anything not 1 as mode 0, so an out-of-range mode silently disagrees.
-    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
-    WARP_SIZE = 64
-    p, rows, ns = x.shape
-    if scale_mode == 0:
-        return (
-            x.reshape(p, rows // n_per_tile, n_per_tile, ns)
-            .permute(0, 1, 3, 2)
-            .contiguous()
-            .reshape(p, rows, ns)
-        )
-    s_lo = WARP_SIZE // n_per_tile
-    s_hi = ns // s_lo
-    return (
-        x.reshape(p, rows // n_per_tile, n_per_tile, s_hi, s_lo)
-        .permute(0, 1, 4, 2, 3)
-        .contiguous()
-        .reshape(p, rows, ns)
-    )
-
-
-def unshuffle_scales(
-    x: torch.Tensor, n_per_tile: int, scale_mode: int = SCALE_MODE_WIDE
-) -> torch.Tensor:
-    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
-    WARP_SIZE = 64
-    p, rows, ns = x.shape
-    if scale_mode == 0:
-        return (
-            x.reshape(p, rows // n_per_tile, ns, n_per_tile)
-            .permute(0, 1, 3, 2)
-            .contiguous()
-            .reshape(p, rows, ns)
-        )
-    s_lo = WARP_SIZE // n_per_tile
-    s_hi = ns // s_lo
-    return (
-        x.reshape(p, rows // n_per_tile, s_lo, n_per_tile, s_hi)
-        .permute(0, 1, 3, 4, 2)
-        .contiguous()
-        .reshape(p, rows, ns)
-    )
-
-
-def preshuffle_cache(
-    values: torch.Tensor,
-    scales: torch.Tensor,
-    num_heads: int,
-    head_size: int,
-    scale_mode: int = SCALE_MODE_WIDE,
-):
-    """Natural order into the stored order. A cache-prep kernel should emit
-    these bytes directly; this is the reference for what that means."""
-    f = cache_format(num_heads, head_size, values.shape[1])
-    return (
-        preshuffle_values(values, f["n_per_tile"], f["d_per_tile"]),
-        preshuffle_scales(scales, f["n_per_tile"], scale_mode),
-    )
-
-
-def pack_cache(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """([P, page, D//2], [P, page, D//32]) -> [P, page, 1, D//2 + D//32].
-
-    Values then scales, as the fp8 cache does. Each region is separately
-    contiguous, which gives the kernel two constexpr page strides.
-    """
-    num_pages, page_size, head_bytes = values.shape
-    num_scales = scales.shape[2]
-    idim = head_bytes + num_scales
-    out = torch.empty(
-        num_pages, page_size * idim, dtype=torch.uint8, device=values.device
-    )
-    out[:, : page_size * head_bytes] = values.reshape(num_pages, -1)
-    out[:, page_size * head_bytes :] = scales.reshape(num_pages, -1)
-    return out.view(num_pages, page_size, 1, idim)
-
-
 def _split_cache(kv_cache: torch.Tensor, head_size: int):
     """(values, scales, page_size, page stride in bytes).
 
@@ -361,6 +243,36 @@ def select_config(
     )
 
 
+def cache_strides(kv_cache, head_size, kv_scale_cache=None):
+    """(page_size, value page stride, scale page stride), in bytes.
+
+    Packed, both regions step by the whole page, not page_size * head_bytes;
+    getting that wrong silently addresses the wrong page.
+    """
+    if kv_scale_cache is None:
+        _, _, page_size, page_stride = _split_cache(kv_cache, head_size)
+        return page_size, page_stride, page_stride
+    page_size = kv_cache[0].numel() // (head_size // 2)
+    return page_size, kv_cache.stride(0), kv_scale_cache.stride(0)
+
+
+def offset_dtype(num_pages, kv_stride, kvs_stride, s_unit):
+    """int32 while both resolved streams still reach the cache. Values are
+    stored in K_WIDTH units and scales in s_unit, so the scales bind first."""
+    fits = (
+        num_pages * kv_stride <= 2**31 * K_WIDTH
+        and num_pages * kvs_stride <= 2**31 * s_unit
+    )
+    return torch.int32 if fits else torch.int64
+
+
+def gather_s_unit(block, num_scales):
+    """The scale list's unit in e8m0 bytes. Two when every resolved offset is
+    even, so the kernel's * U hands the 2-byte alignment back to the vectorizer.
+    The kernel derives the same U; the two must agree."""
+    return 2 if (block % 2 == 0 and num_scales % 2 == 0) else 1
+
+
 def build_candidate_gather(
     candidates,
     ends,
@@ -380,16 +292,10 @@ def build_candidate_gather(
     block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row
     offsets:     resolved-offset width; None picks it from the cache's span
 
-    Does what build_gather does from positions, plus the sort and the slot
-    count, so a layer group builds the pool once and hands it to every
-    consumer.
+    The sort, the slot count and the resolve in one launch, so a layer group
+    can build the pool once and hand it to every consumer. The tests'
+    build_gather is the reference for the resolve.
     """
-    from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import (
-        cache_strides,
-        gather_s_unit,
-        offset_dtype,
-    )
-
     rows, k = candidates.shape
     assert k & (k - 1) == 0, "the sort needs a power-of-two candidate count"
     # One program per row, so the warps are what fills the machine when the
@@ -614,7 +520,7 @@ def paged_mxfp4_mqa_logits(
     clean_logits:   bool. If True, positions row i does not attend to read as
                     -inf, in either output. If False they are unspecified
     preshuffle:     bool. The cache is stored in dot-operand order (see
-                    preshuffle_cache), which reads it straight into the matrix core.
+                    cache_format), which reads it straight into the matrix core.
                     If False it is read token-major and staged through LDS
     dynamic:        bool. Build the work schedule on the device, for a batch whose
                     sequences differ in length

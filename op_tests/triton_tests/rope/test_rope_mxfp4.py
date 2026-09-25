@@ -6,11 +6,13 @@ import torch
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     cache_format,
     paged_mxfp4_mqa_logits,
-    unshuffle_scales,
-    unshuffle_values,
 )
 from aiter.ops.triton.fusions.k_norm_rope_mxfp4_cache import k_norm_rope_mxfp4_cache
 from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
+from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import (
+    unshuffle_scales,
+    unshuffle_values,
+)
 
 HEAD_SIZE, ROPE_DIM, SCALE_GROUP = 128, 64, 32
 _MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
