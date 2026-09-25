@@ -99,8 +99,26 @@ def launch_pa_decode_ps_reduce(
     context_partition_num: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ) -> None:
+    """Reduce PS partitions into ``output``.
+
+    ``query_start_loc`` selects a packed per-token output viewed as
+    ``[1, num_tokens, num_kv_heads, group, head]`` (see
+    ``compile_pa_decode_ps_reduce``).
+    """
     use_work_plan = reduce_info is not None
+    use_query_start_loc = query_start_loc is not None
+    if use_query_start_loc:
+        if use_work_plan:
+            raise ImportError(
+                "FlyDSL pa_decode reduce does not support query_start_loc with "
+                "a work plan"
+            )
+        assert query_start_loc.dtype == torch.int32
+        batch_size = query_start_loc.shape[0] - 1
+    else:
+        batch_size = output.shape[0]
     partition_limit = (
         torch.cuda.get_device_properties(output.device).multi_processor_count
         if use_work_plan
@@ -148,6 +166,7 @@ def launch_pa_decode_ps_reduce(
         query_group_size=query_group_size,
         bounded_plan_logits=bounded_plan_logits,
         vectorize_plan_logits=vectorize_plan_logits,
+        use_query_start_loc=use_query_start_loc,
     )
     sink_ptr = (
         ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
@@ -174,11 +193,16 @@ def launch_pa_decode_ps_reduce(
         stride_logits_group,
         query_seq_len,
         query_group_size,
-        output.shape[0],
+        batch_size,
         output.shape[2],
         (
             ptr_arg(reduce_info, fx.Int32)
             if reduce_info is not None
+            else flyc.from_c_void_p(fx.Int32, 0)
+        ),
+        (
+            ptr_arg(query_start_loc, fx.Int32)
+            if use_query_start_loc
             else flyc.from_c_void_p(fx.Int32, 0)
         ),
         stream,

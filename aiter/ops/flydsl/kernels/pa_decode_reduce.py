@@ -85,6 +85,7 @@ def compile_pa_decode_ps_reduce(
     query_group_size: int | None = None,
     bounded_plan_logits: bool = False,
     vectorize_plan_logits: bool = False,
+    use_query_start_loc: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -98,6 +99,9 @@ def compile_pa_decode_ps_reduce(
     ``vectorize_plan_logits`` also requires D128 bf16/f16 logits, a four-byte
     aligned base and even head/part/group strides. Output stores retain
     scalar alignment.
+    ``use_query_start_loc`` writes a packed per-token output: sequence ``b``
+    owns rows ``[query_start_loc[b], query_start_loc[b + 1])`` and rows past
+    its query length are not stored. ``stride_output_bs`` is then unused.
     """
     _validate_pa_decode_ps_reduce_config(
         max_context_partition_num=max_context_partition_num,
@@ -119,6 +123,8 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(
             "vectorize_plan_logits requires bounded planned D=128 bf16/f16 logits"
         )
+    if use_query_start_loc and use_work_plan:
+        raise ValueError("use_query_start_loc is not supported with a work plan")
     static_query_group_size = query_group_size
     planned_elements_per_thread = 2 if vectorize_plan_logits else 1
 
@@ -182,6 +188,7 @@ def compile_pa_decode_ps_reduce(
         stride_logits_group: fx.Int32,
         query_group_size: fx.Int32,
         reduce_info_ptr: fx.Pointer,
+        query_start_loc_ptr: fx.Pointer,
     ):
         tid = fx.thread_idx.x
         worker = fx.thread_idx.y
@@ -216,6 +223,12 @@ def compile_pa_decode_ps_reduce(
         else:
             stats_seq_offset = batch_idx * stride_exp_sums_seq
             logits_seq_offset = batch_idx * stride_logits_seq
+        if fx.const_expr(use_query_start_loc):
+            query_start_loc = fx.recast_iter(fx.Int32, query_start_loc_ptr)
+            query_row_base = fx.Int32(query_start_loc[batch_idx])
+            sequence_query_len = (
+                fx.Int32(query_start_loc[batch_idx + 1]) - query_row_base
+            )
         if fx.const_expr(bounded_plan_logits):
             # Rebase in i64 before narrowing: packed storage can exceed 2 GiB.
             logits_item_bytes = logits_dtype.width // 8
@@ -788,11 +801,23 @@ def compile_pa_decode_ps_reduce(
             query_idx = udiv_const(eqgs_idx, static_query_group_size)
         else:
             query_idx = eqgs_idx // c_qgs
+        # Rows past the query length belong to the next packed sequence and
+        # must not be stored.
+        if fx.const_expr(use_query_start_loc):
+            output_row_offset = (query_row_base + query_idx) * stride_output_len
+            row_valid = query_idx < sequence_query_len
+        else:
+            output_row_offset = (
+                batch_idx * stride_output_bs + query_idx * stride_output_len
+            )
         if fx.const_expr(use_parallel_lds):
-            if partition_group == zero_i:
+            if fx.const_expr(use_query_start_loc):
+                store_output = (partition_group == zero_i) & row_valid
+            else:
+                store_output = partition_group == zero_i
+            if store_output:
                 output_offset = (
-                    batch_idx * stride_output_bs
-                    + query_idx * stride_output_len
+                    output_row_offset
                     + kv_head_idx * stride_output_kv_head
                     + group_idx * stride_output_group_size
                     + output_element
@@ -800,13 +825,15 @@ def compile_pa_decode_ps_reduce(
                 output[output_offset] = acc.to(output_dtype)
         else:
             output_offset = (
-                batch_idx * stride_output_bs
-                + query_idx * stride_output_len
+                output_row_offset
                 + kv_head_idx * stride_output_kv_head
                 + group_idx * stride_output_group_size
                 + tid * fx.Int32(planned_elements_per_thread)
             )
-            if fx.const_expr(vectorize_plan_logits):
+            if fx.const_expr(use_query_start_loc):
+                if row_valid:
+                    output[output_offset] = acc.to(output_dtype)
+            elif fx.const_expr(vectorize_plan_logits):
                 # Do not require a four-byte-aligned output pointer/row base.
                 output[output_offset] = acc[0].to(output_dtype)
                 output[output_offset + fx.Int32(1)] = acc[1].to(output_dtype)
@@ -836,6 +863,7 @@ def compile_pa_decode_ps_reduce(
         batch_size: fx.Int32,
         num_kv_heads: fx.Int32,
         reduce_info: fx.Pointer,
+        query_start_loc: fx.Pointer,
         stream: fx.Stream,
     ):
         pa_decode_ps_reduce_kernel(
@@ -857,6 +885,7 @@ def compile_pa_decode_ps_reduce(
             stride_logits_group,
             query_group_size,
             reduce_info,
+            query_start_loc,
         ).launch(
             grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
             block=tuple(block_shape),

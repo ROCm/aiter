@@ -184,6 +184,7 @@ template <typename output_t,
           typename logits_t,
           typename sink_t,
           bool USE_SINKS,
+          bool IS_VARLEN,
           int HEAD_SIZE,
           int QUERY_GROUP_SIZE,
           int CONTEXT_PARTITION_NUM>
@@ -203,7 +204,8 @@ __global__ __launch_bounds__(HEAD_SIZE) void pa_decode_ps_reduce_hip_kernel(
     const int stride_logits_seq,
     const int stride_logits_head,
     const int stride_logits_part,
-    const int stride_logits_group)
+    const int stride_logits_group,
+    const int* __restrict__ query_start_loc_ptr)
 {
     static_assert(HEAD_SIZE > 0 && HEAD_SIZE <= 1024,
                   "pa_decode_ps_reduce_hip_kernel requires 0 < HEAD_SIZE <= 1024");
@@ -219,6 +221,20 @@ __global__ __launch_bounds__(HEAD_SIZE) void pa_decode_ps_reduce_hip_kernel(
     const int query_idx  = eqgs_idx / QUERY_GROUP_SIZE;
     const int group_idx  = eqgs_idx - query_idx * QUERY_GROUP_SIZE;
     const int lane       = tid & (kPaPsReduceWarpSize - 1);
+
+    // With query_start_loc the output is packed [num_tokens, ...]: rows past a
+    // sequence's query length belong to the next sequence. The exit depends on
+    // blockIdx only, so the whole block leaves together.
+    int output_row_offset = batch_idx * stride_output_bs + query_idx * stride_output_len;
+    if constexpr(IS_VARLEN)
+    {
+        const int row_base = query_start_loc_ptr[batch_idx];
+        if(query_idx >= query_start_loc_ptr[batch_idx + 1] - row_base)
+        {
+            return;
+        }
+        output_row_offset = (row_base + query_idx) * stride_output_len;
+    }
 
     const auto out_rsrc = pa_ps_make_buffer_rsrc(output_ptr);
     const auto es_rsrc = pa_ps_make_buffer_rsrc(exp_sums_ptr);
@@ -275,9 +291,7 @@ __global__ __launch_bounds__(HEAD_SIZE) void pa_decode_ps_reduce_hip_kernel(
         acc = fmaf(pa_ps_to_float<logits_t>(part_logits), weight, acc);
     }
 
-    const int output_offset = batch_idx * stride_output_bs +
-                              query_idx * stride_output_len +
-                              kv_head_idx * stride_output_kv_head +
+    const int output_offset = output_row_offset + kv_head_idx * stride_output_kv_head +
                               group_idx * stride_output_group_size + tid;
     pa_ps_buffer_store<output_t>(
         out_rsrc, output_offset * static_cast<int>(sizeof(output_t)), pa_ps_from_float<output_t>(acc));
