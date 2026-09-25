@@ -16,7 +16,6 @@ from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import (
 
 HEAD_SIZE, ROPE_DIM, SCALE_GROUP = 128, 64, 32
 _MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-DEV = "cuda"
 
 
 def _e2m1(x):
@@ -58,9 +57,9 @@ def _rope_gptj(x, cos, sin):
     return torch.cat([nope, r.flatten(-2).bfloat16().float()], dim=-1)
 
 
-def _cos_sin(max_pos, gen):
-    angle = torch.rand(max_pos, ROPE_DIM // 2, generator=gen) * 6.28
-    return torch.cat([angle.cos(), angle.sin()], dim=-1).to(DEV)
+def _cos_sin(max_pos):
+    angle = torch.rand(max_pos, ROPE_DIM // 2, device="cuda") * 6.28
+    return torch.cat([angle.cos(), angle.sin()], dim=-1)
 
 
 def _k_reference(k, positions, cos_sin, w, eps, ratio):
@@ -78,7 +77,7 @@ def _paged_pool(num_pages, page_size, pitch_pad, fill):
     """Pages a pitch apart in one allocation, as vLLM keeps a layer's pages."""
     row = HEAD_SIZE // 2 + HEAD_SIZE // SCALE_GROUP
     pitch = page_size * row + pitch_pad
-    pool = torch.full((num_pages * pitch,), fill, dtype=torch.uint8, device=DEV)
+    pool = torch.full((num_pages * pitch,), fill, dtype=torch.uint8, device="cuda")
     return pool, pool.as_strided((num_pages, page_size, row), (pitch, row, 1))
 
 
@@ -105,18 +104,16 @@ def _read_back(cache, page_size, shuffle=None, scale_mode=1):
     return vals, scales
 
 
-def _k_case(num_tokens, page_size, ratio, seed):
-    gen = torch.Generator().manual_seed(seed)
+def _k_case(num_tokens, page_size, ratio):
     num_pages = 2 * num_tokens // page_size + 3
-    slots = torch.randperm(num_pages * page_size, generator=gen)[:num_tokens]
+    slots = torch.randperm(num_pages * page_size, device="cuda")[:num_tokens]
     slots[::7] = -1
-    positions = torch.randint(0, 4096, (num_tokens,), generator=gen)
     return {
-        "k": torch.randn(num_tokens, HEAD_SIZE, generator=gen).bfloat16().to(DEV),
-        "positions": positions.to(DEV),
-        "slots": slots.to(DEV),
-        "w": (1 + 0.1 * torch.randn(HEAD_SIZE, generator=gen)).bfloat16().to(DEV),
-        "cos_sin": _cos_sin(4096, gen),
+        "k": torch.randn(num_tokens, HEAD_SIZE, device="cuda", dtype=torch.bfloat16),
+        "positions": torch.randint(0, 4096, (num_tokens,), device="cuda"),
+        "slots": slots,
+        "w": (1 + 0.1 * torch.randn(HEAD_SIZE, device="cuda")).bfloat16(),
+        "cos_sin": _cos_sin(4096),
         "num_pages": num_pages,
         "ratio": ratio,
     }
@@ -129,7 +126,8 @@ def test_k_cache_layout(num_heads, page_size, ratio):
     """A shuffled store holds exactly the natural store's bytes in the order
     unshuffle_* undoes, in either scale order, and only the tokens that
     publish a key write."""
-    c = _k_case(300, page_size, ratio, seed=num_heads + page_size + ratio)
+    torch.manual_seed(0)
+    c = _k_case(300, page_size, ratio)
     caches = []
     for scale_mode, shuffle in (
         (1, None),
@@ -155,7 +153,7 @@ def test_k_cache_layout(num_heads, page_size, ratio):
 
     vals, scales = caches[0]
     writes = (c["slots"] >= 0) & ((c["positions"] + 1) % ratio == 0)
-    written = torch.zeros(c["num_pages"] * page_size, dtype=torch.bool, device=DEV)
+    written = torch.zeros(c["num_pages"] * page_size, dtype=torch.bool, device="cuda")
     written[c["slots"][writes]] = True
     untouched = ~written.reshape(c["num_pages"], page_size)
     assert (vals[untouched] == 0xAA).all() and (scales[untouched] == 0xAA).all()
@@ -167,7 +165,8 @@ def test_k_cache_matches_reference(ratio, page_size):
     """Values against k_norm -> RoPE -> MXFP4 in torch. Only rounding the two
     implementations order differently may differ: a bf16 ulp in the norm or an
     fp32 log2 at a power-of-two amax. The natural order takes any page size."""
-    c = _k_case(512, page_size, ratio, seed=ratio)
+    torch.manual_seed(0)
+    c = _k_case(512, page_size, ratio)
     _, cache = _paged_pool(c["num_pages"], page_size, 0, fill=0)
     k_norm_rope_mxfp4_cache(
         c["k"], c["positions"], c["cos_sin"], c["w"], 1e-6, cache, c["slots"], ratio
@@ -195,7 +194,8 @@ def test_k_cache_matches_reference(ratio, page_size):
 def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
     """A pattern that does not tile the page's tokens, value bytes or scales
     is refused before anything is written."""
-    c = _k_case(8, 64, 1, seed=0)
+    torch.manual_seed(0)
+    c = _k_case(8, 64, 1)
     _, cache = _paged_pool(c["num_pages"], 64, 0, fill=0xAA)
     with pytest.raises(ValueError, match="does not tile"):
         k_norm_rope_mxfp4_cache(
@@ -216,13 +216,13 @@ def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
     [(64, 20, False), (1000, 64, True), (4200, 64, True)],
 )
 def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
-    gen = torch.Generator().manual_seed(num_heads)
+    torch.manual_seed(0)
     t, h = num_tokens, num_heads
-    q = (torch.randn(t, h + 3, HEAD_SIZE, generator=gen) * 3).bfloat16().to(DEV)
+    q = (torch.randn(t, h + 3, HEAD_SIZE, device="cuda") * 3).bfloat16()
     q = q[:, :h]
-    positions = torch.randint(0, 4096, (t,), generator=gen).to(DEV)
-    cos_sin = _cos_sin(4096, gen)
-    weights = torch.randn(t, h, generator=gen).bfloat16().to(DEV)
+    positions = torch.randint(0, 4096, (t,), device="cuda")
+    cos_sin = _cos_sin(4096)
+    weights = torch.randn(t, h, device="cuda", dtype=torch.bfloat16)
     q_packed, q_scale, w_out = q_rope_mxfp4_quant(
         q, positions, cos_sin, weights if with_weights else None, 0.25 * 0.125
     )
@@ -248,18 +248,18 @@ def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
 def test_round_trip_through_logits(page_size):
     """Keys written by the cache op and a query from the quant op score as the
     dequantized values do: the writer and paged_mxfp4_mqa_logits agree."""
-    gen = torch.Generator().manual_seed(page_size)
+    torch.manual_seed(0)
     batch, next_n, num_heads, ctx = 2, 2, 32, 3 * page_size - 5
     per_seq = -(-ctx // page_size)
     num_pages = batch * per_seq + 2
-    block_table = torch.randperm(num_pages - 1, generator=gen)[: batch * per_seq] + 1
-    block_table = block_table.reshape(batch, per_seq).int().to(DEV)
-    pos = torch.arange(ctx)
-    slots = block_table.cpu()[:, pos // page_size] * page_size + pos % page_size
-    k = torch.randn(batch * ctx, HEAD_SIZE, generator=gen).bfloat16().to(DEV)
-    positions = pos.repeat(batch).to(DEV)
-    cos_sin = _cos_sin(4096, gen)
-    w = torch.ones(HEAD_SIZE, dtype=torch.bfloat16, device=DEV)
+    block_table = torch.randperm(num_pages - 1, device="cuda")[: batch * per_seq] + 1
+    block_table = block_table.reshape(batch, per_seq).int()
+    pos = torch.arange(ctx, device="cuda")
+    slots = block_table[:, pos // page_size] * page_size + pos % page_size
+    k = torch.randn(batch * ctx, HEAD_SIZE, device="cuda", dtype=torch.bfloat16)
+    positions = pos.repeat(batch)
+    cos_sin = _cos_sin(4096)
+    w = torch.ones(HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
     _, cache = _paged_pool(num_pages, page_size, 256, fill=0)
     shuffle = _shuffle(num_heads, page_size)
     k_norm_rope_mxfp4_cache(
@@ -269,19 +269,17 @@ def test_round_trip_through_logits(page_size):
         w,
         1e-6,
         cache,
-        slots.reshape(-1).to(DEV),
+        slots.reshape(-1),
         shuffle=shuffle,
     )
 
-    q = (
-        torch.randn(batch * next_n, num_heads, HEAD_SIZE, generator=gen)
-        .bfloat16()
-        .to(DEV)
+    q = torch.randn(
+        batch * next_n, num_heads, HEAD_SIZE, device="cuda", dtype=torch.bfloat16
     )
-    q_pos = (ctx - next_n + torch.arange(next_n)).repeat(batch).to(DEV)
-    weights = torch.randn(batch * next_n, num_heads, generator=gen).to(DEV)
+    q_pos = (ctx - next_n + torch.arange(next_n, device="cuda")).repeat(batch)
+    weights = torch.randn(batch * next_n, num_heads, device="cuda")
     q_packed, q_scale, w_out = q_rope_mxfp4_quant(q, q_pos, cos_sin, weights)
-    ctx_lens = torch.full((batch,), ctx, dtype=torch.int32, device=DEV)
+    ctx_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
     logits = paged_mxfp4_mqa_logits(
         q_packed.view(batch, next_n, num_heads, -1),
         q_scale.view(batch, next_n, num_heads, -1),
