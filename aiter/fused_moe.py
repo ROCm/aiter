@@ -3874,7 +3874,7 @@ def get_2stage_cfgs(
         # heuristic kernel for that A16W4 combination, so use CK-Tile.
         # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
         # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
-        _min_split_k = 1
+        _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
