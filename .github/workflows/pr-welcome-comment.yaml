@@ -43,7 +43,7 @@ jobs:
             > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\`
 
             **One backend per PR:**
-            A PR changes one kernel backend (\`[Triton/Gluon]\`, \`[HIP]\`, \`[ASM]\`, \`[CK]\`, \`[OPUS]\` or \`[FlyDSL]\`). If the title ends up with two backend tags, split the PR -- as [stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs) when one part cannot merge without the other.
+            A PR changes one kernel backend: \`[Triton/Gluon]\` (Triton and Gluon count as one), \`[HIP]\`, \`[ASM]\`, \`[CK]\`, \`[OPUS]\` or \`[FlyDSL]\`. If the title ends up with two backend tags, split the PR -- as [stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs) when one part cannot merge without the other.
 
             **PR title tags & labels:**
             Component tags (\`[Triton/Gluon]\`, \`[HIP]\`, \`[CK]\`, \`[ASM]\`, ...) are added to the PR title and as PR labels automatically from the changed files and re-synced on every push — change-type tags like \`[fix]\`/\`[Perf]\`, op tags like \`[MLA]\`, and human labels (\`ci:*\`) are left untouched. Add the \`no-auto-title\` label to opt this PR out.`

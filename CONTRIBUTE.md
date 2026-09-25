@@ -403,9 +403,9 @@ Ensure your PR:
 ### One Backend Per PR
 
 A PR changes kernels of one backend only: Triton/Gluon, HIP, ASM, CK, OPUS or
-FlyDSL. Each backend has its own owners, tests and CI jobs, and a PR that mixes
-two waits on both. If the title automation puts two backend tags on your PR,
-split it.
+FlyDSL. Triton and Gluon count as one backend. Each backend has its own owners,
+tests and CI jobs, and a PR that mixes two waits on both. If the title
+automation puts two backend tags on your PR, split it.
 
 Work that spans backends becomes one PR per backend. When one part cannot
 merge without the other -- a kernel in one backend and the dispatch change in
