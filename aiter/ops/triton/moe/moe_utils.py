@@ -87,10 +87,16 @@ def build_block_mapping(
 
 
 def group_sizes_to_expt_tensors(
-    group_sizes: torch.Tensor, block_m: int
+    group_sizes: torch.Tensor, block_m: int, total_tokens: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Convert group_sizes to ExptHist/ExptOffs/ExptData for _moe_gemm_a8w8.
+
     Tokens must be in contiguous expert order (no gather needed).
+
+    Passing ``total_tokens`` makes this CUDA-graph capturable: the block count
+    is then bounded statically instead of read back with ``.item()``, and the
+    padding slots carry ``ExptData = -1``, which the kernel skips. Omitting it
+    keeps the exact block count and the host sync.
     """
     E = group_sizes.shape[0]
     device = group_sizes.device
@@ -104,7 +110,12 @@ def group_sizes_to_expt_tensors(
 
     # Build ExptData = (block_id << 16) | expert_id using tensor ops (no per-expert CPU sync).
     n_blocks_per_expert = (gs + block_m - 1) // block_m  # cdiv without .item()
-    total_blocks = int(n_blocks_per_expert.sum().item())  # single sync at end
+    if total_tokens is None:
+        total_blocks = int(n_blocks_per_expert.sum().item())  # syncs; see docstring
+    else:
+        # Each expert wastes at most one partial block, so this bounds the real
+        # count without a sync. Surplus slots are stamped -1 below.
+        total_blocks = (total_tokens + block_m - 1) // block_m + E
 
     if total_blocks == 0:
         return (
@@ -124,5 +135,7 @@ def group_sizes_to_expt_tensors(
     )
     local_block_id = block_ids - block_cumsum[expert_for_block]
 
-    expt_data = ((local_block_id << 16) | expert_for_block).to(torch.int32)
+    packed = ((local_block_id << 16) | expert_for_block).to(torch.int32)
+    valid = local_block_id < n_blocks_per_expert[expert_for_block]
+    expt_data = torch.where(valid, packed, torch.full_like(packed, -1))
     return expt_hist, expt_offs, expt_offs_sum, expt_data, total_blocks
