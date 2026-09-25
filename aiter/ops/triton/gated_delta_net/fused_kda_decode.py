@@ -108,22 +108,29 @@ def fused_kda_decode(
     stride_beta_tok = beta.stride(1) if beta.dim() == 3 else beta.stride(0)
     stride_og_tok = out_gate.stride(0)
 
-    # The spec-7 kernels are hard-specialized to an 8-token window: the conv
-    # state reserves W - 1 + 7 == 10 positions and ssm_state_indices is 8 wide.
-    spec_len = 8
-    use_parallel_spec7 = (
+    block_v = 16
+    # Tokens per speculative sequence: num_speculative_tokens + 1. H and this
+    # width are not specialized: the parallel kernel indexes heads from
+    # program_id(1) and clamps its token loop to SPEC_LEN.
+    spec_tokens = ssm_state_indices.shape[1] if is_spec_decoding else 0
+    # W == 4 is structural: the recurrence keeps exactly W - 1 = 3 conv history
+    # taps in registers.
+    use_parallel_spec = (
         is_spec_decoding
         and get_arch() == "gfx950"
-        and H == 2
         and K == 128
-        and V == 128
+        and V % block_v == 0
         and W == 4
-        and conv_state.shape[2] == 10
-        and ssm_state_indices.shape[1] == spec_len
-        and T == batch * spec_len
+        and spec_tokens >= 2
+        # The recurrence reads conv history at checkpoint + W - 2 and finalize
+        # writes it at W - 2 + i_t, both with an index up to spec_tokens + 1.
+        and conv_state.shape[2] >= spec_tokens + W - 2
+        # FULL decode graphs may pad the token dimension past the real
+        # batch * spec_tokens tokens. cu_seqlens remains authoritative, and the
+        # kernels bound their work by its per-sequence eos.
+        and T >= batch * spec_tokens
     )
-    if use_parallel_spec7:
-        block_v = 16
+    if use_parallel_spec:
         conv_carry = torch.empty(
             batch,
             3 * H * K,
@@ -153,7 +160,7 @@ def fused_kda_decode(
             V=V,
             W=W,
             BV=block_v,
-            SPEC_LEN=spec_len,
+            SPEC_LEN=spec_tokens,
             stride_x_tok=mixed_qkv.stride(0),
             stride_cw_group=stride_cw_group,
             stride_cw_width=stride_cw_width,
@@ -167,7 +174,7 @@ def fused_kda_decode(
             stride_indices_tok=stride_indices_tok,
             num_warps=2,
         )
-        fused_kda_spec_finalize_kernel[(batch, H, spec_len)](
+        fused_kda_spec_finalize_kernel[(batch, H, spec_tokens)](
             mixed_qkv,
             conv_state,
             conv_carry,
@@ -183,7 +190,7 @@ def fused_kda_decode(
             K=K,
             V=V,
             W=W,
-            SPEC_LEN=spec_len,
+            SPEC_LEN=spec_tokens,
             stride_x_tok=mixed_qkv.stride(0),
             stride_cs_slot=conv_state.stride(0),
             stride_cs_dim=conv_state.stride(1),

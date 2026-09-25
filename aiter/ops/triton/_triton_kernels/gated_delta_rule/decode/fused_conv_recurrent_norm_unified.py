@@ -187,7 +187,8 @@ def _fused_kda_decode_unified_kernel(
             state_idx = tl.load(state_indices_ptr + i_n).to(tl.int64)
             conv_slot = state_idx
 
-        if state_idx < 0:
+        # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID.
+        if state_idx <= 0 or conv_slot <= 0:
             return
 
         p_h_init = (
@@ -359,7 +360,7 @@ def _fused_kda_decode_unified_kernel(
                     + i_n * stride_indices_seq
                     + i_t * stride_indices_tok
                 ).to(tl.int64)
-                if final_idx >= 0:
+                if final_idx > 0:
                     p_h_out = (
                         state_ptr
                         + final_idx * stride_state_slot

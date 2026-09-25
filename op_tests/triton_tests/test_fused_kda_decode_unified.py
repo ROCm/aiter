@@ -17,6 +17,37 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU requi
 
 D = 128
 W = 4
+
+
+class _SpecKernelSpy:
+    """Record grids the parallel spec kernel is launched with.
+
+    Numerical agreement alone cannot tell the two paths apart, since the generic
+    fallback computes the same result. Without this the suite passes while the
+    optimized kernel never runs.
+    """
+
+    def __init__(self, module):
+        self._module = module
+        self._name = "fused_kda_spec_parallel_v_kernel"
+        self.grids = []
+
+    def __enter__(self):
+        self._orig = getattr(self._module, self._name)
+        grids = self.grids
+        orig = self._orig
+
+        class _Launcher:
+            def __getitem__(self, grid):
+                grids.append(grid)
+                return orig[grid]
+
+        setattr(self._module, self._name, _Launcher())
+        return self
+
+    def __exit__(self, *exc):
+        setattr(self._module, self._name, self._orig)
+        return False
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
@@ -234,14 +265,19 @@ def _make_inputs(
     }
     if num_spec > 0:
         inp["state_indices"] = torch.arange(
-            batch * (1 + num_spec), dtype=torch.int32, device=DEVICE
+            1,
+            batch * (1 + num_spec) + 1,
+            dtype=torch.int32,
+            device=DEVICE,
         ).reshape(batch, 1 + num_spec)
         inp["num_accepted_tokens"] = torch.ones(batch, dtype=torch.int32, device=DEVICE)
         inp["conv_state_indices"] = torch.arange(
-            batch, dtype=torch.int32, device=DEVICE
+            1, batch + 1, dtype=torch.int32, device=DEVICE
         )
     else:
-        inp["state_indices"] = torch.arange(batch, dtype=torch.int32, device=DEVICE)
+        inp["state_indices"] = torch.arange(
+            1, batch + 1, dtype=torch.int32, device=DEVICE
+        )
 
     if replay:
         inp["buf_k"] = (
@@ -365,7 +401,12 @@ def test_spec_decode(batch, Hloc, num_spec):
         fused_kda_decode_unified,
     )
 
-    inp = _make_inputs(batch, Hloc, num_spec=num_spec)
+    inp = _make_inputs(
+        batch,
+        Hloc,
+        num_spec=num_spec,
+        full_spec_sequence=True,
+    )
     ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
     ref = _ref_decode(
         inp["mixed_qkv"],
@@ -385,6 +426,7 @@ def test_spec_decode(batch, Hloc, num_spec):
         state_indices=inp["state_indices"],
         num_accepted_tokens=inp["num_accepted_tokens"],
         conv_state_indices=inp["conv_state_indices"],
+        full_spec_sequence=True,
     )
     fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
     out = fused_kda_decode_unified(
@@ -411,17 +453,33 @@ def test_spec_decode(batch, Hloc, num_spec):
 
 
 @pytest.mark.parametrize("weight_layout", ["channels_width", "group_width_channels"])
-def test_optimized_fused_spec_decode_num_spec_7(weight_layout):
+@pytest.mark.parametrize(
+    "batch,Hloc,num_spec",
+    [
+        (4, 2, 7),
+        # Hloc=12 is Kimi-K3 at TP8 (96 KDA heads). The gate used to require
+        # Hloc==2, so serving silently ran the generic fallback kernel.
+        (1, 12, 7),
+        (2, 12, 7),
+        (4, 12, 3),
+        (2, 4, 1),
+        (1, 12, 15),
+    ],
+)
+def test_optimized_fused_spec_decode(weight_layout, batch, Hloc, num_spec):
+    import aiter.ops.triton.gated_delta_net.fused_kda_decode as fkd
     from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     if get_arch() != "gfx950":
-        pytest.skip("parallel spec-7 kernel is only dispatched on gfx950")
+        pytest.skip("parallel spec kernel is only dispatched on gfx950")
 
-    batch, Hloc, num_spec = 4, 2, 7
+    spec_tokens = num_spec + 1
     inp = _make_inputs(batch, Hloc, num_spec=num_spec, full_spec_sequence=True)
     inp["num_accepted_tokens"] = torch.tensor(
-        [1, 2, 4, 7], dtype=torch.int32, device=DEVICE
+        [1 + (i * 3) % spec_tokens for i in range(batch)],
+        dtype=torch.int32,
+        device=DEVICE,
     )
     fused_weight = inp["conv_weight"]
     if weight_layout == "group_width_channels":
@@ -449,13 +507,94 @@ def test_optimized_fused_spec_decode_num_spec_7(weight_layout):
         full_spec_sequence=True,
     )
     fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
-    out = fused_kda_decode(
+    dispatched = _SpecKernelSpy(fkd)
+    with dispatched:
+        out = fused_kda_decode(
+            inp["mixed_qkv"],
+            fused_cs,
+            fused_weight,
+            inp["gate"],
+            inp["beta"],
+            inp["out_gate"],
+            inp["A_log"],
+            inp["dt_bias"],
+            fused_ss,
+            inp["state_indices"],
+            inp["cu_seqlens"],
+            inp["norm_weight"],
+            1e-6,
+            D,
+            Hloc,
+            -5.0,
+            num_accepted_tokens=inp["num_accepted_tokens"],
+            conv_state_indices=inp["conv_state_indices"],
+        )
+    assert dispatched.grids, (
+        "parallel spec kernel was not dispatched; fused_kda_decode silently fell "
+        "back to fused_conv_recurrent_norm_kernel"
+    )
+    torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(fused_cs, ref_cs, atol=0, rtol=0)
+    torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)
+
+
+def test_optimized_fused_spec_decode_uses_real_cu_seqlens_with_padded_tokens():
+    from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("parallel spec-7 kernel is only dispatched on gfx950")
+
+    batch, Hloc, num_spec = 1, 2, 7
+    inp = _make_inputs(batch, Hloc, num_spec=num_spec, full_spec_sequence=True)
+    inp["num_accepted_tokens"] = torch.tensor(
+        [4], dtype=torch.int32, device=DEVICE
+    )
+    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
+    ref = _ref_decode(
         inp["mixed_qkv"],
-        fused_cs,
-        fused_weight,
+        ref_cs,
+        inp["conv_weight"],
         inp["gate"],
         inp["beta"],
         inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        ref_ss,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        Hloc,
+        -5.0,
+        state_indices=inp["state_indices"],
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+        full_spec_sequence=True,
+    )
+
+    pad = 8
+    mixed_qkv = torch.cat(
+        [inp["mixed_qkv"], torch.zeros_like(inp["mixed_qkv"][:pad])], dim=0
+    )
+    gate = torch.cat([inp["gate"], torch.zeros_like(inp["gate"][:, :pad])], dim=1)
+    beta = torch.cat([inp["beta"], torch.zeros_like(inp["beta"][:, :pad])], dim=1)
+    out_gate = torch.cat(
+        [inp["out_gate"], torch.zeros_like(inp["out_gate"][:pad])], dim=0
+    )
+    fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
+    out = torch.zeros(
+        mixed_qkv.shape[0],
+        Hloc * D,
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+    fused_kda_decode(
+        mixed_qkv,
+        fused_cs,
+        inp["conv_weight"],
+        gate,
+        beta,
+        out_gate,
         inp["A_log"],
         inp["dt_bias"],
         fused_ss,
@@ -468,10 +607,50 @@ def test_optimized_fused_spec_decode_num_spec_7(weight_layout):
         -5.0,
         num_accepted_tokens=inp["num_accepted_tokens"],
         conv_state_indices=inp["conv_state_indices"],
+        out=out,
     )
-    torch.testing.assert_close(out, ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(out[:8], ref, atol=0.15, rtol=0.1)
+    torch.testing.assert_close(out[8:], torch.zeros_like(out[8:]), atol=0, rtol=0)
     torch.testing.assert_close(fused_cs, ref_cs, atol=0, rtol=0)
     torch.testing.assert_close(fused_ss, ref_ss, atol=0.05, rtol=0.02)
+
+
+def test_optimized_fused_spec_decode_skips_vllm_null_block():
+    from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("parallel spec-7 kernel is only dispatched on gfx950")
+
+    inp = _make_inputs(1, 2, num_spec=7, full_spec_sequence=True)
+    inp["state_indices"].zero_()
+    inp["conv_state_indices"].zero_()
+    before_cs, before_ss = inp["conv_state"].clone(), inp["state"].clone()
+    out = torch.zeros(8, 2 * D, dtype=DTYPE, device=DEVICE)
+    fused_kda_decode(
+        inp["mixed_qkv"],
+        inp["conv_state"],
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["state"],
+        inp["state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        D,
+        2,
+        -5.0,
+        num_accepted_tokens=inp["num_accepted_tokens"],
+        conv_state_indices=inp["conv_state_indices"],
+        out=out,
+    )
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+    torch.testing.assert_close(inp["conv_state"], before_cs, atol=0, rtol=0)
+    torch.testing.assert_close(inp["state"], before_ss, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("batch,Hloc", [(1, 12), (2, 4)])

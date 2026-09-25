@@ -108,10 +108,11 @@ def fused_conv_recurrent_norm_kernel(
     else:
         state_idx = tl.load(ssm_state_indices_ptr + i_n).to(tl.int64)
         conv_state_idx = state_idx
-    if state_idx < 0:
+    # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID.
+    if state_idx <= 0 or conv_state_idx <= 0:
         return
-    tl.assume(state_idx >= 0)
-    tl.assume(conv_state_idx >= 0)
+    tl.assume(state_idx > 0)
+    tl.assume(conv_state_idx > 0)
 
     lp = H * K
     q_off = i_h * K
@@ -316,8 +317,8 @@ def fused_conv_recurrent_norm_kernel(
                 + i_n * stride_indices_seq
                 + i_t * stride_indices_tok
             ).to(tl.int64)
-            if output_state_idx >= 0:
-                tl.assume(output_state_idx >= 0)
+            if output_state_idx > 0:
+                tl.assume(output_state_idx > 0)
                 p_h_out = (
                     ssm_state_ptr
                     + output_state_idx * stride_ssm_slot
@@ -380,11 +381,11 @@ def fused_kda_spec_parallel_v_kernel(
     stride_indices_seq,
     stride_indices_tok,
 ):
-    """Run the SPEC_LEN-token speculative recurrence in parallel V tiles.
+    """Run the speculative recurrence in parallel V tiles.
 
-    Every sequence is expected to hold exactly SPEC_LEN tokens; ssm_state_indices
-    is only SPEC_LEN wide, so the token loop is clamped to that width to keep a
-    longer sequence from indexing past the row.
+    SPEC_LEN is the width of ssm_state_indices (draft tokens plus the target
+    token). The token loop is clamped to that width so a longer cu_seqlens span
+    cannot index past the row.
     """
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
@@ -417,10 +418,11 @@ def fused_kda_spec_parallel_v_kernel(
         + checkpoint * stride_indices_tok
     ).to(tl.int64)
     conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
-    tl.assume(conv_state_idx >= 0)
-    if read_state_idx < 0:
+    # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID.
+    if read_state_idx <= 0 or conv_state_idx <= 0:
         return
-    tl.assume(read_state_idx >= 0)
+    tl.assume(read_state_idx > 0)
+    tl.assume(conv_state_idx > 0)
 
     lp: tl.constexpr = H * K
     q_off = i_h * K
@@ -535,7 +537,7 @@ def fused_kda_spec_parallel_v_kernel(
         output_state_idx = tl.load(
             ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
         ).to(tl.int64)
-        if output_state_idx >= 0:
+        if output_state_idx > 0:
             p_h_out = (
                 ssm_state_ptr
                 + output_state_idx * stride_ssm_slot
@@ -576,8 +578,8 @@ def fused_kda_spec_finalize_kernel(
 ):
     """Normalize tiled output and commit speculative convolution state once.
 
-    Launched with SPEC_LEN programs on the token axis, matching the width of the
-    conv state reserved for the speculative window.
+    Launched with SPEC_LEN programs on the token axis, matching the width of
+    ssm_state_indices.
     """
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
@@ -594,6 +596,9 @@ def fused_kda_spec_finalize_kernel(
         return
 
     conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
+    if conv_state_idx <= 0:
+        return
+    tl.assume(conv_state_idx > 0)
     lp: tl.constexpr = H * K
     o_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, K), K), K)
     o_v = tl.max_contiguous(tl.multiple_of(tl.arange(0, V), V), V)
