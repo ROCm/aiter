@@ -140,6 +140,13 @@ def build_qsa_k2_family_a_module(
     )
     n_gather_chunks = gather_rounds // gather_chunk
     gather_span = col_owners * vec
+    # The V LDS image is a pure (token, dim) swizzle -- see the PV read below,
+    # which never mentions the thread count. The only place the launch shape
+    # leaks in is the ds_write2st64 immediate, so derive it here rather than
+    # pinning it to the 128-thread case. Consecutive 8-element dim chunks sit
+    # 32 tokens * 4 elements * 2 B = 256 B apart, a round advances by
+    # col_owners chunks, and an st64 unit is 512 B.
+    v_round_st64 = col_owners * 256 // 512
     token_major_v = use_k32 and block_n == 16
     decode_tr_pv = token_major_v
     # PV splits the output dimension across waves, so every wave needs the
@@ -657,10 +664,16 @@ def build_qsa_k2_family_a_module(
                         hi = fx.Vector.from_elements(
                             [v_vec[i + 4] for i in range_constexpr(4)], BFloat16
                         ).bitcast(fx.Int64)[0]
-                        # One base VGPR; round gr is +gr st64 (512 B) and hi
-                        # is +16 st64 (8192 B), matching AMD's offset pairs.
+                        # One base VGPR. Round gr advances d by col_owners
+                        # chunks, i.e. col_owners * 256 B, which is
+                        # col_owners/2 st64 units; hi is the d+4 half at a
+                        # fixed +16 st64 (8192 B). Matches AMD's offset pairs.
                         _ds_write2st64_b64(
-                            store_addr, lo, hi, offset0=gr, offset1=gr + 16
+                            store_addr,
+                            lo,
+                            hi,
+                            offset0=gr * v_round_st64,
+                            offset1=gr * v_round_st64 + 16,
                         )
                 gpu.barrier()
             elif const_expr(not use_k32):
