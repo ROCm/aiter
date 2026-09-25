@@ -49,8 +49,7 @@ def k_norm_rope_mxfp4_cache(
             n_per_tile tokens with its values as [d_per_tile-byte chunk,
             token, byte] and its e8m0 scales as [scale % scale_lanes, token,
             scale // scale_lanes]. paged_mxfp4_mqa_logits reads
-            cache_format()'s n_per_tile and d_per_tile, with
-            64 // n_per_tile scale lanes.
+            cache_format()'s n_per_tile, d_per_tile and scale_lanes.
     """
     _LOGGER.info(
         "K_NORM_ROPE_MXFP4_CACHE: k=%s kv_cache=%s compress_ratio=%d shuffle=%s",
@@ -66,6 +65,12 @@ def k_norm_rope_mxfp4_cache(
         raise ValueError(
             f"k must be [T, D] bf16 with unit last stride, got "
             f"{tuple(k.shape)} {k.dtype} {k.stride()}"
+        )
+    if not all(t.ndim == 1 and t.is_contiguous() for t in (positions, slot_mapping)):
+        raise ValueError(
+            f"positions and slot_mapping must be 1-D contiguous, got "
+            f"{tuple(positions.shape)} {positions.stride()} and "
+            f"{tuple(slot_mapping.shape)} {slot_mapping.stride()}"
         )
     if num_tokens > k.shape[0] or num_tokens > positions.numel():
         raise ValueError(

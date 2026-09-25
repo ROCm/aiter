@@ -134,6 +134,7 @@ def _make_case(
     page_size,
     page_offset=0,
     preshuffle=1,
+    scale_mode=1,
 ):
     """The quantised inputs and the packed cache."""
     ctx = [int(c) for c in ctx_lens]
@@ -170,7 +171,7 @@ def _make_case(
     s_used = kv4s.reshape(used, page_size, ns)
     cache_format(num_heads, head_size, page_size)  # validates the geometry
     if preshuffle:
-        sv, ss = preshuffle_cache(v_used, s_used, num_heads, head_size)
+        sv, ss = preshuffle_cache(v_used, s_used, num_heads, head_size, scale_mode)
     else:
         sv, ss = v_used, s_used
     flat = cache.view(num_pages, -1)
@@ -944,7 +945,7 @@ def _expand_ref(ids, ends, block):
     n_valid = ok.sum(1)
     max_id = torch.where(ok, ids, torch.full_like(ids, -1)).max(1).values
     key = torch.where(ok, ids, torch.full_like(ids, 0x7FFFFFFF)).sort(1).values
-    last = ((nb - 1) * block).long()
+    last = ((nb - 1).clamp(min=0) * block).long()
     pos = torch.where(key == 0x7FFFFFFF, last[:, None], key.long() * block)
     tail = torch.minimum(torch.full_like(ends, block), ends - max_id.int() * block)
     cu = torch.where(
@@ -966,6 +967,7 @@ def test_candidate_gather(num_heads, block):
     ids = ids[:, :K].to(torch.int32)
     ids[torch.rand(rows, K, device="cuda") < 0.1] = -1
     ends = torch.randint(1, ctx + 1, (rows,), dtype=torch.int32, device="cuda")
+    ends[0] = 0
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
 
     pos_r, cu_r = _expand_ref(ids, ends, block)
@@ -1038,6 +1040,36 @@ def test_strided_pages(num_heads, page_size, pad):
     got = paged_mxfp4_mqa_logits(*args, strided, *rest)
     torch.cuda.synchronize()
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("next_n", [1, 4])
+def test_scale_mode_0(num_heads, next_n):
+    """A mode-0 cache scores as mode 1 does, dense and gathered."""
+    ctx, block = [2048, 777], 8
+    st = {}
+    for mode in (0, 1):
+        torch.manual_seed(0)
+        st[mode] = _make_case(2, next_n, num_heads, 128, ctx, 64, scale_mode=mode)
+    ids = torch.rand(2 * next_n, st[1]["mml"] // block, device="cuda")
+    ids = ids.argsort(1)[:, :64].to(torch.int32)
+    ends = _row_ends(ctx, next_n, None)
+    out = {}
+    for mode, c in st.items():
+        args = (c["q4"], c["q4s"], c["cache"], c["weights"], c["cl"], c["block_table"])
+        dense = paged_mxfp4_mqa_logits(*args, c["mml"], scale_mode=mode)
+        gathered = paged_mxfp4_mqa_logits(
+            *args,
+            64 * block,
+            use_gather=True,
+            candidates=ids,
+            row_ends=ends,
+            scale_mode=mode,
+        )
+        out[mode] = (dense, gathered)
+    torch.cuda.synchronize()
+    for a, b in zip(out[0], out[1]):
+        assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
 @pytest.mark.parametrize("gib", [3, 5])

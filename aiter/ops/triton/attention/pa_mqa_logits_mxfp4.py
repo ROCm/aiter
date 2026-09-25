@@ -19,6 +19,7 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 
 SCALE_GROUP = 32
 K_WIDTH = 16
+WARP_SIZE = 64
 # Past this the chunk is compute bound
 COMPUTE_CHUNK = 512
 # Narrow enough to change config for spec. decoding
@@ -70,7 +71,13 @@ def cache_format(num_heads: int, head_size: int, page_size: int) -> dict:
         raise ValueError(
             f"page_size {page_size} must be a multiple of BLOCK_KV ({bkv})"
         )
-    return {"n_per_tile": npt, "d_per_tile": K_WIDTH, "block_kv": bkv}
+    return {
+        "n_per_tile": npt,
+        "d_per_tile": K_WIDTH,
+        # the wide scale order, SCALE_MODE_WIDE
+        "scale_lanes": WARP_SIZE // npt,
+        "block_kv": bkv,
+    }
 
 
 def _split_cache(kv_cache: torch.Tensor, head_size: int):

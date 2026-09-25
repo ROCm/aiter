@@ -208,7 +208,7 @@ def _prepare_candidates_kernel(
 
     # Padding repeats the last legal block, so a short row still walks blocks
     # it owns and row_ends drops the slots.
-    last = (nblocks - 1) * C
+    last = tl.maximum(nblocks - 1, 0) * C
     pos = tl.where(key == 0x7FFFFFFF, last, key * C)
     tl.store(pos_ptr + row * K + cols, pos)
     tail = tl.minimum(C, end - max_id * C)
@@ -1789,7 +1789,11 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
         for r in tl.static_range(0, BLOCK_M):
             block_end = tl.maximum(
                 block_end,
-                tl.load(row_ends_ptr + q_start + first_row + r, mask=live, other=0),
+                tl.load(
+                    row_ends_ptr + q_start + first_row + r,
+                    mask=live & (first_row + r < rows),
+                    other=0,
+                ),
             )
     else:
         block_end = ctx - rows + first_row + BLOCK_M

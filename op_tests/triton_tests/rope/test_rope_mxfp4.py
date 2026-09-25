@@ -84,11 +84,10 @@ def _paged_pool(num_pages, page_size, pitch_pad, fill):
 def _shuffle(num_heads, page_size, scale_mode=1):
     """preshuffle_cache()'s pattern for this launch, as the cache op takes it.
     Scale mode 1 (the logits kernel's) splits a token's scales over
-    64 // n_per_tile lanes; mode 0 keeps them whole."""
+    cache_format()'s scale_lanes; mode 0 keeps them whole."""
     fmt = cache_format(num_heads, HEAD_SIZE, page_size)
-    n = fmt["n_per_tile"]
-    lanes = 64 // n if scale_mode == 1 else HEAD_SIZE // SCALE_GROUP
-    return n, fmt["d_per_tile"], lanes
+    lanes = fmt["scale_lanes"] if scale_mode == 1 else HEAD_SIZE // SCALE_GROUP
+    return fmt["n_per_tile"], fmt["d_per_tile"], lanes
 
 
 def _read_back(cache, page_size, shuffle=None, scale_mode=1):
