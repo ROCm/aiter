@@ -82,6 +82,7 @@ def _get_topk_workspace(
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
     _get_cached_workspace.cache_clear()
+    _get_cached_adaptive_workspace.cache_clear()
 
 
 @lru_cache(maxsize=128)
