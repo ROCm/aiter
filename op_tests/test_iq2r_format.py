@@ -6,6 +6,7 @@ import dataclasses
 import pytest
 import torch
 
+from aiter.ops.iq2r_encoder import iq2r_encode_reference, iq2r_initial_codebook
 from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_CODEBOOK_BYTES,
@@ -18,9 +19,13 @@ from aiter.ops.iq2r_format import (
     IQ2RMetadata,
     iq2r_gpt_oss_metadata,
     iq2r_packed_sizes,
+    iq2r_slice_input_data,
+    iq2r_slice_output_auxiliary,
+    iq2r_slice_output_data,
     iq2r_storage_bits_per_weight,
     iq2r_validate_expert_weights,
 )
+from aiter.ops.iq2r_reference import iq2r_materialize
 
 
 def test_gpt_oss_exact_packed_sizes_and_storage_rate():
@@ -136,3 +141,62 @@ def test_dataclass_replacement_cannot_relabel_o0():
     metadata = iq2r_gpt_oss_metadata("down")
     with pytest.raises(ValueError, match="activation_basis"):
         dataclasses.replace(metadata, activation_basis="hadamard")
+
+
+def test_packed_output_and_input_slices_are_bit_exact():
+    generator = torch.Generator().manual_seed(0x53_08)
+    weight = torch.randn((96, 256), generator=generator)
+    data, auxiliary = iq2r_encode_reference(
+        weight,
+        torch.ones((256,), dtype=torch.float32),
+        iq2r_initial_codebook(),
+        exponent_radius=8,
+    )
+    data = data.unsqueeze(0)
+    auxiliary = auxiliary.unsqueeze(0)
+    metadata = IQ2RMetadata(logical_n=96, logical_k=256)
+    dense = iq2r_materialize(data, auxiliary, metadata)
+
+    output_metadata = IQ2RMetadata(logical_n=64, logical_k=256)
+    output_data = iq2r_slice_output_data(data, metadata, start=16, length=64)
+    output_auxiliary = iq2r_slice_output_auxiliary(
+        auxiliary, metadata, start=16, length=64
+    )
+    torch.testing.assert_close(
+        iq2r_materialize(output_data, output_auxiliary, output_metadata),
+        dense[:, 16:80],
+        rtol=0,
+        atol=0,
+    )
+
+    input_metadata = IQ2RMetadata(logical_n=96, logical_k=128)
+    input_data = iq2r_slice_input_data(data, metadata, start=128, length=128)
+    torch.testing.assert_close(
+        iq2r_materialize(input_data, auxiliary, input_metadata),
+        dense[:, :, 128:],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("function", "start", "length", "match"),
+    [
+        (iq2r_slice_output_data, 1, 32, "output slice"),
+        (iq2r_slice_output_auxiliary, 0, 17, "output slice"),
+        (iq2r_slice_input_data, 32, 128, "input slice"),
+        (iq2r_slice_input_data, 128, 256, "input slice"),
+    ],
+)
+def test_packed_slice_rejects_unaligned_or_out_of_range_requests(
+    function, start, length, match
+):
+    metadata = IQ2RMetadata(logical_n=96, logical_k=256)
+    width = (
+        metadata.auxiliary_bytes
+        if function is iq2r_slice_output_auxiliary
+        else metadata.data_bytes
+    )
+    value = torch.zeros((1, width), dtype=torch.uint8)
+    with pytest.raises(ValueError, match=match):
+        function(value, metadata, start=start, length=length)

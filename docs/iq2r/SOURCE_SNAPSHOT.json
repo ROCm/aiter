@@ -1,0 +1,71 @@
+{
+  "date": "2026-09-25",
+  "repositories": {
+    "aiter": {
+      "base_commit": "b0de60b85e3f1e7592519518d8ba3f265ba3cfb0",
+      "files": {
+        "aiter/fused_moe.py": "9ba1bc0df5d2edb110c2a6a4676a89fc3e26689c6748b63a4ec8c3df433cfe37",
+        "aiter/iq2r_checkpoint.py": "6b44682d2b10b6d324100b301dedeff86a65a795b1e0c56052e5c94375974997",
+        "aiter/iq2r_glm5_compile.py": "9e84e39c5582af04f82815d1fca5b12cda1bb66994b9ad0d9fcff55ac25eb7d9",
+        "aiter/iq2r_moe.py": "8480b7040a67e65f551459234612d3b8ec91030dc5c99802935ff0dd5774bd56",
+        "aiter/iq2r_overlay.py": "fdea302742cfdc3804032754e45936d42909bc7cdcc0262d4f37a95111c73c18",
+        "aiter/iq2r_quad_pack.py": "25b402d2a5ee0e9b23ddd55cecd440dac0e3b5cb1162db84ba33f8d10e45cce5",
+        "aiter/iq2r_scheduled_policy.json": "93983edca9cfd292fbe144478ad80e195fc569d0c80e2ca3c03b5943d3be451a",
+        "aiter/ops/iq2r.py": "352b2a93e877bb0e263b66dbc96046ae48c8ae65de13ecabdeb38038eb26b3af",
+        "aiter/ops/iq2r_format.py": "89775366caaa0173434e34c126f6b88e495fbfb40c660f2acb084ce5b57e8c1b",
+        "csrc/include/iq2r.h": "cd7612d96f8663924bccd81bef14cbdf304ba77a259b1b57a9e678fd1afab50a",
+        "csrc/kernels/iq2r/iq2r_gemm_gfx950.cu": "e717433190ca921d7aa4e6448ebe4ad0548567b86a2348521a4163420dc48830",
+        "csrc/kernels/iq2r/iq2r_moe_aux_gfx950.cu": "ffa7e7af41c81021626b8c2ef15bc6115a8bf2f1b20ce2a70f62a6fe96d2dc61",
+        "csrc/kernels/topk_softmax_kernels_group.cu": "1df622addb0f1dd73e2570590052fd988128f9351b1b50243df2ecc724dc65ad",
+        "csrc/pybind/iq2r_pybind.cu": "97481fe418ac6157d713e16da3987b224be9ebf77cadf7d5a447c6c16fb37835",
+        "op_tests/op_benchmarks/iq2r/bench_iq2r_route_reduce_variants.py": "5f0a636aa6f1cf0d702c09e0930c22a55237df705fb237bdfd34b924625a53e1",
+        "op_tests/test_grouped_topk_nan_hip.py": "59c2c5b9c370f814549ccb86561e2723fd5deae14e9e4e693a33e0e123e240e6",
+        "op_tests/test_iq2r_format.py": "8de6a229158a7a94f34ff4b70b1586f61883ee9eef39d9a80fffa7137901139b",
+        "op_tests/test_iq2r_glm53_ballot_frontend_hip.py": "94b032a0816f515e05bcd0b2a2168428be354310bd4ee4f5560aacbcdfddd8e9",
+        "op_tests/test_iq2r_glm53_invalid_padding_hip.py": "31cb611656a9ec36d7c478b8e0e69a7e5672762830d5706f8fc60b054a967a16",
+        "op_tests/test_iq2r_glm53_scheduled_hip.py": "075982418cf6b8e4f92d1247fd6a8db60a1b79c41777db8baf5a69eb6251fba3",
+        "op_tests/test_iq2r_glm53_static_moe_hip.py": "db2ec0c6652ddb007d2890c6b25abbed8c4433e478626cc15fc2f2079c10839b",
+        "op_tests/test_iq2r_glm53_tp4_scheduled_hip.py": "5b88b539583661798839a2b46f47094ef729dced1c40f472ae7e787dcd05b13b",
+        "op_tests/test_iq2r_glm5_compile.py": "24681760dc231cc7754743cc5e66fb172212229cdfb4cfbe10f2347d8c54dae3",
+        "op_tests/test_iq2r_glm5_moe_hip.py": "0e142cfcef663603e82b3e4f61105122e5522b5c595007eb86e93c7ca07356b2",
+        "op_tests/test_iq2r_large32_synchronization_hip.py": "200024f4a439076e03e84a5e96b1487797d2bad04a6048ccd773ca0aa29da8bc",
+        "op_tests/test_iq2r_moe_hip.py": "aeacfa02552dd9026a4510686b1bb1a6c3aa33e00f6ab4045123f87ea9c0e55f",
+        "op_tests/test_iq2r_overlay.py": "c9b107022ca65738a9e61a9480416c7caed05d91bc5c4df6950ac6f713a98466"
+      }
+    },
+    "ATOM": {
+      "base_commit": "17881b9b5b5d2d4b87e9286fd4940d7f7a3a0d97",
+      "files": {
+        "atom/config.py": "eed5bb011a31893f45bdd448f235d6c1e95b8a0d3969f1d1d743ab326f6ef8bf",
+        "atom/model_engine/engine_core.py": "0c818f2be452f0c1555002a9be51b86f57c34bcb5dd72e2273de2b0cbbc6f8d7",
+        "atom/model_engine/engine_core_mgr.py": "224616ed43b32a26609da81e90e470651fb19a29f5ffa555401f2a2fef23a331",
+        "atom/model_engine/engine_utility.py": "f2c69cd59e8c5dfccdf92ba13e993a8a0931de131c634d60aceb56c21d0f3ffa",
+        "atom/model_engine/llm_engine.py": "bad3b381dfd263e50ef146c46c1a65a81c8a048b4f6c1fc535fedceb116959cf",
+        "atom/model_engine/model_runner.py": "d4a7795d351355d02e758833433b130ac4737c9221df8571f1fb638fe7a7aefa",
+        "atom/model_ops/moe.py": "b25c36d65eb5e1b856b6858029988499ac7ea757491b8bdb85ad408bff4d5305",
+        "atom/models/deepseek_v2.py": "705e9cf919703b9b82dc5010ec34dc239eff212d41f96b8f85c8f0a5249ab2ff",
+        "tests/test_iq2r_moe_ep_hip.py": "bc20123bf5ffe29149f7397a1099ac5c6bb251f3a8959d7af105ce65ccea3b1a",
+        "tests/test_iq2r_moe_method.py": "ab2cf3e746fdfbeb4d981ff522d16f8fb04ff9e814e97e44a3e06aa3151c6c89"
+      }
+    }
+  },
+  "validation": {
+    "native_gpu_tests": {
+      "passed": 131,
+      "failed": 0,
+      "log_sha256": "d4268f1c555e60f381909e3d636d1f4de0a808efc1d7c3225faf40c6190f3b56"
+    },
+    "cpu_tests": {
+      "passed": 124,
+      "failed": 0,
+      "log_sha256": "e8e3dc93ea568d48d1826fc203bb20996b311c7318c43c97df0be3ac8cd5b7d5"
+    },
+    "changed_python_black_check": "pass",
+    "changed_python_ruff_check": "pass",
+    "iq2r_native_module": "b8089077684bd4c887be84b68cf62a8d427490e9354e03a8a84394c35ebdf2ef",
+    "router_module": "f6e0ecfd2549e52fdf9db39a0e786646f2ba19c6b6ca9f897c1b9e4cf70e21eb",
+    "benchmark_serving_source": "19bfd9a27a197a41323eb5da3bb04690bb1508208e58681ecf9d53ddee778e2b",
+    "full_performance_goal": "unmet"
+  },
+  "runtime_origin": "E167/E172/E181 native candidate, with the E190 grouped-top-k guard. ATOM also retains optional local profiler controls. E196 is unselected."
+}

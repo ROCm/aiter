@@ -286,6 +286,155 @@ def iq2r_gpt_oss_metadata(projection: str, **provenance: Any) -> IQ2RMetadata:
     return metadata
 
 
+def _iq2r_record_view(group: Tensor, triplet: int, atom: int) -> Tensor:
+    begin = triplet * IQ2R_TRIPLET_BYTES
+    triplet_data = group[..., begin : begin + IQ2R_TRIPLET_BYTES]
+    if atom < 2:
+        paired = triplet_data[..., :IQ2R_ATOM_PAIR_RECORDS_BYTES].view(
+            *triplet_data.shape[:-1], IQ2R_LANES_PER_TILE, 16
+        )
+        return paired[
+            ..., atom * IQ2R_LANE_RECORD_BYTES : (atom + 1) * IQ2R_LANE_RECORD_BYTES
+        ]
+    third = triplet_data[..., IQ2R_ATOM_TWO_RECORDS_OFFSET:].view(
+        *triplet_data.shape[:-1],
+        IQ2R_LANES_PER_TILE,
+        IQ2R_ATOM_TWO_RECORD_BYTES,
+    )
+    return third[..., :IQ2R_LANE_RECORD_BYTES]
+
+
+def _iq2r_metadata_view(group: Tensor, triplet: int, atom: int) -> Tensor:
+    begin = triplet * IQ2R_TRIPLET_BYTES
+    triplet_data = group[..., begin : begin + IQ2R_TRIPLET_BYTES]
+    third = triplet_data[..., IQ2R_ATOM_TWO_RECORDS_OFFSET:].view(
+        *triplet_data.shape[:-1],
+        IQ2R_LANES_PER_TILE,
+        IQ2R_ATOM_TWO_RECORD_BYTES,
+    )
+    return third[..., IQ2R_ATOM_TWO_METADATA_OFFSET + atom]
+
+
+def _validate_output_slice(metadata: IQ2RMetadata, start: int, length: int) -> None:
+    _require_int("start", start)
+    _require_int("length", length, positive=True)
+    if (
+        start < 0
+        or start % IQ2R_TILE_N
+        or length % IQ2R_TILE_N
+        or start + length > metadata.logical_n
+    ):
+        raise ValueError(
+            f"IQ2R output slice must be in range and aligned to {IQ2R_TILE_N} columns"
+        )
+
+
+def iq2r_slice_output_data(
+    data: Tensor,
+    metadata: IQ2RMetadata,
+    start: int,
+    length: int,
+) -> Tensor:
+    """Repack an exact contiguous output-column slice of stacked IQ2R data."""
+
+    _validate_byte_matrix("data", data, metadata.data_bytes)
+    _validate_output_slice(metadata, start, length)
+    target = IQ2RMetadata(logical_n=length, logical_k=metadata.logical_k)
+    experts = data.shape[0]
+    source_groups = metadata.physical_n_blocks // IQ2R_N_BLOCKS_PER_GROUP
+    target_groups = target.physical_n_blocks // IQ2R_N_BLOCKS_PER_GROUP
+    source = data.view(experts, source_groups, metadata.k_tiles, IQ2R_GROUP_BYTES)
+    output = torch.zeros(
+        (experts, target_groups, target.k_tiles, IQ2R_GROUP_BYTES),
+        dtype=torch.uint8,
+        device=data.device,
+    )
+    source_block_start = start // IQ2R_TILE_N
+    for target_block in range(target.n_blocks):
+        source_block = source_block_start + target_block
+        source_group = source[:, source_block // IQ2R_N_BLOCKS_PER_GROUP]
+        target_group = output[:, target_block // IQ2R_N_BLOCKS_PER_GROUP]
+        source_triplet, source_atom = divmod(
+            source_block % IQ2R_N_BLOCKS_PER_GROUP, IQ2R_ATOMS_PER_TRIPLET
+        )
+        target_triplet, target_atom = divmod(
+            target_block % IQ2R_N_BLOCKS_PER_GROUP, IQ2R_ATOMS_PER_TRIPLET
+        )
+        _iq2r_record_view(target_group, target_triplet, target_atom).copy_(
+            _iq2r_record_view(source_group, source_triplet, source_atom)
+        )
+        _iq2r_metadata_view(target_group, target_triplet, target_atom).copy_(
+            _iq2r_metadata_view(source_group, source_triplet, source_atom)
+        )
+    return output.reshape(experts, target.data_bytes)
+
+
+def iq2r_slice_output_auxiliary(
+    auxiliary: Tensor,
+    metadata: IQ2RMetadata,
+    start: int,
+    length: int,
+) -> Tensor:
+    """Slice codebooks/base exponents for an IQ2R output-column shard."""
+
+    _validate_byte_matrix("auxiliary", auxiliary, metadata.auxiliary_bytes)
+    _validate_output_slice(metadata, start, length)
+    target = IQ2RMetadata(logical_n=length, logical_k=metadata.logical_k)
+    output = torch.full(
+        (auxiliary.shape[0], target.auxiliary_bytes),
+        127,
+        dtype=torch.uint8,
+        device=auxiliary.device,
+    )
+    output[:, :IQ2R_CODEBOOK_BYTES].copy_(auxiliary[:, :IQ2R_CODEBOOK_BYTES])
+    source_block_start = start // IQ2R_TILE_N
+    output[:, IQ2R_CODEBOOK_BYTES : IQ2R_CODEBOOK_BYTES + target.n_blocks].copy_(
+        auxiliary[
+            :,
+            IQ2R_CODEBOOK_BYTES
+            + source_block_start : IQ2R_CODEBOOK_BYTES
+            + source_block_start
+            + target.n_blocks,
+        ]
+    )
+    return output
+
+
+def iq2r_slice_input_data(
+    data: Tensor,
+    metadata: IQ2RMetadata,
+    start: int,
+    length: int,
+) -> Tensor:
+    """Extract an exact contiguous K-tile slice of stacked IQ2R data."""
+
+    _validate_byte_matrix("data", data, metadata.data_bytes)
+    _require_int("start", start)
+    _require_int("length", length, positive=True)
+    if (
+        start < 0
+        or start % IQ2R_TILE_K
+        or length % IQ2R_TILE_K
+        or start + length > metadata.logical_k
+    ):
+        raise ValueError(
+            f"IQ2R input slice must be in range and aligned to {IQ2R_TILE_K} columns"
+        )
+    target = IQ2RMetadata(logical_n=metadata.logical_n, logical_k=length)
+    experts = data.shape[0]
+    groups = metadata.physical_n_blocks // IQ2R_N_BLOCKS_PER_GROUP
+    source = data.view(experts, groups, metadata.k_tiles, IQ2R_GROUP_BYTES)
+    tile_start = start // IQ2R_TILE_K
+    # ``contiguous()`` may return the original narrow view when its strides are
+    # already dense, retaining a non-zero storage offset.  IQ2R consumers treat
+    # byte zero as the first packed tile, so force a fresh zero-offset storage.
+    return (
+        source[:, :, tile_start : tile_start + target.k_tiles]
+        .clone(memory_format=torch.contiguous_format)
+        .view(experts, target.data_bytes)
+    )
+
+
 def _validate_byte_matrix(name: str, value: Tensor, expected_bytes: int) -> None:
     if not isinstance(value, Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
@@ -345,6 +494,9 @@ __all__ = [name for name in globals() if name.startswith("IQ2R_")] + [
     "iq2r_packed_sizes",
     "iq2r_padded_k",
     "iq2r_physical_n_blocks",
+    "iq2r_slice_input_data",
+    "iq2r_slice_output_auxiliary",
+    "iq2r_slice_output_data",
     "iq2r_storage_bits_per_weight",
     "iq2r_validate_expert_weights",
 ]

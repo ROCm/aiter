@@ -818,7 +818,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
     eq_base += n_gt - my_eq;
 
-    if(n_cand <= WARP_SIZE)
+    // Every fast-path output slot must have a candidate. All-NaN rows can
+    // produce n_cand == 0; the iterative fallback keeps their IDs in range.
+    if(n_cand >= topk && n_cand <= WARP_SIZE)
     {
         int slot_gt = gt_base;
         int slot_eq = eq_base;

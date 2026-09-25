@@ -9,7 +9,11 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from aiter.iq2r_checkpoint import iq2r_compiled_tensor_keys, iq2r_glm5_source_keys
+from aiter.iq2r_checkpoint import (
+    iq2r_compiled_tensor_keys,
+    iq2r_glm5_shared_source_keys,
+    iq2r_glm5_source_keys,
+)
 from aiter.iq2r_glm5_compile import (
     GLM5Importance,
     GLM5Layout,
@@ -49,6 +53,7 @@ def test_source_layout_supports_flash_and_plain_glm53():
         "num_hidden_layers": 78,
         "first_k_dense_replace": 3,
         "n_routed_experts": 256,
+        "n_shared_experts": 1,
         "hidden_size": 6144,
         "moe_intermediate_size": 2048,
     }
@@ -75,6 +80,7 @@ def test_source_layout_supports_flash_and_plain_glm53():
     assert plain.source_root == "model"
     assert plain.layer_count == 78
     assert plain.expert_count == 256
+    assert plain.shared_expert_count == 1
     assert plain.hidden_size == 6144
     assert plain.intermediate_size == 2048
 
@@ -86,6 +92,10 @@ def test_plain_glm53_source_keys_use_top_level_model_root():
     )
     assert names["down_proj_weight_scale_inv"] == (
         "model.layers.3.mlp.experts.255.down_proj.weight_scale_inv"
+    )
+    shared = iq2r_glm5_shared_source_keys(3, root="model")
+    assert shared["gate_proj_weight"] == (
+        "model.layers.3.mlp.shared_experts.gate_proj.weight"
     )
 
 
@@ -100,6 +110,7 @@ def test_plain_glm53_compiled_config_keeps_dimensions_top_level():
         block_k=128,
         model_family="glm_moe_dsa",
         source_root="model",
+        shared_expert_count=1,
     )
     importance = GLM5Importance(
         gate_up=torch.empty(0),
@@ -128,6 +139,23 @@ def test_plain_glm53_compiled_config_keeps_dimensions_top_level():
     assert config["moe_intermediate_size"] == 2048
     assert config["iq2r"]["model_family"] == "glm_moe_dsa"
     assert config["iq2r"]["source_root"] == "model"
+
+    fused = _compiled_config(
+        {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "model_type": "glm_moe_dsa",
+        },
+        layout,
+        importance,
+        [3],
+        ["iq2r-layer-0003-gate-up.safetensors"],
+        "/models/zai-org/GLM-5.3",
+        "abc123",
+        True,
+    )
+    assert fused["n_routed_experts"] == 256
+    assert fused["iq2r"]["compiled_expert_count"] == 257
+    assert fused["iq2r"]["fused_shared_expert"] is True
 
 
 @pytest.mark.skipif(
@@ -222,6 +250,57 @@ def test_loads_compact_redline_glm_calibration_artifact(tmp_path):
     assert loaded.down.shape == (2, 2, 2)
     # Per-expert vectors are normalized exactly as Redline's compiler does.
     assert torch.equal(loaded.for_projection(3, "gate_up", 0), torch.ones(4))
+
+
+def test_loads_shared_expert_redline_calibration_targets(tmp_path):
+    layout = GLM5Layout(
+        layer_count=5,
+        first_moe_layer=3,
+        expert_count=2,
+        hidden_size=4,
+        intermediate_size=2,
+        block_n=2,
+        block_k=2,
+        model_family="glm_moe_dsa",
+        source_root="model",
+        shared_expert_count=1,
+    )
+    targets = {}
+    for layer in range(layout.moe_layers):
+        targets[f"model.layers.{layer}.mlp.experts.gate_up_proj.weight"] = {
+            "importance": torch.ones(layout.expert_count, layout.hidden_size)
+        }
+        targets[f"model.layers.{layer}.mlp.experts.down_proj.weight"] = {
+            "importance": torch.ones(layout.expert_count, layout.intermediate_size)
+        }
+        targets[f"model.layers.{layer}.mlp.shared_experts.gate_up_proj.weight"] = {
+            "importance": torch.full((layout.hidden_size,), layer + 3.0)
+        }
+        targets[f"model.layers.{layer}.mlp.shared_experts.down_proj.weight"] = {
+            "importance": torch.full((layout.intermediate_size,), layer + 4.0)
+        }
+    path = tmp_path / "calibration.pt"
+    torch.save(
+        {
+            "format": "redline-calibration",
+            "version": 1,
+            "scheme": "iq2r-diagonal-second-moment",
+            "basis": "native",
+            "targets": targets,
+            "metadata": {
+                "unobserved_target_groups": 0,
+                "unobserved_policy": "error",
+            },
+        },
+        path,
+    )
+
+    loaded = load_glm5_importance(path, layout)
+    assert loaded.shared_gate_up is not None
+    assert loaded.shared_down is not None
+    assert loaded.shared_gate_up.shape == (2, 4)
+    assert loaded.shared_down.shape == (2, 2)
+    assert torch.equal(loaded.for_projection(3, "gate_up", 2), torch.ones(4))
 
 
 def test_uniform_importance_requires_explicit_diagnostic_mode():

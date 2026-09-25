@@ -116,7 +116,13 @@ def _checkpoint_layout(config: dict[str, Any]) -> _CheckpointLayout:
     )
 
     total_layers = _config_int(config, "num_hidden_layers")
-    expert_count = _config_int(config, "num_local_experts", "n_routed_experts")
+    compiled_expert_count = iq2r.get("compiled_expert_count")
+    expert_count = (
+        compiled_expert_count
+        if isinstance(compiled_expert_count, int)
+        and not isinstance(compiled_expert_count, bool)
+        else _config_int(config, "num_local_experts", "n_routed_experts")
+    )
     hidden_size = _config_int(config, "hidden_size")
     intermediate_size = _config_int(
         config, "moe_intermediate_size", "intermediate_size"
@@ -236,6 +242,25 @@ def iq2r_glm5_source_keys(
     ):
         raise ValueError("layer_index and expert_index must be non-negative ints")
     prefix = f"{root}.layers.{layer_index}.mlp.experts.{expert_index}"
+    return {
+        f"{projection}_{kind}": f"{prefix}.{projection}.{kind}"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for kind in ("weight", "weight_scale_inv")
+    }
+
+
+def iq2r_glm5_shared_source_keys(
+    layer_index: int,
+    *,
+    root: str = "model.language_model",
+) -> dict[str, str]:
+    """Return GLM-5 block-FP8 source keys for its single shared expert."""
+
+    if isinstance(layer_index, bool) or not isinstance(layer_index, int):
+        raise TypeError("layer_index must be an int")
+    if layer_index < 0:
+        raise ValueError("layer_index must be non-negative")
+    prefix = f"{root}.layers.{layer_index}.mlp.shared_experts"
     return {
         f"{projection}_{kind}": f"{prefix}.{projection}.{kind}"
         for projection in ("gate_proj", "up_proj", "down_proj")
@@ -511,6 +536,7 @@ __all__ = [
     "IQ2RLayerCheckpoint",
     "iq2r_compiled_tensor_keys",
     "iq2r_glm5_overlay_keys",
+    "iq2r_glm5_shared_source_keys",
     "iq2r_glm5_source_keys",
     "iq2r_gpt_oss_source_keys",
     "load_iq2r_layer_checkpoint",

@@ -12,6 +12,7 @@ import aiter.iq2r_overlay as overlay_module
 from aiter.iq2r_checkpoint import (
     iq2r_compiled_tensor_keys,
     iq2r_glm5_overlay_keys,
+    iq2r_glm5_shared_source_keys,
     iq2r_glm5_source_keys,
     iq2r_gpt_oss_source_keys,
 )
@@ -105,11 +106,14 @@ def _write_plain_glm_source_model(path, layers: int, experts: int) -> None:
     tensors = {
         "model.embed_tokens.weight": torch.arange(4),
         "model.layers.0.mlp.gate_proj.weight": torch.tensor([10]),
-        "model.layers.3.mlp.shared_experts.gate_proj.weight": torch.tensor([11]),
         "model.layers.3.self_attn.q_proj.weight": torch.tensor([12]),
     }
     # Include one MTP layer after num_hidden_layers. It must remain base FP8.
     for layer in range(3, layers + 1):
+        for index, name in enumerate(
+            iq2r_glm5_shared_source_keys(layer, root="model").values()
+        ):
+            tensors[name] = torch.tensor([layer, -1, index])
         for expert in range(experts):
             for index, name in enumerate(
                 iq2r_glm5_source_keys(layer, expert, root="model").values()
@@ -123,6 +127,7 @@ def _write_plain_glm_source_model(path, layers: int, experts: int) -> None:
         "num_hidden_layers": layers,
         "first_k_dense_replace": 3,
         "n_routed_experts": experts,
+        "n_shared_experts": 1,
         "hidden_size": 128,
         "moe_intermediate_size": 64,
         "quantization_config": {
@@ -160,6 +165,10 @@ def _fake_glm_checkpoint(layer: int, experts: int):
             f"compiled-{layer}-down.safetensors",
         ),
     )
+
+
+def _fake_fused_shared_glm_checkpoint(layer: int, experts: int):
+    return _fake_glm_checkpoint(layer, experts + 1)
 
 
 def test_overlay_is_complete_and_index_authoritative(tmp_path, monkeypatch):
@@ -316,6 +325,52 @@ def test_plain_glm_overlay_uses_model_root_and_preserves_non_routed_tensors(
     assert manifest["model_family"] == "glm_moe_dsa"
     assert manifest["source_root"] == "model"
     assert manifest["removed_source_tensor_count"] == 24
+
+
+def test_plain_glm_overlay_fuses_shared_expert_into_257th_iq2r_slot(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    compiled = tmp_path / "compiled"
+    output = tmp_path / "overlay"
+    experts = 2
+    _write_plain_glm_source_model(source, layers=5, experts=experts)
+    compiled.mkdir()
+
+    monkeypatch.setattr(
+        overlay_module,
+        "load_iq2r_layer_checkpoint",
+        lambda _path, layer: _fake_fused_shared_glm_checkpoint(layer, experts),
+    )
+    manifest_path = create_glm5_iq2r_overlay(source, compiled, output)
+
+    config = json.loads((output / "config.json").read_text())
+    assert config["n_routed_experts"] == experts
+    assert config["n_shared_experts"] == 1
+    assert config["quantization_config"]["iq2r_modules"] == [
+        "model.layers.*.mlp.experts",
+        "model.layers.*.mlp.shared_experts",
+    ]
+
+    weight_map = json.loads((output / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    for layer in (3, 4):
+        assert all(
+            name not in weight_map
+            for name in iq2r_glm5_shared_source_keys(layer, root="model").values()
+        )
+        names = iq2r_glm5_overlay_keys(layer, root="model")
+        shard = output / f"iq2r-model-layer-{layer:04d}.safetensors"
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            assert handle.get_slice(names["gate_up_data"]).get_shape()[0] == experts + 1
+            assert handle.get_slice(names["down_data"]).get_shape()[0] == experts + 1
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["expert_count"] == experts
+    assert manifest["compiled_expert_count"] == experts + 1
+    assert manifest["fused_shared_expert"] is True
+    assert manifest["removed_source_tensor_count"] == 36
 
 
 def test_plain_glm_overlay_can_reuse_compiled_projection_shards(tmp_path, monkeypatch):

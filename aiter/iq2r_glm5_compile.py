@@ -25,7 +25,11 @@ from typing import Any, Self
 import torch
 from torch import Tensor
 
-from .iq2r_checkpoint import iq2r_compiled_tensor_keys, iq2r_glm5_source_keys
+from .iq2r_checkpoint import (
+    iq2r_compiled_tensor_keys,
+    iq2r_glm5_shared_source_keys,
+    iq2r_glm5_source_keys,
+)
 from .ops.iq2r import iq2r_encode_device
 from .ops.iq2r_encoder import iq2r_learn_codebook
 from .ops.iq2r_format import (
@@ -39,7 +43,7 @@ _REDLINE_CALIBRATION_FORMAT = "redline-calibration"
 _REDLINE_CALIBRATION_VERSION = 1
 _REDLINE_CALIBRATION_SCHEME = "iq2r-diagonal-second-moment"
 _TARGET_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\."
+    r"^model\.layers\.(\d+)\.mlp\.(experts|shared_experts)\."
     r"(gate_up_proj|up_gate_proj|down_proj)\.weight$"
 )
 
@@ -80,6 +84,7 @@ class GLM5Layout:
     block_k: int
     model_family: str = "glm5_next"
     source_root: str = "model.language_model"
+    shared_expert_count: int = 0
 
     @property
     def moe_layers(self) -> int:
@@ -92,11 +97,24 @@ class GLM5Importance:
     down: Tensor
     metadata: dict[str, Any]
     quality: str
+    shared_gate_up: Tensor | None = None
+    shared_down: Tensor | None = None
 
     def for_projection(self, layer: int, projection: str, expert: int) -> Tensor:
         cache_layer = layer - int(self.metadata["first_moe_layer"])
         source = self.gate_up if projection == "gate_up" else self.down
-        importance = source[cache_layer, expert].float()
+        if expert < source.shape[1]:
+            importance = source[cache_layer, expert].float()
+        else:
+            shared = (
+                self.shared_gate_up if projection == "gate_up" else self.shared_down
+            )
+            if shared is None or expert != source.shape[1]:
+                raise ValueError(
+                    f"no calibrated importance for fused shared expert {expert} "
+                    f"in layer {layer} projection {projection}"
+                )
+            importance = shared[cache_layer].float()
         return (importance / importance.mean().clamp_min(1e-12)).clamp_min(1e-6)
 
 
@@ -144,11 +162,14 @@ def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
         block_k=block_size[1],
         model_family=model_family,
         source_root=source_root,
+        shared_expert_count=int(text.get("n_shared_experts", 0) or 0),
     )
     if not (0 <= layout.first_moe_layer < layout.layer_count):
         raise ValueError("GLM-5 config has an invalid routed-MoE layer range")
     if not (0 < layout.expert_count <= 512):
         raise ValueError("GLM-5 config has an invalid routed expert count")
+    if layout.shared_expert_count not in (0, 1):
+        raise ValueError("GLM-5 IQ2R currently supports at most one shared expert")
     if layout.hidden_size <= 0 or layout.intermediate_size <= 0:
         raise ValueError("GLM-5 config has invalid expert dimensions")
     return layout
@@ -197,6 +218,33 @@ def _validate_importance_shapes(
         raise ValueError("IQ2R importance cache contains negative values")
 
 
+def _validate_shared_importance_shapes(
+    gate_up: Tensor | None,
+    down: Tensor | None,
+    layout: GLM5Layout,
+) -> None:
+    if gate_up is None and down is None:
+        return
+    if gate_up is None or down is None:
+        raise ValueError(
+            "IQ2R shared-expert importance must contain paired gate-up and down targets"
+        )
+    expected_gate = (layout.moe_layers, layout.hidden_size)
+    expected_down = (layout.moe_layers, layout.intermediate_size)
+    if gate_up.dtype != torch.float32 or down.dtype != torch.float32:
+        raise ValueError("IQ2R shared-expert importance diagonals must be float32")
+    if tuple(gate_up.shape) != expected_gate or tuple(down.shape) != expected_down:
+        raise ValueError(
+            "IQ2R shared-expert importance shape mismatch: "
+            f"gate_up={tuple(gate_up.shape)}, down={tuple(down.shape)}, "
+            f"expected_gate={expected_gate}, expected_down={expected_down}"
+        )
+    if not bool(torch.isfinite(gate_up).all()) or not bool(torch.isfinite(down).all()):
+        raise ValueError("IQ2R shared-expert importance contains non-finite values")
+    if bool(torch.lt(gate_up, 0).any()) or bool(torch.lt(down, 0).any()):
+        raise ValueError("IQ2R shared-expert importance contains negative values")
+
+
 def _load_direct_importance(
     payload: dict[str, Any], layout: GLM5Layout
 ) -> GLM5Importance:
@@ -220,8 +268,22 @@ def _load_direct_importance(
     gate_up = payload["gate_up"].contiguous()
     down = payload["down"].contiguous()
     _validate_importance_shapes(gate_up, down, layout)
+    shared_gate_up = payload.get("shared_gate_up")
+    shared_down = payload.get("shared_down")
+    if isinstance(shared_gate_up, Tensor):
+        shared_gate_up = shared_gate_up.contiguous()
+    if isinstance(shared_down, Tensor):
+        shared_down = shared_down.contiguous()
+    _validate_shared_importance_shapes(shared_gate_up, shared_down, layout)
     metadata["first_moe_layer"] = layout.first_moe_layer
-    return GLM5Importance(gate_up, down, metadata, "calibrated-o0")
+    return GLM5Importance(
+        gate_up,
+        down,
+        metadata,
+        "calibrated-o0",
+        shared_gate_up,
+        shared_down,
+    )
 
 
 def _load_calibration_artifact(
@@ -250,16 +312,22 @@ def _load_calibration_artifact(
         raise TypeError("Redline calibration artifact has no targets object")
 
     projections: dict[str, dict[int, Tensor]] = {"gate_up": {}, "down": {}}
+    shared_projections: dict[str, dict[int, Tensor]] = {
+        "gate_up": {},
+        "down": {},
+    }
     for name, target in targets.items():
         match = _TARGET_PATTERN.fullmatch(name)
         if match is None or not isinstance(target, dict):
             continue
         layer = int(match.group(1))
-        projection = "down" if match.group(2) == "down_proj" else "gate_up"
+        module = match.group(2)
+        projection = "down" if match.group(3) == "down_proj" else "gate_up"
         importance = target.get("importance")
         if not isinstance(importance, Tensor):
             raise TypeError(f"calibration target {name!r} has no importance tensor")
-        projections[projection][layer] = importance
+        destination = shared_projections if module == "shared_experts" else projections
+        destination[projection][layer] = importance
 
     gate_layers = set(projections["gate_up"])
     if not gate_layers or gate_layers != set(projections["down"]):
@@ -284,6 +352,31 @@ def _load_calibration_artifact(
         [projections["down"][layer] for layer in ordered_layers]
     ).contiguous()
     _validate_importance_shapes(gate_up, down, layout)
+    shared_gate_layers = set(shared_projections["gate_up"])
+    shared_down_layers = set(shared_projections["down"])
+    if shared_gate_layers != shared_down_layers:
+        raise ValueError(
+            "Redline calibration must contain paired shared gate-up and down targets"
+        )
+    shared_gate_up = None
+    shared_down = None
+    if shared_gate_layers:
+        if shared_gate_layers == actual_layers:
+            shared_ordered_layers = range(layout.first_moe_layer, layout.layer_count)
+        elif shared_gate_layers == compact_layers:
+            shared_ordered_layers = range(layout.moe_layers)
+        else:
+            raise ValueError(
+                "Redline shared-expert calibration layers do not match GLM layers: "
+                f"got {sorted(shared_gate_layers)}"
+            )
+        shared_gate_up = torch.stack(
+            [shared_projections["gate_up"][layer] for layer in shared_ordered_layers]
+        ).contiguous()
+        shared_down = torch.stack(
+            [shared_projections["down"][layer] for layer in shared_ordered_layers]
+        ).contiguous()
+    _validate_shared_importance_shapes(shared_gate_up, shared_down, layout)
     metadata.update(
         {
             "calibration_format": _REDLINE_CALIBRATION_FORMAT,
@@ -292,7 +385,14 @@ def _load_calibration_artifact(
             "first_moe_layer": layout.first_moe_layer,
         }
     )
-    return GLM5Importance(gate_up, down, metadata, "calibrated-o0")
+    return GLM5Importance(
+        gate_up,
+        down,
+        metadata,
+        "calibrated-o0",
+        shared_gate_up,
+        shared_down,
+    )
 
 
 def load_glm5_importance(
@@ -330,6 +430,24 @@ def load_glm5_importance(
                 "warning": "not O0 quality",
             },
             "diagnostic-uniform-not-o0-quality",
+            (
+                torch.ones(
+                    layout.moe_layers,
+                    layout.hidden_size,
+                    dtype=torch.float32,
+                )
+                if layout.shared_expert_count
+                else None
+            ),
+            (
+                torch.ones(
+                    layout.moe_layers,
+                    layout.intermediate_size,
+                    dtype=torch.float32,
+                )
+                if layout.shared_expert_count
+                else None
+            ),
         )
     if diagnostic_uniform_importance:
         raise ValueError(
@@ -469,6 +587,17 @@ def _projection_metadata(layout: GLM5Layout, projection: str) -> IQ2RMetadata:
     raise ValueError(f"unknown projection {projection!r}")
 
 
+def _compiled_expert_count(layout: GLM5Layout, fuse_shared_expert: bool) -> int:
+    if not fuse_shared_expert:
+        return layout.expert_count
+    if layout.model_family != "glm_moe_dsa" or layout.shared_expert_count != 1:
+        raise ValueError(
+            "fused IQ2R shared-expert compilation currently requires plain "
+            "GLM MoE DSA with exactly one shared expert"
+        )
+    return layout.expert_count + 1
+
+
 def _source_projection(
     reader: _TensorReader,
     layout: GLM5Layout,
@@ -476,8 +605,13 @@ def _source_projection(
     expert: int,
     projection: str,
     device: torch.device | str,
+    *,
+    fuse_shared_expert: bool = False,
 ) -> Tensor:
-    names = iq2r_glm5_source_keys(layer, expert, root=layout.source_root)
+    if expert == layout.expert_count and fuse_shared_expert:
+        names = iq2r_glm5_shared_source_keys(layer, root=layout.source_root)
+    else:
+        names = iq2r_glm5_source_keys(layer, expert, root=layout.source_root)
     if projection == "gate_up":
         gate = dequantize_block_fp8(
             reader.get(names["gate_proj_weight"]),
@@ -510,16 +644,19 @@ def _validate_projection_shard(
     projection: str,
     quality: str,
     safe_open,
+    *,
+    fuse_shared_expert: bool = False,
 ) -> None:
     """Validate an existing projection shard before accepting ``--resume``."""
 
     metadata = _projection_metadata(layout, projection)
     module_name = "up_gate_proj" if projection == "gate_up" else "down_proj"
     keys = iq2r_compiled_tensor_keys(layer, projection, module_name=module_name)
+    compiled_experts = _compiled_expert_count(layout, fuse_shared_expert)
     expected_tensors = {
-        keys["data"]: ([layout.expert_count, metadata.data_bytes], "U8"),
+        keys["data"]: ([compiled_experts, metadata.data_bytes], "U8"),
         keys["auxiliary"]: (
-            [layout.expert_count, metadata.auxiliary_bytes],
+            [compiled_experts, metadata.auxiliary_bytes],
             "U8",
         ),
         keys["tile_n"]: ([1], "I32"),
@@ -583,6 +720,7 @@ def _compile_projection(
     resume: bool,
     safe_open,
     save_file,
+    fuse_shared_expert: bool = False,
 ) -> str:
     suffix = "gate-up" if projection == "gate_up" else "down"
     shard_name = f"iq2r-layer-{layer:04d}-{suffix}.safetensors"
@@ -596,18 +734,28 @@ def _compile_projection(
                 projection,
                 importance.quality,
                 safe_open,
+                fuse_shared_expert=fuse_shared_expert,
             )
             return shard_name
         if not force:
             raise FileExistsError(f"refusing to overwrite {shard_path}; pass --force")
 
     metadata = _projection_metadata(layout, projection)
-    data = torch.empty((layout.expert_count, metadata.data_bytes), dtype=torch.uint8)
+    compiled_experts = _compiled_expert_count(layout, fuse_shared_expert)
+    data = torch.empty((compiled_experts, metadata.data_bytes), dtype=torch.uint8)
     auxiliary = torch.empty(
-        (layout.expert_count, metadata.auxiliary_bytes), dtype=torch.uint8
+        (compiled_experts, metadata.auxiliary_bytes), dtype=torch.uint8
     )
-    for expert in range(layout.expert_count):
-        weight = _source_projection(reader, layout, layer, expert, projection, device)
+    for expert in range(compiled_experts):
+        weight = _source_projection(
+            reader,
+            layout,
+            layer,
+            expert,
+            projection,
+            device,
+            fuse_shared_expert=fuse_shared_expert,
+        )
         expected = (metadata.logical_n, metadata.logical_k)
         if tuple(weight.shape) != expected:
             raise ValueError(
@@ -629,14 +777,14 @@ def _compile_projection(
         data[expert].copy_(encoded_data.cpu())
         auxiliary[expert].copy_(encoded_auxiliary.cpu())
         del weight, expert_importance, encoded_data, encoded_auxiliary
-        if (expert + 1) % 16 == 0 or expert + 1 == layout.expert_count:
+        if (expert + 1) % 16 == 0 or expert + 1 == compiled_experts:
             print(
                 json.dumps(
                     {
                         "layer": layer,
                         "projection": projection,
                         "experts_complete": expert + 1,
-                        "experts_total": layout.expert_count,
+                        "experts_total": compiled_experts,
                     }
                 ),
                 flush=True,
@@ -690,6 +838,7 @@ def _compiled_config(
     file_manifest: list[str],
     source_model: str,
     source_config_sha256: str,
+    fuse_shared_expert: bool = False,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "architectures": list(source_config.get("architectures") or []),
@@ -712,6 +861,8 @@ def _compiled_config(
             "model_family": layout.model_family,
             "source_root": layout.source_root,
             "quality": importance.quality,
+            "compiled_expert_count": _compiled_expert_count(layout, fuse_shared_expert),
+            "fused_shared_expert": fuse_shared_expert,
             "compiled_layers": selected_layers,
             "source_model": source_model,
             "source_config_sha256": source_config_sha256,
@@ -747,6 +898,8 @@ def compile_glm5_iq2r(
     sample_vectors: int = 65536,
     force: bool = False,
     resume: bool = False,
+    fuse_shared_expert: bool = False,
+    diagnostic_shared_importance: bool = False,
 ) -> Path:
     """Compile GLM routed experts and return the intermediate config path."""
 
@@ -772,6 +925,30 @@ def compile_glm5_iq2r(
         layout,
         diagnostic_uniform_importance=diagnostic_uniform_importance,
     )
+    _compiled_expert_count(layout, fuse_shared_expert)
+    if fuse_shared_expert and (
+        importance.shared_gate_up is None or importance.shared_down is None
+    ):
+        if not diagnostic_shared_importance:
+            raise ValueError(
+                "fused shared-expert compilation requires shared-expert "
+                "calibration; use --diagnostic-shared-importance only for "
+                "performance bring-up"
+            )
+        importance = GLM5Importance(
+            importance.gate_up,
+            importance.down,
+            {
+                **importance.metadata,
+                "shared_expert_importance": "diagnostic-uniform",
+                "warning": "shared expert is not O0 calibrated",
+            },
+            "calibrated-routed-diagnostic-shared-not-o0-quality",
+            torch.ones(layout.moe_layers, layout.hidden_size, dtype=torch.float32),
+            torch.ones(
+                layout.moe_layers, layout.intermediate_size, dtype=torch.float32
+            ),
+        )
     selected_layers = (
         list(range(layout.first_moe_layer, layout.layer_count))
         if layer_indices is None
@@ -809,6 +986,7 @@ def compile_glm5_iq2r(
                     resume=resume,
                     safe_open=safe_open,
                     save_file=save_file,
+                    fuse_shared_expert=fuse_shared_expert,
                 )
             )
             file_manifest.append(
@@ -826,6 +1004,7 @@ def compile_glm5_iq2r(
                     resume=resume,
                     safe_open=safe_open,
                     save_file=save_file,
+                    fuse_shared_expert=fuse_shared_expert,
                 )
             )
 
@@ -838,6 +1017,7 @@ def compile_glm5_iq2r(
         file_manifest,
         str(model_dir),
         source_config_sha256,
+        fuse_shared_expert,
     )
     output_config = output_dir / "config.json"
     if output_config.exists() and not (force or resume):
@@ -873,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample-vectors", type=int, default=65536)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fuse-shared-expert", action="store_true")
+    parser.add_argument("--diagnostic-shared-importance", action="store_true")
     args = parser.parse_args(argv)
     config_path = compile_glm5_iq2r(
         args.model_dir,
@@ -885,6 +1067,8 @@ def main(argv: list[str] | None = None) -> int:
         sample_vectors=args.sample_vectors,
         force=args.force,
         resume=args.resume,
+        fuse_shared_expert=args.fuse_shared_expert,
+        diagnostic_shared_importance=args.diagnostic_shared_importance,
     )
     print(json.dumps({"config": str(config_path)}))
     return 0

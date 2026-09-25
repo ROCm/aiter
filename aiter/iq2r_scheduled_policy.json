@@ -1,0 +1,26 @@
+{
+  "1": {
+    "gate": "register",
+    "down": "register_single_epilogue"
+  },
+  "2": {
+    "gate": "register",
+    "down": "register_single_epilogue"
+  },
+  "4": {
+    "gate": "wait3",
+    "down": "register_single_epilogue"
+  },
+  "8": {
+    "gate": "wait3",
+    "down": "register_single_epilogue"
+  },
+  "16": {
+    "gate": "wait3",
+    "down": "register_single_epilogue"
+  },
+  "256": {
+    "gate": "unchanged",
+    "down": "register_prefetch_uniform_deferred_scale"
+  }
+}

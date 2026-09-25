@@ -54,6 +54,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("logical_n"),
           py::arg("logical_k"),
           py::arg("tile_n"));
+    m.def("iq2r_task_gemm_indexed_out",
+          &aiter::iq2r_task_gemm_indexed_out,
+          py::arg("activations"),
+          py::arg("activation_scales"),
+          py::arg("data"),
+          py::arg("auxiliary"),
+          py::arg("tasks"),
+          py::arg("task_count"),
+          py::arg("bias"),
+          py::arg("output"),
+          py::arg("logical_n"),
+          py::arg("logical_k"),
+          py::arg("tile_n"),
+          py::arg("gather_indices"));
+    m.def("iq2r_task_gemm_swiglu_quant_out",
+          &aiter::iq2r_task_gemm_swiglu_quant_out,
+          py::arg("activations"),
+          py::arg("activation_scales"),
+          py::arg("data"),
+          py::arg("auxiliary"),
+          py::arg("tasks"),
+          py::arg("task_count"),
+          py::arg("bias"),
+          py::arg("output"),
+          py::arg("output_scales"),
+          py::arg("logical_n"),
+          py::arg("logical_k"),
+          py::arg("limit")     = 0.0,
+          py::arg("alpha")     = 1.0,
+          py::arg("up_offset") = 0.0);
     m.def("iq2r_route_sort_tasks_out",
           &aiter::iq2r_route_sort_tasks_out,
           py::arg("expert_ids"),
@@ -62,9 +92,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scatter_indices"),
           py::arg("tasks"),
           py::arg("task_count"),
+          py::arg("expert_map"),
           py::arg("expert_count"),
           py::arg("expert_start"),
-          py::arg("task_rows"));
+          py::arg("expert_stride"),
+          py::arg("task_rows"),
+          py::arg("drop_nonlocal_tasks") = false);
     m.def("iq2r_route_gather_indexed_out",
           &aiter::iq2r_route_gather_indexed_out,
           py::arg("input"),
@@ -75,6 +108,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           &aiter::iq2r_route_gather_quant_out,
           py::arg("input"),
           py::arg("gather_indices"),
+          py::arg("output"),
+          py::arg("scales"),
+          py::arg("topk"));
+    m.def("iq2r_route_scatter_quant_out",
+          &aiter::iq2r_route_scatter_quant_out,
+          py::arg("input"),
+          py::arg("scatter_indices"),
           py::arg("output"),
           py::arg("scales"),
           py::arg("topk"));
@@ -89,9 +129,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("task_count"),
           py::arg("output"),
           py::arg("scales"),
+          py::arg("expert_map"),
           py::arg("topk"),
           py::arg("expert_count"),
-          py::arg("expert_start"));
+          py::arg("expert_start"),
+          py::arg("expert_stride"),
+          py::arg("drop_nonlocal_routes") = false);
     m.def("iq2r_route_topk_direct_gather_quant_out",
           &aiter::iq2r_route_topk_direct_gather_quant_out,
           py::arg("input"),
@@ -106,7 +149,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("output"),
           py::arg("scales"),
           py::arg("renormalize"),
-          py::arg("router_bias") = std::nullopt);
+          py::arg("router_bias")           = std::nullopt,
+          py::arg("biased_sigmoid")        = false,
+          py::arg("routed_scaling_factor") = 1.0,
+          py::arg("expert_map")            = std::nullopt,
+          py::arg("expert_count")          = 128,
+          py::arg("expert_start")          = 0,
+          py::arg("expert_stride")         = 1,
+          py::arg("drop_nonlocal_routes")  = false);
     m.def("iq2r_route_topk_sort_gather_quant_out",
           &aiter::iq2r_route_topk_sort_gather_quant_out,
           py::arg("input"),
@@ -122,7 +172,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scales"),
           py::arg("task_rows"),
           py::arg("renormalize"),
-          py::arg("router_bias") = std::nullopt);
+          py::arg("router_bias")           = std::nullopt,
+          py::arg("biased_sigmoid")        = false,
+          py::arg("routed_scaling_factor") = 1.0,
+          py::arg("expert_map")            = std::nullopt,
+          py::arg("expert_count")          = 128,
+          py::arg("expert_start")          = 0,
+          py::arg("expert_stride")         = 1,
+          py::arg("drop_nonlocal_routes")  = false);
     m.def("iq2r_swiglu_out",
           &aiter::iq2r_swiglu_out,
           py::arg("gate_up"),
@@ -136,14 +193,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("output"),
           py::arg("scales"),
           py::arg("activated") = std::nullopt,
-          py::arg("limit") = 7.0,
-          py::arg("alpha") = 1.702,
+          py::arg("limit")     = 7.0,
+          py::arg("alpha")     = 1.702,
+          py::arg("up_offset") = 1.0);
+    m.def("iq2r_swiglu_quant_scatter_out",
+          &aiter::iq2r_swiglu_quant_scatter_out,
+          py::arg("gate_up"),
+          py::arg("scatter_indices"),
+          py::arg("output"),
+          py::arg("scales"),
+          py::arg("topk"),
+          py::arg("activated") = std::nullopt,
+          py::arg("limit")     = 7.0,
+          py::arg("alpha")     = 1.702,
           py::arg("up_offset") = 1.0);
     m.def("iq2r_route_reduce_indexed_out",
           &aiter::iq2r_route_reduce_indexed_out,
           py::arg("route_output"),
           py::arg("route_weights"),
           py::arg("scatter_indices"),
+          py::arg("output"),
+          py::arg("topk"));
+    m.def("iq2r_route_reduce_add_indexed_out",
+          &aiter::iq2r_route_reduce_add_indexed_out,
+          py::arg("route_output"),
+          py::arg("route_weights"),
+          py::arg("scatter_indices"),
+          py::arg("shared_output"),
           py::arg("output"),
           py::arg("topk"));
     m.def("iq2r_route_reduce_add_rmsnorm_indexed_out",
@@ -158,4 +234,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("topk"),
           py::arg("epsilon"),
           py::arg("block_size"));
+    m.def("iq2r_gate_aligned_fused_out", &aiter::iq2r_gate_aligned_fused_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("gather"), py::arg("output"), py::arg("output_scales"), py::arg("rows_per_cta"));
+    m.def("iq2r_gate_quad_fused_out", &aiter::iq2r_gate_quad_fused_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("gather"), py::arg("output"), py::arg("output_scales"), py::arg("rows_per_cta"));
+    m.def("iq2r_gate_quad_sparse_out", &aiter::iq2r_gate_quad_sparse_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("gather"), py::arg("output"), py::arg("output_scales"), py::arg("rows_per_cta"));
+    m.def("iq2r_gate_quad_splitk_out", &aiter::iq2r_gate_quad_splitk_out, py::arg("input"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("partials"), py::arg("output"), py::arg("output_scales"), py::arg("physical_waves"));
+    m.def("iq2r_gate_quad_route_fused_out", &aiter::iq2r_gate_quad_route_fused_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("output_scales"));
+    m.def("iq2r_down_sparse_large32_out", &aiter::iq2r_down_sparse_large32_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("grid_multiplier"));
+    m.def("iq2r_down_sparse_scheduled_out", &aiter::iq2r_down_sparse_scheduled_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("grid_multiplier"), py::arg("variant"));
+    m.def("iq2r_down_shortk_out", &aiter::iq2r_down_shortk_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("grid_multiplier"), py::arg("variant"));
+    m.def("iq2r_gate_quad_scheduled_out", &aiter::iq2r_gate_quad_scheduled_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("output_scales"), py::arg("variant"));
+    m.def("iq2r_down_token_fused48_out", &aiter::iq2r_down_token_fused48_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("expert_ids"), py::arg("scatter"), py::arg("route_weights"), py::arg("output"));
+    m.def("iq2r_down_token_route9_out", &aiter::iq2r_down_token_route9_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("expert_ids"), py::arg("scatter"), py::arg("route_weights"), py::arg("output"));
+    m.def("iq2r_glm53_tp4_gate_out", &aiter::iq2r_glm53_tp4_gate_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("output_scales"), py::arg("variant"));
+    m.def("iq2r_glm53_tp4_down_out", &aiter::iq2r_glm53_tp4_down_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("grid_multiplier"), py::arg("variant"));
+    m.def("iq2r_glm53_tp4_route9_out", &aiter::iq2r_glm53_tp4_route9_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("expert_ids"), py::arg("scatter"), py::arg("route_weights"), py::arg("output"));
+    m.def("iq2r_glm53_tp4_indexed_gate_out", &aiter::iq2r_glm53_tp4_indexed_gate_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("gather"), py::arg("output"), py::arg("output_scales"), py::arg("rows_per_cta"));
+    m.def("iq2r_glm53_tp4_large_down_out", &aiter::iq2r_glm53_tp4_large_down_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("output"), py::arg("grid_multiplier"), py::arg("variant"));
+    m.def("iq2r_down_token_pair9_out", &aiter::iq2r_down_token_pair9_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("expert_ids"), py::arg("scatter"), py::arg("route_weights"), py::arg("output"), py::arg("group_tokens"));
+    m.def("iq2r_glm53_dense_gate_out", &aiter::iq2r_glm53_dense_gate_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("tasks"), py::arg("task_count"), py::arg("gather"), py::arg("output"), py::arg("output_scales"), py::arg("rows_per_cta"), py::arg("variant"));
+    m.def("iq2r_down_token_adaptive9_out", &aiter::iq2r_down_token_adaptive9_out, py::arg("activations"), py::arg("scales"), py::arg("data"), py::arg("auxiliary"), py::arg("expert_ids"), py::arg("scatter"), py::arg("route_weights"), py::arg("output"), py::arg("task_count"), py::arg("task_table"));
 }

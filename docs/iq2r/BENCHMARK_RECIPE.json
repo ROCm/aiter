@@ -1,0 +1,72 @@
+{
+  "scope": "Experimental candidate settings; not a release-qualified default or proof of full-model accuracy.",
+  "common_environment": {
+    "IQ2R_GLM53_INDEXED_INPUT": "1",
+    "IQ2R_GLM53_QUAD_GATE": "1",
+    "IQ2R_GLM53_SPARSE_QUAD_GATE": "1",
+    "IQ2R_GLM53_SMALL_QUAD_GATE": "1",
+    "IQ2R_GLM53_SCHEDULED": "1",
+    "IQ2R_GLM53_SPARSE_DOWN": "1",
+    "IQ2R_GLM53_FUSED_DOWN": "1",
+    "IQ2R_GLM53_C32": "1",
+    "IQ2R_GLM53_ROUTE9_DOWN": "1",
+    "IQ2R_GLM53_DIRECT_GATE": "1",
+    "IQ2R_GLM53_BALLOT_ROUTER": "1",
+    "IQ2R_GLM53_XCD_SPARSE_GATE": "1",
+    "IQ2R_GLM53_STATIC_BALLOT": "1",
+    "IQ2R_GLM53_ADAPTIVE_DOWN": "1",
+    "ATOM_IQ2R_GLM53_QUAD_PACK": "1",
+    "IQ2R_GLM53_CODEBOOK_BATCH": "0",
+    "IQ2R_GLM53_SPLIT4_GATE": "0",
+    "IQ2R_GLM53_PAIR_DOWN": "0",
+    "IQ2R_GLM53_MTP_SMALL": "0"
+  },
+  "tp8_environment": {
+    "IQ2R_GLM53_TP4": "0",
+    "IQ2R_GLM53_DENSE_GATE": "2"
+  },
+  "tp4_environment": {
+    "IQ2R_GLM53_TP4": "1",
+    "IQ2R_GLM53_DENSE_GATE": "0"
+  },
+  "workload": {
+    "client": "atom.benchmarks.benchmark_serving",
+    "input_lengths": [
+      1024,
+      8192
+    ],
+    "output_length": 1024,
+    "random_range_ratio": 0.8,
+    "concurrencies": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "seed": 0,
+    "measured_requests": "10 * concurrency",
+    "warmup_requests": "2 * concurrency",
+    "mtp": false,
+    "client_timeout_seconds": 3600
+  },
+  "server": {
+    "tp": [
+      4,
+      8
+    ],
+    "expert_parallel": false,
+    "kv_cache_dtype": "fp8",
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 4096,
+    "max_model_len": 12288,
+    "prefill_chunk_size": 128,
+    "prefix_caching": false
+  },
+  "bookends": "MXFP4 A -> IQ2R -> MXFP4 B on the same node, separately for each TP width",
+  "final_agentic_requirement": "Real MTP acceptance; pending exact GLM-5.2 MXFP4 and ATOM nightly assets"
+}

@@ -25,6 +25,7 @@ from .iq2r_checkpoint import (
     IQ2R_GENERIC_CHECKPOINT_SCHEMA_VERSION,
     iq2r_compiled_tensor_keys,
     iq2r_glm5_overlay_keys,
+    iq2r_glm5_shared_source_keys,
     iq2r_glm5_source_keys,
     iq2r_gpt_oss_source_keys,
     load_iq2r_layer_checkpoint,
@@ -331,12 +332,32 @@ def create_glm5_iq2r_overlay(
         raise ValueError(
             "compiled IQ2R checkpoint is not identified as a GLM-5 checkpoint"
         )
-    if first_checkpoint.total_experts != expert_count:
+    if first_checkpoint.total_experts == expert_count:
+        fuse_shared_expert = False
+    elif first_checkpoint.total_experts == expert_count + 1:
+        fuse_shared_expert = True
+    else:
         raise ValueError(
             "compiled IQ2R and source GLM expert counts differ: "
-            f"{first_checkpoint.total_experts} != {expert_count}"
+            f"{first_checkpoint.total_experts} is neither {expert_count} nor "
+            f"{expert_count + 1}"
         )
-
+    compiled_expert_count = first_checkpoint.total_experts
+    compiled_config_path = compiled_iq2r_dir / "config.json"
+    if compiled_config_path.is_file():
+        compiled_iq2r = _read_json(compiled_config_path).get("iq2r")
+        if isinstance(compiled_iq2r, dict):
+            declared_fusion = bool(compiled_iq2r.get("fused_shared_expert", False))
+            if declared_fusion != fuse_shared_expert:
+                raise ValueError(
+                    "compiled IQ2R shared-expert metadata disagrees with its "
+                    "expert tensor count"
+                )
+    if fuse_shared_expert and layout.shared_expert_count != 1:
+        raise ValueError(
+            "compiled IQ2R checkpoint fuses one shared expert, but the source "
+            f"declares {layout.shared_expert_count}"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     source_shards = _link_base_model_files(
         model_dir, output_dir, source_weight_map, force=force
@@ -355,15 +376,23 @@ def create_glm5_iq2r_overlay(
         )
         if checkpoint.gate_up_bias is not None or checkpoint.down_bias is not None:
             raise ValueError("GLM-5 routed experts must not contain projection biases")
-        if checkpoint.expert_count != expert_count:
+        if checkpoint.expert_count != compiled_expert_count:
             raise ValueError(
                 f"compiled layer {layer_index} contains "
-                f"{checkpoint.expert_count} experts, expected {expert_count}"
+                f"{checkpoint.expert_count} experts, expected {compiled_expert_count}"
             )
 
         for expert_index in range(expert_count):
             for source_name in iq2r_glm5_source_keys(
                 layer_index, expert_index, root=layout.source_root
+            ).values():
+                if source_name not in weight_map:
+                    raise KeyError(f"source index is missing {source_name!r}")
+                del weight_map[source_name]
+                removed_source_tensor_count += 1
+        if fuse_shared_expert:
+            for source_name in iq2r_glm5_shared_source_keys(
+                layer_index, root=layout.source_root
             ).values():
                 if source_name not in weight_map:
                     raise KeyError(f"source index is missing {source_name!r}")
@@ -484,7 +513,10 @@ def create_glm5_iq2r_overlay(
         "base_quantization_config": base_quantization_config,
         # Both GLM checkpoint roots are normalized to ``model.layers`` by the
         # ATOM model adapters before quantization method selection.
-        "iq2r_modules": ["model.layers.*.mlp.experts"],
+        "iq2r_modules": [
+            "model.layers.*.mlp.experts",
+            *(["model.layers.*.mlp.shared_experts"] if fuse_shared_expert else []),
+        ],
     }
     _atomic_write_json(output_dir / "config.json", overlay_config)
 
@@ -503,7 +535,7 @@ def create_glm5_iq2r_overlay(
     _atomic_write_json(output_dir / "model.safetensors.index.json", overlay_index)
 
     source_fp8_weight_bytes = (
-        moe_layer_count * expert_count * 3 * hidden_size * intermediate_size
+        moe_layer_count * compiled_expert_count * 3 * hidden_size * intermediate_size
     )
     manifest = {
         "schema": IQ2R_GENERIC_OVERLAY_SCHEMA,
@@ -515,6 +547,8 @@ def create_glm5_iq2r_overlay(
         "first_moe_layer": first_moe_layer,
         "layer_count": moe_layer_count,
         "expert_count": expert_count,
+        "compiled_expert_count": compiled_expert_count,
+        "fused_shared_expert": fuse_shared_expert,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
         "iq2r_bytes": total_iq2r_bytes,
