@@ -391,15 +391,6 @@ void pa_mqa_logits_mxfp4_build_sched(aiter_tensor_t& cu_tiles,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-// Arch of device `dev`, cached per device (fwd_sched runs every layer; a mixed-arch node must
-// dispatch each GPU by its own arch). `dev` must be current: get_gpu_arch() reads it.
-static const std::string& pa_mqa_logits_mxfp4_device_arch(int dev)
-{
-    static SynchronizedCache<int, std::string> archs;
-    // Node-based map: the returned reference survives later inserts.
-    return archs.get_or_create(dev, [] { return get_gpu_arch(); });
-}
-
 // ══ the public fwd op: dispatch on runtime arch, then (q_per_block, block_k) ═════════════════
 // The other arch's kernel compiles to an empty stub. An unmatched config must raise, never fall
 // back to a default.
@@ -422,9 +413,11 @@ void pa_mqa_logits_mxfp4_fwd_sched(aiter_tensor_t& q,
                                    int block_k)
 {
     aiter_detail::g_aiter_can_throw = true;
-    // The launch runs under this guard; dispatch on q's device, not the current one.
+    // Launch on q's device, not the current one.
     HipDeviceGuard guard(q.device_id);
-    const std::string& arch = pa_mqa_logits_mxfp4_device_arch(q.device_id);
+    // Probed once per process, on the first call's device (fwd_sched runs every layer). Assumes
+    // one arch per process: mixed-arch nodes are not supported.
+    static const std::string arch = get_gpu_arch();
 
 #define PA_MQA_LOGITS_MXFP4_LAUNCH(TRAITS)                                                       \
     pa_mqa_logits_mxfp4_launch_sched<TRAITS>(q, q_scale, kv_cache, kv_scale, block_tables,     \

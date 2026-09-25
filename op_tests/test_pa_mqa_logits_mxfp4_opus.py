@@ -140,7 +140,8 @@ def fp4_dequant(packed, e8m0, block_size=SCALE_BLOCK):
 # ── per-arch scale/cache layout ───────────────────────────────────────────────
 def _is_permuted() -> bool:
     """True on gfx950 (MFMA-permuted layouts), False on gfx1250 (natural). Queried per call on
-    the current device, never at import (the probe inits HIP before ``main()``'s arch gate)."""
+    the current device, never at import (the probe inits HIP before ``main()``'s arch gate).
+    """
     return _device_arch(torch.cuda.current_device()) == GFX950
 
 
@@ -171,7 +172,7 @@ class Inputs:
     block_tables: torch.Tensor
     max_seq_len: int
     q_e8: torch.Tensor  # [T*H, 4] natural E8M0, the source of every q_scale layout
-    kv_e8: torch.Tensor  # [nb*PAGE, 4] natural E8M0, the source of every kv_scale layout
+    kv_e8: torch.Tensor  # [nb*PAGE, 4] natural E8M0, source of all kv_scale layouts
 
 
 def pages_for(max_end):
@@ -357,8 +358,10 @@ def flydsl_cross_check(inp, out, rb, ls, le, variant):
             compute_prefill_schedule,
             flydsl_pa_mqa_logits_fp4_prefill,
         )
-    except Exception as e:  # noqa: BLE001 -- any import failure means "no second opinion"
-        aiter.logger.warning("FlyDSL cross-check unavailable: %s: %s", type(e).__name__, e)
+    except Exception as e:  # noqa: BLE001 -- no import, no second opinion
+        aiter.logger.warning(
+            "FlyDSL cross-check unavailable: %s: %s", type(e).__name__, e
+        )
         return float("nan")
     total_q = int(rb.numel())
     num_blocks = inp.block_tables.numel()
@@ -589,7 +592,12 @@ def check_raw_row_guard(data_init, scale_init, seed, variant):
     le = t([ROWID_WIN] * claimed)
     buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, claimed, 1, variant=variant)
     plan = pa_mqa_logits_mxfp4_plan(
-        t([0, claimed]), le, buffers=buffers, total_q=claimed, local_starts=ls, row_to_batch=rb
+        t([0, claimed]),
+        le,
+        buffers=buffers,
+        total_q=claimed,
+        local_starts=ls,
+        row_to_batch=rb,
     )
     out = torch.full(
         (claimed, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
@@ -658,7 +666,7 @@ def check_row_count_raises(data_init, scale_init, seed, variant):
         "local_ends",
     )
     torch.cuda.synchronize()
-    del inp
+    inp = None  # rebind, not del: the lambdas above close over it
     torch.cuda.empty_cache()
     return {
         "data_init": data_init, "scale_init": scale_init, "seed": seed,
@@ -778,13 +786,21 @@ def run_corner(data_init, scale_init, seed):
     atom = [
         check_atom_decode(data_init, scale_init, seed + 90 + mtp, v, mtp, pad)
         for v in variants
-        for mtp, pad in ((1, ATOM_PAD_SEQS), (2, ATOM_PAD_SEQS), (2, len(ATOM_REAL_CTX)))
+        for mtp, pad in (
+            (1, ATOM_PAD_SEQS),
+            (2, ATOM_PAD_SEQS),
+            (2, len(ATOM_REAL_CTX)),
+        )
     ]
-    return [
-        check_prefill(w, seed + case_seed, label, data_init, scale_init, v)
-        for v in variants
-        for w, case_seed, label in cases
-    ] + row_id + atom
+    return (
+        [
+            check_prefill(w, seed + case_seed, label, data_init, scale_init, v)
+            for v in variants
+            for w, case_seed, label in cases
+        ]
+        + row_id
+        + atom
+    )
 
 
 SPREAD_PROBE_ROWS = 4096
@@ -804,7 +820,8 @@ def scale_spread(scale_init, seed=0, rows=SPREAD_PROBE_ROWS):
 
 def correctness_blindness(data_init, scale_init):
     """Why this init pair cannot catch a wrong answer (all-zero data, or too little exponent
-    spread), or ``None`` when it can. Such pairs are skipped with the reason, not passed."""
+    spread), or ``None`` when it can. Such pairs are skipped with the reason, not passed.
+    """
     if data_init == "zero":
         return "data-init zero makes every fp4 nibble 0, so the reference agrees with anything"
     distinct, disagree = scale_spread(scale_init)

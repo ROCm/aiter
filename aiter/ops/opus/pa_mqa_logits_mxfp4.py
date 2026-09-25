@@ -124,15 +124,23 @@ _MD_NAME = "module_pa_mqa_logits_mxfp4_opus"
 _VARIANTS = {
     GFX1250: (
         # Four rows per CTA, one per wave, sharing a KV tile: prefill, MTP > 1.
-        MqaLogitsVariant("qlen4_kv64", q_per_block=4, block_k=64, cta_resident=768, arch=GFX1250),
+        MqaLogitsVariant(
+            "qlen4_kv64", q_per_block=4, block_k=64, cta_resident=768, arch=GFX1250
+        ),
         # One row per CTA, a single wave32: MTP = 1 decode.
-        MqaLogitsVariant("qlen1_kv64", q_per_block=1, block_k=64, cta_resident=3072, arch=GFX1250),
+        MqaLogitsVariant(
+            "qlen1_kv64", q_per_block=1, block_k=64, cta_resident=3072, arch=GFX1250
+        ),
     ),
     GFX950: (
         # One row per CTA, one wave over a 64-token KV tile: the default.
-        MqaLogitsVariant("qlen1_kv64", q_per_block=1, block_k=64, cta_resident=1024, arch=GFX950),
+        MqaLogitsVariant(
+            "qlen1_kv64", q_per_block=1, block_k=64, cta_resident=1024, arch=GFX950
+        ),
         # One row per CTA, four waves over a 256-token KV tile: for long windows.
-        MqaLogitsVariant("qlen1_kv256", q_per_block=1, block_k=256, cta_resident=1024, arch=GFX950),
+        MqaLogitsVariant(
+            "qlen1_kv256", q_per_block=1, block_k=256, cta_resident=1024, arch=GFX950
+        ),
     ),
 }
 
@@ -146,9 +154,13 @@ def _check_variant_tables():
     for arch, variants in _VARIANTS.items():
         for v in variants:
             if v.arch != arch:
-                raise AssertionError(f"{v} is filed under {arch} but names arch={v.arch}")
+                raise AssertionError(
+                    f"{v} is filed under {arch} but names arch={v.arch}"
+                )
             if min(v.q_per_block, v.block_k, v.cta_resident) < 1:
-                raise AssertionError(f"{arch} {v}: q_per_block / block_k / cta_resident < 1")
+                raise AssertionError(
+                    f"{arch} {v}: q_per_block / block_k / cta_resident < 1"
+                )
 
 
 _check_variant_tables()
@@ -257,7 +269,8 @@ def _max_tiles_for(total_q: int, batch: int, variant: MqaLogitsVariant) -> int:
 
 def _sched_slots(num_tiles: int, variant: MqaLogitsVariant) -> int:
     """The ``num_ctas`` grid: ``num_tiles`` rounded up to whole resident rounds, at least one
-    round so a few long tiles can be split across the GPU. Excludes the builder's scratch."""
+    round so a few long tiles can be split across the GPU. Excludes the builder's scratch.
+    """
     r = variant.cta_resident
     n = max(int(num_tiles), r)
     return -(-n // r) * r
@@ -463,9 +476,11 @@ def pa_mqa_logits_mxfp4_block_table_width(
     wanted = (
         None
         if variant is None
-        else (variant,)
-        if isinstance(variant, (MqaLogitsVariant, str))
-        else tuple(variant)
+        else (
+            (variant,)
+            if isinstance(variant, (MqaLogitsVariant, str))
+            else tuple(variant)
+        )
     )
     if (
         device is None
