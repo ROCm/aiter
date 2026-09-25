@@ -22,7 +22,11 @@ gated on bit-identity against the contiguous kernel.
 import torch
 
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
-    K_WIDTH, SCALE_GROUP, _split_cache, mfma_nonk_dim)
+    K_WIDTH,
+    SCALE_GROUP,
+    _split_cache,
+    mfma_nonk_dim,
+)
 
 
 def cache_strides(kv_cache, head_size, kv_scale_cache=None):
@@ -46,8 +50,10 @@ def offset_dtype(num_pages, kv_stride, kvs_stride, s_unit):
     int32 while both streams still reach: values are stored in K_WIDTH units
     and scales in s_unit, so the scales bind first -- 4 GiB against 32 GiB.
     """
-    fits = (num_pages * kv_stride <= 2 ** 31 * K_WIDTH
-            and num_pages * kvs_stride <= 2 ** 31 * s_unit)
+    fits = (
+        num_pages * kv_stride <= 2**31 * K_WIDTH
+        and num_pages * kvs_stride <= 2**31 * s_unit
+    )
     return torch.int32 if fits else torch.int64
 
 
@@ -63,9 +69,19 @@ def gather_s_unit(block, num_scales):
     return 2 if (block % 2 == 0 and num_scales % 2 == 0) else 1
 
 
-def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
-                  kv_stride, kvs_stride, block, preshuffle=1, scale_mode=1,
-                  dtype=torch.int32):
+def block_offsets(
+    pos0,
+    block_table,
+    page_size,
+    head_size,
+    n_per_tile,
+    kv_stride,
+    kvs_stride,
+    block,
+    preshuffle=1,
+    scale_mode=1,
+    dtype=torch.int32,
+):
     """Resolved (value, scale) offsets for the candidate blocks starting at pos0.
 
     `pos0` is [R, K] int64 KV positions, each a multiple of the candidate block
@@ -82,13 +98,15 @@ def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
     pid = torch.gather(block_table.long(), 1, page).long()
 
     if preshuffle:
-        bn = (t0 % n_per_tile) * K_WIDTH + (t0 // n_per_tile) * (n_per_tile
-                                                                 * head_bytes)
+        bn = (t0 % n_per_tile) * K_WIDTH + (t0 // n_per_tile) * (
+            n_per_tile * head_bytes
+        )
         # Mode 1 puts the token at stride s_hi inside a group, mode 0 at
         # stride 1. Both are constant, which is all a gather needs.
         tok_stride = s_hi if scale_mode == 1 else 1
-        bs = (t0 % n_per_tile) * tok_stride + (t0 // n_per_tile) * (n_per_tile
-                                                                    * num_scales)
+        bs = (t0 % n_per_tile) * tok_stride + (t0 // n_per_tile) * (
+            n_per_tile * num_scales
+        )
     else:
         bn = t0 * head_bytes
         bs = t0 * num_scales
@@ -104,22 +122,38 @@ def block_offsets(pos0, block_table, page_size, head_size, n_per_tile,
     # were a sync apiece, and the resolver already costs more than the launch
     # it feeds.
     v_mod, s_mod, p_mod, v_max, s_max = torch.stack(
-        [(voff % K_WIDTH).max(), (soff % s_unit).max(), (pos0 % block).max(),
-         voff.max() // K_WIDTH, soff.max()]).tolist()
+        [
+            (voff % K_WIDTH).max(),
+            (soff % s_unit).max(),
+            (pos0 % block).max(),
+            voff.max() // K_WIDTH,
+            soff.max(),
+        ]
+    ).tolist()
     assert v_mod == 0, "value offsets must be k_width aligned"
     assert s_mod == 0, "scale offsets must be unit aligned"
     # With page_size % block this keeps a block inside one shuffle group and one
     # page, which is what makes this file's opening `c` term loop invariant. A
     # misaligned start satisfies both checks above and reads the wrong bytes.
     assert p_mod == 0, "positions must be block-aligned"
-    assert dtype == torch.int64 or (v_max < 2 ** 31 and s_max < 2 ** 31), (
-        "resolved offsets do not fit i32; pass dtype=torch.int64")
+    assert dtype == torch.int64 or (
+        v_max < 2**31 and s_max < 2**31
+    ), "resolved offsets do not fit i32; pass dtype=torch.int64"
     return (voff // K_WIDTH).to(dtype), (soff // s_unit).to(dtype)
 
 
-def build_gather(positions, block_table, kv_cache, num_heads, head_size,
-                 block=8, kv_scale_cache=None, preshuffle=1, scale_mode=1,
-                 dtype=None):
+def build_gather(
+    positions,
+    block_table,
+    kv_cache,
+    num_heads,
+    head_size,
+    block=8,
+    kv_scale_cache=None,
+    preshuffle=1,
+    scale_mode=1,
+    dtype=None,
+):
     """[R, K] int64 block-start positions -> the kernel's `gather=` argument.
 
     `positions[r]` must be sorted ascending, unique, every entry a multiple of
@@ -131,18 +165,34 @@ def build_gather(positions, block_table, kv_cache, num_heads, head_size,
     slot space rather than key space. Slots past it are dropped by store_hi.
     """
     n_per_tile = mfma_nonk_dim(num_heads, head_size)
-    page_size, kv_stride, kvs_stride = cache_strides(kv_cache, head_size,
-                                                     kv_scale_cache)
+    page_size, kv_stride, kvs_stride = cache_strides(
+        kv_cache, head_size, kv_scale_cache
+    )
     assert page_size % block == 0 and block <= n_per_tile
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
     if dtype is None:
-        dtype = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride,
-                             gather_s_unit(block, head_size // SCALE_GROUP))
-    voff, soff = block_offsets(positions, block_table, page_size, head_size,
-                               n_per_tile, kv_stride, kvs_stride, block,
-                               preshuffle, scale_mode, dtype)
-    return dict(voff=voff.contiguous(), soff=soff.contiguous(), block=block,
-                positions=positions)
+        dtype = offset_dtype(
+            kv_cache.shape[0],
+            kv_stride,
+            kvs_stride,
+            gather_s_unit(block, head_size // SCALE_GROUP),
+        )
+    voff, soff = block_offsets(
+        positions,
+        block_table,
+        page_size,
+        head_size,
+        n_per_tile,
+        kv_stride,
+        kvs_stride,
+        block,
+        preshuffle,
+        scale_mode,
+        dtype,
+    )
+    return dict(
+        voff=voff.contiguous(), soff=soff.contiguous(), block=block, positions=positions
+    )
 
 
 def expand(positions, block=8):

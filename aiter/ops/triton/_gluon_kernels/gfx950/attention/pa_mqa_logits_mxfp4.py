@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Paged MXFP4 MQA-logits kernel for gfx950, plus its scheduler kernel.
 
-    logits[b*next_n + n, t] = sum_h relu(q[b, n, h, :] . kv[t, :]) * w[b*next_n + n, h]
+logits[b*next_n + n, t] = sum_h relu(q[b, n, h, :] . kv[t, :]) * w[b*next_n + n, h]
 """
 
 import triton
@@ -20,7 +20,6 @@ SCALE_GROUP = gl.constexpr(32)  # OCP MX block size; the scaled MFMA takes no ot
 WARP_SIZE = gl.constexpr(64)
 K_WIDTH = gl.constexpr(16)  # byte containers per lane along K
 _NAN_ALL = gl.constexpr(PropagateNan.ALL)
-
 
 
 @gluon.constexpr_function
@@ -45,10 +44,12 @@ def _scale_group_layout(scale_layout, n_per_tile, s_lo, s_hi, n_hi):
     """
     assert not scale_layout.warp_bases, "preshuffled scales expect one warp"
     return gl.DistributedLinearLayout(
-        reg_bases=[[b[0] // n_per_tile, 0, 0, b[1] // s_lo]
-                   for b in scale_layout.reg_bases],
-        lane_bases=[[0, b[1] % s_lo, b[0] % n_per_tile, 0]
-                    for b in scale_layout.lane_bases],
+        reg_bases=[
+            [b[0] // n_per_tile, 0, 0, b[1] // s_lo] for b in scale_layout.reg_bases
+        ],
+        lane_bases=[
+            [0, b[1] % s_lo, b[0] % n_per_tile, 0] for b in scale_layout.lane_bases
+        ],
         warp_bases=[],
         block_bases=[],
         shape=[n_hi, s_lo, n_per_tile, s_hi],
@@ -67,13 +68,18 @@ def _offset_bases_to_blocked(bases, contiguity, num_warps, warp_size, shape):
     lg2_ws = warp_size.bit_length() - 1
     i = lg2_c
     reg = bases[:lg2_c]
-    lane = bases[i:i + lg2_ws]
+    lane = bases[i : i + lg2_ws]
     i += lg2_ws
-    warp = bases[i:i + lg2_nw]
+    warp = bases[i : i + lg2_nw]
     i += lg2_nw
     warp = warp + [[0] * rank] * (lg2_nw - len(warp))
-    return gl.DistributedLinearLayout(reg_bases=reg + bases[i:], lane_bases=lane,
-                                      warp_bases=warp, block_bases=[], shape=shape)
+    return gl.DistributedLinearLayout(
+        reg_bases=reg + bases[i:],
+        lane_bases=lane,
+        warp_bases=warp,
+        block_bases=[],
+        shape=shape,
+    )
 
 
 @gluon.constexpr_function
@@ -85,35 +91,53 @@ def _staging_layouts(head_bytes, block_kv, num_warps, warp_size):
     lg2_hs = head_bytes.bit_length() - 1
     lg2_ts = block_kv.bit_length() - 1
     hs_lane = lg2_hs - (c.bit_length() - 1)
-    bases = ([[1 << i, 0] for i in range(lg2_hs)]
-             + [[0, 1 << ((i + hs_lane) % lg2_ts)] for i in range(lg2_ts)])
-    shared = gl.PaddedSharedLayout(interval_padding_pairs=[[1024, 16]],
-                                   offset_bases=bases, cga_layout=[],
-                                   shape=[head_bytes, block_kv])
-    return _offset_bases_to_blocked(bases, c, num_warps, warp_size,
-                                    [head_bytes, block_kv]), shared
+    bases = [[1 << i, 0] for i in range(lg2_hs)] + [
+        [0, 1 << ((i + hs_lane) % lg2_ts)] for i in range(lg2_ts)
+    ]
+    shared = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[1024, 16]],
+        offset_bases=bases,
+        cga_layout=[],
+        shape=[head_bytes, block_kv],
+    )
+    return (
+        _offset_bases_to_blocked(
+            bases, c, num_warps, warp_size, [head_bytes, block_kv]
+        ),
+        shared,
+    )
 
 
 @gluon.jit
-def _shuffled_offsets(offs_d, offs_n, D_EXTENT: gl.constexpr,
-                      N_PER_TILE: gl.constexpr, D_PER_TILE: gl.constexpr):
+def _shuffled_offsets(
+    offs_d,
+    offs_n,
+    D_EXTENT: gl.constexpr,
+    N_PER_TILE: gl.constexpr,
+    D_PER_TILE: gl.constexpr,
+):
     # Byte offset of (row, container) inside one preshuffled page.
     TILE: gl.constexpr = N_PER_TILE * D_PER_TILE
     GROUP: gl.constexpr = N_PER_TILE * D_EXTENT
-    return ((offs_d % D_PER_TILE)
-            + (offs_d // D_PER_TILE) * TILE
-            + (offs_n % N_PER_TILE) * D_PER_TILE
-            + (offs_n // N_PER_TILE) * GROUP)
+    return (
+        (offs_d % D_PER_TILE)
+        + (offs_d // D_PER_TILE) * TILE
+        + (offs_n % N_PER_TILE) * D_PER_TILE
+        + (offs_n // N_PER_TILE) * GROUP
+    )
 
 
 @gluon.jit
-def _shuffled_scale_offsets(offs_n, offs_s, NUM_SCALES: gl.constexpr,
-                            N_PER_TILE: gl.constexpr):
+def _shuffled_scale_offsets(
+    offs_n, offs_s, NUM_SCALES: gl.constexpr, N_PER_TILE: gl.constexpr
+):
     # The e8m0 twin, used for Q. Grouping N_PER_TILE rows puts each register
     # element's 64 lanes on one contiguous 64-byte run.
-    return ((offs_n % N_PER_TILE)
-            + offs_s * N_PER_TILE
-            + (offs_n // N_PER_TILE) * (N_PER_TILE * NUM_SCALES))
+    return (
+        (offs_n % N_PER_TILE)
+        + offs_s * N_PER_TILE
+        + (offs_n // N_PER_TILE) * (N_PER_TILE * NUM_SCALES)
+    )
 
 
 @gluon.jit
@@ -140,22 +164,38 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
         (folded if (stride, 0) in reg_bases else summed).append(bit)
     assert chain_bits <= len(folded), f"num_chains={num_chains} needs more folded bits"
     depth = len(folded) - chain_bits
-    return (tuple([2] * head_bits + [block_kv]),
-            tuple(summed + [head_bits] + folded[:chain_bits] + folded[chain_bits:]),
-            tuple([1 << len(summed), block_kv, num_chains] + [2] * depth),
-            depth, 1 << depth)
-
+    return (
+        tuple([2] * head_bits + [block_kv]),
+        tuple(summed + [head_bits] + folded[:chain_bits] + folded[chain_bits:]),
+        tuple([1 << len(summed), block_kv, num_chains] + [2] * depth),
+        depth,
+        1 << depth,
+    )
 
 
 # ends arrives as a row slice, so its alignment moves; it is read once per row
 @triton.jit(do_not_specialize_on_alignment=["ends_ptr"])
 def _prepare_candidates_kernel(
-    ids_ptr, ends_ptr, bt_ptr, pos_ptr, cu_ptr, voff_ptr, soff_ptr,
-    stride_ids, stride_bt,
-    K: tl.constexpr, C: tl.constexpr, PAGE: tl.constexpr, NPT: tl.constexpr,
-    HEAD_BYTES: tl.constexpr, NUM_SCALES: tl.constexpr,
-    KV_STRIDE: tl.constexpr, KVS_STRIDE: tl.constexpr,
-    KW: tl.constexpr, SU: tl.constexpr, TOK_STRIDE: tl.constexpr,
+    ids_ptr,
+    ends_ptr,
+    bt_ptr,
+    pos_ptr,
+    cu_ptr,
+    voff_ptr,
+    soff_ptr,
+    stride_ids,
+    stride_bt,
+    K: tl.constexpr,
+    C: tl.constexpr,
+    PAGE: tl.constexpr,
+    NPT: tl.constexpr,
+    HEAD_BYTES: tl.constexpr,
+    NUM_SCALES: tl.constexpr,
+    KV_STRIDE: tl.constexpr,
+    KVS_STRIDE: tl.constexpr,
+    KW: tl.constexpr,
+    SU: tl.constexpr,
+    TOK_STRIDE: tl.constexpr,
     OFF64: tl.constexpr,
 ):
     """Ranked block ids -> the walk's candidate list, one row per program.
@@ -193,6 +233,7 @@ def _prepare_candidates_kernel(
     tl.store(voff_ptr + row * K + cols, v if OFF64 else v.to(tl.int32))
     tl.store(soff_ptr + row * K + cols, sc if OFF64 else sc.to(tl.int32))
 
+
 @gluon.jit
 def _max_nan(a, b):
     return gl.maximum(a, b, propagate_nan=_NAN_ALL)
@@ -214,23 +255,36 @@ def _relu(x, RELU_ADD: gl.constexpr):
 def _fma_unpacked(a, b, c):
     # a * b + c as one v_fma_f32 the SLP vectorizer cannot pair. Packed FP32
     # cannot co-issue in an MFMA shadow on gfx950 and needs even-aligned pairs
-    return gl.inline_asm_elementwise("v_fma_f32 $0, $1, $2, $3", "=v,v,v,v",
-                                     [a, b, c], dtype=gl.float32,
-                                     is_pure=False, pack=1)
+    return gl.inline_asm_elementwise(
+        "v_fma_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        [a, b, c],
+        dtype=gl.float32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @gluon.jit
 def _split_leaf(x, IDX: gl.constexpr, DEPTH: gl.constexpr):
     for bit in gl.static_range(0, DEPTH):
         lo, hi = x.split()
-        x = lo if (IDX // (2 ** bit)) % 2 == 0 else hi
+        x = lo if (IDX // (2**bit)) % 2 == 0 else hi
     return x
 
 
 @gluon.jit
-def _fold_heads(s, w_col, NUM_HEADS: gl.constexpr, BLOCK_KV: gl.constexpr,
-                mfma_layout: gl.constexpr, NUM_CHAINS: gl.constexpr,
-                FOLD_ASM: gl.constexpr, acc=None, HAS_ACC: gl.constexpr = False):
+def _fold_heads(
+    s,
+    w_col,
+    NUM_HEADS: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    NUM_CHAINS: gl.constexpr,
+    FOLD_ASM: gl.constexpr,
+    acc=None,
+    HAS_ACC: gl.constexpr = False,
+):
     # sum_h s[h, k] * w[h] over the head bits that live in registers. Returns
     # the pre-cross-lane accumulator, so a caller folding several head chunks
     # pays the lane crossing once.
@@ -257,8 +311,9 @@ def _fold_heads(s, w_col, NUM_HEADS: gl.constexpr, BLOCK_KV: gl.constexpr,
 
 @gluon.jit
 def _fold_tail(acc, mfma_layout: gl.constexpr):
-    return gl.convert_layout(gl.sum(gl.sum(acc, axis=2), axis=0),
-                             gl.SliceLayout(0, mfma_layout))
+    return gl.convert_layout(
+        gl.sum(gl.sum(acc, axis=2), axis=0), gl.SliceLayout(0, mfma_layout)
+    )
 
 
 @aggregate
@@ -310,13 +365,38 @@ class Config:
     shared_kv: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, NUM_HEADS, HEAD_SIZE, PAGE_SIZE, BLOCK_KV, BLOCK_M,
-                 KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
-                 UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
-                 PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
-                 VARLEN, MFMA_NONK_DIM, HAS_KV_SPLIT,
-                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE,
-                 BSCORE, BSCORE_BLOCK):
+    def __init__(
+        self,
+        NUM_HEADS,
+        HEAD_SIZE,
+        PAGE_SIZE,
+        BLOCK_KV,
+        BLOCK_M,
+        KV_PAGE_STRIDE,
+        KVS_PAGE_STRIDE,
+        NUM_WARPS,
+        NUM_BUFFERS,
+        DEPTH,
+        UNROLL,
+        PAGE_PIPE,
+        M_CHUNK,
+        NUM_CHAINS,
+        FOLD_ASM,
+        RELU_ADD,
+        PRESHUFFLE,
+        SCALE_MODE,
+        USE_BUFFER_LOAD,
+        RELAXED_STORE,
+        VARLEN,
+        MFMA_NONK_DIM,
+        HAS_KV_SPLIT,
+        KV_REREAD,
+        GATHER,
+        GATHER_BLOCK,
+        GATHER_PIPE,
+        BSCORE,
+        BSCORE_BLOCK,
+    ):
         self.NUM_HEADS = gl.constexpr(NUM_HEADS)
         self.HEAD_BYTES = gl.constexpr(HEAD_SIZE // 2)
         self.NUM_SCALES = gl.constexpr(HEAD_SIZE // SCALE_GROUP.value)
@@ -375,59 +455,76 @@ class Config:
         mfma = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 128] if MFMA_NONK_DIM == 16 else [32, 32, 64],
-            transposed=False, warps_per_cta=[1, NUM_WARPS])
+            transposed=False,
+            warps_per_cta=[1, NUM_WARPS],
+        )
         self.mfma_layout = gl.constexpr(mfma)
-        self.dot_a = gl.constexpr(gl.DotOperandLayout(
-            operand_index=0, parent=mfma, k_width=K_WIDTH.value))
-        self.dot_b = gl.constexpr(gl.DotOperandLayout(
-            operand_index=1, parent=mfma, k_width=K_WIDTH.value))
+        self.dot_a = gl.constexpr(
+            gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=K_WIDTH.value)
+        )
+        self.dot_b = gl.constexpr(
+            gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=K_WIDTH.value)
+        )
 
         A_ROWS = M_CHUNK if M_CHUNK > 0 else NUM_HEADS
         self.A_ROWS = gl.constexpr(A_ROWS)
         self.N_CHUNK = gl.constexpr(NUM_HEADS // A_ROWS)
-        self.q_scale_layout = gl.constexpr(gl.amd.cdna4.get_mfma_scale_layout(
-            self.dot_a.value, [A_ROWS, HEAD_SIZE // SCALE_GROUP.value]))
-        self.kv_scale_layout = gl.constexpr(gl.amd.cdna4.get_mfma_scale_layout(
-            self.dot_b.value, [BLOCK_KV, HEAD_SIZE // SCALE_GROUP.value]))
+        self.q_scale_layout = gl.constexpr(
+            gl.amd.cdna4.get_mfma_scale_layout(
+                self.dot_a.value, [A_ROWS, HEAD_SIZE // SCALE_GROUP.value]
+            )
+        )
+        self.kv_scale_layout = gl.constexpr(
+            gl.amd.cdna4.get_mfma_scale_layout(
+                self.dot_b.value, [BLOCK_KV, HEAD_SIZE // SCALE_GROUP.value]
+            )
+        )
 
         # Only the unshuffled path stages through LDS
-        blocked, shared = _staging_layouts(HEAD_SIZE // 2, BLOCK_KV, NUM_WARPS,
-                                           WARP_SIZE.value)
+        blocked, shared = _staging_layouts(
+            HEAD_SIZE // 2, BLOCK_KV, NUM_WARPS, WARP_SIZE.value
+        )
         self.blocked_kv = gl.constexpr(blocked)
         self.shared_kv = gl.constexpr(shared)
 
 
-
 @gluon.jit
-def _load_q_chunk(cfg, q_ptr, qs_ptr, w_ptr, HEAD_OFFSET: gl.constexpr,
-                  ROWS: gl.constexpr):
+def _load_q_chunk(
+    cfg, q_ptr, qs_ptr, w_ptr, HEAD_OFFSET: gl.constexpr, ROWS: gl.constexpr
+):
     # The query row rides in the pointer, not the offsets, so the i32 buffer
     # offset spans one row rather than the whole tensor.
     hs = gl.arange(0, ROWS, layout=gl.SliceLayout(1, cfg.q_scale_layout))[:, None]
-    ss = gl.arange(0, cfg.NUM_SCALES,
-                   layout=gl.SliceLayout(0, cfg.q_scale_layout))[None, :]
+    ss = gl.arange(0, cfg.NUM_SCALES, layout=gl.SliceLayout(0, cfg.q_scale_layout))[
+        None, :
+    ]
     # Q is token major and converted here
     lay: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
-        threads_per_warp=[WARP_SIZE // (cfg.HEAD_BYTES // 16),
-                          cfg.HEAD_BYTES // 16],
-        warps_per_cta=[cfg.NUM_WARPS, 1], order=[1, 0])
+        threads_per_warp=[WARP_SIZE // (cfg.HEAD_BYTES // 16), cfg.HEAD_BYTES // 16],
+        warps_per_cta=[cfg.NUM_WARPS, 1],
+        order=[1, 0],
+    )
     offs_h = gl.arange(0, ROWS, layout=gl.SliceLayout(1, lay)) + HEAD_OFFSET
     offs_d = gl.arange(0, cfg.HEAD_BYTES, layout=gl.SliceLayout(0, lay))
     q = gl.convert_layout(
         gl.amd.cdna4.buffer_load(
             ptr=q_ptr,
             offsets=(offs_h * cfg.HEAD_BYTES)[:, None] + offs_d[None, :],
-            cache=cfg.Q_CACHE),
-        cfg.dot_a)
+            cache=cfg.Q_CACHE,
+        ),
+        cfg.dot_a,
+    )
     qs = gl.amd.cdna4.buffer_load(
         ptr=qs_ptr,
         offsets=((hs + HEAD_OFFSET) * cfg.NUM_SCALES) + ss,
-        cache=cfg.Q_CACHE)
+        cache=cfg.Q_CACHE,
+    )
 
     hw = gl.arange(0, ROWS, layout=gl.SliceLayout(1, cfg.mfma_layout))
-    w = gl.amd.cdna4.buffer_load(ptr=w_ptr, offsets=(hw + HEAD_OFFSET)[:, None],
-                                 cache=cfg.Q_CACHE)
+    w = gl.amd.cdna4.buffer_load(
+        ptr=w_ptr, offsets=(hw + HEAD_OFFSET)[:, None], cache=cfg.Q_CACHE
+    )
     if cfg.RELU_ADD:
         # The /2 of (x + |x|)/2. Once per row block, outside the KV walk.
         w = w * 0.5
@@ -441,8 +538,9 @@ def _load_q_row(cfg, q_ptr, qs_ptr, w_ptr):
     if cfg.M_CHUNK > 0:
         q, qs, w = (), (), ()
         for c in gl.static_range(0, cfg.N_CHUNK):
-            a, b, d = _load_q_chunk(cfg, q_ptr, qs_ptr, w_ptr,
-                                    c * cfg.M_CHUNK, cfg.M_CHUNK)
+            a, b, d = _load_q_chunk(
+                cfg, q_ptr, qs_ptr, w_ptr, c * cfg.M_CHUNK, cfg.M_CHUNK
+            )
             q, qs, w = q + (a,), qs + (b,), w + (d,)
         return q, qs, w
     else:
@@ -469,8 +567,19 @@ class KVState:
     last_blk: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
-                 val_offsets, scale_offsets, gv_ptr, gs_ptr, last_blk):
+    def __init__(
+        self,
+        cfg,
+        KV_ptr,
+        kv_scales_ptr,
+        blk_ptr,
+        last_page_row,
+        val_offsets,
+        scale_offsets,
+        gv_ptr,
+        gs_ptr,
+        last_blk,
+    ):
         self.cfg = cfg
         self.KV_ptr = KV_ptr
         self.kv_scales_ptr = kv_scales_ptr
@@ -483,37 +592,60 @@ class KVState:
         self.last_blk = last_blk
 
     @gluon.jit
-    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
-                   gv_ptr, gs_ptr, last_blk, val_layout: gl.constexpr):
-        offs_d = gl.arange(0, cfg.HEAD_BYTES,
-                           layout=gl.SliceLayout(1, val_layout))[:, None]
-        offs_n = gl.arange(0, cfg.BLOCK_KV,
-                           layout=gl.SliceLayout(0, val_layout))[None, :]
+    def initialize(
+        cfg,
+        KV_ptr,
+        kv_scales_ptr,
+        blk_ptr,
+        last_page_row,
+        gv_ptr,
+        gs_ptr,
+        last_blk,
+        val_layout: gl.constexpr,
+    ):
+        offs_d = gl.arange(0, cfg.HEAD_BYTES, layout=gl.SliceLayout(1, val_layout))[
+            :, None
+        ]
+        offs_n = gl.arange(0, cfg.BLOCK_KV, layout=gl.SliceLayout(0, val_layout))[
+            None, :
+        ]
         # Do the loop invariant calculation early
         if cfg.GATHER:
             offs_n = offs_n % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
-            val = _shuffled_offsets(offs_d, offs_n, cfg.HEAD_BYTES,
-                                    cfg.N_PER_TILE, cfg.D_PER_TILE)
+            val = _shuffled_offsets(
+                offs_d, offs_n, cfg.HEAD_BYTES, cfg.N_PER_TILE, cfg.D_PER_TILE
+            )
         else:
             val = _token_major_offsets(offs_d, offs_n, cfg.HEAD_BYTES)
 
-        sn = gl.arange(0, cfg.BLOCK_KV,
-                       layout=gl.SliceLayout(1, cfg.kv_scale_layout))[:, None]
-        ss = gl.arange(0, cfg.NUM_SCALES,
-                       layout=gl.SliceLayout(0, cfg.kv_scale_layout))[None, :]
+        sn = gl.arange(0, cfg.BLOCK_KV, layout=gl.SliceLayout(1, cfg.kv_scale_layout))[
+            :, None
+        ]
+        ss = gl.arange(
+            0, cfg.NUM_SCALES, layout=gl.SliceLayout(0, cfg.kv_scale_layout)
+        )[None, :]
         if cfg.GATHER:
             sn = sn % cfg.GATHER_BLOCK
         if cfg.PRESHUFFLE:
             sc = _shuffled_scale_offsets(sn, ss, cfg.NUM_SCALES, cfg.N_PER_TILE)
         else:
             sc = _token_major_scale_offsets(sn, ss, cfg.NUM_SCALES)
-        return KVState(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, val,
-                       sc, gv_ptr, gs_ptr, last_blk)
+        return KVState(
+            cfg,
+            KV_ptr,
+            kv_scales_ptr,
+            blk_ptr,
+            last_page_row,
+            val,
+            sc,
+            gv_ptr,
+            gs_ptr,
+            last_blk,
+        )
 
     @gluon.jit
-    def gather_base(self, tile_pos, base_ptr, layout: gl.constexpr,
-                    AXIS: gl.constexpr):
+    def gather_base(self, tile_pos, base_ptr, layout: gl.constexpr, AXIS: gl.constexpr):
         """This tile's per-column base offset.
 
         One int32 per candidate block, already holding the page address plus
@@ -527,8 +659,10 @@ class KVState:
         """
         cols = gl.arange(0, self.cfg.BLOCK_KV, layout=gl.SliceLayout(AXIS, layout))
         # Split so the tile term stays scalar
-        blk = gl.minimum(tile_pos // self.cfg.GATHER_BLOCK
-                         + cols // self.cfg.GATHER_BLOCK, self.last_blk)
+        blk = gl.minimum(
+            tile_pos // self.cfg.GATHER_BLOCK + cols // self.cfg.GATHER_BLOCK,
+            self.last_blk,
+        )
         # Buffer, not pointer: the row base is scalar and folds into the
         # descriptor, so the per-column term stays i32
         return gl.amd.cdna4.buffer_load(ptr=base_ptr, offsets=blk)
@@ -547,14 +681,18 @@ class KVState:
         S_LO: gl.constexpr = WARP_SIZE // cfg.N_PER_TILE
         S_HI: gl.constexpr = cfg.NUM_SCALES // S_LO
         N_HI: gl.constexpr = cfg.BLOCK_KV // cfg.N_PER_TILE
-        lr: gl.constexpr = _scale_group_layout(cfg.kv_scale_layout, cfg.N_PER_TILE,
-                                               S_LO, S_HI, N_HI)
+        lr: gl.constexpr = _scale_group_layout(
+            cfg.kv_scale_layout, cfg.N_PER_TILE, S_LO, S_HI, N_HI
+        )
         b0 = gl.arange(0, N_HI, layout=_axis_layout(lr, 0, 4))[:, None, None, None]
-        b2 = gl.arange(0, cfg.N_PER_TILE,
-                       layout=_axis_layout(lr, 2, 4))[None, None, :, None]
-        blk = gl.minimum(tile_pos // cfg.GATHER_BLOCK
-                         + (b0 * cfg.N_PER_TILE + b2) // cfg.GATHER_BLOCK,
-                         self.last_blk)
+        b2 = gl.arange(0, cfg.N_PER_TILE, layout=_axis_layout(lr, 2, 4))[
+            None, None, :, None
+        ]
+        blk = gl.minimum(
+            tile_pos // cfg.GATHER_BLOCK
+            + (b0 * cfg.N_PER_TILE + b2) // cfg.GATHER_BLOCK,
+            self.last_blk,
+        )
         # A buffer load, for the reason gather_base gives.
         return gl.amd.cdna4.buffer_load(ptr=self.gs_ptr, offsets=blk)
 
@@ -571,12 +709,17 @@ class KVState:
             # uses: the four-dimensional one for the wide mode-1 read, the
             # plain [BLOCK_KV, NUM_SCALES] one otherwise.
             if self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
-                return (self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
-                        self.gather_scale_base(tile_pos))
+                return (
+                    self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
+                    self.gather_scale_base(tile_pos),
+                )
             else:
-                return (self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
-                        self.gather_base(tile_pos, self.gs_ptr,
-                                         self.cfg.kv_scale_layout, 1))
+                return (
+                    self.gather_base(tile_pos, self.gv_ptr, val_layout, 0),
+                    self.gather_base(
+                        tile_pos, self.gs_ptr, self.cfg.kv_scale_layout, 1
+                    ),
+                )
         else:
             return tile_pos * 0, tile_pos * 0
 
@@ -588,29 +731,33 @@ class KVState:
             # read left to hoist.
             return tile_pos * 0
         else:
-            return gl.load(self.blk_ptr
-                           + gl.minimum(tile_pos >> self.cfg.PAGE_SHIFT,
-                                        self.last_page_row))
+            return gl.load(
+                self.blk_ptr
+                + gl.minimum(tile_pos >> self.cfg.PAGE_SHIFT, self.last_page_row)
+            )
 
     @gluon.jit
-    def tile_ptr(self, base, tile_pos, page, PAGE_STRIDE: gl.constexpr,
-                 PER_TOKEN: gl.constexpr):
+    def tile_ptr(
+        self, base, tile_pos, page, PAGE_STRIDE: gl.constexpr, PER_TOKEN: gl.constexpr
+    ):
         # 64-bit on purpose: one scalar multiply per tile keeps a cache far
         # above 2 GiB addressable while every per-element offset stays i32.
-        return base + (page.to(gl.int64) * PAGE_STRIDE
-                       + (tile_pos & self.cfg.PAGE_MASK).to(gl.int64) * PER_TOKEN)
+        return base + (
+            page.to(gl.int64) * PAGE_STRIDE
+            + (tile_pos & self.cfg.PAGE_MASK).to(gl.int64) * PER_TOKEN
+        )
 
     @gluon.jit
-    def page_off(self, tile_pos, page, PAGE_STRIDE: gl.constexpr,
-                 PER_TOKEN: gl.constexpr):
+    def page_off(
+        self, tile_pos, page, PAGE_STRIDE: gl.constexpr, PER_TOKEN: gl.constexpr
+    ):
         # The same address as a scalar to add into an offsets tensor, which is
         # what the LDS path needs; see LDSLoader.issue.
         in_page = tile_pos & self.cfg.PAGE_MASK
         if self.cfg.USE_BUFFER_LOAD:
             return page * PAGE_STRIDE + in_page * PER_TOKEN
         else:
-            return (page.to(gl.int64) * PAGE_STRIDE
-                    + in_page.to(gl.int64) * PER_TOKEN)
+            return page.to(gl.int64) * PAGE_STRIDE + in_page.to(gl.int64) * PER_TOKEN
 
     @gluon.jit
     def scales(self, tile_pos, page, gtok):
@@ -624,8 +771,11 @@ class KVState:
             # U is the value stream's D_PER_TILE move: the list is stored in
             # units of U so the multiply hands the 2-byte alignment back, and
             # without it each scale run splits into two buffer_load_ubyte.
-            U: gl.constexpr = 2 if (self.cfg.GATHER_BLOCK % 2 == 0
-                                    and self.cfg.NUM_SCALES % 2 == 0) else 1
+            U: gl.constexpr = (
+                2
+                if (self.cfg.GATHER_BLOCK % 2 == 0 and self.cfg.NUM_SCALES % 2 == 0)
+                else 1
+            )
             if self.cfg.USE_BUFFER_LOAD:
                 gs = gtok[1] * U
             else:
@@ -636,20 +786,36 @@ class KVState:
                 return gl.amd.cdna4.buffer_load(
                     ptr=self.kv_scales_ptr,
                     offsets=self.scale_offsets + gs[:, None],
-                    cache=self.cfg.KV_CACHE)
+                    cache=self.cfg.KV_CACHE,
+                )
             else:
-                return gl.load(self.kv_scales_ptr + self.scale_offsets
-                               + gs[:, None], cache_modifier=self.cfg.KV_CACHE)
+                return gl.load(
+                    self.kv_scales_ptr + self.scale_offsets + gs[:, None],
+                    cache_modifier=self.cfg.KV_CACHE,
+                )
         elif self.cfg.PRESHUFFLE and self.cfg.SCALE_MODE == 1:
             return _load_scales_wide(
                 self.cfg,
-                self.tile_ptr(self.kv_scales_ptr, tile_pos, page,
-                              self.cfg.KVS_PAGE_STRIDE, self.cfg.NUM_SCALES), 0)
+                self.tile_ptr(
+                    self.kv_scales_ptr,
+                    tile_pos,
+                    page,
+                    self.cfg.KVS_PAGE_STRIDE,
+                    self.cfg.NUM_SCALES,
+                ),
+                0,
+            )
         else:
-            ptr = self.tile_ptr(self.kv_scales_ptr, tile_pos, page,
-                                self.cfg.KVS_PAGE_STRIDE, self.cfg.NUM_SCALES)
-            return gl.amd.cdna4.buffer_load(ptr=ptr, offsets=self.scale_offsets,
-                                            cache=self.cfg.KV_CACHE)
+            ptr = self.tile_ptr(
+                self.kv_scales_ptr,
+                tile_pos,
+                page,
+                self.cfg.KVS_PAGE_STRIDE,
+                self.cfg.NUM_SCALES,
+            )
+            return gl.amd.cdna4.buffer_load(
+                ptr=ptr, offsets=self.scale_offsets, cache=self.cfg.KV_CACHE
+            )
 
 
 @gluon.jit
@@ -670,26 +836,33 @@ def _load_scales_wide(cfg, ptr, gbase):
     S_LO: gl.constexpr = WARP_SIZE // cfg.N_PER_TILE
     S_HI: gl.constexpr = cfg.NUM_SCALES // S_LO
     N_HI: gl.constexpr = cfg.BLOCK_KV // cfg.N_PER_TILE
-    lr: gl.constexpr = _scale_group_layout(cfg.kv_scale_layout, cfg.N_PER_TILE,
-                                           S_LO, S_HI, N_HI)
+    lr: gl.constexpr = _scale_group_layout(
+        cfg.kv_scale_layout, cfg.N_PER_TILE, S_LO, S_HI, N_HI
+    )
     b0 = gl.arange(0, N_HI, layout=_axis_layout(lr, 0, 4))[:, None, None, None]
     b1 = gl.arange(0, S_LO, layout=_axis_layout(lr, 1, 4))[None, :, None, None]
-    b2 = gl.arange(0, cfg.N_PER_TILE,
-                   layout=_axis_layout(lr, 2, 4))[None, None, :, None]
+    b2 = gl.arange(0, cfg.N_PER_TILE, layout=_axis_layout(lr, 2, 4))[
+        None, None, :, None
+    ]
     b3 = gl.arange(0, S_HI, layout=_axis_layout(lr, 3, 4))[None, None, None, :]
     if cfg.GATHER:
         # The group term is in gbase, and the token index is block-local
         offs = (b2 % cfg.GATHER_BLOCK + b1 * cfg.N_PER_TILE) * S_HI + b3 + gbase
     else:
-        offs = (b0 * (cfg.N_PER_TILE * cfg.NUM_SCALES)
-                + (b2 + b1 * cfg.N_PER_TILE) * S_HI + b3)
+        offs = (
+            b0 * (cfg.N_PER_TILE * cfg.NUM_SCALES)
+            + (b2 + b1 * cfg.N_PER_TILE) * S_HI
+            + b3
+        )
     if cfg.GATHER and not cfg.USE_BUFFER_LOAD:
         raw = gl.load(ptr + offs, cache_modifier=cfg.KV_CACHE)
     else:
         raw = gl.amd.cdna4.buffer_load(ptr=ptr, offsets=offs, cache=cfg.KV_CACHE)
-    return (raw.reshape([N_HI, S_LO, cfg.N_PER_TILE, S_HI])
-            .permute((0, 2, 3, 1))
-            .reshape([cfg.BLOCK_KV, cfg.NUM_SCALES]))
+    return (
+        raw.reshape([N_HI, S_LO, cfg.N_PER_TILE, S_HI])
+        .permute((0, 2, 3, 1))
+        .reshape([cfg.BLOCK_KV, cfg.NUM_SCALES])
+    )
 
 
 @aggregate
@@ -705,11 +878,22 @@ class RegLoader:
         self.st = st
 
     @gluon.jit
-    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
-                   gv_ptr, gs_ptr, last_blk):
-        return RegLoader(KVState.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                            last_page_row, gv_ptr, gs_ptr,
-                                            last_blk, cfg.dot_b))
+    def initialize(
+        cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+    ):
+        return RegLoader(
+            KVState.initialize(
+                cfg,
+                KV_ptr,
+                kv_scales_ptr,
+                blk_ptr,
+                last_page_row,
+                gv_ptr,
+                gs_ptr,
+                last_blk,
+                cfg.dot_b,
+            )
+        )
 
     @gluon.jit
     def page_token(self, tile_pos):
@@ -734,19 +918,24 @@ class RegLoader:
             if cfg.USE_BUFFER_LOAD:
                 return gl.amd.cdna4.buffer_load(
                     ptr=self.st.KV_ptr,
-                    offsets=self.st.val_offsets
-                            + (gtok[0] * cfg.D_PER_TILE)[None, :],
-                    cache=cfg.KV_CACHE)
+                    offsets=self.st.val_offsets + (gtok[0] * cfg.D_PER_TILE)[None, :],
+                    cache=cfg.KV_CACHE,
+                )
             else:
                 return gl.load(
-                    self.st.KV_ptr + self.st.val_offsets
+                    self.st.KV_ptr
+                    + self.st.val_offsets
                     + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :],
-                    cache_modifier=cfg.KV_CACHE)
+                    cache_modifier=cfg.KV_CACHE,
+                )
         else:
             return gl.amd.cdna4.buffer_load(
-                ptr=self.st.tile_ptr(self.st.KV_ptr, tile_pos, page,
-                                     cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES),
-                offsets=self.st.val_offsets, cache=cfg.KV_CACHE)
+                ptr=self.st.tile_ptr(
+                    self.st.KV_ptr, tile_pos, page, cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES
+                ),
+                offsets=self.st.val_offsets,
+                cache=cfg.KV_CACHE,
+            )
 
 
 @aggregate
@@ -765,14 +954,25 @@ class LDSLoader:
         self.kv_shared = kv_shared
 
     @gluon.jit
-    def initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row,
-                   gv_ptr, gs_ptr, last_blk):
-        st = KVState.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                last_page_row, gv_ptr, gs_ptr, last_blk,
-                                cfg.blocked_kv)
+    def initialize(
+        cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+    ):
+        st = KVState.initialize(
+            cfg,
+            KV_ptr,
+            kv_scales_ptr,
+            blk_ptr,
+            last_page_row,
+            gv_ptr,
+            gs_ptr,
+            last_blk,
+            cfg.blocked_kv,
+        )
         shared = gl.allocate_shared_memory(
             KV_ptr.type.element_ty,
-            [cfg.NUM_BUFFERS, cfg.HEAD_BYTES, cfg.BLOCK_KV], layout=cfg.shared_kv)
+            [cfg.NUM_BUFFERS, cfg.HEAD_BYTES, cfg.BLOCK_KV],
+            layout=cfg.shared_kv,
+        )
         return LDSLoader(st, shared)
 
     @gluon.jit
@@ -798,20 +998,24 @@ class LDSLoader:
         dest = self.kv_shared.index(buffer_id)
         if cfg.GATHER:
             if cfg.USE_BUFFER_LOAD:
-                offsets = (self.st.val_offsets
-                           + (gtok[0] * cfg.D_PER_TILE)[None, :])
+                offsets = self.st.val_offsets + (gtok[0] * cfg.D_PER_TILE)[None, :]
             else:
-                offsets = (self.st.val_offsets
-                           + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :])
+                offsets = (
+                    self.st.val_offsets
+                    + (gtok[0].to(gl.int64) * cfg.D_PER_TILE)[None, :]
+                )
         else:
             offsets = self.st.val_offsets + self.st.page_off(
-                tile_pos, page, cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES)
+                tile_pos, page, cfg.KV_PAGE_STRIDE, cfg.HEAD_BYTES
+            )
         if cfg.USE_BUFFER_LOAD:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                dest, self.st.KV_ptr, offsets, cache_modifier=cfg.KV_CACHE)
+                dest, self.st.KV_ptr, offsets, cache_modifier=cfg.KV_CACHE
+            )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
-                dest, self.st.KV_ptr + offsets, cache_modifier=cfg.KV_CACHE)
+                dest, self.st.KV_ptr + offsets, cache_modifier=cfg.KV_CACHE
+            )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
@@ -823,9 +1027,15 @@ class LDSLoader:
 @gluon.jit
 def _dot(cfg, q, q_scale, k, k_scale, ROWS: gl.constexpr):
     acc = gl.zeros([ROWS, cfg.BLOCK_KV], dtype=gl.float32, layout=cfg.mfma_layout)
-    return gl.amd.cdna4.mfma_scaled(a=q, a_scale=q_scale, a_format="e2m1",
-                                    b=k, b_scale=k_scale, b_format="e2m1",
-                                    acc=acc)
+    return gl.amd.cdna4.mfma_scaled(
+        a=q,
+        a_scale=q_scale,
+        a_format="e2m1",
+        b=k,
+        b_scale=k_scale,
+        b_format="e2m1",
+        acc=acc,
+    )
 
 
 @gluon.jit
@@ -836,23 +1046,36 @@ def _row_logits(cfg, q, q_scale, w, k, k_scale):
         acc = None
         for c in gl.static_range(0, cfg.N_CHUNK):
             s = _dot(cfg, q[c], q_scale[c], k, k_scale, cfg.M_CHUNK)
-            acc = _fold_heads(_relu(s, cfg.RELU_ADD), w[c], cfg.M_CHUNK,
-                              cfg.BLOCK_KV,
-                              cfg.mfma_layout, cfg.NUM_CHAINS, cfg.FOLD_ASM,
-                              acc, c > 0)
+            acc = _fold_heads(
+                _relu(s, cfg.RELU_ADD),
+                w[c],
+                cfg.M_CHUNK,
+                cfg.BLOCK_KV,
+                cfg.mfma_layout,
+                cfg.NUM_CHAINS,
+                cfg.FOLD_ASM,
+                acc,
+                c > 0,
+            )
         return _fold_tail(acc, cfg.mfma_layout)
     else:
         s = _dot(cfg, q, q_scale, k, k_scale, cfg.NUM_HEADS)
-        acc = _fold_heads(_relu(s, cfg.RELU_ADD), w, cfg.NUM_HEADS, cfg.BLOCK_KV,
-                          cfg.mfma_layout, cfg.NUM_CHAINS, cfg.FOLD_ASM)
+        acc = _fold_heads(
+            _relu(s, cfg.RELU_ADD),
+            w,
+            cfg.NUM_HEADS,
+            cfg.BLOCK_KV,
+            cfg.mfma_layout,
+            cfg.NUM_CHAINS,
+            cfg.FOLD_ASM,
+        )
         return _fold_tail(acc, cfg.mfma_layout)
 
 
 @aggregate
 @strip_annotate
 class Program:
-    """This workgroup's rows and the window they own.
-    """
+    """This workgroup's rows and the window they own."""
 
     cfg: Config
     out_ptr: gl.tensor
@@ -865,8 +1088,18 @@ class Program:
     bs_stride_s: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi,
-                 store_hi, bs_ptr, bs_stride_s):
+    def __init__(
+        self,
+        cfg,
+        out_ptr,
+        stride_s,
+        stride_k,
+        tile_lo,
+        tile_hi,
+        store_hi,
+        bs_ptr,
+        bs_stride_s,
+    ):
         self.cfg = cfg
         self.out_ptr = out_ptr
         self.stride_s = stride_s
@@ -878,10 +1111,22 @@ class Program:
         self.bs_stride_s = bs_stride_s
 
     @gluon.jit
-    def initialize(cfg, out_ptr, stride_s, stride_k, context_len, block_end,
-                   split_id, num_kv_splits, slice_idx, num_slices,
-                   bs_ptr, bs_stride_s,
-                   HAS_KV_SPLIT: gl.constexpr, DYNAMIC: gl.constexpr):
+    def initialize(
+        cfg,
+        out_ptr,
+        stride_s,
+        stride_k,
+        context_len,
+        block_end,
+        split_id,
+        num_kv_splits,
+        slice_idx,
+        num_slices,
+        bs_ptr,
+        bs_stride_s,
+        HAS_KV_SPLIT: gl.constexpr,
+        DYNAMIC: gl.constexpr,
+    ):
         if cfg.GATHER:
             # block_end counts candidate slots here, not key positions: the
             # walk is over a compact list the host already causally filtered,
@@ -906,10 +1151,20 @@ class Program:
             tile_hi = n_tiles
         # Stops spilling stores on each other's write region
         # The compact end under GATHER: output column j is candidate slot j.
-        store_hi = gl.minimum(keys if cfg.GATHER else context_len,
-                              tile_hi * cfg.BLOCK_KV)
-        return Program(cfg, out_ptr, stride_s, stride_k, tile_lo, tile_hi,
-                       store_hi, bs_ptr, bs_stride_s)
+        store_hi = gl.minimum(
+            keys if cfg.GATHER else context_len, tile_hi * cfg.BLOCK_KV
+        )
+        return Program(
+            cfg,
+            out_ptr,
+            stride_s,
+            stride_k,
+            tile_lo,
+            tile_hi,
+            store_hi,
+            bs_ptr,
+            bs_stride_s,
+        )
 
     @gluon.jit
     def row_bounds(self, ends, BLOCK_M: gl.constexpr):
@@ -938,13 +1193,16 @@ class Program:
         best = gl.reduce(grouped, 1, _max_nan)
         blk = gl.arange(0, BPT, layout=gl.SliceLayout(1, grouped.type.layout))
         gl.amd.cdna4.buffer_store(
-            best, ptr=self.bs_ptr + r * self.bs_stride_s,
+            best,
+            ptr=self.bs_ptr + r * self.bs_stride_s,
             offsets=tile_pos // C + blk,
-            mask=tile_pos + blk * C < self.store_hi)
+            mask=tile_pos + blk * C < self.store_hi,
+        )
 
     @gluon.jit
-    def emit(self, qs, qss, ws, row_hi, k, k_scale, tile_pos,
-             MASKED: gl.constexpr = True):
+    def emit(
+        self, qs, qss, ws, row_hi, k, k_scale, tile_pos, MASKED: gl.constexpr = True
+    ):
         # One row: the bound is exact, so it goes straight into the predicate.
         # Several: a per-row predicate would need one exec mask per row, so the
         # per-row part goes in a select under a shared predicate instead.
@@ -975,8 +1233,12 @@ class Program:
             if cfg.VARLEN and cfg.BLOCK_M > 1 and cfg.STORE_LOGITS:
                 mask = mask & (row_hi[r] > 0)
             if cfg.STORE_LOGITS:
-                gl.amd.cdna4.buffer_store(scores, ptr=self.out_ptr + r * self.stride_s,
-                                          offsets=offsets, mask=mask)
+                gl.amd.cdna4.buffer_store(
+                    scores,
+                    ptr=self.out_ptr + r * self.stride_s,
+                    offsets=offsets,
+                    mask=mask,
+                )
             if cfg.BSCORE:
                 if cfg.VARLEN and cfg.BLOCK_M > 1:
                     if row_hi[r] > 0:
@@ -1011,8 +1273,9 @@ def _loop_with_reg(pgm, loader, qs, qss, ws, row_hi):
     gn = loader.gather_tok(pos + AHEAD) if cfg.GATHER_PIPE else (0, 0)
 
     unroll: gl.constexpr = cfg.UNROLL if cfg.UNROLL > 1 else None
-    for _i in tl.range(0, pgm.tile_hi - pgm.tile_lo - cfg.DEPTH,
-                       loop_unroll_factor=unroll):
+    for _i in tl.range(
+        0, pgm.tile_hi - pgm.tile_lo - cfg.DEPTH, loop_unroll_factor=unroll
+    ):
         if not cfg.PAGE_PIPE:
             pn = loader.page_token(pos + AHEAD)
         if cfg.GATHER_PIPE:
@@ -1096,50 +1359,80 @@ def _loop_with_lds(pgm, loader, qs, qss, ws, row_hi):
 
 # the kernel
 
-_repr = make_kernel_repr("_pa_mqa_logits_mxfp4_kernel",
-                         ["NUM_HEADS", "HEAD_SIZE", "PAGE_SIZE", "BLOCK_KV",
-                          "BLOCK_M", "PRESHUFFLE", "GATHER", "BSCORE",
-                          "BSCORE_BLOCK", "DEPTH",
-                          "UNROLL", "M_CHUNK", "MFMA_NONK_DIM", "NUM_WARPS",
-                          "HAS_KV_SPLIT", "FOLD_ASM", "RELU_ADD"])
+_repr = make_kernel_repr(
+    "_pa_mqa_logits_mxfp4_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "PAGE_SIZE",
+        "BLOCK_KV",
+        "BLOCK_M",
+        "PRESHUFFLE",
+        "GATHER",
+        "BSCORE",
+        "BSCORE_BLOCK",
+        "DEPTH",
+        "UNROLL",
+        "M_CHUNK",
+        "MFMA_NONK_DIM",
+        "NUM_WARPS",
+        "HAS_KV_SPLIT",
+        "FOLD_ASM",
+        "RELU_ADD",
+    ],
+)
 
 
 # These move with the batch and with where a workspace slice starts, and none
 # reaches the generated code, so specializing only recompiled it. A gl.int32
 # equal to 1 is not folded either, which is why the ints drop both checks.
-@gluon.jit(repr=_repr,
-           do_not_specialize=["next_n", "batch", "num_kv_splits",
-                              "stride_logits_s", "stride_bs_s"],
-           do_not_specialize_on_alignment=["sched_ptr", "context_lens_ptr",
-                                           "gather_v_ptr", "gather_s_ptr"])
+@gluon.jit(
+    repr=_repr,
+    do_not_specialize=[
+        "next_n",
+        "batch",
+        "num_kv_splits",
+        "stride_logits_s",
+        "stride_bs_s",
+    ],
+    do_not_specialize_on_alignment=[
+        "sched_ptr",
+        "context_lens_ptr",
+        "gather_v_ptr",
+        "gather_s_ptr",
+    ],
+)
 def _pa_mqa_logits_mxfp4_kernel(
-    Q_ptr,             # uint8 [B, NEXT_N, H, D//2]  packed e2m1
-    q_scales_ptr,      # uint8 [B, NEXT_N, H, D//32] e8m0
-    KV_ptr,            # uint8 paged, page p's values at p * KV_PAGE_STRIDE
-    kv_scales_ptr,     # uint8 paged, page p's e8m0 at p * KVS_PAGE_STRIDE
-    weights_ptr,       # fp32  [B * NEXT_N, H]
+    Q_ptr,  # uint8 [B, NEXT_N, H, D//2]  packed e2m1
+    q_scales_ptr,  # uint8 [B, NEXT_N, H, D//32] e8m0
+    KV_ptr,  # uint8 paged, page p's values at p * KV_PAGE_STRIDE
+    kv_scales_ptr,  # uint8 paged, page p's e8m0 at p * KVS_PAGE_STRIDE
+    weights_ptr,  # fp32  [B * NEXT_N, H]
     context_lens_ptr,  # int32 [B]
-    query_start_loc_ptr,          # int32 [B + 1] row prefix sum, unused unless VARLEN
-    row_ends_ptr,       # int32 [B * NEXT_N] exclusive row end, or the row's
-                       # candidate slot count under GATHER; None unless HAS_ROW_ENDS
-    block_table_ptr,   # int32 [B, stride_blk_b]
-    sched_ptr,         # int32 [grid, 4] descriptors; unused unless DYNAMIC
-    gather_v_ptr,      # int32 [B*NEXT_N, blocks] resolved value offsets
-    gather_s_ptr,      # int32 [B*NEXT_N, blocks] resolved scale byte offsets
+    query_start_loc_ptr,  # int32 [B + 1] row prefix sum, unused unless VARLEN
+    row_ends_ptr,  # int32 [B * NEXT_N] exclusive row end, or the row's
+    # candidate slot count under GATHER; None unless HAS_ROW_ENDS
+    block_table_ptr,  # int32 [B, stride_blk_b]
+    sched_ptr,  # int32 [grid, 4] descriptors; unused unless DYNAMIC
+    gather_v_ptr,  # int32 [B*NEXT_N, blocks] resolved value offsets
+    gather_s_ptr,  # int32 [B*NEXT_N, blocks] resolved scale byte offsets
     block_scores_ptr,  # fp32  [B * NEXT_N, ceil(max_model_len / BSCORE_BLOCK)]
-                       # per-row block maxima; None unless BSCORE
-    logits_ptr,        # fp32  [B * NEXT_N, max_model_len]; None under
-                       # BSCORE == 2, which writes no logits at all
+    # per-row block maxima; None unless BSCORE
+    logits_ptr,  # fp32  [B * NEXT_N, max_model_len]; None under
+    # BSCORE == 2, which writes no logits at all
     next_n: gl.int32,
     batch: gl.int32,
     num_kv_splits: gl.int32,
-    stride_q_b: gl.int32, stride_q_n: gl.int32,
-    stride_qs_b: gl.int32, stride_qs_n: gl.int32,
+    stride_q_b: gl.int32,
+    stride_q_n: gl.int32,
+    stride_qs_b: gl.int32,
+    stride_qs_n: gl.int32,
     stride_w_s: gl.int32,
-    stride_logits_s: gl.int32, stride_logits_k: gl.int32,
+    stride_logits_s: gl.int32,
+    stride_logits_k: gl.int32,
     stride_blk_b: gl.int32,
     stride_gather_r: gl.int32,
-    stride_bs_s,       # None unless BSCORE, so it leaves no kernarg when off
+    stride_bs_s,  # None unless BSCORE, so it leaves no kernarg when off
     max_blocks: gl.int32,
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
@@ -1167,20 +1460,26 @@ def _pa_mqa_logits_mxfp4_kernel(
     DYNAMIC: gl.constexpr,
     VARLEN: gl.constexpr,
     HAS_ROW_ENDS: gl.constexpr,
-    GATHER: gl.constexpr,        # walk a host-resolved candidate list
+    GATHER: gl.constexpr,  # walk a host-resolved candidate list
     GATHER_BLOCK: gl.constexpr,  # KV tokens per candidate block
-    GATHER_PIPE: gl.constexpr,   # hoist the candidate-list read one iteration
-    BSCORE: gl.constexpr,        # 0 off, 1 block maxima beside the logits,
-                                 # 2 block maxima and no logits store
+    GATHER_PIPE: gl.constexpr,  # hoist the candidate-list read one iteration
+    BSCORE: gl.constexpr,  # 0 off, 1 block maxima beside the logits,
+    # 2 block maxima and no logits store
     BSCORE_BLOCK: gl.constexpr,  # columns per candidate block
 ):
     gl.static_assert(BLOCK_KV % MFMA_NONK_DIM == 0)
-    gl.static_assert(PAGE_SIZE % BLOCK_KV == 0,
-                     "BLOCK_KV must divide the page so a tile never spans two")
     gl.static_assert(
-        (GATHER == 0) | ((BLOCK_M == 1) & (BLOCK_KV % GATHER_BLOCK == 0)
-                         & (PAGE_SIZE % GATHER_BLOCK == 0)
-                         & (GATHER_BLOCK <= MFMA_NONK_DIM)),
+        PAGE_SIZE % BLOCK_KV == 0,
+        "BLOCK_KV must divide the page so a tile never spans two",
+    )
+    gl.static_assert(
+        (GATHER == 0)
+        | (
+            (BLOCK_M == 1)
+            & (BLOCK_KV % GATHER_BLOCK == 0)
+            & (PAGE_SIZE % GATHER_BLOCK == 0)
+            & (GATHER_BLOCK <= MFMA_NONK_DIM)
+        ),
         "a candidate block must tile BLOCK_KV, sit inside one page and one "
         "shuffle group, and the gather is one query row per workgroup",
     )
@@ -1189,24 +1488,51 @@ def _pa_mqa_logits_mxfp4_kernel(
         "the gather takes its walk length from row_ends, read as a slot count",
     )
     gl.static_assert(
-        (BSCORE == 0) | ((BSCORE_BLOCK <= BLOCK_KV)
-                         & (BLOCK_KV % BSCORE_BLOCK == 0)),
+        (BSCORE == 0) | ((BSCORE_BLOCK <= BLOCK_KV) & (BLOCK_KV % BSCORE_BLOCK == 0)),
         "a candidate block must tile BLOCK_KV, so that no block straddles a "
         "tile or a KV split and the reduce stays local",
     )
-    gl.static_assert((BSCORE == 0) | (BSCORE == 1) | (BSCORE == 2),
-                     "BSCORE is 0 off, 1 block maxima beside the logits, "
-                     "2 block maxima instead of them")
-    gl.static_assert((BSCORE == 0) | (GATHER == 0),
-                     "block maxima are for the dense producer, not the gather")
+    gl.static_assert(
+        (BSCORE == 0) | (BSCORE == 1) | (BSCORE == 2),
+        "BSCORE is 0 off, 1 block maxima beside the logits, "
+        "2 block maxima instead of them",
+    )
+    gl.static_assert(
+        (BSCORE == 0) | (GATHER == 0),
+        "block maxima are for the dense producer, not the gather",
+    )
 
-    cfg = Config(NUM_HEADS, HEAD_SIZE, PAGE_SIZE, BLOCK_KV, BLOCK_M,
-                 KV_PAGE_STRIDE, KVS_PAGE_STRIDE, NUM_WARPS, NUM_BUFFERS, DEPTH,
-                 UNROLL, PAGE_PIPE, M_CHUNK, NUM_CHAINS, FOLD_ASM, RELU_ADD,
-                 PRESHUFFLE, SCALE_MODE, USE_BUFFER_LOAD, RELAXED_STORE,
-                 VARLEN, MFMA_NONK_DIM, HAS_KV_SPLIT,
-                 KV_REREAD, GATHER, GATHER_BLOCK, GATHER_PIPE,
-                 BSCORE, BSCORE_BLOCK)
+    cfg = Config(
+        NUM_HEADS,
+        HEAD_SIZE,
+        PAGE_SIZE,
+        BLOCK_KV,
+        BLOCK_M,
+        KV_PAGE_STRIDE,
+        KVS_PAGE_STRIDE,
+        NUM_WARPS,
+        NUM_BUFFERS,
+        DEPTH,
+        UNROLL,
+        PAGE_PIPE,
+        M_CHUNK,
+        NUM_CHAINS,
+        FOLD_ASM,
+        RELU_ADD,
+        PRESHUFFLE,
+        SCALE_MODE,
+        USE_BUFFER_LOAD,
+        RELAXED_STORE,
+        VARLEN,
+        MFMA_NONK_DIM,
+        HAS_KV_SPLIT,
+        KV_REREAD,
+        GATHER,
+        GATHER_BLOCK,
+        GATHER_PIPE,
+        BSCORE,
+        BSCORE_BLOCK,
+    )
 
     if DYNAMIC:
         desc = sched_ptr + gl.program_id(0) * 4
@@ -1233,8 +1559,9 @@ def _pa_mqa_logits_mxfp4_kernel(
             else:
                 hi = mid
         batch_id = lo - 1
-        row_block = unit - (gl.load(query_start_loc_ptr + batch_id) // BLOCK_M
-                            + batch_id)
+        row_block = unit - (
+            gl.load(query_start_loc_ptr + batch_id) // BLOCK_M + batch_id
+        )
         split_id = gl.program_id(2)
         slice_idx: gl.int32 = 0
         num_slices: gl.int32 = 0
@@ -1264,8 +1591,11 @@ def _pa_mqa_logits_mxfp4_kernel(
     # The trailing block still owns BLOCK_M real rows when BLOCK_M does not
     # divide the count. Rows two blocks share are computed twice, identically.
     # A varlen sequence can own fewer rows than BLOCK_M, so the floor matters.
-    n0 = row_block if BLOCK_M == 1 else gl.maximum(
-        gl.minimum(row_block * BLOCK_M, rows - BLOCK_M), 0)
+    n0 = (
+        row_block
+        if BLOCK_M == 1
+        else gl.maximum(gl.minimum(row_block * BLOCK_M, rows - BLOCK_M), 0)
+    )
     if VARLEN:
         row0 = (q_start + n0).to(gl.int64)
         q_base, qs_base, w_row = row0 * stride_q_n, row0 * stride_qs_n, row0
@@ -1282,9 +1612,12 @@ def _pa_mqa_logits_mxfp4_kernel(
             rr = gl.minimum(n0 + r, rows - 1) - n0
         else:
             rr = r
-        q, qs, w = _load_q_row(cfg, Q_ptr + (q_base + rr * stride_q_n),
-                               q_scales_ptr + (qs_base + rr * stride_qs_n),
-                               weights_ptr + (w_row + rr) * stride_w_s)
+        q, qs, w = _load_q_row(
+            cfg,
+            Q_ptr + (q_base + rr * stride_q_n),
+            q_scales_ptr + (qs_base + rr * stride_qs_n),
+            weights_ptr + (w_row + rr) * stride_w_s,
+        )
         mfma_qs, q_scales, w_blocks = mfma_qs + (q,), q_scales + (qs,), w_blocks + (w,)
         if HAS_ROW_ENDS:
             e = gl.load(row_ends_ptr + (w_row + rr))
@@ -1317,18 +1650,30 @@ def _pa_mqa_logits_mxfp4_kernel(
         out_ptr = logits_ptr + w_row.to(gl.int64) * stride_logits_s
         out_stride_s = stride_logits_s
         out_stride_k = stride_logits_k
-    pgm = Program.initialize(cfg, out_ptr,
-                             out_stride_s, out_stride_k, context_len,
-                             block_end, split_id, num_kv_splits,
-                             slice_idx, num_slices, bs_ptr, bs_stride_s,
-                             HAS_KV_SPLIT, DYNAMIC)
+    pgm = Program.initialize(
+        cfg,
+        out_ptr,
+        out_stride_s,
+        out_stride_k,
+        context_len,
+        block_end,
+        split_id,
+        num_kv_splits,
+        slice_idx,
+        num_slices,
+        bs_ptr,
+        bs_stride_s,
+        HAS_KV_SPLIT,
+        DYNAMIC,
+    )
     if pgm.tile_lo >= pgm.tile_hi:
         return
     row_hi = pgm.row_bounds(ends, BLOCK_M)
 
     blk_ptr = block_table_ptr + batch_id * stride_blk_b
-    last_page_row = gl.minimum((context_len + PAGE_SIZE - 1) // PAGE_SIZE,
-                               max_blocks) - 1
+    last_page_row = (
+        gl.minimum((context_len + PAGE_SIZE - 1) // PAGE_SIZE, max_blocks) - 1
+    )
 
     # The candidate list is per query row
     g_base = w_row.to(gl.int64) * stride_gather_r
@@ -1337,12 +1682,14 @@ def _pa_mqa_logits_mxfp4_kernel(
     last_blk = gl.maximum((block_end + GATHER_BLOCK - 1) // GATHER_BLOCK - 1, 0)
 
     if PRESHUFFLE:
-        loader = RegLoader.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                      last_page_row, gv_ptr, gs_ptr, last_blk)
+        loader = RegLoader.initialize(
+            cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+        )
         _loop_with_reg(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
     else:
-        loader = LDSLoader.initialize(cfg, KV_ptr, kv_scales_ptr, blk_ptr,
-                                      last_page_row, gv_ptr, gs_ptr, last_blk)
+        loader = LDSLoader.initialize(
+            cfg, KV_ptr, kv_scales_ptr, blk_ptr, last_page_row, gv_ptr, gs_ptr, last_blk
+        )
         _loop_with_lds(pgm, loader, mfma_qs, q_scales, w_blocks, row_hi)
 
     if BSCORE:
@@ -1351,8 +1698,11 @@ def _pa_mqa_logits_mxfp4_kernel(
         # One thread, not one element of a replicated tensor.
         NT: gl.constexpr = NUM_WARPS * WARP_SIZE
         lay: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1], threads_per_warp=[WARP_SIZE],
-            warps_per_cta=[NUM_WARPS], order=[0])
+            size_per_thread=[1],
+            threads_per_warp=[WARP_SIZE],
+            warps_per_cta=[NUM_WARPS],
+            order=[0],
+        )
         tid = gl.arange(0, NT, layout=lay)
         inf = gl.full([NT], float("inf"), gl.float32, layout=lay)
         for r in gl.static_range(0, BLOCK_M):
@@ -1360,21 +1710,37 @@ def _pa_mqa_logits_mxfp4_kernel(
             tile = last // BLOCK_KV
             own = (last >= 0) & (tile >= pgm.tile_lo) & (tile < pgm.tile_hi)
             gl.amd.cdna4.buffer_store(
-                inf, ptr=pgm.bs_ptr + r * pgm.bs_stride_s,
+                inf,
+                ptr=pgm.bs_ptr + r * pgm.bs_stride_s,
                 offsets=tid * 0 + last // BSCORE_BLOCK,
-                mask=own & (tid == 0))
+                mask=own & (tid == 0),
+            )
 
 
 # batch and the slot counts change every step and their alignment never reaches
 # the code. next_n keeps its specialization: it folds at 1 here.
-@triton.jit(do_not_specialize_on_alignment=["batch", "num_ctas", "num_units",
-                                            "max_tiles"])
+@triton.jit(
+    do_not_specialize_on_alignment=["batch", "num_ctas", "num_units", "max_tiles"]
+)
 def _pa_mqa_logits_mxfp4_sched_kernel(
-    context_lens_ptr, row_ends_ptr, query_start_loc_ptr, sched_ptr, batch, next_n,
-    num_ctas, num_units, max_tiles,
-    BLOCK_M: tl.constexpr, BLOCK_KV: tl.constexpr, ROW_BLOCKS: tl.constexpr,
-    ALIGN_W: tl.constexpr, BLOCK_S: tl.constexpr, HAS_ROW_ENDS: tl.constexpr,
-    GATHER: tl.constexpr, VARLEN: tl.constexpr, ALIGN_B: tl.constexpr,
+    context_lens_ptr,
+    row_ends_ptr,
+    query_start_loc_ptr,
+    sched_ptr,
+    batch,
+    next_n,
+    num_ctas,
+    num_units,
+    max_tiles,
+    BLOCK_M: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    ROW_BLOCKS: tl.constexpr,
+    ALIGN_W: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    HAS_ROW_ENDS: tl.constexpr,
+    GATHER: tl.constexpr,
+    VARLEN: tl.constexpr,
+    ALIGN_B: tl.constexpr,
     SLICE_ROOM: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
@@ -1415,15 +1781,18 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # and all, so this counts tiles that are really walked. The count only sets
     # the balance: a live unit is floored at one tile below, so it keeps its slot
     # whatever the trim thinks, and the kernel re-derives the real walk.
-    first_row = (row_blk if BLOCK_M == 1
-                 else tl.maximum(tl.minimum(row_blk * BLOCK_M, rows - BLOCK_M), 0))
+    first_row = (
+        row_blk
+        if BLOCK_M == 1
+        else tl.maximum(tl.minimum(row_blk * BLOCK_M, rows - BLOCK_M), 0)
+    )
     if HAS_ROW_ENDS:
         block_end = tl.zeros([ALIGN_W], tl.int32)
         for r in tl.static_range(0, BLOCK_M):
             block_end = tl.maximum(
                 block_end,
-                tl.load(row_ends_ptr + q_start + first_row + r,
-                        mask=live, other=0))
+                tl.load(row_ends_ptr + q_start + first_row + r, mask=live, other=0),
+            )
     else:
         block_end = ctx - rows + first_row + BLOCK_M
     # Under the gather block_end counts candidate slots, which the context
@@ -1439,7 +1808,8 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     total_tiles = tl.sum(tiles)
     live_units = tl.sum((tiles > 0).to(tl.int32))
     tiles_per_slice = tl.maximum(
-        tl.cdiv(total_tiles, tl.maximum(num_ctas - live_units, 1)), 1)
+        tl.cdiv(total_tiles, tl.maximum(num_ctas - live_units, 1)), 1
+    )
     # Filling the machine once is not enough on a long walk: the static grid
     # caps a workgroup at max_tiles_per_split through _kv_splits and ends up
     # with far more, shorter workgroups, which this kernel keeps gaining from
@@ -1450,12 +1820,13 @@ def _pa_mqa_logits_mxfp4_sched_kernel(
     # spread of lengths sits well above what the balance wants.
     share = tl.maximum((num_ctas - live_units) // tl.maximum(live_units, 1), 1)
     tiles_per_slice = tl.maximum(
-        tiles_per_slice, tl.cdiv(tl.max(tiles), share * SLICE_ROOM))
+        tiles_per_slice, tl.cdiv(tl.max(tiles), share * SLICE_ROOM)
+    )
 
     # Step 3: lay each unit's slices end to end over the slots, so unit i owns
     # slots [first_slot_i, first_slot_i + n_slices_i).
     n_slices = tl.cdiv(tiles, tiles_per_slice)
-    first_slot = tl.cumsum(n_slices) - n_slices      # exclusive prefix sum
+    first_slot = tl.cumsum(n_slices) - n_slices  # exclusive prefix sum
     slots_used = tl.sum(n_slices)
 
     # Step 4: write the descriptors. A unit knows where its slices start, so

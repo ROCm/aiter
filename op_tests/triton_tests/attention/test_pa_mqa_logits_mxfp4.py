@@ -3,12 +3,17 @@
 import pytest
 import torch
 
-from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (cache_format,
-                                            paged_mxfp4_mqa_logits,
-                                            preshuffle_cache,
-                                            unshuffle_scales, unshuffle_values)
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
-    build_candidate_gather, build_schedule)
+    cache_format,
+    paged_mxfp4_mqa_logits,
+    preshuffle_cache,
+    unshuffle_scales,
+    unshuffle_values,
+)
+from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
+    build_candidate_gather,
+    build_schedule,
+)
 from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import build_gather
 
 SCALE_GROUP = 32
@@ -28,8 +33,9 @@ def quantize(x, block=SCALE_GROUP):
     *prefix, d = x.shape
     xb = x.float().reshape(*prefix, d // block, block)
     amax = xb.abs().amax(dim=-1, keepdim=True)
-    exp = torch.where(amax > 0,
-                      torch.ceil(torch.log2(amax.clamp(min=1e-30) / FP4_MAX)), 0.0)
+    exp = torch.where(
+        amax > 0, torch.ceil(torch.log2(amax.clamp(min=1e-30) / FP4_MAX)), 0.0
+    )
     byte = (exp + E8M0_BIAS).clamp(0.0, 254.0)
     scaled = xb / torch.pow(2.0, byte - E8M0_BIAS)
     nib = (scaled.unsqueeze(-1) - _grid(x.device)).abs().argmin(dim=-1).to(torch.uint8)
@@ -47,7 +53,8 @@ def dequantize(packed, e8m0, block=SCALE_GROUP):
     vals = _grid(packed.device)[nib.long()]
     scale = torch.pow(2.0, e8m0.float() - E8M0_BIAS)
     return (vals.reshape(*prefix, d // block, block) * scale.unsqueeze(-1)).reshape(
-        *prefix, d)
+        *prefix, d
+    )
 
 
 def calc_diff(x, y):
@@ -57,23 +64,33 @@ def calc_diff(x, y):
 
 def reference(q_deq, kv_deq, weights, ctx_lens, max_model_len, row_ends=None):
     batch, next_n = q_deq.shape[0], q_deq.shape[1]
-    out = torch.full((batch * next_n, max_model_len), float("-inf"),
-                     dtype=torch.float32, device=q_deq.device)
+    out = torch.full(
+        (batch * next_n, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_deq.device,
+    )
     for b in range(batch):
         ctx = int(ctx_lens[b])
         if ctx == 0:
             continue
         k = kv_deq[b, :ctx].float()
         for n in range(next_n):
-            row = (torch.relu(q_deq[b, n].float() @ k.T)
-                   * weights[b * next_n + n].float()[:, None]).sum(dim=0)
+            row = (
+                torch.relu(q_deq[b, n].float() @ k.T)
+                * weights[b * next_n + n].float()[:, None]
+            ).sum(dim=0)
             # Exclusive, and clamped to the context the way the kernel's
             # store_hi clamps it. Without a tensor it is the kernel's own rule.
-            end = (ctx - next_n + n + 1 if row_ends is None
-                   else min(int(row_ends[b * next_n + n]), ctx))
+            end = (
+                ctx - next_n + n + 1
+                if row_ends is None
+                else min(int(row_ends[b * next_n + n]), ctx)
+            )
             pos = torch.arange(ctx, device=q_deq.device)
             out[b * next_n + n, :ctx] = torch.where(
-                pos < end, row, torch.full_like(row, float("-inf")))
+                pos < end, row, torch.full_like(row, float("-inf"))
+            )
     return out
 
 
@@ -98,8 +115,17 @@ def row_ends_for(kind, ctx_lens, next_n, ratio=2, device="cuda"):
     return torch.tensor(ends, dtype=torch.int32, device=device)
 
 
-def _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
-               page_offset=0, seed=SEED, preshuffle=1):
+def _make_case(
+    batch,
+    next_n,
+    num_heads,
+    head_size,
+    ctx_lens,
+    page_size,
+    page_offset=0,
+    seed=SEED,
+    preshuffle=1,
+):
     """The quantised inputs and the packed cache, seeded so two calls agree."""
     dev = "cuda"
     torch.manual_seed(seed)
@@ -109,12 +135,13 @@ def _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
     used = batch * per_seq
     num_pages = page_offset + used
 
-    q = torch.randn(batch, next_n, num_heads, head_size, device=dev,
-                    dtype=torch.bfloat16)
-    kv = torch.randn(batch, per_seq * page_size, head_size, device=dev,
-                     dtype=torch.bfloat16)
-    weights = torch.randn(batch * next_n, num_heads, device=dev,
-                          dtype=torch.float32)
+    q = torch.randn(
+        batch, next_n, num_heads, head_size, device=dev, dtype=torch.bfloat16
+    )
+    kv = torch.randn(
+        batch, per_seq * page_size, head_size, device=dev, dtype=torch.bfloat16
+    )
+    weights = torch.randn(batch * next_n, num_heads, device=dev, dtype=torch.float32)
     q4, q4s = quantize(q.reshape(-1, head_size))
     q4 = q4.reshape(batch, next_n, num_heads, head_size // 2)
     q4s = q4s.reshape(batch, next_n, num_heads, head_size // SCALE_GROUP)
@@ -130,8 +157,7 @@ def _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
     # block table names are written, so this stays affordable when page_offset
     # pushes num_pages into the millions
     hb, ns = head_size // 2, head_size // SCALE_GROUP
-    cache = torch.zeros(num_pages, page_size, 1, hb + ns, dtype=torch.uint8,
-                        device=dev)
+    cache = torch.zeros(num_pages, page_size, 1, hb + ns, dtype=torch.uint8, device=dev)
     v_used = kv4.reshape(used, page_size, hb)
     s_used = kv4s.reshape(used, page_size, ns)
     fmt = cache_format(num_heads, head_size, page_size)
@@ -141,47 +167,90 @@ def _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
         sv, ss = v_used, s_used
     flat = cache.view(num_pages, -1)
     phys = block_table.reshape(-1).long()
-    flat[phys, :page_size * hb] = sv.reshape(used, -1)
-    flat[phys, page_size * hb:] = ss.reshape(used, -1)
+    flat[phys, : page_size * hb] = sv.reshape(used, -1)
+    flat[phys, page_size * hb :] = ss.reshape(used, -1)
     del v_used, s_used, sv, ss, flat
 
-    return dict(q4=q4, q4s=q4s, kv4=kv4, kv4s=kv4s, cache=cache,
-                weights=weights, block_table=block_table, ctx=ctx,
-                cl=torch.tensor(ctx, dtype=torch.int32, device=dev),
-                mml=per_seq * page_size, num_pages=num_pages, dev=dev)
+    return dict(
+        q4=q4,
+        q4s=q4s,
+        kv4=kv4,
+        kv4s=kv4s,
+        cache=cache,
+        weights=weights,
+        block_table=block_table,
+        ctx=ctx,
+        cl=torch.tensor(ctx, dtype=torch.int32, device=dev),
+        mml=per_seq * page_size,
+        num_pages=num_pages,
+        dev=dev,
+    )
 
 
-def run_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
-             page_offset=0, seed=SEED, check_inf=True, preshuffle=1,
-             clean_logits=True, dynamic=0, row_ends=None):
-    st = _make_case(batch, next_n, num_heads, head_size, ctx_lens, page_size,
-                    page_offset, seed, preshuffle)
+def run_case(
+    batch,
+    next_n,
+    num_heads,
+    head_size,
+    ctx_lens,
+    page_size,
+    page_offset=0,
+    seed=SEED,
+    check_inf=True,
+    preshuffle=1,
+    clean_logits=True,
+    dynamic=0,
+    row_ends=None,
+):
+    st = _make_case(
+        batch,
+        next_n,
+        num_heads,
+        head_size,
+        ctx_lens,
+        page_size,
+        page_offset,
+        seed,
+        preshuffle,
+    )
     q4, q4s, kv4, kv4s = st["q4"], st["q4s"], st["kv4"], st["kv4s"]
     cache, weights, ctx, mml = st["cache"], st["weights"], st["ctx"], st["mml"]
     num_pages = st["num_pages"]
 
     out = paged_mxfp4_mqa_logits(
-        q4, q4s, cache, weights, st["cl"], st["block_table"], mml,
-        preshuffle=preshuffle, clean_logits=clean_logits, dynamic=dynamic,
-        row_ends=row_ends)
+        q4,
+        q4s,
+        cache,
+        weights,
+        st["cl"],
+        st["block_table"],
+        mml,
+        preshuffle=preshuffle,
+        clean_logits=clean_logits,
+        dynamic=dynamic,
+        row_ends=row_ends,
+    )
     torch.cuda.synchronize()
 
-    ref = reference(dequantize(q4, q4s), dequantize(kv4, kv4s), weights, ctx, mml,
-                    row_ends)
+    ref = reference(
+        dequantize(q4, q4s), dequantize(kv4, kv4s), weights, ctx, mml, row_ends
+    )
     # Only the in-window positions are defined without clean_logits, and they
     # are the ones a top-k reads either way.
     fin = torch.isfinite(ref)
     # Every row parked: the -inf pattern is the whole check, and calc_diff over
     # nothing is a nan.
     diff = float(calc_diff(out[fin], ref[fin])) if bool(fin.any()) else 0.0
-    inf_ok = (bool(torch.equal(torch.isinf(out), torch.isinf(ref)))
-              if (check_inf and clean_logits) else True)
+    inf_ok = (
+        bool(torch.equal(torch.isinf(out), torch.isinf(ref)))
+        if (check_inf and clean_logits)
+        else True
+    )
     gib = num_pages * page_size * (head_size // 2 + head_size // SCALE_GROUP) / 2**30
 
     del cache, out, ref, kv4, kv4s
     torch.cuda.empty_cache()
     return diff, inf_ok, gib
-
 
 
 SHAPES = [
@@ -197,19 +266,35 @@ SHAPES = [
     ("ragged", 5, 3, [97, 4096, 1, 2049, 512]),
 ]
 
+
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
-@pytest.mark.parametrize("head_size", [128,])
+@pytest.mark.parametrize(
+    "head_size",
+    [
+        128,
+    ],
+)
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("preshuffle", [1, 0])
 @pytest.mark.parametrize("clean_logits", [True, False])
 @pytest.mark.parametrize("dynamic", [0, 1])
-def test_shape(shape, num_heads, head_size, page_size, preshuffle,
-               clean_logits, dynamic):
+def test_shape(
+    shape, num_heads, head_size, page_size, preshuffle, clean_logits, dynamic
+):
     _, batch, next_n, ctx_lens = shape
-    diff, inf_ok, _ = run_case(batch, next_n, num_heads, head_size, ctx_lens,
-                               page_size, seed=SEED, preshuffle=preshuffle,
-                               clean_logits=clean_logits, dynamic=dynamic)
+    diff, inf_ok, _ = run_case(
+        batch,
+        next_n,
+        num_heads,
+        head_size,
+        ctx_lens,
+        page_size,
+        seed=SEED,
+        preshuffle=preshuffle,
+        clean_logits=clean_logits,
+        dynamic=dynamic,
+    )
     assert diff <= TOL, f"residual {diff:.3e}"
     assert inf_ok, "the -inf pattern does not match the reference"
 
@@ -223,8 +308,7 @@ ROW_ENDS_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("shape", ROW_ENDS_SHAPES,
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("shape", ROW_ENDS_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("kind", ["compressed", "padded"])
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("dynamic", [0, 1])
@@ -233,8 +317,17 @@ def test_row_ends(shape, kind, num_heads, dynamic):
     bound steps once per two rows, and parked rows."""
     _, batch, next_n, ctx_lens = shape
     ends = row_ends_for(kind, ctx_lens, next_n)
-    diff, inf_ok, _ = run_case(batch, next_n, num_heads, 128, ctx_lens, 64,
-                               seed=SEED, dynamic=dynamic, row_ends=ends)
+    diff, inf_ok, _ = run_case(
+        batch,
+        next_n,
+        num_heads,
+        128,
+        ctx_lens,
+        64,
+        seed=SEED,
+        dynamic=dynamic,
+        row_ends=ends,
+    )
     assert diff <= TOL, f"residual {diff:.3e}"
     assert inf_ok, "the -inf pattern does not match the reference"
 
@@ -245,16 +338,32 @@ GATHER_SHAPES = [
 ]
 
 
-def _gather_run(st, num_heads, head_size, next_n, block, preshuffle,
-                positions, row_ends, dynamic=0):
-    meta = build_gather(positions,
-                        st["block_table"].repeat_interleave(next_n, 0),
-                        st["cache"], num_heads, head_size, block,
-                        preshuffle=preshuffle)
+def _gather_run(
+    st, num_heads, head_size, next_n, block, preshuffle, positions, row_ends, dynamic=0
+):
+    meta = build_gather(
+        positions,
+        st["block_table"].repeat_interleave(next_n, 0),
+        st["cache"],
+        num_heads,
+        head_size,
+        block,
+        preshuffle=preshuffle,
+    )
     out = paged_mxfp4_mqa_logits(
-        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-        st["block_table"], st["mml"], preshuffle=preshuffle, use_gather=True, candidates=meta,
-        row_ends=row_ends, dynamic=dynamic)
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        st["mml"],
+        preshuffle=preshuffle,
+        use_gather=True,
+        candidates=meta,
+        row_ends=row_ends,
+        dynamic=dynamic,
+    )
     torch.cuda.synchronize()
     return out
 
@@ -276,8 +385,7 @@ def _identity_list(st, next_n, block):
     return torch.minimum(base.expand(rows, k), last).contiguous(), ends
 
 
-@pytest.mark.parametrize("shape", GATHER_SHAPES,
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("shape", GATHER_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("preshuffle", [1, 0])
 @pytest.mark.parametrize("block", [8, 16, 32])
@@ -290,11 +398,17 @@ def test_gather_identity(shape, num_heads, preshuffle, block):
     in the same order as the dense path, so only bit-identity will do.
     """
     _, batch, next_n, ctx_lens = shape
-    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
-                    preshuffle=preshuffle)
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64, preshuffle=preshuffle)
     ref = paged_mxfp4_mqa_logits(
-        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-        st["block_table"], st["mml"], preshuffle=preshuffle).clone()
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        st["mml"],
+        preshuffle=preshuffle,
+    ).clone()
     torch.cuda.synchronize()
     pos, ends = _identity_list(st, next_n, block)
     got = _gather_run(st, num_heads, 128, next_n, block, preshuffle, pos, ends)
@@ -311,28 +425,36 @@ def test_gather_scattered(num_heads, preshuffle):
     holds its candidates at [0, row_ends[r]) and everything past stays -inf.
     """
     batch, next_n, block, nb = 2, 2, 8, 16
-    st = _make_case(batch, next_n, num_heads, 128, [1024, 768], 64,
-                    preshuffle=preshuffle)
+    st = _make_case(
+        batch, next_n, num_heads, 128, [1024, 768], 64, preshuffle=preshuffle
+    )
     dev, rows = st["dev"], batch * next_n
     g = torch.Generator(device=dev).manual_seed(7)
-    pos = torch.stack([
-        torch.randperm(768 // block, device=dev, generator=g)[:nb].sort().values
-        for _ in range(rows)]).long() * block
+    pos = (
+        torch.stack(
+            [
+                torch.randperm(768 // block, device=dev, generator=g)[:nb].sort().values
+                for _ in range(rows)
+            ]
+        ).long()
+        * block
+    )
     ends = torch.full((rows,), nb * block, dtype=torch.int32, device=dev)
     got = _gather_run(st, num_heads, 128, next_n, block, preshuffle, pos, ends)
 
     kv_deq = dequantize(st["kv4"], st["kv4s"])
     q_deq = dequantize(st["q4"], st["q4s"])
-    slots = (pos[:, :, None]
-             + torch.arange(block, device=dev)[None, None, :]).reshape(rows, -1)
+    slots = (pos[:, :, None] + torch.arange(block, device=dev)[None, None, :]).reshape(
+        rows, -1
+    )
     ref = torch.full_like(got, float("-inf"))
     for r in range(rows):
         b = r // next_n
         k = kv_deq[b].index_select(0, slots[r]).float()
         qk = torch.relu(q_deq[b, r % next_n].float() @ k.T)
-        ref[r, :nb * block] = (qk * st["weights"][r].float()[:, None]).sum(0)
-    assert float(calc_diff(got[:, :nb * block], ref[:, :nb * block])) <= TOL
-    assert bool(torch.isinf(got[:, nb * block:]).all()), "tail is not -inf"
+        ref[r, : nb * block] = (qk * st["weights"][r].float()[:, None]).sum(0)
+    assert float(calc_diff(got[:, : nb * block], ref[:, : nb * block])) <= TOL
+    assert bool(torch.isinf(got[:, nb * block :]).all()), "tail is not -inf"
 
 
 def test_gather_needs_cu_ends():
@@ -354,7 +476,12 @@ def test_gather_ignores_dynamic():
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
-@pytest.mark.parametrize("gib", [5.0, ])
+@pytest.mark.parametrize(
+    "gib",
+    [
+        5.0,
+    ],
+)
 @pytest.mark.parametrize("preshuffle", [1, 0])
 def test_addressing(gib, preshuffle):
     """A buffer op addresses through a 32-bit offset, so put the sequence at the
@@ -365,17 +492,25 @@ def test_addressing(gib, preshuffle):
     per_seq = (ctx + page_size - 1) // page_size
     assert num_pages >= per_seq, (
         f"{gib} GiB is only {num_pages} pages, smaller than the sequence's "
-        f"{per_seq}")
+        f"{per_seq}"
+    )
     free, _ = torch.cuda.mem_get_info()
     if free < (gib + 2) * 2**30:
         pytest.skip(f"needs about {gib + 2:.1f} GiB free")
     try:
         diff, inf_ok, real = run_case(
-            1, 1, 32, head_size, [ctx], page_size, seed=SEED,
+            1,
+            1,
+            32,
+            head_size,
+            [ctx],
+            page_size,
+            seed=SEED,
             preshuffle=preshuffle,
             # the rest of the pool goes below, so the sequence sits at the top
             # and a truncated offset wraps down into real, wrong pages
-            page_offset=num_pages - per_seq)
+            page_offset=num_pages - per_seq,
+        )
     except torch.OutOfMemoryError:
         torch.cuda.empty_cache()
         pytest.skip("out of memory")
@@ -397,15 +532,14 @@ def block_scores_reference(logits, ends, block):
     nb = (width + block - 1) // block
     x = logits
     if nb * block > width:
-        x = torch.nn.functional.pad(x, (0, nb * block - width),
-                                    value=float("-inf"))
+        x = torch.nn.functional.pad(x, (0, nb * block - width), value=float("-inf"))
     col = torch.arange(nb * block, device=logits.device)
-    x = torch.where(col[None, :] < ends[:, None], x,
-                    torch.full_like(x, float("-inf")))
+    x = torch.where(col[None, :] < ends[:, None], x, torch.full_like(x, float("-inf")))
     out = x.reshape(rows, nb, block).amax(-1)
     live = ends > 0
-    out[torch.arange(rows, device=out.device)[live],
-        (ends[live].long() - 1) // block] = float("inf")
+    out[
+        torch.arange(rows, device=out.device)[live], (ends[live].long() - 1) // block
+    ] = float("inf")
     return out
 
 
@@ -414,14 +548,26 @@ def _row_ends(ctx_lens, next_n, row_ends, device="cuda"):
     out = []
     for b, ctx in enumerate(ctx_lens):
         for n in range(next_n):
-            e = (ctx - next_n + n + 1 if row_ends is None
-                 else int(row_ends[b * next_n + n]))
+            e = (
+                ctx - next_n + n + 1
+                if row_ends is None
+                else int(row_ends[b * next_n + n])
+            )
             out.append(max(min(e, ctx), 0))
     return torch.tensor(out, dtype=torch.int32, device=device)
 
 
-def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
-                dynamic=0, row_ends=None, only=False):
+def _bscore_run(
+    st,
+    num_heads,
+    next_n,
+    block,
+    preshuffle=1,
+    clean_logits=True,
+    dynamic=0,
+    row_ends=None,
+    only=False,
+):
     """One launch of the fused reduce. `only` drops the logits store.
 
     Returns what the launcher returned and the score tensor -- which are the
@@ -429,14 +575,24 @@ def _bscore_run(st, num_heads, next_n, block, preshuffle=1, clean_logits=True,
     """
     rows, mml = len(st["ctx"]) * next_n, st["mml"]
     nb = (mml + block - 1) // block
-    bs = torch.full((rows, nb), float("-inf"), dtype=torch.float32,
-                    device=st["dev"])
+    bs = torch.full((rows, nb), float("-inf"), dtype=torch.float32, device=st["dev"])
     out = paged_mxfp4_mqa_logits(
-        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-        st["block_table"], mml, preshuffle=preshuffle,
-        clean_logits=clean_logits, dynamic=dynamic, row_ends=row_ends,
-        block_scores=bs, calc_logits=not only, calc_block_scores=True,
-        candidate_block_size=block)
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        mml,
+        preshuffle=preshuffle,
+        clean_logits=clean_logits,
+        dynamic=dynamic,
+        row_ends=row_ends,
+        block_scores=bs,
+        calc_logits=not only,
+        calc_block_scores=True,
+        candidate_block_size=block,
+    )
     torch.cuda.synchronize()
     # "both" hands back a pair; the callers below want the logits half.
     return (out if only else out[0]), bs
@@ -469,8 +625,9 @@ BSCORE_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("shape", BSCORE_SHAPES[:2],
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize(
+    "shape", BSCORE_SHAPES[:2], ids=lambda s: s[0].replace(" ", "_")
+)
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("dynamic", [0, 1])
 @pytest.mark.parametrize("clean_logits", [True, False])
@@ -482,16 +639,18 @@ def test_block_scores_knobs(shape, num_heads, dynamic, clean_logits):
     """
     _, batch, next_n, ctx_lens = shape
     st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
-    logits, bs = _bscore_run(st, num_heads, next_n, 8, clean_logits=clean_logits,
-                             dynamic=dynamic)
+    logits, bs = _bscore_run(
+        st, num_heads, next_n, 8, clean_logits=clean_logits, dynamic=dynamic
+    )
     ends = _row_ends(st["ctx"], next_n, None)
     ref = block_scores_reference(logits, ends, 8)
     nd = int((ref.view(torch.int32) != bs.view(torch.int32)).sum())
     assert nd == 0, f"{nd} differing words"
 
 
-@pytest.mark.parametrize("shape", BSCORE_SHAPES[:3],
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize(
+    "shape", BSCORE_SHAPES[:3], ids=lambda s: s[0].replace(" ", "_")
+)
 @pytest.mark.parametrize("num_heads", [32, 64])
 def test_block_scores_leaves_logits_alone(shape, num_heads):
     """The maxima come out beside the logits, not instead of them.
@@ -502,8 +661,14 @@ def test_block_scores_leaves_logits_alone(shape, num_heads):
     _, batch, next_n, ctx_lens = shape
     st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
     plain = paged_mxfp4_mqa_logits(
-        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-        st["block_table"], st["mml"]).clone()
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        st["mml"],
+    ).clone()
     torch.cuda.synchronize()
     fused, _ = _bscore_run(st, num_heads, next_n, 8)
     nd = int((plain.view(torch.int32) != fused.view(torch.int32)).sum())
@@ -515,32 +680,52 @@ def test_block_scores_rejects_gather():
     st = _make_case(1, 1, 32, 128, [512], 64)
     pos, ends = _identity_list(st, 1, 8)
     meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
-    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
-                    device=st["dev"])
+    bs = torch.full(
+        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device=st["dev"]
+    )
     with pytest.raises(AssertionError, match="dense producer"):
         paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], use_gather=True, candidates=meta, row_ends=ends,
-            block_scores=bs, calc_block_scores=True)
+            st["q4"],
+            st["q4s"],
+            st["cache"],
+            st["weights"],
+            st["cl"],
+            st["block_table"],
+            st["mml"],
+            use_gather=True,
+            candidates=meta,
+            row_ends=ends,
+            block_scores=bs,
+            calc_block_scores=True,
+        )
 
 
 def test_block_scores_needs_room():
     """A score tensor too narrow for max_model_len is a caller error."""
     st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full((1, st["mml"] // 8 - 1), float("-inf"),
-                    dtype=torch.float32, device=st["dev"])
+    bs = torch.full(
+        (1, st["mml"] // 8 - 1), float("-inf"), dtype=torch.float32, device=st["dev"]
+    )
     with pytest.raises(AssertionError, match="blocks wide"):
         paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], block_scores=bs,
-            calc_block_scores=True)
+            st["q4"],
+            st["q4s"],
+            st["cache"],
+            st["weights"],
+            st["cl"],
+            st["block_table"],
+            st["mml"],
+            block_scores=bs,
+            calc_block_scores=True,
+        )
 
 
 # block maxima with no logits at all
 
 
-@pytest.mark.parametrize("shape", BSCORE_SHAPES[:3],
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize(
+    "shape", BSCORE_SHAPES[:3], ids=lambda s: s[0].replace(" ", "_")
+)
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("block", [8, 32])
 @pytest.mark.parametrize("preshuffle", [1, 0])
@@ -551,10 +736,10 @@ def test_scores_only(shape, num_heads, block, preshuffle):
     both arms against each other and against the reference. Covers mode 1 too.
     """
     _, batch, next_n, ctx_lens = shape
-    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64,
-                    preshuffle=preshuffle)
-    logits, beside, alone = _bscore_arms(st, num_heads, next_n, block,
-                                         preshuffle=preshuffle)
+    st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64, preshuffle=preshuffle)
+    logits, beside, alone = _bscore_arms(
+        st, num_heads, next_n, block, preshuffle=preshuffle
+    )
     nd = _same_words(beside, alone)
     assert nd == 0, f"{nd} differing words against the alongside arm"
     ref = block_scores_reference(logits, _row_ends(st["ctx"], next_n, None), block)
@@ -562,8 +747,9 @@ def test_scores_only(shape, num_heads, block, preshuffle):
     assert nd == 0, f"{nd} differing words against the reference"
 
 
-@pytest.mark.parametrize("shape", BSCORE_SHAPES[:4],
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize(
+    "shape", BSCORE_SHAPES[:4], ids=lambda s: s[0].replace(" ", "_")
+)
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("dynamic", [0, 1])
 def test_scores_only_knobs(shape, num_heads, dynamic):
@@ -573,16 +759,14 @@ def test_scores_only_knobs(shape, num_heads, dynamic):
     """
     _, batch, next_n, ctx_lens = shape
     st = _make_case(batch, next_n, num_heads, 128, ctx_lens, 64)
-    logits, beside, alone = _bscore_arms(st, num_heads, next_n, 8,
-                                         dynamic=dynamic)
+    logits, beside, alone = _bscore_arms(st, num_heads, next_n, 8, dynamic=dynamic)
     assert _same_words(beside, alone) == 0
     ref = block_scores_reference(logits, _row_ends(st["ctx"], next_n, None), 8)
     nd = _same_words(ref, alone)
     assert nd == 0, f"{nd} differing words"
 
 
-@pytest.mark.parametrize("shape", ROW_ENDS_SHAPES,
-                         ids=lambda s: s[0].replace(" ", "_"))
+@pytest.mark.parametrize("shape", ROW_ENDS_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("kind", ["compressed", "padded"])
 def test_scores_only_row_ends(shape, kind):
     """The row bound still reaches the reduce with no store to share it with.
@@ -605,7 +789,7 @@ def test_scores_only_nan(block):
     batch, next_n, page_size = 2, 1, 64
     st = _make_case(batch, next_n, 32, 128, [1024, 777], page_size)
     flat = st["cache"].view(st["cache"].shape[0], -1)
-    scales = flat[:, page_size * 64:]
+    scales = flat[:, page_size * 64 :]
     for i in st["block_table"].reshape(-1).tolist()[:4]:
         scales[i, 5] = 255
     logits, beside, alone = _bscore_arms(st, 32, next_n, block)
@@ -627,15 +811,24 @@ def test_scores_only_allocates_no_logits():
     logits_bytes = rows * mml * 4
 
     def extra(only):
-        bs = torch.full((rows, mml // 8), float("-inf"), dtype=torch.float32,
-                        device=st["dev"])
+        bs = torch.full(
+            (rows, mml // 8), float("-inf"), dtype=torch.float32, device=st["dev"]
+        )
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated()
         paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], mml, block_scores=bs,
-            calc_logits=not only, calc_block_scores=True)
+            st["q4"],
+            st["q4s"],
+            st["cache"],
+            st["weights"],
+            st["cl"],
+            st["block_table"],
+            mml,
+            block_scores=bs,
+            calc_logits=not only,
+            calc_block_scores=True,
+        )
         torch.cuda.synchronize()
         return torch.cuda.max_memory_allocated() - base
 
@@ -645,18 +838,30 @@ def test_scores_only_allocates_no_logits():
     assert without < logits_bytes // 2, without
 
 
-@pytest.mark.parametrize("want_logits,want_scores",
-                         [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "want_logits,want_scores", [(True, False), (False, True), (True, True)]
+)
 def test_outputs_allocates(want_logits, want_scores):
     """Every requested output comes back whether or not the caller owns it."""
     st = _make_case(1, 4, 32, 128, [512], 64)
     rows, mml = 4, st["mml"]
     got = paged_mxfp4_mqa_logits(
-        st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-        st["block_table"], mml, calc_logits=want_logits,
-        calc_block_scores=want_scores, candidate_block_size=8)
-    logits, scores = (got if want_logits and want_scores else
-                      (got, None) if want_logits else (None, got))
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        mml,
+        calc_logits=want_logits,
+        calc_block_scores=want_scores,
+        candidate_block_size=8,
+    )
+    logits, scores = (
+        got
+        if want_logits and want_scores
+        else (got, None) if want_logits else (None, got)
+    )
     if logits is not None:
         assert logits.shape == (rows, mml) and logits.dtype == torch.float32
     if scores is not None:
@@ -668,12 +873,20 @@ def test_outputs_allocates(want_logits, want_scores):
 def test_block_scores_rejects_logits_only():
     """A score tensor with nothing asked to write it is a caller error."""
     st = _make_case(1, 1, 32, 128, [512], 64)
-    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
-                    device=st["dev"])
+    bs = torch.full(
+        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device=st["dev"]
+    )
     with pytest.raises(AssertionError, match="calc_block_scores off"):
         paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], block_scores=bs)
+            st["q4"],
+            st["q4s"],
+            st["cache"],
+            st["weights"],
+            st["cl"],
+            st["block_table"],
+            st["mml"],
+            block_scores=bs,
+        )
 
 
 def test_scores_only_rejects_gather():
@@ -684,13 +897,25 @@ def test_scores_only_rejects_gather():
     st = _make_case(1, 1, 32, 128, [512], 64)
     pos, ends = _identity_list(st, 1, 8)
     meta = build_gather(pos, st["block_table"], st["cache"], 32, 128, 8)
-    bs = torch.full((1, st["mml"] // 8), float("-inf"), dtype=torch.float32,
-                    device=st["dev"])
+    bs = torch.full(
+        (1, st["mml"] // 8), float("-inf"), dtype=torch.float32, device=st["dev"]
+    )
     with pytest.raises(AssertionError, match="dense producer"):
         paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], st["mml"], use_gather=True, candidates=meta, row_ends=ends,
-            block_scores=bs, calc_logits=False, calc_block_scores=True)
+            st["q4"],
+            st["q4s"],
+            st["cache"],
+            st["weights"],
+            st["cl"],
+            st["block_table"],
+            st["mml"],
+            use_gather=True,
+            candidates=meta,
+            row_ends=ends,
+            block_scores=bs,
+            calc_logits=False,
+            calc_block_scores=True,
+        )
 
 
 def _expand_ref(ids, ends, block):
@@ -703,8 +928,9 @@ def _expand_ref(ids, ends, block):
     last = ((nb - 1) * block).long()
     pos = torch.where(key == 0x7FFFFFFF, last[:, None], key.long() * block)
     tail = torch.minimum(torch.full_like(ends, block), ends - max_id.int() * block)
-    cu = torch.where(n_valid > 0, (n_valid.int() - 1) * block + tail,
-                     torch.zeros_like(ends))
+    cu = torch.where(
+        n_valid > 0, (n_valid.int() - 1) * block + tail, torch.zeros_like(ends)
+    )
     return pos, cu.to(torch.int32)
 
 
@@ -725,8 +951,7 @@ def test_candidate_gather(num_heads, block):
 
     pos_r, cu_r = _expand_ref(ids, ends, block)
     ref = build_gather(pos_r, bt, st["cache"], num_heads, 128, block)
-    got, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
-                                     128, block)
+    got, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads, 128, block)
     assert torch.equal(got["voff"], ref["voff"]), "value offsets differ"
     assert torch.equal(got["soff"], ref["soff"]), "scale offsets differ"
     assert torch.equal(got["positions"], pos_r) and torch.equal(cu, cu_r)
@@ -739,18 +964,38 @@ def test_candidates_implicit(num_heads):
     st = _make_case(1, rows, num_heads, 128, [4096], 64)
     ctx = st["ctx"][0]
     g = torch.Generator(device=st["dev"]).manual_seed(7)
-    ids = torch.rand(rows, ctx // block, generator=g,
-                     device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
+    ids = (
+        torch.rand(rows, ctx // block, generator=g, device=st["dev"])
+        .argsort(1)[:, :K]
+        .to(torch.int32)
+    )
     ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
-    meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
-                                      128, block)
-    a = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
-                               st["cl"], st["block_table"], K * block,
-                               use_gather=True, candidates=meta, row_ends=cu)
-    b = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
-                               st["cl"], st["block_table"], K * block,
-                               use_gather=True, candidates=ids, row_ends=ends)
+    meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads, 128, block)
+    a = paged_mxfp4_mqa_logits(
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        K * block,
+        use_gather=True,
+        candidates=meta,
+        row_ends=cu,
+    )
+    b = paged_mxfp4_mqa_logits(
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        K * block,
+        use_gather=True,
+        candidates=ids,
+        row_ends=ends,
+    )
     torch.cuda.synchronize()
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
@@ -766,9 +1011,9 @@ def test_strided_pages(num_heads, page_size, pad):
     stride = page_bytes + pad
     pool = torch.zeros(pages * stride, dtype=torch.uint8, device=st["dev"])
     torch.as_strided(pool, (pages, page_bytes), (stride, 1), 0).copy_(
-        cache.view(pages, -1))
-    strided = torch.as_strided(pool, cache.shape,
-                               (stride,) + cache.stride()[1:], 0)
+        cache.view(pages, -1)
+    )
+    strided = torch.as_strided(pool, cache.shape, (stride,) + cache.stride()[1:], 0)
 
     args = (st["q4"], st["q4s"])
     rest = (st["weights"], st["cl"], st["block_table"], st["mml"])
@@ -785,20 +1030,35 @@ def test_gather_offsets_i64(num_heads, block):
     rows, K = 4, 128
     st = _make_case(1, rows, num_heads, 128, [4096], 64)
     g = torch.Generator(device=st["dev"]).manual_seed(11)
-    ids = torch.rand(rows, st["ctx"][0] // block, generator=g,
-                     device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
+    ids = (
+        torch.rand(rows, st["ctx"][0] // block, generator=g, device=st["dev"])
+        .argsort(1)[:, :K]
+        .to(torch.int32)
+    )
     ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
 
     out = []
     for width in (torch.int32, torch.int64):
-        meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], num_heads,
-                                          128, block, offsets=width)
+        meta, cu = build_candidate_gather(
+            ids, ends, bt, st["cache"], num_heads, 128, block, offsets=width
+        )
         assert meta["voff"].dtype == width and meta["soff"].dtype == width
-        out.append(paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], K * block, use_gather=True, candidates=meta,
-            row_ends=cu, candidate_block_size=block))
+        out.append(
+            paged_mxfp4_mqa_logits(
+                st["q4"],
+                st["q4s"],
+                st["cache"],
+                st["weights"],
+                st["cl"],
+                st["block_table"],
+                K * block,
+                use_gather=True,
+                candidates=meta,
+                row_ends=cu,
+                candidate_block_size=block,
+            )
+        )
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
@@ -808,22 +1068,38 @@ def test_gather_span_window():
     path would not -- it multiplies the list back to bytes in i32."""
     rows, block, K, page_size = 4, 8, 64, 64
     page_bytes = page_size * (64 + 4)
-    st = _make_case(1, rows, 32, 128, [2048], page_size,
-                    page_offset=2 ** 31 // page_bytes + 512)
+    st = _make_case(
+        1, rows, 32, 128, [2048], page_size, page_offset=2**31 // page_bytes + 512
+    )
     g = torch.Generator(device=st["dev"]).manual_seed(13)
-    ids = torch.rand(rows, st["ctx"][0] // block, generator=g,
-                     device=st["dev"]).argsort(1)[:, :K].to(torch.int32)
+    ids = (
+        torch.rand(rows, st["ctx"][0] // block, generator=g, device=st["dev"])
+        .argsort(1)[:, :K]
+        .to(torch.int32)
+    )
     ends = _row_ends(st["ctx"], rows, None)
     bt = st["block_table"].repeat_interleave(rows, 0).contiguous()
 
     out = []
     for width in (None, torch.int64):
-        meta, cu = build_candidate_gather(ids, ends, bt, st["cache"], 32, 128,
-                                          block, offsets=width)
-        out.append(paged_mxfp4_mqa_logits(
-            st["q4"], st["q4s"], st["cache"], st["weights"], st["cl"],
-            st["block_table"], K * block, use_gather=True, candidates=meta,
-            row_ends=cu, candidate_block_size=block))
+        meta, cu = build_candidate_gather(
+            ids, ends, bt, st["cache"], 32, 128, block, offsets=width
+        )
+        out.append(
+            paged_mxfp4_mqa_logits(
+                st["q4"],
+                st["q4s"],
+                st["cache"],
+                st["weights"],
+                st["cl"],
+                st["block_table"],
+                K * block,
+                use_gather=True,
+                candidates=meta,
+                row_ends=cu,
+                candidate_block_size=block,
+            )
+        )
     torch.cuda.synchronize()
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
@@ -837,8 +1113,9 @@ def test_gather_rejects_short_offsets():
     ends = torch.full((rows,), 512, dtype=torch.int32, device="cuda")
     bt = torch.zeros(rows, 16, dtype=torch.int32, device="cuda")
     with pytest.raises(AssertionError, match="do not reach"):
-        build_candidate_gather(ids, ends, bt, cache, 32, 128, block,
-                               offsets=torch.int32)
+        build_candidate_gather(
+            ids, ends, bt, cache, 32, 128, block, offsets=torch.int32
+        )
 
 
 VARLEN_SHAPES = [
@@ -866,27 +1143,35 @@ def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     q4 = q4.reshape(total, num_heads, hs // 2)
     q4s = q4s.reshape(total, num_heads, hs // SCALE_GROUP)
     w = torch.randn(total, num_heads, device=dev)
-    cu = torch.tensor([0] + list(torch.tensor(rows).cumsum(0)),
-                      dtype=torch.int32, device=dev)
+    cu = torch.tensor(
+        [0] + list(torch.tensor(rows).cumsum(0)), dtype=torch.int32, device=dev
+    )
     args = (st["cache"], st["cl"], st["block_table"], st["mml"])
 
-    got = paged_mxfp4_mqa_logits(q4, q4s, args[0], w, *args[1:],
-                                 query_start_loc=cu, next_n=plan_n,
-                                 dynamic=dyn)
+    got = paged_mxfp4_mqa_logits(
+        q4, q4s, args[0], w, *args[1:], query_start_loc=cu, next_n=plan_n, dynamic=dyn
+    )
     ref = torch.full_like(got, float("-inf"))
     for b, r in enumerate(rows):
         lo = int(cu[b])
-        ref[lo:lo + r] = paged_mxfp4_mqa_logits(
-            q4[lo:lo + r][None].contiguous(), q4s[lo:lo + r][None].contiguous(),
-            args[0], w[lo:lo + r].contiguous(), args[1][b:b + 1],
-            args[2][b:b + 1].contiguous(), args[3])
+        ref[lo : lo + r] = paged_mxfp4_mqa_logits(
+            q4[lo : lo + r][None].contiguous(),
+            q4s[lo : lo + r][None].contiguous(),
+            args[0],
+            w[lo : lo + r].contiguous(),
+            args[1][b : b + 1],
+            args[2][b : b + 1].contiguous(),
+            args[3],
+        )
     torch.cuda.synchronize()
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
 
 
-@pytest.mark.parametrize("shape", [(32, 1, [8192]), (128, 1, [4096]),
-                                   (32, 6, [8192])],
-                         ids=lambda s: f"b{s[0]}_n{s[1]}")
+@pytest.mark.parametrize(
+    "shape",
+    [(32, 1, [8192]), (128, 1, [4096]), (32, 6, [8192])],
+    ids=lambda s: f"b{s[0]}_n{s[1]}",
+)
 def test_schedule_idle_slots(shape):
     """Slots past the last slice launch too. Their descriptor arrives stale, so
     the walk has to read it as no work -- a negative slice_idx would pass the
@@ -894,14 +1179,30 @@ def test_schedule_idle_slots(shape):
     batch, next_n, ctx_lens = shape
     st = _make_case(batch, next_n, 32, 128, ctx_lens * batch, 64)
     mml = st["mml"]
-    ref = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
-                                 st["cl"], st["block_table"], mml)
+    ref = paged_mxfp4_mqa_logits(
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        mml,
+    )
     dirty = torch.full((1 << 19,), -12345, dtype=torch.int32, device=st["dev"])
-    sched = build_schedule(st["cl"], next_n, 32, 128, 64, 1, out=dirty,
-                           max_model_len=mml)
+    sched = build_schedule(
+        st["cl"], next_n, 32, 128, 64, 1, out=dirty, max_model_len=mml
+    )
     d = sched.view(-1, 4)
     assert (d[:, 3] <= d[:, 2]).any(), "shape has no idle slots to test"
-    got = paged_mxfp4_mqa_logits(st["q4"], st["q4s"], st["cache"], st["weights"],
-                                 st["cl"], st["block_table"], mml, schedule=sched)
+    got = paged_mxfp4_mqa_logits(
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        mml,
+        schedule=sched,
+    )
     torch.cuda.synchronize()
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))

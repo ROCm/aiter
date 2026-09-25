@@ -45,6 +45,7 @@ SCALE_MODE_WIDE = 1
 # blocks, default
 CANDIDATE_BLOCK = 8
 
+
 def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
     # 32x32x64 leaves one head bit across lanes where 16x16x128 leaves two, so
     # the head sum needs one cross-lane step instead of two.
@@ -55,36 +56,51 @@ def kv_tile(page_size: int) -> int:
     # Capped by the page so a tile never spans two pages
     return min(IDEAL_PAGE_SIZE, page_size)
 
+
 def cache_format(num_heads: int, head_size: int, page_size: int) -> dict:
     """Everything needed to write a preshuffled cache and to read it back."""
     npt = mfma_nonk_dim(num_heads, head_size)
     bkv = kv_tile(page_size)
     if page_size % npt:
-        raise ValueError(f"page_size {page_size} must be a multiple of the MFMA "
-                         f"N ({npt}) or a shuffle group straddles two pages")
+        raise ValueError(
+            f"page_size {page_size} must be a multiple of the MFMA "
+            f"N ({npt}) or a shuffle group straddles two pages"
+        )
     if page_size % bkv:
-        raise ValueError(f"page_size {page_size} must be a multiple of BLOCK_KV "
-                         f"({bkv})")
+        raise ValueError(
+            f"page_size {page_size} must be a multiple of BLOCK_KV " f"({bkv})"
+        )
     return dict(n_per_tile=npt, d_per_tile=K_WIDTH, block_kv=bkv)
 
 
-def preshuffle_values(x: torch.Tensor, n_per_tile: int,
-                      d_per_tile: int = K_WIDTH) -> torch.Tensor:
+def preshuffle_values(
+    x: torch.Tensor, n_per_tile: int, d_per_tile: int = K_WIDTH
+) -> torch.Tensor:
     """[P, page, D//2] uint8 into dot-operand order, within each page."""
     p, rows, d = x.shape
-    return (x.reshape(p, rows // n_per_tile, n_per_tile, d // d_per_tile, d_per_tile)
-            .permute(0, 1, 3, 2, 4).contiguous().reshape(p, rows, d))
+    return (
+        x.reshape(p, rows // n_per_tile, n_per_tile, d // d_per_tile, d_per_tile)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .reshape(p, rows, d)
+    )
 
 
-def unshuffle_values(x: torch.Tensor, n_per_tile: int,
-                     d_per_tile: int = K_WIDTH) -> torch.Tensor:
+def unshuffle_values(
+    x: torch.Tensor, n_per_tile: int, d_per_tile: int = K_WIDTH
+) -> torch.Tensor:
     p, rows, d = x.shape
-    return (x.reshape(p, rows // n_per_tile, d // d_per_tile, n_per_tile, d_per_tile)
-            .permute(0, 1, 3, 2, 4).contiguous().reshape(p, rows, d))
+    return (
+        x.reshape(p, rows // n_per_tile, d // d_per_tile, n_per_tile, d_per_tile)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .reshape(p, rows, d)
+    )
 
 
-def preshuffle_scales(x: torch.Tensor, n_per_tile: int,
-                      scale_mode: int = SCALE_MODE_WIDE) -> torch.Tensor:
+def preshuffle_scales(
+    x: torch.Tensor, n_per_tile: int, scale_mode: int = SCALE_MODE_WIDE
+) -> torch.Tensor:
     """[P, page, D//32] e8m0 into the order the scale load reads.
 
     Mode 1, the default, groups one MFMA tile and puts the lane's run over the
@@ -103,36 +119,59 @@ def preshuffle_scales(x: torch.Tensor, n_per_tile: int,
     WARP_SIZE = 64
     p, rows, ns = x.shape
     if scale_mode == 0:
-        return (x.reshape(p, rows // n_per_tile, n_per_tile, ns)
-                .permute(0, 1, 3, 2).contiguous().reshape(p, rows, ns))
+        return (
+            x.reshape(p, rows // n_per_tile, n_per_tile, ns)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+            .reshape(p, rows, ns)
+        )
     s_lo = WARP_SIZE // n_per_tile
     s_hi = ns // s_lo
-    return (x.reshape(p, rows // n_per_tile, n_per_tile, s_hi, s_lo)
-            .permute(0, 1, 4, 2, 3).contiguous().reshape(p, rows, ns))
+    return (
+        x.reshape(p, rows // n_per_tile, n_per_tile, s_hi, s_lo)
+        .permute(0, 1, 4, 2, 3)
+        .contiguous()
+        .reshape(p, rows, ns)
+    )
 
 
-def unshuffle_scales(x: torch.Tensor, n_per_tile: int,
-                     scale_mode: int = SCALE_MODE_WIDE) -> torch.Tensor:
+def unshuffle_scales(
+    x: torch.Tensor, n_per_tile: int, scale_mode: int = SCALE_MODE_WIDE
+) -> torch.Tensor:
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
     WARP_SIZE = 64
     p, rows, ns = x.shape
     if scale_mode == 0:
-        return (x.reshape(p, rows // n_per_tile, ns, n_per_tile)
-                .permute(0, 1, 3, 2).contiguous().reshape(p, rows, ns))
+        return (
+            x.reshape(p, rows // n_per_tile, ns, n_per_tile)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+            .reshape(p, rows, ns)
+        )
     s_lo = WARP_SIZE // n_per_tile
     s_hi = ns // s_lo
-    return (x.reshape(p, rows // n_per_tile, s_lo, n_per_tile, s_hi)
-            .permute(0, 1, 3, 4, 2).contiguous().reshape(p, rows, ns))
+    return (
+        x.reshape(p, rows // n_per_tile, s_lo, n_per_tile, s_hi)
+        .permute(0, 1, 3, 4, 2)
+        .contiguous()
+        .reshape(p, rows, ns)
+    )
 
 
-def preshuffle_cache(values: torch.Tensor, scales: torch.Tensor,
-                     num_heads: int, head_size: int,
-                     scale_mode: int = SCALE_MODE_WIDE):
+def preshuffle_cache(
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    num_heads: int,
+    head_size: int,
+    scale_mode: int = SCALE_MODE_WIDE,
+):
     """Natural order into the stored order. A cache-prep kernel should emit
     these bytes directly; this is the reference for what that means."""
     f = cache_format(num_heads, head_size, values.shape[1])
-    return (preshuffle_values(values, f["n_per_tile"], f["d_per_tile"]),
-            preshuffle_scales(scales, f["n_per_tile"], scale_mode))
+    return (
+        preshuffle_values(values, f["n_per_tile"], f["d_per_tile"]),
+        preshuffle_scales(scales, f["n_per_tile"], scale_mode),
+    )
 
 
 def pack_cache(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -144,10 +183,11 @@ def pack_cache(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     num_pages, page_size, head_bytes = values.shape
     num_scales = scales.shape[2]
     idim = head_bytes + num_scales
-    out = torch.empty(num_pages, page_size * idim, dtype=torch.uint8,
-                      device=values.device)
-    out[:, :page_size * head_bytes] = values.reshape(num_pages, -1)
-    out[:, page_size * head_bytes:] = scales.reshape(num_pages, -1)
+    out = torch.empty(
+        num_pages, page_size * idim, dtype=torch.uint8, device=values.device
+    )
+    out[:, : page_size * head_bytes] = values.reshape(num_pages, -1)
+    out[:, page_size * head_bytes :] = scales.reshape(num_pages, -1)
     return out.view(num_pages, page_size, 1, idim)
 
 
@@ -164,8 +204,12 @@ def _split_cache(kv_cache: torch.Tensor, head_size: int):
     idim = head_size // 2 + head_size // SCALE_GROUP
     page_size = flat.shape[1] // idim
     head_bytes = head_size // 2
-    return (flat[:, :page_size * head_bytes], flat[:, page_size * head_bytes:],
-            page_size, flat.stride(0))
+    return (
+        flat[:, : page_size * head_bytes],
+        flat[:, page_size * head_bytes :],
+        page_size,
+        flat.stride(0),
+    )
 
 
 # heuristics
@@ -179,8 +223,9 @@ def _spec_block_m(next_n: int, num_heads: int) -> int:
         Higher values have worse occupancy, but better kv cache rereaf
     """
     cap = 7 if num_heads <= 32 else (3 if next_n <= 6 else 2)
-    return min(range(1, cap + 1),
-               key=lambda b: (-(-next_n // b), b * (-(-next_n // b))))
+    return min(
+        range(1, cap + 1), key=lambda b: (-(-next_n // b), b * (-(-next_n // b)))
+    )
 
 
 def plan_block_m(num_heads: int, next_n: int) -> int:
@@ -200,8 +245,9 @@ def plan_block_m(num_heads: int, next_n: int) -> int:
     return 1 if next_n < 2 else min(2, next_n)
 
 
-def _kv_splits(batch, row_blocks, max_model_len, block_kv, target_wgs,
-               min_tiles, max_tiles):
+def _kv_splits(
+    batch, row_blocks, max_model_len, block_kv, target_wgs, min_tiles, max_tiles
+):
     """How many workgroups to put on one row block's KV walk.
 
     A split partitions the output, so there is no reduction to pay for. Three
@@ -224,12 +270,8 @@ def _kv_splits(batch, row_blocks, max_model_len, block_kv, target_wgs,
     return max(1, min(max(by_occupancy, by_balance), by_length))
 
 
-
-
-
 @functools.lru_cache(maxsize=256)
-def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
-                   clean_logits):
+def _select_config(num_heads, head_size, next_n, page_size, preshuffle, clean_logits):
     n_per_tile = mfma_nonk_dim(num_heads, head_size)
     compute_chunk = next_n >= COMPUTE_CHUNK
     spec_rows = num_heads <= 32 and 2 <= next_n <= SPEC_ROWS
@@ -254,7 +296,8 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
             # Two KV tiles per body. Speculative decode has the registers for
             # it; a wide chunk does not
             unroll=2 if (spec_rows and block_m <= 6) else 1,
-            fold_asm=1 if (compute_chunk or spec_rows or num_heads > 32) else 0)
+            fold_asm=1 if (compute_chunk or spec_rows or num_heads > 32) else 0,
+        )
     else:
         # LDS path, for an unshuffled cache
         block_m = min(2 if (num_heads <= 32 and next_n >= 2) else 1, next_n)
@@ -271,7 +314,8 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
             depth=1,
             # One row, which is what lets UNROLL be 2.
             unroll=2 if block_m == 1 else 1,
-            fold_asm=1 if num_heads <= 32 else 0)
+            fold_asm=1 if num_heads <= 32 else 0,
+        )
 
     cfg.update(
         block_m=block_m,
@@ -280,8 +324,11 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
         n_per_tile=n_per_tile,
         # Workgroups to fill the machine: 4 SIMDs per CU
         target_wgs=4 * get_num_sms() * cfg["waves_per_eu"],
-        page_pipe=1 if (num_heads <= 32
-                        or (split_page and not 2 <= next_n <= SPEC_ROWS)) else 0,
+        page_pipe=(
+            1
+            if (num_heads <= 32 or (split_page and not 2 <= next_n <= SPEC_ROWS))
+            else 0
+        ),
         m_chunk=n_per_tile if (num_heads > n_per_tile and n_per_tile == 32) else 0,
         num_chains=1,
         # Only meaningful when we gather
@@ -291,21 +338,39 @@ def _select_config(num_heads, head_size, next_n, page_size, preshuffle,
         relu_add=cfg["fold_asm"],
         min_tiles_per_split=4,
         # Cap on a workgroup's tiles
-        max_tiles_per_split=128 if next_n == 1 else 64)
+        max_tiles_per_split=128 if next_n == 1 else 64,
+    )
     return cfg
 
 
-def select_config(num_heads, head_size, next_n, page_size, preshuffle=1,
-                  clean_logits=True):
+def select_config(
+    num_heads, head_size, next_n, page_size, preshuffle=1, clean_logits=True
+):
     """The config for one shape, cached"""
-    return dict(_select_config(num_heads, head_size, next_n, page_size,
-                               int(bool(preshuffle)), bool(clean_logits)))
+    return dict(
+        _select_config(
+            num_heads,
+            head_size,
+            next_n,
+            page_size,
+            int(bool(preshuffle)),
+            bool(clean_logits),
+        )
+    )
 
 
-def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
-                           head_size, block=CANDIDATE_BLOCK,
-                           kv_scale_cache=None, scale_mode=SCALE_MODE_WIDE,
-                           offsets=None):
+def build_candidate_gather(
+    candidates,
+    ends,
+    block_table,
+    kv_cache,
+    num_heads,
+    head_size,
+    block=CANDIDATE_BLOCK,
+    kv_scale_cache=None,
+    scale_mode=SCALE_MODE_WIDE,
+    offsets=None,
+):
     """Ranked block ids -> (gather, row_ends), in one launch.
 
     candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
@@ -318,17 +383,25 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
     consumer.
     """
     from aiter.ops.triton.attention.pa_mqa_logits_mxfp4_gather import (
-        cache_strides, gather_s_unit, offset_dtype)
+        cache_strides,
+        gather_s_unit,
+        offset_dtype,
+    )
+
     rows, k = candidates.shape
     assert k & (k - 1) == 0, "the sort needs a power-of-two candidate count"
     # One program per row, so the warps are what fills the machine when the
     # rows do not. Above that they only cost occupancy.
-    num_warps = (1 if k <= 1024 else 2) if rows >= 4 * get_num_sms() \
+    num_warps = (
+        (1 if k <= 1024 else 2)
+        if rows >= 4 * get_num_sms()
         else (8 if k >= 2048 else 4)
+    )
     assert block_table.shape[0] == rows and block_table.stride(1) == 1
     n_per_tile = mfma_nonk_dim(num_heads, head_size)
-    page_size, kv_stride, kvs_stride = cache_strides(kv_cache, head_size,
-                                                    kv_scale_cache)
+    page_size, kv_stride, kvs_stride = cache_strides(
+        kv_cache, head_size, kv_scale_cache
+    )
     assert page_size % block == 0 and block <= n_per_tile
     num_scales = head_size // SCALE_GROUP
     s_lo = 64 // n_per_tile
@@ -337,25 +410,54 @@ def build_candidate_gather(candidates, ends, block_table, kv_cache, num_heads,
     fits = offset_dtype(kv_cache.shape[0], kv_stride, kvs_stride, s_unit)
     if offsets is None:
         offsets = fits
-    assert offsets == torch.int64 or fits == torch.int32, (
-        "i32 offsets do not reach this cache; pass offsets=torch.int64")
+    assert (
+        offsets == torch.int64 or fits == torch.int32
+    ), "i32 offsets do not reach this cache; pass offsets=torch.int64"
     pos = torch.empty((rows, k), dtype=torch.int64, device=dev)
     cu = torch.empty((rows,), dtype=torch.int32, device=dev)
     voff = torch.empty((rows, k), dtype=offsets, device=dev)
     soff = torch.empty((rows, k), dtype=offsets, device=dev)
     _prepare_candidates_kernel[(rows,)](
-        candidates, ends, block_table, pos, cu, voff, soff,
-        candidates.stride(0), block_table.stride(0), k, block, page_size,
-        n_per_tile, head_size // 2, num_scales, kv_stride, kvs_stride,
-        K_WIDTH, s_unit,
+        candidates,
+        ends,
+        block_table,
+        pos,
+        cu,
+        voff,
+        soff,
+        candidates.stride(0),
+        block_table.stride(0),
+        k,
+        block,
+        page_size,
+        n_per_tile,
+        head_size // 2,
+        num_scales,
+        kv_stride,
+        kvs_stride,
+        K_WIDTH,
+        s_unit,
         (num_scales // s_lo) if scale_mode == SCALE_MODE_WIDE else 1,
-        OFF64=offsets == torch.int64, num_warps=num_warps)
+        OFF64=offsets == torch.int64,
+        num_warps=num_warps,
+    )
     return dict(voff=voff, soff=soff, block=block, positions=pos), cu
 
-def build_schedule(context_lens, next_n, num_heads, head_size,
-                   page_size=IDEAL_PAGE_SIZE, preshuffle=1, out=None,
-                   row_ends=None, gather=0, query_start_loc=None, total_rows=None,
-                   max_model_len=None):
+
+def build_schedule(
+    context_lens,
+    next_n,
+    num_heads,
+    head_size,
+    page_size=IDEAL_PAGE_SIZE,
+    preshuffle=1,
+    out=None,
+    row_ends=None,
+    gather=0,
+    query_start_loc=None,
+    total_rows=None,
+    max_model_len=None,
+):
     """Descriptors for one launch, or None if the shape does not fit.
 
     A descriptor is (sequence, row block, slice index, slice count), relative
@@ -413,8 +515,7 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
     if varlen and align_w * align_b > 1 << 20:
         return None
     if out is None or out.numel() < num_ctas * 4:
-        out = torch.empty(num_ctas * 4, dtype=torch.int32,
-                          device=context_lens.device)
+        out = torch.empty(num_ctas * 4, dtype=torch.int32, device=context_lens.device)
     # Slice indices one program writes. The grid follows the slices a unit can
     # own, not the slot count, which is what keeps the redone reductions cheap.
     SCHED_BLOCK_S = 4
@@ -442,13 +543,15 @@ def build_schedule(context_lens, next_n, num_heads, head_size,
         num_warps=4,
     )
     # The launcher takes the grid from the length, so the length is the contract
-    return out[:num_ctas * 4]
+    return out[: num_ctas * 4]
 
 
 def _check_schedule(schedule, device):
     if not isinstance(schedule, torch.Tensor):
-        raise TypeError("schedule must be an int32 tensor from build_schedule, "
-                        f"got {type(schedule).__name__}")
+        raise TypeError(
+            "schedule must be an int32 tensor from build_schedule, "
+            f"got {type(schedule).__name__}"
+        )
     schedule = schedule.reshape(-1)
     if schedule.dtype != torch.int32:
         raise TypeError(f"schedule must be int32, got {schedule.dtype}")
@@ -457,8 +560,10 @@ def _check_schedule(schedule, device):
     if schedule.device != device:
         raise ValueError(f"schedule is on {schedule.device}, operands are on {device}")
     if schedule.numel() == 0 or schedule.numel() % 4:
-        raise ValueError("schedule must be a whole number of 4-word descriptors, "
-                         f"got {schedule.numel()} words")
+        raise ValueError(
+            "schedule must be a whole number of 4-word descriptors, "
+            f"got {schedule.numel()} words"
+        )
     return schedule
 
 
@@ -576,7 +681,10 @@ def paged_mxfp4_mqa_logits(
     assert q.dtype == torch.uint8 and q_scales.dtype == torch.uint8
     if varlen:
         assert q_scales.shape == (total_rows, num_heads, num_scales)
-        assert q.stride()[1:] == (head_bytes, 1), "q rows must be contiguous over (H, D)"
+        assert q.stride()[1:] == (
+            head_bytes,
+            1,
+        ), "q rows must be contiguous over (H, D)"
         assert q_scales.stride()[1:] == (num_scales, 1)
     else:
         assert q_scales.shape == (batch, next_n, num_heads, num_scales)
@@ -588,8 +696,9 @@ def paged_mxfp4_mqa_logits(
     assert weights.shape == (total_rows, num_heads) and weights.stride(1) == 1
     if row_ends is not None:
         assert row_ends.dtype == torch.int32, "row_ends must be int32"
-        assert row_ends.shape == (total_rows,) and row_ends.stride(0) == 1, (
-            "row_ends must be a contiguous [B * NEXT_N] vector, indexed like weights")
+        assert (
+            row_ends.shape == (total_rows,) and row_ends.stride(0) == 1
+        ), "row_ends must be a contiguous [B * NEXT_N] vector, indexed like weights"
 
     # page_size comes from the cache rather than the caller: both layouts pin it
     # exactly, and a second source could disagree with the bytes.
@@ -606,7 +715,8 @@ def paged_mxfp4_mqa_logits(
     assert values.dtype == torch.uint8 and scales.dtype == torch.uint8
     assert kv_page_stride % 16 == 0, (
         f"value page stride ({kv_page_stride} B) must be 16-byte aligned or the "
-        "loads cannot be vectorised")
+        "loads cannot be vectorised"
+    )
 
     preshuffle = 1 if preshuffle else 0
     if preshuffle:
@@ -615,18 +725,21 @@ def paged_mxfp4_mqa_logits(
     assert calc_logits or calc_block_scores, "the launch would emit nothing"
     bscore_on = (1 if calc_logits else 2) if calc_block_scores else 0
     cand_block = int(candidate_block_size)
-    assert calc_logits or out_logits is None, (
-        "out_logits is inapplicable with calc_logits off: none are written")
-    assert calc_block_scores or block_scores is None, (
-        "block_scores is inapplicable with calc_block_scores off")
+    assert (
+        calc_logits or out_logits is None
+    ), "out_logits is inapplicable with calc_logits off: none are written"
+    assert (
+        calc_block_scores or block_scores is None
+    ), "block_scores is inapplicable with calc_block_scores off"
 
     def _alloc(cols):
         # clean_logits picks the fill for both outputs: the walk leaves the
         # columns past the context untouched either way.
         shape = (total_rows, cols)
         if clean_logits:
-            return torch.full(shape, float("-inf"), dtype=torch.float32,
-                              device=q.device)
+            return torch.full(
+                shape, float("-inf"), dtype=torch.float32, device=q.device
+            )
         return torch.empty(shape, dtype=torch.float32, device=q.device)
 
     logits = None
@@ -637,14 +750,16 @@ def paged_mxfp4_mqa_logits(
         block_scores = _alloc((max_model_len + cand_block - 1) // cand_block)
     if logits is not None:
         # A buffer store addresses the row through a 32-bit record count.
-        assert max_model_len * 4 < 2 ** 31, (
-            f"max_model_len {max_model_len} exceeds what a buffer store can "
-            "address")
+        assert max_model_len * 4 < 2**31, (
+            f"max_model_len {max_model_len} exceeds what a buffer store can " "address"
+        )
 
-    assert use_gather or candidates is None, (
-        "candidates is inapplicable with use_gather off")
-    assert not (varlen and use_gather), (
-        "the gather already takes one block-table row per query row")
+    assert (
+        use_gather or candidates is None
+    ), "candidates is inapplicable with use_gather off"
+    assert not (
+        varlen and use_gather
+    ), "the gather already takes one block-table row per query row"
     gather = None
     if use_gather:
         assert candidates is not None, "use_gather needs a candidate list"
@@ -654,14 +769,28 @@ def paged_mxfp4_mqa_logits(
             # Resolved here for a single consumer. A layer group should call
             # build_candidate_gather once and pass what it returns.
             n = torch.arange(next_n, device=q.device, dtype=torch.int32)
-            key_ends = (row_ends if row_ends is not None else
-                        torch.clamp(context_lens.repeat_interleave(next_n)
-                                    - next_n + n.repeat(batch) + 1, min=0))
+            key_ends = (
+                row_ends
+                if row_ends is not None
+                else torch.clamp(
+                    context_lens.repeat_interleave(next_n)
+                    - next_n
+                    + n.repeat(batch)
+                    + 1,
+                    min=0,
+                )
+            )
             gather, row_ends = build_candidate_gather(
-                candidates, key_ends,
+                candidates,
+                key_ends,
                 block_table.repeat_interleave(next_n, 0).contiguous(),
-                kv_cache, num_heads, head_size, cand_block, kv_scale_cache,
-                scale_mode)
+                kv_cache,
+                num_heads,
+                head_size,
+                cand_block,
+                kv_scale_cache,
+                scale_mode,
+            )
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
     if gather_on:
@@ -674,16 +803,21 @@ def paged_mxfp4_mqa_logits(
         assert g_voff.shape[0] == total_rows, g_voff.shape
         assert row_ends is not None, (
             "the gather takes its walk length from row_ends, read as the row's "
-            "count of valid candidate slots")
+            "count of valid candidate slots"
+        )
 
-    cfg = select_config(num_heads, head_size, next_n, page_size, preshuffle,
-                        clean_logits)
+    cfg = select_config(
+        num_heads, head_size, next_n, page_size, preshuffle, clean_logits
+    )
     if gather_on:
         # One query row per workgroup because of sparsity
         split_page = page_size > cfg["block_kv"]
-        cfg = dict(cfg, block_m=1, row_blocks=next_n,
-                   depth=2 if (next_n == 1 and split_page and num_heads <= 32)
-                   else 1)
+        cfg = dict(
+            cfg,
+            block_m=1,
+            row_blocks=next_n,
+            depth=2 if (next_n == 1 and split_page and num_heads <= 32) else 1,
+        )
         if preshuffle and next_n >= COMPUTE_CHUNK:
             cfg["unroll"] = 4
     block_m, row_blocks = cfg["block_m"], cfg["row_blocks"]
@@ -692,45 +826,59 @@ def paged_mxfp4_mqa_logits(
     # page_size comes from the cache, so it can be a size BLOCK_KV does not fit.
     assert page_size % block_kv == 0, (
         f"BLOCK_KV {block_kv} must divide page_size {page_size} or a tile spans "
-        "two pages, which are not adjacent")
-    assert block_kv % n_per_tile == 0, (
-        f"BLOCK_KV {block_kv} must be a multiple of the MFMA N ({n_per_tile})")
+        "two pages, which are not adjacent"
+    )
+    assert (
+        block_kv % n_per_tile == 0
+    ), f"BLOCK_KV {block_kv} must be a multiple of the MFMA N ({n_per_tile})"
 
     if bscore_on:
-        assert gather is None, (
-            "block maxima are for the dense producer; the consumers gather")
+        assert (
+            gather is None
+        ), "block maxima are for the dense producer; the consumers gather"
         assert block_scores.dtype == torch.float32
         assert cand_block <= block_kv and block_kv % cand_block == 0, (
             f"candidate_block_size {cand_block} must divide BLOCK_KV "
-            f"{block_kv} or a block straddles a tile")
+            f"{block_kv} or a block straddles a tile"
+        )
         n_blocks = (max_model_len + cand_block - 1) // cand_block
         assert block_scores.shape[0] == total_rows, block_scores.shape
         assert block_scores.shape[1] >= n_blocks, (
             f"block_scores is {block_scores.shape[1]} blocks wide, needs "
-            f"{n_blocks} for max_model_len {max_model_len}")
+            f"{n_blocks} for max_model_len {max_model_len}"
+        )
         assert block_scores.stride(1) == 1, "block_scores rows must be contiguous"
-        assert block_scores.shape[1] * 4 < 2 ** 31, (
-            "block_scores row exceeds what a buffer store can address")
+        assert (
+            block_scores.shape[1] * 4 < 2**31
+        ), "block_scores row exceeds what a buffer store can address"
 
     use_buffer_load = bool(preshuffle) or (
-        num_pages * max(kv_page_stride, kvs_page_stride) < 2 ** 31)
+        num_pages * max(kv_page_stride, kvs_page_stride) < 2**31
+    )
     if gather_on:
         assert block_kv % gather_block == 0 and page_size % gather_block == 0
-        assert gather_block <= n_per_tile, (
-            "a candidate block must sit inside one shuffle group")
+        assert (
+            gather_block <= n_per_tile
+        ), "a candidate block must sit inside one shuffle group"
         # Two limits, not one. The list reaches 2**31 of its own unit, but the
         # buffer path multiplies it back to bytes in i32, so it caps at 2 GiB.
-        use_buffer_load = (gather["voff"].dtype == torch.int32 and
-                           num_pages * max(kv_page_stride, kvs_page_stride)
-                           < 2 ** 31)
+        use_buffer_load = (
+            gather["voff"].dtype == torch.int32
+            and num_pages * max(kv_page_stride, kvs_page_stride) < 2**31
+        )
 
     # The two that need the batch, which select_config does not see.
     # Varlen's grid is one unit per row block plus a spare per sequence, not
     # batch x row_blocks, so the split count has to be sized from that.
     split_q = (1, total_rows // block_m + batch) if varlen else (batch, row_blocks)
     cfg["num_kv_splits"] = _kv_splits(
-        *split_q, max_model_len, block_kv, target_wgs,
-        cfg["min_tiles_per_split"], cfg["max_tiles_per_split"])
+        *split_q,
+        max_model_len,
+        block_kv,
+        target_wgs,
+        cfg["min_tiles_per_split"],
+        cfg["max_tiles_per_split"],
+    )
     # More than one row block per sequence means the second re-reads the same
     # pages, so the lines are worth keeping in L1
     cfg["kv_reread"] = 1 if row_blocks > 1 else 0
@@ -738,10 +886,18 @@ def paged_mxfp4_mqa_logits(
     num_kv_splits = cfg["num_kv_splits"]
     # A gather launch does not build one
     if schedule is None and dynamic and not gather_on:
-        schedule = build_schedule(context_lens, next_n, num_heads, head_size,
-                                  page_size, preshuffle, row_ends=row_ends,
-                                  query_start_loc=query_start_loc, total_rows=total_rows,
-                                  max_model_len=max_model_len)
+        schedule = build_schedule(
+            context_lens,
+            next_n,
+            num_heads,
+            head_size,
+            page_size,
+            preshuffle,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            total_rows=total_rows,
+            max_model_len=max_model_len,
+        )
     use_dynamic = schedule is not None
     if use_dynamic:
         schedule = _check_schedule(schedule, context_lens.device)
