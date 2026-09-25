@@ -201,8 +201,10 @@ def _prepare_candidates_kernel(
 ):
     """Ranked block ids -> the walk's candidate list, one row per program.
 
-    The rank emits by score and the walk needs by position, so the sort is
-    here; everything after it must stay in step with the tests' block_offsets.
+    The rank emits by score. Position order puts the causal-edge block last,
+    where cu trims it, and lets one request's rows walk the same pages
+    together, which is what prefill gains from. Everything after the sort must
+    stay in step with the tests' block_offsets.
     """
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, K)
