@@ -6,9 +6,9 @@ from triton.tools.compile import CompileArgs, compile_kernel
 
 from csrc.cpp_itfs.utils import (
     AITER_CORE_DIR,
-    GPU_ARCH,
     compile_template_op,
     get_default_func_name,
+    get_gfx_runtime,
     not_built,
     run_lib,
     transfer_hsaco,
@@ -50,11 +50,14 @@ def compile(
         )
 
     if not_built(func_name):
+        # Live device, not the build target: a multi-target build resolves to
+        # no single hsa/ directory.
+        asm_dir = f"{AITER_CORE_DIR}/hsa/{get_gfx_runtime()}/mla"
         if gqa_ratio == 128:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
+            hsaco_path = f"{asm_dir}/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
             kernel_name = "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E"
         else:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co"
+            hsaco_path = f"{asm_dir}/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co"
             kernel_name = "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E"
 
         bin_size, bin_data = transfer_hsaco(hsaco_path)
