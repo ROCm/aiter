@@ -72,6 +72,12 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
+        # Block skipping. Both change codegen, so they belong in the name; the
+        # threshold itself does not, because it is a runtime scalar.
+        "ENABLE_BLOCK_SKIP",
+        "PRELOAD_V",
+        "DESCENDING_Q",
+        "DYNAMIC_SCHED",
     ],
 )
 
@@ -128,14 +134,75 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    # Block skipping: drop a K/V tile whose scores are all far enough below the
+    # running maximum that their softmax weights cannot matter. Off by default,
+    # and with ENABLE_BLOCK_SKIP=False every use below folds away at compile
+    # time, so the dense path emits identical code.
+    ENABLE_BLOCK_SKIP: tl.constexpr = False,  # bool
+    PRELOAD_V: tl.constexpr = True,  # bool
+    # log2(threshold), a RUNTIME scalar on purpose. As a constexpr it would key
+    # the compilation cache, so sweeping thresholds would recompile per value.
+    log2_threshold=0.0,  # float32
+    # Scheduling, enabled together with block skipping and only then. Skipping
+    # makes per-head cost depend on the data, and the grid pins each KV head to
+    # one chiplet, so without these the launch waits on whichever head happened
+    # to skip least. They are pure work assignment: identical arithmetic, and
+    # the output is bitwise unchanged.
+    DESCENDING_Q: tl.constexpr = False,  # bool
+    DYNAMIC_SCHED: tl.constexpr = False,  # bool
+    sched_counter_ptr=None,
+    num_q_blocks=0,
+    # Optional instrumentation: [tiles visited, tiles elided]. Off unless the
+    # caller passes a buffer. The useful threshold is workload-dependent, so
+    # this is how a caller checks that theirs elides anything at all.
+    COUNT_SKIPS: tl.constexpr = False,  # bool
+    skip_counter_ptr=None,
 ):
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
         "SPLIT_UNMASKED_LOOP is incompatible with SHUFFLED_KV_CACHE",
     )
+    tl.static_assert(
+        not COUNT_SKIPS or ENABLE_BLOCK_SKIP,
+        "COUNT_SKIPS requires ENABLE_BLOCK_SKIP: with skipping off there is "
+        "nothing to count",
+    )
 
-    kv_head_idx = tl.program_id(0)
-    q_block_global_idx = tl.program_id(1)
+    if DYNAMIC_SCHED:
+        # Claim a work item from a shared counter instead of deriving it from
+        # this workgroup's id.
+        #
+        # The grid is (num_kv_heads, total_num_q_blocks) and Triton linearises
+        # dim 0 fastest, so workgroup w = kv_head + num_kv_heads * q_block. The
+        # hardware places workgroup w on chiplet w % 8, which at 8 KV heads on 8
+        # chiplets means chiplet == kv_head exactly. Every workgroup for a head
+        # is then stuck on one chiplet, and head-dependent skipping becomes
+        # chiplet imbalance that the launch has to wait out.
+        #
+        # Head-major on purpose: consecutive tickets stay within one KV head for
+        # num_q_blocks draws, so the workgroups resident at any instant are
+        # nearly all on the same head and keep its K/V hot. The decode order is
+        # not arbitrary -- issuing tickets q-major instead measures slower.
+        #
+        # The grid still launches exactly one workgroup per work item, so
+        # tickets 0..N-1 are each drawn exactly once and no bounds check is
+        # needed here.
+        ticket = tl.atomic_add(sched_counter_ptr, 1, sem="relaxed", scope="gpu")
+        kv_head_idx = ticket // num_q_blocks
+        q_block_raw = ticket % num_q_blocks
+    else:
+        kv_head_idx = tl.program_id(0)
+        q_block_raw = tl.program_id(1)
+
+    if DESCENDING_Q:
+        # Longest job first. Under causal masking query block i walks key tiles
+        # 0..i, so work grows with the index, and the default order issues the
+        # heaviest blocks LAST -- the worst case for a greedy dispatcher, which
+        # ends up with one long block still running after everything else has
+        # drained. Reversing costs nothing at compile time.
+        q_block_global_idx = num_q_blocks - 1 - q_block_raw
+    else:
+        q_block_global_idx = q_block_raw
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
@@ -288,6 +355,14 @@ def kernel_unified_attention_2d(
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
+    if COUNT_SKIPS:
+        # Accumulated in registers across BOTH tile loops and flushed once, at
+        # the end. Doing the atomics per tile would be ~500x more of them onto
+        # two addresses, which contends badly enough to distort the very timing
+        # this instrumentation exists to explain.
+        n_tiles_seen = 0
+        n_tiles_elided = 0
+
     masked_tile_start = tile_start
     if SPLIT_UNMASKED_LOOP:
         min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
@@ -321,13 +396,14 @@ def kernel_unified_attention_2d(
             )
             K = K_load.to(Q.dtype)
 
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
-            )
-            V = V_load.to(Q.dtype)
+            if PRELOAD_V:
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :],
+                    other=0.0,
+                    cache_modifier=KV_cache_modifier,
+                )
+                V = V_load.to(Q.dtype)
 
             S = qk_scale * tl.dot(Q, K)
 
@@ -347,15 +423,44 @@ def kernel_unified_attention_2d(
                 )
                 S += qq_bias * RCP_LN2
 
-            m_j = tl.maximum(M, tl.max(S, axis=1))
+            s_max = tl.max(S, axis=1)
+            m_j = tl.maximum(M, s_max)
+
+            if ENABLE_BLOCK_SKIP:
+                # The decision is per TILE, not per row: a tile is dropped only
+                # when every row agrees it is negligible. A tile that survives
+                # the vote is then computed exactly as dense.
+                #
+                # M is the running maximum BEFORE this tile. Comparing against
+                # the folded m_j is equivalent for thresholds below 1.0 but
+                # degenerates to `0 < log2(threshold)` above it, skipping every
+                # tile including the one holding the maximum.
+                skip = (s_max - M) < log2_threshold
+                all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+                if COUNT_SKIPS:
+                    n_tiles_seen += 1
+                    n_tiles_elided += all_skip.to(tl.int32)
+            else:
+                all_skip = False
+
             m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-            P = tl.math.exp2(S - m_j[:, None])
-            l_j = tl.sum(P, axis=1)
-            alpha = tl.math.exp2(M - m_j)
-            acc = acc * alpha[:, None]
-            L = L * alpha + l_j
-            M = m_j
-            acc = tl.dot(P.to(V.dtype), V, acc=acc)
+
+            if not (ENABLE_BLOCK_SKIP and all_skip):
+                P = tl.math.exp2(S - m_j[:, None])
+                alpha = tl.math.exp2(M - m_j)
+                l_j = tl.sum(P, axis=1)
+                acc = acc * alpha[:, None]
+                L = L * alpha + l_j
+                M = m_j
+                if not PRELOAD_V:
+                    V_load = tl.load(
+                        value_cache_ptr + v_offset,
+                        mask=dim_mask[None, :],
+                        other=0.0,
+                        cache_modifier=KV_cache_modifier,
+                    )
+                    V = V_load.to(Q.dtype)
+                acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
         masked_tile_start = unmasked_tile_end
 
@@ -429,24 +534,28 @@ def kernel_unified_attention_2d(
             )
 
         # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=v_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            V = (
-                V.reshape(
-                    TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
-                    K_WIDTH,
-                )
-                .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+        # Hoisted by default. With block skipping the load moves below the skip
+        # decision, so a tile that is elided never touches V at all -- that is
+        # where the bandwidth saving comes from, not from the elided matmul.
+        if PRELOAD_V:
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=v_mask,
+                other=other,
+                cache_modifier=KV_cache_modifier,
             )
+
+            V = V_load.to(Q.dtype)
+            if SHUFFLED_KV_CACHE:
+                V = (
+                    V.reshape(
+                        TILE_SIZE // K_WIDTH,
+                        HEAD_SIZE_PADDED,
+                        K_WIDTH,
+                    )
+                    .permute(0, 2, 1)
+                    .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                )
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -488,30 +597,76 @@ def kernel_unified_attention_2d(
 
         # compute running maximum
         # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
+        s_max = tl.max(S, axis=1)
+        m_j = tl.maximum(M, s_max)
+
+        if ENABLE_BLOCK_SKIP:
+            # Per-row votes, but a per-TILE decision: the tile is dropped only
+            # if every row agrees its scores here are negligible against the
+            # running maximum. A tile that survives the vote computes exactly
+            # as dense below.
+            #
+            # M is the maximum BEFORE this tile. Comparing against the folded
+            # m_j is equivalent below a threshold of 1.0, but above it reduces
+            # to `0 < log2(threshold)` -- true for every row, so even the tile
+            # holding the maximum is dropped.
+            skip = (s_max - M) < log2_threshold
+            all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+            if COUNT_SKIPS:
+                n_tiles_seen += 1
+                n_tiles_elided += all_skip.to(tl.int32)
+        else:
+            all_skip = False
 
         # For sliding window there's a chance the max is -inf due to masking of
         # the entire row. In this case we need to set m_j 0 to avoid NaN
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
-        # P : (BLOCK_M, TILE_SIZE)
-        P = tl.math.exp2(S - m_j[:, None])
+        if not (ENABLE_BLOCK_SKIP and all_skip):
+            # P : (BLOCK_M, TILE_SIZE)
+            P = tl.math.exp2(S - m_j[:, None])
 
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
+            # alpha : (BLOCK_M, )
+            alpha = tl.math.exp2(M - m_j)
 
-        # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2(M - m_j)
+            # l_j : (BLOCK_M,)
+            l_j = tl.sum(P, axis=1)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc = acc * alpha[:, None]
 
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
+            # update constants
+            L = L * alpha + l_j
+            M = m_j
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+            if not PRELOAD_V:
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=v_mask,
+                    other=other,
+                    cache_modifier=KV_cache_modifier,
+                )
+
+                V = V_load.to(Q.dtype)
+                if SHUFFLED_KV_CACHE:
+                    V = (
+                        V.reshape(
+                            TILE_SIZE // K_WIDTH,
+                            HEAD_SIZE_PADDED,
+                            K_WIDTH,
+                        )
+                        .permute(0, 2, 1)
+                        .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                    )
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
+
+    if COUNT_SKIPS:
+        # One flush per program, covering both loops. int32 is ample: this
+        # counts TILES, and overflow would need ~2.1e9 of them.
+        tl.atomic_add(skip_counter_ptr + 0, n_tiles_seen)
+        tl.atomic_add(skip_counter_ptr + 1, n_tiles_elided)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.

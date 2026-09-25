@@ -1,5 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -110,6 +112,11 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    # Block skipping. 0.0 disables it; see `unified_attention` for what it means
+    # and for the paths where it is force-disabled.
+    block_skip_threshold: float = 0.0
+    # Optional int32 [2] buffer: [tiles visited, tiles elided].
+    skip_counter: torch.Tensor | None = None
 
 
 def use_2d_kernel(params: _UAParams):
@@ -152,6 +159,25 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # Block skipping (off at 0.0). A K/V tile is skipped when every query row in
+    # the tile has `tile_max - running_max < log2(threshold)`, i.e. its softmax
+    # weights cannot contribute meaningfully. Only whole-tile skips save work,
+    # because the V load and the P@V matmul are per tile rather than per row.
+    #
+    # The useful threshold is model-, and sequence-length-dependent and
+    # has to be calibrated; there is no safe default, which is why this is off
+    # unless asked for. Skipping is approximate: it changes the output.
+    #
+    # Force-disabled on decode and on sliding-window attention, and rejected on
+    # the Gluon backend (see below).
+    block_skip_threshold: float = 0.0,
+    # Optional int32 tensor with at least 2 elements, accumulated in place as
+    # [tiles visited, tiles elided]; their ratio is the achieved elision rate.
+    # Passing a buffer IS the opt-in -- there is no flag and no default one,
+    # because a module-level buffer would be shared mutable state.
+    #
+    # Zero it before the launches you want to measure; it is never reset here.
+    skip_counter: torch.Tensor | None = None,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
@@ -241,6 +267,32 @@ def unified_attention(
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
 
+    # ---- block skipping: paths where it is refused or silently dropped ------
+    # Disabled SILENTLY for decode and sliding window rather than raising. A
+    # caller enabling this typically does so once for a whole model, and the
+    # same wrapper then serves both prefill and decode -- raising would break
+    # every decode step for a flag that only ever targeted prefill.
+    if block_skip_threshold > 0.0:
+        if skip_counter is not None:
+            assert skip_counter.dtype == torch.int32 and skip_counter.numel() >= 2, (
+                "skip_counter must be an int32 tensor with at least 2 elements "
+                f"[tiles_visited, tiles_elided]; got {skip_counter.dtype} with "
+                f"{skip_counter.numel()}"
+            )
+            assert skip_counter.device == q.device, (
+                f"skip_counter is on {skip_counter.device} but q is on {q.device}"
+            )
+        if ALL_DECODE:
+            # One query row per sequence: there is no running maximum to be far
+            # below yet, so nothing can be skipped and the check is pure cost.
+            block_skip_threshold = 0.0
+        elif SLIDING_WINDOW > 0:
+            # Sliding window can mask a whole row, leaving its running maximum
+            # at -inf, which the sanitizer then rewrites to 0.0. That changes
+            # what `tile_max - running_max` means. Untested; run dense until it
+            # has a regression test of its own.
+            block_skip_threshold = 0.0
+
     # build parameters
     params = _UAParams(
         q=q,
@@ -286,6 +338,8 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        block_skip_threshold=block_skip_threshold,
+        skip_counter=skip_counter,
     )
 
     # if batch contains a prefill
@@ -294,6 +348,15 @@ def unified_attention(
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
         if use_gluon_2d:
+            # Unlike decode and sliding window, this one RAISES. The Gluon
+            # kernel cannot honour the threshold, and silently ignoring it would
+            # hand back dense results while the caller believed it had asked for
+            # sparsity -- so any speedup they then measured would be against the
+            # wrong baseline. Fail loudly instead.
+            assert params.block_skip_threshold == 0.0, (
+                "block_skip_threshold is not supported on the Gluon backend "
+                f"({DEVICE_ARCH}); pass backend='triton' or leave it at 0.0"
+            )
             if DEVICE_ARCH == "gfx1250":
                 _unified_attention_2d_gfx1250(params)
             else:
@@ -301,6 +364,11 @@ def unified_attention(
         else:
             _unified_attention_2d_triton(params)
     else:
+        # 3D (few queries over a long KV cache). Out of scope for this change:
+        # each segment restarts its running maximum at -inf, so the first tile
+        # of every segment can never skip and the semantics differ enough to
+        # need their own measurement. Drop the flag rather than pretend.
+        params = params._replace(block_skip_threshold=0.0, skip_counter=None)
         config = get_unified_attention_config("kv_split", params, backend=backend)
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         if shuffled_kv_cache:
@@ -454,6 +522,49 @@ def _unified_attention_2d_triton(params: _UAParams):
             params.block_size >= 32
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
+    # Block skipping. The kernel compares in log2 space because the online
+    # softmax already works there, so convert once here rather than per tile.
+    ENABLE_BLOCK_SKIP = params.block_skip_threshold > 0.0
+    log2_threshold = (
+        math.log2(params.block_skip_threshold) if ENABLE_BLOCK_SKIP else 0.0
+    )
+    # Hoisting the V load is the right default, but it defeats the whole point
+    # when tiles are being skipped: a skipped tile should never touch V. Keep
+    # the hoist only when skipping is off.
+    #
+    # AITER_UA_BLASST_PRELOAD_V=1 keeps V hoisted even with skipping on, making
+    # the feature compute-saving only. A knob rather than a constant because the
+    # BLASST paper deliberately does NOT defer the V load in prefill -- it argues
+    # bandwidth is not the bottleneck there and that conditional loading costs
+    # more latency than it saves. We defer it. This is how that gets measured on
+    # a given shape rather than argued from either side.
+    PRELOAD_V = (not ENABLE_BLOCK_SKIP) or os.environ.get(
+        "AITER_UA_BLASST_PRELOAD_V", "0"
+    ) == "1"
+
+    # Scheduling rides with skipping and only with skipping. The grid pins each
+    # KV head to one chiplet (workgroup w lands on chiplet w % 8, and w =
+    # kv_head + num_kv_heads * q_block), which costs nothing while every head
+    # does the same work. Skipping is what makes per-head cost data-dependent,
+    # so these two exist to repair a problem skipping introduces -- there is no
+    # reason to perturb the dense path with them.
+    #
+    # They only permute which workgroup computes which tile, so the result is
+    # bitwise identical either way.
+    #
+    # AITER_UA_BLASST_SCHED=0 turns the scheduling off while leaving skipping
+    # on. It exists for two reasons: it is the rollback path if the reordering
+    # ever misbehaves on a shape we have not seen, and it is the only way to
+    # measure what the scheduling is worth, since otherwise the two are welded
+    # together. Not a tuning knob -- the default is the shipping configuration.
+    _sched = os.environ.get("AITER_UA_BLASST_SCHED", "1") == "1"
+    DESCENDING_Q = ENABLE_BLOCK_SKIP and _sched
+    DYNAMIC_SCHED = ENABLE_BLOCK_SKIP and _sched
+
+    # Counting is only meaningful when there is something to count, and the
+    # kernel static_asserts the same thing.
+    COUNT_SKIPS = ENABLE_BLOCK_SKIP and params.skip_counter is not None
+
     config = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
@@ -466,6 +577,15 @@ def _unified_attention_2d_triton(params: _UAParams):
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+
+    # One counter per launch, handed out by tl.atomic_add. Allocated only when
+    # the ticket path is on, so the dense launch does not pay for a device
+    # allocation it never reads.
+    sched_counter = (
+        torch.zeros(1, dtype=torch.int32, device=params.q.device)
+        if DYNAMIC_SCHED
+        else None
+    )
 
     kernel_unified_attention_2d[
         (
@@ -517,6 +637,18 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        # Passed explicitly rather than folded into `config`: the same
+        # get_unified_attention_config() also serves the Gluon backend, and a
+        # key added there would reach a kernel that does not accept it.
+        ENABLE_BLOCK_SKIP=ENABLE_BLOCK_SKIP,
+        PRELOAD_V=PRELOAD_V,
+        log2_threshold=log2_threshold,
+        DESCENDING_Q=DESCENDING_Q,
+        DYNAMIC_SCHED=DYNAMIC_SCHED,
+        sched_counter_ptr=sched_counter,
+        num_q_blocks=total_num_q_blocks,
+        COUNT_SKIPS=COUNT_SKIPS,
+        skip_counter_ptr=params.skip_counter,
         **config,
     )
 
