@@ -107,3 +107,104 @@ def test_moe_gemm_mxfp8_empty_tokens():
     group_sizes = torch.zeros(E, dtype=torch.int32, device="cuda")
     out = moe_gemm_mxfp8(lhs, rhs, x_scale, w_scale, group_sizes, quant_block_size=qbs)
     assert out.shape == (0, N)
+
+
+@pytest.mark.parametrize("E, N, K", [(4, 256, 128), (8, 128, 256)])
+def test_moe_gemm_mxfp8_unwritten_rows_are_zero(E, N, K):
+    """Rows excluded from group_sizes must read as 0, not as stale memory.
+
+    The kernel only writes [0, sum(group_sizes)). A caller that routes rows to
+    a foreign or invalid expert leaves them out, so the tail of the output
+    allocation is never written. Poison the caching allocator first so an
+    uninitialized buffer would surface NaN rather than incidental zeros.
+    """
+    qbs = 32
+    poison = [torch.full((256, 1024), float("nan"), device="cuda") for _ in range(32)]
+    del poison
+
+    lhs, rhs, x_scale, w_scale, group_sizes = _make_mxfp8_inputs(E, N, K, qbs)
+    total_tokens = lhs.shape[0]
+    # Account for only half the tokens; the rest must come back zeroed.
+    covered = total_tokens // 2
+    group_sizes = torch.zeros(E, dtype=torch.int32, device="cuda")
+    group_sizes[0] = covered
+
+    out = moe_gemm_mxfp8(lhs, rhs, x_scale, w_scale, group_sizes, quant_block_size=qbs)
+
+    tail = out[covered:]
+    assert torch.isfinite(out).all(), (
+        f"{int(torch.isnan(out).sum())} NaN in output; unwritten rows were not "
+        "zero-initialized"
+    )
+    torch.testing.assert_close(tail, torch.zeros_like(tail))
+
+
+@pytest.mark.parametrize("E, N, K", [(4, 256, 128)])
+def test_moe_gemm_mxfp8_cuda_graph_capture(E, N, K):
+    """The call must be capturable: no device-to-host sync on the host path."""
+    qbs = 32
+    lhs, rhs, x_scale, w_scale, group_sizes = _make_mxfp8_inputs(E, N, K, qbs)
+    args = (lhs, rhs, x_scale, w_scale, group_sizes)
+
+    for _ in range(3):  # warm up autotuning/JIT outside the capture
+        moe_gemm_mxfp8(*args, quant_block_size=qbs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = moe_gemm_mxfp8(*args, quant_block_size=qbs)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref = _mxfp8_reference(lhs, rhs, x_scale, w_scale, group_sizes, qbs, torch.bfloat16)
+    scale = ref.abs().max().clamp_min(1e-4)
+    err = (captured.float() - ref.float()).abs().max()
+    assert err <= 0.2 * scale, f"replayed graph: max err {err:.4f} > 0.2 * {scale:.4f}"
+
+
+@pytest.mark.parametrize("E, N, K", [(4, 256, 128), (8, 128, 256)])
+def test_moe_gemm_mxfp8_kn_weights_match_nk(E, N, K):
+    """A K-major weight skips the internal copy and must not change the result."""
+    qbs = 32
+    lhs, rhs, x_scale, w_scale, group_sizes = _make_mxfp8_inputs(E, N, K, qbs)
+
+    # Same values and logical [E, N, K] shape, K-major storage.
+    rhs_kn = rhs.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    w_scale_kn = w_scale.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    assert rhs_kn.stride(1) == 1 and rhs_kn.shape == rhs.shape
+
+    out_nk = moe_gemm_mxfp8(
+        lhs, rhs, x_scale, w_scale, group_sizes, quant_block_size=qbs
+    )
+    out_kn = moe_gemm_mxfp8(
+        lhs, rhs_kn, x_scale, w_scale_kn, group_sizes, quant_block_size=qbs
+    )
+    torch.testing.assert_close(out_kn, out_nk, rtol=0, atol=0)
+
+
+def test_moe_gemm_mxfp8_ragged_groups():
+    """Uneven group sizes, including zero-token experts and partial blocks."""
+    E, N, K, qbs = 8, 256, 512, 32
+    group_sizes = torch.tensor(
+        [0, 7, 64, 1, 100, 0, 84, 0], dtype=torch.int32, device="cuda"
+    )
+    total_tokens = int(group_sizes.sum().item())
+    torch.manual_seed(0)
+    lhs = torch.randint(-3, 4, (total_tokens, K), dtype=torch.int8, device="cuda").to(
+        torch.float8_e4m3fnuz
+    )
+    rhs = torch.randint(-3, 4, (E, N, K), dtype=torch.int8, device="cuda").to(
+        torch.float8_e4m3fnuz
+    )
+    x_scale = torch.randint(
+        120, 135, (total_tokens, K // qbs), dtype=torch.uint8, device="cuda"
+    )
+    w_scale = torch.randint(
+        120, 135, (E, N, K // qbs), dtype=torch.uint8, device="cuda"
+    )
+
+    out = moe_gemm_mxfp8(lhs, rhs, x_scale, w_scale, group_sizes, quant_block_size=qbs)
+    ref = _mxfp8_reference(lhs, rhs, x_scale, w_scale, group_sizes, qbs, torch.bfloat16)
+    scale = ref.abs().max().clamp_min(1e-4)
+    err = (out.float() - ref.float()).abs().max()
+    assert err <= 0.2 * scale, f"max err {err:.4f} > 0.2 * {scale:.4f}"
