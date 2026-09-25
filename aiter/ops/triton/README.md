@@ -358,6 +358,7 @@ deleted. **Do not re-implement a shuffle** (the telltale is a local
 | ------------------------ | ----------------------------------------------------------------------- |
 | `shuffle_weight(x, ...)` | Arch-aware weight preshuffle: gfx1250 WMMA/TDM path, otherwise delegates to `aiter.ops.shuffle.shuffle_weight` |
 | `moe_weight_decode_view(w)` | Zero-copy `(E, N, K)` → decode view sharing storage (renamed from `moe_weight_gfx1250_decode_view`) |
+| `moe_weight_kn(w)`       | `(E, N, K)` → K-major storage for `_moe_gemm_a8w8`; free view when the caller already stores K-major |
 | `shuffle_scale_gemm` / `unshuffle_scale_gemm` | GEMM MX-scale tiles — gfx950 `(32, 8)`, gfx1250 `(16, 4)` |
 | `shuffle_scale_moe`      | MoE MX scales (a8w4/a8w8/a16w4/a4w4); `return_layout=True` also returns the `SWIZZLE_MX_SCALE` label (`CDNA4_SCALE`/`GFX1250_SCALE`); no-op on arches without a native layout (e.g. gfx942) |
 | `shuffle_scale_batched`  | FP4 blockscale16 batched scales, arch-independent                        |
