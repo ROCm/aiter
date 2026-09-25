@@ -38,6 +38,15 @@ def get_config(
     # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
     #       config in the dictionary.
     assert "default" in config_dict[gmm_type], "Default configuration is absent."
+    # gfx950: 8 warps wins for K, N >= 4096 with >= 256 rows/group, loses below.
+    if (
+        gmm_type == "gmm"
+        and "large_kn" in config_dict[gmm_type]
+        and K >= 4096
+        and N >= 4096
+        and M >= 256 * G
+    ):
+        return config_dict[gmm_type]["large_kn"]
     key = "accumulate" if accumulate else "default"
     return config_dict[gmm_type][key]
 

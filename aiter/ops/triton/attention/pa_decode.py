@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
 
@@ -85,6 +86,14 @@ def paged_attention_decode(
     use_v1 = max_seq_len <= 8192 and (
         max_num_partitions == 1 or num_seqs * num_q_heads > 512
     )
+    # gfx950: v2 beats v1 whenever there is >1 partition (1.02-4.5x, bf16/fp16 KV).
+    if (
+        k_scale.numel() == 1
+        and key_cache.dtype in (torch.float16, torch.bfloat16)
+        and max_num_partitions > 1
+        and get_arch() == "gfx950"
+    ):
+        use_v1 = False
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
