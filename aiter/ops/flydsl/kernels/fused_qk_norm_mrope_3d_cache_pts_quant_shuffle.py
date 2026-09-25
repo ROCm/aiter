@@ -493,10 +493,7 @@ def _build_kv_kernel(
 
         def _fp8_clamp(value: fx.Float32):
             fp8_min, fp8_max = _fp8_range()
-            # Note: min(), max() here cannot be traced by FlyDSL correctly
-            # FIXME: NaN values will be clamped to min, max. Check whether this matches intended semantics
-            vout = value if value > fp8_min else fp8_min  # noqa: FURB136
-            vout = vout if vout < fp8_max else fp8_max  # noqa: FURB136
+            vout = fx.min(fx.max(value, fp8_min), fp8_max)
             return vout
 
         def quant_pair_fp8(v0, v1, scale):
