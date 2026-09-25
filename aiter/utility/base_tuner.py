@@ -26,17 +26,10 @@ def _read_csv(filepath, **kwargs):
     """
     df = pd.read_csv(filepath, **kwargs)
     df.columns = df.columns.str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")].copy()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
     str_cols = df.select_dtypes(include=["object"]).columns
-    if len(str_cols):
-        df = df.assign(
-            **{
-                col: df[col].map(
-                    lambda value: value.strip() if isinstance(value, str) else value
-                )
-                for col in str_cols
-            }
-        )
+    for col in str_cols:
+        df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
     df.dropna(how="all", inplace=True)
     return df
 
@@ -252,19 +245,6 @@ class TunerCommon:
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
         return args
-
-    @staticmethod
-    def measurement_kwargs(args, use_cuda_event=False):
-        """Timing keyword arguments for the function an mp_tuner task measures.
-
-        --warmup and --iters only take effect if they reach the timed call, so
-        a task that passes {} silently measures with run_perftest's defaults.
-        """
-        return {
-            "num_warmup": args.warmup,
-            "num_iters": args.iters,
-            "use_cuda_event": use_cuda_event,
-        }
 
     @abstractmethod
     def _setup_specific_arguments(self):

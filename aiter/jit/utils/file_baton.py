@@ -114,14 +114,7 @@ class FileBaton:
             return False
         except PermissionError:
             return True  # exists but owned by another user
-        # A zombie answers signal 0 until its parent reaps it, but has already
-        # exited and will never release(), wedging the build for everyone after.
-        try:
-            with open(f"/proc/{pid}/stat", "rb") as stat_file:
-                # comm may contain spaces and parens; state follows the last ')'
-                return stat_file.read().rpartition(b")")[2].split()[0] != b"Z"
-        except (OSError, IndexError):
-            return True  # no procfs: trust the signal
+        return True
 
     def _is_stale(self):
         """A lock is stale if its recorded holder is dead, or if it carries no

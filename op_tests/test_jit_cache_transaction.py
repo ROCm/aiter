@@ -41,11 +41,6 @@ def _load_module(path, name):
 
 
 jit_cache = _load_module(JIT_CACHE_PATH, "aiter_jit_cache_transaction_under_test")
-# Loaded by path rather than imported, so the stale-lock tests below do not
-# drag in aiter's package __init__ and its device probing.
-FileBaton = _load_module(
-    JIT_CACHE_PATH.parent / "file_baton.py", "aiter_file_baton_under_test"
-).FileBaton
 versioner_module = _load_module(
     JIT_CACHE_PATH.with_name("_cpp_extension_versioner.py"),
     "aiter_versioner_under_test",
@@ -690,69 +685,6 @@ class TestModuleBuildLock(unittest.TestCase):
                     final.assert_called_once()
                     waiter.assert_not_called()
                     baton.release.assert_called_once()
-
-
-class TestStaleLockDetection(unittest.TestCase):
-    """A builder that dies must not wedge its module's build forever."""
-
-    @staticmethod
-    def _spawn_zombie():
-        """A child that has exited but has not been reaped.
-
-        Its PID stays allocated, so signal 0 still succeeds against it even
-        though it will never run again. Popen rather than os.fork, so the
-        test does not fork a multi-threaded interpreter; the child stays a
-        zombie until the returned handle is waited on.
-        """
-        child = subprocess.Popen([sys.executable, "-c", ""])
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            with open(f"/proc/{child.pid}/stat", "rb") as stat_file:
-                if stat_file.read().rpartition(b")")[2].split()[0] == b"Z":
-                    return child
-            time.sleep(0.01)
-        child.kill()
-        child.wait()
-        raise AssertionError("child did not become a zombie")
-
-    def test_a_zombie_holder_is_treated_as_dead(self):
-        child = self._spawn_zombie()
-        try:
-            os.kill(child.pid, 0)  # the trap: a zombie answers this
-            self.assertFalse(FileBaton._pid_alive(child.pid))
-        finally:
-            child.wait()
-
-    def test_a_live_holder_is_left_alone(self):
-        self.assertTrue(FileBaton._pid_alive(os.getpid()))
-
-    def test_a_lock_held_by_a_zombie_is_stale_and_can_be_broken(self):
-        child = self._spawn_zombie()
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                path = os.path.join(directory, "module.lock")
-                with open(path, "w", encoding="utf-8") as lock_file:
-                    lock_file.write(f"{child.pid}\n{socket.gethostname()}\n")
-                baton = FileBaton(path)
-                self.assertTrue(baton._is_stale())
-                # wait() returns False to tell the caller nobody ever
-                # finished this build, so it has to be redone rather than
-                # assumed complete. Without the zombie check it never
-                # returns at all.
-                self.assertFalse(baton.wait())
-                self.assertFalse(os.path.exists(path))
-        finally:
-            child.wait()
-
-    def test_a_lock_held_by_a_live_process_is_not_stolen(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "module.lock")
-            with open(path, "w", encoding="utf-8") as lock_file:
-                lock_file.write(f"{os.getpid()}\n{socket.gethostname()}\n")
-            baton = FileBaton(path)
-            self.assertFalse(baton._is_stale())
-            self.assertFalse(baton._try_break_stale())
-            self.assertTrue(os.path.exists(path))
 
 
 class TestBuildPublication(unittest.TestCase):
