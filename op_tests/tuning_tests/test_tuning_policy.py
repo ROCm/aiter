@@ -75,6 +75,23 @@ class TestPromotionPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.PromotionPolicy(finalist_rounds=0)
 
+    def test_rejects_a_significance_bar_of_zero(self):
+        with self.assertRaises(ValueError):
+            policy.PromotionPolicy(significance_sigma=0.0)
+
+
+class TestRacePolicy(unittest.TestCase):
+    def test_rejects_an_unusable_error_budget(self):
+        for alpha in (0.0, 1.0):
+            with self.subTest(alpha=alpha), self.assertRaises(ValueError):
+                policy.RacePolicy(alpha=alpha)
+
+    def test_rejects_a_race_that_stops_before_it_may_eliminate(self):
+        with self.assertRaises(ValueError):
+            policy.RacePolicy(min_blocks=5, max_blocks=4)
+        with self.assertRaises(ValueError):
+            policy.RacePolicy(block_calls=0)
+
 
 class TestGateAgainstIncumbent(unittest.TestCase):
     DELTA = policy.PromotionPolicy(indifference_delta=0.02)
@@ -107,6 +124,15 @@ class TestGateAgainstIncumbent(unittest.TestCase):
                 decision = self.gate(incumbent, 50.0)
                 self.assertEqual(decision.outcome, policy.PROMOTE)
                 self.assertIsNone(decision.margin)
+
+    def test_a_standard_error_bar_replaces_the_delta(self):
+        # 2 sigma x 1.5 us combined standard error on 100 us is a 3% bar, so a
+        # 2.5% win that clears the delta is still inside the scatter.
+        bar = policy.standard_error_bar(100.0, 1.5, self.DELTA)
+        self.assertAlmostEqual(bar, 0.03)
+        decision = policy.gate_against_incumbent(100.0, 97.5, self.DELTA, bar=bar)
+        self.assertEqual(decision.outcome, policy.RETAIN)
+        self.assertEqual(self.gate(100.0, 97.5).outcome, policy.PROMOTE)
 
     def test_an_unmeasured_challenger_is_a_caller_error(self):
         for challenger in (None, 0.0, -1.0, float("inf")):
