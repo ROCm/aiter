@@ -55,6 +55,11 @@ _PREFILL_WGS = 256 * 4
 # QK; halving the waves halves that duplication. It costs 42 VGPRs of extra PV
 # accumulator per wave and still wins by 1-12%, more as L and M grow.
 _DECODE_THREADS = 128
+# Splits for M=1, the only batch where the grid alone cannot fill the machine:
+# 64 splits leaves half the SIMDs of half the CUs idle and costs ~12% in the
+# split kernel. M=2 already reaches that wave count, and doubling its splits
+# only buys a bigger merge, so the wider band stops here.
+_TINY_SPLITS = 128
 _DEFAULT_SCALE = _D**-0.5
 _LSE_EMPTY = -1.0e20
 _LOG2E = 1.4426950408889634
@@ -91,7 +96,9 @@ def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
     base_programs = rows * _HK
     # Live AMD: base_programs <= 4 -> 64 splits / 128 WGs; 4 < base < 32
     # -> 32 splits / 512 WGs. Same BN16 / 4-wave tile in both bands.
-    if base_programs <= 4:
+    if base_programs <= 2:
+        block_n, target_splits, threads = 16, _TINY_SPLITS, _DECODE_THREADS
+    elif base_programs <= 4:
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
         block_n, target_splits, threads = 16, 32, _DECODE_THREADS
@@ -128,8 +135,15 @@ def build_qsa_k2_family_a_module(
         raise ValueError(f"block_threads must be 128 or 256, got {block_threads}")
     if block_threads % 64 or block_threads % block_n:
         raise ValueError("thread and column mappings must divide evenly")
-    if n_splits < 1 or n_splits > 64:
-        raise ValueError(f"n_splits must be in 1..64, got {n_splits}")
+    if n_splits < 1 or n_splits > 128:
+        raise ValueError(f"n_splits must be in 1..128, got {n_splits}")
+    # The merge reduces LSE in one wave, so a lane owns this many splits.
+    merge_per_lane = (n_splits + 63) // 64
+    merge_slots = merge_per_lane * 64
+    # Each thread walks every split for its own D element, so the unrolled
+    # load chain is n_splits * (_D / threads) deep. Past ~128 the scheduler
+    # serializes it, so widen the workgroup instead of deepening the chain.
+    merge_threads = 128 if n_splits <= 64 else 256
     if _HQ != _HK * _GROUP:
         raise ValueError("family A GQA head counts do not form groups")
 
@@ -227,7 +241,7 @@ def build_qsa_k2_family_a_module(
 
     @fx.struct
     class MergeStorage:
-        weights: fx.Array[Float32, 64, 16]
+        weights: fx.Array[Float32, merge_slots, 16]
         denominator: fx.Array[Float32, 1, 16]
 
     @flyc.kernel(
@@ -975,8 +989,8 @@ def build_qsa_k2_family_a_module(
 
     @flyc.kernel(
         name="qsa_k2_family_a_port_merge_"
-        + kernel_signature(ns=n_splits, blk=128, d=_D),
-        known_block_size=[128, 1, 1],
+        + kernel_signature(ns=n_splits, blk=merge_threads, d=_D),
+        known_block_size=[merge_threads, 1, 1],
     )
     def merge_kernel(
         partial_out: fx.Tensor,
@@ -988,30 +1002,40 @@ def build_qsa_k2_family_a_module(
         tid = Int32(gpu.thread_id("x"))
         lane = tid % Int32(64)
         zero_f = Float32(0.0)
-        split_live = lane < Int32(n_splits)
-        safe_split = split_live.select(lane, Int32(0))
-        lse = partial_lse[safe_split, row, head]
-        lse = split_live.select(lse, Float32(_LSE_EMPTY))
-        lse_max = lse
+        # One wave reduces the LSEs, so past 64 splits a lane owns several.
+        lses = []
+        for j in range_constexpr(merge_per_lane):
+            s = lane + Int32(j * 64)
+            s_live = s < Int32(n_splits)
+            part_lse = partial_lse[s_live.select(s, Int32(0)), row, head]
+            lses.append(s_live.select(part_lse, Float32(_LSE_EMPTY)))
+
+        lse_max = lses[0]
+        for j in range_constexpr(merge_per_lane):
+            if const_expr(j > 0):
+                lse_max = lse_max.maximumf(lses[j])
         for sh in (32, 16, 8, 4, 2, 1):
             lse_max = lse_max.maximumf(lse_max.shuffle_xor(Int32(sh), Int32(64)))
-        live = split_live & (lse > Float32(_LSE_EMPTY))
-        weight = live.select(_exp2(lse - lse_max), zero_f)
-        den = weight
+
+        merge_storage = fx.SharedAllocator().allocate(MergeStorage).peek()
+        weights = merge_storage.weights.view(fx.make_layout(merge_slots, 1))
+        denominator = merge_storage.denominator.view(fx.make_layout(1, 1))
+
+        den = zero_f
+        for j in range_constexpr(merge_per_lane):
+            w = (lses[j] > Float32(_LSE_EMPTY)).select(_exp2(lses[j] - lse_max), zero_f)
+            if tid < Int32(64):
+                weights[lane + Int32(j * 64)] = w
+            den = den + w
         for sh in (32, 16, 8, 4, 2, 1):
             den = den + den.shuffle_xor(Int32(sh), Int32(64))
 
-        merge_storage = fx.SharedAllocator().allocate(MergeStorage).peek()
-        weights = merge_storage.weights.view(fx.make_layout(64, 1))
-        denominator = merge_storage.denominator.view(fx.make_layout(1, 1))
-        if tid < Int32(64):
-            weights[tid] = weight
         if tid == Int32(0):
             denominator[0] = den
         gpu.barrier()
 
-        for di in range_constexpr(2):
-            d = tid + Int32(di * 128)
+        for di in range_constexpr(_D // merge_threads):
+            d = tid + Int32(di * merge_threads)
             merged = zero_f
             for s in range_constexpr(n_splits):
                 part = Float32(partial_out[Int32(s), row, head, d])
@@ -1064,7 +1088,7 @@ def build_qsa_k2_family_a_module(
         if n_splits > 1:
             merge_kernel(partial_out, partial_lse, out).launch(
                 grid=(rows, n_heads, 1),
-                block=(128, 1, 1),
+                block=(merge_threads, 1, 1),
                 stream=stream,
             )
 
