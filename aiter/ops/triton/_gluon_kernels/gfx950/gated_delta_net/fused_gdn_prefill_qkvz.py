@@ -31,8 +31,9 @@ parametrized against. The schedules are otherwise independent; where two would
 have shared a helper name (``_multiply``, ``_update_conv_state``) the m12289_16384
 b6_15 copy carries a ``_b6_15`` suffix so each schedule binds its own kernels.
 
-The torch/triton host orchestration lives next to the public wrapper in
-``aiter/ops/triton/gated_delta_net/_gdn_prefill_launch.py``.
+The torch/triton host orchestration lives in the public wrapper
+``aiter/ops/triton/gated_delta_net/fused_gdn_prefill_qkvz.py`` -- one host
+launcher per schedule, each lazily importing the kernels below.
 """
 
 from triton.experimental import gluon
