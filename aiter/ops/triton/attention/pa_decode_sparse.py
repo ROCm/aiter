@@ -457,6 +457,9 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     main_tiles = max(1, math.ceil(avg_main / block_k)) if avg_main > 0 else 0
     extra_tiles = max(1, math.ceil(avg_extra / block_k)) if avg_extra > 0 else 0
     tiles = max(1, main_tiles, extra_tiles)
+    if tiles <= 2:
+        # Splitting two tiles saves less than the reduce launch costs.
+        return 1
     if base_wg >= num_sms:
         # Already at least one workgroup per CU without splitting
         return max(1, min(cta_cap, tiles // 4))
