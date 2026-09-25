@@ -2,10 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import copy
+import sys
 
 import pytest
+
+# Support direct execution with the same parametrization as the pytest runner.
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+    gemm_a8w8_blockscale_group32,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
@@ -386,3 +396,223 @@ def test_gemm_afp8wfp8_preshuffle_gluon_matches_triton(
     # consume identical inputs and (today) agree bitwise, so there is no
     # cancellation tail to tolerate here and any drift is a real divergence.
     torch.testing.assert_close(gluon_out, triton_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.fixture
+def _require_gfx950():
+    if not torch.cuda.is_available() or get_gfx() != "gfx950":
+        pytest.skip("CDNA4 scaled MFMA requires gfx950")
+
+
+def _execution_config(packed=False, fused=False, splits=3, n_first=False):
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_M": 32,
+        "REDUCE_BLOCK_SIZE_N": 32,
+        "NUM_KSPLIT": splits,
+        "N_FIRST": n_first,
+        "FUSED_SPLITK": fused,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+    }
+    if packed:
+        config["packed"] = dict(config, BLOCK_SIZE_M=4, K_PACK=4)
+    return config
+
+
+def _compact_scale_inputs(m, n, k, a_group, b_group):
+    torch.manual_seed(m + n + k)
+    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
+    w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    xs = torch.randint(124, 131, (m, k // a_group), device="cuda", dtype=torch.uint8)
+    ws = torch.randint(
+        124,
+        131,
+        ((n + b_group[0] - 1) // b_group[0], k // b_group[1]),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    return x, w, xs, ws, _compact_scale_reference(x, w, xs, ws, a_group, b_group)
+
+
+def _compact_scale_reference(x, w, xs, ws, a_group, b_group):
+    n = w.shape[0]
+    a = x.double() * torch.exp2(xs.double() - 127).repeat_interleave(a_group, -1)
+    b = w.double() * torch.exp2(ws.double() - 127).repeat_interleave(b_group[0], 0)[
+        :n
+    ].repeat_interleave(b_group[1], -1)
+    return a @ b.T
+
+
+def _assert_compact_scale_close(actual, expected):
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=0.016 if actual.dtype == torch.bfloat16 else 3e-5,
+        atol=5e-5 * expected.abs().max().item(),
+    )
+
+
+@pytest.mark.parametrize("a_group", [32, 128])
+@pytest.mark.parametrize("b_group", [(1, 32), (32, 32), (128, 128)])
+@pytest.mark.parametrize(
+    "packed,fused", [(False, False), (False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.usefixtures("_require_gfx950")
+def test_compact_scale_execution_variants(a_group, b_group, packed, fused, transposed):
+    # Tail in M and N, and K=1152 has a tail in the packed 512-element step.
+    x, w, xs, ws, expected = _compact_scale_inputs(
+        7 if packed else 19, 131, 1152, a_group, b_group
+    )
+    if transposed:
+        xs = xs.T.contiguous().reshape(xs.shape)
+        # Independently exercise ordinary tensor strides on the weight scales.
+        ws = ws.T.contiguous().T
+    config = _execution_config(packed, fused, n_first=transposed)
+    original = copy.deepcopy(config)
+    y = torch.empty(expected.shape, device="cuda", dtype=torch.float32)
+    for _ in range(2):  # Fused arrival counters must be reusable.
+        actual = gemm_afp8wfp8(
+            x,
+            w,
+            xs,
+            ws,
+            dtype=torch.float32,
+            y=y,
+            config=config,
+            x_scale_group_size=a_group,
+            w_scale_group_size=b_group,
+            is_x_scale_transposed=transposed,
+        )
+        assert actual is y
+        _assert_compact_scale_close(actual, expected)
+    assert config == original
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("b_group", [(32, 32), (128, 128)])
+@pytest.mark.parametrize("splits", [3, 64])
+@pytest.mark.usefixtures("_require_gfx950")
+def test_split_k_skip_reduce_and_override(packed, b_group, splits):
+    x, w, xs, ws, expected = _compact_scale_inputs(3, 67, 640, 128, b_group)
+    config = _execution_config(packed, fused=True)
+    original = copy.deepcopy(config)
+    partials = gemm_afp8wfp8(
+        x,
+        w,
+        xs,
+        ws,
+        dtype=torch.bfloat16,
+        config=config,
+        x_scale_group_size=128,
+        w_scale_group_size=b_group,
+        split_k=splits,
+        skip_reduce=True,
+    )
+    assert partials.ndim == 3
+    assert partials.dtype == torch.float32
+    assert tuple(partials.shape[1:]) == tuple(expected.shape)
+    assert 1 <= partials.shape[0] <= splits
+    _assert_compact_scale_close(partials.sum(0), expected)
+    actual = gemm_afp8wfp8(
+        x,
+        w,
+        xs,
+        ws,
+        dtype=torch.bfloat16,
+        config=config,
+        x_scale_group_size=128,
+        w_scale_group_size=b_group,
+        split_k=splits,
+    )
+    _assert_compact_scale_close(actual, expected)
+    assert config == original
+
+
+@pytest.mark.parametrize("rows", [1, 32])
+@pytest.mark.usefixtures("_require_gfx950")
+def test_matches_group32_kernel(rows):
+    x, w, xs, ws, expected = _compact_scale_inputs(3, 131, 1152, 32, (rows, 32))
+    config = _execution_config()
+    actual = gemm_afp8wfp8(
+        x.view(torch.uint8),
+        w.view(torch.uint8),
+        xs,
+        ws,
+        dtype=torch.float32,
+        config=config,
+        x_scale_group_size=32,
+        w_scale_group_size=(rows, 32),
+        split_k=3,
+    )
+    legacy = gemm_a8w8_blockscale_group32(
+        x,
+        w,
+        xs,
+        ws,
+        dtype=torch.float32,
+        config=config,
+        weight_group_rows=rows,
+        split_k=3,
+    )
+    _assert_compact_scale_close(actual, expected)
+    _assert_compact_scale_close(actual, legacy)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.usefixtures("_require_gfx950")
+def test_fused_split_k_graph_replay_reads_live_scales(packed):
+    a_group, b_group = 128, (128, 128)
+    x, w, xs, ws, _ = _compact_scale_inputs(3, 131, 1152, a_group, b_group)
+    config = _execution_config(packed=packed, fused=True)
+    kwargs = dict(
+        dtype=torch.float32,
+        config=config,
+        x_scale_group_size=a_group,
+        w_scale_group_size=b_group,
+    )
+    # Initialize per-stream counters before capture, then ensure each replay
+    # consumes current operands/scales and leaves the counters reusable.
+    gemm_afp8wfp8(x, w, xs, ws, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gemm_afp8wfp8(x, w, xs, ws, **kwargs)
+    for factor in (2.0, 0.5):
+        x.copy_((x.float() * factor).to(x.dtype))
+        xs.add_(1)
+        ws.add_(1)
+        graph.replay()
+        _assert_compact_scale_close(
+            actual, _compact_scale_reference(x, w, xs, ws, a_group, b_group)
+        )
+
+
+@pytest.mark.parametrize("a_group", [32, 128])
+@pytest.mark.parametrize("b_group", [(1, 32), (32, 32), (128, 128)])
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.usefixtures("_require_gfx950")
+def test_compact_scale_partial_k_tile(a_group, b_group, fused):
+    # K is divisible by every scale group, but not by the 256-element tile.
+    # This must compile and exercise masked E4M3 loads (EVEN_K=False).
+    x, w, xs, ws, expected = _compact_scale_inputs(19, 131, 640, a_group, b_group)
+    config = _execution_config(fused=fused, splits=3)
+    config["BLOCK_SIZE_K"] = 256
+    actual = gemm_afp8wfp8(
+        x,
+        w,
+        xs,
+        ws,
+        dtype=torch.float32,
+        config=config,
+        x_scale_group_size=a_group,
+        w_scale_group_size=b_group,
+    )
+    _assert_compact_scale_close(actual, expected)
