@@ -11,9 +11,7 @@ from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 
-# Config family each harness tunes: the config_name its kernel passes to
-# get_gemm_config(). Case and dashes vary between families, so the name cannot
-# be derived from the harness filename. Add an entry when adding a harness.
+
 HARNESS_CONFIG_NAMES = {
     "harness_batched_gemm_bf16.py": "BATCHED_GEMM-A16W16",
     "harness_gemm_a16w16.py": "GEMM-A16W16",
