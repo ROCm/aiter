@@ -10,9 +10,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
-| `test_mha_tuner_logic.py` | 1 | No | MHA forward tuner: problem keys, candidate enumeration, gating, evidence, selection proof |
-| `test_block_race.py` | 1 | No | Interleaved elimination race: incumbent protection, resume, tie-breaking, from synthetic latencies |
-| `test_mha_search_and_promotion.py` | 1 | No | MHA forward candidate sample, `--backends` restriction, and the gate against the incumbent |
+| `test_mha_tuner_logic.py` | 1 | No | MHA forward tuner: problem keys, candidate enumeration, gating, runtime CSV, selection proof |
+| `test_mha_search_and_promotion.py` | 1 | No | MHA forward candidate sample, `--backends` restriction, skipping already-tuned shapes unless `--all`, and the gate against the incumbent |
 | `test_mha_store_agreement.py` | 1 | No | `aiter.ops.mha` and the Triton entry point resolve the same tile from one runtime CSV |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |

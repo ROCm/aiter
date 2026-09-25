@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU-only tests for how the MHA forward tuner chooses what to measure and
-what to publish: the candidate sample, the backend restriction, and the
-gate that refuses to displace a configuration it cannot beat."""
+what to publish: the candidate sample, the backend restriction, the shapes
+it skips, and the gate that refuses to displace a configuration it cannot
+beat."""
 
 import json
 import os
@@ -10,17 +11,17 @@ import tempfile
 import types
 import unittest
 from typing import ClassVar
+from unittest import mock
 
 import triton  # noqa: F401  # isort: skip  # Must precede torch on this ROCm environment.
 import pandas as pd
 
 from aiter.ops.mha_fwd_policy import (
+    MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
-    MhaFwdCandidate,
     MhaFwdProblem,
     enumerate_mha_fwd_candidates,
 )
-from aiter.utility.block_race import RaceEntrant
 from op_tests.tuners.tune_mha_fwd import MhaFwdTuner
 
 
@@ -35,10 +36,6 @@ class TestIncumbentGate(unittest.TestCase):
         tuner = MhaFwdTuner.__new__(MhaFwdTuner)
         tuner._incumbents_by_key = {self.KEY: {("gluon", self.INCUMBENT_CONFIG)}}
         tuner._autoselect_by_key = {}
-        tuner._incumbent_probe_by_key = {}
-        tuner._published_by_key = {}
-        tuner._promotions = []
-        tuner._race_winner_by_key = {}
         return tuner
 
     def _frame(self, challenger_us, incumbent_us, samples=(1000.0, 1001.0)):
@@ -66,8 +63,8 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
         self.assertIn("beat incumbent", winner["detail"])
 
-    def test_a_winner_inside_measurement_spread_does_not_displace_the_incumbent(self):
-        """The margin here is 0.1%, far under the scatter of the samples, so
+    def test_a_winner_inside_the_delta_does_not_displace_the_incumbent(self):
+        """The margin here is 0.1%, far under the 2% indifference delta, so
         the two configurations have not been told apart and the run should
         change nothing rather than churn the published table."""
         winner = self._tuner()._gate_against_incumbent(
@@ -111,30 +108,13 @@ class TestIncumbentGate(unittest.TestCase):
             self.KEY, self._frame(challenger_us=2206.0, incumbent_us=1831.0)
         )
         self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
-        self.assertEqual(tuner._promotions[0]["decision"], "incumbent_fastest")
+        self.assertIn("nothing measured beat it", winner["detail"])
 
-    def test_a_race_that_certified_nobody_refuses_to_publish(self):
-        """Screening has no recorded winner and ranks by latency, so its
-        fastest row is the pick. A race that recorded no winner is a different
-        situation: taking the fastest row there could ship a candidate the
-        race eliminated."""
-        tuner = self._tuner()
-        tuner._race_winner_by_key = {self.KEY: None}
-        with self.assertRaises(RuntimeError):
-            tuner._gate_against_incumbent(
-                self.KEY, self._frame(challenger_us=800.0, incumbent_us=1000.0)
-            )
-
-    def test_more_rounds_make_the_gate_more_sensitive_not_less(self):
-        """A range-based threshold widens as samples are added, so gathering
-        more evidence would make a real improvement harder to publish. The
-        standard error has to shrink instead."""
-        tight = [1000.0, 1002.0]
-        many = tight * 8
-        self.assertLess(
-            MhaFwdTuner._standard_error_us({"samples_us": json.dumps(many)}),
-            MhaFwdTuner._standard_error_us({"samples_us": json.dumps(tight)}),
+    def test_a_margin_equal_to_the_delta_is_not_enough(self):
+        winner = self._tuner()._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=980.0, incumbent_us=1000.0)
         )
+        self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
 
     def test_a_winner_slower_than_auto_select_publishes_no_row(self):
         """The incumbent is whatever dispatch resolves, which for some shapes
@@ -151,7 +131,6 @@ class TestIncumbentGate(unittest.TestCase):
             self.KEY, self._frame(challenger_us=1628.0, incumbent_us=1900.0)
         )
         self.assertIsNone(winner, "a slower winner must not reach the table")
-        self.assertEqual(tuner._promotions[0]["decision"], "autoselect_retained")
 
     def test_a_winner_that_beats_auto_select_is_published(self):
         tuner = self._tuner()
@@ -164,7 +143,6 @@ class TestIncumbentGate(unittest.TestCase):
         )
         self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
         self.assertIn("beat auto-select opus", winner["detail"])
-        self.assertEqual(tuner._promotions[0]["decision"], "promoted")
 
     def test_an_auto_select_win_inside_delta_still_publishes_no_row(self):
         """1% against a 2% indifference delta is not a result. Publishing it
@@ -180,16 +158,6 @@ class TestIncumbentGate(unittest.TestCase):
                 self.KEY, self._frame(challenger_us=990.0, incumbent_us=1900.0)
             )
         )
-
-    def test_every_decision_is_recorded_for_the_evidence_file(self):
-        tuner = self._tuner()
-        tuner._gate_against_incumbent(
-            self.KEY, self._frame(challenger_us=800.0, incumbent_us=1000.0)
-        )
-        record = tuner._promotions[0]
-        self.assertEqual(record["decision"], "promoted")
-        self.assertAlmostEqual(record["margin"], 0.2, places=6)
-        self.assertEqual(record["incumbent"]["us"], 1000.0)
 
 
 class TestIncumbentIdentity(unittest.TestCase):
@@ -252,12 +220,12 @@ class TestIncumbentIdentity(unittest.TestCase):
         self.assertEqual(gluon_default(self._row(128, 128)), without_pe)
 
 
-class TestRetunedIncumbent(unittest.TestCase):
-    """Re-tuning a shape has to defend the row it already published.
+class TestAlreadyTunedShapes(unittest.TestCase):
+    """A shape that already has a row is skipped unless --all is given.
 
-    Gating a re-tune against auto-select instead compares the field against a
-    bar the published row already cleared, so anything a contended sweep ranks
-    a fraction ahead of that row replaces it.
+    Re-tuning it against auto-select would let anything a contended sweep
+    ranks a fraction ahead of the published row replace it; --all --compare
+    --update_improved is the re-tune that defends the row.
     """
 
     ROW: ClassVar[dict] = {
@@ -282,7 +250,7 @@ class TestRetunedIncumbent(unittest.TestCase):
         "sink_size": 0,
         "dropout_p": 0.0,
         "logits_soft_cap": 0.0,
-        "how_v3_bf16_cvt": 0,
+        "how_v3_bf16_cvt": 1,
         "return_lse": False,
         "return_attn_probs": False,
         "has_bias": False,
@@ -293,28 +261,13 @@ class TestRetunedIncumbent(unittest.TestCase):
         "has_physical_padding": False,
         "is_grad": False,
     }
-    AUTOSELECT: ClassVar[dict] = {"identity": ("ck", 0, ""), "latency_us": 1900.0}
-    PUBLISHED: ClassVar[dict] = {
-        "identity": ("gluon", 0, '{"BLOCK_M":128,"BLOCK_N":64}'),
-        "latency_us": 900.0,
-    }
 
-    def _tuner(self, probe=None):
-        tuner = MhaFwdTuner.__new__(MhaFwdTuner)
-        tuner._published_by_key = {}
-        tuner._probe_calls = []
+    def _catalogue(self):
+        row = {field: self.ROW[field] for field in MHA_FWD_PROBLEM_KEY_FIELDS}
+        row["dtype"] = "bfloat16"
+        return self._csv(pd.DataFrame([row]), "untuned-")
 
-        def record(row, config_file):
-            tuner._probe_calls.append(config_file)
-            return probe
-
-        tuner._run_fresh_probe = record
-        return tuner
-
-    def _key(self):
-        return MhaFwdProblem.from_mapping(self.ROW).key()
-
-    def _write_table(self, **overrides):
+    def _table(self, **overrides):
         row = {
             **self.ROW,
             "backend": "gluon",
@@ -323,160 +276,58 @@ class TestRetunedIncumbent(unittest.TestCase):
             "us": 42.0,
         }
         row.update(overrides)
-        handle, path = tempfile.mkstemp(prefix="tuned-", suffix=".csv")
+        return self._csv(
+            pd.DataFrame([row])[list(MHA_FWD_RUNTIME_CSV_FIELDS)], "tuned-"
+        )
+
+    def _csv(self, frame, prefix):
+        handle, path = tempfile.mkstemp(prefix=prefix, suffix=".csv")
         os.close(handle)
         self.addCleanup(os.unlink, path)
-        pd.DataFrame([row])[list(MHA_FWD_RUNTIME_CSV_FIELDS)].to_csv(path, index=False)
-        return types.SimpleNamespace(tune_file=path)
+        frame.to_csv(path, index=False)
+        return path
 
-    def test_a_shape_with_no_published_row_reuses_the_auto_select_probe(self):
-        """The two answers are the same when the table has no row for the
-        shape, and probing again would spend a second process to learn it."""
-        tuner = self._tuner()
-        resolved = tuner._resolve_incumbent(
-            self.ROW, types.SimpleNamespace(tune_file=""), self._key(), self.AUTOSELECT
-        )
-        self.assertIs(resolved, self.AUTOSELECT)
-        self.assertEqual(tuner._probe_calls, [])
-
-    def test_a_published_row_becomes_the_incumbent(self):
-        probe = {
-            "status": "verified",
-            "observed": {
-                "backend": "gluon",
-                "num_splits": 0,
-                "backend_config": '{"BLOCK_M":128,"BLOCK_N":64}',
-            },
-            "latency_us": 900.0,
-        }
-        args = self._write_table(backend_config='{"BLOCK_M":128,"BLOCK_N":64}')
-        tuner = self._tuner(probe)
-        tuner._published_by_key = tuner._load_published_table(args)
-        resolved = tuner._resolve_incumbent(
-            self.ROW, args, self._key(), self.AUTOSELECT
-        )
-        self.assertEqual(resolved["identity"], self.PUBLISHED["identity"])
-        self.assertEqual(resolved["latency_us"], 900.0)
-        self.assertEqual(tuner._probe_calls, [args.tune_file])
-
-    def test_a_published_row_that_does_not_resolve_falls_back_to_auto_select(self):
-        """A row dispatch cannot honor is a warning and a fallback at runtime,
-        so the tuner has nothing to defend and gates against auto-select."""
-        args = self._write_table()
-        tuner = self._tuner({"status": "failed", "stderr": "no kernel gate matched"})
-        tuner._published_by_key = tuner._load_published_table(args)
-        self.assertIs(
-            tuner._resolve_incumbent(self.ROW, args, self._key(), self.AUTOSELECT),
-            self.AUTOSELECT,
-        )
-
-    def test_the_published_table_is_keyed_the_way_the_sweep_is(self):
-        """The CSV spells the dtype bf16 and the sweep spells it bfloat16, so
-        keying on raw cells would miss the row it is meant to defend."""
-        args = self._write_table()
-        published = MhaFwdTuner.__new__(MhaFwdTuner)._load_published_table(args)
-        self.assertEqual(list(published), [self._key()])
-        self.assertEqual(published[self._key()], ("gluon", 0, ""))
-
-    def test_a_re_tune_is_gated_on_the_published_row_not_auto_select(self):
-        """1000 us beats the 1900 us auto-select handily and loses to the
-        900 us row already published, and losing is the answer that counts."""
-        tuner = self._tuner()
-        key = self._key()
-        tuner._published_by_key = {key: ("gluon", 0, "")}
-        tuner._incumbents_by_key = {}
-        tuner._incumbent_probe_by_key = {key: self.PUBLISHED}
-        tuner._autoselect_by_key = {key: self.AUTOSELECT}
-        tuner._promotions = []
-        tuner._race_winner_by_key = {}
-        frame = pd.DataFrame(
-            [
-                {
-                    "backend": "opus",
-                    "backend_config": "",
-                    "us": 1000.0,
-                    "samples_us": "[1000.0,1001.0]",
-                }
-            ]
-        )
-        self.assertIsNone(tuner._gate_against_incumbent(key, frame))
-        self.assertEqual(tuner._promotions[0]["decision"], "incumbent_retained")
-
-
-class TestRaceJournalBinding(unittest.TestCase):
-    """Replay is only meaningful for the race that produced the blocks."""
-
-    ARGS = types.SimpleNamespace(
-        delta=0.02,
-        race_alpha=0.05,
-        race_block_calls=20,
-        race_min_blocks=3,
-        race_max_blocks=30,
-    )
-    KEY = ("gfx950", "mi355x", 256)
-
-    def _path(self, candidates, args=None, key=None):
+    def _shapes_to_tune(self, tune_file, retune_all=False):
         tuner = MhaFwdTuner.__new__(MhaFwdTuner)
-        tuner._journal_path = "/tmp/run.journal.jsonl"
-        return tuner._race_block_journal(args or self.ARGS, key or self.KEY, candidates)
+        tuner.get_gfx = lambda: self.ROW["gfx"]
+        tuner.get_cu_num = lambda: self.ROW["cu_num"]
+        args = types.SimpleNamespace(
+            untune_file=self._catalogue(),
+            tune_file=tune_file,
+            all=retune_all,
+            verbose=False,
+        )
+        with mock.patch(
+            "op_tests.tuners.tune_mha_fwd.get_gpu_model",
+            return_value=self.ROW["gpu_model"],
+        ), mock.patch("torch.cuda.current_device", return_value=0):
+            tuner.pre_process(args)
+        return len(tuner.untunedf)
 
-    @staticmethod
-    def _candidates(*names, protected=()):
-        return [
-            RaceEntrant(
-                label=name,
-                payload=MhaFwdCandidate(name),
-                protected=name in protected,
-            )
-            for name in names
-        ]
+    def test_a_shape_with_a_row_is_skipped(self):
+        self.assertEqual(self._shapes_to_tune(self._table()), 0)
 
-    def test_the_same_race_resumes_the_same_journal(self):
-        first = self._path(self._candidates("ck", "opus"))
-        second = self._path(self._candidates("opus", "ck"))
-        self.assertEqual(first, second, "candidate order must not split the journal")
+    def test_all_re_tunes_a_shape_with_a_row(self):
+        self.assertEqual(self._shapes_to_tune(self._table(), retune_all=True), 1)
 
-    def test_a_changed_catalogue_lands_on_a_different_journal(self):
-        """The finding this closes: the name digested only the shape, so
-        editing the candidate list and resuming replayed blocks from a race
-        over a different field."""
-        self.assertNotEqual(
-            self._path(self._candidates("ck", "opus")),
-            self._path(self._candidates("ck", "opus", "triton")),
+    def test_a_shape_without_a_row_is_tuned(self):
+        self.assertEqual(self._shapes_to_tune("/nonexistent/tuned.csv"), 1)
+
+    def test_a_row_on_another_gpu_does_not_skip_the_shape(self):
+        self.assertEqual(self._shapes_to_tune(self._table(gpu_model="mi300x")), 1)
+
+    def test_the_table_is_keyed_the_way_the_sweep_is(self):
+        """The table spells the dtype bf16 and the catalogue bfloat16, so
+        keying on raw cells would miss the row and re-tune the shape."""
+        self.assertEqual(self.ROW["dtype"], "bf16")
+        self.assertEqual(
+            MhaFwdTuner._tuned_keys(pd.read_csv(self._table()), "tuned.csv"),
+            {MhaFwdProblem.from_mapping(self.ROW).key()},
         )
 
-    def test_a_changed_threshold_lands_on_a_different_journal(self):
-        for field, value in (
-            ("delta", 0.05),
-            ("race_alpha", 0.01),
-            ("race_block_calls", 40),
-            ("race_min_blocks", 8),
-            ("race_max_blocks", 10),
-        ):
-            with self.subTest(field=field):
-                changed = types.SimpleNamespace(**vars(self.ARGS))
-                setattr(changed, field, value)
-                self.assertNotEqual(
-                    self._path(self._candidates("ck")),
-                    self._path(self._candidates("ck"), args=changed),
-                )
-
-    def test_a_changed_incumbent_lands_on_a_different_journal(self):
-        """Who is protected decides who leaves the field, and who leaves
-        decides which blocks the survivors are paired over. A re-tune after
-        the published row moved is a different race."""
-        self.assertNotEqual(
-            self._path(self._candidates("ck", "opus")),
-            self._path(self._candidates("ck", "opus", protected=("ck",))),
-        )
-
-    def test_two_shapes_do_not_share_a_journal(self):
-        # The shape key opens with arch, SKU and CU count, so a journal
-        # carried to another GPU lands on a different file too.
-        self.assertNotEqual(
-            self._path(self._candidates("ck")),
-            self._path(self._candidates("ck"), key=("gfx942", "mi325x", 304)),
-        )
+    def test_a_table_without_key_columns_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "missing MHA key columns"):
+            MhaFwdTuner._tuned_keys(pd.DataFrame([{"backend": "ck"}]), "tuned.csv")
 
 
 class TestCandidateSample(unittest.TestCase):
@@ -490,10 +341,8 @@ class TestCandidateSample(unittest.TestCase):
         tuner = MhaFwdTuner.__new__(MhaFwdTuner)
         tuner._args = types.SimpleNamespace(backends=backends)
         tuner._autoselect_by_key = {}
-        tuner._incumbent_probe_by_key = {}
         tuner._incumbents_by_key = {}
         tuner._resolve_autoselect = lambda row: None
-        tuner._resolve_incumbent = lambda row, args, key, autoselect: None
         tuner._shipped_tile_candidates = lambda row: []
         tuner._incumbent_candidates = lambda selection: []
         args = types.SimpleNamespace(candidate_sample=sample)

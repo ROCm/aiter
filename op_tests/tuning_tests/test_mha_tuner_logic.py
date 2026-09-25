@@ -9,7 +9,6 @@ import importlib.util
 import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -499,6 +498,18 @@ class TestMhaWinnerPromotion(unittest.TestCase):
         self.assertEqual(winners.iloc[0]["backend_config"], config)
         self.assertEqual(winners.iloc[0]["num_splits"], 0)
 
+    def test_untyped_results_are_labelled_by_what_failed(self):
+        tuner = _TUNER.MhaFwdTuner()
+        tuner._args = argparse.Namespace(errRatio=0.05)
+        frame = tuner.result_to_df(
+            [
+                self._result("triton", 1.0)[:3],
+                self._result("triton", 2.0, err_ratio=0.2)[:3],
+                self._result("triton", float("inf"), err_ratio=1.0)[:3],
+            ]
+        )
+        self.assertEqual(frame["status"].tolist(), ["ok", "mismatch", "crash"])
+
     def test_faster_ck_row_is_promoted(self):
         tuner = _TUNER.MhaFwdTuner()
         args = argparse.Namespace(profile_file="", errRatio=0.0)
@@ -525,10 +536,24 @@ class TestMhaWinnerPromotion(unittest.TestCase):
         )
         self.assertTrue(winners.empty)
         self.assertEqual(list(tuner.success["status"]), ["retained"])
-        tuner.untunedf = _TUNER.pd.DataFrame([_problem_row()])
-        tuner.tune_start_time = time.time()
-        tuner.tune_summary("Finished")
-        self.assertEqual(tuner._outcomes()[0]["outcome"], "retained")
+
+    def test_a_row_that_overrides_auto_select_is_reported(self):
+        """Writing no row cannot remove one, so a re-tune that finds auto-select
+        best has to say the existing row is still in the way."""
+        tuner = _TUNER.MhaFwdTuner()
+        key = MhaFwdProblem.from_mapping(_problem_row()).key()
+        tuner._autoselect_by_key = {
+            key: {"identity": ("asm_v3", 0, ""), "latency_us": 1.0}
+        }
+        tuner._tuned_before = {key}
+        with self.assertLogs("aiter", level="WARNING") as logs:
+            tuner.post_process(
+                [self._result("triton", 1.5, config='{"BLOCK_M":64}')],
+                argparse.Namespace(
+                    profile_file="", errRatio=0.0, tune_file="tuned.csv"
+                ),
+            )
+        self.assertIn("delete that row", "\n".join(logs.output))
 
     def test_runtime_csv_keeps_backend_config_and_drops_metrics(self):
         tuner = _TUNER.MhaFwdTuner()
@@ -549,21 +574,15 @@ class TestMhaWinnerPromotion(unittest.TestCase):
         result = _TUNER.pd.DataFrame([row], columns=tuner.columns)
         with tempfile.TemporaryDirectory() as directory:
             runtime = os.path.join(directory, "runtime.csv")
-            tuner._journal_path = os.path.join(directory, "journal.jsonl")
-            tuner._evidence_path = os.path.join(directory, "evidence.json")
             tuner._args = argparse.Namespace(
                 warmup=1,
                 iters=2,
-                finalist_rounds=1,
-                strategy="exhaustive",
                 errRatio=0.0,
                 untune_file="catalogue.csv",
                 profile_file="measurements.csv",
             )
-            tuner._run_started_at = 1.0
             tuner.untunedf = _TUNER.pd.DataFrame([problem.as_row()])
             tuner.success = result.copy()
-            tuner._all_results = result.copy()
             with mock.patch.object(
                 tuner,
                 "_run_fresh_probe",
@@ -788,59 +807,7 @@ class TestMhaPublicDispatch(unittest.TestCase):
             mha.flash_attn_varlen_func(q, k, v, cu_q, cu_k, 8, 16)
 
 
-class TestMhaCheckpointJournal(unittest.TestCase):
-    def test_journal_round_trip_and_truncated_tail(self):
-        tuner = _TUNER.MhaFwdTuner()
-        problem = MhaFwdProblem.from_mapping(_problem_row())
-        candidate = MhaFwdCandidate("asm_v3", 3)
-        info = (problem.key(), *candidate.identity)
-        with tempfile.TemporaryDirectory() as directory:
-            tuner._journal_path = os.path.join(directory, "run.jsonl")
-            tuner._args = argparse.Namespace(resume=True)
-            tuner._append_journal_result("first", (info, 2.1, 0.0, "ok"))
-            tuner._append_journal_result(
-                "finalist:0",
-                (info, float("inf"), 1.0, "timeout", "exceeded 60s after 61.2s"),
-            )
-            with open(tuner._journal_path, "a", encoding="utf-8") as file:
-                file.write('{"incomplete":')
-            records = tuner._load_journal()
-        key = (mha_fwd_candidate_id(problem, candidate), "first")
-        self.assertEqual(records[key][1:], (2.1, 0.0, "ok", ""))
-        failed_key = (mha_fwd_candidate_id(problem, candidate), "finalist:0")
-        self.assertEqual(
-            records[failed_key][1:],
-            (float("inf"), 1.0, "timeout", "exceeded 60s after 61.2s"),
-        )
-
-    def test_journal_reads_records_written_before_details_existed(self):
-        tuner = _TUNER.MhaFwdTuner()
-        problem = MhaFwdProblem.from_mapping(_problem_row())
-        candidate = MhaFwdCandidate("asm_v3", 3)
-        legacy = {
-            "schema_version": 1,
-            "candidate_id": mha_fwd_candidate_id(problem, candidate),
-            "phase": "first",
-            "problem": problem.as_row(),
-            "candidate": {
-                "backend": candidate.backend,
-                "num_splits": candidate.num_splits,
-                "backend_config": "",
-            },
-            "status": "crash",
-            "us": None,
-            "errRatio": 1.0,
-            "recorded_at_unix_s": 0.0,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            tuner._journal_path = os.path.join(directory, "run.jsonl")
-            tuner._args = argparse.Namespace(resume=True)
-            with open(tuner._journal_path, "w", encoding="utf-8") as file:
-                file.write(json.dumps(legacy) + "\n")
-            records = tuner._load_journal()
-        key = (mha_fwd_candidate_id(problem, candidate), "first")
-        self.assertEqual(records[key][1:], (float("inf"), 1.0, "crash", ""))
-
+class TestMhaSelectionProbe(unittest.TestCase):
     def test_fresh_probe_invokes_module_from_repo_root(self):
         tuner = _TUNER.MhaFwdTuner()
         tuner._args = argparse.Namespace(warmup=1, iters=2, timeout=5)
@@ -880,53 +847,6 @@ class TestMhaCheckpointJournal(unittest.TestCase):
             [(row["family"], row["backend"], row["num_splits"]) for row in rows],
             [("mha_fwd", "asm_v3", 3), ("mha_fwd", "ck", 0)],
         )
-
-    def test_runtime_and_evidence_are_written_separately(self):
-        tuner = _TUNER.MhaFwdTuner()
-        problem = MhaFwdProblem.from_mapping(_problem_row())
-        row = {
-            **problem.as_row(),
-            "backend": "asm_v3",
-            "num_splits": 3,
-            "backend_config": "",
-            "us": 2.1,
-            "errRatio": 0.0,
-            "status": "ok",
-            "detail": "",
-            "samples_us": "[2.1]",
-            "tflops": 1.0,
-        }
-        result = _TUNER.pd.DataFrame([row], columns=tuner.columns)
-        with tempfile.TemporaryDirectory() as directory:
-            runtime = os.path.join(directory, "runtime.csv")
-            tuner._journal_path = os.path.join(directory, "journal.jsonl")
-            tuner._evidence_path = os.path.join(directory, "evidence.json")
-            tuner._args = argparse.Namespace(
-                warmup=1,
-                iters=2,
-                finalist_rounds=1,
-                strategy="exhaustive",
-                errRatio=0.0,
-                untune_file="catalogue.csv",
-                profile_file="measurements.csv",
-            )
-            tuner._run_started_at = 1.0
-            tuner.untunedf = _TUNER.pd.DataFrame([problem.as_row()])
-            tuner.success = result.copy()
-            tuner._all_results = result.copy()
-            with mock.patch.object(
-                tuner,
-                "_run_fresh_probe",
-                return_value={"status": "verified"},
-            ):
-                tuner.result_to_csv(result, runtime)
-            with open(runtime, encoding="utf-8", newline="") as file:
-                runtime_fields = tuple(csv.DictReader(file).fieldnames or ())
-            with open(tuner._evidence_path, encoding="utf-8") as file:
-                evidence = json.load(file)
-        self.assertEqual(runtime_fields, MHA_FWD_RUNTIME_CSV_FIELDS)
-        self.assertEqual(evidence["run_state"], "verified")
-        self.assertEqual(evidence["measurement"]["candidate_count"], 1)
 
 
 if __name__ == "__main__":

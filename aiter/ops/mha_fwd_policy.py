@@ -523,36 +523,14 @@ MHA_FWD_TASK_TIMEOUT_S = 7200
 # are measurement and promotion policy that other families need unchanged,
 # and they are candidates for a central tuning-policy module.
 
-# Multiples of the combined standard error a winner must clear before it
-# displaces the configuration already in use. Two is the conventional ~95%
-# two-sample separation; the point is that the bar is stated once and is
-# visible in the evidence rather than implied by whichever candidate sorted
-# first.
-MHA_FWD_SIGNIFICANCE_SIGMA = 2.0
-
-# The indifference zone the race uses, as a fraction of the leader's latency.
-# This is a reproducibility threshold rather than a taste parameter: an
-# unchanged configuration moves by roughly this much between sessions on this
-# hardware, so resolving differences below it would be resolving differences
-# that do not survive to the next run. Under the race strategy it is also the
-# bar a challenger must clear to displace the incumbent, because a shrinking
-# standard-error test and a fixed indifference zone disagree about what a tie
-# is, and running both would let one promote what the other called settled.
+# The margin a winner must beat the configuration already in use by, as a
+# fraction of the incumbent's latency. This is a reproducibility threshold
+# rather than a taste parameter: an unchanged configuration moves by roughly
+# this much between sessions on this hardware, so a smaller win is not one
+# the next run would reproduce.
 MHA_FWD_INDIFFERENCE_DELTA = 0.02
 
-# The fastest candidates per shape after the first pass, re-measured over
-# this many fresh-worker rounds before the median decides.
-MHA_FWD_FINALISTS = 8
-MHA_FWD_FINALIST_ROUNDS = 3
-
-# The race's error budget, timed calls per candidate per block, and the block
-# counts before elimination may start and at which the race stops uncertified.
-MHA_FWD_RACE_ALPHA = 0.05
-MHA_FWD_RACE_BLOCK_CALLS = 10
-MHA_FWD_RACE_MIN_BLOCKS = 3
-MHA_FWD_RACE_MAX_BLOCKS = 30
-
-# Seeds --candidate-sample and the race's block order, so a run is repeatable.
+# Seeds --candidate-sample, so a run is repeatable.
 MHA_FWD_SAMPLE_SEED = 20240917
 
 
