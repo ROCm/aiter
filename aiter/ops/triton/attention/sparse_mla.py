@@ -711,6 +711,7 @@ def sparse_mla_fwd(
         ADAPTIVE_SPLITS=num_splits > 1,
         lse_ptr=lse,
         HAS_LSE=return_lse,
-        num_warps=4,
+        # A 2-split tile spans two warps; more warps would hold duplicate lanes.
+        num_warps=min(4, grid_splits),
     )
     return out, (lse if return_lse else None)
