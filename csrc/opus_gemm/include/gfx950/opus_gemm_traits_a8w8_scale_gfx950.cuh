@@ -532,8 +532,8 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // so the panel lives in that floor division's remainder, which varies with
     // B_M and B_K. Measured, kid324/326 have 1.7-3.5 KiB spare (the bound is
     // real for them) while kid336/342 have 52-109 KiB (it is 13-27x loose). See
-    // the base traits' SF_PRELOAD_K_MAX note.
-    static constexpr int SF_PRELOAD_K_MAX = 8192;
+    // the base traits' SF_PRELOAD_K_MAX note. Defined below prefetch_k_iter,
+    // because at GROUP_K=32 it is derived from what the staging leaves.
     // B scale groups spanned by one N-wave's columns. The consumer N-waves read
     // blocked column ranges (nbc, and the matching SPLIT_N_STORE), so wave w owns
     // the contiguous COM_REP_N*W_N columns at w*COM_REP_N*W_N and therefore its
@@ -627,34 +627,63 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // untouched. Decided here rather than by a template flag on purpose: the
     // codegen and every existing instantiation stay exactly as they are, and the
     // gate is precisely "the kids the panel cannot serve".
-    static constexpr bool SF_USE_RING = SF_PER_MFMA_K > 1;
     // The two producer waves share the fill, the same split a_buffer_load_insts
     // makes with its slots / 2.
     static constexpr int SF_RING_PROD_LANES = 2 * opus::get_warp_size();
-    // Widest per-lane chunk the prefetch depth can afford.
-    //
-    // Wider wastes fewer instructions on the small B side but pads more, and
-    // the padding is charged to every prefetch slot -- so the choice is not
-    // free, it trades vm instructions against depth. Tried widest-first, so a
-    // tile only pays the narrow form when its budget is genuinely tight:
-    // kid 9319 has 40,960 bytes for a 12,672-byte stage, where a 1,024-byte
-    // slot drops the depth to 2 and the pipeline needs 3.
-    //
-    // A chunk must also stay inside one row and keep its source offset
-    // naturally aligned, hence dividing the row width.
-    static constexpr int sf_ring_slot_for(int vec) {
-        const int chunk = SF_RING_PROD_LANES * vec;
-        return ((B_M / GROUP_M * SCALES_PER_BK + chunk - 1) / chunk
-                + (N_SCALE_GROUPS * SCALES_PER_BK + chunk - 1) / chunk) * chunk;
+    // Two fill shapes, because buffer_load ... lds advances the LDS address by
+    // TID*4 for byte, short and dword loads alike:
+    //   * GROUP_K=32: one dword per lane, four scales of one row. The row is
+    //     SCALES_PER_BK >= 4 bytes, so a chunk stays inside it and lands dense.
+    //   * GROUP_K=128: a row is one or two bytes per K tile, too short for a
+    //     dword, so one byte per lane, and each scale then occupies a dword of
+    //     LDS (SF_RING_ESTRIDE) -- the consumer reads it at element * 4.
+    // A 2-byte chunk fits neither: it leaves a 2-byte hole after every lane
+    // that the dense index does not skip (kid 9319/9243 returned wrong answers
+    // on exactly that).
+    static constexpr int SF_RING_VEC = SF_PER_MFMA_K > 1 ? 4 : 1;
+    static constexpr int SF_RING_ESTRIDE = 4 / SF_RING_VEC;
+    // One wave's copy, not the producer pair's: the pair splits the slot's
+    // wave-sized chunks between them, so a small side costs one wave's
+    // instruction rather than both waves'. With a pair-wide chunk the 32x32
+    // tile issued two 512-byte copies per wave per tile to move 256 bytes of A
+    // and 8 of B (PMC on kid9398: +24% VMEM reads, +35% TCP accesses against
+    // its 128 twin); per wave it is one.
+    static constexpr int SF_RING_CHUNK = opus::get_warp_size() * SF_RING_VEC;
+    static constexpr int SF_RING_A_CHUNKS =
+        (B_M / GROUP_M * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK;
+    static constexpr int SF_RING_B_CHUNKS =
+        (N_SCALE_GROUPS * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK;
+    // Rounded to the pair so both waves issue the same count (see
+    // sf_ring_load_insts); the odd one out is a padding copy.
+    static constexpr int SF_RING_CHUNKS = (SF_RING_A_CHUNKS + SF_RING_B_CHUNKS + 1) / 2 * 2;
+    // Padded element counts per side; the LDS bytes are these times ESTRIDE.
+    static constexpr int SF_RING_A_ELEMS = SF_RING_A_CHUNKS * SF_RING_CHUNK;
+    static constexpr int SF_RING_B_ELEMS =
+        (SF_RING_CHUNKS - SF_RING_A_CHUNKS) * SF_RING_CHUNK;
+    static constexpr int sf_ring_depth_cap(int budget) {
+        return (B_DIRECT_REG_ && budget > 3) ? 3 : budget;
     }
-    static constexpr int sf_ring_depth_for(int vec) {
-        return max_lds_size_per_wg / (per_block_iter_lds_size + sf_ring_slot_for(vec));
-    }
-    static constexpr int SF_RING_VEC =
-        (SCALES_PER_BK % 4 == 0 && sf_ring_depth_for(4) >= 3) ? 4
-        : (SCALES_PER_BK % 2 == 0 && sf_ring_depth_for(2) >= 3) ? 2
-        : 1;
-    static constexpr int SF_RING_CHUNK = SF_RING_PROD_LANES * SF_RING_VEC;
+    static constexpr int SF_RING_SLOT_BYTES =
+        (SF_RING_A_ELEMS + SF_RING_B_ELEMS) * SF_RING_ESTRIDE;
+    // One slot more than the A/B ring. The consumer reads a tile's scales at
+    // its MMA, which runs one barrier after the tile's A/B went to registers,
+    // and by then the producer has already refilled that A/B slot with tile
+    // k + prefetch_k_iter. Sharing the index made the scales a race that only
+    // loses under load: every twin passed at m16 and 8171/8173 did not at
+    // m1024. The extra slot is what that refill lands in instead.
+    static constexpr int SF_RING_DEPTH = sf_ring_depth_cap(
+        (max_lds_size_per_wg - SF_RING_SLOT_BYTES)
+        / (per_block_iter_lds_size + SF_RING_SLOT_BYTES));
+    // GROUP_K=32 takes the ring whenever a depth-3 slot fits -- 9319 has 40,960
+    // bytes for a 12,672-byte stage, and a 1,024-byte slot drops it to 2, so it
+    // keeps the per-MFMA global path. GROUP_K=128 only where the ring costs the
+    // A/B prefetch nothing: those kids already have a working schedule, and a
+    // shallower one would trade their tile latency for their scale latency.
+    // (PRELOAD_SF_LDS 128 kids keep their panel; the pipeline decides that.)
+    static constexpr bool SF_USE_RING = SF_PER_MFMA_K > 1
+        ? (SCALES_PER_BK % SF_RING_VEC == 0 && SF_RING_DEPTH >= 3)
+        : (SF_RING_DEPTH >= 3
+           && SF_RING_DEPTH == sf_ring_depth_cap(max_lds_size_per_wg / per_block_iter_lds_size));
     // Each side is padded to a whole number of chunks, and the two are separate
     // because they come from different global buffers -- a lane's chunk must not
     // span the boundary.
@@ -668,18 +697,16 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // LDS writes landed. With padding every lane always issues; the out-of-range
     // global reads return zero through the buffer's num_records bound and land
     // in slot padding nobody reads.
-    static constexpr int SF_RING_A_BYTES =
-        (B_M / GROUP_M * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK
-        * SF_RING_CHUNK;
-    static constexpr int SF_RING_B_BYTES =
-        (N_SCALE_GROUPS * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK
-        * SF_RING_CHUNK;
+    static constexpr int SF_RING_A_BYTES = SF_RING_A_ELEMS * SF_RING_ESTRIDE;
+    static constexpr int SF_RING_B_BYTES = SF_RING_B_ELEMS * SF_RING_ESTRIDE;
     static constexpr int SF_RING_SLOT = SF_RING_A_BYTES + SF_RING_B_BYTES;
+    // The byte fill leaves the lane's K scales a dword apart, so they are read
+    // one at a time rather than as SF_LANE_LOAD_VEC contiguous bytes.
+    static constexpr int SF_RING_LOAD_VEC = SF_RING_ESTRIDE == 1 ? SF_LANE_LOAD_VEC : 1;
     // Counted rather than estimated because mb feeds every
     // s_waitcnt_vmcnt(number<mb * p>) in the producer, and being off by one
     // there is a race, not a wrong number.
-    static constexpr int sf_ring_load_insts =
-        SF_RING_A_BYTES / SF_RING_CHUNK + SF_RING_B_BYTES / SF_RING_CHUNK;
+    static constexpr int sf_ring_load_insts = SF_RING_CHUNKS / 2;
 
     // A scale ring slot is charged to every prefetch slot, so the depth is
     // solved against their sum rather than the ring being added afterwards.
@@ -691,13 +718,42 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // per_block_iter_lds_size). That headroom is deliberately not spent on more
     // slots: 4 measured ~25% slower than 3, occupancy here being VGPR-bound
     // rather than LDS-bound.
-    static constexpr int prefetch_k_iter_budget =
-        max_lds_size_per_wg / (per_block_iter_lds_size + (SF_USE_RING ? SF_RING_SLOT : 0));
+    static constexpr int prefetch_k_iter_budget = SF_USE_RING
+        ? (max_lds_size_per_wg - SF_RING_SLOT) / (per_block_iter_lds_size + SF_RING_SLOT)
+        : max_lds_size_per_wg / per_block_iter_lds_size;
     static constexpr int prefetch_k_iter =
         (B_DIRECT_REG_ && prefetch_k_iter_budget > 3) ? 3 : prefetch_k_iter_budget;
     static_assert(prefetch_k_iter >= 3,
                   "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
-    static constexpr int SF_RING_LDS = prefetch_k_iter * SF_RING_SLOT;
+    static constexpr int SF_RING_SLOTS = prefetch_k_iter + 1;
+    static constexpr int SF_RING_LDS = SF_RING_SLOTS * SF_RING_SLOT;
+    // Whether a GROUP_K=32 preload kid can keep the whole-split panel after
+    // all. The panel is what the large tiles cannot hold (168-185 KiB at 8192
+    // of K), but a small one can: 32 rows and one B group is 8.4 KiB. Those
+    // are exactly the tiles whose 128 mirror wins by its panel -- kid8398 took
+    // m32-128 at K=4096 from kid9398's ring by 13-20% -- so they keep it at 32
+    // too, and only the rest go to the ring. The pipeline makes the choice.
+    //
+    // At 32 the reach is what fits beside the staging, capped at the 128
+    // kids' 8192 and floored at 4096 (the K of every DSV4 row; split-K goes
+    // past it). A tile that cannot reach 4096 takes the ring and keeps 8192,
+    // which is then only the launcher's per-split bound, as it was.
+    static constexpr int SF_PANEL_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
+    // Bytes the pipeline pads each 32 panel row by (see SF_PANEL_PAD there);
+    // budgeted whether or not a given kid ends up using it.
+    static constexpr int SF_PANEL_PAD = 16;
+    static constexpr int sf_panel_k_fit =
+        ((max_lds_size_per_wg - prefetch_k_iter * per_block_iter_lds_size - 256)
+         / SF_PANEL_ROWS - SF_PANEL_PAD) * GROUP_K / B_K * B_K;
+    // Less the LDS-B 128x128x128 tile, which stays on the ring. Its GROUP_K=32
+    // form is wrong on every path but the ring -- 9231/9232 (global scales) are
+    // held out of the catalogue for it, and 9229/9325 on this panel returned
+    // rel 0.03 at m16 and inf from m128, at any K, with the LDS as allocated
+    // (163,328) inside the CU. Its 128 mirror, 8229, is right on the panel.
+    static constexpr bool SF_PANEL_FITS = SF_PER_MFMA_K > 1 && sf_panel_k_fit >= 4096
+        && !(B_M == 128 && B_N == 128 && B_K == 128 && !B_DIRECT_REG_);
+    static constexpr int SF_PRELOAD_K_MAX =
+        SF_PANEL_FITS ? (sf_panel_k_fit < 8192 ? sf_panel_k_fit : 8192) : 8192;
 
 
 
@@ -991,8 +1047,17 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int GROUP_M = opus::get<0>(GROUP{});
     static constexpr int GROUP_N = opus::get<1>(GROUP{});
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
-    static_assert(GROUP_M == 1 && GROUP_N == 128 && GROUP_K == 128);
+    static_assert(GROUP_M == 1 && (GROUP_N == 128 || GROUP_N == 32)
+                  && (GROUP_K == 128 || GROUP_K == 32));
     static_assert(B_K % GROUP_K == 0);
+    // Per-lane MX blocks, as in the flatmm traits (see SF_PER_MFMA_K there): at
+    // GROUP_K=32 each lane quarter of an MFMA owns one block, and the lane picks
+    // its byte by lane_id / W_M. All of these collapse to the 128 values.
+    static constexpr int SF_PER_MFMA_K = W_K / GROUP_K;
+    static constexpr int SF_LANE_K_QUARTERS = opus::get_warp_size() / W_M;
+    static_assert(SF_LANE_K_QUARTERS % SF_PER_MFMA_K == 0,
+                  "an MX block must not span part of a lane's K range");
+    static constexpr int SF_LANE_K_DIV = SF_LANE_K_QUARTERS / SF_PER_MFMA_K;
 
     static constexpr int LOAD_GROUP_M = T_M * W_M;
     static constexpr int LOAD_GROUP_N = 64;
@@ -1006,7 +1071,7 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static_assert(NUM_LOAD_GROUPS_PER_BN * LOAD_GROUP_N == B_N);
     static_assert(T_M * W_M == LOAD_GROUP_M,
                   "the T_M waves must exactly divide one A load group's rows");
-    static_assert(NUM_LOAD_GROUPS_PER_BK == B_K / GROUP_K);
+    static_assert(NUM_LOAD_GROUPS_PER_BK * SF_PER_MFMA_K == B_K / GROUP_K);
 
     static constexpr int COM_REP_M = B_M / (W_M * T_M);
     static constexpr int COM_REP_N = B_N / (W_N * T_N);
@@ -1038,10 +1103,14 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int  SF_A_SLOTS_K = SF_GEOM::A_SLOTS_K;
     static_assert(COM_REP_N >= 1 && B_N % (W_N * T_N) == 0);
     static_assert(COM_REP_K == NUM_LOAD_GROUPS_PER_BK);
-    static_assert(B_N <= 2 * GROUP_N);
+    // No B_N <= 2 * GROUP_N: as in the flatmm traits, the B groups are a
+    // per-wave static_for, and at GROUP_N=32 the bound would cap B_N at 64.
     static_assert(GROUP_N % B_N == 0 || B_N % GROUP_N == 0);
 
     static constexpr int SCALES_PER_BK = B_K / GROUP_K;
+    // One byte per MFMA per lane whatever GROUP_K is; equal to SCALES_PER_BK at 128.
+    static constexpr int SF_LANE_SCALES_PER_BK = COM_REP_K;
+    static_assert(SCALES_PER_BK == SF_LANE_SCALES_PER_BK * SF_PER_MFMA_K);
     static constexpr int N_SCALE_GROUPS = (B_N + GROUP_N - 1) / GROUP_N;
     // SF_PRELOAD_K_MAX is defined below, once prefetch_k_iter is known -- it is
     // derived from the LDS the staging leaves over rather than being a constant.
@@ -1130,8 +1199,12 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int SF_PANEL_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
     static constexpr int SF_PANEL_STAGING_LDS =
         prefetch_k_iter * per_block_iter_lds_size;
+    // In bytes per row, not in K: a GROUP_K=32 row is four times as many bytes
+    // per unit K, and pricing its flat panel at 8192 of K would cost the 1x4
+    // kids their second resident workgroup -- the 1.2x above. It keeps the
+    // mirror's residency and gives up reach instead.
     static constexpr int SF_PANEL_FLAT_LDS =
-        SF_PANEL_STAGING_LDS + SF_PANEL_ROWS * (8192 / GROUP_K);
+        SF_PANEL_STAGING_LDS + SF_PANEL_ROWS * (8192 / 128);
     static constexpr int SF_PANEL_RESIDENT_WGS =
         LDS_SIZE_TOTAL / SF_PANEL_FLAT_LDS < 1 ? 1 : LDS_SIZE_TOTAL / SF_PANEL_FLAT_LDS;
     static constexpr int SF_PANEL_LDS_SHARE = LDS_SIZE_TOTAL / SF_PANEL_RESIDENT_WGS;
@@ -1140,14 +1213,20 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
                                                  : max_lds_size_per_wg;
     static constexpr int SF_PANEL_LDS_BUDGET =
         SF_PANEL_LDS_CEILING - SF_PANEL_STAGING_LDS - SF_PANEL_LDS_RESERVE;
+    // The pipeline pads each M-packed A lane row by this at GROUP_K=32 (see
+    // SF_A_PAD there); T_M*W_M rows of it come off the budget first.
+    static constexpr int SF_PANEL_PAD = 16;
+    static constexpr int SF_PANEL_PAD_LDS = GROUP_K == 128 ? 0 : T_M * W_M * SF_PANEL_PAD;
     static constexpr int SF_PRELOAD_K_FIT =
-        (SF_PANEL_LDS_BUDGET / SF_PANEL_ROWS) * GROUP_K;
+        ((SF_PANEL_LDS_BUDGET - SF_PANEL_PAD_LDS) / SF_PANEL_ROWS) * GROUP_K;
     static constexpr int SF_PRELOAD_K_CAP = 32768;
     static constexpr int SF_PRELOAD_K_MAX =
         ((SF_PRELOAD_K_FIT < SF_PRELOAD_K_CAP ? SF_PRELOAD_K_FIT : SF_PRELOAD_K_CAP)
          / B_K) * B_K;
     // Never below what the flat constant already promised, so no kid loses reach.
-    static_assert(SF_PRELOAD_K_MAX >= 8192,
+    // GROUP_K=32 has no such promise and a quarter of the reach per byte; 4096
+    // is the K of every DSV4 row in the tuned table, and split-K goes past it.
+    static_assert(SF_PRELOAD_K_MAX >= (GROUP_K == 128 ? 8192 : 4096),
                   "the scale panel no longer reaches the 8192 of per-split K the "
                   "flat SF_PRELOAD_K_MAX promised; the staging above grew");
 
@@ -1179,10 +1258,11 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
                       <= SF_PANEL_LDS_CEILING,
                   "the shuffled scale panel overflows the LDS share that keeps this "
                   "kernel's workgroups resident");
-    static_assert(SF_SHUF_K_MAX >= 8192,
+    // The shuffled layout is GROUP_K=128 only, so a 32 kid never stages it.
+    static_assert(GROUP_K != 128 || SF_SHUF_K_MAX >= 8192,
                   "the shuffled scale panel no longer reaches 8192 of per-split K");
     static_assert(SF_PANEL_STAGING_LDS
-                      + (long)SF_PANEL_ROWS * SF_PRELOAD_K_MAX / GROUP_K
+                      + (long)SF_PANEL_ROWS * SF_PRELOAD_K_MAX / GROUP_K + SF_PANEL_PAD_LDS
                   <= SF_PANEL_LDS_CEILING,
                   "A staging plus the scale panel overflow the LDS share that "
                   "keeps this kernel's workgroups resident");

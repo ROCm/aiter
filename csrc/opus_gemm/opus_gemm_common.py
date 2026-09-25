@@ -1482,18 +1482,10 @@ def _mx32_twins(local, ctor, skip=frozenset(), **ctor_kwargs):
     `skip` holds mirrors whose twin clang 22 cannot compile, the same defect
     _MX32_CLANG_REGCLASS_SKIP covers for the split-K family, plus any whose twin
     is held out for returning wrong answers.
-
-    OPUS_MX32_UNSKIP=231,232 puts named mirrors back. It exists so a held-out
-    twin can be run under a diagnostic without editing the catalogue, which is
-    the only way to measure one -- and it is opt-in precisely because these kids
-    are held out for being wrong rather than for being slow.
     """
-    unskip = {
-        int(x) for x in os.environ.get("OPUS_MX32_UNSKIP", "").replace(",", " ").split()
-    }
     twins = {}
     for kid, inst in local.items():
-        if kid in skip and kid not in unskip:
+        if kid in skip:
             continue
         if inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False):
             continue
@@ -1586,7 +1578,7 @@ _bmm_bpre_bdirect_tilen_local.update(
 
 def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
                                           mpack_sfa=False, shuffle_scale=False,
-                                          sf_shuf_in_lds=False):
+                                          sf_shuf_in_lds=False, quant_block=128):
     """256x256 preshuffled-B tile over eight all-compute waves, on a 2x4 grid.
 
     This is the T_M sweep's shallow end and, with wavetm1's 1x8/1x4, all that is
@@ -1621,7 +1613,7 @@ def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
         2, 4,           # T_M, T_N (name only; traits derive the real 2x4 grid)
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
         "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
         ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
         wg_per_cu,
@@ -2035,7 +2027,8 @@ _bmm_bpre_wave8n4_local.update({
 
 def _a8w8_mxscale_bmm_bpreshuffle_wavetm1(block_size, bm, bn, bk, wg_per_cu,
                                           xcd_wgm=0, mpack_sfa=False,
-                                          shuffle_scale=False, sf_shuf_in_lds=False):
+                                          shuffle_scale=False, sf_shuf_in_lds=False,
+                                          quant_block=128):
     """The T_M=1 grid at B_M=128, where A stays in registers.
 
     Same schedule and same reason to want T_M=1 as kid195 -- no wave shares an N
@@ -2053,7 +2046,7 @@ def _a8w8_mxscale_bmm_bpreshuffle_wavetm1(block_size, bm, bn, bk, wg_per_cu,
         1, block_size // 64,  # T_M, T_N (name only; traits derive the real grid)
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
         "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
         ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
         wg_per_cu,
@@ -2386,6 +2379,31 @@ _bmm_bpre_wavetm1_local.update({
     for kid, (bs, bm, bn, bk, wg, wgm, lds)
     in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUF_TWIN_TILES.items()
 })
+
+# GROUP_K=32 twins of the two all-compute direct-B families, which own every
+# M >= 1024 cell of the 128 table. Only the plain-panel kids: shuffle_scale and
+# the host M-packed A panel are 128-block layouts, and the pipeline rejects them
+# at 32. The panel keeps its mirror's LDS bytes, so at 32 it reaches a quarter
+# of the mirror's per-split K -- SF_PRELOAD_K_MAX, which the launcher checks.
+def _mx32_wave8_twins(local, ctor, *lead):
+    return {
+        kid + MX32_KID_STRIDE: ctor(
+            *[getattr(inst, a) for a in lead],
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            xcd_wgm=inst.xcd_wgm, quant_block=32,
+        )
+        for kid, inst in local.items()
+        if not (inst.shuffle_scale or inst.mpack_sfa or inst.sf_shuf_in_lds)
+    }
+
+
+_bmm_bpre_wave8n4_local.update(
+    _mx32_wave8_twins(_bmm_bpre_wave8n4_local, _a8w8_mxscale_bmm_bpreshuffle_wave8n4)
+)
+_bmm_bpre_wavetm1_local.update(
+    _mx32_wave8_twins(_bmm_bpre_wavetm1_local, _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
+                      "BLOCK_SIZE")
+)
 
 # The shuffle_scale layout at B_K=256, tried twice as kids 211/212 (shuffle_scale, and the same tile
 # without it) and removed both times. This is the geometry where the layout costs

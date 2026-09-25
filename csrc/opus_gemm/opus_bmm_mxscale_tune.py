@@ -1175,7 +1175,10 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         if args.apply:
             args.tune_file = SHIPPED_CSV
         elif args.bpreshuffle:
-            args.tune_file = BPRESHUFFLE_CSV
+            # Only a default: -o is tune_file, and overriding it merged every
+            # run into the shipped table in place, whatever file was asked for.
+            if not args.tune_file:
+                args.tune_file = BPRESHUFFLE_CSV
             if args.pool == "all":
                 args.pool = "preb"
             # Reading and writing the shipped CSV otherwise makes every source
@@ -1208,8 +1211,17 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             shapes = self._shapes_from_shipped()
         shapes = _validate_tune_shapes(shapes)
 
+        # One row per (shape, group), because groupSize is part of the key. Left
+        # out, every row carried NaN there while tune() reported results under
+        # the kid's real group, so the base tuner matched no result to any
+        # input and wrote an empty table however many candidates passed.
+        groups = sorted(
+            set(args.groupSize) if args.groupSize
+            else {_kid_group(kid) for kid in _CANDIDATE_KIDS}
+        )
         self.untunedf = pd.DataFrame(
-            [{"gfx": gfx, "b": g, "m": m, "n": n, "k": k} for (g, m, n, k) in shapes],
+            [{"gfx": gfx, "b": g, "m": m, "n": n, "k": k, "groupSize": grp}
+             for (g, m, n, k) in shapes for grp in groups],
             columns=self.keys,
         )
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
@@ -1386,6 +1398,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             m = int(untunedf.loc[i, "m"])
             n = int(untunedf.loc[i, "n"])
             k = int(untunedf.loc[i, "k"])
+            row_group = int(untunedf.loc[i, "groupSize"])
             # Per shape, not per sweep: the graph is a win only where the
             # eager per-dispatch floor is a material fraction of the kernel.
             # Whatever this resolves to, it is the same for every candidate on
@@ -1402,7 +1415,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                 # Per kid, not per shape: the block size is the kid's, and each
                 # block size deserves its own winning row.
                 group = _kid_group(kid)
-                if args.groupSize and group not in args.groupSize:
+                if group != row_group:
                     continue
                 info_keys = (gfx, b, m, n, k, group)
                 for sk in _applicable(kid, b, m, n, k, args.pool):

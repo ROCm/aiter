@@ -561,7 +561,9 @@ __attribute__((always_inline)) OPUS_D int sf_lane_k_block(int lane_id, int frag_
     }
 }
 
-template<typename T>
+// KSTRIDE spaces consecutive K scales that many bytes apart: 1 everywhere but
+// the GROUP_K=128 scale ring, whose byte fill lands one scale per dword.
+template<typename T, int KSTRIDE = 1>
 inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stride_sfa) {
     // The K side is two dims so the lane's own MX block can be addressed: the
     // y dim steps one per MFMA and the p dim picks the block inside it. Their
@@ -587,7 +589,7 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
     return opus::make_layout(
         sfa_block_shape,
         opus::unfold_x_stride(sfa_block_dim, sfa_block_shape,
-            opus::tuple{stride_sfa, 1_I}),
+            opus::tuple{stride_sfa, opus::number<KSTRIDE>{}}),
         opus::unfold_p_coord(sfa_block_dim,
             opus::tuple{wave_id_m, lane_id % T::W_M,
                         sf_lane_k_block<T>(lane_id, T::W_M)}));
@@ -654,11 +656,19 @@ __attribute__((always_inline)) OPUS_D int sf_scale_word(S scale) {
 // register class" on kid326, a 128 kernel this work is supposed to leave
 // untouched. The code these emit inline is what the call sites used to hold
 // verbatim, so forcing that back is restoring the old shape, not tuning.
-template<typename T, int NG, typename Mem, typename VSFB>
+// ES is the byte distance between consecutive K scales: 1 except in the
+// GROUP_K=128 scale ring (see make_layout_sfa_mxsk's KSTRIDE).
+template<typename T, int NG, int ES = 1, typename Mem, typename VSFB>
 __attribute__((always_inline)) OPUS_D void
 load_sfb_lane(Mem& mem, int row_base, int lane_k, VSFB& v_sfb) {
     constexpr int slot = NG * T::SF_LANE_SCALES_PER_BK;
-    if constexpr (T::SF_PER_MFMA_K == 1) {
+    if constexpr (ES != 1) {
+        opus::static_for<T::SF_LANE_SCALES_PER_BK>([&](auto ik_c) {
+            constexpr int ik = decltype(ik_c)::value;
+            v_sfb[slot + ik] =
+                opus::load<1>(mem, row_base + (ik * T::SF_PER_MFMA_K + lane_k) * ES)[0];
+        });
+    } else if constexpr (T::SF_PER_MFMA_K == 1) {
         auto sfb = opus::load<T::SF_LANE_SCALES_PER_BK>(mem, row_base);
         opus::static_for<T::SF_LANE_SCALES_PER_BK>([&](auto ik_c) {
             constexpr int ik = decltype(ik_c)::value;
@@ -1049,7 +1059,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // template flag so the codegen and every existing instantiation stay as they
     // are: GROUP_K=128 keeps the whole-split panel described at the LDS sizing
     // below, GROUP_K=32 takes the ring, because the panel cannot hold a 32 split.
-    constexpr bool SF_PANEL = PRELOAD_SF_LDS && !T::SF_USE_RING;
+    // GROUP_K=32 preload kids keep the panel wherever it fits (SF_PANEL_FITS),
+    // and take the ring otherwise.
+    constexpr bool SF_PANEL = PRELOAD_SF_LDS && (T::SF_PER_MFMA_K == 1 || T::SF_PANEL_FITS);
+    static_assert(!(PRELOAD_SF_LDS && !SF_PANEL && !T::SF_USE_RING),
+                  "a GROUP_K=32 preload kid needs the panel or the ring, and neither fits");
     // The ring is no longer tied to PRELOAD_SF_LDS, because at GROUP_K=32 the
     // global path it replaces is worse for every kid, not only for the ones
     // that had opted into a panel.
@@ -1066,13 +1080,20 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // The ring sidesteps that stride: the producer stages a slot with
     // SF_RING_VEC-wide chunked copies and the consumer reads LDS. Its LDS is
     // already paid for -- prefetch_k_iter subtracts SF_RING_SLOT whenever
-    // SF_USE_RING, which is every GROUP_K=32 kid -- so the kids this turns on
-    // have been carrying the cost without the benefit.
+    // SF_USE_RING, which is every GROUP_K=32 kid whose dword-wide slot fits at
+    // depth 3 -- so the kids this turns on have been carrying the cost without
+    // the benefit.
     //
     // SHUFFLE_SCALE reads its own pre-laid-out words and never the ring, and
     // DIRECT_ONLY has its own staging schedule that the ring fill is not part
     // of; both keep the path they had.
-    constexpr bool SF_RING = T::SF_USE_RING && !SHUFFLE_SCALE && !DIRECT_ONLY;
+    //
+    // At GROUP_K=128 the non-preload kids take it too: their per-tile global
+    // scale load is waited on right before the MFMAs and is exposed there --
+    // kid8137's ATT puts 22% of its cycles on that one wait, and its 32 twin,
+    // on the ring, runs in 0.79x the time. The traits only allow it where the
+    // slot leaves the A/B prefetch depth where it was.
+    constexpr bool SF_RING = T::SF_USE_RING && !SF_PANEL && !SHUFFLE_SCALE && !DIRECT_ONLY;
     // Where the scales come from, which is what the waits below turn on. Keyed
     // on this rather than on PRELOAD_SF_LDS: a ring kid reads its scales out of
     // LDS whether or not it asked for a panel, and reading them without the
@@ -1202,16 +1223,31 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr int SFA_K_TILES_MAX  = SF_PANEL ? (SFA_K_MAX / T::B_K) : 1;
     constexpr int SF_SCALES_MAX    = SFA_K_TILES_MAX * T::SCALES_PER_BK;
     constexpr int SFA_ROWS         = T::B_M / T::GROUP_M;
+    // GROUP_K=32 panel kids overlap too, whatever their tile: their panel is
+    // four times a 128 kid's and its fill sits in front of the first barrier.
+    // The DMA cannot pad, so SF_SWZ swizzles the panel instead.
+    constexpr bool SF_PLAIN_OVERLAP_PROLOGUE =
+        PRELOAD_SF_LDS && T::BLOCK_SIZE == 256
+        && ((T::SF_PER_MFMA_K == 1 && T::B_N == 32
+             && ((!T::B_DIRECT_REG && T::B_M == 32 && T::B_K == 256)
+                 || (T::B_DIRECT_REG && T::B_M == 16 && T::B_K == 512)))
+            || (T::SF_PER_MFMA_K > 1 && SF_PANEL && !T::ALL_WAVE));
+    // Row padding for the GROUP_K=32 panel. A wave's 16 lanes read 16 rows, and
+    // at 32 a row is K/32 bytes -- 32 dwords at K=4096 -- so unpadded they land
+    // on two banks: PMC puts 4.2x / 5.0x the 128 kids' LDS bank conflicts on
+    // kid9348 / kid9338, and 1.5x / 6.9x their LDS wait. 16 bytes keeps the
+    // fill's 16-byte stores aligned and spreads the 16 rows over 16 banks. The
+    // overlap-prologue fill is a DMA whose destination has to run contiguous
+    // per wave, so it stays unpadded; so does 128, whose rows are a quarter as
+    // long and whose LDS this work leaves alone.
+    constexpr int SF_PANEL_PAD =
+        (SF_PANEL && T::SF_PER_MFMA_K > 1 && !SF_PLAIN_OVERLAP_PROLOGUE) ? T::SF_PANEL_PAD : 0;
     constexpr int SF_LDS_ELEMS     =
-        SF_PANEL ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX)
+        SF_PANEL ? ((SFA_ROWS + T::N_SCALE_GROUPS) * (SF_SCALES_MAX + SF_PANEL_PAD))
                  : (SF_RING ? T::SF_RING_LDS : 1);
     // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
     // only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS];
-    constexpr bool SF_PLAIN_OVERLAP_PROLOGUE =
-        PRELOAD_SF_LDS && T::BLOCK_SIZE == 256 && T::B_N == 32
-        && ((!T::B_DIRECT_REG && T::B_M == 32 && T::B_K == 256)
-            || (T::B_DIRECT_REG && T::B_M == 16 && T::B_K == 512));
 
     // SF_SHUF_IN_LDS: the shuffled scale panel. Words, not bytes -- the layout's unit
     // is the dword, and staging anything finer would have to unpack and repack it.
@@ -1259,8 +1295,22 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // the two LDS panel base pointers. SFB is packed immediately after SFA using
     // the runtime SFA size so both stay compact regardless of K.
     const int sf_k_scales = loops * T::SCALES_PER_BK;
+    // The panels' row pitch: the packed count plus SF_PANEL_PAD.
+    const int sf_pitch = sf_k_scales + SF_PANEL_PAD;
+    // The overlap-prologue fill is a DMA, so the 32 panel it lands cannot be
+    // padded against bank conflicts (kid9398: 10x its 128 twin's). It is
+    // swizzled instead, which a DMA can do because only the source moves: row
+    // r's 16-byte chunk c holds the row's chunk c ^ ((r >> 1) & mask), so the
+    // 16 rows a wave reads land on 16 bank groups rather than two. mask is 0,
+    // i.e. no swizzle, unless the fill is the 16-byte one and a row has a
+    // power-of-two chunk count -- the consumer tests the same two things.
+    constexpr bool SF_SWZ = SF_PLAIN_OVERLAP_PROLOGUE && T::SF_PER_MFMA_K > 1;
+    const int sf_chunks = sf_k_scales >> 4;
+    const int sf_swz_mask =
+        (SF_SWZ && ((sf_k_scales | kargs.stride_sfa) & 15) == 0
+         && (sf_chunks & (sf_chunks - 1)) == 0) ? sf_chunks - 1 : 0;
     D_SF* s_sfa_ptr = smem_sf;
-    D_SF* s_sfb_ptr = smem_sf + SFA_ROWS * sf_k_scales;
+    D_SF* s_sfb_ptr = smem_sf + SFA_ROWS * sf_pitch;
     constexpr int mb_a = T::a_buffer_load_insts;
     // B_DIRECT_REG issues no staged B, so it contributes nothing to mb.
     constexpr int mb_b = T::B_DIRECT_REG ? 0 : T::b_buffer_load_insts;
@@ -1440,29 +1490,32 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         // its row in the pointer so it passes 0; g_sfb no longer carries its
         // group base, so it passes sfb_base.
         auto fill = [&](auto vec_c, auto sm, auto g, D_SF* dst,
-                        int stride, int base, int total) {
+                        int stride, int base, int total, int swz_mask) {
             constexpr int VEC = decltype(vec_c)::value;
             for (int idx = tid * VEC; idx < total; idx += SF_FILL_THREADS * VEC) {
                 const int r  = idx / sf_k_scales;
                 const int kt = idx - r * sf_k_scales;
                 if constexpr (SF_PLAIN_OVERLAP_PROLOGUE) {
-                    static_assert(T::COM_REP_M == 1,
-                                  "direct plain-panel DMA requires identity M packing");
-                    g.template async_load<VEC>(dst + idx, base + r * stride + kt);
+                    int src_kt = kt;
+                    if constexpr (SF_SWZ && VEC == 16)
+                        src_kt = ((kt >> 4) ^ ((r >> 1) & swz_mask)) << 4;
+                    g.template async_load<VEC>(dst + idx, base + r * stride + src_kt);
                 } else {
-                    sm.template store<VEC>(load<VEC>(g, base + r * stride + kt), idx);
+                    sm.template store<VEC>(load<VEC>(g, base + r * stride + kt),
+                                           SF_PANEL_PAD ? r * sf_pitch + kt : idx);
                 }
             }
         };
-        auto fill_panel = [&](auto sm, auto g, D_SF* dst, int stride, int base, int total) {
+        auto fill_panel = [&](auto sm, auto g, D_SF* dst, int stride, int base, int total,
+                              int swz_mask) {
             const int widths = sf_k_scales | stride;
-            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, dst, stride, base, total);
-            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, dst, stride, base, total);
-            else                         fill(number<1>{},  sm, g, dst, stride, base, total);
+            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, dst, stride, base, total, swz_mask);
+            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, dst, stride, base, total, 0);
+            else                         fill(number<1>{},  sm, g, dst, stride, base, total, 0);
         };
         if (!SF_PLAIN_OVERLAP_PROLOGUE || role == 1) {
-            fill_panel(sm_sfa, g_sfa, s_sfa_ptr, kargs.stride_sfa, 0, sfa_total);
-            fill_panel(sm_sfb, g_sfb, s_sfb_ptr, kargs.stride_sfb, sfb_base, sfb_total);
+            fill_panel(sm_sfa, g_sfa, s_sfa_ptr, kargs.stride_sfa, 0, sfa_total, sf_swz_mask);
+            fill_panel(sm_sfb, g_sfb, s_sfb_ptr, kargs.stride_sfb, sfb_base, sfb_total, 0);
         }
         // vmcnt retires the global reads feeding the panel; lgkmcnt retires the
         // ds_writes that actually publish it. s_barrier does neither on its own.
@@ -1593,32 +1646,36 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 constexpr int VEC   = T::SF_RING_VEC;
                 constexpr int CHUNK = T::SF_RING_CHUNK;
                 constexpr int SPBK  = T::SCALES_PER_BK;
+                constexpr int A_CH  = T::SF_RING_A_CHUNKS;
+                // Element idx lands at idx * ESTRIDE: 1 for the dword fill,
+                // 4 for the byte fill, whose lanes the hardware spaces a dword
+                // apart.
+                constexpr int ES = T::SF_RING_ESTRIDE;
                 D_SF* slot = smem_sf
-                           + (issue_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
+                           + (issue_k % T::SF_RING_SLOTS) * T::SF_RING_SLOT;
                 // The LDS destination has to be wave-uniform: buffer_load_lds
-                // adds lane_id * size to it itself. So only the wave's share of
-                // the chunk goes in the pointer, and the lane term appears just
-                // once -- in the global offset, which is a VGPR and per-lane by
-                // nature. Folding the lane into both is what the first version
-                // did, and it wrote outside the slot.
-                const int wave_base =
-                    wave_id_prod * (int)opus::get_warp_size() * VEC;
+                // adds lane_id * size to it itself. So only the chunk goes in
+                // the pointer, and the lane term appears just once -- in the
+                // global offset, which is a VGPR and per-lane by nature.
                 const int lane_off = lane_id * VEC;
                 const int k_off = issue_k * SPBK;
-                opus::static_for<T::SF_RING_A_BYTES / CHUNK>([&](auto c_c) {
-                    constexpr int c = decltype(c_c)::value * CHUNK;
-                    const int idx = c + wave_base + lane_off;
-                    async_load<VEC>(g_sfa, slot + c + wave_base,
-                                    (idx / SPBK) * kargs.stride_sfa
-                                        + k_off + idx % SPBK);
-                });
-                D_SF* slot_b = slot + T::SF_RING_A_BYTES;
-                opus::static_for<T::SF_RING_B_BYTES / CHUNK>([&](auto c_c) {
-                    constexpr int c = decltype(c_c)::value * CHUNK;
-                    const int idx = c + wave_base + lane_off;
-                    async_load<VEC>(g_sfb, slot_b + c + wave_base,
-                                    sfb_base + (idx / SPBK) * kargs.stride_sfb
-                                        + k_off + idx % SPBK);
+                // Chunk j of the slot is this wave's instruction j/2, so the two
+                // producer waves alternate over A's chunks and then B's. The side
+                // is wave-uniform, and every wave issues sf_ring_load_insts
+                // copies whichever it lands on.
+                opus::static_for<T::sf_ring_load_insts>([&](auto i_c) {
+                    const int j = 2 * decltype(i_c)::value + wave_id_prod;
+                    if (j < A_CH) {
+                        const int idx = j * CHUNK + lane_off;
+                        async_load<VEC>(g_sfa, slot + j * CHUNK * ES,
+                                        (idx / SPBK) * kargs.stride_sfa
+                                            + k_off + idx % SPBK);
+                    } else {
+                        const int idx = (j - A_CH) * CHUNK + lane_off;
+                        async_load<VEC>(g_sfb, slot + j * CHUNK * ES,
+                                        sfb_base + (idx / SPBK) * kargs.stride_sfb
+                                            + k_off + idx % SPBK);
+                    }
                 });
             }
         };
@@ -1713,11 +1770,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
         // LDS read layout for the preloaded SFA panel: same lane/wave mapping as
         // u_sfa but with the compact per-row K-scale count as the row stride.
-        auto u_sfa_lds = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, sf_k_scales);
+        auto u_sfa_lds = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, sf_pitch);
         // The ring's rows are one K tile wide, so its stride is compile-time and
         // the slot base carries the K position instead of a scale_base offset.
-        auto u_sfa_ring =
-            make_layout_sfa_mxsk<T>(lane_id, wave_id_m, T::SCALES_PER_BK);
+        auto u_sfa_ring = make_layout_sfa_mxsk<T, T::SF_RING_ESTRIDE>(
+            lane_id, wave_id_m, T::SCALES_PER_BK * T::SF_RING_ESTRIDE);
 
         // ALL_WAVE staging. Each of the four waves owns a quarter of every async
         // copy (LOAD_WAVES=4) and stages it itself, in place of the producer
@@ -1962,16 +2019,42 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 // same barrier as its A/B. Flat (row, K byte) order, the layout
                 // the fill wrote.
                 D_SF* slot = smem_sf
-                           + (loop_k % T::prefetch_k_iter) * T::SF_RING_SLOT;
+                           + (loop_k % T::SF_RING_SLOTS) * T::SF_RING_SLOT;
                 auto sm_a = make_smem(slot);
-                v_sfa = load<T::SF_LANE_LOAD_VEC>(sm_a, u_sfa_ring);
+                v_sfa = load<T::SF_RING_LOAD_VEC>(sm_a, u_sfa_ring);
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(
                         slot + T::SF_RING_A_BYTES
-                        + (sfb_group_base<T>(wave_id_n_cons) + ng) * T::SCALES_PER_BK);
+                        + (sfb_group_base<T>(wave_id_n_cons) + ng) * T::SCALES_PER_BK
+                              * T::SF_RING_ESTRIDE);
+                    load_sfb_lane<T, ng, T::SF_RING_ESTRIDE>(
+                        sm_b, 0, sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
+                });
+            } else if constexpr (SF_SWZ) {
+                // The swizzled A panel (see SF_SWZ), one byte per (row, MFMA):
+                // rows follow make_layout_sfa_mxsk, the lane's block is
+                // ik*SF_PER_MFMA_K + its quarter, and only the chunk moves.
+                constexpr int CRK = T::SF_LANE_SCALES_PER_BK;
+                const int q = sf_lane_k_block<T>(lane_id, T::W_M);
+                auto sm_a = make_smem(s_sfa_ptr);
+                opus::static_for<T::COM_REP_M>([&](auto im_c) {
+                    constexpr int im = decltype(im_c)::value;
+                    const int row = im * T::T_M * T::W_M + wave_id_m * T::W_M + lane_id % T::W_M;
+                    const int rs = (row >> 1) & sf_swz_mask;
+                    opus::static_for<CRK>([&](auto ik_c) {
+                        constexpr int ik = decltype(ik_c)::value;
+                        const int k = scale_base + ik * T::SF_PER_MFMA_K + q;
+                        v_sfa[im * CRK + ik] =
+                            load<1>(sm_a, row * sf_pitch + ((((k >> 4) ^ rs) << 4) | (k & 15)))[0];
+                    });
+                });
+                opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                    constexpr int ng = decltype(ng_c)::value;
+                    auto sm_b = make_smem(s_sfb_ptr
+                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_pitch + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
-                                        sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
+                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
             } else if constexpr (SF_PANEL) {
                 // Read this K-tile's scales from the preloaded LDS panels
@@ -1987,7 +2070,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr
-                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_k_scales + scale_base);
+                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_pitch + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
                                          sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2008,7 +2091,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         };
 
         auto do_scaled_mma = [&](const auto& va, const auto& vb,
-                                 const vtype_sfa& v_sfa, const vtype_sfb& v_sfb) {
+                                 const vtype_sfa& v_sfa, const vtype_sfb& v_sfb,
+                                 auto scales_landed_c) {
             // The two counters are independent, and which ones this tile has to
             // wait on depends on where its operands came from:
             //   vmcnt  -- the global scale loads (non-preload) and/or direct B.
@@ -2029,7 +2113,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             if constexpr (T::B_DIRECT_REG || !(SF_FROM_LDS || SF_SHUF_IN_LDS)) {
                 s_waitcnt_vmcnt(number<b_direct_insts>{});
             }
-            if constexpr (SF_FROM_LDS) {
+            if constexpr (SF_FROM_LDS && !decltype(scales_landed_c)::value) {
                 s_waitcnt_lgkmcnt(0_I);
             }
             __builtin_amdgcn_s_setprio(1);
@@ -2049,18 +2133,41 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             vtype_sfb v_sfb;
             load_scale_regs(loop_k, v_sfa, v_sfb);
             issue_b_direct(vb_next, loop_k + 1);
-            do_scaled_mma(va, vb, v_sfa, v_sfb);
+            do_scaled_mma(va, vb, v_sfa, v_sfb, opus::bool_constant<false>{});
         };
 
+        // Scales from LDS are read for tile k-1 straight after the barrier that
+        // publishes tile k, ahead of tile k's A/B ds_reads. LDS returns in order,
+        // so the MMA of k-1 then only waits lgkmcnt(ds_read_insts) -- tile k's
+        // reads stay in flight under it. Read after them, as they were, the
+        // scales could only be waited on with lgkmcnt(0), which drained tile k's
+        // reads too and left each MMA behind a full LDS round trip.
+        //
+        // The slot tile k-1's scales sit in is still live here: the panel holds
+        // the whole split, and the ring has the one spare slot for exactly this.
+        constexpr bool SF_EARLY = SF_FROM_LDS && !SHUFFLE_SCALE;
+        vtype_sfa v_sfa_pre;
+        vtype_sfb v_sfb_pre;
+        auto stage_barrier_c = [&](int pub) {
+            stage_barrier(pub);
+            if constexpr (SF_EARLY) load_scale_regs(pub - 1, v_sfa_pre, v_sfb_pre);
+        };
+
+        // lgkm_cnt == 0 marks the one MMA no stage_barrier_c precedes (the last
+        // tile's), which reads its own scales.
         auto wait_lgkm_then_scaled_mma =
             [&](const auto& va, const auto& vb, auto& vb_next, int loop_k, auto lgkm_cnt) {
-                if constexpr (PREFETCH_SCALE) {
+                if constexpr (SF_EARLY && decltype(lgkm_cnt)::value != 0) {
+                    issue_b_direct(vb_next, loop_k + 1);
+                    s_waitcnt_lgkmcnt(lgkm_cnt);
+                    do_scaled_mma(va, vb, v_sfa_pre, v_sfb_pre, opus::bool_constant<true>{});
+                } else if constexpr (PREFETCH_SCALE) {
                     vtype_sfa v_sfa;
                     vtype_sfb v_sfb;
                     load_scale_regs(loop_k, v_sfa, v_sfb);
                     issue_b_direct(vb_next, loop_k + 1);
                     s_waitcnt_lgkmcnt(lgkm_cnt);
-                    do_scaled_mma(va, vb, v_sfa, v_sfb);
+                    do_scaled_mma(va, vb, v_sfa, v_sfb, opus::bool_constant<false>{});
                 } else {
                     s_waitcnt_lgkmcnt(lgkm_cnt);
                     scaled_mma(va, vb, vb_next, loop_k);
@@ -2079,7 +2186,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             constexpr int p = decltype(i_c)::value + 1;
             constexpr int cur = (p - 1) & 1;
             constexpr int nxt = p & 1;
-            stage_barrier(p);
+            stage_barrier_c(p);
             auto sa_p = make_smem(smem_a_at(p, 0, 0));
             if constexpr (nxt == 0) {
                 v_a0 = load<T::VEC_A>(sa_p, u_ra);
@@ -2098,7 +2205,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         constexpr int L = (T::prefetch_k_iter - 2) & 1;
         int k = T::prefetch_k_iter - 1;
         for (; k + 1 < loops - 1; k += 2) {
-            stage_barrier(k);
+            stage_barrier_c(k);
             {
                 int slot = k % T::prefetch_k_iter;
                 auto sa_k = make_smem(smem_a_at(slot, 0, 0));
@@ -2116,7 +2223,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 wait_lgkm_then_scaled_mma(v_a1, v_b1, v_b0, k - 1, number<ds_read_insts>{});
             }
 
-            stage_barrier(k + 1);
+            stage_barrier_c(k + 1);
             {
                 int slot = (k + 1) % T::prefetch_k_iter;
                 auto sa_k = make_smem(smem_a_at(slot, 0, 0));
@@ -2137,7 +2244,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
 
         bool last_in_buf1 = (L != 0);
         if (k < loops - 1) {
-            stage_barrier(k);
+            stage_barrier_c(k);
             {
                 int slot = k % T::prefetch_k_iter;
                 auto sa_k = make_smem(smem_a_at(slot, 0, 0));
@@ -2158,7 +2265,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             k++;
         }
 
-        stage_barrier(loops - 1);
+        stage_barrier_c(loops - 1);
         int last_slot = (loops - 1) % T::prefetch_k_iter;
         auto sa_last = make_smem(smem_a_at(last_slot, 0, 0));
         if (last_in_buf1) {

@@ -90,14 +90,30 @@
 // parity within its pair, hence a template parameter, and the caller unrolls K
 // by two. The M half is (m / SF_SUB) & 1, not im & 1 -- sf_slot/sf_mbit below
 // apply SF_GEOM's decomposition of it.
+// The default on_nrep of mma_mxscale_wave8_accum: nothing to do between
+// n-repeats.
+struct wave8_nrep_noop {
+    template<typename I> OPUS_D void operator()(I) const {}
+};
+
+// B_EARLY: on_nrep(number<in>) runs after the last MFMA of n-repeat in, which
+// is when that n-repeat's slice of v_b is dead, and the caller issues the next
+// K tile's B for it there. Every staged wait then also has the in slices
+// already reissued behind it, which is what the extra term below counts.
 template<typename T, typename Mma, int B_TRAIL, bool B_STAGED_WAIT,
-         bool SHUFFLE_SCALE = false, int KP = 0,
-         typename VA, typename VB, typename VSFA, typename VSFB, typename VC>
+         bool SHUFFLE_SCALE = false, int KP = 0, bool B_EARLY = false,
+         typename VA, typename VB, typename VSFA, typename VSFB, typename VC,
+         typename OnN = wave8_nrep_noop>
 OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
-                                    const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c) {
+                                    const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c,
+                                    const OnN& on_nrep = OnN{}) {
     static_assert(std::is_same_v<typename T::D_SF, unsigned char> || SHUFFLE_SCALE);
-    static_assert(T::SCALES_PER_BK == T::COM_REP_K,
-                  "one A scale byte per (row, K group), i.e. GROUP_K == W_K");
+    // One byte per (row, MFMA) per lane: at GROUP_K=32 read_scales has already
+    // picked the lane's own block, so the registers look the same as at 128.
+    static_assert(T::SF_LANE_SCALES_PER_BK == T::COM_REP_K,
+                  "one A scale byte per lane per (row, MFMA)");
+    static_assert(!SHUFFLE_SCALE || T::SF_PER_MFMA_K == 1,
+                  "the shuffle_scale layout is GROUP_K=128 only");
     static_assert(!SHUFFLE_SCALE || T::COM_REP_K <= 2,
                   "the shuffle_scale layout's dword holds two K blocks, so a tile covers "
                   "one of them (paired across tiles) or both");
@@ -148,7 +164,7 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfb[ng * T::COM_REP_K + ik] =
-                    pack_e8m0x4(v_sfb[ng * T::SCALES_PER_BK + ik]);
+                    sf_scale_word<T>(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]);
             });
         });
     }
@@ -158,7 +174,8 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
         if constexpr (B_STAGED_WAIT) {
             // B was issued one dwordx4 per (n-repeat, k-repeat, half), n-repeat
             // major, so everything from n-repeat in+1 on may still be in flight.
-            constexpr int rest = (T::COM_REP_N - 1 - in) * T::COM_REP_K * 2 + B_TRAIL;
+            constexpr int rest = (T::COM_REP_N - 1 - in) * T::COM_REP_K * 2 + B_TRAIL
+                               + (B_EARLY ? in * T::COM_REP_K * 2 : 0);
             s_waitcnt_vmcnt(opus::number<rest>{});
         }
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
@@ -211,6 +228,7 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
                     opus::number<i_tile_c * c_len + c_len>{});
             });
         });
+        if constexpr (B_EARLY) on_nrep(in_c);
     });
 }
 
@@ -220,6 +238,32 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
 // Main kernel: 8 all-compute waves in a T_M x T_N grid, direct-to-register
 // preshuffled B, LDS-resident scale panels, fp32 workspace or direct output.
 // ============================================================================
+
+// One n-repeat of make_layout_gmem_b_direct_mxsk: the same (k_rep, half, lane)
+// chain with the n-repeat dim cut to 1, so a single n-repeat's B can be issued
+// on its own at + j * stride_b * 16.
+template<typename T>
+inline __device__ auto make_layout_gmem_b_direct_nrep_mxsk(int lane_id, int stride_b, int nbc) {
+    constexpr int grpk_b = opus::get_warp_size() / T::W_N;
+    constexpr auto b_block_shape = opus::make_tuple(
+        opus::number<1>{},
+        opus::number<T::COM_REP_K>{},
+        opus::number<2>{},
+        opus::number<grpk_b>{},
+        opus::number<T::W_N>{},
+        opus::number<T::VEC_B>{});
+    constexpr auto b_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+    auto u_gb = opus::make_layout<0>(
+        b_block_shape,
+        opus::unfold_x_stride(b_block_dim, b_block_shape,
+            opus::tuple{stride_b * 16, 1_I}),
+        opus::unfold_p_coord(b_block_dim,
+            opus::tuple{lane_id / T::W_N, lane_id % T::W_N}));
+    u_gb += nbc * stride_b * 16;
+    return u_gb;
+}
 
 // DIRECT_ONLY / PREFETCH_SCALE / PRELOAD_SF_LDS are kept in the signature so the
 // codegen'd launcher can instantiate this exactly like the shared kernel; only
@@ -271,6 +315,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     static_assert(T::ALL_WAVE && (T::WAVES == 8 || T::WAVES == 4),
                   "four or eight all-compute waves");
     static_assert(T::GROUP_M == 1, "one A scale byte per row per K group");
+    // Both host-side scale layouts pack 128-wide K blocks.
+    static_assert(T::SF_PER_MFMA_K == 1 || (!SFA_MPACK_GLOBAL && !SHUFFLE_SCALE),
+                  "GROUP_K=32 reads the plain scale panels only");
 
     // Wait on B one n-repeat at a time rather than all at once. Correct either
     // way; false is the conservative single wait for the whole tile.
@@ -471,8 +518,14 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr bool SF_LDS_B = !SHUFFLE_SCALE;
     constexpr bool SF_PLAIN_DEFER_BARRIER =
         (SF_LDS_A || SF_LDS_B) && T::B_M == 128 && T::B_K == 256;
+    // Pad per M-packed lane row of the GROUP_K=32 A panel. A row there is
+    // COM_REP_M*K/32 bytes, 128 dwords at K=4096, so a wave's 16 lanes all hit
+    // one bank: PMC puts 4.2x the 128 kid's LDS bank conflicts on kid9348. The
+    // pad moves consecutive rows four banks apart. 128 keeps its layout.
+    constexpr int SF_A_PAD = (SF_LDS_A && T::SF_PER_MFMA_K > 1) ? T::SF_PANEL_PAD : 0;
     constexpr int SF_LDS_ELEMS =
-        ((SF_LDS_A ? SFA_ROWS : 0) + (SF_LDS_B ? T::N_SCALE_GROUPS : 0)) * SF_SCALES_MAX;
+        ((SF_LDS_A ? SFA_ROWS : 0) + (SF_LDS_B ? T::N_SCALE_GROUPS : 0)) * SF_SCALES_MAX
+        + SFA_MB * SF_A_PAD;
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS > 0 ? SF_LDS_ELEMS : 1];
 
     // Shuffled-word panel, in dwords, holding what read_scales_shuf would
@@ -509,8 +562,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     };
 
     const int sf_k_scales = loops * T::SCALES_PER_BK;
+    // Bytes per M-packed lane row of the A panel.
+    const int sfa_pitch = sf_k_scales * T::COM_REP_M + SF_A_PAD;
     D_SF* s_sfa_ptr = smem_sf;
-    D_SF* s_sfb_ptr = smem_sf + (SF_LDS_A ? SFA_ROWS * sf_k_scales : 0);
+    D_SF* s_sfb_ptr = smem_sf + (SF_LDS_A ? SFA_MB * sfa_pitch : 0);
 
     // One-shot cooperative fill of both panels by all BLOCK_SIZE threads,
     // published by the barrier at the end. OOB rows of a partial M tile read 0
@@ -586,8 +641,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                         v[j * VEC + i] = row[i];
                     });
                 });
-                const int dst =
-                    (mb * sf_k_scales + kt) * T::COM_REP_M + pk * SFA_PACK;
+                const int dst = SF_A_PAD
+                    ? mb * sfa_pitch + kt * T::COM_REP_M + pk * SFA_PACK
+                    : (mb * sf_k_scales + kt) * T::COM_REP_M + pk * SFA_PACK;
                 opus::static_for<VEC>([&](auto i_c) {
                     constexpr int i = decltype(i_c)::value;
                     opus::vector_t<D_SF, SFA_PACK> w;
@@ -629,6 +685,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // Each N-wave owns COM_REP_N contiguous 16-column blocks of the tile.
     auto u_gb_direct = make_layout_gmem_b_direct_mxsk<T>(
         lane_id, kargs.stride_b, wave_id_n * T::COM_REP_N);
+    auto u_gb_nrep = make_layout_gmem_b_direct_nrep_mxsk<T>(
+        lane_id, kargs.stride_b, wave_id_n * T::COM_REP_N);
     // Lane-invariant part of this lane's M-packed panel row, at the panel's own
     // pitch. The K tile and the subtile index are added at the read. The LDS
     // panel holds this split's K range, so its pitch is sf_k_scales and the split
@@ -640,6 +698,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // First B scale group of this wave's column range. A range narrower than
     // GROUP_N makes consecutive N-waves share a group rather than step one.
     const int sfb_group0 = wave_id_n * T::SFB_WAVE_COLS / T::GROUP_N;
+    // This lane's MX block within each MFMA; a literal 0 at GROUP_K=128.
+    const int sf_lane_k = sf_lane_k_block<T>(lane_id, T::W_M);
 
     // Shuffled scale addressing, counted in dwords. Splitting a row over blocks of
     // 2*SF_SUB puts the block index high, op_sel's M bit in the middle and the row
@@ -773,9 +833,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     typename decltype(mma)::vtype_c v_c;
     clear(v_c);
 
-    // v_sfa is indexed [K group][M subtile] -- the panel packs it that way.
-    using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
-    using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS * T::SCALES_PER_BK>;
+    // v_sfa is indexed [MFMA K][M subtile] -- the panel packs it that way. Sized
+    // by the lane's bytes, which is SCALES_PER_BK at 128 and a quarter of it at 32.
+    using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SF_LANE_SCALES_PER_BK>;
+    using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS * T::SF_LANE_SCALES_PER_BK>;
 
     // Shuffled scale words live across the K tile pair that reads them, so they sit outside
     // k_tile: the KP=0 tile loads them and the KP=1 tile reuses the registers.
@@ -870,6 +931,31 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         const int kk = loop_k < loops ? loop_k : loops - 1;
         v_b = load<T::VEC_B>(g_b, u_gb_direct, b_direct_iter_offset_mxsk<T>(kk));
     };
+    // B single-buffered is what made the next tile's B wait for this tile's
+    // last MFMA: ATT on kid8194/8205 puts 6-7% of cycles on that load's issue
+    // and another 8% on the first MFMA after it. The MMA loop is n-repeat
+    // outermost, so n-repeat j's slice of v_b is dead once its MFMAs are, and
+    // the next tile's slice j can go then, behind the remaining n-repeats. Same
+    // registers, same vmcnt order as the whole-tile issue at the end -- only
+    // earlier. Plain staged kids only: the shuffled and prefetching schedules
+    // count their own loads into the same stream.
+    // Where it measures: against the end-of-tile issue, graph replay, best of two builds on one
+    // GPU, over six shapes, the 1x4 T_M=1 kids (8203/8205 and twins) came in at
+    // 0.94-1.00 on every shape and the 128x128 2x4 ones (8348/8349) at 0.94-1.05,
+    // mostly under 1. The 256-wide 2x4 tiles (8194/8346, 8168/8175) and the 1x8
+    // grid were a wash either way, so they keep the end-of-tile issue.
+    constexpr bool B_EARLY_TILE =
+        (T::T_M == 1 && T::WAVES == 4) || (T::B_M == 128 && T::B_N == 128);
+    constexpr bool B_EARLY = B_EARLY_TILE && B_STAGED_WAIT && !SHUFFLE_SCALE;
+    constexpr int B_NREP_ELEMS = T::COM_REP_K * decltype(mma)::mma_b_len;
+    auto issue_b_nrep = [&](int loop_k, auto j_c) {
+        constexpr int j = decltype(j_c)::value;
+        const int kk = loop_k < loops ? loop_k : loops - 1;
+        auto piece = load<T::VEC_B>(g_b, u_gb_nrep,
+                                    b_direct_iter_offset_mxsk<T>(kk) + j * kargs.stride_b * 16);
+        opus::set_slice(v_b, piece, opus::number<j * B_NREP_ELEMS>{},
+                        opus::number<(j + 1) * B_NREP_ELEMS>{});
+    };
 
     auto read_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
         const int scale_base = loop_k * T::SCALES_PER_BK;
@@ -877,22 +963,45 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         // per K group are adjacent in either panel. Read straight from the host's
         // panel when there is one -- the caller must pass
         // shuffle_scale_mxsk_mpack(x_scale, B_M, T_M*W_M).
-        if constexpr (SFA_MPACK_GLOBAL) {
-            v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(
-                g_sfa, (sfa_mpack_row + scale_base) * T::COM_REP_M);
-        } else {
-            auto sm_a = make_smem(s_sfa_ptr + (sfa_mpack_row + scale_base) * T::COM_REP_M);
-            v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(sm_a, 0);
-        }
-        opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
-            constexpr int ng = decltype(ng_c)::value;
-            auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_k_scales + scale_base);
-            auto sfb = load<T::SCALES_PER_BK>(sm_b, 0);
-            opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                constexpr int kg = decltype(kg_c)::value;
-                v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+        if constexpr (T::SF_PER_MFMA_K > 1) {
+            // GROUP_K=32: the lane's block of MFMA ik is K scale
+            // ik*SF_PER_MFMA_K + sf_lane_k, and the panel's [row][k][subtile]
+            // order keeps its COM_REP_M subtile bytes adjacent at every k, so
+            // each MFMA is still one aligned COM_REP_M-byte read.
+            auto sm_a = make_smem(s_sfa_ptr
+                                  + (wave_id_m * T::W_M + lane_id % T::W_M) * sfa_pitch
+                                  + (scale_base + sf_lane_k) * T::COM_REP_M);
+            opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                constexpr int ik = decltype(ik_c)::value;
+                auto w = load<T::COM_REP_M>(sm_a, ik * T::SF_PER_MFMA_K * T::COM_REP_M);
+                opus::static_for<T::COM_REP_M>([&](auto im_c) {
+                    constexpr int im = decltype(im_c)::value;
+                    v_sfa[ik * T::COM_REP_M + im] = w[im];
+                });
             });
-        });
+            opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_k_scales + scale_base);
+                load_sfb_lane<T, ng>(sm_b, 0, sf_lane_k, v_sfb);
+            });
+        } else {
+            if constexpr (SFA_MPACK_GLOBAL) {
+                v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(
+                    g_sfa, (sfa_mpack_row + scale_base) * T::COM_REP_M);
+            } else {
+                auto sm_a = make_smem(s_sfa_ptr + (sfa_mpack_row + scale_base) * T::COM_REP_M);
+                v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(sm_a, 0);
+            }
+            opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_k_scales + scale_base);
+                auto sfb = load<T::SCALES_PER_BK>(sm_b, 0);
+                opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
+                    constexpr int kg = decltype(kg_c)::value;
+                    v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+                });
+            });
+        }
     };
 
     // One K tile of the steady state. The order is what keeps both counters
@@ -953,8 +1062,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             mma_mxscale_wave8_accum<T, decltype(mma), A_MB, STAGED, true, KP>(
                 v_a, v_b, v_sfa_shuf, v_sfb_shuf, v_c);
         } else {
-            mma_mxscale_wave8_accum<T, decltype(mma), A_MB, STAGED>(
-                v_a, v_b, v_sfa, v_sfb, v_c);
+            mma_mxscale_wave8_accum<T, decltype(mma), A_MB, STAGED, false, 0, B_EARLY>(
+                v_a, v_b, v_sfa, v_sfb, v_c,
+                [&](auto j_c) { issue_b_nrep(k + 1, j_c); });
         }
         __builtin_amdgcn_s_setprio(0);
 
@@ -969,7 +1079,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             });
         }
 
-        issue_b_direct(k + 1);
+        if constexpr (!B_EARLY) issue_b_direct(k + 1);
     };
 
     // Prefill: PF-1 A tiles, then B(0).
