@@ -23,7 +23,7 @@
 //     workspace; a reduce kernel sums splits + casts to bf16 C.
 //
 //   opus_gemm_a16w16_persistent_traits_gfx950<..., TILE, WAVE, HAS_OOB,
-//                                              CACHECTL_A, CACHECTL_B, NUM_XCD>
+//                                              CACHECTL_A, CACHECTL_B>
 //     M-outer + N-fast XCD swizzle persistent pipeline.
 //
 //   opus_gemm_a16w16_mono_tile_traits_gfx950<..., DTYPE, VEC>
@@ -119,8 +119,7 @@ struct opus_gemm_a16w16_traits_gfx950 {
     static constexpr int CACHECTL_A = CACHECTL_A_;
     static constexpr int CACHECTL_B = CACHECTL_B_;
 
-    // HipKittens XCD swizzle parameters (Algorithm 1); the die count is that
-    // of the part this instance is built for.
+    // HipKittens XCD swizzle parameters (Algorithm 1).
     static constexpr int NUM_XCD = NUM_XCD_;
     static constexpr int SWIZZLE_W = SWIZZLE_W_;
     static constexpr int SWIZZLE_C = SWIZZLE_C_;
@@ -458,10 +457,10 @@ struct opus_flatmm_splitk_traits_gfx950 {
 // the split-barrier traits. Other (cachectl_a, cachectl_b) combos are
 // exposed as separate KIDs by the tuner.
 //
-// NUM_XCD_ is the die count of the part this instance is built for. The
-// swizzle is hard-wired to N-fast inside the persistent pipeline body and does
-// NOT take SWIZZLE_W/C parameters (those belong to the HipKittens
-// split-barrier swizzle, which is a different, orthogonal optimization).
+// The swizzle is hard-wired to
+// N-fast inside the persistent pipeline body and does NOT take SWIZZLE_W/C
+// parameters (those belong to the HipKittens split-barrier swizzle, which
+// is a different, orthogonal optimization).
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,

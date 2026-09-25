@@ -17,19 +17,12 @@ from codegen.common import (
     register_emit,
 )
 
-# ---------------- gfx950 die count ----------------
-# gfx950 ships at 256 CUs with eight dies and at 128 with four. The swizzle is
-# baked per instance, so a wheel is only correct on the part it was built for.
-_FALLBACK_NUM_XCD = 8
-
 
 def build_num_xcd():
-    """Die count of the part these instances are built for."""
     try:
         from aiter.jit.utils.build_targets import build_num_xcds
     except ImportError:
-        # Standalone codegen run: aiter, and so torch, is not importable.
-        return _FALLBACK_NUM_XCD
+        return 8  # Standalone codegen without aiter.
     return build_num_xcds("gfx950")
 
 
