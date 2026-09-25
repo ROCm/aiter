@@ -1213,7 +1213,8 @@ def _pa_decode_sparse_v4_2buff(
     # it until that store is fixed. Cost is one reduce launch and the partial
     # buffers; at the batch sizes that reach 1 split those are small next to
     # the KV cache.
-    kv_splits = max(2, kv_splits)
+    # [test] clamp removed so KV_SPLITS==1 is reachable
+    kv_splits = kv_splits
     if kv_splits > 8:
         reduce_num_warps = 4
         reduce_waves_per_eu = 1

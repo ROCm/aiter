@@ -1185,12 +1185,19 @@ def _v4_2buff_tile(
     # here than on gfx950 because the row mapping scales the block number by
     # blk_rows, which on a pooled cache is ~37x the page size.
     slot_hi = gl.where(is_main, main_slots, extra_slots) if HAS_EXTRA else main_slots
-    ok = (
-        ((jj * BLOCK_K + k_off) < n)
-        & (slot_reg >= 0)
-        & (slot_reg < slot_hi)
-    )
-    safe = gl.where(ok, slot_reg, 0)
+    ok = (jj * BLOCK_K + k_off) < n
+    if HAS_INVALID or HAS_EXTRA:
+        # A mask is carried on this path, so the slot terms ride along in it
+        # and `safe` reuses the result. The two-stream tests pass
+        # has_invalid=False and still hand over -1 slots, so the flag alone
+        # cannot decide this -- see the gfx950 note above.
+        ok = ok & (slot_reg >= 0) & (slot_reg < slot_hi)
+        safe = gl.where(ok, slot_reg, 0)
+    else:
+        # No mask is carried, so nothing would consume a predicate. Clamp the
+        # row instead of building one: two ops rather than a compare, an AND
+        # and a select.
+        safe = gl.minimum(gl.maximum(slot_reg, 0), slot_hi - 1)
     if HAS_EXTRA:
         row = gl.where(
             is_main,
