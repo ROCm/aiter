@@ -1,0 +1,10 @@
+{
+    "dispatch": {
+        "bf16": {
+            "v1_max_partitions": 1
+        },
+        "fp16": {
+            "v1_max_partitions": 1
+        }
+    }
+}
