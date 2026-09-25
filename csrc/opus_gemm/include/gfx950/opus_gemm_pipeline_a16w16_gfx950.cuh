@@ -217,10 +217,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         if (xy >= limit) {
             // Swizzle covers new_xy ∈ [0, limit) contiguously. Within that,
             // (limit / tid_per_group) groups are full; the remainder lands in
-            // a partial last group covering (covered_in_partial) of its
-            // tiles. The original fallback `xy/num_tiles_n` jumps row-major
-            // from xy without accounting for those holes, dropping the rest
-            // of that group.
+            // a partial last group covering (covered_in_partial) tiles.
+            // This group may have fewer than W rows, so dividing by W loses
+            // the exact resume offset. The original fallback `xy/num_tiles_n`
+            // jumps row-major from xy without accounting for those holes,
+            // dropping the rest of that group.
             int full_groups = limit / tid_per_group;
             int covered_in_partial = limit - full_groups * tid_per_group;
             int partial_first_row = full_groups * W;
