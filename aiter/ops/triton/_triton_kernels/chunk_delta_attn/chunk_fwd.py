@@ -68,6 +68,10 @@ def chunk_delta_attn_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     state_v_first: bool = False,
+    out: torch.Tensor | None = None,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -103,6 +107,9 @@ def chunk_delta_attn_fwd(
         state_v_first:      Store the recurrent state V-first (``[V, K]``) instead
                             of the default ``[K, V]``. Matches fla's option of the
                             same name.
+        out:                Optional contiguous output buffer, same shape as
+                            ``v``. FlashKDA-only, like ``state_cache``.
+        state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -151,6 +158,17 @@ def chunk_delta_attn_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
+    if state_cache is not None and not use_flash_kda:
+        raise ValueError(
+            "paged state_cache is only implemented on the FlashKDA path; "
+            "gather into initial_state, or pass a call that flash_kda_supported accepts"
+        )
+    if out is not None and not use_flash_kda:
+        raise ValueError(
+            "out is only implemented on the FlashKDA path; use the returned "
+            "tensor, or pass a call that flash_kda_supported accepts"
+        )
+
     if use_flash_kda:
         o, final_state = flash_kda_fwd(
             q=q,
@@ -167,6 +185,10 @@ def chunk_delta_attn_fwd(
             state_v_first=state_v_first,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            out=out,
+            state_cache=state_cache,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
         )
         return o, final_state, None, None, None, None, None, None, None
 
