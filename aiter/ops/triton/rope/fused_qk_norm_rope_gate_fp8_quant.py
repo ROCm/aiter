@@ -105,6 +105,50 @@ def fused_qk_norm_rope_gate_fp8_quant(
     ``[MAX_SEQUENCES, num_kv_heads]`` for compile/CUDA-graph stability. Rows
     before ``quant_sequence_start`` and rows at or after ``num_sequences`` are
     unspecified and must not be consumed.
+
+    Args:
+        q_gate: BF16 tensor with shape
+            ``[tokens, 2 * num_query_heads * head_dim]``. Each head stores
+            interleaved Q and output-gate vectors.
+        key: BF16 tensor with shape ``[tokens, num_kv_heads * head_dim]``.
+        value: BF16 tensor with the same shape as ``key``.
+        query_norm_weight: Raw, zero-centered Gemma RMSNorm weight with shape
+            ``[head_dim]``.
+        key_norm_weight: Raw, zero-centered Gemma RMSNorm weight with shape
+            ``[head_dim]``.
+        cos_sin_cache: BF16 RoPE cache with shape
+            ``[max_position, rotary_dim]``.
+        positions: Token positions with shape ``[tokens]``.
+        cu_seqlens: Int32 cumulative sequence lengths with shape
+            ``[num_sequences + 1]``.
+        num_actual_tokens: Number of initialized token rows. Rows at or above
+            this boundary are ignored.
+        quant_token_start: First token row to quantize.
+        quant_sequence_start: Sequence containing ``quant_token_start``.
+        num_query_heads: Number of local query heads.
+        num_kv_heads: Number of local key/value heads.
+        head_dim: Per-head Q/K/V width.
+        rotary_dim: Even rotary width, no larger than ``head_dim``.
+        eps: RMSNorm epsilon.
+        query_out: Optional preallocated BF16 normalized/rotated query output.
+        key_out: Optional preallocated BF16 normalized/rotated key output.
+        gate_out: Optional preallocated BF16 output-gate tensor.
+        query_fp8_out: Optional preallocated E4M3-FN query output.
+        key_fp8_out: Optional preallocated E4M3-FN key output.
+        value_fp8_out: Optional preallocated E4M3-FN value output.
+        query_descale_out: Optional preallocated FP32 query descales.
+        key_descale_out: Optional preallocated FP32 key descales.
+        value_descale_out: Optional preallocated FP32 value descales.
+
+    Returns:
+        A ``FusedQKNormRopeGateFp8QuantOutput`` containing BF16
+        normalized/rotated query and key tensors, the BF16 gate tensor, FP8
+        Q/K/V tensors for the requested suffix, and FP32 Q/K/V descales.
+
+    Raises:
+        ValueError: If shapes, dtypes, devices, layouts, or suffix bounds are
+            unsupported.
+        RuntimeError: If the device is not gfx950 with E4M3-FN FP8 support.
     """
     total_tokens = q_gate.shape[0]
     num_sequences = cu_seqlens.numel() - 1
@@ -346,7 +390,6 @@ def fused_qk_norm_rope_gate_fp8_quant(
 
     half_rotary = rotary_dim // 2
     head_block = triton.next_power_of_2(head_dim)
-    rotary_half_block = triton.next_power_of_2(half_rotary)
     persistent_qk_norm_rope_gate_token_amax_kernel[
         (
             triton.cdiv(total_tokens, QK_TOKENS_PER_PROGRAM),
@@ -379,11 +422,8 @@ def fused_qk_norm_rope_gate_fp8_quant(
         eps=eps,
         INPUT_DTYPE=tl.bfloat16,
         HEAD_BLOCK=head_block,
-        ROT_HALF_BLOCK=rotary_half_block,
-        HAS_PASS=rotary_dim < head_dim,
         TOKENS_PER_PROGRAM=QK_TOKENS_PER_PROGRAM,
         ADD_GEMMA_OFFSET=True,
-        REUSE_NORMALIZED_ROTARY=True,
         num_warps=max(1, head_block // 64),
         num_stages=2,
     )

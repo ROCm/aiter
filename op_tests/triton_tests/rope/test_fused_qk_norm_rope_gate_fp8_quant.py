@@ -46,12 +46,14 @@ def _reference_qk_gate(
     key_norm_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    num_query_heads: int = NUM_QUERY_HEADS,
+    num_kv_heads: int = NUM_KV_HEADS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = q_gate.shape[0]
-    q_gate_view = q_gate.view(tokens, NUM_QUERY_HEADS, 2 * HEAD_DIM)
+    q_gate_view = q_gate.view(tokens, num_query_heads, 2 * HEAD_DIM)
     query = q_gate_view[..., :HEAD_DIM]
     gate = q_gate_view[..., HEAD_DIM:]
-    key_view = key.view(tokens, NUM_KV_HEADS, HEAD_DIM)
+    key_view = key.view(tokens, num_kv_heads, HEAD_DIM)
 
     def normalize(values: torch.Tensor, raw_weight: torch.Tensor) -> torch.Tensor:
         inv_rms = torch.rsqrt(values.float().square().mean(dim=-1, keepdim=True) + EPS)
@@ -90,14 +92,17 @@ def _expected_descales(
     value: torch.Tensor,
     cu_seqlens: torch.Tensor,
     quant_sequence_start: int,
+    num_query_heads: int = NUM_QUERY_HEADS,
+    num_kv_heads: int = NUM_KV_HEADS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    query = query.view(-1, NUM_QUERY_HEADS, HEAD_DIM).float()
-    key = key.view(-1, NUM_KV_HEADS, HEAD_DIM).float()
-    value = value.view(-1, NUM_KV_HEADS, HEAD_DIM).float()
+    query = query.view(-1, num_query_heads, HEAD_DIM).float()
+    key = key.view(-1, num_kv_heads, HEAD_DIM).float()
+    value = value.view(-1, num_kv_heads, HEAD_DIM).float()
     num_sequences = cu_seqlens.numel() - 1
+    gqa_ratio = num_query_heads // num_kv_heads
     output = [
         torch.empty(
-            (num_sequences, NUM_KV_HEADS),
+            (num_sequences, num_kv_heads),
             dtype=torch.float32,
             device=query.device,
         )
@@ -106,31 +111,38 @@ def _expected_descales(
     for sequence in range(quant_sequence_start, num_sequences):
         start = int(cu_seqlens[sequence].item())
         end = int(cu_seqlens[sequence + 1].item())
-        output[0][sequence, 0] = (query[start:end].abs().amax() / FP8_MAX).clamp_min(
-            1.0e-12
-        )
-        output[1][sequence, 0] = (key[start:end].abs().amax() / FP8_MAX).clamp_min(
-            1.0e-12
-        )
-        output[2][sequence, 0] = (value[start:end].abs().amax() / FP8_MAX).clamp_min(
-            1.0e-12
-        )
+        for kv_head in range(num_kv_heads):
+            q_head_start = kv_head * gqa_ratio
+            q_head_end = q_head_start + gqa_ratio
+            output[0][sequence, kv_head] = (
+                query[start:end, q_head_start:q_head_end].abs().amax() / FP8_MAX
+            ).clamp_min(1.0e-12)
+            output[1][sequence, kv_head] = (
+                key[start:end, kv_head].abs().amax() / FP8_MAX
+            ).clamp_min(1.0e-12)
+            output[2][sequence, kv_head] = (
+                value[start:end, kv_head].abs().amax() / FP8_MAX
+            ).clamp_min(1.0e-12)
     return output[0], output[1], output[2]
 
 
-def _make_inputs(lengths: list[int]):
+def _make_inputs(
+    lengths: list[int],
+    num_query_heads: int = NUM_QUERY_HEADS,
+    num_kv_heads: int = NUM_KV_HEADS,
+):
     device = torch.device("cuda")
     total_tokens = sum(lengths)
     torch.manual_seed(1234 + total_tokens)
     q_gate = torch.randn(
         total_tokens,
-        NUM_QUERY_HEADS * 2 * HEAD_DIM,
+        num_query_heads * 2 * HEAD_DIM,
         dtype=torch.bfloat16,
         device=device,
     )
     key = torch.randn(
         total_tokens,
-        NUM_KV_HEADS * HEAD_DIM,
+        num_kv_heads * HEAD_DIM,
         dtype=torch.bfloat16,
         device=device,
     )
@@ -166,6 +178,106 @@ def _make_inputs(lengths: list[int]):
         positions,
         cu_seqlens,
     )
+
+
+@pytest.mark.parametrize("num_kv_heads", [2, 4])
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_multiple_kv_heads(num_kv_heads):
+    num_query_heads = NUM_QUERY_HEADS
+    lengths = [5, 17, 108]
+    inputs = _make_inputs(
+        lengths,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    q_gate, key, value, q_weight, k_weight, cache, positions, cu_seqlens = inputs
+    output = fused_qk_norm_rope_gate_fp8_quant(
+        *inputs,
+        num_actual_tokens=sum(lengths),
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=HEAD_DIM,
+        rotary_dim=ROTARY_DIM,
+        eps=EPS,
+    )
+    torch.cuda.synchronize()
+
+    ref_query, ref_key, ref_gate = _reference_qk_gate(
+        q_gate,
+        key,
+        q_weight,
+        k_weight,
+        cache,
+        positions,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    torch.testing.assert_close(output.query, ref_query, rtol=1.0e-2, atol=1.0e-2)
+    torch.testing.assert_close(output.key, ref_key, rtol=1.0e-2, atol=1.0e-2)
+    torch.testing.assert_close(output.gate, ref_gate, rtol=0, atol=0)
+
+    expected_descales = _expected_descales(
+        output.query,
+        output.key,
+        value,
+        cu_seqlens,
+        quant_sequence_start=0,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    for actual, expected in zip(
+        (
+            output.query_descale,
+            output.key_descale,
+            output.value_descale,
+        ),
+        expected_descales,
+    ):
+        torch.testing.assert_close(
+            actual[: len(lengths)],
+            expected,
+            rtol=2.0e-6,
+            atol=1.0e-8,
+        )
+
+    query = output.query.view(-1, num_query_heads, HEAD_DIM).float()
+    output_key = output.key.view(-1, num_kv_heads, HEAD_DIM).float()
+    output_value = value.view(-1, num_kv_heads, HEAD_DIM).float()
+    gqa_ratio = num_query_heads // num_kv_heads
+    for sequence in range(len(lengths)):
+        start = int(cu_seqlens[sequence].item())
+        end = int(cu_seqlens[sequence + 1].item())
+        for kv_head in range(num_kv_heads):
+            q_head_start = kv_head * gqa_ratio
+            q_head_end = q_head_start + gqa_ratio
+            reconstructed_query = (
+                output.query_fp8[start:end, q_head_start:q_head_end].float()
+                * output.query_descale[sequence, kv_head]
+            )
+            reconstructed_key = (
+                output.key_fp8[start:end, kv_head].float()
+                * output.key_descale[sequence, kv_head]
+            )
+            reconstructed_value = (
+                output.value_fp8[start:end, kv_head].float()
+                * output.value_descale[sequence, kv_head]
+            )
+            references = (
+                query[start:end, q_head_start:q_head_end],
+                output_key[start:end, kv_head],
+                output_value[start:end, kv_head],
+            )
+            reconstructed = (
+                reconstructed_query,
+                reconstructed_key,
+                reconstructed_value,
+            )
+            for actual, expected in zip(reconstructed, references):
+                relative_error = (
+                    actual - expected
+                ).abs().amax() / expected.abs().amax()
+                assert relative_error < 0.04
+                assert torch.isfinite(actual).all()
 
 
 @pytest.mark.parametrize("lengths", [[128], [5, 17, 108], [8193]])

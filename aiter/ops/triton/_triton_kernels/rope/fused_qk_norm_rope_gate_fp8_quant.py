@@ -5,8 +5,109 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_persistent_qk_norm_rope_gate_token_amax_repr = make_kernel_repr(
+    "persistent_qk_norm_rope_gate_token_amax",
+    [
+        "num_q_heads",
+        "num_kv_heads",
+        "head_dim",
+        "rotary_dim",
+        "INPUT_DTYPE",
+        "HEAD_BLOCK",
+        "TOKENS_PER_PROGRAM",
+        "ADD_GEMMA_OFFSET",
+    ],
+)
+
+_v_token_amax_repr = make_kernel_repr(
+    "v_token_amax",
+    ["num_kv_heads", "head_dim", "BLOCK_D"],
+)
+
+_segmented_qkv_partial_amax_repr = make_kernel_repr(
+    "segmented_qkv_partial_amax",
+    [
+        "num_q_heads",
+        "num_kv_heads",
+        "gqa_ratio",
+        "BLOCK_T",
+        "NUM_BLOCKS",
+        "HAS_SEQUENCE_OFFSET",
+    ],
+)
+
+_segmented_qkv_scale_repr = make_kernel_repr(
+    "segmented_qkv_scale",
+    [
+        "num_kv_heads",
+        "FP8_MAX_VALUE",
+        "NUM_BLOCKS",
+        "BLOCK_B",
+        "HAS_SEQUENCE_OFFSET",
+    ],
+)
+
+_quantize_qk_grouped_repr = make_kernel_repr(
+    "quantize_qk_grouped",
+    [
+        "num_q_heads",
+        "num_kv_heads",
+        "gqa_ratio",
+        "head_dim",
+        "FP8_MAX_VALUE",
+        "BLOCK_D",
+        "SEARCH_STEPS",
+    ],
+)
+
+_quantize_qk_grouped_offset_repr = make_kernel_repr(
+    "quantize_qk_grouped_offset",
+    [
+        "num_q_heads",
+        "num_kv_heads",
+        "gqa_ratio",
+        "head_dim",
+        "FP8_MAX_VALUE",
+        "BLOCK_D",
+        "SEARCH_STEPS",
+        "SINGLE_SEQUENCE",
+    ],
+)
+
+_quantize_v_grouped_offset_repr = make_kernel_repr(
+    "quantize_v_grouped_offset",
+    [
+        "num_kv_heads",
+        "head_dim",
+        "FP8_MAX_VALUE",
+        "BLOCK_D",
+        "SEARCH_STEPS",
+        "SINGLE_SEQUENCE",
+    ],
+)
+
 
 @triton.jit
+def _find_sequence_for_token(
+    token,
+    cu_seqlens_ptr,
+    num_sequences,
+    SEARCH_STEPS: tl.constexpr,
+):
+    low = 0
+    high = num_sequences - 1
+    for _ in tl.static_range(0, SEARCH_STEPS):
+        middle = (low + high) // 2
+        boundary = tl.load(cu_seqlens_ptr + middle + 1)
+        move_right = token >= boundary
+        low = tl.where(move_right, middle + 1, low)
+        high = tl.where(move_right, high, middle)
+    return low
+
+
+@triton.jit(repr=_persistent_qk_norm_rope_gate_token_amax_repr)
 def persistent_qk_norm_rope_gate_token_amax_kernel(
     q_gate_ptr,
     k_ptr,
@@ -34,11 +135,8 @@ def persistent_qk_norm_rope_gate_token_amax_kernel(
     eps: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
-    ROT_HALF_BLOCK: tl.constexpr,
-    HAS_PASS: tl.constexpr,
     TOKENS_PER_PROGRAM: tl.constexpr,
     ADD_GEMMA_OFFSET: tl.constexpr,
-    REUSE_NORMALIZED_ROTARY: tl.constexpr,
 ):
     token_block = tl.program_id(0)
     head = tl.program_id(1)
@@ -61,23 +159,6 @@ def persistent_qk_norm_rope_gate_token_amax_kernel(
     if ADD_GEMMA_OFFSET:
         weight += 1.0
 
-    rotary_offsets = tl.arange(0, ROT_HALF_BLOCK)
-    rotary_mask = rotary_offsets < half_rotary
-    if not REUSE_NORMALIZED_ROTARY:
-        w1 = tl.load(
-            weight_ptr + rotary_offsets,
-            mask=rotary_mask,
-            other=0.0,
-        ).to(tl.float32)
-        w2 = tl.load(
-            weight_ptr + half_rotary + rotary_offsets,
-            mask=rotary_mask,
-            other=0.0,
-        ).to(tl.float32)
-        if ADD_GEMMA_OFFSET:
-            w1 += 1.0
-            w2 += 1.0
-
     for token_offset in tl.static_range(0, TOKENS_PER_PROGRAM):
         token = token_block * TOKENS_PER_PROGRAM + token_offset
         valid_token = token < num_tokens
@@ -99,136 +180,57 @@ def persistent_qk_norm_rope_gate_token_amax_kernel(
         inv_rms = tl.rsqrt(variance + eps)
         normalized = (values * inv_rms * weight).to(INPUT_DTYPE).to(tl.float32)
 
-        if REUSE_NORMALIZED_ROTARY:
-            position = tl.load(
-                positions_ptr + token,
-                mask=valid_token,
-                other=0,
-            ).to(tl.int64)
-            cache_base = position * cache_stride_p
-            rotary_full_mask = (head_offsets < rotary_dim) & valid_token
-            partner_offsets = tl.where(
-                head_offsets < half_rotary,
-                head_offsets + half_rotary,
-                tl.where(
-                    head_offsets < rotary_dim,
-                    head_offsets - half_rotary,
-                    head_offsets,
-                ),
+        position = tl.load(
+            positions_ptr + token,
+            mask=valid_token,
+            other=0,
+        ).to(tl.int64)
+        cache_base = position * cache_stride_p
+        rotary_full_mask = (head_offsets < rotary_dim) & valid_token
+        partner_offsets = tl.where(
+            head_offsets < half_rotary,
+            head_offsets + half_rotary,
+            tl.where(
+                head_offsets < rotary_dim,
+                head_offsets - half_rotary,
+                head_offsets,
+            ),
+        )
+        partner = tl.gather(normalized, partner_offsets, axis=0)
+        frequency_offsets = head_offsets % half_rotary
+        cos = tl.load(
+            cos_sin_cache_ptr + cache_base + frequency_offsets,
+            mask=rotary_full_mask,
+            other=0.0,
+        ).to(tl.float32)
+        sin = tl.load(
+            cos_sin_cache_ptr + cache_base + half_rotary + frequency_offsets,
+            mask=rotary_full_mask,
+            other=0.0,
+        ).to(tl.float32)
+        rotated = tl.where(
+            head_offsets < half_rotary,
+            normalized * cos - partner * sin,
+            normalized * cos + partner * sin,
+        )
+        combined = (
+            tl.where(
+                head_offsets < rotary_dim,
+                rotated,
+                normalized,
             )
-            partner = tl.gather(normalized, partner_offsets, axis=0)
-            frequency_offsets = head_offsets % half_rotary
-            cos = tl.load(
-                cos_sin_cache_ptr + cache_base + frequency_offsets,
-                mask=rotary_full_mask,
-                other=0.0,
-            ).to(tl.float32)
-            sin = tl.load(
-                cos_sin_cache_ptr + cache_base + half_rotary + frequency_offsets,
-                mask=rotary_full_mask,
-                other=0.0,
-            ).to(tl.float32)
-            rotated = tl.where(
-                head_offsets < half_rotary,
-                normalized * cos - partner * sin,
-                normalized * cos + partner * sin,
-            )
-            combined = (
-                tl.where(
-                    head_offsets < rotary_dim,
-                    rotated,
-                    normalized,
-                )
-                .to(INPUT_DTYPE)
-                .to(tl.float32)
-            )
-            tl.store(
-                out_base + head_offsets,
-                combined,
-                mask=full_mask,
-            )
-            token_amax = tl.max(
-                tl.where(full_mask, tl.abs(combined), 0.0),
-                axis=0,
-            )
-        else:
-            if HAS_PASS:
-                pass_mask = head_mask & (head_offsets >= rotary_dim) & valid_token
-                tl.store(
-                    out_base + head_offsets,
-                    normalized,
-                    mask=pass_mask,
-                )
-                pass_amax = tl.max(
-                    tl.where(pass_mask, tl.abs(normalized), 0.0),
-                    axis=0,
-                )
-            else:
-                pass_amax = 0.0
-
-            rotary_token_mask = rotary_mask & valid_token
-            x1 = tl.load(
-                in_base + rotary_offsets,
-                mask=rotary_token_mask,
-                other=0.0,
-            ).to(tl.float32)
-            x2 = tl.load(
-                in_base + half_rotary + rotary_offsets,
-                mask=rotary_token_mask,
-                other=0.0,
-            ).to(tl.float32)
-            x1 = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
-            x2 = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
-
-            position = tl.load(
-                positions_ptr + token,
-                mask=valid_token,
-                other=0,
-            ).to(tl.int64)
-            cache_base = position * cache_stride_p
-            cos = tl.load(
-                cos_sin_cache_ptr + cache_base + rotary_offsets,
-                mask=rotary_token_mask,
-                other=0.0,
-            ).to(tl.float32)
-            sin = tl.load(
-                cos_sin_cache_ptr + cache_base + half_rotary + rotary_offsets,
-                mask=rotary_token_mask,
-                other=0.0,
-            ).to(tl.float32)
-
-            out1 = (x1 * cos - x2 * sin).to(INPUT_DTYPE).to(tl.float32)
-            out2 = (x2 * cos + x1 * sin).to(INPUT_DTYPE).to(tl.float32)
-            tl.store(
-                out_base + rotary_offsets,
-                out1,
-                mask=rotary_token_mask,
-            )
-            tl.store(
-                out_base + half_rotary + rotary_offsets,
-                out2,
-                mask=rotary_token_mask,
-            )
-
-            rotary_amax = tl.maximum(
-                tl.max(
-                    tl.where(
-                        rotary_token_mask,
-                        tl.abs(out1),
-                        0.0,
-                    ),
-                    axis=0,
-                ),
-                tl.max(
-                    tl.where(
-                        rotary_token_mask,
-                        tl.abs(out2),
-                        0.0,
-                    ),
-                    axis=0,
-                ),
-            )
-            token_amax = tl.maximum(pass_amax, rotary_amax)
+            .to(INPUT_DTYPE)
+            .to(tl.float32)
+        )
+        tl.store(
+            out_base + head_offsets,
+            combined,
+            mask=full_mask,
+        )
+        token_amax = tl.max(
+            tl.where(full_mask, tl.abs(combined), 0.0),
+            axis=0,
+        )
 
         if is_k:
             tl.store(
@@ -260,7 +262,7 @@ def persistent_qk_norm_rope_gate_token_amax_kernel(
             )
 
 
-@triton.jit
+@triton.jit(repr=_v_token_amax_repr)
 def v_token_amax_kernel(
     v_ptr,
     v_token_amax_ptr,
@@ -292,7 +294,7 @@ def v_token_amax_kernel(
     )
 
 
-@triton.jit
+@triton.jit(repr=_segmented_qkv_partial_amax_repr)
 def segmented_qkv_partial_amax_kernel(
     q_token_amax_ptr,
     k_token_amax_ptr,
@@ -353,7 +355,7 @@ def segmented_qkv_partial_amax_kernel(
     tl.store(partial_amax_ptr + partial_base + 2, v_max)
 
 
-@triton.jit
+@triton.jit(repr=_segmented_qkv_scale_repr)
 def segmented_qkv_scale_kernel(
     partial_amax_ptr,
     q_descale_ptr,
@@ -408,7 +410,7 @@ def segmented_qkv_scale_kernel(
     tl.store(v_descale_ptr + sequence * num_kv_heads + kv_head, v_scale)
 
 
-@triton.jit
+@triton.jit(repr=_quantize_qk_grouped_repr)
 def quantize_qk_grouped_kernel(
     q_ptr,
     k_ptr,
@@ -439,19 +441,12 @@ def quantize_qk_grouped_kernel(
     head = tl.program_id(1)
     valid_token = token < num_actual_tokens
 
-    low = 0
-    high = num_sequences
-    for _ in tl.static_range(0, SEARCH_STEPS):
-        middle = (low + high) // 2
-        boundary = tl.load(
-            cu_seqlens_ptr + middle + 1,
-            mask=middle < num_sequences,
-            other=num_actual_tokens,
-        )
-        move_right = token >= boundary
-        low = tl.where(move_right, middle + 1, low)
-        high = tl.where(move_right, high, middle)
-    sequence = tl.minimum(low, num_sequences - 1)
+    sequence = _find_sequence_for_token(
+        token,
+        cu_seqlens_ptr,
+        num_sequences,
+        SEARCH_STEPS,
+    )
 
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
@@ -483,7 +478,7 @@ def quantize_qk_grouped_kernel(
     tl.store(out_base + d_offsets, quantized.to(tl.float8e4nv), mask=d_mask)
 
 
-@triton.jit
+@triton.jit(repr=_quantize_qk_grouped_offset_repr)
 def quantize_qk_grouped_offset_kernel(
     q_ptr,
     k_ptr,
@@ -522,19 +517,12 @@ def quantize_qk_grouped_offset_kernel(
     if SINGLE_SEQUENCE:
         sequence = sequence_start
     else:
-        low = 0
-        high = total_sequences
-        for _ in tl.static_range(0, SEARCH_STEPS):
-            middle = (low + high) // 2
-            boundary = tl.load(
-                cu_seqlens_ptr + middle + 1,
-                mask=middle < total_sequences,
-                other=num_actual_tokens,
-            )
-            move_right = token >= boundary
-            low = tl.where(move_right, middle + 1, low)
-            high = tl.where(move_right, high, middle)
-        sequence = tl.minimum(low, total_sequences - 1)
+        sequence = _find_sequence_for_token(
+            token,
+            cu_seqlens_ptr,
+            total_sequences,
+            SEARCH_STEPS,
+        )
 
     sequence_token_start = tl.load(cu_seqlens_ptr + sequence)
     sequence_token_end = tl.minimum(
@@ -578,7 +566,7 @@ def quantize_qk_grouped_offset_kernel(
     tl.store(out_base + d_offsets, quantized.to(tl.float8e4nv), mask=d_mask)
 
 
-@triton.jit
+@triton.jit(repr=_quantize_v_grouped_offset_repr)
 def quantize_v_grouped_offset_kernel(
     v_ptr,
     v_out_ptr,
@@ -608,19 +596,12 @@ def quantize_v_grouped_offset_kernel(
     if SINGLE_SEQUENCE:
         sequence = sequence_start
     else:
-        low = 0
-        high = total_sequences
-        for _ in tl.static_range(0, SEARCH_STEPS):
-            middle = (low + high) // 2
-            boundary = tl.load(
-                cu_seqlens_ptr + middle + 1,
-                mask=middle < total_sequences,
-                other=num_actual_tokens,
-            )
-            move_right = token >= boundary
-            low = tl.where(move_right, middle + 1, low)
-            high = tl.where(move_right, high, middle)
-        sequence = tl.minimum(low, total_sequences - 1)
+        sequence = _find_sequence_for_token(
+            token,
+            cu_seqlens_ptr,
+            total_sequences,
+            SEARCH_STEPS,
+        )
 
     sequence_token_start = tl.load(cu_seqlens_ptr + sequence)
     sequence_token_end = tl.minimum(
