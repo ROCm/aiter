@@ -13,8 +13,11 @@ name: PR Title Tags & Labels
 # touched. The same rule applies to labels: only the component labels listed
 # in COMPONENT_LABELS are ever added or removed — human labels (ci:*, ...)
 # are left alone, while hand-toggling a managed component label is corrected
-# on the spot. To opt a PR out entirely, add the 'no-auto-title' label — it
-# takes effect immediately, and removing it re-syncs the PR on the spot.
+# on the spot. To keep a PR's title untouched, add the 'no-auto-title' label —
+# it takes effect immediately, and removing it re-syncs the title on the spot.
+# Component labels are synced regardless of the opt-out: the AITER-triton
+# Kernels board (aiter-triton-board.yaml and the board's own auto-add rules)
+# relies on them being present.
 #
 # The tag set is documented in CONTRIBUTE.md ("PR Title Format") — keep the
 # two in sync when adding or renaming tags.
@@ -77,10 +80,10 @@ jobs:
               return;
             }
             const pr = context.payload.pull_request;
-            if (pr.labels.some(l => l.name === 'no-auto-title')) {
-              core.info("Label 'no-auto-title' set — skipping.");
-              return;
-            }
+            // 'no-auto-title' only opts the PR out of the title rewrite below;
+            // labels are still synced, so a Triton/Gluon PR cannot drop off the
+            // board by opting out.
+            const optedOut = pr.labels.some(l => l.name === 'no-auto-title');
 
             // ---- changed files (paginated) ----
             const files = (await github.paginate(github.rest.pulls.listFiles, {
@@ -156,7 +159,9 @@ jobs:
             ).replace(/\s{2,}/g, ' ').trim();
 
             const newTitle = (add.map(t => `[${t}]`).join(' ') + ' ' + stripped).trim();
-            if (newTitle === original) {
+            if (optedOut) {
+              core.info("Label 'no-auto-title' set — leaving the title alone.");
+            } else if (newTitle === original) {
               core.info(`Title already in sync (computed: ${JSON.stringify(tags)})`);
             } else {
               core.info(`Retitling: "${original}" -> "${newTitle}"`);
