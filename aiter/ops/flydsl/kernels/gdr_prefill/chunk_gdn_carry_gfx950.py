@@ -10,6 +10,110 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from ..gdr_common import _gview, _load_vec, _store_vec
 
 
+def _prefetch_a(maps, block, k_base, col, group, wave):
+    cp = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    return fx.Vector.from_elements(
+        [
+            _load_vec(
+                cp,
+                fx.slice(
+                    maps,
+                    (
+                        block,
+                        k_base + kk * 4 + group,
+                        panel * 64 + wave * 16 + col,
+                        None,
+                    ),
+                ),
+                1,
+                fx.Float32,
+            )
+            for kk in range(8)
+            for panel in range(2)
+        ],
+        dtype=fx.Float32,
+    )
+
+
+@flyc.jit
+def _affine_step(
+    maps: fx.Tensor,
+    rhs: fx.Tensor,
+    block: fx.Int32,
+    next_block: fx.Int32,
+    first_a: fx.Vector,
+    c_values: fx.Vector,
+    col: fx.Int32,
+    group: fx.Int32,
+    wave: fx.Int32,
+    N: fx.Constexpr[int],
+):
+    """Multiply A by an LDS [128,N,1] RHS, add C, and return next A's seed.
+
+    Accumulators and C are ordered by 16-column tile, 64-row panel, then
+    four MFMA values per lane. Maps retain the packed [block,probe,row,1] view.
+    """
+    lds_cp = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32, fx.Float32))
+    frag_a = fx.make_rmem_tensor(1, fx.Float32)
+    frag_b = fx.make_rmem_tensor(1, fx.Float32)
+    frag_c = fx.make_rmem_tensor(4, fx.Float32)
+    acc_count = 2 * (N // 16)
+
+    def multiply(a_values, k_base, accumulators):
+        values = list(accumulators)
+        for kk in range_constexpr(8):
+            for tile in range_constexpr(N // 16):
+                sv = _load_vec(
+                    lds_cp,
+                    fx.slice(rhs, (k_base + kk * 4 + group, tile * 16 + col, None)),
+                    1,
+                    fx.Float32,
+                )
+                frag_b.store(fx.Vector.from_elements([sv], dtype=fx.Float32))
+                for panel in range_constexpr(2):
+                    slot = tile * 2 + panel
+                    frag_a.store(
+                        fx.Vector.from_elements(
+                            [a_values[kk * 2 + panel]], dtype=fx.Float32
+                        )
+                    )
+                    frag_c.store(fx.Vector(values[slot]))
+                    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+                    values[slot] = frag_c.load()
+        return values
+
+    # Each buffer covers eight K4 steps, not a full 64 KiB map.
+    for chunk, carried in range(
+        fx.Int32(0),
+        fx.Int32(3),
+        fx.Int32(1),
+        init=[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(acc_count)]
+        + [first_a],
+    ):
+        k_base = fx.Int32(chunk) * 32
+        next_a = _prefetch_a(maps, block, k_base + 32, col, group, wave)
+        accumulators = multiply(
+            fx.Vector(carried[acc_count]), k_base, carried[:acc_count]
+        )
+        result = yield accumulators + [next_a]
+
+    # The caller clamps next_block on the final step, including one-block requests.
+    next_a = _prefetch_a(maps, next_block, fx.Int32(0), col, group, wave)
+    accumulators = multiply(
+        fx.Vector(result[acc_count]), fx.Int32(96), result[:acc_count]
+    )
+    output = fx.Vector.from_elements(
+        [
+            fx.Vector(accumulators[slot])[j] + c_values[slot * 4 + j]
+            for slot in range(acc_count)
+            for j in range(4)
+        ],
+        dtype=fx.Float32,
+    )
+    return output, next_a
+
+
 def compile_chunk_gdn_carry(
     *, H: int, use_initial_state: bool, STATE_DTYPE_BF16: bool = False
 ):
@@ -63,10 +167,6 @@ def compile_chunk_gdn_carry(
         )
         shared = fx.SharedAllocator().allocate(SharedStorage).peek()
         state = shared.state.view(fx.make_layout((K, BV, 1), (BV, 1, 1)))
-        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32, fx.Float32))
-        frag_a = fx.make_rmem_tensor(1, fx.Float32)
-        frag_b = fx.make_rmem_tensor(1, fx.Float32)
-        frag_c = [fx.make_rmem_tensor(4, fx.Float32) for _ in range(2)]
         for panel in range_constexpr(2):
             for j in range_constexpr(4):
                 row = panel * 64 + wave * 16 + group * 4 + j
@@ -89,39 +189,45 @@ def compile_chunk_gdn_carry(
                     )
         gpu.barrier()
 
-        for block in range(first, end - 1, fx.Int32(1)):
+        # Empty requests have no map; use an in-bounds seed even for a zero-trip scan.
+        seed_block = (first < end).select(first, fx.Int32(0))
+        first_a = _prefetch_a(maps, seed_block, fx.Int32(0), col, group, wave)
+        for block, carried_a in range(first, end - 1, fx.Int32(1), init=[first_a]):
             b = fx.Int32(block)
-            # Four waves cover 64 rows; retain both panels until all old-state
-            # reads finish. FP32 inputs avoid truncating the accumulated maps.
-            for kk, acc in range(
-                fx.Int32(0),
-                fx.Int32(K),
-                fx.Int32(4),
-                init=[
-                    fx.Vector.filled(4, 0.0, fx.Float32),
-                    fx.Vector.filled(4, 0.0, fx.Float32),
-                ],
-            ):
-                k = fx.Int32(kk) + group
-                sv = _load_vec(lds_cp, fx.slice(state, (k, col, None)), 1, fx.Float32)
-                frag_b.store(fx.Vector.from_elements([sv], dtype=fx.Float32))
-                for panel in range_constexpr(2):
-                    row_a = panel * 64 + wave * 16 + col
-                    av = _load_vec(
-                        cp, fx.slice(maps, (b, k, row_a, None)), 1, fx.Float32
+            c_values = fx.Vector.from_elements(
+                [
+                    _load_vec(
+                        cp,
+                        fx.slice(
+                            maps,
+                            (b, K + v, panel * 64 + wave * 16 + group * 4 + j, None),
+                        ),
+                        1,
+                        fx.Float32,
                     )
-                    frag_a.store(fx.Vector.from_elements([av], dtype=fx.Float32))
-                    frag_c[panel].store(fx.Vector(acc[panel]))
-                    fx.gemm(mma, frag_c[panel], frag_a, frag_b, frag_c[panel])
-                result = yield [frag_c[0].load(), frag_c[1].load()]
+                    for panel in range(2)
+                    for j in range(4)
+                ],
+                dtype=fx.Float32,
+            )
+            next_block = (b + 1 < end - 1).select(b + 1, b)
+            values, next_a = _affine_step(
+                maps,
+                state,
+                b,
+                next_block,
+                fx.Vector(carried_a[0]),
+                c_values,
+                col,
+                group,
+                wave,
+                BV,
+            )
             gpu.barrier()
             for panel in range_constexpr(2):
-                values = fx.Vector(result[panel])
                 for j in range_constexpr(4):
                     row = panel * 64 + wave * 16 + group * 4 + j
-                    next_state = values[j] + _load_vec(
-                        cp, fx.slice(maps, (b, K + v, row, None)), 1, fx.Float32
-                    )
+                    next_state = values[panel * 4 + j]
                     _store_vec(
                         lds_cp,
                         fx.slice(state, (row, col, None)),
@@ -137,6 +243,7 @@ def compile_chunk_gdn_carry(
                         fx.Float32,
                     )
             gpu.barrier()
+            _carried_result = yield [next_a]
 
     @flyc.jit
     def launch(
