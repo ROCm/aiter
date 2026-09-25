@@ -36,6 +36,11 @@
       "num_ctas": 1,
       "num_stages": 2
     },
+    "mid_head_skip": [
+      {"causal": true, "max_seqlen_k": 512, "min_programs": 512},
+      {"causal": false, "min_head_dim_v": 97, "max_seqlen_k": 256, "min_programs": 1024},
+      {"causal": false, "max_seqlen_k": 128, "min_programs": 1024}
+    ],
     "pe": {
       "BLOCK_M": 128,
       "BLOCK_N": 32,
