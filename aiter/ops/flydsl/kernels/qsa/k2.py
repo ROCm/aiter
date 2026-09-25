@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Family A FlyDSL QSA K2, shaped after the live AMD Triton kernel.
+"""FlyDSL QSA K2 sparse paged GQA, shaped after the live AMD Triton kernel.
 
 One workgroup owns ``(row, kv_head, split)``.  Q is staged once, paged K/V
 are gathered in ``BLOCK_N`` tiles, QK and PV use BF16 MFMA, and online
-softmax is maintained in log2 space.  Host dispatch mirrors live AMD:
-small decode uses BLOCK_N=16 / four waves / split-K, while prefill uses
-BLOCK_N=64 / two waves / one split and writes output directly.
+softmax is maintained in log2 space.  Decode runs BLOCK_N=16 over two waves
+with split-K; prefill runs BLOCK_N=32 over two waves and, once the grid
+alone fills the machine, writes its output directly.
 
-gfx942 aliases K and V in one LDS tile so BLOCK_N=64 stays under 64 KiB.
+gfx942 aliases K and V in one LDS tile so the tile stays under 64 KiB.
 gfx950 stores K and V separately and gathers this tile's V after K is
 visible so QK can run while V is in flight.  Softmax stays in registers
 (full-D QK on every wave, in-wave P transpose); LDS is MMA scratch only.
 Expand, partial RoPE, and the sigmoid output gate remain outside K2.
+
+The GQA shape is a build parameter rather than a constant -- the caller's
+tensors supply it -- but only the shapes in ``_TUNED_SHAPES`` have a
+measured launch policy, so the dispatch gate admits just those.
 """
 
 from functools import lru_cache
@@ -39,14 +43,14 @@ from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.shapes import FAMILY_A_GQA
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
-_HQ = FAMILY_A_GQA.n_heads
-_HK = FAMILY_A_GQA.kv_heads
-_GROUP = FAMILY_A_GQA.group_size
-_D = FAMILY_A_GQA.head_dim
-# Pad K (and aliased KV) rows so consecutive columns do not share LDS banks
-# on 128-bit stores. D=256 makes n*D a multiple of 32 banks otherwise.
-_K_STRIDE = _D + 8
-_HEAD_PAD = 16
+# GQA shapes whose launch policy has been measured, as
+# ``(n_q_heads, n_kv_heads, head_dim)``. The kernel body is shape-generic,
+# but the band table in ``_launch_config``, the prefill workgroup target and
+# the BLOCK_N choices are all fitted, so serving an untuned shape would be
+# correct and slow. Widen this only alongside a measurement.
+_TUNED_SHAPES = frozenset(
+    {(FAMILY_A_GQA.n_heads, FAMILY_A_GQA.kv_heads, FAMILY_A_GQA.head_dim)}
+)
 # 256 CUs on MI355X times the four BN32 prefill workgroups each keeps resident.
 _PREFILL_WGS = 256 * 4
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
@@ -60,7 +64,6 @@ _DECODE_THREADS = 128
 # split kernel. M=2 already reaches that wave count, and doubling its splits
 # only buys a bigger merge, so the wider band stops here.
 _TINY_SPLITS = 128
-_DEFAULT_SCALE = _D**-0.5
 _LSE_EMPTY = -1.0e20
 _LOG2E = 1.4426950408889634
 
@@ -91,9 +94,9 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
     )
 
 
-def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
+def _launch_config(rows: int, n_sel: int, n_kv_heads: int) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned AMD-shaped policy."""
-    base_programs = rows * _HK
+    base_programs = rows * n_kv_heads
     # Live AMD: base_programs <= 4 -> 64 splits / 128 WGs; 4 < base < 32
     # -> 32 splits / 512 WGs. Same BN16 / 4-wave tile in both bands.
     if base_programs <= 2:
@@ -120,13 +123,30 @@ def _launch_config(rows: int, n_sel: int) -> tuple[int, int, int]:
     return block_n, threads, min(max_useful_splits, target_splits)
 
 
-def build_qsa_k2_family_a_module(
+def build_qsa_k2_module(
+    n_q_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
     page_size: int,
     use_k32: bool,
     block_n: int,
     block_threads: int,
     n_splits: int,
 ):
+    if n_kv_heads < 1 or n_q_heads % n_kv_heads:
+        raise ValueError(
+            f"{n_q_heads} query heads do not group over {n_kv_heads} KV heads"
+        )
+    group_size = n_q_heads // n_kv_heads
+    # The group occupies the M dim of one 16x16 MFMA, and D is walked in
+    # K32 steps of eight-element vectors.
+    if group_size > 16:
+        raise ValueError(f"group must fit one MFMA M dim, got {group_size}")
+    if head_dim % 32:
+        raise ValueError(f"head_dim must be a multiple of 32, got {head_dim}")
+    # Pad K (and aliased KV) rows so consecutive columns do not share LDS
+    # banks on 128-bit stores; a bare head_dim makes n*D a multiple of 32.
+    k_stride = head_dim + 8
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
     if block_n not in (16, 32, 64):
@@ -141,24 +161,22 @@ def build_qsa_k2_family_a_module(
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
     # Each thread walks every split for its own D element, so the unrolled
-    # load chain is n_splits * (_D / merge_threads) deep. Past ~128 the
+    # load chain is n_splits * (head_dim / merge_threads) deep. Past ~128 the
     # scheduler serializes it, so widen the workgroup instead of deepening the
     # chain -- but stop at one element per thread, past which the extra
     # threads own no D and the merge would write nothing.
-    merge_threads = min(128, _D)
-    while merge_threads < _D and n_splits * (_D // merge_threads) > 128:
+    merge_threads = min(128, head_dim)
+    while merge_threads < head_dim and n_splits * (head_dim // merge_threads) > 128:
         merge_threads *= 2
-    if _HQ != _HK * _GROUP:
-        raise ValueError("family A GQA head counts do not form groups")
 
     num_waves = block_threads // 64
     n_subtiles = block_n // 16
     qk_k = 32 if use_k32 else 16
     qk_vec = qk_k // 4
-    qk_steps = _D // qk_k
-    out_chunks = _D // (num_waves * 16)
+    qk_steps = head_dim // qk_k
+    out_chunks = head_dim // (num_waves * 16)
     vec = 8
-    d_chunks = _D // vec
+    d_chunks = head_dim // vec
     col_owners = block_threads // block_n
     gather_rounds = d_chunks // col_owners
     # Every gather round in flight costs 4 VGPRs. BN64 owns only two threads
@@ -183,7 +201,7 @@ def build_qsa_k2_family_a_module(
     # split three ways: ``owner`` picks one of the col_owners threads sharing
     # a token, and the rest splits into a quarter and a group whose radices
     # multiply to gather_rounds. One group slot holds a 16 B vector for every
-    # thread, so the whole image is block_n * _D * 2 B for any launch shape.
+    # thread, so the whole image is block_n * head_dim * 2 B for any launch shape.
     k_quarter_radix = min(4, gather_rounds)
     k_group_radix = gather_rounds // k_quarter_radix
     k_group_slot = block_threads * 16
@@ -196,7 +214,7 @@ def build_qsa_k2_family_a_module(
     # leaves enough LDS to just pay for the second region. Decode keeps the
     # overlay: its tile is a quarter the size and it uses a different V map.
     split_kv_lds = use_k32 and not token_major_v
-    v_elem_off = block_n * _D if split_kv_lds else 0
+    v_elem_off = block_n * head_dim if split_kv_lds else 0
     v_pf_rounds = gather_rounds if split_kv_lds else gather_chunk
     v_pf_chunks = v_pf_rounds // gather_chunk
     # PV splits the output dimension across waves, so every wave needs the
@@ -218,11 +236,11 @@ def build_qsa_k2_family_a_module(
             layout = fx.make_composed_layout(
                 fx.static(fx.SwizzleType.get(3, 3, 3)),
                 offset,
-                fx.make_layout(shape, (_D, 1)),
+                fx.make_layout(shape, (head_dim, 1)),
             )
             ptr = k_arr.ptr
         else:
-            layout = fx.make_layout(shape, (_K_STRIDE, 1))
+            layout = fx.make_layout(shape, (k_stride, 1))
             ptr = k_arr.ptr + offset
         return fx.make_view(ptr, layout)
 
@@ -230,7 +248,7 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            kv: fx.Array[BFloat16, block_n * _D + v_elem_off, 16]
+            kv: fx.Array[BFloat16, block_n * head_dim + v_elem_off, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
 
         _k_field, _v_field = "kv", "kv"
@@ -238,7 +256,7 @@ def build_qsa_k2_family_a_module(
 
         @fx.struct
         class SharedStorage:
-            kv: fx.Array[BFloat16, block_n * _K_STRIDE, 16]
+            kv: fx.Array[BFloat16, block_n * k_stride, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
 
         _k_field, _v_field = "kv", "kv"
@@ -249,8 +267,11 @@ def build_qsa_k2_family_a_module(
         denominator: fx.Array[Float32, 1, 16]
 
     @flyc.kernel(
-        name="qsa_k2_family_a_port_split_"
+        name="qsa_k2_split_"
         + kernel_signature(
+            hq=n_q_heads,
+            hk=n_kv_heads,
+            d=head_dim,
             ps=page_size,
             bn=block_n,
             blk=block_threads,
@@ -309,8 +330,8 @@ def build_qsa_k2_family_a_module(
         score_layout = fx.make_layout(4, 1)
         v_lds = getattr(storage, _v_field).view(
             fx.make_layout(
-                (block_n, _K_STRIDE if not use_k32 else _D),
-                (_K_STRIDE if not use_k32 else _D, 1),
+                (block_n, k_stride if not use_k32 else head_dim),
+                (k_stride if not use_k32 else head_dim, 1),
             )
         )
 
@@ -469,15 +490,14 @@ def build_qsa_k2_family_a_module(
         # token-major in registers, which is already the PV A fragment map.
         # Issue the loads, then the page-table load, then mask: the masking is
         # the only prologue work long enough to cover a page-table round trip.
-        q_live = lane_m < Int32(_GROUP)
+        q_live = lane_m < Int32(group_size)
         q_frags = []
         for ks in range_constexpr(qk_steps):
-            q_base = (row * Int32(_HQ) + kv_h * Int32(_GROUP)) * Int32(_D) + Int32(
-                ks * qk_k
-            )
+            q_head = row * Int32(n_q_heads) + kv_h * Int32(group_size)
+            q_base = q_head * Int32(head_dim) + Int32(ks * qk_k)
             q_tile = fx.make_view(
                 fx.get_iter(q_buf) + q_base,
-                fx.make_layout((16, qk_k), (_D, 1)),
+                fx.make_layout((16, qk_k), (head_dim, 1)),
             )
             q_src = qk_q_copy.partition_S(q_tile)
             q_frag = fx.make_fragment_like(q_src)
@@ -573,7 +593,7 @@ def build_qsa_k2_family_a_module(
                             Int32(gr * gather_span),
                             (block_n, gather_span),
                         )
-                        k_dst = kv_store.partition_D(k_tile)
+                        k_dst = kv_store.partitionhead_dim(k_tile)
                         k_store_frag = fx.make_fragment_like(k_dst)
                         fx.memref_store_vec(k_vec, k_store_frag)
                         fx.copy(lds_copy, k_store_frag, k_dst)
@@ -617,7 +637,7 @@ def build_qsa_k2_family_a_module(
                             )
                         acc4 = qk_mfma(a_vec, fx.Vector(q_regs[ks]), acc4)
                 else:
-                    k_row_bytes = Int32(_D if use_k32 else _K_STRIDE)
+                    k_row_bytes = Int32(head_dim if use_k32 else k_stride)
                     sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
                     a_src = qk_a_copy.partition_S(sA)
                     a_frag = fx.make_fragment_like(a_src)
@@ -688,7 +708,7 @@ def build_qsa_k2_family_a_module(
                 store_elem = (
                     (col % Int32(32)) * Int32(4)
                     + chunk_owner * Int32(128)
-                    + _idiv(col, Int32(32)) * Int32(32 * _D)
+                    + _idiv(col, Int32(32)) * Int32(32 * head_dim)
                 )
                 store_addr = Int32((store_elem + Int32(v_elem_off)) * Int32(2))
                 for gc in range_constexpr(n_gather_chunks):
@@ -742,9 +762,9 @@ def build_qsa_k2_family_a_module(
                     fx.memref_store_vec(v_vec, v_frag)
                     v_tile = fx.make_view(
                         fx.get_iter(v_lds) + Int32(gr * gather_span),
-                        fx.make_layout((block_n, gather_span), (_K_STRIDE, 1)),
+                        fx.make_layout((block_n, gather_span), (k_stride, 1)),
                     )
-                    v_dst = kv_store.partition_D(v_tile)
+                    v_dst = kv_store.partitionhead_dim(v_tile)
                     v_store_frag = fx.make_fragment_like(v_dst)
                     fx.memref_store_vec(v_vec, v_store_frag)
                     fx.copy(lds_copy, v_store_frag, v_dst)
@@ -845,13 +865,13 @@ def build_qsa_k2_family_a_module(
                 )
             next_acc = []
             for c in range_constexpr(out_chunks):
-                d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
+                d = wave * Int32(head_dim // num_waves) + Int32(c * 16) + lane_m
                 acc4 = fx.Vector(state[c]) * alpha4
                 v_ops = []
                 for ng in range_constexpr(n_subtiles):
                     n0 = Int32(ng * 16) + lane_kg * Int32(4)
                     if const_expr(use_k32):
-                        d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
+                        d_base = wave * Int32(head_dim // num_waves) + Int32(c * 16)
                         if const_expr(decode_tr_pv):
                             src_n = (
                                 Int32(ng * 16)
@@ -882,8 +902,9 @@ def build_qsa_k2_family_a_module(
                                 + src_d % Int32(4)
                                 + (src_n % Int32(32)) * Int32(4)
                                 + _idiv(src_d, Int32(8)) * Int32(128)
-                                + (_idiv(src_d, Int32(4)) % Int32(2)) * Int32(16 * _D)
-                                + _idiv(src_n, Int32(32)) * Int32(32 * _D)
+                                + (_idiv(src_d, Int32(4)) % Int32(2))
+                                * Int32(16 * head_dim)
+                                + _idiv(src_n, Int32(32)) * Int32(32 * head_dim)
                             )
                             src = fx.make_view(
                                 k_arr.ptr + src_off, fx.make_layout(4, 1)
@@ -945,11 +966,11 @@ def build_qsa_k2_family_a_module(
         if const_expr(decode_tr_pv):
             # PV C now keeps one query head on lane_m and four contiguous D
             # rows in each VGPR vector. Store that fragment directly.
-            if lane_m < Int32(_GROUP):
-                head = kv_h * Int32(_GROUP) + lane_m
+            if lane_m < Int32(group_size):
+                head = kv_h * Int32(group_size) + lane_m
                 has = l_final > Float32(0.0)
                 for c in range_constexpr(out_chunks):
-                    d_base = wave * Int32(_D // num_waves) + Int32(c * 16)
+                    d_base = wave * Int32(head_dim // num_waves) + Int32(c * 16)
                     for i in range_constexpr(4):
                         d = d_base + lane_kg * Int32(4) + Int32(i)
                         value = has.select(
@@ -970,19 +991,19 @@ def build_qsa_k2_family_a_module(
             )
             for i in range_constexpr(4):
                 local_head = lane_kg * Int32(4) + Int32(i)
-                if local_head < Int32(_GROUP):
-                    head = kv_h * Int32(_GROUP) + local_head
+                if local_head < Int32(group_size):
+                    head = kv_h * Int32(group_size) + local_head
                     den = l4[i]
                     has = den > Float32(0.0)
                     for c in range_constexpr(out_chunks):
-                        d = wave * Int32(_D // num_waves) + Int32(c * 16) + lane_m
+                        d = wave * Int32(head_dim // num_waves) + Int32(c * 16) + lane_m
                         value = has.select(fx.Vector(results[c])[i] / den, Float32(0.0))
                         if n_splits == 1:
                             out[row, head, d] = value.to(BFloat16)
                         else:
                             partial_out[split, row, head, d] = value
-        if n_splits > 1 and lane_kg == zero and lane_m < Int32(_GROUP):
-            head = kv_h * Int32(_GROUP) + lane_m
+        if n_splits > 1 and lane_kg == zero and lane_m < Int32(group_size):
+            head = kv_h * Int32(group_size) + lane_m
             den = l_final
             has = den > Float32(0.0)
             lse = has.select(
@@ -992,8 +1013,8 @@ def build_qsa_k2_family_a_module(
             partial_lse[split, row, head] = lse
 
     @flyc.kernel(
-        name="qsa_k2_family_a_port_merge_"
-        + kernel_signature(ns=n_splits, blk=merge_threads, d=_D),
+        name="qsa_k2_merge_"
+        + kernel_signature(ns=n_splits, blk=merge_threads, d=head_dim),
         known_block_size=[merge_threads, 1, 1],
     )
     def merge_kernel(
@@ -1038,7 +1059,7 @@ def build_qsa_k2_family_a_module(
             denominator[0] = den
         gpu.barrier()
 
-        for di in range_constexpr(_D // merge_threads):
+        for di in range_constexpr(head_dim // merge_threads):
             d = tid + Int32(di * merge_threads)
             merged = zero_f
             for s in range_constexpr(n_splits):
@@ -1105,18 +1126,28 @@ def build_qsa_k2_family_a_module(
 
 @lru_cache(maxsize=32)
 def _plan(
+    n_q_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
     page_size: int,
     use_k32: bool,
     block_n: int,
     block_threads: int,
     n_splits: int,
 ):
-    return build_qsa_k2_family_a_module(
-        page_size, use_k32, block_n, block_threads, n_splits
+    return build_qsa_k2_module(
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        page_size,
+        use_k32,
+        block_n,
+        block_threads,
+        n_splits,
     )
 
 
-def qsa_k2_family_a_serves(
+def qsa_k2_serves(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1124,20 +1155,20 @@ def qsa_k2_family_a_serves(
     page_table: torch.Tensor,
 ) -> str | None:
     """Why this K2 kernel cannot serve these tensors, or None if it can."""
-    gqa = FAMILY_A_GQA
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         return f"q and caches must be bfloat16, got {q.dtype} and {k_cache.dtype}"
     if v_cache.dtype != k_cache.dtype or v_cache.shape != k_cache.shape:
         return "v_cache must match k_cache dtype and shape"
-    if q.dim() != 3 or q.shape[1] != gqa.n_heads or q.shape[2] != gqa.head_dim:
-        return f"q must be [M, {gqa.n_heads}, {gqa.head_dim}], got {tuple(q.shape)}"
+    if q.dim() != 3:
+        return f"q must be [M, Hq, D], got {tuple(q.shape)}"
     if k_cache.dim() != 4:
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
-    if k_cache.shape[2] != gqa.kv_heads or k_cache.shape[3] != gqa.head_dim:
-        return (
-            f"k_cache KV/D must be ({gqa.kv_heads}, {gqa.head_dim}), "
-            f"got {k_cache.shape[2:]}"
-        )
+    if k_cache.shape[3] != q.shape[2]:
+        return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
+    shape = (int(q.shape[1]), int(k_cache.shape[2]), int(q.shape[2]))
+    if shape not in _TUNED_SHAPES:
+        tuned = ", ".join(str(s) for s in sorted(_TUNED_SHAPES))
+        return f"(Hq, Hk, D) {shape} has no tuned launch policy; tuned: {tuned}"
     if indices.dim() != 2 or indices.shape[0] != q.shape[0]:
         return "indices must be [M, W]"
     if indices.dtype != torch.int32:
@@ -1149,7 +1180,7 @@ def qsa_k2_family_a_serves(
     return None
 
 
-def qsa_k2_family_a(
+def qsa_k2(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1159,11 +1190,14 @@ def qsa_k2_family_a(
     out: torch.Tensor | None = None,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Write family A sparse GQA ``o [M, 24, 256]`` from paged K/V."""
-    reason = qsa_k2_family_a_serves(q, k_cache, v_cache, indices, page_table)
+    """Write sparse GQA ``o [M, Hq, D]`` from paged K/V."""
+    reason = qsa_k2_serves(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
-        raise ValueError(f"[FlyDSL qsa_k2_family_a] {reason}")
+        raise ValueError(f"[FlyDSL qsa_k2] {reason}")
     rows = q.shape[0]
+    n_q_heads = int(q.shape[1])
+    head_dim = int(q.shape[2])
+    n_kv_heads = int(k_cache.shape[2])
     if token_to_req.shape != (rows,) or token_to_req.dtype != torch.int32:
         raise ValueError(f"token_to_req must be int32 [{rows}]")
     if out is None:
@@ -1178,7 +1212,7 @@ def qsa_k2_family_a(
     if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
     if softmax_scale is None:
-        softmax_scale = _DEFAULT_SCALE
+        softmax_scale = head_dim**-0.5
     if not rows or not indices.shape[1]:
         return out.zero_()
 
@@ -1193,20 +1227,29 @@ def qsa_k2_family_a(
         "gfx950"
     )
     n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel)
+    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads)
     if n_splits == 1:
         partial_out = out
         partial_lse = out
     else:
         partial_out = torch.empty(
-            (n_splits, rows, _HQ, _D), dtype=torch.float32, device=q.device
+            (n_splits, rows, n_q_heads, head_dim), dtype=torch.float32, device=q.device
         )
         partial_lse = torch.empty(
-            (n_splits, rows, _HQ), dtype=torch.float32, device=q.device
+            (n_splits, rows, n_q_heads), dtype=torch.float32, device=q.device
         )
 
     _run_compiled(
-        _plan(page_size, use_k32, block_n, block_threads, n_splits),
+        _plan(
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            page_size,
+            use_k32,
+            block_n,
+            block_threads,
+            n_splits,
+        ),
         q,
         k_cache,
         v_cache,
@@ -1222,8 +1265,8 @@ def qsa_k2_family_a(
         int(k_cache.shape[0]),
         float(softmax_scale * _LOG2E),
         int(rows),
-        int(_HK),
-        int(_HQ),
+        int(n_kv_heads),
+        int(n_q_heads),
         torch.cuda.current_stream(q.device),
     )
     return out
