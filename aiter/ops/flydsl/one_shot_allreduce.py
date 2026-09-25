@@ -100,7 +100,6 @@ class OneShotAllReduce:
         block: int | None = None,
         max_bytes: int | None = None,
         link: str | None = None,
-        probe: str = "full",
         skip_self: bool | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
@@ -157,7 +156,6 @@ class OneShotAllReduce:
         self.max_bytes = (
             max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
-        self.probe = probe
 
         # ``skip_self``: None means "whatever the rung says".
         ss = None if skip_self is None else bool(skip_self)
@@ -208,7 +206,6 @@ class OneShotAllReduce:
                         inbox_memory=resolved_inbox,
                         fanout=key[2],
                         block=key[3],
-                        probe=probe,
                         skip_self=key[4],
                         rank=self.rank,
                     )
@@ -364,13 +361,6 @@ class OneShotAllReduce:
         return int(nbytes) <= self.max_bytes
 
     def allreduce(self, inp, out, stream=None):
-        if self.probe != "full":
-            raise RuntimeError(
-                f"OneShotAllReduce was built with probe={self.probe!r}, a "
-                "measurement-only variant that does not move the payload and "
-                "computes a wrong answer. Use compile_and_launch()/_launch() "
-                "to time it."
-            )
         live_bytes = self._check_payload(inp, out)
         if not self.is_beneficial(live_bytes):
             raise ValueError(

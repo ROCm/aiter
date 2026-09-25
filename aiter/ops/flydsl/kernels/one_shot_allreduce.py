@@ -154,13 +154,6 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 FANOUT_ORDERS = ("peer", "atom")
 DEFAULT_FANOUT = "peer"
 
-# Measurement-only build variants. "sync" keeps the colour loop, the flag
-# publish and the flag wait but touches no payload, so it times the floor this
-# schedule cannot go below: launch path + one flag round trip + rank-arrival
-# skew. It computes a wrong answer by construction and must never be dispatched
-# to; ``OneShotAllReduce`` refuses to run a probe build through ``allreduce``.
-PROBE_MODES = ("full", "sync")
-
 # Whether a rank pushes its own contribution through its own inbox. Keeping it
 # costs a store, a load and a flag per tile in memory the rank already holds in
 # registers, which is 1/N of each; dropping it specialises the binary per rank.
@@ -196,7 +189,6 @@ def make_one_shot_allreduce_kernel(
     grid: int,
     inbox_memory: str = "uncached",
     fanout: str = DEFAULT_FANOUT,
-    probe: str = "full",
     skip_self: bool = False,
     rank: int | None = None,
     block: int = DEFAULT_BLOCK,
@@ -220,8 +212,6 @@ def make_one_shot_allreduce_kernel(
         )
     if fanout not in FANOUT_ORDERS:
         raise ValueError(f"fanout must be one of {FANOUT_ORDERS}, got {fanout!r}")
-    if probe not in PROBE_MODES:
-        raise ValueError(f"probe must be one of {PROBE_MODES}, got {probe!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
 
@@ -481,18 +471,11 @@ def make_one_shot_allreduce_kernel(
         for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
             tile = bid + i * n_blocks
             parity = color & fx.Int32(1)
-            # ``probe`` is a trace-time constant, so only one arm is emitted.
-            # "sync" is measurement-only: the handshake with no payload
-            # touched, so the wall time is the launch path plus the flag round
-            # trip plus rank-arrival skew. Nothing this schedule does to the
-            # data movement can go below it. Output is garbage.
-            if const_expr(probe == "full"):
-                my_atoms = _load_tile(tile)
-                _fanout(parity, my_atoms)
+            my_atoms = _load_tile(tile)
+            _fanout(parity, my_atoms)
             _publish(parity, color)
             _wait(parity, color)
-            if const_expr(probe == "full"):
-                _store_tile(tile, _reduce(parity, my_atoms))
+            _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -526,13 +509,9 @@ def make_one_shot_allreduce_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}"
-    if block != DEFAULT_BLOCK:
-        tag += f"_b{block}"
+    tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
-    if probe != "full":
-        tag += f"_{probe}"
     if skip_self:
         # ``_r<n>_`` is the rank field the bench's variant comparison already
         # knows to collapse before checking that the ranks agree; a build
@@ -561,7 +540,6 @@ def make_one_shot_allreduce_kernel(
         "world_size": world_size,
         "inbox_memory": inbox_memory,
         "fanout": fanout,
-        "probe": probe,
         "skip_self": skip_self,
         "grid": grid,
         "block": block,
