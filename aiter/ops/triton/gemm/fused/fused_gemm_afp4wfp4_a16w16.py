@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 impo
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
@@ -199,6 +200,7 @@ def fused_gemm_afp4wfp4_a16w16(
             ADD_BIAS_BF16=(bias_bf16 is not None),
             SKIP_REDUCE=skip_reduce,
             **config,
+            NUM_XCDS=get_num_xcds(),
         )
 
     M_POW2 = triton.next_power_of_2(M)

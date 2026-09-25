@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 # -----------------------------------------------------------------------------
@@ -70,7 +71,7 @@ def allocate_output(
 def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()

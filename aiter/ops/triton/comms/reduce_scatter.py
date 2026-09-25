@@ -16,6 +16,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from aiter.ops.triton.utils.device_info import get_num_sms
+
 if TYPE_CHECKING:
     from aiter.ops.triton.comms.iris import IrisCommContext
 
@@ -168,7 +170,7 @@ def reduce_scatter(
     block_m: int = 16,
     block_n: int = 64,
     group_size_m: int = 8,
-    num_sms: int = 256,
+    num_sms: int | None = 256,
 ) -> Tensor:
     """
     Perform reduce-scatter along the M (row) dimension.
@@ -184,7 +186,8 @@ def reduce_scatter(
         block_m (int): Block size for M dimension. Default: 16
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
-        num_sms (int): Number of SMs to use (persistent kernel). Default: 256
+        num_sms (int | None): Persistent grid size. Default: 256.
+            None uses the current device's CU count.
 
     Returns:
         Tensor: Output shard of shape [M_shard, N] where M_shard = M // world_size
@@ -227,6 +230,8 @@ def reduce_scatter(
     output_shard = iris_ctx.zeros((M_shard, N), dtype=input_tensor.dtype)
 
     # Launch kernel
+    if num_sms is None:
+        num_sms = get_num_sms()
     grid = (num_sms,)
     _reduce_scatter_kernel[grid](
         input_tensor,

@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _get_config,
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import add_default_gemm_config_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -100,6 +101,7 @@ def gemm_a16w16_atomic_(
         y.stride(0),
         y.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     return y

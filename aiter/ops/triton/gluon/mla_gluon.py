@@ -53,7 +53,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # fmt: off
 @gluon.jit
@@ -924,16 +924,21 @@ def mla_gluon(
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
-        # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
-        # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+        # Auto-pick NUM_KV_SPLITS so the launch fills about one wave of workgroups.
+        NUM_CUS = get_num_sms()
         base_grid = (
             NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * qlen * (batch_size // NUM_XCDS)
         )
-        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
+        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(NUM_CUS, base_grid)))
 
         assert (
             batch_size % 64 == 0
         ), f"mla_gluon[bh64] requires batch_size divisible by 64, got {batch_size}"
+        # cur_batch advances by NUM_XCDS; require complete batch groups.
+        assert batch_size % NUM_XCDS == 0, (
+            f"mla_gluon[bh64] requires batch_size divisible by the die count "
+            f"{NUM_XCDS}, got {batch_size}"
+        )
         # gl.assume(num_iter > 3) inside the kernel requires every split to have
         # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
         # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
@@ -952,12 +957,12 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # Fixed ~256-WG launch budget, independent of sequence length so CUDA
+        # One-wave launch budget, independent of sequence length so CUDA
         # Graph capture cannot freeze it; the kernels derive the per-batch
         # partition from the runtime KV length. Head blocks and MTP qlen already
         # consume part of the wave, so the budget divides by them too.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+        NUM_KV_SPLITS = max(1, get_num_sms() // (batch_size * qlen * NUM_M_BLOCKS))
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
