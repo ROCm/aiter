@@ -2,10 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Selector coverage for the FlyDSL fp8_mqa_logits kernel variants.
 
-``_auto_variant`` is pure shape arithmetic, so these launch no kernel: they pin
-the RPB bands, the middle-band step-down, and the unchanged WPB rule, none of
-which the shape sweep in ``test_flydsl_fp8_mqa_logits.py`` reaches (its largest
-shape is below the top RPB threshold, so ``r4`` never gets selected there).
+CI discovers ``op_tests/test_*.py``. These pin the RPB bands, the middle-band
+step-down, and the WPB rule; they launch no kernel. The GPU sweep covers the
+auto-selected ``r4`` path.
 """
 
 import pytest
@@ -42,7 +41,7 @@ def _rpb_wpb(seq_len, seq_len_kv):
         (256, 1024, 1),
         (64, 8192, 2),  # exactly RPB2_MIN_ELEMS
         (512, 1024, 2),
-        (1024, 1560, 2),  # largest shape the existing sweep covers
+        (1024, 1560, 2),
         (513, 1024, 1),  # middle band, odd seq_len: step down
         (1, 2**20, 1),
         (2048, 1024, 4),  # exactly RPB4_MIN_ELEMS
@@ -122,3 +121,7 @@ def test_resolve_variant_rejects_unknown_tag(monkeypatch):
     monkeypatch.delenv("FLYDSL_FP8_MQA_LOGITS_VARIANT", raising=False)
     with pytest.raises(ValueError, match="unknown fp8_mqa_logits variant"):
         _resolve_variant("mfma_r3_w4", 1024, 131072, NUM_HEADS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

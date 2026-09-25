@@ -648,7 +648,7 @@ def _full_set(args):
 def _reduced_set(args):
     """One case per (shape, window) pair, with the remaining axes rotated.
 
-    56 cases on the defaults, which is what the CI lane runs. Shape and window
+    65 cases on the defaults, which is what the CI lane runs. Shape and window
     are the axes that reach genuinely distinct kernel paths -- the grid.y split,
     the negative/empty window collapse, the cu_starts clamp -- so they are
     covered exhaustively. num_heads, head_dim, clean_logits and the operand
@@ -750,6 +750,10 @@ def main():
             # enough that most blocks end up owning an empty column range.
             (64, 2048),
             (64, 8192),
+            # r4 auto-select: 256*8192 == 2**21. 257 is odd, so the launcher
+            # pads seq_len up to a multiple of RPB=4.
+            (256, 8192),
+            (257, 8192),
             # s_kv < s_q. A causal mask then puts cu_ends below zero on the
             # leading rows, so these cover the negative-window path end to end.
             (128, 64),
