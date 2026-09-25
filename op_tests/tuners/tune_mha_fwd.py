@@ -1,25 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Exhaustive, correctness-gated tuner for packed-varlen MHA forward.
+"""Correctness-gated tuner for packed-varlen MHA forward.
 
-The input CSV is a workload catalogue, the optional profile CSV is the
-measurement record, and the output CSV is the exact-key runtime dispatch
+The input CSV is a workload catalogue, the optional profile CSV plus journal
+are measurement evidence, and the output CSV is the exact-key runtime dispatch
 artifact: backend, num_splits, and backend_config for the winning candidate.
 
-Shapes that already have a row are skipped unless --all is given. To re-tune
-without replacing a row that is still as good, use --all --compare
---update_improved, which times the public operator before and after tuning.
+Shapes that already have a row are skipped unless --all is given. With --all,
+the published row is the incumbent a challenger has to beat.
 """
 
+import argparse
 import json
 import math
 import os
 import random
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 import zlib
+from collections import Counter
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -29,7 +32,7 @@ import torch
 
 from aiter import logger
 from aiter.jit.core import AITER_CONFIG_MHA_FWD
-from aiter.jit.utils.chip_info import get_gpu_model
+from aiter.jit.utils.chip_info import TUNING_HARDWARE_FIELDS, get_gpu_model
 from aiter.ops.mha import (
     _load_mha_fwd_tuning_table,
     flash_attn_varlen_func,
@@ -44,12 +47,13 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_ERROR_ATOL,
     MHA_FWD_ERROR_METRIC,
     MHA_FWD_ERROR_RTOL,
-    MHA_FWD_INDIFFERENCE_DELTA,
+    MHA_FWD_FAMILY,
     MHA_FWD_MAX_ERROR_RATIO,
     MHA_FWD_METRIC_FIELDS,
     MHA_FWD_PROBLEM_KEY_FIELDS,
+    MHA_FWD_PROMOTION,
+    MHA_FWD_RACE,
     MHA_FWD_RUNTIME_CSV_FIELDS,
-    MHA_FWD_SAMPLE_SEED,
     MHA_FWD_TASK_TIMEOUT_S,
     MHA_FWD_TILE_CONFIG_BACKENDS,
     MHA_FWD_TUNING_KEY_FIELDS,
@@ -59,10 +63,24 @@ from aiter.ops.mha_fwd_policy import (
     as_bool,
     canonical_backend_config,
     enumerate_mha_fwd_candidates,
+    mha_fwd_candidate_id,
     parse_backend_config,
 )
+from aiter.test_common import checkAllclose
 from aiter.utility.base_tuner import TunerCommon
-from aiter.utility.mp_tuner import mp_tuner
+from aiter.utility.block_race import (
+    JsonlBlockJournal,
+    RaceEntrant,
+    cuda_event_timer,
+    race,
+)
+from aiter.utility.mp_tuner import MpTunerTask, mp_tuner
+from aiter.utility.tuning_policy import (
+    RETAIN,
+    SAMPLE_SEED,
+    gate_against_incumbent,
+    standard_error_bar,
+)
 
 UNTUNED_FIELDS = MHA_FWD_PROBLEM_KEY_FIELDS
 RESULT_FIELDS = (*MHA_FWD_CANDIDATE_FIELDS, *MHA_FWD_METRIC_FIELDS)
@@ -385,6 +403,7 @@ class MhaFwdTuner(TunerCommon):
         "errRatio": MHA_FWD_MAX_ERROR_RATIO,
         "timeout": MHA_FWD_TASK_TIMEOUT_S,
         "config_env_name": MHA_FWD_CONFIG_ENV,
+        "finalist_rounds": MHA_FWD_PROMOTION.finalist_rounds,
     }
     # errRatio is the fraction of output elements outside these tolerances.
     ERROR_METRIC = MHA_FWD_ERROR_METRIC
@@ -396,28 +415,110 @@ class MhaFwdTuner(TunerCommon):
             "MhaFwdTuner",
             list(MHA_FWD_TUNING_KEY_FIELDS),
             list(RESULT_FIELDS),
-            "Exhaustively tune packed-varlen MHA forward. Shapes that already "
-            "have a row are skipped unless --all is given; --all --compare "
-            "--update_improved re-tunes them and replaces a row only if the "
-            "public operator got faster by at least --min_improvement_pct.",
+            "Tune packed-varlen MHA forward, exhaustively or by delta race. "
+            "Shapes that already have a row are skipped unless --all is given; "
+            "with --all the published row is the incumbent to beat.",
         )
+        self._samples_by_info: dict[tuple, tuple[float, ...]] = {}
+        self._journal_path = ""
+        self._evidence_path = ""
         self._args = None
-        self._tuned_before: set[tuple] = set()
+        self._run_started_at = 0.0
         self._last_results = pd.DataFrame(columns=self.columns)
+        self._all_results = pd.DataFrame(columns=self.columns)
         self._selection_proofs: list[dict[str, Any]] = []
         self._incumbents_by_key: dict[tuple, set[tuple[str, str]]] = {}
         self._autoselect_by_key: dict[tuple, dict[str, Any] | None] = {}
+        self._incumbent_probe_by_key: dict[tuple, dict[str, Any] | None] = {}
+        self._published_by_key: dict[tuple, tuple[str, int, str]] = {}
+        self._promotions: list[dict[str, Any]] = []
+        self._race_reports: list[dict[str, Any]] = []
+        self._race_winner_by_key: dict[tuple, tuple] = {}
 
     def _setup_specific_arguments(self):
+        self.parser.add_argument(
+            "--journal-file",
+            default="",
+            help="append-only candidate checkpoint (default: <profile-or-output>.journal.jsonl)",
+        )
+        self.parser.add_argument(
+            "--evidence-file",
+            default="",
+            help="atomic run manifest (default: <output>.evidence.json)",
+        )
+        self.parser.add_argument(
+            "--resume",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="resume completed candidate phases from the checkpoint journal",
+        )
+        self.parser.add_argument(
+            "--finalist-rounds",
+            type=int,
+            default=self.get_arg_defaults()["finalist_rounds"],
+            help="fresh-worker measurement rounds for each top-eight finalist",
+        )
+        self.parser.add_argument(
+            "--strategy",
+            choices=("exhaustive", "race"),
+            default="exhaustive",
+            help=(
+                "how the field is measured: exhaustive screens every candidate "
+                "once in its own worker, race measures them as an interleaved "
+                "elimination race. Use --candidate-sample and --backends to "
+                "make the field smaller"
+            ),
+        )
+        self.parser.add_argument(
+            "--delta",
+            type=float,
+            default=MHA_FWD_PROMOTION.indifference_delta,
+            help=(
+                "race only: the indifference zone. Candidates within this of "
+                "the leader are treated as settled rather than as a harder "
+                "question, and the same threshold decides whether a challenger "
+                "displaces the incumbent, so one definition of "
+                "indistinguishable holds end to end"
+            ),
+        )
+        self.parser.add_argument(
+            "--race-alpha",
+            type=float,
+            default=MHA_FWD_RACE.alpha,
+            help="race only: error budget, spread over every candidate and look",
+        )
+        self.parser.add_argument(
+            "--race-block-calls",
+            type=int,
+            default=MHA_FWD_RACE.block_calls,
+            help="race only: timed calls per candidate per block",
+        )
+        self.parser.add_argument(
+            "--race-min-blocks",
+            type=int,
+            default=MHA_FWD_RACE.min_blocks,
+            help="race only: blocks before any candidate may be eliminated",
+        )
+        self.parser.add_argument(
+            "--race-max-blocks",
+            type=int,
+            default=MHA_FWD_RACE.max_blocks,
+            help=(
+                "race only: ceiling on blocks. Reaching it without certifying "
+                "returns a ranking rather than a guarantee, and the evidence "
+                "records that it was not certified"
+            ),
+        )
         self.parser.add_argument(
             "--candidate-sample",
             type=int,
             default=None,
             help=(
                 "draw a seeded sample of this many catalogue entries instead of "
-                "the whole catalogue. The sample is fixed by seed, so two runs "
-                "measure the same field; each tile backend's shipped default "
-                "and the auto-select incumbent are measured whatever it draws"
+                "the whole catalogue. Applies to every strategy, because the "
+                "point is to give two strategies the identical field when "
+                "comparing them; the sample is fixed by seed so two runs are "
+                "comparable, and the evidence records that it was sampled"
             ),
         )
         self.parser.add_argument(
@@ -426,7 +527,7 @@ class MhaFwdTuner(TunerCommon):
             help=(
                 "comma-separated backends to measure (default: all). A control "
                 "for comparing contracts, not a tuning mode: the winner is the "
-                "fastest of what was allowed to run"
+                "fastest of what was allowed to run, and the evidence says so"
             ),
         )
 
@@ -460,6 +561,8 @@ class MhaFwdTuner(TunerCommon):
         return 0.0 if us <= 0 or not math.isfinite(us) else flop / us / 1e6
 
     def pre_process(self, args):
+        if args.finalist_rounds < 1:
+            raise ValueError("--finalist-rounds must be positive")
         if not args.untune_file or not os.path.isfile(args.untune_file):
             raise FileNotFoundError(f"MHA problem CSV not found: {args.untune_file}")
         frame = pd.read_csv(args.untune_file)
@@ -519,11 +622,11 @@ class MhaFwdTuner(TunerCommon):
         else:
             self.tunedf = pd.DataFrame(columns=MHA_FWD_RUNTIME_CSV_FIELDS)
         self._args = args
-        self._tuned_before = self._tuned_keys(self.tunedf, args.tune_file)
+        self._published_by_key = self._load_published_table(args)
         if not args.all:
             skipped = pd.Series(
                 [
-                    self.lookup_key(row) in self._tuned_before
+                    self.lookup_key(row) in self._published_by_key
                     for _, row in self.untunedf.iterrows()
                 ],
                 index=self.untunedf.index,
@@ -539,35 +642,12 @@ class MhaFwdTuner(TunerCommon):
                 if args.verbose:
                     print(self.untunedf[skipped])
             self.untunedf = self.untunedf[~skipped].reset_index(drop=True)
-
-    @classmethod
-    def _tuned_keys(cls, frame: pd.DataFrame, path: str) -> set[tuple]:
-        """The lookup keys a tuned table already has rows for.
-
-        Keyed through the problem rather than the raw cells, the way dispatch
-        reads the table: a row written as bf16 or GFX950 still names the shape
-        it describes.
-        """
-        if frame.empty:
-            return set()
-        missing = [
-            field for field in MHA_FWD_TUNING_KEY_FIELDS if field not in frame.columns
-        ]
-        if missing:
-            raise ValueError(f"{path} is missing MHA key columns: {missing}")
-        keys = set()
-        for line, row in enumerate(frame.to_dict("records"), start=2):
-            try:
-                keys.add(cls.lookup_key(row))
-            except (KeyError, TypeError, ValueError) as error:
-                logger.warning(
-                    "%s:%d does not parse as a problem (%s); its shape is "
-                    "tuned as if it had no row",
-                    path,
-                    line,
-                    error,
-                )
-        return keys
+        self._run_started_at = time.time()
+        evidence_base = args.profile_file or args.tune_file
+        self._journal_path = args.journal_file or f"{evidence_base}.journal.jsonl"
+        self._evidence_path = args.evidence_file or f"{args.tune_file}.evidence.json"
+        if not args.resume and os.path.exists(self._journal_path):
+            os.remove(self._journal_path)
 
     @staticmethod
     def lookup_key(row) -> tuple[str, ...]:
@@ -607,14 +687,136 @@ class MhaFwdTuner(TunerCommon):
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    @staticmethod
+    def _atomic_write_json(payload: dict[str, Any], path: str) -> None:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                json.dump(payload, file, indent=2, sort_keys=True, allow_nan=False)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _append_journal_result(self, phase: str, result) -> None:
+        info, us, err_ratio, status = result[:4]
+        detail = result[4] if len(result) > 4 else ""
+        problem, candidate = self._problem_and_candidate(info)
+        record = {
+            "schema_version": 2,
+            "candidate_id": mha_fwd_candidate_id(problem, candidate),
+            "phase": phase,
+            "problem": problem.as_row(),
+            "candidate": {
+                "backend": candidate.backend,
+                "num_splits": candidate.num_splits,
+                "backend_config": candidate.config_json,
+            },
+            "status": status,
+            "detail": str(detail),
+            "us": float(us) if math.isfinite(float(us)) else None,
+            "errRatio": float(err_ratio),
+            "recorded_at_unix_s": time.time(),
+        }
+        destination = Path(self._journal_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(destination, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "ab") as file:
+            file.write(
+                (
+                    json.dumps(
+                        record,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            file.flush()
+            os.fsync(file.fileno())
+
+    def _load_journal(self, force: bool = False) -> dict[tuple[str, str], tuple]:
+        records: dict[tuple[str, str], tuple] = {}
+        if (not self._args.resume and not force) or not os.path.isfile(
+            self._journal_path
+        ):
+            return records
+        # A process kill can leave one partial final write. Remove only that
+        # unterminated suffix before any resumed append so future records do
+        # not become concatenated onto invalid JSON.
+        with open(self._journal_path, "rb+") as file:
+            payload = file.read()
+            if payload and not payload.endswith(b"\n"):
+                last_newline = payload.rfind(b"\n")
+                file.truncate(last_newline + 1)
+        with open(self._journal_path, encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    problem = MhaFwdProblem.from_mapping(record["problem"])
+                    candidate_row = record["candidate"]
+                    candidate = MhaFwdCandidate(
+                        candidate_row["backend"],
+                        int(candidate_row["num_splits"]),
+                        (
+                            json.loads(candidate_row["backend_config"])
+                            if candidate_row.get("backend_config")
+                            else None
+                        ),
+                    )
+                    candidate_id = mha_fwd_candidate_id(problem, candidate)
+                    if candidate_id != record["candidate_id"]:
+                        raise ValueError("candidate ID does not match record payload")
+                    info = (
+                        problem.key(),
+                        candidate.backend,
+                        candidate.num_splits,
+                        candidate.config_json,
+                    )
+                    result = (
+                        info,
+                        (
+                            float(record["us"])
+                            if record.get("us") is not None
+                            else float("inf")
+                        ),
+                        float(record["errRatio"]),
+                        str(record["status"]),
+                        str(record.get("detail", "")),
+                    )
+                    records[(candidate_id, str(record["phase"]))] = result
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    print(
+                        f"ignoring incomplete journal record {line_number}: {exc}",
+                        file=sys.stderr,
+                    )
+        return records
+
     def tune(self, untunedf, tunedf, args):
-        all_infos, task_by_info = self._plan_candidates(untunedf, args)
-        return self._tune_by_screening(args, all_infos, task_by_info)
+        all_infos, task_by_info, plans = self._plan_candidates(untunedf, args)
+        if getattr(args, "strategy", "exhaustive") == "race":
+            return self._tune_by_race(args, untunedf, plans, all_infos)
+        return self._tune_by_screening(args, untunedf, all_infos, task_by_info)
 
     def _plan_candidates(self, untunedf, args):
-        """Every candidate of every shape, and the mp_tuner task measuring it."""
+        """Enumerate every candidate once, for whichever measurement follows.
+
+        Screening and racing need the same candidate list, data arguments and
+        launch arguments, so these are assembled once rather than twice.
+        """
         all_infos = []
         task_by_info = {}
+        plans = []
         for row_index, row in untunedf.iterrows():
             problem = MhaFwdProblem.from_mapping(
                 {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
@@ -653,28 +855,21 @@ class MhaFwdTuner(TunerCommon):
                     if candidate.backend_config is not None
                     else None
                 )
-                # In the order mp_tuner's work_group unpacks a task.
-                task_by_info[info] = (
-                    info,
-                    generate_data,
-                    gen_args,
-                    _run_candidate,
-                    (
+                task_by_info[info] = MpTunerTask(
+                    info=info,
+                    gen_data=generate_data,
+                    gen_args=gen_args,
+                    func=_run_candidate,
+                    args=(
                         ["q", "k", "v", "cu_q", "cu_k"],
                         candidate.backend,
                         candidate.num_splits,
                         config,
                         *launch_tail,
                     ),
-                    {
-                        # Without these run_perftest times with its own
-                        # defaults and --warmup/--iters silently do nothing.
-                        "num_warmup": args.warmup,
-                        "num_iters": args.iters,
-                        "use_cuda_event": True,
-                    },
-                    _chunked_reference,
-                    (
+                    kwargs=self.measurement_kwargs(args, use_cuda_event=True),
+                    ref_func=_chunked_reference,
+                    ref_args=(
                         ["q", "k", "v", "cu_q", "cu_k"],
                         softmax_scale,
                         bool(row.causal),
@@ -682,13 +877,24 @@ class MhaFwdTuner(TunerCommon):
                         int(row.window_right),
                         bool(row.return_lse),
                     ),
-                    {},
-                    None,
-                    self.ERROR_RTOL,
-                    self.ERROR_ATOL,
+                    ref_kwargs={},
+                    ref=None,
+                    rtol=self.ERROR_RTOL,
+                    atol=self.ERROR_ATOL,
                 )
 
-        return all_infos, task_by_info
+            plans.append(
+                {
+                    "key": key,
+                    "row": row,
+                    "gen_args": gen_args,
+                    "candidates": candidates,
+                    "softmax_scale": softmax_scale,
+                    "launch_tail": launch_tail,
+                }
+            )
+
+        return all_infos, task_by_info, plans
 
     def candidate_field(self, row, key, args) -> tuple[MhaFwdCandidate, ...]:
         """Every candidate measured for one shape.
@@ -703,10 +909,12 @@ class MhaFwdTuner(TunerCommon):
         )
         sample = getattr(args, "candidate_sample", None)
         if sample is not None and sample < len(candidates):
-            candidates = random.Random(MHA_FWD_SAMPLE_SEED).sample(candidates, sample)
+            candidates = random.Random(SAMPLE_SEED).sample(candidates, sample)
         autoselect = self._resolve_autoselect(row)
         self._autoselect_by_key[key] = autoselect
-        incumbents = self._incumbent_candidates(autoselect)
+        incumbent = self._resolve_incumbent(row, args, key, autoselect)
+        self._incumbent_probe_by_key[key] = incumbent
+        incumbents = self._incumbent_candidates(incumbent)
         known = {candidate.identity for candidate in candidates}
         for extra in (*self._shipped_tile_candidates(row), *incumbents):
             if extra.identity not in known:
@@ -735,29 +943,407 @@ class MhaFwdTuner(TunerCommon):
             bool(row.return_lse),
         )
 
-    def _tune_by_screening(self, args, all_infos, task_by_info):
-        """Measure every candidate once, correctness-gated, one shape per group.
+    def _tune_by_screening(self, args, untunedf, all_infos, task_by_info):
+        journal = self._load_journal()
+        problem_keys = [
+            MhaFwdProblem.from_mapping(
+                {field: row[field] for field in MHA_FWD_TUNING_KEY_FIELDS}
+            ).key()
+            for _, row in untunedf.iterrows()
+        ]
 
-        A shape's candidates share one worker, so its inputs and reference are
-        built once. A candidate that faults the worker costs the whole shape
-        its measurements; the shape is then reported as failed and no row is
-        written for it.
+        def pending_for_phase(phase: str, infos):
+            pending_tasks = []
+            pending_data = []
+            for key in problem_keys:
+                tasks_for_shape = []
+                for info in infos:
+                    if info[0] != key:
+                        continue
+                    problem, candidate = self._problem_and_candidate(info)
+                    if (
+                        mha_fwd_candidate_id(problem, candidate),
+                        phase,
+                    ) not in journal:
+                        tasks_for_shape.append(task_by_info[info])
+                if tasks_for_shape:
+                    pending_tasks.extend(tasks_for_shape)
+                    pending_data.append((len(tasks_for_shape), ()))
+            return pending_tasks, pending_data
+
+        tasks, tasks_data = pending_for_phase("first", all_infos)
+        while tasks:
+            before = len(journal)
+            mp_tuner(
+                tasks,
+                tasks_data,
+                args.mp,
+                False,
+                True,
+                args.errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+                return_status=True,
+                result_callback=lambda result: self._append_journal_result(
+                    "first", result
+                ),
+            )
+            journal = self._load_journal(force=True)
+            if len(journal) <= before:
+                raise RuntimeError("MHA checkpoint made no progress")
+            tasks, tasks_data = pending_for_phase("first", all_infos)
+
+        first_by_info = {
+            result[0]: result
+            for (_, phase), result in journal.items()
+            if phase == "first"
+        }
+        first_pass = [
+            first_by_info[info] for info in all_infos if info in first_by_info
+        ]
+
+        finalists_by_key: dict[tuple, list[tuple]] = {}
+        for result in first_pass:
+            info, us, err_ratio, status = result[:4]
+            if (
+                status == "ok"
+                and us > 0
+                and math.isfinite(us)
+                and err_ratio <= args.errRatio
+            ):
+                finalists_by_key.setdefault(info[0], []).append(result)
+
+        finalist_infos = []
+        for _, row in untunedf.iterrows():
+            finalist_infos.extend(
+                result[0]
+                for result in sorted(
+                    finalists_by_key.get(self.lookup_key(row), ()),
+                    key=lambda item: item[1],
+                )[: MHA_FWD_PROMOTION.finalists]
+            )
+        if not finalist_infos:
+            return first_pass
+
+        print(
+            f"re-measuring {len(finalist_infos)} finalists for "
+            f"{args.finalist_rounds} fresh-worker rounds",
+            flush=True,
+        )
+        round_results: dict[tuple, list[tuple]] = {info: [] for info in finalist_infos}
+        for round_index in range(args.finalist_rounds):
+            phase = f"finalist:{round_index}"
+            finalist_tasks, finalist_data = pending_for_phase(phase, finalist_infos)
+            while finalist_tasks:
+                before = len(journal)
+                mp_tuner(
+                    finalist_tasks,
+                    finalist_data,
+                    args.mp,
+                    False,
+                    True,
+                    args.errRatio,
+                    timeout=args.timeout,
+                    verbose=args.verbose,
+                    return_status=True,
+                    result_callback=lambda result, phase=phase: (
+                        self._append_journal_result(phase, result)
+                    ),
+                )
+                journal = self._load_journal(force=True)
+                if len(journal) <= before:
+                    raise RuntimeError(
+                        f"MHA checkpoint made no progress during {phase}"
+                    )
+                finalist_tasks, finalist_data = pending_for_phase(phase, finalist_infos)
+            for info in finalist_infos:
+                problem, candidate = self._problem_and_candidate(info)
+                round_results[info].append(
+                    journal[(mha_fwd_candidate_id(problem, candidate), phase)]
+                )
+
+        final_by_info = {}
+        for info, results in round_results.items():
+            statuses = [result[3] for result in results]
+            failed_status = next(
+                (status for status in statuses if status != "ok"), None
+            )
+            samples = tuple(
+                float(result[1])
+                for result in results
+                if result[3] == "ok" and math.isfinite(result[1]) and result[1] > 0
+            )
+            self._samples_by_info[info] = samples
+            if failed_status is not None or len(samples) != args.finalist_rounds:
+                status = failed_status or "crash"
+                us = float("inf")
+                detail = next(
+                    (
+                        str(result[4])
+                        for result in results
+                        if len(result) > 4 and result[3] != "ok" and result[4]
+                    ),
+                    f"only {len(samples)} of {args.finalist_rounds} "
+                    "finalist rounds produced a measurement",
+                )
+            else:
+                status = "ok"
+                us = float(statistics.median(samples))
+                detail = ""
+            err_ratio = max((float(result[2]) for result in results), default=1.0)
+            final_by_info[info] = (info, us, err_ratio, status, detail)
+
+        return [final_by_info.get(result[0], result) for result in first_pass]
+
+    def _tune_by_race(self, args, untunedf, plans, all_infos):
+        """Measure each shape as one interleaved elimination race.
+
+        Screening measures each candidate once, alone. One contended
+        measurement therefore drops a candidate for good, and the finalist
+        rounds exist only to undo that. A race measures every survivor in
+        every block, paired against the others, and leaving the field takes
+        statistical proof, so the finalist rounds go with it.
+
+        Nothing re-measures the winner. A process-wide effect moves every
+        candidate together and cannot change their order, and one extra round
+        is weaker evidence than the blocks it would overrule.
         """
-        if not all_infos:
-            return []
-        group_sizes: dict[tuple, int] = {}
-        for info in all_infos:
-            group_sizes[info[0]] = group_sizes.get(info[0], 0) + 1
-        return mp_tuner(
-            [task_by_info[info] for info in all_infos],
-            [(size, ()) for size in group_sizes.values()],
-            args.mp,
-            False,
-            True,
-            args.errRatio,
-            timeout=args.timeout,
+        results = []
+        for plan in plans:
+            results.extend(self._race_one_shape(args, plan))
+        return results
+
+    def _race_block_journal(self, args, key, entrants):
+        """Per-block checkpoint for one shape, beside the candidate journal.
+
+        The candidate journal records finished candidate-phases while a race's
+        unit of durable progress is the finished block, so they cannot share a
+        file. They do share the ``--resume`` flag and the directory.
+
+        The name digests everything that decides how the race runs, not only
+        the shape: the candidate field, who is protected from elimination, the
+        thresholds, the block budget and the shuffle seed. A replayed block is
+        only meaningful for the race that produced it, so changing any of them
+        lands on a different file and the stale blocks are never read. The
+        shape key carries the arch, the SKU and the CU count, so a journal
+        from another GPU already lands elsewhere too.
+        """
+        if not self._journal_path:
+            return None
+        fingerprint = json.dumps(
+            {
+                "key": list(map(str, key)),
+                "candidates": sorted(entrant.payload.identity for entrant in entrants),
+                "protected": sorted(
+                    entrant.label for entrant in entrants if entrant.protected
+                ),
+                "delta": float(args.delta),
+                "alpha": float(args.race_alpha),
+                "block_calls": int(args.race_block_calls),
+                "min_blocks": int(args.race_min_blocks),
+                "max_blocks": int(args.race_max_blocks),
+                "seed": int(SAMPLE_SEED),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+        return f"{self._journal_path}.race-{digest}.jsonl"
+
+    def _race_one_shape(self, args, plan):
+        key = plan["key"]
+        row = plan["row"]
+        candidates = plan["candidates"]
+        data = generate_data(*plan["gen_args"])
+        tensors = (data["q"], data["k"], data["v"], data["cu_q"], data["cu_k"])
+
+        expected = _chunked_reference(
+            *tensors,
+            plan["softmax_scale"],
+            bool(row.causal),
+            int(row.window_left),
+            int(row.window_right),
+            bool(row.return_lse),
+        )
+
+        def launch(candidate):
+            config = (
+                dict(candidate.backend_config)
+                if candidate.backend_config is not None
+                else None
+            )
+            return _run_candidate(
+                *tensors,
+                candidate.backend,
+                candidate.num_splits,
+                config,
+                *plan["launch_tail"],
+            )
+
+        # Correctness and warm-up in one pass, before any timed call, so a
+        # compile is never charged to a measurement and a wrong candidate never
+        # reaches the race.
+        entrants = []
+        info_by_label = {}
+        rejected = []
+        for candidate in candidates:
+            info = (key, candidate.backend, candidate.num_splits, candidate.config_json)
+            label = (
+                f"{candidate.backend}|{candidate.num_splits}|{candidate.config_json}"
+            )
+            try:
+                produced = launch(candidate)
+                torch.cuda.synchronize()
+                err_ratio = self._error_ratio(produced, expected, row, args)
+            except Exception as error:  # noqa: BLE001 - unsupported is an outcome
+                rejected.append(
+                    (info, 1.0, "crash", f"{type(error).__name__}: {error}")
+                )
+                continue
+            if err_ratio > args.errRatio:
+                rejected.append(
+                    (info, err_ratio, "failed", f"error ratio {err_ratio:.4f}")
+                )
+                continue
+            protected = (
+                candidate.backend,
+                canonical_backend_config(candidate.backend_config),
+            ) in self._incumbents_by_key.get(key, set())
+            entrants.append(
+                RaceEntrant(label=label, payload=candidate, protected=protected)
+            )
+            info_by_label[label] = (info, err_ratio)
+
+        if not entrants:
+            print(f"no candidate survived correctness for {key}", flush=True)
+            return [
+                (info, float("inf"), err, status, detail)
+                for info, err, status, detail in rejected
+            ]
+
+        print(
+            f"racing {len(entrants)} candidates for {key} "
+            f"(delta={args.delta:.1%}, at most {args.race_max_blocks} blocks)",
+            flush=True,
+        )
+        journal_path = self._race_block_journal(args, key, entrants)
+        journal = (
+            JsonlBlockJournal(journal_path, resume=args.resume)
+            if journal_path
+            else None
+        )
+        outcome = race(
+            entrants,
+            cuda_event_timer(lambda entrant: launch(entrant.payload)),
+            delta=args.delta,
+            alpha=args.race_alpha,
+            block_calls=args.race_block_calls,
+            min_blocks=args.race_min_blocks,
+            max_blocks=args.race_max_blocks,
+            seed=SAMPLE_SEED,
+            journal=journal,
+            resume=args.resume,
             verbose=args.verbose,
         )
+
+        return self._race_results(args, key, outcome, info_by_label, rejected)
+
+    @staticmethod
+    def _error_ratio(produced, expected, row, args):
+        """Same correctness bar the worker path applies, applied in process."""
+        actual = _normalize_result(
+            produced, bool(row.return_lse), int(row.total_q), int(row.nhead_q)
+        )
+        pairs = (
+            zip(actual, expected)
+            if isinstance(expected, tuple)
+            else ((actual, expected),)
+        )
+        worst = 0.0
+        for got, want in pairs:
+            worst = max(
+                worst,
+                float(
+                    checkAllclose(
+                        got,
+                        want,
+                        rtol=MhaFwdTuner.ERROR_RTOL,
+                        atol=MhaFwdTuner.ERROR_ATOL,
+                        tol_err_ratio=args.errRatio,
+                        printLog=False,
+                    )
+                ),
+            )
+        return worst
+
+    def _race_results(self, args, key, outcome, info_by_label, rejected):
+        """Turn one race into the result rows the rest of the tuner expects.
+
+        Every raced candidate is reported with its race estimate, so the
+        profile's numbers are on the same footing.
+        """
+        results = [
+            (info, float("inf"), err, status, detail)
+            for info, err, status, detail in rejected
+        ]
+
+        winner_label = outcome.winner
+        tie_break = outcome.tie_break
+
+        self._race_reports.append(
+            {
+                "key": list(key),
+                "delta": args.delta,
+                "alpha": args.race_alpha,
+                "block_calls": args.race_block_calls,
+                "candidates": len(info_by_label),
+                "rejected": len(rejected),
+                "blocks_run": outcome.blocks_run,
+                "blocks_replayed": outcome.blocks_replayed,
+                "calls_spent": outcome.calls_spent,
+                "certified": outcome.certified,
+                "eliminated": sum(
+                    1 for v in outcome.verdicts if v.state == "eliminated"
+                ),
+                "survivors": [
+                    {
+                        "label": label,
+                        "estimate_us": outcome.samples[label].estimate,
+                        "relative_spread": outcome.samples[label].relative_spread,
+                    }
+                    for label in outcome.survivors
+                ],
+                "winner": winner_label,
+                "tie_break": tie_break,
+                "history": [
+                    {
+                        "block": record.block,
+                        "active": record.active,
+                        "eliminated": record.eliminated,
+                        "wall_seconds": record.wall_seconds,
+                    }
+                    for record in outcome.history
+                ],
+            }
+        )
+        self._race_winner_by_key[key] = (
+            winner_label and info_by_label.get(winner_label, (None,))[0]
+        )
+
+        for verdict in outcome.verdicts:
+            info, err_ratio = info_by_label[verdict.label]
+            samples = tuple(outcome.samples[verdict.label].block_medians)
+            self._samples_by_info[info] = samples
+            results.append(
+                (
+                    info,
+                    float(outcome.samples[verdict.label].estimate),
+                    float(err_ratio),
+                    "crash" if verdict.state == "crashed" else "ok",
+                    verdict.note,
+                )
+            )
+        return results
 
     def result_to_df(self, results):
         rows = []
@@ -774,8 +1360,9 @@ class MhaFwdTuner(TunerCommon):
                 status = "ok"
             key, backend, num_splits, backend_config = info
             row = dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key))
-            samples = (
-                (float(us),) if status == "ok" and us > 0 and math.isfinite(us) else ()
+            samples = self._samples_by_info.get(
+                info,
+                (float(us),) if status == "ok" and us > 0 and math.isfinite(us) else (),
             )
             row.update(
                 {
@@ -804,6 +1391,14 @@ class MhaFwdTuner(TunerCommon):
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         resultdf = self.result_to_df(rets)
         self._last_results = resultdf.copy()
+        self._all_results = (
+            resultdf.copy()
+            if self._all_results.empty
+            else pd.concat([self._all_results, resultdf], ignore_index=True)
+        ).drop_duplicates(
+            subset=[*MHA_FWD_TUNING_KEY_FIELDS, *MHA_FWD_CANDIDATE_FIELDS],
+            keep="last",
+        )
         if args.profile_file:
             if os.path.exists(args.profile_file):
                 old = pd.read_csv(args.profile_file)
@@ -842,17 +1437,6 @@ class MhaFwdTuner(TunerCommon):
             if winner is not None:
                 winners.append(winner)
                 continue
-            if (
-                self.lookup_key(dict(zip(MHA_FWD_TUNING_KEY_FIELDS, key)))
-                in self._tuned_before
-            ):
-                logger.warning(
-                    "%s is best left on auto-select, but its existing row in %s "
-                    "still overrides it; delete that row to return the shape to "
-                    "auto-select",
-                    key,
-                    args.tune_file,
-                )
             # The shape is settled, not missing, so it counts as covered; it is
             # kept out of winnerdf so no runtime row is written for it.
             kept = valid.iloc[0].copy()
@@ -930,6 +1514,26 @@ class MhaFwdTuner(TunerCommon):
                 if self.failed.empty
                 else pd.concat([self.failed, proof_failures], ignore_index=True)
             )
+        covered = (
+            self.failed.copy()
+            if self.success.empty
+            else (
+                self.success.copy()
+                if self.failed.empty
+                else pd.concat([self.success, self.failed], ignore_index=True)
+            )
+        )
+        covered_count = (
+            covered.drop_duplicates(subset=list(MHA_FWD_TUNING_KEY_FIELDS)).shape[0]
+            if not covered.empty
+            else 0
+        )
+        run_state = (
+            "partial"
+            if not self.failed.empty or covered_count < len(self.untunedf)
+            else "verified" if self._selection_proofs else "measured"
+        )
+        self._write_evidence(run_state, file)
 
     def sortResults(self, tune_file, issorted, values):
         if not os.path.exists(tune_file):
@@ -942,18 +1546,37 @@ class MhaFwdTuner(TunerCommon):
             frame = frame.sort_values(list(MHA_FWD_TUNING_KEY_FIELDS))
         self._atomic_write_csv(frame[list(MHA_FWD_RUNTIME_CSV_FIELDS)], tune_file)
 
+    @staticmethod
+    def _standard_error_us(row) -> float:
+        """Standard error of a candidate's finalist-round measurements.
+
+        The finalist rounds are the run's only repeated observation, so their
+        scatter is what it knows about its own reproducibility. Standard error
+        rather than range, because a range widens as samples are added while
+        this shrinks as 1/sqrt(n), making --finalist-rounds the lever for
+        resolving smaller improvements.
+        """
+        try:
+            samples = json.loads(row.get("samples_us") or "[]")
+        except (TypeError, ValueError):
+            return 0.0
+        samples = [float(s) for s in samples if math.isfinite(float(s)) and s > 0]
+        if len(samples) < 2:
+            return 0.0
+        return statistics.stdev(samples) / math.sqrt(len(samples))
+
     def _gate_against_incumbent(self, key, valid):
         """The row to publish, or None to leave the shape on auto-select.
 
         Publishing a winner that sits inside measurement noise of the
         incumbent buys nothing and risks shipping a regression a contended
-        sweep happened to rank first, so a winner has to beat the incumbent by
-        more than the indifference delta.
+        sweep happened to rank first.
         """
-        fastest = valid.iloc[0].copy()
+        fastest = self._race_pick(key, valid)
         incumbents = self._incumbents_by_key.get(key, set())
         if (fastest["backend"], fastest["backend_config"]) in incumbents:
             fastest["detail"] = "incumbent retained: nothing measured beat it"
+            self._record_promotion(key, fastest, fastest, 0.0, 0.0, "incumbent_fastest")
             return fastest
 
         measured = valid[
@@ -965,21 +1588,23 @@ class MhaFwdTuner(TunerCommon):
             return self._gate_against_autoselect(key, fastest)
 
         incumbent = measured.iloc[0]
-        margin = (float(incumbent["us"]) - float(fastest["us"])) / float(
-            incumbent["us"]
+        noise = self._indifference_threshold(fastest, incumbent)
+        decision = gate_against_incumbent(
+            float(incumbent["us"]), float(fastest["us"]), MHA_FWD_PROMOTION, bar=noise
         )
-        delta = MHA_FWD_INDIFFERENCE_DELTA
-        if margin <= delta:
+        margin = decision.margin
+        if decision.outcome == RETAIN:
             kept = incumbent.copy()
             kept["detail"] = (
-                f"incumbent retained: winner was {margin:+.2%} against the "
-                f"{delta:.2%} indifference delta"
+                f"incumbent retained: winner was {margin:+.2%} against "
+                f"{noise:.2%} measurement spread"
+            )
+            self._record_promotion(
+                key, fastest, incumbent, margin, noise, "within_noise"
             )
             return kept
-        fastest["detail"] = (
-            f"beat incumbent by {margin:.2%} against the {delta:.2%} "
-            "indifference delta"
-        )
+        fastest["detail"] = f"beat incumbent by {margin:.2%} against {noise:.2%} spread"
+        self._record_promotion(key, fastest, incumbent, margin, noise, "promoted")
         return fastest
 
     def _gate_against_autoselect(self, key, fastest):
@@ -987,33 +1612,146 @@ class MhaFwdTuner(TunerCommon):
 
         asm_v3 leaves its split count to C++, which reports 0, and 0 is not a
         legal candidate split, so the shipped configuration cannot be entered
-        in the field and is timed by the fresh probe instead.
+        in the field and is timed by the fresh probe instead. One probe
+        latency carries no round spread, so the bar is the fixed indifference
+        delta rather than a standard-error separation.
 
-        Returning None writes no row, which is how a shape reaches auto-select
-        in the first place.
+        Returning None leaves the table as it stands. For a shape with no row
+        that means auto-select, which is how it reaches auto-select in the
+        first place; for a shape being re-tuned it means the published row
+        survives, which is what retaining that incumbent means.
         """
-        selection = self._autoselect_by_key.get(key)
+        selection = self._incumbent_probe_by_key.get(
+            key
+        ) or self._autoselect_by_key.get(key)
         latency = None if selection is None else selection.get("latency_us")
-        if not latency or float(latency) <= 0:
+        noise = self._delta()
+        decision = gate_against_incumbent(
+            latency, float(fastest["us"]), MHA_FWD_PROMOTION, bar=noise
+        )
+        if decision.margin is None:
             fastest["detail"] = "incumbent not measured; improvement unverified"
+            self._record_promotion(key, fastest, None, None, None, "incumbent_absent")
             return fastest
 
         latency = float(latency)
         backend = selection["identity"][0]
-        margin = (latency - float(fastest["us"])) / latency
-        delta = MHA_FWD_INDIFFERENCE_DELTA
-        if margin <= delta:
+        baseline = {"backend": backend, "backend_config": "", "us": latency}
+        margin = decision.margin
+        has_row = key in self._published_by_key
+        # A published row that did not resolve was replaced by auto-select as
+        # the incumbent, so that is what was gated against.
+        retuning = has_row and selection is not self._autoselect_by_key.get(key)
+        bar = "the published row" if retuning else "auto-select"
+        if decision.outcome == RETAIN:
             print(
-                f"leaving {key} on auto-select: {backend} at {latency:.1f} us "
-                f"was not beaten by {delta:.2%}",
+                f"leaving {key} on {bar}: {backend} at {latency:.1f} us "
+                f"was not beaten by {noise:.2%}",
                 flush=True,
+            )
+            if has_row and not retuning:
+                logger.warning(
+                    "%s is best left on auto-select, but its existing row in %s "
+                    "still overrides it; delete that row to return the shape to "
+                    "auto-select",
+                    key,
+                    getattr(self._args, "tune_file", "the tuned table"),
+                )
+            self._record_promotion(
+                key,
+                fastest,
+                baseline,
+                margin,
+                noise,
+                "incumbent_retained" if retuning else "autoselect_retained",
             )
             return None
         fastest["detail"] = (
-            f"beat auto-select {backend} by {margin:.2%} against the "
-            f"{delta:.2%} indifference delta"
+            f"beat {bar} {backend} by {margin:.2%} against {noise:.2%} spread"
         )
+        self._record_promotion(key, fastest, baseline, margin, noise, "promoted")
         return fastest
+
+    def _indifference_threshold(self, challenger, incumbent) -> float:
+        """The relative margin a challenger must beat the incumbent by.
+
+        Under ``--strategy race``, delta. Otherwise twice the combined
+        standard error of the two candidates' finalist rounds, as a fraction
+        of the incumbent's latency: a two-sample separation at roughly 95%.
+        """
+        args = getattr(self, "_args", None)
+        if getattr(args, "strategy", "exhaustive") == "race":
+            return self._delta()
+        combined_se = math.hypot(
+            self._standard_error_us(challenger), self._standard_error_us(incumbent)
+        )
+        return standard_error_bar(
+            float(incumbent["us"]), combined_se, MHA_FWD_PROMOTION
+        )
+
+    def _delta(self) -> float:
+        """The indifference delta this run uses: --delta, or the policy's."""
+        args = getattr(self, "_args", None)
+        return float(getattr(args, "delta", MHA_FWD_PROMOTION.indifference_delta))
+
+    def _race_pick(self, key, valid):
+        """The row the race certified, or the fastest one if no race was run.
+
+        Screening ranks by latency, so there its fastest row is the pick. A
+        race ranks by steadiness and prefers the incumbent, so reading its
+        fastest row instead would discard that tie-break and can publish a
+        candidate the race eliminated.
+        """
+        if key not in self._race_winner_by_key:
+            return valid.iloc[0].copy()
+        picked = self._race_winner_by_key[key]
+        if picked is None:
+            raise RuntimeError(
+                f"the race for {key} certified no winner; publishing the "
+                "fastest point estimate would ship a candidate the race "
+                "never certified"
+            )
+        match = valid[
+            (valid["backend"] == picked[1])
+            & (valid["num_splits"] == picked[2])
+            & (valid["backend_config"] == picked[3])
+        ]
+        if match.empty:
+            raise RuntimeError(
+                f"race winner {picked[1:]} for {key} is absent from the gated "
+                "results; publishing the fastest point estimate would ship a "
+                "candidate the race never certified"
+            )
+        return match.iloc[0].copy()
+
+    def _record_promotion(self, key, challenger, incumbent, margin, noise, decision):
+        """Keep why each shape was or was not retuned, for the evidence file.
+
+        Without it a reader of the published table cannot tell a measured
+        improvement from a tie that happened to sort first.
+        """
+        self._promotions.append(
+            {
+                "key": list(key) if isinstance(key, tuple) else key,
+                "decision": decision,
+                "challenger": {
+                    "backend": challenger["backend"],
+                    "backend_config": challenger["backend_config"],
+                    "us": float(challenger["us"]),
+                },
+                "incumbent": (
+                    None
+                    if incumbent is None
+                    else {
+                        "backend": incumbent["backend"],
+                        "backend_config": incumbent["backend_config"],
+                        "us": float(incumbent["us"]),
+                    }
+                ),
+                "margin": None if margin is None else round(float(margin), 6),
+                "measurement_spread": None if noise is None else round(float(noise), 6),
+            }
+        )
 
     def _incumbent_candidates(self, selection) -> list[MhaFwdCandidate]:
         """The configuration the shipped dispatch resolves for this shape today.
@@ -1080,6 +1818,42 @@ class MhaFwdTuner(TunerCommon):
             return None
         return self._selection_from_proof(proof)
 
+    def _resolve_incumbent(self, row, args, key, autoselect) -> dict[str, Any] | None:
+        """What dispatch resolves for this shape with the table as it ships.
+
+        For a shape with no row that is auto-select, already probed above, and
+        probing again would spend a second process on the same answer. For a
+        shape being re-tuned it is the published row, and that row is what a
+        challenger has to beat: gating a re-tune against auto-select instead
+        lets anything inside the noise of the published row replace it, which
+        is the churn the incumbent gate exists to prevent.
+        """
+        if key not in self._published_by_key:
+            return autoselect
+        proof = self._run_fresh_probe(row, args.tune_file)
+        if proof["status"] != "verified":
+            logger.warning(
+                "the published row for this shape did not resolve (%s); "
+                "gating against auto-select instead",
+                proof.get("stderr", "").strip().splitlines()[-1:] or "no detail",
+            )
+            return autoselect
+        selection = self._selection_from_proof(proof)
+        if selection is None:
+            return autoselect
+        published = self._published_by_key[key]
+        if selection["identity"] != published:
+            # Dispatch declining to honor a row is a fallback, not a failure,
+            # so what actually ran is the incumbent rather than what the table
+            # asked for.
+            logger.warning(
+                "the published row %r is not what dispatch ran (%r); gating "
+                "against what ran",
+                published,
+                selection["identity"],
+            )
+        return selection
+
     @staticmethod
     def _selection_from_proof(proof) -> dict[str, Any] | None:
         """The candidate identity and latency a verified probe observed."""
@@ -1095,6 +1869,49 @@ class MhaFwdTuner(TunerCommon):
             ),
             "latency_us": proof.get("latency_us"),
         }
+
+    def _load_published_table(self, args) -> dict[tuple, tuple[str, int, str]]:
+        """The rows the tuned table already ships, keyed the way the sweep is.
+
+        A key that is already in the table is being re-tuned rather than tuned,
+        and that distinction decides both what the incumbent is and whether a
+        shape that no longer earns a row can be left alone or has to lose it.
+        """
+        path = getattr(args, "tune_file", "")
+        if not path or not os.path.exists(path):
+            return {}
+        frame = pd.read_csv(path)
+        if frame.empty:
+            return {}
+        missing = [
+            column
+            for column in MHA_FWD_RUNTIME_CSV_FIELDS
+            if column not in frame.columns
+        ]
+        if missing:
+            raise ValueError(f"{path} is missing MHA runtime columns: {missing}")
+        published = {}
+        for line, row in enumerate(frame.to_dict("records"), start=2):
+            # Keyed through the problem rather than the raw cells: the sweep
+            # keys on normalized spelling, and a table written as bf16 or
+            # GFX950 would otherwise miss the shape it describes.
+            try:
+                key = MhaFwdProblem.from_mapping(row).key()
+            except (KeyError, TypeError, ValueError) as error:
+                logger.warning(
+                    "%s:%d does not parse as a problem (%s); the shape it "
+                    "names will be gated against auto-select",
+                    path,
+                    line,
+                    error,
+                )
+                continue
+            published[key] = (
+                str(row["backend"]),
+                int(row["num_splits"]),
+                "" if pd.isna(row["backend_config"]) else str(row["backend_config"]),
+            )
+        return published
 
     def _shipped_tile_candidates(self, row) -> list[MhaFwdCandidate]:
         """The tile dicts the dict-config kernels resolve for this shape today.
@@ -1256,6 +2073,124 @@ class MhaFwdTuner(TunerCommon):
         finally:
             if os.path.exists(proof_path):
                 os.unlink(proof_path)
+
+    def _write_evidence(self, run_state: str, runtime_file: str) -> None:
+        status_counts = Counter(self._all_results.get("status", pd.Series(dtype=str)))
+        try:
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parents[2],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            revision = "unknown"
+        runtime_path = Path(runtime_file)
+        runtime_bytes = runtime_path.read_bytes() if runtime_path.is_file() else b""
+        payload = {
+            "schema_version": 1,
+            "family": MHA_FWD_FAMILY,
+            "run_state": run_state,
+            "strategy": self._args.strategy,
+            "hardware": [
+                {field: row[field] for field in TUNING_HARDWARE_FIELDS}
+                for _, row in self.untunedf[list(TUNING_HARDWARE_FIELDS)]
+                .drop_duplicates()
+                .iterrows()
+            ],
+            "software": {
+                "aiter_revision": revision,
+                "rocm": torch.version.hip,
+                "torch": torch.__version__,
+            },
+            "measurement": {
+                "warmup": int(self._args.warmup),
+                "iterations": int(self._args.iters),
+                "finalists": MHA_FWD_PROMOTION.finalists,
+                "finalist_rounds": int(self._args.finalist_rounds),
+                "statistic": "median of finalist round means",
+                "rtol": self.ERROR_RTOL,
+                "atol": self.ERROR_ATOL,
+                "error_metric": self.ERROR_METRIC,
+                "maximum_error_ratio": float(self._args.errRatio),
+                "candidate_count": len(self._all_results),
+                "status_counts": dict(sorted(status_counts.items())),
+            },
+            "artifacts": {
+                "workload_catalogue": os.path.abspath(self._args.untune_file),
+                "candidate_journal": os.path.abspath(self._journal_path),
+                "measurement_record": (
+                    os.path.abspath(self._args.profile_file)
+                    if self._args.profile_file
+                    else None
+                ),
+                "runtime_config": os.path.abspath(runtime_file),
+                "runtime_config_sha256": (
+                    sha256(runtime_bytes).hexdigest() if runtime_bytes else None
+                ),
+            },
+            "selection_proofs": self._selection_proofs,
+            "outcomes": self._outcomes(),
+            "search_strategy": getattr(self._args, "strategy", "exhaustive"),
+            "candidate_sample": getattr(self._args, "candidate_sample", None),
+            "restricted_backends": self._restricted_backends(),
+            "promotions": self._promotions,
+            # What the gate actually compared against, rather than what a
+            # reader would have to infer from the strategy name.
+            "indifference_threshold": (
+                self._delta()
+                if getattr(self._args, "strategy", "") == "race"
+                else f"{MHA_FWD_PROMOTION.significance_sigma} x combined standard error"
+            ),
+            "races": self._race_reports,
+            "coverage_limits": [
+                (
+                    "CK is measured as built. Its tile recipe comes from a"
+                    " table CK bakes in when the module is JIT-compiled, so"
+                    " there is no per-call knob to sweep and a ck winner here"
+                    " is CK at its own default tiling. Tuning those tiles is"
+                    " the separate pipeline in PR #5024, which rebuilds CK per"
+                    " candidate tile; deploying its JSON changes what this"
+                    " tuner measures for ck."
+                ),
+            ],
+            "command": [sys.executable, *sys.argv],
+            "started_at_unix_s": self._run_started_at,
+            "finished_at_unix_s": time.time(),
+        }
+        self._atomic_write_json(payload, self._evidence_path)
+
+    def _outcomes(self) -> list[dict[str, Any]]:
+        """What the run concluded for each catalogue key.
+
+        ``retained`` is a finished answer, not a gap: the incumbent held, so
+        the table is already right for that shape.
+        """
+
+        failed = {self.lookup_key(row) for _, row in self.failed.iterrows()}
+        succeeded = {
+            self.lookup_key(row): row["status"] for _, row in self.success.iterrows()
+        }
+        outcomes = []
+        for _, row in self.untunedf.iterrows():
+            key = self.lookup_key(row)
+            if key in failed:
+                outcome = "failed"
+            elif key in succeeded:
+                outcome = "retained" if succeeded[key] == "retained" else "published"
+            else:
+                outcome = "unmeasured"
+            outcomes.append({"key": list(key), "outcome": outcome})
+        return outcomes
+
+    def tune_summary(self, status):
+        if status != "Finished":
+            self._write_evidence(
+                "partial" if not self._all_results.empty else "failed",
+                self._args.tune_file,
+            )
+        return super().tune_summary(status)
 
     def _clear_op_caches(self):
         _load_mha_fwd_tuning_table.cache_clear()

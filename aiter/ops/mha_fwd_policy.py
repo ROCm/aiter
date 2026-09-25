@@ -19,6 +19,7 @@ from itertools import product
 from typing import Any, Literal
 
 from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
+from ..utility.tuning_policy import DEFAULT_PROMOTION, DEFAULT_RACE
 
 # ---------------------------------------------------------------------------
 # Family identity, stated once for the tuner and the tuning-test tables.
@@ -519,19 +520,11 @@ MHA_FWD_ERROR_ATOL = 2e-2
 MHA_FWD_MAX_ERROR_RATIO = 0.0
 MHA_FWD_TASK_TIMEOUT_S = 7200
 
-# Nothing in the justification of the values below is about attention. They
-# are measurement and promotion policy that other families need unchanged,
-# and they are candidates for a central tuning-policy module.
-
-# The margin a winner must beat the configuration already in use by, as a
-# fraction of the incumbent's latency. This is a reproducibility threshold
-# rather than a taste parameter: an unchanged configuration moves by roughly
-# this much between sessions on this hardware, so a smaller win is not one
-# the next run would reproduce.
-MHA_FWD_INDIFFERENCE_DELTA = 0.02
-
-# Seeds --candidate-sample, so a run is repeatable.
-MHA_FWD_SAMPLE_SEED = 20240917
+# What a challenger must beat and how a race spends its measurements say
+# nothing about attention, so they come from the shared tuning policy. Override
+# a value here with dataclasses.replace if this family ever needs its own.
+MHA_FWD_PROMOTION = DEFAULT_PROMOTION
+MHA_FWD_RACE = DEFAULT_RACE
 
 
 def as_bool(value: Any) -> bool:
