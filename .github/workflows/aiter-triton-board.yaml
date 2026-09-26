@@ -1,0 +1,118 @@
+name: AITER-triton Kernels board
+
+# Puts work on the AITER-triton Kernels board
+# (https://github.com/orgs/ROCm/projects/232) straight from the repo, so the
+# board does not depend on labels being applied. An issue or PR is added when
+# any of these hold:
+#   1. it is assigned to a member of @ROCm/triton_kernels_team
+#   2. it is a PR whose diff touches Triton/Gluon code
+#   3. it carries the Triton/Gluon label.
+# Draft PRs wait until they are marked ready for review.
+#
+# Enabling it (org / repo admin):
+#   1. Grant the AITER CI GitHub App the organization permissions
+#      "Projects: Read & write" (to add items to the board) and
+#      "Members: read" (rule 1 reads the team roster), then accept the new
+#      permissions on the ROCm installation. Without "Members: read" the team
+#      lookup returns 403 and the assignee rule is skipped.
+#   2. Set the repository variable AITER_TRITON_BOARD_ADD to 'true'.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, assigned, labeled]
+  issues:
+    types: [opened, reopened, assigned, labeled]
+
+permissions: {}
+
+concurrency:
+  group: triton-board-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  add-to-board:
+    if: ${{ vars.AITER_TRITON_BOARD_ADD == 'true' && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint an AITER CI App token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AITER_CI_APP_ID }}
+          private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: aiter
+
+      - name: Decide whether the item belongs on the board
+        id: decide
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app_token.outputs.token }}
+          script: |
+            const ORG = 'ROCm';
+            const TEAM_SLUG = 'triton_kernels_team';
+            const TRITON_PATHS = [
+              'aiter/ops/triton/',
+              'aiter/aot/triton/',
+              'aiter/utility/triton/',
+              'op_tests/triton_tests/',
+              'op_tests/op_benchmarks/triton/',
+            ];
+
+            const pr = context.payload.pull_request;
+            const item = pr ?? context.payload.issue;
+            const reasons = [];
+
+            // Rule 1: assigned to a team member. The team is read live, so
+            // adding someone to @ROCm/triton_kernels_team is all it takes.
+            const assignees = (item.assignees ?? []).map(a => a.login);
+            if (assignees.length) {
+              try {
+                const members = await github.paginate(github.rest.teams.listMembersInOrg, {
+                  org: ORG,
+                  team_slug: TEAM_SLUG,
+                  per_page: 100,
+                });
+                const team = new Set(members.map(m => m.login.toLowerCase()));
+                const teamAssignees = assignees.filter(login => team.has(login.toLowerCase()));
+                if (teamAssignees.length) {
+                  reasons.push(`assigned to ${teamAssignees.join(', ')}`);
+                }
+              } catch (e) {
+                core.warning(`Could not list @${ORG}/${TEAM_SLUG} members (HTTP ${e.status ?? '?'}: ${e.message}). `
+                  + 'Grant the AITER CI App the organization "Members: read" permission; '
+                  + 'skipping the assignee rule for this run.');
+              }
+            }
+
+            // Rule 3: already labeled.
+            if ((item.labels ?? []).some(l => l.name === 'Triton/Gluon')) {
+              reasons.push('labeled Triton/Gluon');
+            }
+
+            // Rule 2: the diff itself.
+            if (pr) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              if (files.some(f => TRITON_PATHS.some(p => f.filename.startsWith(p)))) {
+                reasons.push('touches Triton/Gluon paths');
+              }
+            }
+
+            if (reasons.length) {
+              core.info(`#${item.number} belongs on the board: ${reasons.join('; ')}`);
+            } else {
+              core.info(`#${item.number} does not belong on the board.`);
+            }
+            core.setOutput('add', reasons.length > 0);
+
+      - name: Add the item to the board
+        if: ${{ steps.decide.outputs.add == 'true' }}
+        uses: actions/add-to-project@v2
+        with:
+          project-url: https://github.com/orgs/ROCm/projects/232
+          github-token: ${{ steps.app_token.outputs.token }}
