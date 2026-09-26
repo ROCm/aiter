@@ -24,6 +24,48 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Small-token scheduling checkpoint — E278–E283
+
+E280 combines exact index/sign packing, shorter sign-temporary lifetimes, and
+four independent codebook reads per batch. Native gate VGPRs fall from E275's
+129 to 102, restoring two theoretical CTAs/CU with no spills. E280 TP8/TP4 r2
+include clean bookends and all four rocprof counter groups. Original IQ2R
+checks remain exact across changing inputs/routes. These are synthetic local
+MoE-call times; tokens are not serving concurrency.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R latency overhead |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 4 | spread | 25.21 | 24.67 | -2.2% |
+| 8 | 4 | hot | 20.06 | 22.37 | +11.5% |
+| 8 | 8 | spread | 36.52 | 35.66 | -2.4% |
+| 8 | 8 | hot | 26.92 | 22.56 | -16.2% |
+| 8 | 16 | spread | 48.72 | 54.72 | +12.3% |
+| 8 | 16 | hot | 28.29 | 26.84 | -5.1% |
+| 4 | 4 | spread | 36.03 | 32.83 | -8.9% |
+| 4 | 4 | hot | 27.74 | 26.51 | -4.4% |
+| 4 | 8 | spread | 55.12 | 54.23 | -1.6% |
+| 4 | 8 | hot | 23.15 | 27.40 | +18.3% |
+| 4 | 16 | spread | 93.41 | 81.75 | -12.5% |
+| 4 | 16 | hot | 31.04 | 28.85 | -7.1% |
+
+The same E280 policy is used for every small-token row; no route-pattern
+selector or best-of-variant table is used. E278 isolated sign scheduling fixed
+the residency cliff; E280 batching adds a further gain. Batching does not lower
+every wait counter: at TP8 M8 spread, E278→E280 gate trace is17.17→16.35µs while
+LDS-wait cycles rise414,794→514,652. Scheduling and residency must be assessed
+using completed work/time, rather than treating a single wait count as latency.
+
+E279 adaptive down extension and E281 route9 extension are unselected because
+of spread-route or broad regressions. E282 applies the new decoder schedule to
+the dense gate: exact, but slightly slower than E261, so dense selection is
+unchanged. E283 down scheduling fails correctness in its TP8 four-read and TP4
+one-read arms and is ineligible pending diagnosis. E284 passes30 TP8/TP4 shape/pattern cases and240 changing steps with
+exact final outputs and intermediate FP8 bytes/scales; actual captures remain. None of E275–E283 is integrated into production.
+
+The goal remains unmet. TP8 M4 hot/M16 spread and TP4 M8 hot remain behind in
+this small fixture. Dense gaps, boundary/intermediate/captured-input checks,
+production integration, official serving bookends and real-MTP quality remain.
+
 ## Current measured position
 
 TP8 uses E261 and TP4 uses E262: adjacent9-bit index packing, exact static
@@ -107,6 +149,14 @@ Both decoder/instruction work and repeated traffic remain material costs.
 E218 r2 TP4 gate improves from 646.37 to 419.81 µs versus MXFP4 262.11 µs.
 Its down remains 558.09 µs versus MXFP4 201.69 µs, with 2384.9 versus 1017.9 MB
 of DRAM traffic. E222 reduces whole-block TP4 time further; it remains behind.
+
+Chunked occupancy correction: original E261/E262 summaries added occupancy
+rates across two sequential down/reduction launches. The preserved
+`summary-v2.json` files instead use duration-weighted rates from the same
+occupancy pass. At4096 spread, down occupancy is36.80% atTP8 and38.51% atTP4.
+Clean times, trace times, additive counters and the published comparison table
+are unchanged. Original summaries remain preserved for artifact audit; use v2
+for occupancy rates. See `experiments/single-gpu-report/occupancy-correction-r1.json`.
 
 ## Corrected small-token baseline
 
@@ -194,7 +244,25 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 |E262|Adapt packing, normalized signs and column batches to TP4. M32 down becomes preferable in these tests. Exact, faster than E252; substantial dense gap remains.|
 |E263|Read codebooks through global memory without LDS staging. Exact, much slower in every tested shape; rejected.|
 |E264|N-atom LDS lookahead with unroll1/2 and compiler scheduling barriers. Exact, but r2 gains are small/mixed and registers increase; no broad selection.|
-|E265|In progress: M64/N32-per-wave gate with packed indices/signs, buffered activations, weight lookahead and current ordering. Test lower accumulator state at four/eight waves and two grid sizes.|
+|E265|M64/N32 gate with the current packed decoder and pipeline. Exact and lower register allocation, but only hot1024 improves; no broad selection.|
+|E266|MFMA16/32 repeated accumulation matches bit for bit in six K128/K768/K6144 tests,1572864 outputs. No performance claim; independent scalar bound remains open.|
+|E267|MFMA32 gate with K128 activation buffering and current decoder/order. Exact but slower in all four shapes; no selection.|
+|E268|Batch two/three K128 activation/weight tiles in the N32 gate. Exact but slower on dense4096 cases; no selection.|
+|E269–E270|Persistent gate grids1/2/3/4/6/8/12 at TP8/TP4. Exact; larger grids give small/mixed changes and no broad selection.|
+|E271|TP4 packed MFMA32 down, M32/M64 with/without next-N-group lookahead. Exact, small hot gain but spread regressions; no broad selection.|
+|E272|Single K6144 accumulation chain changes FP32 rounding: relative L2 about1e-7–3e-7 and78 BF16 differences across524288 outputs. Diagnostic only; no acceptance or quality claim.|
+|E273|Single FP32 gate accumulation chain changes rounding and has no broad speedup. Native registers246→181 still permit only two CTAs/CU; unselected.|
+|E274|Exact late-activation gate with compiler minimum3-CTA hint. Forcing168 registers spills224–308 bytes/thread and regresses; rejected.|
+|E275|Apply exact packing/normalized signs to C4 gate and route9 down at TP8/TP4. Smaller decoder instruction count and useful gains; TP4 spread gate regresses. No broad selector yet.|
+|E276|Packed compact-route and register down at8/16 tokens, TP8/TP4. Exact; down helps, packed gate regresses spread routes.|
+|E277|Single scale byte and minimum-two-CTA hint both remain at129 VGPRs/one CTA. Resource-only; no timing or correctness claim.|
+|E278|Bound sign-temporary lifetimes in small gate. Exact;129→104 VGPRs, two-CTA residency restored. Atom barriers do not broadly win.|
+|E279|Extend TP8 adaptive down reuse to4/16 tokens. Exact; helps hot routing, regresses M4 spread; unselected.|
+|E280|Batch two/four codebook reads with shorter sign lifetimes. Four-read gate uses102 VGPRs, exact and faster across small TP8/TP4 cases; isolated.|
+|E281|Extend token-owned route9 down to8/16 tokens at both TPs. Exact but slower; rejected.|
+|E282|Apply E278/E280 decoder schedule to dense M64 gate. Exact, slightly slower than E261; unselected.|
+|E283|Small down sign scheduling/batching. TP8 four-read and TP4 one-read arms fail correctness; ineligible pending diagnosis.|
+|E284|Unchanged E280 passes30 TP8/TP4 shape/pattern cases and240 changing steps, including intermediate FP8 bytes/scales and12/13-task boundaries.|
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

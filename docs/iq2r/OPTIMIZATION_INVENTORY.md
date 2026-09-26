@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E265. Related scouts,
+attempts from the initial GLM integration through E284. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E265
+## Isolated single-GPU optimization, E199–E284
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -35,7 +35,16 @@ unselected or rejected. E258 established a useful two-batch down/reduction
 order at4096 tokens. E259/E260 reduce sign/index instructions; E261 confirms
 signed-book exactness and shows that deferring reductions loses the batching
 gain. E264 N-atom lookahead is exact but has small mixed gains; no broad selection.
-E265 tests M64/N32 gate geometry with the current packed decoder and pipeline. Earlier attempts and numerical-reference limitations remain in the
+E265 completed exactly without a broad gain. E266 verifies repeated MFMA16/32
+primitive equivalence. E267 MFMA32 and E268 larger activation batches were exact but did not win.
+E269/E270 gate grids and E271 TP4 MFMA32 down show small/mixed gains.
+E272/E273 changed-order diagnostics have no broad speedup. E274 forced residency
+spills regress. E275/E276 extend exact packing to small-token kernels; E277
+scale-byte/hint variants do not fix the cliff. E278/E280 restore small-gate
+residency and improve timing through bounded sign lifetimes and read batching.
+E279/E281 down extensions and E282 dense scheduling are unselected. E283
+down scheduling has TP8/TP4 correctness failures and is ineligible. E284
+passes30 E280 task-boundary/shape cases with exact intermediate values/scales. Earlier attempts and numerical-reference limitations remain in the
 single-GPU report. Serving sweeps remain paused.
 
 

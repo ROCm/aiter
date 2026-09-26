@@ -1,6 +1,246 @@
 {
-  "scope": "Local synthetic TP-rank MoE boundary, microseconds. Not ATOM benchmark_serving. E261/E262 remain isolated.",
+  "scope": "Synthetic single-GPU TP-rank MoE-call microseconds; not serving concurrency. E280 small candidate, E261/E262 dense candidates remain isolated.",
   "rows": [
+    {
+      "tp": 8,
+      "tokens": 4,
+      "routes": "spread",
+      "mxfp4_us": 25.21069049835205,
+      "iq2r_us": 24.666941165924072,
+      "original_iq2r_us": 26.55220329761505,
+      "latency_overhead_percent": -2.156820466553755,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        25.242692232131958,
+        25.178688764572144
+      ],
+      "clean_iq2r_us": [
+        24.68244433403015,
+        24.651437997817993
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 4,
+      "routes": "hot",
+      "mxfp4_us": 20.059271901845932,
+      "iq2r_us": 22.371425479650497,
+      "original_iq2r_us": 24.429187178611755,
+      "latency_overhead_percent": 11.526607691038837,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        20.07414996623993,
+        20.044393837451935
+      ],
+      "clean_iq2r_us": [
+        22.408175468444824,
+        22.33467549085617
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 8,
+      "routes": "spread",
+      "mxfp4_us": 36.524027585983276,
+      "iq2r_us": 35.660772025585175,
+      "original_iq2r_us": 38.26491832733154,
+      "latency_overhead_percent": -2.3635278403124182,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        36.7020308971405,
+        36.34602427482605
+      ],
+      "clean_iq2r_us": [
+        35.651275515556335,
+        35.670268535614014
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 8,
+      "routes": "hot",
+      "mxfp4_us": 26.918333768844604,
+      "iq2r_us": 22.560175508260727,
+      "original_iq2r_us": 24.209436774253845,
+      "latency_overhead_percent": -16.19029728217438,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        27.058711647987366,
+        26.777955889701843
+      ],
+      "clean_iq2r_us": [
+        22.572925686836243,
+        22.54742532968521
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 16,
+      "routes": "spread",
+      "mxfp4_us": 48.71737360954285,
+      "iq2r_us": 54.72167134284973,
+      "original_iq2r_us": 57.14106261730194,
+      "latency_overhead_percent": 12.324756628774324,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        48.93037974834442,
+        48.50436747074127
+      ],
+      "clean_iq2r_us": [
+        54.8031747341156,
+        54.64016795158386
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 16,
+      "routes": "hot",
+      "mxfp4_us": 28.288090229034424,
+      "iq2r_us": 26.837199926376343,
+      "original_iq2r_us": 28.409966826438904,
+      "latency_overhead_percent": -5.128979336925732,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        28.3357173204422,
+        28.240463137626648
+      ],
+      "clean_iq2r_us": [
+        26.908698678016663,
+        26.765701174736023
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 4,
+      "routes": "spread",
+      "mxfp4_us": 36.03227287530899,
+      "iq2r_us": 32.83187448978424,
+      "original_iq2r_us": 35.582396388053894,
+      "latency_overhead_percent": -8.882033050204319,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        36.011525988578796,
+        36.053019762039185
+      ],
+      "clean_iq2r_us": [
+        32.93049931526184,
+        32.73324966430664
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 4,
+      "routes": "hot",
+      "mxfp4_us": 27.739590406417847,
+      "iq2r_us": 26.510584354400635,
+      "original_iq2r_us": 29.331478476524353,
+      "latency_overhead_percent": -4.430512613960113,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        27.634969353675842,
+        27.84421145915985
+      ],
+      "clean_iq2r_us": [
+        26.556462049484253,
+        26.464706659317017
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 8,
+      "routes": "spread",
+      "mxfp4_us": 55.118054151535034,
+      "iq2r_us": 54.22704219818115,
+      "original_iq2r_us": 58.17995369434357,
+      "latency_overhead_percent": -1.616551903128216,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        55.046433210372925,
+        55.189675092697144
+      ],
+      "clean_iq2r_us": [
+        54.26567196846008,
+        54.18841242790222
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 8,
+      "routes": "hot",
+      "mxfp4_us": 23.14930632710457,
+      "iq2r_us": 27.396340668201447,
+      "original_iq2r_us": 28.870350122451782,
+      "latency_overhead_percent": 18.346270428519063,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        23.163680732250214,
+        23.134931921958923
+      ],
+      "clean_iq2r_us": [
+        27.460217475891113,
+        27.33246386051178
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 16,
+      "routes": "spread",
+      "mxfp4_us": 93.41298937797546,
+      "iq2r_us": 81.75275921821594,
+      "original_iq2r_us": 88.66419494152069,
+      "latency_overhead_percent": -12.48245050008936,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        93.22049021720886,
+        93.60548853874207
+      ],
+      "clean_iq2r_us": [
+        81.73063397407532,
+        81.77488446235657
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 16,
+      "routes": "hot",
+      "mxfp4_us": 31.042619049549103,
+      "iq2r_us": 28.847475349903107,
+      "original_iq2r_us": 30.159859359264374,
+      "latency_overhead_percent": -7.071386908888666,
+      "arm": "iq2r_batch4",
+      "experiment": "e280",
+      "revision": 2,
+      "clean_mxfp4_us": [
+        31.082993745803833,
+        31.002244353294373
+      ],
+      "clean_iq2r_us": [
+        28.852224349975586,
+        28.842726349830627
+      ]
+    },
     {
       "tp": 8,
       "tokens": 1024,
