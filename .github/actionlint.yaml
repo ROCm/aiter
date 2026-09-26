@@ -4,6 +4,7 @@ self-hosted-runner:
     - linux-aiter-oci-mi300x-8
     - aiter-di-ci-spur-login
     - aiter-di-ci-spur-login-vllm
+    - aiter-di-ci-spur-login-sglang
     - aiter-gfx1100
     - build-only-aiter
     - linux-aiter-build-mi250
