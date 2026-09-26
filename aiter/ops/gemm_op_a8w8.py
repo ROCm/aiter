@@ -21,6 +21,7 @@ from ..jit.core import (
 )
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num
+from ..utility.untuned_shapes import record as _record_untuned_shape
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
@@ -459,28 +460,57 @@ _CKGEMM_CONFIG_CACHE: dict = {}
 _CKGEMM_HAS_GFX: dict = {}
 
 
+def _assert_uniquely_keyed(frame, index_cols: list, tuned_file) -> None:
+    """Fail with the diagnosis instead of pandas' "index must be unique".
+
+    A tuned table whose rows are not unique on ``index_cols`` cannot be turned
+    into a lookup, and ``to_dict("index")`` says only that the index is not
+    unique -- not which file, which shapes, or why. The usual cause is a table
+    keyed on a column this lookup does not consider: ``a8w8_tuned_gemm.csv``
+    has carried ``q_dtype_w`` since #1782, so it holds an int8 row and an fp8
+    row for the same (gfx, cu_num, M, N, K), and belongs to
+    ``get_GEMM_config_with_quant_type``.
+    """
+    collisions = frame.duplicated(index_cols, keep=False)
+    if not collisions.any():
+        return
+    shapes = frame[collisions].groupby(index_cols, sort=False).ngroups
+    extra = ""
+    if "q_dtype_w" in frame.columns and "q_dtype_w" not in index_cols:
+        kinds = sorted(str(v) for v in frame.loc[collisions, "q_dtype_w"].unique())
+        extra = (
+            f" Its rows are distinguished by q_dtype_w ({', '.join(kinds)}), which"
+            " this lookup does not key on -- use get_GEMM_config_with_quant_type()"
+            " for this table."
+        )
+    raise ValueError(
+        f"{tuned_file} is not uniquely keyed by {tuple(index_cols)}: "
+        f"{shapes} shape(s) carry more than one row.{extra}"
+    )
+
+
+# Cache config resolution only. The public wrapper records misses on every
+# dispatch until the recorder confirms the row, so transient I/O can recover.
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
-    if tuned_file is None:
-        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
+def _get_CKGEMM_config_cached(M: int, N: int, K: int, tuned_file):
     if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
         # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
         # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
-        if "gfx" in ckgemm_dict.columns:
-            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-                ["gfx", "cu_num", "M", "N", "K"]
-            ).to_dict("index")
-            _CKGEMM_HAS_GFX[tuned_file] = True
-        else:
+        has_gfx = "gfx" in ckgemm_dict.columns
+        if not has_gfx:
             logger.warning(
                 f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
-            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-                ["cu_num", "M", "N", "K"]
-            ).to_dict("index")
-            _CKGEMM_HAS_GFX[tuned_file] = False
+        index_cols = (
+            ["gfx", "cu_num", "M", "N", "K"] if has_gfx else ["cu_num", "M", "N", "K"]
+        )
+        _assert_uniquely_keyed(ckgemm_dict, index_cols, tuned_file)
+        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(index_cols).to_dict(
+            "index"
+        )
+        _CKGEMM_HAS_GFX[tuned_file] = has_gfx
 
     gfx = get_gfx()
     cu_num = get_cu_num()
@@ -497,27 +527,50 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
                     f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {tuned_file} , kernel name is {config['kernelName']}!"
                 )
             break
-    if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
-        )
     return config
+
+
+@functools.lru_cache(maxsize=1024)
+def _log_CKGEMM_miss_once(M: int, N: int, K: int, tuned_file):
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+    )
+
+
+def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
+    config = _get_CKGEMM_config_cached(M, N, K, tuned_file)
+    if config is None:
+        _log_CKGEMM_miss_once(M, N, K, tuned_file)
+        # AITER_TUNE_GEMM=1 -> collect the miss in this family's untuned schema,
+        # so a serving run yields a ready-to-tune shape list (see #5267).
+        _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
+    return config
+
+
+def _clear_CKGEMM_config_cache():
+    _get_CKGEMM_config_cached.cache_clear()
+    _log_CKGEMM_miss_once.cache_clear()
+
+
+get_CKGEMM_config.cache_clear = _clear_CKGEMM_config_cache
+get_CKGEMM_config.cache_info = _get_CKGEMM_config_cached.cache_info
 
 
 _GEMM_QUANT_TYPE_CACHE: dict = {}
 _GEMM_QUANT_TYPE_HAS_GFX: dict = {}
 
 
+# Keep retryable miss telemetry outside this lookup cache as above.
 @functools.lru_cache(maxsize=1024)
-def get_GEMM_config_with_quant_type(
+def _get_GEMM_config_with_quant_type_cached(
     M: int,
     N: int,
     K: int,
     q_dtype_w: torch.dtype,
-    tuned_file=None,
+    tuned_file,
 ):
-    if tuned_file is None:
-        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     # Load file if not cached
     if tuned_file not in _GEMM_QUANT_TYPE_CACHE:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
@@ -560,11 +613,44 @@ def get_GEMM_config_with_quant_type(
                     msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
                 logger.info(msg)
             break
-    if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+    return config
+
+
+@functools.lru_cache(maxsize=1024)
+def _log_quant_type_miss_once(M, N, K, q_dtype_w, tuned_file):
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+    )
+
+
+def get_GEMM_config_with_quant_type(
+    M: int,
+    N: int,
+    K: int,
+    q_dtype_w: torch.dtype,
+    tuned_file=None,
+    record_untuned=True,
+):
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    config = _get_GEMM_config_with_quant_type_cached(M, N, K, q_dtype_w, tuned_file)
+    if config is None and record_untuned:
+        _log_quant_type_miss_once(M, N, K, q_dtype_w, tuned_file)
+        _record_untuned_shape(
+            tuned_file, {"M": M, "N": N, "K": K, "q_dtype_w": q_dtype_w}
         )
     return config
+
+
+def _clear_quant_type_config_cache():
+    _get_GEMM_config_with_quant_type_cached.cache_clear()
+    _log_quant_type_miss_once.cache_clear()
+
+
+get_GEMM_config_with_quant_type.cache_clear = _clear_quant_type_config_cache
+get_GEMM_config_with_quant_type.cache_info = (
+    _get_GEMM_config_with_quant_type_cached.cache_info
+)
 
 
 def gemm_a8w8_fake(
@@ -748,6 +834,7 @@ def gemm_a8w8_bpreshuffle(
         k,
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        record_untuned=w_k == k,
     )
     if config is None and w_k > k:
         config = get_GEMM_config_with_quant_type(
