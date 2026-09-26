@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E401 and E403. Related scouts,
+attempts from the initial GLM integration through E407, excluding ongoing E408. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E403
+## Isolated single-GPU optimization, E199–E407
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -224,6 +224,15 @@ single-GPU report. Serving sweeps remain paused.
 | E400 | Remove the obsolete register-weight cache barrier from TP4 M256 gate, keeping selected plane4 down fixed. All 315 checks and stable rows pass; retain removal for 0.7–1.5% whole-MoE gains. Hot remains 25.8% behind fresh MXFP4. Reuse is an alternative; E403 qualifies removal. |
 | E401 | The frozen E399 TP8 M128 module passes 1,080 exact real-weight input/intermediate/final graph/eager checks across three slices, five patterns and eight changes, with native dispatch and zero scratch. Correctness only. |
 | E403 | The frozen E400 TP4 M256 removal module passes 1,080 exact real-weight checks and native dispatch after restoring a missing harness packing helper. Preserve the failed first attempt; module, arithmetic and tolerances are unchanged. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E402 | Four-wave M16 gate with grid2/4/8 passes 378 exact checks and stable timing. Grid4 trades a 0.9% hot gain for 0.7–0.8% spread/mixed regressions; E400 remains selected. |
+| E404 | DWORD-plane codebooks retain exact values but double LDS bank-conflict counts. All 315 checks and stable rows pass; full-wait and cross-K variants regress 3.3–11.4% and are rejected. Native audit setup failure is preserved. |
+| E405 | Padded 12-byte codebook proposal stops at a CPU alignment probe: compiler selects two 32-bit reads, so the intended single 64-bit read is not established. No GPU timing or promotion. |
+| E406 | Modern M32 register/cross-K reuse passes 315 exact checks and stable timing. Bounded unrolling reduces 142 to 128 VGPRs, but every row still loses; rejected. |
+| E407 | Two-word cross-K lookahead fails the initial M32 finite-output check before timings. Native code copies an outstanding DS result without a wait. Failure, source and binary are frozen for E408 diagnosis; no candidate selected. |
 
 
 ## How to read the outcomes
