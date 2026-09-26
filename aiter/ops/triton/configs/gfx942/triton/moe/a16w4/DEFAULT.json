@@ -33,19 +33,19 @@
     },
     "bm64_n1024_k5120": {
         "BLOCK_SIZE_K": 256,
-        "BLOCK_SIZE_N": 256,
-        "matrix_instr_nonkdim": 32,
+        "BLOCK_SIZE_N": 128,
+        "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 8,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "bm64_n1536_k5120": {
-        "BLOCK_SIZE_K": 256,
-        "BLOCK_SIZE_N": 256,
-        "matrix_instr_nonkdim": 32,
+        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_N": 128,
+        "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 8,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "bm64_n5120_k512": {
         "BLOCK_SIZE_K": 128,
