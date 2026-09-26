@@ -20,6 +20,7 @@ from aiter.dist.parallel_state import (
     destroy_model_parallel,
     ensure_model_parallel_initialized,
     get_custom_group,
+    get_tp_group,
     init_distributed_environment,
     set_custom_all_reduce,
 )
@@ -46,7 +47,7 @@ def barrier_before_teardown():
     if not dist.is_initialized():
         return
     torch.cuda.synchronize()
-    dist.barrier()
+    get_tp_group().barrier()
     torch.cuda.synchronize()
 
 

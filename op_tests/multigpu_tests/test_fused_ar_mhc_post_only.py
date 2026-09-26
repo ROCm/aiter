@@ -64,7 +64,7 @@ def barrier_before_teardown():
     if not dist.is_initialized():
         return
     torch.cuda.synchronize()
-    dist.barrier()
+    get_tp_group().barrier()
     torch.cuda.synchronize()
 
 
