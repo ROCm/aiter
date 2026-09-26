@@ -8,7 +8,11 @@ from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import
     _fused_add_rmsnorm_pad,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -19,10 +23,7 @@ def _get_config(block_size_n: int, backend: str) -> dict:
         "normalization", "FUSED_ADD_RMSNORM_PAD", backend=backend
     )
     raw = load_config_json(f"{config_dir}/DEFAULT.json")
-    for bound in sorted(int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")):
-        if block_size_n <= bound:
-            return dict(raw[f"N_LEQ_{bound}"])
-    return dict(raw["any"])
+    return select_leq_config(raw, block_size_n)
 
 
 def fused_add_rmsnorm_pad(
