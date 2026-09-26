@@ -74,6 +74,7 @@ def get_gfx():
 
 
 _LDS_CAPACITY_BYTES = {
+    "gfx908": 64 * 1024,
     "gfx90a": 64 * 1024,
     "gfx942": 64 * 1024,
     "gfx950": 160 * 1024,
@@ -175,11 +176,12 @@ def get_asic_revision() -> int:
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
 # These cu_num values were only ever tuned on a single arch historically:
-#   256 -> gfx950, 80/304 -> gfx942.
+#   120 -> gfx908, 256 -> gfx950, 80/304 -> gfx942.
 # Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
 # are always written with their real arch by the tuner, so they never rely on
 # this backfill.
 _LEGACY_CU_NUM_TO_GFX = {
+    120: "gfx908",
     256: "gfx950",
     80: "gfx942",
     304: "gfx942",
