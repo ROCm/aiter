@@ -150,6 +150,10 @@ def launch_gemm_a8w4_tdm(
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
+    # GEMM1 always uses a physical 4x4 cluster when the existing N multicast
+    # path selects four columns.  The four M rows are partitioned into
+    # expert-homogeneous multicast subgroups below.
+    cluster_m = 4 if (stage1_act and cluster_n == 4) else 1
     cache_tag = (
         K,
         tile_m,
@@ -167,6 +171,7 @@ def launch_gemm_a8w4_tdm(
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
+        cluster_m,
         next_stage_on,
         num_waves_per_tensor_tdm,
         enable_ep_scatter,
@@ -276,7 +281,7 @@ def launch_gemm_a8w4_tdm(
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
-    _cl = f"_cn{cluster_n}" if cluster_n > 1 else ""
+    _cl = f"_cm{cluster_m}_cn{cluster_n}" if cluster_n > 1 else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
     _waves_per_tensor = (
@@ -338,21 +343,27 @@ def launch_gemm_a8w4_tdm(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
 
-        # DeepGEMM contiguous-M swizzle, run at cluster granularity so peers land
-        # on one m_tile. Ternaries, not `if`: the rewriter would trace a branch.
+        # DeepGEMM contiguous-M swizzle, run at physical-cluster granularity.
         TILES_PER_GROUP = 16
+        assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
         total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
         swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
         local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
         n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
-        blocks_per_group = n_units * TILES_PER_GROUP
+        local_m = fx.block_idx.y if cluster_m > 1 else 0
+        m_units = (total_m_tiles + cluster_m - 1) // cluster_m
+        group_m_units = TILES_PER_GROUP // cluster_m
+        blocks_per_group = n_units * group_m_units
         group = swz_id // blocks_per_group
-        group_first_tile = group * TILES_PER_GROUP
+        group_first_tile = group * group_m_units
         in_group = swz_id - group * blocks_per_group
-        rem_tiles = total_m_tiles - group_first_tile
-        group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
-        m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
+        rem_tiles = m_units - group_first_tile
+        group_tiles = (rem_tiles < group_m_units).select(rem_tiles, group_m_units)
+        m_unit = group_first_tile + (
+            in_group - (in_group // group_tiles) * group_tiles
+        )
+        m_tile = m_unit * cluster_m + local_m
         blk_m = m_tile * tile_m
         n_unit = in_group // group_tiles
         blk_n = (
@@ -360,9 +371,13 @@ def launch_gemm_a8w4_tdm(
             if cluster_n > 1
             else n_unit * tile_n
         )
-        # Peers differ only in n_tile, so A alone is broadcast, to the whole
-        # cluster -- a constant all-ones mask, no cluster-local id needed.
-        a_mcast_mask = (1 << cluster_n) - 1 if cluster_n > 1 else 0
+        # A always follows the existing 1x4 direction: one M row broadcasts
+        # across the four N columns, even when the physical cluster is 4x4.
+        a_mcast_mask = (
+            ((1 << cluster_n) - 1) << (local_m * cluster_n)
+            if cluster_n > 1
+            else None
+        )
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
@@ -390,6 +405,49 @@ def launch_gemm_a8w4_tdm(
         sb_batch_off = eb64 * (N_SUPERS * K4)
         # Per-expert A-data OOB: bound to the owning expert's valid-row
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+
+        b_mcast_mask = None
+        full_cluster = None
+        if const_expr(cluster_m > 1):
+            # Intersect this expert's contiguous M-tile interval with the four
+            # physical M rows.  This produces Hx4 logical subclusters: A still
+            # multicasts across each row, while B multicasts down each column.
+            cluster_first_m = m_unit * cluster_m
+            valid_m_tiles = (tile_map[n_experts - 1] + tile_m - 1) // tile_m
+            full_cluster = cluster_first_m + cluster_m <= valid_m_tiles
+            prev_expert = (expert > 0).select(expert - 1, 0)
+            prev_expert = (prev_expert < n_experts).select(
+                prev_expert, n_experts - 1
+            )
+            first_m = (expert > 0).select(
+                (tile_map[prev_expert] + tile_m - 1) // tile_m, 0
+            )
+            end_m = tile_map[(expert < n_experts).select(expert, n_experts - 1)]
+            end_m = (end_m + tile_m - 1) // tile_m
+            column_mask = fx.Int32(0)
+            group_size = fx.Int32(0)
+            for mi in range_constexpr(cluster_m):
+                peer_m = cluster_first_m + mi
+                same_expert = (peer_m >= first_m) & (peer_m < end_m)
+                column_mask = column_mask | same_expert.select(
+                    1 << (mi * cluster_n), 0
+                )
+                group_size = group_size + same_expert.select(1, 0)
+            # A partial M-tail retains four independent copies of the current
+            # 1x4 A protocol.  Disable B multicast there so sentinel rows can
+            # take the existing early exit without entering a cluster barrier.
+            # A one-row expert subgroup is also the current 1x4 fallback: A
+            # broadcasts across N and B remains an ordinary per-WG load.
+            use_b_mcast = full_cluster & (group_size > 1)
+            b_mcast_mask = use_b_mcast.select(column_mask << local_n, 0)
+
+        def cluster_sync():
+            if const_expr(cluster_m > 1):  # noqa: SIM102 - preserve DSL staging
+                if full_cluster:
+                    workgroup_barrier()
+                    if wave == 0:
+                        rocdl.s_barrier_signal(-3)
+                    rocdl.s_barrier_wait(-3)
 
         # static=False (one dyn-shared base) only where a second region is
         # needed, so the non-scatter path keeps its per-leaf static allocation.
@@ -487,7 +545,7 @@ def launch_gemm_a8w4_tdm(
             k_adv,
             wv,
             pad=None,
-            wg_mask=0,
+            wg_mask=None,
             split_inner=False,
         ):
             split_i = split_inner and len(wv) > 1
@@ -515,12 +573,12 @@ def launch_gemm_a8w4_tdm(
                 num_warps=nw,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask),
+                early_timeout=bool(wg_mask is not None),
                 **pad_kw,
             )
-            if wg_mask:
-                # Non-zero mask switches the TDM from GLOBAL_LOAD_ASYNC to
-                # CLUSTER_LOAD_ASYNC, fanning one load out to every peer's LDS.
+            if const_expr(wg_mask is not None):
+                # A runtime zero mask keeps a partial-M tail on the ordinary
+                # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
                 atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
             jobs.append(
                 Job(
@@ -566,6 +624,7 @@ def launch_gemm_a8w4_tdm(
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
+            wg_mask=b_mcast_mask,
         )
         add_tdm_loads(
             gSA_base,
@@ -1140,6 +1199,8 @@ def launch_gemm_a8w4_tdm(
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
+            cluster_sync()
+
             def run_mainloop(interleave_ab):
                 if const_expr(enable_ep_scatter):
                     # Rowmap (dst_i32, weight_f32) TDM descriptor: a (tile_m, 2) i32
@@ -1204,6 +1265,9 @@ def launch_gemm_a8w4_tdm(
                             )
                             workgroup_barrier()
                             issue(s, kt + num_buffers, my_jobs)
+                            if const_expr(cluster_m > 1):
+                                if (kt + 1) % num_buffers == 0:
+                                    cluster_sync()
 
                     dispatch_wave_job(steady_post)
                     for j in range_constexpr(num_buffers):
@@ -1281,6 +1345,9 @@ def launch_gemm_a8w4_tdm(
                                 ),
                                 interleave_ab=interleave_ab,
                             )
+                            if const_expr(cluster_m > 1):
+                                if (kt + 1) % num_buffers == 0:
+                                    cluster_sync()
 
                     dispatch_wave_job(steady_mid)
 
@@ -1780,18 +1847,18 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta,
         f32_situ_linear_beta,
     )
-    grid = (m_tiles * n_tiles, 1, 1)
+    grid = (((m_tiles + cluster_m - 1) // cluster_m) * n_tiles, cluster_m, 1)
     if cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.
         kernel(
             *kargs,
-            value_attrs={"rocdl.cluster_dims": f"{cluster_n},1,1"},
+            value_attrs={"rocdl.cluster_dims": f"{cluster_n},{cluster_m},1"},
         ).launch(
             grid=grid,
             block=(block, 1, 1),
             stream=stream,
-            cluster=(cluster_n, 1, 1),
+            cluster=(cluster_n, cluster_m, 1),
         )
     else:
         kernel(*kargs).launch(grid=grid, block=(block, 1, 1), stream=stream)
