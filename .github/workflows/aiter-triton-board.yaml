@@ -13,12 +13,17 @@ name: AITER-triton Kernels board
 #   3. it carries the Triton/Gluon label.
 # Such a PR is added to the board and its Status follows the PR state: a draft
 # sits in "Backlog"; an open PR sits in "In review" unless someone has already
-# moved it on to "In Progress" or "Approved". Every run re-derives this from
-# the current PR state, so runs are idempotent and safe to cancel or reorder.
+# moved it on to "In Progress" or "Approved". When the Triton/Gluon label or an
+# assignee is removed and no rule still applies, the PR is taken off the board.
+#
+# Every run works from the PR's current state (fetched at the start of the
+# run), not from the event payload, so late runs, cancelled runs and bursts of
+# events all converge on the same result.
 #
 # Issues stay label-driven through the board's own auto-add rule. Here they are
-# only added when assigned to a team member (rule 1); their Status is left to
-# the board's "Item added" automation.
+# added when assigned to a team member or labeled (rules 1 and 3), removed
+# again on unassign/unlabel when neither applies any more, and their Status is
+# left to the board's "Item added" automation.
 #
 # Enabling it (org / repo admin):
 #   1. Grant the AITER CI GitHub App the organization permissions
@@ -34,9 +39,18 @@ name: AITER-triton Kernels board
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize, assigned, labeled]
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - converted_to_draft
+      - synchronize
+      - assigned
+      - unassigned
+      - labeled
+      - unlabeled
   issues:
-    types: [opened, reopened, assigned]
+    types: [opened, reopened, assigned, unassigned, labeled, unlabeled]
 
 permissions: {}
 
@@ -79,9 +93,19 @@ jobs:
             // an open, non-draft PR is corrected to "In review".
             const KEEP_OPEN = ['in review', 'in progress', 'approved'];
 
-            const pr = context.payload.pull_request;
-            const item = pr ?? context.payload.issue;
-            const what = `${pr ? 'PR' : 'issue'} #${item.number}`;
+            const { owner, repo } = context.repo;
+            const action = context.payload.action;
+            const isPR = Boolean(context.payload.pull_request);
+            const number = (context.payload.pull_request ?? context.payload.issue).number;
+            const what = `${isPR ? 'PR' : 'issue'} #${number}`;
+
+            // Work from the current state, not the event payload: by the time
+            // this runs the PR may have been marked ready, converted to draft,
+            // relabeled, reassigned or closed.
+            const item = isPR
+              ? (await github.rest.pulls.get({ owner, repo, pull_number: number })).data
+              : (await github.rest.issues.get({ owner, repo, issue_number: number })).data;
+            const pr = isPR ? item : null;
 
             if (pr && pr.state !== 'open') {
               core.info(`${what} is closed — nothing to do.`);
@@ -111,12 +135,12 @@ jobs:
                 + 'skipping the team rule for this run.');
             }
 
+            // Rule 2: the diff itself.
             if (pr) {
-              // Rule 2: the diff itself.
               const files = await github.paginate(github.rest.pulls.listFiles, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: pr.number,
+                owner,
+                repo,
+                pull_number: number,
                 per_page: 100,
               });
               const names = files.map(f => f.filename);
@@ -126,20 +150,47 @@ jobs:
               if (names.some(f => TRITON_CI.some(re => re.test(f)))) {
                 reasons.push('touches Triton CI');
               }
-              // Rule 3: already labeled.
-              if ((pr.labels ?? []).some(l => l.name === LABEL)) {
-                reasons.push(`labeled ${LABEL}`);
-              }
             }
 
-            if (!reasons.length) {
-              core.info(`${what} does not belong on the board.`);
-              return;
+            // Rule 3: labeled.
+            if ((item.labels ?? []).some(l => l.name === LABEL)) {
+              reasons.push(`labeled ${LABEL}`);
             }
-            core.info(`${what} belongs on the board: ${reasons.join('; ')}`);
 
-            // ---- add it and, for PRs, keep Status in step with the PR ----
+            // Losing the label or an assignee is the only thing that takes an
+            // item off the board; other events never remove anything, so items
+            // people added by hand are left alone.
+            const lostQualifier = action === 'unassigned'
+              || (action === 'unlabeled' && context.payload.label?.name === LABEL);
+
             try {
+              if (!reasons.length) {
+                if (!lostQualifier) {
+                  core.info(`${what} does not belong on the board.`);
+                  return;
+                }
+                const { node } = await github.graphql(`
+                  query($id: ID!) {
+                    node(id: $id) {
+                      ... on PullRequest { projectItems(first: 100) { nodes { id project { id number } } } }
+                      ... on Issue { projectItems(first: 100) { nodes { id project { id number } } } }
+                    }
+                  }`, { id: item.node_id });
+                const onBoard = (node?.projectItems?.nodes ?? []).find(n => n.project.number === PROJECT_NUMBER);
+                if (!onBoard) {
+                  core.info(`${what} no longer qualifies and is not on the board.`);
+                  return;
+                }
+                await github.graphql(`
+                  mutation($project: ID!, $item: ID!) {
+                    deleteProjectV2Item(input: { projectId: $project, itemId: $item }) { deletedItemId }
+                  }`, { project: onBoard.project.id, item: onBoard.id });
+                core.info(`${what} no longer qualifies — removed from the board.`);
+                return;
+              }
+              core.info(`${what} belongs on the board: ${reasons.join('; ')}`);
+
+              // ---- add it and, for PRs, keep Status in step with the PR ----
               const { organization: { projectV2: project } } = await github.graphql(`
                 query($org: String!, $number: Int!) {
                   organization(login: $org) {
