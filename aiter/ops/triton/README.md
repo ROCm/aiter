@@ -68,7 +68,7 @@ handed to the same `@triton.jit` kernel.
 - A helper both sides need is split, not duplicated: the torch-free part under
   `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
   places for exactly this reason.
-- `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
+- `utils/_triton/tuning/` is exempt — those are standalone tuning scripts
   that run in a PyTorch environment, not part of the importable surface.
 - Non-PyTorch users still write their own wrappers. Their framework creates
   the tensors, so allocation, dtype and layout checks, and the launch belong
@@ -308,9 +308,23 @@ depend on a benchmark.
 - `configs/gemm/aot/` and `configs/paged_mqa_logits/aot/` are runtime AOT
   caches, not tuning configs — never check them in or migrate them.
 
-For adding a config, seeding a new arch, and the per-family key schemes, follow
-`configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tuning/README.md`.
+For config placement and seeding a new architecture, follow `configs/CLAUDE.md`
+(§5 and §6). The [shared GEMM tuner](utils/_triton/tuning/README.md) benchmarks
+the current config, tries candidates through `get_gemm_config()`, logs failures,
+and saves the fastest config when it improves performance or the M bucket has
+no tuned config. It measures rocprofv3 GEMM/reduction kernel timestamps, excluding
+wrapper overhead. Each config runs in a fresh process with a timeout; crashes
+and timeouts are logged and the sweep continues.
+
+Run `python3 utils/_triton/tuning/tune_gemm.py --list` for the cases. Run tuning
+on each target GPU (gfx942, gfx950, gfx1250, or future architectures) with a
+supported kernel and valid `DEFAULT.json`. The author must keep its keys
+consistent with the selected kernel; Triton and Gluon can use different keys.
+For wrappers exposing backend selection, use `--backend triton`, `gluon`, or
+`both`. Omitting it preserves the wrapper's default, including Gluon on
+supported gfx1250 routes; explicitly selecting Triton remains supported.
+See [coverage](utils/_triton/tuning/COVERAGE.md) for the missing-harness inventory,
+shared families, and separate MoE tuning paths.
 
 ---
 
@@ -472,3 +486,7 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 - Unit test under `op_tests/triton_tests/<category>/` and a benchmark script
   under `op_tests/op_benchmarks/triton/bench_<op>.py` — a kernel ships as
   kernel + wrapper + test + benchmark.
+- GEMM wrappers: a tuning case in `utils/_triton/tuning/gemm_cases.py` (see
+  its README), and each `DEFAULT.json` of the family lists exactly the config
+  keys the kernel reads, since those are the keys `tune_gemm.py` tries and
+  writes.
