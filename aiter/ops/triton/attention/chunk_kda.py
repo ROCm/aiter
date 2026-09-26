@@ -180,8 +180,10 @@ def chunk_kda_walk(
         out: [1, T, H, 128] destination, may alias the dead v; allocated if None.
         initial_state: fp32 [N, H, V, K] per-sequence start state, zeros if None.
         output_final_state: return a fresh fp32 [N, H, V, K] final state.
-        state_cache: fp32 [slots, H, V, K] paged state, read and written in
-            place at ``state_indices``; replaces initial_state / output_final_state.
+        state_cache: fp32 [slots, H, V, K] paged state, dense within a slot but with
+            any slot stride (vLLM pads and shares hybrid cache pages); read and
+            written in place at ``state_indices``; replaces initial_state /
+            output_final_state.
         state_indices: int32 [N] cache row per sequence.
         has_initial_state: bool [N]; False starts that sequence from zeros.
         out_gate, norm_weight: fuse o = rmsnorm(o) * norm_weight * sigmoid(out_gate).
@@ -262,6 +264,8 @@ def chunk_kda_walk(
         out_gate_ptr=out_gate,
         norm_weight_ptr=norm_weight,
         norm_eps=norm_eps,
+        stride_state_n=state_in.stride(0) if state_in is not None else 0,
+        stride_state_out_n=state_out.stride(0) if state_out is not None else 0,
         stride_o_token=out.stride(1),
         stride_og_token=out_gate.stride(1) if fuse_norm else 0,
         scale=scale,

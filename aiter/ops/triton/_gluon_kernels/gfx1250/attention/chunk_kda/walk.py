@@ -173,6 +173,8 @@ def chunk_kda_walk_kernel(
     out_gate_ptr,
     norm_weight_ptr,
     norm_eps,
+    stride_state_n,
+    stride_state_out_n,
     stride_o_token: gl.constexpr,
     stride_og_token: gl.constexpr,
     scale: gl.constexpr,
@@ -218,7 +220,9 @@ def chunk_kda_walk_kernel(
         slot = gl.load(state_indices_ptr + i_n).to(gl.int64)
     else:
         slot = i_n.to(gl.int64)
-    s_row = ((slot * H + i_h) * V + i_v * BV) * K
+    # rows step by the cache's own slot stride: vLLM's hybrid pages pad and share each slot
+    s_head = (i_h * V + i_v * BV) * K
+    s_row = slot * stride_state_n + s_head
     if USE_INITIAL_STATE:
         m = s_off >= 0
         if IS_PAGED:
@@ -368,4 +372,6 @@ def chunk_kda_walk_kernel(
         )
 
     if STORE_FINAL_STATE:
-        gl.amd.gfx1250.buffer_store(S, state_out_ptr + s_row, s_off)
+        gl.amd.gfx1250.buffer_store(
+            S, state_out_ptr + slot * stride_state_out_n + s_head, s_off
+        )

@@ -162,19 +162,25 @@ def test_chunk_kda_workspace(seqlens):
     assert_close("decay", ref["decay"], ws["decay"])
 
 
-def test_chunk_kda_paged():
-    """vLLM path: state cache read and written in place, out aliasing the dead v."""
+@pytest.mark.parametrize("padded", [False, True])
+def test_chunk_kda_paged(padded):
+    """vLLM path: state cache read and written in place, out aliasing the dead v. ``padded`` lays the
+    cache out like vLLM's hybrid pages: each slot's page holds the conv state first, then the
+    recurrent state, then padding, so the slot stride is not H * D * D."""
     seqlens, H = [130, 1, 64, 257], 24
     inp = make_inputs(seqlens, H, seed=1)
     N = len(seqlens)
-    cache = torch.full((3 * N, H, D, D), POISON, device=DEVICE)
+    lead, tail = (3 * 2 * H * D, 1000) if padded else (0, 0)
+    page = lead + H * D * D + tail
+    raw = torch.full((3 * N, page), POISON, device=DEVICE)
+    cache = raw.as_strided((3 * N, H, D, D), (page, D * D, D, 1), storage_offset=lead)
     slots = torch.randperm(3 * N, device=DEVICE)[:N].int()
     has_init = torch.tensor([True, False, True, False], device=DEVICE)
     cache[slots.long()] = torch.randn(N, H, D, D, device=DEVICE)
     h0 = torch.where(has_init[:, None, None, None], cache[slots.long()], 0.0)
     o_ref, s_ref = run_ref(inp, h0)
-    untouched = torch.ones(3 * N, dtype=torch.bool, device=DEVICE)
-    untouched[slots.long()] = False
+    written = torch.zeros_like(raw, dtype=torch.bool)
+    written.as_strided(cache.shape, cache.stride(), lead)[slots.long()] = True
 
     o, s = run_kernel(
         inp,
@@ -186,7 +192,7 @@ def test_chunk_kda_paged():
     assert s is None and o.data_ptr() == inp["v"].data_ptr()
     assert_close("o", o_ref, o)
     assert_close("final_state", s_ref, cache[slots.long()])
-    assert (cache[untouched] == POISON).all(), "untouched cache slots were written"
+    assert (raw[~written] == POISON).all(), "cache memory outside the used slots was written"
 
 
 def test_chunk_kda_fused_norm():
