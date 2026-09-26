@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E384. Related scouts,
+attempts from the initial GLM integration through E387. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E384
+## Isolated single-GPU optimization, E199–E387
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -190,6 +190,13 @@ single-GPU report. Serving sweeps remain paused.
 | E382 | Move TP4 compact gate records from LDS to registers and add cross-K lookup scheduling. 378 exact checks, max drift 2.91%; cross-K improves E368 by 2.7–4.5%. Register-only loses mixed; codebook reuse adds no consistent benefit. TP4 M256 hot remains 23.4% behind MXFP4. |
 | E383 | Remove the pre-partial-store barrier inherited from the unused LDS weight cache in the register-only gate. 252 r1 checks pass but hot drifts 3.31%. Independent r2 passes 72 new checks and stable bookends, improving E381 by 0.7–2.2%; TP8 M256 hot remains 1.5% behind. |
 | E384 | Qualify E381/E383 TP8 M256, E382 TP4 M256 and E363/E379 TP4 M1024/M4096 on three real layer/rank slices each. All 4,320 exact changing graph/eager checks, input/intermediate scales, native dispatch and zero scratch pass. Small captures are tiled to larger shapes; no serving or timing claim. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E385 | Three-slot activation ring with actual selective VM retirement passes 420 checks and stable bookends, but both variants lose. LDS waits fall while VALU instructions rise about 12%. Compiler-drain r2/r3 and scratch-descriptor r4 attempts are preserved without GPU timing. Rejected. |
+| E386 | Direct codebook byte addressing removes one VALU instruction per atom. All 420 checks and timing rows pass. Retain at TP4 M4096 only for 0.3–0.6% gains; M1024 is mixed and paired 64-bit sign shifts are unselected. Dense gaps remain about 22%. |
+| E387 | Transfer direct byte addresses to selected compact TP8 M256. All 252 checks pass; VALU counts fall about 2.8%, but qualified spread regresses. Hot drift 3.2529% remains provisional at the unchanged 3% ceiling. Unselected. |
 
 
 ## How to read the outcomes
