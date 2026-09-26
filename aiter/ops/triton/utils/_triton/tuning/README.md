@@ -1,6 +1,8 @@
 # Triton GEMM tuning scripts
 
-Run every command from this directory.
+Run every command from this directory. List the available kernel names with `python3 harness.py --help`.
+
+`sweep_configs.py`, `verify_configs.py`, and `write_best_configs.py` accept a kernel name in place of the old harness filename. They also accept legacy names such as `harness_gemm_a16w16.py`; existing `screen-harness_<kernel>.py-<M>-<N>-<K>.log` filenames are preserved. For direct profiling, use `harness.py <kernel> M N K ...`.
 
 | File | What it does |
 | --- | --- |
@@ -8,13 +10,12 @@ Run every command from this directory.
 | `write_best_configs.py` | Picks the fastest config per `M` from those logs and writes `<arch>-<config name>-N=<N>-K=<K>.json` |
 | `verify_configs.py` | Profiles a harness with the configs installed in the config tree and prints the kernel name and runtime |
 | `parse_kernel_trace.py` | Reduces a `rocprofv3 --kernel-trace` CSV to the median kernel runtime per config; called by the scripts above |
-| `harness_<op>.py` | Runs `<op>` with each config given on its command line, or with the installed configs if none are given; the scripts above run it under `rocprofv3` |
-| `harness_template.py` | Starting point for a new harness |
+| `harness.py` | Selects a kernel by name, imports its dependencies inside that case, and runs each supplied config (or installed configs if none are given); the scripts above run it under `rocprofv3` |
 | `_utils.py` | Helpers shared by the harnesses and scripts |
 
-Profiling a single config: a harness takes `M N K` followed by the ten config values, in the order of `config_parms_key` in `_utils.py`:
+Profiling a single config: `harness.py` takes a kernel name and `M N K` followed by the ten config values, in the order of `config_parms_key` in `_utils.py`:
 
-    rocprofv3 --kernel-trace -f csv -o res -- python3 harness_gemm_afp4wfp4.py 4 2112 7168 8 32 1024 1 2 1 1 16 0 7
+    rocprofv3 --kernel-trace -f csv -o res -- python3 harness.py gemm_afp4wfp4 4 2112 7168 8 32 1024 1 2 1 1 16 0 7
     python3 parse_kernel_trace.py res_kernel_trace.csv -k gemm
 
 **Running the sweep**
@@ -23,7 +24,7 @@ Example 1: Tuning for A16W16 GEMM using default BLOCK_SIZE ranges using GPU 0, s
 
     python3 sweep_configs.py \
         64 8192 3584 0 \
-        harness_gemm_a16w16.py \
+        gemm_a16w16 \
         > example1.out
 
 Example 2: Background tuning for A8W8 GEMM blockscale using specific `BLOCK_SIZE_K` ranges using GPU 0 ~ 6, because A8W8 blockscale gemm requires only `BLOCK_SIZE_K=128`
@@ -36,7 +37,7 @@ Example 2: Background tuning for A8W8 GEMM blockscale using specific `BLOCK_SIZE
         G=$2
         nohup python3 sweep_configs.py \
             $M $N $K $G \
-            harness_gemm_a8w8_blockscale.py \
+            gemm_a8w8_blockscale \
             --block-size-k-range 128 \
             > example2-M=$M-N=$N-K=$K-G=$G.out &
     done
@@ -48,7 +49,7 @@ Example 3: Background tuning for AFP4WFP4 GEMM. In this case `BLOCK_SIZE_M` has 
     G=0
     python3 sweep_configs.py \
         64 $N $K $G \
-        harness_gemm_afp4wfp4_preshuffle.py \
+        gemm_afp4wfp4_preshuffle \
         --block-size-k-range 256 512 1024 \
         --overwrite \
         --verbose \
@@ -56,23 +57,23 @@ Example 3: Background tuning for AFP4WFP4 GEMM. In this case `BLOCK_SIZE_M` has 
 
 **Writing the JSON config files**
 
-`write_best_configs.py` prints the fastest config found for each `M` and names the JSON files after the config family the harness tunes, listed in `HARNESS_CONFIG_NAMES` at the top of the script (`--json-prefix` overrides it).
+`write_best_configs.py` prints the fastest config found for each `M` and names the JSON files after the config family the harness tunes, listed in `KERNEL_CONFIG_NAMES` in `harness.py` (`--json-prefix` overrides it).
 
 Example 1:
 
-    python3 write_best_configs.py harness_gemm_a16w16.py --n-list 8192 --k-list 3584
+    python3 write_best_configs.py gemm_a16w16 --n-list 8192 --k-list 3584
 
 Example 2:
 
     N=2112
     K=7168
-    python3 write_best_configs.py harness_gemm_a8w8_blockscale.py --n-list $N --k-list $K
+    python3 write_best_configs.py gemm_a8w8_blockscale --n-list $N --k-list $K
 
 Example 3:
 
     N=7168
     K=2048
-    python3 write_best_configs.py harness_gemm_afp4wfp4_preshuffle.py --n-list $N --k-list $K
+    python3 write_best_configs.py gemm_afp4wfp4_preshuffle --n-list $N --k-list $K
 
 **Verifying the configs**
 
@@ -87,10 +88,10 @@ Two gotchas: a family's `DEFAULT.json` must be in place before any specialized f
 
 then, you can run, for example,
 
-    python3 verify_configs.py 32 2112 7168 harness_gemm_a8w8_blockscale_preshuffle.py
+    python3 verify_configs.py 32 2112 7168 gemm_a8w8_blockscale_preshuffle
 
 and check the kernel name (with config suffix) and runtime to see if both kernel name and runtime match those inside the JSON config files. If the kernel name and runtime do not match, it could be that your JSON file name is wrong. You have to go to the file where the kernel resides and check the `_get_config` function to check the `config_name` arguments.
 
 **Adding a harness**
 
-Copy `harness_template.py` to `harness_<op>.py`, fill in its three blocks, and add the harness to `HARNESS_CONFIG_NAMES` in `write_best_configs.py` with the `config_name` that the kernel's `_get_config` passes to `get_gemm_config`.
+Add a `case` to `get_profile_functions()` in `harness.py`: keep its imports inside the case, generate inputs once, and yield a profiling function for each config. Add the kernel name to `KERNEL_CONFIG_NAMES` in the same file, using the `config_name` passed to `get_gemm_config`. No separate harness file is needed.

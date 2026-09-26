@@ -3,13 +3,17 @@ import os
 import subprocess
 import sys
 
+from harness import kernel_name
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("M", type=int, help="M dim")
     parser.add_argument("N", type=int, help="N dim")
     parser.add_argument("K", type=int, help="K dim")
-    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
+    parser.add_argument(
+        "F", type=kernel_name, help="Kernel name (see harness.py --help)"
+    )
 
     args = parser.parse_args()
     return args
@@ -20,11 +24,25 @@ def main():
     M = args.M
     N = args.N
     K = args.K
-    harness_filename = args.F
+    kernel = args.F
+    harness_filename = f"harness_{kernel}.py"
 
     file_tag = f"{harness_filename}-{M}-{N}-{K}"
-    cmd = f"""rocprofv3 --kernel-trace -f csv -o verf_{file_tag} -- python3 {harness_filename} {M} {N} {K}"""
-    cmd = cmd.split(" ")
+    cmd = [
+        "rocprofv3",
+        "--kernel-trace",
+        "-f",
+        "csv",
+        "-o",
+        f"verf_{file_tag}",
+        "--",
+        sys.executable,
+        os.path.join(os.path.dirname(__file__), "harness.py"),
+        kernel,
+        str(M),
+        str(N),
+        str(K),
+    ]
 
     rocprof_filename = f"verf_{file_tag}_kernel_trace.csv"
 
