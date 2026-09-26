@@ -65,7 +65,7 @@ The E191 router-guard qualification and fresh official sweeps remain separate
 acceptance work. A completed benchmark request is not evidence of a correct
 answer. See the result document for the partial performance comparison.
 
-The [single-GPU optimization report](SINGLE_GPU_ANALYSIS.md) tracks E199–E396 local MoE experiments. Those microsecond timings are separate from the official serving results; dense candidate kernels remain isolated; E225 restores a previously selected frontend.
+The [single-GPU optimization report](SINGLE_GPU_ANALYSIS.md) tracks E199–E403 local MoE experiments. Those microsecond timings are separate from the official serving results; dense candidate kernels remain isolated; E225 restores a previously selected frontend.
 
 E225 restores the previously selected E167 C4/C8 static ballot frontend omitted
 from the consolidated AITER source. New tests inspect actual GPU kernel names:

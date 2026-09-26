@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E396. Related scouts,
+attempts from the initial GLM integration through E401 and E403. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E396
+## Isolated single-GPU optimization, E199–E403
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -214,6 +214,16 @@ single-GPU report. Serving sweeps remain paused.
 | E394 | Apply sign planes to TP4 down while preserving four ordered K128 updates. 315 r1 checks pass; hot drift is 3.19%. Narrowed unchanged-binary r2 adds 72 checks and stable bookends. Retain plane4: hot improves 1.5% versus control, but remains 25.8% behind fresh MXFP4. |
 | E395 | Qualify E393/E394 plane4 on three actual layer/rank slices each, five patterns and eight input changes. All 2,160 exact input/intermediate/final graph/eager checks and native dispatch pass. Preserve and repair timestamp attribution using unique explicit correlation IDs; no GPU arithmetic or tolerance change. |
 | E396 | Remove the dense gate/up shared-memory epilogue transfer using rounded registers and byte/vector4 stores. All 420 exact checks and stable rows pass after a route-versus-token comparison repair. Both candidates regress despite unchanged 256-register allocation and zero scratch/spills; rejected. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E397 | M128 one-thread-per-token route visits pass 252 checks but regress all three cases; half the waves are idle during visits. Rejected. |
+| E398 | M128 balanced two-thread-per-token visits pass 315 checks and modestly improve spread/mixed. Hot drift is 3.0066%, above the unchanged 3% ceiling. Preserve the provisional row; balanced and aggregated variants are unselected. |
+| E399 | Transfer register records, cross-K codebook carry, same-expert reuse and obsolete-barrier removal to TP8 M128. All 252 checks and stable rows pass. Hot is 42.53 us versus fresh MXFP4 43.35 us; spread/mixed also win. Retained and qualified by E401. |
+| E400 | Remove the obsolete register-weight cache barrier from TP4 M256 gate, keeping selected plane4 down fixed. All 315 checks and stable rows pass; retain removal for 0.7–1.5% whole-MoE gains. Hot remains 25.8% behind fresh MXFP4. Reuse is an alternative; E403 qualifies removal. |
+| E401 | The frozen E399 TP8 M128 module passes 1,080 exact real-weight input/intermediate/final graph/eager checks across three slices, five patterns and eight changes, with native dispatch and zero scratch. Correctness only. |
+| E403 | The frozen E400 TP4 M256 removal module passes 1,080 exact real-weight checks and native dispatch after restoring a missing harness packing helper. Preserve the failed first attempt; module, arithmetic and tolerances are unchanged. |
 
 
 ## How to read the outcomes
