@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import gc
 
 import pandas as pd
@@ -13,6 +14,8 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
+torch.manual_seed(1)
+torch.cuda.manual_seed_all(1)
 
 # Correctness sweep: a few timed iters is plenty (was 1000). This is a
 # correctness check, not a perf gate; the high iter count made the file the
@@ -26,7 +29,15 @@ TOL_ERR_RATIO = 0.05
 
 
 @benchmark()
-def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
+def run_topk_case(
+    batch_size,
+    hiddensize,
+    topk,
+    largest,
+    dtype,
+    num_iters=NUM_ITERS,
+    num_warmup=NUM_WARMUP,
+):
     device = "cuda"
     # Each row is a permutation of [0, hiddensize) -> distinct values for topk.
     # Vectorised; replaces the per-row Python randperm loop (batch_size iters).
@@ -40,8 +51,8 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
         x,
         topk,
         largest=largest,
-        num_iters=NUM_ITERS,
-        num_warmup=NUM_WARMUP,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
     )
     id_ref, _ref = torch.sort(ref_index)
 
@@ -59,8 +70,8 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
         torch.tensor([], dtype=torch.int32, device=device),  # rowEnds
         -1,
         1,  # stride0, stride1
-        num_iters=NUM_ITERS,
-        num_warmup=NUM_WARMUP,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
     )
     id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
 
@@ -91,33 +102,92 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
 BATCH_SIZES = [3072]
 HIDDENSIZES = [3072, 4096, 8192, 16384, 32768, 65536, 131072]
 TOPKS = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
-largest = True
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark and validate plain top-k")
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        choices=["fp16", "bf16", "fp32"],
+        nargs="+",
+        default=["fp32"],
+        help="Input dtypes (default: fp32)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        type=int,
+        nargs="+",
+        default=BATCH_SIZES,
+        help="Batch sizes",
+    )
+    parser.add_argument(
+        "-n",
+        "--hiddensize",
+        type=int,
+        nargs="+",
+        default=HIDDENSIZES,
+        help="Last-dimension widths",
+    )
+    parser.add_argument(
+        "-k", "--topk", type=int, nargs="+", default=TOPKS, help="Top-k values"
+    )
+    parser.add_argument(
+        "-i", "--num-iters", type=int, default=NUM_ITERS, help="Timed iterations"
+    )
+    parser.add_argument(
+        "-w", "--num-warmup", type=int, default=NUM_WARMUP, help="Warmup iterations"
+    )
+    parser.add_argument(
+        "--smallest",
+        action="store_true",
+        help="Select the smallest values instead of the largest",
+    )
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+    dtypes_to_test = [dtypes.d_dtypes[name] for name in args.dtype]
+    largest = not args.smallest
+    gfx = aiter.get_gfx()
     rows = []
-    for batch_size in BATCH_SIZES:
-        for hiddensize in HIDDENSIZES:
-            for topk in TOPKS:
-                if topk > hiddensize:
-                    continue
-                print(f"\n{'='*60}")
-                print(
-                    f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}"
-                )
-                print(f"{'='*60}")
-                ret = run_topk_case(batch_size, hiddensize, topk, largest, dtypes.fp32)
-                rows.append(
-                    {
-                        "batch_size": batch_size,
-                        "hiddensize": hiddensize,
-                        "topk": topk,
-                        "error": ret["err"],
-                        "time_us (aiter)": ret["us_aiter"],
-                        "time_us (torch)": ret["us_torch"],
-                        "time_us (triton)": ret["us_triton"],
-                    }
-                )
+    for dtype in dtypes_to_test:
+        for batch_size in args.batch_size:
+            for hiddensize in args.hiddensize:
+                for topk in args.topk:
+                    if topk > hiddensize:
+                        continue
+                    print(f"\n{'='*60}")
+                    print(
+                        f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, "
+                        f"topk={topk}, dtype={dtype}, largest={largest}"
+                    )
+                    print(f"{'='*60}")
+                    ret = run_topk_case(
+                        batch_size,
+                        hiddensize,
+                        topk,
+                        largest,
+                        dtype,
+                        args.num_iters,
+                        args.num_warmup,
+                    )
+                    rows.append(
+                        {
+                            "gfx": gfx,
+                            "batch_size": batch_size,
+                            "hiddensize": hiddensize,
+                            "topk": topk,
+                            "dtype": dtype,
+                            "largest": largest,
+                            "error": ret["err"],
+                            "time_us (aiter)": ret["us_aiter"],
+                            "time_us (torch)": ret["us_torch"],
+                            "time_us (triton)": ret["us_triton"],
+                        }
+                    )
 
     df = pd.DataFrame(rows)
     df["speedup (aiter vs torch)"] = df["time_us (torch)"] / df["time_us (aiter)"]

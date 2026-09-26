@@ -1477,7 +1477,6 @@ def _get_ck_exclude_modules():
         "module_rope_1c_cached_positions_offsets_fwd",
         "module_rope_2c_cached_positions_offsets_fwd",
         "module_sample",
-        "module_topk_plain",
     }
 
     return ck_modules
