@@ -338,15 +338,28 @@ def run_benchmark(custom, args):
 
         cu_query_lens = inputs["cu_query_lens"]
         num_contexts = len(cu_query_lens) - 1
+        window = args.sliding_window if args.sliding_window else None
         total_flops = 0.0
+        total_k = 0
         for i in range(num_contexts):
             sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
             sk = seqlens_k[i].item()
-            valid = sq * sk - ((sq**2 - sq) / 2)
+            if window is None:
+                valid = sq * sk - ((sq**2 - sq) / 2)
+                kv_read = sk
+            else:
+                # With a sliding window each of the sq (causal) queries attends to
+                # at most `window` keys, so count windowed causal pairs instead of
+                # the full triangle. Query i (0-indexed within the block) attends
+                # to min(sk - sq + i + 1, window) keys.
+                idx = torch.arange(sq, device=seqlens_k.device)
+                valid = torch.clamp(sk - sq + 1 + idx, max=window).sum().item()
+                # Keys streamed from HBM = union of all query windows.
+                kv_read = min(sk, sq - 1 + window)
             total_flops += valid * HQ * (D_HEAD + D_HEAD_V) * 2.0
+            total_k += kv_read
 
         total_q = cu_query_lens[-1].item()
-        total_k = seqlens_k.sum().item()
         q_bytes = total_q * HQ * D_HEAD * q_tensor.element_size()
         k_bytes = total_k * HK * D_HEAD * k_tensor.element_size()
         v_bytes = total_k * HK * D_HEAD_V * v_tensor.element_size()
