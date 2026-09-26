@@ -472,6 +472,7 @@ def fhmoe_fake(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     output: torch.Tensor | None = None,
+    has_fake_topk_slot: bool | None = None,
 ) -> torch.Tensor:
     del (
         w1,
@@ -498,6 +499,7 @@ def fhmoe_fake(
         shared_w1_scale,
         shared_w2_scale,
         shared_expert_id,
+        has_fake_topk_slot,
     )
     if output is not None:
         return output
@@ -540,6 +542,7 @@ def fhmoe_(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     output: torch.Tensor | None = None,
+    has_fake_topk_slot: bool | None = None,
 ) -> torch.Tensor:
     from aiter.fused_moe import _fused_moe_impl
 
@@ -613,6 +616,7 @@ def fhmoe_(
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
         output=output,
+        has_fake_topk_slot=has_fake_topk_slot,
         _q_dtype_a=q_dtype_a,
         _metadata_transform=_use_fhmoe_wrappers,
         _metadata_config_file=metadata_config_file,

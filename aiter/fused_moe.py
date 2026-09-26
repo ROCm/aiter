@@ -849,6 +849,7 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    has_fake_topk_slot: bool | None = None,  # EP lookup: False keeps routed topk
 ):
     if (
         any(
@@ -889,6 +890,7 @@ def fused_moe(
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
             output=output,
+            has_fake_topk_slot=has_fake_topk_slot,
         )
     if not block_size_M:
         block_size_M = -1
@@ -939,6 +941,7 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        has_fake_topk_slot=has_fake_topk_slot,
     )
 
 
@@ -981,6 +984,7 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    has_fake_topk_slot: bool | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1042,6 +1046,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    has_fake_topk_slot: bool | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1085,6 +1090,7 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        has_fake_topk_slot=has_fake_topk_slot,
     )
 
 
@@ -1119,6 +1125,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    has_fake_topk_slot: bool | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1322,6 +1329,7 @@ def _fused_moe_impl(
             has_stage2_scatter=stage2_scatter is not None,
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
+            has_fake_topk_slot=has_fake_topk_slot,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1575,6 +1583,7 @@ def _fused_moe_impl(
             output=output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
+            has_fake_topk_slot=has_fake_topk_slot,
         )
         return _return_output(ret, output)
 
@@ -2857,6 +2866,32 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+def _fmoe_config_topk_candidates(
+    topk: int,
+    *,
+    is_ep: bool,
+    has_fake_topk_slot: bool | None,
+) -> tuple[int, ...]:
+    """Return fused-MoE config-key widths in lookup order.
+
+    EP callers historically received an unconditional ``topk - 1`` key. Keep
+    that as the default; callers that do not append a fake slot must pass
+    ``has_fake_topk_slot=False``.
+    """
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError(f"topk must be positive, got {topk}")
+    if has_fake_topk_slot is True and not is_ep:
+        raise ValueError("has_fake_topk_slot is only valid with expert_mask/EP")
+    if has_fake_topk_slot is True:
+        if topk < 2:
+            raise ValueError("a fake top-k slot requires runtime topk >= 2")
+        return (topk - 1,)
+    if not is_ep or has_fake_topk_slot is False or topk == 1:
+        return (topk,)
+    return (topk - 1, topk)
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -2889,6 +2924,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    has_fake_topk_slot: bool | None = None,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3011,42 +3047,41 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    keys = (
-        gfx,
-        cu_num,
-        token,
-        model_dim,
-        inter_dim,
-        expert,
-        topk,
-        activation,
-        str(dtype),
-        str(q_dtype_a),
-        str(q_dtype_w),
-        str(q_type),
-        use_g1u1,
-        doweight_stage1,
+    runtime_topk = int(topk)
+    topk_candidates = _fmoe_config_topk_candidates(
+        runtime_topk,
+        is_ep=is_ep,
+        has_fake_topk_slot=has_fake_topk_slot,
     )
-    keys_disabled = (
-        gfx,
-        cu_num,
-        token,
-        model_dim,
-        inter_dim,
-        expert,
-        topk,
-        _ACT_TYPE_DISABLED_KEY,
-        str(dtype),
-        str(q_dtype_a),
-        str(q_dtype_w),
-        str(q_type),
-        use_g1u1,
-        doweight_stage1,
-    )
-    if config_file is not None:
-        fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
-        keys += fhmoe_keys
-        keys_disabled += fhmoe_keys
+
+    def _key_pair(config_topk):
+        shared = (
+            gfx,
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            config_topk,
+        )
+        suffix = (
+            str(dtype),
+            str(q_dtype_a),
+            str(q_dtype_w),
+            str(q_type),
+            use_g1u1,
+            doweight_stage1,
+        )
+        keys_local = shared + (activation,) + suffix
+        keys_disabled_local = shared + (_ACT_TYPE_DISABLED_KEY,) + suffix
+        if config_file is not None:
+            fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
+            keys_local += fhmoe_keys
+            keys_disabled_local += fhmoe_keys
+        return keys_local, keys_disabled_local
+
+    topk = topk_candidates[0]
+    keys, keys_disabled = _key_pair(topk)
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -3071,29 +3106,46 @@ def get_2stage_cfgs(
 
     def _lookup_cfg(c2s):
         if not c2s:
-            return None
+            return None, topk, keys, keys_disabled
         primary, fallback = c2s
-        lookup_keys = keys[:7] + (str(activation),) + keys[8:]
-        result = primary.get(lookup_keys, None)
-        if result is None and config_file is None:
-            result = fallback.get(keys_disabled, None)
-        # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
-            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-            for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
-                # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-                keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
-                keys_fb_disabled = (
-                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
+        for config_topk in topk_candidates:
+            candidate_keys, candidate_disabled = _key_pair(config_topk)
+            lookup_keys = candidate_keys[:7] + (str(activation),) + candidate_keys[8:]
+            result = primary.get(lookup_keys, None)
+            if result is None and config_file is None:
+                result = fallback.get(candidate_disabled, None)
+            if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
+                tier_idx = (
+                    _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
                 )
-                result = primary.get(keys_fb, None)
-                if result is None:
-                    result = fallback.get(keys_fb_disabled, None)
-                if result is not None:
-                    break
-        return result
+                for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+                    keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
+                    keys_fb_disabled = (
+                        candidate_disabled[:2]
+                        + (fallback_tier,)
+                        + candidate_disabled[3:]
+                    )
+                    result = primary.get(keys_fb, None)
+                    if result is None:
+                        result = fallback.get(keys_fb_disabled, None)
+                    if result is not None:
+                        break
+            if result is not None:
+                return result, config_topk, candidate_keys, candidate_disabled
+        return None, topk, keys, keys_disabled
 
-    cfg = _lookup_cfg(active_cfg_2stages)
+    cfg, topk, keys, keys_disabled = _lookup_cfg(active_cfg_2stages)
+    if (
+        cfg is not None
+        and has_fake_topk_slot is None
+        and is_ep
+        and topk == runtime_topk
+    ):
+        logger.warning(
+            "[fused_moe] selected runtime-width EP config fallback "
+            f"(runtime/config topk={runtime_topk}); callers without an appended "
+            "fake slot should pass has_fake_topk_slot=False explicitly"
+        )
     if (
         cfg is None
         and config_file is None
@@ -3103,7 +3155,7 @@ def get_2stage_cfgs(
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = _lookup_cfg(cfg_2stages)
+        cfg, topk, keys, keys_disabled = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
 
@@ -4017,6 +4069,7 @@ def fused_moe_2stages(
     output=None,
     _stage2_override: Callable | None = None,
     routing_num_experts: int | None = None,
+    has_fake_topk_slot: bool | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -4064,6 +4117,7 @@ def fused_moe_2stages(
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        has_fake_topk_slot=has_fake_topk_slot,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)

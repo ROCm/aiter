@@ -86,6 +86,18 @@ _LAZY_IMPORTS = {
         ".gemm_kernels",
         "flydsl_preshuffle_gemm_a8",
     ),
+    "flydsl_mxscale_preshuffle_gemm": (
+        ".mxscale_preshuffle_kernels",
+        "flydsl_mxscale_preshuffle_gemm",
+    ),
+    "gemm_mxscale_preshuffle": (
+        ".mxscale_preshuffle_kernels",
+        "gemm_mxscale_preshuffle",
+    ),
+    "get_mxscale_preshuffle_config": (
+        ".mxscale_preshuffle_kernels",
+        "get_mxscale_preshuffle_config",
+    ),
     "flydsl_qk_norm_rope_quant": (
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
@@ -123,6 +135,7 @@ __all__ = [
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
+    "flydsl_mxscale_preshuffle_gemm",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
     "flydsl_pa_mqa_logits_fp4_varqlen",
@@ -131,6 +144,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gemm_mxscale_preshuffle",
+    "get_mxscale_preshuffle_config",
     "pa_decode",
 ]
 
