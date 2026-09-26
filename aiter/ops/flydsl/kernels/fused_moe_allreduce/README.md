@@ -9,7 +9,7 @@ argument order, the same packed weight layouts and the same outputs.
 |---|---|
 | `fused_moe_allreduce_w8a8.py` | the kernel (`compile_fused_moe_allreduce(samples, proto)`) |
 | `../../fused_moe_allreduce.py` | host side: weight packers, `fused_moe_allreduce_w8a8(...)` (TileRT op signature), `FusedMoeAllreduceW8A8` module |
-| `op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py` | accuracy + benchmark against a torch golden and the TileRT code object |
+| `op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py` | accuracy + benchmark against a torch golden and the TileRT code object; `-q 8` = A8W8, `-q 4` = A4W4 |
 
 ## Shapes
 
@@ -84,6 +84,50 @@ shards, about 45 MB per token (about 180 MB per S=4 launch), which comes to abou
 - On a single GPU, `out` and `hidden_mid` are bit-identical to TileRT. With 8 GPUs they differ by
   at most 1 bf16 ulp.
 
+## A4W4 variant (`fused_moe_allreduce_a4w4.py`)
+
+This variant has the same fusion, arguments and outputs as W8A8, but uses MXFP4 for the expert
+weights and activations:
+
+- **Format:** fp4 e2m1 values packed two per byte, with one e8m0 scale per 32 elements along K.
+  The scale is rounded up (`ceil_pow2(amax / 6)`), which is aiter's `MX_DEFAULT_ROUND_MODE`.
+- **Quantized in the kernel:** the normed activations and the SiLU mids, per 32 elements.
+- **Unchanged:** the router GEMV stays in bf16.
+- **Scales in hardware:** `mfma_scale_f32_16x16x128_f8f6f4` runs in fp4 mode and applies the
+  per-32 scales itself, so there is no separate block-dequant multiply.
+- **Traffic:** every token streams about 25 MB instead of about 45 MB.
+- **Host API:** `aiter.ops.flydsl.fused_moe_allreduce_a4w4`
+  - `FusedMoeAllreduceA4W4`, with the same interface as `FusedMoeAllreduceW8A8`;
+  - `fused_moe_allreduce_a4w4(...)`;
+  - the packers `pack_up_gate_a4w4` and `pack_down_a4w4`.
+- **Logical weights:**
+  - `ug_w [257, 512, 3072]` u8 with `ug_scales [257, 512, 192]` e8m0;
+  - `down_w [257, 6144, 128]` u8 with `down_scales [257, 6144, 8]` e8m0.
+
+Results from `op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py -q 4 8` (the `perf (us)` table it
+prints): 8x MI355X, TP8, CUDA graph, TileRT KI=8. Both FlyDSL variants are built from the same master
+weights.
+
+| tokens (S) | proto | TileRT A8W8 (us) | FlyDSL A8W8 (us) | FlyDSL A4W4 (us) | TileRT / FlyDSL A8W8 | FlyDSL A8W8 / A4W4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0 | 16.19 | 16.33 | 14.43 | 0.99 | 1.13 |
+| 1 | 1 | 17.02 | 17.15 | 14.59 | 0.99 | 1.18 |
+| 2 | 0 | 22.48 | 22.47 | 16.35 | 1.00 | 1.37 |
+| 2 | 1 | 22.60 | 22.61 | 16.51 | 1.00 | 1.37 |
+| 4 | 0 | 34.71 | 35.56 | 22.87 | 0.98 | 1.55 |
+| 4 | 1 | 34.97 | 35.08 | 22.64 | 1.00 | 1.55 |
+
+A ratio above 1 means the kernel after the slash is faster. Run-to-run noise on this machine is about 3-4% (an earlier
+run measured A4W4 at 13.2 us for S=1).
+
+Accuracy:
+
+- Against an fp32 golden that reproduces the MXFP4 quantization, `out` rel-L2 is at most 5e-5 and
+  `hidden_mid` is exact.
+- Against the unquantized bf16 model, the MoE output rel-L2 is about 0.30 for A4W4 and about 0.06
+  for A8W8 (on random Gaussian weights). This is the precision cost of 4-bit activations and
+  weights.
+
 ## Usage
 
 ```python
@@ -101,6 +145,8 @@ exchanges an uncached symmetric buffer over HIP IPC.
 ```bash
 # accuracy + perf vs TileRT (single process, all GPUs)
 python op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py -s 1 2 4 --proto 0 1
+# A4W4 and A8W8 side by side
+python op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py -q 4 8
 # accuracy only
 python op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py --no-perf
 ```

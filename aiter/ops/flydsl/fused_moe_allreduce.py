@@ -224,6 +224,8 @@ class UncachedSymmetricBuffer:
 
 
 class FusedMoeAllreduceW8A8:
+    _op = staticmethod(fused_moe_allreduce_w8a8)
+
     def __init__(
         self,
         *,
@@ -269,6 +271,8 @@ class FusedMoeAllreduceW8A8:
                     err = hip.hipDeviceEnablePeerAccess(peer.index, 0)
                     if err not in (0, 704):
                         raise RuntimeError(f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}")
+                    if err:
+                        hip.hipGetLastError()
         torch.cuda.set_device(prev)
         bufs = [torch.zeros(SYM_BYTES, dtype=torch.uint8, device=d) for d in devices]
         ptrs = [b.data_ptr() for b in bufs]
@@ -322,7 +326,7 @@ class FusedMoeAllreduceW8A8:
         norm, scores, mid, probs, indices, out_new = self._outputs(s_n, hidden.device)
         if out is None:
             out = out_new
-        fused_moe_allreduce_w8a8(
+        self._op(
             hidden,
             self.gamma,
             self.router_w,
@@ -361,7 +365,7 @@ class FusedMoeAllreduceW8A8:
                 for proto in protos:
                     self._warm_tag = getattr(self, "_warm_tag", 1 << 30) + 1
                     norm, scores, mid, probs, indices, out = self._outputs(s_n, dev)
-                    fused_moe_allreduce_w8a8(
+                    self._op(
                         hidden, self.gamma, self.router_w, self.ug_w, self.ug_scales,
                         self.bias, self.down_w, self.down_scales, None, self.sym, 0, 1,
                         self._warm_tag, norm, scores, self.score_lines, self.flags, probs,
