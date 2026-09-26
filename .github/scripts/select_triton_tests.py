@@ -37,8 +37,8 @@ GLOBAL_PREFIXES = (
     ".github/",
     SRC + "utils/",
     KERNELS + "common/",
-    GLUON_KERNELS + "common/"
-    TESTS + "utils/",
+    GLUON_KERNELS + "common/",
+    TESTS + "utils/"
 )
 
 # Directories under the source tree that are not op categories.
