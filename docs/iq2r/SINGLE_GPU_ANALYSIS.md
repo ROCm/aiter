@@ -24,6 +24,54 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Compact gate and decoding checkpoint — E327–E339
+
+The fixed compact-gate policy beats MXFP4 in six of eight stable M64/M128 synthetic cases. TP8 M128 hot remains 1.4% slower; TP4 M64 hot remains 0.3% slower. These small remaining gaps are still open. TP4 r2 repeats the frozen selected candidate after the original hot rows exceeded the unchanged drift limit.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 64 | spread | 103.76 | 86.67 | -16.5% |
+| 8 | 64 | hot | 41.06 | 34.49 | -16.0% |
+| 8 | 128 | spread | 122.56 | 104.61 | -14.6% |
+| 8 | 128 | hot | 44.29 | 44.90 | +1.4% |
+| 4 | 64 | spread | 193.15 | 159.39 | -17.5% |
+| 4 | 64 | hot | 42.51 | 42.64 | +0.3% |
+| 4 | 128 | spread | 213.66 | 170.10 | -20.4% |
+| 4 | 128 | hot | 61.10 | 60.61 | -0.8% |
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Token
+counts are not serving concurrency. Clean measurements use 32 rotating banks,
+five-second warmup and fresh MXFP4 bookends. Every selected row meets the
+unchanged 3% maximum drift limit. All attempts and unstable rows remain in
+their experiment reports.
+
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. The MXFP4 native path uses A4W4; IQ2R
+preserves FP8 activations and decoded FP8 weights. Synthetic MXFP4 is requantized
+from materialized IQ2R, so these fixtures do not establish original-checkpoint
+model quality.
+
+Static sign planes remove nibble expansion/multiplication without adding weight
+bytes or changing decoded values. Gate vector instructions fall by 16–19%.
+Component-major gate partial sums reduce LDS instruction count; total measured
+bank conflicts do not fall. Compact M16 task lists avoid unused half-task slots
+and lower gate register pressure while keeping M32 tasks for down. Encoding
+both task prefixes in one scan targets the extra dual-list frontend latency.
+
+Native dispatch, zero scratch, changing graph/eager outputs, exact token-major
+input FP8/scales, route-aligned gate FP8/scales and final BF16 outputs are audited.
+The independent task-list checker validates every emitted compact gate tile.
+The original MXFP4 atomic-output bounds remain unchanged. E339 adds a new
+weight/input seed, eight changes, zeros, 16× inputs, slot permutations, and
+spread/hot/skew/mixed routing; it makes no performance claim.
+
+No new production runtime integration or serving qualification is claimed.
+The overall goal remains unmet: dense and other outstanding shape gaps, real
+weight/captured-input qualification of these changes, safe packing/fallbacks,
+model quality, and the final ATOM 1k/1k and 8k/1k sweeps remain. Serving sweeps
+stay paused until useful candidates are qualified and integrated.
+
 ## Medium-token checkpoint — E323–E326
 
 IQ2R now beats MXFP4 in three of four freshly measured M64/M128 cases.
@@ -524,6 +572,20 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E324 | Qualify E321 TP8 M4 reuse and E319 TP4 M4 codebook completion on real slices/captures. Exact, 768 checks; no new MXFP4/serving comparison. |
 | E325 | Use existing independent-output-wave down kernels at M64/M128. N384 halves sparse MFMA work and nearly matches MXFP4 down; correct intermediate checks for atomic-sort permutations. |
 | E326 | Overlap route sorting and identity input quantization in one launch; pair FP8 conversions. Combined policy beats MXFP4 at M64 spread/hot and M128 spread; M128 hot still behind. |
+
+| E327 | Normalize codebook signs and repack adjacent 9-bit down indices; compare final-reduction variants. E289b9 is best among these arms, but M128 hot remains behind. Excessive bookend drift is retained. |
+| E328 | Batch independent packed gate codebook reads at M32. Batch4 helps spread modestly; register weight-record prefetch regresses. All numerical checks pass; unstable timings remain provisional. |
+| E329 | Direct gate epilogue removes the shared gate/up transfer and barrier while retaining BF16 rounding. LDS drops by 4 KiB; the hot gap remains. |
+| E330 | Split M32 gate tasks into M16 subtiles, testing workgroup counts and ordering. M16 improves hot routes but badly regresses spread; no route-specific CPU selector is selected. |
+| E331 | Use E326 frontend plus TP4 N256/N512 quad down tiles. Four ordered K128 sums remain exact. N256 at M64 and N512 at M128 beats spread MXFP4 but leaves hot 3–5% behind. |
+| E332 | Transpose static sign bits into four planes so shift plus AND/OR replaces nibble extraction and multiplication. Same bytes/decoded values, 16–19% fewer gate VALU instructions. Gate-only gains; down-only unselected. |
+| E333 | Adapt packed/direct/sign-plane gate to TP4. E333 sign-plane gate with fixed E331 down policy beats spread MXFP4 by 14–15%; hot remains about 4% behind. |
+| E334 | Ablate component-major gate reduction storage and all-eight-wave M32 epilogues. Component storage reduces LDS instructions without lowering total bank conflicts. The combined version helps; plain parallel reduction regresses. M64 hot timing drift is retained. |
+| E335 | Emit compact M16 gate tasks while retaining M32 down tasks. Stable fixed grid2 beats M64/M128 spread and M64 hot MXFP4; M128 hot remains +4.0%. All 504 checks and independent task-list checks pass. The second task-prefix scan costs about 1.7 µs. |
+| E336 | TP4 compact M16 gate tasks with unchanged N256/N512 down shape policy. All 504 exact/task-list checks pass. Stable spread gains of 16–19%; hot gaps remain 3.3% at M64 and 1.5% at M128. |
+| E337 | Extend medium TP8 candidates to M32/M256 with explicit short-K/scheduled-large entry wrappers so packed tensors reach only their matching decoder. Pending GPU qualification. |
+| E338 | Combine component-major compact M16 gate reduction and one packed task-prefix scan. Six of eight stable medium-token cases beat fresh MXFP4; TP8 M128 hot +1.4%, TP4 M64 hot +0.3%. TP4 r1 hot drift is retained; frozen selected-arm r2 qualifies with max 0.61% drift. |
+| E339 | Frozen E338 passes 1,152 exact arm checks across TP8/TP4 with a new weight/input seed, zeros, 16x inputs, reordered slots, and spread/hot/skew/mixed routes. No performance or actual-weight claim. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

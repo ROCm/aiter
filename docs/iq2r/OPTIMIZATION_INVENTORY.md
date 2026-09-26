@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
-Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E326. Related scouts,
+Updated 2026-09-26. This is a concise inventory of the documented optimization
+attempts from the initial GLM integration through E339. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E326
+## Isolated single-GPU optimization, E199–E339
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -108,6 +108,23 @@ single-GPU report. Serving sweeps remain paused.
 | E324 | Qualify E321 TP8 M4 reuse and E319 TP4 M4 codebook completion on real slices/captures. Exact, 768 checks; no new MXFP4/serving comparison. |
 | E325 | Use existing independent-output-wave down kernels at M64/M128. N384 halves sparse MFMA work and nearly matches MXFP4 down; correct intermediate checks for atomic-sort permutations. |
 | E326 | Overlap route sorting and identity input quantization in one launch; pair FP8 conversions. Combined policy beats MXFP4 at M64 spread/hot and M128 spread; M128 hot still behind. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E327 | Normalize codebook signs and repack adjacent 9-bit down indices; compare final-reduction variants. E289b9 is best among these arms, but M128 hot remains behind. Excessive bookend drift is retained. |
+| E328 | Batch independent packed gate codebook reads at M32. Batch4 helps spread modestly; register weight-record prefetch regresses. All numerical checks pass; unstable timings remain provisional. |
+| E329 | Direct gate epilogue removes the shared gate/up transfer and barrier while retaining BF16 rounding. LDS drops by 4 KiB; the hot gap remains. |
+| E330 | Split M32 gate tasks into M16 subtiles, testing workgroup counts and ordering. M16 improves hot routes but badly regresses spread; no route-specific CPU selector is selected. |
+| E331 | Use E326 frontend plus TP4 N256/N512 quad down tiles. Four ordered K128 sums remain exact. N256 at M64 and N512 at M128 beats spread MXFP4 but leaves hot 3–5% behind. |
+| E332 | Transpose static sign bits into four planes so shift plus AND/OR replaces nibble extraction and multiplication. Same bytes/decoded values, 16–19% fewer gate VALU instructions. Gate-only gains; down-only unselected. |
+| E333 | Adapt packed/direct/sign-plane gate to TP4. E333 sign-plane gate with fixed E331 down policy beats spread MXFP4 by 14–15%; hot remains about 4% behind. |
+| E334 | Ablate component-major gate reduction storage and all-eight-wave M32 epilogues. Component storage reduces LDS instructions without lowering total bank conflicts. The combined version helps; plain parallel reduction regresses. M64 hot timing drift is retained. |
+| E335 | Emit compact M16 gate tasks while retaining M32 down tasks. Stable fixed grid2 beats M64/M128 spread and M64 hot MXFP4; M128 hot remains +4.0%. All 504 checks and independent task-list checks pass. The second task-prefix scan costs about 1.7 µs. |
+| E336 | TP4 compact M16 gate tasks with unchanged N256/N512 down shape policy. All 504 exact/task-list checks pass. Stable spread gains of 16–19%; hot gaps remain 3.3% at M64 and 1.5% at M128. |
+| E337 | Extend medium TP8 candidates to M32/M256 with explicit short-K/scheduled-large entry wrappers so packed tensors reach only their matching decoder. Pending GPU qualification. |
+| E338 | Combine component-major compact M16 gate reduction and one packed task-prefix scan. Six of eight stable medium-token cases beat fresh MXFP4; TP8 M128 hot +1.4%, TP4 M64 hot +0.3%. TP4 r1 hot drift is retained; frozen selected-arm r2 qualifies with max 0.61% drift. |
+| E339 | Frozen E338 passes 1,152 exact arm checks across TP8/TP4 with a new weight/input seed, zeros, 16x inputs, reordered slots, and spread/hot/skew/mixed routes. No performance or actual-weight claim. |
 
 
 ## How to read the outcomes
