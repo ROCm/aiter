@@ -24,6 +24,66 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Work supply and vector partial exchange — E425–E430
+
+The TP4 M256 M32 candidate reaches 75.57 us versus fresh MXFP4 at 68.98 us, still 9.5% behind on hot routing. A separate M16 grid3 experiment improves spread/mixed by 4.1%/3.4% versus its matched grid2 control. Both ingredients pass real-weight qualification on their timed binaries. The 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 119.15 | 101.60 | -14.7% |
+| 8 | 128 | hot | 43.35 | 42.53 | -1.9% |
+| 8 | 256 | spread | 131.03 | 111.48 | -14.9% |
+| 8 | 256 | hot | 61.32 | 58.53 | -4.5% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 223.90 | 179.49 | -19.8% |
+| 4 | 256 | hot | 68.93 | 86.72 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 594.30 | 730.14 | +22.9% |
+| 4 | 4096 | hot | 488.88 | 602.89 | +23.3% |
+
+E425 spills and is rejected before GPU work. E426 removes future compressed-weight/codebook records and reaches 74 registers without spills. E427 holds the device instruction bytes fixed and raises the grid from two to three workgroups per CU: hot measured active-CU occupancy rises 3.85 to 4.94, but complete hot time improves only 1.4%. Four workgroups are unselected.
+
+| TP4 M256 routes | MXFP4 us | M16 grid3 us | IQ2R time difference |
+|:---|---:|---:|---:|
+| spread | 223.93 | 175.28 | -21.7% |
+| hot | 69.04 | 81.05 | +17.4% |
+| mixed | 225.31 | 184.78 | -18.0% |
+
+E428 groups four N atoms in the parallel M32 partial exchange. Native LDS accesses become 128-bit vectors; hot LDS instructions fall 9.8% and VALU instructions rise 3.2%. Complete hot time improves 1.29% versus E423, while spread/mixed regress 0.38%/0.24%. It remains an ingredient with a cold-route tradeoff.
+
+| TP4 M256 routes | MXFP4 us | M32 vector exchange us | IQ2R time difference |
+|:---|---:|---:|---:|
+| spread | 225.69 | 186.42 | -17.4% |
+| hot | 68.98 | 75.57 | +9.5% |
+| mixed | 226.96 | 200.18 | -11.8% |
+
+The tables have separate fresh matched MXFP4 bookends; do not compare cross-experiment absolute times as matched gains. E426–E428 add 1,008 exact synthetic checks. E429/E430 add 1,440 exact real-weight checks on the unchanged E427/E428 binaries. All timing rows meet the unchanged 3% per-arm drift rule; maximum drift is 2.8432%. Real qualification uses three layer/capture-rank slices, with actual TP4 weight ranks 0/3/3, and includes tiled small captures. E429 preserves an initial reporting-only failure. TCC counts differ substantially between E426 and later collections; absolute cross-collection bandwidth interpretation remains under investigation in E431. Native exactness, grids and clean timings are unaffected.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## M32 residency and epilogue qualification — E420–E424
 
 The new TP4 M256 candidate narrows hot-route overhead to 10.2% versus matched MXFP4, with 1,440 exact real-weight checks on its unchanged binary. It beats MXFP4 on spread and mixed, but retains a cold-route tradeoff against scalar M16. The existing 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet.
@@ -1305,6 +1365,13 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E422 | Correct minimum-four-waves bound lowers M32 registers to 124/126 with no spills. Hot active-CU occupancy rises 2.00 to 3.75; gate trace drops 49.23 to 36.19 us despite higher aggregate waits. 378 exact checks and stable rows; retain within-record candidate, hot still 11.8% behind MXFP4. |
 | E423 | Parallelize M32 epilogue using both existing private LDS slots. 315 exact checks, stable bookends and unchanged 124 registers; 0.45–1.10% faster than matched E422. Hot reaches 76.06 us versus 69.00 us MXFP4, still 10.2% behind. |
 | E424 | Unchanged E423 binary passes 1,440 exact real-weight checks at TP4 M256, three layer/rank slices, five patterns and eight changes. Native grids and zero scratch pass; no whole-model or serving claim. |
+
+| E425 | Minimum-six-waves M16 spills 13 VGPRs/56 private bytes and is rejected before GPU work. Failure and native build preserved. |
+| E426 | Current-record-only M16 reaches 74 VGPRs without spills and improves matched scalar control 1.7–2.9%. 315 exact checks; grid2 does not materially raise occupancy and hot remains behind. |
+| E427 | Identical device bytes at grid2/3/4. Grid3 improves complete MoE 4.14/1.41/3.36% on spread/hot/mixed; hot occupancy rises 3.85 to 4.94. 378 exact checks and stable rows; retain ingredient, hot still 17.4% behind MXFP4. |
+| E428 | Vector M32 partial exchange preserves ordered sums, uses 122 registers/no spills and reduces hot LDS instructions 9.8%. 315 exact checks; hot improves 1.29% to 75.57 us versus 68.98 us MXFP4, with small cold regressions. |
+| E429 | Frozen E427 grid3 binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Preserve initial reporting-only KeyError and repair; no kernel rebuild or tolerance change. |
+| E430 | Frozen E428 vector-exchange binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Native grids and zero scratch pass; no serving claim. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

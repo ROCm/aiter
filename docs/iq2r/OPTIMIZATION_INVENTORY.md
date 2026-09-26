@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E424. Related scouts,
+attempts from the initial GLM integration through E430. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E424
+## Isolated single-GPU optimization, E199–E430
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -266,6 +266,16 @@ single-GPU report. Serving sweeps remain paused.
 | E422 | Correct minimum-four-waves bound lowers M32 registers to 124/126 with no spills. Hot active-CU occupancy rises 2.00 to 3.75; gate trace drops 49.23 to 36.19 us despite higher aggregate waits. 378 exact checks and stable rows; retain within-record candidate, hot still 11.8% behind MXFP4. |
 | E423 | Parallelize M32 epilogue using both existing private LDS slots. 315 exact checks, stable bookends and unchanged 124 registers; 0.45–1.10% faster than matched E422. Hot reaches 76.06 us versus 69.00 us MXFP4, still 10.2% behind. |
 | E424 | Unchanged E423 binary passes 1,440 exact real-weight checks at TP4 M256, three layer/rank slices, five patterns and eight changes. Native grids and zero scratch pass; no whole-model or serving claim. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E425 | Minimum-six-waves M16 spills 13 VGPRs/56 private bytes and is rejected before GPU work. Failure and native build preserved. |
+| E426 | Current-record-only M16 reaches 74 VGPRs without spills and improves matched scalar control 1.7–2.9%. 315 exact checks; grid2 does not materially raise occupancy and hot remains behind. |
+| E427 | Identical device bytes at grid2/3/4. Grid3 improves complete MoE 4.14/1.41/3.36% on spread/hot/mixed; hot occupancy rises 3.85 to 4.94. 378 exact checks and stable rows; retain ingredient, hot still 17.4% behind MXFP4. |
+| E428 | Vector M32 partial exchange preserves ordered sums, uses 122 registers/no spills and reduces hot LDS instructions 9.8%. 315 exact checks; hot improves 1.29% to 75.57 us versus 68.98 us MXFP4, with small cold regressions. |
+| E429 | Frozen E427 grid3 binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Preserve initial reporting-only KeyError and repair; no kernel rebuild or tolerance change. |
+| E430 | Frozen E428 vector-exchange binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Native grids and zero scratch pass; no serving claim. |
 
 
 ## How to read the outcomes
