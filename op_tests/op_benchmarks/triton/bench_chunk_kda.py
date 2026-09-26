@@ -14,7 +14,6 @@ from aiter.ops.triton.attention.chunk_kda import (
     chunk_kda_walk,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.op_benchmarks.triton.bench_kda import _time
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 try:  # the Triton chunk path vLLM runs on gfx1250 today
@@ -60,6 +59,56 @@ def traffic_bytes(B, T, H, stage):
     prepare = 4 * tok + B * T * H * 2 + ws
     walk = ws + tok + 2 * state
     return {"prepare": prepare, "walk": walk, "total": prepare + walk}[stage]
+
+
+def _time(fn, args):
+    """One measurement in ms; cudagraph keeps host launch cost out of the span."""
+    if args.timing == "cudagraph":
+        return _bench_graph(fn, args.graph_ms, args.n_replays)
+    return triton.testing.do_bench(
+        fn, warmup=args.warmup, rep=args.rep, quantiles=[0.5, 0.2, 0.8]
+    )
+
+
+def _bench_graph(fn, graph_ms, n_replays):
+    """Replay a graph of ~graph_ms of launches; returns (median, p20, p80) ms."""
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    ev0, ev1 = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    ev0.record()
+    for _ in range(20):
+        fn()
+    ev1.record()
+    torch.cuda.synchronize()
+    est_ms = ev0.elapsed_time(ev1) / 20
+    n_per_graph = max(1, int(graph_ms / est_ms)) if est_ms > 0 else 1000
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn()
+        side.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            for _ in range(n_per_graph):
+                fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    per_iter = []
+    for _ in range(n_replays):
+        s, e = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        s.record()
+        graph.replay()
+        e.record()
+        torch.cuda.synchronize()
+        per_iter.append(s.elapsed_time(e) / n_per_graph)
+    per_iter.sort()
+    lo = per_iter[int(0.2 * (len(per_iter) - 1))]
+    hi = per_iter[int(0.8 * (len(per_iter) - 1))]
+    return per_iter[len(per_iter) // 2], lo, hi
 
 
 def benchmark(args):
