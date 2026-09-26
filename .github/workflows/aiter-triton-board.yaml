@@ -1,27 +1,42 @@
 name: AITER-triton Kernels board
 
-# Puts work on the AITER-triton Kernels board
-# (https://github.com/orgs/ROCm/projects/232) straight from the repo, so the
-# board does not depend on labels being applied. An issue or PR is added when
-# any of these hold:
-#   1. it is assigned to a member of @ROCm/triton_kernels_team
-#   2. it is a PR whose diff touches Triton/Gluon code
+# Keeps the AITER-triton Kernels board
+# (https://github.com/orgs/ROCm/projects/232) in step with the repo.
+#
+# Pull requests are handled entirely here. A PR belongs on the board when any
+# of these hold:
+#   1. it is authored by, or assigned to, a member of @ROCm/triton_kernels_team
+#      (the team is read live on each run, so there is no roster to maintain);
+#   2. its diff touches Triton/Gluon code (TRITON_PATHS) or Triton CI
+#      (TRITON_CI: anything under .github/ with "triton" in its path, plus
+#      requirements-triton*);
 #   3. it carries the Triton/Gluon label.
-# Draft PRs wait until they are marked ready for review.
+# Such a PR is added to the board and its Status follows the PR state: a draft
+# sits in "Backlog"; an open PR sits in "In review" unless someone has already
+# moved it on to "In Progress" or "Approved". Every run re-derives this from
+# the current PR state, so runs are idempotent and safe to cancel or reorder.
+#
+# Issues stay label-driven through the board's own auto-add rule. Here they are
+# only added when assigned to a team member (rule 1); their Status is left to
+# the board's "Item added" automation.
 #
 # Enabling it (org / repo admin):
 #   1. Grant the AITER CI GitHub App the organization permissions
-#      "Projects: Read & write" (to add items to the board) and
-#      "Members: read" (rule 1 reads the team roster), then accept the new
-#      permissions on the ROCm installation. Without "Members: read" the team
-#      lookup returns 403 and the assignee rule is skipped.
+#      "Projects: Read & write" (add items, set Status) and "Members: read"
+#      (rule 1 reads the team), then accept the new permissions on the ROCm
+#      installation. Without "Members: read" the team lookup returns 403 and
+#      rule 1 is skipped with a warning.
 #   2. Set the repository variable AITER_TRITON_BOARD_ADD to 'true'.
+#
+# pull_request_target is used so fork PRs are covered. This is safe here
+# because the job never checks out or executes PR code — it only reads PR
+# metadata and the changed-file list from the API.
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review, synchronize, assigned, labeled]
+    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize, assigned, labeled]
   issues:
-    types: [opened, reopened, assigned, labeled]
+    types: [opened, reopened, assigned]
 
 permissions: {}
 
@@ -30,8 +45,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  add-to-board:
-    if: ${{ vars.AITER_TRITON_BOARD_ADD == 'true' && !github.event.pull_request.draft }}
+  board:
+    if: ${{ vars.AITER_TRITON_BOARD_ADD == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Mint an AITER CI App token
@@ -43,14 +58,15 @@ jobs:
           owner: ROCm
           repositories: aiter
 
-      - name: Decide whether the item belongs on the board
-        id: decide
+      - name: Sync the item with the board
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app_token.outputs.token }}
           script: |
             const ORG = 'ROCm';
+            const PROJECT_NUMBER = 232;
             const TEAM_SLUG = 'triton_kernels_team';
+            const LABEL = 'Triton/Gluon';
             const TRITON_PATHS = [
               'aiter/ops/triton/',
               'aiter/aot/triton/',
@@ -58,61 +74,133 @@ jobs:
               'op_tests/triton_tests/',
               'op_tests/op_benchmarks/triton/',
             ];
+            const TRITON_CI = [/^\.github\/.*triton/i, /^requirements-triton/i];
+            // Open-PR statuses a person may have set by hand; anything else on
+            // an open, non-draft PR is corrected to "In review".
+            const KEEP_OPEN = ['in review', 'in progress', 'approved'];
 
             const pr = context.payload.pull_request;
             const item = pr ?? context.payload.issue;
+            const what = `${pr ? 'PR' : 'issue'} #${item.number}`;
+
+            if (pr && pr.state !== 'open') {
+              core.info(`${what} is closed — nothing to do.`);
+              return;
+            }
+
+            // ---- does it belong on the board? ----
             const reasons = [];
 
-            // Rule 1: assigned to a team member. The team is read live, so
-            // adding someone to @ROCm/triton_kernels_team is all it takes.
-            const assignees = (item.assignees ?? []).map(a => a.login);
-            if (assignees.length) {
-              try {
-                const members = await github.paginate(github.rest.teams.listMembersInOrg, {
-                  org: ORG,
-                  team_slug: TEAM_SLUG,
-                  per_page: 100,
-                });
-                const team = new Set(members.map(m => m.login.toLowerCase()));
-                const teamAssignees = assignees.filter(login => team.has(login.toLowerCase()));
-                if (teamAssignees.length) {
-                  reasons.push(`assigned to ${teamAssignees.join(', ')}`);
-                }
-              } catch (e) {
-                core.warning(`Could not list @${ORG}/${TEAM_SLUG} members (HTTP ${e.status ?? '?'}: ${e.message}). `
-                  + 'Grant the AITER CI App the organization "Members: read" permission; '
-                  + 'skipping the assignee rule for this run.');
+            // Rule 1: authored by (PRs) or assigned to a team member.
+            const people = (item.assignees ?? []).map(a => a.login);
+            if (pr) people.unshift(pr.user.login);
+            try {
+              const members = await github.paginate(github.rest.teams.listMembersInOrg, {
+                org: ORG,
+                team_slug: TEAM_SLUG,
+                per_page: 100,
+              });
+              const team = new Set(members.map(m => m.login.toLowerCase()));
+              const ours = people.filter(login => team.has(login.toLowerCase()));
+              if (ours.length) {
+                reasons.push(`team: ${[...new Set(ours)].join(', ')}`);
               }
+            } catch (e) {
+              core.warning(`Could not list @${ORG}/${TEAM_SLUG} members (HTTP ${e.status ?? '?'}: ${e.message}). `
+                + 'Grant the AITER CI App the organization "Members: read" permission; '
+                + 'skipping the team rule for this run.');
             }
 
-            // Rule 3: already labeled.
-            if ((item.labels ?? []).some(l => l.name === 'Triton/Gluon')) {
-              reasons.push('labeled Triton/Gluon');
-            }
-
-            // Rule 2: the diff itself.
             if (pr) {
+              // Rule 2: the diff itself.
               const files = await github.paginate(github.rest.pulls.listFiles, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: pr.number,
                 per_page: 100,
               });
-              if (files.some(f => TRITON_PATHS.some(p => f.filename.startsWith(p)))) {
+              const names = files.map(f => f.filename);
+              if (names.some(f => TRITON_PATHS.some(p => f.startsWith(p)))) {
                 reasons.push('touches Triton/Gluon paths');
+              }
+              if (names.some(f => TRITON_CI.some(re => re.test(f)))) {
+                reasons.push('touches Triton CI');
+              }
+              // Rule 3: already labeled.
+              if ((pr.labels ?? []).some(l => l.name === LABEL)) {
+                reasons.push(`labeled ${LABEL}`);
               }
             }
 
-            if (reasons.length) {
-              core.info(`#${item.number} belongs on the board: ${reasons.join('; ')}`);
-            } else {
-              core.info(`#${item.number} does not belong on the board.`);
+            if (!reasons.length) {
+              core.info(`${what} does not belong on the board.`);
+              return;
             }
-            core.setOutput('add', reasons.length > 0);
+            core.info(`${what} belongs on the board: ${reasons.join('; ')}`);
 
-      - name: Add the item to the board
-        if: ${{ steps.decide.outputs.add == 'true' }}
-        uses: actions/add-to-project@v2
-        with:
-          project-url: https://github.com/orgs/ROCm/projects/232
-          github-token: ${{ steps.app_token.outputs.token }}
+            // ---- add it and, for PRs, keep Status in step with the PR ----
+            try {
+              const { organization: { projectV2: project } } = await github.graphql(`
+                query($org: String!, $number: Int!) {
+                  organization(login: $org) {
+                    projectV2(number: $number) {
+                      id
+                      field(name: "Status") {
+                        ... on ProjectV2SingleSelectField { id options { id name } }
+                      }
+                    }
+                  }
+                }`, { org: ORG, number: PROJECT_NUMBER });
+              if (!project?.field?.options) {
+                throw new Error(`project ${PROJECT_NUMBER} or its Status field is not visible to the App token`);
+              }
+
+              // Adding an item that is already on the board returns the
+              // existing item, so this is safe to repeat on every event.
+              const { addProjectV2ItemById: { item: boardItem } } = await github.graphql(`
+                mutation($project: ID!, $content: ID!) {
+                  addProjectV2ItemById(input: { projectId: $project, contentId: $content }) {
+                    item {
+                      id
+                      fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                      }
+                    }
+                  }
+                }`, { project: project.id, content: item.node_id });
+              const current = boardItem.fieldValueByName?.name ?? null;
+
+              if (!pr) {
+                core.info(`${what} is on the board (Status: ${current ?? 'unset'}; left to the board's automation).`);
+                return;
+              }
+
+              let wanted;
+              if (pr.draft) {
+                wanted = 'Backlog';
+              } else if (KEEP_OPEN.includes((current ?? '').toLowerCase())) {
+                wanted = current;
+              } else {
+                wanted = 'In review';
+              }
+              if (wanted === current) {
+                core.info(`${what} is on the board with Status "${current}" — nothing to change.`);
+                return;
+              }
+              const option = project.field.options.find(o => o.name.toLowerCase() === wanted.toLowerCase());
+              if (!option) {
+                throw new Error(`the board has no Status option named "${wanted}"`);
+              }
+              await github.graphql(`
+                mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project, itemId: $item, fieldId: $field,
+                    value: { singleSelectOptionId: $option }
+                  }) { projectV2Item { id } }
+                }`, { project: project.id, item: boardItem.id, field: project.field.id, option: option.id });
+              core.info(`${what}: Status ${current ?? 'unset'} -> ${option.name}.`);
+            } catch (e) {
+              core.setFailed(`Could not update the board: ${e.message}. `
+                + 'If this is a permission error, grant the AITER CI App the organization '
+                + `"Projects: Read & write" permission for https://github.com/orgs/${ORG}/projects/${PROJECT_NUMBER}.`);
+            }
