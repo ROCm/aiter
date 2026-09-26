@@ -197,7 +197,10 @@ The returned config is a fresh deep copy, safe to mutate.
 - `any` must exist unless every reachable `M` is covered by an explicit bound.
   A `KeyError` at lookup time usually means it is missing.
 - The deprecated `{"large": …, "small": …}` shape must not be introduced.
-- Each `M_*` entry carries at minimum:
+- Each `M_*` entry uses the keys consumed by that family's kernel on that
+  architecture and backend. The kernel author owns this contract, including
+  nested variant configs. Do not require Triton keys in a Gluon config or
+  copy another backend's schema. The common Triton GEMM keys are:
 
   ```
   BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
@@ -208,7 +211,10 @@ The returned config is a fresh deep copy, safe to mutate.
   `add_default_gemm_config_params()` backfills `NUM_KSPLIT=1` and
   `cache_modifier=None` as a last resort, and `compute_splitk_params()`
   derives `SPLITK_BLOCK_SIZE` and may clamp `BLOCK_SIZE_K` / `NUM_KSPLIT`.
-  Neither is a license to omit keys.
+  Neither is a license to omit keys the kernel requires. Each family's
+  `DEFAULT.json` declares its tuning keys; the shared tuner reads them from
+  this file. Add new keys there and provide candidate values through the
+  tuning case's `space` or `--space`, without adding another tuning script.
 
 ### `_get_config()` stays a thin wrapper
 

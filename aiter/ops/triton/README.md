@@ -68,7 +68,7 @@ handed to the same `@triton.jit` kernel.
 - A helper both sides need is split, not duplicated: the torch-free part under
   `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
   places for exactly this reason.
-- `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
+- `utils/_triton/tuning/` is exempt — those are standalone tuning scripts
   that run in a PyTorch environment, not part of the importable surface.
 - Non-PyTorch users still write their own wrappers. Their framework creates
   the tensors, so allocation, dtype and layout checks, and the launch belong
@@ -309,8 +309,18 @@ depend on a benchmark.
   caches, not tuning configs — never check them in or migrate them.
 
 For adding a config, seeding a new arch, and the per-family key schemes, follow
-`configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tuning/README.md`.
+`configs/CLAUDE.md` (§5 and §6). To tune a GEMM on any arch and backend, run
+`utils/_triton/tuning/tune_gemm.py` (see its README): it tries every config
+where the wrapper reads its own through `get_gemm_config()`, and keeps the
+fastest validated candidate. The keys it tries are the keys of the family's
+`DEFAULT.json`, so the kernel author must keep those consistent with what
+the selected kernel reads. Triton and Gluon can use different keys. Run
+`python3 utils/_triton/tuning/tune_gemm.py --list` to list cases without a GPU;
+see [tuning coverage](utils/_triton/tuning/COVERAGE.md) for the former harness
+gaps, shared families, and separate MoE tuning paths. Run tuning on each target
+GPU (gfx942, gfx950, gfx1250, or a future architecture) with its own valid
+`DEFAULT.json` and supported kernel; no architecture list is built into the
+tuner.
 
 ---
 
@@ -472,3 +482,7 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 - Unit test under `op_tests/triton_tests/<category>/` and a benchmark script
   under `op_tests/op_benchmarks/triton/bench_<op>.py` — a kernel ships as
   kernel + wrapper + test + benchmark.
+- GEMM wrappers: a tuning case in `utils/_triton/tuning/gemm_cases.py` (see
+  its README), and each `DEFAULT.json` of the family lists exactly the config
+  keys the kernel reads, since those are the keys `tune_gemm.py` tries and
+  writes.

@@ -88,7 +88,7 @@ their tuned configs can be imported by a framework that is not PyTorch
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
   on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
-  harnesses, not importable library code.
+  scripts, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not
   require torch.
@@ -145,10 +145,11 @@ Flag, inside GEMM-family config JSON:
   `M_GEQ_<x>` / `"any"`.
 - A new config file with no `"any"` entry (lookup raises `KeyError` for
   uncovered M unless every reachable M hits an explicit bound).
-- Entries missing required params: `BLOCK_SIZE_M`, `BLOCK_SIZE_N`,
-  `BLOCK_SIZE_K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
-  `matrix_instr_nonkdim`, `cache_modifier`, `NUM_KSPLIT`. (Loader backfill of
-  `NUM_KSPLIT`/`cache_modifier` is a last resort, not a license to omit.)
+- Entries missing keys required by their kernel on the selected architecture
+  and backend. The kernel author maintains this contract in `DEFAULT.json`;
+  Triton and Gluon do not have to use the same keys. Loader backfill of
+  `NUM_KSPLIT`/`cache_modifier` is a last resort, not a license to omit keys
+  the kernel requires.
 - MOE dispatch keys (`bm<block_m>_n<N>_k<K>`) in a GEMM config or GEMM
   `M_LEQ_x`/`M_GEQ_y` keys in a MOE dispatch table — the schemes must not mix.
 - For `*AFP4WFP4*` specialized filenames: `K` must be the logical K
@@ -397,6 +398,37 @@ All weight/scale pre-shuffle helpers are unified in
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from
   `aiter.ops.triton.utils.shuffle`.
+- A GEMM also ships a tuning case. `utils/_triton/tuning/tune_gemm.py` runs a
+  GEMM through its case in `gemm_cases.py`, tries every config where the
+  wrapper reads its own through `get_gemm_config()`, and keeps the fastest;
+  the keys it tries are the keys of the family's `DEFAULT.json` for the arch
+  and backend being tuned. Flag:
+  - A new public GEMM wrapper under `gemm/` with no case in `gemm_cases.py`,
+    or a case not named after the wrapper or its configurable variant.
+    Document composed/deprecated wrapper exceptions in the coverage inventory
+    and its CPU test.
+  - A case that passes `config=` to the wrapper (the script can only replace
+    what the lookup returns), or that drops the wrapper's `backend` argument
+    when the wrapper has one (that backend becomes untunable).
+  - A GEMM family whose `DEFAULT.json` keys differ from the config keys the
+    kernel reads: a key the kernel ignores is tried for nothing, and a key
+    missing from `DEFAULT.json` is never tuned and never written.
+  - A new backend or arch path in a GEMM wrapper that resolves its config
+    without `get_gemm_config()`: that path cannot be tuned.
+  - A new case that reuses an output buffer without resetting accumulators,
+    returns only part of a multi-output result, or drops an exposed kernel
+    variant such as `persistent`: candidates must exercise the intended
+    production path and check all outputs.
+  - A new tunable key with no candidate values in the family's configs,
+    case `space`, or documented `--space` example. Add the key to the target
+    arch/backend's `DEFAULT.json`; do not add an architecture-specific tuner
+    or require a common key schema across all kernels.
+  - A new architecture or backend without its own valid `DEFAULT.json` and
+    kernel implementation. The tuner uses the running GPU's architecture;
+    adding a tuning case does not make unsupported hardware supported.
+  - A new case, backend, or tuning option without corresponding updates to the
+    tuning README and coverage inventory. Composed feed-forward ops tune
+    their constituent GEMMs; MoE dispatch tables use their own tuning path.
 
 ## Keeping this file and the README current
 
