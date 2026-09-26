@@ -1767,9 +1767,6 @@ def use_nt(token, topk, e):
     return (token * topk // e) < 64
 
 
-_SUPPORTED_SPLIT_K = (2,)
-
-
 @functools.lru_cache(maxsize=2048)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
@@ -1790,8 +1787,9 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
         return 0
     tilek = 256
     split_max = (cu_num + tg_num - 1) // tg_num
-    for i in _SUPPORTED_SPLIT_K:
-        if i <= split_max and (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
+    # at least split = 2
+    for i in reversed(range(2, split_max + 1)):
+        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
             return i
     return 0
 
@@ -3642,7 +3640,7 @@ def get_2stage_cfgs(
         and q_dtype_a == dtypes.bf16
         and dtype == dtypes.bf16
         and bool(opus_weights_shuffled)
-        and get_gfx() in ("gfx942", "gfx950")
+        and get_gfx() == "gfx950"
     ):
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
