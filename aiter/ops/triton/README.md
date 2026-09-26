@@ -68,7 +68,7 @@ handed to the same `@triton.jit` kernel.
 - A helper both sides need is split, not duplicated: the torch-free part under
   `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
   places for exactly this reason.
-- `utils/_triton/tunning/` is exempt — those are standalone tuning harnesses
+- `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
   that run in a PyTorch environment, not part of the importable surface.
 - Non-PyTorch users still write their own wrappers. Their framework creates
   the tensors, so allocation, dtype and layout checks, and the launch belong
@@ -310,7 +310,7 @@ depend on a benchmark.
 
 For adding a config, seeding a new arch, and the per-family key schemes, follow
 `configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tunning/README.md`.
+`utils/_triton/tuning/README.md`.
 
 ---
 
@@ -410,7 +410,27 @@ placeholder to the value: `%d` for counts and dimensions, `%f` for thresholds
 and real scalars, `%s` for tensors, `torch.Size` shapes, tuples and strings.
 `%d` or `%f` on `None` raises when the record is emitted, which logging
 reports as `--- Logging error ---` on stderr instead of raising, so use `%s`
-for anything optional.
+for anything optional:
+
+```python
+logger.info("%s", 1.0)    # ok
+logger.info("%s", None)   # ok
+logger.info("%f", 1.0)    # ok
+logger.info("%f", None)   # TypeError: must be real number, not NoneType
+```
+
+The signature is the thing to check: a parameter annotated `float | None` or
+`int | None` takes `%s` even where the call site happens to have resolved it.
+
+An exception is not an argument to format. `logging` renders the traceback
+itself, so pass `exc_info=True` rather than `%s`-ing the caught object.
+`AiterTritonLogger` forwards only `*args`, so reach the stdlib logger for that:
+
+```python
+except Exception:
+    logger.warning("config parse error", exc_info=True)                 # aiter.logger
+    _LOGGER.get_logger().warning("config parse error", exc_info=True)   # AiterTritonLogger
+```
 
 Gate verbose output with `logger.debug(...)`, not with an `if` around the
 call; `AITER_LOG_LEVEL=DEBUG` turns it on, and `aiter/__init__.py` applies
