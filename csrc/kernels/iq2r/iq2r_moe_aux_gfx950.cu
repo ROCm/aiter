@@ -1017,6 +1017,197 @@ void iq2r_route_grouped_ballot_quant_glm_kernel(
     }
 }
 
+template<int Tokens>
+__global__ __launch_bounds__(kMaxQuantThreads)
+void iq2r_route_grouped_static_ballot_quant_glm_kernel(
+    const opus::bf16_t* __restrict__ input,
+    const int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ sorted_expert_ids,
+    int32_t* __restrict__ gather_indices,
+    int32_t* __restrict__ scatter_indices,
+    int32_t* __restrict__ tasks,
+    int32_t* __restrict__ task_count,
+    opus::fp8_t* __restrict__ output,
+    uint8_t* __restrict__ scales,
+    int tokens,
+    int hidden,
+    int input_stride,
+    int groups_per_row,
+    int task_capacity,
+    int scale_m_blocks,
+    bool tiled_scales)
+{
+    constexpr int kExpertCount  = kGlmExperts + 1;
+    constexpr int kInvalidBucket = kExpertCount;
+    constexpr int kTaskRows      = 16;
+
+    __shared__ int route_experts[kGlmGroupedDecodeMaxRoutes];
+    __shared__ int token_sorted_routes[kGlmGroupedDecodeTopK];
+    __shared__ int counts[kExpertCount + 1];
+    __shared__ int offsets[kExpertCount + 1];
+    __shared__ int wave_totals[4];
+    __shared__ int routed_count;
+    __shared__ int routed_task_count;
+
+    const int thread = static_cast<int>(threadIdx.x);
+    const int token  = static_cast<int>(blockIdx.x);
+    constexpr int routes = Tokens * kGlmGroupedDecodeTopK;
+    constexpr int Chunks = (routes + 63) / 64;
+
+    for(int route = thread; route < routes; route += kMaxQuantThreads)
+    {
+        const int expert = expert_ids[route];
+        route_experts[route] = expert >= 0 && expert < kExpertCount ? expert : -1;
+    }
+    __syncthreads();
+
+    // Four waves rank the token's nine routes. Each ballot compares the
+    // target with 64 independent predecessors instead of serial LDS reads.
+    const int lane=thread%64,wave=thread/64;
+    int previous_bucket[Chunks];
+#pragma unroll
+    for(int chunk=0;chunk<Chunks;++chunk)
+    {
+        const int previous=chunk*64+lane;
+        const int previous_expert=previous<routes?route_experts[previous]:-1;
+        previous_bucket[chunk]=previous_expert>=0?previous_expert:kInvalidBucket;
+    }
+    for(int rank=wave;rank<kGlmGroupedDecodeTopK;rank+=4)
+    {
+        const int route=token*kGlmGroupedDecodeTopK+rank;
+        const int expert=route_experts[route];
+        const int bucket=expert>=0?expert:kInvalidBucket;
+        int sorted_route=0;
+#pragma unroll
+        for(int chunk=0;chunk<Chunks;++chunk)
+        {
+            const int previous=chunk*64+lane;
+            const bool precedes=previous<routes && (previous_bucket[chunk]<bucket ||
+                (previous_bucket[chunk]==bucket && previous<route));
+            sorted_route+=__popcll(__ballot(precedes));
+        }
+        if(lane==0)
+        {
+            token_sorted_routes[rank]=sorted_route;
+            sorted_expert_ids[sorted_route]=expert;
+            gather_indices[sorted_route]=route;
+            scatter_indices[route]=sorted_route;
+        }
+    }
+    __syncthreads();
+
+    if(token == 0)
+    {
+        counts[thread] = 0;
+        if(thread == 0)
+        {
+            counts[kGlmExperts] = 0;
+            counts[kInvalidBucket] = 0;
+        }
+        __syncthreads();
+
+        for(int route = thread; route < routes; route += kMaxQuantThreads)
+        {
+            const int expert = route_experts[route];
+            atomicAdd(counts + (expert >= 0 ? expert : kInvalidBucket), 1);
+        }
+        __syncthreads();
+
+        const int count_prefix =
+            iq2r_block_inclusive_scan_256(counts[thread], wave_totals);
+        offsets[thread] = count_prefix - counts[thread];
+        if(thread == kGlmExperts - 1)
+            routed_count = count_prefix;
+        __syncthreads();
+
+        const int local_tasks = (counts[thread] + kTaskRows - 1) / kTaskRows;
+        const int task_prefix =
+            iq2r_block_inclusive_scan_256(local_tasks, wave_totals);
+        int task = task_prefix - local_tasks;
+        for(int local = 0; local < counts[thread]; local += kTaskRows, ++task)
+        {
+            if(task < task_capacity)
+            {
+                tasks[task * kTaskColumns] = offsets[thread] + local;
+                tasks[task * kTaskColumns + 1] =
+                    min(kTaskRows, counts[thread] - local);
+                tasks[task * kTaskColumns + 2] = thread;
+            }
+        }
+        if(thread == kGlmExperts - 1)
+            routed_task_count = task_prefix;
+        __syncthreads();
+
+        if(thread == 0)
+        {
+            int total_tasks = routed_task_count;
+            int sorted_begin = routed_count;
+            for(int local = 0; local < counts[kGlmExperts]; local += kTaskRows)
+            {
+                if(total_tasks < task_capacity)
+                {
+                    tasks[total_tasks * kTaskColumns] = sorted_begin + local;
+                    tasks[total_tasks * kTaskColumns + 1] =
+                        min(kTaskRows, counts[kGlmExperts] - local);
+                    tasks[total_tasks * kTaskColumns + 2] = kGlmExperts;
+                }
+                ++total_tasks;
+            }
+            sorted_begin += counts[kGlmExperts];
+            for(int local = 0; local < counts[kInvalidBucket]; local += kTaskRows)
+            {
+                if(total_tasks < task_capacity)
+                {
+                    tasks[total_tasks * kTaskColumns] = sorted_begin + local;
+                    tasks[total_tasks * kTaskColumns + 1] =
+                        min(kTaskRows, counts[kInvalidBucket] - local);
+                    tasks[total_tasks * kTaskColumns + 2] = -1;
+                }
+                ++total_tasks;
+            }
+            task_count[0] = total_tasks <= task_capacity ? total_tasks : -1;
+        }
+        __syncthreads();
+    }
+
+    if(thread >= groups_per_row)
+        return;
+
+    const int column_begin = thread * kQuantGroup;
+    const int64_t input_offset =
+        static_cast<int64_t>(token) * input_stride + column_begin;
+    using input_vector = opus::vector_t<opus::bf16_t, kQuantGroup>;
+    using output_vector = opus::vector_t<opus::fp8_t, kQuantGroup>;
+    const input_vector values =
+        *reinterpret_cast<const input_vector*>(input + input_offset);
+
+    float abs_max = 1.0e-10f;
+#pragma unroll
+    for(int element = 0; element < kQuantGroup; ++element)
+        abs_max = fmaxf(abs_max, fabsf(static_cast<float>(values[element])));
+
+    const auto block_scale =
+        fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode, MxDtype::FP8_E4M3>(abs_max);
+    const float inverse_scale = 1.0f / block_scale.dq_scale;
+    output_vector quantized;
+#pragma unroll
+    for(int element = 0; element < kQuantGroup; ++element)
+        quantized[element] =
+            opus::fp32_to_fp8(static_cast<float>(values[element]) * inverse_scale);
+
+#pragma unroll
+    for(int rank = 0; rank < kGlmGroupedDecodeTopK; ++rank)
+    {
+        const int sorted_route = token_sorted_routes[rank];
+        const int64_t output_offset =
+            static_cast<int64_t>(sorted_route) * hidden + column_begin;
+        *reinterpret_cast<output_vector*>(output + output_offset) = quantized;
+        scales[iq2r_scale_offset(
+            sorted_route, thread, groups_per_row, scale_m_blocks, tiled_scales)] =
+            block_scale.byte;
+    }
+}
+
 // EP decode variant for at most sixteen routes. One CTA builds compact tasks
 // for the local expert range and quantizes each source token once. Non-local
 // routes receive scatter index -1 and require no GEMM, SwiGLU, or reduction
@@ -2608,7 +2799,69 @@ void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
     {
         const char* ballot_setting=std::getenv("IQ2R_GLM53_BALLOT_ROUTER");
         const bool ballot=ballot_setting && std::strcmp(ballot_setting,"1" )==0 && input.size(0)>=4;
-        if(ballot)
+        const int tokens=static_cast<int>(input.size(0));
+        const char* static_setting=std::getenv("IQ2R_GLM53_STATIC_BALLOT");
+        const bool static_ballot=static_setting && std::strcmp(static_setting,"1")==0;
+        if(ballot && static_ballot && (tokens==4 || tokens==8))
+        {
+            static thread_local bool audited[2]={false,false};
+            const int index=tokens==8;
+            const char* audit=std::getenv("ATOM_IQ2R_AUDIT");
+            if(audit && std::strcmp(audit,"1")==0 && !audited[index])
+            {
+                audited[index]=true;
+                std::fprintf(stderr,"IQ2R_STATIC_BALLOT device=%d tokens=%d kernel=iq2r_route_grouped_static_ballot_quant_glm_kernel\n",input.device_id,tokens);
+            }
+            if(tokens==4)
+            {
+        hipLaunchKernelGGL((iq2r_route_grouped_static_ballot_quant_glm_kernel<4>),
+                           dim3(static_cast<uint32_t>(input.size(0))),
+                           dim3(quant_threads),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const opus::bf16_t*>(input.data_ptr()),
+                           static_cast<const int32_t*>(expert_ids.data_ptr()),
+                           static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+                           static_cast<int32_t*>(gather_indices.data_ptr()),
+                           static_cast<int32_t*>(scatter_indices.data_ptr()),
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           static_cast<opus::fp8_t*>(output.data_ptr()),
+                           static_cast<uint8_t*>(scales.data_ptr()),
+                           static_cast<int>(input.size(0)),
+                           static_cast<int>(input.size(1)),
+                           static_cast<int>(input.stride(0)),
+                           static_cast<int>(groups_per_row),
+                           static_cast<int>(tasks.size(0)),
+                           scale_m_blocks,
+                           tiled_scales);
+            }
+            else
+            {
+        hipLaunchKernelGGL((iq2r_route_grouped_static_ballot_quant_glm_kernel<8>),
+                           dim3(static_cast<uint32_t>(input.size(0))),
+                           dim3(quant_threads),
+                           0,
+                           getCurrentHIPStream(),
+                           static_cast<const opus::bf16_t*>(input.data_ptr()),
+                           static_cast<const int32_t*>(expert_ids.data_ptr()),
+                           static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+                           static_cast<int32_t*>(gather_indices.data_ptr()),
+                           static_cast<int32_t*>(scatter_indices.data_ptr()),
+                           static_cast<int32_t*>(tasks.data_ptr()),
+                           static_cast<int32_t*>(task_count.data_ptr()),
+                           static_cast<opus::fp8_t*>(output.data_ptr()),
+                           static_cast<uint8_t*>(scales.data_ptr()),
+                           static_cast<int>(input.size(0)),
+                           static_cast<int>(input.size(1)),
+                           static_cast<int>(input.stride(0)),
+                           static_cast<int>(groups_per_row),
+                           static_cast<int>(tasks.size(0)),
+                           scale_m_blocks,
+                           tiled_scales);
+            }
+        }
+        else if(ballot)
         {
             static thread_local bool audited[17]={};
             const int tokens=static_cast<int>(input.size(0));

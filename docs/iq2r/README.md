@@ -66,3 +66,10 @@ acceptance work. A completed benchmark request is not evidence of a correct
 answer. See the result document for the partial performance comparison.
 
 The [single-GPU optimization report](SINGLE_GPU_ANALYSIS.md) tracks E199–E219 local MoE experiments. Those microsecond timings are separate from the official serving results; production kernels are unchanged by these experiments.
+
+E225 restores the previously selected E167 C4/C8 static ballot frontend omitted
+from the consolidated AITER source. New tests inspect actual GPU kernel names:
+the old source failed both enabled C4/C8 dispatch cases; the corrected source
+passes all 54 dispatch, routing, and TP8/TP4 complete-MoE checks. Dense candidate
+kernels remain isolated. Existing E199 small-token local controls used the generic
+frontend despite setting STATIC_BALLOT; fresh corrected comparisons are required.

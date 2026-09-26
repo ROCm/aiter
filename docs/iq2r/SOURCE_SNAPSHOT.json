@@ -15,7 +15,7 @@
         "aiter/ops/iq2r_format.py": "89775366caaa0173434e34c126f6b88e495fbfb40c660f2acb084ce5b57e8c1b",
         "csrc/include/iq2r.h": "cd7612d96f8663924bccd81bef14cbdf304ba77a259b1b57a9e678fd1afab50a",
         "csrc/kernels/iq2r/iq2r_gemm_gfx950.cu": "e717433190ca921d7aa4e6448ebe4ad0548567b86a2348521a4163420dc48830",
-        "csrc/kernels/iq2r/iq2r_moe_aux_gfx950.cu": "ffa7e7af41c81021626b8c2ef15bc6115a8bf2f1b20ce2a70f62a6fe96d2dc61",
+        "csrc/kernels/iq2r/iq2r_moe_aux_gfx950.cu": "80494f4fcadc61c7abdd130acf6531a21e0b7ab2df2cefd6909b29f62e5f586b",
         "csrc/kernels/topk_softmax_kernels_group.cu": "1df622addb0f1dd73e2570590052fd988128f9351b1b50243df2ecc724dc65ad",
         "csrc/pybind/iq2r_pybind.cu": "97481fe418ac6157d713e16da3987b224be9ebf77cadf7d5a447c6c16fb37835",
         "op_tests/op_benchmarks/iq2r/bench_iq2r_route_reduce_variants.py": "5f0a636aa6f1cf0d702c09e0930c22a55237df705fb237bdfd34b924625a53e1",
@@ -30,7 +30,8 @@
         "op_tests/test_iq2r_glm5_moe_hip.py": "0e142cfcef663603e82b3e4f61105122e5522b5c595007eb86e93c7ca07356b2",
         "op_tests/test_iq2r_large32_synchronization_hip.py": "200024f4a439076e03e84a5e96b1487797d2bad04a6048ccd773ca0aa29da8bc",
         "op_tests/test_iq2r_moe_hip.py": "aeacfa02552dd9026a4510686b1bb1a6c3aa33e00f6ab4045123f87ea9c0e55f",
-        "op_tests/test_iq2r_overlay.py": "c9b107022ca65738a9e61a9480416c7caed05d91bc5c4df6950ac6f713a98466"
+        "op_tests/test_iq2r_overlay.py": "c9b107022ca65738a9e61a9480416c7caed05d91bc5c4df6950ac6f713a98466",
+        "op_tests/test_iq2r_glm53_frontend_dispatch_hip.py": "051aca726e9820a6891c37a01601544519359af7d61afa5b220227b6e6b47ebc"
       }
     },
     "ATOM": {
@@ -65,7 +66,19 @@
     "iq2r_native_module": "b8089077684bd4c887be84b68cf62a8d427490e9354e03a8a84394c35ebdf2ef",
     "router_module": "f6e0ecfd2549e52fdf9db39a0e786646f2ba19c6b6ca9f897c1b9e4cf70e21eb",
     "benchmark_serving_source": "19bfd9a27a197a41323eb5da3bb04690bb1508208e58681ecf9d53ddee778e2b",
-    "full_performance_goal": "unmet"
+    "full_performance_goal": "unmet",
+    "scope": "Historical broad checks on the pre-restoration consolidation; E225 follow-up validation is recorded in static_frontend_restoration."
   },
-  "runtime_origin": "E167/E172/E181 native candidate, with the E190 grouped-top-k guard. ATOM also retains optional local profiler controls. E196 is unselected."
+  "runtime_origin": "E167/E172/E181 native candidate, with the E190 grouped-top-k guard. ATOM also retains optional local profiler controls. E196 is unselected.",
+  "static_frontend_restoration": {
+    "experiment": "E225",
+    "problem": "The consolidated source omitted the E167 specialized C4/C8 frontend even though the benchmark runtime and documentation selected it. The STATIC_BALLOT environment flag was ignored.",
+    "before_auxiliary_sha256": "ffa7e7af41c81021626b8c2ef15bc6115a8bf2f1b20ce2a70f62a6fe96d2dc61",
+    "reproduced_before": "2 dispatch tests failed (C4/C8 enabled); 3 fallback/control tests passed.",
+    "qualified_after": "54 GPU tests passed: 5 actual-kernel dispatch tests, 45 routing/quantization graph tests, and 4 complete TP8/TP4 MoE graph tests.",
+    "qualification_log_sha256": "1c7c64e73c346fbb68f5e62d5d9117229ed8219484dad6bcc2a4ce365d6c6372",
+    "note": "This restores previously selected E167 behavior. E199\u2013E224 dense optimization candidates remain isolated.",
+    "tp8_comparison": "Completed fresh clean/trace/clean run at 1,2,4,8,16 tokens, spread and hot routes. Native C4/C8 static kernels confirmed.",
+    "tp4_comparison": "Not qualified: MXFP4 changing-graph vs eager maximum normalized difference 0.0151515 exceeded the fixed 0.015 harness threshold in two attempts. IQ2R restoration checks passed; no tolerance change."
+  }
 }
