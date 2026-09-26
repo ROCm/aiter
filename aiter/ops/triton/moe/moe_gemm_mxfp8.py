@@ -22,6 +22,7 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import _moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_utils import group_sizes_to_expt_tensors
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.shuffle import moe_weight_kn
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 __all__ = ["moe_gemm_mxfp8"]
@@ -78,7 +79,10 @@ def moe_gemm_mxfp8(
         K % quant_block_size == 0
     ), f"K ({K}) must be divisible by quant_block_size ({quant_block_size})"
 
-    out = torch.empty(total_tokens, N, dtype=out_dtype, device=lhs.device)
+    # Rows excluded from group_sizes are never written; zero-fill so they do
+    # not surface stale allocator contents. A NaN there survives a caller's
+    # `* 0` mask (NaN * 0 == NaN) and spreads through the top-k reduction.
+    out = torch.zeros(total_tokens, N, dtype=out_dtype, device=lhs.device)
     if total_tokens == 0:
         return out
 
@@ -98,16 +102,18 @@ def moe_gemm_mxfp8(
     BLOCK_N = cfg.kwargs["BLOCK_N"]
 
     expt_hist, expt_offs, expt_offs_sum, expt_data, grid_m = (
-        group_sizes_to_expt_tensors(group_sizes, BLOCK_M)
+        group_sizes_to_expt_tensors(group_sizes, BLOCK_M, total_tokens)
     )
     if grid_m == 0:
         return out
 
     grid_n = triton.cdiv(N, BLOCK_N)
 
-    # Permute rhs/w_scale from NK to KN layout as required by _moe_gemm_a8w8.
-    rhs_kn = rhs.permute(0, 2, 1).contiguous()
-    w_scale_kn = w_scale.permute(0, 2, 1).contiguous()
+    # _moe_gemm_a8w8 wants KN. Expert weights are static after load, so a
+    # caller storing them K-major already gets a view instead of a per-call
+    # copy of the whole tensor (2.4-7.9 ms on gfx942 at Hy4 shapes).
+    rhs_kn = moe_weight_kn(rhs)
+    w_scale_kn = moe_weight_kn(w_scale)
     bias_stride = N if bias is not None else 0
 
     _moe_gemm_a8w8[(grid_m * grid_n,)](
