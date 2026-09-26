@@ -9,6 +9,9 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
@@ -71,6 +74,8 @@ def get_x_vals():
     x_vals += [(v, 7168, 16384) for v in (1, 32, 64, 128, 256, 1024)]
     x_vals += [(v, 6144, 7168) for v in (1, 32, 64, 128, 256, 1024)]
     x_vals += [(v, 7168, 3072) for v in (1, 32, 64, 128, 256, 1024)]
+    # split-K whose last partition runs past K
+    x_vals += [(v, 6144, K) for v in (1, 16, 64) for K in (640, 896)]
     return x_vals
 
 
@@ -196,6 +201,23 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
             return gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
+
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+
+
+@pytest.mark.parametrize("K", [640, 896])
+def test_gemm_splitk_tail(K):
+    # an 8-way split leaves the last partition running past K
+    M, N = 16, 6144
+    x, weight, _, x_scale, _, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+        M, N, K, *block_shape, output=True
+    )
+    config = dict(_get_config(M, N, K, backend="triton")[0], NUM_KSPLIT=8)
+
+    a = run_torch(x, weight, x_scale, w_scale)
+    b = gemm_a8w8_blockscale(
+        x, weight, x_scale, w_scale, torch.bfloat16, y, config=config, backend="triton"
+    )
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 

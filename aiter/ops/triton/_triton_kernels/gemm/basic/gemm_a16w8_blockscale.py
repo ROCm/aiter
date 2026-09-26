@@ -32,7 +32,8 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0
+        and args["K"] % args["SPLITK_BLOCK_SIZE"] == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
