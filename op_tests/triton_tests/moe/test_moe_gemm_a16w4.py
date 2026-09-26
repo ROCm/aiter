@@ -9,6 +9,7 @@ import torch
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
+    get_kernel_config_triton,
     moe_gemm_a16w4,
     moe_gemm_torch,
 )
@@ -21,6 +22,7 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
@@ -247,3 +249,123 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# `test_op` skips unless is_fp4_avail() (gfx950/gfx1250), so it never reaches
+# the gfx942 tuned table. The kernel has no fp4 gate and runs on gfx942.
+
+_TUNED_ARCH = "gfx942"
+
+# backend=None and "gluon" both fall back to triton on gfx942; pin it so the
+# path under test is named, not inferred.
+_TUNED_BACKEND = "triton"
+_TUNED_DO_GATHER = False
+_TUNED_DO_SCATTER = False
+_TUNED_HAS_Y_GAMMAS = False
+_TUNED_APPLY_SWIGLU = False
+
+# Same tolerances as test_op; fixed, not fitted to observed error.
+_TUNED_MAXTOL = 4e-1
+_TUNED_RMSTOL = 4e-2
+
+# Routing derives block_m from m, n_expts_act and n_expts_tot, so these two
+# plus the token count select which entry a case lands on.
+_TUNED_N_EXPTS_TOT = 8
+_TUNED_N_EXPTS_ACT = 1
+
+
+def _shipped_tuned_table():
+    cfg_dir = resolve_config_dir("moe", "A16W4", backend="triton", arch=_TUNED_ARCH)
+    # Required: a missing table would collect zero cases and report green.
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")
+
+
+def _tuned_cases():
+    cases = sorted(_shipped_tuned_table().items())
+    assert cases, "gfx942 a16w4 table is empty; its entries would go untested"
+    return cases
+
+
+@pytest.mark.parametrize(
+    "key, entry", _tuned_cases(), ids=lambda v: v if isinstance(v, str) else None
+)
+def test_tuned_table_numerics(key, entry, device="cuda"):
+    if arch_info.get_arch() != _TUNED_ARCH:
+        pytest.skip(f"a16w4 tuned table is {_TUNED_ARCH}-only")
+
+    block_m = int(key.split("_")[0][2:])
+    n = int(key.split("_")[1][1:])
+    k = int(key.split("_")[2][1:])
+
+    m = block_m * _TUNED_N_EXPTS_TOT // _TUNED_N_EXPTS_ACT
+
+    torch.manual_seed(0)
+    weight_dtype = str_to_torch_dtype["mxfp4_e2m1"]
+
+    m, rdata, gindx, sindx = init_routing_data(
+        m,
+        _TUNED_N_EXPTS_TOT,
+        _TUNED_N_EXPTS_ACT,
+        _TUNED_DO_GATHER,
+        _TUNED_DO_SCATTER,
+        device=device,
+    )
+    assert (
+        rdata.block_m == block_m
+    ), f"routing produced block_m={rdata.block_m}, need {block_m} to reach {key}"
+
+    x_tri, w_tri, bias_tri, gammas = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        sindx,
+        _TUNED_N_EXPTS_TOT,
+        _TUNED_N_EXPTS_ACT,
+        torch.bfloat16,
+        torch.bfloat16,
+        _TUNED_HAS_Y_GAMMAS,
+        device=device,
+    )
+    x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+
+    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+
+    # A dead key falls back to the stock tile and still computes the right
+    # answer, so numerics alone cannot prove the entry was reached. Resolve
+    # through the wrapper's own lookup, not by rebuilding the key here.
+    resolved = get_kernel_config_triton(m=m, n=n, k=k, routing_data=rdata)
+    assert resolved["block_m"] == block_m
+    assert (
+        resolved["block_n"] == entry["BLOCK_SIZE_N"]
+    ), f"{key} did not reach the table"
+    assert (
+        resolved["block_k"] == entry["BLOCK_SIZE_K"]
+    ), f"{key} did not reach the table"
+    assert resolved["num_warps"] == entry["num_warps"]
+    assert resolved["num_stages"] == entry["num_stages"]
+    assert resolved["waves_per_eu"] == entry["waves_per_eu"]
+    assert resolved["matrix_instr_nonkdim"] == entry["matrix_instr_nonkdim"]
+
+    ref_y = moe_gemm_torch(
+        x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, _TUNED_APPLY_SWIGLU
+    )
+    tri_y = moe_gemm_a16w4(
+        x_tri,
+        w_tri,
+        None,
+        w_scale_tri,
+        None,
+        None,
+        bias_tri,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        None,
+        torch.bfloat16,
+        _TUNED_APPLY_SWIGLU,
+        backend=_TUNED_BACKEND,
+    )
+    assert_close(ref_y, tri_y, maxtol=_TUNED_MAXTOL, rmstol=_TUNED_RMSTOL)
