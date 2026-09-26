@@ -24,6 +24,55 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## TP4 follow-up and dense layout qualification — E304–E311
+
+The E302 combined small-token candidate has fresh qualified TP4 M16 results.
+TP4 M4 also passed correctness, but its 4–5% timing drift prevents qualification.
+TP4 M8's earlier unchanged-MXFP4 bound failure remains unresolved.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R latency overhead |
+|---:|---:|:---|---:|---:|---:|
+| 4 | 16 | spread | 91.83 | 79.70 | -13.2% |
+| 4 | 16 | hot | 31.13 | 26.03 | -16.4% |
+
+E308 changes dense down records from groups of three N16 blocks to groups of
+four, with N512 workgroup tiles and matching reduction indexing. Separate
+transformed tensors preserve exact decoded weights/scales, original allocation
+size, M32 rows and one/two interleaved column batches. No legacy decoder receives
+quad records. E262 gate and routing policy remain unchanged.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R latency overhead |
+|---:|---:|:---|---:|---:|---:|
+| 4 | 1024 | spread | 292.89 | 319.97 | +9.2% |
+| 4 | 1024 | hot | 187.53 | 204.78 | +9.2% |
+| 4 | 4096 | spread | 601.03 | 803.23 | +33.6% |
+| 4 | 4096 | hot | 499.58 | 650.75 | +30.3% |
+
+Each row averages fresh complete clean bookends over 32 rotating weight banks.
+The dense N512 candidate improves previous E262 by 0.7–3.5%; all four cases
+have less than 2.1% timing drift. The dense MXFP4 gap remains about 9–34%.
+These are synthetic local MoE-call times, not serving concurrency.
+
+E311 qualifies unchanged E308 and E262 across 39 eligible TP4 shape/routing
+cases and 312 changing steps, including zero/16x inputs and dense/chunk
+boundaries: 936 exact checks across clean/trace/clean. Final BF16 and intermediate
+FP8 bytes/scales match original IQ2R after restoring original route order.
+Scatter permutations and gather/scatter inverses are checked. The initial raw-row
+checker failed on E262 because the sorters use different valid row orders;
+the diagnostic and both checkers are preserved. No runtime or tolerance changed.
+Native E308 gate/down/reduction dispatch is verified with zero scratch. Actual
+dense captures and production fallback handling remain unqualified.
+
+E304 stages persistent-down metadata and cuts vector reads by 62%, but remains
+much slower than E261. E305/E306 shorten live state or change compiler residency
+hints without meaningful speedups. E307 TP8 quad down gives mixed small gains;
+E309/E310 M4 quad adaptations do not improve the selected combination. These
+remain unselected. E312 is a separate fused frontend/gate POC in progress.
+
+No new production runtime is integrated. Serving sweeps remain paused. Earlier
+model-quality, TP4 baseline-bound and independent scalar-MFMA bound issues remain
+open; these checks do not clear them or establish serving parity.
+
 ## Combined small-token qualification — E293–E303
 
 E302 measures the unchanged E293 binary with the E297 combined policy:
@@ -353,6 +402,15 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E301 | Store each persistent expert result once; map routes at reduction. Exact; recovers part of E300 regression but remains unselected. |
 | E302 | One-second graph warmup yields stable TP8 combined comparisons. Five of six small-token cases beat fresh MXFP4; M4 hot remains +8.5%. |
 | E303 | Swizzle persistent-down LDS output columns. Bank conflicts fall 96.5%, time does not improve; exact, zero scratch, unselected. |
+
+| E304 | Stage route metadata once per persistent M32 tile. Exact; vector reads fall 62%, but total time still trails E261 badly. Unselected. |
+| E305 | Retire persistent down accumulators one N16 result at a time. Exact, fewer registers, no meaningful gain; unselected. |
+| E306 | Disable M16-half unrolling and request two-block compiler residency. Both variants use 112 registers and about 27% measured occupancy; no gain. |
+| E307 | Exact N64 down records and N256/N512 tiles at TP8. N512 gives mixed small gains; no broad selection. First compile failure preserved. |
+| E308 | TP4 quad down with N512/batch4. Exact; 0.7–3.5% better than E262 in all four dense cases, still 9–34% behind MXFP4. |
+| E309 | Use N64 quads in M4 token-owned down. Exact but slower at spread/hot routes; unselected. |
+| E310 | Load only a compact N16 quad record, reuse it across M4, and share a 384-workgroup grid with the N64 fallback. Exact; no gain over the selected path. |
+| E311 | Qualify E308 and E262 at 39 TP4 dense shape/routing cases, 312 changes and 936 exact checks. Correct the raw-row checker using verified route permutations; no tolerance change. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
