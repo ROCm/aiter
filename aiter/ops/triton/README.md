@@ -68,7 +68,7 @@ handed to the same `@triton.jit` kernel.
 - A helper both sides need is split, not duplicated: the torch-free part under
   `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
   places for exactly this reason.
-- `utils/_triton/tunning/` is exempt — those are standalone tuning harnesses
+- `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
   that run in a PyTorch environment, not part of the importable surface.
 - Non-PyTorch users still write their own wrappers. Their framework creates
   the tensors, so allocation, dtype and layout checks, and the launch belong
@@ -310,7 +310,7 @@ depend on a benchmark.
 
 For adding a config, seeding a new arch, and the per-family key schemes, follow
 `configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tunning/README.md`.
+`utils/_triton/tuning/README.md`.
 
 ---
 

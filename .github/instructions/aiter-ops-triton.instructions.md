@@ -16,8 +16,9 @@ relevant rule — reviewers may not know these conventions yet.
   benchmark (see *Tests and benchmarks*); those belong to the kernel and are
   not separate concerns.
 - **One kernel backend per PR.** Flag a PR whose changed files belong to more
-  than one backend -- Triton/Gluon (`aiter/ops/triton/`, `aiter/aot/triton/`),
-  HIP (`csrc/`), ASM (`hsa/`, `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS
+  than one backend -- Triton/Gluon (`aiter/ops/triton/`, `aiter/aot/triton/`;
+  Triton and Gluon are one backend, so a PR mixing the two is fine), HIP
+  (`csrc/`), ASM (`hsa/`, `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS
   (`aiter/ops/opus/`), FlyDSL (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`) --
   and list the files of the other backend, so the author knows what to move.
   Ask for one PR per backend. When the parts depend on each other, suggest
@@ -86,7 +87,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 - `import torch`, `from torch import ...` or any `torch.` use added to a
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
-  on both sides). `utils/_triton/tunning/` is exempt: standalone tuning
+  on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
   harnesses, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not

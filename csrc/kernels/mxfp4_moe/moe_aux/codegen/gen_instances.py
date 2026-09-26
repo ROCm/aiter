@@ -25,6 +25,8 @@ SHAPES = [
     (384, 7168, 768, 6),  # dsv4_tp4
     (384, 7168, 512, 6),  # dsv4_tp6 (and dsv4_tp8: INTER 384->512 padded)
     (384, 5120, 768, 6),  # dsv4.1 TP=4 (INTER 576->640, support key pads to 768)
+    (128, 5120, 1280, 3),  # dsv4.1 DSpark TP=2 (INTER 1152 pads to 1280)
+    (384, 5120, 1280, 6),  # dsv4.1 target TP=2 (INTER 1152 pads to 1280)
     (96, 5120, 2304, 6),  # dsv4.1 EP=4, TP=1
     (32, 5120, 2304, 2),  # dsv4.1 DSpark EP
     (32, 5120, 2304, 3),  # dsv4.1 DSpark EP

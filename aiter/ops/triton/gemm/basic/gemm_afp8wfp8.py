@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import copy
 import math
 
 import torch
@@ -12,11 +13,52 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 )
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _gemm_afp8wfp8_kernel,
+    _gemm_afp8wfp8_packed_kernel,
     _gemm_afp8wfp8_preshuffle_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
+
+# One arrival counter per output tile of a fused split-K launch.
+_SPLIT_COUNTERS = 1 << 16
+_split_counters_by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _split_counters(device: torch.device) -> torch.Tensor | None:
+    """Zeroed arrival counters per (device, stream), as for the a16w16 split-K
+    semaphores; kernels re-zero what they use. None when a stream's first use
+    falls inside a capture that cannot allocate outside the graph pool."""
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    counters = _split_counters_by_stream.get(key)
+    if counters is None:
+        if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
+            return None
+        with persistent_alloc(device):
+            counters = torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
+        _split_counters_by_stream[key] = counters
+    return counters
+
+
+def _split_k_partition(k: int, splits: int, step: int) -> tuple[int, int]:
+    """Partition size rounded up to whole steps, and the non-empty count."""
+    part = -(-k // splits)
+    size = -(-part // step) * step
+    return size, -(-k // size)
+
+
+def _fused_workspace(y, tiles, splits, block_m, block_n):
+    """(grid, partials, counters) for fused split-K, or None to run unfused."""
+    assert tiles <= _SPLIT_COUNTERS, "Too many output tiles for fused split-K"
+    counters = _split_counters(y.device)
+    if counters is None:
+        return None
+    partials = torch.empty(
+        tiles * splits * block_m * block_n, dtype=torch.float32, device=y.device
+    )
+    return (-(-tiles // 8) * 8 * splits,), partials, counters
+
 
 _LOGGER = AiterTritonLogger()
 
@@ -80,129 +122,222 @@ def gemm_afp8wfp8(
     skip_reduce: bool | None = False,
     x_scale_group_size: int = 128,
     is_x_scale_transposed: bool = False,
+    w_scale_group_size: tuple[int, int] = (128, 128),
+    split_k: int | None = None,
 ) -> torch.Tensor:
-    """
-    Computes matrix multiplication Y = X @ W^T with FP8 activations and FP8
-    weights (e8m0 act scales, 128x128 e8m0 weight scales).
+    """Compute X @ W.T with E4M3 operands and compact E8M0 scales.
 
-    Args:
-        x: FP8 e4m3 (or uint8 view) input matrix with shape (M, K).
-        w: FP8 e4m3 (or uint8 view) weight matrix with shape (N, K) — internally
-           transposed to (K, N) before the kernel call.
-        x_scales: e8m0 (uint8) per-group scale for x with shape
-           (M, K // x_scale_group_size).
-        w_scales: e8m0 (uint8) per-block scale for w with shape (N // 128, K // 128).
-        dtype: Output dtype (BF16 or FP16). Default bf16.
-        y: Optional pre-allocated output tensor with shape (M, N).
-        config: Optional kernel-tuning dict. If None uses defaults.
-        x_scale_group_size: K elements per activation scale — 128 for blockscale
-           activations (default), 32 for MX activations.
-        is_x_scale_transposed: x_scales bytes are column-major, i.e. logically
-           (K // group, M). Default False (row-major).
+    Activation scales cover 1x32 or 1x128 elements. ``w_scale_group_size``
+    specifies (N, K) elements per weight scale: (1, 32), (32, 32), or
+    (128, 128). Scale tensors have shapes (M, K / activation group) and
+    (ceil(N / weight N group), K / weight K group). Byte views are accepted.
 
-    Returns:
-        torch.Tensor: Output with shape (M, N).
+    Config files select ordinary or ``packed`` K-panel execution, N_FIRST
+    traversal, NUM_KSPLIT, and FUSED_SPLITK. Each scale layout has a separate
+    config family. An explicit ``split_k`` overrides the configured count;
+    partitions are aligned to whole kernel steps. ``skip_reduce`` disables
+    fused reduction and returns FP32 partials when more than one split remains.
+    Packed execution and fused reduction require gfx950.
     """
+    assert x.ndim == w.ndim == 2, "Expected matrix operands"
     M, K = x.shape
     N, K_w = w.shape
-    assert K == K_w, f"K mismatch: x has K={K}, w has K={K_w}"
+    assert K == K_w and K > 0 and N > 0, "Expected matching positive K and positive N"
+    w_scale_group_size = tuple(w_scale_group_size)
+    assert w_scale_group_size in ((1, 32), (32, 32), (128, 128))
+    group_n, group_k = w_scale_group_size
+    assert K % group_k == 0, "K must be divisible by the weight scale K group"
     stride_asm, stride_ask = _resolve_x_scale_strides(
         x_scales, M, K, x_scale_group_size, is_x_scale_transposed
     )
-
-    # Transpose w to (K, N) for the kernel.
-    w_t = w.T
-
-    # tl.dot_scaled with format "e4m3" expects uint8-typed operands; reinterpret
-    # the FP8 buffers as uint8 (bit-identical view).
-    if x.dtype != torch.uint8:
-        x = x.view(torch.uint8)
-    if w_t.dtype != torch.uint8:
-        w_t = w_t.view(torch.uint8)
-
+    assert w_scales.ndim == 2 and tuple(w_scales.shape) == (
+        triton.cdiv(N, group_n),
+        K // group_k,
+    ), "Invalid weight scale shape"
+    assert x_scales.ndim == 2, "Expected matrix activation scales"
+    assert all(
+        t.dtype in (torch.uint8, torch.float8_e4m3fn) for t in (x, w)
+    ), "Operands must be E4M3 or byte views"
+    assert all(
+        t.dtype in (torch.uint8, torch.float8_e8m0fnu) for t in (x_scales, w_scales)
+    ), "Scales must be E8M0 or byte views"
+    assert all(
+        t.is_cuda and t.device == x.device for t in (x, w, x_scales, w_scales)
+    ), "Operands must share a GPU"
+    assert all(
+        all(s > 0 for s in t.stride()) for t in (x, w, x_scales, w_scales)
+    ), "Expected positive strides"
+    assert dtype in (torch.bfloat16, torch.float16, torch.float32)
+    assert split_k is None or (type(split_k) is int and split_k > 0)
+    if y is not None:
+        assert y.shape == (M, N) and y.dtype == dtype and y.device == x.device
+        assert all(s > 0 for s in y.stride())
+    if M == 0:
+        return y if y is not None else torch.empty((M, N), dtype=dtype, device=x.device)
     if config is None:
-        config, _ = _get_config(M, N, K)
-
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        config_name = "GEMM-AFP8WFP8"
+        if (x_scale_group_size, w_scale_group_size) != (128, (128, 128)):
+            config_name += f"_A{x_scale_group_size}_W{group_n}X{group_k}"
+        config, _ = _get_config(M, N, K, config_name=config_name)
+    # Never mutate a caller's config or a nested packed config.
+    config = copy.deepcopy(config)
+    packed = config.get("packed")
+    launch = config if packed is None else packed
+    block_m, block_n, block_k = (
+        launch[k] for k in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+    )
+    assert block_k >= 64 and block_k % 32 == 0
+    k_pack = 1 if packed is None else launch["K_PACK"]
+    if packed is not None:
+        assert k_pack in (1, 2, 4) and block_m * k_pack >= 16 and block_k >= 128
+    requested_splits = launch["NUM_KSPLIT"] if split_k is None else split_k
+    assert type(requested_splits) is int and requested_splits > 0
+    split_size, num_splits = _split_k_partition(K, requested_splits, block_k * k_pack)
+    fused = (
+        launch.get("FUSED_SPLITK", config["FUSED_SPLITK"])
+        and not skip_reduce
+        and num_splits > 1
+    )
+    if packed is not None or fused:
+        assert get_arch() == "gfx950", "Packed-K and fused split-K require gfx950"
+    if y is None and (num_splits == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
-    if config["NUM_KSPLIT"] > 1:
-        y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N),
-            dtype=torch.float32,
-            device=x.device,
+    grid_m, grid_n = triton.cdiv(M, block_m), triton.cdiv(N, block_n)
+    workspace = None
+    if fused:
+        workspace = _fused_workspace(y, grid_m * grid_n, num_splits, block_m, block_n)
+    if workspace is None:
+        out = (
+            y
+            if num_splits == 1
+            else torch.empty((num_splits, M, N), dtype=torch.float32, device=x.device)
+        )
+        partials = counters = out
+        fused_splits = 1
+        grid = (
+            (grid_m, grid_n, num_splits)
+            if packed is not None
+            else (grid_m * grid_n * num_splits,)
         )
     else:
-        y_pp = None
-
-    grid = lambda META: (
-        (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),
-    )
-
-    _gemm_afp8wfp8_kernel[grid](
-        x,
-        w_t,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scales,
-        w_scales,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w_t.stride(0),
-        w_t.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        stride_asm,
-        stride_ask,
-        w_scales.stride(0),
-        w_scales.stride(1),
-        A_SCALE_K_GROUP=x_scale_group_size,
-        **config,
-    )
-
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
-        REDUCE_BLOCK_SIZE_M = 32
-        REDUCE_BLOCK_SIZE_N = 32
-        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
-
-        grid_reduce = (
-            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
-            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        grid, partials, counters = workspace
+        out, fused_splits = y, num_splits
+    stride_ck = out.stride(0) if workspace is None and num_splits > 1 else 0
+    stride_cm, stride_cn = out.stride()[-2:]
+    # Native FP8 pointers preserve the compiler's efficient scaled-dot layouts.
+    # Byte pointers can inflate LDS allocation despite identical E4M3 bits.
+    x, w = x.view(torch.float8_e4m3fn), w.view(torch.float8_e4m3fn)
+    x_scales, w_scales = x_scales.view(torch.uint8), w_scales.view(torch.uint8)
+    launch_options = {
+        k: launch[k]
+        for k in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim")
+    }
+    scales = {
+        "A_SCALE_K_GROUP": x_scale_group_size,
+        "B_SCALE_N_GROUP": group_n,
+        "B_SCALE_K_GROUP": group_k,
+    }
+    if packed is not None:
+        # Native E4M3 pointers avoid the extra LDS conversion generated for
+        # byte operands in packed dot_scaled, while accepting public byte views.
+        _gemm_afp8wfp8_packed_kernel[grid](
+            x.view(torch.float8_e4m3fn),
+            w.view(torch.float8_e4m3fn),
+            x_scales,
+            w_scales,
+            out,
+            partials,
+            counters,
+            M,
+            N,
+            K,
+            block_m,
+            block_n,
+            block_k,
+            k_pack,
+            LAUNCH_OPTIONS=tuple(launch_options.items()),
+            SPLITK_BLOCK_SIZE=split_size,
+            NUM_KSPLIT=num_splits,
+            FUSED_SPLITS=fused_splits,
+            B_CACHE_MODIFIER=launch["cache_modifier"],
+            stride_am=x.stride(0),
+            stride_ak=x.stride(1),
+            stride_bn=w.stride(0),
+            stride_bk=w.stride(1),
+            stride_asm=stride_asm,
+            stride_ask=stride_ask,
+            stride_bsn=w_scales.stride(0),
+            stride_bsk=w_scales.stride(1),
+            stride_cm=stride_cm,
+            stride_cn=stride_cn,
+            stride_ck=stride_ck,
+            **scales,
+            **launch_options,
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
-            y_pp,
+    else:
+        _gemm_afp8wfp8_kernel[grid](
+            x,
+            w.T,
+            out,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(1),
+            w.stride(0),
+            stride_ck,
+            stride_cm,
+            stride_cn,
+            stride_asm,
+            stride_ask,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            GROUP_SIZE_M=config["GROUP_SIZE_M"],
+            NUM_KSPLIT=num_splits,
+            SPLITK_BLOCK_SIZE=split_size,
+            N_FIRST=config["N_FIRST"],
+            FUSED_SPLITS=fused_splits,
+            ws_ptr=partials,
+            cnt_ptr=counters,
+            cache_modifier=launch["cache_modifier"],
+            **scales,
+            **launch_options,
+        )
+    if workspace is None and num_splits > 1:
+        if skip_reduce:
+            return out
+        reduce_m, reduce_n = (
+            config["REDUCE_BLOCK_SIZE_M"],
+            config["REDUCE_BLOCK_SIZE_N"],
+        )
+        _gemm_splitk_reduce_kernel[
+            (triton.cdiv(M, reduce_m), triton.cdiv(N, reduce_n))
+        ](
+            out,
             y,
             None,
             M,
             N,
-            y_pp.stride(0),
-            y_pp.stride(1),
-            y_pp.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
             y.stride(0),
             y.stride(1),
-            BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
-            BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT=ACTUAL_KSPLIT,
-            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
+            BLOCK_SIZE_M=reduce_m,
+            BLOCK_SIZE_N=reduce_n,
+            ACTUAL_KSPLIT=num_splits,
+            MAX_KSPLIT=triton.next_power_of_2(num_splits),
             ADD_BIAS=False,
             activation=None,
             use_activation=False,
             KERNEL_NAME="_gemm_afp8wfp8_reduce_kernel",
         )
-
     return y
 
 
@@ -280,7 +415,9 @@ def gemm_afp8wfp8_preshuffle(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     if config is None:
-        config, _ = _get_config(M, N, K, shuffle=True, backend=backend)
+        config, _ = _get_config(
+            M, N, K, config_name="GEMM-AFP8WFP8_PRESHUFFLED", backend=backend
+        )
 
     # CTA-cluster (CGA) multicast, gluon only. CTAS_M x CTAS_N CTAs form one
     # cluster, and each operand fetch is multicast to every CTA in the cluster
