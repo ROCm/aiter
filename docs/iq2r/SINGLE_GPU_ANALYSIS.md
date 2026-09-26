@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## TP8 M256 isolated parity and real-weight qualification — E413–E414
+
+All eight selected TP8 comparison rows now beat their matched MXFP4 baselines. E413 closes M256 hot with 58.53 versus 61.32 us (4.5% faster), while preserving wins on spread and mixed using one fixed policy. Five of six compact TP4 rows beat baseline; TP4 M256 hot and dense gaps remain. This is isolated operator parity within the selected TP8 coverage, not complete TP8 coverage or serving parity.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 119.15 | 101.60 | -14.7% |
+| 8 | 128 | hot | 43.35 | 42.53 | -1.9% |
+| 8 | 256 | spread | 131.03 | 111.48 | -14.9% |
+| 8 | 256 | hot | 61.32 | 58.53 | -4.5% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 223.90 | 179.49 | -19.8% |
+| 4 | 256 | hot | 68.93 | 86.72 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 603.20 | 738.76 | +22.5% |
+| 4 | 4096 | hot | 501.69 | 612.41 | +22.1% |
+
+E413 passes 315 synthetic checks and all fresh-bookend rows remain within the unchanged 3% drift limit. The combined activation/codebook pipeline is 14.9% faster than MXFP4 on TP8 M256 spread, 4.5% faster on hot and 10.9% faster on mixed. It gives up some previous-control cold speed (6.1% spread, 4.2% mixed) to close hot parity with one policy. E414 then passes 1,440 exact real-weight checks on three layer/rank slices using the identical binary, including input/intermediate FP8/scales and final BF16. Whole-model quality and serving remain unqualified.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Activation and compiler scheduling follow-up — E408–E412
 
 The selected comparison is unchanged: seven of eight selected TP8 rows and five of six compact TP4 rows beat matched MXFP4. TP8 M256 hot remains 0.9% behind, TP4 M256 hot 25.8% behind, and dense TP4 M4096 about 22% behind. Complete isolated and serving parity remain unmet.
@@ -1150,6 +1194,9 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E410 | Remove unnecessary M16 other-slot drain; compiler inserts a later wait and complete latency is unchanged. Bounded K loop reduces registers 126 to 108 but regresses. All 378 checks pass. |
 | E411 | Ordinary compiler-visible LDS loads make two-word cross-K dependencies trackable. M16 gains 1.1% hot with effectively unchanged cold timing; M32 loses. All 378 checks pass. |
 | E412 | Combine activation staging and compiler-visible codebook loads. No-drain form reaches 83.05 us hot against 68.93 us MXFP4, with cold regressions against E400. All 441 checks pass; retain for TP8 transfer, no TP4 broad promotion. |
+
+| E413 | TP8 M256 activation/codebook overlap beats matched MXFP4 on spread/hot/mixed by 14.9/4.6/10.9%, with 315 exact synthetic checks and stable fresh bookends. Trades previous cold speed for one policy that closes tested hot parity. |
+| E414 | The unchanged E413 binary passes 1,440 real-weight graph/eager checks across three TP8 layer/rank slices, five patterns and eight changes. No whole-model or serving claim. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

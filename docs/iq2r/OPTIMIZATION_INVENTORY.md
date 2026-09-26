@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E412. Related scouts,
+attempts from the initial GLM integration through E414. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E412
+## Isolated single-GPU optimization, E199–E414
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -242,6 +242,12 @@ single-GPU report. Serving sweeps remain paused.
 | E410 | Remove unnecessary M16 other-slot drain; compiler inserts a later wait and complete latency is unchanged. Bounded K loop reduces registers 126 to 108 but regresses. All 378 checks pass. |
 | E411 | Ordinary compiler-visible LDS loads make two-word cross-K dependencies trackable. M16 gains 1.1% hot with effectively unchanged cold timing; M32 loses. All 378 checks pass. |
 | E412 | Combine activation staging and compiler-visible codebook loads. No-drain form reaches 83.05 us hot against 68.93 us MXFP4, with cold regressions against E400. All 441 checks pass; retain for TP8 transfer, no TP4 broad promotion. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E413 | TP8 M256 activation/codebook overlap beats matched MXFP4 on spread/hot/mixed by 14.9/4.6/10.9%, with 315 exact synthetic checks and stable fresh bookends. Trades previous cold speed for one policy that closes tested hot parity. |
+| E414 | The unchanged E413 binary passes 1,440 real-weight graph/eager checks across three TP8 layer/rank slices, five patterns and eight changes. No whole-model or serving claim. |
 
 
 ## How to read the outcomes
