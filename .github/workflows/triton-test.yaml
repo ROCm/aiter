@@ -4,33 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    # labeled: re-run when adding ci:triton-300x to start extra MI300X jobs
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    # Selection skips unrelated changes; the result check is reported for every PR.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches: [main]
-    paths:
-      - "aiter/ops/triton/**"
-      - "op_tests/triton_tests/**"
-      - "op_tests/op_benchmarks/triton/**"
-      - ".github/scripts/build_aiter_triton.sh"
-      - ".github/scripts/download_triton_wheel.sh"
-      - ".github/scripts/install_triton.sh"
-      - ".github/scripts/select_triton_tests.py"
-      - ".github/scripts/split_tests.sh"
-      - ".github/scripts/verify_triton_pin.py"
-      - ".github/requirements/triton-test.txt"
-      # Docs-only changes (README.md, configs/CLAUDE.md, conv/DESIGN.md, ...)
-      # don't affect test results — skip the test suites when a PR touches
-      # nothing else.
-      - "!**/*.md"
-      - '!docs/**'
-      - '!LICENSE'
-      - '!.gitignore'
-      - '!.github/workflows/**'
-      - '!.github/scripts/sglang_downstream.py'
-      # Re-include Triton workflow files after the broad workflow exclusion.
-      - ".github/workflows/triton-test.yaml"
-      - ".github/workflows/prepare-triton-wheel.yaml"
-      - ".github/workflows/ci-config.yaml"
   workflow_dispatch:
 
 concurrency:
@@ -39,11 +15,13 @@ concurrency:
 
 jobs:
   ci_config:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    needs: [split_triton_tests]
+    if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
     uses: ./.github/workflows/ci-config.yaml
 
   check-signal:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    needs: [split_triton_tests]
+    if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -57,17 +35,35 @@ jobs:
 
   # Step 1: split triton tests into 8 shards, output triton_shard_0.list ... triton_shard_7.list
   split_triton_tests:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
-    needs: [check-signal]
     outputs:
       shard_count: 8
+      selected_count: ${{ steps.select.outputs.selected_count }}
+      needs_mi300x: ${{ steps.select.outputs.needs_mi300x == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:triton-300x') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Compare the event's merge commit with its base parent.
+          fetch-depth: 2
+
+      - name: Select Triton tests from PR diff
+        id: select
+        env:
+          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-full') }}
+        run: |
+          set -ex
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FULL_LABEL" != "true" ]; then
+            python3 .github/scripts/select_triton_tests.py \
+              --merge-ref HEAD --output selected_triton_tests.list
+          else
+            python3 .github/scripts/select_triton_tests.py \
+              --all --output selected_triton_tests.list
+          fi
 
       - name: Split Triton Tests (8 shards)
-        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton
+        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton --select-file selected_triton_tests.list
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
@@ -77,8 +73,8 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
-    needs: [check-signal, ci_config]
+    if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
+    needs: [split_triton_tests, check-signal, ci_config]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
       docker-image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
@@ -87,7 +83,7 @@ jobs:
 
   # Step 2: MI35X matrix jobs
   triton:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 60
@@ -248,35 +244,17 @@ jobs:
           echo "Setting up Aiter and Triton..."
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
-      # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
-      #       command to enable test selection.
-      # - name: Triton Test Selection Script
-      #   # main branch should always run the full test suite.
-      #   if: ${{ github.ref != 'refs/heads/main' }}
-      #   run: |
-      #     set -ex
-      #     git fetch --no-tags origin --depth=1 \
-      #       "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
-      #     git fetch --no-tags origin --depth=1 \
-      #       "refs/heads/${{ github.event.pull_request.base.ref }}:target"
-      #     ENV_FILE=$(docker exec -w /workspace triton_test \
-      #       mktemp /workspace/github_env.XXXXXXXXXX.tmp)
-      #     docker exec -w /workspace triton_test \
-      #       git config --global --add safe.directory /workspace
-      #     docker exec -w /workspace triton_test \
-      #       python .github/scripts/select_triton_tests.py \
-      #         --source pr-merge --target target \
-      #         --env-var TRITON_TEST --env-file "${ENV_FILE}"
-      #     # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
-      #     docker exec -w /workspace triton_test rm "${ENV_FILE}"
-
       - name: Triton Tests
         run: |
           set -exo pipefail
           echo "Running Triton Tests..."
           mkdir -p test-reports
           docker exec -w /workspace triton_test mkdir -p test-reports
-          # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
+          if [ -z "$TRITON_TEST" ]; then
+            echo "No tests selected for this shard."
+            echo '<testsuites/>' > test-reports/triton.xml
+            exit 0
+          fi
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
           docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
             --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
@@ -310,9 +288,9 @@ jobs:
         run: |
           docker rm -f triton_test || true
 
-  # Step 2b: MI300X matrix jobs (opt-in via ci:triton-300x on PRs, always on main)
+  # MI300X runs for gfx942 changes, an explicit label, or --all.
   triton-mi300x:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
+    if: ${{ needs.split_triton_tests.outputs.selected_count != '0' && needs.split_triton_tests.outputs.needs_mi300x == 'true' }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-oci-mi300x-1
     timeout-minutes: 60
@@ -427,6 +405,11 @@ jobs:
           echo "Running Triton Tests..."
           mkdir -p test-reports
           docker exec -w /workspace triton_test mkdir -p test-reports
+          if [ -z "$TRITON_TEST" ]; then
+            echo "No tests selected for this shard."
+            echo '<testsuites/>' > test-reports/triton.xml
+            exit 0
+          fi
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
           docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
             --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
@@ -460,65 +443,32 @@ jobs:
         run: |
           docker rm -f triton_test || true
 
-  triton-mi300x-test-finish:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
-    name: Triton MI300X Test Results
-    runs-on: ubuntu-latest
-    needs: [triton-mi300x]
-    steps:
-      - name: Download all MI300X test reports
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        with:
-          pattern: triton-test-mi300x-shard-*
-          path: .
-
-      - name: Check Triton MI300X Test Results
-        run: |
-          set -ex
-          echo "Checking Triton MI300X Test Results..."
-          all_passed=true
-          for shard in {0..7}; do
-            if [ ! -f triton-test-mi300x-shard-${shard}/triton.xml ]; then
-              echo "MI300X test report for shard ${shard} not found."
-              all_passed=false
-              break
-            fi
-          done
-          if [ "$all_passed" = true ]; then
-            echo "All MI300X tests passed."
-          else
-            echo "MI300X test failures or errors detected."
-            exit 1
-          fi
-
   triton-test-finish:
-    if: ${{ (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Triton Test Results
+    if: always()
     runs-on: ubuntu-latest
-    needs: [triton]
+    needs: [split_triton_tests, triton, triton-mi300x]
     steps:
-      - name: Download all test reports
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        with:
-          pattern: triton-test-shard-*
-          path: .
-      - name: Check Triton Test Results
+      - name: Check required Triton jobs
+        env:
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          SELECTION_RESULT: ${{ needs.split_triton_tests.result }}
+          SELECTED_COUNT: ${{ needs.split_triton_tests.outputs.selected_count }}
+          NEEDS_MI300X: ${{ needs.split_triton_tests.outputs.needs_mi300x }}
+          MI35X_RESULT: ${{ needs.triton.result }}
+          MI300X_RESULT: ${{ needs.triton-mi300x.result }}
         run: |
-          set -ex
-          echo "Checking Triton Test Results..."
-          all_passed=true
-          for shard in {0..7}; do
-            if [ ! -f triton-test-shard-${shard}/triton.xml ]; then
-              echo "Test report for shard ${shard} not found."
-              all_passed=false
-              break
-            fi
-          done
-          if [ "$all_passed" = true ]; then
-            echo "All tests passed."
-          else
-            echo "Test failures or errors detected."
-            exit 1
+          set -euo pipefail
+          if [ "$PR_DRAFT" = true ]; then
+            echo "Draft PR; tests are deferred until ready for review."
+            exit 0
+          fi
+          test "$SELECTION_RESULT" = success
+          if [ "$SELECTED_COUNT" = 0 ]; then
+            echo "No Triton/Gluon tests required for this change."
+            exit 0
+          fi
+          test "$MI35X_RESULT" = success
+          if [ "$NEEDS_MI300X" = true ]; then
+            test "$MI300X_RESULT" = success
           fi
