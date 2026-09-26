@@ -26,22 +26,25 @@ Cross-format model quality is not established by synthetic tensors.
 
 ## Current measured position
 
-TP8 uses E243 gate (two-iteration unroll, single scale byte, padded-row MFMA),
-E235 ordered E220 down, and E209 reduction. TP4 uses E244 gate with E252 M64 down, which processes all three output
-atoms and fully unrolls its four K128 iterations. Both include
-eight-XCD ordering and groups of four tasks. Each row averages two clean
-bookends from E243 r2 or E252 r2. Further qualification is required; neither is integrated.
+TP8 uses E261 and TP4 uses E262: adjacent9-bit index packing, exact static
+normalization of codebook signs, and an M32 down tile. At1024 tokens down and
+reduction use one column batch; at4096 they use two interleaved batches. Original
+reference weights have signed codebooks, and candidate transformations retain
+all decoded FP8 bytes and storage sizes. This is a synthetic fixture change
+from earlier positive-book tables, with matched references within every run.
+Each row averages complete E261 r3 or E262 r2 clean bookends. Neither candidate
+is integrated; the shape policy needs wider qualification.
 
 | TP | Tokens | Routes | MXFP4 µs | IQ2R candidate µs | IQ2R latency overhead |
 |---:|---:|:---|---:|---:|---:|
-|8|1024|spread|213.21|223.90|+5.0%|
-|8|1024|hot|125.21|160.35|+28.1%|
-|8|4096|spread|460.16|581.43|+26.4%|
-|8|4096|hot|391.91|487.22|+24.3%|
-|4|1024|spread|295.04|341.25|+15.7%|
-|4|1024|hot|190.48|222.25|+16.7%|
-|4|4096|spread|610.35|904.01|+48.1%|
-|4|4096|hot|505.20|742.14|+46.9%|
+|8|1024|spread|213.38|215.14|+0.8%|
+|8|1024|hot|124.76|143.96|+15.4%|
+|8|4096|spread|452.02|518.98|+14.8%|
+|8|4096|hot|395.27|441.25|+11.6%|
+|4|1024|spread|294.69|323.04|+9.6%|
+|4|1024|hot|190.81|212.45|+11.3%|
+|4|4096|spread|606.06|817.97|+35.0%|
+|4|4096|hot|500.69|678.25|+35.5%|
 
 No automatic route-pattern selector is qualified. Original TP4 dense samples
 have unresolved intermittent outliers and are not a qualified denominator.
@@ -180,7 +183,18 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 |E253|Store/reduce the BF16 route buffer in column-tile-major order without a transpose. Exact, no consistent gain; not selected.|
 |E254|Precompute 16-bit codebook offsets and final scale bytes in static gate records. Exact representation, 3.25 rather than 2.25 bits/weight excluding codebook. Exact; about4% fewer gate VALU instructions but more traffic and a large M1024 spread regression. Unselected.|
 
+|E255|Independent M32 tasks with current ordering. Exact and lower register pressure, but hot/4096-token regressions outweigh a small M1024 spread gain. Unselected.|
+|E256|Separate low/high LDS codebook planes and three-dword entries. Exact, zero scratch; both layouts are slower in all four shapes. Unselected.|
+|E257|Reduce a token/N384 tile on ninth-producer arrival. Exact and zero scratch, but synchronization/reduction costs cause a large regression. Rejected.|
 
+|E258|Interleave down and ordered reduction in two column batches. Improves4096-token cases; more batches and1024-token cases regress. Reduction DRAM counters do not explain the gain.|
+|E259|Combine sign masking/insertion for nonnegative codebooks; exact static normalization supports signed books without storage growth. Modest gate gains; CPU byte-reference checks pass.|
+|E260|Pack four adjacent9-bit indices in the same low32/high4 fields, eliminating most index reconstruction. Exact and unchanged payload size; combined gate/down gains.|
+|E261|Combine normalized signs, packed indices and one/two column batches at TP8. Signed-book whole-MoE checks pass; gate VALU drops22% at4096 spread. Delaying both reductions until after both down chunks loses the gain.|
+|E262|Adapt packing, normalized signs and column batches to TP4. M32 down becomes preferable in these tests. Exact, faster than E252; substantial dense gap remains.|
+|E263|Read codebooks through global memory without LDS staging. Exact, much slower in every tested shape; rejected.|
+|E264|N-atom LDS lookahead with unroll1/2 and compiler scheduling barriers. Exact, but r2 gains are small/mixed and registers increase; no broad selection.|
+|E265|In progress: M64/N32-per-wave gate with packed indices/signs, buffered activations, weight lookahead and current ordering. Test lower accumulator state at four/eight waves and two grid sizes.|
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

@@ -1,148 +1,156 @@
 {
-  "scope": "Local synthetic TP-rank MoE boundary, microseconds. Not ATOM benchmark_serving. Dense candidates remain isolated. E225 restores the previously selected static frontend.",
+  "scope": "Local synthetic TP-rank MoE boundary, microseconds. Not ATOM benchmark_serving. E261/E262 remain isolated.",
   "rows": [
     {
       "tp": 8,
       "tokens": 1024,
       "routes": "spread",
-      "mxfp4_us": 213.21197748184204,
-      "iq2r_us": 223.8961935043335,
-      "latency_overhead_percent": 5.011076839433826,
-      "arm": "iq2r_extunroll2xcd",
-      "experiment": "e243",
+      "mxfp4_us": 213.3760929107666,
+      "iq2r_us": 215.14447927474976,
+      "latency_overhead_percent": 0.8287649941751907,
+      "arm": "iq2r_extpackedchunk0",
+      "experiment": "e261",
+      "revision": 3,
       "clean_mxfp4_us": [
-        212.12422847747803,
-        214.29972648620605
+        217.88599491119385,
+        208.86619091033936
       ],
       "clean_iq2r_us": [
-        224.13830757141113,
-        223.65407943725586
+        218.357515335083,
+        211.9314432144165
       ]
     },
     {
       "tp": 8,
       "tokens": 1024,
       "routes": "hot",
-      "mxfp4_us": 125.21414160728455,
-      "iq2r_us": 160.34979224205017,
-      "latency_overhead_percent": 28.06044923021822,
-      "arm": "iq2r_extunroll2xcd",
-      "experiment": "e243",
+      "mxfp4_us": 124.75887537002563,
+      "iq2r_us": 143.95752549171448,
+      "latency_overhead_percent": 15.388604670206485,
+      "arm": "iq2r_extpackedchunk0",
+      "experiment": "e261",
+      "revision": 3,
       "clean_mxfp4_us": [
-        123.7260103225708,
-        126.70227289199829
+        127.82328128814697,
+        121.6944694519043
       ],
       "clean_iq2r_us": [
-        160.81379652023315,
-        159.8857879638672
+        147.07841873168945,
+        140.8366322517395
       ]
     },
     {
       "tp": 8,
       "tokens": 4096,
       "routes": "spread",
-      "mxfp4_us": 460.16149520874023,
-      "iq2r_us": 581.4263343811035,
-      "latency_overhead_percent": 26.352669755072533,
-      "arm": "iq2r_extunroll2xcd",
-      "experiment": "e243",
+      "mxfp4_us": 452.0240306854248,
+      "iq2r_us": 518.9839601516724,
+      "latency_overhead_percent": 14.813356131689082,
+      "arm": "iq2r_extpackedchunk1",
+      "experiment": "e261",
+      "revision": 3,
       "clean_mxfp4_us": [
-        458.49900245666504,
-        461.82398796081543
+        451.88817977905273,
+        452.1598815917969
       ],
       "clean_iq2r_us": [
-        581.2749862670898,
-        581.5776824951172
+        525.440502166748,
+        512.5274181365967
       ]
     },
     {
       "tp": 8,
       "tokens": 4096,
       "routes": "hot",
-      "mxfp4_us": 391.906201839447,
-      "iq2r_us": 487.2181177139282,
-      "latency_overhead_percent": 24.32008358814588,
-      "arm": "iq2r_extunroll2xcd",
-      "experiment": "e243",
+      "mxfp4_us": 395.27233839035034,
+      "iq2r_us": 441.2540674209595,
+      "latency_overhead_percent": 11.632923573113786,
+      "arm": "iq2r_extpackedchunk1",
+      "experiment": "e261",
+      "revision": 3,
       "clean_mxfp4_us": [
-        385.4761600494385,
-        398.33624362945557
+        395.6324815750122,
+        394.9121952056885
       ],
       "clean_iq2r_us": [
-        487.6180171966553,
-        486.8182182312012
+        450.12965202331543,
+        432.3784828186035
       ]
     },
     {
       "tp": 4,
       "tokens": 1024,
       "routes": "spread",
-      "mxfp4_us": 295.0411915779114,
-      "iq2r_us": 341.2510633468628,
-      "latency_overhead_percent": 15.662176363176993,
-      "arm": "iq2r_extpipe4unrollm4b3u4",
-      "experiment": "e252",
+      "mxfp4_us": 294.68719959259033,
+      "iq2r_us": 323.04190397262573,
+      "latency_overhead_percent": 9.62196675635596,
+      "arm": "iq2r_extpackedtp4chunk3",
+      "experiment": "e262",
+      "revision": 2,
       "clean_mxfp4_us": [
-        291.9297933578491,
-        298.15258979797363
+        297.3090887069702,
+        292.06531047821045
       ],
       "clean_iq2r_us": [
-        336.6888761520386,
-        345.813250541687
+        326.17454528808594,
+        319.9092626571655
       ]
     },
     {
       "tp": 4,
       "tokens": 1024,
       "routes": "hot",
-      "mxfp4_us": 190.48089385032654,
-      "iq2r_us": 222.2476363182068,
-      "latency_overhead_percent": 16.677127992081697,
-      "arm": "iq2r_extpipe4unrollm4b3u4",
-      "experiment": "e252",
+      "mxfp4_us": 190.80650210380554,
+      "iq2r_us": 212.45168447494507,
+      "latency_overhead_percent": 11.344048621238167,
+      "arm": "iq2r_extpackedtp4chunk3",
+      "experiment": "e262",
+      "revision": 2,
       "clean_mxfp4_us": [
-        188.41474056243896,
-        192.5470471382141
+        193.1797742843628,
+        188.4332299232483
       ],
       "clean_iq2r_us": [
-        218.38698387145996,
-        226.1082887649536
+        216.9527292251587,
+        207.95063972473145
       ]
     },
     {
       "tp": 4,
       "tokens": 4096,
       "routes": "spread",
-      "mxfp4_us": 610.3458881378174,
-      "iq2r_us": 904.0130138397217,
-      "latency_overhead_percent": 48.11486919292454,
-      "arm": "iq2r_extpipe4unrollm4b3u4",
-      "experiment": "e252",
+      "mxfp4_us": 606.0553073883057,
+      "iq2r_us": 817.9749488830566,
+      "latency_overhead_percent": 34.96704655685359,
+      "arm": "iq2r_extpackedtp4chunk4",
+      "experiment": "e262",
+      "revision": 2,
       "clean_mxfp4_us": [
-        610.0428581237793,
-        610.6489181518555
+        611.9898796081543,
+        600.120735168457
       ],
       "clean_iq2r_us": [
-        901.07421875,
-        906.9518089294434
+        824.9432563781738,
+        811.0066413879395
       ]
     },
     {
       "tp": 4,
       "tokens": 4096,
       "routes": "hot",
-      "mxfp4_us": 505.1966667175293,
-      "iq2r_us": 742.141580581665,
-      "latency_overhead_percent": 46.90151964059153,
-      "arm": "iq2r_extpipe4unrollm4b3u4",
-      "experiment": "e252",
+      "mxfp4_us": 500.69496631622314,
+      "iq2r_us": 678.2488822937012,
+      "latency_overhead_percent": 35.4614941076401,
+      "arm": "iq2r_extpackedtp4chunk4",
+      "experiment": "e262",
+      "revision": 2,
       "clean_mxfp4_us": [
-        509.8622798919678,
-        500.5310535430908
+        504.02674674987793,
+        497.36318588256836
       ],
       "clean_iq2r_us": [
-        744.1089153289795,
-        740.1742458343506
+        684.4914436340332,
+        672.0063209533691
       ]
     }
   ]

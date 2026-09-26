@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E254. Related scouts,
+attempts from the initial GLM integration through E265. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,14 +19,25 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E254
+## Isolated single-GPU optimization, E199–E265
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
-The [single-GPU report](SINGLE_GPU_ANALYSIS.md), [numeric results](SINGLE_GPU_RESULTS.json)
-and [evidence index](SINGLE_GPU_EVIDENCE.json) track all attempts. E243 gate with E235 down and E209 reduction leads TP8; E244 gate with E252 down leads TP4. Both remain
-behind MXFP4 and isolated. E225 restores the previously selected E167 C4/C8
-frontend omitted from consolidated source; dispatch/correctness tests passed.
-The report lists all attempts through E254, including rejected decode sharing, sign tables, predecode, tiled route-output and last-producer-reduction trials. Serving results are unchanged.
+The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
+E261 at TP8 and E262 at TP4 combine adjacent9-bit index packing, exact
+codebook-sign normalization and larger-token column batches. Stored payload
+sizes and decoded FP8 weights are unchanged. Both improve their prior isolated
+controls and remain behind MXFP4. E225's static-frontend restoration remains
+the only production change from this isolated phase.
+
+E255 independent M32 gate tasks, E256 alternate LDS codebook layouts, E257
+per-token completion counters and E263 direct global codebook reads were
+unselected or rejected. E258 established a useful two-batch down/reduction
+order at4096 tokens. E259/E260 reduce sign/index instructions; E261 confirms
+signed-book exactness and shows that deferring reductions loses the batching
+gain. E264 N-atom lookahead is exact but has small mixed gains; no broad selection.
+E265 tests M64/N32 gate geometry with the current packed decoder and pipeline. Earlier attempts and numerical-reference limitations remain in the
+single-GPU report. Serving sweeps remain paused.
+
 
 ## How to read the outcomes
 
