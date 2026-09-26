@@ -11,6 +11,7 @@ The per-family loaders build on this module and keep their own files:
 """
 
 import functools
+import itertools
 import json
 import os
 import re
@@ -150,3 +151,71 @@ def resolve_config_dir(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
     return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
+
+
+def _axis_of(component: str) -> str:
+    """``M_LEQ_32`` -> ``M``."""
+    return component.split("_", 1)[0]
+
+
+def _bound_of(component: str) -> int:
+    return int(component.rsplit("_", 1)[1])
+
+
+def _candidates(axis: str, value, parts: set) -> list:
+    """Components of ``axis`` matching ``value``, most specific first: LEQ
+    bounds ascending, then GEQ bounds descending, then ``"any"``."""
+    leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound_of)
+    geq = sorted(
+        (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound_of, reverse=True
+    )
+    return (
+        [c for c in leq if value <= _bound_of(c)]
+        + [c for c in geq if value >= _bound_of(c)]
+        + ["any"]
+    )
+
+
+def _canonical(key: str, axes: tuple) -> tuple:
+    """Expand a bucket key to one slot per axis, ``"any"`` where it says nothing."""
+    slot = dict.fromkeys(axes, "any")
+    if key != "any":
+        for part in key.split("."):
+            slot[_axis_of(part)] = part
+    return tuple(slot[a] for a in axes)
+
+
+@functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
+def _bucket_index(keys: tuple, axes: tuple) -> tuple:
+    """Build ``(slots -> key, LEQ/GEQ components declared per axis)``, cached
+    on the key names (all it depends on)."""
+    parts = {a: set() for a in axes}
+    for key in keys:
+        if key != "any":
+            for part in key.split("."):
+                parts[_axis_of(part)].add(part)
+    return {_canonical(k, axes): k for k in keys}, parts
+
+
+def lookup_config(table: dict, axes: tuple, **values) -> dict:
+    """Resolve a launch config from a flat table keyed by composite bucket
+    keys, e.g. ``{"M_LEQ_32": {...}, "M_GEQ_33.N_LEQ_1024": {...}, "any": {...}}``.
+    Each key lists only the axes that matter for that bucket, joined by '.';
+    a bucket's value is a complete config, not a patch on a default -- exactly
+    one bucket wins, so there is no rule-stacking to replay.
+
+    Axes are matched in the order given by ``axes`` (the leftmost wins when
+    more than one key could apply): for each axis, candidates are tried LEQ
+    bounds ascending, then GEQ bounds descending, then the shared ``"any"``
+    fallback -- every table needs one. Returns a fresh, mutable dict.
+    """
+    index, parts = _bucket_index(tuple(table), axes)
+    per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]
+    for slots in itertools.product(*per_axis):
+        if slots in index:
+            return dict(table[index[slots]])
+    raise KeyError(
+        "no entry for "
+        + " ".join(f"{a}={values[a]!r}" for a in axes)
+        + f"; every table needs an 'any' entry (keys: {sorted(table)[:8]})"
+    )

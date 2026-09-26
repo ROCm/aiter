@@ -164,11 +164,8 @@ def _mxfp4_quant_op(
     USE_ASM: tl.constexpr = False,
 ):
     """
-    Converts given x (in fp32) to mxfp4 format.
-    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
-    SCALING_MODE: 0 is "even" (_mxfp4_scale_from_amax), 1 is "ceil"
-    (_mxfp4_ceil_scale_from_amax).
-    USE_ASM: see _mxfp4_pack_op.
+    Converts given x (in its native load dtype, e.g. bf16) to mxfp4 format.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
     """
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
@@ -606,12 +603,10 @@ def _dynamic_mxfp4_quant_kernel(
             )
         else:
             if EVEN_M_N:
-                x = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+                x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
             else:
                 x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-                x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
-                    tl.float32
-                )
+                x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg")
 
             out_tensor, bs_e8m0 = _mxfp4_quant_op(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
