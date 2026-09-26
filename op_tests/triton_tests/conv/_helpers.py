@@ -30,6 +30,10 @@ Public surface:
 - ``COMMON_SHAPES``, ``get_edge_case_shapes()``
     Shared shape data — 3x3 stride-1 shapes routable by every kernel,
     and the 12-shape edge-case list respectively.
+
+- ``assert_weight_pack_cache_clear_is_scoped(...)``
+    Shared setup and assertions for the dimension-specific Conv2D and Conv3D
+    weight-pack cache-clear tests.
 """
 
 import random
@@ -43,6 +47,7 @@ import torch.nn.functional as F
 from aiter.ops.triton.conv._utils import (
     _is_1x1_conv,
     _is_3x3_conv,
+    _is_winograd_2d_eligible,
     _out_hw,
 )
 from aiter.ops.triton.conv.conv2d import (
@@ -55,6 +60,47 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3_cblocked,
 )
 from aiter.ops.triton.utils.conv_config_utils import has_conv_config
+
+CONV2D_WEIGHT_PACK_CACHE_NAMES = (
+    "_PACK_CACHE",
+    "_PACK_CACHE_3x3",
+    "_PACK_CACHE_WINOGRAD_F4X3",
+)
+CONV3D_WEIGHT_PACK_CACHE_NAMES = (
+    "_PACK_CACHE_3D_GENERAL",
+    "_PACK_CACHE_3D_3X3X3",
+    "_PACK_CACHE_3D_WINOGRAD_HW",
+)
+_ALL_WEIGHT_PACK_CACHE_NAMES = (
+    *CONV2D_WEIGHT_PACK_CACHE_NAMES,
+    *CONV3D_WEIGHT_PACK_CACHE_NAMES,
+)
+
+
+def assert_weight_pack_cache_clear_is_scoped(
+    monkeypatch,
+    prepack_module,
+    clear_caches,
+    cleared_names,
+):
+    preserved_names = tuple(
+        name for name in _ALL_WEIGHT_PACK_CACHE_NAMES if name not in cleared_names
+    )
+    caches = {}
+    for name in (*cleared_names, *preserved_names):
+        cache = prepack_module._LRUPackCache(maxsize=1)
+        cache.put(name, object(), object())
+        monkeypatch.setattr(prepack_module, name, cache)
+        caches[name] = cache
+
+    clear_caches()
+
+    assert all(
+        not caches[name]._d for name in cleared_names
+    ), f"expected caches to be cleared: {cleared_names}"
+    assert all(
+        caches[name]._d for name in preserved_names
+    ), f"expected caches to be preserved: {preserved_names}"
 
 
 def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):
@@ -135,13 +181,6 @@ def _direct_3x3_guard(R, S, stride, dilation, C):
     return _is_3x3_conv(R, S) and has_conv_config("CONV-3X3-NCHW")
 
 
-def _wino_guard(R, S, stride, dilation, C):
-    # _is_winograd_eligible signature varies by upstream — keep the flag tight
-    from aiter.ops.triton.conv._utils import _is_winograd_eligible
-
-    return _is_winograd_eligible(R, S, stride, dilation, C)
-
-
 METHOD_REGISTRY = {
     "default": MethodEntry(conv2d_nchw, None, False, "", "default"),
     "direct": MethodEntry(
@@ -151,11 +190,15 @@ METHOD_REGISTRY = {
         conv2d_nchw_cblocked, _3x3_guard, False, "[cblocked]", "cblocked"
     ),
     "winograd_f4x3": MethodEntry(
-        conv2d_winograd_f4x3, _wino_guard, True, "[winograd_f4x3]", "WF(4,3)"
+        conv2d_winograd_f4x3,
+        _is_winograd_2d_eligible,
+        True,
+        "[winograd_f4x3]",
+        "WF(4,3)",
     ),
     "winograd_f4x3_cblocked": MethodEntry(
         conv2d_winograd_f4x3_cblocked,
-        _wino_guard,
+        _is_winograd_2d_eligible,
         True,
         "[winograd_f4x3_cblocked]",
         "WF4cb",
