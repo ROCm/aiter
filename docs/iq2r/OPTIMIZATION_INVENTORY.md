@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E353. Related scouts,
+attempts from the initial GLM integration through E364. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E353
+## Isolated single-GPU optimization, E199–E364
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -143,6 +143,21 @@ single-GPU report. Serving sweeps remain paused.
 | E351 | Two-read dense gate lookahead holds static allocation at256 registers. All420 checks and all timing rows pass. Improves E345 control by0.3–1.2%, with occupancy retained and DRAM essentially unchanged; still4.5–27.4% behind MXFP4. |
 | E352 | Compact TP8 codebook schedule ablation: all504 checks and timing rows pass. Four-read lookahead is fastest across all four cases, saving0.7–2.5% versus control. Spread wins; M128/M256 hot remain0.6%/4.5% slower than MXFP4. LDS waits rise slightly, so this is not a fewer-LDS-waits claim. |
 | E353 | Replace TP4 down shared activation cache with direct register loads, M32/M64 and optional one-K128 activation lookahead. All588 checks and timing rows pass, but every variant loses. Global-read instruction count rises sharply while physical DRAM bytes change modestly; rejected. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E354 | Widen batched route reduction to vector8/batch3. Exact; reduces metadata shuffles, global reads and VALU instructions. Retained, with small TP8 full-block gains; hot parity remains open. |
+| E355 | Cache activations cooperatively and reuse each K128 fragment across four output atoms. M64 without extra lookahead improves dense TP4; M64 lookahead crosses 256 registers and loses. All 588 exact checks pass. |
+| E356 | Apply four-read codebook lookahead to compact TP4. All 504 checks pass and all four M64/M128 spread/hot rows beat fresh MXFP4. |
+| E357 | Frozen E354 TP8 expanded correctness/native qualification:1152 exact checks across M32/M64/M128/M256, four routing patterns, new seed and eight input/route changes. |
+| E358 | Reuse the dense activation/weight pipeline at M32 TP8. Exact, but no broad gain; both hot timing rows exceed 3% drift. Lower traffic and waits do not compensate for low useful workgroup occupancy. |
+| E359 | MFMA32 with bounded current/next K128 records passes 672 exact checks and stable timing, but every variant loses to E355. More VALU and global-read instructions offset wider matrix instructions. |
+| E360 | Frozen E356 TP4 expanded correctness/native qualification:576 exact checks at M64/M128 with spread/hot/skew/mixed routes and eight input changes. |
+| E361 | Qualify frozen E354/E356 on three real layer/rank weight slices at TP8 and TP4: 6480 exact checks. capture_tiled repeats saved M4/M8 rows; remaining patterns use generated inputs. Operator correctness only. |
+| E362 | Enable XCD remapping at M256 with grid multiplier2. Both patterns improve, all 336 exact checks pass; hot falls to 64.71us versus fresh MXFP4 62.76us (3.1% gap). Actual grid geometry and zero scratch verified. |
+| E363 | Combine E351 two-read gate and E355 M64 down: 504 exact checks, all rows stable, 0.6–3.6% faster than E345. Dense MXFP4 gaps remain 3.3–23.5%. Incorrect r1 tensor selection is preserved; corrected fresh r2 qualifies. |
+| E364 | Pair MFMA32 records and reuse activations: 588 exact checks and all stable rows. M32 improves one hot case but loses on the other three; M64 lookahead crosses 256 registers. No broad selection; initial compilation error retained. |
 
 
 ## How to read the outcomes

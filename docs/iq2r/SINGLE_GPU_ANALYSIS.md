@@ -24,6 +24,48 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Shared activations and workgroup ordering checkpoint — E354–E364
+
+The selected isolated kernels beat MXFP4 on six of eight TP8 rows and all four compact TP4 rows. TP8 hot gaps are 0.4% at 128 tokens and 3.1% at 256. The combined dense TP4 kernel remains 3.3–23.5% behind. The full performance goal is not achieved.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 121.73 | 103.33 | -15.1% |
+| 8 | 128 | hot | 44.16 | 44.32 | +0.4% |
+| 8 | 256 | spread | 134.87 | 113.61 | -15.8% |
+| 8 | 256 | hot | 62.76 | 64.71 | +3.1% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 603.04 | 744.74 | +23.5% |
+| 4 | 4096 | hot | 500.70 | 610.02 | +21.8% |
+
+E354 reduces route metadata and vector-load overhead. E355 shares activation fragments and E356 applies four-read compact TP4 decoding. E357/E360 pass expanded synthetic correctness; E361 passes 6480 real-weight operator checks, with larger capture_tiled batches explicitly constructed from small captures. E358 full M32 pipeline is unselected, with hot timing drift retained. E359 MFMA32 is exact but slower. E362 improves M256 TP8 through workgroup remapping; LDS wait counts do not fall. E363 combines qualified dense kernels; its r1 tensor-selection failure is preserved and corrected before a fresh full r2. E364 paired MFMA32 records pass 588 checks but do not produce a broad speedup. Every listed comparison uses one fixed arm for both routing patterns.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Ordered down and dense decoding checkpoint — E340–E353
 
 The selected isolated kernels beat MXFP4 on six of eight TP8 rows and three of eight TP4 rows shown. TP8 hot gaps are down to 0.6% at 128 tokens and 4.5% at 256; TP4 M64 hot remains 2.0% behind and dense cases remain 4.5–27.4% behind. The full performance goal is not achieved.
@@ -643,6 +685,18 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E351 | Two-read dense gate lookahead holds static allocation at256 registers. All420 checks and all timing rows pass. Improves E345 control by0.3–1.2%, with occupancy retained and DRAM essentially unchanged; still4.5–27.4% behind MXFP4. |
 | E352 | Compact TP8 codebook schedule ablation: all504 checks and timing rows pass. Four-read lookahead is fastest across all four cases, saving0.7–2.5% versus control. Spread wins; M128/M256 hot remain0.6%/4.5% slower than MXFP4. LDS waits rise slightly, so this is not a fewer-LDS-waits claim. |
 | E353 | Replace TP4 down shared activation cache with direct register loads, M32/M64 and optional one-K128 activation lookahead. All588 checks and timing rows pass, but every variant loses. Global-read instruction count rises sharply while physical DRAM bytes change modestly; rejected. |
+
+| E354 | Widen batched route reduction to vector8/batch3. Exact; reduces metadata shuffles, global reads and VALU instructions. Retained, with small TP8 full-block gains; hot parity remains open. |
+| E355 | Cache activations cooperatively and reuse each K128 fragment across four output atoms. M64 without extra lookahead improves dense TP4; M64 lookahead crosses 256 registers and loses. All 588 exact checks pass. |
+| E356 | Apply four-read codebook lookahead to compact TP4. All 504 checks pass and all four M64/M128 spread/hot rows beat fresh MXFP4. |
+| E357 | Frozen E354 TP8 expanded correctness/native qualification:1152 exact checks across M32/M64/M128/M256, four routing patterns, new seed and eight input/route changes. |
+| E358 | Reuse the dense activation/weight pipeline at M32 TP8. Exact, but no broad gain; both hot timing rows exceed 3% drift. Lower traffic and waits do not compensate for low useful workgroup occupancy. |
+| E359 | MFMA32 with bounded current/next K128 records passes 672 exact checks and stable timing, but every variant loses to E355. More VALU and global-read instructions offset wider matrix instructions. |
+| E360 | Frozen E356 TP4 expanded correctness/native qualification:576 exact checks at M64/M128 with spread/hot/skew/mixed routes and eight input changes. |
+| E361 | Qualify frozen E354/E356 on three real layer/rank weight slices at TP8 and TP4: 6480 exact checks. capture_tiled repeats saved M4/M8 rows; remaining patterns use generated inputs. Operator correctness only. |
+| E362 | Enable XCD remapping at M256 with grid multiplier2. Both patterns improve, all 336 exact checks pass; hot falls to 64.71us versus fresh MXFP4 62.76us (3.1% gap). Actual grid geometry and zero scratch verified. |
+| E363 | Combine E351 two-read gate and E355 M64 down: 504 exact checks, all rows stable, 0.6–3.6% faster than E345. Dense MXFP4 gaps remain 3.3–23.5%. Incorrect r1 tensor selection is preserved; corrected fresh r2 qualifies. |
+| E364 | Pair MFMA32 records and reuse activations: 588 exact checks and all stable rows. M32 improves one hot case but loses on the other three; M64 lookahead crosses 256 registers. No broad selection; initial compilation error retained. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
