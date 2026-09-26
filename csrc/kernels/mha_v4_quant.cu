@@ -52,12 +52,36 @@ __device__ float swap_thread_data(float data)
     return data;
 }
 
+// Remove K's per-(batch, head, channel) token mean. Softmax is shift-invariant in a component
+// shared by every key, but quantization noise is not. No-op when `mean` is null.
+template <int vec_size, int dim, typename floatxvec_t>
+__device__ inline void subtract_k_mean(floatxvec_t& af,
+                                       float const* __restrict__ mean,
+                                       const int32_t row,
+                                       const int32_t lane,
+                                       const int32_t heads,
+                                       const int32_t seq_heads)
+{
+    if(mean == nullptr)
+        return;
+    const int32_t mean_row = (row / seq_heads) * heads + (row % heads);
+    float const* __restrict__ mrow =
+        mean + static_cast<int64_t>(mean_row) * dim + lane * vec_size;
+#pragma unroll
+    for(int i = 0; i < vec_size; i++)
+        af[i] -= mrow[i];
+}
+
 template <typename DTYPE_I, int vec_size = 16>
 __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ out,
                                                          DTYPE_I const* __restrict__ input,
+                                                         float const* __restrict__ mean,
+                                                         const int32_t heads,
+                                                         const int32_t seq_heads,
                                                          const int32_t m,
                                                          const int32_t in_stride,
-                                                         const int32_t out_stride)
+                                                         const int32_t out_stride,
+                                                         float* __restrict__ partial_amax = nullptr)
 {
     constexpr int dim         = kHeadDim;
     constexpr int warp_size   = opus::get_warp_size();
@@ -79,6 +103,9 @@ __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ ou
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
+
+    // K-smoothing: remove the per-(batch, head, channel) token mean before rotating.
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, seq_heads);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -114,6 +141,24 @@ __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ ou
         *reinterpret_cast<outxvec_t*>(out + static_cast<int64_t>(row) * out_stride +
                                       lane * vec_size) = rotated;
     }
+
+    // The rotated values are already in registers, so a per-tensor amax costs a reduction rather
+    // than the extra full read a separate pass would need.
+    if(partial_amax != nullptr)
+    {
+        float local = 0.0f;
+        if(row < m)
+        {
+#pragma unroll
+            for(int i = 0; i < vec_size; i++)
+                local = fmaxf(local, fabsf(static_cast<float>(
+                                  static_cast<DTYPE_I>(af[i] * dim_rsqrt))));
+        }
+        auto max_op  = [](float a, float b) { return fmaxf(a, b); };
+        local        = multithread_reduce(local, max_op, opus::get_warp_size());
+        if(threadIdx.x == 0)
+            partial_amax[blockIdx.x] = local;
+    }
 }
 
 template <typename DTYPE_I, int vec_size = 16>
@@ -123,7 +168,10 @@ __global__ void hadamard_rotate_activation_mxfp8_quant_kernel(
     DTYPE_I const* __restrict__ input,
     const int32_t m,
     const int32_t stride,
-    const float multiplier)
+    const float multiplier,
+    float const* __restrict__ mean = nullptr,
+    const int32_t heads           = 0,
+    const int32_t seq_heads       = 0)
 {
     constexpr int dim         = 128;
     constexpr int warp_size   = opus::get_warp_size();
@@ -146,6 +194,8 @@ __global__ void hadamard_rotate_activation_mxfp8_quant_kernel(
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
+
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, seq_heads);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -215,7 +265,8 @@ __global__ void hadamard_rotate_activation_mxfp6_quant_kernel(
     const float multiplier,
     const int32_t sequence = 0,
     const int32_t heads    = 0,
-    const int32_t tiles    = 0)
+    const int32_t tiles    = 0,
+    float const* __restrict__ mean = nullptr)
 {
     constexpr int dim         = 128;
     constexpr int warp_size   = opus::get_warp_size();
@@ -238,6 +289,8 @@ __global__ void hadamard_rotate_activation_mxfp6_quant_kernel(
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
+
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, sequence * heads);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -423,7 +476,8 @@ __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
     const float multiplier,
     const int32_t sequence = 0,
     const int32_t heads    = 0,
-    const int32_t tiles    = 0)
+    const int32_t tiles    = 0,
+    float const* __restrict__ mean = nullptr)
 {
     constexpr int dim         = 128;
     constexpr int warp_size   = opus::get_warp_size();
@@ -446,6 +500,8 @@ __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
+
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, sequence * heads);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -771,9 +827,34 @@ void launch_quant(aiter_tensor_t& out,
     kernel(grid, dim3(block_size), stream, m, static_cast<float>(multiplier));
 }
 
+// Validates the optional (batch, heads, 128) fp32 K mean against a BSHD input. Returns nullptr
+// and leaves the outputs untouched when the tensor is empty.
+static const float* check_k_mean(const aiter_tensor_t& mean,
+                                 const aiter_tensor_t& input,
+                                 int32_t& heads,
+                                 int32_t& seq_heads)
+{
+    if(mean.numel() == 0)
+        return nullptr;
+    AITER_CHECK(mean.is_gpu() && mean.device_id == input.device_id,
+                "K mean must be on the same GPU as input");
+    AITER_CHECK(mean.dtype() == AITER_DTYPE_fp32, "K mean must be fp32");
+    AITER_CHECK(mean.is_contiguous(), "K mean must be contiguous");
+    AITER_CHECK(mean.dim() == 3 && mean.size(2) == kHeadDim,
+                "K mean must be (batch, heads, 128)");
+    AITER_CHECK(input.dim() == 4, "K mean requires BSHD input");
+    heads     = static_cast<int32_t>(mean.size(1));
+    seq_heads = static_cast<int32_t>(input.size(1)) * heads;
+    AITER_CHECK(static_cast<int32_t>(input.size(2)) == heads, "K mean heads must match input");
+    return reinterpret_cast<const float*>(mean.data_ptr());
+}
+
 } // namespace
 
-void rotate_activation_hd128(aiter_tensor_t& out, const aiter_tensor_t& input)
+void rotate_activation_hd128(aiter_tensor_t& out,
+                             const aiter_tensor_t& input,
+                             const aiter_tensor_t& mean,
+                             aiter_tensor_t& partial_amax)
 {
     constexpr int32_t dim        = kHeadDim;
     constexpr int32_t block_size = WARP_SIZE;
@@ -802,24 +883,44 @@ void rotate_activation_hd128(aiter_tensor_t& out, const aiter_tensor_t& input)
     const int32_t out_stride = dim;
     const dim3 grid((m + m_block - 1) / m_block);
     HipDeviceGuard device_guard(input.device_id);
+    const float* mean_ptr = nullptr;
+    int32_t heads         = 1;
+    int32_t seq_heads     = m;
+    mean_ptr              = check_k_mean(mean, input, heads, seq_heads);
+    float* amax_ptr = nullptr;
+    if(partial_amax.numel() > 0)
+    {
+        AITER_CHECK(partial_amax.dtype() == AITER_DTYPE_fp32, "partial amax must be fp32");
+        AITER_CHECK(partial_amax.numel() >= grid.x,
+                    "partial amax needs one slot per rotate block");
+        amax_ptr = reinterpret_cast<float*>(partial_amax.data_ptr());
+    }
     const hipStream_t stream = aiter::getCurrentHIPStream();
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rotate_activation_hd128", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
         hadamard_rotate_activation_hd128_kernel<DTYPE_I><<<grid, dim3(block_size), 0, stream>>>(
             reinterpret_cast<DTYPE_I*>(out.data_ptr()),
             reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
+            mean_ptr,
+            heads,
+            seq_heads,
             m,
             in_stride,
-            out_stride);
+            out_stride,
+            amax_ptr);
     });
 }
 
 void rotate_activation_mxfp8_quant(aiter_tensor_t& out,
                                    aiter_tensor_t& scale,
                                    const aiter_tensor_t& input,
-                                   const double multiplier)
+                                   const double multiplier,
+                                   const aiter_tensor_t& mean)
 {
     check_inputs<128, AITER_DTYPE_fp8>(out, scale, input);
+    int32_t mean_heads     = 1;
+    int32_t mean_seq_heads = static_cast<int32_t>(input.numel() / kHeadDim);
+    const float* mean_ptr  = check_k_mean(mean, input, mean_heads, mean_seq_heads);
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rotate_activation_mxfp8_quant", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
         launch_quant(out, scale, input, multiplier, [&](dim3 grid,
@@ -833,7 +934,10 @@ void rotate_activation_mxfp8_quant(aiter_tensor_t& out,
                 reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
                 m,
                 128,
-                factor);
+                factor,
+                mean_ptr,
+                mean_heads,
+                mean_seq_heads);
         });
     });
 }
@@ -864,7 +968,8 @@ void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
 
 void rotate_activation_mxfp6_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
-                                     const aiter_tensor_t& input)
+                                     const aiter_tensor_t& input,
+                                     const aiter_tensor_t& mean)
 {
     constexpr int64_t tile = kHeadDim;
     AITER_CHECK(input.dim() == 4, "input must be BSHD");
@@ -880,6 +985,9 @@ void rotate_activation_mxfp6_quant_k(aiter_tensor_t& out,
     // aiter_tensor_t has no as_strided; pass the logical (unpadded) out/scale numel
     // so check_inputs validates the m*96 / m*4 layout without a strided view.
     check_inputs<96>(out, scale, input, m * 96, m * 4);
+    int32_t mean_heads     = 1;
+    int32_t mean_seq_heads = static_cast<int32_t>(m);
+    const float* mean_ptr  = check_k_mean(mean, input, mean_heads, mean_seq_heads);
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rotate_activation_mxfp6_quant_k", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
         constexpr int32_t block_size = WARP_SIZE;
@@ -896,7 +1004,8 @@ void rotate_activation_mxfp6_quant_k(aiter_tensor_t& out,
                                                     1.0f,
                                                     sequence,
                                                     heads,
-                                                    tiles);
+                                                    tiles,
+                                                    mean_ptr);
     });
 }
 
@@ -973,7 +1082,8 @@ void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
 
 void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
-                                     const aiter_tensor_t& input)
+                                     const aiter_tensor_t& input,
+                                     const aiter_tensor_t& mean)
 {
     constexpr int64_t tile = kHeadDim;
     AITER_CHECK(input.dim() == 4, "input must be BSHD");
@@ -985,6 +1095,9 @@ void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                 "out must have one padded 8192-byte tile per batch and head");
     // aiter_tensor_t has no as_strided; pass the logical (unpadded) out numel.
     check_inputs<64>(out, scale, input, static_cast<int64_t>(input.numel()) / 2);
+    int32_t mean_heads     = 1;
+    int32_t mean_seq_heads = static_cast<int32_t>(input.numel() / kHeadDim);
+    const float* mean_ptr  = check_k_mean(mean, input, mean_heads, mean_seq_heads);
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "rotate_activation_mxfp4_quant_k", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
         constexpr int32_t block_size = WARP_SIZE;
@@ -1002,7 +1115,8 @@ void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                                                     1.0f,
                                                     sequence,
                                                     heads,
-                                                    tiles);
+                                                    tiles,
+                                                    mean_ptr);
     });
 }
 

@@ -339,7 +339,9 @@ def sage_quant_v_amax_finalize_kernel(
         mask=(offs_n[:, None] < NUM_SEQ_BLKS) & (offs_d[None, :] < D),
         other=0.0,
     )
-    scale = tl.max(partial, axis=0) * (1.0 / FP8_MAX)
+    # An all-zero channel would otherwise give scale 0, and dividing by it turns the whole
+    # channel into NaN rather than zero. Sequence-parallel head padding produces exactly that.
+    scale = tl.maximum(tl.max(partial, axis=0), 1e-12) * (1.0 / FP8_MAX)
     tl.store(V_Scale + bh * D + offs_d, scale, mask=offs_d < D)
 
 

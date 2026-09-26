@@ -12,9 +12,8 @@ the packed API; the work table is built inside the sparse custom op.
 import csv
 import functools
 import os
-import warnings
 from enum import IntEnum
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
 import torch
 from torch import Tensor
@@ -38,7 +37,6 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
-    quantize_v_mxfp4,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
@@ -54,7 +52,6 @@ __all__ = (
     "AttentionScaleMode",
     "mha_v4",
     "mha_v4_kv_tile",
-    "mha_v4_mxfp8",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
     "mha_v4_sparse_work_table",
@@ -72,7 +69,6 @@ __all__ = (
     "quantize_mxfp8_k",
     "quantize_mxfp8_q",
     "quantize_v_fp8",
-    "quantize_v_mxfp4",
     "quantize_v_mxfp4_fp6_p",
     "quantize_v_mxfp6",
     "quantize_v_mxfp6_fp6_p",
@@ -192,6 +188,14 @@ _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
 # find_config(..., mode=1).
 _MHA_V4_SPARSE_MODE = 1
+
+# Shared-K component, relative to a typical K row, above which removing it improves quantization.
+# Real video models run to 0.67 (HunyuanVideo 1.5) and 0.76 (Wan) at the extreme, and on the one
+# captured layer above 0.7 the recipes disagree: FP8 lost 7% while MXFP4 and F8F6 gained. The win
+# is only consistent past ~0.85, where it is already 1.16x-1.31x, so the gate sits there and
+# leaves every layer either model actually produces untouched.
+_K_SMOOTH_MIN_COMMON = 0.85
+_K_SMOOTH_SAMPLE_ROWS = 2048
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -405,10 +409,6 @@ def _resolve_raw_recipe(
     )
 
     if q_format == AttentionFormat.BF16:
-        if sparse:
-            raise NotImplementedError(
-                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
-            )
         kind = (
             _RawRecipeKind.BF16
             if v_format == AttentionFormat.BF16
@@ -421,23 +421,13 @@ def _resolve_raw_recipe(
     elif q_format in _FP8_FORMATS:
         kind = _RawRecipeKind.FP8
     elif q_format == AttentionFormat.MXFP4:
-        if v_format == AttentionFormat.MXFP6:
+        if v_format != AttentionFormat.MXFP4:
             raise NotImplementedError(
                 "raw preprocessing is not implemented yet for "
                 f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
             )
-        # Sparse still uses the legacy FP8-V row; update this mode split when its MXFP4-V row lands.
-        if not sparse and _is_fp8_format(v_format):
-            raise NotImplementedError(
-                "dense MXFP4 Q/K with FP8 V does not have a kernel row yet"
-            )
         kind = _RawRecipeKind.MXFP4
     elif q_format == AttentionFormat.MXFP6:
-        # Dense already has MXFP6 Q/K/V; remove this guard when the matching sparse row lands.
-        if sparse and v_format == AttentionFormat.MXFP6:
-            raise NotImplementedError(
-                "sorted-sparse MXFP6 Q/K/V does not have a kernel row yet"
-            )
         kind = _RawRecipeKind.MXFP6
     else:
         raise NotImplementedError(
@@ -445,15 +435,17 @@ def _resolve_raw_recipe(
             f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
         )
 
-    # Sparse FP6-P recipes still use canonical V packing; align them when those rows are updated.
-    uses_dense_p_pack = not sparse and (
+    # FP6-P rows need V repacked to match the FP6 P operand's K layout, or the kernel reads V rows
+    # in the wrong order. Dense and sparse agree on this per recipe; the mode never changes it.
+    uses_fp6_p_pack = (
         (kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6)
         or (
             kind == _RawRecipeKind.MXFP6
             and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
         )
+        or (kind == _RawRecipeKind.MXFP4 and v_format == AttentionFormat.MXFP4)
     )
-    v_pack = AttentionPack.V_FOR_FP6_P if uses_dense_p_pack else AttentionPack.DEFAULT
+    v_pack = AttentionPack.V_FOR_FP6_P if uses_fp6_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
 
 
@@ -542,11 +534,13 @@ def _fmha_v4_fwd_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del out
+    del out, seqlens_k, lse
 
 
 @compile_ops(
@@ -570,10 +564,12 @@ def _fmha_v4_fwd(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_launch", mutates_args=("out",))
+@torch.library.custom_op("aiter::mha_v4_fwd_launch", mutates_args=("out", "lse"))
 def _mha_v4_fwd_launch(
     q: Tensor,
     k: Tensor,
@@ -590,6 +586,8 @@ def _mha_v4_fwd_launch(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     _fmha_v4_fwd(
         q,
@@ -607,6 +605,8 @@ def _mha_v4_fwd_launch(
         k_scale_mode,
         v_scale_mode,
         softmax_scale,
+        seqlens_k,
+        lse,
     )
 
 
@@ -627,10 +627,13 @@ def _mha_v4_fwd_launch_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
+    del seqlens_k, lse
 
 
 def _fmha_v4_fwd_sparse_fake(
@@ -757,6 +760,98 @@ def _mha_v4_fwd_sparse_launch_fake(
     del kv_block_indices, lut_start, lut_count
 
 
+# (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
+# the s_lse kernarg, so an object without the epilogue would silently leave the buffer untouched
+# instead of failing. Keyed on the pair because one Q format spans several rows (FP8 Q reaches both
+# the fp8 and the f8f6 object).
+_LSE_CAPABLE_QV = frozenset(
+    {
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.FP8_E4M3_FNUZ),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.FP6_E2M3),
+        (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.FP6_E2M3),
+        (AttentionFormat.INT8, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.INT8, AttentionFormat.FP8_E4M3_FNUZ),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.MXFP6, AttentionFormat.FP8_E4M3_FNUZ),
+    }
+)
+
+
+def _check_lse_capable(
+    q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
+) -> None:
+    """Reject LSE where the exported value has not been measured."""
+    if sparse:
+        raise NotImplementedError(
+            "MHA v4 does not produce LSE on the sorted-sparse path yet"
+        )
+    arch = get_gfx()
+    if arch != "gfx950":
+        # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
+        # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
+        # passing every output test says nothing about it. Lift this once MI300 is measured.
+        raise NotImplementedError(f"MHA v4 LSE is not validated on {arch} yet")
+    if (q_format, v_format) not in _LSE_CAPABLE_QV:
+        raise NotImplementedError(
+            f"MHA v4 LSE is not implemented for Q={q_format.name} "
+            f"V={v_format.name} yet"
+        )
+
+
+# (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
+# carries the load, but only these objects were rebuilt with it; the rest would silently attend
+# over the full padded key length, so they are rejected rather than left to return a wrong answer.
+_VARLEN_CAPABLE_QV = frozenset(
+    {
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
+    }
+)
+
+
+def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
+    """Reject per-batch key lengths on rows whose code object ignores them."""
+    arch = get_gfx()
+    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+        raise NotImplementedError(
+            f"MHA v4 per-batch key lengths are not implemented for "
+            f"Q={q_format.name} V={v_format.name} on {arch} yet"
+        )
+
+
+def _empty_lse(q: Tensor, return_lse: bool) -> Optional[Tensor]:  # noqa: UP045
+    """An FP32 ``[batch, heads, Sq]`` LSE buffer for a BSHD ``q``, or None.
+
+    The kernel derives the LSE batch stride as heads * head stride, so this must stay contiguous.
+    """
+    if not return_lse:
+        return None
+    return torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device
+    )
+
+
+def _validate_gqa_heads(query_heads: int, kv_heads: int, operation: str) -> None:
+    """K and V may carry fewer heads than Q; the kernel addresses them through the ratio."""
+    if kv_heads == 0:
+        raise ValueError(f"{operation} requires non-empty KV heads")
+    if query_heads % kv_heads != 0:
+        raise ValueError(
+            f"{operation} requires query heads to be divisible by KV heads"
+        )
+    gqa_ratio = query_heads // kv_heads
+    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
+        raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
+
+
 def mha_v4_packed(
     q: Tensor,
     k: Tensor,
@@ -774,21 +869,25 @@ def mha_v4_packed(
     v_pack: AttentionPack = AttentionPack.DEFAULT,
     softmax_scale: Optional[float] = None,  # noqa: UP045
     out: Optional[Tensor] = None,  # noqa: UP045
+    lse: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
+    seqlens_k: Optional[Tensor] = None,  # noqa: UP045
     kv_block_indices: Optional[Tensor] = None,  # noqa: UP045
     lut_start: Optional[Tensor] = None,  # noqa: UP045
     lut_count: Optional[Tensor] = None,  # noqa: UP045
-) -> Tensor:
+) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
     Formats, packing, and scale modes select an explicit ASM row. Packed widths and
     nonstandard K layouts are validated before launch; output is BF16 BSHD.
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
+    With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
     """
-    if return_lse:
-        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
+    if return_lse:
+        _check_lse_capable(q_format, v_format, lut is not None)
     _validate_pack_contract(v_format, v_pack)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
@@ -800,14 +899,7 @@ def mha_v4_packed(
         raise ValueError("Q, K, and V must have the same batch size")
     if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
         raise ValueError("K and V must have matching sequence and head dimensions")
-    kv_heads = k.shape[2]
-    if kv_heads == 0:
-        raise ValueError("MHA v4 requires non-empty KV heads")
-    if query_heads % kv_heads != 0:
-        raise ValueError("MHA v4 requires query heads to be divisible by KV heads")
-    gqa_ratio = query_heads // kv_heads
-    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
-        raise ValueError("MHA v4 supports power-of-two GQA ratios up to 16")
+    _validate_gqa_heads(query_heads, k.shape[2], "MHA v4")
     if not q.is_cuda or not k.is_cuda or not v.is_cuda:
         raise ValueError("MHA v4 expects GPU tensors")
     if q.device != k.device or q.device != v.device:
@@ -832,6 +924,20 @@ def mha_v4_packed(
 
     if softmax_scale is None:
         softmax_scale = logical_head_dim**-0.5
+    if seqlens_k is not None:
+        if kv_block_indices is not None:
+            raise NotImplementedError(
+                "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
+            )
+        _check_varlen_capable(q_format, v_format)
+        if seqlens_k.dtype != torch.int32 or seqlens_k.device != q.device:
+            raise ValueError(
+                "seqlens_k must be an int32 tensor on the same device as Q"
+            )
+        if seqlens_k.numel() < batch:
+            raise ValueError("seqlens_k needs one entry per batch")
+        if not seqlens_k.is_contiguous():
+            raise ValueError("seqlens_k must be contiguous")
     if out is None:
         out = torch.empty(
             (batch, query_length, query_heads, logical_head_dim),
@@ -842,6 +948,9 @@ def mha_v4_packed(
         raise ValueError("out has the wrong shape for MHA v4")
     elif out.dtype != torch.bfloat16 or out.device != q.device:
         raise ValueError("out must be a BF16 tensor on the same device as Q")
+
+    if lse is None or not return_lse:
+        lse = _empty_lse(q, return_lse)
 
     launch_args = (
         q,
@@ -861,12 +970,8 @@ def mha_v4_packed(
         softmax_scale,
     )
     if lut is None:
-        _mha_v4_fwd_launch(*launch_args)
+        _mha_v4_fwd_launch(*launch_args, seqlens_k, lse)
     else:
-        if q_format == AttentionFormat.BF16:
-            raise NotImplementedError(
-                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
-            )
         kv_tile = mha_v4_kv_tile()
         if k.shape[1] % kv_tile != 0:
             raise ValueError(
@@ -874,11 +979,13 @@ def mha_v4_packed(
                 f"multiple of {kv_tile}"
             )
         _mha_v4_fwd_sparse_launch(*launch_args, *lut)
+    if return_lse:
+        return out, lse
     return out
 
 
 @torch.library.custom_op(
-    "aiter::mha_v4_launch_mxfp4_coalesced_v3", mutates_args=("out",)
+    "aiter::mha_v4_launch_mxfp4_coalesced_v3", mutates_args=("out", "lse")
 )
 def _launch_mxfp4_coalesced(
     q: Tensor,
@@ -891,6 +998,7 @@ def _launch_mxfp4_coalesced(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
     resolved_v_pack = AttentionPack(v_pack)
@@ -918,6 +1026,8 @@ def _launch_mxfp4_coalesced(
         *scale_modes,
         softmax_scale=softmax_scale,
         out=out,
+        lse=lse,
+        return_lse=lse is not None,
         v_pack=resolved_v_pack,
     )
 
@@ -934,6 +1044,7 @@ def _launch_mxfp4_coalesced_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del (
         q,
@@ -945,11 +1056,12 @@ def _launch_mxfp4_coalesced_fake(
         v_format,
         v_pack,
         softmax_scale,
+        lse,
     )
     del out
 
 
-@torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out",))
+@torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out", "lse"))
 def _launch_mxfp6(
     q: Tensor,
     q_descale: Tensor,
@@ -963,6 +1075,7 @@ def _launch_mxfp6(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
     resolved_v_pack = AttentionPack(v_pack)
@@ -990,6 +1103,8 @@ def _launch_mxfp6(
         *scale_modes,
         softmax_scale=softmax_scale,
         out=out,
+        lse=lse,
+        return_lse=lse is not None,
         v_pack=resolved_v_pack,
     )
 
@@ -1008,10 +1123,60 @@ def _launch_mxfp6_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
-    del sequence_k, heads, v_format, v_pack, softmax_scale
+    del sequence_k, heads, v_format, v_pack, softmax_scale, lse
     del out
+
+
+def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
+    """A per-(batch, head, channel) constant to remove from K, or None if it would not pay.
+
+    Softmax is shift-invariant in a component shared by every key, but quantization noise is not,
+    so once that component dominates, removing it is a large win: measured 3.5x on FP8 and 5.1x on
+    MXFP4 at the extreme. Recipes that never quantize K have nothing to gain.
+
+    Shift-invariance holds for *any* constant vector, not just the exact mean, so this estimates it
+    from a strided sample. That keeps the cost independent of sequence length -- a full reduction
+    over K is what made centering too expensive to keep before -- and a few thousand rows estimate
+    the shared component to well under the accuracy it is worth removing.
+
+    It is also not a win at every magnitude. The subtraction takes energy out of K's RMS but not
+    out of its outliers, so a per-tensor scale (set by amax) gets relatively coarser. Below a
+    common mode of ~0.85 that costs more than the shared component does, and real traces sit at
+    0.12-0.76, so the gate leaves them untouched.
+    """
+    if kind in (_RawRecipeKind.BF16, _RawRecipeKind.BF16_FP8):
+        return None
+    stride = max(1, k.shape[1] // _K_SMOOTH_SAMPLE_ROWS)
+    sample = k[:, ::stride].float()
+    mean = sample.mean(dim=1)
+    # Compared squared to keep the whole gate to a handful of tiny kernels; it is launch-bound.
+    row_sq = sample.pow(2).sum(dim=-1).mean(dim=1)
+    gate = mean.pow(2).sum(dim=-1) > _K_SMOOTH_MIN_COMMON**2 * row_sq
+    return (mean * gate.unsqueeze(-1)).contiguous()
+
+
+def _restore_k_mean_in_lse(
+    lse: Optional[Tensor],  # noqa: UP045
+    q: Tensor,
+    k_mean: Optional[Tensor],  # noqa: UP045
+    softmax_scale: Optional[float],  # noqa: UP045
+) -> Optional[Tensor]:  # noqa: UP045
+    """Undo K smoothing in the exported LSE.
+
+    Smoothing runs the kernel against ``k - k_mean``, which shifts every score in the call by the
+    per-query constant ``q @ k_mean``. Output is unaffected because a shift shared by all keys
+    cancels in the softmax, but the LSE inherits it. Ring attention weights each chunk by
+    ``exp(lse)`` and derives a separate ``k_mean`` per chunk, so leaving the shift in mis-weights
+    the chunks against one another.
+    """
+    if lse is None or k_mean is None:
+        return lse
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    lse += torch.einsum("bshd,bhd->bhs", q, k_mean.to(q.dtype)).float() * scale
+    return lse
 
 
 def _validate_mha_v4_raw_inputs(
@@ -1039,16 +1204,7 @@ def _validate_mha_v4_raw_inputs(
         raise ValueError(
             f"{operation} requires K and V with matching sequence and head dimensions"
         )
-    kv_heads = k.shape[2]
-    if kv_heads == 0:
-        raise ValueError(f"{operation} requires non-empty KV heads")
-    if q.shape[2] % kv_heads != 0:
-        raise ValueError(
-            f"{operation} requires query heads to be divisible by KV heads"
-        )
-    gqa_ratio = q.shape[2] // kv_heads
-    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
-        raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
+    _validate_gqa_heads(q.shape[2], k.shape[2], operation)
     if out is None:
         return torch.empty_like(q, dtype=torch.bfloat16)
     if out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
@@ -1070,7 +1226,8 @@ def mha_v4(
     q_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
     k_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
     v_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
-) -> Tensor:
+    seqlens_k: Optional[Tensor] = None,  # noqa: UP045
+) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Quantize BF16 BSHD operands and run non-causal MHA v4.
 
     Q and K formats must match. Formats select the canonical quantizers and
@@ -1083,9 +1240,19 @@ def mha_v4(
     and 256x64 on gfx942. Sparse LUT rows are one per query head; K/V addressing
     uses the GQA ratio. A row may select nothing: an all-False row is a no-op
     that writes a zero output tile.
+    With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
     """
     if return_lse:
-        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
+        _check_lse_capable(q_format, v_format, block_mask is not None)
+    # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
+    # own launchers, which never forward seqlens_k.
+    if seqlens_k is not None:
+        if block_mask is not None:
+            raise NotImplementedError(
+                "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
+            )
+        _check_varlen_capable(q_format, v_format)
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None
     recipe = _resolve_raw_recipe(
@@ -1099,6 +1266,15 @@ def mha_v4(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
 
+    # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose
+    # quantizer is still Triton and so needs a materialised K.
+    k_mean = _k_mean(k, recipe.kind)
+    # INT8 materialises the subtraction below and drops k_mean, so keep it for the LSE correction.
+    k_mean_lse = k_mean
+    if k_mean is not None and recipe.kind is _RawRecipeKind.INT8_FP8:
+        k = (k.float() - k_mean.unsqueeze(1)).to(k.dtype)
+        k_mean = None
+
     lut_indices: Optional[Tensor] = None  # noqa: UP045
     lut_start: Optional[Tensor] = None  # noqa: UP045
     lut_count: Optional[Tensor] = None  # noqa: UP045
@@ -1109,6 +1285,9 @@ def mha_v4(
         "lut_start": lut_start,
         "lut_count": lut_count,
     }
+    # Set by the two recipes that reach the kernel through their own custom op instead of calling
+    # mha_v4_packed directly; the shared tail below runs it.
+    launch = None
     if recipe.kind == _RawRecipeKind.BF16:
         q_quantized, q_descale = q, q
         k_quantized, k_descale = k, k
@@ -1121,7 +1300,7 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp8_k(k)
+        k_quantized, k_descale = quantize_mxfp8_k(k, k_mean)
         v_quantized, v_descale = quantize_fp8(v)
     elif recipe.kind == _RawRecipeKind.INT8_FP8:
         q_quantized, q_descale = quantize_int8(q)
@@ -1129,7 +1308,7 @@ def mha_v4(
         v_quantized, v_descale = quantize_fp8(v)
     elif recipe.kind == _RawRecipeKind.FP8:
         q_quantized, q_descale = quantize_fp8_rotated(q)
-        k_quantized, k_descale = quantize_fp8_rotated(k)
+        k_quantized, k_descale = quantize_fp8_rotated(k, k_mean)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
         elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
@@ -1140,13 +1319,11 @@ def mha_v4(
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp4_k(k)
-        if _is_fp8_format(v_format):
-            v_quantized, v_descale = quantize_v_fp8(v)
-        else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
+        k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
+        v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
-            _launch_mxfp4_coalesced(
+            launch = functools.partial(
+                _launch_mxfp4_coalesced,
                 q_quantized,
                 q_descale,
                 k_quantized,
@@ -1158,30 +1335,25 @@ def mha_v4(
                 int(recipe.v_pack),
                 softmax_scale,
             )
-            return out
-        k_view = mxfp4_k_view(k_quantized, k_descale)
-        v_view = (
-            v_quantized
-            if _is_fp8_format(v_format)
-            else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
-        )
-        k_quantized = k_view
-        v_quantized = v_view
+        else:
+            k_view = mxfp4_k_view(k_quantized, k_descale)
+            v_view = mxfp4_v_view(v_quantized, v_descale, k.shape[1])
+            k_quantized = k_view
+            v_quantized = v_view
     elif recipe.kind == _RawRecipeKind.MXFP6:
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp6_k(k)
+        k_quantized, k_descale = quantize_mxfp6_k(k, k_mean)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         elif v_format == AttentionFormat.MXFP6:
             v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
-        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
-            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
-            _launch_mxfp6(
+            launch = functools.partial(
+                _launch_mxfp6,
                 q_quantized,
                 q_descale,
                 k_quantized,
@@ -1195,22 +1367,29 @@ def mha_v4(
                 int(recipe.v_pack),
                 softmax_scale,
             )
-            return out
-        k_view, k_descale_view = mxfp6_k_view(
-            k_quantized, k_descale, q.shape[0], k.shape[1], k.shape[2]
-        )
-        v_view = (
-            v_quantized
-            if v_format != AttentionFormat.MXFP4
-            else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
-        )
-        k_quantized = k_view
-        k_descale = k_descale_view
-        v_quantized = v_view
+        else:
+            k_view, k_descale_view = mxfp6_k_view(
+                k_quantized, k_descale, q.shape[0], k.shape[1], k.shape[2]
+            )
+            v_view = (
+                v_quantized
+                if v_format != AttentionFormat.MXFP4
+                else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
+            )
+            k_quantized = k_view
+            k_descale = k_descale_view
+            v_quantized = v_view
     else:
         raise AssertionError(f"unhandled MHA v4 raw recipe: {recipe.kind!r}")
 
-    return mha_v4_packed(
+    if launch is not None:
+        lse_out = _empty_lse(q, return_lse)
+        launch(lse_out)
+        if return_lse:
+            return out, _restore_k_mean_in_lse(lse_out, q, k_mean_lse, softmax_scale)
+        return out
+
+    result = mha_v4_packed(
         q_quantized,
         k_quantized,
         v_quantized,
@@ -1227,43 +1406,12 @@ def mha_v4(
         out=out,
         return_lse=return_lse,
         v_pack=recipe.v_pack,
+        seqlens_k=seqlens_k,
         **packed_lut,
     )
-
-
-def mha_v4_mxfp8(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    softmax_scale: Optional[float] = None,  # noqa: UP045
-    out: Optional[Tensor] = None,  # noqa: UP045
-    return_lse: bool = False,
-    block_mask: Optional[Tensor] = None,  # noqa: UP045
-) -> Tensor:
-    """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8.
-
-    Deprecated: this recipe is reachable through :func:`mha_v4` by passing FP8
-    formats with E8M0 per-1x32 Q/K scale modes.
-    """
-    warnings.warn(
-        "mha_v4_mxfp8 is deprecated; call mha_v4 with FP8 formats and "
-        "E8M0_PER_1X32 Q/K scale modes instead",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    fp8_format = native_fp8_format()
-    return mha_v4(
-        q,
-        k,
-        v,
-        fp8_format,
-        fp8_format,
-        fp8_format,
-        softmax_scale=softmax_scale,
-        out=out,
-        return_lse=return_lse,
-        block_mask=block_mask,
-        q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
-        k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
-        v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
-    )
+    if return_lse:
+        packed_out, packed_lse = result
+        return packed_out, _restore_k_mean_in_lse(
+            packed_lse, q, k_mean_lse, softmax_scale
+        )
+    return result
