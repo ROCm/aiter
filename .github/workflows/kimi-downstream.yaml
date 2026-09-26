@@ -2,7 +2,7 @@ name: Kimi Downstream Test
 
 # End-to-end Kimi-K2.5-MXFP4 accuracy regression for AITER against the official
 # nightly downstream serving images:
-#   vLLM   -> rocm/vllm-dev:nightly                 (upstream-native KimiK25)
+#   vLLM   -> vllm/vllm-openai-rocm:nightly                 (upstream-native KimiK25)
 #   SGLang -> lmsysorg/sglang-rocm:<mi35x rocm720>  (upstream-native kimi_k25)
 #
 # The PR's AITER is built from source into the image at runtime (gfx950), then a
@@ -43,7 +43,7 @@ jobs:
         include:
           - backend: vllm
             # Official ROCm vLLM nightly (floating tag).
-            base_image: rocm/vllm-dev:nightly
+            base_image: vllm/vllm-openai-rocm:nightly
             script: kimi_vllm_accuracy.sh
             continue_on_error: false
           - backend: sglang
@@ -99,7 +99,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" -w /workspace \
             -v /models:/models \
             --name ${CONTAINER} \
-            ${{ matrix.base_image }}
+            --entrypoint /bin/bash \
+            ${{ matrix.base_image }} -lc "sleep infinity"
           docker exec ${CONTAINER} git config --global --add safe.directory /workspace || true
 
       - name: Build & install PR AITER (gfx950)

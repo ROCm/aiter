@@ -1,6 +1,6 @@
 #!/bin/bash
 # Self-contained Kimi-K2.5 vLLM (upstream) gsm8k accuracy check.
-# Runs inside an official ROCm vLLM image (e.g. rocm/vllm-dev:nightly) with the
+# Runs inside an official ROCm vLLM image (e.g. vllm/vllm-openai-rocm:nightly) with the
 # PR's AITER already installed. Launches `vllm serve`, runs lm_eval gsm8k 3-shot,
 # and prints `KIMI_FLEX_EXTRACT=<value>` for the workflow to gate on.
 set -uo pipefail
@@ -27,7 +27,7 @@ if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then echo "ERROR: port $PORT busy
 
 echo "== launching vllm serve =="
 # NOTE: do NOT pass `--load-format fastsafetensors` here. The official
-# rocm/vllm-dev:nightly image does not bundle the `fastsafetensors` package, so
+# vllm/vllm-openai-rocm:nightly image does not bundle the `fastsafetensors` package, so
 # that flag makes every TP worker die during weight load with
 # `ImportError: Please install vllm[fastsafetensors] for fastsafetensors support`
 # (surfaced only as "WorkerProc initialization failed" in the parent). The

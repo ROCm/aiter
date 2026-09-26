@@ -15,7 +15,7 @@ concurrency:
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly
+  BASE_IMAGE: vllm/vllm-openai-rocm:nightly
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-whl-${{ github.run_id }}
@@ -98,8 +98,9 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e AITER_USE_SYSTEM_TRITON=1 \
+            --entrypoint /bin/bash \
             ${{ env.BASE_IMAGE }} \
-            bash -lc '
+            -lc '
               set -euo pipefail
               git config --global --add safe.directory /workspace
               shopt -s nullglob
@@ -238,7 +239,8 @@ jobs:
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
               -e AITER_USE_SYSTEM_TRITON=1 \
               ${{ matrix.extra_env_args }} \
-              ${{ env.BASE_IMAGE }} bash -lc "
+              --entrypoint /bin/bash \
+              ${{ env.BASE_IMAGE }} -lc "
                 set -euo pipefail
                 shopt -s nullglob
                 wheels=(/workspace/aiter_wheels/*.whl)
