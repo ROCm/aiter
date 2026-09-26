@@ -887,6 +887,21 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_topk_index_score": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/topk_index/topk_index_score.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/topk_index/topk_index_score_entry.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DOPUS_IDX_SCORE_OWN_MODULE'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_batched_gemm_bf16_tune": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/batched_gemm_bf16_tune_pybind.cu'",
