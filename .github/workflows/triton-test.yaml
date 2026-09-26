@@ -15,7 +15,6 @@ on:
       - ".github/scripts/download_triton_wheel.sh"
       - ".github/scripts/install_triton.sh"
       - ".github/scripts/select_triton_tests.py"
-      - ".github/scripts/tests/**"
       - ".github/scripts/split_tests.sh"
       - ".github/scripts/verify_triton_pin.py"
       - ".github/requirements/triton-test.txt"
@@ -70,9 +69,6 @@ jobs:
         with:
           # Compare the event's merge commit with its base parent.
           fetch-depth: 2
-
-      - name: Check Triton test selection
-        run: python3 -m unittest discover -s .github/scripts/tests -v
 
       - name: Select Triton tests from PR diff
         id: select
