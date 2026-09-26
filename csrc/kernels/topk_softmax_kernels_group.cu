@@ -435,6 +435,13 @@ __device__ void blockReduceMax(float& val, int& idx)
     __syncthreads();
 }
 
+template <typename T>
+__forceinline__ __device__ float dtype2acctype(T x) { return x; }
+template <>
+__forceinline__ __device__ float dtype2acctype<__half>(__half x) { return __half2float(x); }
+template <>
+__forceinline__ __device__ float dtype2acctype<__hip_bfloat16>(__hip_bfloat16 x) { return __bfloat162float(x); }
+
 template <typename DTYPE_I,
           typename f32vec,
           int NUM_GRP,
@@ -507,12 +514,12 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
-                gating[i] = static_cast<float>(tmp[i]);
+                gating[i] = dtype2acctype(tmp[i]);
                 gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
                 if constexpr(isBiased)
                 {
                     sig[i] = gating[i]; // pre-bias sigmoid = routing weight
-                    tmp2_f32[i] = static_cast<float>(tmp2[i]);
+                    tmp2_f32[i] = dtype2acctype(tmp2[i]);
                     gating[i] += tmp2_f32[i];
                 }
             }
@@ -528,7 +535,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
 
-            float gating = gating_output[token_idx * stride_gating + e];
+            float gating = dtype2acctype(gating_output[token_idx * stride_gating + e]);
             scores[e]    = gating;
             if(gating > max_val)
             {
@@ -1109,12 +1116,12 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
-                gating[i] = static_cast<float>(tmp[i]);
+                gating[i] = dtype2acctype(tmp[i]);
                 // gating[i] = __builtin_amdgcn_rcpf(1.0f + expf(-gating[i]));
                 gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
                 if constexpr(isBiased)
                 {
-                    tmp2_f32[i] = static_cast<float>(tmp2[i]);
+                    tmp2_f32[i] = dtype2acctype(tmp2[i]);
                     gating[i] += tmp2_f32[i];
                 }
                 gating[i] = ::isnan(gating[i]) ? -INFINITY : gating[i];
@@ -1132,7 +1139,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {
             int e = threadIdx.x + i_ * blockDim.x;
 
-            float gating = gating_output[token_idx * stride_gating + e];
+            float gating = dtype2acctype(gating_output[token_idx * stride_gating + e]);
             // scores[e] = gating;
             scores_[i_] = gating;
             if(gating > max_val)
@@ -1464,7 +1471,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {
             if constexpr(isBiased)
             {
-                topk_v -= static_cast<float>(correction_bias[topk_i]);
+                topk_v -= dtype2acctype(correction_bias[topk_i]);
             }
             if(need_renorm)
             {
@@ -1495,7 +1502,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             int topk_i   = final_topk_idx[threadIdx.x];
             if constexpr(isBiased)
             {
-                topk_v -= static_cast<float>(correction_bias[topk_i]);
+                topk_v -= dtype2acctype(correction_bias[topk_i]);
             }
             if(need_renorm)
             {

@@ -90,6 +90,13 @@ __device__ __forceinline__ int a16w4_shuffle_scale_id(
            K_Pack_idx * 2 + N_Pack_idx;
 }
 
+template <typename T>
+__forceinline__ __device__ float mxfp4_to_float(T x) { return x; }
+template <>
+__forceinline__ __device__ float mxfp4_to_float<__half>(__half x) { return __half2float(x); }
+template <>
+__forceinline__ __device__ float mxfp4_to_float<__hip_bfloat16>(__hip_bfloat16 x) { return __bfloat162float(x); }
+
 template <typename float_type, MxScaleRoundMode rmode, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
 __global__ __launch_bounds__(kBlockThreads)
 void quant_mxfp4_kernel(
@@ -118,12 +125,12 @@ void quant_mxfp4_kernel(
 #if defined(__gfx950__)
     #pragma unroll
     for (int i = 0; i < kGroupSize; ++i)
-        group_max = fmaxf(group_max, fabsf(static_cast<float>(elems[i])));
+        group_max = fmaxf(group_max, fabsf(mxfp4_to_float(elems[i])));
 #else
     float vals[kGroupSize];
     #pragma unroll
     for (int i = 0; i < kGroupSize; ++i) {
-        vals[i]   = static_cast<float>(elems[i]);
+        vals[i]   = mxfp4_to_float(elems[i]);
         group_max = fmaxf(group_max, fabsf(vals[i]));
     }
 #endif

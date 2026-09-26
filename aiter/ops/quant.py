@@ -683,6 +683,7 @@ def get_torch_act(aType):
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
         ActivationType.GeluTanh: lambda x: F.gelu(x, approximate="tanh"),
+        ActivationType.Relu2: lambda x: F.relu(x) ** 2,
     }
     return tmp.get(aType, NotImplementedError)
 

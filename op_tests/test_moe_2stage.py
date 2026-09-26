@@ -279,8 +279,8 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.bf16
         and WQDType == dtypes.fp4x2
-        and actType == aiter.ActivationType.Situv2
-    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
+        and actType in (aiter.ActivationType.Situv2, aiter.ActivationType.Relu2)
+    ):  # a16w4 SiTUv2 / Relu2: no per-expert bias supported by these kernels.
         # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
         # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
         exp_bias1 = exp_bias2 = None
@@ -1099,6 +1099,7 @@ def _iter_legacy_cases():
         wq_dtype,
         doweight_stage1,
         act_type,
+        use_g1u1=True,
         **over,
     ):
         return dict(
@@ -1113,7 +1114,7 @@ def _iter_legacy_cases():
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
-            use_g1u1=True,
+            use_g1u1=use_g1u1,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
@@ -1169,21 +1170,25 @@ def _iter_legacy_cases():
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
                     for m in args.tokenNum:
-                        yield _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
-                            **_situv2_beta_kwargs(act_type),
-                        ), extras
+                        yield (
+                            _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                act_type,
+                                use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                                preshuffle=preshuffle,
+                                hidden_pad=0,
+                                intermediate_pad=0,
+                                **_situv2_beta_kwargs(act_type),
+                            ),
+                            extras,
+                        )
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
                 yield _kw(
@@ -1207,18 +1212,22 @@ def _iter_legacy_cases():
                 ):
                     continue
                 for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        act_type,
-                        **_situv2_beta_kwargs(act_type),
-                    ), extras
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            **_situv2_beta_kwargs(act_type),
+                        ),
+                        extras,
+                    )
 
 
 def test_route_workspace_token_capacity():

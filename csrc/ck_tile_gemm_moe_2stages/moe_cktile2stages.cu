@@ -6,6 +6,7 @@
 #include "moe_cktile2stages_name_dispatch.h"
 #include "py_itfs_common.h"
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
+#include "aiter_enum.h"
 #include <cmath>
 
 template <typename ADataType,
@@ -242,7 +243,34 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       false>::dispatch(M, N, K, block_m);
             }
         }
+        else if(activation == static_cast<int>(ActivationType::Relu2) && !has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+        }
     }
+    TORCH_CHECK(false,
+	            "moe_dispatch: unsupported (activation=", activation,
+	            ", has_bias=", has_bias, ", split_k=", split_k,
+	            ") combination \u2014 no generated kernel instance covers this case");
 }
 
 torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
