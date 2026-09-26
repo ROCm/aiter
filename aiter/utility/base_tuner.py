@@ -16,6 +16,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
+from aiter.utility.tuning_policy import COMPARE_MIN_IMPROVEMENT_PCT, DEFAULT_MEASUREMENT
 
 INVALID_TIME = -1
 
@@ -26,10 +27,17 @@ def _read_csv(filepath, **kwargs):
     """
     df = pd.read_csv(filepath, **kwargs)
     df.columns = df.columns.str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")].copy()
     str_cols = df.select_dtypes(include=["object"]).columns
-    for col in str_cols:
-        df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
+    if len(str_cols):
+        df = df.assign(
+            **{
+                col: df[col].map(
+                    lambda value: value.strip() if isinstance(value, str) else value
+                )
+                for col in str_cols
+            }
+        )
     df.dropna(how="all", inplace=True)
     return df
 
@@ -39,19 +47,15 @@ class TunerCommon:
         "verbose": False,
         "tune_file": "",
         "untune_file": "",
-        "errRatio": 0.05,
+        "errRatio": DEFAULT_MEASUREMENT.err_ratio,
         "batch": 100,
         "profile_file": "",  # for all results
-        # Per-task watchdog (seconds). A worker killed by a GPU memory-access
-        # fault leaves its in-flight task unresolvable; with no timeout the whole
-        # run hangs. A generous default lets the existing reaping path drop the
-        # lost task and restart the pool, while staying comfortably above any
-        # legitimate shape-group tuning time so healthy tasks are never falsely
-        # reaped. Override with --timeout for tighter/looser bounds.
-        "timeout": 1800,
-        "warmup": 5,  # 5 warmup iters for profiling
-        "iters": 101,  # 101 run iters for profiling
-        "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
+        # Override with --timeout for tighter/looser bounds.
+        "timeout": DEFAULT_MEASUREMENT.timeout,
+        "warmup": DEFAULT_MEASUREMENT.warmup,
+        "iters": DEFAULT_MEASUREMENT.iters,
+        # only write shapes improved by >= N%
+        "min_improvement_pct": COMPARE_MIN_IMPROVEMENT_PCT,
     }
     dtype2bpe_dict: ClassVar[dict[str, Any]] = {
         dtypes.fp16: 2,
@@ -236,7 +240,7 @@ class TunerCommon:
             "--min_improvement_pct",
             dest="min_improvement_pct",
             type=float,
-            default=defaults.get("min_improvement_pct", 3.0),
+            default=defaults.get("min_improvement_pct", COMPARE_MIN_IMPROVEMENT_PCT),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
 
@@ -245,6 +249,19 @@ class TunerCommon:
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
         return args
+
+    @staticmethod
+    def measurement_kwargs(args, use_cuda_event=False):
+        """Timing keyword arguments for the function an mp_tuner task measures.
+
+        --warmup and --iters only take effect if they reach the timed call, so
+        a task that passes {} silently measures with run_perftest's defaults.
+        """
+        return {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+            "use_cuda_event": use_cuda_event,
+        }
 
     @abstractmethod
     def _setup_specific_arguments(self):
@@ -669,7 +686,11 @@ class TunerCommon:
         not falsely flag kernels whose error fluctuates slightly across seeds.
         """
         default_limit = float(
-            getattr(args, "errRatio", self.ARG_DEFAULTS.get("errRatio", 0.05))
+            getattr(
+                args,
+                "errRatio",
+                self.ARG_DEFAULTS.get("errRatio", DEFAULT_MEASUREMENT.err_ratio),
+            )
         )
         default_desc = f"--errRatio={default_limit:.6g}"
         if row is None or not hasattr(row, "get"):

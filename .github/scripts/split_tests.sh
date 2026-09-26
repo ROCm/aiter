@@ -56,7 +56,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
             printf '%s\n' \
                 "$TEST_DIR/tuning_tests/test_csv_validation.py" \
                 "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
-                "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py"
+                "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py" \
+                "$TEST_DIR/tuning_tests/test_tuning_policy.py"
         } | LC_ALL=C sort -u
     )
 elif [[ "$TEST_TYPE" == "triton" ]]; then
@@ -183,6 +184,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/tuning_tests/test_config_shape_collision.py]=4
     FILE_TIMES[op_tests/tuning_tests/test_csv_validation.py]=4
     FILE_TIMES[op_tests/tuning_tests/test_mixed_mxfp_tuning.py]=4
+    FILE_TIMES[op_tests/tuning_tests/test_tuning_policy.py]=4
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=5
     FILE_TIMES[op_tests/test_groupnorm.py]=5
     FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=5
