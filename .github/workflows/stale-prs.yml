@@ -1,0 +1,37 @@
+name: Stale pull requests
+
+# Labels a pull request `stale` after 15 days without activity. Nothing is
+# closed. Issues are out of scope.
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: stale-prs
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0
+        with:
+          days-before-pr-stale: 15
+          # -1 never closes; unset would fall back to the action's 7-day default.
+          days-before-pr-close: -1
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          stale-pr-label: stale
+          exempt-pr-labels: 'keep-open,blocked,do-not-close,dependencies'
+          exempt-draft-pr: true
+          operations-per-run: 300
+          stale-pr-message: >
+            No activity for 15 days, so this is now labelled `stale`. A push or
+            a comment clears it; `keep-open` exempts it. Nothing is closed
+            automatically.
