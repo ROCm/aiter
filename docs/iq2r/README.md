@@ -64,3 +64,5 @@ zero request failures, but only 340/352 TP4 and 339/352 TP8 checks passed.
 The E191 router-guard qualification and fresh official sweeps remain separate
 acceptance work. A completed benchmark request is not evidence of a correct
 answer. See the result document for the partial performance comparison.
+
+The [single-GPU optimization report](SINGLE_GPU_ANALYSIS.md) tracks E199–E219 local MoE experiments. Those microsecond timings are separate from the official serving results; production kernels are unchanged by these experiments.

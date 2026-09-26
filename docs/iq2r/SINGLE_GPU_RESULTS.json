@@ -1,0 +1,149 @@
+{
+  "scope": "Local synthetic TP-rank MoE boundary, microseconds. Not ATOM benchmark_serving. Production unchanged by E199+.",
+  "rows": [
+    {
+      "tp": 8,
+      "tokens": 1024,
+      "routes": "spread",
+      "mxfp4_us": 209.16733741760254,
+      "iq2r_us": 225.33584833145142,
+      "latency_overhead_percent": 7.729940588940254,
+      "arm": "iq2r_extwide4m4g2",
+      "experiment": "e217",
+      "clean_mxfp4_us": [
+        209.627103805542,
+        208.7075710296631
+      ],
+      "clean_iq2r_us": [
+        226.28800868988037,
+        224.38368797302246
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 1024,
+      "routes": "hot",
+      "mxfp4_us": 121.88706994056702,
+      "iq2r_us": 173.09640645980835,
+      "latency_overhead_percent": 42.01375629442185,
+      "arm": "iq2r_extwide4m4g2",
+      "experiment": "e217",
+      "clean_mxfp4_us": [
+        121.95682525634766,
+        121.81731462478638
+      ],
+      "clean_iq2r_us": [
+        173.35728406906128,
+        172.83552885055542
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 4096,
+      "routes": "spread",
+      "mxfp4_us": 454.68201637268066,
+      "iq2r_us": 629.3985366821289,
+      "latency_overhead_percent": 38.42608988657288,
+      "arm": "iq2r_extwide4m4g2",
+      "experiment": "e217",
+      "clean_mxfp4_us": [
+        453.59530448913574,
+        455.7687282562256
+      ],
+      "clean_iq2r_us": [
+        629.6838283538818,
+        629.113245010376
+      ]
+    },
+    {
+      "tp": 8,
+      "tokens": 4096,
+      "routes": "hot",
+      "mxfp4_us": 387.4485492706299,
+      "iq2r_us": 543.988561630249,
+      "latency_overhead_percent": 40.402787067935854,
+      "arm": "iq2r_extwide4m4g2",
+      "experiment": "e217",
+      "clean_mxfp4_us": [
+        383.89739990234375,
+        390.999698638916
+      ],
+      "clean_iq2r_us": [
+        544.1905975341797,
+        543.7865257263184
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 1024,
+      "routes": "spread",
+      "mxfp4_us": 291.8701767921448,
+      "iq2r_us": 403.27298641204834,
+      "latency_overhead_percent": 38.1686168982037,
+      "arm": "iq2r_extpipe4tr4m4",
+      "experiment": "e218",
+      "clean_mxfp4_us": [
+        290.73004722595215,
+        293.0103063583374
+      ],
+      "clean_iq2r_us": [
+        404.644250869751,
+        401.9017219543457
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 1024,
+      "routes": "hot",
+      "mxfp4_us": 187.59952187538147,
+      "iq2r_us": 270.2723741531372,
+      "latency_overhead_percent": 44.0687968984663,
+      "arm": "iq2r_extpipe4tr4m4",
+      "experiment": "e218",
+      "clean_mxfp4_us": [
+        186.60664558410645,
+        188.5923981666565
+      ],
+      "clean_iq2r_us": [
+        271.7661380767822,
+        268.7786102294922
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 4096,
+      "routes": "spread",
+      "mxfp4_us": 607.256817817688,
+      "iq2r_us": 1109.1837882995605,
+      "latency_overhead_percent": 82.65481024744332,
+      "arm": "iq2r_extpipe4tr4m4",
+      "experiment": "e218",
+      "clean_mxfp4_us": [
+        611.4813804626465,
+        603.0322551727295
+      ],
+      "clean_iq2r_us": [
+        1120.0825691223145,
+        1098.2850074768066
+      ]
+    },
+    {
+      "tp": 4,
+      "tokens": 4096,
+      "routes": "hot",
+      "mxfp4_us": 502.9242753982544,
+      "iq2r_us": 946.6344833374023,
+      "latency_overhead_percent": 88.22604706996573,
+      "arm": "iq2r_extpipe4tr4m4",
+      "experiment": "e218",
+      "clean_mxfp4_us": [
+        508.41875076293945,
+        497.42980003356934
+      ],
+      "clean_iq2r_us": [
+        944.1152572631836,
+        949.1537094116211
+      ]
+    }
+  ]
+}

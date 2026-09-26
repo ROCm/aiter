@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E196. Related scouts,
+attempts from the initial GLM integration through E219. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -18,6 +18,16 @@ The execution plan: `GLM53_IQ2R_DATAFLOW_EXECUTION_PLAN.md` owns the remaining
 acceptance work. This source snapshot consolidates the measured E167/E172/E181 native implementation and the E190 router guard; the latter was not in the E180 r8 benchmark. Later E194–E196 scouts remain unselected.
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
+
+## Isolated single-GPU optimization, E199–E219
+
+The user paused further serving sweeps and requested synthetic one-rank MoE
+profiling. The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists each experiment,
+clean matched timings, rocprof findings, rejected attempts, and remaining work.
+[Machine-readable results](SINGLE_GPU_RESULTS.json) and an
+[evidence index](SINGLE_GPU_EVIDENCE.json) accompany it. E214 gate and E217 down
+are promising TP8 candidates; E218 adapts the gate pipeline to TP4. All remain
+behind MXFP4 and none is production-selected. Serving results are unchanged.
 
 ## How to read the outcomes
 
