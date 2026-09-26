@@ -14,6 +14,7 @@ partitions override static recommendations. CLI timing includes the reducer.
 """
 
 import argparse
+import copy
 import importlib
 import itertools
 from dataclasses import dataclass, replace
@@ -26,18 +27,21 @@ import torch
 import aiter
 from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl import pa_decode_tuning as tuning
 from aiter.test_common import benchmark, run_perftest
 
 try:
     from aiter.ops.flydsl.pa_decode import (
         MAX_CONTEXT_PARTITIONS,
         get_recommended_splits,
+        load_tuned_results,
         pa_decode,
         plan_pa_decode,
     )
 except (ImportError, AttributeError, RuntimeError, OSError):
     MAX_CONTEXT_PARTITIONS = 256
     get_recommended_splits = pa_decode = plan_pa_decode = None
+    load_tuned_results = None
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 KV_COMPUTE_BLOCK = 256
@@ -92,9 +96,12 @@ class DecodeCase:
     max_partitions: int | None = None
     workgroup_budget: int | None = None
     sparse: bool = True
+    cache_address_boundary: int = 0
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
+    # Eager, shorter contexts, all-empty replay, restored contexts.
+    active_partition_maxima: tuple[int, int, int, int] | None = None
 
 
 def _require_gpu():
@@ -106,7 +113,7 @@ def _require_gpu():
         pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _default_cuda_device():
     # Restore the default device for other tests.
     _require_gpu()
@@ -235,6 +242,14 @@ def _make_inputs(case, planned=False):
         2 * torch.randperm(num_pages) + 1 if case.sparse else torch.arange(num_pages)
     )
     physical_pages = 2 * num_pages + 1 if case.sparse else num_pages
+    if case.cache_address_boundary:
+        # Straddle a byte-address boundary with only a few live FP8 pages.
+        assert case.sparse
+        assert case.cache_address_boundary in (2**31, 2**32)
+        page_bias = case.cache_address_boundary // (kv_heads * page * dim) - num_pages
+        assert page_bias > 0
+        selected += page_bias
+        physical_pages += page_bias
 
     def scatter(tensor):
         if not case.sparse:
@@ -623,6 +638,28 @@ CASES = [
     ),
     _case("fused-wide", parts=8, query_splits=1, wide_kv_addressing=True),
     _case(
+        "fused-wide-actual-2gib",
+        parts=2,
+        lengths=(0, 1, 257, 1027),
+        query_splits=1,
+        cache_address_boundary=2**31,
+    ),
+    _case(
+        "fused-wide-actual-4gib",
+        parts=2,
+        lengths=(0, 1, 257, 1027),
+        query_splits=1,
+        cache_address_boundary=2**32,
+    ),
+    _case(
+        "fused-wide-actual-2gib-window",
+        parts=2,
+        window=1023,
+        lengths=(0, 1, 257, 1283),
+        query_splits=1,
+        cache_address_boundary=2**31,
+    ),
+    _case(
         "fused-hkv2-window",
         (4, 2, 16, 128),
         (128, 0, 1),
@@ -633,6 +670,68 @@ CASES = [
         wide_kv_addressing=False,
     ),
     _case("mtp2-query-split", (2, 1, 16, 128), parts=3, lengths=(257, 259)),
+    *_cases(
+        "shape lengths workgroup_budget",
+        [
+            ("b4-ql2-budget512", (2, 1, 16, 128), (0, 1, 1025, 4096), 512),
+            ("b1-budget512", (4, 1, 16, 128), (4096,), 512),
+            ("b4-budget256", (4, 1, 16, 128), (0, 1, 1025, 4096), 256),
+            ("b4-budget512", (4, 1, 16, 128), (0, 1, 1025, 4096), 512),
+        ],
+        prefix="selector-mqa-",
+        parts=None,
+    ),
+    *_cases(
+        "shape query_splits",
+        [
+            (f"hkv{heads}-g{group}-qs{splits}", (4, heads, group, 128), splits)
+            for heads, group in ((4, 16), (8, 8))
+            for splits in (1, 2, 4)
+        ],
+        prefix="selector-",
+        parts=None,
+        lengths=(0, 1, 1025, 4096),
+        workgroup_budget=512,
+        sink=FP32,
+    ),
+    *_cases(
+        "lengths workgroup_budget",
+        [
+            ("b1-budget512", (4096,), 512),
+            ("b4-budget256", (10924, 21846, 32768, 2), 256),
+        ],
+        prefix="selector-hkv4-g16-ql2-",
+        shape=(2, 4, 16, 128),
+        parts=None,
+    ),
+    _case(
+        "selector-hkv8-g8-b4-budget128",
+        (4, 8, 8, 128),
+        parts=None,
+        lengths=(10925, 21846, 32768, 4),
+        workgroup_budget=128,
+    ),
+    *_cases(
+        "shape window",
+        [
+            ("hkv4-g16-auto", (4, 4, 16, 128), 0),
+            ("hkv8-g8-auto", (4, 8, 8, 128), 0),
+            ("hkv4-g16-window-auto", (4, 4, 16, 128), 1024),
+            ("hkv8-g8-window-auto", (4, 8, 8, 128), 1024),
+        ],
+        prefix="selector-",
+        parts=None,
+        lengths=(4096,),
+        workgroup_budget=512,
+    ),
+    *_cases(
+        "cache",
+        [("page16", (16, 1, 1)), ("plain-v", (128, 0, 1))],
+        prefix="selector-mqa-",
+        parts=None,
+        lengths=(4096,),
+        workgroup_budget=512,
+    ),
     *_cases(
         "cache parts window lengths workgroup_budget",
         [
@@ -866,12 +965,105 @@ CASES = [
         lengths=(1, 3, 257, 258, 514, 515, 0, 0),
         workgroup_budget=32,
     ),
+    _case(
+        "reduce-compact-shortcount-refresh",
+        parts=65,
+        workgroup_budget=160,
+        sink=FP32,
+        lengths=(0, 1, 1025, 2049, 8193),
+        active_partition_maxima=(33, 32, 0, 33),
+    ),
+    # Preserve the native CU cap while hitting the smaller window task bound.
+    # At the just-over-boundary windows, shortening by seven crosses a tile
+    # boundary and increases the active count; captured refresh must allow it.
+    *_cases(
+        "window lengths cache dtype sink active_partition_maxima",
+        [
+            (
+                "w1024",
+                1024,
+                (0, 1, 1544),
+                (128, 1, 1),
+                BF16,
+                FP32,
+                (5, 6, 0, 5),
+            ),
+            (
+                "bound4",
+                766,
+                (0, 1, 1288),
+                (128, 1, 1),
+                BF16,
+                None,
+                (4, 4, 0, 4),
+            ),
+            (
+                "bound5-refresh-fp16",
+                767,
+                (0, 1, 1288),
+                (16, 0, 1),
+                FP16,
+                FP16,
+                (4, 5, 0, 4),
+            ),
+            (
+                "bound8-scalar",
+                1790,
+                (0, 1, 2312),
+                (128, 1, 0),
+                BF16,
+                FP32,
+                (8, 8, 0, 8),
+            ),
+            (
+                "bound9-refresh",
+                1791,
+                (0, 1, 2312),
+                (64, 0, 1),
+                BF16,
+                BF16,
+                (8, 9, 0, 8),
+            ),
+            (
+                "bound64-fp16",
+                16126,
+                (0, 1, 16648),
+                (128, 1, 1),
+                FP16,
+                FP32,
+                (64, 64, 0, 64),
+            ),
+            (
+                "bound65-refresh",
+                16127,
+                (0, 1, 16648),
+                (16, 1, 1),
+                BF16,
+                None,
+                (64, 65, 0, 64),
+            ),
+        ],
+        prefix="reduce-default-cu-",
+        parts=None,
+    ),
+    _case(
+        "reduce-default-cu-hkv2-head256-fp16",
+        (4, 2, 8, 256),
+        (64, 0, 1),
+        parts=None,
+        window=1024,
+        sink=FP32,
+        dtype=FP16,
+        lengths=(0, 1, 1544),
+        active_partition_maxima=(5, 6, 0, 5),
+    ),
     _case("empty", window=1, sink=FP16, lengths=(0,) * 4),
 ]
 
 
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
 @pytest.mark.parametrize("case", CASES)
+@pytest.mark.usefixtures("_default_cuda_device")
 def test_pa_decode(case, planned, monkeypatch):
     """Check numerics, contracts and graph replays."""
     if planned and case.num_partitions is not None:
@@ -918,10 +1110,15 @@ def test_pa_decode(case, planned, monkeypatch):
         for name in ("query_splits", "wide_kv_addressing")
         if getattr(case, name) is not None
     }
-    if overrides:
+    if overrides or case.cache_address_boundary:
         build_tile = module.compile_pa_decode_tile
 
         def compile_tile(**kwargs):
+            if case.cache_address_boundary:
+                cache_extent = max(args[2].numel(), args[3].numel())
+                assert cache_extent > case.cache_address_boundary
+                assert kwargs["wide_kv_addressing"]
+                assert kwargs["kv_buffer_u32"] == (cache_extent < 2**32)
             return build_tile(**{**kwargs, **overrides})
 
         monkeypatch.setattr(module, "compile_pa_decode_tile", compile_tile)
@@ -932,7 +1129,29 @@ def test_pa_decode(case, planned, monkeypatch):
 
         monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
 
-    def check(disabled_sink=False):
+    reducer_caps = []
+    if plan is not None and case.active_partition_maxima is not None:
+        build_reduce = module.compile_pa_decode_ps_reduce
+        expected_reducer_cap = plan.max_partitions
+        if case.sliding_window > 0:
+            expected_reducer_cap = min(
+                expected_reducer_cap, max(case.active_partition_maxima)
+            )
+
+        def compile_reduce(**kwargs):
+            assert kwargs["use_work_plan"]
+            assert kwargs["max_context_partition_num"] == expected_reducer_cap
+            assert kwargs["compact_plan"] == (
+                case.head_dim == 128
+                and expected_reducer_cap > 64
+                and plan.capacity <= 32 * len(case.lengths)
+            )
+            reducer_caps.append(kwargs["max_context_partition_num"])
+            return build_reduce(**kwargs)
+
+        monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", compile_reduce)
+
+    def check(disabled_sink=False, phase=0):
         _assert_close(output, reference(sinks=None) if disabled_sink else reference())
         visible = (
             context[:, None]
@@ -945,6 +1164,12 @@ def test_pa_decode(case, planned, monkeypatch):
             assert (output[:, torch.isposinf(sinks)] == 0).all()
         if plan is not None:
             active = _assert_plan(plan, context.cpu().tolist())
+            if case.cache_address_boundary and active:
+                spans = plan.work_info[:active, 2] - plan.work_info[:active, 1]
+                assert spans.max().item() > 1
+            if case.active_partition_maxima is not None:
+                expected = min(case.active_partition_maxima[phase], plan.max_partitions)
+                assert plan.reduce_info[:, 1].max().item() == expected
             for tensor in scratch:
                 assert torch.isnan(tensor[:, active:]).all()
         elif args[8] == 1:
@@ -972,8 +1197,11 @@ def test_pa_decode(case, planned, monkeypatch):
         for tensor in (output, *scratch):
             tensor.fill_(float("nan"))
         graph.replay()
-        check(disabled_sink=step == 2)
+        check(disabled_sink=step == 2, phase=step + 1)
 
+    if plan is not None and case.active_partition_maxima is not None:
+        assert len(reducer_caps) >= 2  # Both eager and graph capture used the spy.
+        monkeypatch.setattr(module, "compile_pa_decode_ps_reduce", build_reduce)
     _assert_contracts(args, options)
     if plan is not None:
         # Check int32 limits without allocating a matching KV cache.
@@ -986,6 +1214,368 @@ def test_pa_decode(case, planned, monkeypatch):
             query_length=case.query_length,
         )
         _assert_plan(extreme_plan, lengths)
+
+
+def _synthetic_tuning_results(
+    *,
+    architecture="gfx950",
+    num_cu=256,
+    model=None,
+    context_length=512,
+    query_length=1,
+    window=0,
+    dtype="bfloat16",
+    per_token=True,
+    trans_v=True,
+):
+    """Fabricated timings/accuracy for file and API tests, never GPU measurements."""
+    model = tuning.resolve_model("mqa-synthetic") if model is None else model
+    shape = tuning.make_shape(
+        model,
+        4,
+        context_length,
+        query_length,
+        page_size=128,
+        dtype=dtype,
+        per_token=per_token,
+        trans_v=trans_v,
+        window=window,
+    )
+    key = tuning.make_key(shape, architecture, num_cu)
+    candidates = tuning.candidate_groups((4, 8), 4, 1, num_cu)
+    accuracy = {
+        stage: {
+            "passed": True,
+            "finite": True,
+            "atol": tuning.ATOL,
+            "rtol": tuning.RTOL,
+            "elements": 4 * query_length * model["num_query_heads"] * model["head_dim"],
+            "max_abs_error": 0.0,
+            "max_tolerance_ratio": 0.0,
+        }
+        for stage in tuning.ACCURACY_STAGES
+    }
+    for candidate in candidates:
+        latency = {4: 5.1, 8: 5.0}.get(candidate["workgroup_budget"], 8.0)
+        candidate.update(
+            status="PASS",
+            plan_unchanged=True,
+            samples_us=[latency] * 3,
+            accuracy=copy.deepcopy(accuracy),
+            errors=[],
+        )
+    kv_bytes = tuning.unique_kv_bytes(shape)
+    record = {
+        "key": key,
+        "key_sha256": tuning.fingerprint(key),
+        "benchmark_input": {field: shape[field] for field in tuning.BENCHMARK_FIELDS},
+        "status": "PASS",
+        "candidates": candidates,
+        "selection": tuning.summarize_candidates(candidates, kv_bytes),
+        "unique_kv_bytes": kv_bytes,
+        "sources_after": copy.deepcopy(key["sources"]),
+        "errors": [],
+    }
+    return {
+        "schema_version": tuning.SCHEMA_VERSION,
+        "scope": "test-only synthetic data; not measured accuracy or performance",
+        "records": [record],
+    }, shape
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["records", "empty-run"])
+def test_pa_tuning_csv_roundtrip(tmp_path, empty):
+    data, _ = _synthetic_tuning_results()
+    if empty:
+        data["records"] = []
+    else:
+        for window, no_candidates in ((128, False), (257, True)):
+            failed, _ = _synthetic_tuning_results(window=window)
+            record = failed["records"][0]
+            record.update(status="OOM", selection=None)
+            record["errors"] = ['test diagnostic, "quoted"\nsecond line: 测试']
+            if no_candidates:
+                record["candidates"] = []
+            else:
+                record["candidates"][-1].update(status="OOM", samples_us=[])
+            data["records"].append(record)
+    path = tmp_path / "results.csv"
+    tuning.save_results(path, data)
+    assert tuning.load_results(path) == data
+    assert list(tmp_path.iterdir()) == [path]
+    if not empty:
+        key = data["records"][0]["key"]
+        reloaded = tuning.load_results(path)
+        assert tuning.lookup_budget(reloaded, key) == 4
+        assert tuning.lookup_budget(reloaded, key, best=True) == 8
+        assert tuning.lookup_budget(reloaded, data["records"][1]["key"]) is None
+    with pytest.raises(FileExistsError):
+        tuning.save_results(path, data)
+    tuning.save_results(path, data, overwrite=True)
+    assert tuning.load_results(path) == data
+
+
+def _tuned_runtime():
+    if load_tuned_results is None:
+        pytest.skip("FlyDSL runtime is not available")
+    return importlib.import_module("aiter.ops.flydsl.pa_decode")
+
+
+def test_pa_tuning_loader_cache(tmp_path, monkeypatch):
+    module = _tuned_runtime()
+    data, shape = _synthetic_tuning_results()
+    path = tmp_path / "results.csv"
+    tuning.save_results(path, data)
+    result = module.load_tuned_results(path)
+    assert result.lookup_budget(shape, "gfx950", 256) == 4
+    monkeypatch.setattr(module, "_DEFAULT_TUNED_FILE", path)
+    assert module.load_tuned_results().lookup_budget(shape, "gfx950", 256) == 4
+    assert (
+        module.load_tuned_results(path, best=True).lookup_budget(shape, "gfx950", 256)
+        == 8
+    )
+    with pytest.raises(AttributeError):
+        result.budgets = {}
+    with pytest.raises(TypeError):
+        result.budgets[()] = 1
+
+    def unexpected_io(*_args, **_kwargs):
+        raise AssertionError("cached lookup must not read the CSV or source files")
+
+    with monkeypatch.context() as cached:
+        cached.setattr(tuning, "load_results", unexpected_io)
+        cached.setattr(tuning, "source_identity", unexpected_io)
+        assert module.load_tuned_results(path) is result
+        assert result.lookup_budget(shape, "gfx950", 256) == 4
+    record = data["records"][0]
+    record["candidates"][0]["samples_us"] = [7.0] * 3
+    record["selection"] = tuning.summarize_candidates(
+        record["candidates"], record["unique_kv_bytes"]
+    )
+    tuning.save_results(path, data, overwrite=True)
+    assert module.load_tuned_results(path) is result
+    refreshed = module.load_tuned_results(path, reload=True)
+    assert refreshed.lookup_budget(shape, "gfx950", 256) == 8
+    assert result.lookup_budget(shape, "gfx950", 256) == 4
+    path.unlink()
+    assert module.load_tuned_results(path) is refreshed
+    with pytest.raises(FileNotFoundError):
+        module.load_tuned_results(path, reload=True)
+    monkeypatch.setattr(module, "_DEFAULT_TUNED_FILE", path)
+    assert module.load_tuned_results().lookup_budget(shape, "gfx950", 256) is None
+    path.write_text("not a tuning CSV\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        module.load_tuned_results(path)
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["architecture", "cu", "shape", "sources", "sources_after", "accuracy"]
+)
+def test_pa_tuning_loader_mismatch(tmp_path, mismatch):
+    module = _tuned_runtime()
+    data, shape = _synthetic_tuning_results()
+    architecture, num_cu = "gfx950", 256
+    record = data["records"][0]
+    if mismatch == "architecture":
+        architecture = "gfx942"
+    elif mismatch == "cu":
+        num_cu = 128
+    elif mismatch == "shape":
+        shape["context_length"] = 511
+    elif mismatch == "sources":
+        record["key"]["sources"]["kernels/pa_decode/op_epilog.py"] = "0" * 64
+        record["key_sha256"] = tuning.fingerprint(record["key"])
+        record["sources_after"] = copy.deepcopy(record["key"]["sources"])
+    elif mismatch == "sources_after":
+        record["sources_after"] = None
+    else:
+        baseline = next(c for c in record["candidates"] if c["is_baseline"])
+        baseline["accuracy"]["graph"]["passed"] = False
+    path = tmp_path / "results.csv"
+    tuning.save_results(path, data)
+    assert (
+        module.load_tuned_results(path).lookup_budget(shape, architecture, num_cu)
+        is None
+    )
+
+
+@pytest.mark.parametrize("conflicting", [False, True], ids=["agree", "conflict"])
+def test_pa_tuning_local_shape_projection(tmp_path, conflicting):
+    module = _tuned_runtime()
+    data, shape = _synthetic_tuning_results()
+    model = tuning.resolve_model(num_query_heads=32, num_kv_heads=2, tp_size=2)
+    other, _ = _synthetic_tuning_results(model=model)
+    record = other["records"][0]
+    if conflicting:
+        record["candidates"][0]["samples_us"] = [7.0] * 3
+        record["selection"] = tuning.summarize_candidates(
+            record["candidates"], record["unique_kv_bytes"]
+        )
+    data["records"].append(record)
+    path = tmp_path / "results.csv"
+    tuning.save_results(path, data)
+    for field in (
+        "global_num_query_heads",
+        "global_num_kv_heads",
+        "tp_size",
+        "kv_replication_factor",
+    ):
+        shape.pop(field)
+    result = module.load_tuned_results(path).lookup_budget(shape, "gfx950", 256)
+    assert result == (None if conflicting else 4)
+
+
+@pytest.mark.parametrize(
+    "query_length,window,dtype,per_token,trans_v",
+    [(4, 0, BF16, True, True), (1, 257, FP16, False, False)],
+    ids=["mtp4-padded-bf16-per-token", "window-fp16-per-tensor"],
+)
+@pytest.mark.usefixtures("_default_cuda_device")
+def test_pa_tuning_auto_plan(
+    tmp_path, monkeypatch, query_length, window, dtype, per_token, trans_v
+):
+    module = _tuned_runtime()
+    case = DecodeCase(
+        lengths=(128, 256, 384, 511 if query_length > 1 else 512),
+        query_length=query_length,
+        sliding_window=window,
+        dtype=dtype,
+        per_token=per_token,
+        trans_v=trans_v,
+        num_partitions=None,
+        workgroup_budget=4,
+        sparse=False,
+    )
+    args, options, reference = _make_inputs(case, planned=True)
+    context_bound = max(case.lengths)
+    compile_bound = (
+        (context_bound + case.block_size - 1) // case.block_size
+    ) * case.block_size
+    num_cu = torch.cuda.get_device_properties(args[1].device).multi_processor_count
+    data, shape = _synthetic_tuning_results(
+        architecture=get_gfx_runtime(),
+        num_cu=num_cu,
+        context_length=context_bound,
+        query_length=query_length,
+        window=window,
+        dtype="bfloat16" if dtype == BF16 else "float16",
+        per_token=per_token,
+        trans_v=trans_v,
+    )
+    path = tmp_path / "results.csv"
+    tuning.save_results(path, data)
+    assert (
+        module.load_tuned_results(path).lookup_budget(shape, get_gfx_runtime(), num_cu)
+        == 4
+    )
+    _run_flydsl(*args, **options)
+    expected = args[0].clone()
+    _assert_close(expected, reference())
+    if query_length > 1:
+        padded = torch.zeros((4, 65536 // case.block_size), dtype=torch.int32)
+        padded[:, : args[5].shape[1]].copy_(args[5])
+        args = (*args[:5], padded, *args[6:])
+    allocated = []
+    compile_bounds = []
+    build_plan = module.plan_pa_decode
+    build_tile = module.compile_pa_decode_tile
+
+    def observe_plan(*plan_args, **plan_options):
+        plan = build_plan(*plan_args, **plan_options)
+        if plan_options.get("plan") is None:
+            allocated.append(plan)
+        return plan
+
+    def observe_compile(**kwargs):
+        compile_bounds.append(kwargs["max_context_length"])
+        return build_tile(**kwargs)
+
+    monkeypatch.setattr(module, "plan_pa_decode", observe_plan)
+    monkeypatch.setattr(module, "compile_pa_decode_tile", observe_compile)
+    automatic = list(args)
+    automatic[8] = None
+    automatic[14:17] = [None, None, None]
+    auto_options = {"sliding_window": window, "tuned_file": path}
+    module.pa_decode(*automatic, **auto_options, max_context_length=context_bound)
+    assert allocated[-1].capacity == 4 != 2 * num_cu
+    assert allocated[-1].max_partitions == num_cu
+    assert compile_bounds[-1] == compile_bound
+    _assert_plan(allocated[-1], case.lengths)
+    _assert_close(args[0], expected)
+    _assert_close(args[0], reference())
+
+    empty_path = tmp_path / "empty.csv"
+    tuning.save_results(empty_path, {**data, "records": []})
+    table_bound = args[5].shape[1] * case.block_size
+    for tuned_file, hint in ((path, None), (empty_path, context_bound)):
+        module.pa_decode(
+            *automatic,
+            sliding_window=window,
+            tuned_file=tuned_file,
+            max_context_length=hint,
+        )
+        assert allocated[-1].capacity == 2 * num_cu
+        assert compile_bounds[-1] == (table_bound if hint is None else compile_bound)
+        _assert_close(args[0], reference())
+    with_sinks = automatic.copy()
+    with_sinks[-1] = torch.zeros(args[1].shape[1], dtype=FP32)
+    module.pa_decode(*with_sinks, **auto_options, max_context_length=context_bound)
+    assert allocated[-1].capacity == 2 * num_cu
+    _assert_close(args[0], reference(sinks=with_sinks[-1]))
+    for hint in (True, -1, table_bound + 1, 1.5):
+        with pytest.raises(ValueError, match="max_context_length"):
+            module.pa_decode(*automatic, **auto_options, max_context_length=hint)
+    with pytest.raises(ValueError, match="scratch"):
+        module.pa_decode(*args[:8], None, *args[9:], **auto_options)
+    with pytest.raises(ValueError, match="tuned_file"):
+        module.pa_decode(*automatic[:8], 4, *automatic[9:], **auto_options)
+
+    def unexpected_load(*_args, **_kwargs):
+        raise AssertionError("capture and explicit plans must not load or allocate")
+
+    with monkeypatch.context() as captured:
+        captured.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        captured.setattr(module, "load_tuned_results", unexpected_load)
+        captured.setattr(module, "plan_pa_decode", unexpected_load)
+        with pytest.raises(RuntimeError, match="work_plan"):
+            module.pa_decode(
+                *automatic, **auto_options, max_context_length=context_bound
+            )
+
+    # A prebuilt plan owns its capacity and replays without loading tuning files.
+    path.unlink()
+    monkeypatch.setattr(module, "load_tuned_results", unexpected_load)
+    plan = options["work_plan"]
+    metadata = plan.work_info, plan.reduce_info
+    explicit = (*args[:8], None, *args[9:])
+
+    def decode_explicit():
+        assert (
+            plan_pa_decode(
+                args[4], 1, sliding_window=window, query_length=query_length, plan=plan
+            )
+            is plan
+        )
+        module.pa_decode(
+            *explicit, **options, tuned_file=path, max_context_length=context_bound
+        )
+        assert compile_bounds[-1] == compile_bound
+
+    decode_explicit()
+    _assert_close(args[0], reference())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode_explicit()
+    for lengths in ((0, 0, 127, 255), (0, 0, 0, 0), case.lengths):
+        args[4].copy_(torch.tensor(lengths, dtype=torch.int32))
+        for tensor in (args[0], *args[14:17]):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        _assert_close(args[0], reference())
+        active = _assert_plan(plan, lengths)
+        assert plan.work_info is metadata[0] and plan.reduce_info is metadata[1]
+        for tensor in args[14:17]:
+            assert torch.isnan(tensor[:, active:]).all()
 
 
 @benchmark()
