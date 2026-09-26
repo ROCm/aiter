@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Dense reuse and task scheduling — E374–E379
+
+The reported selected kernels beat MXFP4 on six of eight TP8 rows and five of six compact TP4 rows. TP8 M256 token-major routing improves its control by 0.8–1.7%, but hot remains 4.3% behind fresh MXFP4. TP4 M256 hot remains 29.7% behind, and the reported dense TP4 rows remain 3.3–23.5% behind. N1024 down provides a small M4096 improvement. The full isolated and serving goal remains unmet.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 121.73 | 103.33 | -15.1% |
+| 8 | 128 | hot | 44.16 | 44.32 | +0.4% |
+| 8 | 256 | spread | 136.49 | 111.22 | -18.5% |
+| 8 | 256 | hot | 63.64 | 66.38 | +4.3% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 232.58 | 186.30 | -19.9% |
+| 4 | 256 | hot | 71.31 | 92.46 | +29.7% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 598.92 | 739.46 | +23.5% |
+| 4 | 4096 | hot | 496.62 | 612.02 | +23.2% |
+
+E374 earlier codebook lookups are rejected, while its unchanged Pipeline4 arm independently qualifies a TP4 M256 tradeoff. E375 reduces padded MFMA work without broad improvement. E376 separate task-fill launches lose qualified spread; drifting hot/boundary rows remain provisional. E377 reduces registers but adds global-read instructions and loses every row. E378 retains plain token-major route visits after 315 exact checks; optional wave aggregation is not selected. E379 retains N1024/grid8 down only at M4096 after 420 exact checks, preserving identical MFMA counts and ordered arithmetic. All failures and prior results remain available. Cross-session timings are not interchangeable. Fleet health and the six saved real-weight shards were rechecked, but no new real-weight or model-quality qualification is claimed.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Ordered quad down and gate pipelines — E365–E373
 
 The selected kernels beat MXFP4 on six of the eight reported TP8 rows and five of six compact TP4 rows. TP8 hot gaps are 0.4% at 128 tokens and 2.3% at 256. Newly qualified TP4 M256 spread is 19.9% faster, but hot is 29.7% slower. The four reported dense TP4 rows remain 3.3–23.5% slower. The full isolated and serving goal is not achieved.
@@ -751,6 +795,13 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E371 | Hold N512 down arithmetic/layout fixed and compare persistent grid8/4/2. 210 exact checks, both rows stable. Grid4 improves hot 1.9% for a 0.24% spread cost; its matched MXFP4 hot gap is 2.3%. |
 | E372 | Use four K waves with two separate K768 accumulators each, retaining the original eight-part ordered sum. 252 exact checks, zero scratch. Both M16/M32 versions lose qualified spread; MXFP4 hot drift 3.61% is retained. |
 | E373 | Adapt vector8/batch3, vector8/batch9 and vector16/batch3 reduction to N512 tile-major output. R1 hot drift 3.47% is retained. Narrowed r2 passes 168 exact checks with stable rows; vector8/b3 improves hot 1.4% for a 0.28% spread cost. Native E308 already overlaps nine payload loads; no missing-load-overlap claim. |
+
+| E374 | Move first codebook lookups before activation completion. 210 exact checks and stable rows, but slower. The unchanged Pipeline4 arm independently qualifies a TP4 M256 tradeoff: hot improves 9.7% versus compact control while spread loses 10.6%. |
+| E375 | Pass actual active M16 fragments to the dense M64 gate. 336 exact checks and stable rows. Spread MFMA counts fall 36.6%/13.1%, but only M1024 spread improves (1.2%); other rows regress. Keep dense control. |
+| E376 | Choose compact/Pipeline4 work per actual M32 task count in two disjoint launches. 315 exact checks include 16/17-row boundaries. Qualified spread loses 19.9%; hot/boundary drift remains provisional. Reject extra sparse pipeline launch. |
+| E377 | Halve dense N atoms per wave and load only the matching packed-record half. 336 exact checks and stable rows. Registers fall 256 to 182 with identical MFMA counts, but global-read instructions rise about 62% and all cases regress 11.7–24.1%. |
+| E378 | Visit route slots across adjacent tokens; separately test guarded uniform-wave atomics. Corrected r2 passes 315 exact checks and all rows stabilize. Plain token-major visits improve their control 0.8–1.7% and are retained for qualification; hot remains 4.3% behind fresh MXFP4. Setup/preparation failures are preserved. |
+| E379 | Widen dense down to N1024 by reusing each M64 activation cache across four sequential N groups. 420 exact checks and stable rows; unchanged 220 registers and identical MFMA counts. Retain grid8 at M4096 only (0.2–0.9% gains); M1024 stays N512. Dense MXFP4 gaps remain about 23%. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

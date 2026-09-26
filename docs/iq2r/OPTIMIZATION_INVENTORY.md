@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E373. Related scouts,
+attempts from the initial GLM integration through E379. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E373
+## Isolated single-GPU optimization, E199–E379
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -171,6 +171,16 @@ single-GPU report. Serving sweeps remain paused.
 | E371 | Hold N512 down arithmetic/layout fixed and compare persistent grid8/4/2. 210 exact checks, both rows stable. Grid4 improves hot 1.9% for a 0.24% spread cost; its matched MXFP4 hot gap is 2.3%. |
 | E372 | Use four K waves with two separate K768 accumulators each, retaining the original eight-part ordered sum. 252 exact checks, zero scratch. Both M16/M32 versions lose qualified spread; MXFP4 hot drift 3.61% is retained. |
 | E373 | Adapt vector8/batch3, vector8/batch9 and vector16/batch3 reduction to N512 tile-major output. R1 hot drift 3.47% is retained. Narrowed r2 passes 168 exact checks with stable rows; vector8/b3 improves hot 1.4% for a 0.28% spread cost. Native E308 already overlaps nine payload loads; no missing-load-overlap claim. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E374 | Move first codebook lookups before activation completion. 210 exact checks and stable rows, but slower. The unchanged Pipeline4 arm independently qualifies a TP4 M256 tradeoff: hot improves 9.7% versus compact control while spread loses 10.6%. |
+| E375 | Pass actual active M16 fragments to the dense M64 gate. 336 exact checks and stable rows. Spread MFMA counts fall 36.6%/13.1%, but only M1024 spread improves (1.2%); other rows regress. Keep dense control. |
+| E376 | Choose compact/Pipeline4 work per actual M32 task count in two disjoint launches. 315 exact checks include 16/17-row boundaries. Qualified spread loses 19.9%; hot/boundary drift remains provisional. Reject extra sparse pipeline launch. |
+| E377 | Halve dense N atoms per wave and load only the matching packed-record half. 336 exact checks and stable rows. Registers fall 256 to 182 with identical MFMA counts, but global-read instructions rise about 62% and all cases regress 11.7–24.1%. |
+| E378 | Visit route slots across adjacent tokens; separately test guarded uniform-wave atomics. Corrected r2 passes 315 exact checks and all rows stabilize. Plain token-major visits improve their control 0.8–1.7% and are retained for qualification; hot remains 4.3% behind fresh MXFP4. Setup/preparation failures are preserved. |
+| E379 | Widen dense down to N1024 by reusing each M64 activation cache across four sequential N groups. 420 exact checks and stable rows; unchanged 220 registers and identical MFMA counts. Retain grid8 at M4096 only (0.2–0.9% gains); M1024 stays N512. Dense MXFP4 gaps remain about 23%. |
 
 
 ## How to read the outcomes
