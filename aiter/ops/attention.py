@@ -831,6 +831,37 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_fp8_asm_fwd(
+    # [num_partials, num_heads, 512] fp32
+    split_data: torch.Tensor,
+    # [num_partials, num_heads] fp32
+    split_lse: torch.Tensor,
+    # [total_q, num_heads, 512] bf16
+    final_output: torch.Tensor,
+    # [total_q, num_heads] fp32; None skips the un-split rows' LSE
+    final_lse: torch.Tensor | None,
+    # [total_q, num_heads, 576] fp8
+    q: torch.Tensor,
+    # [num_pages, 1, 1, 576] fp8
+    kv_buffer: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    # round-robin CP only (cp_world_size > 1 and causal)
+    qo_indptr: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    g_kv_indptr: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+) -> None: ...
+
+
 MD_NAME_V4 = "module_mla_v4_asm"
 
 
@@ -1270,6 +1301,13 @@ def get_mla_metadata_info_v1(
             and num_head_qo == 12
             and packed_qo_len <= 128
             and fast_mode
+        )
+        or (
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
         )
     ):
         if num_head_qo * 2 > 128:

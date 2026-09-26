@@ -95,7 +95,10 @@
         "extra_include": [],
         "verbose": "False",
         "torch_exclude": "True",
-        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m mla_dsl --output_dir {{}}'"
+        ]
     },
     "module_mla_v4_asm": {
         "srcs": [
