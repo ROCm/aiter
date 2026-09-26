@@ -85,6 +85,21 @@ _DECODE_WARP_SHAPE = {
     (16, True): (4, 16),
 }
 
+# Measured (NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K) per batch size, for
+# the single shape `_kda_tiling` accepts: 12 key and value heads, 128 wide, bf16
+# activations over an f32 state. A row splits the value dimension to fill one
+# part's CUs, and the arch does not fix those: MI308X and MI300X are both gfx942,
+# at 80 CUs and 304. An unlisted part falls through to `_decode_tiling`; so sweep
+# it and add its own row.
+_KDA_DECODE_BY_PART = {
+    # MI300X
+    ("gfx942", 304): {1: (8, 4, 32), 4: (32, 1, 32), 64: (8, 1, 16), 256: (2, 4, 32)},
+    # MI308X
+    ("gfx942", 80): {1: (32, 1, 32), 4: (2, 4, 16), 64: (1, 4, 16), 256: (4, 1, 16)},
+    # MI355X
+    ("gfx950", 256): {1: (64, 1, 32), 4: (4, 8, 32), 64: (1, 4, 16), 256: (16, 1, 16)},
+}
+
 
 def _decode_warp_shape(head_k_dim, tile_v, f32_state):
     """The warp shape for a value tile: the measured entry, or a derived one.
@@ -140,7 +155,7 @@ def _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_
     return {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
 
 
-def get_default_kwargs(
+def _kda_tiling(
     dtype_str,
     state_dtype_str,
     batch_size,
@@ -150,11 +165,61 @@ def get_default_kwargs(
     head_k_dim,
     head_v_dim,
 ):
-    """The decode tiling for this launch.
+    """The measured K3 tiling, or None so the caller can use `_decode_tiling`.
 
-    Takes the whole launch shape, not just the part the rule reads, so a caller
-    does not have to know which part that is.
+    Callers run this inside ``torch.cuda.device(...)``, so ``get_num_sms()``
+    reads the launch device.
     """
+    if (
+        dtype_str != "torch.bfloat16"
+        or state_dtype_str != "torch.float32"
+        or seq_length != 1
+        or num_k_heads != 12
+        or num_v_heads != 12
+        or head_k_dim != 128
+        or head_v_dim != 128
+    ):
+        return None
+    cfg = _KDA_DECODE_BY_PART.get((GDR_GPU_ARCH, get_num_sms()), {}).get(batch_size)
+    if cfg is None:
+        return None
+    num_blocks, num_warps, warp_threads_k = cfg
+    return {
+        "NUM_BLOCKS_PER_V_DIM": num_blocks,
+        "NUM_WARPS": num_warps,
+        "WARP_THREADS_K": warp_threads_k,
+    }
+
+
+def get_default_kwargs(
+    dtype_str,
+    state_dtype_str,
+    batch_size,
+    seq_length,
+    num_k_heads,
+    num_v_heads,
+    head_k_dim,
+    head_v_dim,
+    gate_mode="gdr",
+):
+    """The KDA-tuned config for this launch, else the tiling rule.
+
+    Main's scalar GDR path uses ``_decode_tiling``. KDA uses
+    ``_kda_tiling`` for the measured K3 shapes, else the same heuristic.
+    """
+    if gate_mode == "kda":
+        config = _kda_tiling(
+            dtype_str,
+            state_dtype_str,
+            batch_size,
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+        if config is not None:
+            return config
     return _decode_tiling(
         batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str
     )
@@ -341,10 +406,9 @@ def flydsl_gdr_decode(
     read_indices: torch.Tensor | None = None,
     write_indices: torch.Tensor | None = None,
 ):
-    if stream is None:
-        stream = torch.cuda.current_stream()
     device = query.device
     dtype = query.dtype
+    stream = _mtp_stream(query, stream)
     read_indices = indices if read_indices is None else read_indices
     write_indices = indices if write_indices is None else write_indices
     for input in [
@@ -358,13 +422,21 @@ def flydsl_gdr_decode(
         read_indices,
         write_indices,
         out,
+        state,
     ]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
-    for input in [key, value, a, b, dt_bias, out]:
+    if dtype not in (torch.half, torch.bfloat16):
+        raise ValueError(
+            f"`query` must be fp16 or bf16; got {dtype}. The kernel converts its "
+            "output to one of the two, so a wider type is silently narrowed."
+        )
+    for input in [key, value, a, b, out]:
         assert input.dtype == dtype
     assert state.dtype in [torch.float, torch.bfloat16]
     assert A_log.dtype in [torch.float, torch.bfloat16]
+    assert dt_bias.dtype in [torch.float, torch.bfloat16, torch.half]
+    assert indices.dtype == torch.int32
     assert read_indices.dtype == torch.int32
     assert write_indices.dtype == torch.int32
     if query.stride(-1) != 1:
@@ -377,21 +449,83 @@ def flydsl_gdr_decode(
             "`key` must have a contiguous last dimension for vectorized loads; "
             f"got stride {key.stride()}."
         )
+    if not out.is_contiguous():
+        raise ValueError(
+            "`out` must be contiguous because the kernel uses packed output strides; "
+            f"got stride {out.stride()}."
+        )
+    if not need_shuffle_state and state.stride(-1) != 1:
+        raise ValueError(
+            "`state` must be [pool, HV, V, K] with K contiguous when "
+            f"`need_shuffle_state` is False; got stride {state.stride()}."
+        )
 
-    if need_shuffle_state:
-        state_ = state.permute(0, 1, 3, 2).contiguous()
-    else:
-        state_ = state
+    # `a`'s rank selects the gate; the shapes below follow from it.
+    gate_mode = "kda" if a.dim() == 4 else "gdr"
+
+    for name, tensor in (("query", query), ("value", value), ("state", state)):
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"`{name}` must be 4D, got {tensor.dim()}D {tuple(tensor.shape)}."
+            )
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
-    num_v_heads = value.shape[-2]
-    head_v_dim = value.shape[-1]
+    num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
+
+    # Offsets come from `query`'s (B, Sq, H, D), so a tensor matching only the
+    # last dim is read row-shifted, not rejected. Shape only: views are valid.
+    qk = (batch_size, seq_length, num_k_heads, head_k_dim)
+    v = (batch_size, seq_length, num_v_heads, head_v_dim)
+    per_head = (batch_size, seq_length, num_v_heads)
+    slot = (
+        (num_v_heads, head_k_dim, head_v_dim)
+        if need_shuffle_state
+        else (num_v_heads, head_v_dim, head_k_dim)
+    )
+    expected = [
+        ("key", key, qk),
+        ("value", value, v),
+        ("out", out, v),
+        ("b", b, per_head),
+        ("A_log", A_log, (num_v_heads,)),
+        ("read_indices", read_indices, (batch_size,)),
+        ("write_indices", write_indices, (batch_size,)),
+        ("state", state, (state.shape[0], *slot)),
+        ("a", a, (*per_head, head_k_dim) if gate_mode == "kda" else per_head),
+        (
+            "dt_bias",
+            dt_bias,
+            (num_v_heads, head_k_dim) if gate_mode == "kda" else (num_v_heads,),
+        ),
+    ]
+    for name, tensor, shape in expected:
+        if tensor.shape != shape:
+            raise ValueError(
+                f"`{name}` must have shape {shape} for a {gate_mode} decode with "
+                f"query {qk} and value {v}; got {tuple(tensor.shape)}."
+            )
+
+    if gate_mode == "kda":
+        # `a` keeps its strides and is vector-loaded along D_k, so that axis
+        # must be dense. dt_bias is copied contiguous below, so it is free.
+        assert (
+            a.stride(-1) == 1
+        ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
+
+    # Staging copies share `stream` with the launch, so it is ordered against
+    # them. Inputs produced elsewhere are the caller's to order.
     # The tiling reads the CU count off the current device. One fastmath setting
     # for every float op the body traces, rather than a flag per call site; the
     # jit compiles on first call, not on build, so it has to still be in scope
     # at the launch.
-    with CompilationContext.compile_hints({"fastmath": "fast"}), torch.cuda.device(
-        query.device.index
+    with (
+        CompilationContext.compile_hints({"fastmath": "fast"}),
+        torch.cuda.device(device.index),
+        torch.cuda.stream(stream),
     ):
+        if need_shuffle_state:
+            state_ = state.permute(0, 1, 3, 2).contiguous()
+        else:
+            state_ = state
         kwargs_ = get_default_kwargs(
             str(dtype),
             str(state_.dtype),
@@ -401,10 +535,12 @@ def flydsl_gdr_decode(
             num_v_heads,
             head_k_dim,
             head_v_dim,
+            gate_mode,
         )
         exe = create_vk_gdr_decode_kernel(
             get_dtype_str(query.dtype),
             get_dtype_str(A_log.dtype),
+            get_dtype_str(dt_bias.dtype),
             get_dtype_str(state_.dtype),
             seq_length,
             num_k_heads,
@@ -418,6 +554,7 @@ def flydsl_gdr_decode(
             a.stride(),
             b.stride(),
             use_qk_l2norm,
+            gate_mode,
             **kwargs_,
         )
         _run_compiled(
@@ -436,9 +573,9 @@ def flydsl_gdr_decode(
             batch_size,
             stream,
         )
-    if need_shuffle_state:
-        state_ = state_.permute(0, 1, 3, 2).contiguous()
-        state.copy_(state_)
+        if need_shuffle_state:
+            state_ = state_.permute(0, 1, 3, 2).contiguous()
+            state.copy_(state_)
 
 
 # Consumers may safely allocate ``out`` with ``torch.empty``: the fused kernel
