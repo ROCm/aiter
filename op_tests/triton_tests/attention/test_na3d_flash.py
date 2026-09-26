@@ -146,7 +146,10 @@ def _na3d_sdpa_exact(
 
     Generic GPU-grouped reference function.  With ``w_offset=0`` and full
     ``q/k/v`` this computes exact neighborhood attention for all W positions
-    and is equivalent to ``na3d_sdpa_ref`` but GPU-accelerated with cached masks.
+    and is equivalent to ``na3d_sdpa_ref``, but GPU-accelerated: queries are
+    grouped by tile geometry so each distinct geometry builds its additive mask
+    once per call (deduplicated, not cached across calls -- see
+    ``_na3d_sdpa_mask``), and the masks are freed when this function returns.
 
     Args:
         q          : ``(B, T, H, W_sub, NH, HD)`` bfloat16, Q pre-scaled.
