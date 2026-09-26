@@ -8,6 +8,9 @@ arch and dtype: gfx950 fp8 to ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the
 m32x8 prefill kernel, anything else ``None`` so the caller falls through to
 CK/Triton.
 
+``flydsl_flash_attn_paged_prefill_func`` is an explicit gfx950 FP8 paged
+prefill API with optional LSE; unsupported requests raise without fallback.
+
 ``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
 `flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
@@ -43,6 +46,7 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 __all__ = [
     "flydsl_flash_attn_batch_func",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_paged_prefill_func",
     "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
 ]
@@ -218,6 +222,86 @@ def flydsl_flash_attn_func(
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
     return o_p
+
+
+def flydsl_flash_attn_paged_prefill_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    block_table: torch.Tensor | None = None,
+    seqlen_k: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    kv_page_indices: torch.Tensor | None = None,
+    kv_last_page_lens: torch.Tensor | None = None,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = True,
+    out: torch.Tensor | None = None,
+    return_lse: bool = False,
+    lse: torch.Tensor | None = None,
+    stream: torch.cuda.Stream | None = None,
+):
+    """Compute causal paged prefill with the gfx950 FlyDSL FP8 kernel.
+
+    Q is packed ``[total_q, Hq, Dqk]``; Q/K/V must be OCP E4M3FN with
+    single-element FP32 descales on the same GPU. Supported ``(Dqk, Dv)``
+    pairs are ``(128, 128)``, ``(192, 128)`` and ``(192, 192)``. Page-1 KV
+    caches use rank-3/4 linear layouts; pages 16/64/1024 use vectorized
+    rank-5 layouts. Hq must be divisible by Hkv.
+
+    Supply either a rectangular ``block_table`` and KV token ``seqlen_k``,
+    or CSR ``kv_indptr``/``kv_page_indices`` with ``kv_last_page_lens`` for
+    pages larger than one. A supplied block table takes precedence. All
+    metadata is int32 on Q's device. The maxima are trusted host launch bounds
+    and must cover every request's actual Q/K length; undersized values violate
+    the API contract and are not recomputed from device metadata on this hot path.
+    The causal mask is bottom-right aligned, including when Q is longer
+    than KV. ``softmax_scale`` defaults to ``Dqk**-0.5`` and must be a
+    positive finite Python scalar, independent of the quantization descales.
+
+    Returns BF16 ``out[total_q, Hq, Dv]``, or ``(out, lse)`` when
+    ``return_lse=True``. LSE is FP32 ``[Hq, total_q]`` in natural-log units;
+    fully masked rows have zero output and LSE ``-inf``. Both buffers may
+    be preallocated and must be contiguous on Q's device. ``lse`` requires
+    ``return_lse=True``. Launches use the current stream unless supplied.
+
+    This is an explicit inference-only API: unsupported hardware, dtypes,
+    layouts or noncausal requests raise rather than falling back. Local
+    windows, sinks, ALiBi, soft capping, dropout and per-page scales are not
+    supported. Backend scheduling controls stay in the kernel launcher.
+    """
+    from .kernels.flash_attn_paged_fp8_func_gfx950 import (
+        flydsl_flash_attn_paged_fp8_func,
+    )
+
+    return flydsl_flash_attn_paged_fp8_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        max_seqlen_q,
+        max_seqlen_k,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out,
+        return_lse=return_lse,
+        lse=lse,
+        stream=stream,
+    )
 
 
 def _fp8_gfx950_supported(
