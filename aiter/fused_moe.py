@@ -849,7 +849,93 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    iq2r_w1_auxiliary: torch.Tensor | None = None,
+    iq2r_w2_auxiliary: torch.Tensor | None = None,
+    iq2r_w1_metadata=None,
+    iq2r_w2_metadata=None,
+    iq2r_w1_tile_n: int | None = None,
+    iq2r_w2_tile_n: int | None = None,
+    iq2r_workspace=None,
+    iq2r_router_logits: torch.Tensor | None = None,
+    iq2r_router_bias: torch.Tensor | None = None,
+    iq2r_router_renormalize: bool = True,
 ):
+    if quant_type == QuantType.iq2r_2bit:
+        unsupported = {
+            "expert_mask": expert_mask,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "a1_scale": a1_scale,
+            "a2_scale": a2_scale,
+            "num_local_tokens": num_local_tokens,
+            "shared_w1": shared_w1,
+            "shared_w2": shared_w2,
+            "shared_w1_scale": shared_w1_scale,
+            "shared_w2_scale": shared_w2_scale,
+            "stage2_scatter": stage2_scatter,
+            "quant_type_a": quant_type_a,
+            "quant_dtype_a": quant_dtype_a,
+            "quant_dtype_a2": quant_dtype_a2,
+        }
+        present = [name for name, value in unsupported.items() if value is not None]
+        if present:
+            raise NotImplementedError("IQ2R does not support " + ", ".join(present))
+        if shared_expert_id != -1:
+            raise NotImplementedError("IQ2R does not support fused shared experts")
+        if activation != ActivationType.Swiglu:
+            raise ValueError("IQ2R requires SwiGLU activation")
+        if doweight_stage1:
+            raise NotImplementedError(
+                "IQ2R applies route weights after the down projection"
+            )
+        if block_size_M not in (None, -1):
+            raise ValueError("IQ2R uses its workspace task_rows selection")
+        if moe_sorting_dispatch_policy != 0:
+            raise ValueError("IQ2R uses its dedicated stable route sorter")
+        if hidden_pad != 0 or intermediate_pad != 0:
+            raise ValueError("IQ2R requires unpadded logical expert dimensions")
+        if dtype not in (None, torch.bfloat16):
+            raise TypeError("IQ2R output dtype must be bfloat16")
+        if gate_mode not in (None, GateMode.SEPARATED.value):
+            raise ValueError("IQ2R requires separated gate/up semantics")
+        required = {
+            "iq2r_w1_auxiliary": iq2r_w1_auxiliary,
+            "iq2r_w2_auxiliary": iq2r_w2_auxiliary,
+            "iq2r_w1_metadata": iq2r_w1_metadata,
+            "iq2r_w2_metadata": iq2r_w2_metadata,
+            "iq2r_w1_tile_n": iq2r_w1_tile_n,
+            "iq2r_w2_tile_n": iq2r_w2_tile_n,
+            "iq2r_workspace": iq2r_workspace,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError("IQ2R dispatch requires " + ", ".join(missing))
+        from aiter.iq2r_moe import iq2r_fused_moe
+
+        return iq2r_fused_moe(
+            hidden_states,
+            w1,
+            iq2r_w1_auxiliary,
+            w2,
+            iq2r_w2_auxiliary,
+            topk_weight,
+            topk_ids,
+            gate_up_metadata=iq2r_w1_metadata,
+            down_metadata=iq2r_w2_metadata,
+            gate_up_tile_n=iq2r_w1_tile_n,
+            down_tile_n=iq2r_w2_tile_n,
+            gate_up_bias=bias1,
+            down_bias=bias2,
+            workspace=iq2r_workspace,
+            router_logits=iq2r_router_logits,
+            router_bias=iq2r_router_bias,
+            renormalize=iq2r_router_renormalize,
+            output=output,
+            swiglu_limit=7.0 if swiglu_limit is None else float(swiglu_limit),
+            swiglu_alpha=1.702 if beta is None else float(beta),
+            swiglu_up_offset=1.0 if linear_beta is None else float(linear_beta),
+        )
+
     if (
         any(
             tensor is not None
@@ -1425,7 +1511,9 @@ def _fused_moe_impl(
     assert not metadata.flat or get_gfx() in (
         "gfx942",
         "gfx950",
-    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    ), (
+        f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    )
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1663,9 +1751,9 @@ def fused_moe_1stage(
                     num_rows=num_local_tokens,
                 )
             else:
-                assert (
-                    a1_scale is not None or quant_type == QuantType.No
-                ), "a1_scale must be provided for quantized input for fused_moe"
+                assert a1_scale is not None or quant_type == QuantType.No, (
+                    "a1_scale must be provided for quantized input for fused_moe"
+                )
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
                     scale_t = torch.empty_like(a1_scale)
@@ -3172,8 +3260,7 @@ def get_2stage_cfgs(
             reject_reason = f"no MXMOE kernel for activation {activation!r}"
         elif configured_act != expected_act:
             reject_reason = (
-                f"activation {configured_act!r} does not match runtime "
-                f"{expected_act!r}"
+                f"activation {configured_act!r} does not match runtime {expected_act!r}"
             )
         elif swiglu_limit and expected_act not in ("silu", "swiglu"):
             reject_reason = (
@@ -4177,9 +4264,9 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
     else:
-        assert (
-            a1_scale is not None or quant_type == QuantType.No
-        ), "a1_scale must be provided for quantized input for fused_moe"
+        assert a1_scale is not None or quant_type == QuantType.No, (
+            "a1_scale must be provided for quantized input for fused_moe"
+        )
         a1 = hidden_states
     # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
     # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
