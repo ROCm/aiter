@@ -24,6 +24,53 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Combined small-token qualification — E293–E303
+
+E302 measures the unchanged E293 binary with the E297 combined policy:
+E280 exact packing/gate scheduling, E286 independent down waves only at TP8
+M16, E287 static M16 routing, E289 batched reduction, E292 M4 down epilogue,
+and E293 four-column-partition input quantization.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R latency overhead |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 4 | spread | 25.34 | 24.41 | -3.7% |
+| 8 | 4 | hot | 20.43 | 22.18 | +8.5% |
+| 8 | 8 | spread | 36.46 | 35.59 | -2.4% |
+| 8 | 8 | hot | 26.76 | 22.49 | -16.0% |
+| 8 | 16 | spread | 48.95 | 46.64 | -4.7% |
+| 8 | 16 | hot | 28.18 | 24.71 | -12.3% |
+
+Each row averages complete clean bookends over 32 rotating banks. One second
+of synchronized rotating-graph warmup precedes each case and profiling pass;
+measurement rounds and fixed correctness bounds are unchanged. Every baseline
+and candidate bookend has less than 1% drift. All seven phases pass with exact
+IQ2R checks and native dispatch, zero scratch. Five of six cases beat fresh
+MXFP4; TP8 M4 hot remains 8.5% slower. These are synthetic one-rank MoE times,
+not serving concurrency or checkpoint model-quality comparisons.
+
+E297 qualifies 30 synthetic TP8/TP4 shape/routing cases, 240 changing steps,
+720 exact checks and 45 frontend ordering/invalid-route tests. E299 qualifies
+the same combination on 16 actual TP8 M4/M8 captures and six real weight
+slices: 32 capture/TP cases, 256 changing steps and 768 exact checks. Final
+BF16 and intermediate FP8 bytes/scales match original IQ2R. TP4 reuses TP8
+hidden/routes with TP4 weights; M16 remains synthetic-only.
+
+On these captures, combined versus original IQ2R is 23.15 versus 24.80 µs
+at TP8 M4, 31.48 versus 33.21 at TP8 M8, 30.66 versus 32.83 at TP4 M4,
+and 43.76 versus 48.84 at TP4 M8. These are not MXFP4 comparisons.
+
+E294 compact M4 weight reuse, E295 dense batched reduction, E296 temporary
+FP8 gate expansion, E298 global M4 codebook reads and E300–E303 persistent
+fused down remain unselected. E303 removes 96.5% of measured LDS bank
+conflicts without improving time; repeated route metadata loads are the
+next candidate. E293/E294/E295 scout timing drift remains documented and
+does not replace the stable E302 results.
+
+No new production runtime is integrated. TP4 M8's unchanged-MXFP4 fixed-bound
+failure remains unresolved; no new TP4 comparison is claimed here. Earlier
+model-quality and independent scalar-MFMA error-bound issues remain open.
+Dense TP8/TP4 gaps and serving qualification remain. Serving sweeps stay paused.
+
 ## Follow-up results — E285–E292
 
 E289 combines E280 packing/gate scheduling, independent down-projection waves at TP8 M16, the static M16 frontend and batched final reduction reads. E292 separately parallelizes the existing M4 fused-down epilogue. These are shape-specific isolated experiments, with no new production integration.
@@ -294,6 +341,18 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 |E290|Widen route9 output tiles to96/192 columns. Exact, slower at TP8 M4; rejected.|
 |E291|Unchanged E289 combination passes30 boundary/shape cases,240 changing steps and45 frontend tests; captured qualification remains.|
 |E292|Map48 fused-down output columns to48 reducing lanes. Exact and modestly faster at TP8/TP4 M4; TP8 hot gap remains.|
+
+| E293 | Partition small input quantization across two/four column groups. Exact; original timing drift prevents qualification. E302 supplies stable combined results. |
+| E294 | Reuse M4 down weights across compact expert tasks. Exact N16/N48 variants regress on hot routes; unselected, scout drift retained. |
+| E295 | Batch independent reads in dense chunk reduction. Exact, no broad improvement over E261; unselected. |
+| E296 | Expand active gate weights to temporary FP8 each call. All preparation counted; exact but slower with or without prefetch; rejected. |
+| E297 | Combined policy passes 30 TP8/TP4 cases, 240 changing steps, 720 exact checks and 45 frontend tests. |
+| E298 | Read M4 codebooks directly from global memory. Exact but down time nearly doubles; rejected. TP4 compiled, not measured. |
+| E299 | Combined policy passes 32 real-capture/TP cases and 768 exact checks using six actual weight slices. TP4 reuses TP8 inputs; M16 unqualified on captures. |
+| E300 | Retain dense hot-route down weights in registers and fuse ordered route reduction. Dynamic guards/fallbacks timed; exact but much slower. |
+| E301 | Store each persistent expert result once; map routes at reduction. Exact; recovers part of E300 regression but remains unselected. |
+| E302 | One-second graph warmup yields stable TP8 combined comparisons. Five of six small-token cases beat fresh MXFP4; M4 hot remains +8.5%. |
+| E303 | Swizzle persistent-down LDS output columns. Bank conflicts fall 96.5%, time does not improve; exact, zero scratch, unselected. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

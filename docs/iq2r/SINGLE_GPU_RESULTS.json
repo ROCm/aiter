@@ -396,6 +396,87 @@
   ],
   "followup_rows": [
     {
+      "tp": 8,
+      "tokens": 4,
+      "routes": "spread",
+      "mxfp4_us": 25.343455374240875,
+      "iq2r_us": 24.407821893692017,
+      "latency_overhead_percent": -3.6918149744483486,
+      "max_bookend_drift_percent": 0.44395172658509774,
+      "module_sha256": "6e6d2009ccaf2028fbb5c0c11583fb814ca1019d2f6e4e59ea486d3e6fbb1bc9",
+      "experiment": "e302",
+      "run": "tp8-r1",
+      "arm": "iq2r_combined"
+    },
+    {
+      "tp": 8,
+      "tokens": 4,
+      "routes": "hot",
+      "mxfp4_us": 20.43079063296318,
+      "iq2r_us": 22.17705324292183,
+      "latency_overhead_percent": 8.547210146342632,
+      "max_bookend_drift_percent": 0.5196546596824374,
+      "module_sha256": "6e6d2009ccaf2028fbb5c0c11583fb814ca1019d2f6e4e59ea486d3e6fbb1bc9",
+      "experiment": "e302",
+      "run": "tp8-r1",
+      "arm": "iq2r_combined"
+    },
+    {
+      "tp": 8,
+      "tokens": 8,
+      "routes": "spread",
+      "mxfp4_us": 36.457422375679016,
+      "iq2r_us": 35.58991253376007,
+      "latency_overhead_percent": -2.3795150216041283,
+      "max_bookend_drift_percent": 0.9840903440489372,
+      "module_sha256": "6e6d2009ccaf2028fbb5c0c11583fb814ca1019d2f6e4e59ea486d3e6fbb1bc9",
+      "experiment": "e302",
+      "run": "tp8-r1",
+      "arm": "iq2r_combined"
+    },
+    {
+      "tp": 8,
+      "tokens": 8,
+      "routes": "hot",
+      "mxfp4_us": 26.763714849948883,
+      "iq2r_us": 22.488933801651,
+      "latency_overhead_percent": -15.972300826938623,
+      "max_bookend_drift_percent": 0.2689965522185089,
+      "module_sha256": "6e6d2009ccaf2028fbb5c0c11583fb814ca1019d2f6e4e59ea486d3e6fbb1bc9",
+      "experiment": "e302",
+      "run": "tp8-r1",
+      "arm": "iq2r_combined"
+    },
+    {
+      "tp": 8,
+      "tokens": 16,
+      "routes": "spread",
+      "mxfp4_us": 48.94927442073822,
+      "iq2r_us": 46.63750231266022,
+      "latency_overhead_percent": -4.722791370117996,
+      "max_bookend_drift_percent": 0.8574915838394375,
+      "module_sha256": "6e6d2009ccaf2028fbb5c0c11583fb814ca1019d2f6e4e59ea486d3e6fbb1bc9",
+      "experiment": "e302",
+      "run": "tp8-r1",
+      "arm": "iq2r_combined"
+    },
+    {
+      "tp": 8,
+      "tokens": 16,
+      "routes": "hot",
+      "mxfp4_us": 28.1799778342247,
+      "iq2r_us": 24.70957487821579,
+      "latency_overhead_percent": -12.315137280889177,
+      "max_bookend_drift_percent": 0.6459113809585325,
+      "module_sha256": "6e6d2009ccaf2028fbb5c0c11583fb814ca1019d2f6e4e59ea486d3e6fbb1bc9",
+      "experiment": "e302",
+      "run": "tp8-r1",
+      "arm": "iq2r_combined"
+    }
+  ],
+  "followup_scope": "E302 stable TP8 combined-candidate qualification; historical selection and r7 rows retained. No new TP4 or serving comparison.",
+  "historical_followup_rows_r7": [
+    {
       "experiment": "e292",
       "run": "tp8-r1",
       "arm": "iq2r_parallelreduce",
@@ -467,6 +548,5 @@
       "latency_overhead_percent": -5.528157942022038,
       "module_sha256": "07d266667cf88bc6479c0ed7c7e7f23a3b9a8c637dc7200521ef8928fb1beb1e"
     }
-  ],
-  "followup_scope": "Independent E289/E292 shape-specific tests; historical20-row selection table retained. No serving result."
+  ]
 }
