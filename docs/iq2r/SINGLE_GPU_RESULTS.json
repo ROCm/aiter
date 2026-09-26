@@ -648,7 +648,7 @@
       "module_sha256": "c59530042158c93b7975fd9e928d7ffbdd21b4a60bb28a9ed09c2d0abfe64705"
     }
   ],
-  "followup_scope": "The TP4 M256 M32 candidate reaches 75.57 us versus fresh MXFP4 at 68.98 us, still 9.5% behind on hot routing. A separate M16 grid3 experiment improves spread/mixed by 4.1%/3.4% versus its matched grid2 control. Both ingredients pass real-weight qualification on their timed binaries. The 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet. Isolated MoE only; all historical serving/POC records retained.",
+  "followup_scope": "E433 full/partial M32 specialization reaches 73.31 us versus fresh MXFP4 at 69.10 us on TP4 M256 hot routing, still 6.1% behind. It improves its matched E428 control by 3.46% on hot and passes 720 exact real-weight checks using the timed binary. The 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet. Isolated MoE only; all historical serving/POC records retained.",
   "historical_followup_rows_r7": [
     {
       "experiment": "e292",
@@ -6980,6 +6980,674 @@
       "latency_overhead_percent": -11.79925857917803,
       "max_bookend_drift_percent": 0.40802386997402734,
       "module_sha256": "288dc8b4a2a02c4be61554be5724d54d931e7f5d3db0f69e42822b48691c00dd"
+    }
+  ],
+  "historical_followup_rows_r27": [
+    {
+      "experiment": "e347",
+      "run": "tp8-r2",
+      "arm": "iq2r_combined2",
+      "tp": 8,
+      "tokens": 32,
+      "routes": "spread",
+      "mxfp4_us": 78.77956628799438,
+      "iq2r_us": 66.56883656978607,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -15.499869183805304,
+      "max_bookend_drift_percent": 0.10888760003393504,
+      "module_sha256": "5d5aa8fee4df6f5344e1249fa19b97fa8d93c0c32f5fa5dd5d5f8a413781fc7f"
+    },
+    {
+      "experiment": "e347",
+      "run": "tp8-r2",
+      "arm": "iq2r_combined2",
+      "tp": 8,
+      "tokens": 32,
+      "routes": "hot",
+      "mxfp4_us": 28.557877242565155,
+      "iq2r_us": 28.085121512413025,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -1.6554302203088622,
+      "max_bookend_drift_percent": 0.4998417155725631,
+      "module_sha256": "5d5aa8fee4df6f5344e1249fa19b97fa8d93c0c32f5fa5dd5d5f8a413781fc7f"
+    },
+    {
+      "experiment": "e342",
+      "run": "tp8-r1",
+      "arm": "iq2r_parallel_tasks",
+      "tp": 8,
+      "tokens": 64,
+      "routes": "spread",
+      "mxfp4_us": 103.36410999298096,
+      "iq2r_us": 86.55871748924255,
+      "original_iq2r_us": 133.14173221588135,
+      "latency_overhead_percent": -16.258440676245932,
+      "max_bookend_drift_percent": 0.6036574629515767,
+      "module_sha256": "972655a3660dec8b303732d9cb01028ede9acbcc6f1a9c50a3d297f748505ea5"
+    },
+    {
+      "experiment": "e342",
+      "run": "tp8-r1",
+      "arm": "iq2r_parallel_tasks",
+      "tp": 8,
+      "tokens": 64,
+      "routes": "hot",
+      "mxfp4_us": 40.97159057855606,
+      "iq2r_us": 34.37553346157074,
+      "original_iq2r_us": 43.995240330696106,
+      "latency_overhead_percent": -16.09909945853457,
+      "max_bookend_drift_percent": 1.7121813336541607,
+      "module_sha256": "972655a3660dec8b303732d9cb01028ede9acbcc6f1a9c50a3d297f748505ea5"
+    },
+    {
+      "experiment": "e399",
+      "run": "glm53-e399-tp8-r2",
+      "arm": "iq2r_gate",
+      "tp": 8,
+      "tokens": 128,
+      "routes": "spread",
+      "mxfp4_us": 119.15470957756042,
+      "iq2r_us": 101.6048014163971,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -14.728673523172587,
+      "max_bookend_drift_percent": 0.6910848283331072,
+      "module_sha256": "98856c23cbdf3a61e6e4b6bb8365b48f1f308207fde6783c42d983113f1b3ae9"
+    },
+    {
+      "experiment": "e399",
+      "run": "glm53-e399-tp8-r2",
+      "arm": "iq2r_gate",
+      "tp": 8,
+      "tokens": 128,
+      "routes": "hot",
+      "mxfp4_us": 43.35426837205887,
+      "iq2r_us": 42.530640959739685,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -1.899760838427611,
+      "max_bookend_drift_percent": 1.4975790832628935,
+      "module_sha256": "98856c23cbdf3a61e6e4b6bb8365b48f1f308207fde6783c42d983113f1b3ae9"
+    },
+    {
+      "experiment": "e413",
+      "run": "glm53-e413-tp8-r1",
+      "arm": "iq2r_combined",
+      "tp": 8,
+      "tokens": 256,
+      "routes": "spread",
+      "mxfp4_us": 131.03023767471313,
+      "iq2r_us": 111.48279905319214,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -14.918265408361808,
+      "max_bookend_drift_percent": 1.5164653267905266,
+      "module_sha256": "a607f9f01068c1ee44a9dd68fc8991473ebff4f24e0a7fc985e8dd2b777eefdd"
+    },
+    {
+      "experiment": "e413",
+      "run": "glm53-e413-tp8-r1",
+      "arm": "iq2r_combined",
+      "tp": 8,
+      "tokens": 256,
+      "routes": "hot",
+      "mxfp4_us": 61.32183074951172,
+      "iq2r_us": 58.534303307533264,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -4.545734215543873,
+      "max_bookend_drift_percent": 0.6786906156251747,
+      "module_sha256": "a607f9f01068c1ee44a9dd68fc8991473ebff4f24e0a7fc985e8dd2b777eefdd"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 64,
+      "routes": "spread",
+      "mxfp4_us": 191.77803993225098,
+      "iq2r_us": 159.06231999397278,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -17.05915857198019,
+      "max_bookend_drift_percent": 0.40080672627614555,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 64,
+      "routes": "hot",
+      "mxfp4_us": 42.530037462711334,
+      "iq2r_us": 42.01715588569641,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -1.205927875009749,
+      "max_bookend_drift_percent": 0.5193984261436121,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 128,
+      "routes": "spread",
+      "mxfp4_us": 212.2068166732788,
+      "iq2r_us": 169.63640451431274,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -20.060812761028778,
+      "max_bookend_drift_percent": 0.3670090069218937,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 128,
+      "routes": "hot",
+      "mxfp4_us": 60.88428497314453,
+      "iq2r_us": 59.32152271270752,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -2.5667744330516995,
+      "max_bookend_drift_percent": 0.472079303636379,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e400",
+      "run": "glm53-e400-tp4-r2",
+      "arm": "iq2r_remove",
+      "tp": 4,
+      "tokens": 256,
+      "routes": "spread",
+      "mxfp4_us": 223.89580011367798,
+      "iq2r_us": 179.48601841926575,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -19.835022216524013,
+      "max_bookend_drift_percent": 0.8743972781052523,
+      "module_sha256": "e7bd9bd9128d2b861ad2066832d9b630ba5cad3dc7a0ed636f432562cf5edf9e"
+    },
+    {
+      "experiment": "e400",
+      "run": "glm53-e400-tp4-r2",
+      "arm": "iq2r_remove",
+      "tp": 4,
+      "tokens": 256,
+      "routes": "hot",
+      "mxfp4_us": 68.93275678157806,
+      "iq2r_us": 86.7245465517044,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 25.810355773963643,
+      "max_bookend_drift_percent": 0.33209015733337355,
+      "module_sha256": "e7bd9bd9128d2b861ad2066832d9b630ba5cad3dc7a0ed636f432562cf5edf9e"
+    },
+    {
+      "experiment": "e363",
+      "run": "tp4-r2",
+      "arm": "iq2r_extpackedcombined",
+      "tp": 4,
+      "tokens": 1024,
+      "routes": "spread",
+      "mxfp4_us": 290.4756546020508,
+      "iq2r_us": 300.01959800720215,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 3.2856259221539563,
+      "max_bookend_drift_percent": 0.9859783351686126,
+      "module_sha256": "4c9cb5535b6dfb66b5a092d376ad2a1ef22cb33d2aeed677b068d6d9342b99d7"
+    },
+    {
+      "experiment": "e363",
+      "run": "tp4-r2",
+      "arm": "iq2r_extpackedcombined",
+      "tp": 4,
+      "tokens": 1024,
+      "routes": "hot",
+      "mxfp4_us": 187.38163709640503,
+      "iq2r_us": 196.84134125709534,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 5.0483624261556725,
+      "max_bookend_drift_percent": 1.0478721823945996,
+      "module_sha256": "4c9cb5535b6dfb66b5a092d376ad2a1ef22cb33d2aeed677b068d6d9342b99d7"
+    },
+    {
+      "experiment": "e416",
+      "run": "glm53-e416-tp4-r2",
+      "arm": "iq2r_extpackedvisible",
+      "tp": 4,
+      "tokens": 4096,
+      "routes": "spread",
+      "mxfp4_us": 594.2987680435181,
+      "iq2r_us": 730.1437854766846,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 22.858034500118496,
+      "max_bookend_drift_percent": 0.6035442053959861,
+      "module_sha256": "c59530042158c93b7975fd9e928d7ffbdd21b4a60bb28a9ed09c2d0abfe64705"
+    },
+    {
+      "experiment": "e416",
+      "run": "glm53-e416-tp4-r2",
+      "arm": "iq2r_extpackedvisible",
+      "tp": 4,
+      "tokens": 4096,
+      "routes": "hot",
+      "mxfp4_us": 488.88280391693115,
+      "iq2r_us": 602.8900146484375,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 23.31994699303801,
+      "max_bookend_drift_percent": 2.243807933692627,
+      "module_sha256": "c59530042158c93b7975fd9e928d7ffbdd21b4a60bb28a9ed09c2d0abfe64705"
+    }
+  ],
+  "qualification_r28": [
+    {
+      "status": "pass",
+      "graph_eager_checks": 4320,
+      "rows": [
+        {
+          "case": "tp4_compact-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+        },
+        {
+          "case": "tp4_compact-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+        },
+        {
+          "case": "tp4_compact-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+        },
+        {
+          "case": "tp4_dense-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "65369d9ac98d0f5e19f02a6079a30badbc1bc81e82334316602149e1eb57be4c"
+        },
+        {
+          "case": "tp4_dense-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "65369d9ac98d0f5e19f02a6079a30badbc1bc81e82334316602149e1eb57be4c"
+        },
+        {
+          "case": "tp4_dense-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "65369d9ac98d0f5e19f02a6079a30badbc1bc81e82334316602149e1eb57be4c"
+        },
+        {
+          "case": "tp8_compact-layer3-rank0",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+        },
+        {
+          "case": "tp8_compact-layer40-rank3",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+        },
+        {
+          "case": "tp8_compact-layer77-rank7",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 1080,
+      "rows": [
+        {
+          "case": "tp4_dense-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        },
+        {
+          "case": "tp4_dense-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        },
+        {
+          "case": "tp4_dense-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 2160,
+      "rows": [
+        {
+          "case": "tp4_compact-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
+        },
+        {
+          "case": "tp4_compact-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
+        },
+        {
+          "case": "tp4_compact-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
+        },
+        {
+          "case": "tp8_compact-layer3-rank0",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
+        },
+        {
+          "case": "tp8_compact-layer40-rank3",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
+        },
+        {
+          "case": "tp8_compact-layer77-rank7",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 1080,
+      "rows": [
+        {
+          "case": "tp8_m128-layer3-rank0",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "98856c23cbdf3a61e6e4b6bb8365b48f1f308207fde6783c42d983113f1b3ae9"
+        },
+        {
+          "case": "tp8_m128-layer40-rank3",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "98856c23cbdf3a61e6e4b6bb8365b48f1f308207fde6783c42d983113f1b3ae9"
+        },
+        {
+          "case": "tp8_m128-layer77-rank7",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "98856c23cbdf3a61e6e4b6bb8365b48f1f308207fde6783c42d983113f1b3ae9"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 1080,
+      "rows": [
+        {
+          "case": "tp4_m256-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "e7bd9bd9128d2b861ad2066832d9b630ba5cad3dc7a0ed636f432562cf5edf9e"
+        },
+        {
+          "case": "tp4_m256-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "e7bd9bd9128d2b861ad2066832d9b630ba5cad3dc7a0ed636f432562cf5edf9e"
+        },
+        {
+          "case": "tp4_m256-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "e7bd9bd9128d2b861ad2066832d9b630ba5cad3dc7a0ed636f432562cf5edf9e"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 1440,
+      "rows": [
+        {
+          "case": "tp8_m256-layer3-rank0",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 480,
+          "module_sha256": "a607f9f01068c1ee44a9dd68fc8991473ebff4f24e0a7fc985e8dd2b777eefdd"
+        },
+        {
+          "case": "tp8_m256-layer40-rank3",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 480,
+          "module_sha256": "a607f9f01068c1ee44a9dd68fc8991473ebff4f24e0a7fc985e8dd2b777eefdd"
+        },
+        {
+          "case": "tp8_m256-layer77-rank7",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 480,
+          "module_sha256": "a607f9f01068c1ee44a9dd68fc8991473ebff4f24e0a7fc985e8dd2b777eefdd"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 2160,
+      "rows": [
+        {
+          "case": "tp4_dense-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "c59530042158c93b7975fd9e928d7ffbdd21b4a60bb28a9ed09c2d0abfe64705"
+        },
+        {
+          "case": "tp4_dense-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "c59530042158c93b7975fd9e928d7ffbdd21b4a60bb28a9ed09c2d0abfe64705"
+        },
+        {
+          "case": "tp4_dense-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "c59530042158c93b7975fd9e928d7ffbdd21b4a60bb28a9ed09c2d0abfe64705"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 1440,
+      "rows": [
+        {
+          "case": "tp4_m256-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 480,
+          "module_sha256": "448dacc2686a28d6f463b0cff4cc8695e4d858d60abfc4b50826ab7ab7de8e52"
+        },
+        {
+          "case": "tp4_m256-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 480,
+          "module_sha256": "448dacc2686a28d6f463b0cff4cc8695e4d858d60abfc4b50826ab7ab7de8e52"
+        },
+        {
+          "case": "tp4_m256-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 480,
+          "module_sha256": "448dacc2686a28d6f463b0cff4cc8695e4d858d60abfc4b50826ab7ab7de8e52"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 720,
+      "rows": [
+        {
+          "case": "tp4_m256-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "9649f3074cb987304b58d9ee72dbb4f17610ed0b3be39024653de632d9b2c198"
+        },
+        {
+          "case": "tp4_m256-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "9649f3074cb987304b58d9ee72dbb4f17610ed0b3be39024653de632d9b2c198"
+        },
+        {
+          "case": "tp4_m256-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "9649f3074cb987304b58d9ee72dbb4f17610ed0b3be39024653de632d9b2c198"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 720,
+      "rows": [
+        {
+          "case": "tp4_m256-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "288dc8b4a2a02c4be61554be5724d54d931e7f5d3db0f69e42822b48691c00dd"
+        },
+        {
+          "case": "tp4_m256-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "288dc8b4a2a02c4be61554be5724d54d931e7f5d3db0f69e42822b48691c00dd"
+        },
+        {
+          "case": "tp4_m256-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "288dc8b4a2a02c4be61554be5724d54d931e7f5d3db0f69e42822b48691c00dd"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 720,
+      "rows": [
+        {
+          "case": "tp4_m256-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "749318b15a05f48702fa0e82381ab94c99d3d2d71adfcc991a51756899982d77"
+        },
+        {
+          "case": "tp4_m256-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "749318b15a05f48702fa0e82381ab94c99d3d2d71adfcc991a51756899982d77"
+        },
+        {
+          "case": "tp4_m256-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 240,
+          "module_sha256": "749318b15a05f48702fa0e82381ab94c99d3d2d71adfcc991a51756899982d77"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    }
+  ],
+  "candidate_rows_r28": [
+    {
+      "tp": 4,
+      "tokens": 256,
+      "routes": "spread",
+      "experiment": "e433",
+      "run": "glm53-e433-tp4-r1",
+      "arm": "iq2r_specialized",
+      "mxfp4_us": 224.62996244430542,
+      "iq2r_us": 183.58085751533508,
+      "latency_overhead_percent": -18.274100428231176,
+      "max_bookend_drift_percent": 0.17677412195167644,
+      "module_sha256": "749318b15a05f48702fa0e82381ab94c99d3d2d71adfcc991a51756899982d77"
+    },
+    {
+      "tp": 4,
+      "tokens": 256,
+      "routes": "hot",
+      "experiment": "e433",
+      "run": "glm53-e433-tp4-r1",
+      "arm": "iq2r_specialized",
+      "mxfp4_us": 69.10392045974731,
+      "iq2r_us": 73.30634891986847,
+      "latency_overhead_percent": 6.081316996434438,
+      "max_bookend_drift_percent": 1.3742487998045474,
+      "module_sha256": "749318b15a05f48702fa0e82381ab94c99d3d2d71adfcc991a51756899982d77"
+    },
+    {
+      "tp": 4,
+      "tokens": 256,
+      "routes": "mixed",
+      "experiment": "e433",
+      "run": "glm53-e433-tp4-r1",
+      "arm": "iq2r_specialized",
+      "mxfp4_us": 226.82863473892212,
+      "iq2r_us": 195.7822620868683,
+      "latency_overhead_percent": -13.687148753413759,
+      "max_bookend_drift_percent": 0.45710212426334323,
+      "module_sha256": "749318b15a05f48702fa0e82381ab94c99d3d2d71adfcc991a51756899982d77"
     }
   ]
 }

@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E430. Related scouts,
+attempts from the initial GLM integration through E435. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E430
+## Isolated single-GPU optimization, E199–E435
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -276,6 +276,15 @@ single-GPU report. Serving sweeps remain paused.
 | E428 | Vector M32 partial exchange preserves ordered sums, uses 122 registers/no spills and reduces hot LDS instructions 9.8%. 315 exact checks; hot improves 1.29% to 75.57 us versus 68.98 us MXFP4, with small cold regressions. |
 | E429 | Frozen E427 grid3 binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Preserve initial reporting-only KeyError and repair; no kernel rebuild or tolerance change. |
 | E430 | Frozen E428 vector-exchange binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Native grids and zero scratch pass; no serving claim. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E431 | Known-byte precompiled add probe validates current TCC units for eager/graph, exact outputs and zero scratch. Preserves initial read-only-cwd profiler failure. Historical E426 discrepancy remains unexplained; no counter rescaling. |
+| E432 | Component-vector partial stores/remapped lanes pass 315 exact checks but lose to E428 on all patterns. Lower VALU counts accompany higher LDS instructions/waits. Fresh E423/E428 controls reverse their earlier small hot ordering; reject and preserve both measurements. |
+| E433 | Specialize full/partial M32 K loops once per work item. 315 exact checks, stable bookends, 120 VGPRs/70 SGPRs and zero spills. Improves matched E428 by 1.28/3.46/1.74%; hot remains 6.08% behind MXFP4. |
+| E434 | Unchanged timed E433 binary passes 720 exact real-weight graph/eager checks across three slices/five patterns/eight changes. Input/intermediate FP8/scales, final BF16, native grids and zero scratch verified. Operator qualification only. |
+| E435 | M64 paired-task weight reuse with one activation slot spills 15 VGPRs/64 private bytes at the required launch bound. Rejected before GPU correctness/timing; source, native binary and failure preserved. |
 
 
 ## How to read the outcomes

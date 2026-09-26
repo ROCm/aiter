@@ -24,6 +24,60 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## M32 loop specialization and counter validation — E431–E435
+
+E433 full/partial M32 specialization reaches 73.31 us versus fresh MXFP4 at 69.10 us on TP4 M256 hot routing, still 6.1% behind. It improves its matched E428 control by 3.46% on hot and passes 720 exact real-weight checks using the timed binary. The 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 119.15 | 101.60 | -14.7% |
+| 8 | 128 | hot | 43.35 | 42.53 | -1.9% |
+| 8 | 256 | spread | 131.03 | 111.48 | -14.9% |
+| 8 | 256 | hot | 61.32 | 58.53 | -4.5% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 223.90 | 179.49 | -19.8% |
+| 4 | 256 | hot | 68.93 | 86.72 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 594.30 | 730.14 | +22.9% |
+| 4 | 4096 | hot | 488.88 | 602.89 | +23.3% |
+
+| TP4 M256 routes | MXFP4 us | E428 control us | E433 specialized us | IQ2R time difference |
+|:---|---:|---:|---:|---:|
+| spread | 224.63 | 185.96 | 183.58 | -18.3% |
+| hot | 69.10 | 75.93 | 73.31 | +6.1% |
+| mixed | 226.83 | 199.24 | 195.78 | -13.7% |
+
+E433 moves the full/partial task decision outside the K loop, removes conditional branches between paired MFMA sites and lowers native allocation to 120 VGPRs/70 SGPRs with zero spills. Matched improvements versus E428 are 1.28% spread, 3.46% hot and 1.74% mixed. Hot gate trace falls 34.04 to 33.02 us and aggregate waits fall 37.91M to 30.51M; LDS waits rise slightly and occupancy is essentially unchanged. E432 component-vector storage is rejected: lower VALU counts are offset by more LDS work. Its fresh controls also reverse the earlier small E423/E428 hot ordering, so E428's 1.29% gain is not consistently reproduced. Both qualified measurements remain visible.
+
+E432/E433 add 630 exact synthetic checks with maximum per-arm bookend drift below 3%. E434 adds 720 exact real-weight checks across layers 3/40/77 and capture ranks 0/3/7, mapping to actual TP4 weight ranks 0/3/3. Tiled small captures do not establish native M256 capture or whole-model quality. E435 M64 task pairing spills 15 VGPRs/64 private bytes and is rejected before GPU work; it has no timing result.
+
+E431 validates current TCC units using a known-byte add probe: 128 MiB logical traffic produces about 128.011 MiB measured traffic in both eager and graph dispatches. This rules out general eightfold graph duplication in this configuration. E426's historical discrepancy remains unexplained; old counters are unchanged and no universal correction factor is applied.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Work supply and vector partial exchange — E425–E430
 
 The TP4 M256 M32 candidate reaches 75.57 us versus fresh MXFP4 at 68.98 us, still 9.5% behind on hot routing. A separate M16 grid3 experiment improves spread/mixed by 4.1%/3.4% versus its matched grid2 control. Both ingredients pass real-weight qualification on their timed binaries. The 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet.
@@ -1372,6 +1426,12 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E428 | Vector M32 partial exchange preserves ordered sums, uses 122 registers/no spills and reduces hot LDS instructions 9.8%. 315 exact checks; hot improves 1.29% to 75.57 us versus 68.98 us MXFP4, with small cold regressions. |
 | E429 | Frozen E427 grid3 binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Preserve initial reporting-only KeyError and repair; no kernel rebuild or tolerance change. |
 | E430 | Frozen E428 vector-exchange binary passes 720 exact real-weight checks across three slices/five patterns/eight changes. Native grids and zero scratch pass; no serving claim. |
+
+| E431 | Known-byte precompiled add probe validates current TCC units for eager/graph, exact outputs and zero scratch. Preserves initial read-only-cwd profiler failure. Historical E426 discrepancy remains unexplained; no counter rescaling. |
+| E432 | Component-vector partial stores/remapped lanes pass 315 exact checks but lose to E428 on all patterns. Lower VALU counts accompany higher LDS instructions/waits. Fresh E423/E428 controls reverse their earlier small hot ordering; reject and preserve both measurements. |
+| E433 | Specialize full/partial M32 K loops once per work item. 315 exact checks, stable bookends, 120 VGPRs/70 SGPRs and zero spills. Improves matched E428 by 1.28/3.46/1.74%; hot remains 6.08% behind MXFP4. |
+| E434 | Unchanged timed E433 binary passes 720 exact real-weight graph/eager checks across three slices/five patterns/eight changes. Input/intermediate FP8/scales, final BF16, native grids and zero scratch verified. Operator qualification only. |
+| E435 | M64 paired-task weight reuse with one activation slot spills 15 VGPRs/64 private bytes at the required launch bound. Rejected before GPU correctness/timing; source, native binary and failure preserved. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
