@@ -195,7 +195,13 @@ def _unary_tile_supported(input: Tensor) -> bool:
     # Mirror the C++ tile fast-path condition (unary_operator.cu): contiguous,
     # N % 8 == 0 and K % vec == 0, where vec is the number of elements spanning
     # 16 bytes for this dtype (fp16/bf16 -> 8, fp32 -> 4).
-    if not input.is_contiguous():
+    if (
+        input.device.type != "cuda"
+        or input.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or input.dim() not in (2, 3)
+        or input.numel() == 0
+        or not input.is_contiguous()
+    ):
         return False
     dim = input.dim()
     if dim == 2:
