@@ -11,6 +11,8 @@ import torch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
+    fused_kda_spec_finalize_kernel,
+    fused_kda_spec_parallel_v_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -32,6 +34,9 @@ def fused_kda_decode(
     head_dim: int,
     num_local_heads: int,
     lower_bound: float,
+    num_accepted_tokens: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused KDA decode: conv1d + recurrence + gated RMSNorm.
 
@@ -45,13 +50,16 @@ def fused_kda_decode(
         A_log: [H] fp32, per-head decay parameter.
         dt_bias: [H*K] fp32, per-channel bias.
         ssm_state: [N, H, V, K] fp32, delta-rule state matrices.
-        ssm_state_indices: [B] int32, batch-to-slot mapping.
+        ssm_state_indices: [B] for normal decode or [B, S] for spec decode.
         cu_seqlens: [B+1] int64, cumulative sequence lengths.
         norm_weight: [K] fp32, RMSNorm weight.
         norm_eps: float, RMSNorm epsilon.
         head_dim: int, K = V = head_dim.
         num_local_heads: int, H = num_local_heads.
         lower_bound: float, KDA gate lower bound (typically -5.0).
+        num_accepted_tokens: [B] int32 accepted-token counts for spec decode.
+        conv_state_indices: [B] int32 convolution-cache slots for spec decode.
+        out: Optional preallocated [T, H*K] bf16 output.
 
     Returns:
         out: [B, H*K] bf16, final output after RMSNorm + gate.
@@ -62,7 +70,28 @@ def fused_kda_decode(
     lp = H * K
     batch = cu_seqlens.shape[0] - 1
 
-    out = torch.empty(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
+    is_spec_decoding = num_accepted_tokens is not None
+    if is_spec_decoding:
+        if ssm_state_indices.ndim != 2 or conv_state_indices is None:
+            raise ValueError(
+                "Spec decode requires 2-D ssm_state_indices and conv_state_indices"
+            )
+        stride_indices_seq = ssm_state_indices.stride(0)
+        stride_indices_tok = ssm_state_indices.stride(1)
+    else:
+        stride_indices_seq = ssm_state_indices.stride(0)
+        stride_indices_tok = 1
+    num_accepted_tokens_arg = (
+        num_accepted_tokens if num_accepted_tokens is not None else ssm_state_indices
+    )
+    conv_state_indices_arg = (
+        conv_state_indices if conv_state_indices is not None else ssm_state_indices
+    )
+
+    if out is None:
+        out = torch.empty(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
+    elif out.shape != (T, lp):
+        raise ValueError(f"Expected out shape {(T, lp)}, got {tuple(out.shape)}")
 
     # Conv weight strides: support [3*lp, W] and [3, W, lp]
     if conv_weight.dim() == 3:
@@ -79,6 +108,98 @@ def fused_kda_decode(
     stride_beta_tok = beta.stride(1) if beta.dim() == 3 else beta.stride(0)
     stride_og_tok = out_gate.stride(0)
 
+    block_v = 16
+    # Tokens per speculative sequence: num_speculative_tokens + 1. H and this
+    # width are not specialized: the parallel kernel indexes heads from
+    # program_id(1) and clamps its token loop to SPEC_LEN.
+    spec_tokens = ssm_state_indices.shape[1] if is_spec_decoding else 0
+    # W == 4 is structural: the recurrence keeps exactly W - 1 = 3 conv history
+    # taps in registers.
+    use_parallel_spec = (
+        is_spec_decoding
+        and get_arch() == "gfx950"
+        and K == 128
+        and V % block_v == 0
+        and W == 4
+        and spec_tokens >= 2
+        # The recurrence reads conv history at checkpoint + W - 2 and finalize
+        # writes it at W - 2 + i_t, both with an index up to spec_tokens + 1.
+        and conv_state.shape[2] >= spec_tokens + W - 2
+        # FULL decode graphs may pad the token dimension past the real
+        # batch * spec_tokens tokens. cu_seqlens remains authoritative, and the
+        # kernels bound their work by its per-sequence eos.
+        and T >= batch * spec_tokens
+    )
+    if use_parallel_spec:
+        conv_carry = torch.empty(
+            batch,
+            3 * H * K,
+            2,
+            dtype=torch.bfloat16,
+            device=mixed_qkv.device,
+        )
+        fused_kda_spec_parallel_v_kernel[(batch, H, V // block_v)](
+            mixed_qkv,
+            conv_weight,
+            conv_state,
+            conv_carry,
+            gate,
+            beta,
+            A_log,
+            dt_bias,
+            ssm_state,
+            ssm_state_indices,
+            num_accepted_tokens,
+            conv_state_indices,
+            cu_seqlens,
+            out,
+            lower_bound,
+            K**-0.5,
+            H=H,
+            K=K,
+            V=V,
+            W=W,
+            BV=block_v,
+            SPEC_LEN=spec_tokens,
+            stride_x_tok=mixed_qkv.stride(0),
+            stride_cw_group=stride_cw_group,
+            stride_cw_width=stride_cw_width,
+            stride_cw_ch=stride_cw_ch,
+            stride_cs_slot=conv_state.stride(0),
+            stride_cs_dim=conv_state.stride(1),
+            stride_cs_pos=conv_state.stride(2),
+            stride_beta_tok=stride_beta_tok,
+            stride_ssm_slot=ssm_state.stride(0),
+            stride_indices_seq=stride_indices_seq,
+            stride_indices_tok=stride_indices_tok,
+            num_warps=2,
+        )
+        fused_kda_spec_finalize_kernel[(batch, H, spec_tokens)](
+            mixed_qkv,
+            conv_state,
+            conv_carry,
+            ssm_state_indices,
+            num_accepted_tokens,
+            conv_state_indices,
+            cu_seqlens,
+            norm_weight,
+            out_gate,
+            out,
+            norm_eps,
+            H=H,
+            K=K,
+            V=V,
+            W=W,
+            SPEC_LEN=spec_tokens,
+            stride_x_tok=mixed_qkv.stride(0),
+            stride_cs_slot=conv_state.stride(0),
+            stride_cs_dim=conv_state.stride(1),
+            stride_cs_pos=conv_state.stride(2),
+            stride_og_tok=stride_og_tok,
+            num_warps=2,
+        )
+        return out
+
     grid = (batch, H)
     fused_conv_recurrent_norm_kernel[grid](
         mixed_qkv,
@@ -90,6 +211,8 @@ def fused_kda_decode(
         dt_bias,
         ssm_state,
         ssm_state_indices,
+        num_accepted_tokens_arg,
+        conv_state_indices_arg,
         cu_seqlens,
         norm_weight,
         out_gate,
@@ -97,11 +220,12 @@ def fused_kda_decode(
         lower_bound,
         norm_eps,
         K**-0.5,
-        T,
         H=H,
         K=K,
         V=V,
         W=W,
+        STATE_LEN=conv_state.shape[2],
+        IS_SPEC_DECODING=is_spec_decoding,
         stride_x_tok=mixed_qkv.stride(0),
         stride_cw_group=stride_cw_group,
         stride_cw_width=stride_cw_width,
@@ -112,6 +236,8 @@ def fused_kda_decode(
         stride_beta_tok=stride_beta_tok,
         stride_og_tok=stride_og_tok,
         stride_ssm_slot=ssm_state.stride(0),
-        num_warps=2 if get_arch() == "gfx942" else 4,
+        stride_indices_seq=stride_indices_seq,
+        stride_indices_tok=stride_indices_tok,
+        num_warps=2 if get_arch() in ("gfx942", "gfx950") else 4,
     )
     return out
