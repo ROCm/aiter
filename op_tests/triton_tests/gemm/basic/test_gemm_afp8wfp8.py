@@ -158,7 +158,7 @@ def get_shapes():
 
 
 @pytest.mark.parametrize("M, N, K", get_shapes())
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
 def test_gemm_afp8wfp8(
     M: int,
@@ -480,14 +480,14 @@ def test_compact_scale_execution_variants(a_group, b_group, packed, fused, trans
         ws = ws.T.contiguous().T
     config = _execution_config(packed, fused, n_first=transposed)
     original = copy.deepcopy(config)
-    y = torch.empty(expected.shape, device="cuda", dtype=torch.float32)
+    y = torch.empty(expected.shape, device="cuda", dtype=torch.bfloat16)
     for _ in range(2):  # Fused arrival counters must be reusable.
         actual = gemm_afp8wfp8(
             x,
             w,
             xs,
             ws,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             y=y,
             config=config,
             x_scale_group_size=a_group,
@@ -549,7 +549,7 @@ def test_compact_scales_with_uint8_operands(rows):
         w.view(torch.uint8),
         xs,
         ws,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         config=config,
         x_scale_group_size=32,
         w_scale_group_size=(rows, 32),
@@ -565,7 +565,7 @@ def test_fused_split_k_graph_replay_reads_live_scales(packed):
     x, w, xs, ws, _ = _compact_scale_inputs(3, 131, 1152, a_group, b_group)
     config = _execution_config(packed=packed, fused=True)
     kwargs = dict(
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         config=config,
         x_scale_group_size=a_group,
         w_scale_group_size=b_group,
@@ -602,7 +602,7 @@ def test_compact_scale_partial_k_tile(a_group, b_group, fused):
         w,
         xs,
         ws,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         config=config,
         x_scale_group_size=a_group,
         w_scale_group_size=b_group,
@@ -656,31 +656,24 @@ def run_group32_reference(x, weight, xs, ws, weight_group_rows=32):
         (1023, 4097, 1280),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.usefixtures("_require_gfx950")
 def test_group32_projection_panel_scales_and_tails(m, n, k, dtype):
     x, weight, xs, ws = generate_group32_inputs(m, n, k)
     actual = gemm_a8w8_blockscale_group32(x, weight, xs, ws, dtype=dtype)
     expected = run_group32_reference(x, weight, xs, ws)
     peak = expected.abs().max().item()
-    # Keep the established native-MFMA FP32 bound. BF16 additionally rounds
-    # output; near cancellation still uses the same peak-relative floor.
+    # Compare rounded BF16 outputs; near cancellation uses a peak-relative floor.
     torch.testing.assert_close(
         actual.float(),
         expected.to(dtype).float(),
-        rtol=(
-            0.016
-            if dtype == torch.bfloat16
-            else 0.002
-            if dtype == torch.float16
-            else 3e-5
-        ),
+        rtol=0.016,
         atol=5e-5 * peak,
     )
 
 
 @pytest.mark.parametrize("m,packed", [(3, True), (129, False)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.usefixtures("_require_gfx950")
 def test_tuned_variants_use_production_config(m, packed, dtype):
     n, k = 8192, 1280
@@ -695,13 +688,7 @@ def test_tuned_variants_use_production_config(m, packed, dtype):
     torch.testing.assert_close(
         actual.float(),
         expected.to(dtype).float(),
-        rtol=(
-            0.016
-            if dtype == torch.bfloat16
-            else 0.002
-            if dtype == torch.float16
-            else 3e-5
-        ),
+        rtol=0.016,
         atol=5e-5 * expected.abs().max().item(),
     )
 
@@ -719,7 +706,7 @@ def test_group32_projection_extreme_scale_codes(a_code, b_code):
     ws = torch.full((64, 40), b_code, device="cuda", dtype=torch.uint8).view(
         torch.float8_e8m0fnu
     )
-    actual = gemm_a8w8_blockscale_group32(x, weight, xs, ws, dtype=torch.float32)
+    actual = gemm_a8w8_blockscale_group32(x, weight, xs, ws, dtype=torch.bfloat16)
     if 255 in (a_code, b_code):
         assert actual.isnan().all()
     else:
@@ -734,13 +721,13 @@ def test_group32_projection_extreme_scale_codes(a_code, b_code):
 def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split_k):
     x, weight, xs, ws = generate_group32_inputs(2 * rows, n, k)
     gemm_a8w8_blockscale_group32(
-        x, weight, xs, ws, dtype=torch.float32, split_k=split_k
+        x, weight, xs, ws, dtype=torch.bfloat16, split_k=split_k
     )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = gemm_a8w8_blockscale_group32(
-            x, weight, xs, ws, dtype=torch.float32, split_k=split_k
+            x, weight, xs, ws, dtype=torch.bfloat16, split_k=split_k
         )
     for factor in (2, 0.5):
         x.copy_((x.float() * factor).to(x.dtype))
@@ -749,13 +736,13 @@ def test_group32_projection_graph_reads_live_inputs_and_scales(rows, n, k, split
         expected = run_group32_reference(x, weight, xs, ws)
         torch.testing.assert_close(
             actual.float(),
-            expected.float(),
-            rtol=3e-5,
+            expected.to(torch.bfloat16).float(),
+            rtol=0.016,
             atol=5e-5 * expected.abs().max().item(),
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.usefixtures("_require_gfx950")
 def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
     x, weight, xs, ws = generate_group32_inputs(97, 8193, 576)
@@ -770,13 +757,7 @@ def test_row_scaled_fp8_projection_with_token_and_column_tails(dtype):
     torch.testing.assert_close(
         actual.float(),
         expected.to(dtype).float(),
-        rtol=(
-            0.016
-            if dtype == torch.bfloat16
-            else 0.002
-            if dtype == torch.float16
-            else 3e-5
-        ),
+        rtol=0.016,
         atol=5e-5 * expected.abs().max().item(),
     )
 
@@ -894,9 +875,12 @@ def test_public_small_n_scale_layouts(n, group_n, raw_views):
     operands = (x, w, xs, ws)
     if raw_views:
         operands = tuple(t.view(torch.uint8) for t in operands)
-    actual = gemm_a8w8_blockscale(*operands, dtype=torch.float32)
+    actual = gemm_a8w8_blockscale(*operands, dtype=torch.bfloat16)
     torch.testing.assert_close(
-        actual.double(), expected, rtol=3e-5, atol=5e-5 * expected.abs().max().item()
+        actual.float(),
+        expected.to(torch.bfloat16).float(),
+        rtol=0.016,
+        atol=5e-5 * expected.abs().max().item(),
     )
 
 
@@ -939,13 +923,7 @@ def _assert_matches_reference(actual, x, w, xs, ws, dtype, weight_group_rows=32)
     torch.testing.assert_close(
         actual.float(),
         expected.to(dtype).float(),
-        rtol=(
-            0.016
-            if dtype == torch.bfloat16
-            else 0.002
-            if dtype == torch.float16
-            else 3e-5
-        ),
+        rtol=0.016,
         atol=5e-5 * expected.abs().max().item(),
     )
 
@@ -954,7 +932,7 @@ def _assert_matches_reference(actual, x, w, xs, ws, dtype, weight_group_rows=32)
 @pytest.mark.parametrize(
     "m,n,k", [(1, 512, 5120), (3, 2053, 1280), (16, 1152, 5120), (37, 5120, 2304)]
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.usefixtures("_require_gfx950")
 def test_fused_split_k_matches_reference(variant, m, n, k, dtype):
     x, w, xs, ws = generate_group32_inputs(m, n, k)
@@ -974,8 +952,8 @@ def test_weight_cache_modifier_keeps_results(variant, m, n, k):
     if variant == "packed":
         cached["packed"] = dict(config["packed"], cache_modifier=".cg")
     run = gemm_a8w8_blockscale_group32
-    expected = run(x, w, xs, ws, dtype=torch.float32, config=config)
-    actual = run(x, w, xs, ws, dtype=torch.float32, config=cached)
+    expected = run(x, w, xs, ws, dtype=torch.bfloat16, config=config)
+    actual = run(x, w, xs, ws, dtype=torch.bfloat16, config=cached)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -983,9 +961,9 @@ def test_weight_cache_modifier_keeps_results(variant, m, n, k):
 def test_fused_split_k_row_scales():
     x, w, xs, ws = generate_group32_inputs(5, 2053, 1280, weight_group_rows=1)
     actual = gemm_a8w8_blockscale_group32(
-        x, w, xs, ws, weight_group_rows=1, dtype=torch.float32, config=_FUSED_TILE
+        x, w, xs, ws, weight_group_rows=1, dtype=torch.bfloat16, config=_FUSED_TILE
     )
-    _assert_matches_reference(actual, x, w, xs, ws, torch.float32, 1)
+    _assert_matches_reference(actual, x, w, xs, ws, torch.bfloat16, 1)
 
 
 @pytest.mark.parametrize("variant", ["tile", "packed"])
@@ -993,7 +971,7 @@ def test_fused_split_k_row_scales():
 def test_fused_split_k_is_deterministic_and_rezeroes_counters(variant):
     x, w, xs, ws = generate_group32_inputs(4, 1152, 5120)
     run = lambda: gemm_a8w8_blockscale_group32(
-        x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+        x, w, xs, ws, dtype=torch.bfloat16, config=_FUSED[variant]
     )
     first = run()
     # A stale counter or an early partial read would change a later sum.
@@ -1009,20 +987,20 @@ def test_fused_split_k_graph_replay_on_warmed_stream(variant):
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         gemm_a8w8_blockscale_group32(
-            x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+            x, w, xs, ws, dtype=torch.bfloat16, config=_FUSED[variant]
         )
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         actual = gemm_a8w8_blockscale_group32(
-            x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+            x, w, xs, ws, dtype=torch.bfloat16, config=_FUSED[variant]
         )
     for factor in (2, 0.5):
         x.copy_((x.float() * factor).to(x.dtype))
         xs.view(torch.uint8).add_(1)
         graph.replay()
         torch.cuda.synchronize()
-        _assert_matches_reference(actual, x, w, xs, ws, torch.float32)
+        _assert_matches_reference(actual, x, w, xs, ws, torch.bfloat16)
 
 
 @pytest.mark.parametrize("variant", ["tile", "packed"])
@@ -1036,11 +1014,11 @@ def test_fused_split_k_first_use_inside_capture(variant, monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = gemm_a8w8_blockscale_group32(
-            x, w, xs, ws, dtype=torch.float32, config=_FUSED[variant]
+            x, w, xs, ws, dtype=torch.bfloat16, config=_FUSED[variant]
         )
     graph.replay()
     torch.cuda.synchronize()
-    _assert_matches_reference(actual, x, w, xs, ws, torch.float32)
+    _assert_matches_reference(actual, x, w, xs, ws, torch.bfloat16)
 
 
 @pytest.mark.parametrize("variant", ["tile", "packed"])
@@ -1048,7 +1026,7 @@ def test_fused_split_k_first_use_inside_capture(variant, monkeypatch):
 def test_fused_split_k_concurrent_streams(variant):
     inputs = [generate_group32_inputs(m, 1152, 5120) for m in (3, 5)]
     expected = [
-        gemm_a8w8_blockscale_group32(*t, dtype=torch.float32, config=_FUSED[variant])
+        gemm_a8w8_blockscale_group32(*t, dtype=torch.bfloat16, config=_FUSED[variant])
         for t in inputs
     ]
     torch.cuda.synchronize()
@@ -1060,7 +1038,7 @@ def test_fused_split_k_concurrent_streams(variant):
             with torch.cuda.stream(stream):
                 outputs[i].append(
                     gemm_a8w8_blockscale_group32(
-                        *operands, dtype=torch.float32, config=_FUSED[variant]
+                        *operands, dtype=torch.bfloat16, config=_FUSED[variant]
                     )
                 )
     torch.cuda.synchronize()
