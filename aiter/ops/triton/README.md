@@ -312,12 +312,17 @@ For config placement and seeding a new architecture, follow `configs/CLAUDE.md`
 (§5 and §6). The [shared GEMM tuner](utils/_triton/tuning/README.md) benchmarks
 the current config, tries candidates through `get_gemm_config()`, logs failures,
 and saves the fastest config when it improves performance or the M bucket has
-no tuned config. It times the complete wrapper call with `do_bench`.
+no tuned config. It measures rocprofv3 GEMM/reduction kernel timestamps, excluding
+wrapper overhead. Each config runs in a fresh process with a timeout; crashes
+and timeouts are logged and the sweep continues.
 
 Run `python3 utils/_triton/tuning/tune_gemm.py --list` for the cases. Run tuning
 on each target GPU (gfx942, gfx950, gfx1250, or future architectures) with a
 supported kernel and valid `DEFAULT.json`. The author must keep its keys
 consistent with the selected kernel; Triton and Gluon can use different keys.
+For wrappers exposing backend selection, use `--backend triton`, `gluon`, or
+`both`. Omitting it preserves the wrapper's default, including Gluon on
+supported gfx1250 routes; explicitly selecting Triton remains supported.
 See [coverage](utils/_triton/tuning/COVERAGE.md) for the missing-harness inventory,
 shared families, and separate MoE tuning paths.
 

@@ -6,9 +6,8 @@ builds representative inputs and calls the public wrapper; the tuner follows
 the wrapper's config lookup to its architecture, backend, family and filename.
 No architecture-specific tuning harness is needed.
 
-The CPU tests in `op_tests/triton_tests/gemm/test_tune_gemm.py` check public
-GEMM wrapper coverage. When adding a wrapper, add a case or document an explicit
-exception in that test. Backend kernel variants selected by `kernel_type` in
+When adding a public GEMM wrapper, add a case or document an explicit exception
+in this inventory. Backend kernel variants selected by `kernel_type` in
 the config are searched through the same case.
 
 ## Gaps in the previous 16-harness workflow
@@ -65,8 +64,11 @@ Current dense/batched Gluon wrapper routes are:
 | `gemm_a16w16`, `gemm_a16w16_persistent`, `batched_gemm_bf16` | `gfx1250` |
 | `gemm_a8w8_blockscale_preshuffle`, `gemm_afp4wfp4_preshuffle`, `gemm_afp8wfp8_preshuffle` | `gfx1250` |
 
-Pass `--backend triton` or `--backend gluon` for wrappers with a backend
-argument. `gemm_a8w8_preshuffle` is Gluon-only, so omit the flag. Other dense,
+Pass `--backend triton`, `--backend gluon`, or `--backend both` for wrappers with
+a backend argument. Both backends are tuned independently; omitting the flag
+preserves the wrapper's default, including Gluon preference on supported gfx1250
+routes. Triton remains selectable where supported. `gemm_a8w8_preshuffle` is
+Gluon-only, so omit the flag. Other dense,
 batched, fused and feed-forward cases currently use Triton. There is no dense
 Gluon GEMM implementation on `gfx942` in this tree; the shared tuner does not
 create one. The `gfx1250` Gluon MXFP4 route takes preshuffled weights, so use
@@ -112,8 +114,9 @@ Likewise, flags such as dtype, activation, layout, multiply/add fuse type,
 group32 scale grouping and split-cat proportions need distinct lookup keys
 before they can retain independent tuned results.
 
-The benchmark times the complete callable, including output resets and
-reductions. Fused feed-forward cases zero their atomic output each invocation.
+rocprofv3 times only selected GEMM/reduction kernels between GPU markers;
+wrapper overhead and output resets are excluded. Fused feed-forward cases
+select `_ff_` kernel names and zero their atomic output each invocation.
 FP4 fused cases disable AOT metadata while tuning so each candidate is
 compiled from its actual config.
 

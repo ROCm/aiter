@@ -14,6 +14,8 @@ Take `backend=None` and pass `**backend_kwarg(backend)` when the wrapper has a
 backend argument, so --backend can pick one. `space=` on the decorator pins
 keys the kernel constrains (blockscale kernels need BLOCK_SIZE_K=128), so the
 sweep does not try values that can only fail.
+`kernels=` lists name substrings for rocprofv3 to time, including reducers.
+The default "gemm" excludes cache clears, resets and unrelated GPU work.
 
 Imports stay inside each case, so listing the cases imports no kernels.
 """
@@ -21,9 +23,10 @@ Imports stay inside each case, so listing the cases imports no kernels.
 CASES = {}
 
 
-def gemm_case(space=None):
+def gemm_case(space=None, kernels=("gemm",)):
     def register(case):
         case.space = dict(space or {})
+        case.kernels = kernels
         CASES[case.__name__] = case
         return case
 
@@ -757,11 +760,11 @@ def _fused_ff_case(M, N, K, gated):
     return fn
 
 
-@gemm_case()
+@gemm_case(kernels=("_ff_",))
 def ff_a16w16_fused_gated(M, N, K):
     return _fused_ff_case(M, N, K, gated=True)
 
 
-@gemm_case()
+@gemm_case(kernels=("_ff_",))
 def ff_a16w16_fused_ungated(M, N, K):
     return _fused_ff_case(M, N, K, gated=False)

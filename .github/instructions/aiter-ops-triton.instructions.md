@@ -401,14 +401,17 @@ All weight/scale pre-shuffle helpers are unified in
 - A GEMM also ships a tuning case in `utils/_triton/tuning/gemm_cases.py`.
   The shared driver benchmarks the current config, tries candidates through
   `get_gemm_config()`, logs failures, and saves the best config if it is faster
-  or the lookup reports no tuned M bucket. It times the complete callable.
+  or the lookup reports no tuned M bucket. rocprofv3 measures selected GPU
+  GEMM/reduction kernels; wrapper overhead and resets are excluded. Each config
+  runs in a fresh process with a timeout, and failures do not stop the sweep.
   Flag:
   - A new public GEMM wrapper under `gemm/` with no case in `gemm_cases.py`,
     or a case not named after the wrapper or its configurable variant.
-    Document composed/deprecated wrapper exceptions in the coverage inventory
-    and its CPU test.
+    Document composed/deprecated wrapper exceptions in the coverage inventory.
   - A case passing `config=`, dropping an exposed `backend` or configurable
     variant, returning only some outputs, or failing to reset accumulators.
+  - A case whose `kernels` filter misses a GEMM/reduction launch or includes
+    unrelated work, or whose inputs are not repeatable with the worker's seed.
   - A backend/architecture path that bypasses `get_gemm_config()` or lacks a
     valid implementation and `DEFAULT.json` on its target GPU.
   - `DEFAULT.json` keys that do not match what the selected kernel reads.

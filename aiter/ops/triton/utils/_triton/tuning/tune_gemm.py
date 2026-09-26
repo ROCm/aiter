@@ -1,18 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tune a GEMM, log failed configs, and save the fastest working config.
+"""Tune a GEMM with rocprofv3 and save a faster or missing config.
 
-python tune_gemm.py gemm_a8w8 M=16 N=1024 K=1024
+python tune_gemm.py gemm_a8w8 M=16 N=1024 K=1024 --backend both
 python tune_gemm.py --list
 """
 
 import argparse
-import copy
+import csv
 import inspect
 import itertools
 import json
 import math
+import os
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -23,12 +30,32 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("op", nargs="?", choices=CASES)
     parser.add_argument("dims", nargs="*", metavar="DIM=INT")
-    parser.add_argument("--list", action="store_true", help="list GEMMs without a GPU")
-    parser.add_argument("--backend", choices=("triton", "gluon"))
+    parser.add_argument("--list", action="store_true", help="list cases without a GPU")
+    parser.add_argument(
+        "--backend",
+        choices=("triton", "gluon", "both"),
+        help="default: wrapper's choice; both: tune each backend separately",
+    )
     parser.add_argument("--space", nargs="+", default=[], metavar="KEY=V1,V2")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=900,
+        help="seconds per config, including compilation",
+    )
+    parser.add_argument(
+        "--runs", type=int, default=250, help="profiled invocations per config"
+    )
+    parser.add_argument(
+        "--kernel-names",
+        nargs="+",
+        help="kernel-name substrings to include in GPU timing",
+    )
     args = parser.parse_args()
     if not args.list and not args.op:
         parser.error("choose a GEMM, or use --list")
+    if args.timeout <= 0 or args.runs <= 0:
+        parser.error("--timeout and --runs must be positive")
     return args
 
 
@@ -58,89 +85,31 @@ def parse_space(tokens):
     return space
 
 
-class ConfigLookup:
-    """Record the wrapper's lookup, then supply each candidate at that lookup."""
-
-    def __init__(self, original):
-        self.original = original
-        self.signature = inspect.signature(original)
-        self.lookup = None
-        self.current = None
-        self.is_tuned = False
-        self.candidate = None
-
-    def __call__(self, *args, **kwargs):
-        call = self.signature.bind(*args, **kwargs)
-        call.apply_defaults()
-        if self.lookup is None:
-            self.lookup = dict(call.arguments)
-        elif self.lookup != call.arguments:
-            raise ValueError(
-                "This case reads multiple configs; tune its GEMMs separately"
-            )
-        if self.candidate is not None:
-            return copy.deepcopy(self.candidate), True
-        if self.current is None:
-            self.current, self.is_tuned = self.original(*args, **kwargs)
-        return copy.deepcopy(self.current), self.is_tuned
-
-
-def find_family(lookup):
-    """Use the same default, batch and custom filenames as get_gemm_config."""
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-
-    if lookup is None:
-        raise ValueError("The case never called get_gemm_config()")
-    name = lookup["config_name"]
-    directory = Path(resolve_config_dir("gemm", name, backend=lookup["backend"]))
-    default = directory / "DEFAULT.json"
-    default_table = load_config_json(str(default))
-    suffix = lookup["specialized_filename"]
-    if suffix is not None:
-        paths = [directory / f"{name}-{suffix}.json"]
-    else:
-        N, K, B = lookup["N"], lookup["K"], lookup["B"]
-        if N is None or K is None:
-            raise ValueError("The lookup needs N/K or a specialized filename")
-        paths = [directory / f"{name}-N={N}-K={K}.json"]
-        if B is not None:
-            paths.insert(0, directory / f"{name}-B={B}-N={N}-K={K}.json")
-    source = next((path for path in paths if path.exists()), default)
-    return directory, default_table, source, paths[0]
-
-
-def candidate_configs(directory, default_table, lookup, overrides):
-    """Try the family's config keys, using shared ranges and published values."""
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
-    from aiter.ops.triton.utils.config_utils import load_config_json
-
+def candidate_configs(record, overrides):
+    """Only search keys declared by this kernel's architecture/backend default."""
     keys = dict.fromkeys(
         key
-        for bucket in default_table.values()
+        for bucket in record["defaults"].values()
         if isinstance(bucket, dict)
         for key in bucket
     )
-    seen = {}
-    for path in sorted(directory.glob("*.json")):
-        for bucket in load_config_json(str(path)).values():
-            if isinstance(bucket, dict):
-                for key, value in bucket.items():
-                    if value not in seen.setdefault(key, []):
-                        seen[key].append(value)
     unknown = overrides.keys() - keys.keys()
     if unknown:
         print(
             f"Skipping search keys absent from this backend's DEFAULT.json: {sorted(unknown)}"
         )
+    lookup = record["lookup"]
     space = {}
     for key in keys:
-        # The config rules retire kpack when retuning architectures other than gfx942.
-        if key == "kpack" and get_arch() != "gfx942":
-            continue
+        if key == "kpack" and record["arch"] != "gfx942":
+            continue  # Follow the config rules for retired kpack on newer architectures.
         space[key] = overrides.get(
-            key, candidate_values(key, lookup["M"], lookup["N"], lookup["K"], seen)
+            key,
+            candidate_values(
+                key, lookup["M"], lookup["N"], lookup["K"], record["seen"]
+            ),
         )
-    print("Search space:", json.dumps(space))
+    print("Search space:", json.dumps(space), flush=True)
     for values in itertools.product(*space.values()):
         yield dict(zip(space, values))
 
@@ -177,113 +146,164 @@ def candidate_values(key, M, N, K, seen):
     return values
 
 
-def snapshot(result):
-    """Copy outputs because the next call may reuse the same buffers."""
-    outputs = result if isinstance(result, (tuple, list)) else (result,)
-    return tuple(output.detach().clone() for output in outputs)
-
-
-def check_outputs(outputs, reference):
-    import torch
-
-    if not outputs:
-        raise ValueError("The case returned no output tensors")
-    if reference is not None and len(outputs) != len(reference):
-        raise ValueError("Output tensor count changed")
-    for index, output in enumerate(outputs):
-        if not torch.isfinite(output.float()).all():
-            raise ValueError(f"Output {index} contains NaN or Inf")
-        if reference is not None:
-            expected = reference[index]
-            if output.shape != expected.shape or output.dtype != expected.dtype:
-                raise ValueError(f"Output {index} shape or dtype changed")
-            if output.is_floating_point():
-                output, expected = output.float(), expected.float()
-                error = (
-                    (output - expected).norm() / expected.norm().clamp_min(1e-12)
-                ).item()
-                if not math.isfinite(error) or error > 0.05:
-                    raise ValueError(f"Output {index} differs from the current config")
-            elif not torch.equal(output, expected):
-                raise ValueError(f"Output {index} integer values changed")
-
-
-def measure(run, hook, errors, reference=None):
-    """Check and time one config. Log failures and return infinity so they cannot win."""
-    from triton.testing import do_bench
-
-    try:
-        outputs = snapshot(run())
-        check_outputs(outputs, reference)
-        elapsed = do_bench(run, return_mode="median")
-        if not math.isfinite(elapsed) or elapsed <= 0:
-            raise ValueError(f"Invalid benchmark time: {elapsed}")
-        return elapsed, outputs
-    except Exception as error:
-        config = hook.candidate if hook.candidate is not None else hook.current
-        errors.write(json.dumps(config) + "\n" + traceback.format_exc() + "\n")
-        errors.flush()
-        print(f"Failed: {type(error).__name__}: {error}")
-        # These errors poison the GPU context; continuing would fail every config.
-        if any(
-            message in str(error).lower()
-            for message in (
-                "illegal memory access",
-                "device-side assert",
-                "memory access fault",
-            )
-        ):
-            raise
-        return float("inf"), None
-
-
-def write_config(source, target, lookup, config):
-    """Replace only this M bucket, retaining the rest of the source table."""
-    from aiter.ops.triton.utils.config_utils import load_config_json
-    from aiter.ops.triton.utils.gemm_config_utils import STANDARD_M_BOUNDS
-
-    table = dict(load_config_json(str(source)))
-    bounds = lookup["bounds"] or table.get("M_BOUNDS", STANDARD_M_BOUNDS)
-    bucket = next(
-        (f"M_LEQ_{b}" for b in bounds if b >= lookup["M"]), f"M_GEQ_{bounds[-1]}"
-    )
-    table[bucket] = config
-    target.write_text(json.dumps(table, indent=4) + "\n")
-    load_config_json.cache_clear()
-    print(f"Saved {bucket} in {target}")
-
-
-def tune(run, hook, overrides, errors, backend=None):
-    # 1. Measure the config the wrapper currently uses.
-    current_ms, reference = measure(run, hook, errors)
-    directory, defaults, source, target = find_family(hook.lookup)
-    if backend is not None and hook.lookup["backend"] != backend:
+def kernel_time(directory, names, runs):
+    """Median sum of selected GPU kernel durations per invocation, in microseconds."""
+    rows = []
+    for path in directory.rglob("*_kernel_trace.csv"):
+        with path.open(newline="") as trace:
+            rows.extend(csv.DictReader(trace))
+    samples, duration = [], None
+    for row in sorted(rows, key=lambda row: int(row["Start_Timestamp"])):
+        name = row["Kernel_Name"].lower()
+        if "tuning_run_marker" in name:
+            if duration is not None:
+                samples.append(duration)
+            duration = 0
+        elif duration is not None and any(part.lower() in name for part in names):
+            elapsed = int(row["End_Timestamp"]) - int(row["Start_Timestamp"])
+            if elapsed <= 0:
+                raise ValueError(f"Invalid kernel duration for {name}: {elapsed}")
+            duration += elapsed
+    if len(samples) != runs or any(value <= 0 for value in samples):
         raise ValueError(
-            f"Requested {backend}, but the wrapper selected {hook.lookup['backend']}"
+            f"Incomplete kernel trace: expected {runs} nonempty runs, got {len(samples)}; check kernel names {names}"
         )
-    print(f"Current: {current_ms:.4f} ms ({source})")
-    if reference is None:
+    return statistics.median(samples) / 1000
+
+
+def profile_config(spec, directory, timeout, names, errors, results):
+    """A fresh process contains compilation errors, GPU crashes and timeouts."""
+    directory.mkdir()
+    spec_path = directory / "spec.json"
+    spec_path.write_text(json.dumps(spec))
+    command = [
+        "rocprofv3",
+        "--kernel-trace",
+        "-f",
+        "csv",
+        "-d",
+        str(directory),
+        "-o",
+        "profile",
+        "--",
+        sys.executable,
+        str(Path(__file__).with_name("profile_gemm.py")),
+        str(spec_path),
+    ]
+    config = spec["config"]
+    elapsed, error = None, None
+    try:
+        # A file avoids pipe deadlocks and retains the full compiler/driver error.
+        with (directory / "output.log").open("w") as output:
+            process = subprocess.Popen(
+                command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            try:
+                process.wait(timeout=timeout)
+            finally:
+                # Kill the whole group, including a hung GPU child of rocprofv3.
+                if process.poll() is None or process.returncode != 0:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
+        if process.returncode:
+            raise RuntimeError(f"rocprofv3 exited with code {process.returncode}")
+        elapsed = kernel_time(directory, names, spec["runs"])
+    except Exception:  # noqa: BLE001 -- log this config's failure and keep tuning
+        error = traceback.format_exc()
+        print(f"Failed config; continuing. See {errors.name}", flush=True)
+    # The worker records the baseline config before executing it, even if it crashes.
+    if config is None and Path(spec["record"]).exists():
+        config = json.loads(Path(spec["record"]).read_text()).get("config")
+    if error is not None:
+        errors.write(
+            json.dumps({"backend": spec["backend"], "config": config}) + "\n" + error
+        )
+        output_path = directory / "output.log"
+        if output_path.exists():
+            errors.write(output_path.read_text(errors="replace"))
+        errors.write("\n")
+        errors.flush()
+    results.write(
+        json.dumps(
+            {"config": config, "time_us": elapsed, "status": "error" if error else "ok"}
+        )
+        + "\n"
+    )
+    results.flush()
+    return elapsed if elapsed is not None else math.inf
+
+
+def tune(args, dims, backend, errors, results):
+    case = CASES[args.op]
+    overrides = {**case.space, **parse_space(args.space)}
+    names = args.kernel_names or case.kernels
+    with tempfile.TemporaryDirectory(prefix="aiter-tune-") as temporary:
+        directory = Path(temporary)
+        spec = {
+            "op": args.op,
+            "dims": dims,
+            "backend": backend,
+            "config": None,
+            "runs": args.runs,
+            "record": str(directory / "lookup.json"),
+            "reference": str(directory / "reference.pt"),
+            "lookup": None,
+        }
+
+        # 1. Profile the config used today. Its lookup tells us where to save.
+        current_us = profile_config(
+            spec, directory / "current", args.timeout, names, errors, results
+        )
+        if not Path(spec["record"]).exists():
+            print(
+                "No config lookup was reached; check backend support and the error log."
+            )
+            return False
+        record = json.loads(Path(spec["record"]).read_text())
+        spec["lookup"] = record["lookup"]
+        selected = record["lookup"]["backend"]
+        if backend is not None and selected != backend:
+            errors.write(
+                f"Requested {backend}, but wrapper selected {selected}; no configs written.\n"
+            )
+            print(f"Requested {backend}, but wrapper selected {selected}; skipping.")
+            return False
         print(
-            "Current config failed; candidates will only be checked for finite outputs."
+            f"{record['arch']}/{selected}: current {current_us:.3f} us ({record['source']})",
+            flush=True,
         )
-    best_config = hook.current if math.isfinite(current_ms) else None
-    best_ms = current_ms
+        if not Path(spec["reference"]).exists():
+            print(
+                "Current config failed; candidates will only be checked for finite outputs."
+            )
+        best_config = record["config"] if math.isfinite(current_us) else None
+        best_us = current_us
 
-    # 2. Try each candidate. Failed configs are logged by measure() and skipped.
-    for config in candidate_configs(directory, defaults, hook.lookup, overrides):
-        hook.candidate = config
-        elapsed, _ = measure(run, hook, errors, reference)
-        if elapsed < best_ms:
-            best_config, best_ms = copy.deepcopy(config), elapsed
-            print(f"Best: {best_ms:.4f} ms {json.dumps(best_config)}")
+        # 2. Each config gets its own process. A failure cannot stop the next one.
+        for index, config in enumerate(candidate_configs(record, overrides)):
+            spec["config"] = config
+            elapsed = profile_config(
+                spec, directory / str(index), args.timeout, names, errors, results
+            )
+            if elapsed < best_us:
+                best_config, best_us = config, elapsed
+                print(f"Best: {best_us:.3f} us {json.dumps(config)}", flush=True)
 
-    # 3. Add a missing tuned config, or replace an existing one only if faster.
-    if best_config is None:
-        raise RuntimeError("No config worked; see the error log")
-    if not hook.is_tuned or best_ms < current_ms:
-        write_config(source, target, hook.lookup, best_config)
-    else:
-        print("No faster config found; kept the existing config.")
+        # 3. Save only a faster config, or fill a missing tuned M bucket.
+        if best_config is None:
+            print("No config worked; no config file changed.")
+            return False
+        if not record["is_tuned"] or best_us < current_us:
+            table = record["table"]
+            table[record["bucket"]] = best_config
+            Path(record["target"]).write_text(json.dumps(table, indent=4) + "\n")
+            print(f"Saved {record['bucket']} in {record['target']}")
+        else:
+            print("No faster config found; kept the existing config.")
+        return True
 
 
 def main():
@@ -294,26 +314,22 @@ def main():
         return
     case = CASES[args.op]
     dims = parse_dims(args.dims)
-    kwargs = dict(dims, **backend_kwarg(args.backend))
-    # Report missing or unknown dimensions before building GPU inputs.
-    inspect.signature(case).bind(**kwargs)
-    overrides = {**case.space, **parse_space(args.space)}
-
-    from aiter.ops.triton.utils import gemm_config_utils
-
-    run = case(**kwargs)
-    original = gemm_config_utils._get_gemm_config_cached
-    hook = ConfigLookup(original)
+    backends = ["gluon", "triton"] if args.backend == "both" else [args.backend]
+    for backend in backends:
+        inspect.signature(case).bind(**dims, **backend_kwarg(backend))
+    if os.name != "posix" or shutil.which("rocprofv3") is None:
+        raise SystemExit("Run tuning on Linux with ROCm and rocprofv3 on PATH")
     shape = "-".join(f"{key}={value}" for key, value in dims.items())
-    error_path = Path(f"errors-{args.op}-{shape}.txt")
-    print(f"Errors will be written to {error_path}")
-    gemm_config_utils._get_gemm_config_cached = hook
-    try:
-        with error_path.open("w") as errors:
-            tune(run, hook, overrides, errors, args.backend)
-    finally:
-        gemm_config_utils._get_gemm_config_cached = original
-        original.cache_clear()
+    succeeded = True
+    for backend in backends:
+        tag = f"{args.op}-{shape}-{backend or 'auto'}"
+        with open(f"errors-{tag}.txt", "w") as errors, open(
+            f"results-{tag}.jsonl", "w"
+        ) as results:
+            print(f"Logs: {errors.name}, {results.name}", flush=True)
+            succeeded = tune(args, dims, backend, errors, results) and succeeded
+    if not succeeded:
+        raise SystemExit("One or more backends could not be tuned; see the error logs")
 
 
 if __name__ == "__main__":
