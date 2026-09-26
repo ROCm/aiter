@@ -989,3 +989,51 @@ def test_mha_backward_varlen(
     tols = [fwd_tol] + bwd_tols
     for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected",
+    [
+        (True, 128, None, None, None, "mid_head"),  # no shape info
+        (True, 128, 128, 512, 512, "default"),  # causal rule, both at boundary
+        (True, 128, 128, 512, 511, "mid_head"),  # one program short
+        (True, 128, 128, 513, 512, "mid_head"),  # KV one token too long
+        (True, 96, 512, 512, 128, "default"),  # 128 * cdiv(512, 128) = 512
+        (False, 128, 128, 512, 4096, "mid_head"),  # causal rule only
+        (False, 97, 128, 256, 1024, "default"),  # non-causal wide-head rule
+        (False, 96, 128, 256, 1024, "mid_head"),  # head below min_head_dim_v
+        (False, 97, 128, 257, 1024, "mid_head"),
+        (False, 97, 128, 256, 1023, "mid_head"),
+        (False, 65, 128, 128, 1024, "default"),  # short-KV rule
+        (False, 65, 128, 128, 1023, "mid_head"),
+        (True, 64, 128, 128, 4096, "small_head"),  # outside mid_head range
+        (True, 160, 128, 128, 4096, "default"),
+    ],
+)
+def test_mha_fwd_mid_head_selection(
+    causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected
+):
+    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    fwd_cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
+    )["fwd"]
+    if get_arch() != "gfx950":
+        # Arches without mid_head keep the pre-existing selection.
+        assert "mid_head_skip" not in fwd_cfg or "mid_head" in fwd_cfg
+        pytest.skip("mid_head_skip rules are only defined for gfx950")
+    cfg = _get_config(
+        False,
+        torch.bfloat16,
+        head_dim_v=head_dim_v,
+        causal=causal,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        batch_heads=batch_heads,
+    )
+    assert cfg == fwd_cfg[expected]
