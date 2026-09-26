@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E311. Related scouts,
+attempts from the initial GLM integration through E322. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E311
+## Isolated single-GPU optimization, E199–E322
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -85,6 +85,21 @@ single-GPU report. Serving sweeps remain paused.
 | E309 | Use N64 quads in M4 token-owned down. Exact but slower at spread/hot routes; unselected. |
 | E310 | Load only a compact N16 quad record, reuse it across M4, and share a 384-workgroup grid with the N64 fallback. Exact; no gain over the selected path. |
 | E311 | Qualify E308 and E262 at 39 TP4 dense shape/routing cases, 312 changes and 936 exact checks. Correct the raw-row checker using verified route permutations; no tolerance change. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E312 | Fuse route preparation and BF16 quantization into gate. Exact, but repeats work and regresses; unselected. |
+| E313 | Quantize unique inputs once before route-fused gate. Exact; partial recovery, still slower than separate frontend. |
+| E314 | Replace each gate workgroup histogram/scans with one-wave stable sorting. Exact but fusion still slower; excessive drift retained. |
+| E315 | Use one-wave stable sorting in standalone frontend. Exact; useful M4 gain at two column partitions. |
+| E316 | Cooperative 32-lane scale-group quantization. Exact, slower; drift makes timings provisional. |
+| E317 | Pair native FP8 conversions and pack bytes directly. Exact, small additional gain; early input loads regress. |
+| E318 | Qualify E315/E317 input/intermediate/final outputs at M4 TP8/TP4, plus 240 CPU-route/native-quant frontend checks. |
+| E319 | Complete each route wave’s private codebook without the initial workgroup barrier; test direct VMEM-to-LDS copy. Exact, modest gains; TP8 timing provisional, TP4 stable. |
+| E320 | Qualify E317 frontend with 16 actual captures and six real TP8/TP4 weight slices; exact intermediate/final results. |
+| E321 | GPU-guarded two/four-token weight reuse with separate reducing waves. Two-token candidate reaches M4 TP8 hot parity and beats spread MXFP4. |
+| E322 | Qualify wave-private codebook and token reuse/fallback on changing guards, reordered slots and invalid IDs; exact. Correct reporting-only invalid bincount without changing runtime/tolerances. |
 
 
 ## How to read the outcomes

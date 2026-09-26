@@ -24,6 +24,56 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## M4 latency checkpoint — E312–E322
+
+The TP8 M4 candidate now reaches local synthetic hot-route parity with MXFP4
+while retaining a spread-route advantage. The 0.5% hot difference is small;
+it should be treated as parity, not a robust lead. TP4 M4 also has fresh stable
+comparisons ahead of MXFP4. Each row uses one fixed candidate policy for both
+route patterns, complete clean bookends and 32 rotating weight banks.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R latency overhead |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 4 | spread | 25.26 | 23.24 | -8.0% |
+| 8 | 4 | hot | 19.99 | 19.89 | -0.5% |
+| 4 | 4 | spread | 36.93 | 32.60 | -11.7% |
+| 4 | 4 | hot | 28.47 | 25.78 | -9.4% |
+
+These are complete single-GPU TP-rank MoE-call times, not serving concurrency.
+TP8 uses E317 wave sorting/paired FP8 conversion plus E321 two-token down reuse
+when a GPU ballot confirms identical expert slots. Other routes use the timed
+per-token fallback. TP4 uses the same frontend with E319 wave-private codebook
+completion. Down retains the final cross-wave reduction barrier.
+
+At TP8 hot routing, E321 pair2 halves down MFMA instructions (27,648 to 13,824)
+and reduces VALU from 1.42M to 0.82M. Spread MFMA work is unchanged. All native
+kernels have zero scratch. E321 uses five-second warmup after several earlier
+attempts had excessive timing drift. E319 TP8, E314 and E316 drift is retained
+and those timing tables are provisional.
+
+E318 validates input FP8/scales, gate FP8/scales and final BF16 at TP8/TP4;
+240 separate frontend checks include invalid IDs and scale extremes. E322 adds
+changing reuse guards, reordered expert slots and invalid routes: 1,536 exact
+graph/eager checks and 1,152 comparisons with original IQ2R across both TPs.
+Its first attempt failed only in post-validation invalid-ID count reporting;
+the corrected checker and original failure are preserved, with no runtime or
+tolerance change. E320 independently qualifies E317 frontend on 16 actual TP8
+captures and six TP8/TP4 weight slices. TP4 reuses TP8 captures. Captured
+qualification of E321 down is still required.
+
+E312/E313 fused gate/frontend attempts regress. E314 replaces repeated large
+histogram scans with wave sorting but fusion still loses. E315 moves the wave
+sort to the standalone frontend and wins; E316 cooperative quantization loses.
+E317 paired FP8 conversion adds a small gain; early loads regress. E319 removes
+an unnecessary initial workgroup barrier. E321 reuses weights across matching
+tokens and assigns their reductions to separate waves.
+
+The overall goal remains unmet. Larger-token and dense gaps remain, including
+the previously measured 9–34% dense TP4 deficit. No new production runtime is
+integrated and serving sweeps remain paused. Next: actual-capture qualification
+of the new down path and fresh M32/M64/M128/M256 MoE attribution, then qualified
+integration and unchanged ATOM benchmark_serving acceptance.
+
 ## TP4 follow-up and dense layout qualification — E304–E311
 
 The E302 combined small-token candidate has fresh qualified TP4 M16 results.
@@ -411,6 +461,18 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E309 | Use N64 quads in M4 token-owned down. Exact but slower at spread/hot routes; unselected. |
 | E310 | Load only a compact N16 quad record, reuse it across M4, and share a 384-workgroup grid with the N64 fallback. Exact; no gain over the selected path. |
 | E311 | Qualify E308 and E262 at 39 TP4 dense shape/routing cases, 312 changes and 936 exact checks. Correct the raw-row checker using verified route permutations; no tolerance change. |
+
+| E312 | Fuse route preparation and BF16 quantization into gate. Exact, but repeats work and regresses; unselected. |
+| E313 | Quantize unique inputs once before route-fused gate. Exact; partial recovery, still slower than separate frontend. |
+| E314 | Replace each gate workgroup histogram/scans with one-wave stable sorting. Exact but fusion still slower; excessive drift retained. |
+| E315 | Use one-wave stable sorting in standalone frontend. Exact; useful M4 gain at two column partitions. |
+| E316 | Cooperative 32-lane scale-group quantization. Exact, slower; drift makes timings provisional. |
+| E317 | Pair native FP8 conversions and pack bytes directly. Exact, small additional gain; early input loads regress. |
+| E318 | Qualify E315/E317 input/intermediate/final outputs at M4 TP8/TP4, plus 240 CPU-route/native-quant frontend checks. |
+| E319 | Complete each route wave’s private codebook without the initial workgroup barrier; test direct VMEM-to-LDS copy. Exact, modest gains; TP8 timing provisional, TP4 stable. |
+| E320 | Qualify E317 frontend with 16 actual captures and six real TP8/TP4 weight slices; exact intermediate/final results. |
+| E321 | GPU-guarded two/four-token weight reuse with separate reducing waves. Two-token candidate reaches M4 TP8 hot parity and beats spread MXFP4. |
+| E322 | Qualify wave-private codebook and token reuse/fallback on changing guards, reordered slots and invalid IDs; exact. Correct reporting-only invalid bincount without changing runtime/tolerances. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
