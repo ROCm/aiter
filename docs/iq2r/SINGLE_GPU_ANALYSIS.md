@@ -24,6 +24,48 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Ordered down and dense decoding checkpoint — E340–E353
+
+The selected isolated kernels beat MXFP4 on six of eight TP8 rows and three of eight TP4 rows shown. TP8 hot gaps are down to 0.6% at 128 tokens and 4.5% at 256; TP4 M64 hot remains 2.0% behind and dense cases remain 4.5–27.4% behind. The full performance goal is not achieved.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 121.47 | 102.79 | -15.4% |
+| 8 | 128 | hot | 43.79 | 44.04 | +0.6% |
+| 8 | 256 | spread | 135.48 | 116.80 | -13.8% |
+| 8 | 256 | hot | 62.69 | 65.48 | +4.5% |
+| 4 | 64 | spread | 192.76 | 160.17 | -16.9% |
+| 4 | 64 | hot | 42.39 | 43.25 | +2.0% |
+| 4 | 128 | spread | 213.04 | 170.07 | -20.2% |
+| 4 | 128 | hot | 60.96 | 60.28 | -1.1% |
+| 4 | 1024 | spread | 292.24 | 309.81 | +6.0% |
+| 4 | 1024 | hot | 188.55 | 197.06 | +4.5% |
+| 4 | 4096 | spread | 604.94 | 770.63 | +27.4% |
+| 4 | 4096 | hot | 501.74 | 625.64 | +24.7% |
+
+E347 restores exact ordered M256 down accumulation; E349 passes576 extended correctness checks. E350 four-read dense lookahead crosses the256-register boundary and loses despite fewer LDS waits. E351 limits lookahead to two reads and gives a small gain with occupancy retained. E352 four-read lookahead improves compact TP8 with stable occupancy; LDS waits do not fall. E346/E348 shared-expert fusion and E353 direct global activation loads are exact but slower and rejected. The E342 TP4 r1/r2 drift and harness-edit error remain visible; corrected r3 asserts its timed arms and qualifies all rows. These are explicit measured policies by TP/token range; no route-pattern-based selector is proposed.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Compact gate and decoding checkpoint — E327–E339
 
 The fixed compact-gate policy beats MXFP4 in six of eight stable M64/M128 synthetic cases. TP8 M128 hot remains 1.4% slower; TP4 M64 hot remains 0.3% slower. These small remaining gaps are still open. TP4 r2 repeats the frozen selected candidate after the original hot rows exceeded the unchanged drift limit.
@@ -305,7 +347,7 @@ MoE-call times; tokens are not serving concurrency.
 | 8 | 16 | spread | 48.72 | 54.72 | +12.3% |
 | 8 | 16 | hot | 28.29 | 26.84 | -5.1% |
 | 4 | 4 | spread | 36.03 | 32.83 | -8.9% |
-| 4 | 4 | hot | 27.74 | 26.51 | -4.4% |
+| 4 | 4 | hot | 27.74 | 26.51 | -4.5% |
 | 4 | 8 | spread | 55.12 | 54.23 | -1.6% |
 | 4 | 8 | hot | 23.15 | 27.40 | +18.3% |
 | 4 | 16 | spread | 93.41 | 81.75 | -12.5% |
@@ -586,6 +628,21 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E337 | Extend medium TP8 candidates to M32/M256 with explicit short-K/scheduled-large entry wrappers so packed tensors reach only their matching decoder. Pending GPU qualification. |
 | E338 | Combine component-major compact M16 gate reduction and one packed task-prefix scan. Six of eight stable medium-token cases beat fresh MXFP4; TP8 M128 hot +1.4%, TP4 M64 hot +0.3%. TP4 r1 hot drift is retained; frozen selected-arm r2 qualifies with max 0.61% drift. |
 | E339 | Frozen E338 passes 1,152 exact arm checks across TP8/TP4 with a new weight/input seed, zeros, 16x inputs, reordered slots, and spread/hot/skew/mixed routes. No performance or actual-weight claim. |
+
+| E337 / E344 | The M256 extension exposed changed down rounding: two independent K128 partial sums differed from the original sequential accumulator. Preserve the failure; E344 restores the ordered chain and passes 504 checks without changing tolerances. Spread cases improve; hot gaps remain. |
+| E340 | Independent route-reduction wave grouping remains unselected; all attempted results are retained. |
+| E341 | Aggregate periodic-route histogram/scatter atomics. Exact at TP8 but slower than E338 in all four M64/M128 cases; TP4 remains compiled and unmeasured. |
+| E342 | Parallel task-record emission improves TP8 medium cases modestly. TP4 r1 drift and the r2 dispatcher-edit mistake are preserved. Correctly asserted r3 qualifies all rows: both spread cases and M128 hot beat MXFP4; M64 hot remains 2.0% slower. |
+| E343 | Transpose sign bits into static planes in the dense TP4 gate and group four independent codebook reads. Exact and modestly faster; gate VALU counts fall, while total all-wait cycles do not improve against E308. |
+| E345 | Apply sign planes and grouped codebook reads to TP4 dense down while fixing the E343 gate. Original-IQ2R timing drift invalidates different r1/r2 rows. Prospective r3 retains original IQ2R for exact correctness/native checks and times MXFP4/candidate only: every row qualifies, but dense gaps remain 6.1–28.0%. |
+| E346 | Fuse shared-expert down into final route reduction, retaining BF16 rounding and route order. All 504 poisoned-scratch checks pass. Scattered output ownership nearly doubles physical traffic at M4096; much slower, rejected. |
+| E347 | Combine compact component-major M16 gate, E342 frontend and exact M256 down. R1 timing drift is preserved. Frozen r2 qualifies all rows: M32 spread/hot and M256 spread beat MXFP4; M256 hot remains7.4% slower. |
+| E348 | Transpose shared results locally and give reduction lanes contiguous eight-column reads. All 588 checks and timing rows qualify; traffic falls sharply versus E346, but every new fusion arm still loses to E345. Rejected. |
+| E349 | Frozen E347 passes576 extended checks with new seed, eight changes, zeros, large inputs, slot permutations and four routing patterns. Native gate/frontend/ordered-down and zero scratch verified; no performance claim. |
+| E350 | Explicit four-read codebook groups and one-atom lookahead in TP4 dense gate. All504 checks and timing rows pass, but all candidates lose. At M4096 hot, four-read lookahead lowers LDS waits yet measured occupancy roughly halves and gate time rises270→358µs. Unroll1 stays above256 registers and loses further. |
+| E351 | Two-read dense gate lookahead holds static allocation at256 registers. All420 checks and all timing rows pass. Improves E345 control by0.3–1.2%, with occupancy retained and DRAM essentially unchanged; still4.5–27.4% behind MXFP4. |
+| E352 | Compact TP8 codebook schedule ablation: all504 checks and timing rows pass. Four-read lookahead is fastest across all four cases, saving0.7–2.5% versus control. Spread wins; M128/M256 hot remain0.6%/4.5% slower than MXFP4. LDS waits rise slightly, so this is not a fewer-LDS-waits claim. |
+| E353 | Replace TP4 down shared activation cache with direct register loads, M32/M64 and optional one-K128 activation lookahead. All588 checks and timing rows pass, but every variant loses. Global-read instruction count rises sharply while physical DRAM bytes change modestly; rejected. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

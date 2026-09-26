@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E339. Related scouts,
+attempts from the initial GLM integration through E353. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E339
+## Isolated single-GPU optimization, E199–E353
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -125,6 +125,24 @@ single-GPU report. Serving sweeps remain paused.
 | E337 | Extend medium TP8 candidates to M32/M256 with explicit short-K/scheduled-large entry wrappers so packed tensors reach only their matching decoder. Pending GPU qualification. |
 | E338 | Combine component-major compact M16 gate reduction and one packed task-prefix scan. Six of eight stable medium-token cases beat fresh MXFP4; TP8 M128 hot +1.4%, TP4 M64 hot +0.3%. TP4 r1 hot drift is retained; frozen selected-arm r2 qualifies with max 0.61% drift. |
 | E339 | Frozen E338 passes 1,152 exact arm checks across TP8/TP4 with a new weight/input seed, zeros, 16x inputs, reordered slots, and spread/hot/skew/mixed routes. No performance or actual-weight claim. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E337 / E344 | The M256 extension exposed changed down rounding: two independent K128 partial sums differed from the original sequential accumulator. Preserve the failure; E344 restores the ordered chain and passes 504 checks without changing tolerances. Spread cases improve; hot gaps remain. |
+| E340 | Independent route-reduction wave grouping remains unselected; all attempted results are retained. |
+| E341 | Aggregate periodic-route histogram/scatter atomics. Exact at TP8 but slower than E338 in all four M64/M128 cases; TP4 remains compiled and unmeasured. |
+| E342 | Parallel task-record emission improves TP8 medium cases modestly. TP4 r1 drift and the r2 dispatcher-edit mistake are preserved. Correctly asserted r3 qualifies all rows: both spread cases and M128 hot beat MXFP4; M64 hot remains 2.0% slower. |
+| E343 | Transpose sign bits into static planes in the dense TP4 gate and group four independent codebook reads. Exact and modestly faster; gate VALU counts fall, while total all-wait cycles do not improve against E308. |
+| E345 | Apply sign planes and grouped codebook reads to TP4 dense down while fixing the E343 gate. Original-IQ2R timing drift invalidates different r1/r2 rows. Prospective r3 retains original IQ2R for exact correctness/native checks and times MXFP4/candidate only: every row qualifies, but dense gaps remain 6.1–28.0%. |
+| E346 | Fuse shared-expert down into final route reduction, retaining BF16 rounding and route order. All 504 poisoned-scratch checks pass. Scattered output ownership nearly doubles physical traffic at M4096; much slower, rejected. |
+| E347 | Combine compact component-major M16 gate, E342 frontend and exact M256 down. R1 timing drift is preserved. Frozen r2 qualifies all rows: M32 spread/hot and M256 spread beat MXFP4; M256 hot remains7.4% slower. |
+| E348 | Transpose shared results locally and give reduction lanes contiguous eight-column reads. All 588 checks and timing rows qualify; traffic falls sharply versus E346, but every new fusion arm still loses to E345. Rejected. |
+| E349 | Frozen E347 passes576 extended checks with new seed, eight changes, zeros, large inputs, slot permutations and four routing patterns. Native gate/frontend/ordered-down and zero scratch verified; no performance claim. |
+| E350 | Explicit four-read codebook groups and one-atom lookahead in TP4 dense gate. All504 checks and timing rows pass, but all candidates lose. At M4096 hot, four-read lookahead lowers LDS waits yet measured occupancy roughly halves and gate time rises270→358µs. Unroll1 stays above256 registers and loses further. |
+| E351 | Two-read dense gate lookahead holds static allocation at256 registers. All420 checks and all timing rows pass. Improves E345 control by0.3–1.2%, with occupancy retained and DRAM essentially unchanged; still4.5–27.4% behind MXFP4. |
+| E352 | Compact TP8 codebook schedule ablation: all504 checks and timing rows pass. Four-read lookahead is fastest across all four cases, saving0.7–2.5% versus control. Spread wins; M128/M256 hot remain0.6%/4.5% slower than MXFP4. LDS waits rise slightly, so this is not a fewer-LDS-waits claim. |
+| E353 | Replace TP4 down shared activation cache with direct register loads, M32/M64 and optional one-K128 activation lookahead. All588 checks and timing rows pass, but every variant loses. Global-read instruction count rises sharply while physical DRAM bytes change modestly; rejected. |
 
 
 ## How to read the outcomes
