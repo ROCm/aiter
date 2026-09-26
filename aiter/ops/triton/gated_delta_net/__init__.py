@@ -28,6 +28,9 @@ from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
     chunk_gated_delta_rule_opt_vk,
     fused_recurrent_gated_delta_rule,
 )
+from aiter.ops.triton.gated_delta_net.gdn_segment_scan import (
+    gdn_segment_scan_fwd,
+)
 
 __all__ = [
     "GatedDeltaRulePrefillMetadata",
@@ -40,4 +43,5 @@ __all__ = [
     "chunk_gated_delta_rule_opt_vk",
     "fused_rearrange_sigmoid_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
+    "gdn_segment_scan_fwd",
 ]

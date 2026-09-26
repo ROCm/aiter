@@ -12,9 +12,19 @@ track whatever has been tuned (including per-model tables under
 every shape, so sequence lengths the table never measured stay off the JIT
 path.
 
+The head split is not so forgiving. The kernel specialises on it, and the
+shipped tables cover an ``H // Hg`` of 2 (``qwen3_5_35b``) and 4
+(``qwen3_5_397b``) only -- Qwen3.8 is 128 value heads to 16 key heads, a
+ratio of 8 at every TP degree, so a CSV-driven run compiles artifacts its
+server will never ask for. Pass ``--heads`` to re-key the rows onto the
+deployed split, and read the shape line the header prints before trusting
+a cache.
+
 Usage:
     python -m aiter.aot.flydsl.chunk_gdn_h
     python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
+    # Qwen3.8 (128 value / 16 key heads) at TP8:
+    python -m aiter.aot.flydsl.chunk_gdn_h --heads 16:2
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
@@ -25,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import itertools
 import os
 import sys
@@ -82,6 +93,16 @@ def _parse_bool(s: str) -> bool:
     raise ValueError(f"unrecognised bool literal {s!r}")
 
 
+def _parse_heads(spec: str) -> tuple[int, int]:
+    try:
+        H, Hg = spec.split(":")
+        return int(H), int(Hg)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--heads expects H:Hg (e.g. 16:2), got {spec!r}"
+        ) from None
+
+
 def _torch_dtype_for_kernel(dtype_str: str):
     import torch
 
@@ -93,7 +114,9 @@ def _torch_dtype_for_kernel(dtype_str: str):
     return getattr(torch, name)
 
 
-def parse_csv(csv_path: str) -> list[dict[str, Any]]:
+def parse_csv(
+    csv_path: str, heads: list[tuple[int, int]] | None = None
+) -> list[dict[str, Any]]:
     """Expand opt tuned rows into compile jobs.
 
     Shapes and layout switches come straight from the row -- including the
@@ -104,6 +127,13 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
     because a row's own tuned ``BV`` is always among them. ``g_head_major`` and
     ``use_state_indices`` are fanned out for a related reason: they are not
     tuned dimensions, but they do fork the compiled artifact.
+
+    ``heads`` re-keys every row onto the given ``(H, Hg)`` splits instead of
+    the row's own. The kernel specialises on the head split, so a model whose
+    split was never tuned gets no coverage at all from the table -- and that
+    is the model whose kernels are still on the JIT path. Everything except
+    the head counts stays as measured, and rows that differ only in their
+    head split collapse in the dedupe below.
     """
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -120,8 +150,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 K = int(row["K"])
                 V = int(row["V"])
                 BT = int(row.get("BT") or 64)
-                H = int(row["H"])
-                Hg = int(row["Hg"])
+                head_pairs = heads or [(int(row["H"]), int(row["Hg"]))]
                 cu_num = int(row.get("cu_num") or 0)
                 is_varlen = _parse_bool(row.get("is_varlen") or "True")
                 use_h0 = _parse_bool(row.get("use_h0") or "True")
@@ -141,8 +170,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 continue
 
             indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
-            for BV, g_head_major, use_state_indices in itertools.product(
-                bvs, _G_HEAD_MAJOR, indices
+            for (H, Hg), BV, g_head_major, use_state_indices in itertools.product(
+                head_pairs, bvs, _G_HEAD_MAJOR, indices
             ):
                 job = {
                     "kernel_name": _KERNEL_NAME,
@@ -343,6 +372,16 @@ def main():
         default=DEFAULT_CSVS,
         help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
     )
+    parser.add_argument(
+        "--heads",
+        type=_parse_heads,
+        nargs="+",
+        default=None,
+        help="Compile these H:Hg splits instead of the ones in the CSV rows.\n"
+        "Needed whenever the deployed model's head split is not in the\n"
+        "tuned tables: they currently cover H//Hg of 2 and 4 only, so a\n"
+        "model at any other ratio gets no coverage from the CSVs at all.",
+    )
     args = parser.parse_args()
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
@@ -356,18 +395,30 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
-    jobs = collect_aot_jobs(csv_paths, parse_csv)
+    jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, heads=args.heads))
+    shapes = sorted({(j["H"], j["Hg"]) for j in jobs})
 
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h opt (K5) AOT Pre-compilation")
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
+    # Printed because the failure this guards against is silent: a cache full
+    # of the wrong head split looks exactly like a cache that works, right up
+    # until the server JITs anyway.
+    print(
+        "  Shapes:       "
+        + (", ".join(f"H={H} Hg={Hg}" for H, Hg in shapes) or "(none)")
+    )
     print(f"  Total jobs:   {len(jobs)}")
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)
+
+    if not jobs:
+        print("\nNo shapes to compile. Check the CSV rows and --heads.")
+        sys.exit(1)
 
     total_t0 = time.time()
     print(f"\n--- Compiling {len(jobs)} kernels ---")
