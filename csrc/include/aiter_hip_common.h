@@ -31,6 +31,23 @@ namespace aiter_detail {
 
 inline thread_local bool g_aiter_can_throw = false;
 
+// Makes AITER_CHECK throw instead of abort() for the duration of a scope, and
+// restores the previous mode on exit. Use at entry points that are reached from
+// a language binding, where a failed check has to surface as a catchable error
+// rather than take the process down. Save/restore rather than a plain store:
+// the flag is thread-local, and a binding thread is shared with other ops.
+class AiterThrowGuard
+{
+    public:
+    AiterThrowGuard() : prev_(g_aiter_can_throw) { g_aiter_can_throw = true; }
+    ~AiterThrowGuard() noexcept { g_aiter_can_throw = prev_; }
+    AiterThrowGuard(const AiterThrowGuard&)            = delete;
+    AiterThrowGuard& operator=(const AiterThrowGuard&) = delete;
+
+    private:
+    bool prev_;
+};
+
 template <typename... Args>
 [[noreturn, gnu::noinline]] inline void
 aiter_check_fatal(const char* file, size_t line, Args&&... args)
