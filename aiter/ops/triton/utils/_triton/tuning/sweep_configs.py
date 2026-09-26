@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument("N", type=int, help="N dim")
     parser.add_argument("K", type=int, help="K dim")
     parser.add_argument("G", type=int, help="GPU card ID")
-    parser.add_argument("F", type=str, help="Unit test filename")
+    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
     parser.add_argument(
         "--block-size-m-range",
         nargs="+",
@@ -125,7 +125,7 @@ def main():
     N = args.N
     K = args.K
     G = args.G
-    ut_filename = args.F
+    harness_filename = args.F
     block_size_m_range = args.block_size_m_range
     block_size_n_range = args.block_size_n_range
     block_size_k_range = args.block_size_k_range
@@ -142,7 +142,7 @@ def main():
     batch_timeout = args.timeout
 
     assert M == triton.next_power_of_2(M), "M has to be power of 2"
-    assert os.path.isfile(ut_filename), f"{ut_filename} not found"
+    assert os.path.isfile(harness_filename), f"{harness_filename} not found"
     assert all(
         v == triton.next_power_of_2(v) for v in block_size_m_range
     ), "All possible BLOCK_SIZE_M must be power of 2"
@@ -207,7 +207,7 @@ def main():
         "cache_modifier": cache_modifier_range,
         "NUM_KSPLIT": spk_range,
     }
-    print("Raw tunning space:", flush=True)
+    print("Raw tuning space:", flush=True)
     for k, v in parms.items():
         print(f"\t{k} = {v}", flush=True)
 
@@ -225,7 +225,7 @@ def main():
     print(f"Total number of cases to run: {len(parms_comb_list_pruned)}", flush=True)
     print()
     parms_comb_list = parms_comb_list_pruned
-    file_tag = f"{ut_filename}-{M}-{N}-{K}"
+    file_tag = f"{harness_filename}-{M}-{N}-{K}"
     log_filename = f"screen-{file_tag}.log"
     print(f"Screening results will be output to {log_filename}", flush=True)
     print()
@@ -277,7 +277,7 @@ def main():
             comb_str += " "
         comb_str = comb_str.strip()
 
-        cmd = f"""rocprofv3 --kernel-trace -f csv -o res-{file_tag} -- python3 {ut_filename} {M} {N} {K} {comb_str}"""
+        cmd = f"""rocprofv3 --kernel-trace -f csv -o res-{file_tag} -- python3 {harness_filename} {M} {N} {K} {comb_str}"""
         cmd = cmd.split(" ")
 
         rocprof_filename = f"res-{file_tag}_kernel_trace.csv"
@@ -308,10 +308,10 @@ def main():
 
         if process.returncode == 0:
             if os.path.isfile(rocprof_filename):
-                cmd_rprof = f"""python3 rprof.py {rocprof_filename} -k gemm"""
-                cmd_rprof = cmd_rprof.split(" ")
+                cmd_parse = f"python3 parse_kernel_trace.py {rocprof_filename} -k gemm"
+                cmd_parse = cmd_parse.split(" ")
                 process = subprocess.Popen(
-                    cmd_rprof, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    cmd_parse, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                 )
                 stdout_data, stderr_data = process.communicate()
                 if process.returncode == 0:

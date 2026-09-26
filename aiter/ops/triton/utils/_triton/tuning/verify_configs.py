@@ -9,7 +9,7 @@ def parse_args():
     parser.add_argument("M", type=int, help="M dim")
     parser.add_argument("N", type=int, help="N dim")
     parser.add_argument("K", type=int, help="K dim")
-    parser.add_argument("F", type=str, help="Unit test filename")
+    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
 
     args = parser.parse_args()
     return args
@@ -20,10 +20,10 @@ def main():
     M = args.M
     N = args.N
     K = args.K
-    ut_filename = args.F
+    harness_filename = args.F
 
-    file_tag = f"{ut_filename}-{M}-{N}-{K}"
-    cmd = f"""rocprofv3 --kernel-trace -f csv -o verf_{file_tag} -- python3 {ut_filename} {M} {N} {K}"""
+    file_tag = f"{harness_filename}-{M}-{N}-{K}"
+    cmd = f"""rocprofv3 --kernel-trace -f csv -o verf_{file_tag} -- python3 {harness_filename} {M} {N} {K}"""
     cmd = cmd.split(" ")
 
     rocprof_filename = f"verf_{file_tag}_kernel_trace.csv"
@@ -45,10 +45,10 @@ def main():
 
     if process.returncode == 0:
         if os.path.isfile(rocprof_filename):
-            cmd_rprof = f"""python3 rprof.py {rocprof_filename} -k gemm"""
-            cmd_rprof = cmd_rprof.split(" ")
+            cmd_parse = f"python3 parse_kernel_trace.py {rocprof_filename} -k gemm"
+            cmd_parse = cmd_parse.split(" ")
             process = subprocess.Popen(
-                cmd_rprof, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                cmd_parse, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
             stdout_data, stderr_data = process.communicate()
             if process.returncode == 0:
