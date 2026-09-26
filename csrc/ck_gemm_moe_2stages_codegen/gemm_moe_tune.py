@@ -4995,7 +4995,14 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
+            # gfx942 has no CK/ASM MXFP4 route, but the FlyDSL a16w4 port is
+            # supported and can be tuned in isolation.
+            tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
+            if (
+                get_gfx() not in ["gfx950"]
+                and q_type in [aiter.QuantType.per_1x32]
+                and tune_only != "flydsl"
+            ):
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
             if not use_g1u1:
@@ -5023,7 +5030,6 @@ class FmoeTuner(TunerCommon):
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
             # unset = flydslv2; empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
-            tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
             _tune_only = {s for s in tune_only.split(",") if s}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):

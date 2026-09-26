@@ -794,6 +794,14 @@ def resolve_activation_dtype(
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
+        elif (
+            activation == ActivationType.Silu
+            and os.environ.get("AITER_SILU_A16W4", "0") == "1"
+        ):
+            # Opt into the existing bf16-activation FlyDSL port for standard
+            # SiLU-and-mul models. Keep this explicit because changing the
+            # default would displace tuned A4W4 paths.
+            q_dtype_a = dtypes.bf16
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -1240,6 +1248,13 @@ def _fused_moe_impl(
         and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Situv2
     )
+    _is_a16w4_silu_optin = (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and activation == ActivationType.Silu
+        and os.environ.get("AITER_SILU_A16W4", "0") == "1"
+    )
     # Validate the Swiglu shapes that get re-routed onto the a16w4 FlyDSL port
     # against the runtime-only constraints that get_2stage_cfgs cannot see.
     _is_a16w4_swiglu_rerouted = (
@@ -1260,9 +1275,15 @@ def _fused_moe_impl(
             gate_mode=gate_mode,
         )
     )
-    if _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted:
+    if _is_a16w4_situv2 or _is_a16w4_silu_optin or _is_a16w4_swiglu_rerouted:
         _a16w4_why = (
-            "SiTUv2" if _is_a16w4_situv2 else f"Swiglu with inter_dim={inter_dim}"
+            "SiTUv2"
+            if _is_a16w4_situv2
+            else (
+                "SiLU opt-in"
+                if _is_a16w4_silu_optin
+                else f"Swiglu with inter_dim={inter_dim}"
+            )
         )
         for _bad, _why in (
             (
@@ -3650,6 +3671,17 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
+    _is_a16w4_silu_optin = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Silu
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and os.environ.get("AITER_SILU_A16W4", "0") == "1"
+    )
     # bf16 A x mxfp4 W with Swiglu normally takes the CK-Tile branch above. When
     # cktile_mxfp4_ok is False that branch is skipped, and the shape needs the
     # same a16w4 FlyDSL kernels as SiTUv2 -- there is no A quantisation either
@@ -3666,7 +3698,9 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
-    _is_a16w4 = _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted
+    _is_a16w4 = (
+        _is_a16w4_situv2 or _is_a16w4_silu_optin or _is_a16w4_swiglu_rerouted
+    )
     use_mxfp4_flydsl = _is_a16w4 or (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
@@ -3738,8 +3772,14 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
-        if token < 2048:
+        # gfx942 A16W4 cannot use the generic BM128 fallback: its stage2
+        # requires 128 KiB LDS while CDNA3 exposes 64 KiB. Stay within the
+        # legal tile families used by the tuner.
+        if _is_a16w4 and get_gfx() == "gfx942" and token < 1024:
+            _tile_m, _s1_sfx, _s2_sfx = 16, "_w2", "_bnt2"
+        elif _is_a16w4 and get_gfx() == "gfx942" and token < 16384:
+            _tile_m, _s1_sfx, _s2_sfx = 32, "_w3_bnt0", ""
+        elif token < 2048:
             _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
         elif token < 4096:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
@@ -4092,6 +4132,10 @@ def fused_moe_2stages(
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
                 activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or (
+                    activation == ActivationType.Silu
+                    and os.environ.get("AITER_SILU_A16W4", "0") == "1"
+                )
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
@@ -4331,7 +4375,13 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and (
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or (
+                    activation == ActivationType.Silu
+                    and os.environ.get("AITER_SILU_A16W4", "0") == "1"
+                )
+            )
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
