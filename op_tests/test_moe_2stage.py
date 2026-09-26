@@ -279,8 +279,8 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.bf16
         and WQDType == dtypes.fp4x2
-        and actType == aiter.ActivationType.Situv2
-    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
+        and actType in (aiter.ActivationType.Situv2, aiter.ActivationType.Relu2)
+    ):  # a16w4 SiTUv2 / Relu2: no per-expert bias supported by these kernels.
         # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
         # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
         exp_bias1 = exp_bias2 = None
