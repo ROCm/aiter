@@ -27,21 +27,21 @@ Cross-format model quality is not established by synthetic tensors.
 ## Current measured position
 
 TP8 uses E243 gate (two-iteration unroll, single scale byte, padded-row MFMA),
-E235 ordered E220 down, and E209 reduction. TP4 uses E244 gate and its M64 down
-kernel, which processes all three output atoms before advancing K. Both include
+E235 ordered E220 down, and E209 reduction. TP4 uses E244 gate with E252 M64 down, which processes all three output
+atoms and fully unrolls its four K128 iterations. Both include
 eight-XCD ordering and groups of four tasks. Each row averages two clean
-bookends from its own run. Further qualification is required; neither is integrated.
+bookends from E243 r2 or E252 r2. Further qualification is required; neither is integrated.
 
 | TP | Tokens | Routes | MXFP4 µs | IQ2R candidate µs | IQ2R latency overhead |
 |---:|---:|:---|---:|---:|---:|
-|8|1024|spread|208.47|220.38|+5.7%|
-|8|1024|hot|121.84|153.71|+26.2%|
-|8|4096|spread|454.68|573.54|+26.1%|
-|8|4096|hot|394.32|483.58|+22.6%|
-|4|1024|spread|292.62|341.39|+16.7%|
-|4|1024|hot|188.70|221.23|+17.2%|
-|4|4096|spread|604.35|913.07|+51.1%|
-|4|4096|hot|496.27|751.02|+51.3%|
+|8|1024|spread|213.21|223.90|+5.0%|
+|8|1024|hot|125.21|160.35|+28.1%|
+|8|4096|spread|460.16|581.43|+26.4%|
+|8|4096|hot|391.91|487.22|+24.3%|
+|4|1024|spread|295.04|341.25|+15.7%|
+|4|1024|hot|190.48|222.25|+16.7%|
+|4|4096|spread|610.35|904.01|+48.1%|
+|4|4096|hot|505.20|742.14|+46.9%|
 
 No automatic route-pattern selector is qualified. Original TP4 dense samples
 have unresolved intermittent outliers and are not a qualified denominator.
@@ -56,7 +56,34 @@ while trace time barely changes: 232.55 to 231.61 µs. About 78.1M VALU and 3.71
 FP8 MFMA instructions remain. This supports reducing decoder and instruction
 work as well as traffic. FP8-specific counters are zero for MXFP4 and do not
 measure FP4 work. Device metadata reports 160 KiB LDS per CU/block and eight
-maximum waves per SIMD. E243/E244 full counter follow-ups remain pending.
+maximum waves per SIMD. E243/E244 full counter follow-ups are complete. E243 M4096 spread gate
+reduces VALU instructions 78.12M → 70.51M and all-wait cycles 58.87M → 41.50M;
+trace time falls 226.70 → 217.65 µs. LDS-specific waits rise 4.04M → 11.41M;
+occupancy stays near 19%. The useful metric is completed work/time, not a
+single wait category.
+
+E244 M4096 spread down reduces VALU 121.68M → 97.72M, vector reads
+2.18M → 1.37M and DRAM 1226.85 → 849.52 MB. It increases registers
+108+4 → 20+132 and measured occupancy falls 40.45% → 25.10%. Its down trace
+is slower (365.39 → 390.46 µs), while the complete clean block improves
+941.25 → 910.21 µs and the gate trace improves 411.70 → 375.96 µs.
+These data do not establish a standalone down-stage speedup; they motivate
+trading some record reloads for fewer live accumulators. Counter passes and
+trace timestamps are diagnostic; clean block time decides candidate wins.
+
+
+E252's full follow-up at TP4 M4096 spread reduces down VALU instructions
+97.72M → 83.32M, with unchanged 3.716M FP8 MFMA instructions and 1.374M
+vector reads. Down trace falls399.66 → 383.77µs; measured occupancy stays
+about25.2%. The paired clean block improves917.12 → 904.01µs. All four
+paired cases improve about1.3–1.6%, but the dense TP4 gap is still large.
+
+At TP8 M4096 spread, E243 full-MoE profiled DRAM is1.789GB versus1.923GB
+for MXFP4: only7.0% fewer bytes at the complete boundary. Down plus route
+reduction already account for1.211GB of IQ2R traffic. The large per-route
+BF16 output is written and then gathered for reduction, so halving stored
+weight bytes cannot halve total MoE traffic. These counters come from
+separate profiling passes and are not an instantaneous bandwidth reading.
 
 E220 profile-r2, 4096 spread, rocprof attribution:
 
@@ -140,7 +167,18 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 |E240–E241|Remove branches before padded-row MFMAs. Exact; small broad TP8 gate gain, TP4 shape-dependent.|
 |E242|Sign nibbles via wave shuffle or 64-byte LDS lookup. Exact, slower or neutral; rejected.|
 |E243|Use a single activation scale byte and unroll the gate K loop by two; combine with XCD/task ordering. Exact, modest broad TP8 gains. Larger unrolls regress.|
-|E244|TP4 gate adaptation; move down K loop outside the three output atoms so each record is consumed once. Exact, broader dense gains; full counters and further qualification pending.|
+|E244|TP4 gate adaptation; move down K loop outside the three output atoms so each record is consumed once. Exact, broader dense gains; full counters show fewer instructions/bytes but lower down occupancy. Further qualification pending.|
+
+|E245|Batch independent codebook reads, then load each activation fragment close to use. Exact; small shape-dependent gains, no broad selector. Compiler fences regress.|
+|E246|Full sign-expanded codebook, with its copy cost included. Exact, larger LDS allocation, slower; rejected.|
+|E247|Half-expanded sign codebook with smaller copy/LDS cost. Exact, still slower; rejected.|
+|E248|Decode active down experts into call-local FP8 scratch on every timed call. Exact, slower; initial decoder launch imbalance and missing consumer lookahead motivated E250.|
+|E249|TP4 processes two N atoms per K loop and tests full short-K unrolling. Exact, modest broad improvement with M64/unroll4; smaller unrolls regress.|
+|E250|Direct expert-indexed decode plus FP8 weight-fragment lookahead repairs E248 scheduling costs. Exact, much faster than E248 but still slower than fused IQ2R.|
+|E251|Ordinary and scaled FP8 MFMAs match bit for bit; CPU/GPU double references agree. Controlled probes localize extra rounding to eight-product groups. Exact random-dot semantics and justified bound remain unresolved.|
+|E252|Fully unroll TP4 down's four K128 iterations while retaining all three N atoms. Exact, modest broad gain over E244; full counters show about15% fewer down VALU instructions with similar occupancy.|
+|E253|Store/reduce the BF16 route buffer in column-tile-major order without a transpose. Exact, no consistent gain; not selected.|
+|E254|Precompute 16-bit codebook offsets and final scale bytes in static gate records. Exact representation, 3.25 rather than 2.25 bits/weight excluding codebook. Exact; about4% fewer gate VALU instructions but more traffic and a large M1024 spread regression. Unselected.|
 
 
 
