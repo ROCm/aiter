@@ -188,13 +188,45 @@ class FMoeKernel
         int gdy;
         int gdz;
         // flat_mode==1: one-TG-per-(token,topk) grid; no host moe_sort.
-        // flat_mode==2: emsort persistent grid; no host moe_sort, same grid as ps.
+        // flat_mode==2: EMSORT consumes raw topk and uses the configured persistent
+        // TG pool as a 2D grid: hidden slices on X, expert owners on Y. The shader
+        // derives expert ownership from tgy and loops over its compacted queue.
         if(this->flat_mode == 1)
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
+        }
+        else if(this->flat_mode == 2)
+        {
+            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= 512,
+                        __func__,
+                        ": EMSORT supports token_cnt*topk <= 512; got ",
+                        static_cast<uint64_t>(token_cnt) * topk);
+            AITER_CHECK(eprt <= 1024,
+                        __func__,
+                        ": EMSORT supports at most 1024 experts; got ",
+                        eprt);
+            AITER_CHECK(inter_dim % sub_GU == 0,
+                        __func__,
+                        ": EMSORT requires inter_dim divisible by sub_GU; got inter_dim=",
+                        inter_dim,
+                        ", sub_GU=",
+                        sub_GU);
+            gdx = inter_dim / sub_GU;
+            const int emsort_tgs = args.total_tgs > 0
+                                       ? static_cast<int>(args.total_tgs)
+                                       : 256;
+            AITER_CHECK(gdx > 0 && (emsort_tgs % gdx) == 0,
+                        __func__,
+                        ": EMSORT requires total_tgs divisible by inter_dim/sub_GU; got total_tgs=",
+                        emsort_tgs,
+                        ", slices=",
+                        gdx);
+            bdx = 256;
+            gdy = emsort_tgs / gdx;
+            gdz = 1;
         }
         else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
                 (args.total_tgs % args.ps_deno) == 0) // ps
