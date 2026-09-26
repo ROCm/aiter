@@ -37,6 +37,7 @@ GLOBAL_PREFIXES = (
     ".github/",
     SRC + "utils/",
     KERNELS + "common/",
+    GLUON_KERNELS + "common/"
     TESTS + "utils/",
 )
 
