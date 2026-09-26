@@ -21,10 +21,8 @@ back to their source paths when it finds collisions. We copy the entire
 all globbing, untuned-key lookups, and any write-backs hit the copy, never the
 real repo.
 
-Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. It is
-**not yet wired into any CI workflow** -- run it manually in a torch-enabled
-environment, or add it to a suitable job (e.g. the CPU/level01 tuning tests) to
-make it an actual PR/main regression guard.
+Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. The
+level 0+1 tuning workflow runs it as a PR/main regression guard.
 
 Run:
     python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
@@ -54,6 +52,9 @@ AITER_ROOT = os.path.dirname(
 # runtime; the merge set and dedup key are resolved entirely by get_config_file.
 FAMILIES = [
     ("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"),
@@ -67,7 +68,12 @@ FAMILIES = [
         "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
         "batched_gemm_a8w8_blockscale_mxscale_tuned",
     ),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
+    ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
@@ -184,6 +190,15 @@ class TestConfigShapeCollision(unittest.TestCase):
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
 
+    def test_a6w6_blockscale(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
+
+    def test_a6w4_asm(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm")
+
+    def test_a4w6_asm(self):
+        self._check_family("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm")
+
     def test_a8w8(self):
         self._check_family("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm")
 
@@ -215,8 +230,37 @@ class TestConfigShapeCollision(unittest.TestCase):
             "batched_gemm_a8w8_blockscale_mxscale_tuned",
         )
 
+        # The generic config registry owns file discovery and merging; the
+        # dedicated caller policy still owns public-kid normalization.
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        rows = policy._load_mxscale_bmm_tuned("opus")
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"],
+            8311,
+            "legacy local OPUS kid 311 must become public global kid 8311",
+        )
+        self.assertEqual(
+            rows[("gfx950", 8, 128, 1024, 4096)]["kernelId"],
+            8653,
+            "legacy local OPUS kid 653 must become public global kid 8653",
+        )
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+    def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+        )
+
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
+
+    def test_conv3d_bf16(self):
+        self._check_family("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d")
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")

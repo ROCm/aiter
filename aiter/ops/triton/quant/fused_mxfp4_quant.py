@@ -6,6 +6,7 @@ import triton.language as tl
 
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _gluon_fused_reduce_rms_mxfp4_quant_kernel,
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
@@ -19,6 +20,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -56,7 +58,7 @@ def fused_rms_mxfp4_quant(
 
         always returns (out1_fp4, out1_bs), out1, out2, out_res1
     """
-    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+    _LOGGER.info("FUSED_RMS_MXFP4_QUANT: inp1=%s", tuple(x1.shape))
 
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = x1.shape
@@ -200,7 +202,7 @@ def fused_flatten_mxfp4_quant(
     - out: The output matrix with shape (M, (N1 * N2) // 2).
     - out_block_scales: The output matrix with shape (M, cdiv(N1 * N2, MXFP4_QUANT_BLOCK_SIZE)).
     """
-    _LOGGER.info(f"FUSED_FLATTEN_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info("FUSED_FLATTEN_MXFP4_QUANT: x=%s", tuple(x.shape))
     M, N1, N2 = x.shape
 
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -285,7 +287,10 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         A tuple of (y, y_scale).
     """
     _LOGGER.info(
-        f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation} shuffle={shuffle}"
+        "FUSED_REDUCE_ACT_MUL_MXFP4_QUANT: x=%s activation=%s shuffle=%s",
+        tuple(x.shape),
+        activation,
+        shuffle,
     )
 
     assert (
@@ -422,6 +427,7 @@ def fused_reduce_rms_mxfp4_quant(
     output_unquantized_inp1=False,
     dtype=None,
     out3=None,
+    args: str = "auto",
 ):
     """
     This op contains several steps:
@@ -444,7 +450,7 @@ def fused_reduce_rms_mxfp4_quant(
 
         always returns (out1_fp4, out1_bs), out1, out2, out_res1, out3
     """
-    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+    _LOGGER.info("FUSED_RMS_MXFP4_QUANT: inp1=%s", tuple(x1.shape))
 
     out_dtype = dtype if dtype is not None else x1.dtype
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -546,7 +552,21 @@ def fused_reduce_rms_mxfp4_quant(
     elif x2 is not None:
         r = 2
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
-    _fused_reduce_rms_mxfp4_quant_kernel[grid](
+
+    # check if args is gluon and arch is not gfx1250
+    if args == "gluon" and get_arch() != "gfx1250":
+        _LOGGER.warning(
+            "Gluon kernel is not supported on this arch, defaulting to triton kernel"
+        )
+
+    # select kernel based on args and arch
+    kernel = (
+        _gluon_fused_reduce_rms_mxfp4_quant_kernel
+        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        else _fused_reduce_rms_mxfp4_quant_kernel
+    )
+
+    kernel[grid](
         x1,
         x1_weight,
         x2,
@@ -713,7 +733,18 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     )
 
 
-@triton.jit
+_fused_quant_fp8_sort_repr = make_kernel_repr(
+    "_fused_quant_fp8_sort_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+        "TOPK",
+    ],
+)
+
+
+@triton.jit(repr=_fused_quant_fp8_sort_repr)
 def _fused_quant_fp8_sort_kernel(
     # Pointers
     input_ptr,

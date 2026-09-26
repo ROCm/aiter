@@ -70,7 +70,10 @@ def paged_attention_decode(
     """
 
     _LOGGER.info(
-        f"PA_DECODE: q={tuple(query.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)}"
+        "PA_DECODE: q=%s key_cache=%s value_cache=%s",
+        tuple(query.shape),
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
     )
     # get num_seqs, num_kv_heads, kv_blk_sz, head_sz and query_grp_sz
     num_seqs = query.shape[0]
@@ -249,6 +252,8 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
+            waves_per_eu=3 if query_grp_sz > 1 else 0,
+            num_stages=1,
         )
 
 
@@ -536,6 +541,8 @@ def paged_attn_decode_v1_per_token_quant(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
+            waves_per_eu=3 if query_grp_sz > 1 else 0,
+            num_stages=1,
         )
 
 

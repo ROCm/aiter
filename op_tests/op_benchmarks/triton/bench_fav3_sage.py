@@ -11,15 +11,15 @@ from typing import Any, Literal
 
 import torch
 import triton
-from aiter.ops.triton.mha import (
-    flash_attn_func,
-)
 
 import aiter
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
+)
+from aiter.ops.triton.attention.mha import (
+    flash_attn_func,
 )
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
@@ -101,7 +101,7 @@ def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
         inputs.append(data)
         # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
 
-    logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
+    logger.info("Loaded %d captured inputs for benchmarking", len(inputs))
     return inputs
 
 
@@ -1191,7 +1191,7 @@ def run_benchmark_block_sparse_repetitions(args):
                     ]
                 )
             writer.writerow(row)
-        logger.info(f"Wrote CSV row to {csv_path}")
+        logger.info("Wrote CSV row to %s", csv_path)
 
 
 def run_benchmark_masks_list(
@@ -1414,7 +1414,9 @@ def main():
 
     # Handle captured input mode separately
     if args.load_captured:
-        logger.info(f"Running benchmark with captured inputs from: {args.captured_dir}")
+        logger.info(
+            "Running benchmark with captured inputs from: %s", args.captured_dir
+        )
         run_benchmark_captured(args)
         return 0
 

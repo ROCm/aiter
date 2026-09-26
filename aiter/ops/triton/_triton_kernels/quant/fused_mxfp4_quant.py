@@ -1,7 +1,11 @@
+from functools import partial
+
 import triton
 import triton.language as tl
 
-from .quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 @triton.jit
@@ -16,15 +20,38 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     return rms_norm
 
 
+_fused_rms_mxfp4_quant_repr = make_kernel_repr(
+    "_fused_rms_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_N2",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "HAS_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "SCALE_N",
+        "SCALE_M_PAD",
+        "SCALE_N_PAD",
+        "SHUFFLE",
+        "SHUFFLE_PAD",
+        "EVEN_M_N",
+        "EVEN_M_N2",
+    ],
+)
+
+
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_rms_mxfp4_quant_repr)
 def _fused_rms_mxfp4_quant_kernel(
     x1_ptr,
     w1_ptr,
@@ -222,7 +249,16 @@ def _fused_rms_mxfp4_quant_kernel(
         )
 
 
-@triton.jit
+_fused_flatten_mxfp4_quant_repr = make_kernel_repr(
+    "_fused_flatten_mxfp4_quant",
+    [
+        "BLOCK_SIZE_N2",
+        "MXFP4_QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_flatten_mxfp4_quant_repr)
 def _fused_flatten_mxfp4_quant(
     x_ptr,
     out_ptr,
@@ -268,13 +304,43 @@ def _fused_flatten_mxfp4_quant(
     )
 
 
+_fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
+    "_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M1",
+        "BLOCK_SIZE_N1",
+        "BLOCK_SIZE_M2",
+        "BLOCK_SIZE_N2",
+        "NUM_ITER",
+        "NUM_STAGES",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "EVEN_M_N",
+        "SCALING_MODE",
+        "scaleN",
+        "scaleM_pad",
+        "scaleN_pad",
+        "SHUFFLE",
+        "X_HAS_SPLITK",
+        "X_NUM_KSPLIT",
+        "X_NUM_KSPLIT_POW2",
+        "num_warps",
+        "num_stages",
+    ],
+)
+
+
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M1"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N1"] * args["NUM_ITER"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n,
+            block_m="BLOCK_SIZE_M1",
+            n="N1",
+            block_n="BLOCK_SIZE_N1",
+            num_iter="NUM_ITER",
+        ),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr)
 def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
     x_ptr,
     y_ptr,
@@ -482,17 +548,46 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
             )
 
 
+_fused_reduce_rms_mxfp4_quant_repr = make_kernel_repr(
+    "_fused_reduce_rms_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_N2",
+        "BLOCK_SIZE_N3",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "HAS_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "HAS_SPLITK",
+        "NUM_SPLITK",
+        "NUM_SPLITK_POW2",
+        "SCALE_N",
+        "SCALE_M_PAD",
+        "SCALE_N_PAD",
+        "SHUFFLE",
+        "SHUFFLE_PAD",
+        "EVEN_M_N",
+        "EVEN_M_N2",
+        "EVEN_M_N3",
+    ],
+)
+
+
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
-        "EVEN_M_N3": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N3"] % (args["BLOCK_SIZE_N3"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
+        "EVEN_M_N3": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+        ),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_reduce_rms_mxfp4_quant_repr)
 def _fused_reduce_rms_mxfp4_quant_kernel(
     x1_ptr,
     w1_ptr,
@@ -818,7 +913,19 @@ def _fused_reduce_rms_mxfp4_quant_kernel(
         )
 
 
-@triton.jit
+_fused_dynamic_mxfp4_quant_moe_sort_repr = make_kernel_repr(
+    "_fused_dynamic_mxfp4_quant_moe_sort_kernel",
+    [
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "BLOCK_SIZE_Mx",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "TOPK",
+    ],
+)
+
+
+@triton.jit(repr=_fused_dynamic_mxfp4_quant_moe_sort_repr)
 def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     x_ptr,
     x_fp4_ptr,

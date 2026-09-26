@@ -36,6 +36,7 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
@@ -84,9 +85,9 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
-        op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
+        op_tests/multigpu_tests/bench_mega_moe.py)
             {
-                echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
+                echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
             } | tee -a latest_test.log
             test_cmd=(
                 timeout 60m
@@ -101,9 +102,22 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine scatter_fused --layers 2 --acc_verify 1
+                        --combine fused --dispatch_backend flydsl \
+                        --stage1_fused 1 --layers 2 --acc_verify 1
                 '
                 _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_comm_fused_moe.py)
+            {
+                echo "Running comm-fused MoE production validation on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                torchrun
+                --standalone
+                --nproc_per_node=8
+                "$file"
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
@@ -111,6 +125,40 @@ for file in "${sharded_files[@]}"; do
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
+            ;;
+        op_tests/test_flydsl_pa_decode.py)
+            # The CLI sweep is separate from the compact parametrized regression.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 -m pytest -q "$test_file"
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/test_gemm_a6w6.py)
+            {
+                echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file" --all-kernels -mnk 257,513,129
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/test_gemm_a6w4.py|op_tests/test_gemm_a4w6.py)
+            {
+                echo "Running tuned dispatch, independent Wan references, and every mixed ASM kernel on fully padded M/N/K tails"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)

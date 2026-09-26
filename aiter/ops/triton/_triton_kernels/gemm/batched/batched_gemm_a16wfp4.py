@@ -19,7 +19,6 @@ _batched_gemm_a16wfp4_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "PRE_QUANT",
         "HAVE_Y_SCALE",
         "cache_modifier",
@@ -43,8 +42,6 @@ _batched_gemm_a16wfp4_reduce_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_batched_gemm_a16wfp4_repr)
@@ -78,7 +75,6 @@ def _batched_gemm_a16wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PRE_QUANT: tl.constexpr,
     HAVE_Y_SCALE: tl.constexpr,
     cache_modifier: tl.constexpr,
@@ -128,7 +124,11 @@ def _batched_gemm_a16wfp4_kernel(
     c_scale_rcprl = (1 / c_scale).to(tl.float32)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        # Sourced in-body rather than as a constexpr so M and N stay out of the
+        # specialisation key: under serving, M is the scheduler-formed batch size,
+        # so a constexpr here mints a new binary per batch shape. Same form as
+        # gemm/basic/gemm_afp4wfp4.py.
+        remap_xcd(pid, num_pid_m * num_pid_n)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -165,9 +165,8 @@ def _batched_gemm_a16wfp4_kernel(
             + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-        )
+        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_scale_k
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr
@@ -179,17 +178,26 @@ def _batched_gemm_a16wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
+                # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
+                # in e8m0, which dot_scaled propagates even where the masked-off
+                # data is zero. Read those groups as 127, a scale of 2^0.
+                scale_mask = offs_scale_k[None, :] < (
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                 a_bf16 = tl.load(
-                    a_ptrs, mask=offs_k_bf16[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs,
+                    mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,
+                    other=0,
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
@@ -283,6 +291,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -294,14 +306,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 

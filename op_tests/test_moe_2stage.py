@@ -28,7 +28,13 @@ from aiter.int4_utils import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
+from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -102,6 +108,11 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    if actType == aiter.ActivationType.Situv2:
+        beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
     is_mxfp8 = (
@@ -408,9 +419,7 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
-        # pr1 torch_moe_stage1 exposes situ_beta/situ_linear_beta (no None
-        # handling); mirror the kernel's None -> 1.0 mapping so the reference
-        # matches fused_moe for SiTUv2 (harmless for other activations).
+        # SiTUv2 defaults were resolved above; other activations ignore these values.
         situ_beta=1.0 if beta is None else float(beta),
         situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
@@ -742,14 +751,14 @@ parser.add_argument(
     "--beta",
     type=float,
     default=None,
-    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
+    help="SiTUv2 gate scale param (beta). Default None uses the kernel default (4.0).",
 )
 parser.add_argument(
     "--linear-beta",
     type=float,
     default=None,
-    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
-    "Only affects SiTUv2.",
+    help="SiTUv2 up (linear) scale param (linear_beta). "
+    "Default None uses the kernel default (25.0).",
 )
 parser.add_argument(
     "--kernel",
@@ -813,7 +822,7 @@ def _row_to_kwargs(row):
     inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    gate_mode = _effective_gate_mode(q_type, aq_dtype, wq_dtype)
     return {
         "dtype": _str2dtype(row["dtype"]),
         "token": int(row["token"]),
@@ -942,7 +951,7 @@ def _situv2_beta_kwargs(act_type):
     return {}
 
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
+def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
     # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
     # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
     # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
@@ -954,13 +963,21 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
-    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
+    if (
+        q_type == aiter.QuantType.per_1x32
+        and aq_dtype == dtypes.fp8
+        and wq_dtype == dtypes.fp8
+    ):
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
-    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+    if (quant_type, aq_dtype, wq_dtype) in (
+        _PER1X32_BF16_FP4,
+        _PER1X32_FP8_FP4,
+        _PER1X32_FP4_FP4,
+    ):
         return swiglu_limit
     return None
 
@@ -1092,7 +1109,7 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=_effective_gate_mode(quant_type, aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -1204,6 +1221,35 @@ def _iter_legacy_cases():
                     ), extras
 
 
+def test_route_workspace_token_capacity():
+    cases = (
+        (1, 1),
+        (247, 256),
+        (256, 256),
+        (257, 512),
+        (32768, 32768),
+        (32769, 65536),
+        (65536, 65536),
+        (65537, 131072),
+        (117626, 131072),
+        (128332, 131072),
+        (131072, 131072),
+        (131073, 262144),
+    )
+    for token_num, expected_capacity in cases:
+        assert _route_workspace_token_capacity(token_num) == expected_capacity
+
+    for token_num in (0, -1):
+        try:
+            _route_workspace_token_capacity(token_num)
+        except ValueError as error:
+            assert "must be positive" in str(error)
+        else:
+            raise AssertionError(f"expected ValueError for token_num={token_num}")
+
+    aiter.logger.info("moe_2stage: route workspace capacity passed")
+
+
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1276,6 +1322,116 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+def test_output_buffer_contract():
+    """Validate output identity, copy-back, validation, and compile contracts."""
+    torch.manual_seed(0)
+    token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
+    dtype = dtypes.bf16
+    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    args = (hidden, w1, w2, topk_weights, topk_ids)
+
+    ref = fused_moe(*args)
+    # The comparisons below are exact, so check that is a kernel property.
+    assert torch.equal(ref, fused_moe(*args)), "fused_moe is not run-to-run stable"
+
+    def fresh_buffer():
+        return torch.full((token, model_dim), -7.0, dtype=dtype)
+
+    def call_and_read_back(buf):
+        out = fused_moe(*args, output=buf)
+        # Reading buf afterwards is the trap: compiled, it is answered from
+        # whatever the fake said the op returned.
+        return out.sum(), buf.sum()
+
+    sort = aiter.fused_moe._moe_sorting_impl
+
+    def sort_without_output(*a, **kw):
+        kw["output"] = None
+        return sort(*a, **kw)
+
+    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
+    # paths, which cannot take the caller's buffer and must copy their result into it.
+    for in_place in (True, False):
+        try:
+            if not in_place:
+                aiter.fused_moe._moe_sorting_impl = sort_without_output
+            buf = fresh_buffer()
+            assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
+            assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
+
+            eager = call_and_read_back(fresh_buffer())
+            compiled = torch.compile(call_and_read_back)(fresh_buffer())
+            assert [float(x) for x in eager] == [
+                float(x) for x in compiled
+            ], f"{in_place=}: eager {eager} != compiled {compiled}"
+            assert eager[0] == eager[1] == ref.sum()
+        finally:
+            aiter.fused_moe._moe_sorting_impl = sort
+
+    def expect_raise(described, **kwargs):
+        try:
+            fused_moe(*args, **kwargs)
+        except RuntimeError:
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_raise("a mis-shaped output", output=torch.empty((token, model_dim + 1)))
+    expect_raise(
+        "an output of the wrong dtype",
+        output=torch.empty((token, model_dim), dtype=dtypes.fp32),
+    )
+    expect_raise(
+        "a non-contiguous output",
+        output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
+    )
+    # moe_sorting zeroes output before stage1 reads hidden_states.
+    expect_raise("an output overlapping hidden_states", output=hidden)
+
+    # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
+    pool = torch.zeros((2 * token, model_dim), dtype=dtype)
+    pool[:token] = hidden
+    assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+
+    stage2_scatter = Stage2ScatterContext(
+        arena_handle=0,
+        combine_input_offset=0,
+        slot_stride_bytes=1,
+        max_tokens_per_rank=token,
+        world_size=1,
+        source_token_map=torch.zeros_like(topk_ids, dtype=dtypes.i32),
+    )
+
+    def call_with_stage2_scatter(buf):
+        return fused_moe(
+            *args,
+            stage2_scatter=stage2_scatter,
+            output=buf,
+        )
+
+    def expect_stage2_scatter_raise(described, call):
+        try:
+            call()
+        except RuntimeError as error:
+            assert "output= is incompatible with stage2_scatter" in str(error)
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter",
+        lambda: call_with_stage2_scatter(fresh_buffer()),
+    )
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter under torch.compile",
+        lambda: torch.compile(call_with_stage2_scatter)(fresh_buffer()),
+    )
+
+    aiter.logger.info("moe_2stage: output buffer contract passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1288,9 +1444,11 @@ def _iter_with_env(case_iter, **env_overrides):
 
 
 _case_iters = []
+test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
+    test_output_buffer_contract()
     if not args.no_flydsl_csv:
         _case_iters.append(
             _iter_with_env(

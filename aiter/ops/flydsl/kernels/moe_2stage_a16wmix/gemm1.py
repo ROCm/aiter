@@ -5,7 +5,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -56,7 +56,7 @@ def _gemm1_body_a16w4(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
-    use_k16=False,
+    rocm_arch="",
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -64,6 +64,7 @@ def _gemm1_body_a16w4(
     in-kernel) or raw bf16. Non-scaled MFMA(16,16,32,bf16) K=32; epilogue SiLU(gate)*up
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
     """
+    _is_gfx942 = str(rocm_arch).startswith("gfx942")
     N_OUT = 2 * INTER
     elem_bytes = 2  # bf16
     a_elem_bytes = 2
@@ -125,7 +126,7 @@ def _gemm1_body_a16w4(
         TILE_K=TILE_K,
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
-        use_k16=use_k16,
+        rocm_arch=rocm_arch,
     )
     # Intermediate [sorted_size, inter] bf16: num_records = cumsum0*inter*2, so masked
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
@@ -145,6 +146,9 @@ def _gemm1_body_a16w4(
 
     def _a_row_base_dwords(row_local):
         # arg_mind holds the raw sorted_token_ids (token in low 24 bits, slot in high 8).
+        # token_id is multiplied in fx.Int32; tokens*K*2 bytes >= 2^31 overflows silently
+        # (~116k tokens at K=9216). Pre-existing on gfx950; newly reachable on gfx942
+        # (#5519).
         fused = fx.Int32(_global_i32_at(arg_mind, bx_m + row_local))
         return (fused & fx.Int32(0x00FFFFFF)) * fx.Int32(c_k_div4)
 
@@ -169,7 +173,7 @@ def _gemm1_body_a16w4(
         a_load_threads=a_load_threads,
         row_base_dwords=_a_row_base_dwords,
         dma_cache_mod=2,
-        dma_via_vgpr=use_k16,
+        dma_via_vgpr=_is_gfx942,
         k_grp_base_bytes=k_grp_base_bytes,
         A_SLOT_BYTES=A_SLOT_BYTES,
     )
@@ -226,14 +230,14 @@ def _gemm1_body_a16w4(
             acc_gate[mi][ni].store(zero4)
             acc_up[mi][ni].store(zero4)
 
-    # Arch-gate: gfx950 K=32 (one MFMA/K-step); gfx942 (use_k16) has no 16x16x32 -> split
+    # Arch-gate: gfx950 K=32 (one MFMA/K-step); gfx942 has no 16x16x32 -> split
     # each v8bf16 K-step into two v4bf16 halves -> TWO 16x16x16 MFMAs into the same acc.
-    if const_expr(use_k16):
+    if const_expr(_is_gfx942):
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
     else:
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
 
-    _mma = functools.partial(_mma_bf16, mma_atom, use_k16)
+    _mma = functools.partial(_mma_bf16, mma_atom, _is_gfx942)
 
     # ---- B tile load + compute helpers ----------------------------------------
     # One K tile of BOTH operands as a single value: the software pipeline below keeps
@@ -388,7 +392,7 @@ def compile_gemm1_a16w4_port(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
-    use_k16,
+    rocm_arch,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -441,6 +445,11 @@ def compile_gemm1_a16w4_port(
     assert (
         TILE_N // (4 // k_wave)
     ) >= 16, f"TILE_N//(4//k_wave) must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}, k_wave={k_wave}"
+    # Whole 16-wide groups per N-wave, else num_acc_n truncates (TILE_N=96: 8 of 24).
+    assert TILE_N % (16 * (4 // k_wave)) == 0, (
+        f"TILE_N must be a multiple of {16 * (4 // k_wave)} (16*(4//k_wave), else "
+        f"num_acc_n truncates and drops columns), got TILE_N={TILE_N}, k_wave={k_wave}"
+    )
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     NUM_N_BLOCKS = _INTER // TILE_N
 
@@ -461,11 +470,9 @@ def compile_gemm1_a16w4_port(
 
     assert act in (
         "silu",
+        "swiglu",
         "situv2",
-    ), f"a16w4 gemm1 act must be 'silu' or 'situv2', got {act!r}"
-    # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in
-    # (not in name_suffix -- ARCH is already in the JIT cache key).
-    _use_k16 = use_k16
+    ), f"a16w4 gemm1 act must be 'silu', 'swiglu', or 'situv2', got {act!r}"
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
@@ -514,16 +521,12 @@ def compile_gemm1_a16w4_port(
 
         def _xcd(pid):
             xc = _umod(pid, _NXCD)
-            wgid = (
-                xc * _xq
-                + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
-                + _udiv(pid, _NXCD)
-            )
+            wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
             _ng = fx.Int32(_SW * NUM_N_BLOCKS)
             group_id = wgid // _ng
             first_pid_m = group_id * fx.Int32(_SW)
             remaining_m = total_m_blocks - first_pid_m
-            group_size_m = fx.Int32(arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW))))
+            group_size_m = fx.min(remaining_m, fx.Int32(_SW))
             wig = wgid % _ng
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
@@ -534,8 +537,8 @@ def compile_gemm1_a16w4_port(
                 _tile = _xcd(bx_i32)
             else:
                 _tile = bx_i32
-            # SiTUv2 runtime scalars; silu ignores them (and emits none of this).
-            if const_expr(act == "situv2"):
+            # Runtime activation scalars; plain silu ignores them.
+            if const_expr(act in ("swiglu", "situv2")):
                 _situ = situ_params(
                     fx.Float32(f32_situ_beta),
                     fx.Float32(f32_situ_beta_rcp),
@@ -571,7 +574,7 @@ def compile_gemm1_a16w4_port(
                 w_dtype=w_dtype,
                 w_layout=w_layout,
                 k_wave=k_wave,
-                use_k16=_use_k16,
+                rocm_arch=rocm_arch,
             )
 
     @flyc.jit

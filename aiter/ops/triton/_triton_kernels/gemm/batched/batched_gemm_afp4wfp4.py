@@ -18,7 +18,6 @@ _batched_gemm_afp4_wfp4_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
     ],
 )
@@ -39,8 +38,6 @@ _batched_gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_batched_gemm_afp4_wfp4_repr)
@@ -77,7 +74,6 @@ def _batched_gemm_afp4_wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -138,7 +134,11 @@ def _batched_gemm_afp4_wfp4_kernel(
     stride_bsn = tl.cast(stride_in_bsn, tl.int64)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        # Sourced in-body rather than as a constexpr so M and N stay out of the
+        # specialisation key: under serving, M is the scheduler-formed batch size,
+        # so a constexpr here mints a new binary per batch shape. Same form as
+        # gemm/basic/gemm_afp4wfp4.py.
+        remap_xcd(pid, num_pid_m * num_pid_n)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -290,6 +290,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -304,14 +308,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 

@@ -26,8 +26,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.activation import _tanh
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.core import load_config_json
-from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_kernel_extend_repr = make_kernel_repr(
     "_fwd_kernel",
@@ -320,7 +319,7 @@ def _fwd_kernel(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(HEAD_SIZE, dtype):
-    cfg_dir, _ = resolve_config_dir("attention", "EXTEND_ATTENTION", backend="triton")
+    cfg_dir = resolve_config_dir("attention", "EXTEND_ATTENTION", backend="triton")
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
     # HEAD_SIZE 192 = 128 head and 64 pe head dim
