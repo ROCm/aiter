@@ -5,8 +5,10 @@ import argparse
 import itertools
 import os
 import random
+from itertools import pairwise
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -312,6 +314,134 @@ def test_metadata(
         round(us["serial"] / us["parallel"], 3) if us["parallel"] else float("nan")
     )
     return ret
+
+
+@pytest.mark.parametrize("num_splits", [63, 64, 65, 128])
+@pytest.mark.parametrize("query_length", [1, 3, 9, 17])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("uniform_query", [False, True])
+def test_pa_metadata_reduce_groups(num_splits, query_length, is_causal, uniform_query):
+    device = "cuda"
+    num_cu = torch.cuda.get_device_properties(0).multi_processor_count
+    lengths = [32, num_splits * 16, 32]
+    page_counts = [(length + 15) // 16 for length in lengths]
+    if sum(page_counts) > num_cu:
+        pytest.skip("The split-boundary fixture requires one workgroup per page")
+
+    batch_size = len(lengths)
+    gqa = 16
+    query_lengths = (
+        [query_length] * batch_size
+        if uniform_query
+        else [max(1, query_length - 1), query_length, max(1, query_length - 2)]
+    )
+    query_offsets = [0]
+    for length in query_lengths:
+        query_offsets.append(query_offsets[-1] + length)
+    query_tiles = [(length * gqa + 127) // 128 for length in query_lengths]
+    num_tiles = sum(query_tiles)
+    max_works = (batch_size + num_cu - 1) * max(query_tiles)
+    sentinel = 0x12345678
+    guard_size = 64
+    guarded_storage = {}
+
+    def allocate_guarded(name, shape):
+        size = 1
+        for dimension in shape:
+            size *= dimension
+        storage = torch.full(
+            (size + 2 * guard_size,), sentinel, dtype=torch.int32, device=device
+        )
+        guarded_storage[name] = storage
+        return storage[guard_size:-guard_size].view(shape)
+
+    query_indptr = torch.tensor(query_offsets, dtype=torch.int32, device=device)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    kv_indptr[1:] = torch.tensor(page_counts, dtype=torch.int32, device=device).cumsum(
+        0
+    )
+    context_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    metadata_ptrs = torch.empty(2, dtype=torch.uint64, device=device)
+    work_indptr = allocate_guarded("work_indptr", (num_cu + 1,))
+    work_info = allocate_guarded("work_info", (max_works, 8))
+    reduce_indptr = allocate_guarded("reduce_indptr", (num_tiles + 1,))
+    final_map = allocate_guarded("final_map", (num_tiles, 2))
+    partial_map = allocate_guarded("partial_map", (max_works,))
+
+    def launch():
+        aiter.get_pa_metadata_v1(
+            query_indptr,
+            kv_indptr,
+            context_lens,
+            gqa,
+            1,
+            is_causal,
+            metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            final_map,
+            partial_map,
+            kv_granularity=16,
+            block_size=16,
+            max_seqlen_qo=query_length,
+            uni_seqlen_qo=query_length if uniform_query else -1,
+            fast_mode=True,
+            max_split_per_batch=-1,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launch()
+        stream.synchronize()
+        eager = {name: storage.clone() for name, storage in guarded_storage.items()}
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                launch()
+            for storage in guarded_storage.values():
+                storage.fill_(sentinel)
+            graph.replay()
+            stream.synchronize()
+            for name, storage in guarded_storage.items():
+                torch.testing.assert_close(storage, eager[name], atol=0, rtol=0)
+        finally:
+            graph.reset()
+
+    for name, storage in guarded_storage.items():
+        assert torch.all(storage[:guard_size] == sentinel), name
+        assert torch.all(storage[-guard_size:] == sentinel), name
+
+    work_offsets = work_indptr.cpu().tolist()
+    assert work_offsets[0] == 0
+    assert all(begin <= end for begin, end in pairwise(work_offsets))
+    records = work_info[: work_offsets[-1]].cpu().tolist()
+    expected_indptr = [0]
+    expected_final_map = []
+    expected_partial_map = []
+    for batch_index, page_count in enumerate(page_counts):
+        num_query_tiles = query_tiles[batch_index]
+        tile_size = (
+            query_lengths[batch_index] + num_query_tiles - 1
+        ) // num_query_tiles
+        for tile_index in range(num_query_tiles):
+            query_begin = query_offsets[batch_index] + tile_index * tile_size
+            query_end = min(query_begin + tile_size, query_offsets[batch_index + 1])
+            tile_work = [
+                record
+                for record in records
+                if record[0] == batch_index and record[2:4] == [query_begin, query_end]
+            ]
+            assert len(tile_work) == page_count
+            assert all(record[1] >= 0 for record in tile_work)
+            expected_partial_map.extend(record[1] for record in tile_work)
+            expected_indptr.append(len(expected_partial_map))
+            expected_final_map.append([query_begin, query_end])
+
+    assert reduce_indptr.cpu().tolist() == expected_indptr
+    assert final_map.cpu().tolist() == expected_final_map
+    assert partial_map[: expected_indptr[-1]].cpu().tolist() == expected_partial_map
 
 
 def main():
