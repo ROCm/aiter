@@ -1,0 +1,851 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Launcher, scheduler and cache layout helpers for the paged MXFP4 MQA-logits
+# kernel.
+
+import functools
+
+import torch
+import triton
+
+from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_mqa_logits_mxfp4 import (
+    _pa_mqa_logits_mxfp4_kernel,
+    _pa_mqa_logits_mxfp4_sched_kernel,
+    _prepare_candidates_kernel,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
+
+SCALE_GROUP = 32
+K_WIDTH = 16
+WARP_SIZE = 64
+# Past this the chunk is compute bound
+COMPUTE_CHUNK = 512
+# Narrow enough to change config for spec. decoding
+SPEC_ROWS = 8
+# no need for dynamic scheduling for lower conc.
+MIN_DYNAMIC_BATCH = 4
+# Descriptors the scheduler may hand out, 1 MB of them
+SCHED_SLOT_CAP = 1 << 16
+# How far above max_tiles_per_split a slice must sit before splitting it
+# further is worth the extra workgroups
+CAP_ENGAGE = 4
+# How many times its average share of the slots one unit may take before
+# slices are shortened to rein it in
+SLICE_ROOM = 4
+# this is the most performant page size
+IDEAL_PAGE_SIZE = 64
+
+# e8m0 byte order. 1 ships: one MFMA tile per group, read as one wide run.
+# 0 is the narrow order, kept so a gather can be measured against a cache it
+# was not written for.
+SCALE_MODE_WIDE = 1
+
+# DeepSeek-V4.1's two-level indexer groups the context in 8-token candidate
+# blocks, default
+CANDIDATE_BLOCK = 8
+
+
+def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
+    # 32x32x64 leaves one head bit across lanes where 16x16x128 leaves two, so
+    # the head sum needs one cross-lane step instead of two.
+    return 32 if (head_size <= 64 or num_heads >= 32) else 16
+
+
+def kv_tile(page_size: int) -> int:
+    # Capped by the page so a tile never spans two pages
+    return min(IDEAL_PAGE_SIZE, page_size)
+
+
+def cache_format(num_heads: int, head_size: int, page_size: int) -> dict:
+    """Everything needed to write a preshuffled cache and to read it back."""
+    npt = mfma_nonk_dim(num_heads, head_size)
+    bkv = kv_tile(page_size)
+    if page_size % npt:
+        raise ValueError(
+            f"page_size {page_size} must be a multiple of the MFMA "
+            f"N ({npt}) or a shuffle group straddles two pages"
+        )
+    if page_size % bkv:
+        raise ValueError(
+            f"page_size {page_size} must be a multiple of BLOCK_KV ({bkv})"
+        )
+    return {
+        "n_per_tile": npt,
+        "d_per_tile": K_WIDTH,
+        # the wide scale order, SCALE_MODE_WIDE
+        "scale_lanes": WARP_SIZE // npt,
+        "block_kv": bkv,
+    }
+
+
+def _split_cache(kv_cache: torch.Tensor, head_size: int):
+    """(values, scales, page_size, page stride in bytes).
+
+    A page is contiguous in itself but pages need not be adjacent: vLLM keeps
+    one layer's pages inside a block-major pool, a whole block apart. view() so
+    a cache that is not contiguous within a page raises instead of being copied
+    on every call.
+    """
+    num_pages = kv_cache.shape[0]
+    flat = kv_cache.view(num_pages, -1)
+    idim = head_size // 2 + head_size // SCALE_GROUP
+    page_size = flat.shape[1] // idim
+    head_bytes = head_size // 2
+    return (
+        flat[:, : page_size * head_bytes],
+        flat[:, page_size * head_bytes :],
+        page_size,
+        flat.stride(0),
+    )
+
+
+# heuristics
+
+
+def _spec_block_m(next_n: int, num_heads: int) -> int:
+    """Rows per workgroup for a speculative chunk.
+
+    Search for best block m:
+        Lower values have better occupancy, but worse kv cache reread
+        Higher values have worse occupancy, but better kv cache rereaf
+    """
+    cap = 7 if num_heads <= 32 else (3 if next_n <= 6 else 2)
+    return min(
+        range(1, cap + 1), key=lambda b: (-(-next_n // b), b * (-(-next_n // b)))
+    )
+
+
+def plan_block_m(num_heads: int, next_n: int) -> int:
+    """BLOCK_M. Exported so a caller sizing operands cannot drift from it."""
+    if next_n >= COMPUTE_CHUNK:
+        # wide chunk
+        return 3 if num_heads <= 32 else 1
+    if 2 <= next_n <= SPEC_ROWS:
+        return _spec_block_m(next_n, num_heads)
+    if num_heads <= 32 and next_n > SPEC_ROWS:
+        # A prefill chunk under the wide-chunk plan still has rows to fill the
+        # M dimension: 2 costs 1.17x of the per-shape best over 32K-344K and
+        # up to 1.56x. 4 only starves the grid below ~64 rows.
+        return 3 if next_n < 64 else 4
+    if num_heads > 32 and next_n >= 2:
+        return min(2, next_n)
+    return 1 if next_n < 2 else min(2, next_n)
+
+
+def _kv_splits(
+    batch, row_blocks, max_model_len, block_kv, target_wgs, min_tiles, max_tiles
+):
+    """How many workgroups to put on one row block's KV walk.
+
+    A split partitions the output, so there is no reduction to pay for. Three
+    terms: fill the machine, keep any workgroup under max_tiles so the tail does
+    not set the step time, and never split below min_tiles.
+    """
+    tile_q = max(1, batch * row_blocks)
+    n_tiles = max(1, (max_model_len + block_kv - 1) // block_kv)
+    by_occupancy = (target_wgs + tile_q - 1) // tile_q
+    by_balance = (n_tiles + max_tiles - 1) // max_tiles
+    by_length = max(1, n_tiles // max(1, min_tiles))
+    # A second wave that is only part filled costs a whole wave of latency for
+    # a fraction of the work, so drop back to one. Not worth it once the launch
+    # is tall enough to hide the tail, or if it would leave the machine idle.
+    if (
+        by_occupancy < by_balance < CAP_ENGAGE * by_occupancy
+        and tile_q * by_balance < 2 * target_wgs
+    ):
+        whole = max(1, target_wgs // tile_q)
+        if whole * tile_q >= 0.9 * target_wgs:
+            by_balance = by_occupancy = whole
+    return max(1, min(max(by_occupancy, by_balance), by_length))
+
+
+@functools.lru_cache(maxsize=256)
+def _select_config(num_heads, head_size, next_n, page_size, preshuffle, clean_logits):
+    n_per_tile = mfma_nonk_dim(num_heads, head_size)
+    compute_chunk = next_n >= COMPUTE_CHUNK
+    spec_rows = num_heads <= 32 and 2 <= next_n <= SPEC_ROWS
+    wide_decode = num_heads > 32 and next_n == 1
+    block_kv = kv_tile(page_size)
+    # A page wider than the tile leaves a live in-page offset between the
+    # block-table read and the KV address; a page equal to it folds that away.
+    # Two rules below carry a term for it, and both are gated so the common
+    # page_size == BLOCK_KV path is untouched.
+    split_page = page_size > block_kv
+
+    if preshuffle:
+        # Register path. One warp: with no KV tile in LDS a second warp has no
+        # producer/consumer to help with, only its barriers.
+        block_m = min(plan_block_m(num_heads, next_n), next_n)
+        cfg = {
+            "num_warps": 1,
+            "num_buffers": 1,
+            "waves_per_eu": 3 if (compute_chunk or wide_decode) else 2,
+            # A second KV tile in flight
+            "depth": 2 if (wide_decode or (next_n == 1 and split_page)) else 1,
+            # Two KV tiles per body. Speculative decode has the registers for
+            # it; a wide chunk does not
+            "unroll": 2 if (spec_rows and block_m <= 6) else 1,
+            "fold_asm": 1 if (compute_chunk or spec_rows or num_heads > 32) else 0,
+        }
+    else:
+        # LDS path, for an unshuffled cache
+        block_m = min(2 if (num_heads <= 32 and next_n >= 2) else 1, next_n)
+        if next_n == 1:
+            waves_per_eu = 2
+        elif num_heads <= 32 and next_n <= SPEC_ROWS:
+            waves_per_eu = 3
+        else:
+            waves_per_eu = 4
+        cfg = {
+            "num_warps": 2 if (num_heads > 32 and next_n > 1) else 1,
+            "num_buffers": 2,
+            "waves_per_eu": waves_per_eu,
+            "depth": 1,
+            # One row, which is what lets UNROLL be 2.
+            "unroll": 2 if block_m == 1 else 1,
+            "fold_asm": 1 if num_heads <= 32 else 0,
+        }
+
+    cfg.update(
+        block_m=block_m,
+        row_blocks=(next_n + block_m - 1) // block_m,
+        block_kv=block_kv,
+        n_per_tile=n_per_tile,
+        # Workgroups to fill the machine: 4 SIMDs per CU
+        target_wgs=4 * get_num_sms() * cfg["waves_per_eu"],
+        page_pipe=(
+            1
+            if (num_heads <= 32 or (split_page and not 2 <= next_n <= SPEC_ROWS))
+            else 0
+        ),
+        m_chunk=n_per_tile if (num_heads > n_per_tile and n_per_tile == 32) else 0,
+        num_chains=1,
+        # Only meaningful when we gather
+        gather_pipe=1,
+        relaxed_store=0 if clean_logits else 1,
+        # Follows FOLD_ASM rather than standing alone, requires unvectorized fma ops
+        relu_add=cfg["fold_asm"],
+        min_tiles_per_split=4,
+        # Cap on a workgroup's tiles
+        max_tiles_per_split=128 if next_n == 1 else 64,
+    )
+    return cfg
+
+
+def select_config(
+    num_heads, head_size, next_n, page_size, preshuffle=1, clean_logits=True
+):
+    """The config for one shape, cached"""
+    return dict(
+        _select_config(
+            num_heads,
+            head_size,
+            next_n,
+            page_size,
+            int(bool(preshuffle)),
+            bool(clean_logits),
+        )
+    )
+
+
+def cache_strides(kv_cache, head_size, kv_scale_cache=None):
+    """(page_size, value page stride, scale page stride), in bytes.
+
+    Packed, both regions step by the whole page, not page_size * head_bytes;
+    getting that wrong silently addresses the wrong page.
+    """
+    if kv_scale_cache is None:
+        _, _, page_size, page_stride = _split_cache(kv_cache, head_size)
+        return page_size, page_stride, page_stride
+    page_size = kv_cache[0].numel() // (head_size // 2)
+    return page_size, kv_cache.stride(0), kv_scale_cache.stride(0)
+
+
+def build_candidate_gather(
+    candidates,
+    ends,
+    block_table,
+    kv_cache,
+    num_heads,
+    head_size,
+    block=CANDIDATE_BLOCK,
+    kv_scale_cache=None,
+):
+    """Ranked block ids -> (gather, row_ends), in one launch.
+
+    candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
+    ends:        [B * NEXT_N] int32 exclusive per-row key bound
+    block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row
+
+    Returns the sorted block starts (positions) and the slot of each one
+    (page * page_size + offset), which is all the walk reads, so a layer group
+    can build the pool once and hand it to every consumer.
+    """
+    rows, k = candidates.shape
+    assert k & (k - 1) == 0, "the sort needs a power-of-two candidate count"
+    # One program per row, so the warps are what fills the machine when the
+    # rows do not. Above that they only cost occupancy.
+    num_warps = (
+        (1 if k <= 1024 else 4)
+        if rows >= 4 * get_num_sms()
+        else (8 if k >= 2048 else 4)
+    )
+    assert block_table.shape[0] == rows and block_table.stride(1) == 1
+    page_size = cache_strides(kv_cache, head_size, kv_scale_cache)[0]
+    assert page_size % block == 0 and block <= mfma_nonk_dim(num_heads, head_size)
+    assert (
+        kv_cache.shape[0] * page_size < 2**31
+    ), "the pool holds more tokens than int32 slots address"
+    dev = candidates.device
+    pos = torch.empty((rows, k), dtype=torch.int32, device=dev)
+    cu = torch.empty((rows,), dtype=torch.int32, device=dev)
+    slots = torch.empty((rows, k), dtype=torch.int32, device=dev)
+    _prepare_candidates_kernel[(rows,)](
+        candidates,
+        ends,
+        block_table,
+        pos,
+        cu,
+        slots,
+        candidates.stride(0),
+        block_table.stride(0),
+        k,
+        block,
+        page_size,
+        num_warps=num_warps,
+    )
+    return {"slots": slots, "block": block, "positions": pos}, cu
+
+
+def build_schedule(
+    context_lens,
+    next_n,
+    num_heads,
+    head_size,
+    page_size=IDEAL_PAGE_SIZE,
+    preshuffle=1,
+    out=None,
+    row_ends=None,
+    gather=0,
+    query_start_loc=None,
+    total_rows=None,
+    max_model_len=None,
+):
+    """Descriptors for one launch, or None if the shape does not fit.
+
+    A descriptor is (sequence, row block, slice index, slice count), relative
+    rather than absolute, so the kernel converts it against its own tile count.
+
+    row_ends only affects balance here. Pass the same gather flag the launch
+    uses, or the slot counts are read as key positions.
+    """
+    plan = select_config(num_heads, head_size, next_n, page_size, preshuffle)
+    row_blocks, block_m = plan["row_blocks"], plan["block_m"]
+    if gather:
+        row_blocks, block_m = next_n, 1
+    block_kv, target_wgs = plan["block_kv"], plan["target_wgs"]
+    batch = int(context_lens.numel())
+    varlen = query_start_loc is not None
+    if varlen:
+        assert total_rows is not None, "varlen needs the packed row count"
+        # One spare unit per sequence absorbs its partial last block.
+        work = total_rows // block_m + batch
+    else:
+        work = batch * row_blocks
+    # Too few sequences to have an imbalance worth the scheduler launch.
+    if batch < MIN_DYNAMIC_BATCH:
+        return None
+    # enough work already
+    if work > target_wgs:
+        return None
+    # Slots enough to keep a slice under the cap the static grid uses, which
+    # is what its _kv_splits by_balance term does. Without max_model_len the
+    # walk length is unknown here, so the slice stays uncapped as before.
+    assert max_model_len, "build_schedule sizes its slices from max_model_len"
+    cap = plan["max_tiles_per_split"]
+    n_tiles = max(1, (max_model_len + block_kv - 1) // block_kv)
+    # target_wgs is one occupancy wave, so capping past it leaves a partly
+    # filled one. Only worth that when the slice would otherwise be many times
+    # the cap, as a prefill chunk's is; a decode slice is already close to it.
+    room0 = max(target_wgs - work, 1)
+    plain = max(1, (n_tiles * work + room0 - 1) // room0)
+    if plain < CAP_ENGAGE * cap:
+        cap = plain
+    per_unit = (n_tiles + cap - 1) // cap
+    slots = work * per_unit
+    num_ctas = max(target_wgs, min(slots, SCHED_SLOT_CAP))
+    room = max(num_ctas - work, 1)
+    max_tiles = max(cap, (n_tiles * work + room - 1) // room)
+    # The bound on slices per unit, which fixes the write's shape. It has to
+    # clear what an even split actually gives, num_ctas // work, or the floor
+    # it implies would cut the slice count and with it the parallelism; above
+    # that it only reins in a unit whose walk dwarfs the rest.
+    even = (num_ctas + work - 1) // work
+    max_slices = 1 << (max(per_unit, even) - 1).bit_length()
+    align_w = max(16, 1 << (work - 1).bit_length())
+    align_b = max(16, 1 << (batch - 1).bit_length())
+    # The varlen search is one ALIGN_W x ALIGN_B predicate matrix per program
+    if varlen and align_w * align_b > 1 << 20:
+        return None
+    if out is None or out.numel() < num_ctas * 4:
+        out = torch.empty(num_ctas * 4, dtype=torch.int32, device=context_lens.device)
+    # Slice indices one program writes. The grid follows the slices a unit can
+    # own, not the slot count, which is what keeps the redone reductions cheap.
+    SCHED_BLOCK_S = 4
+    _pa_mqa_logits_mxfp4_sched_kernel[(triton.cdiv(max_slices, SCHED_BLOCK_S),)](
+        context_lens,
+        row_ends,
+        query_start_loc,
+        out,
+        batch,
+        next_n,
+        num_ctas,
+        work,
+        max_tiles,
+        BLOCK_M=block_m,
+        BLOCK_KV=block_kv,
+        ROW_BLOCKS=row_blocks,
+        ALIGN_W=align_w,
+        BLOCK_S=SCHED_BLOCK_S,
+        HAS_ROW_ENDS=1 if row_ends is not None else 0,
+        GATHER=int(gather),
+        VARLEN=1 if varlen else 0,
+        ALIGN_B=align_b,
+        SLICE_ROOM=SLICE_ROOM,
+        BLOCK_T=256,
+        num_warps=4,
+    )
+    # The launcher takes the grid from the length, so the length is the contract
+    return out[: num_ctas * 4]
+
+
+def _check_schedule(schedule, device):
+    if not isinstance(schedule, torch.Tensor):
+        raise TypeError(
+            "schedule must be an int32 tensor from build_schedule, "
+            f"got {type(schedule).__name__}"
+        )
+    schedule = schedule.reshape(-1)
+    if schedule.dtype != torch.int32:
+        raise TypeError(f"schedule must be int32, got {schedule.dtype}")
+    if not schedule.is_contiguous():
+        raise ValueError("schedule must be contiguous")
+    if schedule.device != device:
+        raise ValueError(f"schedule is on {schedule.device}, operands are on {device}")
+    if schedule.numel() == 0 or schedule.numel() % 4:
+        raise ValueError(
+            "schedule must be a whole number of 4-word descriptors, "
+            f"got {schedule.numel()} words"
+        )
+    return schedule
+
+
+def paged_mxfp4_mqa_logits(
+    q: torch.Tensor,
+    q_scales: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_model_len: int,
+    kv_scale_cache: torch.Tensor | None = None,
+    out_logits: torch.Tensor | None = None,
+    clean_logits: bool = True,
+    preshuffle: int = 1,
+    scale_mode: int = SCALE_MODE_WIDE,
+    dynamic: int = 0,
+    schedule: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    next_n: int | None = None,
+    use_gather: bool = False,
+    candidates: torch.Tensor | dict | None = None,
+    block_scores: torch.Tensor | None = None,
+    calc_logits: bool = True,
+    calc_block_scores: bool = False,
+    candidate_block_size: int = CANDIDATE_BLOCK,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    This function computes the logits to be used by a topk function for sparse
+    attention, from an MXFP4 query against a paged MXFP4 KV cache.
+
+    q:              [B, NEXT_N, NUM_HEADS, HEAD_SIZE//2], dtype uint8, packed e2m1
+    q_scales:       [B, NEXT_N, NUM_HEADS, HEAD_SIZE//32], dtype uint8, e8m0
+    kv_cache:       [NUM_PAGES, PAGE_SIZE, 1, HEAD_SIZE//2 + HEAD_SIZE//32], dtype
+                    uint8, each page holding its e2m1 values then its e8m0 scales
+    weights:        [B * NEXT_N, NUM_HEADS], dtype float32
+    context_lens:   [B], dtype int32
+    block_table:    [B, MAX_BLOCKS], dtype int32, page index per sequence position
+    max_model_len:  int, column count of the logits
+    kv_scale_cache: [NUM_PAGES, PAGE_SIZE, 1, HEAD_SIZE//32], dtype uint8, when the
+                    scales are kept apart from the values rather than packed after
+                    them. kv_cache is then the values alone
+    out_logits:     [B * NEXT_N, max_model_len], dtype float32. Allocated here if
+                    absent; a tensor you pass must arrive -inf under clean_logits
+    clean_logits:   bool. If True, positions row i does not attend to read as
+                    -inf, in either output. If False they are unspecified
+    preshuffle:     bool. The cache is stored in dot-operand order (see
+                    cache_format), which reads it straight into the matrix core.
+                    If False it is read token-major and staged through LDS
+    dynamic:        bool. Build the work schedule on the device, for a batch whose
+                    sequences differ in length
+    schedule:       [NUM_CTAS, 4], dtype int32, work descriptors from
+                    build_schedule. Takes precedence over dynamic
+    row_ends:        [B * NEXT_N], dtype int32, optional. Exclusive per-row key
+                    bound, indexed like weights, defaulting to
+                    context_lens[b] - NEXT_N + n + 1; pass it under compression
+                    or context parallelism. build_schedule needs the same tensor.
+                    Under gather it counts the row's valid candidate slots
+    use_gather:     bool. Walk a candidate list rather than the context, so
+                    output column j holds candidate slot j
+    candidates:     [B * NEXT_N, K] int32 ranked block ids, resolved here, or
+                    what build_candidate_gather returned, used as is. row_ends
+                    is the per-row key bound for the first and the slot count
+                    for the second
+    block_scores:   [B * NEXT_N, ceil(max_model_len / candidate_block_size)],
+                    dtype float32. Allocated here if absent. Blocks [0,
+                    ceil(context_len / C)) are written, the tail past them is
+                    not -- clean_logits decides what it reads as, exactly as it
+                    does for the logits. The block holding each row's newest
+                    key is pinned to +inf, so recent context is a candidate
+                    whatever it scored
+    calc_logits:    bool, default True
+    calc_block_scores: bool, default False. With calc_logits off no
+                    [B * NEXT_N, max_model_len] logits tensor is allocated or
+                    written at all
+    candidate_block_size: int, columns per candidate block. Must divide
+                    BLOCK_KV so no block straddles a tile or a KV split
+
+    Returns:
+                    logits, or block_scores, or both as a pair -- whichever was
+                    asked for
+
+    About block scores:
+    --------------------
+    It has one consumer: pass 1 of the two-pass producer. No indexer layer can
+    use it alone, because every layer needs its own top-k and that needs
+    logits. The producer layer runs this, ranks the maxima into a candidate
+    pool, and then runs a second `gather` launch over that pool to recover its
+    own top-k.
+
+    """
+    # Gluon kernel for gfx950 only for now
+    assert arch_info.get_arch() == "gfx950", "gfx950 only"
+    assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
+
+    varlen = query_start_loc is not None
+    if varlen:
+        assert q.dim() == 3, "varlen q is [TOTAL_ROWS, NUM_HEADS, HEAD_SIZE // 2]"
+        assert query_start_loc.dtype == torch.int32 and query_start_loc.stride(0) == 1
+        total_rows, num_heads, head_bytes = q.shape
+        batch = query_start_loc.numel() - 1
+        # q has no next_n axis when the rows are packed, so the caller names
+        # the row count to plan the launch's one config from; the average is
+        # the count most of the work belongs to.
+        next_n = next_n or max(1, total_rows // max(batch, 1))
+    else:
+        assert next_n is None, "next_n comes from q's shape unless rows are packed"
+        batch, next_n, num_heads, head_bytes = q.shape
+        total_rows = batch * next_n
+    head_size = head_bytes * 2
+    num_scales = head_size // SCALE_GROUP
+    assert num_heads & (num_heads - 1) == 0, "head count must be a power of 2"
+    assert head_size & (head_size - 1) == 0, "head size must be a power of 2"
+    assert q.dtype == torch.uint8 and q_scales.dtype == torch.uint8
+    if varlen:
+        assert q_scales.shape == (total_rows, num_heads, num_scales)
+        assert q.stride()[1:] == (
+            head_bytes,
+            1,
+        ), "q rows must be contiguous over (H, D)"
+        assert q_scales.stride()[1:] == (num_scales, 1)
+    else:
+        assert q_scales.shape == (batch, next_n, num_heads, num_scales)
+        assert q.stride()[2:] == (head_bytes, 1), "q must be row-contiguous over (H, D)"
+        assert q_scales.stride()[2:] == (num_scales, 1)
+    assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
+    assert block_table.shape[0] == batch
+    assert context_lens.dtype == torch.int32
+    assert weights.shape == (total_rows, num_heads) and weights.stride(1) == 1
+    if row_ends is not None:
+        assert row_ends.dtype == torch.int32, "row_ends must be int32"
+        assert (
+            row_ends.shape == (total_rows,) and row_ends.stride(0) == 1
+        ), "row_ends must be a contiguous [B * NEXT_N] vector, indexed like weights"
+
+    # page_size comes from the cache rather than the caller: both layouts pin it
+    # exactly, and a second source could disagree with the bytes.
+    if kv_scale_cache is None:
+        values, scales, page_size, page_stride = _split_cache(kv_cache, head_size)
+        kv_page_stride = kvs_page_stride = page_stride
+        num_pages = kv_cache.shape[0]
+    else:
+        values, scales = kv_cache, kv_scale_cache
+        num_pages = values.shape[0]
+        page_size = values[0].numel() // head_bytes
+        kv_page_stride = values.stride(0)
+        kvs_page_stride = scales.stride(0)
+    assert values.dtype == torch.uint8 and scales.dtype == torch.uint8
+    assert kv_page_stride % 16 == 0, (
+        f"value page stride ({kv_page_stride} B) must be 16-byte aligned or the "
+        "loads cannot be vectorised"
+    )
+
+    preshuffle = 1 if preshuffle else 0
+    if preshuffle:
+        cache_format(num_heads, head_size, page_size)  # validates the geometry
+
+    assert calc_logits or calc_block_scores, "the launch would emit nothing"
+    bscore_on = (1 if calc_logits else 2) if calc_block_scores else 0
+    cand_block = int(candidate_block_size)
+    assert (
+        calc_logits or out_logits is None
+    ), "out_logits is inapplicable with calc_logits off: none are written"
+    assert (
+        calc_block_scores or block_scores is None
+    ), "block_scores is inapplicable with calc_block_scores off"
+
+    def _alloc(cols):
+        # clean_logits picks the fill for both outputs: the walk leaves the
+        # columns past the context untouched either way.
+        shape = (total_rows, cols)
+        if clean_logits:
+            return torch.full(
+                shape, float("-inf"), dtype=torch.float32, device=q.device
+            )
+        return torch.empty(shape, dtype=torch.float32, device=q.device)
+
+    logits = None
+    if calc_logits:
+        logits = out_logits if out_logits is not None else _alloc(max_model_len)
+        assert logits.shape == (total_rows, max_model_len)
+    if calc_block_scores and block_scores is None:
+        block_scores = _alloc((max_model_len + cand_block - 1) // cand_block)
+    if logits is not None:
+        # A buffer store addresses the row through a 32-bit record count.
+        assert (
+            max_model_len * 4 < 2**31
+        ), f"max_model_len {max_model_len} exceeds what a buffer store can address"
+
+    assert (
+        use_gather or candidates is None
+    ), "candidates is inapplicable with use_gather off"
+    assert not (
+        varlen and use_gather
+    ), "the gather already takes one block-table row per query row"
+    gather = None
+    if use_gather:
+        assert candidates is not None, "use_gather needs a candidate list"
+        if isinstance(candidates, dict):
+            gather = candidates
+        else:
+            # Resolved here for a single consumer. A layer group should call
+            # build_candidate_gather once and pass what it returns.
+            n = torch.arange(next_n, device=q.device, dtype=torch.int32)
+            key_ends = (
+                row_ends
+                if row_ends is not None
+                else torch.clamp(
+                    context_lens.repeat_interleave(next_n)
+                    - next_n
+                    + n.repeat(batch)
+                    + 1,
+                    min=0,
+                )
+            )
+            gather, row_ends = build_candidate_gather(
+                candidates,
+                key_ends,
+                block_table.repeat_interleave(next_n, 0).contiguous(),
+                kv_cache,
+                num_heads,
+                head_size,
+                cand_block,
+                kv_scale_cache,
+            )
+    gather_on = 1 if gather is not None else 0
+    gather_block = int(gather["block"]) if gather_on else 8
+    if gather_on:
+        g_slots = gather["slots"]
+        assert g_slots.dtype == torch.int32 and g_slots.stride(1) == 1
+        assert g_slots.shape[0] == total_rows, g_slots.shape
+        assert row_ends is not None, (
+            "the gather takes its walk length from row_ends, read as the row's "
+            "count of valid candidate slots"
+        )
+
+    cfg = select_config(
+        num_heads, head_size, next_n, page_size, preshuffle, clean_logits
+    )
+    if gather_on:
+        # One query row per workgroup because of sparsity
+        split_page = page_size > cfg["block_kv"]
+        cfg = dict(
+            cfg,
+            block_m=1,
+            row_blocks=next_n,
+            depth=2 if (next_n == 1 and split_page and num_heads <= 32) else 1,
+        )
+        if preshuffle and next_n >= COMPUTE_CHUNK:
+            cfg["unroll"] = 4
+    block_m, row_blocks = cfg["block_m"], cfg["row_blocks"]
+    block_kv, n_per_tile = cfg["block_kv"], cfg["n_per_tile"]
+    target_wgs = cfg["target_wgs"]
+    # page_size comes from the cache, so it can be a size BLOCK_KV does not fit.
+    assert page_size % block_kv == 0, (
+        f"BLOCK_KV {block_kv} must divide page_size {page_size} or a tile spans "
+        "two pages, which are not adjacent"
+    )
+    assert (
+        block_kv % n_per_tile == 0
+    ), f"BLOCK_KV {block_kv} must be a multiple of the MFMA N ({n_per_tile})"
+
+    if bscore_on:
+        assert (
+            gather is None
+        ), "block maxima are for the dense producer; the consumers gather"
+        assert block_scores.dtype == torch.float32
+        assert cand_block <= block_kv and block_kv % cand_block == 0, (
+            f"candidate_block_size {cand_block} must divide BLOCK_KV "
+            f"{block_kv} or a block straddles a tile"
+        )
+        n_blocks = (max_model_len + cand_block - 1) // cand_block
+        assert block_scores.shape[0] == total_rows, block_scores.shape
+        assert block_scores.shape[1] >= n_blocks, (
+            f"block_scores is {block_scores.shape[1]} blocks wide, needs "
+            f"{n_blocks} for max_model_len {max_model_len}"
+        )
+        assert block_scores.stride(1) == 1, "block_scores rows must be contiguous"
+        assert (
+            block_scores.shape[1] * 4 < 2**31
+        ), "block_scores row exceeds what a buffer store can address"
+
+    use_buffer_load = bool(preshuffle) or (
+        num_pages * max(kv_page_stride, kvs_page_stride) < 2**31
+    )
+    if gather_on:
+        assert block_kv % gather_block == 0 and page_size % gather_block == 0
+        assert (
+            gather_block <= n_per_tile
+        ), "a candidate block must sit inside one shuffle group"
+        assert (
+            num_pages * page_size < 2**31
+        ), "the pool holds more tokens than int32 slots address"
+        use_buffer_load = num_pages * max(kv_page_stride, kvs_page_stride) < 2**31
+
+    # The two that need the batch, which select_config does not see.
+    # Varlen's grid is one unit per row block plus a spare per sequence, not
+    # batch x row_blocks, so the split count has to be sized from that.
+    split_q = (1, total_rows // block_m + batch) if varlen else (batch, row_blocks)
+    cfg["num_kv_splits"] = _kv_splits(
+        *split_q,
+        max_model_len,
+        block_kv,
+        target_wgs,
+        cfg["min_tiles_per_split"],
+        cfg["max_tiles_per_split"],
+    )
+    # More than one row block per sequence means the second re-reads the same
+    # pages, so the lines are worth keeping in L1
+    cfg["kv_reread"] = 1 if row_blocks > 1 else 0
+
+    num_kv_splits = cfg["num_kv_splits"]
+    # A gather launch does not build one
+    if schedule is None and dynamic and not gather_on:
+        schedule = build_schedule(
+            context_lens,
+            next_n,
+            num_heads,
+            head_size,
+            page_size,
+            preshuffle,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            total_rows=total_rows,
+            max_model_len=max_model_len,
+        )
+    use_dynamic = schedule is not None
+    if use_dynamic:
+        schedule = _check_schedule(schedule, context_lens.device)
+        # schedule length is the grid
+        grid = (schedule.numel() // 4, 1, 1)
+    elif varlen:
+        # One unit per row block plus a spare per sequence, which is what the
+        # kernel's search over query_start_loc covers; the spares exit there.
+        grid = (total_rows // block_m + batch, 1, num_kv_splits)
+        schedule = context_lens
+    else:
+        grid = (row_blocks, batch, num_kv_splits)
+        # Placeholder ptr
+        schedule = context_lens
+
+    _pa_mqa_logits_mxfp4_kernel[grid](
+        Q_ptr=q,
+        q_scales_ptr=q_scales,
+        KV_ptr=values,
+        kv_scales_ptr=scales,
+        weights_ptr=weights,
+        context_lens_ptr=context_lens,
+        # None specializes to a constexpr, so an unused argument leaves no trace.
+        row_ends_ptr=row_ends,
+        query_start_loc_ptr=query_start_loc,
+        block_table_ptr=block_table,
+        sched_ptr=schedule,
+        slots_ptr=g_slots if gather_on else schedule,
+        # None specializes to a constexpr, so neither reaches the kernarg
+        # segment with the reduce off.
+        block_scores_ptr=block_scores if bscore_on else None,
+        logits_ptr=logits,
+        next_n=next_n,
+        batch=batch,
+        num_kv_splits=num_kv_splits,
+        stride_q_b=0 if varlen else q.stride(0),
+        stride_q_n=q.stride(0) if varlen else q.stride(1),
+        stride_qs_b=0 if varlen else q_scales.stride(0),
+        stride_qs_n=q_scales.stride(0) if varlen else q_scales.stride(1),
+        stride_w_s=weights.stride(0),
+        stride_logits_s=logits.stride(0) if logits is not None else 0,
+        stride_logits_k=logits.stride(1) if logits is not None else 0,
+        stride_blk_b=block_table.stride(0),
+        stride_gather_r=g_slots.stride(0) if gather_on else 0,
+        stride_bs_s=block_scores.stride(0) if bscore_on else None,
+        max_blocks=block_table.shape[1],
+        NUM_HEADS=num_heads,
+        HEAD_SIZE=head_size,
+        PAGE_SIZE=page_size,
+        KV_PAGE_STRIDE=kv_page_stride,
+        KVS_PAGE_STRIDE=kvs_page_stride,
+        BLOCK_KV=block_kv,
+        BLOCK_M=block_m,
+        NUM_WARPS=cfg["num_warps"],
+        NUM_BUFFERS=cfg["num_buffers"],
+        DEPTH=cfg["depth"],
+        UNROLL=cfg["unroll"],
+        PAGE_PIPE=cfg["page_pipe"],
+        M_CHUNK=cfg["m_chunk"],
+        NUM_CHAINS=cfg["num_chains"],
+        FOLD_ASM=cfg["fold_asm"],
+        RELU_ADD=cfg["relu_add"],
+        RELAXED_STORE=cfg["relaxed_store"],
+        VARLEN=1 if varlen else 0,
+        PRESHUFFLE=preshuffle,
+        SCALE_MODE=int(scale_mode),
+        USE_BUFFER_LOAD=use_buffer_load,
+        MFMA_NONK_DIM=n_per_tile,
+        HAS_KV_SPLIT=1 if (num_kv_splits > 1 or use_dynamic) else 0,
+        KV_REREAD=cfg["kv_reread"],
+        DYNAMIC=int(use_dynamic),
+        HAS_ROW_ENDS=1 if row_ends is not None else 0,
+        GATHER=gather_on,
+        GATHER_BLOCK=gather_block,
+        GATHER_PIPE=cfg["gather_pipe"] if gather_on else 0,
+        BSCORE=bscore_on,
+        BSCORE_BLOCK=cand_block if bscore_on else CANDIDATE_BLOCK,
+        num_warps=cfg["num_warps"],
+        waves_per_eu=cfg["waves_per_eu"],
+    )
+    if calc_logits and calc_block_scores:
+        return logits, block_scores
+    return logits if calc_logits else block_scores

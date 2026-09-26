@@ -931,6 +931,9 @@ def fused_moe(
             stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+        ep_combine_quant=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         ep_source_token_map=scatter_source_map,
         output=output,
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
@@ -972,6 +975,7 @@ def fused_moe_fake(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
@@ -1032,6 +1036,7 @@ def fused_moe_(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
@@ -1047,6 +1052,7 @@ def fused_moe_(
             max_tokens_per_rank=ep_max_tokens_per_rank,
             world_size=ep_world_size,
             source_token_map=ep_source_token_map,
+            combine_quant_bits=int(ep_combine_quant),
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -1895,7 +1901,9 @@ def _normalize_mxfp4_activation_params(
         situ_beta = 1.0 if beta is None else float(beta)
         situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
     normalized_swiglu_limit = (
-        swiglu_limit if activation == ActivationType.Swiglu else None
+        swiglu_limit
+        if activation in (ActivationType.Silu, ActivationType.Swiglu)
+        else None
     )
     return situ_beta, situ_linear_beta, normalized_swiglu_limit
 
@@ -2416,14 +2424,11 @@ def _mxfp4_a4w4_stage1_fw(
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     runtime_situ_beta = float(situ_beta)
     runtime_situ_linear_beta = float(situ_linear_beta)
-    # swiglu_limit reaches the kernel as a scalar closure value, so it lands in
-    # FlyDSL's disk-cache key (see the note in mxfp4_gemm1.py), yet
-    # _activation_mul_batch only consumes it for swiglu -- silu and situv2 ignore
-    # it entirely. Pin the other activations to the default so a caller's limit
-    # cannot fork the cache into entries whose generated code is identical.
-    runtime_swiglu_limit = 7.0
-    if p1["act"] == "swiglu" and swiglu_limit is not None:
-        runtime_swiglu_limit = float(swiglu_limit)
+    # Match generic FlyDSL v1/v2 semantics. MXMOE captures this value in the
+    # compiled kernel closure; +inf represents an unclamped SiLU.
+    runtime_swiglu_limit = _get_flydsl_moe_kernels().runtime_swiglu_limit(
+        swiglu_limit, p1["act"]
+    )
     if not p1.get("enable_bias", False) and bias1 is not None:
         raise ValueError(
             "MXMOE bias presence does not match the cache-safe kernel name"
@@ -2624,6 +2629,10 @@ def _flydsl_stage2_fp8_enabled():
     return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
+def _opus_stage2_fp8_enabled():
+    return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -2661,6 +2670,11 @@ def _flydsl_v2_stage2_wrapper(
     bn = cfg["tile_n"]
     bk = cfg["tile_k"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
+    if cfg["sort_block_m"] and block_m is not None and int(block_m) != sbm:
+        raise ValueError(
+            "FlyDSL v2 stage2 sorting layout mismatch: moe_sorting uses "
+            f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
+        )
     epilog = cfg["epilog"]
     max_sorted = inter_states.shape[0]
 
@@ -2743,6 +2757,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
+        is_ep=expert_mask is not None,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -2996,10 +3011,6 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
     keys = (
         gfx,
         cu_num,
@@ -3164,9 +3175,7 @@ def get_2stage_cfgs(
                 f"activation {configured_act!r} does not match runtime "
                 f"{expected_act!r}"
             )
-        elif swiglu_limit and expected_act != "swiglu":
-            # MXMOE's _activation_mul_batch consumes the limit for swiglu only;
-            # zero is the existing no-clamp sentinel on non-SwiGLU paths.
+        elif swiglu_limit and expected_act not in ("silu", "swiglu"):
             reject_reason = (
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
@@ -3183,6 +3192,8 @@ def get_2stage_cfgs(
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
             )
+        elif is_ep:
+            reject_reason = "the MXMOE output_aux sort drops expert_mask"
         if reject_reason is not None:
             cfg = None
             logger.warning(
@@ -3343,6 +3354,15 @@ def get_2stage_cfgs(
         )
     else:
         block_m = cfg["block_m"]
+        nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
+        if nt_override != -1:
+            use_non_temporal_load = bool(nt_override)
+        elif "nt" in cfg:
+            try:
+                use_non_temporal_load = bool(int(float(cfg["nt"])))
+            except (TypeError, ValueError):
+                # blank or malformed column: keep the pre-column behaviour
+                use_non_temporal_load = False
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
             ksplit = cfg["ksplit"]
         else:
@@ -3663,6 +3683,39 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
+    # The fallback's layout GEMM2 writes bf16 only, and its output_aux sort drops expert_mask.
+    _mxmoe_fallback_ok = (
+        dtype == dtypes.bf16
+        and not is_ep
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Situv2
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and gate_mode != GateMode.INTERLEAVE
+        and not (has_stage1_bias or has_stage2_bias)
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and model_dim % 256 == 0
+        and inter_dim % 128 == 0
+        and aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk)
+        and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
+    )
+    if _mxmoe_fallback_ok and cfg is None:
+        _bm = 64 if token < 512 else 128
+        _rows_per_expert = -(-token * topk // expert)
+        _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
+        _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
+        _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
+        _kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x128_reduce_sbm{_bm}"
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using heuristic MXMOE fallback (kn1={_kn1!r}, kn2={_kn2!r})"
+        )
+        return _make_mxfp4_metadata(_kn1, _kn2, gate_mode, 0, block_m=_bm)
+
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
@@ -4222,6 +4275,8 @@ def fused_moe_2stages(
         )
         if uses_flydsl_v2_stage2:
             extra_stage2_args["topk_weights"] = topk_weights
+    if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
+        extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf

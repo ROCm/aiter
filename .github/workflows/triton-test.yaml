@@ -10,13 +10,22 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths:
-      - "aiter/ops/triton/**"
-      - "op_tests/triton_tests/**"
-      - "op_tests/op_benchmarks/triton/**"
+      # Triton tests also depend on shared aiter modules and test helpers.
+      # The selector falls back to the full suite for inputs outside its graph.
+      - "aiter/**"
+      - "op_tests/**"
+      - "pyproject.toml"
+      - "setup.py"
+      - "setup.cfg"
+      - "requirements*.txt"
+      - "conftest.py"
+      - "pytest.ini"
       - ".github/scripts/build_aiter_triton.sh"
       - ".github/scripts/download_triton_wheel.sh"
+      - ".github/scripts/ensure_zstd.sh"
       - ".github/scripts/install_triton.sh"
       - ".github/scripts/select_triton_tests.py"
+      - ".github/scripts/tests/**"
       - ".github/scripts/split_tests.sh"
       - ".github/scripts/verify_triton_pin.py"
       - ".github/requirements/triton-test.txt"
@@ -71,6 +80,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Keep the event's merge commit and its base parent together. A
+          # freshly fetched PR merge ref may have moved since this run began.
+          fetch-depth: 2
+
+      - name: Check Triton test selection
+        run: python3 -m unittest discover -s .github/scripts/tests -v
 
       - name: Select Triton tests from PR diff
         id: select
@@ -82,10 +98,8 @@ jobs:
           # whose imports reach it. main pushes, nightly, manual runs and PRs
           # labeled ci:triton-full always run the full suite.
           if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FULL_LABEL" != "true" ]; then
-            git fetch --no-tags --depth=2 origin \
-              "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
             python3 .github/scripts/select_triton_tests.py \
-              --merge-ref pr-merge --output selected_triton_tests.list
+              --merge-ref HEAD --output selected_triton_tests.list
           else
             python3 .github/scripts/select_triton_tests.py \
               --all --output selected_triton_tests.list
@@ -174,7 +188,22 @@ jobs:
         with:
           name: triton_shards
 
+      - name: Ensure zstd for Triton wheel cache
+        if: ${{ runner.os == 'Linux' }}
+        run: ./.github/scripts/ensure_zstd.sh
+
+      - name: Restore Triton wheel cache
+        id: restore_triton_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: triton_wheels
+          key: ${{ needs.prepare_triton_wheel.outputs.cache_key }}
+
       - name: Download Triton wheel artifact
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         id: download_triton_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
@@ -183,8 +212,8 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
-      - name: Speedtest after Triton artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+      - name: Speedtest after Triton cache or artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -261,8 +290,9 @@ jobs:
 
       - name: Triton Tests
         run: |
-          set -ex
+          set -exo pipefail
           echo "Running Triton Tests..."
+          mkdir -p test-reports
           docker exec -w /workspace triton_test mkdir -p test-reports
           if [ -z "${TRITON_TEST// /}" ]; then
             # Diff-based selection picked no tests for this shard.
@@ -270,17 +300,34 @@ jobs:
             docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
           else
             # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
-            docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-              --junitxml=test-reports/triton.xml
+            # Unit tests must not autotune: surface any tuning and fail the job if it happened.
+            docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
+              --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
+            if grep -q "Triton autotuning for function" test-reports/pytest.log; then
+              echo "::error::runtime autotuning ran inside unit tests"
+              # Name them here as well as in the artifact: the log is long, and
+              # the whole point of the gate is which kernel tuned.
+              grep -n "Triton autotuning for function" test-reports/pytest.log | head -20 || true
+              exit 1
+            fi
           fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: success()
+        # Not success(): a shard that trips the autotuning gate is exactly the
+        # run whose log is worth keeping, and success() skips the upload for
+        # it -- so the evidence only ever existed in the live Actions log,
+        # which expires.
+        if: ${{ !cancelled() }}
         with:
           name: triton-test-shard-${{ matrix.shard }}
-          path: test-reports/triton.xml
+          path: |
+            test-reports/triton.xml
+            test-reports/pytest.log
           retention-days: 7
+          # A shard that died before pytest ran has neither file, which is not
+          # itself an error worth failing the upload over.
+          if-no-files-found: ignore
 
       - name: Cleanup container
         if: always()
@@ -316,7 +363,22 @@ jobs:
         with:
           name: triton_shards
 
+      - name: Ensure zstd for Triton wheel cache
+        if: ${{ runner.os == 'Linux' }}
+        run: ./.github/scripts/ensure_zstd.sh
+
+      - name: Restore Triton wheel cache
+        id: restore_triton_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: triton_wheels
+          key: ${{ needs.prepare_triton_wheel.outputs.cache_key }}
+
       - name: Download Triton wheel artifact
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         id: download_triton_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
@@ -385,25 +447,43 @@ jobs:
 
       - name: Triton Tests
         run: |
-          set -ex
+          set -exo pipefail
           echo "Running Triton Tests..."
+          mkdir -p test-reports
           docker exec -w /workspace triton_test mkdir -p test-reports
           if [ -z "${TRITON_TEST// /}" ]; then
             # Diff-based selection picked no tests for this shard.
             echo "No tests selected for this shard — writing an empty report."
             docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
           else
-            docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-              --junitxml=test-reports/triton.xml
+            # Unit tests must not autotune: surface any tuning and fail the job if it happened.
+            docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
+              --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
+            if grep -q "Triton autotuning for function" test-reports/pytest.log; then
+              echo "::error::runtime autotuning ran inside unit tests"
+              # Name them here as well as in the artifact: the log is long, and
+              # the whole point of the gate is which kernel tuned.
+              grep -n "Triton autotuning for function" test-reports/pytest.log | head -20 || true
+              exit 1
+            fi
           fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: success()
+        # Not success(): a shard that trips the autotuning gate is exactly the
+        # run whose log is worth keeping, and success() skips the upload for
+        # it -- so the evidence only ever existed in the live Actions log,
+        # which expires.
+        if: ${{ !cancelled() }}
         with:
           name: triton-test-mi300x-shard-${{ matrix.shard }}
-          path: test-reports/triton.xml
+          path: |
+            test-reports/triton.xml
+            test-reports/pytest.log
           retention-days: 7
+          # A shard that died before pytest ran has neither file, which is not
+          # itself an error worth failing the upload over.
+          if-no-files-found: ignore
 
       - name: Cleanup container
         if: always()
@@ -411,11 +491,33 @@ jobs:
           docker rm -f triton_test || true
 
   triton-mi300x-test-finish:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
+    # Report dependency failures even when the GPU matrix was skipped. A
+    # successful empty selection is the only preparation result we skip.
+    if: ${{ !cancelled() && (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) && (needs.split_triton_tests.outputs.selected_count != '0' || needs.split_triton_tests.result != 'success' || needs.prepare_triton_wheel.result != 'success' || needs.check-signal.result != 'success' || needs.ci_config.result != 'success') }}
     name: Triton MI300X Test Results
     runs-on: ubuntu-latest
-    needs: [triton-mi300x]
+    needs: [triton-mi300x, split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     steps:
+      - name: Check prerequisite and MI300X job results
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          jobs = json.loads(os.environ["JOB_RESULTS"])
+          failed = False
+          for name, job in jobs.items():
+              result = job["result"]
+              print(f"{name}: {result}")
+              if result != "success":
+                  print(f"::error::{name} did not succeed ({result})")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
       - name: Download all MI300X test reports
         uses: actions/download-artifact@v4
         timeout-minutes: 15
@@ -443,11 +545,33 @@ jobs:
           fi
 
   triton-test-finish:
-    if: ${{ (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) }}
+    # Report dependency failures even when the GPU matrix was skipped. A
+    # successful empty selection is the only preparation result we skip.
+    if: ${{ !cancelled() && (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || contains(fromJSON('["ci:triton-300x", "ci:triton-full"]'), github.event.label.name)) && (needs.split_triton_tests.outputs.selected_count != '0' || needs.split_triton_tests.result != 'success' || needs.prepare_triton_wheel.result != 'success' || needs.check-signal.result != 'success' || needs.ci_config.result != 'success') }}
     name: Triton Test Results
     runs-on: ubuntu-latest
-    needs: [triton]
+    needs: [triton, split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     steps:
+      - name: Check prerequisite and MI35X job results
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          jobs = json.loads(os.environ["JOB_RESULTS"])
+          failed = False
+          for name, job in jobs.items():
+              result = job["result"]
+              print(f"{name}: {result}")
+              if result != "success":
+                  print(f"::error::{name} did not succeed ({result})")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
       - name: Download all test reports
         uses: actions/download-artifact@v4
         timeout-minutes: 15
