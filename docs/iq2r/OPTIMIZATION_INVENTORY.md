@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E407, excluding ongoing E408. Related scouts,
+attempts from the initial GLM integration through E412. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E407
+## Isolated single-GPU optimization, E199–E412
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -233,6 +233,15 @@ single-GPU report. Serving sweeps remain paused.
 | E405 | Padded 12-byte codebook proposal stops at a CPU alignment probe: compiler selects two 32-bit reads, so the intended single 64-bit read is not established. No GPU timing or promotion. |
 | E406 | Modern M32 register/cross-K reuse passes 315 exact checks and stable timing. Bounded unrolling reduces 142 to 128 VGPRs, but every row still loses; rejected. |
 | E407 | Two-word cross-K lookahead fails the initial M32 finite-output check before timings. Native code copies an outstanding DS result without a wait. Failure, source and binary are frozen for E408 diagnosis; no candidate selected. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E408 | Draining two-word cross-K carries fixes the tested M32 kernel: 315 full-run plus 27 diagnostic checks pass, but all timings lose. Tied-output repair fails correctness; all failures retained. |
+| E409 | Two-slot M16 activation staging reuses existing LDS, passes 378 checks and improves TP4 hot by 5.7%, but loses spread/mixed. Single-slot M32 loses throughout. |
+| E410 | Remove unnecessary M16 other-slot drain; compiler inserts a later wait and complete latency is unchanged. Bounded K loop reduces registers 126 to 108 but regresses. All 378 checks pass. |
+| E411 | Ordinary compiler-visible LDS loads make two-word cross-K dependencies trackable. M16 gains 1.1% hot with effectively unchanged cold timing; M32 loses. All 378 checks pass. |
+| E412 | Combine activation staging and compiler-visible codebook loads. No-drain form reaches 83.05 us hot against 68.93 us MXFP4, with cold regressions against E400. All 441 checks pass; retain for TP8 transfer, no TP4 broad promotion. |
 
 
 ## How to read the outcomes

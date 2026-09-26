@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Activation and compiler scheduling follow-up — E408–E412
+
+The selected comparison is unchanged: seven of eight selected TP8 rows and five of six compact TP4 rows beat matched MXFP4. TP8 M256 hot remains 0.9% behind, TP4 M256 hot 25.8% behind, and dense TP4 M4096 about 22% behind. Complete isolated and serving parity remain unmet.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 119.15 | 101.60 | -14.7% |
+| 8 | 128 | hot | 43.35 | 42.53 | -1.9% |
+| 8 | 256 | spread | 135.83 | 104.72 | -22.9% |
+| 8 | 256 | hot | 62.80 | 63.36 | +0.9% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 223.90 | 179.49 | -19.8% |
+| 4 | 256 | hot | 68.93 | 86.72 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 603.20 | 738.76 | +22.5% |
+| 4 | 4096 | hot | 501.69 | 612.41 | +22.1% |
+
+E408 repairs the tested M32 carry but does not improve performance; its tied variant still fails and is preserved. E409 M16 activation lookahead reduces matched TP4 M256 hot time from 88.17 to 83.13 us, but regresses spread/mixed. E410 explicit-drain removal is neutral, and bounded unrolling regresses. E411 compiler-visible M16 codebook loads pass exactness and gain 1.1% on hot with essentially unchanged cold timing; its M32 variant loses. E412 combined overlap reaches 83.05 us versus 68.93 us MXFP4 on hot, still 20.5% behind. No broad replacement or serving parity is claimed. These experiments add 1,890 full-run checks and 27 diagnostics; all completed full-run rows meet the unchanged 3% drift limit.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Scheduling and LDS-layout follow-up — E402, E404–E407
 
 The selected comparison is unchanged: seven of eight selected TP8 rows and five of six compact TP4 rows beat matched MXFP4. TP8 M256 hot remains 0.9% behind, TP4 M256 hot 25.8% behind, and dense TP4 M4096 about 22% behind. Complete isolated and serving parity remain unmet.
@@ -1100,6 +1144,12 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E405 | Padded 12-byte codebook proposal stops at a CPU alignment probe: compiler selects two 32-bit reads, so the intended single 64-bit read is not established. No GPU timing or promotion. |
 | E406 | Modern M32 register/cross-K reuse passes 315 exact checks and stable timing. Bounded unrolling reduces 142 to 128 VGPRs, but every row still loses; rejected. |
 | E407 | Two-word cross-K lookahead fails the initial M32 finite-output check before timings. Native code copies an outstanding DS result without a wait. Failure, source and binary are frozen for E408 diagnosis; no candidate selected. |
+
+| E408 | Draining two-word cross-K carries fixes the tested M32 kernel: 315 full-run plus 27 diagnostic checks pass, but all timings lose. Tied-output repair fails correctness; all failures retained. |
+| E409 | Two-slot M16 activation staging reuses existing LDS, passes 378 checks and improves TP4 hot by 5.7%, but loses spread/mixed. Single-slot M32 loses throughout. |
+| E410 | Remove unnecessary M16 other-slot drain; compiler inserts a later wait and complete latency is unchanged. Bounded K loop reduces registers 126 to 108 but regresses. All 378 checks pass. |
+| E411 | Ordinary compiler-visible LDS loads make two-word cross-K dependencies trackable. M16 gains 1.1% hot with effectively unchanged cold timing; M32 loses. All 378 checks pass. |
+| E412 | Combine activation staging and compiler-visible codebook loads. No-drain form reaches 83.05 us hot against 68.93 us MXFP4, with cold regressions against E400. All 441 checks pass; retain for TP8 transfer, no TP4 broad promotion. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
