@@ -35,7 +35,17 @@ class MoriAll2AllManager(All2AllManagerBase):
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         mori.shmem.shmem_torch_process_group_init("mori")
 
-    def __init__(self, cpu_group):
+    def __init__(self, cpu_group, skip_shmem_init: bool = False):
+        """
+        Args:
+            skip_shmem_init: don't initialize mori's shmem heap. The heap backs
+                the dispatch/combine ops from `get_handle` (and MegaMoEV2);
+                callers that drive EP through their own mori cco communicator
+                (mori dispatch_combine_v2 / MegaMoEGfx1250) never touch it.
+                Shmem init resolves every cross-host peer to RDMA, so without
+                a NIC it asserts "no transport available for peer" on an EP
+                group that spans nodes.
+        """
         assert has_mori(), (
             "MoRI kernels not found. Please follow https://github.com/ROCm/mori/blob/main/README.md"
             " to install MoRI kernels."
@@ -43,7 +53,11 @@ class MoriAll2AllManager(All2AllManagerBase):
 
         super().__init__(cpu_group)
         self.handle_cache = Cache()
-        self._init_mori_shmem(cpu_group)
+        self.skip_shmem_init = skip_shmem_init
+        if skip_shmem_init:
+            logger.info("MoriAll2AllManager: skipping mori shmem init")
+        else:
+            self._init_mori_shmem(cpu_group)
 
     def _make_all2all_kwargs(
         self,
