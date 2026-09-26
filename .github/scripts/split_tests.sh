@@ -287,6 +287,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a16wfp4.py]=23
     FILE_TIMES[op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py]=22
     FILE_TIMES[op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py]=20
+    FILE_TIMES[op_tests/triton_tests/attention/test_paged_attention_output_gate.py]=20
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a16w16_quant_x.py]=20
     FILE_TIMES[op_tests/triton_tests/attention/test_fav3_sage_compile.py]=18
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w8_blockscale.py]=16
