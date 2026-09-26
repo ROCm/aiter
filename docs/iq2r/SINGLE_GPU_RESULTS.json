@@ -1,148 +1,148 @@
 {
-  "scope": "Local synthetic TP-rank MoE boundary, microseconds. Not ATOM benchmark_serving. Production unchanged by E199+.",
+  "scope": "Local synthetic TP-rank MoE boundary, microseconds. Not ATOM benchmark_serving. Dense candidates remain isolated. E225 restores the previously selected static frontend.",
   "rows": [
     {
       "tp": 8,
       "tokens": 1024,
       "routes": "spread",
-      "mxfp4_us": 209.16733741760254,
-      "iq2r_us": 225.33584833145142,
-      "latency_overhead_percent": 7.729940588940254,
-      "arm": "iq2r_extwide4m4g2",
-      "experiment": "e217",
+      "mxfp4_us": 211.72653436660767,
+      "iq2r_us": 231.96347951889038,
+      "latency_overhead_percent": 9.558058092634791,
+      "arm": "iq2r_extbestred8",
+      "experiment": "e220",
       "clean_mxfp4_us": [
-        209.627103805542,
-        208.7075710296631
+        215.70210456848145,
+        207.7509641647339
       ],
       "clean_iq2r_us": [
-        226.28800868988037,
-        224.38368797302246
+        237.40880489349365,
+        226.5181541442871
       ]
     },
     {
       "tp": 8,
       "tokens": 1024,
       "routes": "hot",
-      "mxfp4_us": 121.88706994056702,
-      "iq2r_us": 173.09640645980835,
-      "latency_overhead_percent": 42.01375629442185,
-      "arm": "iq2r_extwide4m4g2",
-      "experiment": "e217",
+      "mxfp4_us": 125.44868588447571,
+      "iq2r_us": 170.38507461547852,
+      "latency_overhead_percent": 35.82053364224495,
+      "arm": "iq2r_extbestred8",
+      "experiment": "e220",
       "clean_mxfp4_us": [
-        121.95682525634766,
-        121.81731462478638
+        128.53809595108032,
+        122.3592758178711
       ],
       "clean_iq2r_us": [
-        173.35728406906128,
-        172.83552885055542
+        174.3672490119934,
+        166.40290021896362
       ]
     },
     {
       "tp": 8,
       "tokens": 4096,
       "routes": "spread",
-      "mxfp4_us": 454.68201637268066,
-      "iq2r_us": 629.3985366821289,
-      "latency_overhead_percent": 38.42608988657288,
-      "arm": "iq2r_extwide4m4g2",
-      "experiment": "e217",
+      "mxfp4_us": 455.4833650588989,
+      "iq2r_us": 596.751594543457,
+      "latency_overhead_percent": 31.015014009631425,
+      "arm": "iq2r_extbestred8",
+      "experiment": "e220",
       "clean_mxfp4_us": [
-        453.59530448913574,
-        455.7687282562256
+        462.3799800872803,
+        448.5867500305176
       ],
       "clean_iq2r_us": [
-        629.6838283538818,
-        629.113245010376
+        595.4574108123779,
+        598.0457782745361
       ]
     },
     {
       "tp": 8,
       "tokens": 4096,
       "routes": "hot",
-      "mxfp4_us": 387.4485492706299,
-      "iq2r_us": 543.988561630249,
-      "latency_overhead_percent": 40.402787067935854,
-      "arm": "iq2r_extwide4m4g2",
-      "experiment": "e217",
+      "mxfp4_us": 394.943368434906,
+      "iq2r_us": 500.5414009094238,
+      "latency_overhead_percent": 26.737512492736613,
+      "arm": "iq2r_extbestred8",
+      "experiment": "e220",
       "clean_mxfp4_us": [
-        383.89739990234375,
-        390.999698638916
+        393.0626392364502,
+        396.8240976333618
       ],
       "clean_iq2r_us": [
-        544.1905975341797,
-        543.7865257263184
+        498.6177921295166,
+        502.46500968933105
       ]
     },
     {
       "tp": 4,
       "tokens": 1024,
       "routes": "spread",
-      "mxfp4_us": 291.8701767921448,
-      "iq2r_us": 403.27298641204834,
-      "latency_overhead_percent": 38.1686168982037,
-      "arm": "iq2r_extpipe4tr4m4",
-      "experiment": "e218",
+      "mxfp4_us": 296.15899324417114,
+      "iq2r_us": 365.84609746932983,
+      "latency_overhead_percent": 23.530301565991785,
+      "arm": "iq2r_extpipe4deep4m4g2p1",
+      "experiment": "e222",
       "clean_mxfp4_us": [
-        290.73004722595215,
-        293.0103063583374
+        296.19603157043457,
+        296.1219549179077
       ],
       "clean_iq2r_us": [
-        404.644250869751,
-        401.9017219543457
+        367.4196481704712,
+        364.2725467681885
       ]
     },
     {
       "tp": 4,
       "tokens": 1024,
       "routes": "hot",
-      "mxfp4_us": 187.59952187538147,
-      "iq2r_us": 270.2723741531372,
-      "latency_overhead_percent": 44.0687968984663,
-      "arm": "iq2r_extpipe4tr4m4",
-      "experiment": "e218",
+      "mxfp4_us": 190.6834840774536,
+      "iq2r_us": 268.3093786239624,
+      "latency_overhead_percent": 40.709291065280716,
+      "arm": "iq2r_extpipe4deep4m4g2p1",
+      "experiment": "e222",
       "clean_mxfp4_us": [
-        186.60664558410645,
-        188.5923981666565
+        190.96688032150269,
+        190.40008783340454
       ],
       "clean_iq2r_us": [
-        271.7661380767822,
-        268.7786102294922
+        271.1845397949219,
+        265.43421745300293
       ]
     },
     {
       "tp": 4,
       "tokens": 4096,
       "routes": "spread",
-      "mxfp4_us": 607.256817817688,
-      "iq2r_us": 1109.1837882995605,
-      "latency_overhead_percent": 82.65481024744332,
-      "arm": "iq2r_extpipe4tr4m4",
-      "experiment": "e218",
+      "mxfp4_us": 612.4496698379517,
+      "iq2r_us": 1006.7938804626465,
+      "latency_overhead_percent": 64.38801913780678,
+      "arm": "iq2r_extpipe4deep4m4g2p1",
+      "experiment": "e222",
       "clean_mxfp4_us": [
-        611.4813804626465,
-        603.0322551727295
+        622.6760387420654,
+        602.2233009338379
       ],
       "clean_iq2r_us": [
-        1120.0825691223145,
-        1098.2850074768066
+        1021.6554641723633,
+        991.9322967529297
       ]
     },
     {
       "tp": 4,
       "tokens": 4096,
       "routes": "hot",
-      "mxfp4_us": 502.9242753982544,
-      "iq2r_us": 946.6344833374023,
-      "latency_overhead_percent": 88.22604706996573,
-      "arm": "iq2r_extpipe4tr4m4",
-      "experiment": "e218",
+      "mxfp4_us": 496.2385654449463,
+      "iq2r_us": 854.7238349914551,
+      "latency_overhead_percent": 72.24050980904262,
+      "arm": "iq2r_extpipe4deep4m4g2p1",
+      "experiment": "e222",
       "clean_mxfp4_us": [
-        508.41875076293945,
-        497.42980003356934
+        495.2504634857178,
+        497.2266674041748
       ],
       "clean_iq2r_us": [
-        944.1152572631836,
-        949.1537094116211
+        859.3620300292969,
+        850.0856399536133
       ]
     }
   ]
