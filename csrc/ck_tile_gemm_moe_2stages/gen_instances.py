@@ -284,7 +284,9 @@ template torch::Tensor
                 "(acc_data_type)": dtype_dict[self.acc_dtype],
                 "(c_data_type)": dtype_dict[self.c_dtype],
                 "(activation)": self.activation,
-                "(has_bias)": "true" if self.activation == 2 and not self.is_split_k else "false",
+                "(has_bias)": (
+                    "true" if self.activation == 2 and not self.is_split_k else "false"
+                ),
                 "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
