@@ -6,7 +6,6 @@ import ast
 import os
 import subprocess
 import sys
-from collections import deque
 from functools import cache
 from pathlib import Path
 
@@ -16,6 +15,8 @@ GLUON_KERNELS = SRC + "_gluon_kernels/"
 CONFIGS = SRC + "configs/"
 TESTS = "op_tests/triton_tests/"
 BENCH = "op_tests/op_benchmarks/triton/"
+ROOT = Path(__file__).resolve().parents[2]
+IMPORT_ROOTS = ("aiter.ops.triton", "op_tests.triton_tests")
 
 # A change here can affect anything: run the full suite.
 GLOBAL_PREFIXES = (
@@ -28,28 +29,11 @@ GLOBAL_PREFIXES = (
 # Directories under the source tree that are not op categories.
 NON_CATEGORY_DIRS = {"utils", "configs", "_triton_kernels", "_gluon_kernels"}
 
-# These can change collection, dependencies or the installed package itself.
-SHARED_FILES = {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "conftest.py"}
-
 # Config categories whose source/test folders use a different layout.
 CONFIG_CATEGORIES = {
     "attention": {"attention", "chunk_delta_attn"},
     "mhc": {"fusions"},
 }
-
-
-def find_root():
-    # Normally two levels above .github/scripts/; fall back to the current
-    # directory so the script also works when run from a repo checkout.
-    here = Path(__file__).resolve().parent.parent.parent
-    return here if (here / TESTS).is_dir() else Path.cwd()
-
-
-ROOT = find_root()
-
-
-def log(msg):
-    print(msg, file=sys.stderr)
 
 
 def basename(path):
@@ -61,10 +45,7 @@ def stem(path):
 
 
 def subjects(test_path):
-    """What a test file is named after: `test_gemm_a16w16.py` -> gemm_a16w16.
-    `torch_compile/test_compile_rmsnorm.py` also answers to `rmsnorm`, since
-    those tests reach their op through a dynamic helper the import scan
-    cannot see."""
+    """Source names covered by test_<op>.py or test_compile_<op>.py."""
     base = stem(test_path)[len("test_") :]
     found = {base}
     if base.startswith("compile_"):
@@ -91,26 +72,9 @@ def category_of(path):
     return None
 
 
-# --- import graph -----------------------------------------------------------
-
-
-# Roots the graph follows. Tests are in here as well as sources: the suite
-# reuses reference implementations and input generators across test files, so
-# a fused test often reaches the kernel it exercises only through another test.
-#
-# Dynamic loaders cannot be proved safe by the graph; tests that reach them
-# run on every relevant selection, even if they also import another source.
-# Changes to code outside these roots run the full suite.
-IMPORT_ROOTS = ("aiter.ops.triton", "op_tests.triton_tests")
-
-
 @cache
 def resolve_module(dotted, gone=frozenset()):
-    """aiter.ops.triton.x.y -> the repo file for that module, if it exists --
-    or if the diff deleted it. An importer of a deleted module still carries the
-    import statement, and will fail at collection; keeping that edge is what
-    lets the graph name it. Cached: the same names recur across hundreds of
-    files and each miss costs two filesystem probes."""
+    """Resolve local modules, retaining edges to deleted files."""
     if not any(
         dotted == root or dotted.startswith(root + ".") for root in IMPORT_ROOTS
     ):
@@ -123,11 +87,7 @@ def resolve_module(dotted, gone=frozenset()):
 
 
 def scan_imports(path, gone=frozenset(), dynamic=None):
-    """Local imports, including relative imports and literal module references.
-
-    Record dynamic loaders separately: literal references help find dependents,
-    but do not prove that all runtime targets have been enumerated.
-    """
+    """Collect local imports and flag loaders with unknown runtime targets."""
     found = set()
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     loaders = {"import_module", "__import__", "spec_from_file_location"}
@@ -145,11 +105,8 @@ def scan_imports(path, gone=frozenset(), dynamic=None):
                     raise RuntimeError(f"{path}: relative import escapes its package")
                 package = package[: len(package) - node.level + 1]
                 module = ".".join(package + ([module] if module else []))
-            # `from aiter.ops.triton.moe import moe_op_gemm_a8w4` — the
-            # imported names may themselves be submodules.
+            # Imported names can themselves be submodules.
             names = [module] + [f"{module}.{a.name}" for a in node.names]
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            names = [node.value]
         elif isinstance(node, ast.Call):
             name = getattr(node.func, "id", getattr(node.func, "attr", None))
             if dynamic is not None and name in loaders:
@@ -164,9 +121,9 @@ def scan_imports(path, gone=frozenset(), dynamic=None):
 def reachable(start, imports):
     """Transitive closure of `start`'s imports inside the triton tree."""
     seen = set()
-    frontier = deque([start])
+    frontier = [start]
     while frontier:
-        for dep in imports.get(frontier.popleft(), ()):
+        for dep in imports.get(frontier.pop(), ()):
             if dep not in seen:
                 seen.add(dep)
                 frontier.append(dep)
@@ -174,252 +131,144 @@ def reachable(start, imports):
 
 
 def changed_files(args):
-    if args.merge_ref:
-        # A PR merge ref: diff against its first parent (the base branch).
-        refs = [args.merge_ref + "^1", args.merge_ref]
-    else:
-        refs = [f"{args.target}...{args.source}"]
-    # Rename detection hides the old path in --name-only output. Treat renames
-    # as delete + add so remaining importers of the old name are still selected.
+    # Compare the checked-out PR merge to its base parent; retain both rename paths.
+    refs = [args.merge_ref + "^1", args.merge_ref]
     cmd = ["git", "diff", "--name-only", "--no-renames", "-z", *refs]
     out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=True)
     return [path for path in out.stdout.split("\0") if path]
 
 
-# --- selection --------------------------------------------------------------
-
-
-def unmapped(tests, test_reach, sources):
-    """Tests the selector cannot tie to any source: nothing under
-    aiter/ops/triton in their import closure and no source named after them.
-    They run on every non-empty selection, since no diff can prove it did not
-    touch them, and the list in the summary is how growth of this set gets
-    noticed."""
-    stems = {stem(s) for s in sources}
-    return [
-        t
-        for t in tests
-        if not any(p.startswith(SRC) for p in test_reach[t])
-        and not (subjects(t) & stems)
-    ]
-
-
 def select(diff):
-    """Map changed files to test files. Raises when a subset is not safe."""
+    """Select affected test files, raising when a subset cannot be determined."""
     tests = list_files(TESTS, "test_*.py")
     sources = list_files(SRC, "*.py")
-    # Python files the diff names that are no longer in the tree. Edges to
-    # them are kept, so whatever still imports one is found and run -- it is
-    # exactly what breaks once this merges.
     gone = frozenset(
         f
         for f in diff
         if f.endswith(".py") and f.startswith((SRC, TESTS)) and not (ROOT / f).is_file()
     )
-    # Helpers are parsed as well as test_*.py: a test can reach its kernel
-    # through one, and a helper change has to find the tests behind it.
     dynamic = set()
     imports = {
         f: scan_imports(f, gone, dynamic) for f in sources + list_files(TESTS, "*.py")
     }
-    # Name-only tests (such as torch_compile tests) need the wrapper's entire
-    # dependency closure, not just a match when that wrapper itself changes.
-    by_source_name = {}
-    for s in sources:
-        by_source_name.setdefault(stem(s), set()).add(s)
-    for t in tests:
-        for name in subjects(t):
-            imports[t].update(by_source_name.get(name, ()))
-    # Every module each test can reach, so a change anywhere in that set
-    # selects the test -- this is what covers fused kernels without a map.
-    test_reach = {t: reachable(t, imports) for t in tests}
-    by_subject = {}
-    for t in tests:
-        for s in subjects(t):
-            by_subject.setdefault(s, []).append(t)
+    # Name-only tests also inherit their wrapper's transitive dependencies.
+    by_name = {}
+    for source in set(sources) | {f for f in gone if f.startswith(SRC)}:
+        by_name.setdefault(stem(source), set()).add(source)
+    for test in tests:
+        for name in subjects(test):
+            imports[test].update(by_name.get(name, ()))
+    test_reach = {test: reachable(test, imports) for test in tests}
+
+    def reached_by(path):
+        return {test for test in tests if path in test_reach[test]}
+
+    def folder_tests(path):
+        category = category_of(path)
+        hits = {test for test in tests if category and category_of(test) == category}
+        if not hits:
+            raise RuntimeError(f"{path}: no mapped tests or op test folder")
+        return hits
 
     selected = set()
     reasons = []
     relevant = False
-
-    def reached_by(f):
-        """Tests whose import closure contains f."""
-        return [t for t in tests if f in test_reach[t]]
-
-    def folder_of(cat, changed):
-        hits = [t for t in tests if t.startswith(TESTS + cat + "/")]
-        if not hits:
-            raise RuntimeError(f"{changed}: category '{cat}' has no tests")
-        return hits
-
-    def add_for_source(f):
-        """Paired and importing tests; fall back to the op folder if unmapped."""
-        paired = by_subject.get(stem(f), [])
-        fused = [t for t in reached_by(f) if t not in paired]
-        if paired or fused:
-            selected.update(paired)
-            note = f"paired {len(paired)}"
-        else:
-            cat = category_of(f)
-            if not cat:
-                raise RuntimeError(f"{f}: no paired test and no category")
-            selected.update(folder_of(cat, f))
-            note = f"no mapped test -> '{cat}' folder"
-        selected.update(fused)
-        reasons.append(f"{f}: {note}, fused {len(fused)}")
-
-    for f in diff:
-        if f.endswith(".md") or basename(f) == ".gitkeep":
+    for path in diff:
+        if path.endswith(".md") or basename(path) == ".gitkeep":
             continue
-
-        if f.startswith(GLOBAL_PREFIXES):
-            raise RuntimeError(f"{f} is shared machinery/CI infra")
-
-        if f.startswith(BENCH):
-            reasons.append(f"{f}: benchmark — no unit tests selected")
-            continue
-
-        if f.startswith(TESTS):
-            relevant = True
-            # Package initializers also execute on implicit parent imports,
-            # which are not individual edges in this module-level graph.
-            if basename(f) == "__init__.py":
-                raise RuntimeError(f"{f}: test package __init__ changed")
-            if basename(f).startswith("test_") and f.endswith(".py"):
-                if f in gone:
-                    # Deleted, or renamed away: not a path split_tests.sh will
-                    # accept. What still imports it is, and will fail once this
-                    # merges, so that is what runs.
-                    importers = reached_by(f)
-                    selected.update(importers)
-                    reasons.append(
-                        f"{f}: deleted test — not run; {len(importers)} importing test(s)"
-                    )
-                    continue
-                importers = reached_by(f)
-                selected.add(f)
-                selected.update(importers)
-                reasons.append(
-                    f"{f}: changed test — runs itself + {len(importers)} importing"
-                )
+        if path.startswith(GLOBAL_PREFIXES):
+            raise RuntimeError(f"{path}: shared machinery/CI changed")
+        if not path.startswith((SRC, TESTS)):
+            if path.startswith(BENCH):
                 continue
-            cat = category_of(f)  # a test helper runs its whole folder
-            if not cat:
-                raise RuntimeError(f"{f} is a shared test helper")
-            folder = set(folder_of(cat, f))
-            outside = [t for t in reached_by(f) if t not in folder]
-            selected.update(folder)
-            selected.update(outside)
-            reasons.append(
-                f"{f}: test helper -> '{cat}' folder ({len(folder)})"
-                f" + {len(outside)} importing test(s)"
-            )
+            # A mixed PR may also change dependencies outside the import graph.
+            if path.startswith(("aiter/", "op_tests/", "requirements")) or path in {
+                "setup.py",
+                "setup.cfg",
+                "pyproject.toml",
+                "pytest.ini",
+                "conftest.py",
+            }:
+                raise RuntimeError(f"{path}: shared code outside the import graph")
             continue
+        relevant = True
+        if basename(path) == "__init__.py":
+            raise RuntimeError(f"{path}: package initializer changed")
 
-        if f.startswith(CONFIGS):
-            relevant = True
-            # Only the nested layout maps to an op:
-            # configs/<arch>/<backend>/<op>/<d_type>/...
-            parts = f[len(CONFIGS) :].split("/")
+        if path.startswith(CONFIGS):
+            # configs/<arch>/<backend>/<op>/<family>/<file>.json
+            parts = path[len(CONFIGS) :].split("/")
             if not (
-                f.endswith(".json")
+                path.endswith(".json")
                 and len(parts) >= 5
                 and parts[1] in ("triton", "gluon")
             ):
-                raise RuntimeError(f"{f}: config outside the nested layout")
-            op, d_type = parts[2], parts[3]
-            # A config is read by the wrapper at run time, never imported, so
-            # the graph cannot say which variants consume it — a tuning
-            # change for `attention/mha` also reaches test_mha_with_pe and
-            # test_mha_with_sink. Run the whole op folder and all dependents.
+                raise RuntimeError(f"{path}: unknown config layout")
+            op, family = parts[2:4]
             categories = CONFIG_CATEGORIES.get(op, {op})
-            hits = {t for t in tests if category_of(t) in categories}
+            hits = {test for test in tests if category_of(test) in categories}
             if not hits and not any(
-                category_of(s) in categories or stem(s) == op for s in sources
+                category_of(source) in categories or stem(source) == op
+                for source in sources
             ):
-                raise RuntimeError(f"{f}: unknown config op '{op}'")
-            in_folder = len(hits)
-            # Family names are not necessarily Python filenames (for example
-            # rmsnorm_large_m_small_n or gemm_afp4wfp4_preshuffled). Include
-            # dependencies of the entire op, matching the folder-level rule.
-            consumers = [
-                s
-                for s in sources
-                if category_of(s) in categories or stem(s) in (op, d_type)
-            ]
-            hits.update(t for t in tests if any(c in test_reach[t] for c in consumers))
-            hits.update(by_subject.get(d_type, []))
+                raise RuntimeError(f"{path}: unknown config op '{op}'")
+            # Family names need not match filenames; include the whole op and dependents.
+            consumers = {
+                source
+                for source in sources
+                if category_of(source) in categories or stem(source) in (op, family)
+            }
+            hits.update(test for test in tests if test_reach[test] & consumers)
             if not hits:
-                raise RuntimeError(f"{f}: config maps to no tests")
-            selected.update(hits)
-            reasons.append(
-                f"{f}: config -> '{op}' folder ({in_folder})"
-                f" + {len(hits) - in_folder} importing test(s)"
-            )
-            continue
-
-        if f.startswith(SRC):
-            relevant = True
-            if basename(f) == "__init__.py":
-                raise RuntimeError(f"{f}: package __init__ changed")
-            if not f.endswith(".py"):
-                raise RuntimeError(f"{f}: non-Python file under triton sources")
-            add_for_source(f)
-            continue
-
-        if (
-            f.startswith(("aiter/", "op_tests/"))
-            or f in SHARED_FILES
-            or ("/" not in f and f.startswith("requirements") and f.endswith(".txt"))
-        ):
-            raise RuntimeError(
-                f"{f}: shared code or test environment outside the graph"
-            )
+                raise RuntimeError(f"{path}: config maps to no tests")
+            reason = f"'{op}' folder and dependents"
+        elif path.startswith(TESTS):
+            hits = reached_by(path)
+            if basename(path).startswith("test_") and path.endswith(".py"):
+                if path not in gone:
+                    hits.add(path)
+                reason = "changed test and importers"
+            else:
+                hits.update(folder_tests(path))
+                reason = "test helper folder and importers"
+        else:
+            if not path.endswith(".py"):
+                raise RuntimeError(f"{path}: non-Python source changed")
+            hits = reached_by(path)
+            reason = "paired and importing tests"
+            if not hits:
+                hits = folder_tests(path)
+                reason = "unmapped source; whole op folder"
+        selected.update(hits)
+        reasons.append(f"{path}: {reason} ({len(hits)} tests)")
 
     if relevant and not selected:
-        raise RuntimeError("relevant files changed but nothing was selected")
+        raise RuntimeError("relevant files changed but no tests were selected")
     if selected:
-        extra = [t for t in unmapped(tests, test_reach, sources) if t not in selected]
+        # Static imports cannot rule out impact on unmapped or dynamic tests.
+        extra = {
+            test
+            for test in tests
+            if not any(path.startswith(SRC) for path in test_reach[test])
+            or test in dynamic
+            or test_reach[test] & dynamic
+        } - selected
         selected.update(extra)
-        reasons.append(
-            f"{len(extra)} test(s) no source maps to, run on every selection: "
-            + ", ".join(basename(t) for t in extra)
-        )
-        opaque = [
-            t
-            for t in tests
-            if t not in selected and (t in dynamic or test_reach[t] & dynamic)
-        ]
-        selected.update(opaque)
-        if opaque:
-            reasons.append(
-                f"{len(opaque)} test(s) with dynamic dependencies, run conservatively: "
-                + ", ".join(basename(t) for t in opaque)
-            )
+        if extra:
+            reasons.append("unmapped/dynamic tests: " + ", ".join(sorted(extra)))
     return sorted(selected), reasons
-
-
-# --- output -----------------------------------------------------------------
 
 
 def write_outputs(tests, reasons, is_full, output):
     Path(output).write_text("".join(t + "\n" for t in tests), encoding="utf-8")
-    if is_full:
-        header = f"Triton test selection: FULL SUITE ({len(tests)} files)"
-    else:
-        header = f"Triton test selection: {len(tests)} of {len(list_files(TESTS, 'test_*.py'))} test files"
-    log(header)
-    for r in reasons:
-        log(f"  - {r}")
+    mode = "full suite" if is_full else "selected"
+    report = f"Triton tests: {len(tests)} files ({mode})\n"
+    report += "".join(f"- {reason}\n" for reason in reasons)
+    print(report, file=sys.stderr)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(f"### {header}\n\n")
-            fh.writelines(f"- {r}\n" for r in reasons)
-            if not is_full:
-                fh.write("\n<details><summary>Selected tests</summary>\n\n")
-                fh.writelines(f"- `{t}`\n" for t in tests)
-                fh.write("\n</details>\n")
+            fh.write(report + "\n")
 
 
 def parse_args():
@@ -428,14 +277,9 @@ def parse_args():
     mode.add_argument(
         "--merge-ref", help="PR merge ref; diff is taken against its first parent"
     )
-    mode.add_argument("--source", help="source ref (with --target)")
     mode.add_argument("--all", action="store_true", help="select the full suite")
-    ap.add_argument("--target", help="target ref for --source mode")
     ap.add_argument("--output", default="selected_triton_tests.list")
-    args = ap.parse_args()
-    if args.source and not args.target:
-        ap.error("--source requires --target")
-    return args
+    return ap.parse_args()
 
 
 def main():
@@ -447,9 +291,6 @@ def main():
         return
     try:
         diff = changed_files(args)
-        log(f"Changed files ({len(diff)}):")
-        for f in diff:
-            log(f"  {f}")
         tests, reasons = select(diff)
         is_full = False
     except Exception as why:  # noqa: BLE001 -- any failure falls open to a full run

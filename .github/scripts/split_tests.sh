@@ -8,12 +8,10 @@
 # Parameters:
 #   --shards N     number of shards (required)
 #   --test-type TYPE test type, default aiter
-#   --select-file F  only shard test files listed (one per line) in F;
-#                    an empty selection writes empty shard lists and exits 0
+#   --select-file F  only shard test files listed in F (one per line)
 #   --dry-run      only output allocation plan, do not execute
 #   -v             Pytest's -v option, no effect
-# Exit code: 0 on success, 1 on a usage error or when the selection file
-#            names a path that is not a collected test file
+# Exit code: 0 on success, 1 for invalid arguments or selected paths
 
 set -euo pipefail
 
@@ -72,19 +70,14 @@ if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# ------------------------------
-# optional diff-based selection (see select_triton_tests.py)
-# ------------------------------
+# Apply the optional selection before sharding.
 if [[ -n "$SELECT_FILE" ]]; then
     if [[ ! -f "$SELECT_FILE" ]]; then
         echo "Selection file not found: $SELECT_FILE" >&2
         exit 1
     fi
-    # Assigned empty rather than bare `declare -A`: under `set -u` a declared
-    # but never assigned array makes ${#SELECTED[@]} an unbound variable.
     declare -A SELECTED=()
     while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%$'\r'}"
         [[ -n "$line" ]] && SELECTED["$line"]=1
     done < "$SELECT_FILE"
     FILTERED=()
@@ -94,9 +87,7 @@ if [[ -n "$SELECT_FILE" ]]; then
             unset "SELECTED[$f]"
         fi
     done
-    # Whatever is left names a path that is not a collected test file. Dropping
-    # those silently would let a selector bug empty the shards and report a
-    # green run that executed nothing, so fail where it can be seen.
+    # Never silently drop a path the selector asked to run.
     if [[ ${#SELECTED[@]} -gt 0 ]]; then
         echo "Selection lists paths that are not test files under ${TEST_DIR}:" >&2
         for f in "${!SELECTED[@]}"; do echo "  ${f}" >&2; done
