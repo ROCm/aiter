@@ -9,6 +9,9 @@ import torch.nn.functional as F
 import triton
 
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w8_blockscale import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale,
     gemm_a16w8_blockscale_preshuffle,
@@ -144,5 +147,20 @@ def test_gemm(dtype, M, N, K, output, shuffle):
     a = run_torch(x, weight, w_scale, dtype)
     impl = gemm_a16w8_blockscale_preshuffle if shuffle else gemm_a16w8_blockscale
     b = run_triton(impl, x, weight_triton, w_scale, prequant, dtype, y)
+
+    triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
+
+
+@pytest.mark.parametrize("K", [640, 896])
+def test_gemm_splitk_tail(K):
+    # an 8-way split leaves the last partition running past K
+    M, N = 16, 6144
+    x, weight, _, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
+        M, N, K, *block_shape
+    )
+    config = dict(_get_config(M, N, K)[0], NUM_KSPLIT=8)
+
+    a = run_torch(x, weight, w_scale)
+    b = gemm_a16w8_blockscale(x, weight, w_scale, torch.bfloat16, y, config=config)
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)

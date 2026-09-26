@@ -27,7 +27,8 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0
+        and args["K"] % args["SPLITK_BLOCK_SIZE"] == 0,
     }
 )
 @triton.jit(repr=_gemm_a8w8_blockscale_repr)
