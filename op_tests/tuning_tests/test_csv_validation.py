@@ -35,6 +35,7 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
+        "fhmoe": "tuned_fhmoe.csv",
     }
 
     def _load_csv(self, name):
@@ -173,6 +174,24 @@ class TestCSVValidation(unittest.TestCase):
             "FlyDSL stage2 sorting layout mismatches:\n" + "\n".join(mismatches),
         )
 
+    def test_fhmoe_no_duplicates(self):
+        self._check_no_duplicates(
+            "fhmoe",
+            extra_keys=[
+                "act_type",
+                "dtype",
+                "q_dtype_a",
+                "q_dtype_w",
+                "q_type",
+                "use_g1u1",
+                "doweight_stage1",
+                "shared_expert_id",
+                "hidden_pad",
+                "intermediate_pad",
+                "gate_mode",
+            ],
+        )
+
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
             with self.subTest(csv=name):
@@ -227,6 +246,7 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",
+            "untuned_fhmoe.csv",
         ]
         for f in untuned_files:
             with self.subTest(file=f):
