@@ -1023,7 +1023,9 @@ def test_v4_nm_accuracy_and_perf():
     _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
 
 
-def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
+def _run_varlen_point(
+    kv_lens, gqa_ratio=128, seed=0, attn_sink=True, split_kwargs=None
+):
     """Accuracy at a RAGGED (per-seq variable kv_len) decode shape with
     auto-split (num_kv_splits=None).
 
@@ -1094,12 +1096,11 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
         kv_last_page_lens=kv_last_page_lens,
-        split_indptr=None,
         max_seqlen_q=1,
         sink=sink,
         sm_scale=sm_scale,
         out_16_nosplit=0,
-        num_kv_splits=None,
+        **(split_kwargs or {"split_indptr": None, "num_kv_splits": None}),
     )
     # Single/multi-split output contract (see ATOM paged_decode.py:986): the
     # merged result lands in `output` for resolved splits > 1; the single-pass
@@ -1139,6 +1140,47 @@ def test_v4_nm_varlen_ragged_kv_tail_split_guard():
     _run_varlen_point([516, 516, 516, 516])  # uniform max (split=16, ~32/split)
     _run_varlen_point([500, 250, 100, 40])  # more extreme ragged
     _run_varlen_point([66, 50, 40, 33])  # all-short
+
+
+@pytest.mark.parametrize(
+    "num_seqs,kv_len,expected",
+    [
+        # One wave of workgroups: split only when KV is long enough to pay
+        # for the partial write + stage-2 merge.
+        (7, 1152, 8),
+        (7, 384, 5),
+        (35, 1152, 3),
+        (56, 1152, 2),
+        # 49..119 seqs with short KV: the occupancy-only pick chose 13-16
+        # splits (5-14 waves) here and ran 3-7x slower than one split.
+        (49, 384, 1),
+        (119, 384, 1),
+        (126, 1152, 1),
+        # Past one wave, long KV still splits to even out the tail wave.
+        (140, 8320, 4),
+    ],
+)
+def test_v4_nm_split_planner_picks(num_seqs, kv_len, expected):
+    assert aiter.mla._v4_nm_pick_num_kv_splits(num_seqs, 2, kv_len, 256) == expected
+
+
+@needs_gfx950
+def test_v4_nm_kv_len_hint_accuracy():
+    """Auto split driven by `kv_len_hint` (the caller's worst-case KV length)."""
+    _run_varlen_point([1152, 900, 64, 1152], split_kwargs={"kv_len_hint": 1152})
+    _run_varlen_point([8320, 200], split_kwargs={"kv_len_hint": 8320})
+
+
+@needs_gfx950
+def test_v4_nm_one_split_per_seq_on_wide_grid():
+    """Every seq on one split while the grid has 4: the kernel still writes
+    FP32 partials, so the stage-2 merge must not take its in-place BF16 copy
+    (it used to, keyed on split_indptr[-1] == num_seqs, and returned NaN)."""
+    kv_lens = [384, 384, 384, 384]
+    split_indptr = torch.arange(len(kv_lens) + 1, dtype=torch.int32, device="cuda")
+    _run_varlen_point(
+        kv_lens, split_kwargs={"num_kv_splits": 4, "split_indptr": split_indptr}
+    )
 
 
 @needs_gfx950

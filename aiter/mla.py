@@ -359,6 +359,38 @@ def get_meta_param(
     return num_kv_splits, num_kv_splits_indptr
 
 
+# gfx950 v4 nm decode latency model used to pick `num_kv_splits`:
+#
+#   t(i) ~= L + W(i) * (C + A * kv_len / i) + [i > 1] * (S + D * num_seqs * i)
+#   W(i)  = ceil(num_seqs * tg_factor * i / cu_num)   (workgroup waves)
+#
+# A is the per-token KV cost of one workgroup, C the per-wave fixed cost, and
+# S + D * num_seqs * i the FP32 partial write + stage-2 merge that every split
+# launch pays. Least-squares fit (relative error) on MI355X, gqa=128, qSeqLen=1,
+# CUDA-graph replay, 1..16 splits over uniform-KV shapes (7..448 seqs,
+# kv_len 192..8320). The previous occupancy-only pick (ignore_total_kv=1)
+# rewards filling whole multiples of cu_num, e.g. 13-16 splits for 49-119 seqs
+# whose KV fits one wave.
+_V4_NM_SPLIT_COST_GFX950 = (12.74, 3.21, 0.0300, 3.38, 0.076)  # L, C, A, S, D (us)
+_V4_NM_MAX_SPLITS = 16
+
+
+@functools.lru_cache(maxsize=1024)
+def _v4_nm_pick_num_kv_splits(num_seqs, tg_factor, kv_len, cu_num):
+    """Cost-model split count for gfx950 v4 nm decode (see model above)."""
+    L, C, A, S, D = _V4_NM_SPLIT_COST_GFX950
+    kv_len = max(1, kv_len)
+    best_cost, best_splits = None, 1
+    for i in range(1, _V4_NM_MAX_SPLITS + 1):
+        waves = -(-num_seqs * tg_factor * i // cu_num)
+        cost = L + waves * (C + A * kv_len / i)
+        if i > 1:
+            cost += S + D * num_seqs * i
+        if best_cost is None or cost < best_cost:
+            best_cost, best_splits = cost, i
+    return best_splits
+
+
 # Persistent MLA-decode kernel gate: the persistent kernel
 # ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
 # ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
@@ -1677,6 +1709,7 @@ def mla_decode_fwd_v4_nm(
     # the nm path (page_size=1 -> kv_seq_len comes from the token-level kv_indptr).
     # None flows through to a nullptr kernarg; the host guards the deref and the
     # kernel never loads through it, so no buffer is allocated.
+    kv_len_hint=None,  # int; per-seq KV length the auto split pick optimizes for
 ):
     """v4 MLA decode forward.
 
@@ -1703,6 +1736,11 @@ def mla_decode_fwd_v4_nm(
       for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
+      On gfx950 the auto pick instead minimizes a fitted latency model
+      (`_v4_nm_pick_num_kv_splits`) for sequences of `kv_len_hint` KV tokens.
+      Pass the longest KV length the call can see (e.g. window + top-k for a
+      sparse layer) when `kv_page_indices` is a capacity-sized buffer; without
+      it the model uses `ceil(total_kv / num_seqs)`.
 
     Multi-pass mode (`num_kv_splits > 1`):
       1. If `split_indptr` is None, build a uniform one:
@@ -1771,8 +1809,14 @@ def mla_decode_fwd_v4_nm(
     #       could shrink it and desync the buffer shapes). Only synthesize a
     #       uniform split_indptr if the caller didn't pass one.
     total_kv = kv_page_indices.shape[0]
+    tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+    if num_kv_splits is None and get_gfx() == "gfx950":
+        if kv_len_hint is None:
+            kv_len_hint = -(-total_kv // max(1, num_seqs))
+        num_kv_splits = _v4_nm_pick_num_kv_splits(
+            num_seqs, tg_factor, int(kv_len_hint), get_cu_num()
+        )
     if num_kv_splits is None or split_indptr is None:
-        tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
         # v4 nm forces occupancy-only split selection: ignore total_kv so the
         # split count is driven purely by CU occupancy (drops the avg_kv HBM
         # term + fp8 min-block cap in get_meta_param).
@@ -1921,7 +1965,12 @@ def mla_decode_fwd_v4_nm(
             0,  # stride_lse_bs (unused, HAS_FINAL_LSE=False)
             page_size=1,  # v4 nm KV cache is page_size=1
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
-            MAYBE_FINAL_OUT=True,
+            # The kernel only writes the packed-BF16 result in place when
+            # num_kv_splits == 1, which never reaches this merge. A ragged
+            # split_indptr whose entries are all 1 still gets FP32 partials,
+            # so the in-place copy (keyed on split_indptr[-1] == num_seqs) must
+            # stay off.
+            MAYBE_FINAL_OUT=False,
             HAS_FINAL_LSE=False,
             USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
             BATCH_NUM=num_seqs,
