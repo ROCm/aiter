@@ -4209,6 +4209,41 @@ def flash_attn_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
+    def can_impl_fmha_fwd_gfx1250_gluon_fp8():
+        # gfx1250 Gluon per-tensor FP8 dense FA (not MXFP8 e8m0).
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (sink_ptr is None)
+        ret = ret and (window_size[0] == -1 and window_size[1] == -1)
+        ret = ret and (len(window_size) < 3 or window_size[2] == 0)
+        ret = ret and (
+            q.dtype == dtypes.fp8 and k.dtype == q.dtype and v.dtype == q.dtype
+        )
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        ret = ret and (q_descale.dtype != dtypes.fp8_e8m0)
+        ret = ret and (q.dim() == 4 and k.dim() == 4 and v.dim() == 4)
+        ret = ret and (q.shape[2] % k.shape[2] == 0)
+        head_dim = q.shape[-1]
+        ret = ret and (head_dim in (64, 128))
+        ret = ret and (k.shape[-1] == head_dim and v.shape[-1] == head_dim)
+        return ret
+
+    if can_impl_fmha_fwd_gfx1250_gluon_fp8():
+        from .triton._gluon_kernels.gfx1250.attention.mha_prefill import (
+            gluon_mha_prefill_gfx1250_dense,
+        )
+
+        return gluon_mha_prefill_gfx1250_dense(
+            q,
+            k,
+            v,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
     if not ENABLE_CK and sink_ptr is None:
         from .triton.attention.mha_v3 import (
             flash_attn_func as flash_attn_func_v3_triton,
