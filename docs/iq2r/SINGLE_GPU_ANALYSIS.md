@@ -24,6 +24,58 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## M32 residency and epilogue qualification — E420–E424
+
+The new TP4 M256 candidate narrows hot-route overhead to 10.2% versus matched MXFP4, with 1,440 exact real-weight checks on its unchanged binary. It beats MXFP4 on spread and mixed, but retains a cold-route tradeoff against scalar M16. The existing 18 selected coverage rows remain unchanged; complete isolated and serving parity remain unmet.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 119.15 | 101.60 | -14.7% |
+| 8 | 128 | hot | 43.35 | 42.53 | -1.9% |
+| 8 | 256 | spread | 131.03 | 111.48 | -14.9% |
+| 8 | 256 | hot | 61.32 | 58.53 | -4.5% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 223.90 | 179.49 | -19.8% |
+| 4 | 256 | hot | 68.93 | 86.72 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 594.30 | 730.14 | +22.9% |
+| 4 | 4096 | hot | 488.88 | 602.89 | +23.3% |
+
+E420 within-record codebook scheduling improves its M32 control but does not change residency. E421 initially misinterprets the second HIP launch-bound argument: the installed header requests waves per SIMD, not blocks per CU; its raw title is preserved with an explicit correction. E422 uses the correct minimum-four-waves constraint, reaches 124/126 registers with zero spills, and raises hot active-CU occupancy from 2.00 to 3.75 waves. The within-record gate trace falls 49.23 to 36.19 us even though aggregate wait counters increase. E423 then parallelizes the M32 epilogue using the two existing private LDS slots, improving matched complete-MoE time another 0.45–1.10%. E424 passes 1,440 exact real-weight checks using the unchanged E423 module.
+
+| TP4 M256 routes | MXFP4 us | Scalar M16 us | Parallel M32 candidate us | Candidate vs MXFP4 |
+|:---|---:|---:|---:|---:|
+| spread | 224.37 | 187.06 | 188.86 | -15.8% |
+| hot | 69.00 | 82.58 | 76.06 | +10.2% |
+| mixed | 225.56 | 200.12 | 206.31 | -8.5% |
+
+These four timing experiments add 1,386 exact synthetic checks; every completed row meets the unchanged 3% per-arm drift rule. M32 remains slower than scalar M16 on cold patterns; E400 was not a separate fresh arm in E423, so the broad selection is unchanged. Real qualification is operator-only, with tiled small captures and TP4 weight ranks 0/3/3 for capture ranks 0/3/7. The runtimes and real slices were preserved and restored with 44,705 verified files on continuation node crsuse2-aws-140; future timings require fresh same-node MXFP4 bookends.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## TP4 scheduling and real-weight qualification — E415–E419
 
 All eight selected TP8 rows still beat matched MXFP4; five of six selected compact TP4 rows beat baseline. E416 improves its matched dense TP4 control by 0.52–1.44% and passes real-weight qualification, but dense parity and TP4 M256 hot remain open. No production or serving parity is claimed.
@@ -1247,6 +1299,12 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E417 | Corrected M32 one/two-slot activation staging passes 378 exact checks and stable rows but regresses. Hot double-slot VALU counts fall 36.1% versus M16 while measured mean active-CU wave occupancy drops 3.80 to 2.00. Reject; preserve the initial cross-wave union ownership failure and repair. |
 | E418 | Unchanged E416 binary passes 2,160 exact real-weight checks at TP4 M1024/M4096 over layers 3/40/77 and five patterns. Capture ranks 0/3/7 map to actual TP4 weight ranks 0/3/3. Operator correctness only. |
 | E419 | Bound M32 two-slot K-loop unrolling to one/two. 378 exact checks and stable rows, but static VGPRs remain 130/135 and measured occupancy stays near two waves per active CU. Both regress and are rejected. |
+
+| E420 | Within-record codebook lookahead passes 315 exact checks and stable rows, improving M32 control by 2.7–7.3%. Still 130 registers/two active-CU waves and slower than M16/MXFP4; unselected. |
+| E421 | Launch-bound value two passes 378 exact checks and stable rows but leaves 130 registers. Correct the original interpretation: AMD maps the argument to waves per SIMD, not blocks per CU. No selected gain. |
+| E422 | Correct minimum-four-waves bound lowers M32 registers to 124/126 with no spills. Hot active-CU occupancy rises 2.00 to 3.75; gate trace drops 49.23 to 36.19 us despite higher aggregate waits. 378 exact checks and stable rows; retain within-record candidate, hot still 11.8% behind MXFP4. |
+| E423 | Parallelize M32 epilogue using both existing private LDS slots. 315 exact checks, stable bookends and unchanged 124 registers; 0.45–1.10% faster than matched E422. Hot reaches 76.06 us versus 69.00 us MXFP4, still 10.2% behind. |
+| E424 | Unchanged E423 binary passes 1,440 exact real-weight checks at TP4 M256, three layer/rank slices, five patterns and eight changes. Native grids and zero scratch pass; no whole-model or serving claim. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

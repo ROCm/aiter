@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E419. Related scouts,
+attempts from the initial GLM integration through E424. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E419
+## Isolated single-GPU optimization, E199–E424
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -257,6 +257,15 @@ single-GPU report. Serving sweeps remain paused.
 | E417 | Corrected M32 one/two-slot activation staging passes 378 exact checks and stable rows but regresses. Hot double-slot VALU counts fall 36.1% versus M16 while measured mean active-CU wave occupancy drops 3.80 to 2.00. Reject; preserve the initial cross-wave union ownership failure and repair. |
 | E418 | Unchanged E416 binary passes 2,160 exact real-weight checks at TP4 M1024/M4096 over layers 3/40/77 and five patterns. Capture ranks 0/3/7 map to actual TP4 weight ranks 0/3/3. Operator correctness only. |
 | E419 | Bound M32 two-slot K-loop unrolling to one/two. 378 exact checks and stable rows, but static VGPRs remain 130/135 and measured occupancy stays near two waves per active CU. Both regress and are rejected. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E420 | Within-record codebook lookahead passes 315 exact checks and stable rows, improving M32 control by 2.7–7.3%. Still 130 registers/two active-CU waves and slower than M16/MXFP4; unselected. |
+| E421 | Launch-bound value two passes 378 exact checks and stable rows but leaves 130 registers. Correct the original interpretation: AMD maps the argument to waves per SIMD, not blocks per CU. No selected gain. |
+| E422 | Correct minimum-four-waves bound lowers M32 registers to 124/126 with no spills. Hot active-CU occupancy rises 2.00 to 3.75; gate trace drops 49.23 to 36.19 us despite higher aggregate waits. 378 exact checks and stable rows; retain within-record candidate, hot still 11.8% behind MXFP4. |
+| E423 | Parallelize M32 epilogue using both existing private LDS slots. 315 exact checks, stable bookends and unchanged 124 registers; 0.45–1.10% faster than matched E422. Hot reaches 76.06 us versus 69.00 us MXFP4, still 10.2% behind. |
+| E424 | Unchanged E423 binary passes 1,440 exact real-weight checks at TP4 M256, three layer/rank slices, five patterns and eight changes. Native grids and zero scratch pass; no whole-model or serving claim. |
 
 
 ## How to read the outcomes
