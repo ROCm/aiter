@@ -1,4 +1,3 @@
+errors-*.txt
 *.csv
-*.log
-*.json
 .rocprofv3/
