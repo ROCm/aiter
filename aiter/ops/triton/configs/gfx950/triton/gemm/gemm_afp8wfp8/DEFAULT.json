@@ -9,6 +9,10 @@
         "waves_per_eu": 1,
         "num_stages": 3,
         "matrix_instr_nonkdim": 16,
-        "cache_modifier": null
+        "cache_modifier": null,
+        "N_FIRST": false,
+        "FUSED_SPLITK": false,
+        "REDUCE_BLOCK_SIZE_M": 32,
+        "REDUCE_BLOCK_SIZE_N": 32
     }
 }
