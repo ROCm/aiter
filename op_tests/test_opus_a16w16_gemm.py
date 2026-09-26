@@ -589,7 +589,10 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     )
     row = {"libtype": "opus", "solidx": 200, "splitK": 2, "kernelName": ""}
     monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {key: row})
-    monkeypatch.setattr(tuned, "get_gfx", lambda: "gfx942")
+    # Dispatch reads the live GPU via get_gfx_runtime(), not get_gfx(): the
+    # latter honours the GPU_ARCHS build variable, which must not decide which
+    # tuned row a running process selects.
+    monkeypatch.setattr(tuned, "get_gfx_runtime", lambda: "gfx942")
     monkeypatch.setattr(tuned, "get_cu_num", lambda: 304)
     # Revisit the stale key in both padded lookups without the native helper.
     monkeypatch.setattr(tuned, "get_padded_m", lambda M, _N, _K, _gl: M)
