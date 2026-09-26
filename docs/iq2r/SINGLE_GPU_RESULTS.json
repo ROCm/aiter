@@ -5,144 +5,144 @@
       "tp": 8,
       "tokens": 1024,
       "routes": "spread",
-      "mxfp4_us": 211.72653436660767,
-      "iq2r_us": 231.96347951889038,
-      "latency_overhead_percent": 9.558058092634791,
-      "arm": "iq2r_extbestred8",
-      "experiment": "e220",
+      "mxfp4_us": 208.47073793411255,
+      "iq2r_us": 220.37585973739624,
+      "latency_overhead_percent": 5.710692023859165,
+      "arm": "iq2r_extunroll2xcd",
+      "experiment": "e243",
       "clean_mxfp4_us": [
-        215.70210456848145,
-        207.7509641647339
+        209.36813354492188,
+        207.57334232330322
       ],
       "clean_iq2r_us": [
-        237.40880489349365,
-        226.5181541442871
+        220.77250480651855,
+        219.97921466827393
       ]
     },
     {
       "tp": 8,
       "tokens": 1024,
       "routes": "hot",
-      "mxfp4_us": 125.44868588447571,
-      "iq2r_us": 170.38507461547852,
-      "latency_overhead_percent": 35.82053364224495,
-      "arm": "iq2r_extbestred8",
-      "experiment": "e220",
+      "mxfp4_us": 121.84222936630249,
+      "iq2r_us": 153.70551347732544,
+      "latency_overhead_percent": 26.15126485845085,
+      "arm": "iq2r_extunroll2xcd",
+      "experiment": "e243",
       "clean_mxfp4_us": [
-        128.53809595108032,
-        122.3592758178711
+        121.78510427474976,
+        121.89935445785522
       ],
       "clean_iq2r_us": [
-        174.3672490119934,
-        166.40290021896362
+        153.72165441513062,
+        153.68937253952026
       ]
     },
     {
       "tp": 8,
       "tokens": 4096,
       "routes": "spread",
-      "mxfp4_us": 455.4833650588989,
-      "iq2r_us": 596.751594543457,
-      "latency_overhead_percent": 31.015014009631425,
-      "arm": "iq2r_extbestred8",
-      "experiment": "e220",
+      "mxfp4_us": 454.67684268951416,
+      "iq2r_us": 573.5366821289062,
+      "latency_overhead_percent": 26.141608342380017,
+      "arm": "iq2r_extunroll2xcd",
+      "experiment": "e243",
       "clean_mxfp4_us": [
-        462.3799800872803,
-        448.5867500305176
+        454.6518325805664,
+        454.7018527984619
       ],
       "clean_iq2r_us": [
-        595.4574108123779,
-        598.0457782745361
+        574.3532180786133,
+        572.7201461791992
       ]
     },
     {
       "tp": 8,
       "tokens": 4096,
       "routes": "hot",
-      "mxfp4_us": 394.943368434906,
-      "iq2r_us": 500.5414009094238,
-      "latency_overhead_percent": 26.737512492736613,
-      "arm": "iq2r_extbestred8",
-      "experiment": "e220",
+      "mxfp4_us": 394.320809841156,
+      "iq2r_us": 483.57951641082764,
+      "latency_overhead_percent": 22.636062906654008,
+      "arm": "iq2r_extunroll2xcd",
+      "experiment": "e243",
       "clean_mxfp4_us": [
-        393.0626392364502,
-        396.8240976333618
+        391.6872978210449,
+        396.9543218612671
       ],
       "clean_iq2r_us": [
-        498.6177921295166,
-        502.46500968933105
+        483.2569122314453,
+        483.90212059020996
       ]
     },
     {
       "tp": 4,
       "tokens": 1024,
       "routes": "spread",
-      "mxfp4_us": 296.15899324417114,
-      "iq2r_us": 365.84609746932983,
-      "latency_overhead_percent": 23.530301565991785,
-      "arm": "iq2r_extpipe4deep4m4g2p1",
-      "experiment": "e222",
+      "mxfp4_us": 292.62064695358276,
+      "iq2r_us": 341.39420986175537,
+      "latency_overhead_percent": 16.667847404461988,
+      "arm": "iq2r_extpipe4u2outerm4",
+      "experiment": "e244",
       "clean_mxfp4_us": [
-        296.19603157043457,
-        296.1219549179077
+        292.1012878417969,
+        293.14000606536865
       ],
       "clean_iq2r_us": [
-        367.4196481704712,
-        364.2725467681885
+        341.87300205230713,
+        340.9154176712036
       ]
     },
     {
       "tp": 4,
       "tokens": 1024,
       "routes": "hot",
-      "mxfp4_us": 190.6834840774536,
-      "iq2r_us": 268.3093786239624,
-      "latency_overhead_percent": 40.709291065280716,
-      "arm": "iq2r_extpipe4deep4m4g2p1",
-      "experiment": "e222",
+      "mxfp4_us": 188.7040078639984,
+      "iq2r_us": 221.22892141342163,
+      "latency_overhead_percent": 17.235942107209713,
+      "arm": "iq2r_extpipe4u2outerm4",
+      "experiment": "e244",
       "clean_mxfp4_us": [
-        190.96688032150269,
-        190.40008783340454
+        188.6178970336914,
+        188.79011869430542
       ],
       "clean_iq2r_us": [
-        271.1845397949219,
-        265.43421745300293
+        221.4214324951172,
+        221.03641033172607
       ]
     },
     {
       "tp": 4,
       "tokens": 4096,
       "routes": "spread",
-      "mxfp4_us": 612.4496698379517,
-      "iq2r_us": 1006.7938804626465,
-      "latency_overhead_percent": 64.38801913780678,
-      "arm": "iq2r_extpipe4deep4m4g2p1",
-      "experiment": "e222",
+      "mxfp4_us": 604.3476104736328,
+      "iq2r_us": 913.0675792694092,
+      "latency_overhead_percent": 51.08317852929536,
+      "arm": "iq2r_extpipe4u2outerm4",
+      "experiment": "e244",
       "clean_mxfp4_us": [
-        622.6760387420654,
-        602.2233009338379
+        605.4875373840332,
+        603.2076835632324
       ],
       "clean_iq2r_us": [
-        1021.6554641723633,
-        991.9322967529297
+        913.1065368652344,
+        913.028621673584
       ]
     },
     {
       "tp": 4,
       "tokens": 4096,
       "routes": "hot",
-      "mxfp4_us": 496.2385654449463,
-      "iq2r_us": 854.7238349914551,
-      "latency_overhead_percent": 72.24050980904262,
-      "arm": "iq2r_extpipe4deep4m4g2p1",
-      "experiment": "e222",
+      "mxfp4_us": 496.2652921676636,
+      "iq2r_us": 751.0186195373535,
+      "latency_overhead_percent": 51.33410121367532,
+      "arm": "iq2r_extpipe4u2outerm4",
+      "experiment": "e244",
       "clean_mxfp4_us": [
-        495.2504634857178,
-        497.2266674041748
+        496.9583511352539,
+        495.57223320007324
       ],
       "clean_iq2r_us": [
-        859.3620300292969,
-        850.0856399536133
+        750.6457805633545,
+        751.3914585113525
       ]
     }
   ]

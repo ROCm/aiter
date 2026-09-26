@@ -26,20 +26,22 @@ Cross-format model quality is not established by synthetic tensors.
 
 ## Current measured position
 
-TP8 uses E214 gate + E220 four-wave/M32/two-group down + E209 vector8 reduction.
-TP4 uses E218 four-wave gate + E222 four-wave/M64/two-group down. Each row
-averages two clean bookends from its own run.
+TP8 uses E243 gate (two-iteration unroll, single scale byte, padded-row MFMA),
+E235 ordered E220 down, and E209 reduction. TP4 uses E244 gate and its M64 down
+kernel, which processes all three output atoms before advancing K. Both include
+eight-XCD ordering and groups of four tasks. Each row averages two clean
+bookends from its own run. Further qualification is required; neither is integrated.
 
 | TP | Tokens | Routes | MXFP4 µs | IQ2R candidate µs | IQ2R latency overhead |
 |---:|---:|:---|---:|---:|---:|
-|8|1024|spread|211.73|231.96|+9.6%|
-|8|1024|hot|125.45|170.39|+35.8%|
-|8|4096|spread|455.48|596.75|+31.0%|
-|8|4096|hot|394.94|500.54|+26.7%|
-|4|1024|spread|296.16|365.85|+23.5%|
-|4|1024|hot|190.68|268.31|+40.7%|
-|4|4096|spread|612.45|1006.79|+64.4%|
-|4|4096|hot|496.24|854.72|+72.2%|
+|8|1024|spread|208.47|220.38|+5.7%|
+|8|1024|hot|121.84|153.71|+26.2%|
+|8|4096|spread|454.68|573.54|+26.1%|
+|8|4096|hot|394.32|483.58|+22.6%|
+|4|1024|spread|292.62|341.39|+16.7%|
+|4|1024|hot|188.70|221.23|+17.2%|
+|4|4096|spread|604.35|913.07|+51.1%|
+|4|4096|hot|496.27|751.02|+51.3%|
 
 No automatic route-pattern selector is qualified. Original TP4 dense samples
 have unresolved intermittent outliers and are not a qualified denominator.
@@ -48,6 +50,13 @@ are valid. E218 r2 and E220 r2 use strict trace containment with a host-only
 marker margin and provide valid stage attribution.
 
 ## Where the time goes
+
+E235 full counters on 4,096 spread tokens reduce gate DRAM from 990.6 to 543.3 MB
+while trace time barely changes: 232.55 to 231.61 µs. About 78.1M VALU and 3.714M
+FP8 MFMA instructions remain. This supports reducing decoder and instruction
+work as well as traffic. FP8-specific counters are zero for MXFP4 and do not
+measure FP4 work. Device metadata reports 160 KiB LDS per CU/block and eight
+maximum waves per SIMD. E243/E244 full counter follow-ups remain pending.
 
 E220 profile-r2, 4096 spread, rocprof attribution:
 
@@ -118,6 +127,21 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 |E225|Restore omitted E167 static frontend and test actual dispatch. Pushed production correction; fresh TP8 small-token comparison and exact TP4 IQ2R checks.|
 |E226|M128 gate with half-quad N32 waves. Exact and spill-free, but gate/whole-block slower; rejected.|
 |E227|Transpose dense gate MFMA for direct wave-local SwiGLU/quantization. Exact, no broad gain; not selected.|
+|E228|LDS sign-mask lookup replaces integer expansion. Gate slower; down roughly neutral. Not selected.|
+|E229–E230|Retune only down grid size on current TP8/TP4 kernels. Exact, small shape-dependent gains; no general selector selected.|
+|E231|Corrected MFMA32 primitive matches current MFMA16 bit for bit across 262144 FP32 outputs each for unit and varying scales. Independent scalar roundoff-bound issue affects both and remains open.|
+|E232|Exact compressed-record repacking and MFMA32 down. Whole MoE exact; slower than E220.|
+|E233|Add next-group weight lookahead to MFMA32 down. A harness data-selector bug was caught and fixed; corrected run exact, no performance win.|
+|E234|MFMA32 gate with K64 activation pipeline and direct epilogue. Exact, no spills, slower; rejected.|
+|E235–E236|Revisit XCD/task ordering on current TP8/TP4 kernels. Exact, modest gains. TP8 full counters show gate DRAM nearly halved without a meaningful gate-time change; decoder/instruction work remains. TP4 clean gain 3.5–10.3%, still behind MXFP4.|
+|E237|Decode weights once into LDS and share among M waves at M64/M128. Exact but slower in every tested shape; rejected.|
+|E238|Decode each active expert into call-local FP8 scratch and pay decode inside every timed call. Exact, no overall gain; rejected.|
+|E239|Last producer performs ordered route reduction after release/acquire signaling. Completed checks exact; severe regression, clean screen stopped intentionally. Separate trace-only evidence retained.|
+|E240–E241|Remove branches before padded-row MFMAs. Exact; small broad TP8 gate gain, TP4 shape-dependent.|
+|E242|Sign nibbles via wave shuffle or 64-byte LDS lookup. Exact, slower or neutral; rejected.|
+|E243|Use a single activation scale byte and unroll the gate K loop by two; combine with XCD/task ordering. Exact, modest broad TP8 gains. Larger unrolls regress.|
+|E244|TP4 gate adaptation; move down K loop outside the three output atoms so each record is consumed once. Exact, broader dense gains; full counters and further qualification pending.|
+
 
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module

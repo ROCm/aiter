@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E227. Related scouts,
+attempts from the initial GLM integration through E244. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,15 +19,14 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E227
+## Isolated single-GPU optimization, E199–E244
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md), [numeric results](SINGLE_GPU_RESULTS.json)
-and [evidence index](SINGLE_GPU_EVIDENCE.json) track all attempts. E214 gate + E220
-down + E209 reduction leads TP8; E218 gate + E222 down leads TP4. Both remain
+and [evidence index](SINGLE_GPU_EVIDENCE.json) track all attempts. E243 gate with E235 down and E209 reduction leads TP8; E244 gate/down leads TP4. Both remain
 behind MXFP4 and isolated. E225 restores the previously selected E167 C4/C8
 frontend omitted from consolidated source; dispatch/correctness tests passed.
-E221/E223/E224/E226/E227 are neutral or rejected. Serving results are unchanged.
+The report lists all attempts through E244, including rejected decode-sharing, predecode and last-producer-reduction trials. Serving results are unchanged.
 
 ## How to read the outcomes
 
