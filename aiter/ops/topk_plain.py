@@ -17,7 +17,7 @@ from .topk import get_topk_scratch_workspace
 def _topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
-    topk_out: torch.Tensor,
+    topk_out: torch.Tensor | None,
     topk: int,
     largest: bool = True,
     rowStarts: torch.Tensor = None,
@@ -36,19 +36,12 @@ def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 _MAX_CAPACITY = 2048
 
 
-def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
-    """Would a `rowStarts`/`rowEnds` call stay on the batched launcher?
+def _uses_radix(width: int, topk: int) -> bool:
+    """Mirrors `should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu.
 
-    Mirrors `should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu, which
-    the variable-length `AdaptiveTopK` consults. When it holds, one batched
-    launch serves every row. When it does not, that overload falls back to a
-    host-side loop calling the single-row selector once per row -- measured at
-    k=16, N=32768, M=16384 as 294918 profiler events per call against 25 for the
-    uniform form, and the cost grows with the row count while this test does not
-    look at the row count at all.
-
-    Exposed so a caller choosing between kernels can avoid that fallback rather
-    than discover it.
+    Both `AdaptiveTopK` overloads consult it to choose between the radix
+    selector and the block-sort fallback, and the two questions below are both
+    really this one.
     """
     if topk <= 1:
         return False
@@ -57,10 +50,41 @@ def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
     return topk * log_k * log_k >= (4.8 * width) / denom
 
 
+def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
+    """Would a `rowStarts`/`rowEnds` call stay on the batched launcher?
+
+    When the radix path holds, one batched launch serves every row. When it does
+    not, the variable-length `AdaptiveTopK` falls back to a host-side loop
+    calling the single-row selector once per row -- measured at k=16, N=32768,
+    M=16384 as 294918 profiler events per call against 25 for the uniform form,
+    and the cost grows with the row count while this test does not look at the
+    row count at all.
+
+    Exposed so a caller choosing between kernels can avoid that fallback rather
+    than discover it.
+    """
+    return _uses_radix(width, topk)
+
+
+def topk_plain_values_optional(width: int, topk: int) -> bool:
+    """May `topk_out` be None for this geometry?
+
+    Only the radix path has a build that leaves the selected values unwritten;
+    the block-sort fallback writes them unconditionally. The other two
+    conditions -- fp32, largest-first -- are properties of the call rather than
+    the shape, so a caller doing a half-format or smallest-first selection has
+    to pass a buffer whatever this says.
+
+    Worth asking: writing values a caller discards costs 52us of the 741us
+    `topk_plain` takes at 4096 rows of 131072 at k=2048.
+    """
+    return _uses_radix(width, topk)
+
+
 def topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
-    topk_out: torch.Tensor,
+    topk_out: torch.Tensor | None,
     topk: int,
     largest: bool = True,
     rowStarts: torch.Tensor = None,
@@ -74,6 +98,9 @@ def topk_plain(
     cached) here on the Python side via torch's caching allocator and passed into
     the kernel, so the C++ side never allocates device memory itself. Non-fp32
     inputs never reach the radix path, so no workspace is allocated for them.
+
+    `topk_out` may be None where `topk_plain_values_optional` holds; the C++
+    side refuses it elsewhere rather than writing through a null.
     """
     if topk > _MAX_CAPACITY:
         # `AdaptiveTopK` asserts this at its entry, ahead of any dtype branch,
