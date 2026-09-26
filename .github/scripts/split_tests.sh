@@ -179,6 +179,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_opus_a16w16_policy_parity.py]=6
     FILE_TIMES[op_tests/test_opus_a8w8_bmm.py]=6
     FILE_TIMES[op_tests/test_pa_mqa_logits_offset.py]=6
+    FILE_TIMES[op_tests/test_triton_fmoe_dispatch.py]=10
     FILE_TIMES[op_tests/test_quant_mxfp6_gemm.py]=6
     FILE_TIMES[op_tests/tuning_tests/test_config_shape_collision.py]=4
     FILE_TIMES[op_tests/tuning_tests/test_csv_validation.py]=4
