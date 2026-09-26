@@ -2,7 +2,7 @@
 
 The serving goal remains unmet. Production sweeps are paused by user request.
 This work uses one MI355X GPU to represent one TP8 or TP4 rank, without loading
-a model checkpoint. Dense E199+ candidate kernels remain isolated. E225 restores a previously
+a complete model. E285 additionally stages individual real checkpoint slices. Dense E199+ candidate kernels remain isolated. E225 restores a previously
 selected C4/C8 frontend omitted from the consolidated production source. Official comparison remains unchanged ATOM
 `benchmark_serving` at 1k/1k and 8k/1k, C1 through C256.
 
@@ -23,6 +23,29 @@ Clean measurements rotate 32 distinct weight banks, use seven alternating
 rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
+
+## Follow-up results — E285–E292
+
+E289 combines E280 packing/gate scheduling, independent down-projection waves at TP8 M16, the static M16 frontend and batched final reduction reads. E292 separately parallelizes the existing M4 fused-down epilogue. These are shape-specific isolated experiments, with no new production integration.
+
+| Experiment | TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R latency overhead |
+|:---|---:|---:|:---|---:|---:|---:|
+| E292 | 8 | 4 | spread | 25.30 | 24.47 | -3.3% |
+| E292 | 8 | 4 | hot | 19.97 | 22.23 | +11.3% |
+| E289 | 8 | 16 | spread | 49.86 | 48.88 | -2.0% |
+| E289 | 8 | 16 | hot | 28.59 | 25.51 | -10.8% |
+| E292 | 4 | 4 | spread | 36.20 | 32.64 | -9.8% |
+| E292 | 4 | 4 | hot | 27.86 | 26.32 | -5.5% |
+
+Each row averages complete clean bookends over32 rotating banks; all baseline/candidate drift in this table is below3%. E289 TP8 M16 and E292 TP4 M4 include full counters. The selected M16 spread case is now faster than its fresh MXFP4 control. TP8 M4 hot remains behind. Token lists and RNG progression differ between experiments; compare arms within a row. These are synthetic one-rank MoE calls, not serving concurrency.
+
+E285 qualifies unchanged E280 using16 actual TP8 captures and six real TP8/TP4 checkpoint slices:32 capture/TP cases and256 changing steps, with exact final BF16 and intermediate FP8 bytes/scales. TP4 reuses TP8 hidden/routes with TP4 slices. E280 reduces local latency against original IQ2R by4.9/4.7% at TP8 M4/M8 and5.3/6.1% at TP4 M4/M8. These real-capture comparisons do not include MXFP4.
+
+E291 qualifies the E289 combination across30 synthetic shape/routing cases and240 changing steps, including zero/16× inputs and12/13 boundaries. Final outputs and intermediate values/scales are exact. Native dispatch is verified, zero scratch, and all45 stable-order/invalid-route/changing-graph frontend tests pass. E285 and E291 cover different candidates; they do not substitute for captured qualification of the newly combined path.
+
+E286 down removes cross-wave partial-sum transfers: TP8 M16 spread down22.66→16.69µs, unchanged DRAM/MFMA counts,31% fewer LDS instructions and49% fewer LDS-wait cycles. E289 reduction batches independent reads: memory instruction counts and traffic remain essentially unchanged, while WAIT_ANY cycles fall56%. Neither result establishes higher achieved occupancy.
+
+E288 TP4 adaptive fusion and E290 wider route9 tiles are unselected due regressions. E289 TP4 r1 is incomplete because unchanged MXFP4 exceeded the fixed graph/eager bound (0.0153846 versus0.015); no TP4 M8 comparison is qualified. E292 r1 TP4 has elevated candidate drift and is retained; r2 supplies the stable table above. Dense E261/E262 results below remain unchanged. Serving sweeps stay paused.
 
 ## Small-token scheduling checkpoint — E278–E283
 
@@ -263,6 +286,14 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 |E282|Apply E278/E280 decoder schedule to dense M64 gate. Exact, slightly slower than E261; unselected.|
 |E283|Small down sign scheduling/batching. TP8 four-read and TP4 one-read arms fail correctness; ineligible pending diagnosis.|
 |E284|Unchanged E280 passes30 TP8/TP4 shape/pattern cases and240 changing steps, including intermediate FP8 bytes/scales and12/13-task boundaries.|
+|E285|Qualify unchanged E280 on16 actual captures and six real layer/rank weight slices:32 cases/256 changes, exact final/intermediate values.|
+|E286|Assign down columns to independent waves, removing cross-wave partial sums. Exact, useful at TP8 M16 spread; TP4/hot mixed.|
+|E287|Instantiate static ballot routing for M16. Exact; saves about0.3–0.4µs. Invalid-route/stable-order tests pass under E291.|
+|E288|TP4 four/eight-token adaptive fused down. Exact but spread regressions outweigh hot gains; unselected.|
+|E289|Batch nine independent reduction reads. Exact; combined TP8 M16 spread48.88µs beats fresh MXFP449.86µs. TP4 comparison fails unchanged-baseline tolerance.|
+|E290|Widen route9 output tiles to96/192 columns. Exact, slower at TP8 M4; rejected.|
+|E291|Unchanged E289 combination passes30 boundary/shape cases,240 changing steps and45 frontend tests; captured qualification remains.|
+|E292|Map48 fused-down output columns to48 reducing lanes. Exact and modestly faster at TP8/TP4 M4; TP8 hot gap remains.|
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

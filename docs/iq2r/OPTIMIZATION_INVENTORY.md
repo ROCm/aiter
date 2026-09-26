@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E284. Related scouts,
+attempts from the initial GLM integration through E292. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -12,14 +12,14 @@ MXFP4 bookends. The official workloads are 1024/1024 and 8192/1024 at
 C1/2/4/8/16/32/64/128/256. The final agentic workload uses real MTP acceptance.
 
 The latest measurements and limitations are posted on
-[ATOM #2335](https://github.com/ROCm/ATOM/pull/2335#issuecomment-5837890842) and
-[AITER #5728](https://github.com/ROCm/aiter/pull/5728#issuecomment-5837891193).
+[ATOM #2335](https://github.com/ROCm/ATOM/pull/2335) and
+[AITER #5728](https://github.com/ROCm/aiter/pull/5728).
 The execution plan: `GLM53_IQ2R_DATAFLOW_EXECUTION_PLAN.md` owns the remaining
 acceptance work. This source snapshot consolidates the measured E167/E172/E181 native implementation and the E190 router guard; the latter was not in the E180 r8 benchmark. Later E194–E196 scouts remain unselected.
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E284
+## Isolated single-GPU optimization, E199–E292
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -46,6 +46,18 @@ E279/E281 down extensions and E282 dense scheduling are unselected. E283
 down scheduling has TP8/TP4 correctness failures and is ineligible. E284
 passes30 E280 task-boundary/shape cases with exact intermediate values/scales. Earlier attempts and numerical-reference limitations remain in the
 single-GPU report. Serving sweeps remain paused.
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E285 | Qualify unchanged E280 on16 actual captures and six real layer/rank weight slices:32 cases/256 changes, exact final/intermediate values. |
+| E286 | Assign down columns to independent waves, removing cross-wave partial sums. Exact, useful at TP8 M16 spread; TP4/hot mixed. |
+| E287 | Instantiate static ballot routing for M16. Exact; saves about0.3–0.4µs. Invalid-route/stable-order tests pass under E291. |
+| E288 | TP4 four/eight-token adaptive fused down. Exact but spread regressions outweigh hot gains; unselected. |
+| E289 | Batch nine independent reduction reads. Exact; combined TP8 M16 spread48.88µs beats fresh MXFP449.86µs. TP4 comparison fails unchanged-baseline tolerance. |
+| E290 | Widen route9 output tiles to96/192 columns. Exact, slower at TP8 M4; rejected. |
+| E291 | Unchanged E289 combination passes30 boundary/shape cases,240 changing steps and45 frontend tests; captured qualification remains. |
+| E292 | Map48 fused-down output columns to48 reducing lanes. Exact and modestly faster at TP8/TP4 M4; TP8 hot gap remains. |
 
 
 ## How to read the outcomes

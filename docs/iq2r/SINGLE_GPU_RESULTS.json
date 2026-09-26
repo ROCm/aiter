@@ -393,5 +393,80 @@
         672.0063209533691
       ]
     }
-  ]
+  ],
+  "followup_rows": [
+    {
+      "experiment": "e292",
+      "run": "tp8-r1",
+      "arm": "iq2r_parallelreduce",
+      "tp": 8,
+      "tokens": 4,
+      "routes": "spread",
+      "mxfp4_us": 25.30442774295807,
+      "iq2r_us": 24.471421539783478,
+      "latency_overhead_percent": -3.291938516200621,
+      "module_sha256": "07d266667cf88bc6479c0ed7c7e7f23a3b9a8c637dc7200521ef8928fb1beb1e"
+    },
+    {
+      "experiment": "e292",
+      "run": "tp8-r1",
+      "arm": "iq2r_parallelreduce",
+      "tp": 8,
+      "tokens": 4,
+      "routes": "hot",
+      "mxfp4_us": 19.97351497411728,
+      "iq2r_us": 22.230659425258636,
+      "latency_overhead_percent": 11.300687205363126,
+      "module_sha256": "07d266667cf88bc6479c0ed7c7e7f23a3b9a8c637dc7200521ef8928fb1beb1e"
+    },
+    {
+      "experiment": "e289",
+      "run": "tp8-r2",
+      "arm": "iq2r_reduce9",
+      "tp": 8,
+      "tokens": 16,
+      "routes": "spread",
+      "mxfp4_us": 49.85920935869217,
+      "iq2r_us": 48.87595623731613,
+      "latency_overhead_percent": -1.9720591923197528,
+      "module_sha256": "e16c224673e179a353ca258050c61ab4ce51f53e4130fa0945850d2479f2c81b"
+    },
+    {
+      "experiment": "e289",
+      "run": "tp8-r2",
+      "arm": "iq2r_reduce9",
+      "tp": 8,
+      "tokens": 16,
+      "routes": "hot",
+      "mxfp4_us": 28.59431654214859,
+      "iq2r_us": 25.512424111366272,
+      "latency_overhead_percent": -10.777989486965167,
+      "module_sha256": "e16c224673e179a353ca258050c61ab4ce51f53e4130fa0945850d2479f2c81b"
+    },
+    {
+      "experiment": "e292",
+      "run": "tp4-r2",
+      "arm": "iq2r_parallelreduce",
+      "tp": 4,
+      "tokens": 4,
+      "routes": "spread",
+      "mxfp4_us": 36.19737774133682,
+      "iq2r_us": 32.63835906982422,
+      "latency_overhead_percent": -9.832255521228717,
+      "module_sha256": "07d266667cf88bc6479c0ed7c7e7f23a3b9a8c637dc7200521ef8928fb1beb1e"
+    },
+    {
+      "experiment": "e292",
+      "run": "tp4-r2",
+      "arm": "iq2r_parallelreduce",
+      "tp": 4,
+      "tokens": 4,
+      "routes": "hot",
+      "mxfp4_us": 27.864456176757812,
+      "iq2r_us": 26.324065029621124,
+      "latency_overhead_percent": -5.528157942022038,
+      "module_sha256": "07d266667cf88bc6479c0ed7c7e7f23a3b9a8c637dc7200521ef8928fb1beb1e"
+    }
+  ],
+  "followup_scope": "Independent E289/E292 shape-specific tests; historical20-row selection table retained. No serving result."
 }
