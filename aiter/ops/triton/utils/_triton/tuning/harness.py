@@ -3,6 +3,7 @@
 """Profile a selected kernel; only its case imports GPU and operator modules."""
 
 import argparse
+from functools import partial
 from pathlib import Path
 
 KERNEL_CONFIG_NAMES = {
@@ -35,12 +36,13 @@ def kernel_name(value):
     return name
 
 
-def get_profile_functions(kernel, input_shape, config_list):
-    """Generate inputs once and yield one profiling callable per config."""
+def get_kernel_runner(kernel, input_shape):
+    """Create inputs once and bind them to the selected kernel's config argument."""
+    M, N, K = input_shape
+
     match kernel:
         case "batched_gemm_bf16":
             import torch
-            import triton
 
             from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
                 batched_gemm_bf16,
@@ -50,35 +52,14 @@ def get_profile_functions(kernel, input_shape, config_list):
             )
 
             dtype = torch.bfloat16
-
-            M, N, K = input_shape
-
             B = 8 if K == 4096 else 16
-
-            x, weight, bias, y = generate_batched_gemm_a16w16_inputs(
-                B,
-                M,
-                N,
-                K,
-                dtype,
-                output=True,
+            x, w, bias, y = generate_batched_gemm_a16w16_inputs(
+                B, M, N, K, dtype, output=True
             )
-
-            for config in config_list:
-                if config is not None:
-                    config = config.copy()
-                    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-                        input_shape[2], config["NUM_KSPLIT"]
-                    )
-
-                def fn(config=config):
-                    batched_gemm_bf16(x, weight, bias, dtype, YQ=y, config=config)
-
-                yield fn
+            return partial(batched_gemm_bf16, x, w, bias, dtype, YQ=y)
 
         case "gemm_a16w16":
             import torch
-            import triton
 
             from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
             from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
@@ -86,29 +67,13 @@ def get_profile_functions(kernel, input_shape, config_list):
             )
 
             dtype = torch.bfloat16
-
             x, w, bias, _, y = generate_gemm_a16w16_inputs(
-                *input_shape,
-                dtype,
-                output=True,
-                bias=True,
+                M, N, K, dtype, output=True, bias=True
             )
-
-            for config in config_list:
-                if config is not None:
-                    config = config.copy()
-                    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-                        input_shape[2], config["NUM_KSPLIT"]
-                    )
-
-                def fn(config=config):
-                    gemm_a16w16(x, w, bias, dtype, y, config=config)
-
-                yield fn
+            return partial(gemm_a16w16, x, w, bias, dtype, y)
 
         case "gemm_a16w16_atomic":
             import torch
-            import triton
 
             from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import (
                 gemm_a16w16_atomic,
@@ -118,25 +83,13 @@ def get_profile_functions(kernel, input_shape, config_list):
             )
 
             dtype = torch.bfloat16
+            x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=True)
 
-            x, w, _, _, y = generate_gemm_a16w16_inputs(
-                *input_shape,
-                dtype,
-                output=True,
-            )
+            def run(config):
+                y.zero_()
+                gemm_a16w16_atomic(x, w, dtype, y, config=config)
 
-            for config in config_list:
-                if config is not None:
-                    config = config.copy()
-                    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-                        input_shape[2], config["NUM_KSPLIT"]
-                    )
-
-                def fn(config=config):
-                    y.zero_()
-                    gemm_a16w16_atomic(x, w, dtype, y, config=config)
-
-                yield fn
+            return run
 
         case "gemm_a16w16_gated":
             import torch
@@ -146,77 +99,15 @@ def get_profile_functions(kernel, input_shape, config_list):
                 generate_gemm_a16w16_gated_inputs,
             )
 
-            M, N, K = input_shape
-
             dtype = torch.bfloat16
+            x, w, _, y = generate_gemm_a16w16_gated_inputs(M, N, K, dtype, output=True)
+            return partial(gemm_a16w16_gated, x, w, dtype, y)
 
-            x, w, _, y = generate_gemm_a16w16_gated_inputs(
-                M,
-                N,
-                K,
-                dtype,
-                output=True,
-            )
-
-            for config in config_list:
-                if config is not None:
-                    config = config.copy()
-                    # Gated kernel doesn't support split-K, remove those keys
-                    config.pop("NUM_KSPLIT", None)
-                    config.pop("SPLITK_BLOCK_SIZE", None)
-
-                def fn(config=config):
-                    gemm_a16w16_gated(x, w, dtype, y, config=config)
-
-                yield fn
-
-        case "gemm_a16w8_blockscale":
+        case "gemm_a16w8_blockscale" | "gemm_a16w8_blockscale_preshuffle":
             import torch
 
             from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
                 gemm_a16w8_blockscale,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
-                generate_gemm_a16w8_blockscale_inputs,
-            )
-
-            dtype = torch.bfloat16
-
-            shuffle = False
-
-            block_shape_n, block_shape_k = 128, 128
-
-            x, weight, weight_triton, w_scale, y = (
-                generate_gemm_a16w8_blockscale_inputs(
-                    *input_shape,
-                    block_shape_n,
-                    block_shape_k,
-                    dtype=dtype,
-                    output=True,
-                    shuffle=shuffle,
-                )
-            )
-
-            for config in config_list:
-                assert config is None or config["BLOCK_SIZE_K"] == 128
-
-                def fn(config=config):
-                    gemm_a16w8_blockscale(
-                        x,
-                        weight_triton,
-                        w_scale,
-                        dtype,
-                        y,
-                        prequant=False,
-                        config=config,
-                    )
-
-                yield fn
-
-        case "gemm_a16w8_blockscale_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
                 gemm_a16w8_blockscale_preshuffle,
             )
             from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
@@ -224,37 +115,14 @@ def get_profile_functions(kernel, input_shape, config_list):
             )
 
             dtype = torch.bfloat16
-
-            shuffle = True
-
-            block_shape_n, block_shape_k = 128, 128
-
-            x, weight, weight_triton, w_scale, y = (
-                generate_gemm_a16w8_blockscale_inputs(
-                    *input_shape,
-                    block_shape_n,
-                    block_shape_k,
-                    dtype=dtype,
-                    output=True,
-                    shuffle=shuffle,
-                )
+            shuffle = kernel == "gemm_a16w8_blockscale_preshuffle"
+            gemm = (
+                gemm_a16w8_blockscale_preshuffle if shuffle else gemm_a16w8_blockscale
             )
-
-            for config in config_list:
-                assert config is None or config["BLOCK_SIZE_K"] == 128
-
-                def fn(config=config):
-                    gemm_a16w8_blockscale_preshuffle(
-                        x,
-                        weight_triton,
-                        w_scale,
-                        dtype,
-                        y,
-                        prequant=False,
-                        config=config,
-                    )
-
-                yield fn
+            x, _, w, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
+                M, N, K, 128, 128, dtype=dtype, output=True, shuffle=shuffle
+            )
+            return partial(gemm, x, w, w_scale, dtype, y, prequant=False)
 
         case "gemm_a16wfp4":
             import torch
@@ -264,10 +132,7 @@ def get_profile_functions(kernel, input_shape, config_list):
                 generate_gemm_a16wfp4_inputs,
             )
 
-            M, N, K = input_shape
-
             dtype = torch.bfloat16
-
             x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
                 M,
                 N,
@@ -278,107 +143,29 @@ def get_profile_functions(kernel, input_shape, config_list):
                 layout="TN",
                 shuffle=False,
             )
-
-            for config in config_list:
-
-                def fn(config=config):
-                    # Signature: gemm_a16wfp4(x, w, w_scales, atomic_add, dtype, y, config)
-                    gemm_a16wfp4(x, w, w_scales, False, dtype, y, config=config)
-
-                yield fn
+            return partial(gemm_a16wfp4, x, w, w_scales, False, dtype, y)
 
         case "gemm_a8w8":
             import torch
 
             from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
-            from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
             from aiter.ops.triton.utils.types import get_fp8_dtypes
             from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
                 generate_gemm_a8w8_inputs,
             )
 
-            M, N, K = input_shape
-
-            _, e4m3_type = get_fp8_dtypes()
-
+            _, fp8_dtype = get_fp8_dtypes()
             dtype = torch.bfloat16
-
-            x, weight, weight_triton, x_scale, w_scale, bias, y = (
-                generate_gemm_a8w8_inputs(
-                    *input_shape,
-                    in_dtype=e4m3_type,
-                    out_dtype=dtype,
-                    layout="TN",
-                    output=True,
-                )
+            x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
+                M, N, K, in_dtype=fp8_dtype, out_dtype=dtype, layout="TN", output=True
             )
+            return partial(gemm_a8w8, x, w, x_scale, w_scale, None, dtype, y)
 
-            for config in config_list:
-                if config is not None:
-                    compute_splitk_params(config, K)
-
-                def fn(config=config):
-                    gemm_a8w8(
-                        x,
-                        weight_triton,
-                        x_scale,
-                        w_scale,
-                        None,
-                        dtype,
-                        y,
-                        config=config,
-                    )
-
-                yield fn
-
-        case "gemm_a8w8_blockscale":
+        case "gemm_a8w8_blockscale" | "gemm_a8w8_blockscale_preshuffle":
             import torch
 
             from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
                 gemm_a8w8_blockscale,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
-                generate_gemm_a8w8_blockscale_inputs,
-            )
-
-            dtype = torch.bfloat16
-
-            shuffle = False
-
-            block_shape_n, block_shape_k = 128, 128
-
-            x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-                generate_gemm_a8w8_blockscale_inputs(
-                    *input_shape,
-                    block_shape_n,
-                    block_shape_k,
-                    dtype=dtype,
-                    layout="TN",
-                    output=True,
-                    shuffle=shuffle,
-                )
-            )
-
-            for config in config_list:
-                assert config is None or config["BLOCK_SIZE_K"] == 128
-
-                def fn(config=config):
-                    gemm_a8w8_blockscale(
-                        x,
-                        weight_triton,
-                        x_scale_shuffled,
-                        w_scale,
-                        dtype,
-                        y,
-                        config=config,
-                    )
-
-                yield fn
-
-        case "gemm_a8w8_blockscale_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
                 gemm_a8w8_blockscale_preshuffle,
             )
             from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
@@ -386,38 +173,20 @@ def get_profile_functions(kernel, input_shape, config_list):
             )
 
             dtype = torch.bfloat16
-
-            shuffle = True
-
-            block_shape_n, block_shape_k = 128, 128
-
-            x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-                generate_gemm_a8w8_blockscale_inputs(
-                    *input_shape,
-                    block_shape_n,
-                    block_shape_k,
-                    dtype=dtype,
-                    layout="TN",
-                    output=True,
-                    shuffle=shuffle,
-                )
+            shuffle = kernel == "gemm_a8w8_blockscale_preshuffle"
+            gemm = gemm_a8w8_blockscale_preshuffle if shuffle else gemm_a8w8_blockscale
+            x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+                M,
+                N,
+                K,
+                128,
+                128,
+                dtype=dtype,
+                layout="TN",
+                output=True,
+                shuffle=shuffle,
             )
-
-            for config in config_list:
-                assert config is None or config["BLOCK_SIZE_K"] == 128
-
-                def fn(config=config):
-                    gemm_a8w8_blockscale_preshuffle(
-                        x,
-                        weight_triton,
-                        x_scale_shuffled,
-                        w_scale,
-                        dtype,
-                        y,
-                        config=config,
-                    )
-
-                yield fn
+            return partial(gemm, x, w, x_scale, w_scale, dtype, y)
 
         case "gemm_a8w8_per_token_scale":
             import torch
@@ -430,26 +199,13 @@ def get_profile_functions(kernel, input_shape, config_list):
             )
 
             dtype = torch.bfloat16
-
-            x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
-                *input_shape,
-                dtype=dtype,
-                layout="TN",
-                output=True,
+            x, w, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
+                M, N, K, dtype=dtype, layout="TN", output=True
             )
-
-            for config in config_list:
-
-                def fn(config=config):
-                    gemm_a8w8_per_token_scale(
-                        x, weight, x_scale, w_scale, dtype, y, config=config
-                    )
-
-                yield fn
+            return partial(gemm_a8w8_per_token_scale, x, w, x_scale, w_scale, dtype, y)
 
         case "gemm_a8wfp4":
             import torch
-            import triton
 
             from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
             from aiter.ops.triton.utils.types import get_fp8_dtypes
@@ -457,76 +213,37 @@ def get_profile_functions(kernel, input_shape, config_list):
                 generate_gemm_a8wfp4_inputs,
             )
 
-            M, N, K = input_shape
-
-            _, e4m3_type = get_fp8_dtypes()
-
+            _, fp8_dtype = get_fp8_dtypes()
             dtype = torch.float16
-
             x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
-                M,
-                N,
-                K,
-                e4m3_type,
-                dtype,
-                layout="TN",
-                output=True,
+                M, N, K, fp8_dtype, dtype, layout="TN", output=True
             )
+            return partial(gemm_a8wfp4, x, w, y, x_scales, w_scales, dtype)
 
-            for config in config_list:
-                if config is not None:
-                    config = config.copy()
-                    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
-
-                def fn(config=config):
-                    gemm_a8wfp4(x, w, y, x_scales, w_scales, dtype, config=config)
-
-                yield fn
-
-        case "gemm_afp4wfp4":
+        case "gemm_afp4wfp4" | "gemm_afp4wfp4_preshuffle":
             import torch
 
-            from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
+            from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
+                gemm_afp4wfp4,
+                gemm_afp4wfp4_preshuffle,
+            )
             from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
                 generate_gemm_afp4wfp4_inputs,
             )
 
             dtype = torch.bfloat16
-
-            shuffle = False
-
-            (
-                x,
-                w,
-                w_triton,
-                x_scales,
-                w_scales,
-                x_scales_triton,
-                w_scales_triton,
-                _out_dtype,
-                y,
-            ) = generate_gemm_afp4wfp4_inputs(
-                *input_shape,
+            shuffle = kernel == "gemm_afp4wfp4_preshuffle"
+            gemm = gemm_afp4wfp4_preshuffle if shuffle else gemm_afp4wfp4
+            x, _, w, _, _, x_scales, w_scales, _, y = generate_gemm_afp4wfp4_inputs(
+                M,
+                N,
+                K,
                 dtype,
                 output=True,
                 shuffle_scales_fg=shuffle,
                 shuffle_weight_fg=shuffle,
             )
-
-            for config in config_list:
-
-                def fn(config=config):
-                    gemm_afp4wfp4(
-                        x,
-                        w_triton,
-                        x_scales_triton,
-                        w_scales_triton,
-                        dtype,
-                        y,
-                        config=config,
-                    )
-
-                yield fn
+            return partial(gemm, x, w, x_scales, w_scales, dtype, y)
 
         case "gemm_afp4wfp4_pre_quant_atomic":
             import torch
@@ -538,10 +255,7 @@ def get_profile_functions(kernel, input_shape, config_list):
                 generate_gemm_a16wfp4_inputs,
             )
 
-            M, N, K = input_shape
-
             dtype = torch.float32
-
             x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
                 M,
                 N,
@@ -552,60 +266,7 @@ def get_profile_functions(kernel, input_shape, config_list):
                 layout="TN",
                 shuffle=False,
             )
-
-            for config in config_list:
-
-                def fn(config=config):
-                    gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, y, config=config)
-
-                yield fn
-
-        case "gemm_afp4wfp4_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
-                gemm_afp4wfp4_preshuffle,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-                generate_gemm_afp4wfp4_inputs,
-            )
-
-            dtype = torch.bfloat16
-
-            shuffle = True
-
-            (
-                x,
-                w,
-                w_triton,
-                x_scales,
-                w_scales,
-                x_scales_triton,
-                w_scales_triton,
-                _out_dtype,
-                y,
-            ) = generate_gemm_afp4wfp4_inputs(
-                *input_shape,
-                dtype,
-                output=True,
-                shuffle_scales_fg=shuffle,
-                shuffle_weight_fg=shuffle,
-            )
-
-            for config in config_list:
-
-                def fn(config=config):
-                    gemm_afp4wfp4_preshuffle(
-                        x,
-                        w_triton,
-                        x_scales_triton,
-                        w_scales_triton,
-                        dtype,
-                        y,
-                        config=config,
-                    )
-
-                yield fn
+            return partial(gemm_afp4wfp4_pre_quant, x, w, w_scales, dtype, y)
 
         case "gemm_afp8wfp8_preshuffle":
             import torch
@@ -613,36 +274,57 @@ def get_profile_functions(kernel, input_shape, config_list):
             from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
                 gemm_afp8wfp8_preshuffle,
             )
-            from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
             from aiter.ops.triton.utils.types import get_fp8_dtypes
             from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import (
                 generate_inputs,
             )
 
-            M, N, K = input_shape
-
-            _, e4m3_type = get_fp8_dtypes()
-
+            get_fp8_dtypes()
             dtype = torch.bfloat16
-
-            x_fp8, _w_fp8, w_kernel, x_scales, w_scales = generate_inputs(
-                *input_shape,
-                shuffle=True,
+            x, _, w, x_scales, w_scales = generate_inputs(M, N, K, shuffle=True)
+            return partial(
+                gemm_afp8wfp8_preshuffle, x, w, x_scales, w_scales, dtype=dtype
             )
-
-            for config in config_list:
-                if config is not None:
-                    compute_splitk_params(config, K)
-
-                def fn(config=config):
-                    gemm_afp8wfp8_preshuffle(
-                        x_fp8, w_kernel, x_scales, w_scales, dtype=dtype, config=config
-                    )
-
-                yield fn
 
         case _:
             raise ValueError(f"Unknown kernel: {kernel}")
+
+
+def _prepare_config(kernel, K, config):
+    """Apply kernel-specific config adjustments before the timed call."""
+    if config is None:
+        return None
+
+    match kernel:
+        case "batched_gemm_bf16" | "gemm_a16w16" | "gemm_a16w16_atomic" | "gemm_a8wfp4":
+            import triton
+
+            config = config.copy()
+            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+        case "gemm_a16w16_gated":
+            config = config.copy()
+            config.pop("NUM_KSPLIT", None)
+            config.pop("SPLITK_BLOCK_SIZE", None)
+        case "gemm_a8w8" | "gemm_afp8wfp8_preshuffle":
+            from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+
+            compute_splitk_params(config, K)
+        case (
+            "gemm_a16w8_blockscale"
+            | "gemm_a16w8_blockscale_preshuffle"
+            | "gemm_a8w8_blockscale"
+            | "gemm_a8w8_blockscale_preshuffle"
+        ):
+            assert config["BLOCK_SIZE_K"] == 128
+
+    return config
+
+
+def get_profile_functions(kernel, input_shape, config_list):
+    """Reuse one set of inputs across all configs, preparing each outside profiling."""
+    run = get_kernel_runner(kernel, input_shape)
+    for config in config_list:
+        yield partial(run, config=_prepare_config(kernel, input_shape[2], config))
 
 
 def main(argv=None):

@@ -94,4 +94,4 @@ and check the kernel name (with config suffix) and runtime to see if both kernel
 
 **Adding a harness**
 
-Add a `case` to `get_profile_functions()` in `harness.py`: keep its imports inside the case, generate inputs once, and yield a profiling function for each config. Add the kernel name to `KERNEL_CONFIG_NAMES` in the same file, using the `config_name` passed to `get_gemm_config`. No separate harness file is needed.
+Add a `case` to `get_kernel_runner()` in `harness.py`: keep imports inside the case, generate inputs once, and return the kernel call with its inputs bound using `partial`. The shared `get_profile_functions()` loop supplies each config. Add any config adjustments to `_prepare_config()` so they run outside profiling. Add the kernel name to `KERNEL_CONFIG_NAMES` in the same file, using the `config_name` passed to `get_gemm_config`. No separate harness file is needed.
