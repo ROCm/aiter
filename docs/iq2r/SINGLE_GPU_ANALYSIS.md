@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Ordered-down sign planes and dense epilogues — E392–E396
+
+Complete isolated and serving parity remain unmet. Six of eight TP8 rows and five of six compact TP4 rows beat matched MXFP4. New ordered-down sign planes improve the selected M256 kernels. TP8 M256 hot remains 0.9% behind; TP4 M256 hot is 25.8% behind its fresh baseline. Dense TP4 M4096 remains about 22% behind.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 121.73 | 103.33 | -15.1% |
+| 8 | 128 | hot | 44.16 | 44.32 | +0.4% |
+| 8 | 256 | spread | 135.83 | 104.72 | -22.9% |
+| 8 | 256 | hot | 62.80 | 63.36 | +0.9% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 232.20 | 181.33 | -21.9% |
+| 4 | 256 | hot | 70.37 | 88.52 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 603.20 | 738.76 | +22.5% |
+| 4 | 4096 | hot | 501.69 | 612.41 | +22.1% |
+
+E392 concurrent filtered gates are rejected, with the profiler stall preserved. E393 passes 315 checks and stable timing; plane4 is retained. E394 passes 315 r1 checks, preserves the 3.19% hot drift failure, then passes 72 new checks and independent narrowed stable bookends. Both reduce VALU instructions without consistently reducing wait cycles. E395 passes 2,160 real-weight checks for these two modules. Its timestamp attribution failure is preserved and recovered using unique explicit dispatch/marker correlation IDs. E396 passes 420 exact checks after fixing input-layout comparison in the harness, but both direct dense epilogues regress and are rejected. No native arithmetic or numerical tolerance was relaxed. Earlier small-token and TP8 dense deficits remain outside this selected table.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Tile reuse and real-weight qualification — E388–E391
 
 Complete isolated and serving parity remain unmet. The selected comparison is unchanged: six of eight TP8 rows and five of six compact TP4 rows beat matched MXFP4. Dense TP4 M4096 remains 22.5%/22.1% slower. E388–E390 do not improve the selected policy.
@@ -949,6 +993,12 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E389 | Pair exact K64 records into three K128 loads. All 420 checks and stable bookends pass; VMEM instruction savings recover 1.3–2.9% versus E388, but remain slower than the selected kernel. Unselected. |
 | E390 | Double gate M reuse to 128 rows and retain N64 per wave. All 336 checks pass, with zero scratch and stable bookends. Register allocation rises to 446, occupancy roughly halves, padding grows on spread routes, and whole-MoE regresses 12.2–59.3%. Rejected; build failures preserved. |
 | E391 | Qualify frozen E386 at TP4 M4096 on three real layer/rank slices, five route patterns and eight input changes. All 1,080 exact checks pass, including input/intermediate/final results, native dispatch and zero scratch. Operator qualification only; no timing or whole-model-quality claim. |
+
+| E392 | Concurrent disjoint compact/pipeline gates pass 90 clean exact/bounded checks but lose to selected E382. The original rocprof graph stall and independent clean bookends are preserved; no native overlap qualification is claimed. Rejected. |
+| E393 | Transfer sign planes and grouped codebook reads to TP8 ordered K256 down. All 315 checks and stable rows pass; retain plane4 for 1.0–1.7% complete-MoE gains. MFMA/read counts are unchanged; wait counters are mixed. Hot remains 0.9% behind fresh MXFP4. |
+| E394 | Apply sign planes to TP4 down while preserving four ordered K128 updates. 315 r1 checks pass; hot drift is 3.19%. Narrowed unchanged-binary r2 adds 72 checks and stable bookends. Retain plane4: hot improves 1.5% versus control, but remains 25.8% behind fresh MXFP4. |
+| E395 | Qualify E393/E394 plane4 on three actual layer/rank slices each, five patterns and eight input changes. All 2,160 exact input/intermediate/final graph/eager checks and native dispatch pass. Preserve and repair timestamp attribution using unique explicit correlation IDs; no GPU arithmetic or tolerance change. |
+| E396 | Remove the dense gate/up shared-memory epilogue transfer using rounded registers and byte/vector4 stores. All 420 exact checks and stable rows pass after a route-versus-token comparison repair. Both candidates regress despite unchanged 256-register allocation and zero scratch/spills; rejected. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit

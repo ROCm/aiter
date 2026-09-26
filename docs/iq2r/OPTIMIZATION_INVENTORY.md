@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E391. Related scouts,
+attempts from the initial GLM integration through E396. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E391
+## Isolated single-GPU optimization, E199–E396
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -205,6 +205,15 @@ single-GPU report. Serving sweeps remain paused.
 | E389 | Pair exact K64 records into three K128 loads. All 420 checks and stable bookends pass; VMEM instruction savings recover 1.3–2.9% versus E388, but remain slower than the selected kernel. Unselected. |
 | E390 | Double gate M reuse to 128 rows and retain N64 per wave. All 336 checks pass, with zero scratch and stable bookends. Register allocation rises to 446, occupancy roughly halves, padding grows on spread routes, and whole-MoE regresses 12.2–59.3%. Rejected; build failures preserved. |
 | E391 | Qualify frozen E386 at TP4 M4096 on three real layer/rank slices, five route patterns and eight input changes. All 1,080 exact checks pass, including input/intermediate/final results, native dispatch and zero scratch. Operator qualification only; no timing or whole-model-quality claim. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E392 | Concurrent disjoint compact/pipeline gates pass 90 clean exact/bounded checks but lose to selected E382. The original rocprof graph stall and independent clean bookends are preserved; no native overlap qualification is claimed. Rejected. |
+| E393 | Transfer sign planes and grouped codebook reads to TP8 ordered K256 down. All 315 checks and stable rows pass; retain plane4 for 1.0–1.7% complete-MoE gains. MFMA/read counts are unchanged; wait counters are mixed. Hot remains 0.9% behind fresh MXFP4. |
+| E394 | Apply sign planes to TP4 down while preserving four ordered K128 updates. 315 r1 checks pass; hot drift is 3.19%. Narrowed unchanged-binary r2 adds 72 checks and stable bookends. Retain plane4: hot improves 1.5% versus control, but remains 25.8% behind fresh MXFP4. |
+| E395 | Qualify E393/E394 plane4 on three actual layer/rank slices each, five patterns and eight input changes. All 2,160 exact input/intermediate/final graph/eager checks and native dispatch pass. Preserve and repair timestamp attribution using unique explicit correlation IDs; no GPU arithmetic or tolerance change. |
+| E396 | Remove the dense gate/up shared-memory epilogue transfer using rounded registers and byte/vector4 stores. All 420 exact checks and stable rows pass after a route-versus-token comparison repair. Both candidates regress despite unchanged 256-register allocation and zero scratch/spills; rejected. |
 
 
 ## How to read the outcomes

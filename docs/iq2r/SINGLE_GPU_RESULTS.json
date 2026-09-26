@@ -480,32 +480,32 @@
       "module_sha256": "4e4d163071f145c25a47f5ba507937b27f684e4208d259b09dedde77683e7d0e"
     },
     {
-      "experiment": "e383",
-      "run": "tp8-r2",
-      "arm": "iq2r_nobarrier",
+      "experiment": "e393",
+      "run": "tp8-r1",
+      "arm": "iq2r_plane4",
       "tp": 8,
       "tokens": 256,
       "routes": "spread",
-      "mxfp4_us": 135.27498245239258,
-      "iq2r_us": 106.07311725616455,
+      "mxfp4_us": 135.83332300186157,
+      "iq2r_us": 104.71757650375366,
       "original_iq2r_us": null,
-      "latency_overhead_percent": -21.587040461457875,
-      "max_bookend_drift_percent": 2.267326196345315,
-      "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+      "latency_overhead_percent": -22.90729977774414,
+      "max_bookend_drift_percent": 1.714621806405867,
+      "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
     },
     {
-      "experiment": "e383",
-      "run": "tp8-r2",
-      "arm": "iq2r_nobarrier",
+      "experiment": "e393",
+      "run": "tp8-r1",
+      "arm": "iq2r_plane4",
       "tp": 8,
       "tokens": 256,
       "routes": "hot",
-      "mxfp4_us": 63.118141889572144,
-      "iq2r_us": 64.06640112400055,
+      "mxfp4_us": 62.803250551223755,
+      "iq2r_us": 63.359132409095764,
       "original_iq2r_us": null,
-      "latency_overhead_percent": 1.502356067590549,
-      "max_bookend_drift_percent": 2.699962046073434,
-      "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+      "latency_overhead_percent": 0.8851163801125495,
+      "max_bookend_drift_percent": 0.42135019844160554,
+      "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
     },
     {
       "experiment": "e356",
@@ -564,32 +564,32 @@
       "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
     },
     {
-      "experiment": "e382",
-      "run": "tp4-r1",
-      "arm": "iq2r_cross",
+      "experiment": "e394",
+      "run": "tp4-r2",
+      "arm": "iq2r_plane4",
       "tp": 4,
       "tokens": 256,
       "routes": "spread",
-      "mxfp4_us": 232.9748511314392,
-      "iq2r_us": 183.05018544197083,
+      "mxfp4_us": 232.1992039680481,
+      "iq2r_us": 181.33004307746887,
       "original_iq2r_us": null,
-      "latency_overhead_percent": -21.42920810851897,
-      "max_bookend_drift_percent": 0.5596482526764734,
-      "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+      "latency_overhead_percent": -21.907551800900706,
+      "max_bookend_drift_percent": 2.864267129116784,
+      "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
     },
     {
-      "experiment": "e382",
-      "run": "tp4-r1",
-      "arm": "iq2r_cross",
+      "experiment": "e394",
+      "run": "tp4-r2",
+      "arm": "iq2r_plane4",
       "tp": 4,
       "tokens": 256,
       "routes": "hot",
-      "mxfp4_us": 72.5436121225357,
-      "iq2r_us": 89.54626321792603,
+      "mxfp4_us": 70.3650563955307,
+      "iq2r_us": 88.52257132530212,
       "original_iq2r_us": null,
-      "latency_overhead_percent": 23.437833598181747,
-      "max_bookend_drift_percent": 2.9147521494844364,
-      "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+      "latency_overhead_percent": 25.804733002281388,
+      "max_bookend_drift_percent": 0.7342075117708022,
+      "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
     },
     {
       "experiment": "e363",
@@ -648,7 +648,7 @@
       "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
     }
   ],
-  "followup_scope": "Complete isolated and serving parity remain unmet. The selected comparison is unchanged: six of eight TP8 rows and five of six compact TP4 rows beat matched MXFP4. Dense TP4 M4096 remains 22.5%/22.1% slower. E388\u2013E390 do not improve the selected policy. Isolated MoE only; all historical serving/POC records retained.",
+  "followup_scope": "Complete isolated and serving parity remain unmet. Six of eight TP8 rows and five of six compact TP4 rows beat matched MXFP4. New ordered-down sign planes improve the selected M256 kernels. TP8 M256 hot remains 0.9% behind; TP4 M256 hot is 25.8% behind its fresh baseline. Dense TP4 M4096 remains about 22% behind. Isolated MoE only; all historical serving/POC records retained.",
   "historical_followup_rows_r7": [
     {
       "experiment": "e292",
@@ -2932,6 +2932,409 @@
           "cases_per_phase": 5,
           "graph_eager_checks": 360,
           "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    }
+  ],
+  "historical_followup_rows_r19": [
+    {
+      "experiment": "e347",
+      "run": "tp8-r2",
+      "arm": "iq2r_combined2",
+      "tp": 8,
+      "tokens": 32,
+      "routes": "spread",
+      "mxfp4_us": 78.77956628799438,
+      "iq2r_us": 66.56883656978607,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -15.499869183805304,
+      "max_bookend_drift_percent": 0.10888760003393504,
+      "module_sha256": "5d5aa8fee4df6f5344e1249fa19b97fa8d93c0c32f5fa5dd5d5f8a413781fc7f"
+    },
+    {
+      "experiment": "e347",
+      "run": "tp8-r2",
+      "arm": "iq2r_combined2",
+      "tp": 8,
+      "tokens": 32,
+      "routes": "hot",
+      "mxfp4_us": 28.557877242565155,
+      "iq2r_us": 28.085121512413025,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -1.6554302203088622,
+      "max_bookend_drift_percent": 0.4998417155725631,
+      "module_sha256": "5d5aa8fee4df6f5344e1249fa19b97fa8d93c0c32f5fa5dd5d5f8a413781fc7f"
+    },
+    {
+      "experiment": "e342",
+      "run": "tp8-r1",
+      "arm": "iq2r_parallel_tasks",
+      "tp": 8,
+      "tokens": 64,
+      "routes": "spread",
+      "mxfp4_us": 103.36410999298096,
+      "iq2r_us": 86.55871748924255,
+      "original_iq2r_us": 133.14173221588135,
+      "latency_overhead_percent": -16.258440676245932,
+      "max_bookend_drift_percent": 0.6036574629515767,
+      "module_sha256": "972655a3660dec8b303732d9cb01028ede9acbcc6f1a9c50a3d297f748505ea5"
+    },
+    {
+      "experiment": "e342",
+      "run": "tp8-r1",
+      "arm": "iq2r_parallel_tasks",
+      "tp": 8,
+      "tokens": 64,
+      "routes": "hot",
+      "mxfp4_us": 40.97159057855606,
+      "iq2r_us": 34.37553346157074,
+      "original_iq2r_us": 43.995240330696106,
+      "latency_overhead_percent": -16.09909945853457,
+      "max_bookend_drift_percent": 1.7121813336541607,
+      "module_sha256": "972655a3660dec8b303732d9cb01028ede9acbcc6f1a9c50a3d297f748505ea5"
+    },
+    {
+      "experiment": "e354",
+      "run": "tp8-r1",
+      "arm": "iq2r_v8b3",
+      "tp": 8,
+      "tokens": 128,
+      "routes": "spread",
+      "mxfp4_us": 121.73398733139038,
+      "iq2r_us": 103.32596898078918,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -15.12151105384395,
+      "max_bookend_drift_percent": 0.8009484789736436,
+      "module_sha256": "4e4d163071f145c25a47f5ba507937b27f684e4208d259b09dedde77683e7d0e"
+    },
+    {
+      "experiment": "e354",
+      "run": "tp8-r1",
+      "arm": "iq2r_v8b3",
+      "tp": 8,
+      "tokens": 128,
+      "routes": "hot",
+      "mxfp4_us": 44.1628560423851,
+      "iq2r_us": 44.31898295879364,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 0.3535254066419524,
+      "max_bookend_drift_percent": 1.2363317427754876,
+      "module_sha256": "4e4d163071f145c25a47f5ba507937b27f684e4208d259b09dedde77683e7d0e"
+    },
+    {
+      "experiment": "e383",
+      "run": "tp8-r2",
+      "arm": "iq2r_nobarrier",
+      "tp": 8,
+      "tokens": 256,
+      "routes": "spread",
+      "mxfp4_us": 135.27498245239258,
+      "iq2r_us": 106.07311725616455,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -21.587040461457875,
+      "max_bookend_drift_percent": 2.267326196345315,
+      "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+    },
+    {
+      "experiment": "e383",
+      "run": "tp8-r2",
+      "arm": "iq2r_nobarrier",
+      "tp": 8,
+      "tokens": 256,
+      "routes": "hot",
+      "mxfp4_us": 63.118141889572144,
+      "iq2r_us": 64.06640112400055,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 1.502356067590549,
+      "max_bookend_drift_percent": 2.699962046073434,
+      "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 64,
+      "routes": "spread",
+      "mxfp4_us": 191.77803993225098,
+      "iq2r_us": 159.06231999397278,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -17.05915857198019,
+      "max_bookend_drift_percent": 0.40080672627614555,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 64,
+      "routes": "hot",
+      "mxfp4_us": 42.530037462711334,
+      "iq2r_us": 42.01715588569641,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -1.205927875009749,
+      "max_bookend_drift_percent": 0.5193984261436121,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 128,
+      "routes": "spread",
+      "mxfp4_us": 212.2068166732788,
+      "iq2r_us": 169.63640451431274,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -20.060812761028778,
+      "max_bookend_drift_percent": 0.3670090069218937,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e356",
+      "run": "tp4-r1",
+      "arm": "iq2r_read4",
+      "tp": 4,
+      "tokens": 128,
+      "routes": "hot",
+      "mxfp4_us": 60.88428497314453,
+      "iq2r_us": 59.32152271270752,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -2.5667744330516995,
+      "max_bookend_drift_percent": 0.472079303636379,
+      "module_sha256": "826cf9fb7ea0a0481ba655f5300e4ed2bf6fbdb2e7261c88682e3c4d261eae4f"
+    },
+    {
+      "experiment": "e382",
+      "run": "tp4-r1",
+      "arm": "iq2r_cross",
+      "tp": 4,
+      "tokens": 256,
+      "routes": "spread",
+      "mxfp4_us": 232.9748511314392,
+      "iq2r_us": 183.05018544197083,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": -21.42920810851897,
+      "max_bookend_drift_percent": 0.5596482526764734,
+      "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+    },
+    {
+      "experiment": "e382",
+      "run": "tp4-r1",
+      "arm": "iq2r_cross",
+      "tp": 4,
+      "tokens": 256,
+      "routes": "hot",
+      "mxfp4_us": 72.5436121225357,
+      "iq2r_us": 89.54626321792603,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 23.437833598181747,
+      "max_bookend_drift_percent": 2.9147521494844364,
+      "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+    },
+    {
+      "experiment": "e363",
+      "run": "tp4-r2",
+      "arm": "iq2r_extpackedcombined",
+      "tp": 4,
+      "tokens": 1024,
+      "routes": "spread",
+      "mxfp4_us": 290.4756546020508,
+      "iq2r_us": 300.01959800720215,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 3.2856259221539563,
+      "max_bookend_drift_percent": 0.9859783351686126,
+      "module_sha256": "4c9cb5535b6dfb66b5a092d376ad2a1ef22cb33d2aeed677b068d6d9342b99d7"
+    },
+    {
+      "experiment": "e363",
+      "run": "tp4-r2",
+      "arm": "iq2r_extpackedcombined",
+      "tp": 4,
+      "tokens": 1024,
+      "routes": "hot",
+      "mxfp4_us": 187.38163709640503,
+      "iq2r_us": 196.84134125709534,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 5.0483624261556725,
+      "max_bookend_drift_percent": 1.0478721823945996,
+      "module_sha256": "4c9cb5535b6dfb66b5a092d376ad2a1ef22cb33d2aeed677b068d6d9342b99d7"
+    },
+    {
+      "experiment": "e386",
+      "run": "tp4-r1",
+      "arm": "iq2r_extpackedindex",
+      "tp": 4,
+      "tokens": 4096,
+      "routes": "spread",
+      "mxfp4_us": 603.1976699829102,
+      "iq2r_us": 738.7606859207153,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 22.474061602666005,
+      "max_bookend_drift_percent": 0.5820724346267327,
+      "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+    },
+    {
+      "experiment": "e386",
+      "run": "tp4-r1",
+      "arm": "iq2r_extpackedindex",
+      "tp": 4,
+      "tokens": 4096,
+      "routes": "hot",
+      "mxfp4_us": 501.68845653533936,
+      "iq2r_us": 612.4101400375366,
+      "original_iq2r_us": null,
+      "latency_overhead_percent": 22.069808874384165,
+      "max_bookend_drift_percent": 1.3340437106350203,
+      "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+    }
+  ],
+  "qualification_r20": [
+    {
+      "status": "pass",
+      "graph_eager_checks": 4320,
+      "rows": [
+        {
+          "case": "tp4_compact-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+        },
+        {
+          "case": "tp4_compact-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+        },
+        {
+          "case": "tp4_compact-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "be66cfad165d72dcb56c8a85dee8fd5288b8e87c2f938725070ae2fc7b654d08"
+        },
+        {
+          "case": "tp4_dense-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "65369d9ac98d0f5e19f02a6079a30badbc1bc81e82334316602149e1eb57be4c"
+        },
+        {
+          "case": "tp4_dense-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "65369d9ac98d0f5e19f02a6079a30badbc1bc81e82334316602149e1eb57be4c"
+        },
+        {
+          "case": "tp4_dense-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 10,
+          "graph_eager_checks": 720,
+          "module_sha256": "65369d9ac98d0f5e19f02a6079a30badbc1bc81e82334316602149e1eb57be4c"
+        },
+        {
+          "case": "tp8_compact-layer3-rank0",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+        },
+        {
+          "case": "tp8_compact-layer40-rank3",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+        },
+        {
+          "case": "tp8_compact-layer77-rank7",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "81cc7ccfa38f01380b106f24533421137dce8c30917023acc6b455f48f90ba2a"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 1080,
+      "rows": [
+        {
+          "case": "tp4_dense-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        },
+        {
+          "case": "tp4_dense-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        },
+        {
+          "case": "tp4_dense-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "0ca5024619e0b5599400d914dc393ceb3692ad40368281a4aaf622125ab5e2a4"
+        }
+      ],
+      "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
+    },
+    {
+      "status": "pass",
+      "graph_eager_checks": 2160,
+      "rows": [
+        {
+          "case": "tp4_compact-layer3-rank0",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
+        },
+        {
+          "case": "tp4_compact-layer40-rank3",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
+        },
+        {
+          "case": "tp4_compact-layer77-rank7",
+          "tp": 4,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "92f57596987d02e11be141ef9ab4c44f2e22f9f7b5281ebc2fccce549955be17"
+        },
+        {
+          "case": "tp8_compact-layer3-rank0",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
+        },
+        {
+          "case": "tp8_compact-layer40-rank3",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
+        },
+        {
+          "case": "tp8_compact-layer77-rank7",
+          "tp": 8,
+          "cases_per_phase": 5,
+          "graph_eager_checks": 360,
+          "module_sha256": "7037760038e89eae2b81277740e2a0bd5a5015390be804d358d3953206492f93"
         }
       ],
       "scope": "Real-weight operator correctness only. capture_tiled repeats saved small captures; other patterns use generated inputs with real weights. No MXFP4/performance or whole-model-quality claim."
