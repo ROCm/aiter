@@ -15,12 +15,12 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
-    gated_delta_rule_autotune_configs,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
 @triton.heuristics(
@@ -30,12 +30,15 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
+        [
+            triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+            for BK in [32, 64, 128]
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ],
+    ),
     key=["H", "K", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -159,7 +162,8 @@ def chunk_scaled_dot_kkt_fwd(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in [2, 4, 8]

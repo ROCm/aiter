@@ -74,6 +74,21 @@ set_start_method("spawn", force=True)
 FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 
 
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
+
+
 def test_group_size_validation_python_check():
     """Non-distributed unit test for the Python-side ``_validate_per_group_size``.
 
@@ -300,6 +315,7 @@ def fused_ar_rmsnorm_per_group_quant(
     scale_stride = scale_out.stride()
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()

@@ -15,9 +15,11 @@ from einops import rearrange
 from einops import repeat as eirp
 
 import aiter
+from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
+from aiter.benchmark_reporting import print_json_table
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -67,6 +69,15 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_abpreshuffle(
+    x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
+):
+    return aiter.gemm_a8w8_blockscale_abpreshuffle(
+        x_shuffled, weightshuffle, x_scale, w_scale, dtype
+    )
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=None):
     # Direct call into the triton preshuffle kernel, mirroring the dispatch in
     # gemm_a8w8_blockscale_bpreshuffle: reshape the (n, k) preshuffled weight to
@@ -87,25 +98,54 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
+def test_gemm(
+    dtype,
+    m,
+    n,
+    k,
+    ck_preshuffle=True,
+    use_flydsl=False,
+    data_init="uniform",
+    scale_init="auto",
+    seed=0,
+    apre=False,
+):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    generator = bench_init.make_generator(seed)
+    if data_init == "constant":
+        x = torch.full((m, k), 0.5, dtype=dtypes.fp32, device="cuda").to(dtypes.fp8)
+        weight = torch.full((n, k), 0.5, dtype=dtypes.fp32, device="cuda").to(
+            dtypes.fp8
+        )
+    else:
+        x = bench_init.fill_fp8((m, k), data_init, generator, dtype=dtypes.fp8)
+        weight = bench_init.fill_fp8((n, k), data_init, generator, dtype=dtypes.fp8)
+
+    if scale_init == "constant":
+        x_scale_raw = torch.full(
+            (scale_m, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
+        )
+        w_scale_raw = torch.full(
+            (scale_n, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
+        )
+    else:
+        x_scale_raw = bench_init.fill_scale_e8m0(
+            (scale_m, scale_k), scale_init, generator
+        )
+        w_scale_raw = bench_init.fill_scale_e8m0(
+            (scale_n, scale_k), scale_init, generator
+        )
     use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
     if use_flydsl_fp8_scale:
-        FP8_E4M3_MAX = 448.0
-        x_scale = fp4_utils.f32_to_mx_e8m0_scale(
-            x_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
-        )
-        w_scale = fp4_utils.f32_to_mx_e8m0_scale(
-            w_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
-        )
+        x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
+        w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
+    else:
+        x_scale = fp4_utils.e8m0_to_f32(x_scale_raw)
+        w_scale = fp4_utils.e8m0_to_f32(w_scale_raw)
 
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -131,6 +171,23 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
+
+    if apre and use_flydsl_fp8_scale:
+        # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
+        # A -- padded to M+1 rows; x_scale and the result keep the true M.
+        if m % 2:
+            x_apre = torch.zeros((m + 1, k), dtype=x.dtype, device=x.device)
+            x_apre[:m] = x
+        else:
+            x_apre = x
+        e, avg_e = run_gemm_abpreshuffle(
+            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
+        )
+        ret["apre us"] = avg_e
+        ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
+        ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
+        ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
+        ret["apre/ck"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -305,10 +362,34 @@ parser.add_argument(
     e.g.: -nk 24576,1536""",
 )
 parser.add_argument(
+    "--data-init",
+    dest="data_init",
+    nargs="+",
+    choices=bench_init.DATA_DISTS,
+    default=None,
+    help="DATA initialization distribution(s), paired position-wise with "
+    "--scale-init (length-1 broadcasts). Default: constant uniform",
+)
+parser.add_argument(
+    "--scale-init",
+    dest="scale_init",
+    nargs="+",
+    choices=bench_init.E8M0_SCALE_DISTS,
+    default=None,
+    help="E8M0 SCALE initialization distribution(s), paired position-wise "
+    "with --data-init (length-1 broadcasts). Default: constant auto",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=0,
+    help="RNG seed for input, weight, and scales (default: 0)",
+)
+parser.add_argument(
     "--ck_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[True, False],
+    default=None,
     help="""weight ck_preshuffle or not.
     e.g.: --ck_preshuffle True
         or --ck_preshuffle False
@@ -320,11 +401,28 @@ parser.add_argument(
     help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
 )
 parser.add_argument(
+    "--apre",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False],
+    help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
+    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
+    Sweeps like --ck_preshuffle.
+    e.g.: --apre True
+        or --apre True False""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
     help="""CSV file containing M, N, K columns (one shape per row).
     e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "--table",
+    action="store_true",
+    help="""Also print the summary as a human-readable table.
+    The default output is the single-line JSON record.""",
 )
 parser.add_argument(
     "-o",
@@ -344,9 +442,25 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+data_init_list = args.data_init or ["constant", "uniform"]
+scale_init_list = args.scale_init or ["constant", "auto"]
+if len(data_init_list) == 1:
+    data_init_list *= len(scale_init_list)
+if len(scale_init_list) == 1:
+    scale_init_list *= len(data_init_list)
+if len(data_init_list) != len(scale_init_list):
+    parser.error(
+        "--data-init and --scale-init must have equal length "
+        "(or length 1 to broadcast)"
+    )
+init_pairs = list(zip(data_init_list, scale_init_list))
+
+if args.ck_preshuffle is None:
+    args.ck_preshuffle = [True] if args.flydsl else [True, False]
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
+l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
 
 df = []
 if args.csv is not None:
@@ -356,42 +470,51 @@ if args.csv is not None:
     print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
     for dtype in args.dtype:
         for preshuffle in l_preshuffle:
-            for _, row in shapes_df.iterrows():
-                ret = test_gemm(
-                    dtype,
-                    int(row["M"]),
-                    int(row["N"]),
-                    int(row["K"]),
-                    ck_preshuffle=preshuffle,
-                    use_flydsl=args.flydsl,
-                )
-                df.append(ret)
+            for data_init, scale_init in init_pairs:
+                for apre in l_apre:
+                    for _, row in shapes_df.iterrows():
+                        ret = test_gemm(
+                            dtype,
+                            int(row["M"]),
+                            int(row["N"]),
+                            int(row["K"]),
+                            ck_preshuffle=preshuffle,
+                            use_flydsl=args.flydsl,
+                            data_init=data_init,
+                            scale_init=scale_init,
+                            seed=args.seed,
+                            apre=apre,
+                        )
+                        df.append(ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
-                    ret = test_gemm(
-                        dtype, m, n, k, ck_preshuffle=ck_p, use_flydsl=args.flydsl
-                    )
-                    df.append(ret)
+                    for apre in l_apre:
+                        for data_init, scale_init in init_pairs:
+                            ret = test_gemm(
+                                dtype,
+                                m,
+                                n,
+                                k,
+                                ck_preshuffle=ck_p,
+                                use_flydsl=args.flydsl,
+                                data_init=data_init,
+                                scale_init=scale_init,
+                                seed=args.seed,
+                                apre=apre,
+                            )
+                            df.append(ret)
 
-df = pd.DataFrame(df)
-
-# Configure pandas to show all columns without truncation
-pd.set_option("display.max_columns", None)
-pd.set_option("display.width", None)
-pd.set_option("display.max_colwidth", None)
-pd.set_option("display.expand_frame_repr", False)
-
-print("\n" + "=" * 150)
-print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
-print("=" * 150)
-print(df.to_string(index=False))
-print("=" * 150)
-
-df_md = df.to_markdown(index=False)
-aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
+df = pd.DataFrame([row for row in df if row is not None])
+print_json_table("gemm_a8w8_blockscale summary", df)
+if args.table and not df.empty:
+    print("\n" + "=" * 150)
+    print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+    print("=" * 150)
+    print(df.to_string(index=False))
+    print("=" * 150)
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")
