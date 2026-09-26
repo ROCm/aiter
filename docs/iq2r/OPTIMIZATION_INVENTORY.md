@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E387. Related scouts,
+attempts from the initial GLM integration through E391. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E387
+## Isolated single-GPU optimization, E199–E391
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -197,6 +197,14 @@ single-GPU report. Serving sweeps remain paused.
 | E385 | Three-slot activation ring with actual selective VM retirement passes 420 checks and stable bookends, but both variants lose. LDS waits fall while VALU instructions rise about 12%. Compiler-drain r2/r3 and scratch-descriptor r4 attempts are preserved without GPU timing. Rejected. |
 | E386 | Direct codebook byte addressing removes one VALU instruction per atom. All 420 checks and timing rows pass. Retain at TP4 M4096 only for 0.3–0.6% gains; M1024 is mixed and paired 64-bit sign shifts are unselected. Dense gaps remain about 22%. |
 | E387 | Transfer direct byte addresses to selected compact TP8 M256. All 252 checks pass; VALU counts fall about 2.8%, but qualified spread regresses. Hot drift 3.2529% remains provisional at the unchanged 3% ceiling. Unselected. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E388 | Modern sign-plane/byte-address MFMA32 gate passes 336 exact checks and stable bookends, but loses 5.4–10.5%. Wider matrix instructions reduce counts without reducing arithmetic; waits rise. Failed padded fixture retained. |
+| E389 | Pair exact K64 records into three K128 loads. All 420 checks and stable bookends pass; VMEM instruction savings recover 1.3–2.9% versus E388, but remain slower than the selected kernel. Unselected. |
+| E390 | Double gate M reuse to 128 rows and retain N64 per wave. All 336 checks pass, with zero scratch and stable bookends. Register allocation rises to 446, occupancy roughly halves, padding grows on spread routes, and whole-MoE regresses 12.2–59.3%. Rejected; build failures preserved. |
+| E391 | Qualify frozen E386 at TP4 M4096 on three real layer/rank slices, five route patterns and eight input changes. All 1,080 exact checks pass, including input/intermediate/final results, native dispatch and zero scratch. Operator qualification only; no timing or whole-model-quality claim. |
 
 
 ## How to read the outcomes
