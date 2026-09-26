@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from triton.language.target_info import is_hip_cdna4
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -142,11 +143,25 @@ def _mxfp4_scale_from_amax(amax):
 
 
 @triton.jit
+def _mxfp4_ceil_scale_from_amax(amax):
+    """E8M0 2^ceil(log2(amax / 6)) and its reciprocal, so no value saturates.
+    Exact, from the exponent bits."""
+    # An all-zero block still gets a normal scale, 2^-126.
+    ratio = tl.maximum(amax, 6.0 * (2**-126)) * (1.0 / 6.0)
+    # Adding 0x7FFFFF carries into the exponent unless the mantissa is zero.
+    bs_e8m0 = (ratio.to(tl.uint32, bitcast=True) + 0x7FFFFF) >> 23
+    quant_scale = ((254 - bs_e8m0) << 23).to(tl.float32, bitcast=True)
+    return bs_e8m0.to(tl.uint8), quant_scale
+
+
+@triton.jit
 def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N,
     BLOCK_SIZE_M,
     MXFP4_QUANT_BLOCK_SIZE,
+    SCALING_MODE: tl.constexpr = 0,
+    USE_ASM: tl.constexpr = False,
 ):
     """
     Converts given x (in its native load dtype, e.g. bf16) to mxfp4 format.
@@ -157,7 +172,11 @@ def _mxfp4_quant_op(
     x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-    bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
+    if SCALING_MODE == 0:
+        bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
+    else:
+        tl.static_assert(SCALING_MODE == 1)
+        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax)
 
     # Compute quantized x
     qx = x * quant_scale
@@ -166,6 +185,7 @@ def _mxfp4_quant_op(
         BLOCK_SIZE_N,
         BLOCK_SIZE_M,
         MXFP4_QUANT_BLOCK_SIZE,
+        USE_ASM,
     )
 
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
@@ -173,6 +193,43 @@ def _mxfp4_quant_op(
 
 @triton.jit
 def _mxfp4_pack_op(
+    qx,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    USE_ASM: tl.constexpr = False,
+):
+    """Round normalized FP32 values to E2M1 and pack adjacent columns.
+    USE_ASM opts in to the gfx950 instruction where there is one; the default
+    is the bit arithmetic."""
+    if USE_ASM and is_hip_cdna4():
+        x_fp4 = _mxfp4_pack_cvt(qx, BLOCK_SIZE_N, BLOCK_SIZE_M)
+    else:
+        x_fp4 = _mxfp4_pack_bits(qx, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE)
+    return x_fp4
+
+
+@triton.jit
+def _mxfp4_pack_cvt(
+    qx,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """_mxfp4_pack_bits in one gfx950 instruction per pair: the same byte for
+    every non-NaN input."""
+    lo, hi = tl.split(qx.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
+    return tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[lo, hi, 1.0],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
+
+
+@triton.jit
+def _mxfp4_pack_bits(
     qx,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
