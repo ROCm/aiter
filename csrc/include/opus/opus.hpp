@@ -1846,7 +1846,13 @@ struct gmem {
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D auto _load(int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
-        if      constexpr (sizeof(type) == 1)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b8  (cached_rsrc, v_os, s_os, aux)); }
+        constexpr index_t logical_bytes =
+            vec * vector_size * sizeof(scalar_type);
+        // Clang rounds a three-dword ext_vector_type up to 16 bytes for its C++
+        // object representation. Select B96 from the logical element count so
+        // compact 12-byte records remain one VMEM request instead of B128.
+        if      constexpr (logical_bytes == 12) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b96(cached_rsrc, v_os, s_os, aux)); }
+        else if constexpr (sizeof(type) == 1)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b8  (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 2)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b16 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b32 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b64 (cached_rsrc, v_os, s_os, aux)); }
