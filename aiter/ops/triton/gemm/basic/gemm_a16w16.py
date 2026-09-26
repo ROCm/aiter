@@ -385,6 +385,7 @@ def gemm_a16w16_(
         BLOCK_K = config["BLOCK_K"]
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
+        waves_per_eu = config.get("waves_per_eu", 0)
 
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
@@ -473,6 +474,7 @@ def gemm_a16w16_(
             USE_ACTIVATION=activation is not None,
             ADD_BIAS=(bias is not None),
             num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
         )
 
         return y
