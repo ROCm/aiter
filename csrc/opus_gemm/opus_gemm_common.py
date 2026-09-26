@@ -447,12 +447,15 @@ a8w8_scale_kernels_list = {
 
 
 def _a8w8_mxscale_bmm_flatmm_splitk(
-    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False
+    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
+    quant_block=128,
 ):
+    # quant_block is GROUP_N and GROUP_K together: A and B quantise on the same
+    # block, either DSv4's 128 or MX's 32. GROUP_M stays 1 (per token) for both.
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
         256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
-        1, 128, 128, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
+        1, quant_block, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
         wg_per_cu, splitk_workspace_dtype="fp32_t",
     )
     inst.name_root = "opus_bmm"
@@ -503,6 +506,47 @@ _bmm_flatmm_local.update({
     kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
+
+# Every flatmm_splitk tile again at GROUP_N == GROUP_K == 32, the MX block.
+#
+# Derived from the 128 tables rather than restated, so a tile added above cannot
+# silently lack its MX twin and the two can never drift apart in geometry: a
+# pair differs in nothing but the quantisation granularity, which is what makes
+# them comparable. The kernel name carries the GROUP triple, so a twin reads
+# ..._1x32x32_... and neither it nor its tuned rows can be mistaken for the
+# 128 kid it mirrors.
+#
+# The kid is the mirror's plus MX32_KID_STRIDE, keeping the low digits the way
+# the 8000 globalisation does: local 321 and 1321 become global 8321 and 9321,
+# so a pair is recognisable on sight in a log or a tuned CSV.
+MX32_KID_STRIDE = 1000
+# Three tiles get no twin: clang 22 fails them with "operand has incorrect
+# register class", the same ROCm 7.2.4 defect the kid326 workspace note below
+# already works around. All three are WG_PER_CU=1 kernels on the largest tiles,
+# where the register budget is tightest, and GROUP_K=32 adds just enough --
+# a wider v_sfb and the lane's block index -- to cross the line. Their 128
+# twins compile; nothing here is wrong with the tile itself.
+_MX32_CLANG_REGCLASS_SKIP = frozenset({128, 139, 256})
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, direct, prefetch, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+    if kid not in _MX32_CLANG_REGCLASS_SKIP
+})
+# The PRELOAD_SF_LDS tiles get MX twins too, and they take the scale ring rather
+# than the whole-split panel -- the traits pick that from GROUP_K (SF_USE_RING),
+# so nothing here says which. The panel could not serve them: its rows cost
+# SFA_K_MAX/GROUP_K bytes each, 64 at 128 and 256 at 32, and the large tiles
+# asked for 168,960 to 185,344 bytes of a CU's 163,840. The ring is at most
+# 11,264 and is a function of prefetch_k_iter rather than of K.
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, preload_sf=True, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
+
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
 # exact high-pressure PRELOAD_SF_LDS + D_OUT=void specialization after the
@@ -566,6 +610,28 @@ _bmm_pipeline_local = {
     152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
     158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
 }
+# MX twin for the pipeline family. This family is where the large-M wins live --
+# at g8/m32768 8158 measures 2122 TFLOPS and 8150 1493, against 1158 for the best
+# flatmm kid -- so with no twin here every large-M 32 shape fell back to the
+# flatmm 9325 and lost about half. The block size itself is not what costs that:
+# the same kernel at 32 gives up only ~13% (8325 1158 -> 9325 1004).
+#
+# 150 (no preload) comes first on purpose. The PRELOAD_SF_LDS variant's B-scale
+# panel is sized one byte per thread, and GROUP_N=32 multiplies that by 16, so
+# 158's twin needs the panel rebalanced as a separate step; 150 needs only the
+# lane-addressed scale the traits already describe.
+#
+# 150's twin is kept even though it loses to the flatmm 9325: at GROUP_N=32 the
+# half-tile spans four B scale groups, and those are rows of the scale matrix
+# rather than neighbouring bytes, so its steady-state B fetch is four loads where
+# the 128 kid needs one. Staging that panel in LDS is exactly what 158 does, so
+# the twin that wins is 9158 and 9150 is the substrate it is built on.
+_bmm_pipeline_local.update({
+    150 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(GROUP_N=32, GROUP_K=32),
+    158 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
+        preload_sf_lds=True, GROUP_N=32, GROUP_K=32
+    ),
+})
 _bmm_mouter_local = {
     131: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
     144: _a8w8_mxscale_bmm_spec(

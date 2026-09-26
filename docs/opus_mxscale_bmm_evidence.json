@@ -1,0 +1,236 @@
+{
+  "date": "2026-09-24",
+  "architecture": "gfx950",
+  "base_vs_head_gs128_no_regression": "unverified",
+  "review_fix_build": {
+    "host_source_sha256": "404672b881c1627ca586579eec2044be029d5a7a7924ce9443534479fc564173",
+    "before_module_sha256": "5cdd602f2db3ced3423973d427362ff2acf00826572b0507ae2a73085d0e2455",
+    "candidate_module_sha256": "be797e20ca37661ab2242f2cabebf4f7011c74b3196737784572cef4792e4713",
+    "gpu_code_objects": 253,
+    "gpu_code_unchanged": true
+  },
+  "tests": {
+    "interface_and_config_collision": 55,
+    "gpu_regressions": 46,
+    "installed_smoke": 9,
+    "unknown_kid_before": "SIGABRT in contained fresh-thread child",
+    "unknown_kid_after": "catchable RuntimeError"
+  },
+  "large_grid": [
+    {
+      "kid": 8646,
+      "dtype": "bf16",
+      "seed": 77,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.0003133714199066162,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 8646,
+      "dtype": "bf16",
+      "seed": 991,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.0003175288438796997,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 9646,
+      "dtype": "bf16",
+      "seed": 77,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.0003134012222290039,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 9646,
+      "dtype": "bf16",
+      "seed": 991,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.00031745433807373047,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 8646,
+      "dtype": "fp32",
+      "seed": 77,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.0002923905849456787,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 8646,
+      "dtype": "fp32",
+      "seed": 991,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.0002977102994918823,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 9646,
+      "dtype": "fp32",
+      "seed": 77,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.00029249489307403564,
+      "finite": true,
+      "bitwise_repeatable": true
+    },
+    {
+      "kid": 9646,
+      "dtype": "fp32",
+      "seed": 991,
+      "b": 4,
+      "m": 16384,
+      "n": 1024,
+      "k": 4096,
+      "split_k": 1,
+      "repeats": 10,
+      "mismatch_fraction": 0.00029765069484710693,
+      "finite": true,
+      "bitwise_repeatable": true
+    }
+  ],
+  "scoped_gs128_traversal_experiment": {
+    "scope": "Pre/post batch-pair traversal only; baseline is not established as the exact PR base",
+    "group_size": 128,
+    "batch": 16,
+    "n": 1024,
+    "k": 4096,
+    "dtype": "bf16",
+    "source_log_sha256": "37dbd112ad7c59d00185dff87f68ab47dd90c5bdad148cd5f30ec75b54e2ff22",
+    "timer": "original default Eager/profiler, 5 warmup/101 iters; shared fixed addresses sized by automatic rotation formula",
+    "rounds": 6,
+    "before_module_sha256": "2e5a4b8c9b9805ac24bf653d5089ecbe7cdb1f4e1952bda8bec2aeb13b4754d6",
+    "candidate_module_sha256": "c6f40ae9b42183360c6bc28f9bd4363ce4609f533a53589bfa7a178f515922b1",
+    "samples": [
+      {
+        "m": 4096,
+        "rotations": 73,
+        "before_us": [
+          276.542202020202,
+          276.9751999999999,
+          275.32998000000003,
+          275.0419699999999,
+          280.80239,
+          278.31197999999995
+        ],
+        "after_us": [
+          279.27640999999994,
+          275.22778494623645,
+          278.9111666666668,
+          274.1183299999999,
+          278.7463699999999,
+          275.501762886598
+        ],
+        "before_median_us": 276.75870101010094,
+        "after_median_us": 277.12406644329894
+      },
+      {
+        "m": 8192,
+        "rotations": 40,
+        "before_us": [
+          536.7202258064516,
+          544.4287291666664,
+          535.260031578947,
+          538.3665463917525,
+          538.2738673469389,
+          539.9365937499999
+        ],
+        "after_us": [
+          539.8938617021281,
+          539.3290361445783,
+          540.362845360825,
+          538.4969895833335,
+          540.2299999999999,
+          534.600586956522
+        ],
+        "before_median_us": 538.3202068693457,
+        "after_median_us": 539.6114489233532
+      },
+      {
+        "m": 16384,
+        "rotations": 21,
+        "before_us": [
+          1208.948936170213,
+          1211.7253191489365,
+          1211.547527472527,
+          1208.7301789473688,
+          1210.9671489361706,
+          1211.6549247311818
+        ],
+        "after_us": [
+          1020.4084400000003,
+          1017.8667878787878,
+          1019.1696799999996,
+          1020.84815,
+          1013.8500200000003,
+          1011.8160700000004
+        ],
+        "before_median_us": 1211.2573382043488,
+        "after_median_us": 1018.5182339393937
+      },
+      {
+        "m": 32768,
+        "rotations": 11,
+        "before_us": [
+          2421.317571428569,
+          2410.5945517241394,
+          2412.8679411764706,
+          2414.3389764705876,
+          2407.9852168674706,
+          2418.621802325581
+        ],
+        "after_us": [
+          1993.2338775510211,
+          2004.3756122448967,
+          1997.8383737373729,
+          2013.5993473684232,
+          1999.3612857142862,
+          1997.0255505617972
+        ],
+        "before_median_us": 2413.603458823529,
+        "after_median_us": 1998.5998297258295
+      }
+    ]
+  }
+}

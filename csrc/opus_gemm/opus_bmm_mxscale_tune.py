@@ -86,6 +86,28 @@ from opus_gemm_common import (
     a8w8_mxscale_bmm_kernel_lists,
     bmm_mxscale_global_kid,
 )
+
+# The quantisation block is a property of the kid, not of the shape: a 32-block
+# kid needs 32-block scales and its tuned row is meaningless for a 128 one. So
+# it is read off the instance here rather than taken from the module constant.
+_KID_INSTANCE = {
+    kid: inst
+    for family in a8w8_mxscale_bmm_kernel_lists
+    for kid, inst in family.items()
+}
+
+
+def _kid_group(kid):
+    # _TUNE_POLICY is keyed on global ids, so take the id as given and only fall
+    # back to globalising a local one.
+    inst = _KID_INSTANCE.get(kid) or _KID_INSTANCE[bmm_mxscale_global_kid(kid)]
+    assert inst.GROUP_N == inst.GROUP_K, (
+        f"kid {kid} quantises N and K on different blocks "
+        f"({inst.GROUP_N}/{inst.GROUP_K}); the tuned schema carries one groupSize"
+    )
+    return inst.GROUP_K
+
+
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -178,6 +200,21 @@ _TUNE_POLICY = {
     8137: [1],
     8325: [1],
 }
+
+# Every mirror in the policy above sweeps its GROUP_K=32 twin on the same split-K
+# factors. Derived rather than listed: the twins are generated from the 128
+# tables, so a literal list would go stale exactly when a twin is added, and the
+# one thing worse than an untuned kid is a kid nobody noticed was untuned.
+#
+# groupSize is part of the tuned key, so a twin competes only against other 32
+# kids for its shape and gets its own winning row.
+_TUNE_POLICY.update(
+    {
+        twin: factors
+        for mirror, factors in list(_TUNE_POLICY.items())
+        if (twin := mirror + 1000) in _KID_INSTANCE
+    }
+)
 
 # Only non-direct flatmm split-K launchers are swept with splitK>1.
 # Any other family sweeping it is a policy bug, so fail loudly at import.
@@ -302,10 +339,11 @@ def gen_bmm_mxscale_data(
     6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
     """
     torch.manual_seed(seed)
+    group = _kid_group(kernel_id)
     O_bf16 = _gen_varied((batch, m, k), k, device)
     W_bf16 = _gen_varied((batch, n, k), k, device)
-    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
-    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group)
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
 
     workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
@@ -314,7 +352,11 @@ def gen_bmm_mxscale_data(
         if workspace_numel
         else None
     )
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
+    ref = (
+        run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group)
+        .transpose(0, 1)
+        .to(out_dtype)
+    )
     return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref)
 
 
@@ -356,7 +398,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
-    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k"]
+    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "groupSize"]
     RESULTS: ClassVar[list[str]] = [
         "libtype",
         "kernelId",
@@ -379,8 +421,9 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             self.RESULTS,
             description="Tune opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a)",
         )
-        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV).
-        self.sort_keys = ["gfx", "b", "n", "m", "k"]
+        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV),
+        # then groupSize, so a shape's 32 and 128 rows land next to each other.
+        self.sort_keys = ["gfx", "b", "n", "m", "k", "groupSize"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -391,7 +434,11 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         info, time, _err = results
         if time == self.INVALID_TIME:
             return 0, 0
-        _gfx, b, m, n, k = info[0]
+        # Keyed by name, not by position: KEYS grew a groupSize column when the
+        # 32-block twins got their own tuned rows, and a positional unpack here
+        # silently became an arity error that failed every shape.
+        _keys = dict(zip(self.keys, info[0]))
+        b, m, n, k = (_keys["b"], _keys["m"], _keys["n"], _keys["k"])
         us_s = time * 1e-6
         tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
         # fp8 A + fp8 W + bf16 out.
@@ -463,6 +510,13 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             type=_intlist,
             default=[4096],
             help="comma list of K (default 4096)",
+        )
+        self.parser.add_argument(
+            "--groupSize",
+            type=_intlist,
+            default=None,
+            help="only tune kids with these quantisation block sizes "
+            "(e.g. 32); default is every group in the policy",
         )
         self.parser.add_argument(
             "--apply",
@@ -680,10 +734,14 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             m = int(untunedf.loc[i, "m"])
             n = int(untunedf.loc[i, "n"])
             k = int(untunedf.loc[i, "k"])
-            info_keys = (gfx, b, m, n, k)
-
             n_cand = 0
             for kid in _TUNE_POLICY:
+                # Per kid, not per shape: the block size is the kid's, and each
+                # block size deserves its own winning row.
+                group = _kid_group(kid)
+                if args.groupSize and group not in args.groupSize:
+                    continue
+                info_keys = (gfx, b, m, n, k, group)
                 for sk in _applicable(kid, b, m, n, k):
                     info = (info_keys, kid, sk, "")
                     task.append(
