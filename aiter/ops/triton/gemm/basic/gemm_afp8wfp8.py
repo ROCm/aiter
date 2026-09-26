@@ -19,7 +19,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-
 from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
 # One arrival counter per output tile of a fused split-K launch.
@@ -176,13 +175,10 @@ def gemm_afp8wfp8(
     if M == 0:
         return y if y is not None else torch.empty((M, N), dtype=dtype, device=x.device)
     if config is None:
-        config, _ = _get_config(
-            M,
-            N,
-            K,
-            x_scale_group_size=x_scale_group_size,
-            w_scale_group_size=w_scale_group_size,
-        )
+        config_name = "GEMM-AFP8WFP8"
+        if (x_scale_group_size, w_scale_group_size) != (128, (128, 128)):
+            config_name += f"_A{x_scale_group_size}_W{group_n}X{group_k}"
+        config, _ = _get_config(M, N, K, config_name=config_name)
     # Never mutate a caller's config or a nested packed config.
     config = copy.deepcopy(config)
     packed = config.get("packed")
@@ -236,11 +232,11 @@ def gemm_afp8wfp8(
         k: launch[k]
         for k in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim")
     }
-    scales = dict(
-        A_SCALE_K_GROUP=x_scale_group_size,
-        B_SCALE_N_GROUP=group_n,
-        B_SCALE_K_GROUP=group_k,
-    )
+    scales = {
+        "A_SCALE_K_GROUP": x_scale_group_size,
+        "B_SCALE_N_GROUP": group_n,
+        "B_SCALE_K_GROUP": group_k,
+    }
     if packed is not None:
         # Native E4M3 pointers avoid the extra LDS conversion generated for
         # byte operands in packed dot_scaled, while accepting public byte views.
@@ -419,7 +415,9 @@ def gemm_afp8wfp8_preshuffle(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     if config is None:
-        config, _ = _get_config(M, N, K, shuffle=True, backend=backend)
+        config, _ = _get_config(
+            M, N, K, config_name="GEMM-AFP8WFP8_PRESHUFFLED", backend=backend
+        )
 
     # CTA-cluster (CGA) multicast, gluon only. CTAS_M x CTAS_N CTAs form one
     # cluster, and each operand fetch is multicast to every CTA in the cluster

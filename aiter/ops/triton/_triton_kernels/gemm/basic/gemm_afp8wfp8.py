@@ -722,18 +722,7 @@ def _get_config(
     M: int,
     N: int,
     K: int,
-    shuffle: bool = False,
+    config_name: str = "GEMM-AFP8WFP8",
     backend: str = "triton",
-    x_scale_group_size: int = 128,
-    w_scale_group_size: tuple[int, int] = (128, 128),
 ):
-    # backend selects the per-backend config dir (<arch>/<backend>/gemm/), so the
-    # triton and gluon kernels can carry different tuning keys for the same shape.
-    if shuffle:
-        return get_gemm_config("GEMM-AFP8WFP8_PRESHUFFLED", M, N, K, backend=backend)
-    else:
-        name = "GEMM-AFP8WFP8"
-        if (x_scale_group_size, w_scale_group_size) != (128, (128, 128)):
-            gn, gk = w_scale_group_size
-            name += f"_A{x_scale_group_size}_W{gn}X{gk}"
-        return get_gemm_config(name, M, N, K, backend=backend)
+    return get_gemm_config(config_name, M, N, K, backend=backend)

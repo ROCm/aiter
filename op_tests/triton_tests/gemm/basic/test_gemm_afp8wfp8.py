@@ -15,11 +15,11 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic import gemm_afp8wfp8 as afp8wfp8_op
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
     gemm_a8w8_blockscale_group32,
 )
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
     gemm_afp8wfp8_preshuffle,
@@ -564,12 +564,12 @@ def test_fused_split_k_graph_replay_reads_live_scales(packed):
     a_group, b_group = 128, (128, 128)
     x, w, xs, ws, _ = _compact_scale_inputs(3, 131, 1152, a_group, b_group)
     config = _execution_config(packed=packed, fused=True)
-    kwargs = dict(
-        dtype=torch.bfloat16,
-        config=config,
-        x_scale_group_size=a_group,
-        w_scale_group_size=b_group,
-    )
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "config": config,
+        "x_scale_group_size": a_group,
+        "w_scale_group_size": b_group,
+    }
     # Initialize per-stream counters before capture, then ensure each replay
     # consumes current operands/scales and leaves the counters reusable.
     gemm_afp8wfp8(x, w, xs, ws, **kwargs)

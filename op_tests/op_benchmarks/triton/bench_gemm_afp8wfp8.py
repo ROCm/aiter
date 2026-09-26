@@ -10,12 +10,13 @@ Use --test to validate an FP64 reference before timing each shape.
 
 import csv
 import math
-from pathlib import Path
 import warnings
+from pathlib import Path
 
 import torch
 import triton
 
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
     gemm_afp8wfp8_preshuffle,
@@ -31,7 +32,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
-from aiter.ops.shuffle import shuffle_weight
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
