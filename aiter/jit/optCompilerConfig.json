@@ -2063,5 +2063,18 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_fused_moe_router": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fused_moe_router_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_moe_router.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     }
 }

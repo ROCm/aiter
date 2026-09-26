@@ -97,6 +97,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_moe_dp_share_expert.py]=131
     FILE_TIMES[op_tests/test_batched_gemm_bf16.py]=124
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=108
+    FILE_TIMES[op_tests/test_fused_moe_router.py]=95
     FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=92
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py]=86
     FILE_TIMES[op_tests/test_flydsl_causal_conv1d_update.py]=84

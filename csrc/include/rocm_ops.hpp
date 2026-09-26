@@ -1431,6 +1431,39 @@ namespace py = pybind11;
           py::arg("score_func")            = "sqrtsoftplus", \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
 
+#define FUSED_MOE_ROUTER_PYBIND                                                \
+    m.def("fused_moe_router_impl",                                             \
+          &aiter::fused_moe_router_impl,                                       \
+          py::arg("gating"),                                                   \
+          py::arg("bias"),                                                     \
+          py::arg("hidden"),                                                   \
+          py::arg("topk_ids"),                                                 \
+          py::arg("topk_weights"),                                             \
+          py::arg("sorted_ids"),                                               \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("out_fp4"),                                                  \
+          py::arg("out_scale"),                                                \
+          py::arg("num_experts"),                                              \
+          py::arg("topk"),                                                     \
+          py::arg("unit_size"),                                                \
+          py::arg("group_size"),                                               \
+          py::arg("need_renorm"),                                              \
+          py::arg("routed_scaling_factor"),                                    \
+          py::arg("workspace"),                                                \
+          py::arg("expert_mask")              = std::nullopt,                  \
+          py::arg("moe_buf")                  = std::nullopt,                  \
+          py::arg("num_fused_shared_experts") = 0,                             \
+          py::arg("shared_expert_weight")     = 1.0,                           \
+          py::arg("ep_rank")                  = 0,                             \
+          py::arg("ep_size")                  = 1,                             \
+          "Fused MoE routing preamble: topk + moe_sort + MXFP4 quant.");       \
+    m.def("fused_moe_router_workspace_size",                                   \
+          &aiter::fused_moe_router_workspace_size,                             \
+          py::arg("max_tokens"),                                               \
+          "workspace bytes for up to max_tokens tokens");
+
 #define MOE_TOPK_CK_PYBIND          \
     m.def("topk_sigmoid",           \
           &aiter::topk_sigmoid,     \
