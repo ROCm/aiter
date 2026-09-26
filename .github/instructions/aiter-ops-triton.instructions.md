@@ -398,37 +398,25 @@ All weight/scale pre-shuffle helpers are unified in
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from
   `aiter.ops.triton.utils.shuffle`.
-- A GEMM also ships a tuning case. `utils/_triton/tuning/tune_gemm.py` runs a
-  GEMM through its case in `gemm_cases.py`, tries every config where the
-  wrapper reads its own through `get_gemm_config()`, and keeps the fastest;
-  the keys it tries are the keys of the family's `DEFAULT.json` for the arch
-  and backend being tuned. Flag:
+- A GEMM also ships a tuning case in `utils/_triton/tuning/gemm_cases.py`.
+  The shared driver benchmarks the current config, tries candidates through
+  `get_gemm_config()`, logs failures, and saves the best config if it is faster
+  or the lookup reports no tuned M bucket. It times the complete callable.
+  Flag:
   - A new public GEMM wrapper under `gemm/` with no case in `gemm_cases.py`,
     or a case not named after the wrapper or its configurable variant.
     Document composed/deprecated wrapper exceptions in the coverage inventory
     and its CPU test.
-  - A case that passes `config=` to the wrapper (the script can only replace
-    what the lookup returns), or that drops the wrapper's `backend` argument
-    when the wrapper has one (that backend becomes untunable).
-  - A GEMM family whose `DEFAULT.json` keys differ from the config keys the
-    kernel reads: a key the kernel ignores is tried for nothing, and a key
-    missing from `DEFAULT.json` is never tuned and never written.
-  - A new backend or arch path in a GEMM wrapper that resolves its config
-    without `get_gemm_config()`: that path cannot be tuned.
-  - A new case that reuses an output buffer without resetting accumulators,
-    returns only part of a multi-output result, or drops an exposed kernel
-    variant such as `persistent`: candidates must exercise the intended
-    production path and check all outputs.
-  - A new tunable key with no candidate values in the family's configs,
-    case `space`, or documented `--space` example. Add the key to the target
-    arch/backend's `DEFAULT.json`; do not add an architecture-specific tuner
-    or require a common key schema across all kernels.
-  - A new architecture or backend without its own valid `DEFAULT.json` and
-    kernel implementation. The tuner uses the running GPU's architecture;
-    adding a tuning case does not make unsupported hardware supported.
-  - A new case, backend, or tuning option without corresponding updates to the
-    tuning README and coverage inventory. Composed feed-forward ops tune
-    their constituent GEMMs; MoE dispatch tables use their own tuning path.
+  - A case passing `config=`, dropping an exposed `backend` or configurable
+    variant, returning only some outputs, or failing to reset accumulators.
+  - A backend/architecture path that bypasses `get_gemm_config()` or lacks a
+    valid implementation and `DEFAULT.json` on its target GPU.
+  - `DEFAULT.json` keys that do not match what the selected kernel reads.
+    The author owns this contract; architectures and backends may differ.
+    New keys need candidate values in family JSON, case `space`, or `--space`.
+  - New author requirements without updates to the tuning README, coverage
+    inventory, Triton README and these instructions. Composed feed-forward
+    ops tune their constituent GEMMs; MoE tables have a separate lookup.
 
 ## Keeping this file and the README current
 

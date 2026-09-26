@@ -308,19 +308,18 @@ depend on a benchmark.
 - `configs/gemm/aot/` and `configs/paged_mqa_logits/aot/` are runtime AOT
   caches, not tuning configs — never check them in or migrate them.
 
-For adding a config, seeding a new arch, and the per-family key schemes, follow
-`configs/CLAUDE.md` (§5 and §6). To tune a GEMM on any arch and backend, run
-`utils/_triton/tuning/tune_gemm.py` (see its README): it tries every config
-where the wrapper reads its own through `get_gemm_config()`, and keeps the
-fastest validated candidate. The keys it tries are the keys of the family's
-`DEFAULT.json`, so the kernel author must keep those consistent with what
-the selected kernel reads. Triton and Gluon can use different keys. Run
-`python3 utils/_triton/tuning/tune_gemm.py --list` to list cases without a GPU;
-see [tuning coverage](utils/_triton/tuning/COVERAGE.md) for the former harness
-gaps, shared families, and separate MoE tuning paths. Run tuning on each target
-GPU (gfx942, gfx950, gfx1250, or a future architecture) with its own valid
-`DEFAULT.json` and supported kernel; no architecture list is built into the
-tuner.
+For config placement and seeding a new architecture, follow `configs/CLAUDE.md`
+(§5 and §6). The [shared GEMM tuner](utils/_triton/tuning/README.md) benchmarks
+the current config, tries candidates through `get_gemm_config()`, logs failures,
+and saves the fastest config when it improves performance or the M bucket has
+no tuned config. It times the complete wrapper call with `do_bench`.
+
+Run `python3 utils/_triton/tuning/tune_gemm.py --list` for the cases. Run tuning
+on each target GPU (gfx942, gfx950, gfx1250, or future architectures) with a
+supported kernel and valid `DEFAULT.json`. The author must keep its keys
+consistent with the selected kernel; Triton and Gluon can use different keys.
+See [coverage](utils/_triton/tuning/COVERAGE.md) for the missing-harness inventory,
+shared families, and separate MoE tuning paths.
 
 ---
 

@@ -21,10 +21,9 @@ Imports stay inside each case, so listing the cases imports no kernels.
 CASES = {}
 
 
-def gemm_case(space=None, kernel_names=("gemm",)):
+def gemm_case(space=None):
     def register(case):
         case.space = dict(space or {})
-        case.kernel_names = tuple(kernel_names)
         CASES[case.__name__] = case
         return case
 
@@ -758,11 +757,11 @@ def _fused_ff_case(M, N, K, gated):
     return fn
 
 
-@gemm_case(kernel_names=("ff_a16w16_fused",))
+@gemm_case()
 def ff_a16w16_fused_gated(M, N, K):
     return _fused_ff_case(M, N, K, gated=True)
 
 
-@gemm_case(kernel_names=("ff_a16w16_fused",))
+@gemm_case()
 def ff_a16w16_fused_ungated(M, N, K):
     return _fused_ff_case(M, N, K, gated=False)

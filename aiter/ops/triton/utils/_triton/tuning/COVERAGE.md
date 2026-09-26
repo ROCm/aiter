@@ -112,10 +112,10 @@ Likewise, flags such as dtype, activation, layout, multiply/add fuse type,
 group32 scale grouping and split-cat proportions need distinct lookup keys
 before they can retain independent tuned results.
 
-Fused feed-forward cases zero their atomic output each invocation. Their case
-metadata names `ff_a16w16_fused` for profiling because those kernel names do
-not contain `gemm`. FP4 fused cases disable AOT metadata while tuning so each
-candidate is compiled from its actual config.
+The benchmark times the complete callable, including output resets and
+reductions. Fused feed-forward cases zero their atomic output each invocation.
+FP4 fused cases disable AOT metadata while tuning so each candidate is
+compiled from its actual config.
 
 ## MoE and grouped GEMMs needing a different lookup integration
 
@@ -134,7 +134,7 @@ these implementations.
 | `moe_gemm_mxfp8` | `get_tuned_kernel_config()` under `moe/mxfp8_fnuz`; needs an adapter for that config format and grouped inputs. |
 | `gmm`, `ptgmm`, `nptgmm` | Separate grouped-matmul config lookup under `gmm/`; needs an adapter and group-size/transposition cases. |
 
-For these families, reuse the sweep, profiling and verification machinery
-after defining a suitable lookup adapter. Do not flatten routing-dependent
+For these families, reuse the benchmark loop after defining a suitable
+lookup adapter. Do not flatten routing-dependent
 MoE configs into an ordinary `(M, N, K)` lookup: expert distribution and
 routing block size affect the kernel's launch and correctness.
