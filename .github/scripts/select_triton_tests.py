@@ -38,7 +38,7 @@ GLOBAL_PREFIXES = (
     SRC + "utils/",
     KERNELS + "common/",
     GLUON_KERNELS + "common/",
-    TESTS + "utils/"
+    TESTS + "utils/",
 )
 
 # Directories under the source tree that are not op categories.
