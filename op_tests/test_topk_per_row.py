@@ -1,4 +1,5 @@
 import argparse
+import itertools
 
 import numpy as np
 import pandas as pd
@@ -6,6 +7,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import topk
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.test_common import benchmark, perftest
@@ -209,6 +211,7 @@ def run_top_k_per_row_decode(
     flydsl: bool = False,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -255,6 +258,7 @@ def run_top_k_per_row_decode(
             k=k,
             stable=stable,
             values=values,
+            max_row_len=max_row_len,
         )
 
 
@@ -422,6 +426,101 @@ def test_top_k_per_row_decode(
     return ret
 
 
+# A context-sized decode buffer that each call only partly fills, which is what
+# `max_row_len` is for. Every carried card's adaptive bands take these shapes;
+# test_decode_bound_gate() fails if a re-fitted table stops taking them.
+_BOUNDED_BATCH = (4, 16)
+_BOUNDED_CONTEXT = 131072
+_BOUNDED_KS = (512, 1024, 2048)
+
+
+def create_planted_logits(seq_lens: torch.Tensor, width: int, top_k: int):
+    """Distinct logits whose top k sit at known positions inside each row's live
+    length, with padding that outranks all of them, so a read past a row's end
+    selects padding."""
+    rows = seq_lens.shape[0]
+    logits = -torch.arange(width, dtype=torch.float32, device="cuda").repeat(rows, 1)
+    for r, n in enumerate(seq_lens.tolist()):
+        stride = n // top_k
+        pos = torch.arange(top_k, device="cuda") * stride + r % stride
+        logits[r, pos] = 1000.0 + torch.arange(top_k, device="cuda")
+        logits[r, n:] = 1e4
+    return logits
+
+
+@benchmark()
+def test_top_k_per_row_decode_bounded(
+    batch_size: int, context_len: int, top_k: int, stable: bool = False
+) -> dict:
+    """Decode rows of ragged length in a buffer 4x the bound, the longest row on
+    the bound, called with `max_row_len` as a serving stack would."""
+    torch.set_default_device("cuda:0")
+    seq_lens = torch.randint(
+        top_k, context_len + 1, (batch_size,), dtype=torch.int32, device="cuda"
+    )
+    seq_lens[0] = context_len
+    logits = create_planted_logits(seq_lens, 4 * context_len, top_k)
+    indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+
+    _, us = run_top_k_per_row_decode(
+        *args, False, k=top_k, stable=stable, max_row_len=context_len
+    )
+    torch.cuda.synchronize()
+
+    # The reference sees each row's live part only.
+    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    live = torch.arange(logits.shape[1], device="cuda")[None, :] < seq_lens[:, None]
+    masked = torch.where(live, logits, float("-inf"))
+    torch_indices = masked.topk(top_k, dim=-1)[1]
+
+    return {
+        "backend": topk.decode_backend_for_call(
+            *args, top_k, stable, max_row_len=context_len
+        ),
+        "all_close": compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k, stable=stable
+        ),
+        "us": us,
+    }
+
+
+def adaptive_band_cells(card):
+    """One bounded cell per band `card` ships, at the band's smallest corner, with
+    each k group's members taken in turn across its bands."""
+    for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
+        for ks, bands in per_group.items():
+            for i, (min_width, _, min_rows, _) in enumerate(bands):
+                yield min_rows, min_width, ks[i % len(ks)], stable
+
+
+def test_decode_bound_gate():
+    """Host-side rules of the decode gate, checked for every card the adaptive
+    table carries; no kernel runs."""
+    table = topk._ADAPTIVE_BANDS_BY_K_GROUP
+    for (arch, cu), per_emit in table.items():
+        unmeasured = next(c for c in range(1, 1024) if (arch, c) not in table)
+        for stable, per_group in per_emit.items():
+            for bands in per_group.values():
+                # Ascending and disjoint: a malformed band admits an unmeasured
+                # shape rather than failing.
+                seen_to = 0
+                for min_w, max_w, min_r, max_r in bands:
+                    assert seen_to < min_w <= max_w and 0 < min_r <= max_r, bands
+                    seen_to = max_w
+            for batch, k in itertools.product(_BOUNDED_BATCH, _BOUNDED_KS):
+                call = (stable, 4 * _BOUNDED_CONTEXT, batch, k, True)
+                cell = (arch, cu, *call)
+                bounded = topk._decode_backend(arch, cu, *call, _BOUNDED_CONTEXT)
+                assert bounded == topk.BACKEND_ADAPTIVE, cell
+                # An unmeasured CU count keeps what ran before the adaptive
+                # bands, and `None` declines those bands and nothing else.
+                plain = topk._decode_backend(arch, unmeasured, *call, _BOUNDED_CONTEXT)
+                assert plain != topk.BACKEND_ADAPTIVE, cell
+                assert topk._decode_backend(arch, cu, *call, None) == plain, cell
+    print(f"[decode_bound_gate] PASS: {len(table)} cards")
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -535,6 +634,7 @@ args = parser.parse_args()
 
 # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
 test_mb_workspace_reuse()
+test_decode_bound_gate()
 
 
 # Ask each path which arches it serves rather than keeping a second copy
@@ -619,3 +719,22 @@ df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
 assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
+
+
+card = (get_gfx(), topk._decode_cu_count(torch.cuda.current_device()))
+if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+    torch.manual_seed(0)
+    # The table picks these shapes and k, not the command line: every band this
+    # card ships runs once, at a corner small enough to allocate here.
+    df = [test_top_k_per_row_decode_bounded(*c) for c in adaptive_band_cells(card)]
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode bounded summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"topk_per_row_decode bounded mismatch:\n{df_md}"
+    assert (
+        df["backend"] == topk.BACKEND_ADAPTIVE
+    ).all(), f"bounded decode left the adaptive kernel:\n{df_md}"
+else:
+    aiter.logger.warning(
+        "%s at %d CU carries no adaptive decode bands; bounded decode skipped", *card
+    )

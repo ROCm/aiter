@@ -11,6 +11,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk import topk_per_row_decode_adaptive as _adaptive
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
@@ -28,6 +29,26 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+
+# The gate's answer for this call. The arch, the k and the shape are all the
+# gate's decision; nothing here re-derives them.
+_BACKEND_ADAPTIVE = "adaptive"
+
+
+@lru_cache(maxsize=16)
+def _get_cached_adaptive_workspace(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    return torch.zeros(slots, device=device, dtype=torch.int32)
+
+
+def _get_adaptive_workspace(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    # Do not let graph-pool allocations escape through the process cache.
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(slots, device=device, dtype=torch.int32)
+    return _get_cached_adaptive_workspace(device, stream_id, slots)
 
 
 @lru_cache(maxsize=16)
@@ -61,6 +82,7 @@ def _get_topk_workspace(
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
     _get_cached_workspace.cache_clear()
+    _get_cached_adaptive_workspace.cache_clear()
 
 
 @lru_cache(maxsize=128)
@@ -360,6 +382,82 @@ def is_flydsl_top_k_per_row_decode_supported(
     )
 
 
+def _run_adaptive(
+    logits,
+    next_n,
+    seq_lens,
+    indices,
+    rows,
+    width,
+    stride0,
+    stride1,
+    k,
+    stable,
+    stream,
+    cfg_width=None,
+):
+    """Launch the adaptive kernel for a shape the gate has already chosen it for.
+
+    `cfg_width` is the longest row this launch can contain and `width` is how
+    wide the buffer holding it is; they differ when a caller passed a
+    `max_row_len`. The config takes the former, because every quantity it picks
+    -- the tier, the blocks per row, the parts, the compact path, and whether
+    the workspace needs zeroing -- is sized for the work, and the padding is not
+    work. The kernel still folds each row onto as many of the launch's
+    workgroups as that row's own `seq_lens` entry needs.
+
+    `cfg_width` defaults to `width` for a caller that states no bound.
+    """
+    from aiter.ops import topk as _gate
+
+    if cfg_width is None:
+        cfg_width = width
+    # The gate's own count, so the band it admitted and the grid built here
+    # describe the same card.
+    cfg = _adaptive.decode_adaptive_config(
+        rows,
+        cfg_width,
+        k,
+        ordered=stable,
+        cu_count=_gate._decode_cu_count(logits.device.index),
+    )
+    kw = cfg["kw"]
+    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(top_k=k, **kw)
+    workspace = _get_adaptive_workspace(
+        logits.device,
+        stream.cuda_stream,
+        _adaptive.topk_workspace_slots(
+            rows,
+            11,
+            compact=cfg["compact"],
+            compact_cap=kw.get("compact_cap_mult", 16) * k,
+        ),
+    )
+    # `cfg_width` again, not `width`: this asks whether the config above left
+    # counters a pass could read before writing, so it has to be asked about the
+    # same config. On the width it answers for a kernel that was never built.
+    if _adaptive.needs_workspace_zero(
+        cfg_width,
+        k,
+        kw["tiered_short_max"],
+        tier_mode=kw.get("tier_mode", "auto"),
+        bits_per_pass=11,
+    ):
+        workspace.zero_()
+    _run_compiled(
+        launcher,
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        workspace,
+        rows,
+        stride0,
+        stride1,
+        stream,
+    )
+
+
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -371,9 +469,49 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
 ) -> None:
-    """Write per-row TopK indices using each request's effective context length."""
+    """Write per-row TopK indices using each request's effective context length.
 
+    `max_row_len` bounds `seq_lens` from the host, and is a guarantee rather
+    than a hint -- `aiter.ops.topk.top_k_per_row_decode` documents what it
+    costs to get wrong.
+    """
+    _decode_with_backend(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        values,
+        None,
+        max_row_len,
+    )
+
+
+def _decode_with_backend(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None,
+    backend: str | None,
+    max_row_len: int | None,
+) -> None:
+    """Run the decode on `backend`, which must be the gate's answer or None to ask it.
+
+    An `upstream` answer still runs the chunked pair here, because this host
+    owns no other kernel to fall back to.
+    """
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
     )
@@ -382,6 +520,48 @@ def flydsl_top_k_per_row_decode(
     arch = torch.cuda.get_device_properties(logits.device).gcnArchName
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
+
+    if backend is None:
+        from aiter.ops.topk import decode_backend_for_call
+
+        backend = decode_backend_for_call(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            rows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            values,
+            max_row_len=max_row_len,
+        )
+
+    if backend == _BACKEND_ADAPTIVE:
+        # Only the adaptive path takes a host-side config, and it is reached only
+        # when the gate admitted the call, which needs `max_row_len`. So the
+        # width is computed here, not before the gate: `decode_adaptive_width`
+        # requires a bound and a `None` reaching it is a bug, not a fallback.
+        from aiter.ops.topk import decode_adaptive_width
+
+        cfg_width = decode_adaptive_width(width, max_row_len)
+        _run_adaptive(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            rows,
+            width,
+            stride0,
+            stride1,
+            k,
+            stable,
+            stream,
+            cfg_width=cfg_width,
+        )
+        return
+
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k, wave_size=wave_size, write_values=values is not None

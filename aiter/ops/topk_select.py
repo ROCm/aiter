@@ -471,6 +471,7 @@ def topk_select(
     abort_when_nan_found: bool = False,
     tie: str | None = None,
     deterministic: bool = False,
+    max_row_len: int | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Per-row top-k, dispatched across aiter's four selectors.
 
@@ -550,6 +551,18 @@ def topk_select(
             Weaker than ``tie`` and cheaper than it: it only excludes ``plain``,
             keeping the small-k selector that ``tie='low'`` has to give up. Costs
             up to 1.9x where ``plain`` would have won.
+        max_row_len: an upper bound on every entry of ``end``, for an ``input``
+            sized to a maximum context that a given call only partly fills. It
+            opts a call into the adaptive decode kernel, which is then sized
+            from the live length rather than from the buffer -- worth up to
+            1.21x median on a 1M buffer. ``None`` declines that one kernel and
+            moves nothing else: the outer selector (``topk_select_backend``)
+            and the other decode kernels read the physical width either way.
+            It never changes a result.
+
+            **A guarantee, not a hint**: part of what it selects is compiled in,
+            so a value below the longest live row returns wrong indices rather
+            than merely slower ones. ``None``, the default, is always correct.
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
@@ -597,7 +610,16 @@ def topk_select(
         input.dtype is torch.float32,
     )
     _dispatch(
-        backend, input, row_lens, idx, topk, rows, end is not None, tie, deterministic
+        backend,
+        input,
+        row_lens,
+        idx,
+        topk,
+        rows,
+        end is not None,
+        tie,
+        deterministic,
+        max_row_len=max_row_len,
     )
 
     values = None
@@ -697,7 +719,16 @@ def _stream_scratch(input, dtype=None):
 
 
 def _dispatch(
-    backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
+    backend,
+    input,
+    row_lens,
+    idx,
+    topk,
+    rows,
+    ragged,
+    tie=None,
+    deterministic=False,
+    max_row_len=None,
 ):
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
@@ -743,6 +774,7 @@ def _dispatch(
             1,
             topk,
             stable=tie == "low" or deterministic,
+            max_row_len=max_row_len,
         )
     elif backend == "stream":
         wave = wave_size_of(input.device.index)
