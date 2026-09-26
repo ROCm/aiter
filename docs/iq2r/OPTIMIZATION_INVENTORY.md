@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-25. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E322. Related scouts,
+attempts from the initial GLM integration through E326. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E322
+## Isolated single-GPU optimization, E199–E326
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -100,6 +100,14 @@ single-GPU report. Serving sweeps remain paused.
 | E320 | Qualify E317 frontend with 16 actual captures and six real TP8/TP4 weight slices; exact intermediate/final results. |
 | E321 | GPU-guarded two/four-token weight reuse with separate reducing waves. Two-token candidate reaches M4 TP8 hot parity and beats spread MXFP4. |
 | E322 | Qualify wave-private codebook and token reuse/fallback on changing guards, reordered slots and invalid IDs; exact. Correct reporting-only invalid bincount without changing runtime/tolerances. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E323 | Profile original M32/M64/M128/M256 MoE. Down dominates M64/M128 spread despite lower DRAM bytes; padding and decode instruction volume are material. Excessive drift remains visible. |
+| E324 | Qualify E321 TP8 M4 reuse and E319 TP4 M4 codebook completion on real slices/captures. Exact, 768 checks; no new MXFP4/serving comparison. |
+| E325 | Use existing independent-output-wave down kernels at M64/M128. N384 halves sparse MFMA work and nearly matches MXFP4 down; correct intermediate checks for atomic-sort permutations. |
+| E326 | Overlap route sorting and identity input quantization in one launch; pair FP8 conversions. Combined policy beats MXFP4 at M64 spread/hot and M128 spread; M128 hot still behind. |
 
 
 ## How to read the outcomes

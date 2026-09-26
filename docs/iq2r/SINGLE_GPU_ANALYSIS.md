@@ -24,6 +24,52 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Medium-token checkpoint — E323–E326
+
+IQ2R now beats MXFP4 in three of four freshly measured M64/M128 cases.
+M128 hot remains 10.8% slower. One fixed policy is used for both routing
+patterns: E235 N384/grid4 down plus E326 variant3 combined frontend.
+
+| TP | Tokens | Routes | MXFP4 µs | Original IQ2R µs | IQ2R candidate µs | IQ2R overhead |
+|---:|---:|:---|---:|---:|---:|---:|
+| 8 | 64 | spread | 103.71 | 133.41 | 99.25 | -4.3% |
+| 8 | 64 | hot | 41.47 | 43.87 | 38.43 | -7.3% |
+| 8 | 128 | spread | 122.51 | 160.67 | 119.47 | -2.5% |
+| 8 | 128 | hot | 44.62 | 60.63 | 49.44 | +10.8% |
+
+Complete synthetic single-GPU TP-rank MoE calls, not serving concurrency.
+Both clean bookends completed with 32 rotating weight banks and five-second
+warmup; maximum drift is 1.03%. All 504 graph/eager checks pass, candidate
+input FP8/scales, route-aligned gate FP8/scales and final BF16 match original
+IQ2R exactly, and native traces show the intended kernels with zero scratch.
+The MXFP4 atomic-output bounds are unchanged.
+
+E323 identified M128 spread down as the main gap: about 78 versus 40 µs,
+despite 27% less profiled DRAM traffic. The M32 tasks use only 14% of their
+computed rows. E325 assigns waves to output columns, reuses activations and
+skips empty M16 subtiles. It roughly halves spread MFMA work and cuts VMEM-read
+instructions by 71%, bringing down near MXFP4. E326 overlaps independent route
+sorting and token-major input quantization in one launch, saving another
+4–5 µs. Paired FP8 conversion and 256 active quantization threads provide a
+small further gain.
+
+E325's first checker compared buffers in a changing atomic-sort order. The
+corrected checker first verifies inverse gather/scatter and expert IDs, then
+compares intermediates in original route order. The failure is retained;
+runtime, input generation and numerical tolerances were unchanged. E323 and
+E325 rows exceeding the existing 3% drift limit remain provisional.
+
+E324 qualifies the earlier TP8 M4 two-token reuse and TP4 M4 wave-private
+codebook changes on six real weight slices and 16 captured inputs: 32 cases,
+256 changing steps and 768 checks, exact intermediate/final results, zero
+scratch. All 122 collected artifact hashes match. TP4 reuses TP8 captured
+inputs with TP4 weights; this adds no MXFP4 or serving comparison.
+
+The overall goal remains unmet. M128 hot, M32/M256, TP4 medium and dense gaps,
+broader qualification, model quality and production integration remain.
+Serving sweeps stay paused. Next POCs test packed down decoding/final reduction
+and packed batched codebook reads in the medium-token gate.
+
 ## M4 latency checkpoint — E312–E322
 
 The TP8 M4 candidate now reaches local synthetic hot-route parity with MXFP4
@@ -473,6 +519,11 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E320 | Qualify E317 frontend with 16 actual captures and six real TP8/TP4 weight slices; exact intermediate/final results. |
 | E321 | GPU-guarded two/four-token weight reuse with separate reducing waves. Two-token candidate reaches M4 TP8 hot parity and beats spread MXFP4. |
 | E322 | Qualify wave-private codebook and token reuse/fallback on changing guards, reordered slots and invalid IDs; exact. Correct reporting-only invalid bincount without changing runtime/tolerances. |
+
+| E323 | Profile original M32/M64/M128/M256 MoE. Down dominates M64/M128 spread despite lower DRAM bytes; padding and decode instruction volume are material. Excessive drift remains visible. |
+| E324 | Qualify E321 TP8 M4 reuse and E319 TP4 M4 codebook completion on real slices/captures. Exact, 768 checks; no new MXFP4/serving comparison. |
+| E325 | Use existing independent-output-wave down kernels at M64/M128. N384 halves sparse MFMA work and nearly matches MXFP4 down; correct intermediate checks for atomic-sort permutations. |
+| E326 | Overlap route sorting and identity input quantization in one launch; pair FP8 conversions. Combined policy beats MXFP4 at M64 spread/hot and M128 spread; M128 hot still behind. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
