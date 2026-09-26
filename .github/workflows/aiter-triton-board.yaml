@@ -11,31 +11,12 @@ name: AITER-triton Kernels board
 #      (TRITON_CI: anything under .github/ with "triton" in its path, plus
 #      requirements-triton*);
 #   3. it carries the Triton/Gluon label.
-# Such a PR is added to the board and its Status follows the PR state: a draft
-# sits in "Backlog"; an open PR sits in "In review" unless someone has already
-# moved it on to "In Progress" or "Approved". When the Triton/Gluon label or an
-# assignee is removed and no rule still applies, the PR is taken off the board.
-#
-# Every run works from the PR's current state (fetched at the start of the
-# run), not from the event payload, so late runs, cancelled runs and bursts of
-# events all converge on the same result.
 #
 # Issues stay label-driven through the board's own auto-add rule. Here they are
 # added when assigned to a team member or labeled (rules 1 and 3), removed
 # again on unassign/unlabel when neither applies any more, and their Status is
 # left to the board's "Item added" automation.
 #
-# Enabling it (org / repo admin):
-#   1. Grant the AITER CI GitHub App the organization permissions
-#      "Projects: Read & write" (add items, set Status) and "Members: read"
-#      (rule 1 reads the team), then accept the new permissions on the ROCm
-#      installation. Without "Members: read" the team lookup returns 403 and
-#      rule 1 is skipped with a warning.
-#   2. Set the repository variable AITER_TRITON_BOARD_ADD to 'true'.
-#
-# pull_request_target is used so fork PRs are covered. This is safe here
-# because the job never checks out or executes PR code — it only reads PR
-# metadata and the changed-file list from the API.
 
 on:
   pull_request_target:
