@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E379. Related scouts,
+attempts from the initial GLM integration through E384. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E379
+## Isolated single-GPU optimization, E199–E384
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -181,6 +181,15 @@ single-GPU report. Serving sweeps remain paused.
 | E377 | Halve dense N atoms per wave and load only the matching packed-record half. 336 exact checks and stable rows. Registers fall 256 to 182 with identical MFMA counts, but global-read instructions rise about 62% and all cases regress 11.7–24.1%. |
 | E378 | Visit route slots across adjacent tokens; separately test guarded uniform-wave atomics. Corrected r2 passes 315 exact checks and all rows stabilize. Plain token-major visits improve their control 0.8–1.7% and are retained for qualification; hot remains 4.3% behind fresh MXFP4. Setup/preparation failures are preserved. |
 | E379 | Widen dense down to N1024 by reusing each M64 activation cache across four sequential N groups. 420 exact checks and stable rows; unchanged 220 registers and identical MFMA counts. Retain grid8 at M4096 only (0.2–0.9% gains); M1024 stays N512. Dense MXFP4 gaps remain about 23%. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E380 | Carry four next-K codebook reads across the compact gate loop without deeper weight prefetch. 252 exact checks, max drift 2.63%; improves E378 by 2.9–4.0%. Retained at TP8 M256; hot remains behind MXFP4. |
+| E381 | Keep the shared codebook while a persistent workgroup stays on the same expert. 252 exact checks and stable timing. Global-read/LDS instruction savings match the task model exactly; 0.5–2.6% gains, with small spread/mixed differences. |
+| E382 | Move TP4 compact gate records from LDS to registers and add cross-K lookup scheduling. 378 exact checks, max drift 2.91%; cross-K improves E368 by 2.7–4.5%. Register-only loses mixed; codebook reuse adds no consistent benefit. TP4 M256 hot remains 23.4% behind MXFP4. |
+| E383 | Remove the pre-partial-store barrier inherited from the unused LDS weight cache in the register-only gate. 252 r1 checks pass but hot drifts 3.31%. Independent r2 passes 72 new checks and stable bookends, improving E381 by 0.7–2.2%; TP8 M256 hot remains 1.5% behind. |
+| E384 | Qualify E381/E383 TP8 M256, E382 TP4 M256 and E363/E379 TP4 M1024/M4096 on three real layer/rank slices each. All 4,320 exact changing graph/eager checks, input/intermediate scales, native dispatch and zero scratch pass. Small captures are tiled to larger shapes; no serving or timing claim. |
 
 
 ## How to read the outcomes

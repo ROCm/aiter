@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Compact gate scheduling and real-weight qualification — E380–E384
+
+The reported selected kernels beat MXFP4 on six of eight TP8 rows and five of six compact TP4 rows. New gate scheduling reduces the reported TP8 M256 hot gap to 1.5% and TP4 M256 hot gap to 23.4%. Dense TP4 remains 3.3–23.5% behind. Latest compact and dense candidates pass 4,320 real-weight operator checks. Complete isolated and serving parity remain unmet.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 121.73 | 103.33 | -15.1% |
+| 8 | 128 | hot | 44.16 | 44.32 | +0.4% |
+| 8 | 256 | spread | 135.27 | 106.07 | -21.6% |
+| 8 | 256 | hot | 63.12 | 64.07 | +1.5% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 232.97 | 183.05 | -21.4% |
+| 4 | 256 | hot | 72.54 | 89.55 | +23.4% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 598.92 | 739.46 | +23.5% |
+| 4 | 4096 | hot | 496.62 | 612.02 | +23.2% |
+
+E380 carries codebook lookups across K iterations; E381 reuses a codebook within one expert; E382 transfers register loading and cross-K scheduling to TP4; E383 removes an obsolete weight-cache barrier. E383 r1 hot drift of 3.31% remains provisional; selected r2 is an independent pair at the unchanged 3% limit. E384 verifies nine real-weight slice/configuration runs with eight input/route changes and native dispatch. Its capture_tiled inputs repeat small saved captures and do not establish native large-batch or whole-model quality. All attempts are preserved. Earlier small-token and TP8 dense deficits remain outside this selected table; cross-session times are not interchangeable.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Dense reuse and task scheduling — E374–E379
 
 The reported selected kernels beat MXFP4 on six of eight TP8 rows and five of six compact TP4 rows. TP8 M256 token-major routing improves its control by 0.8–1.7%, but hot remains 4.3% behind fresh MXFP4. TP4 M256 hot remains 29.7% behind, and the reported dense TP4 rows remain 3.3–23.5% behind. N1024 down provides a small M4096 improvement. The full isolated and serving goal remains unmet.
@@ -802,6 +846,12 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E377 | Halve dense N atoms per wave and load only the matching packed-record half. 336 exact checks and stable rows. Registers fall 256 to 182 with identical MFMA counts, but global-read instructions rise about 62% and all cases regress 11.7–24.1%. |
 | E378 | Visit route slots across adjacent tokens; separately test guarded uniform-wave atomics. Corrected r2 passes 315 exact checks and all rows stabilize. Plain token-major visits improve their control 0.8–1.7% and are retained for qualification; hot remains 4.3% behind fresh MXFP4. Setup/preparation failures are preserved. |
 | E379 | Widen dense down to N1024 by reusing each M64 activation cache across four sequential N groups. 420 exact checks and stable rows; unchanged 220 registers and identical MFMA counts. Retain grid8 at M4096 only (0.2–0.9% gains); M1024 stays N512. Dense MXFP4 gaps remain about 23%. |
+
+| E380 | Carry four next-K codebook reads across the compact gate loop without deeper weight prefetch. 252 exact checks, max drift 2.63%; improves E378 by 2.9–4.0%. Retained at TP8 M256; hot remains behind MXFP4. |
+| E381 | Keep the shared codebook while a persistent workgroup stays on the same expert. 252 exact checks and stable timing. Global-read/LDS instruction savings match the task model exactly; 0.5–2.6% gains, with small spread/mixed differences. |
+| E382 | Move TP4 compact gate records from LDS to registers and add cross-K lookup scheduling. 378 exact checks, max drift 2.91%; cross-K improves E368 by 2.7–4.5%. Register-only loses mixed; codebook reuse adds no consistent benefit. TP4 M256 hot remains 23.4% behind MXFP4. |
+| E383 | Remove the pre-partial-store barrier inherited from the unused LDS weight cache in the register-only gate. 252 r1 checks pass but hot drifts 3.31%. Independent r2 passes 72 new checks and stable bookends, improving E381 by 0.7–2.2%; TP8 M256 hot remains 1.5% behind. |
+| E384 | Qualify E381/E383 TP8 M256, E382 TP4 M256 and E363/E379 TP4 M1024/M4096 on three real layer/rank slices each. All 4,320 exact changing graph/eager checks, input/intermediate scales, native dispatch and zero scratch pass. Small captures are tiled to larger shapes; no serving or timing claim. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
