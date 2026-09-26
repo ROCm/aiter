@@ -1,17 +1,21 @@
 #!/bin/bash
 # Accuracy / functional UT for the TP MegaMoE layer (single-kernel fused engine).
 #
-#   ./run_megamoe_tp_ut.sh [-m "dsv3 glm5 kimi3 dsv4"] [-t "256 512 1024 2048"] [-n 4] [-o DIR]
+#   ./run_megamoe_tp_ut.sh [-m "dsv3 glm5 kimi3 dsv4"] [-t "256 512 1024 2048"] [-n 4]
+#                          [-c "ag_rs ar_ar"] [-s] [-o DIR]
 #
-# Every (model, tokens) cell runs op_tests/multigpu_tests/test_mega_moe_TP.py in
-# its own process with --impl both --no-perf and the torch reference enabled, so
-# each cell checks:
+# Every (mode, model, tokens) cell runs op_tests/multigpu_tests/test_mega_moe_TP.py
+# in its own process with --impl both --no-perf and the torch reference enabled,
+# so each cell checks:
 #   split  vs torch reference   rel_l2 < 0.06   (test gate)
 #   fused  vs split             rel_l2 < 0.06   (test gate; split runs FP8 route outputs)
 #   fused  vs torch reference   rel_l2 < 0.06   (test gate)
 #                                      < UT_REF_TOL (default 0.04, this script)
 # plus a NaN check on both outputs. Exit status is non-zero if any cell fails.
 #
+# -c: communication modes, ag_rs (AllGather / ReduceScatter) and/or ar_ar
+#     (AllReduce before and after). -s: one process drives all -n GPUs
+#     (--single-process) instead of torchrun.
 # GPUs: before each cell, waits for -n idle GPUs (prefers 4-7). Set GPUS=4,5,6,7
 # to pin them instead. Environment overrides: PYTHON, TORCHRUN, UT_REF_TOL.
 # The fused kernel keeps FP8 route rows by default (~0.027 vs torch, the split
@@ -22,17 +26,22 @@ AITER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS="dsv3 glm5 kimi3 dsv4"
 TOKENS="256 512 1024 2048"
 NP=4
+MODES="ag_rs ar_ar"
+SP=0
 OUT="$AITER_DIR/megamoe_tp_results/ut_$(date +%m%d_%H%M%S)"
-while getopts "m:t:n:o:h" opt; do
+while getopts "m:t:n:c:so:h" opt; do
   case $opt in
     m) MODELS=$OPTARG ;;
+    c) MODES=$OPTARG ;;
+    s) SP=1 ;;
     t) TOKENS=$OPTARG ;;
     n) NP=$OPTARG ;;
     o) OUT=$OPTARG ;;
-    *) sed -n '2,20p' "$0"; exit 2 ;;
+    *) sed -n '2,24p' "$0"; exit 2 ;;
   esac
 done
 PYTHON=${PYTHON:-/tmp/aiter_venv/bin/python}
+[ -x "$PYTHON" ] || PYTHON=$(command -v python3)
 TORCHRUN=${TORCHRUN:-$(dirname "$PYTHON")/torchrun}
 UT_REF_TOL=${UT_REF_TOL:-0.04}
 mkdir -p "$OUT"
@@ -74,17 +83,21 @@ wait_gpus() {
 
 cd "$AITER_DIR"
 fail=0
-for M in $MODELS; do
+for C in $MODES; do
+ for M in $MODELS; do
   for T in $TOKENS; do
-    base="$OUT/${M}_${T}"
+    base="$OUT/${C}_${M}_${T}"
     if ! wait_gpus "$NP"; then
-      echo "FAIL  $M/$T: no $NP idle GPUs"; fail=1; continue
+      echo "FAIL  $C $M/$T: no $NP idle GPUs"; fail=1; continue
     fi
     rm -f /dev/shm/nccl-*
-    timeout ${TMO:-1800} "$TORCHRUN" --nproc_per_node="$NP" \
-      op_tests/multigpu_tests/test_mega_moe_TP.py --models "$M" --tokens "$T" \
-      --impl both --no-perf --accuracy-max-tokens "$T" \
-      --csv "$base.csv" > "$base.log" 2>&1
+    args=(op_tests/multigpu_tests/test_mega_moe_TP.py --models "$M" --tokens "$T"
+          --comm-mode "$C" --impl both --no-perf --accuracy-max-tokens "$T" --csv "$base.csv")
+    if [ "$SP" = 1 ]; then
+      timeout ${TMO:-1800} "$PYTHON" "${args[@]}" --single-process --tp "$NP" > "$base.log" 2>&1
+    else
+      timeout ${TMO:-1800} "$TORCHRUN" --nproc_per_node="$NP" "${args[@]}" > "$base.log" 2>&1
+    fi
     rc=$?
     verdict=$("$PYTHON" - "$base.csv" "$rc" "$UT_REF_TOL" "$base.log" <<'EOF'
 import math, os, sys
@@ -105,9 +118,10 @@ print(f"{'PASS' if ok else 'FAIL'}  split_vs_ref={split:.5f} fused_vs_split={fvs
 EOF
 )
     echo "$verdict" | grep -q '^PASS' || fail=1
-    printf '%-6s %-10s gpus=%s\n' "${verdict%% *}" "$M/$T" "$HIP_VISIBLE_DEVICES"
+    printf '%-6s %-6s %-10s gpus=%s\n' "${verdict%% *}" "$C" "$M/$T" "$HIP_VISIBLE_DEVICES"
     echo "       ${verdict#* }"
   done
+ done
 done
 echo "logs: $OUT"
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME CELLS FAILED"

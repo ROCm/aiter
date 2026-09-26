@@ -2,13 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Tensor-parallel MoE layer as one kernel (MegaMoE TP).
 
-Experts are replicated over the TP group and ``inter_dim`` is sharded; tokens
-enter sequence-parallel. One launch quantizes and all-gathers the tokens,
-runs GEMM1 + activation + GEMM2 for this rank's inter slice (the intermediate
-stays in LDS), sums each token's top-k routes and reduce-scatters the result::
+Experts are replicated over the TP group and ``inter_dim`` is sharded. One
+launch runs the collectives around GEMM1 + activation + GEMM2 of this rank's
+inter slice (the intermediate stays in LDS), dispatched on ``comm_mode``:
 
-    moe = MegaMoeTP(MegaMoeTPConfig(...), w1=..., w1_scale=..., w2=..., w2_scale=...)
-    y_local = moe(x_local, topk_weights, topk_ids)     # [m, model_dim] bf16
+* ``"ag_rs"`` (default): tokens enter sequence-parallel; the layer quantizes
+  and all-gathers them, sums each token's top-k routes and reduce-scatters::
+
+    y_local = moe(x_local, topk_weights, topk_ids)   # [m, H] -> [m, H]
+
+* ``"ar_ar"``: every rank holds a bf16 partial of all ``M = tp * m`` tokens
+  (e.g. a row-parallel projection's output) and the routing of all of them;
+  the layer all-reduces the input, and all-reduces the output::
+
+    y = moe(x_partial, topk_weights, topk_ids)       # [M, H] -> [M, H]
 
 Weights are MXFP4 (``shuffle_weight(16, 16)`` + ``e8m0_shuffle`` scales), the
 layout the flydsl MoE kernels take. See ``kernels/mega_moe_tp/fused_tp.py``.
@@ -24,7 +31,9 @@ from aiter import ActivationType
 
 from .kernels.mega_moe_tp.fused_tp_engine import FusedTpMegaMoe, fused_tp_supported
 
-__all__ = ["MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
+__all__ = ["COMM_MODES", "MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
+
+COMM_MODES = ("ag_rs", "ar_ar")
 
 
 def mega_moe_tp_supported(gfx: str | None = None) -> bool:
@@ -48,6 +57,7 @@ class MegaMoeTPConfig:
     activation: ActivationType = ActivationType.Silu
     beta: float | None = None  # Situv2 only
     linear_beta: float | None = None  # Situv2 only
+    comm_mode: str = "ag_rs"  # "ag_rs" | "ar_ar"
 
 
 class MegaMoeTP:
@@ -69,6 +79,8 @@ class MegaMoeTP:
                 f"MegaMoeTP does not tile model_dim={cfg.model_dim} "
                 f"inter_dim={cfg.inter_dim} tp={cfg.world_size}"
             )
+        if cfg.comm_mode not in COMM_MODES:
+            raise ValueError(f"comm_mode must be one of {COMM_MODES}, got {cfg.comm_mode!r}")
         situ = cfg.activation == ActivationType.Situv2
         self.cfg = cfg
         self.engine = FusedTpMegaMoe(
@@ -88,6 +100,7 @@ class MegaMoeTP:
             situ_linear_beta=(
                 cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0
             ),
+            comm_mode=cfg.comm_mode,
             group=group,
             device=device,
         )
@@ -98,7 +111,12 @@ class MegaMoeTP:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """x_local [m, model_dim] bf16 (this rank's tokens), topk_* [m, topk]."""
+        """ag_rs: x_local [m, H] bf16 (this rank's tokens), topk_* [m, topk].
+        ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]."""
         return self.engine(x_local, topk_weights, topk_ids)
 
     __call__ = forward
+
+    def poll_errors(self) -> int:
+        """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
+        return self.engine.poll_errors()

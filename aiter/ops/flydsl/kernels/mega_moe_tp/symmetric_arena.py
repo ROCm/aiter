@@ -18,7 +18,7 @@ from .hip_ipc import (
 
 logger = logging.getLogger("aiter")
 
-__all__ = ["SymmetricArena", "SymmetricSlice"]
+__all__ = ["PeerArenaGroup", "SymmetricArena", "SymmetricSlice"]
 
 _DEFAULT_ALIGN = 256
 
@@ -32,6 +32,46 @@ def _open_once(handle: bytes) -> int:
     peer = ipc_open_mem_handle(handle)
     _OPEN_HANDLES[handle] = peer
     return peer
+
+
+class PeerArenaGroup:
+    """Every rank of a TP group driven by this one process (no IPC).
+
+    Each rank's arena is ordinary device memory on its own GPU; peers reach it
+    through peer access, which the constructor enables between every pair.
+    Pass the group as ``group=`` together with the rank."""
+
+    def __init__(self, devices):
+        import ctypes
+
+        self.devices = [torch.device(d) for d in devices]
+        self.world_size = len(self.devices)
+        self._base: dict[int, int] = {}
+        hip = ctypes.CDLL("libamdhip64.so")
+        prev = torch.cuda.current_device()
+        for d in self.devices:
+            torch.cuda.set_device(d)
+            for peer in self.devices:
+                if peer != d:
+                    err = hip.hipDeviceEnablePeerAccess(peer.index, 0)
+                    if err not in (0, 704):  # 704: already enabled
+                        raise RuntimeError(f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}")
+                    if err:
+                        hip.hipGetLastError()
+        torch.cuda.set_device(prev)
+
+    def rank_of(self, device: torch.device) -> int:
+        return self.devices.index(torch.device(device))
+
+    def register(self, rank: int, base_ptr: int) -> None:
+        self._base[rank] = base_ptr
+
+    def base_ptrs(self) -> tuple[int, ...]:
+        if len(self._base) != self.world_size:
+            raise RuntimeError(
+                f"{len(self._base)} of {self.world_size} ranks committed their arena"
+            )
+        return tuple(self._base[r] for r in range(self.world_size))
 
 
 @dataclass
@@ -62,9 +102,13 @@ class SymmetricArena:
         align: int = _DEFAULT_ALIGN,
     ):
         self.group = group
-        self.rank = dist.get_rank(group=group)
-        self.world_size = dist.get_world_size(group=group)
         self.device = device or torch.device("cuda", torch.cuda.current_device())
+        if isinstance(group, PeerArenaGroup):
+            self.rank = group.rank_of(self.device)
+            self.world_size = group.world_size
+        else:
+            self.rank = dist.get_rank(group=group)
+            self.world_size = dist.get_world_size(group=group)
         self.align = int(align)
         self._slices: dict[str, SymmetricSlice] = {}
         self._cursor = 0
@@ -107,6 +151,8 @@ class SymmetricArena:
         total = (self._cursor + self.align - 1) // self.align * self.align
         self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
         base_ptr = int(self._storage.data_ptr())
+        if isinstance(self.group, PeerArenaGroup):
+            return self._commit_peer_group(base_ptr)
         with torch.cuda.device(self.device):
             alloc_base = mem_allocation_base(base_ptr)
             handle = ipc_get_mem_handle(base_ptr)
@@ -144,8 +190,20 @@ class SymmetricArena:
         dist.barrier(group=self.group)
         return self
 
+    def _commit_peer_group(self, base_ptr: int) -> SymmetricArena:
+        self.group.register(self.rank, base_ptr)
+        for entry in self._slices.values():
+            end = entry.offset + entry.nbytes
+            entry.local = (
+                self._storage[entry.offset : end].view(entry.dtype).view(entry.shape)
+            )
+        self._committed = True
+        return self
+
     @property
     def base_ptrs(self) -> tuple[int, ...]:
+        if isinstance(self.group, PeerArenaGroup):
+            return self.group.base_ptrs()
         return self._base_ptrs
 
     def close(self) -> None:

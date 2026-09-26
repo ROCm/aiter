@@ -196,6 +196,7 @@ import aiter
 from aiter import dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from aiter.fused_moe import (
@@ -598,6 +599,11 @@ class TpMoeInputs:
     route_meta_local: torch.Tensor  # [m, 2*topk] i32
     global_tokens: int
     local_tokens: int
+    #: "ag_rs": x_local / topk_* are this rank's [m] token shard.
+    #: "ar_ar": x_local is this rank's bf16 PARTIAL of every token [M, H] (the
+    #: layer all-reduces it) and topk_* the routing of all M tokens, the same
+    #: on every rank.
+    comm_mode: str = "ag_rs"
 
 
 def make_inputs(
@@ -607,12 +613,15 @@ def make_inputs(
     global_tokens: int,
     seed: int,
     route: str,
+    comm_mode: str = "ag_rs",
 ) -> TpMoeInputs:
     if global_tokens % tp_size:
         raise ValueError(
             f"global tokens={global_tokens} must be divisible by TP={tp_size}"
         )
     m = global_tokens // tp_size
+    if comm_mode == "ar_ar":
+        return _make_inputs_ar(shape, ctx, tp_size, global_tokens, seed, route)
     gen = torch.Generator(device=ctx.device).manual_seed(seed + ctx.rank)
     x = torch.randn(
         (m, shape.model_dim), dtype=dtypes.bf16, device=ctx.device, generator=gen
@@ -653,6 +662,43 @@ def make_inputs(
         route_meta_local=meta,
         global_tokens=global_tokens,
         local_tokens=m,
+    )
+
+
+def _make_inputs_ar(shape, ctx, tp_size, global_tokens, seed, route) -> TpMoeInputs:
+    """AR/AR inputs: a bf16 partial of all M tokens per rank (their sum is the
+    layer input, ~N(0, 1) like the AG/RS inputs) and one routing shared by
+    every rank, drawn from a rank-independent generator."""
+    M = global_tokens
+    gen = torch.Generator(device=ctx.device).manual_seed(seed + 7919 * (ctx.rank + 1))
+    x = torch.randn((M, shape.model_dim), dtype=torch.float32, device=ctx.device, generator=gen)
+    x = (x * tp_size**-0.5).to(dtypes.bf16)
+    shared = torch.Generator(device=ctx.device).manual_seed(seed + 104729)
+    if route == "balanced":
+        score = torch.zeros((M, shape.experts), dtype=dtypes.bf16, device=ctx.device)
+        start = 0
+        for token_id in range(M):
+            end = start + shape.topk
+            if end <= shape.experts:
+                score[token_id, start:end] = 1.0
+            else:
+                score[token_id, start:] = 1.0
+                score[token_id, : end - shape.experts] = 1.0
+            start = end % shape.experts
+    else:
+        score = torch.randn((M, shape.experts), dtype=dtypes.bf16, device=ctx.device, generator=shared)
+    topk_weights, topk_ids = fused_topk(x, score, shape.topk, True)
+    meta = torch.empty((M, 2 * shape.topk), dtype=torch.int32, device=ctx.device)
+    meta[:, : shape.topk].copy_(topk_ids)
+    meta[:, shape.topk :].copy_(topk_weights.view(torch.int32))
+    return TpMoeInputs(
+        x_local=x.contiguous(),
+        topk_weights_local=topk_weights.contiguous(),
+        topk_ids_local=topk_ids.contiguous(),
+        route_meta_local=meta,
+        global_tokens=M,
+        local_tokens=M // tp_size,
+        comm_mode="ar_ar",
     )
 
 
@@ -795,6 +841,18 @@ class TpCollectives:
                 device=x.device,
             )
         dist.reduce_scatter_tensor(out, x)
+        return out
+
+    def all_reduce(self, x: torch.Tensor, out: torch.Tensor | None = None):
+        """Sum ``x`` across ranks (every rank gets the full sum)."""
+        x = x.contiguous()
+        if self.enabled and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            try:
+                return tensor_model_parallel_all_reduce(x, prefill_support=True)
+            except Exception:  # noqa: BLE001 - shape the kernel declines
+                self.fell_back = True
+        out = x.clone() if out is None else out.copy_(x)
+        dist.all_reduce(out)
         return out
 
     def describe(self) -> str:
@@ -1352,6 +1410,50 @@ class SplitTpMoe:
         self.gemms(a1, a1_scale, wts, ids, sorted_ret, plan)
 
 
+class SplitTpMoeAR(SplitTpMoe):
+    """AR/AR layer: AR -> quant -> sort -> GEMM1 -> GEMM2 -> AR.
+
+    Every rank holds a bf16 partial of all M tokens and the full routing, so
+    the only collectives are the two all-reduces (aiter's one-shot all-reduce,
+    or the P2P kernels in --single-process); the GEMMs are the same tuned
+    kernels as the AG/RS chain, on all M tokens."""
+
+    name = "split_ar"
+
+    def __init__(self, weights, ctx, max_local_tokens, comm=None):
+        super().__init__(weights, ctx, max_local_tokens, comm=comm)
+        total = max_local_tokens * weights.tp_size
+        H = weights.shape.model_dim
+        self._x = torch.empty((total, H), dtype=dtypes.bf16, device=ctx.device)
+        self._y = torch.empty((total, H), dtype=dtypes.bf16, device=ctx.device)
+
+    def _all_reduce(self, x, out):
+        if self.comm is None:
+            out.copy_(x)
+            dist.all_reduce(out)
+            return out
+        return self.comm.all_reduce(x, out=out)
+
+    def steps(self, inputs: TpMoeInputs):
+        g = inputs.global_tokens
+        plan = self.plans(g)
+        x = self._all_reduce(inputs.x_local, self._x[:g])
+        w_all, i_all = inputs.topk_weights_local, inputs.topk_ids_local
+        sorted_ret = self.sorting(w_all, i_all, plan)
+        if plan.prequant:
+            xq, xq_scale = self.quant(x)
+            a1, a1_scale = xq, xq_scale
+        else:
+            xq = xq_scale = None
+            a1, a1_scale = x, None
+        return plan, w_all, i_all, sorted_ret, xq, xq_scale, a1, a1_scale
+
+    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
+        plan, w_all, i_all, sorted_ret, _xq, _s, a1, a1_scale = self.steps(inputs)
+        partial = self.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
+        return self._all_reduce(partial, self._y[: inputs.global_tokens])
+
+
 # ---------------------------------------------------------------------------
 # Placeholder for the fused kernel
 # ---------------------------------------------------------------------------
@@ -1373,6 +1475,8 @@ class MegaMoeTP:
         weights: TpMoeWeights,
         ctx: DistCtx,
         max_local_tokens: int,
+        group=None,
+        comm_mode: str = "ag_rs",
     ):
         self.weights = weights
         self.shape = weights.shape
@@ -1392,6 +1496,7 @@ class MegaMoeTP:
             activation=self.shape.act_type,
             beta=DEFAULT_SITUV2_BETA if situ else None,
             linear_beta=DEFAULT_SITUV2_LINEAR_BETA if situ else None,
+            comm_mode=comm_mode,
         )
         self.engine = MegaMoeTPEngine(
             self.config,
@@ -1399,6 +1504,7 @@ class MegaMoeTP:
             w1_scale=weights.w1_scale,
             w2=weights.w2,
             w2_scale=weights.w2_scale,
+            group=group,
             device=ctx.device,
         )
 
@@ -1444,10 +1550,38 @@ class TorchReferenceTpMoe:
 
     @torch.no_grad()
     def __call__(self, inputs: TpMoeInputs, allgather: AllGatherTokens):
-        shape = self.shape
-        w = self.weights
         x_all, w_all, i_all = allgather(inputs)
         x_all, w_all, i_all = x_all.clone(), w_all.clone(), i_all.clone()
+        partial = self.partial(x_all, w_all, i_all, inputs.global_tokens)
+
+        # ReduceScatter == all-reduce then slice this rank's shard.
+        acc = partial.float()
+        dist.all_reduce(acc)
+        m = inputs.local_tokens
+        start = self.ctx.rank * m
+        return acc[start : start + m]
+
+    @torch.no_grad()
+    def all_reduce_layer(self, inputs: TpMoeInputs) -> torch.Tensor:
+        """AR/AR: the sum of every rank's partial input through this rank's
+        shard, summed again over ranks -- the full output on every rank."""
+        xs = inputs.x_local.float()
+        dist.all_reduce(xs)
+        partial = self.partial(
+            xs.to(dtypes.bf16),
+            inputs.topk_weights_local,
+            inputs.topk_ids_local,
+            inputs.global_tokens,
+        )
+        acc = partial.float()
+        dist.all_reduce(acc)
+        return acc
+
+    @torch.no_grad()
+    def partial(self, x_all, w_all, i_all, global_tokens: int) -> torch.Tensor:
+        """This rank's (unreduced) MoE output for every global token."""
+        shape = self.shape
+        w = self.weights
 
         # a4w4 activation quant: test_moe_2stage.py:274 (the generic else branch,
         # since AQDType=fp4x2 is not in [bf16, fp16, fp8]).
@@ -1473,7 +1607,7 @@ class TorchReferenceTpMoe:
         )
 
         a2_qt, a2_scale = torch_quant(out1, quant_dtype=AQ_DTYPE)
-        a2_qt = a2_qt.view(inputs.global_tokens, shape.topk, -1)
+        a2_qt = a2_qt.view(global_tokens, shape.topk, -1)
 
         partial = torch_moe_stage2(
             a2_qt,
@@ -1488,13 +1622,7 @@ class TorchReferenceTpMoe:
             w2_bias=None,
             doweight=True,
         )
-
-        # ReduceScatter == all-reduce then slice this rank's shard.
-        acc = partial.float()
-        dist.all_reduce(acc)
-        m = inputs.local_tokens
-        start = self.ctx.rank * m
-        return acc[start : start + m]
+        return partial
 
 
 def rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -1723,8 +1851,14 @@ def run_case(
     max_local_tokens: int,
 ) -> dict:
     tp = args.tp
-    inputs = make_inputs(shape, ctx, tp, global_tokens, args.seed, args.route)
-    moe = SplitTpMoe(weights, ctx, max_local_tokens, comm=args.comm_backend)
+    ar = args.comm_mode == "ar_ar"
+    inputs = make_inputs(shape, ctx, tp, global_tokens, args.seed, args.route, args.comm_mode)
+    split_cls = SplitTpMoeAR if ar else SplitTpMoe
+    moe = split_cls(weights, ctx, max_local_tokens, comm=args.comm_backend)
+
+    def reference():
+        ref = TorchReferenceTpMoe(weights, ctx)
+        return ref.all_reduce_layer(inputs) if ar else ref(inputs, moe.allgather)
     kname1, kname2 = moe.kernel_names(global_tokens)
     if not args.no_jit_warmup and not jit_warmup(moe, shape, ctx, global_tokens):
         raise SkipCase(
@@ -1734,6 +1868,7 @@ def run_case(
     row: dict = {
         "model": shape.name,
         "tp": tp,
+        "comm_mode": args.comm_mode,
         "global_tokens": global_tokens,
         "local_tokens": inputs.local_tokens,
         "model_dim": shape.model_dim,
@@ -1751,8 +1886,7 @@ def run_case(
     y_actual = y.clone()
     barrier()
     if global_tokens <= args.accuracy_max_tokens:
-        reference = TorchReferenceTpMoe(weights, ctx)
-        y_expected = reference(inputs, moe.allgather)
+        y_expected = reference()
         row["rel_l2"] = rel_l2(y_actual, y_expected)
         del y_expected
         torch.cuda.empty_cache()
@@ -1782,7 +1916,7 @@ def run_case(
             row["fused_graph_us"] = float("nan")
             row["fused_note"] = MegaMoeTP.unavailable_reason()
         else:
-            fused = MegaMoeTP(weights, ctx, max_local_tokens)
+            fused = MegaMoeTP(weights, ctx, max_local_tokens, comm_mode=args.comm_mode)
             y_fused = fused(inputs)
             fused_gate = args.fused_rtol
             row["fused_rel_l2"] = rel_l2(y_fused, y_actual)
@@ -1797,8 +1931,7 @@ def run_case(
                     f"rel_l2={row['fused_rel_l2']:.6f} exceeds {fused_gate}"
                 )
             if global_tokens <= args.accuracy_max_tokens:
-                reference = TorchReferenceTpMoe(weights, ctx)
-                y_expected = reference(inputs, moe.allgather)
+                y_expected = reference()
                 row["fused_ref_rel_l2"] = rel_l2(fused(inputs), y_expected)
                 del y_expected
                 torch.cuda.empty_cache()
@@ -1824,6 +1957,8 @@ def run_case(
     partial = moe.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
     row["ag_wire"] = plan.ag_wire
 
+    if args.leg_device_time and ar:
+        raise SkipCase("--leg-device-time covers the AG/RS chain only")
     if args.leg_device_time:
         # A leg run measures the leg and nothing else, and returns. One capture
         # per process is what this stack reliably survives: adding the two
@@ -1903,6 +2038,365 @@ def run_case(
 
 
 # ---------------------------------------------------------------------------
+# Single-process mode: one process drives every TP GPU
+# ---------------------------------------------------------------------------
+# Some nodes cannot synchronize GPUs across processes at speed (a kernel that
+# polls a flag another process's GPU writes over HIP IPC can take hundreds of
+# ms per launch), which makes every torchrun timing meaningless there. One
+# process driving all ranks through peer access has no such problem, so
+# --single-process runs the same cell that way: the split baseline keeps its
+# tuned GEMMs, sort and quant, and its collectives are the one-shot P2P kernels
+# of ``p2p_collectives.py``; the fused engine maps its arena through
+# ``PeerArenaGroup`` instead of IPC. Rows carry the same columns as torchrun's.
+def _sp_rel_l2(actual, expected) -> float:
+    err = sum(float(((a.float() - e.float().to(a.device)) ** 2).sum()) for a, e in zip(actual, expected))
+    ref = sum(float((e.float() ** 2).sum()) for e in expected)
+    return float("nan") if ref == 0.0 else (err / ref) ** 0.5
+
+
+def _sp_run(devices, fn):
+    """fn(rank) on every rank's device, one host thread per rank, then wait for
+    all of them. Threads, because a rank's call may block the host (a
+    synchronizing allocation, a pageable copy, a module load) while its GPU
+    waits in a collective for peers: a single thread would never launch them."""
+    import threading
+
+    out, err = [None] * len(devices), [None] * len(devices)
+
+    def work(r):
+        try:
+            torch.cuda.set_device(devices[r])
+            out[r] = fn(r)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            err[r] = exc
+
+    threads = [threading.Thread(target=work, args=(r,)) for r in range(len(devices))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for e in err:
+        if e is not None:
+            raise e
+    for d in devices:
+        torch.cuda.synchronize(d)
+    return out
+
+
+def _sp_time_graph(devices, fn, args) -> tuple[float, list | None]:
+    """Capture fn(rank) per rank, replay every rank's graph together; the
+    slowest rank's time, best of --rounds."""
+    graphs = []
+    try:
+        for _ in range(args.sp_warmup):
+            _sp_run(devices, fn)
+        streams = [torch.cuda.Stream(d) for d in devices]
+        for _ in range(3):
+            for r, d in enumerate(devices):
+                with torch.cuda.device(d), torch.cuda.stream(streams[r]):
+                    fn(r)
+            for d in devices:
+                torch.cuda.synchronize(d)
+        outs = []
+        for r, d in enumerate(devices):
+            with torch.cuda.device(d):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=streams[r]):
+                    outs.append(fn(r))
+                graphs.append(g)
+        for d in devices:
+            torch.cuda.synchronize(d)
+        import threading
+
+        # One host thread per rank, released together: every rank's replays
+        # start at the same time, as they do with one process per rank (a
+        # single thread replaying rank after rank skews them by ~10-20 us).
+        best = float("inf")
+        for _ in range(args.rounds + 1):
+            evs = [
+                (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                for _ in devices
+            ]
+            gate = threading.Barrier(len(devices))
+
+            def replay(r):
+                torch.cuda.set_device(devices[r])
+                with torch.cuda.stream(streams[r]):
+                    gate.wait()
+                    evs[r][0].record(streams[r])
+                    for _ in range(args.iters):
+                        graphs[r].replay()
+                    evs[r][1].record(streams[r])
+
+            ts = [threading.Thread(target=replay, args=(r,)) for r in range(len(devices))]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            for d in devices:
+                torch.cuda.synchronize(d)
+            best = min(best, max(e[0].elapsed_time(e[1]) for e in evs) * 1000.0 / args.iters)
+        for r, d in enumerate(devices):
+            with torch.cuda.device(d), torch.cuda.stream(streams[r]):
+                graphs[r].replay()
+        for d in devices:
+            torch.cuda.synchronize(d)
+        return best, [o.clone() for o in outs]
+    except Exception as exc:  # noqa: BLE001 - diagnostic column only
+        logger.warning("[TP-MOE] single-process graph timing failed: %s", exc)
+        return float("nan"), None
+    finally:
+        graphs = None
+        gc.collect()
+        for d in devices:
+            torch.cuda.synchronize(d)
+
+
+def run_case_sp(shape, weights, ctxs, args, global_tokens, max_local_tokens, p2p, group) -> dict:
+    tp = args.tp
+    devices = [c.device for c in ctxs]
+    ar = args.comm_mode == "ar_ar"
+    inputs = [make_inputs(shape, c, tp, global_tokens, args.seed, args.route, args.comm_mode) for c in ctxs]
+    split_cls = SplitTpMoeAR if ar else SplitTpMoe
+    split = []
+    for r, c in enumerate(ctxs):
+        with torch.cuda.device(c.device):
+            split.append(split_cls(weights[r], c, max_local_tokens, comm=p2p.comm(r)))
+    kname1, kname2 = split[0].kernel_names(global_tokens)
+    if not args.no_jit_warmup:
+        for r, c in enumerate(ctxs):
+            with torch.cuda.device(c.device):
+                x = torch.randn((global_tokens, shape.model_dim), dtype=dtypes.bf16, device=c.device)
+                ids = (torch.arange(global_tokens * shape.topk, dtype=torch.int32, device=c.device) % shape.experts).view(global_tokens, shape.topk)
+                wts = torch.full((global_tokens, shape.topk), 1.0 / shape.topk, dtype=torch.float32, device=c.device)
+                try:
+                    split[r].warmup(x, wts, ids)
+                except Exception as exc:  # noqa: BLE001
+                    raise SkipCase(f"kernel build failed: {exc}") from exc
+    row: dict = {
+        "model": shape.name,
+        "tp": tp,
+        "comm_mode": args.comm_mode,
+        "global_tokens": global_tokens,
+        "local_tokens": inputs[0].local_tokens,
+        "model_dim": shape.model_dim,
+        "inter_dim_local": weights[0].local_inter_dim,
+        "experts": shape.experts,
+        "topk": shape.topk,
+        "act": str(shape.act_type).split(".")[-1],
+        "gemm1_kernel": kname1,
+        "gemm2_kernel": kname2,
+        "rel_l2": float("nan"),
+        "comm": "p2p-single-process",
+    }
+    y = [t.clone() for t in _sp_run(devices, lambda r: split[r](inputs[r]))]
+    if any(bool(torch.isnan(t).any()) for t in y):
+        raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: output has NaN")
+
+    expected = None
+    if global_tokens <= args.accuracy_max_tokens:
+        if ar:
+            x_all = sum(i.x_local.float().to(devices[0]) for i in inputs).to(dtypes.bf16)
+            w_all = inputs[0].topk_weights_local.to(devices[0])
+            i_all = inputs[0].topk_ids_local.to(devices[0])
+        else:
+            x_all = torch.cat([i.x_local.to(devices[0]) for i in inputs])
+            w_all = torch.cat([i.topk_weights_local.to(devices[0]) for i in inputs])
+            i_all = torch.cat([i.topk_ids_local.to(devices[0]) for i in inputs])
+        total = None
+        for r, c in enumerate(ctxs):
+            with torch.cuda.device(c.device):
+                ref = TorchReferenceTpMoe(weights[r], c)
+                p = ref.partial(x_all.to(c.device), w_all.to(c.device), i_all.to(c.device), global_tokens).float().to(devices[0])
+            total = p if total is None else total + p
+        m = inputs[0].local_tokens
+        expected = [total if ar else total[r * m : (r + 1) * m] for r in range(tp)]
+        row["rel_l2"] = _sp_rel_l2(y, expected)
+        if not row["rel_l2"] < args.rtol:
+            raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: rel_l2={row['rel_l2']:.6f} exceeds {args.rtol}")
+
+    fused = None
+    if args.impl in ("fused", "both"):
+        fused = []
+        for r, c in enumerate(ctxs):
+            with torch.cuda.device(c.device):
+                fused.append(MegaMoeTP(weights[r], c, max_local_tokens, group=group, comm_mode=args.comm_mode))
+        yf = [t.clone() for t in _sp_run(devices, lambda r: fused[r](inputs[r]))]
+        errs = [f.engine.poll_errors() for f in fused]
+        if any(errs):
+            raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: fused watchdog fired {errs}")
+        row["fused_rel_l2"] = _sp_rel_l2(yf, y)
+        if not row["fused_rel_l2"] < args.fused_rtol:
+            raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: fused vs unfused rel_l2={row['fused_rel_l2']:.6f} exceeds {args.fused_rtol}")
+        if expected is not None:
+            row["fused_ref_rel_l2"] = _sp_rel_l2(yf, expected)
+            if not row["fused_ref_rel_l2"] < args.rtol:
+                raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: fused vs torch rel_l2={row['fused_ref_rel_l2']:.6f} exceeds {args.rtol}")
+    if args.no_perf:
+        return row
+
+    row["ag_wire"] = split[0].plans(global_tokens).ag_wire
+    if args.impl == "fused":
+        row["split_graph_us"], rep = float("nan"), None
+    else:
+        row["split_graph_us"], rep = _sp_time_graph(devices, lambda r: split[r](inputs[r]), args)
+    if rep is not None:
+        row["split_graph_rel_l2"] = _sp_rel_l2(rep, y)
+        if not row["split_graph_rel_l2"] < args.rtol:
+            raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: split graph replay rel_l2={row['split_graph_rel_l2']:.6f}")
+    if fused is not None:
+        row["fused_graph_us"], rep = _sp_time_graph(devices, lambda r: fused[r](inputs[r]), args)
+        if rep is not None:
+            row["fused_graph_rel_l2"] = _sp_rel_l2(rep, yf)
+        f = row["fused_graph_us"]
+        row["graph_speedup"] = row["split_graph_us"] / f if f > 0 else float("nan")
+    return row
+
+
+def _flydsl_multi_device() -> None:
+    """Let every FlyDSL kernel launch on whichever GPU is current.
+
+    A compiled FlyDSL artifact loads its code object into the device that is
+    current when its execution engine is first built, and every cache above it
+    (call states, ``flyc.compile`` results kept by aiter) holds that engine's
+    entry point. One process driving several GPUs needs one engine per device,
+    so the entry point becomes a dispatcher that builds (a pickled copy of the
+    artifact, i.e. the same binary) and caches one engine per device."""
+    import pickle
+    import threading
+
+    from flydsl.compiler import jit_executor, jit_function
+
+    art_cls = jit_executor.CompiledArtifact
+    lock = threading.RLock()
+    jf_call = jit_function.JitFunction.__call__
+
+    def _locked_call(self, *a, **k):
+        # compiles and first launches from several rank threads at once
+        with lock:
+            return jf_call(self, *a, **k)
+
+    jit_function.JitFunction.__call__ = _locked_call
+    if getattr(art_cls, "_mega_moe_multi_device", False):
+        return
+    orig = art_cls._get_func_exe
+
+    class _PerDevice:
+        def __init__(self, art):
+            self.art = art
+            self.home = torch.cuda.current_device()
+            self.fns = {}
+            self.keep = []
+
+        def __call__(self, packed):
+            dev = torch.cuda.current_device()
+            fn = self.fns.get(dev)
+            if fn is None:
+                with lock:
+                    fn = self._build(dev)
+            return fn(packed)
+
+        def _build(self, dev):
+            fn = self.fns.get(dev)
+            if fn is None:
+                if dev == self.home:
+                    fn = orig(self.art)
+                else:
+                    twin = pickle.loads(pickle.dumps(self.art))
+                    twin._post_load_processors = list(self.art._post_load_processors)
+                    fn = orig(twin)
+                    self.keep.append(twin)
+                self.fns[dev] = fn
+            return fn
+
+    def _get_func_exe(self):
+        disp = getattr(self, "_per_device_exe", None)
+        if disp is None:
+            disp = _PerDevice(self)
+            self._per_device_exe = disp
+        return disp
+
+    art_cls._get_func_exe = _get_func_exe
+    art_cls._mega_moe_multi_device = True
+
+
+def main_single_process(args) -> int:
+    from p2p_collectives import P2PGroup
+
+    _flydsl_multi_device()
+
+    from aiter.ops.flydsl.kernels.mega_moe_tp.symmetric_arena import PeerArenaGroup
+
+    tp = args.tp or torch.cuda.device_count()
+    args.tp = tp
+    devices = [torch.device("cuda", i) for i in range(tp)]
+    torch.cuda.set_device(devices[0])
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        print(f"[SKIP] a4w4 MoE needs {SUPPORTED_GFX}, found {gfx}")
+        return 0
+    bad = [t for t in args.tokens if t <= 0 or t % tp]
+    if bad:
+        raise ValueError(f"tokens {bad} must be positive multiples of TP={tp}")
+    tokens = sorted(set(args.tokens))
+    max_local = max(tokens) // tp
+    group = PeerArenaGroup(devices)
+    p2p = P2PGroup(devices, max_local)
+    ctxs = [DistCtx(rank=r, world=tp, device=d) for r, d in enumerate(devices)]
+    print(
+        f"[ENV] gfx={gfx} cu={get_cu_num()} tp={tp} route={args.route} quant=a4w4 "
+        f"mode=single-process comm_mode={args.comm_mode} baseline_comm=p2p fmoe_csv={AITER_CONFIGS.AITER_CONFIG_FMOE_FILE}",
+        flush=True,
+    )
+    rows: list[dict] = []
+    for name in args.models:
+        shape = MODELS[name]
+        print(f"\n=== {shape.tag(tp)} ===", flush=True)
+        weights = []
+        for c in ctxs:
+            with torch.cuda.device(c.device):
+                weights.append(build_sharded_weights(shape, c, tp, args.seed))
+        for global_tokens in tokens:
+            try:
+                row = run_case_sp(shape, weights, ctxs, args, global_tokens, max_local, p2p, group)
+            except SkipCase as exc:
+                print(f"[SKIP] {shape.name} M={global_tokens}: {exc}", flush=True)
+                continue
+            rows.append(row)
+            nan = float("nan")
+            print(
+                f"[TP-MOE] {shape.name} M={global_tokens} m={row['local_tokens']} "
+                f"rel_l2={row['rel_l2']:.6f} fused_rel_l2={row.get('fused_rel_l2', nan):.6f} "
+                f"fused_ref_rel_l2={row.get('fused_ref_rel_l2', nan):.6f}"
+                + (
+                    ""
+                    if args.no_perf
+                    else f" | split={row.get('split_graph_us', nan):.1f} "
+                    f"fused={row.get('fused_graph_us', nan):.1f} "
+                    f"speedup={row.get('graph_speedup', nan):.3f}"
+                ),
+                flush=True,
+            )
+            for d in devices:
+                with torch.cuda.device(d):
+                    torch.cuda.empty_cache()
+        del weights
+    if rows:
+        df = pd.DataFrame(rows)
+        cols = [c for c in _PERF_COLUMNS if c in df.columns]
+        extra = [c for c in df.columns if c not in cols]
+        print("\n" + "=" * 100)
+        print("TP MoE (AllGather + GEMM1 + GEMM2 + ReduceScatter), a4w4, single process")
+        print("=" * 100)
+        print(df[cols].to_markdown(index=False, floatfmt=".3f"))
+        if args.csv:
+            df[cols + extra].to_csv(args.csv, index=False)
+            print(f"\nwrote {args.csv}")
+    print(f"\nTP_MOE_UT_OK cases={len(rows)}", flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 #: How much a smaller M may exceed the next larger M before it is called out.
@@ -1951,6 +2445,7 @@ def _report_non_monotonic(df) -> None:
 
 _PERF_COLUMNS = [
     "model",
+    "comm_mode",
     "global_tokens",
     "local_tokens",
     "inter_dim_local",
@@ -2104,6 +2599,29 @@ def parse_args(argv=None):
         "a few of them (kimi3 died on the 4th), so a multi-cell run is refused "
         "by default with the per-cell loop printed instead.",
     )
+    p.add_argument(
+        "--comm-mode",
+        choices=["ag_rs", "ar_ar"],
+        default="ag_rs",
+        help="ag_rs: tokens enter sequence-parallel (AllGather before, "
+        "ReduceScatter after). ar_ar: every rank holds a partial of all "
+        "tokens (AllReduce before and after); the fused kernel is dispatched "
+        "accordingly.",
+    )
+    p.add_argument(
+        "--single-process",
+        action="store_true",
+        help="One process drives all --tp visible GPUs through peer access "
+        "(no torchrun). For nodes where cross-process GPU synchronization is "
+        "too slow for torchrun timings to mean anything; the split baseline's "
+        "collectives are then the one-shot P2P kernels of p2p_collectives.py.",
+    )
+    p.add_argument(
+        "--sp-warmup",
+        type=int,
+        default=20,
+        help="Eager iterations before each single-process graph capture.",
+    )
     p.add_argument("--csv", default=None, help="Write the perf table here (rank 0).")
     return p.parse_args(argv)
 
@@ -2111,6 +2629,8 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if args.single_process:
+        return main_single_process(args)
     # Everything is measured under graph replay now, and that is the regime the
     # one-shot collectives win in, so 'auto' is simply 'custom'.
     resolved_comm = "custom" if args.comm == "auto" else args.comm
@@ -2172,7 +2692,7 @@ def main(argv=None) -> int:
         if ctx.is_main:
             print(
                 f"[ENV] gfx={gfx} cu={get_cu_num()} tp={args.tp} "
-                f"route={args.route} quant=a4w4 "
+                f"route={args.route} quant=a4w4 comm_mode={args.comm_mode} "
                 f"baseline_comm={args.comm_backend.describe()} "
                 f"fmoe_csv={AITER_CONFIGS.AITER_CONFIG_FMOE_FILE}",
                 flush=True,
