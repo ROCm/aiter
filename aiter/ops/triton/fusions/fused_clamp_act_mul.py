@@ -23,6 +23,16 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
+_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _is_gluon_available():
+    """Check if the gluon backend is supported for current GPU architecture."""
+    try:
+        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     """Tuned config for ``(M, N)`` on ``backend``, or the untuned default.
@@ -35,10 +45,11 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     through to the default. A null ``BLOCK_SIZE_N`` means "keep the caller's
     width" (the whole row unless overridden).
 
-    triton takes ``DEFAULT.json`` for the running arch, falling back to the
-    gfx950 copy where that arch has none, and picks the smallest
-    ``N_LEQ_<x> >= block_size_n``, else ``any``. M and N are unused there --
-    the triton kernel only tunes on the row width.
+    triton takes the largest ``M_GEQ_<x> <= M`` from the N-specialized file when
+    one exists. The kernel runs one program per row, so at a large M the grid
+    saturates the GPU and the width table's small-M ``num_warps`` is too high.
+    Otherwise, it reads ``DEFAULT.json`` for the running arch, falling back to the
+    gfx950 copy and picks the smallest ``N_LEQ_<x> >= block_size_n``, else ``any``.
 
     Returns:
         The config dict for this shape.
@@ -47,6 +58,19 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/fusions/fused_clamp_act_mul"
 
     if backend == "triton":
+        specialized = load_config_json(
+            f"{base}/FUSED_CLAMP_ACT_MUL-N={N}.json", required=False
+        )
+        if specialized is not None:
+            # Largest ``M_GEQ_<x> <= M`` wins. If there is no match, fall through
+            # to the width table below.
+            bounds = [
+                int(k[len("M_GEQ_") :]) for k in specialized if k.startswith("M_GEQ_")
+            ]
+            hit = max((b for b in bounds if M >= b), default=None)
+            if hit is not None:
+                return dict(specialized[f"M_GEQ_{hit}"])
+
         raw = load_config_json(f"{base}/DEFAULT.json", required=False)
         if raw is None:
             raw = load_config_json(
@@ -269,7 +293,7 @@ def fused_clamp_act_mul(
 
     # choose backend
     if backend is None:
-        backend = "gluon" if get_arch() in ("gfx1250",) else "triton"
+        backend = "gluon" if _is_gluon_available() else "triton"
     backend = backend.lower()
     assert backend in (
         "triton",
@@ -299,9 +323,9 @@ def fused_clamp_act_mul(
             BLOCK_SIZE_N & (BLOCK_SIZE_N - 1) == 0
         ), f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a power of two"
 
-        assert get_arch() in (
-            "gfx1250",
-        ), f"Gluon backend requires gfx1250, got '{get_arch()}'"
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
         # (M chunks * rows to process, N tiles)
         _fused_clamp_silu_mul_gluon_kernel[
