@@ -884,6 +884,25 @@ def mla_decode_v4_asm(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME_V4, ffi_type="ctypes")
+def mla_decode_v4_fused_asm(
+    Q: torch.Tensor,
+    qrope: torch.Tensor,
+    KV: torch.Tensor,
+    kvrope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    sink: torch.Tensor,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+    kv_last_page_lens: torch.Tensor | None = None,
+) -> None: ...
+
+
 @compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_prefill_asm_fwd(
     # [num_seqs, num_heads, head_size]

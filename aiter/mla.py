@@ -15,11 +15,39 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.asm.asm_utils import get_gfx_from_device
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
 _FLYDSL_MLA_REDUCE_TARGET_DV = 512
+MLA_V4_FUSED_MAX_SPLITS = 16
+
+
+def mla_v4_fused_slot_f32(num_heads: int, v_head_dim: int) -> int:
+    if v_head_dim != 512:
+        raise ValueError(
+            f"mla v4 fused layout requires v_head_dim=512, got {v_head_dim}"
+        )
+    return (num_heads + 1) * v_head_dim
+
+
+def is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, num_kv_splits):
+    if get_gfx_from_device(Q.device) != "gfx1250":
+        return False
+    nsplit = int(num_kv_splits)
+    if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):
+        return False
+    if os.environ.get("AITER_MLA_V4_FUSED", "1") == "0":
+        return False
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    gqa = Q.size(1) // KV.size(2)
+    return (
+        Q.dtype in fp8_dtypes
+        and KV.dtype in fp8_dtypes
+        and gqa == 32
+        and int(max_seqlen_q) == 1
+    )
 
 
 def _flydsl_mla_reduce_supported(
@@ -1680,7 +1708,7 @@ def mla_decode_fwd_v4_nm(
 ):
     """v4 MLA decode forward.
 
-    Routes through the canonical aiter JIT C-ABI module
+    Launches shipped code objects through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
     `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
@@ -1716,6 +1744,20 @@ def mla_decode_fwd_v4_nm(
          FlashAttention LSE merge across the `num_kv_splits` axis and
          writes the merged result directly into the BF16 `output` tensor.
 
+    Fused multi-pass (gfx1250, `2 <= num_kv_splits <= 16`, variant listed in
+    `mla_v4_fused_asm.csv`, e.g. qh32 decode):
+      stage1 and the cross-split merge run in ONE cluster launch (no triton
+      stage2); the final BF16 result is written into `output`. The fp32
+      partial scratch uses a padded slot of `(num_heads + 1) * v_head_dim`
+      elements, so it is allocated here unless the caller passes `logits` in
+      that native shape `[total_q, num_kv_splits, (num_heads+1)*v_head_dim]`
+      (a caller `logits` in the regular 4D shape is ignored). The returned
+      `logits` / `attn_lse` are kernel scratch, viewed as
+      `[total_q, num_kv_splits, num_heads, v_head_dim]` / the regular lse
+      shape; read the result from `output`. `num_kv_splits > 16` keeps the
+      stage1 + stage2 path. Set `AITER_MLA_V4_FUSED=0` to force stage1 +
+      stage2 everywhere.
+
       `sink` (REQUIRED, keyword-only):
       Per-Q-head attention sink logit, total `num_heads` FP32 values
       (= `num_kv_heads * gqa_ratio`). Adds a virtual K-column of logit
@@ -1724,6 +1766,7 @@ def mla_decode_fwd_v4_nm(
 
     """
     require_gfx1250_asm("mla_decode_v4_asm")
+    runtime_gfx = get_gfx_from_device(q.device)
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)
@@ -1770,6 +1813,11 @@ def mla_decode_fwd_v4_nm(
     #       an explicit value back through get_meta_param's fp8 cap (which
     #       could shrink it and desync the buffer shapes). Only synthesize a
     #       uniform split_indptr if the caller didn't pass one.
+    # The fused kernel does not consume split_indptr and therefore only supports
+    # the uniform map synthesized below. Conservatively retain the two-stage
+    # path whenever the caller supplies a map; inspecting a CUDA tensor here
+    # would introduce a host synchronization and break graph capture.
+    fused_split_map_is_uniform = split_indptr is None
     total_kv = kv_page_indices.shape[0]
     if num_kv_splits is None or split_indptr is None:
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
@@ -1816,6 +1864,59 @@ def mla_decode_fwd_v4_nm(
 
     expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
+
+    fused = (
+        is_mla_v4_fused_eligible(q, kv_buffer, max_seqlen_q, num_kv_splits)
+        if fused_split_map_is_uniform
+        else False
+    )
+    if fused:
+        slot = mla_v4_fused_slot_f32(num_heads, v_head_dim)
+        fused_logits_shape = (total_q, num_kv_splits, slot)
+        if logits is not None and tuple(logits.shape) == fused_logits_shape:
+            scratch = logits
+        elif logits is None or tuple(logits.shape) == expected_logits_shape:
+            # Write-only scratch: empty splits are never read back.
+            scratch = torch.empty(
+                fused_logits_shape, dtype=dtypes.fp32, device=q.device
+            )
+        else:
+            raise ValueError(
+                f"mla_decode_fwd_v4_nm: caller-provided `logits` has shape "
+                f"{tuple(logits.shape)}, expected {fused_logits_shape} (fused "
+                f"native) or {expected_logits_shape}."
+            )
+        if attn_lse is None:
+            attn_lse = torch.empty(
+                expected_lse_shape, dtype=dtypes.fp32, device=q.device
+            )
+        elif tuple(attn_lse.shape) != expected_lse_shape:
+            raise ValueError(
+                f"mla_decode_fwd_v4_nm: caller-provided `attn_lse` has shape "
+                f"{tuple(attn_lse.shape)}, expected {expected_lse_shape}."
+            )
+        aiter.mla_decode_v4_fused_asm(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            sink,
+            scratch,
+            attn_lse,
+            output,
+            max_seqlen_q,
+            int(num_kv_splits),
+            kv_last_page_lens,
+        )
+        logits = scratch.as_strided(
+            expected_logits_shape,
+            (num_kv_splits * slot, slot, v_head_dim, 1),
+        )
+        return logits, attn_lse
+
     if out_16_nosplit != 0:
         # V3-style zero-copy final output. When out_16_nosplit=1 (single-pass),
         # the kernel writes the final DENSELY-PACKED BF16 result into ptr_R
@@ -1897,7 +1998,7 @@ def mla_decode_fwd_v4_nm(
         # ragged rebuild). Other archs keep the original mgc=64 for the gqa16/8
         # single-token tile.
         if max_seqlen_q == 1 and num_heads in (8, 16):
-            mgc = 32 if get_gfx() == "gfx950" else 64
+            mgc = 32 if runtime_gfx == "gfx950" else 64
         else:
             mgc = 16
 

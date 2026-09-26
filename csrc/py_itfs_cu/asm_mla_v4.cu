@@ -128,8 +128,8 @@ static constexpr int kV4DimRope = 64;
 // 1:1 in key set so v3 and v4 stay structurally identical.
 //
 // Lookup keys: (qType, kvType, Gqa, ps, qSeqLen, prefill, causal, lse).
-// `sub_Q` and `page_size` are NOT keys — sub_Q is derived in the dispatcher
-// (see the V3-style decision tree below) and page_size comes from KV->size(1).
+// `sub_Q` and `page_size` are NOT keys — sub_Q is carried by the registry
+// (with the legacy heuristic as a fallback) and page_size comes from KV->size(1).
 //
 // `num_kv_splits` ("passes") is also NOT a key — the .co supports any value
 // at runtime via slot 9 of the kernarg packet.
@@ -408,6 +408,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // to load.
     const std::string arch_id = get_gpu_arch();
     const bool is_gfx1250     = (arch_id == "gfx1250");
+    AITER_CHECK(!is_gfx1250 || page_size == 1,
+                __func__,
+                ": gfx1250 only supports KV page_size==1");
     int csv_gqa               = gqa_ratio;
     int csv_qseqlen           = config_max_seqlen_q;
     if(!is_gfx1250)
@@ -506,6 +509,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+        if(cfg.sub_Q > 0)
+            sub_Q = cfg.sub_Q;
         impl_ptr =
             &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
@@ -541,4 +546,155 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
 
     impl_ptr->launch_kernel({arg_buf, &arg_size, gdx, gdy, gdz, block_dim, 1, 1, stream});
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_v4_fused_asm,
+    (aiter_tensor_t * Q,
+     aiter_tensor_t* qrope,
+     aiter_tensor_t* KV,
+     aiter_tensor_t* kvrope,
+     aiter_tensor_t* qo_indptr,
+     aiter_tensor_t* kv_indptr,
+     aiter_tensor_t* kv_page_indices,
+     aiter_tensor_t* sink,
+     aiter_tensor_t* splitData,
+     aiter_tensor_t* splitLse,
+     aiter_tensor_t* output,
+     int max_seqlen_q,
+     int num_kv_splits,
+     aiter_tensor_t* kv_last_page_lens,
+     hipStream_t stream),
+    (Q,
+     qrope,
+     KV,
+     kvrope,
+     qo_indptr,
+     kv_indptr,
+     kv_page_indices,
+     sink,
+     splitData,
+     splitLse,
+     output,
+     max_seqlen_q,
+     num_kv_splits,
+     kv_last_page_lens,
+     stream))
+{
+#if !EN_MLA_V4_KERNARG_PRELOAD
+    AITER_CHECK(false, __func__, ": fused MLA v4 requires the preload kernarg ABI");
+#else
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+    AITER_CHECK(Q != nullptr && qrope != nullptr && KV != nullptr && kvrope != nullptr &&
+                    qo_indptr != nullptr && kv_indptr != nullptr &&
+                    kv_page_indices != nullptr && sink != nullptr && splitData != nullptr &&
+                    splitLse != nullptr && output != nullptr,
+                __func__,
+                ": required tensor argument is null");
+    AITER_CHECK(Q->is_contiguous() && KV->is_contiguous(),
+                __func__,
+                ": only supports contiguous Q/KV");
+    AITER_CHECK(qrope->is_contiguous() && kvrope->is_contiguous(),
+                __func__,
+                ": only supports contiguous qrope/kvrope");
+    AITER_CHECK(sink->data_ptr() != nullptr, __func__, ": sink data_ptr is null");
+    AITER_CHECK(num_kv_splits >= 2 && num_kv_splits <= 16,
+                __func__,
+                ": num_kv_splits must be in [2, 16], got ",
+                num_kv_splits);
+
+    const int num_seqs      = qo_indptr->size(0) - 1;
+    const int num_heads     = Q->size(1);
+    const int num_kv_heads  = KV->size(2);
+    const int page_size     = KV->size(1);
+    const int dim_qk_packed = KV->size(3);
+    const int gqa_ratio     = num_heads / num_kv_heads;
+    const int total_q       = num_seqs * max_seqlen_q;
+    constexpr int v_head_dim = 512;
+
+    AITER_CHECK(num_kv_heads == 1, __func__, ": only supports num_kv_heads==1");
+    AITER_CHECK(page_size == 1, __func__, ": only supports KV page_size==1");
+    AITER_CHECK(Q->size(2) == dim_qk_packed,
+                __func__,
+                ": Q head_size must equal KV head_size");
+    AITER_CHECK(Q->dtype() == AITER_DTYPE_fp8 && KV->dtype() == AITER_DTYPE_fp8,
+                __func__,
+                ": only supports fp8/fp8");
+    AITER_CHECK(gqa_ratio == 32 && max_seqlen_q == 1,
+                __func__,
+                ": only supports gqa=32 and max_seqlen_q=1");
+    AITER_CHECK(output->dtype() == AITER_DTYPE_bf16 && output->is_contiguous(),
+                __func__,
+                ": output must be contiguous bf16");
+    AITER_CHECK(output->numel() >=
+                    static_cast<size_t>(total_q) * num_heads * v_head_dim,
+                __func__,
+                ": output is too small");
+
+    const size_t scratch_slot = static_cast<size_t>(num_heads + 1) * v_head_dim;
+    const size_t need_data =
+        static_cast<size_t>(total_q) * num_kv_splits * scratch_slot;
+    const size_t need_lse =
+        static_cast<size_t>(total_q) * num_kv_splits * num_heads;
+    AITER_CHECK(splitData->dtype() == AITER_DTYPE_fp32 &&
+                    splitData->is_contiguous() && splitData->numel() >= need_data,
+                __func__,
+                ": splitData must be contiguous fp32 fused scratch");
+    AITER_CHECK(splitLse->dtype() == AITER_DTYPE_fp32 &&
+                    splitLse->is_contiguous() && splitLse->numel() >= need_lse,
+                __func__,
+                ": splitLse must be contiguous fp32 scratch");
+
+    CFG* config_map = &cfg_mla_v4_fused_asm;
+    const std::string kernelName = get_heuristic_kernel_mla_v4(
+        "fp8", "fp8", gqa_ratio, 0, 0, 0, max_seqlen_q, 0, arch_id, config_map);
+    auto it = config_map->find(kernelName);
+    AITER_CHECK(it != config_map->end(), __func__, ": cannot find suitable fused kernel");
+    const auto& cfg = it->second;
+    AITER_CHECK(cfg.sub_Q > 0, __func__, ": fused kernel registry has invalid sub_Q");
+
+    const HipDeviceGuard device_guard(Q->device_id);
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const char* name    = cfg.knl_name.c_str();
+    const char* co_name = cfg.co_name.c_str();
+    AiterAsmKernel& impl =
+        impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+
+    MlaV4KernelArgsPreload args = {};
+    args.ptr_R                   = splitData->data_ptr();
+    args.ptr_Q                   = Q->data_ptr();
+    args.ptr_KV                  = KV->data_ptr();
+    args.ptr_LTP                 = kv_indptr->data_ptr();
+    args.ptr_LTL = kv_last_page_lens ? kv_last_page_lens->data_ptr() : nullptr;
+    args.ptr_QTP             = qo_indptr->data_ptr();
+    args.ptr_QROPE           = qrope->data_ptr();
+    args.ptr_KVROPE          = kvrope->data_ptr();
+    args.scalar_f            = 1.0f / std::sqrt(static_cast<float>(kV4DimNope + kV4DimRope));
+    args.s_gqa_ratio         = static_cast<unsigned int>(num_heads * max_seqlen_q);
+    args.s_kv_split          = static_cast<unsigned int>(num_kv_splits);
+    args.s_total_kv          = static_cast<unsigned int>(KV->size(0) * page_size);
+    args.out_16_nosplit      = 0;
+    args.ptr_LSE             = splitLse->data_ptr();
+    args.ptr_LTD             = kv_page_indices->data_ptr();
+    args.ptr_valid_split     = output->data_ptr();
+    args.s_use_valid_split   = 0;
+    args.ptr_sink            = sink->data_ptr();
+
+    const int gdx = (num_heads * max_seqlen_q + cfg.sub_Q - 1) / cfg.sub_Q;
+    const int block_dim = 4 * static_cast<int>(get_warp_size_func());
+    size_t arg_size = sizeof(args);
+    impl.launch_kernel({&args,
+                        &arg_size,
+                        num_kv_splits * gdx,
+                        num_seqs,
+                        1,
+                        block_dim,
+                        1,
+                        1,
+                        stream,
+                        num_kv_splits,
+                        1,
+                        1});
+#endif
 }
