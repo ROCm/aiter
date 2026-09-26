@@ -9,16 +9,6 @@ from torch import Tensor
 
 from .dispatch import _opus_dispatch
 
-# gfx950-only, unlike the GEMM entries below, and nothing here gates on arch at import:
-# the wrappers re-check at call time so a non-gfx950 caller gets a named error instead of
-# a JIT failure.
-from .pa_mqa_logits_opus import (
-    pa_mqa_logits_mxfp4_build_sched,
-    pa_mqa_logits_mxfp4_sched,
-    pa_mqa_logits_mxfp4_sched_buffer_ints,
-    pa_mqa_logits_mxfp4_sched_slots,
-)
-
 
 def opus_gemm(
     XQ: Tensor,
@@ -112,8 +102,4 @@ __all__ = [
     "gemm_a16w16_opus",
     "opus_bmm",
     "opus_gemm",
-    "pa_mqa_logits_mxfp4_build_sched",
-    "pa_mqa_logits_mxfp4_sched",
-    "pa_mqa_logits_mxfp4_sched_buffer_ints",
-    "pa_mqa_logits_mxfp4_sched_slots",
 ]
