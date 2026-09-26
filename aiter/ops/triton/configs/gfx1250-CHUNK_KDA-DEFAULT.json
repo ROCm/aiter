@@ -1,0 +1,13 @@
+{
+  "walk_few_seq_heads": {
+    "BV": 32,
+    "num_warps": 2,
+    "num_stages": 2
+  },
+  "walk_default": {
+    "BV": 64,
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 3
+  }
+}
