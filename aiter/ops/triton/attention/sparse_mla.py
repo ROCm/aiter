@@ -61,6 +61,107 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
     return u8, u8.view(torch.bfloat16), u8.view(torch.float32), u8.shape[1]
 
 
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+# The kernel reads every fp8 byte, in q, the cache and the dot operands, as OCP
+# e4m3, which is gfx950's native fp8. gfx942's is fnuz, and the kernel does not
+# decode it yet, so gfx942 takes bf16 q and a bf16 cache only.
+FP8_ARCHS = ("gfx950",)
+
+# The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
+# reach the kernel below: they route to pa_decode_sparse, whose packed driver is
+# gfx950-only. Everywhere else they land in its fallback path, which reads a
+# plain grouped fp8 pool rather than these records, so it rejects them on dtype.
+PACKED_ARCHS = ("gfx950",)
+
+# gfx942 has 64 KB of LDS, not gfx950's 160, so BLOCK_K=64 (~67 KB) will not
+# launch. num_warps stays 4 instead of block_k // 16, which the cap would halve.
+_ARCH_BLOCK_K = {"gfx942": 32, "gfx950": 64}
+_ARCH_NUM_WARPS = {"gfx942": 4, "gfx950": 4}
+
+
+def _arch_block_k(arch: str) -> int:
+    return _ARCH_BLOCK_K.get(arch, 64)
+
+
+def _arch_num_warps(arch: str) -> int:
+    return _ARCH_NUM_WARPS.get(arch, _arch_block_k(arch) // 16)
+
+
+def _check_packed_arch(arch: str) -> None:
+    """Packed caches and the two-loop are gfx950-only, whatever SUPPORTED_ARCHS says.
+
+    Left alone these reach pa_decode_sparse and fail inside it on a cache dtype,
+    which says nothing about the arch being the reason.
+    """
+    if arch not in PACKED_ARCHS:
+        flat = "bf16, fp8_scalar or fp8_dsv32_mla" if arch in FP8_ARCHS else "bf16"
+        raise ValueError(
+            f"the fp8_dsv4_mla and fp8_g64 caches and the SWA+top-k two-loop are "
+            f"{'/'.join(PACKED_ARCHS)}-only and have no implementation on {arch}. "
+            f"Use the flat {flat} cache there."
+        )
+
+
+def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
+    """fp8 q and caches only where OCP e4m3 is the native fp8.
+
+    A cache arrives as bytes, usually behind a uint8 view, so a gfx942 cache in
+    its native fnuz cannot be told apart from OCP here. Read as OCP it comes out
+    2x too large, and NaN wherever the quantizer saturated at 240.
+    """
+    if arch in FP8_ARCHS:
+        return
+    got = [
+        what
+        for what, is_fp8 in (
+            (f"q is {q_dtype}", q_dtype.itemsize == 1),
+            (f"the cache is {fmt}", fmt != "bf16"),
+        )
+        if is_fp8
+    ]
+    if got:
+        raise ValueError(
+            f"sparse_mla_fwd takes bf16 q and a bf16 cache on {arch}, but "
+            f"{' and '.join(got)}. The kernel reads fp8 as OCP e4m3, and {arch}'s "
+            "native fp8 is fnuz, which it does not decode yet."
+        )
+
+
+# An arch listed here has its geometry checked against that LDS budget. gfx942
+# is the only one that needs it: it already takes the smaller of the two tiles
+# this wrapper selects, so a latent too wide to fit has nowhere left to go.
+# gfx950 has 160 KB and is left to the launcher, as before.
+_ARCH_LDS_BUDGET = {"gfx942": 64 * 1024}
+# Row pitch padding, and the scratch the kernel takes beyond the tiles. Both
+# hold only for bf16 tiles with the async path off, which is every gfx942
+# launch: fp8 dots are rejected there and lds_limited forces ASYNC_LDS off.
+_LDS_PAD = 8
+_LDS_SCRATCH_PER_BLOCK_K = 32
+
+
+def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim):
+    """Reject a geometry whose tiles cannot fit, naming what would.
+
+    Left to the launcher this surfaces as an opaque OutOfResources.
+    """
+    budget = _ARCH_LDS_BUDGET.get(arch)
+    if budget is None:
+        return
+    rope = block_k * (qk_rope_head_dim + _LDS_PAD) * 2 if qk_rope_head_dim else 0
+    need = (
+        block_k * (kv_lora_rank + _LDS_PAD) * 2
+        + rope
+        + _LDS_SCRATCH_PER_BLOCK_K * block_k
+    )
+    if need > budget:
+        raise ValueError(
+            f"kv_lora_rank={kv_lora_rank} with qk_rope_head_dim="
+            f"{qk_rope_head_dim} needs {need} B of LDS at BLOCK_K={block_k}, "
+            f"over {arch}'s {budget} B. This geometry needs gfx950's 160 KB."
+        )
+
+
 def _mla_num_splits(
     num_queries: int, heads_blocks: int, avg_topk: float, block_k: int = 64
 ) -> int:
@@ -88,6 +189,7 @@ def _async_launch_config(
     uni_tile: bool = True,
     has_extra: bool = False,
     block_k: int = 64,
+    lds_limited: bool = False,
 ) -> tuple[bool, int, int]:
     """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
 
@@ -107,6 +209,10 @@ def _async_launch_config(
     )
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
+    # The tiles below are sized for gfx950's LDS; block_k already fits this arch.
+    if lds_limited:
+        waves_per_eu = 1 if (use_buffer_load and workgroups <= num_sms) else 2
+        return False, block_k, waves_per_eu
     if enabled and workgroups >= 4 * num_sms:
         return True, 64, 4
     waves_per_eu = 2
@@ -115,13 +221,19 @@ def _async_launch_config(
     return enabled, (128 if enabled else block_k), waves_per_eu
 
 
-def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
+def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
             f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"
         )
     if dot_precision == "bf16":
         return False
+    if arch not in FP8_ARCHS:
+        raise ValueError(
+            f"dot_precision='fp8' is not supported on {arch}: the kernel feeds the "
+            f"matrix core OCP e4m3, and {arch}'s decodes fnuz. Use "
+            "dot_precision='bf16'."
+        )
     if fmt == "fp8_dsv32_mla":
         raise ValueError(
             "dot_precision='fp8' does not support the fp8_dsv32_mla cache."
@@ -291,6 +403,7 @@ def _forward_paged(
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
+    _check_packed_arch(arch_info.get_arch())
     unsupported = [
         name
         for name, asked in (
@@ -352,7 +465,9 @@ def sparse_mla_fwd(
 
     Supported KV cache formats. The format is inferred from kv_buffer's shape,
     dtype and kv_scale; each row gives what the caller has to pass. R is the
-    QK width, kv_lora_rank + qk_rope_head_dim.
+    QK width, kv_lora_rank + qk_rope_head_dim. Every fp8 format, like fp8 q, is
+    gfx950-only: the kernel reads fp8 as OCP e4m3, and gfx942's native fp8 is
+    fnuz.
 
         format         kv_buffer                     kv_scale        geometry args
         bf16           [slots, R], [nb, block, R],   None            as the model
@@ -487,7 +602,10 @@ def sparse_mla_fwd(
             extra_indptr,
             extra_indices,
         )
-    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
+    arch = arch_info.get_arch()
+    assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
+    _check_fp8_arch(arch, fmt, q.dtype)
+    lds_limited = arch == "gfx942"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -509,7 +627,7 @@ def sparse_mla_fwd(
             )
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
     cache, alt, scl, block_size = _cache_pointers(fmt, kv_buffer, d_qk, kv_scale)
-    fp8_dots = _resolve_dot_precision(dot_precision, fmt)
+    fp8_dots = _resolve_dot_precision(dot_precision, fmt, arch)
     if not q_is_fp8:
         # q_scale describes an fp8 q's encoding. With bf16 q the kernel quantizes
         # per (query, head-block) tile when the dots are fp8, so a caller-supplied
@@ -527,8 +645,8 @@ def sparse_mla_fwd(
     # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
     # BLOCK_M = next_pow2(H) instead of padding heads
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    block_k = 64
-    num_warps = block_k // 16
+    block_k = _arch_block_k(arch)
+    num_warps = _arch_num_warps(arch)
 
     num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
     avg_topk = kv_indices.numel() / max(1, num_queries)
@@ -603,7 +721,9 @@ def sparse_mla_fwd(
         uni_tile=True,
         has_extra=False,
         block_k=block_k,
+        lds_limited=lds_limited,
     )
+    _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim)
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""

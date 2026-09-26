@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for sparse_mla_fwd (gfx950 gluon MLA).
+"""Tests for sparse_mla_fwd (gluon MLA, gfx950 and gfx942).
 
 Covers both geometries: separated rope (DSV3.2, GLM-5.1, GLM-5.2) and
 rope-free (GLM-5.3-Flash), where the query is the latent alone.
@@ -13,20 +13,27 @@ import torch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
-if arch_info.get_arch() == "gfx950":
-    import aiter.ops.triton.attention.sparse_mla as smd
-    from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+import aiter.ops.triton.attention.sparse_mla as smd
+from aiter.ops.triton.attention.sparse_mla import (
+    FP8_ARCHS,
+    SUPPORTED_ARCHS,
+    sparse_mla_fwd,
+)
 
-# The packed fp8_ds_mla record is OCP e4m3 by definition of the format.
+# The arch-native fp8, as a producer on this machine writes it. That is OCP e4m3,
+# what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else.
 FP8_DTYPE = get_fp8_e4m3_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 KV_LORA, ROPE = 512, 64
 D_QK = KV_LORA + ROPE
 
 
-def _skip_unless_gfx950():
-    if arch_info.get_arch() != "gfx950":
-        pytest.skip("sparse_mla_fwd is gfx950-only")
+def _skip_unless_supported(dots="bf16", fmt="bf16"):
+    arch = arch_info.get_arch()
+    if arch not in SUPPORTED_ARCHS:
+        pytest.skip(f"sparse_mla_fwd does not support {arch}")
+    if (dots == "fp8" or fmt != "bf16") and arch not in FP8_ARCHS:
+        pytest.skip(f"fp8 is read as OCP e4m3, and {arch}'s native fp8 is fnuz")
 
 
 def quantize_flat_fp8(kv):
@@ -141,14 +148,106 @@ def _run_and_check(
     ids=["topk2048", "ragged500", "prefill"],
 )
 def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
-    _skip_unless_gfx950()
+    _skip_unless_supported(dots, fmt)
     _run_and_check(
         fmt, C=C, H=H, topk=topk, ragged=ragged, pool=pool, tol=tol, dot_precision=dots
     )
 
 
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_dot_precision_arch_gate(arch):
+    """The fp8-dot gate, for every arch, from any machine.
+
+    The matrix above skips its fp8 cases off gfx950, so the gate has no
+    coverage on any arch without this.
+    """
+    assert smd._resolve_dot_precision("bf16", "fp8_scalar", arch) is False
+    if arch in FP8_ARCHS:
+        assert smd._resolve_dot_precision("fp8", "fp8_scalar", arch) is True
+    else:
+        with pytest.raises(ValueError, match="fnuz"):
+            smd._resolve_dot_precision("fp8", "fp8_scalar", arch)
+
+
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_packed_cache_arch_gate(arch):
+    """Packed caches are gfx950-only even where SUPPORTED_ARCHS is wider.
+
+    They return to pa_decode_sparse before the kernel's own arch gate, so
+    widening that gate does not reach them.
+    """
+    if arch in smd.PACKED_ARCHS:
+        smd._check_packed_arch(arch)
+    else:
+        with pytest.raises(ValueError, match="fp8_dsv4_mla"):
+            smd._check_packed_arch(arch)
+
+
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_fp8_arch_gate(arch):
+    """fp8 q and fp8 caches, for every arch, from any machine."""
+    smd._check_fp8_arch(arch, "bf16", torch.bfloat16)
+    for fmt, q_dtype in (
+        ("fp8_scalar", torch.bfloat16),
+        ("fp8_dsv32_mla", torch.bfloat16),
+        ("bf16", torch.float8_e4m3fn),
+    ):
+        if arch in FP8_ARCHS:
+            smd._check_fp8_arch(arch, fmt, q_dtype)
+        else:
+            with pytest.raises(ValueError, match="fnuz"):
+                smd._check_fp8_arch(arch, fmt, q_dtype)
+
+
+@pytest.mark.parametrize("fmt", ["tensor", "dsmla"])
+def test_native_fp8_cache_rejected(fmt):
+    """This arch's own fp8 behind a uint8 view, through the public wrapper.
+
+    Only the arch tells those bytes apart from OCP, and going through
+    sparse_mla_fwd also catches the gate losing its one call site.
+    """
+    arch = arch_info.get_arch()
+    if arch not in SUPPORTED_ARCHS or arch in FP8_ARCHS:
+        pytest.skip(f"fp8 caches run on {arch}")
+    q, cache, ks, idx, ptr, _ = _build(fmt, 1, 16, 64, 1024, ragged=False)
+    assert cache.dtype == torch.uint8
+    with pytest.raises(ValueError, match="fnuz"):
+        sparse_mla_fwd(q, cache, ptr, idx, D_QK**-0.5, kv_scale=ks)
+
+
+def test_lds_budget_gfx950_is_unchecked():
+    """gfx950 is left to the launcher; the 64 KB table is gfx942-only."""
+    smd._check_lds_budget("gfx950", 64, 2048, 64)
+
+
+@pytest.mark.parametrize(
+    "kv_lora_rank, rope, need",
+    [
+        (512, 0, None),
+        (512, 64, None),
+        (1000, 0, None),  # exactly 64 KB
+        (1008, 0, 66048),
+        (1024, 0, 67072),
+        (1024, 64, 71680),
+        (2048, 0, 132608),
+    ],
+)
+def test_lds_budget_gfx942_boundary(kv_lora_rank, rope, need):
+    """CPU-only: the gfx942 64 KB guard, including the measured rejects.
+
+    The GPU suite only launches the default 512/64 geometry. These are the
+    rope-free and separated-rope points from the OutOfResources sweep.
+    """
+    block_k = smd._arch_block_k("gfx942")
+    if need is None:
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope)
+        return
+    with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope)
+
+
 def test_ds_mla_format():
-    _skip_unless_gfx950()
+    _skip_unless_supported(fmt="dsmla")
     _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
 
 
@@ -169,7 +268,7 @@ def reference_lse(q, kv_truth, indices, indptr, sm_scale):
     ids=["split", "split_ragged", "nosplit"],
 )
 def test_return_lse(fmt, C, topk, ragged, splits):
-    _skip_unless_gfx950()
+    _skip_unless_supported(fmt=fmt)
     H, pool = 16, 1 << 16
     sm = D_QK**-0.5
     q, cache, ks, idx, ptr, truth = _build(fmt, C, H, topk, pool, ragged)
@@ -188,13 +287,15 @@ def test_return_lse(fmt, C, topk, ragged, splits):
     assert torch.equal(out.view(torch.int16), out_no.view(torch.int16))
 
 
-def test_global_load_path():
+@pytest.mark.parametrize("fmt", ["bf16", "tensor"])
+def test_global_load_path(fmt):
     """A pool whose addressable span passes buffer_load's 2 GB offset limit."""
-    _skip_unless_gfx950()
+    _skip_unless_supported(fmt=fmt)
     live = 1 << 16
     sm = D_QK**-0.5
-    q, cache, ks, idx, ptr, truth = _build("tensor", 8, 16, 2048, live, ragged=False)
-    big = torch.empty(3_800_000, D_QK, dtype=cache.dtype, device=cache.device)
+    q, cache, ks, idx, ptr, truth = _build(fmt, 8, 16, 2048, live, ragged=False)
+    rows = 3_800_000 // cache.element_size()
+    big = torch.empty(rows, D_QK, dtype=cache.dtype, device=cache.device)
     big[:live] = cache
     assert smd.max_addressable_bytes(big) >= 2**31 - 1  # past buffer_load's offset
     out, _ = sparse_mla_fwd(q, big, ptr, idx, sm, kv_scale=ks)
@@ -214,7 +315,7 @@ def test_global_load_path():
     ids=["topk2048", "ragged500", "prefill"],
 )
 def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
-    _skip_unless_gfx950()
+    _skip_unless_supported(dots, fmt)
     _run_and_check(
         fmt,
         C=C,
