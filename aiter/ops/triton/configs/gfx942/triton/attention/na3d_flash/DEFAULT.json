@@ -9,6 +9,6 @@
         "BLOCK_Q": 32,
         "BLOCK_KV": 64,
         "num_warps": 4,
-        "num_stages": 2
+        "num_stages": 4
     }
 }
