@@ -6,6 +6,7 @@ from itertools import product
 
 import triton
 from _utils import pre_pruning_rules
+from harness import kernel_name
 
 
 def echo_to_file(msg: str, filename: str, clear: bool = False):
@@ -25,7 +26,9 @@ def parse_args():
     parser.add_argument("N", type=int, help="N dim")
     parser.add_argument("K", type=int, help="K dim")
     parser.add_argument("G", type=int, help="GPU card ID")
-    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
+    parser.add_argument(
+        "F", type=kernel_name, help="Kernel name (see harness.py --help)"
+    )
     parser.add_argument(
         "--block-size-m-range",
         nargs="+",
@@ -125,7 +128,8 @@ def main():
     N = args.N
     K = args.K
     G = args.G
-    harness_filename = args.F
+    kernel = args.F
+    harness_filename = f"harness_{kernel}.py"  # Keep existing log filenames.
     block_size_m_range = args.block_size_m_range
     block_size_n_range = args.block_size_n_range
     block_size_k_range = args.block_size_k_range
@@ -142,7 +146,6 @@ def main():
     batch_timeout = args.timeout
 
     assert M == triton.next_power_of_2(M), "M has to be power of 2"
-    assert os.path.isfile(harness_filename), f"{harness_filename} not found"
     assert all(
         v == triton.next_power_of_2(v) for v in block_size_m_range
     ), "All possible BLOCK_SIZE_M must be power of 2"
@@ -277,8 +280,22 @@ def main():
             comb_str += " "
         comb_str = comb_str.strip()
 
-        cmd = f"""rocprofv3 --kernel-trace -f csv -o res-{file_tag} -- python3 {harness_filename} {M} {N} {K} {comb_str}"""
-        cmd = cmd.split(" ")
+        cmd = [
+            "rocprofv3",
+            "--kernel-trace",
+            "-f",
+            "csv",
+            "-o",
+            f"res-{file_tag}",
+            "--",
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "harness.py"),
+            kernel,
+            str(M),
+            str(N),
+            str(K),
+            *comb_str.split(),
+        ]
 
         rocprof_filename = f"res-{file_tag}_kernel_trace.csv"
 

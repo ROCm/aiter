@@ -6,36 +6,18 @@ from _utils import (
     config_parms_key,
     read_screen_file,
 )
+from harness import KERNEL_CONFIG_NAMES, kernel_name
 
 from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 
 
-HARNESS_CONFIG_NAMES = {
-    "harness_batched_gemm_bf16.py": "BATCHED_GEMM-A16W16",
-    "harness_gemm_a16w16.py": "GEMM-A16W16",
-    "harness_gemm_a16w16_atomic.py": "GEMM-A16W16-ATOMIC",
-    "harness_gemm_a16w16_gated.py": "GEMM-A16W16-gated",
-    "harness_gemm_a16w8_blockscale.py": "GEMM-A16W8_BLOCKSCALE",
-    "harness_gemm_a16w8_blockscale_preshuffle.py": "GEMM-A16W8_BLOCKSCALE_PRESHUFFLED",
-    "harness_gemm_a16wfp4.py": "GEMM-A16WFP4",
-    "harness_gemm_a8w8.py": "GEMM-A8W8",
-    "harness_gemm_a8w8_blockscale.py": "GEMM-A8W8_BLOCKSCALE",
-    "harness_gemm_a8w8_blockscale_preshuffle.py": "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED",
-    "harness_gemm_a8w8_per_token_scale.py": "GEMM-A8W8_PER_TOKEN_SCALE",
-    "harness_gemm_a8wfp4.py": "GEMM-A8WFP4",
-    "harness_gemm_afp4wfp4.py": "GEMM-AFP4WFP4",
-    # gemm_afp4wfp4_pre_quant is gemm_a16wfp4 with atomic_add=True.
-    "harness_gemm_afp4wfp4_pre_quant_atomic.py": "GEMM-A16WFP4",
-    "harness_gemm_afp4wfp4_preshuffle.py": "GEMM-AFP4WFP4_PRESHUFFLED",
-    "harness_gemm_afp8wfp8_preshuffle.py": "GEMM-AFP8WFP8_PRESHUFFLED",
-}
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("F", type=str, help="Harness script (harness_<op>.py)")
+    parser.add_argument(
+        "F", type=kernel_name, help="Kernel name (see harness.py --help)"
+    )
     parser.add_argument(
         "--n-list", nargs="+", type=int, help="List of N dim", default=[]
     )
@@ -67,7 +49,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    harness_filename = args.F
+    harness_filename = f"harness_{args.F}.py"
     nlist = args.n_list
     klist = args.k_list
     config_json_file_prefix = args.json_prefix
@@ -80,12 +62,7 @@ def main():
     list_of_shapes = [(nlist[i], klist[i]) for i in range(len(nlist))]
 
     if config_json_file_prefix is None:
-        config_name = HARNESS_CONFIG_NAMES.get(os.path.basename(harness_filename))
-        if config_name is None:
-            sys.exit(
-                f"No config name known for {harness_filename}: pass --json-prefix "
-                "or add it to HARNESS_CONFIG_NAMES"
-            )
+        config_name = KERNEL_CONFIG_NAMES[args.F]
         config_json_file_prefix = f"{DEVICE_ARCH}-{config_name}"
     print(f"Writing JSON configs to {config_json_file_prefix}-N=<N>-K=<K>.json")
 
