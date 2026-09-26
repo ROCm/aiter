@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## TP4 scheduling and real-weight qualification — E415–E419
+
+All eight selected TP8 rows still beat matched MXFP4; five of six selected compact TP4 rows beat baseline. E416 improves its matched dense TP4 control by 0.52–1.44% and passes real-weight qualification, but dense parity and TP4 M256 hot remain open. No production or serving parity is claimed.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 119.15 | 101.60 | -14.7% |
+| 8 | 128 | hot | 43.35 | 42.53 | -1.9% |
+| 8 | 256 | spread | 131.03 | 111.48 | -14.9% |
+| 8 | 256 | hot | 61.32 | 58.53 | -4.5% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 223.90 | 179.49 | -19.8% |
+| 4 | 256 | hot | 68.93 | 86.72 | +25.8% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 594.30 | 730.14 | +22.9% |
+| 4 | 4096 | hot | 488.88 | 602.89 | +23.3% |
+
+E415 scalar wave addressing cuts static M16 register use to 104 and improves the overlap control modestly, but retains a cold-route tradeoff against E400. E416 compiler-visible dense codebook reads pass 420 synthetic checks and improve matched E386 by 0.52–1.44%; E418 adds 2,160 exact real-weight checks using the same binary. Replace only the two selected M4096 rows; M1024 stays on E363, which was not a fresh E416 arm. The new M4096 MXFP4 denominators differ from previous sessions, so cross-session percentage changes are not matched regressions or speedups. E417 corrected M32 buffering and E419 bounded unrolling are rejected: lower aggregate instructions/waits do not offset about half the measured wave occupancy. Together E415–E419 add 1,554 synthetic and 2,160 real-weight checks. All completed timing rows meet the unchanged 3% rule. Frozen failures are retained. Correct the earlier evolving inventory shorthand for E413 hot from 4.6% to 4.5% (unrounded 4.5457%); raw and published R24 evidence remain unchanged.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## TP8 M256 isolated parity and real-weight qualification — E413–E414
 
 All eight selected TP8 comparison rows now beat their matched MXFP4 baselines. E413 closes M256 hot with 58.53 versus 61.32 us (4.5% faster), while preserving wins on spread and mixed using one fixed policy. Five of six compact TP4 rows beat baseline; TP4 M256 hot and dense gaps remain. This is isolated operator parity within the selected TP8 coverage, not complete TP8 coverage or serving parity.
@@ -1195,8 +1239,14 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E411 | Ordinary compiler-visible LDS loads make two-word cross-K dependencies trackable. M16 gains 1.1% hot with effectively unchanged cold timing; M32 loses. All 378 checks pass. |
 | E412 | Combine activation staging and compiler-visible codebook loads. No-drain form reaches 83.05 us hot against 68.93 us MXFP4, with cold regressions against E400. All 441 checks pass; retain for TP8 transfer, no TP4 broad promotion. |
 
-| E413 | TP8 M256 activation/codebook overlap beats matched MXFP4 on spread/hot/mixed by 14.9/4.6/10.9%, with 315 exact synthetic checks and stable fresh bookends. Trades previous cold speed for one policy that closes tested hot parity. |
+| E413 | TP8 M256 activation/codebook overlap beats matched MXFP4 on spread/hot/mixed by 14.9/4.5/10.9%, with 315 exact synthetic checks and stable fresh bookends. Trades previous cold speed for one policy that closes tested hot parity. |
 | E414 | The unchanged E413 binary passes 1,440 real-weight graph/eager checks across three TP8 layer/rank slices, five patterns and eight changes. No whole-model or serving claim. |
+
+| E415 | Scalar wave identity lowers M16 VGPRs 120 to 104 and hot VALU instructions 6.1%; metadata-first adds no general benefit. 378 exact checks and stable rows. Retain scalar as an ingredient; E400 cold routes stay faster. Best hot remains 18.4% behind MXFP4. |
+| E416 | Dense scalar identity plus compiler-visible codebook loads passes 420 exact checks and stable rows, improving matched E386 by 0.52–1.44%. Static 247/248 VGPRs do not change hardware residency. Retain tracked loads at M4096 after E418; dense parity remains open. |
+| E417 | Corrected M32 one/two-slot activation staging passes 378 exact checks and stable rows but regresses. Hot double-slot VALU counts fall 36.1% versus M16 while measured mean active-CU wave occupancy drops 3.80 to 2.00. Reject; preserve the initial cross-wave union ownership failure and repair. |
+| E418 | Unchanged E416 binary passes 2,160 exact real-weight checks at TP4 M1024/M4096 over layers 3/40/77 and five patterns. Capture ranks 0/3/7 map to actual TP4 weight ranks 0/3/3. Operator correctness only. |
+| E419 | Bound M32 two-slot K-loop unrolling to one/two. 378 exact checks and stable rows, but static VGPRs remain 130/135 and measured occupancy stays near two waves per active CU. Both regress and are rejected. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
