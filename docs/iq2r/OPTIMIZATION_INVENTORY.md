@@ -1,7 +1,7 @@
 # GLM-5.3 IQ2R optimization inventory
 
 Updated 2026-09-26. This is a concise inventory of the documented optimization
-attempts from the initial GLM integration through E364. Related scouts,
+attempts from the initial GLM integration through E373. Related scouts,
 integration steps, and qualification runs are grouped together. Rejected
 approaches remain listed so they are not mistaken for unexplored ideas.
 
@@ -19,7 +19,7 @@ acceptance work. This source snapshot consolidates the measured E167/E172/E181 n
 
 The published [benchmark comparison](BENCHMARK_RESULTS.md) and [source/validation notes](README.md) accompany this inventory. Artifact paths in the tables identify the retained optimization workspace; their hashes are in [EVIDENCE_INDEX.json](EVIDENCE_INDEX.json). Large raw traces, generated binaries, and model data are retained outside these source repositories.
 
-## Isolated single-GPU optimization, E199–E364
+## Isolated single-GPU optimization, E199–E373
 
 The user paused serving sweeps and requested one-rank synthetic MoE profiling.
 The [single-GPU report](SINGLE_GPU_ANALYSIS.md) lists all attempts.
@@ -158,6 +158,19 @@ single-GPU report. Serving sweeps remain paused.
 | E362 | Enable XCD remapping at M256 with grid multiplier2. Both patterns improve, all 336 exact checks pass; hot falls to 64.71us versus fresh MXFP4 62.76us (3.1% gap). Actual grid geometry and zero scratch verified. |
 | E363 | Combine E351 two-read gate and E355 M64 down: 504 exact checks, all rows stable, 0.6–3.6% faster than E345. Dense MXFP4 gaps remain 3.3–23.5%. Incorrect r1 tensor selection is preserved; corrected fresh r2 qualifies. |
 | E364 | Pair MFMA32 records and reuse activations: 588 exact checks and all stable rows. M32 improves one hot case but loses on the other three; M64 lookahead crosses 256 registers. No broad selection; initial compilation error retained. |
+
+
+| Experiment | Brief explanation and outcome |
+|:---|:---|
+| E365 | One-ahead register weight records and gate grid3. R1 hot drift 3.56% is provisional; narrowed r2 passes 168 exact checks and stable timing. Register/grid2 improves hot versus its matched control; grid3 is unselected. |
+| E366 | Pair partial reads and emit four FP8 output bytes in one dword store, preserving all rounding. 168 exact checks and stable timing; independently useful. Four byte stores become one dword and data-permutation instructions fall. |
+| E367 | Combine register-record loading with vector gate output. 252 exact checks; qualified spread loses to both components and hot drift is 4.46%. No additive gain established; unselected. |
+| E368 | Extend compact TP4 to M256 with a matching quad decoder preserving four sequential K128 accumulations. 168 exact checks and stable rows. Remapping helps both patterns; spread beats MXFP4 but hot remains 29.7% behind. |
+| E369 | Adapt ordered quad down to TP8 K256 with N256/N512 outputs and matching tile-major reduction. 210 exact checks and stable rows. N512 improves both patterns against the matched triplet control; hot remains 1.7% behind that run's MXFP4. |
+| E370 | Reuse gate weights over M32 rows, separately testing split-K read4 and full activation/weight pipelines. 252 exact checks. All new variants lose qualified spread; hot drift 3.19% prevents qualification. |
+| E371 | Hold N512 down arithmetic/layout fixed and compare persistent grid8/4/2. 210 exact checks, both rows stable. Grid4 improves hot 1.9% for a 0.24% spread cost; its matched MXFP4 hot gap is 2.3%. |
+| E372 | Use four K waves with two separate K768 accumulators each, retaining the original eight-part ordered sum. 252 exact checks, zero scratch. Both M16/M32 versions lose qualified spread; MXFP4 hot drift 3.61% is retained. |
+| E373 | Adapt vector8/batch3, vector8/batch9 and vector16/batch3 reduction to N512 tile-major output. R1 hot drift 3.47% is retained. Narrowed r2 passes 168 exact checks with stable rows; vector8/b3 improves hot 1.4% for a 0.28% spread cost. Native E308 already overlaps nine payload loads; no missing-load-overlap claim. |
 
 
 ## How to read the outcomes

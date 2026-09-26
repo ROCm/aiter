@@ -24,6 +24,50 @@ rounds, and bracket separate rocprof traces/counter passes. Candidates must
 match the original IQ2R output exactly as graph inputs and routes change.
 Cross-format model quality is not established by synthetic tensors.
 
+## Ordered quad down and gate pipelines — E365–E373
+
+The selected kernels beat MXFP4 on six of the eight reported TP8 rows and five of six compact TP4 rows. TP8 hot gaps are 0.4% at 128 tokens and 2.3% at 256. Newly qualified TP4 M256 spread is 19.9% faster, but hot is 29.7% slower. The four reported dense TP4 rows remain 3.3–23.5% slower. The full isolated and serving goal is not achieved.
+
+| TP | Tokens | Routes | MXFP4 µs | IQ2R µs | IQ2R time difference |
+|---:|---:|:---|---:|---:|---:|
+| 8 | 32 | spread | 78.78 | 66.57 | -15.5% |
+| 8 | 32 | hot | 28.56 | 28.09 | -1.7% |
+| 8 | 64 | spread | 103.36 | 86.56 | -16.3% |
+| 8 | 64 | hot | 40.97 | 34.38 | -16.1% |
+| 8 | 128 | spread | 121.73 | 103.33 | -15.1% |
+| 8 | 128 | hot | 44.16 | 44.32 | +0.4% |
+| 8 | 256 | spread | 135.15 | 111.86 | -17.2% |
+| 8 | 256 | hot | 62.64 | 64.10 | +2.3% |
+| 4 | 64 | spread | 191.78 | 159.06 | -17.1% |
+| 4 | 64 | hot | 42.53 | 42.02 | -1.2% |
+| 4 | 128 | spread | 212.21 | 169.64 | -20.1% |
+| 4 | 128 | hot | 60.88 | 59.32 | -2.6% |
+| 4 | 256 | spread | 232.58 | 186.30 | -19.9% |
+| 4 | 256 | hot | 71.31 | 92.46 | +29.7% |
+| 4 | 1024 | spread | 290.48 | 300.02 | +3.3% |
+| 4 | 1024 | hot | 187.38 | 196.84 | +5.0% |
+| 4 | 4096 | spread | 603.04 | 744.74 | +23.5% |
+| 4 | 4096 | hot | 500.70 | 610.02 | +21.8% |
+
+E365 qualifies one-ahead register records with a prospectively narrowed repeat; E366 vector gate output qualifies independently, but E367 does not establish an additive gain. E368 extends exact ordered down to TP4 M256 and exposes a hot gap. E369 adapts quad down to TP8 M256 and E371 adjusts its grid, keeping one policy across both routing patterns. E370/E372 M32 and split-K gate variants pass exact checks but lose qualified spread; drifting hot rows remain provisional. E373 vector8/batch3 qualifies in a prospectively narrowed r2 with 168 exact checks; it improves hot at a 0.28% spread cost. Disassembly confirms E308 already overlaps all nine payload reads, correcting the initial source-level interpretation; E373 changes metadata handling, workgroup size and registers. No new real-weight or model-quality qualification is claimed.
+
+Microseconds per complete isolated TP-rank MoE call; lower is better. Tokens
+are not serving concurrency. Measurements use 32 rotating banks, five-second
+warmup and fresh MXFP4 bookends; every selected row passes the unchanged 3%
+maximum-drift rule. Failed attempts and provisional rows remain preserved.
+The comparison includes input quantization/task sorting, gate/up/SwiGLU and
+intermediate quantization, down, and final route reduction. Router projection,
+top-k and TP all-reduce are excluded. MXFP4 uses A4W4; IQ2R retains FP8
+activations and decodes weights to FP8. Synthetic MXFP4 is requantized from
+materialized IQ2R and does not establish original-checkpoint model quality.
+
+Exact changing graph/eager checks, route-aligned gate FP8/scales, native
+kernel dispatch and zero scratch are audited. The original MXFP4 numerical
+bounds are unchanged. No new production integration or serving qualification
+is claimed. Dense/hot gaps, broader real-capture qualification, safe packing
+and fallbacks, model quality and final ATOM benchmark_serving acceptance remain.
+Serving sweeps stay paused while these candidates are qualified and integrated.
+
 ## Shared activations and workgroup ordering checkpoint — E354–E364
 
 The selected isolated kernels beat MXFP4 on six of eight TP8 rows and all four compact TP4 rows. TP8 hot gaps are 0.4% at 128 tokens and 3.1% at 256. The combined dense TP4 kernel remains 3.3–23.5% behind. The full performance goal is not achieved.
@@ -697,6 +741,16 @@ Dense E199+ results are unaffected by this small-token dispatch correction.
 | E362 | Enable XCD remapping at M256 with grid multiplier2. Both patterns improve, all 336 exact checks pass; hot falls to 64.71us versus fresh MXFP4 62.76us (3.1% gap). Actual grid geometry and zero scratch verified. |
 | E363 | Combine E351 two-read gate and E355 M64 down: 504 exact checks, all rows stable, 0.6–3.6% faster than E345. Dense MXFP4 gaps remain 3.3–23.5%. Incorrect r1 tensor selection is preserved; corrected fresh r2 qualifies. |
 | E364 | Pair MFMA32 records and reuse activations: 588 exact checks and all stable rows. M32 improves one hot case but loses on the other three; M64 lookahead crosses 256 registers. No broad selection; initial compilation error retained. |
+
+| E365 | One-ahead register weight records and gate grid3. R1 hot drift 3.56% is provisional; narrowed r2 passes 168 exact checks and stable timing. Register/grid2 improves hot versus its matched control; grid3 is unselected. |
+| E366 | Pair partial reads and emit four FP8 output bytes in one dword store, preserving all rounding. 168 exact checks and stable timing; independently useful. Four byte stores become one dword and data-permutation instructions fall. |
+| E367 | Combine register-record loading with vector gate output. 252 exact checks; qualified spread loses to both components and hot drift is 4.46%. No additive gain established; unselected. |
+| E368 | Extend compact TP4 to M256 with a matching quad decoder preserving four sequential K128 accumulations. 168 exact checks and stable rows. Remapping helps both patterns; spread beats MXFP4 but hot remains 29.7% behind. |
+| E369 | Adapt ordered quad down to TP8 K256 with N256/N512 outputs and matching tile-major reduction. 210 exact checks and stable rows. N512 improves both patterns against the matched triplet control; hot remains 1.7% behind that run's MXFP4. |
+| E370 | Reuse gate weights over M32 rows, separately testing split-K read4 and full activation/weight pipelines. 252 exact checks. All new variants lose qualified spread; hot drift 3.19% prevents qualification. |
+| E371 | Hold N512 down arithmetic/layout fixed and compare persistent grid8/4/2. 210 exact checks, both rows stable. Grid4 improves hot 1.9% for a 0.24% spread cost; its matched MXFP4 hot gap is 2.3%. |
+| E372 | Use four K waves with two separate K768 accumulators each, retaining the original eight-part ordered sum. 252 exact checks, zero scratch. Both M16/M32 versions lose qualified spread; MXFP4 hot drift 3.61% is retained. |
+| E373 | Adapt vector8/batch3, vector8/batch9 and vector16/batch3 reduction to N512 tile-major output. R1 hot drift 3.47% is retained. Narrowed r2 passes 168 exact checks with stable rows; vector8/b3 improves hot 1.4% for a 0.28% spread cost. Native E308 already overlaps nine payload loads; no missing-load-overlap claim. |
 
 Each experiment lives in `experiments/eNNN/`, with preserved source, module
 identity, and results. E207 profile-r2 and E212 profile-r2/clean-b have explicit
