@@ -322,6 +322,7 @@ def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monke
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
+@pytest.mark.parametrize("B", [1, 4, 57, 64])
 # @pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (2,1), (24,4)]) #TODO: GQA failing
 @pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16)])
 @pytest.mark.parametrize("D", [1, 64, 128])
