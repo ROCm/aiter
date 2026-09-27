@@ -86,6 +86,7 @@ class DecodeCase:
     block_size: int = 128
     trans_v: bool = True
     dtype: torch.dtype = torch.bfloat16
+    kv_dtype: torch.dtype | None = None
     num_partitions: int | None = 7
     per_token: bool = True
     sliding_window: int = 0
@@ -183,8 +184,15 @@ def _make_inputs(case, planned=False):
     heads = kv_heads * case.query_group_size
     counts = [max(1, (length + page - 1) // page) for length in case.lengths]
     num_pages = sum(counts)
+    is_bf16_kv = case.kv_dtype == torch.bfloat16
     quant_dtype = (
-        torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
+        torch.bfloat16
+        if is_bf16_kv
+        else (
+            torch.float8_e4m3fn
+            if get_gfx_runtime() == "gfx950"
+            else torch.float8_e4m3fnuz
+        )
     )
     query = torch.empty((batch * ql, heads, dim), dtype=case.dtype).uniform_(-0.5, 0.5)
     if case.masked_scale:
@@ -195,9 +203,14 @@ def _make_inputs(case, planned=False):
     value = torch.empty(
         (num_pages, kv_heads, page, value_dim), dtype=case.dtype
     ).uniform_(-0.5, 0.5)
-    quantize = pertoken_quant if case.per_token else per_tensor_quant
-    key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
-    value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
+    if is_bf16_kv:
+        assert case.dtype == torch.bfloat16 and not case.per_token
+        key_quant, value_quant = key, value
+        key_scale = value_scale = None
+    else:
+        quantize = pertoken_quant if case.per_token else per_tensor_quant
+        key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
+        value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
     del key, value
 
     if case.per_token and case.sparse:
@@ -217,7 +230,7 @@ def _make_inputs(case, planned=False):
             # Positive periodic V exposes repeated sink mass without cancellation;
             # per-tensor cases retain a shared scale and use larger FP8 values.
             token_values = (torch.arange(count * page) % 4 + 1).float()
-            token_values *= 0.25 if case.per_token else 32
+            token_values *= 0.25 if case.per_token or is_bf16_kv else 32
             key_quant[start:end].zero_()
             value_quant[start:end] = token_values.reshape(count, 1, page, 1).to(
                 quant_dtype
@@ -253,13 +266,18 @@ def _make_inputs(case, planned=False):
     key_quant, value_quant = scatter(key_quant), scatter(value_quant)
     if case.per_token:
         key_scale, value_scale = scatter(key_scale), scatter(value_scale)
+    vector_width = 8 if is_bf16_kv else 16
     key_cache = (
-        key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
+        key_quant.reshape(
+            physical_pages, kv_heads, page, dim // vector_width, vector_width
+        )
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
     value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, value_dim)
+        value_quant.reshape(
+            physical_pages, kv_heads, page // vector_width, vector_width, value_dim
+        )
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case.trans_v
@@ -336,6 +354,12 @@ def _make_inputs(case, planned=False):
         sinks,
     )
     options = {"sliding_window": case.sliding_window, "work_plan": plan}
+    reference_key_scale = (
+        torch.ones(1, dtype=torch.float32) if is_bf16_kv else key_scale
+    )
+    reference_value_scale = (
+        torch.ones(1, dtype=torch.float32) if is_bf16_kv else value_scale
+    )
     reference = partial(
         run_torch,
         query,
@@ -343,8 +367,8 @@ def _make_inputs(case, planned=False):
         value_quant.permute(0, 1, 3, 2),
         table,
         context,
-        key_scale,
-        value_scale,
+        reference_key_scale,
+        reference_value_scale,
         query_length=ql,
         sliding_window=case.sliding_window,
         sinks=sinks,
@@ -594,6 +618,46 @@ CASES = [
         window=1024,
         sink=FP32,
         lengths=(65536,),
+    ),
+    _case(
+        "bf16-qlen8-window1024-sinks",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(1023, 1024, 1025, 1031, 2051),
+    ),
+    _case(
+        "bf16-qlen8-window1024-long",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(65536,),
+    ),
+    _case(
+        "bf16-qlen8-window1024-np1",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=1,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(1023, 1031),
+    ),
+    _case(
+        "bf16-qlen8-window1024-hkv2",
+        shape=(8, 2, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(1031, 2051),
     ),
     *_cases(
         "shape cache parts window sink",
@@ -1080,6 +1144,55 @@ def test_pa_decode(case, planned, monkeypatch):
             query_length=case.query_length,
         )
         _assert_plan(extreme_plan, lengths)
+
+
+def test_pa_decode_bf16_qlen8_window1024_large_physical_page():
+    """A selected BF16 K/V page beyond 2 GiB must retain its full address."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("BF16 page-offset regression is qualified on gfx950")
+    dim, page, query_length, heads, window, parts = 128, 64, 8, 16, 1024, 8
+    physical_page = (1 << 31) // (dim * page * 2) + 3
+    assert physical_page * dim * page * 2 > 1 << 31
+    key = torch.empty((physical_page + 1, 1, dim // 8, page, 8), dtype=torch.bfloat16)
+    value = torch.empty((physical_page + 1, 1, page // 8, dim, 8), dtype=torch.bfloat16)
+    key[physical_page].zero_()
+    value[physical_page].fill_(2)
+    query = torch.zeros((query_length, heads, dim), dtype=torch.bfloat16)
+    output = torch.full_like(query, float("nan"))
+    lengths = torch.tensor([1031], dtype=torch.int32)
+    table = torch.full((1, 17), physical_page, dtype=torch.int32)
+    plan = plan_pa_decode(
+        lengths,
+        1,
+        max_partitions=parts,
+        sliding_window=window,
+        query_length=query_length,
+    )
+    shape = (1, plan.capacity, query_length * heads)
+    pmax = torch.empty(shape, dtype=torch.float32)
+    psum = torch.empty_like(pmax)
+    pout = torch.empty((*shape, dim), dtype=torch.bfloat16)
+    pa_decode(
+        output,
+        query,
+        key,
+        value,
+        lengths,
+        table,
+        dim**-0.5,
+        query_length,
+        parts,
+        compute_type=torch.bfloat16,
+        key_scale=None,
+        value_scale=None,
+        max_logits=pmax,
+        exp_sums=psum,
+        temporary_output=pout,
+        sliding_window=window,
+        work_plan=plan,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 2), rtol=0, atol=0)
 
 
 @benchmark()
