@@ -137,7 +137,6 @@ def compile_mixed_moe_gemm1_common(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
-    pipeline_phases: int = 4,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
 ):
@@ -148,6 +147,17 @@ def compile_mixed_moe_gemm1_common(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
+    if persist_m == 0 or persist_m < -1:
+        raise ValueError(f"persist_m must be -1 or positive, got {persist_m}")
+    persistent = persist_m == -1
+    if persistent and xcd_swizzle:
+        raise ValueError("persistent stage1 does not support xcd_swizzle")
+    if persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        cu_num = get_cu_num()
+    else:
+        cu_num = 0
     gpu_arch = get_hip_arch()
 
     def _al(x, a):
@@ -252,20 +262,6 @@ def compile_mixed_moe_gemm1_common(
 
     _use_cshuffle_epilog = True
 
-    # Negative persist_m values are internal scheduler modes:
-    #   -1: one balanced device-driven loop over all valid M tiles;
-    #   -2: one spill-free primary tile per worker;
-    #   -3: balanced overflow for tiles beyond the primary CU-sized prefix.
-    persistent = persist_m < 0
-    split_primary = persist_m == -2
-    split_overflow = persist_m == -3
-    if const_expr(persistent):
-        from aiter.jit.utils.chip_info import get_cu_num
-
-        cu_num = get_cu_num()
-    else:
-        cu_num = 0
-
     need_fp4 = out_dtype == "fp4"
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
@@ -275,19 +271,9 @@ def compile_mixed_moe_gemm1_common(
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
     async_tag = "_async" if use_async_copy else ""
-    persistent_primary_tiles = cu_num
-    persistent_workers = 16 if split_overflow else cu_num
-    if split_primary:
-        pm_tag = f"_persist1_cu{persistent_workers}"
-    elif split_overflow:
-        pm_tag = f"_persist_overflow_w{persistent_workers}"
-    elif persistent:
-        pm_tag = f"_persist_cu{cu_num}"
-    else:
-        pm_tag = f"_pm{persist_m}"
+    pm_tag = f"_persist_stride_cu{cu_num}" if persistent else f"_pm{persist_m}"
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
     kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    phase_tag = f"_ph{pipeline_phases}" if pipeline_phases != 4 else ""
     go_tag = "_go" if mock_gate_only else ""
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
@@ -303,7 +289,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{pm_tag}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{phase_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{pm_tag}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -411,9 +397,7 @@ def compile_mixed_moe_gemm1_common(
                     ni_idx = ni_packed * pack_N + inxdl
                     pipe_all_mfma.append((k_idx, ni_idx, ikxdl, inxdl, ku128))
 
-    if pipeline_phases not in (4, 8):
-        raise ValueError(f"pipeline_phases must be 4 or 8, got {pipeline_phases}")
-    pipe_mfma_per_phase = max(1, len(pipe_all_mfma) // pipeline_phases)
+    pipe_mfma_per_phase = max(1, len(pipe_all_mfma) // 4)
     pipe_n_phases = len(pipe_all_mfma) // pipe_mfma_per_phase
 
     a_groups_per_phase = (len(pipe_a_groups) + pipe_n_phases - 1) // pipe_n_phases
@@ -555,11 +539,8 @@ def compile_mixed_moe_gemm1_common(
                         // tile_n_idx
                         // two
                     )
-                if const_expr(persistent):
-                    grid_y = arith.constant(persistent_workers, index=True)
-                else:
-                    persist_m_idx = arith.constant(persist_m, index=True)
-                    grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
+                persist_m_idx = arith.constant(persist_m, index=True)
+                grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
                 linear_id = bx_persist * grid_x + by
                 num_workgroups = grid_x * grid_y
                 num_xcds_idx = arith.constant(num_xcds, index=True)
@@ -699,33 +680,14 @@ def compile_mixed_moe_gemm1_common(
                 sort_scale_nbytes = fx.Int32(sort_padded_rows * sort_padded_cols)
                 sorted_scale_rsrc = ptr_rsrc(arg_out_scale_sorted, sort_scale_nbytes)
 
-            c0_p = arith.constant(0, index=True)
-            c1_p = arith.constant(1, index=True)
+            c_pm = arith.constant(max(persist_m, 1), index=True)
             if const_expr(persistent):
-                c_workers = arith.constant(persistent_workers, index=True)
-                c_sbm_p = arith.constant(sort_block_m, index=True)
-                num_valid_idx = fx.Index(num_valid_i32)
-                total_m_tiles = (num_valid_idx + c_sbm_p - c1_p) // c_sbm_p
-                if const_expr(split_overflow):
-                    c_primary_tiles = arith.constant(
-                        persistent_primary_tiles, index=True
-                    )
-                    has_overflow = total_m_tiles > c_primary_tiles
-                    total_m_tiles = has_overflow.select(
-                        total_m_tiles - c_primary_tiles,
-                        c0_p,
-                    )
-                tiles_per_block_base = total_m_tiles // c_workers
-                tiles_remainder = total_m_tiles - (tiles_per_block_base * c_workers)
-                has_extra_tile = bx_persist < tiles_remainder
-                extra_tile = has_extra_tile.select(c1_p, c0_p)
-                tiles_per_block = tiles_per_block_base + extra_tile
-                start_tail = has_extra_tile.select(bx_persist, tiles_remainder)
-                persist_start_tile = bx_persist * tiles_per_block_base + start_tail
-                if const_expr(split_overflow):
-                    persist_start_tile = persist_start_tile + c_primary_tiles
-            else:
-                c_pm = arith.constant(persist_m, index=True)
+                c_workers = arith.constant(cu_num, index=True)
+                c_block_m = arith.constant(sort_block_m, index=True)
+                c_one = arith.constant(1, index=True)
+                total_m_tiles = (
+                    fx.Index(num_valid_i32) + c_block_m - c_one
+                ) // c_block_m
             # Per-iteration state, rebound by _persist_iter each pass so the
             # closures below see the current iteration's values.
             bx = bx_m = bx_m_i32 = blk_valid = None
@@ -2023,8 +1985,6 @@ def compile_mixed_moe_gemm1_common(
                         ],
                         f32_t,
                     )
-                    # Preserve the public BF16 stage boundary before the fused
-                    # intermediate is quantized to MXFP8 for GEMM2.
                     if const_expr(need_fp8):
                         result = result.to(fx.BFloat16).to(fx.Float32)
                     return result
@@ -2807,10 +2767,8 @@ def compile_mixed_moe_gemm1_common(
             def _persist_iter(mi_p):
                 nonlocal bx, bx_m, bx_m_i32, blk_valid
                 nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
-                if const_expr(split_primary):
-                    bx = bx_persist
-                elif const_expr(persistent):
-                    bx = persist_start_tile + mi_p
+                if const_expr(persistent):
+                    bx = mi_p
                 else:
                     bx = bx_persist * c_pm + mi_p
                 bx_m = bx * arith.constant(sort_block_m, index=True)
@@ -2826,19 +2784,21 @@ def compile_mixed_moe_gemm1_common(
                         shared_expert_id
                     )
                 _gemm1_dispatch()
-                if const_expr(not split_primary):
-                    gpu.barrier()
+                gpu.barrier()
+
+            c0_p = arith.constant(0, index=True)
+            c1_p = arith.constant(1, index=True)
 
             @flyc.jit
             def _run_persist():
                 # init=[] keeps the index-typed induction variable (scf_range),
                 # matching the original scf.ForOp; the plain no-init form would
                 # dispatch to an i32 counter.
-                if const_expr(split_primary):
-                    _persist_iter(c0_p)
+                if const_expr(persistent):
+                    for mi_p, _ in range(bx_persist, total_m_tiles, c_workers, init=[]):
+                        _persist_iter(mi_p)
                 else:
-                    loop_end = tiles_per_block if persistent else c_pm
-                    for mi_p, _ in range(c0_p, loop_end, c1_p, init=[]):
+                    for mi_p, _ in range(c0_p, c_pm, c1_p, init=[]):
                         _persist_iter(mi_p)
 
             _run_persist()
@@ -2966,10 +2926,10 @@ def compile_mixed_moe_gemm1_common(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
-        pipeline_phases,
         v2_output_layout,
-        persistent_workers if persistent else 0,
     )
+    if persistent:
+        cache_tag += (cu_num,)
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
 
@@ -3025,7 +2985,7 @@ def compile_mixed_moe_gemm1_common(
             )
 
         if const_expr(persistent):
-            gy = arith.constant(persistent_workers, index=True)
+            gy = arith.constant(cu_num, index=True)
         else:
             c_pm_l = arith.constant(persist_m, index=True)
             gy = (

@@ -23,8 +23,8 @@ already cover against a torch reference.
 
 The harness mirrors how SGLang's MoRI dispatch calls this: per_1x32 MXFP4 expert
 weights in the shuffled a8w4 layout and GateMode.INTERLEAVE. Swiglu tests force
-the decode-sized activation policy to FP8. Plain-SiLU interleaved MXFP4 selects
-FP8 directly on gfx950, so its regression runs with the default threshold.
+the decode-sized activation policy to FP8. Plain-SiLU EP selects FP8 directly
+on gfx950, so its regression runs with the default threshold.
 """
 
 import os
@@ -129,12 +129,14 @@ def test_passthrough_is_bit_identical_to_internal_quantization(tokens):
     )
 
 
-def test_silu_interleave_uses_a8w4_below_default_threshold(monkeypatch):
-    """Plain-SiLU interleaved MXFP4 must not fall into unsupported A16W4."""
+def test_ep_silu_interleave_uses_a8w4_below_default_threshold(monkeypatch):
+    """Plain-SiLU EP must not fall into unsupported A16W4."""
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "256")
     monkeypatch.setenv("AITER_FLYDSL_FORCE", "0")
     x, w1, w2, kwargs = _build(8)
     kwargs["activation"] = ActivationType.Silu
+    kwargs["expert_mask"] = torch.ones(EXPERTS, dtype=torch.int32, device=x.device)
+    kwargs["ep_has_fake_route"] = False
 
     internal = fused_moe(x, w1, w2, **kwargs)
     a1, a1_scale = per_1x32_mx_quant_hip(

@@ -1196,6 +1196,7 @@ def _fused_moe_impl(
         and activation == ActivationType.Silu
         and gate_mode == GateMode.INTERLEAVE
         and get_gfx() == "gfx950"
+        and expert_mask is not None
         and isShuffled
         and isG1U1
         and not doweight_stage1
@@ -2029,7 +2030,6 @@ def _flydsl_stage1_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
-        pipeline_phases=parsed.get("pipeline_phases", 4),
         v2_output_layout=v2_output_layout,
     )
 
