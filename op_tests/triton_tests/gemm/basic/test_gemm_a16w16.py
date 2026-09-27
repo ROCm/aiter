@@ -100,6 +100,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
     x_vals = [(16, 1024, 1024)]
+    x_vals += [(16, 896, 3584)]
     x_vals += [(128, 8192, 512)]
     x_vals += [(256, 512, 8192)]
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
@@ -215,6 +216,25 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     y = y.to(torch.float32).zero_()
     triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
 
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
+@pytest.mark.parametrize("strided", [False, True])
+def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
+    """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    base = torch.randn((M, 2 * N if strided else N), dtype=torch.float32, device="cuda")
+    y = base[:, :N]
+    torch_out = torch.addmm(y, x.float(), w.float().T)
+
+    triton_out = gemm_a16w16_atomic(x, w, torch.float32, y, accumulate=True)
+
+    assert triton_out.data_ptr() == y.data_ptr()
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
