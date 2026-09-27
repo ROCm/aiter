@@ -25,7 +25,9 @@
 //   2. the store is bounded by the window, not max_seq_len: local_ends past out.size(1)
 //      writes past the row;
 //   3. a row with no live sequence has an empty window (local_ends <= local_starts); only such
-//      a row may have a negative row_to_batch. Cells outside a row's window are never written.
+//      a row may have a negative row_to_batch. Cells outside a row's window are never written;
+//   4. at q_per_block > 1, cu_seq_q[batch] <= num_rows: the tile cut reads cu_seq_q on device,
+//      and build_sched reads each tiled row's local_ends / local_starts / row_to_batch.
 #pragma once
 #include "aiter_tensor.h"
 #include <cstdint>

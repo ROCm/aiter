@@ -40,7 +40,7 @@ On gfx1250 each scale is the plain E8M0 byte of one 32-element K block, and each
 launchers (which check ``numel``) would accept the wrong one and return plausible wrong logits;
 the ndim check here is the only guard, and it cannot catch an array reshaped to the right ndim.
 
-THREE CONDITIONS the kernel cannot check:
+FOUR CONDITIONS the kernel cannot check:
 
 1. the window rule is non-decreasing in the row index within a tile (true of every causal and
    CSA-compressed rule), so a tile's union is its first row's start and last row's end. If
@@ -50,7 +50,11 @@ THREE CONDITIONS the kernel cannot check:
 3. a row that belongs to no live sequence (a CUDAGraph pad row) carries an EMPTY window
    (``local_ends <= local_starts``), and only such a row may have a negative ``row_to_batch``.
    At ``q_per_block == 1`` ``cu_seq_q`` is not consulted, so this is what keeps a pad row from
-   reading ``q`` or ``block_tables``.
+   reading ``q`` or ``block_tables``;
+4. at ``q_per_block > 1`` ``cu_seq_q[batch] <= total_q``. The tile cut reads ``cu_seq_q`` on
+   device and the builder then reads every tiled row's ``local_ends`` / ``local_starts`` /
+   ``row_to_batch``, so a ``cu_seq_q`` claiming more rows than ``total_q`` reads those arrays
+   past ``total_q``. Claiming fewer is fine: rows past ``cu_seq_q[batch]`` are not scheduled.
 """
 
 from __future__ import annotations
@@ -600,7 +604,10 @@ def pa_mqa_logits_mxfp4_plan(
 
     ``row_to_batch`` maps each row to its ``block_tables`` row; ``None`` means ``block_tables``
     is indexed per query row. Mixing per-sequence and per-row conventions silently reads wrong
-    pages. Negative ids are allowed only on empty-window rows.
+    pages. Negative ids are allowed only on empty-window rows. A tile reads ONE ``block_tables``
+    row, its first row's: at ``q_per_block > 1`` with ``None``, every row of a sequence must
+    therefore carry the same ``block_tables`` row as the sequence's first row; if they differ,
+    pass ``row_to_batch``.
 
     ``buffers`` (from :func:`pa_mqa_logits_mxfp4_plan_buffers`) supplies the memory, grid and
     kernel instance; without it the plan allocates fresh and uses the arch's default instance.
