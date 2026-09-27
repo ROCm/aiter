@@ -5,7 +5,7 @@
 
 This module owns the part that is independent of a particular GEMM lowering:
 
-* a bounded (at most one CTA per CU) producer cohort;
+* a bounded producer cohort;
 * generation-tagged payload readiness and ready-tile queue publication; and
 * a persistent consumer work queue which producer CTAs join after finite work.
 
@@ -20,8 +20,8 @@ Planner/allocator ABI (all entries are i32):
 ``tile_expected[t]``
     Number of producer arrivals needed by tile ``t``.
 ``tile_ready[t]``
-    System-scope arrival counter, incremented with
-    :func:`publish_tile_arrival`.
+    System-scope negative-arrivals-remaining counter, incremented with
+    :func:`publish_tile_arrivals`; the producer whose add crosses zero closes it.
 ``ready_epoch[t]``
     The final producer release-publishes the plan generation here. Consumers
     dynamically claim GEMM ``(M, N)`` work ids, map each back to its dense M
@@ -39,7 +39,7 @@ from typing import Protocol, runtime_checkable
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int64
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
@@ -78,6 +78,7 @@ class Stage1MegaKernelConfig:
     tile_k: int = 256
     gemm_n: int = 6144
     num_cu: int = 256
+    ctas_per_cu: int = 1
     producer_ctas: int = 16
     waves_per_cta: int = 4
     compact_cap: int = 1
@@ -98,7 +99,7 @@ class Stage1MegaEmitter(Protocol):
     traceable (for example by using ``@flyc.jit``/``comm_ops.traced`` helpers).
 
     ``emit_producer`` must perform a finite share of compact payload movement
-    and call :func:`publish_tile_arrival` once per completed contribution.
+    and call :func:`publish_tile_arrivals` once per dest-rank tile this CTA filled.
     Every workgroup thread calls both methods; emitters may specialize by
     ``tid``/``wave_id`` but must leave the workgroup converged on return.
 
@@ -112,11 +113,9 @@ class Stage1MegaEmitter(Protocol):
     LDS_BYTES: int
     WAVES_PER_CTA: int
 
-    def emit_producer(self, **context) -> None:
-        ...
+    def emit_producer(self, **context) -> None: ...
 
-    def emit_consumer(self, **context) -> None:
-        ...
+    def emit_consumer(self, **context) -> None: ...
 
 
 def _require(condition: bool, message: str) -> None:
@@ -129,7 +128,9 @@ def _validate_config(config: Stage1MegaKernelConfig) -> None:
         int(config.hidden_dim) == SUPPORTED_HIDDEN_DIM,
         f"stage1 mega-kernel supports hidden_dim={SUPPORTED_HIDDEN_DIM} only",
     )
-    _require(int(config.topk) in SUPPORTED_TOPK, f"topk must be one of {SUPPORTED_TOPK}")
+    _require(
+        int(config.topk) in SUPPORTED_TOPK, f"topk must be one of {SUPPORTED_TOPK}"
+    )
     _require(
         config.dispatch_wire in SUPPORTED_WIRES,
         f"dispatch_wire must be one of {SUPPORTED_WIRES}",
@@ -138,7 +139,10 @@ def _validate_config(config: Stage1MegaKernelConfig) -> None:
     _require(0 <= int(config.rank) < 4, "rank must be in [0, 4)")
     _require(int(config.experts_per_rank) > 0, "experts_per_rank must be positive")
     _require(int(config.tile_m) in (16, 32, 64), "tile_m must be 16, 32 or 64")
-    _require(int(config.tile_n) > 0 and config.tile_n % 128 == 0, "tile_n must be 128-aligned")
+    _require(
+        int(config.tile_n) > 0 and config.tile_n % 128 == 0,
+        "tile_n must be 128-aligned",
+    )
     _require(int(config.gemm_n) > 0, "gemm_n must be positive")
     _require(
         int(config.tile_k) in (128, 256, 512)
@@ -147,8 +151,12 @@ def _validate_config(config: Stage1MegaKernelConfig) -> None:
     )
     _require(int(config.num_cu) > 0, "num_cu must be positive")
     _require(
-        0 < int(config.producer_ctas) < int(config.num_cu),
-        "producer_ctas must be in [1, num_cu)",
+        1 <= int(config.ctas_per_cu) <= 4,
+        "ctas_per_cu must be in [1, 4]",
+    )
+    _require(
+        0 < int(config.producer_ctas) < int(config.num_cu) * int(config.ctas_per_cu),
+        "producer_ctas must be smaller than the launch grid",
     )
     _require(
         int(config.waves_per_cta) in (4, 8),
@@ -182,7 +190,10 @@ def _validate_emitter(emitter: Stage1MegaEmitter | None) -> Stage1MegaEmitter:
             "Stage1MegaEmitter ABI mismatch: expected "
             f"{EMITTER_ABI_VERSION}, got {getattr(emitter, 'ABI_VERSION', None)!r}"
         )
-    if not isinstance(getattr(emitter, "LDS_BYTES", None), int) or emitter.LDS_BYTES <= 0:
+    if (
+        not isinstance(getattr(emitter, "LDS_BYTES", None), int)
+        or emitter.LDS_BYTES <= 0
+    ):
         raise TypeError("emitter.LDS_BYTES must be a positive integer")
     if (
         not isinstance(getattr(emitter, "GEMM_CORE_VERSION", None), int)
@@ -199,44 +210,45 @@ def _validate_emitter(emitter: Stage1MegaEmitter | None) -> Stage1MegaEmitter:
 
 
 @comm_ops.traced
-def publish_tile_arrival(
+def publish_tile_arrivals(
     *,
     tile_id,
+    count,
     generation,
     tile_count,
-    addr_tile_generation,
-    addr_tile_expected,
     addr_tile_ready,
     addr_ready_epoch,
 ):
-    """Publish one payload contribution and release the last-arriving tile.
+    """Publish ``count`` payload rows of one tile and close it if this add fills it.
 
-    This helper is the only supported producer-to-consumer publication path.
-    Waiting on the slot generation prevents a producer from incrementing a
-    stale counter before the compact planner has reset it. The final RMW is
-    unique and observes the other producers' release sequence; it publishes
-    the generation directly at the dense tile id.
+    The planner initialized ``tile_ready[t]`` to ``-expected``. A producer CTA
+    aggregates its own rows in LDS and issues one system RMW per tile it
+    touched. The unique add that observes ``old < 0`` and ``old + count >= 0``
+    is the closer.
     """
 
-    valid = (tile_id >= fx.Int32(0)) & (tile_id < fx.Int32(tile_count))
+    valid = (
+        (tile_id >= fx.Int32(0))
+        & (tile_id < fx.Int32(tile_count))
+        & (count > fx.Int32(0))
+    )
     if valid:
-        comm_ops.wait_i32_until_equals(addr_tile_generation, generation)
-        comm_ops.fence_system_acquire()
-        expected = fx.Int32(
-            comm_ops.load_i32_global_system(
-                addr_tile_expected + fx.Int64(tile_id) * fx.Int64(4)
+        old = fx.Int32(
+            comm_ops.atomic_add_system(
+                addr_tile_ready + fx.Int64(tile_id) * fx.Int64(4), count
             )
         )
-        if expected > fx.Int32(0):
-            old = fx.Int32(
-                comm_ops.atomic_add_system(
-                    addr_tile_ready + fx.Int64(tile_id) * fx.Int64(4), fx.Int32(1)
-                )
-            )
-            if old + fx.Int32(1) == expected:
-                comm_ops.fence_system_acquire()
-                comm_ops.fence_system_release()
-                comm_ops.store_i32_system(addr_ready_epoch, tile_id, generation)
+        if (old < fx.Int32(0)) & ((old + count) >= fx.Int32(0)):
+            comm_ops.fence_system_acquire()
+            comm_ops.fence_system_release()
+            comm_ops.store_i32_system(addr_ready_epoch, tile_id, generation)
+
+
+def publish_tile_arrival(**kwargs):
+    """One-row wrapper around :func:`publish_tile_arrivals`."""
+
+    kwargs.setdefault("count", fx.Int32(1))
+    return publish_tile_arrivals(**kwargs)
 
 
 @functools.cache
@@ -262,11 +274,9 @@ def compile_stage1_mega_kernel(
         )
 
     block_threads = int(config.waves_per_cta) * WAVE
-    grid_x = int(config.num_cu)
+    grid_x = int(config.num_cu) * int(config.ctas_per_cu)
     producer_ctas = int(config.producer_ctas)
-    tile_count = int(config.tile_count)
     tile_layout = compact_tile_layout(compact_cap=int(config.compact_cap))
-    expected_byte_off = tile_layout.expected_dw * 4
     ready_byte_off = tile_layout.ready_dw * 4
     ready_epoch_byte_off = tile_layout.queue_dw * 4
 
@@ -278,6 +288,7 @@ def compile_stage1_mega_kernel(
         f"ep4_stage1_mega_{config.dispatch_wire}_h{config.hidden_dim}"
         f"_k{config.topk}_tm{config.tile_m}_n{config.gemm_n}_tn{config.tile_n}"
         f"_tk{config.tile_k}_p{producer_ctas}_w{config.waves_per_cta}_r{config.rank}"
+        f"_cpc{config.ctas_per_cu}"
         f"_abi{EMITTER_ABI_VERSION}_lds{emitter.LDS_BYTES}"
         f"_gc{emitter.GEMM_CORE_VERSION}"
     )
@@ -310,11 +321,8 @@ def compile_stage1_mega_kernel(
         claimed_ptr = lds.storage.ptr
         claimed_addr = fx.Int64(fx.ptrtoint(claimed_ptr))
         lds_base_ptr = lds.storage.ptr + 128
-        generation = fx.Int32(
-            comm_ops.load_i32_global_system(addr_plan_generation)
-        )
+        generation = fx.Int32(comm_ops.load_i32_global_system(addr_plan_generation))
         addr_tile_generation = addr_tile_state + fx.Int64(COMPACT_TILE_GEN_DW * 4)
-        addr_tile_expected = addr_tile_state + fx.Int64(expected_byte_off)
         addr_tile_ready = addr_tile_state + fx.Int64(ready_byte_off)
         addr_ready_epoch = addr_tile_state + fx.Int64(ready_epoch_byte_off)
         addr_work_head = addr_tile_state + fx.Int64(COMPACT_TILE_WORK_DW * 4)
@@ -359,7 +367,6 @@ def compile_stage1_mega_kernel(
             "generation": generation,
             "num_work_tiles": num_work_tiles,
             "addr_tile_generation": addr_tile_generation,
-            "addr_tile_expected": addr_tile_expected,
             "addr_tile_ready": addr_tile_ready,
             "addr_ready_epoch": addr_ready_epoch,
             "lds_base_ptr": lds_base_ptr,
@@ -373,8 +380,7 @@ def compile_stage1_mega_kernel(
                 producer_ctas=fx.Int32(producer_ctas),
                 publish_tile_arrival=publish_tile_arrival,
             )
-        # Contract: producer callbacks are finite and converged.  Their CTAs now
-        # join the same queue as initially consumer-only CTAs.
+        # Producer CTAs finish dispatch, then join the same GEMM queue.
         fx.barrier()
 
         active = fx.Int32(1)
@@ -480,7 +486,9 @@ def run_stage1_mega_kernel(
     if any(not isinstance(address, int) or address <= 0 for address in addresses):
         raise ValueError("all protocol addresses must be positive host integers")
     if len(user_args) > 16:
-        raise ValueError("Stage1MegaEmitter supports at most sixteen opaque user addresses")
+        raise ValueError(
+            "Stage1MegaEmitter supports at most sixteen opaque user addresses"
+        )
     if any(not isinstance(address, int) or address < 0 for address in user_args):
         raise ValueError("user_args must contain non-negative host integer addresses")
     padded_user_args = tuple(user_args) + (0,) * (16 - len(user_args))
@@ -508,5 +516,6 @@ __all__ = [
     "compile_stage1_mega_kernel",
     "launch_stage1_mega_kernel",
     "publish_tile_arrival",
+    "publish_tile_arrivals",
     "run_stage1_mega_kernel",
 ]

@@ -10,6 +10,7 @@ import mori.cco.device.flydsl as cco
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.buffer_ops import create_buffer_resource_from_addr
 from aiter.ops.flydsl.kernels.gemm1_consumer_gfx1250 import (
     GEMM_TILE_CORE_VERSION,
@@ -19,8 +20,7 @@ from aiter.ops.flydsl.kernels.gemm1_consumer_gfx1250 import (
 
 from .compact_plan import COMPACT_TILE_GEN_DW, compact_tile_layout
 from .dispatch_tdm import CompactPayloadSpec, emit_compact_payload_rows
-from .stage1_mega_kernel import EMITTER_ABI_VERSION
-
+from .stage1_mega_kernel import EMITTER_ABI_VERSION, publish_tile_arrivals
 
 # Opaque mega-kernel argument ABI. Keep this mapping next to the only concrete
 # emitter so the host launcher and both sides of the kernel cannot drift.
@@ -48,15 +48,78 @@ def _global_i8_ptr(address):
     return fx.inttoptr(ptr_ty, fx.Int64(address))
 
 
+@comm_ops.traced
+def _wait_remote_generations(
+    *, tid, world_size, window, tile_state_offset, generation
+):
+    if tid == fx.Int32(0):
+        for peer in range(world_size):
+            remote = fx.Int64(window.lsa_ptr(peer, tile_state_offset))
+            comm_ops.wait_i32_until_equals(
+                remote + fx.Int64(COMPACT_TILE_GEN_DW * 4), generation
+            )
+            comm_ops.fence_system_acquire()
+    fx.barrier()
+
+
+@comm_ops.traced
+def _zero_i32_lds(*, tid, n, stride, base):
+    for i in range(tid, n, stride):
+        comm_ops.store_i32_lds(base + fx.Int64(i) * fx.Int64(4), fx.Int32(0))
+
+
+@comm_ops.traced
+def _accumulate_tile_hit(
+    *, lane, route, dest_tok, dest_pe, tile_m, tile_count, hist_base
+):
+    real_tile = dest_tok // fx.Int32(tile_m)
+    if (
+        (lane == fx.Int32(route))
+        & (real_tile >= fx.Int32(0))
+        & (real_tile < fx.Int32(tile_count))
+    ):
+        slot = dest_pe * fx.Int32(tile_count) + real_tile
+        comm_ops.atomic_add_lds(hist_base + fx.Int64(slot) * fx.Int64(4), fx.Int32(1))
+
+
+@comm_ops.traced
+def _flush_tile_hist(
+    *,
+    tid,
+    block,
+    world_size,
+    tile_count,
+    hist_base,
+    window,
+    tile_state_offset,
+    ready_off,
+    epoch_off,
+    generation,
+):
+    fx.barrier()
+    slots = world_size * tile_count
+    for i in range(tid, slots, block):
+        count = fx.Int32(comm_ops.load_i32_lds(hist_base + fx.Int64(i) * fx.Int64(4)))
+        if count > fx.Int32(0):
+            dest_pe = i // fx.Int32(tile_count)
+            tile_id = i - dest_pe * fx.Int32(tile_count)
+            remote = fx.Int64(window.lsa_ptr(dest_pe, tile_state_offset))
+            publish_tile_arrivals(
+                tile_id=tile_id,
+                count=count,
+                generation=generation,
+                tile_count=tile_count,
+                addr_tile_ready=remote + fx.Int64(ready_off),
+                addr_ready_epoch=remote + fx.Int64(epoch_off),
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class Gfx1250Stage1MegaEmitter:
     """Inline compact dispatch producers and one scheduled GEMM tile."""
 
     ABI_VERSION = EMITTER_ABI_VERSION
     GEMM_CORE_VERSION = GEMM_TILE_CORE_VERSION
-    # The largest supported tuned GEMM1 arena is below this bound; reserving it
-    # once lets dispatch and GEMM reuse LDS instead of summing their footprints.
-    LDS_BYTES = 192 * 1024
 
     rank: int
     world_size: int
@@ -95,6 +158,37 @@ class Gfx1250Stage1MegaEmitter:
     def WAVES_PER_CTA(self) -> int:
         return int(self.m_warp) * int(self.n_warp)
 
+    @property
+    def _gemm_arena_bytes(self) -> int:
+        a_pack = 2 if self.a_is_fp4 else 1
+        stage_a = self.tile_m * (self.tile_k // a_pack + 16)
+        stage_b = (self.tile_n // 16) * (self.tile_k // 2) * 16
+        sa_kdw = self.tile_k // 128
+        sa_pad = (
+            1 if sa_kdw > 0 and (sa_kdw & (sa_kdw - 1)) == 0 and sa_kdw % 2 == 0 else 0
+        )
+        stage_sa = self.tile_m * (sa_kdw + sa_pad) * 4
+        stage_sb = (self.tile_n // 32) * (self.tile_k // 4) * 4
+        pitch = ((stage_a + stage_b + stage_sa + stage_sb + 511) // 512) * 512
+
+        as_full_kdw = self.K // 128
+        as_full_b = ((self.tile_m * as_full_kdw * 4 + 127) // 128) * 128
+        gemm_arena = self.num_buffers * pitch
+        if self.tdm_as_in_prologue:
+            gemm_arena += as_full_b
+        c_store = ((self.tile_m * (self.tile_n + 16) * 2 + 127) // 128) * 128
+        return max(gemm_arena, c_store)
+
+    @property
+    def LDS_BYTES(self) -> int:
+        """Shared arena: dispatch finishes before GEMM reuses the same LDS."""
+
+        producer_arena = self.WAVES_PER_CTA * self.wire_row_stride
+        hist_tiles = (self.compact_cap + self.tile_m - 1) // self.tile_m
+        producer_arena += self.world_size * hist_tiles * 4
+        producer_arena = ((producer_arena + 127) // 128) * 128
+        return max(self._gemm_arena_bytes, producer_arena)
+
     def __post_init__(self):
         if self.world_size != 4:
             raise ValueError("stage1 mega emitter supports EP4 only")
@@ -113,6 +207,7 @@ class Gfx1250Stage1MegaEmitter:
         self,
         *,
         config,
+        tid,
         wave_id,
         generation,
         producer_id,
@@ -136,7 +231,9 @@ class Gfx1250Stage1MegaEmitter:
             scale_bytes=self.dispatch_scale_bytes,
         )
         producer_lds = self.WAVES_PER_CTA * spec.tile_bytes
-        if producer_lds > self.LDS_BYTES:
+        hist_off = producer_lds
+        hist_slots = self.world_size * int(config.tile_count)
+        if hist_off + hist_slots * 4 > self.LDS_BYTES:
             raise ValueError("dispatch producer LDS exceeds shared mega arena")
 
         lane = fx.thread_idx.x & fx.Int32(31)
@@ -144,27 +241,34 @@ class Gfx1250Stage1MegaEmitter:
             T.i32, fx.index_cast(T.index, fx.ptrtoint(lds_base_ptr))
         )
         tile_addr = lds_base_i32 + fx.Int32(wave_id) * fx.Int32(spec.tile_bytes)
+        hist_base = fx.Int64(lds_base_i32) + fx.Int64(hist_off)
+        block = fx.Int32(self.WAVES_PER_CTA * 32)
         window = cco.Window(user_args[ARG_ARENA])
         rsrc_tok_map = create_buffer_resource_from_addr(user_args[ARG_TOKEN_MAP])
         rsrc_weights = create_buffer_resource_from_addr(user_args[ARG_TOPK_WEIGHTS])
         rsrc_scale = create_buffer_resource_from_addr(user_args[ARG_SOURCE_SCALE])
         layout = compact_tile_layout(compact_cap=self.compact_cap)
-        expected_off = layout.expected_dw * 4
         ready_off = layout.ready_dw * 4
         epoch_off = layout.queue_dw * 4
 
+        _zero_i32_lds(tid=tid, n=hist_slots, stride=block, base=hist_base)
+        _wait_remote_generations(
+            tid=tid,
+            world_size=self.world_size,
+            window=window,
+            tile_state_offset=self.tile_state_offset,
+            generation=generation,
+        )
+
         def on_route_complete(*, dest_pe, dest_tok, route, lane, **_ignored):
-            remote = fx.Int64(window.lsa_ptr(dest_pe, self.tile_state_offset))
-            real_tile = dest_tok // fx.Int32(self.tile_m)
-            tile_id = (lane == fx.Int32(route)).select(real_tile, fx.Int32(-1))
-            publish_tile_arrival(
-                tile_id=tile_id,
-                generation=generation,
+            _accumulate_tile_hit(
+                lane=lane,
+                route=route,
+                dest_tok=dest_tok,
+                dest_pe=dest_pe,
+                tile_m=self.tile_m,
                 tile_count=config.tile_count,
-                addr_tile_generation=remote + fx.Int64(COMPACT_TILE_GEN_DW * 4),
-                addr_tile_expected=remote + fx.Int64(expected_off),
-                addr_tile_ready=remote + fx.Int64(ready_off),
-                addr_ready_epoch=remote + fx.Int64(epoch_off),
+                hist_base=hist_base,
             )
 
         emit_compact_payload_rows(
@@ -181,6 +285,19 @@ class Gfx1250Stage1MegaEmitter:
             rsrc_inp_scale=rsrc_scale,
             on_route_complete=on_route_complete,
         )
+        _flush_tile_hist(
+            tid=tid,
+            block=block,
+            world_size=self.world_size,
+            tile_count=config.tile_count,
+            hist_base=hist_base,
+            window=window,
+            tile_state_offset=self.tile_state_offset,
+            ready_off=ready_off,
+            epoch_off=epoch_off,
+            generation=generation,
+        )
+        _ = publish_tile_arrival
 
     def emit_consumer(
         self,
@@ -253,20 +370,20 @@ class Gfx1250Stage1MegaEmitter:
 
 
 __all__ = [
-    "Gfx1250Stage1MegaEmitter",
     "ARG_ARENA",
-    "ARG_SOURCE_PAYLOAD",
-    "ARG_SOURCE_SCALE",
-    "ARG_TOKEN_MAP",
-    "ARG_TOPK_WEIGHTS",
-    "ARG_OUTPUT_PAYLOAD",
-    "ARG_WEIGHT",
-    "ARG_WEIGHT_SCALE",
-    "ARG_PSUM",
-    "ARG_OUTPUT_SCALE",
     "ARG_BIAS",
+    "ARG_CONTIGUOUS_M",
     "ARG_INPUT_PAYLOAD",
     "ARG_INPUT_SCALE",
+    "ARG_OUTPUT_PAYLOAD",
+    "ARG_OUTPUT_SCALE",
+    "ARG_PSUM",
+    "ARG_SOURCE_PAYLOAD",
+    "ARG_SOURCE_SCALE",
     "ARG_TOKEN_COUNT",
-    "ARG_CONTIGUOUS_M",
+    "ARG_TOKEN_MAP",
+    "ARG_TOPK_WEIGHTS",
+    "ARG_WEIGHT",
+    "ARG_WEIGHT_SCALE",
+    "Gfx1250Stage1MegaEmitter",
 ]

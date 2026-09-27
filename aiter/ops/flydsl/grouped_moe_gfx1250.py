@@ -605,6 +605,20 @@ def _grouped_a8w4_tdm_moe(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
                     f"the compact plan's row alignment {_plan_align}"
                 )
+    _mega_ctx = (
+        getattr(_compact_ctx, "stage1_mega", None) if _compact_ctx is not None else None
+    )
+    if (
+        _mega_ctx is not None
+        and "AITER_TDM_M_WARP" not in os.environ
+        and int(_mega_ctx.source_payload.shape[0]) <= 128
+        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+        == (32, 256, 256, 1, 4, 2)
+    ):
+        # The fused kernel reuses the dispatch LDS arena and benefits from
+        # twice the M-wave parallelism at decode sizes. The original CSV row
+        # was tuned for standalone GEMM1 and is ~3% slower after fusion.
+        m_warp = 2
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
@@ -1003,9 +1017,9 @@ def _grouped_a8w4_tdm_moe(
                 _waves = int(m_warp) * int(n_warp)
                 if _waves not in (4, 8):
                     raise ValueError(f"unsupported GEMM wave count {_waves}")
-                _cu = int(torch.cuda.get_device_properties(device).multi_processor_count)
-                _producer_ctas = 64 if int(token_num) <= 512 else 128
-                _producer_ctas = min(_producer_ctas, _cu - 1)
+                _cu = int(
+                    torch.cuda.get_device_properties(device).multi_processor_count
+                )
                 _emitter = Gfx1250Stage1MegaEmitter(
                     rank=int(_mega_ctx.rank),
                     world_size=int(stage2_scatter.world_size),
@@ -1045,6 +1059,21 @@ def _grouped_a8w4_tdm_moe(
                     situ_beta=float(situ_beta),
                     situ_linear_beta=float(situ_linear_beta),
                 )
+                _lds_per_cta = int(_emitter.LDS_BYTES) + 128
+                _ctas_per_cu = min(3, (320 * 1024) // _lds_per_cta)
+                _ctas_per_cu = int(
+                    os.environ.get("AITER_STAGE1_MEGA_CTAS_PER_CU", _ctas_per_cu)
+                )
+                _source_tokens = int(_mega_ctx.source_payload.shape[0])
+                _producer_cap = 64 if _source_tokens <= 512 else 128
+                _producer_ctas = min(
+                    _producer_cap,
+                    max(1, (_source_tokens + _waves - 1) // _waves),
+                )
+                _producer_ctas = int(
+                    os.environ.get("AITER_STAGE1_MEGA_PRODUCER_CTAS", _producer_ctas)
+                )
+                _producer_ctas = min(_producer_ctas, _cu * _ctas_per_cu - 1)
                 _mega_config = Stage1MegaKernelConfig(
                     hidden_dim=int(model_dim),
                     topk=int(topk),
@@ -1057,6 +1086,7 @@ def _grouped_a8w4_tdm_moe(
                     tile_k=int(tile_k),
                     gemm_n=int(two_inter),
                     num_cu=_cu,
+                    ctas_per_cu=_ctas_per_cu,
                     producer_ctas=_producer_ctas,
                     waves_per_cta=_waves,
                     compact_cap=int(_mega_ctx.compact_cap),
@@ -1094,7 +1124,9 @@ def _grouped_a8w4_tdm_moe(
                 _fallback_key = (type(error).__name__, str(error))
                 if _fallback_key not in _WARNED_STAGE1_MEGA_FALLBACK:
                     _WARNED_STAGE1_MEGA_FALLBACK.add(_fallback_key)
-                    logger.warning("[stage1 mega] falling back to two kernels: %s", error)
+                    logger.warning(
+                        "[stage1 mega] falling back to two kernels: %s", error
+                    )
         if not _mega_launched:
             flydsl_grouped_gemm_a8w4_masked(
                 a2_payload.view(torch.uint8),

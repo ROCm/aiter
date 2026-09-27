@@ -130,11 +130,12 @@ def compact_done_nbytes(*, npes: int, slots: int = 2) -> int:
 #   [6] queue_head  consumer cursor into ready_queue.
 #   [7] queue_tail  producer cursor into ready_queue.
 #   tile_expected[tile_cap]  arrivals a tile needs before it may be computed.
-#                            One per ROW, so a producer ticks once per row it
-#                            lands. 0 means the tile holds no row this
+#                            Counted per ROW. 0 means the tile holds no row this
 #                            generation and no producer may publish it.
-#   tile_ready[tile_cap]     arrivals so far; a producer atomic-adds here and the
-#                            one that closes a tile publishes it.
+#   tile_ready[tile_cap]     negative arrivals remaining. The planner initializes
+#                            it to -tile_expected; a producer atomic-adds its
+#                            aggregated row count and the add that crosses zero
+#                            publishes the tile.
 #   ready_queue[tile_cap]    completion plane, one entry per tile: either the
 #                            tile ids in completion order (queue_head/tail) or
 #                            the generation stamped at the tile's own id, for a
@@ -708,9 +709,7 @@ def compile_tdm_compact_plan(
                         for src in range_constexpr(npes):
                             cnt = comm_ops.load_i32_lds(
                                 lds_matrix
-                                + fx.Int64(
-                                    src * segs + dest * fx.Int32(epr) + safe_e
-                                )
+                                + fx.Int64(src * segs + dest * fx.Int32(epr) + safe_e)
                                 * fx.Int64(4)
                             )
                             if src == rank:
@@ -758,6 +757,11 @@ def compile_tdm_compact_plan(
                                         rows_ti,
                                         rsrc_tile,
                                         fx.Int32(tile_exp_dw) + first + fx.Int32(ti),
+                                    )
+                                    buffer_store(
+                                        arith.constant(0) - rows_ti,
+                                        rsrc_tile,
+                                        fx.Int32(tile_rdy_dw) + first + fx.Int32(ti),
                                     )
                         buffer_store(send, rsrc_base, idx)
                         comm_ops.store_i32_lds(
