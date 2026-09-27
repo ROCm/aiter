@@ -80,6 +80,8 @@ def test_kv_past_4gib_stays_persistent():
     assert _use_persistent_mla_decode(64, 16, 1, bf16, bf16, (1 << 32) - 15) is True
     with patch.dict(os.environ, {"AITER_MLA_DECODE_PERSISTENT_MAX_BATCH": "4"}):
         assert _use_persistent_mla_decode(8, 16, 1, bf16, bf16, 5 << 30) is True
+    with patch.dict(os.environ, {"AITER_MLA_USE_OPUS": "1"}):
+        assert _use_persistent_mla_decode(64, 16, 1, bf16, bf16, 5 << 30) is False
 
 
 def test_out_of_scope():

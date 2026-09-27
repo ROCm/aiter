@@ -416,8 +416,8 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype, kv_by
     if not is_regression_profile:
         return True
 
-    # The non-persistent fallback addresses KV with 32-bit offsets.
-    if kv_bytes > _MLA_KV_32BIT_SPAN:
+    # Non-persistent fallback uses 32-bit KV offsets; opus is unverified past 4 GiB.
+    if kv_bytes > _MLA_KV_32BIT_SPAN and os.environ.get("AITER_MLA_USE_OPUS") != "1":
         return True
 
     max_batch = _persistent_mla_decode_max_batch()
