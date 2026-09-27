@@ -161,6 +161,7 @@ GLOBAL_LOAD_PRESETS: tuple[str, ...] = (
     "qh64_bf16_q1",
     "qh16_fp8_q1",
     "qh16_fp8_q4",
+    "qh32_fp8_q1",
     "qh32_fp8_q2",
     "qh32_fp8_q4",
     "qh8_fp8_q4",

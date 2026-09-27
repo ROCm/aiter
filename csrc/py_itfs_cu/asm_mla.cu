@@ -8,9 +8,47 @@
 #include <cstddef>
 #include <cstdio>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 AITER_CTYPES_ERROR_DEF
+
+// Largest KV span (bytes from ptr_KV) that a 32-bit buffer descriptor with
+// num_records 0xFFFFFFF0 can reach.
+static constexpr uint64_t kMlaKv32BitSpan = 0xFFFFFFF0ull;
+
+// gfx950 decode code objects that load KV with buffer_load (32-bit offset
+// page_id * s_Bs, v_mul_u32_u24) and no global_load. Past kMlaKv32BitSpan they
+// read the wrong KV rows without faulting. Remove an entry once its .co is
+// rebuilt with 64-bit KV addressing.
+static bool mla_co_has_32bit_kv_offset(const std::string& arch_id, const std::string& co_name)
+{
+    static const std::unordered_set<std::string> gfx950 = {
+        "MLA_A16W16_1TG_4W_16mx4_32nx1_Coex0_Msk1_QH16.co",
+        "MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16.co",
+        "mla_a16w16_qh16_m16x4_n16x1_coex0_mask1.co",
+        "mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_lse_ps.co",
+        "mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps.co",
+        "mla_a16w16_qh16_m32x4_n16x1_coex0_mask1.co",
+        "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co",
+        "mla_a16w16_qh8_qseqlen2_gqaratio8.co",
+        "mla_a16w16_qh8_qseqlen2_gqaratio8_causal.co",
+        "mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps.co",
+        "mla_a8w8_qh128_m32x4_n16x2_msk0.co",
+        "mla_a8w8_qh128_m32x4_n16x2_msk1.co",
+        "mla_a8w8_qh16_qseqlen2_gqaratio16.co",
+        "mla_a8w8_qh16_qseqlen2_gqaratio16_ps.co",
+        "mla_a8w8_qh32_qseqlen1_gqaratio32_lse_ps.co",
+        "mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co",
+        "mla_a8w8_qh8_qseqlen1_gqaratio8_v3.co",
+        "mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co",
+        "mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co",
+    };
+    const size_t slash = co_name.find_last_of('/');
+    const std::string file = (slash == std::string::npos) ? co_name : co_name.substr(slash + 1);
+    return arch_id == "gfx950" && gfx950.count(file) != 0;
+}
 
 // Debug instrumentation (host prints + post-launch sync/error checks + raw
 // buffer dumps) for the gfx1250 gfx1250 MLA dispatch is compiled ONLY when
@@ -1006,6 +1044,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
         && ((gqa_ratio == 16 && (max_seqlen_q == 3 || max_seqlen_q == 4))
             || (gqa_ratio == 32 && (max_seqlen_q == 2 || max_seqlen_q == 3))
+            || (gqa_ratio == 32 && max_seqlen_q == 1)
             || (gqa_ratio == 64 && max_seqlen_q == 1))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 16;
@@ -1030,6 +1069,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+
+        const uint64_t kv_span = static_cast<uint64_t>(KV->size(0)) * KV->stride(0) * KV->element_size();
+        AITER_CHECK(kv_span <= kMlaKv32BitSpan || !mla_co_has_32bit_kv_offset(arch_id, cfg.co_name),
+                    __func__, ": ", co_name, " addresses KV with 32-bit offsets but kv_buffer spans ",
+                    kv_span, " bytes (limit ", kMlaKv32BitSpan,
+                    "); it would read the wrong KV rows. Use a kv_buffer of at most 4 GiB per call.");
 
         impl_ptr =
             &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
