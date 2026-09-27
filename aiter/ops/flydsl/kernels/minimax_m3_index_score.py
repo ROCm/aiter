@@ -85,7 +85,8 @@ barrier per page. Measured, 3 trials, shuffled fp8 (flyS -> best token_waves):
 
 So: worth setting at q=1 (or any shape with fewer pages than wave slots),
 worth nothing at q=8 long sequence, and actively harmful at tw4 once the
-machine is already full. Defaulted off; sweep it per shape.
+machine is already full. Auto-selection is limited to the much narrower
+native-layout Q1 regime in resolve_config; explicit 1 keeps it off.
 
 Where the bandwidth actually is, and what is left
 -------------------------------------------------
@@ -189,7 +190,8 @@ class IndexScoreConfig:
                    with one LDS round trip and one barrier per page to combine
                    the partial maxes. feat_waves * token_waves waves cover one
                    page; the remaining WAVES // (feat_waves * token_waves)
-                   cover distinct pages.
+                   cover distinct pages. 0 selects the narrow automatic split
+                   in resolve_config; explicit 1/2/4 always win.
     pages_per_wave pages one wave walks back to back, pipelined across the
                    boundary. 0 means pick it from the launch bounds; see
                    resolve_config, which every entry point calls first.
@@ -226,12 +228,27 @@ class IndexScoreConfig:
                    buys nothing here; only the nt bit matters. Left at 2 because
                    it is the smaller claim, not because 3 was shown worse.
 
+                   -1 (the default) resolves to 2, except on the served
+                   decode path (see resolve_config), where it resolves to 0.
+                   Those NT numbers were taken with a read-modify-write flush
+                   in front of every launch, which leaves the cache full of
+                   dirty lines that only an allocating load pays for; timed
+                   instead as 57 layers' pools back to back, the default
+                   policy is 3-7% faster at every served batch size.
+
     sched          instruction-scheduling hint for the page loop. -1 picks it
                    from the query shape (see resolve_config); 0 leaves the
                    backend alone. 1/2/3 emit `rocdl.iglp_opt(0/1/2)` at the top
                    of the loop body -- LLVM's canned MFMA/VMEM interleavings,
                    written for FA-shaped loops. 4 spells the interleave out with
                    `sched_group_barrier`, one VMEM group per MFMA group.
+
+    spread         work-map layout. 0 hands out fixed chunks of `work_chunk`
+                   pages; 1 spreads each step's live pages evenly over the CUs,
+                   1..4 pages per CTA and at most one per wave (see
+                   make_spread_work_map). Needs one page per wave and no
+                   intra-page split. -1 resolves to 1 on the served decode path
+                   when pages_per_wave resolves to 1, else 0.
 
     cp_world       ranks a context-parallel indexer splits the blocks over, and
     cp_rank        which one this launch is. The default 1/0 is the whole
@@ -257,15 +274,16 @@ class IndexScoreConfig:
     """
 
     feat_waves: int = 1
-    token_waves: int = 1
+    token_waves: int = 0  # 0 = auto; explicit 1/2/4 are never overridden
     pages_per_wave: int = 0  # 0 = auto, resolved from the launch bounds
     q_to_lds: bool = False
     shuffled: bool = False
     waves_per_eu: int = 0
-    nt_k: int = 2
+    nt_k: int = -1  # -1 = auto: 0 on the served decode path, else 2
     sched: int = -1  # -1 = auto, resolved from the query shape
     cp_world: int = 1  # 1 = no context parallelism; see above
     cp_rank: int = 0
+    spread: int = -1  # -1 = auto: 1 on the served one-page-per-wave path, else 0
 
 
 def feature_tiles(S: int, H: int) -> int:
@@ -304,7 +322,7 @@ def reduce_lds_bytes(S: int, H: int, cfg: "IndexScoreConfig") -> int:
     rather than just the g == 0 writers makes the write contiguous and the read
     lane-local, and it is only WAVES*FTW*64*4 B -- 2 KB at S=8 H=4.
     """
-    if cfg.token_waves == 1:
+    if cfg.token_waves <= 1:
         return 0
     return WAVES * _tiling(S, H, cfg)[1] * WAVE * 4
 
@@ -317,7 +335,38 @@ def work_chunk(cfg: IndexScoreConfig) -> int:
     """
     if not cfg.pages_per_wave:
         raise ValueError("pages_per_wave is unresolved; call resolve_config first")
-    return (WAVES // (cfg.feat_waves * cfg.token_waves)) * cfg.pages_per_wave
+    # An explicit page depth disables auto token splitting.
+    return (WAVES // (cfg.feat_waves * (cfg.token_waves or 1))) * cfg.pages_per_wave
+
+
+def _grid_chunks(max_block: int, cfg: IndexScoreConfig) -> int:
+    """Grid columns per request. A spread map needs one spare row per request:
+    it may cut up to one CTA per request boundary, and the spare column keeps
+    four pages per CTA enough even at full capacity."""
+    chunk = work_chunk(cfg)
+    return (max_block + chunk - 1) // chunk + (1 if cfg.spread > 0 else 0)
+
+
+def _spread_fits(batch: int, max_block: int, cfg: IndexScoreConfig) -> bool:
+    """A spread row packs the first page in 16 bits and the page count in the
+    top byte of the length word, so both have to fit; the map kernel unrolls
+    the batch."""
+    return (
+        batch <= SPREAD_MAX_BATCH
+        and max_block <= 0xFFFF
+        and max_block * cfg.cp_world * PAGE <= 0xFFFFFF
+    )
+
+
+# The spread map is built by one small kernel with the request loop unrolled,
+# so it is limited to batches this size (the served ladder stops at 4).
+SPREAD_MAX_BATCH = 64
+MAP_THREADS = 256
+
+# Chunks the packed work map can address. A row names its chunk in 16 bits, so
+# a grid wider than this cannot be packed at all -- which is also what bounds
+# `max_block` once the chunk is one page.
+_MAX_CHUNKS = 0x10000
 
 
 # Oversubscription the page loop is allowed to spend. Below this many CTAs the
@@ -326,6 +375,108 @@ def work_chunk(cfg: IndexScoreConfig) -> int:
 # _auto_num_splits in mqa_logits/fp8_mqa_logits.py, which tuned the same
 # trade-off on the same class of kernel.
 _CTA_OVERSUBSCRIBE = 4
+
+
+def _auto_token_split(cfg: IndexScoreConfig) -> bool:
+    """Only tune the untouched decode path; CP does not alter the gate.
+
+    `shuffled` is in scope. It changes the *order* the K bytes are read in, not
+    how much work there is, so the depth tables and the spread map -- which are
+    about filling CUs -- carry over unchanged. Leaving it out cost a factor of
+    two at small launches: a 128-page case fell back to the capacity estimate's
+    4 pages/wave, i.e. 8 CTAs on 256 CUs, and measured 9.6 us against the
+    native layout's 3.9. The one thing that does not carry over is the cache
+    policy, which the layout inverts; see `nt_k` at the resolve site.
+    """
+    return (
+        cfg.token_waves == 0
+        and cfg.pages_per_wave == 0
+        and cfg.feat_waves == 1
+        and not cfg.q_to_lds
+        and cfg.waves_per_eu == 0
+        and cfg.nt_k == -1
+        and cfg.sched == -1
+        and cfg.spread == -1
+    )
+
+
+# pages_per_wave for the served MiniMax-M3 decode launches, keyed by (S, H):
+# (largest graph batch, depth) steps, then 4 beyond the last one.
+_SERVED_DECODE_DEPTH = {
+    (4, 1): ((4, 1), (16, 2)),  # TP4 MTP: Q4, one index head
+    (8, 4): ((2, 1), (4, 2), (16, 3)),  # Q8, four index heads
+}
+# Every other one-feature-tile shape (S*H <= 16) was swept too -- S1H1, S4H4,
+# S1H4 behave within a few percent of S4H1 at every batch -- so they share its
+# table.
+_ONE_TILE_DECODE_DEPTH = _SERVED_DECODE_DEPTH[(4, 1)]
+
+
+def _decode_depth_table(S: int, H: int):
+    if (S, H) in _SERVED_DECODE_DEPTH:
+        return _SERVED_DECODE_DEPTH[(S, H)]
+    if S and H and feature_tiles(S, H) == 1:
+        return _ONE_TILE_DECODE_DEPTH
+    return None
+
+
+def _served_decode(cfg: IndexScoreConfig, S: int, H: int, max_block: int) -> bool:
+    """A decode launch with a measured depth table, no CP. The tables were
+    measured at max_block 8192; past 0xFFFF blocks their shallow depths would
+    not even pack, so such capacities keep the estimate."""
+    return (
+        _auto_token_split(cfg)
+        and _decode_depth_table(S, H) is not None
+        and cfg.cp_world == 1
+        and max_block <= 0xFFFF
+    )
+
+
+def _served_decode_depth(batch: int, S: int = 4, H: int = 1) -> int:
+    """pages_per_wave for a served decode launch, by graph batch size."""
+    for limit, depth in _decode_depth_table(S, H):
+        if batch <= limit:
+            return depth
+    return 4
+
+
+def _occupancy_depth_cap(
+    batch: int, max_block: int, cfg: IndexScoreConfig, device=None
+) -> int:
+    """Deepest pages_per_wave that still hands every CU a CTA.
+
+    The served depth tables above are keyed on batch alone, but depth only pays
+    off when there are enough pages to fill the machine at that depth. A full
+    batch of *short* requests has both: a large batch and very little work.
+    `batch * max_block` is the graph's page capacity and so an upper bound on
+    the live pages, which makes this cap safe in the direction that matters --
+    a batch that really is long keeps its tabled depth, and only a launch that
+    provably cannot fill one CU round gets trimmed.
+
+    Without it a short-context full batch strands half the GPU: bs32 at an 8K
+    context is 2048 pages, which at the tabled depth 4 is 16 pages per CTA,
+    i.e. 128 CTAs on 256 CUs. Measured, 12 layers replayed, S4H1 fp8:
+
+      bs32 8K (2048 pages)   depth 4 12.64 us   depth 2  8.68   depth 1  9.04
+      bs16 8K (1024 pages)   depth 2  6.80      depth 1  5.82
+      bs8  8K ( 512 pages)   depth 2  6.63      depth 1  5.44
+      bs64 8K (4096 pages)   depth 4 14.49      depth 2 15.21   (cap: 4, kept)
+
+    The non-served auto path below already guards occupancy this way; this is
+    the same guard for the tabled path.
+    """
+    per_wave = WAVES // (cfg.feat_waves * max(cfg.token_waves, 1))
+    return max(1, (batch * max_block) // (per_wave * _cu_count(device)))
+
+
+def _cu_count(device=None) -> int:
+    import torch
+
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    if device is None:
+        return get_cu_num()
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def resolve_config(
@@ -338,8 +489,14 @@ def resolve_config(
 ):
     """Fill in `cfg`'s shape-dependent fields. Idempotent; explicit wins.
 
-    Two fields are auto, each only when left at its sentinel: `pages_per_wave`
-    at 0, and `sched` at -1. `sched` needs the query shape, so pass S and H if
+    Three fields are auto, each only at its sentinel: `token_waves` and
+    `pages_per_wave` at 0, and `sched` at -1. Explicit token_waves=1 preserves
+    the original unsplit behavior. Auto token splitting selects four waves and
+    depth one only for native-layout Q1, one feature tile, and batch*local_blocks
+    <= device CU count, with all other tuning knobs untouched. Up to twice
+    that page count, two token waves fill the first CTA scheduling round;
+    beyond it the split resolves to one. CP bounds are local.
+    `sched` needs the query shape, so pass S and H if
     you use that sentinel; without them it stays unresolved and the kernel
     treats it as off.
 
@@ -378,6 +535,61 @@ def resolve_config(
     (the holes are counted as work), which biases towards the longer loop; every
     ragged case measured still wants the longest one, so the bias is harmless.
 
+    served decode
+    ~~~~~~~~~~~~~
+    The capacity estimate above is wrong for the launch MiniMax-M3 actually
+    serves: TP4 decode with MTP gives S=4, H=1, no CP, and max_block is the
+    1M-token capacity (8192), so it always picked 2 (batch 1) or 4 pages per
+    wave. Real lengths are far shorter -- captured from an agentic cc=4 run,
+    median 110K tokens, and 97% of steps are graph batch 1 or 2 -- so that
+    left 20-450 live CTAs, one wave per SIMD, each walking a 16-32 panel chain
+    that ATT showed to be pure K latency. The grid has to stay graph-stable,
+    so the depth is chosen from the graph batch alone, and the auto cache
+    policy goes to 0 (see nt_k). Timed as 57 layers' pools back to back,
+    served lengths, weighted mean us per graph batch, fp8:
+
+      batch    old auto   ppw 1   ppw 2   ppw 3   ppw 4   Triton
+      1          8.87      7.21    8.57     -      -       7.82
+      2         19.83     14.11   15.98     -      -      16.37
+      4         20.60     14.90   16.11     -      -      25.32
+      8         49.08     44.96   44.89   44.47   45.97   61.12
+      16        92.69     87.05   84.93   85.85   86.67  111.30
+      32       157.96    154.61  148.98  147.24  147.64  204.00
+      128      687.18    678.01  656.67  647.15  641.87  874.92
+
+    (batch 1-4: captured steps, nt 0; 8+: synthetic full batches with
+    captured lengths, nt 0 except "old auto"). Over the captured step mix
+    that is 1.28x the old auto and 1.14x Triton. Inside batch 1 the long
+    steps (~466K) would still prefer 4 (-4%), which a batch-only rule
+    cannot see. Measured at max_block 8192 only; other shapes keep the
+    capacity estimate.
+
+    Where that resolves to one page per wave, the map resolves to spread
+    (see make_spread_work_map): the grid is still fixed by the graph batch,
+    but each step's live pages are dealt out so no CU ends up holding a
+    spilled full CTA. Captured steps, layers bench, weighted over the step
+    mix: S4 H1 9.81 -> 9.56 us, S8 H4 9.92 -> 9.64.
+
+    S=8, H=4 (two feature tiles) gets its own table from the same harness
+    and lengths. nt 1 ties nt 0 and nt 3 ties nt 2, which is ~9% slower;
+    sched 0/1, q_to_lds and feat_waves 2 (-30%) do not help. Weighted mean us,
+    nt 0 except "old auto" (ppw 2 at batch 1, else 4; nt 2):
+
+      batch    old auto   ppw 1   ppw 2   ppw 3   ppw 4   ppw 8   Triton
+      1          9.20      7.99    8.95   10.95   12.30     -     12.13
+      2         19.84     15.72   16.38   15.63   17.20     -     28.42
+      4         18.58     15.67   14.33   14.28   16.44     -     39.85
+      8         49.82     53.57   47.87   46.85   47.04     -    113.76
+      16        96.27    108.56   91.36   89.19   89.84     -    231.76
+      32       200.93    224.95  191.98  183.25  181.97     -    456.05
+      64       366.28       -    351.26     -    324.82  320.98  890.39
+      128      782.80       -    728.38     -    678.39  671.71 1565.10
+
+    (batch 1-4: captured steps; 8+: synthetic full batches; 64/128 from a
+    separate run.) Batch 2 is a tie between 1 and 3 (3 wins captured steps
+    by 0.6%, 1 wins full batches by 3.6%); 8 stays out of the ladder for the
+    reasons above.
+
     sched
     ~~~~~
     iglp_opt(0) pays exactly when a wave has more than one feature tile, and
@@ -399,19 +611,50 @@ def resolve_config(
     interleave were measured at the same point and all lose: at serve_b32_q8 fp8,
     111.4 (variant 0) against 111.6 / 114.2 / 119.0.
     """
+    auto_tokens = _auto_token_split(cfg)
+    served = _served_decode(cfg, S, H, max_block)
+    if served and S == 1 and batch * ((max_block + 1) // 2) <= _cu_count(device):
+        # Q1 launches small enough for the token split below keep it: that
+        # regime was measured separately and the depth tables were not.
+        served = False
+    if cfg.nt_k < 0:
+        # The native layout wants K in L1 and the shuffled layout does not, and
+        # the reason is the same fact seen from two sides. Natively one K
+        # instruction takes 64 B from each of 16 rows, so every 128 B line is
+        # requested twice; L1 turns the second into a hit, and NT would send it
+        # back to L2 -- NT measures 0.94-1.00x there, i.e. it only ever loses.
+        # Shuffled, one instruction is 1024 contiguous bytes and each line is
+        # requested exactly once, so there is no second access to lose and the
+        # fill buys nothing: NT is 1.10-1.22x. Neither half pays alone --
+        # coalescing at the default policy is only 1.00-1.05x -- which is why
+        # this flips with the layout rather than with the launch. Measured over
+        # 12-layer replays, bs1-32 x 8K-512K, both S4H1 and S8H4; the shuffled
+        # arm peaks at 6.69 TB/s against a 6.3-6.4 TB/s native ceiling.
+        cfg = replace(cfg, nt_k=0 if served and not cfg.shuffled else 2)
+    if cfg.token_waves == 0:
+        cfg = replace(cfg, token_waves=1)
     if cfg.pages_per_wave and cfg.sched >= 0:
-        return cfg
+        return _resolve_spread(cfg, served, batch, max_block)
 
-    if not cfg.pages_per_wave:
-        import torch
-
-        from aiter.jit.utils.chip_info import get_cu_num
-
-        cu = (
-            get_cu_num()
-            if device is None
-            else torch.cuda.get_device_properties(device).multi_processor_count
+    if not cfg.pages_per_wave and served:
+        cfg = replace(
+            cfg,
+            pages_per_wave=min(
+                _served_decode_depth(batch, S, H),
+                _occupancy_depth_cap(batch, max_block, cfg, device),
+            ),
         )
+    elif not cfg.pages_per_wave:
+        cu = _cu_count(device)
+        # One page per CTA fills otherwise missing CU scheduling slots. Only
+        # native-layout Q1/one-tile launches were measured for this auto path.
+        if auto_tokens and S == 1 and 0 < H <= MFMA_N:
+            if batch * max_block <= cu:
+                cfg = replace(cfg, token_waves=WAVES)
+            elif batch * ((max_block + 1) // 2) <= cu:
+                # Two pages/CTA retain one scheduling round while halving each
+                # wave's panel chain. Beyond one round the LDS exchange loses.
+                cfg = replace(cfg, token_waves=2)
         target = cu * _CTA_OVERSUBSCRIBE
         best = 1
         for ppw in (2, 4):
@@ -423,13 +666,27 @@ def resolve_config(
 
     if cfg.sched < 0 and S and H:
         cfg = replace(cfg, sched=1 if _tiling(S, H, cfg)[1] > 1 else 0)
-    return cfg
+    return _resolve_spread(cfg, served, batch, max_block)
+
+
+def _resolve_spread(cfg: IndexScoreConfig, served: bool, batch: int, max_block: int):
+    if cfg.spread >= 0:
+        return cfg
+    on = (
+        served
+        and cfg.pages_per_wave == 1
+        and cfg.token_waves == 1
+        and _spread_fits(batch, max_block, cfg)
+    )
+    return replace(cfg, spread=int(on))
 
 
 def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
     """Is this config legal for this shape? Mirrors gemm_kernels.selection_filter."""
-    # 0 is the "auto" sentinel and legal everywhere; resolve_config only ever
-    # picks a value this same filter would accept.
+    # Check the auto token split as its fallback geometry; its Q1 branch is
+    # also legal (one feature tile, four token waves).
+    if cfg.token_waves == 0:
+        cfg = replace(cfg, token_waves=1)
     if cfg.pages_per_wave < 0 or cfg.feat_waves < 1 or cfg.token_waves < 1:
         return False
     # The two intra-page splits have to partition the CTA's waves between them,
@@ -440,12 +697,18 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
         return False
     if cfg.waves_per_eu and not 1 <= cfg.waves_per_eu <= 10:
         return False
-    if not 0 <= cfg.nt_k <= 3:
+    if not -1 <= cfg.nt_k <= 3:  # -1 is the auto sentinel, see resolve_config
         return False
     if not -1 <= cfg.sched <= 4:  # -1 is the auto sentinel, see resolve_config
         return False
     if cfg.cp_world < 1 or not 0 <= cfg.cp_rank < cfg.cp_world:
         return False
+    if not -1 <= cfg.spread <= 1:  # -1 is the auto sentinel, see resolve_config
+        return False
+    if cfg.spread == 1 and (
+        cfg.pages_per_wave > 1 or cfg.token_waves > 1 or cfg.feat_waves > 1
+    ):
+        return False  # a spread CTA holds at most one page per wave
     if cfg.q_to_lds or cfg.token_waves > 1:
         from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
@@ -473,6 +736,8 @@ def kernel_name(S: int, H: int, fp8: bool, cfg: IndexScoreConfig) -> str:
         name += f"_kc{cfg.nt_k}"
     if cfg.sched > 0:  # 0 and the unresolved -1 both mean "no hint"
         name += f"_sc{cfg.sched}"
+    if cfg.spread > 0:
+        name += "_sp"
     if cfg.cp_world > 1:
         # The rank is part of the name, not just the world: ranks sharing a
         # node share the JIT cache directory, and they compile *different*
@@ -498,6 +763,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
     # the emitted code is byte-identical to the non-CP kernel.
     CP_WORLD = cfg.cp_world
     CP_RANK = cfg.cp_rank
+    SPREAD = cfg.spread > 0
 
     F = S * H
     # FT feature tiles in total; FTW of them per wave; FT_PAD = FTW*feat_waves
@@ -637,6 +903,11 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         seq_len = fx.Int32(fx.add_offset(wm, fx.Int32(1)).load(T.i32))
         b = (packed >> fx.Int32(16)) & fx.Int32(0xFFFF)
         c = packed & fx.Int32(0xFFFF)
+        if const_expr(SPREAD):
+            # A spread row names its first page rather than a chunk, and
+            # carries its page count (1..4) in the length word's top byte.
+            span = (seq_len >> fx.Int32(24)) & fx.Int32(0xFF)
+            seq_len = seq_len & fx.Int32(0xFFFFFF)
         # Pages this request actually owns. Grid is sized from max_seq_len, so
         # trailing waves find nothing to do.
         num_pages = (seq_len + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
@@ -842,12 +1113,21 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         # only forms an address, and the store it would feed is masked off
         # below. Clamping uses cmp+select, not maximumf/minimumf -- those are
         # *float* ops and would compare these indices as bit patterns.
+        # `limit` is where this CTA's pages end: the request's end, or for a
+        # spread row the end of its own span.
+        if const_expr(SPREAD):
+            first = c
+            end = c + span
+            limit = (end < num_pages).select(end, num_pages)
+        else:
+            first = c * fx.Int32(CHUNK)
+            limit = num_pages
         pages = [
-            c * fx.Int32(CHUNK) + fx.Int32(j * PAGE_WAVES) + pw
+            first + fx.Int32(j * PAGE_WAVES) + pw
             for j in range_constexpr(pages_per_wave)
         ]
         zero = fx.Int32(0)
-        nm1 = num_pages - fx.Int32(1)
+        nm1 = limit - fx.Int32(1)
         last = (nm1 < zero).select(zero, nm1)
 
         def load_page_id(p):
@@ -1035,34 +1315,65 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
             `nxt_page`'s opening loads instead of idling and hand them back, so
             the wave never drains and refills at a page boundary.
 
-            The software depth is one panel and stays that way: pf=2/4/8 were
-            measured and emitted byte-identical ISA (24 loads, maxvmcnt 8) --
-            the scheduler hoists to its own depth regardless of the source
-            order, so a deeper queue here only made the Python harder to read.
+            FP8 keeps three panels in flight, capped by the wave's token
+            slice, and carries that window across pages. Scheduling boundaries
+            prevent LLVM from collapsing it back to the one-panel source
+            schedule. BF16 retains the original one-panel software queue.
             """
             if const_expr(1 <= sched <= 3):
                 fx.rocdl.iglp_opt(sched - 1)
             run_max = [neg_inf for _ in range_constexpr(FTW)]
-            queue = (
-                list(carry)
-                if carry is not None
-                else [[issue_k(page, 0, i) for i in range_constexpr(K_LOADS)]]
-            )
-            out_carry = []
-
-            for panel in range_constexpr(PANELS_W):
-                raws = queue.pop(0)
-                # Issue panel n+1's loads before consuming panel n's, so they
-                # are in flight during the MFMAs rather than waited on.
-                if const_expr(panel + 1 < PANELS_W):
+            if const_expr(fp8):
+                # A scheduling boundary makes the three-panel window real;
+                # changing only the source queue depth lets LLVM undo it.
+                depth = min(3, PANELS_W)
+                queue = list(carry) if carry is not None else []
+                for panel in range_constexpr(len(queue), depth):
                     queue.append(
-                        [issue_k(page, panel + 1, i) for i in range_constexpr(K_LOADS)]
+                        [issue_k(page, panel, i) for i in range_constexpr(K_LOADS)]
                     )
-                elif nxt_page is not None:
-                    out_carry.append(
-                        [issue_k(nxt_page, 0, i) for i in range_constexpr(K_LOADS)]
-                    )
-                score_panel(p, panel, raws, run_max)
+                out_carry = []
+                for panel in range_constexpr(PANELS_W):
+                    raws = queue.pop(0)
+                    fx.rocdl.sched_barrier(0)
+                    score_panel(p, panel, raws, run_max)
+                    fx.rocdl.sched_barrier(0)
+                    future = panel + depth
+                    if const_expr(future < PANELS_W):
+                        queue.append(
+                            [issue_k(page, future, i) for i in range_constexpr(K_LOADS)]
+                        )
+                    elif nxt_page is not None:
+                        out_carry.append(
+                            [
+                                issue_k(nxt_page, future - PANELS_W, i)
+                                for i in range_constexpr(K_LOADS)
+                            ]
+                        )
+            else:
+                queue = (
+                    list(carry)
+                    if carry is not None
+                    else [[issue_k(page, 0, i) for i in range_constexpr(K_LOADS)]]
+                )
+                out_carry = []
+
+                for panel in range_constexpr(PANELS_W):
+                    raws = queue.pop(0)
+                    # Issue panel n+1's loads before consuming panel n's, so they
+                    # are in flight during the MFMAs rather than waited on.
+                    if const_expr(panel + 1 < PANELS_W):
+                        queue.append(
+                            [
+                                issue_k(page, panel + 1, i)
+                                for i in range_constexpr(K_LOADS)
+                            ]
+                        )
+                    elif nxt_page is not None:
+                        out_carry.append(
+                            [issue_k(nxt_page, 0, i) for i in range_constexpr(K_LOADS)]
+                        )
+                    score_panel(p, panel, raws, run_max)
 
             if const_expr(sched == 4):
                 # Ask for the order the source already has -- one panel's loads,
@@ -1198,7 +1509,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
                 valid = (
                     None
                     if const_expr(pages_per_wave == 1 and TOKEN_WAVES == 1)
-                    else pages[j] < num_pages
+                    else pages[j] < limit
                 )
                 store_page(pages[j], run_max, valid)
 
@@ -1210,7 +1521,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
         else:
 
             @flyc.jit
-            def _maybe(_pred=(pages[0] < num_pages), _w=body):
+            def _maybe(_pred=(pages[0] < limit), _w=body):
                 if _pred:
                     _w()
 
@@ -1367,7 +1678,7 @@ def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: in
         raise ValueError("seq_lens must be contiguous")
     batch = seq_lens.shape[0]
     chunks = (max_block + chunk - 1) // chunk
-    if batch > 0xFFFF or chunks > 0x10000 or batch * chunks * 8 > 0xFFFFFFFF:
+    if batch > 0xFFFF or chunks > _MAX_CHUNKS or batch * chunks * 8 > 0xFFFFFFFF:
         raise ValueError("work_map: packed IDs or address span out of range")
     if out is not None:
         _validate_map(out, batch * chunks, seq_lens.device, exact=True)
@@ -1400,6 +1711,330 @@ def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: in
     return out
 
 
+def make_spread_work_map(seq_lens, rows, cu, out=None, world: int = 1, rank: int = 0):
+    """The one-page-per-wave map, with the last CU round spread thin.
+
+    make_work_map gives every CTA a full chunk of four pages, which is fine
+    until the live CTAs spill past a multiple of the CU count: the spill lands
+    as a second full CTA on a few CUs and the launch waits for them. Measured
+    at batch 1 in the served layers bench, 1024 -> 1028 pages (256 -> 257 CTAs)
+    costs 5.4 -> 6.7 us, while 1024 -> 1025 (the extra CTA holding one page)
+    costs nothing; 2048 -> 2052 is 8.4 -> 9.9. It is the pages that pile onto
+    one CU, not the CTA count -- eight-wave CTAs (half as many, same pages per
+    CU) and fewer, deeper CTAs were both measured and both lose.
+
+    So a step needing r CU rounds keeps r - 1 rounds of full four-page CTAs
+    and spreads what is left over the last round's CTAs, 1..4 pages each and
+    the larger ones first, so no CU holds more than ceil(pages / cu) plus
+    rounding. Spreading every round evenly instead balances as well but pays
+    a CTA prologue per page or two: -6% at S8 H4, 3300 pages.
+
+    Row n is [0] = (b << 16) | first page, [1] = seq_len | (pages << 24); holes
+    are (0, 0) and packed at the tail as before. The full CTAs come first in
+    dispatch order, taken from the front of the batch; then each request's
+    remainder, over a share of the last round proportional to its size. Each
+    request can round its share up by one CTA, so one slot per live request
+    is held back. `rows` is the grid, with one spare row per request (see
+    _grid_chunks), which is what keeps four pages per CTA enough at full
+    capacity. Device ops only: cudagraph-capturable.
+    """
+    import torch
+
+    batch = seq_lens.shape[0]
+    dev = seq_lens.device
+    if out is None:
+        out = torch.empty((rows, 2), dtype=torch.int32, device=dev)
+    else:
+        _validate_map(out, rows, dev, exact=True)
+    lens = seq_lens.to(torch.int32)
+    nblk = (lens + (PAGE - 1)) // PAGE
+    if world > 1:
+        nblk = (
+            (nblk - rank)
+            .clamp_(min=0)
+            .add_(world - 1)
+            .div_(world, rounding_mode="floor")
+        )
+    nblk = nblk.to(torch.int64)
+    total = nblk.sum()
+    live_reqs = (nblk > 0).sum()
+    rounds = ((total + 4 * live_reqs + 4 * cu - 1) // (4 * cu)).clamp(min=1)
+    # Full four-page CTAs for every round but the last, front of the batch first.
+    fits = nblk // 4
+    fits_cum = torch.cumsum(fits, 0)
+    full = torch.minimum(fits_cum[-1], (rounds - 1) * cu)
+    a = torch.minimum((full - (fits_cum - fits)).clamp(min=0), fits)
+    # The rest, spread over what is left of the last round.
+    rest = nblk - 4 * a
+    rest_total = total - 4 * full
+    thin = torch.minimum(rounds * cu - full - live_reqs, rest_total)
+    thin = torch.minimum(thin, rows - full - live_reqs).clamp(min=1)
+    k = (rest * thin + rest_total.clamp(min=1) - 1) // rest_total.clamp(min=1)
+    a_cum = torch.cumsum(a, 0)
+    k_cum = torch.cumsum(k, 0)
+
+    n = torch.arange(rows, dtype=torch.int64, device=dev)
+    in_full = n < full
+    bf = torch.searchsorted(a_cum, n, right=True).clamp(max=batch - 1)
+    first_f = 4 * (n - (a_cum - a)[bf])
+    nt = n - full
+    bt = torch.searchsorted(k_cum, nt, right=True)
+    live = in_full | ((nt >= 0) & (bt < batch))
+    bt = bt.clamp(max=batch - 1)
+    it = nt - (k_cum - k)[bt]
+    kt = k[bt].clamp(min=1)
+    base, extra = rest[bt] // kt, rest[bt] % kt
+    first_t = 4 * a[bt] + it * base + torch.minimum(it, extra)
+    b = torch.where(in_full, bf, bt)
+    first = torch.where(in_full, first_f, first_t)
+    span = torch.where(in_full, 4, base + (it < extra).to(torch.int64))
+    out[:, 0] = torch.where(live, (b << 16) | first, 0).to(torch.int32)
+    out[:, 1] = torch.where(live, lens[b].to(torch.int64) | (span << 24), 0).to(
+        torch.int32
+    )
+    return out
+
+
+def build_spread_map(batch: int, world: int = 1, rank: int = 0):
+    """make_spread_work_map as one kernel: one thread per row, batch unrolled.
+
+    The torch version is ~40 small ops -- ~1 ms of host launches per step when
+    built eagerly, ~190 us of GPU time inside a graph, against a scorer that
+    spends ~0.5 ms per step over all 57 layers. Every thread redoes the O(batch)
+    per-request prefix arithmetic for its own row instead of sharing it, which
+    at batch <= SPREAD_MAX_BATCH is cheaper than a second pass or a barrier.
+    Bit-identical to make_spread_work_map; the tests hold the two together.
+    """
+    if not 1 <= batch <= SPREAD_MAX_BATCH:
+        raise ValueError(f"spread map batch must be in [1, {SPREAD_MAX_BATCH}]")
+    name = f"m3_index_spread_map_B{batch}"
+    if world > 1:
+        name += f"_cp{world}r{rank}"
+
+    @flyc.kernel(name=name, known_block_size=[MAP_THREADS, 1, 1])
+    def map_kernel(
+        arg_lens: fx.Pointer, arg_out: fx.Pointer, i32_rows: fx.Int32, i32_cu: fx.Int32
+    ):
+        n = fx.Int32(gpu.block_id("x")) * fx.Int32(MAP_THREADS) + fx.Int32(
+            gpu.thread_id("x")
+        )
+        lens_buf = ptr_buf_tensor(arg_lens, fx.Int32)
+        out_buf = ptr_buf_tensor(arg_out, fx.Int32)
+        zero, one, four = fx.Int32(0), fx.Int32(1), fx.Int32(4)
+
+        def lo(x, y):
+            return (x < y).select(x, y)
+
+        def hi(x, y):
+            return (x < y).select(y, x)
+
+        lens = [
+            fx.Int32(fx.add_offset(fx.get_iter(lens_buf), fx.Int32(b)).load(T.i32))
+            for b in range_constexpr(batch)
+        ]
+        nblk = []
+        for b in range_constexpr(batch):
+            pages = (lens[b] + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
+            if const_expr(world > 1):
+                pages = (hi(pages - fx.Int32(rank), zero) + fx.Int32(world - 1)) // (
+                    fx.Int32(world)
+                )
+            nblk.append(pages)
+
+        total, live, fits_total = zero, zero, zero
+        for b in range_constexpr(batch):
+            total = total + nblk[b]
+            live = live + (nblk[b] > zero).select(one, zero)
+            fits_total = fits_total + nblk[b] // four
+        cu = i32_cu
+        rounds = hi((total + four * live + four * cu - one) // (four * cu), one)
+        full = lo(fits_total, (rounds - one) * cu)
+        rest_total = total - four * full
+        thin = lo(lo(rounds * cu - full - live, rest_total), i32_rows - full - live)
+        thin = hi(thin, one)
+        denom = hi(rest_total, one)
+
+        nt = n - full
+        fits_before, a_before, k_before = zero, zero, zero
+        hit, hit_b, hit_first, hit_span, hit_len = zero, zero, zero, zero, zero
+        for b in range_constexpr(batch):
+            fits = nblk[b] // four
+            a = lo(hi(full - fits_before, zero), fits)
+            fits_before = fits_before + fits
+            rest = nblk[b] - four * a
+            # rest * thin can pass 2**31 (65535 pages x ~1M rows): widen.
+            k = fx.Int32(
+                (fx.Int64(rest) * fx.Int64(thin) + fx.Int64(denom) - fx.Int64(1))
+                // fx.Int64(denom)
+            )
+            in_full = (n >= a_before) & (n < a_before + a)
+            in_thin = (nt >= k_before) & (nt < k_before + k)
+            it = nt - k_before
+            kk = hi(k, one)
+            base = rest // kk
+            extra = rest - base * kk
+            first_t = four * a + it * base + lo(it, extra)
+            span_t = base + (it < extra).select(one, zero)
+            first = in_full.select(four * (n - a_before), first_t)
+            span = in_full.select(four, span_t)
+            take = in_full | in_thin
+            hit = take.select(one, hit)
+            hit_b = take.select(fx.Int32(b), hit_b)
+            hit_first = take.select(first, hit_first)
+            hit_span = take.select(span, hit_span)
+            hit_len = take.select(lens[b], hit_len)
+            a_before = a_before + a
+            k_before = k_before + k
+
+        live_row = hit > zero
+        row0 = live_row.select((hit_b << fx.Int32(16)) | hit_first, zero)
+        row1 = live_row.select(hit_len | (hit_span << fx.Int32(24)), zero)
+
+        def _store(_n=n, _r0=row0, _r1=row1):
+            base = fx.get_iter(out_buf)
+            fx.add_offset(base, _n * fx.Int32(2)).store(_r0)
+            fx.add_offset(base, _n * fx.Int32(2) + fx.Int32(1)).store(_r1)
+
+        @flyc.jit
+        def _guarded(_p=(n < i32_rows), _w=_store):
+            if _p:
+                _w()
+
+        _guarded()
+
+    @flyc.jit
+    def launch(
+        arg_lens: fx.Pointer,
+        arg_out: fx.Pointer,
+        i32_rows: fx.Int32,
+        i32_cu: fx.Int32,
+        i32_blocks: fx.Int32,
+        stream: fx.Stream,
+    ):
+        map_kernel(arg_lens, arg_out, i32_rows, i32_cu).launch(
+            grid=(fx.Int64(i32_blocks), 1, 1),
+            block=(MAP_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+def build_chunk_map(batch: int, chunk: int, world: int = 1, rank: int = 0):
+    """make_work_map as one kernel: one thread per row, batch unrolled.
+
+    Same reason as :func:`build_spread_map` -- the torch version is a dozen
+    small ops whose cost is launch floor, ~50-60 us of GPU time inside a graph
+    against a scorer that can be 4 us -- and the same shape of answer: each
+    thread redoes the O(batch) prefix sum for its own row.
+    Bit-identical to `make_work_map`; the tests hold the two together.
+    """
+    if not 1 <= batch <= SPREAD_MAX_BATCH:
+        raise ValueError(f"chunk map batch must be in [1, {SPREAD_MAX_BATCH}]")
+    name = f"m3_index_chunk_map_B{batch}_C{chunk}"
+    if world > 1:
+        name += f"_cp{world}r{rank}"
+
+    @flyc.kernel(name=name, known_block_size=[MAP_THREADS, 1, 1])
+    def map_kernel(arg_lens: fx.Pointer, arg_out: fx.Pointer, i32_rows: fx.Int32):
+        n = fx.Int32(gpu.block_id("x")) * fx.Int32(MAP_THREADS) + fx.Int32(
+            gpu.thread_id("x")
+        )
+        lens_buf = ptr_buf_tensor(arg_lens, fx.Int32)
+        out_buf = ptr_buf_tensor(arg_out, fx.Int32)
+        zero, one = fx.Int32(0), fx.Int32(1)
+
+        hit, hit_b, hit_c, hit_len = zero, zero, zero, zero
+        before = zero
+        for b in range_constexpr(batch):
+            length = fx.Int32(
+                fx.add_offset(fx.get_iter(lens_buf), fx.Int32(b)).load(T.i32)
+            )
+            pages = (length + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
+            if const_expr(world > 1):
+                avail = pages - fx.Int32(rank)
+                avail = (avail < zero).select(zero, avail)
+                pages = (avail + fx.Int32(world - 1)) // fx.Int32(world)
+            nch = (pages + fx.Int32(chunk - 1)) // fx.Int32(chunk)
+            take = (n >= before) & (n < before + nch)
+            hit = take.select(one, hit)
+            hit_b = take.select(fx.Int32(b), hit_b)
+            hit_c = take.select(n - before, hit_c)
+            hit_len = take.select(length, hit_len)
+            before = before + nch
+
+        live = hit > zero
+        row0 = live.select((hit_b << fx.Int32(16)) | hit_c, zero)
+        row1 = live.select(hit_len, zero)
+
+        def _store(_n=n, _r0=row0, _r1=row1):
+            base = fx.get_iter(out_buf)
+            fx.add_offset(base, _n * fx.Int32(2)).store(_r0)
+            fx.add_offset(base, _n * fx.Int32(2) + fx.Int32(1)).store(_r1)
+
+        @flyc.jit
+        def _guarded(_p=(n < i32_rows), _w=_store):
+            if _p:
+                _w()
+
+        _guarded()
+
+    @flyc.jit
+    def launch(
+        arg_lens: fx.Pointer,
+        arg_out: fx.Pointer,
+        i32_rows: fx.Int32,
+        i32_blocks: fx.Int32,
+        stream: fx.Stream,
+    ):
+        map_kernel(arg_lens, arg_out, i32_rows).launch(
+            grid=(fx.Int64(i32_blocks), 1, 1),
+            block=(MAP_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+def _run_chunk_map(seq_lens, rows, chunk, out, world, rank):
+    import torch
+
+    batch = seq_lens.shape[0]
+    key = ("chunk_map", batch, chunk, world, rank, seq_lens.device.index)
+    if key not in _CACHE:
+        _CACHE[key] = build_chunk_map(batch, chunk, world, rank)
+    with torch.cuda.device(seq_lens.device):
+        _run_compiled(
+            _CACHE[key],
+            ptr_arg(seq_lens, fx.Int32),
+            ptr_arg(out, fx.Int32),
+            rows,
+            (rows + MAP_THREADS - 1) // MAP_THREADS,
+            torch.cuda.current_stream(seq_lens.device).cuda_stream,
+        )
+    return out
+
+
+def _run_spread_map(seq_lens, rows, cu, out, world, rank):
+    import torch
+
+    batch = seq_lens.shape[0]
+    key = ("spread_map", batch, world, rank, seq_lens.device.index)
+    if key not in _CACHE:
+        _CACHE[key] = build_spread_map(batch, world, rank)
+    with torch.cuda.device(seq_lens.device):
+        _run_compiled(
+            _CACHE[key],
+            ptr_arg(seq_lens, fx.Int32),
+            ptr_arg(out, fx.Int32),
+            rows,
+            cu,
+            (rows + MAP_THREADS - 1) // MAP_THREADS,
+            torch.cuda.current_stream(seq_lens.device).cuda_stream,
+        )
+    return out
+
+
 def work_map_size(
     batch: int, max_block: int, S: int = 0, H: int = 0, cfg=None, *, device=None
 ) -> int:
@@ -1415,14 +2050,14 @@ def work_map_size(
     copy would go wrong the first time this runs on a different chip.
 
     Under context parallelism `max_block` is the local bound, so this is the
-    shard's grid -- roughly 1/world of the unsharded one.
+    shard's grid -- roughly 1/world of the unsharded one. Pass S/H to enable
+    automatic token splitting. Omitting them keeps the legacy unsplit map;
+    score_flydsl accepts that exact map with the matching fallback geometry.
     """
     cfg = cfg or IndexScoreConfig()
     _validate_bounds(batch, max_block, cfg, resolved=False)
     cfg = resolve_config(batch, max_block, cfg, S, H, device=device)
-    _validate_bounds(batch, max_block, cfg)
-    chunk = work_chunk(cfg)
-    return batch * ((max_block + chunk - 1) // chunk)
+    return _validate_bounds(batch, max_block, cfg)
 
 
 def work_map_capacity(
@@ -1430,12 +2065,43 @@ def work_map_capacity(
 ) -> int:
     """Persistent rows for every batch/block bound within the envelope.
 
-    Unlike exact work_map_size, auto depth uses the minimum (one page/wave),
-    so crossing a CU-dependent dispatch threshold cannot exceed this buffer.
+    Use the smallest CTA chunk reachable by automatic depth/token splitting,
+    independent of CU count. Explicit configurations retain their tighter
+    geometry-specific envelope.
+
+    Include Q1 even when S is a larger query bound: serving callers can reuse a
+    maximum-query allocation for decode replays, and asking with the largest S
+    and launching Q1 is the natural mistake -- it costs 4x on the buffer (128 x
+    8192 blocks: 262144 rows against 262144*4) and buys that the mistake still
+    works. Nothing in aiter or ATOM pre-allocates this yet, so the cost is
+    currently notional and the safety is the point.
+
+    Not, however, where `max_block` cannot pack at one page per chunk: there
+    the block count is itself what runs into the packing limit, and the token
+    split that would need it cannot fire anyway -- `resolve_config` only takes
+    it when `batch * max_block` fits the CU count, which at that width it never
+    does. Widening there rejected bounds this used to accept (`max_block`
+    262144 at batch 128), for a geometry no launch can reach.
     """
     cfg = cfg or IndexScoreConfig()
-    cfg = replace(cfg, pages_per_wave=cfg.pages_per_wave or 1)
-    return _validate_bounds(max_batch, max_block, cfg)
+    _validate_bounds(max_batch, max_block, cfg, resolved=False)
+    auto = _auto_token_split(cfg)
+    split = auto and max_block <= _MAX_CHUNKS
+    geometry = replace(
+        cfg,
+        token_waves=WAVES if split else (cfg.token_waves or 1),
+        pages_per_wave=cfg.pages_per_wave or 1,
+        nt_k=max(cfg.nt_k, 0),  # cache policy never changes the geometry
+        spread=max(cfg.spread, 0),
+    )
+    rows = _validate_bounds(max_batch, max_block, geometry)
+    # ...or the spread map the served path may resolve to instead, which only
+    # batches up to SPREAD_MAX_BATCH can (its rows grow with the batch).
+    spread_batch = min(max_batch, SPREAD_MAX_BATCH)
+    if auto and _spread_fits(spread_batch, max_block, cfg):
+        spread = replace(geometry, token_waves=1, pages_per_wave=1, spread=1)
+        rows = max(rows, _validate_bounds(spread_batch, max_block, spread))
+    return rows
 
 
 def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, cfg=None, out=None):
@@ -1476,15 +2142,41 @@ def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, cfg=None, out=No
         )
     ):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
-    chunk = work_chunk(cfg)
+    rows = seq_lens.shape[0] * _grid_chunks(max_block, cfg)
     if out is not None:
-        rows = seq_lens.shape[0] * ((max_block + chunk - 1) // chunk)
         _validate_map(out, rows, seq_lens.device)
         out = out[:rows]
+    return _make_map(seq_lens, max_block, cfg, rows, out)
+
+
+def _make_map(seq_lens, max_block, cfg, rows, out=None):
     # The shard comes from the same cfg the kernel will be compiled against, so
     # the map and the kernel cannot disagree about which blocks this rank owns.
+    import torch
+
+    batch = seq_lens.shape[0]
+    if batch and batch <= SPREAD_MAX_BATCH and seq_lens.stride() == (1,):
+        if out is None:
+            out = torch.empty((rows, 2), dtype=torch.int32, device=seq_lens.device)
+        else:
+            _validate_map(out, rows, seq_lens.device, exact=True)
+        if cfg.spread > 0:
+            cu = torch.cuda.get_device_properties(seq_lens.device).multi_processor_count
+            return _run_spread_map(seq_lens, rows, cu, out, cfg.cp_world, cfg.cp_rank)
+        return _run_chunk_map(
+            seq_lens, rows, work_chunk(cfg), out, cfg.cp_world, cfg.cp_rank
+        )
+    if cfg.spread > 0:  # no torch fallback: the spread row packing is kernel-only
+        raise ValueError(
+            f"spread map needs a contiguous batch of 1..{SPREAD_MAX_BATCH}"
+        )
     return make_work_map(
-        seq_lens, max_block, chunk, out=out, world=cfg.cp_world, rank=cfg.cp_rank
+        seq_lens,
+        max_block,
+        work_chunk(cfg),
+        out=out,
+        world=cfg.cp_world,
+        rank=cfg.cp_rank,
     )
 
 
@@ -1531,13 +2223,15 @@ def _validate_bounds(batch, max_block, cfg, *, resolved=True) -> int:
         cfg.sched,
         cfg.nt_k,
         cfg.waves_per_eu,
+        cfg.spread,
     )
     if any(not isinstance(value, int) for value in integer_fields):
         raise ValueError("config geometry and policy fields must be integers")
     if (
-        not 0 <= cfg.nt_k <= 3
+        not (0 if resolved else -1) <= cfg.nt_k <= 3
         or not -1 <= cfg.sched <= 4
         or not 0 <= cfg.waves_per_eu <= 10
+        or not (0 if resolved else -1) <= cfg.spread <= 1
     ):
         raise ValueError("invalid cache, scheduling or occupancy policy")
     if not isinstance(batch, int) or not 0 <= batch <= 0xFFFF:
@@ -1546,8 +2240,8 @@ def _validate_bounds(batch, max_block, cfg, *, resolved=True) -> int:
         raise ValueError("max_block must be positive")
     if (
         cfg.feat_waves < 1
-        or cfg.token_waves < 1
-        or WAVES % (cfg.feat_waves * cfg.token_waves)
+        or cfg.token_waves < (1 if resolved else 0)
+        or WAVES % (cfg.feat_waves * (cfg.token_waves or 1))
     ):
         raise ValueError("invalid wave split")
     if (
@@ -1559,9 +2253,14 @@ def _validate_bounds(batch, max_block, cfg, *, resolved=True) -> int:
     if not resolved:
         return 0  # Geometry only; auto depth must be resolved before packing.
     # Includes rounded tail lanes and causal token arithmetic, before masking.
-    chunk = work_chunk(replace(cfg, pages_per_wave=cfg.pages_per_wave or 1))
-    chunks = (max_block + chunk - 1) // chunk
-    if chunks > 0x10000 or batch * chunks * 8 > 0xFFFFFFFF:
+    geometry = replace(cfg, pages_per_wave=cfg.pages_per_wave or 1)
+    chunk = work_chunk(geometry)
+    chunks = _grid_chunks(max_block, geometry)
+    if cfg.spread > 0 and not _spread_fits(batch, max_block, cfg):
+        raise ValueError(
+            "spread: batch, max_block or its token span exceeds the map packing"
+        )
+    if chunks > _MAX_CHUNKS or batch * chunks * 8 > 0xFFFFFFFF:
         raise ValueError("work_map: packed chunk or address range exceeded")
     if ((chunks * chunk) * cfg.cp_world + cfg.cp_rank) * PAGE > 0x7FFFFFFF:
         raise ValueError("max_block: causal token address exceeds int32")
@@ -1615,8 +2314,21 @@ def _validate_metadata(
         raise ValueError("cache: a single page span exceeds int32")
     batch = idx_q.shape[0] // S
     cfg = cfg or IndexScoreConfig()
+    auto_tokens = _auto_token_split(cfg)
     _validate_bounds(batch, max_block, cfg, resolved=False)
     cfg = resolve_config(batch, max_block, cfg, S, H, device=device)
+    # Legacy build_work_map(seq_lens, max_block) has no query dimensions and
+    # therefore uses unsplit geometry. Preserve those supplied maps, but only
+    # for the auto branch: an explicit split must still require its exact grid.
+    if (
+        auto_tokens
+        and cfg.token_waves > 1
+        and isinstance(work_map, torch.Tensor)
+        and work_map.ndim == 2
+        and work_map.shape[0] == batch * ((max_block + WAVES - 1) // WAVES)
+        and work_map.shape[0] != batch * max_block
+    ):
+        cfg = replace(cfg, token_waves=1)
     rows = _validate_bounds(batch, max_block, cfg)
     if cfg.shuffled and cache.stride(1) != HEAD_DIM:
         raise ValueError("shuffled cache must be packed within each page")
@@ -1770,16 +2482,14 @@ def score_flydsl(
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
 
-    launch, chunk = _get(S, H, fp8, cfg, idx_q.device.index)
+    launch, _chunk = _get(S, H, fp8, cfg, idx_q.device.index)
     # Grid depends only on launch-time bounds, never on seq_lens contents, so
     # it stays valid across a cudagraph replay with different lengths.
-    chunks = (max_block + chunk - 1) // chunk
+    chunks = _grid_chunks(max_block, cfg)
     # Per *step*, not per layer -- a serving caller should hoist this out and
     # pass it in, since every layer of a step sees the same lengths.
     if work_map is None:
-        work_map = make_work_map(
-            seq_lens, max_block, chunk, world=cfg.cp_world, rank=cfg.cp_rank
-        )
+        work_map = _make_map(seq_lens, max_block, cfg, batch * chunks)
 
     with torch.cuda.device(idx_q.device):
         _run_compiled(
