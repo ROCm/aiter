@@ -344,3 +344,84 @@ def test_mimo_draft_qlen8_window1024_sink_and_graph_replay():
         rtol=0,
         atol=0,
     )
+
+
+def test_mimo_draft_qlen8_window1024_matches_independent_fp32():
+    """Check randomized draft attention with shuffled pages and per-head sinks."""
+    torch.manual_seed(20260927)
+    contexts = (1031, 2051)
+    batch, head_dim, window, parts = len(contexts), 128, 1024, 8
+    max_pages = (max(contexts) + PAGE - 1) // PAGE
+    pages = batch * max_pages
+    k = (torch.randn((pages, PAGE, 1, head_dim), device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    v = (torch.randn((pages, PAGE, 1, VALUE_DIM), device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    key_cache, value_cache = _pack_caches(k, v)
+    query = (torch.randn((batch * QLEN, HEADS, head_dim), device="cuda") * 0.5).to(
+        torch.bfloat16
+    )
+    output = torch.empty(
+        (batch * QLEN, HEADS, VALUE_DIM), dtype=torch.bfloat16, device="cuda"
+    )
+    table = torch.randperm(pages, device="cuda").to(torch.int32).view(batch, max_pages)
+    lengths = torch.tensor(contexts, dtype=torch.int32, device="cuda")
+    key_scale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    value_scale = torch.tensor([1.25], dtype=torch.float32, device="cuda")
+    sinks = torch.linspace(-1.0, 1.0, HEADS, dtype=torch.float32, device="cuda")
+    plan = plan_pa_decode(
+        lengths,
+        1,
+        max_partitions=parts,
+        sliding_window=window,
+        query_length=QLEN,
+    )
+    scalar_shape = (1, plan.capacity, QLEN * HEADS)
+    pmax = torch.empty(scalar_shape, dtype=torch.float32, device="cuda")
+    psum = torch.empty_like(pmax)
+    pout = torch.empty((*scalar_shape, VALUE_DIM), dtype=torch.bfloat16, device="cuda")
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        lengths,
+        table,
+        head_dim**-0.5,
+        QLEN,
+        plan.max_partitions,
+        compute_type=key_cache.dtype,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        max_logits=pmax,
+        exp_sums=psum,
+        temporary_output=pout,
+        sinks=sinks,
+        sliding_window=window,
+        work_plan=plan,
+    )
+
+    reference = torch.empty_like(output, dtype=torch.float32)
+    for b, context in enumerate(contexts):
+        positions = torch.arange(context, device="cuda")
+        physical_pages = table[b, positions // PAGE].long()
+        offsets = positions % PAGE
+        keys = k[physical_pages, offsets, 0].float() * key_scale
+        values = v[physical_pages, offsets, 0].float() * value_scale
+        for i in range(QLEN):
+            right = context - QLEN + i + 1
+            left = max(0, right - window)
+            logits = (query[b * QLEN + i].float() @ keys[left:right].T) / math.sqrt(
+                head_dim
+            )
+            logits_with_sink = torch.cat((logits, sinks[:, None]), dim=1)
+            weights = torch.softmax(logits_with_sink, dim=1)[:, :-1]
+            reference[b * QLEN + i] = weights @ values[left:right]
+
+    relative_l2 = torch.linalg.vector_norm(
+        output.float() - reference
+    ) / torch.linalg.vector_norm(reference)
+    assert relative_l2 < 0.035
+    torch.testing.assert_close(output.float(), reference, rtol=0.02, atol=0.004)
