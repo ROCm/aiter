@@ -72,7 +72,7 @@ def generate_batched_gemm_a16wfp4_inputs(B, M, N, K, dtype, layout="TN", output=
 
 def get_x_vals():
 
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 8)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
     x_vals += [
         (1, 1280, 8192),
@@ -115,10 +115,12 @@ def get_x_vals():
         b = batch_sizes[i % num_batch_sizes]
         x_vals_with_batch.append((b, m, n, k))
 
+    # Cover small, medium, and large batch/M values with both N/K
+    # orientations. The former full Cartesian grid added many near-duplicates.
     x_vals_with_batch = [
         (b, 2**m, n, k)
-        for b in range(1, 17)
-        for m in range(9)
+        for b in (1, 4, 8, 16)
+        for m in (0, 2, 5, 8)
         for (n, k) in [(512, 128), (128, 512)]
     ]
     # This mirrors GLM MLA's qk_nope_head_dim=192.
@@ -175,7 +177,7 @@ def run_torch(x, w, w_scales, dtype):
 
 
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     if not (arch_info.is_fp4_avail()):

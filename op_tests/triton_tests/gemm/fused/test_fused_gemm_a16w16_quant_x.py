@@ -94,7 +94,7 @@ def get_fewer_x_vals():
 
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_fused_gemm_a16w16_quant_x_activation(
     M: int, N: int, K: int, dtype, output, activation

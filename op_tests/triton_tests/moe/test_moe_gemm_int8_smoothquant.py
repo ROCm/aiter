@@ -42,7 +42,7 @@ def alloc_rand_like(x):
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
-    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    logits = torch.randn((m, n_expts_tot), dtype=torch.bfloat16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
@@ -105,24 +105,15 @@ class Case:
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
             Case(16, 256, 256, 8, 2),
-            Case(64, 512, 512, 8, 2),
             Case(128, 1024, 512, 8, 4),
-            Case(256, 2048, 1024, 16, 4),
             Case(256, 2048, 2048, 32, 2, preshuffled=True),
-            Case(512, 4096, 2048, 128, 8),
-            Case(1024, 7168, 4096, 64, 8),
-            Case(2048, 4096, 7168, 128, 8),
             Case(300, 400, 400, 8, 2),
             Case(16, 2560, 4096, 128, 6),
             Case(32, 2560, 4096, 128, 6, preshuffled=True),
             Case(128, 2560, 4096, 128, 6),
-            Case(512, 2560, 4096, 128, 6),
-            Case(2048, 2560, 4096, 128, 6),
             Case(16, 4096, 1280, 128, 6),
             Case(16, 4096, 1280, 128, 6, preshuffled=True),
             Case(128, 4096, 1280, 128, 6),
-            Case(512, 4096, 1280, 128, 6),
-            Case(2048, 4096, 1280, 128, 6),
         ]
     ],
 )

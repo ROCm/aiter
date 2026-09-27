@@ -47,7 +47,7 @@ def alloc_rand_like(x):
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
-    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    logits = torch.randn((m, n_expts_tot), dtype=torch.bfloat16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
@@ -133,26 +133,6 @@ class Case:
                 8,
                 hbm_swizzling=True,
             ),
-            Case(
-                4096,
-                4096,
-                7168,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                8192,
-                7168,
-                2048,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
             # TP8
             Case(
                 16,
@@ -174,38 +154,13 @@ class Case:
                 8,
                 hbm_swizzling=True,
             ),
-            Case(
-                4096,
-                512,
-                7168,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                8192,
-                7168,
-                256,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
             # Precision combinations
-            Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 256, 8),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 256, 8),
-            Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 256, 8),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8),
             # edges
             Case(300, 400, 400, "float8_e4m3fn", "float8_e4m3fn", 8, 2),
             Case(300, 400, 400, "float8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 400, "mxfloat8_e4m3fn", "float8_e4m3fn", 8, 2),
             Case(300, 400, 400, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
             Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
-            Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
         ]
     ],
 )

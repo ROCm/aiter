@@ -11,24 +11,24 @@ from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attentio
 @pytest.mark.parametrize(
     "batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        (1, 64, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 64, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [65536], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 64, 16, [131072], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 64, 16, [262144], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 64, 16, [524288], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 96, 16, [32768], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 96, 16, [65536], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 96, 16, [131072], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 96, 16, [262144], 64, 912, torch.bfloat16, 16, 64, 2, 4),
         # h * n_ctx * d == 3.22e9 elements, past INT32_MAX. Guards the 64-bit
         # widening of the per-head K/V offset in la_persistent_paged.
-        (1, 96, 16, [524288], 64, 912, torch.float16, 16, 256, 2, 4),
-        (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),
-        (1, 128, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
-        (3, 64, 16, [4096, 32768, 65536], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 96, 16, [524288], 64, 912, torch.bfloat16, 16, 256, 2, 4),
+        (1, 96, 16, [1048576], 16, 912, torch.bfloat16, 16, 256, 1, 4),
+        (1, 128, 16, [32768], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 128, 16, [65536], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 128, 16, [131072], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 128, 16, [262144], 64, 912, torch.bfloat16, 16, 64, 2, 4),
+        (1, 128, 16, [524288], 16, 912, torch.bfloat16, 16, 256, 1, 4),
+        (3, 64, 16, [4096, 32768, 65536], 64, 912, torch.bfloat16, 16, 64, 2, 4),
         (
             8,
             64,
@@ -36,7 +36,7 @@ from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attentio
             [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
             64,
             912,
-            torch.float16,
+            torch.bfloat16,
             16,
             64,
             2,
@@ -204,7 +204,7 @@ def main():
     n_ctx = [4096]
     d = 64
     total_programs = 32
-    init_dtype = torch.float16
+    init_dtype = torch.bfloat16
     BLOCK_M = 16
     BLOCK_N = 64
     waves_per_eu = 1

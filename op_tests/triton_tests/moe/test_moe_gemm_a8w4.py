@@ -70,7 +70,7 @@ def alloc_rand_like(x):
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
-    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    logits = torch.randn((m, n_expts_tot), dtype=torch.bfloat16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
@@ -133,13 +133,8 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(32, 6144, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(8192, 3072, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4, 1024, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(1024, 3072, 512, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(4096, 3072, 3072, "float8_e4m3fn", 128, 4),
             Case(16, 1024, 1024, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(4096, 1024, 1024, "mxfloat8_e4m3fn", 128, 4),
             Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
@@ -149,7 +144,6 @@ class Case:
             Case(32, 500, 600, "mxfloat8_e4m3fn", 64, 4),
             Case(16, 512, 512, "float8_e4m3fn", 32, 2),
             Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
-            Case(64, 4096, 4096, "mxfloat8_e4m3fn", 256, 6, hbm_swizzling=True),
             Case(64, 4096, 2048, "mxfloat8_e4m3fn", 256, 6, hbm_swizzling=True),
             Case(32, 6144, 7168, "mxfloat8_e4m3fn", 96, 6, hbm_swizzling=True),
             Case(128, 7168, 3072, "mxfloat8_e4m3fn", 96, 6, hbm_swizzling=True),

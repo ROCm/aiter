@@ -96,23 +96,25 @@ def generate_cp_test_data(seq_len, seq_len_kv):
     return ks, ke
 
 
+# CP changes the input ranges only for even query lengths that divide s_k.
 @pytest.mark.parametrize(
-    "s_q, s_k",
+    "s_q, s_k, disable_cp",
     [
-        (1, 1),
-        (1, 16),
-        (1, 113),
-        (17, 76),
-        (61, 113),
-        (61, 1024),
-        (128, 1024),
-        (1024, 1024),
-        (1024, 1560),
+        (1, 1, True),
+        (1, 16, True),
+        (1, 113, True),
+        (17, 76, True),
+        (61, 113, True),
+        (61, 1024, True),
+        (128, 1024, True),
+        (128, 1024, False),
+        (1024, 1024, True),
+        (1024, 1024, False),
+        (1024, 1560, True),
     ],
 )
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("disable_cp", [True, False])
 @pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
 def test_fp8_mqa_logits(

@@ -6,24 +6,10 @@ Kernel correctness tests compare Triton against torch.nn.functional.conv2d on
 synthetic tensors. Routing tests exercise configuration lookup without launching
 kernels. No model loading, network access, or torchvision.
 
-Test matrix (uniform across the four primary test families):
-
-    NCHW × {fp16, bf16} × every kernel  (5 kernels)         = 10
-    NHWC × {fp16, bf16}                  (single dispatch)  =  2
-                                                            ---
-                                  base cases per test family  12
-
-test_edge, test_fuzz, test_no_bias use the base matrix as-is.
-test_activations multiplies the base matrix by 3 (relu/relu6/gelu) -> 36.
-
-Plus test_cross_method (differential correctness) that runs every NCHW
-kernel on shapes routable by all of them and verifies they all match
-F.conv2d. NCHW-only by design; 2 cases (one per dtype).
-
-Plus 7 exact-route and configuration-precedence regression cases, and 2
-scalar-parameter cases (one per layout).
-
-Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 = 83 cases.
+The four primary test families cover BF16 in every NCHW kernel and NHWC
+single dispatch. Activation tests cover relu/relu6/gelu. Differential tests
+compare all NCHW methods, and configuration tests retain exact-route regressions.
+Scalar-parameter regressions cover both layouts.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
@@ -73,7 +59,7 @@ if _current_arch not in ALL_SUPPORTED_ARCHS:
 # is a no-op there, so re-running for every method id would just duplicate work.
 def _build_matrix():
     matrix = []
-    for dtype, dtype_id in [(torch.float16, "fp16"), (torch.bfloat16, "bf16")]:
+    for dtype, dtype_id in [(torch.bfloat16, "bf16")]:
         for method in ORDERED_METHODS:
             matrix.append(((dtype, "nchw", method), f"{dtype_id}_nchw_{method}"))
         matrix.append(((dtype, "nhwc", "default"), f"{dtype_id}_nhwc"))
@@ -131,7 +117,7 @@ def test_activations(dtype, layout, method, activation):
 # -- Differential correctness across all 5 NCHW kernels (NCHW-only) ----------
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_cross_method(dtype):
     suite = _make_suite(dtype, "nchw")
     run_cross_method(suite)

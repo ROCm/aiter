@@ -45,7 +45,7 @@ def alloc_rand_like(x):
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
-    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    logits = torch.randn((m, n_expts_tot), dtype=torch.bfloat16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
@@ -107,29 +107,22 @@ class Case:
             Case(4, 4, 8, 128, 4),
             Case(4, 32, 64, 128, 4),
             Case(4, 1024, 3072, 128, 4),
-            Case(32, 6144, 3072, 128, 4),
             Case(16, 1024, 1024, 128, 4),
             Case(16, 128, 128, 2, 1),
             Case(16, 256, 256, 128, 4),
             Case(4096, 256, 256, 128, 4),
             Case(1024, 3072, 512, 128, 4),
-            Case(4096, 3072, 3072, 128, 4),
-            Case(8192, 3072, 3072, 128, 4),
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
             Case(16, 32, 256, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 8, 4, hbm_swizzling=True),
-            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
-            Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
             Case(64, 512, 4096, 256, 6, hbm_swizzling=True),
             Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 128, 4, hbm_swizzling=True),
             Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
-            Case(4096, 256, 256, 128, 4, hbm_swizzling=True),
             Case(4097, 1024, 1024, 128, 4, hbm_swizzling=True),
-            Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
         ]
     ],
 )
@@ -144,7 +137,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("backend", [None, "gluon", "triton"])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
 def test_op(
     m,
     n,

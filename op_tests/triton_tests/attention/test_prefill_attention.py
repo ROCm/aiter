@@ -82,7 +82,7 @@ def varlen_input_helper(
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("absorb", [False])
 @pytest.mark.parametrize("varlen", [True, False])
-def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.float16):
+def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.bfloat16):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     if varlen:
@@ -117,7 +117,7 @@ def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.floa
             scores.masked_fill_(causal_mask.unsqueeze(1), float("-inf"))
         scores = scores.float()
 
-        p = torch.softmax(scores * sm_scale, dim=-1).half()
+        p = torch.softmax(scores * sm_scale, dim=-1).to(dtype)
         ref_out[start_q:end_q] = torch.einsum("qhk,khd->qhd", p, v[start_k:end_k])
 
     # compare

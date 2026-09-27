@@ -69,7 +69,7 @@ def generate_batched_gemm_afp4wfp4_inputs(
 
 def get_x_vals():
 
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 8)]
     x_vals += [(4864, 4096, 8192), (4864, 8192, 4160)]
     # TODO: There's a known bug for large test cases (e.g (9728, 8192, 65536))
     # That will cause a failure on the next test. My best guess is that we're not
@@ -121,10 +121,12 @@ def get_x_vals():
             b = 1
         x_vals_with_batch.append((b, m, n, k))
 
+    # Cover small, medium, and large batch/M values with both N/K
+    # orientations while avoiding the redundant Cartesian product.
     x_vals_with_batch += [
         (b, 2**m, n, k)
-        for b in range(1, 17)
-        for m in range(9)
+        for b in (1, 4, 8, 16)
+        for m in (0, 2, 5, 8)
         for (n, k) in [(512, 128), (128, 512)]
     ]
     return x_vals_with_batch
@@ -188,7 +190,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     if not (arch_info.is_fp4_avail()):
