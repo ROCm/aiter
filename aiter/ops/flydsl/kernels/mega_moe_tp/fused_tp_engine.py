@@ -9,6 +9,8 @@ kernel, and the GEMM1 -> GEMM2 intermediate stays in LDS.
 
 from __future__ import annotations
 
+import heapq
+import math
 import os
 
 import torch
@@ -28,6 +30,8 @@ from .fused_tp import (
     XQ_SHIFT,
     XQ_P,
     compile_fused_tp,
+    gemm2_chunk_groups,
+    gemm2_group_step,
     fused_tp_supported,
 )
 from .symmetric_arena import SymmetricArena
@@ -163,16 +167,28 @@ class FusedTpMegaMoe:
                 e += 1
         self._xsplit = 0
         self._xrem = 0
+        self._xw = 0
         if rem:
             p = self._pieces(rem)
             nslice = I // 128
-            xsplit = (
-                rem * p < C
-                and rem <= XQ_MAX
+            xok = (
+                rem <= XQ_MAX
                 and nslice <= XQ_P
                 and os.environ.get("AITER_MEGAMOE_XSPLIT", "1") == "1"
             )
-            if xsplit:
+            if xok and rem * p >= C and (rem * p) % C:
+                # Many leftover experts whose inter pieces do not deal evenly
+                # (dsv4 / kimi3 at TP8: 128 experts x 3 pieces on 256 CTAs --
+                # half the CTAs would carry a third of an expert more, and a
+                # CTA does not stream faster when others idle). Each leftover
+                # expert's GEMM1 is cut into exporting inter slices, dealt
+                # round robin, and its GEMM2 into chunk-aligned column slices,
+                # dealt chunk by chunk to the least loaded CTA: every CTA ends
+                # within a slice of the mean, and the slices finish the
+                # chunks in order.
+                self._schedule_balanced(per, e, rem, nslice)
+                p = 1
+            elif xok and rem * p < C:
                 # Few leftover experts (glm5: 257 on 256 CTAs): inter pieces
                 # would leave a handful of CTAs a quarter expert behind, and a
                 # piece's GEMM2 still pays the full-width epilogue. Instead a
@@ -187,6 +203,8 @@ class FusedTpMegaMoe:
                 # UNIT_SIGNAL unit signals every chunk in order.
                 self._xsplit = nslice
                 g2 = self.H // 256
+                step = math.lcm(gemm2_group_step(self.H, I), gemm2_chunk_groups(self.H, I))
+                self._xw = step
                 hosts = sorted({(C - 1 - idx) % C for idx in range(rem * nslice)})
                 slot = {}
                 for j in range(rem):
@@ -200,18 +218,27 @@ class FusedTpMegaMoe:
                 def kind(k, j, groups=0):
                     return k | (groups << 8) | (j << XQ_SHIFT)
 
+                # a host exports its own expert first (its column slices run
+                # on other CTAs right after their own expert), then its slice
+                # of the leftover expert
                 for c in hosts:
                     e0 = per[c][0][0]
                     per[c] = [(e0, 0, I, kind(UNIT_G1X, slot[e0]))]
                 for idx in range(rem * nslice):
                     j, k = divmod(idx, nslice)
-                    per[(C - 1 - idx) % C].insert(0, (e + j, k * 128, 128, kind(UNIT_G1X, slot[e + j])))
+                    per[(C - 1 - idx) % C].append((e + j, k * 128, 128, kind(UNIT_G1X, slot[e + j])))
                 others = [c for c in range(C) if c not in hosts]
-                cols = [(ex, g, 0, kind(UNIT_G2COL, j, 1)) for ex, j in slot.items() for g in range(g2)]
+                cols = [
+                    (ex, g, 0, kind(UNIT_G2COL, j, step))
+                    for ex, j in slot.items()
+                    for g in range(0, g2, step)
+                ]
                 for idx, unit in enumerate(cols):
                     per[others[idx % len(others)]].append(unit)
+                # the full expert signals the chunks as its GEMM2 goes; a host
+                # (no GEMM2 of its own) on its first unit, right away
                 for c in range(C):
-                    k = next((k for k in range(len(per[c])) if per[c][k][3] == 0), len(per[c]) - 1)
+                    k = next((k for k in range(len(per[c])) if per[c][k][3] == 0), 0)
                     e0, i0, icnt, kd = per[c][k]
                     per[c][k] = (e0, i0, icnt, kd | UNIT_SIGNAL)
                 p = 1
@@ -235,6 +262,52 @@ class FusedTpMegaMoe:
             torch.tensor(units, dtype=torch.int32, device=dev),
             torch.tensor(starts, dtype=torch.int32, device=dev),
         )
+
+    def _schedule_balanced(self, per, e, rem, nslice):
+        H, I, C = self.H, self.I, len(per)
+        g2 = H // 256
+        unit = math.lcm(gemm2_group_step(H, I), gemm2_chunk_groups(H, I))
+        self._xsplit, self._xrem, self._xw = nslice, rem, unit
+
+        def kind(k, j, groups=0):
+            return k | (groups << 8) | (j << XQ_SHIFT)
+
+        # cost model in weight bytes; a unit's fixed cost (route scan, import
+        # or export, pipeline refill) as the bytes streamed meanwhile
+        full, g1x, grp = 3 * I * H // 2, 128 * H + 48 * 1024, 256 * I // 2
+        over = 96 * 1024
+        load = [full * len(lst) for lst in per]
+        for idx in range(rem * nslice):
+            j, k = divmod(idx, nslice)
+            c = (C - 1 - idx) % C
+            per[c].insert(0, (e + j, k * 128, 128, kind(UNIT_G1X, j)))
+            load[c] += g1x
+
+        def deal(n):
+            """GEMM2 of every leftover expert in n chunk-aligned column slices,
+            dealt slice by slice (chunk order) to the least loaded CTA."""
+            nu = g2 // unit
+            cuts = [unit * (nu * t // n) for t in range(n + 1)]
+            heap = [(load[c], c) for c in range(C)]
+            heapq.heapify(heap)
+            out = []
+            for t in range(n):
+                g0, g1 = cuts[t], cuts[t + 1]
+                for j in range(rem):
+                    lc, c = heapq.heappop(heap)
+                    out.append((c, (e + j, g0, 0, kind(UNIT_G2COL, j, g1 - g0))))
+                    heapq.heappush(heap, (lc + (g1 - g0) * grp + over, c))
+            return max(l for l, _ in heap), out
+
+        best = min((deal(n) for n in range(1, g2 // unit + 1)), key=lambda r: r[0])
+        for c, u in best[1]:
+            per[c].append(u)
+        # the last full expert signals the chunks (its route rows are the
+        # CTA's last ones before the column slices, which count themselves)
+        for c in range(C):
+            k = max(k for k in range(len(per[c])) if per[c][k][3] == 0)
+            e0, i0, icnt, kd = per[c][k]
+            per[c][k] = (e0, i0, icnt, kd | UNIT_SIGNAL)
 
     def _mt(self, local_tokens: int) -> int:
         routes = local_tokens * self.tp * self.K
@@ -260,6 +333,7 @@ class FusedTpMegaMoe:
             timeline=self.tl is not None,
             xsplit=self._xsplit,
             xrem=self._xrem,
+            xw=self._xw,
         )
 
     def forward(

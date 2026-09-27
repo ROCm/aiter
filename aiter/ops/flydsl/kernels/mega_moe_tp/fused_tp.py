@@ -61,6 +61,8 @@ __all__ = [
     "compile_fused_tp",
     "fused_tp_consts",
     "fused_tp_supported",
+    "gemm2_chunk_groups",
+    "gemm2_group_step",
 ]
 
 MAX_TP = 8
@@ -97,9 +99,10 @@ CTRL_CNT = (
 CTRL_XF = 32
 CTRL_ERR = 20  # watchdog: OR of ERR_* of every wait that gave up
 ERR_FLAG, ERR_META, ERR_CHUNK, ERR_COMM, ERR_YAG = 1, 2, 4, 8, 16
-# A wait that sees no progress for POLL_LIMIT polls (seconds) gives up and
+# A wait that sees no progress for DEADLINE ticks of the 100 MHz real-time
+# clock (2 s: longer than any stall of a healthy peer) gives up and
 # records its stage instead of hanging the GPU (a peer that never arrives).
-POLL_LIMIT = 1 << 22
+DEADLINE = 200_000_000
 TL_SLOTS = 16  # timeline builds: int64 timestamps per CTA
 CTRL_XE = 40  # [N_XCD] workgroups of XCD x done with this launch
 N_XCD = 8  # workgroups are dealt round-robin over the XCDs
@@ -112,7 +115,7 @@ CTRL_GRAB = CTRL_LRDY + NCK_MAX * LRDY_STRIDE
 # leftover expert j exported its intermediate
 CTRL_XQ = CTRL_GRAB + 2 * NCK_MAX * LRDY_STRIDE
 XQ_P = 8
-XQ_MAX = 64
+XQ_MAX = 128
 CTRL_INTS = CTRL_XQ + XQ_MAX * XQ_P
 # unit kinds: units[u][3] = kind | groups << 8 | UNIT_SIGNAL | slot << XQ_SHIFT
 #   kind      UNIT_FULL, or column-split: UNIT_G1X (GEMM1 inter slice exporting
@@ -151,6 +154,30 @@ def fused_tp_supported(model_dim: int, inter_dim: int, tp: int) -> bool:
     )
 
 
+def _nsk2_for(nks: int, g2: int) -> int:
+    """GEMM2 weight-ring depth (k-steps) for NKS k-steps per column group: the
+    full ring whenever its period (lcm(NSK, NKS) / NKS groups) tiles G2."""
+    if g2 % (NSK * nks // math.gcd(NSK, nks) // nks) == 0:
+        return NSK
+    if nks % 3 == 0:
+        return 3
+    return 2
+
+
+def gemm2_group_step(H: int, I: int) -> int:
+    """Column groups one full-K GEMM2 pipeline step covers (GPI): a column
+    range handed to gemm2 must be a multiple of it."""
+    ks2, g2 = I // 128, H // 64 // NW
+    nsk2 = _nsk2_for(ks2, g2)
+    return nsk2 * ks2 // math.gcd(nsk2, ks2) // ks2
+
+
+def gemm2_chunk_groups(H: int, I: int) -> int:
+    """Column groups per ReduceScatter chunk (GPC)."""
+    ks2, g2 = I // 128, H // 64 // NW
+    return 2 if (2 * ks2 * OPS <= 63 and g2 % 2 == 0) else 1
+
+
 def _attr(v):
     return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), int(v))
 
@@ -163,7 +190,7 @@ traced = ASTRewriter.transform
 
 
 @functools.cache
-def fused_tp_consts(H: int, I: int, TOPK: int, MT: int, TMAX: int) -> dict:
+def fused_tp_consts(H: int, I: int, TOPK: int, MT: int, TMAX: int, agr: int = 1) -> dict:
     """Compile-time geometry shared by the kernel and the host."""
     RG = MT * 16
     KS1 = H // 128
@@ -176,7 +203,7 @@ def fused_tp_consts(H: int, I: int, TOPK: int, MT: int, TMAX: int) -> dict:
     NA_ROWOPS = RG * ACB // 1024
     NSC_BLK = (RG + 63) // 64
     NA_L = NA_ROWOPS + NSC_BLK * KCS
-    GPC = 2 if (2 * KS2 * OPS <= 63 and G2 % 2 == 0) else 1
+    GPC = gemm2_chunk_groups(H, I)
     NCK = G2 // GPC
     CW = GPC * NW * 64
     c = {
@@ -208,17 +235,19 @@ def fused_tp_consts(H: int, I: int, TOPK: int, MT: int, TMAX: int) -> dict:
     c["L_RING"] = take(NW * NSK * SLOT)
     c["L_A"] = take(NAB * RG * ACB)
     c["L_AS"] = take(NAB * KCS * NSC_BLK * 64 * 4)
-    c["L_INTER"] = take(RG * SI_STRIDE)
+    # the AllGather staging (agr rows of MXFP4 + scales) shares this area and
+    # L_INTERS with the GEMM2 operand: size it for whichever is larger
+    c["L_INTER"] = take(max(RG * SI_STRIDE, agr * (H // 2 + H // 32) - RG * (I // 32)))
     c["L_INTERS"] = take(RG * (I // 32))
     c["L_RIX"] = take(TMAX * 4)
     c["L_WT"] = take(TMAX * 4)
     # control ints
-    c["L_CTL"] = take(64 * 4)
+    c["L_CTL"] = take(128 * 4)
     c["LDS_BYTES"] = (off + 127) // 128 * 128
     assert H // 256 <= NCHA_MAX
     assert KS1 % NSK == 0 and NSK % KCS == 0
     assert (NSK - 1) * OPS <= 63 and NA_L * (ALOAD_DEPTH - 1) <= 63
-    assert NCK <= NCK_MAX
+    assert NCK <= NCK_MAX and NCK <= 31  # C_FBITS
     return c
 
 
@@ -230,8 +259,11 @@ C_ASEQ = 16  # [NAB]
 C_AFREE = 20  # [NAB]
 C_QBASE = 24  # [NW]
 C_MBOX = 28  # [NW + NCOMM + NPUSH] per-wave mailbox
+C_FBITS = 36  # final stage: chunks some wave claimed
+CLAIM_W = 3  # unclaimed chunks a final claim looks at
 C_AGFREE = 41  # the AllGather staging (in the GEMM2 operand area) is read out
 C_UNIT = 48  # [6] this CTA's unit range and first unit (ub, ue, expert, i0, icnt, kind)
+C_XC, C_XC_N = 64, 32  # [C_XC_N] compute waves done with a column slice's chunk
 
 
 @functools.cache
@@ -254,6 +286,7 @@ def compile_fused_tp(
     timeline: bool = False,
     xsplit: int = 0,
     xrem: int = 0,
+    xw: int = 0,
 ):
     """Build the launcher for one (shape, MT) instance.
 
@@ -263,7 +296,7 @@ def compile_fused_tp(
     shard as usual; the routing is the input's (every rank has all of it). The
     output rows the ReduceScatter produced are all-gathered back, chunk by
     chunk as they finish, into every rank's ``yall`` arena slot."""
-    c = fused_tp_consts(H, I, TOPK, MT, TMAX)
+    c = fused_tp_consts(H, I, TOPK, MT, TMAX, agr)
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
     NA_ROWOPS, NSC_BLK, NA_L = c["NA_ROWOPS"], c["NSC_BLK"], c["NA_L"]
@@ -299,14 +332,17 @@ def compile_fused_tp(
         + f"_ag{agr}_tp{tp}"
         + ("_ar" if ar else "")
         + ("_tl" if timeline else "")
-        + (f"_x{xsplit}" if xsplit else "")
+        + (f"_x{xsplit}r{xrem}w{xw}" if xsplit else "")
     )
     # Column-split leftover experts (xsplit = GEMM1 inter slices per expert):
     # the engine's units then include UNIT_G1X / UNIT_G2COL, see unit_tile_x.
     XPIECES = int(xsplit)
     XSPLIT = XPIECES > 0
     # every column slice counts itself into its chunk's readiness once more
-    XCOL_PER_CHUNK = int(xrem) * GPC if XSPLIT else 0
+    XSTEP = gemm2_group_step(H, I)
+    # column slices are chunk aligned: each covers a chunk of its expert once
+    assert not XSPLIT or (int(xw) % XSTEP == 0 and int(xw) % GPC == 0)
+    XCOL_PER_CHUNK = int(xrem) if XSPLIT else 0
     assert XPIECES <= XQ_P
     AR = bool(ar)
 
@@ -376,6 +412,20 @@ def compile_fused_tp(
             ordering=_llvm.AtomicOrdering.release,
             syncscope="workgroup",
         )
+
+    def lds_atomic_or(base, off, v):
+        return i32(
+            _llvm.AtomicRMWOp(
+                _llvm.AtomicBinOp._or,
+                lds_ptr3(base, off),
+                _u(i32(v)),
+                _llvm.AtomicOrdering.monotonic,
+                syncscope="workgroup",
+            ).res
+        )
+
+    def _ctpop(v):
+        return i32(_llvm.call_intrinsic(T.i32, "llvm.ctpop.i32", [_u(i32(v))], [], []))
 
     def lds_cas(base, off, cmp, new):
         r = _llvm.AtomicCmpXchgOp(
@@ -652,6 +702,12 @@ def compile_fused_tp(
         if bad:
             report(a, code)
 
+    def _now():
+        return fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+
+    def _alive(t0):
+        return (_now() - t0) < fx.Int64(DEADLINE)
+
     @traced
     def _mark(a, k):
         t = fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
@@ -668,7 +724,8 @@ def compile_fused_tp(
     def spin_sys_ge(addr, target, a=None):
         cur = g_ld_sys(addr)
         n = i32(0)
-        while (cur < target) & (n < i32(POLL_LIMIT)):
+        t0 = _now()
+        while (cur < target) & _alive(t0):
             rocdl.s_sleep(2)
             cur = g_ld_sys(addr)
             n = n + i32(1)
@@ -996,11 +1053,7 @@ def compile_fused_tp(
 
     # ---------------------------- GEMM2 -------------------------------
     def nsk2_for(nks):
-        if 4 % nks == 0 and G2 % (4 // nks) == 0:
-            return 4
-        if nks % 3 == 0:
-            return 3
-        return 2
+        return _nsk2_for(nks, G2)
 
     @traced
     def report_chunk(L, lane, w, cidx):
@@ -1047,8 +1100,12 @@ def compile_fused_tp(
         bst(sc, rs, (ok & (q4 == i32(0))).select(soff, oob), 0, AUX_SC1)
 
     @traced
-    def gemm2(L, tid, a, expert, ks0, r0, rows, signal, NKS, pidx, gi_lo=None, gi_hi=None):
-        """Column groups [gi_lo, gi_hi) (default: all G2) of the unit's GEMM2."""
+    def gemm2(L, tid, a, expert, ks0, r0, rows, signal, NKS, pidx, gi_lo=None, gi_hi=None, colsig=None, pre=None):
+        """Column groups [gi_lo, gi_hi) (default: all G2) of the unit's GEMM2.
+        colsig: a column slice's last row tile -- each wave counts itself into
+        every chunk once its route rows there are stored. pre: runs once the
+        weight ring's first loads are issued (a column slice's operand import,
+        which the weights do not wait for)."""
         NSK2 = nsk2_for(NKS)
         GPI = (NSK2 * NKS // math.gcd(NSK2, NKS)) // NKS
         assert G2 % GPI == 0
@@ -1103,6 +1160,8 @@ def compile_fused_tp(
 
         for qq in range_constexpr(NSK2):
             issue(g_lo * i32(NKS) + i32(qq), qq)
+        if const_expr(pre is not None):
+            pre()
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
         for gi0_ in range(g_lo, g_hi, i32(GPI)):
             gi0 = i32(gi0_)
@@ -1211,8 +1270,31 @@ def compile_fused_tp(
                     if const_expr(FP8R):
                         store_route_fp8(r_routes, halves, rix, n0, q4, lane, ok, oob, a)
                 maybe_report(L, lane, w, gi, signal, RLAG)
+                if const_expr(colsig is not None):
+                    col_report(L, a, lane, gi, g_lo, colsig, RLAG)
         wait_vm(0)
         _final_report(L, lane, w, signal)
+        if const_expr(colsig is not None):
+            if colsig:
+                col_done(L, a, lane, (g_hi - i32(1)) // i32(GPC))
+
+    @traced
+    def col_report(L, a, lane, gi, g_lo, colsig, rlag_wait):
+        """The previous chunk's rows are stored (report lag as maybe_report)."""
+        if colsig & (((gi + i32(1)) % i32(GPC)) == i32(0)) & (gi + i32(1) > g_lo + i32(GPC)):
+            wait_vm(rlag_wait)
+            col_done(L, a, lane, (gi // i32(GPC)) - i32(1))
+        rocdl.sched_barrier(0)
+
+    @traced
+    def col_done(L, a, lane, cidx):
+        """This wave's part of a column slice's chunk is stored; the last of
+        the compute waves counts the slice into the chunk."""
+        if lane == i32(0):
+            off = L_CTL + (C_XC * 4) + (cidx % i32(C_XC_N)) * i32(4)
+            if lds_atomic_add(L, off, i32(1)) == i32(NW - 1):
+                lds_st(L, off, i32(0))
+                _signal_one(a, lane, a["epoch"], 0, cidx)
 
     @traced
     def _final_report(L, lane, w, signal):
@@ -1282,6 +1364,11 @@ def compile_fused_tp(
                 last = u == ue - i32(1)
             if last & (R == i32(0)):
                 report_chunk(L, lane, tid // i32(64), i32(NCK - 1))
+            if const_expr(XSPLIT):
+                # a CTA without a full expert stores no route rows of its own:
+                # it counts into every chunk as its SIGNAL unit starts
+                if ((kind & i32(0xFF)) != i32(UNIT_FULL)) & ((kind & i32(UNIT_SIGNAL)) != i32(0)):
+                    report_chunk(L, lane, tid // i32(64), i32(NCK - 1))
             for r0_ in range(i32(0), R, i32(RG)):
                 r0 = i32(r0_)
                 rows = fx.min(R - r0, i32(RG))
@@ -1292,19 +1379,16 @@ def compile_fused_tp(
                 cbar(L, tid)
             if const_expr(XSPLIT):
                 _xq_flag(a, tid, expert, i0, icnt, kind)
-                _xcol_signal(a, tid, kind, i0)
-                # a CTA without a full expert signals every chunk after its
-                # SIGNAL unit (its route rows, if any, are all stored)
-                if ((kind & i32(0xFF)) != i32(UNIT_FULL)) & ((kind & i32(UNIT_SIGNAL)) != i32(0)):
-                    wait_vm(0)
-                    report_chunk(L, lane, tid // i32(64), i32(NCK - 1))
+                _xcol_empty(a, tid, kind, i0, R)
         mark(a, tid == i32(0), 6)
 
     @traced
-    def _xcol_signal(a, tid, kind, gi):
-        """A column slice's route rows are stored: count it into its chunk."""
-        if ((kind & i32(0xFF)) == i32(UNIT_G2COL)) & (tid == i32(0)):
-            _signal_one(a, tid, a["epoch"], gpu.grid_dim.x, gi // i32(GPC))
+    def _xcol_empty(a, tid, kind, gi, R):
+        """A column slice without rows counts every wave into its chunks here."""
+        if ((kind & i32(0xFF)) == i32(UNIT_G2COL)) & (R == i32(0)) & (tid == i32(0)):
+            c0 = gi // i32(GPC)
+            for c_ in range(c0, c0 + (kind.shrui(i32(8)) & i32(0xFF)) // i32(GPC), i32(1)):
+                _signal_one(a, tid, a["epoch"], 0, i32(c_))
 
     def unit_tile(L, tid, a, u, ub, ue, expert, i0, icnt, r0, rows, R):
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
@@ -1327,9 +1411,9 @@ def compile_fused_tp(
         i0 = first column group, kind >> 8 = groups); else a normal unit."""
         k = kind & i32(0xFF)
         if k == i32(UNIT_G2COL):
-            xq_import(L, tid, a, kind, r0, rows)
             gemm2(L, tid, a, expert, i32(0), r0, rows, fx.Boolean(False), KS2, i32(0),
-                  i0, i0 + (kind.shrui(i32(8)) & i32(0xFF)))
+                  i0, i0 + (kind.shrui(i32(8)) & i32(0xFF)), r0 + i32(RG) >= R,
+                  pre=lambda: xq_import(L, tid, a, kind, r0, rows))
         else:
             if k == i32(UNIT_G1X):
                 gemm1(L, tid, a, expert, i0, icnt // i32(128))
@@ -1439,16 +1523,31 @@ def compile_fused_tp(
         # here miscompiles inside push_chunk's dynamic while loop
         return uni(g_add_agent(addr, (lane == i32(0)).select(i32(1), i32(0))))
 
+    def push_units(ttot):
+        """Push units per chunk (TB tokens each)."""
+        nblk = i32(gpu.grid_dim.x)
+        return fx.min(i32(2) * nblk, (ttot + i32(TB - 1)) // i32(TB))
+
+    def push_first_unit(ns, cidx):
+        """CTA b pushes units u = b - rot, + nblk, ... (mod nblk) of chunk
+        cidx, rot = cidx * ns: with fewer units than CTAs the chunks rotate
+        over all CTAs -- the same CTAs pushing every chunk queue up the last
+        chunks behind the earlier ones (pushes during GEMM take ~15 us)."""
+        nblk = i32(gpu.grid_dim.x)
+        rot = (cidx * ns) % nblk
+        return (i32(gpu.block_id("x")) - rot + nblk) % nblk
+
     @traced
     def push_chunk(L, tid, a, epoch, cidx):
         """Push this CTA's units of the chunk's token rows (unit u: tokens u,
-        u + ns, ...; CTA b takes units b, b + nblk, ...). A static split: a
+        u + ns, ...; see push_first_unit for the CTAs'). A static split: a
         grab counter per chunk costs a device-scope atomic per unit, and those
         serialize across the XCDs."""
         lane = tid % i32(64)
         ttot = a["ttot"]
         nblk = gpu.grid_dim.x
-        ns = fx.min(i32(2) * i32(nblk), (ttot + i32(TB - 1)) // i32(TB))
+        ns = push_units(ttot)
+        u0 = push_first_unit(ns, cidx)
         c0 = cidx * i32(CW)
         routes_bytes = route_region_bytes(ttot)
         r_routes = rsrc(a["routes"], routes_bytes)
@@ -1459,8 +1558,8 @@ def compile_fused_tp(
         bid = i32(gpu.block_id("x"))
         mark(a, (lane == i32(0)) & (cidx == i32(0)), 9)
         mark(a, (lane == i32(0)) & (cidx == i32(NCK - 1)), 13)
-        n = fx.max((ns - bid + i32(nblk) - i32(1)) // i32(nblk), i32(0))
-        for u_ in range(bid, ns, i32(nblk)):
+        n = fx.max((ns - u0 + i32(nblk) - i32(1)) // i32(nblk), i32(0))
+        for u_ in range(u0, ns, i32(nblk)):
             u = i32(u_)
             for t0_ in range(u, ttot, ns * i32(TB)):
                 t0 = i32(t0_)
@@ -1622,19 +1721,23 @@ def compile_fused_tp(
             for j in range_constexpr(VPL):
                 v = lane + i32(j * 64)
                 vc = fx.min(v, i32(CW // 8 - 1))
-                acc = [fx.Float32(0.0)] * 8
+                # every rank's partial in flight at once, then the sum
+                lds_ = []
                 for p in range_constexpr(MAX_TP):
                     pc = fx.min(i32(p), a["tp"] - i32(1))
                     doff, soff = part_offs(a, pc * a["mmax"] + row, c0 + vc * i32(8))
                     if const_expr(RSF8):
-                        vals = route_decode(
+                        lds_.append(
                             (
                                 bld(r_recv, doff, 0, V2I, AUX_SYS),
                                 bld(r_recv, soff, 0, T.i8, AUX_SYS),
                             )
                         )
                     else:
-                        vals = bf16x8_to_f32(bld(r_recv, doff, 0, V4I, AUX_SYS))
+                        lds_.append(bld(r_recv, doff, 0, V4I, AUX_SYS))
+                acc = [fx.Float32(0.0)] * 8
+                for p in range_constexpr(MAX_TP):
+                    vals = route_decode(lds_[p]) if RSF8 else bf16x8_to_f32(lds_[p])
                     live = i32(p) < a["tp"]
                     acc = [
                         x + live.select(y, fx.Float32(0.0)) for x, y in zip(acc, vals)
@@ -1689,15 +1792,24 @@ def compile_fused_tp(
     def yag_wait(tid, a, epoch):
         """AR: every rank's output rows of every chunk are in yall (checked
         per CTA before it finishes, so the end-of-launch L2 drop follows)."""
-        if tid < i32(64):
+        if (tid < i32(64)) & (i32(gpu.block_id("x")) < a["m"]):
             lane = tid % i32(64)
             pend = _yag_pending(a, lane, epoch)
             n = i32(0)
-            while (pend != i32(0)) & (n < i32(POLL_LIMIT)):
+            t0 = _now()
+            while (pend != i32(0)) & _alive(t0):
                 rocdl.s_sleep(1)
                 pend = _yag_pending(a, lane, epoch)
                 n = n + i32(1)
             _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_YAG)
+
+    def comm_idle(a):
+        """No push unit (see push_chunk) and no output row in this CTA: the
+        same on every rank."""
+        bid = i32(gpu.block_id("x"))
+        ns = push_units(a["ttot"])
+        some = (ns * i32(NCK) >= i32(gpu.grid_dim.x)) | (bid < ns)
+        return (some.select(i32(0), i32(1)) == i32(1)) & (bid >= a["m"])
 
     @traced
     def claim(L, lane, w, ctr_idx, stage, a, epoch):
@@ -1706,23 +1818,28 @@ def compile_fused_tp(
         if lane == i32(0):
             cc = lds_ld_acq(L, L_CTL + ctr_idx * 4)
             ccl = fx.min(cc, i32(NCK - 1))
-            rdy = i32(1)
-            if const_expr(stage == 0):
-                v = g_ld_sys(
-                    fx.Int64(a["ctrl"])
-                    + fx.Int64((i32(CTRL_LRDY) + ccl * i32(LRDY_STRIDE)) * i32(4))
-                )
-                rdy = (v >= epoch).select(i32(1), i32(0))
-            else:
-                # the chunk's MAX_TP push flags share one 32 B line: two loads
-                rf = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_flag"]))
-                fo = (i32(FLAG_RDY) + ccl * i32(MAX_TP)) * i32(4)
-                fl = fx.Vector(bld(rf, fo, 0, V4I, AUX_SYS))
-                fh = fx.Vector(bld(rf, fo + i32(16), 0, V4I, AUX_SYS))
-                for p in range_constexpr(MAX_TP):
-                    f = fx.Int32((fl if p < 4 else fh)[p % 4])
-                    ok_p = (i32(p) >= a["tp"]) | (f >= epoch)
-                    rdy = ok_p.select(rdy, i32(0))
+            rdy = i32(0)
+            # a finished stage stops loading flags: every poll is an uncached
+            # load, and hundreds of waves on the same lines slow them all
+            if cc < i32(NCK):
+                if const_expr(stage == 0):
+                    v = g_ld_sys(
+                        fx.Int64(a["ctrl"])
+                        + fx.Int64((i32(CTRL_LRDY) + ccl * i32(LRDY_STRIDE)) * i32(4))
+                    )
+                    rdy = (v >= epoch).select(i32(1), i32(0))
+                else:
+                    # the chunk's MAX_TP push flags share one 32 B line: two loads
+                    rf = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_flag"]))
+                    fo = (i32(FLAG_RDY) + ccl * i32(MAX_TP)) * i32(4)
+                    fl = fx.Vector(bld(rf, fo, 0, V4I, AUX_SYS))
+                    fh = fx.Vector(bld(rf, fo + i32(16), 0, V4I, AUX_SYS))
+                    r1 = i32(1)
+                    for p in range_constexpr(MAX_TP):
+                        f = fx.Int32((fl if p < 4 else fh)[p % 4])
+                        ok_p = (i32(p) >= a["tp"]) | (f >= epoch)
+                        r1 = ok_p.select(r1, i32(0))
+                    rdy = r1
             want = (cc < i32(NCK)) & (rdy == i32(1))
             newv = want.select(cc + i32(1), cc)
             got = lds_cas(L, L_CTL + ctr_idx * 4, cc, newv)
@@ -1732,13 +1849,56 @@ def compile_fused_tp(
         return uni(lds_ld_acq(L, L_CTL + (C_MBOX * 4) + w * i32(4)))
 
     @traced
+    def claim_final(L, lane, w, a, epoch):
+        """Claim a chunk whose partials all arrived and that no wave took yet.
+        The flags of the next CLAIM_W unclaimed chunks are loaded together and
+        the first ready one whose claim bit this wave sets is taken: the last
+        chunks' partials all land at about the same time, and taking them in
+        order costs a claim round trip each. C_PULL counts the claims."""
+        if lane == i32(0):
+            boff = L_CTL + C_FBITS * 4
+            bits = lds_ld_acq(L, boff)
+            ndone = lds_ld_acq(L, L_CTL + C_PULL * 4)
+            # lowest unclaimed chunk: the trailing ones of bits
+            cc = _ctpop(bits ^ (bits + i32(1))) - i32(1)
+            res = i32(-1)
+            if (ndone < i32(NCK)) & (cc < i32(NCK)):
+                rdys = [_final_ready(a, fx.min(cc + i32(d), i32(NCK - 1)), epoch)
+                        for d in range(CLAIM_W)]
+                r2 = i32(-1)
+                for d in range_constexpr(CLAIM_W):
+                    c = fx.min(cc + i32(d), i32(NCK - 1))
+                    free = ((bits >> c) & i32(1)) == i32(0)
+                    try_ = (r2 < i32(0)) & (cc + i32(d) < i32(NCK)) & rdys[d] & free
+                    old = lds_atomic_or(L, boff, try_.select(i32(1) << c, i32(0)))
+                    won = try_ & (((old >> c) & i32(1)) == i32(0))
+                    r2 = won.select(c, r2)
+                lds_atomic_add(L, L_CTL + C_PULL * 4, (r2 >= i32(0)).select(i32(1), i32(0)))
+                res = r2
+            lds_st(L, L_CTL + (C_MBOX * 4) + w * i32(4), res)
+        rocdl.sched_barrier(0)
+        return uni(lds_ld_acq(L, L_CTL + (C_MBOX * 4) + w * i32(4)))
+
+    def _final_ready(a, c, epoch):
+        # the chunk's MAX_TP push flags share one 32 B line: two loads
+        rf = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_flag"]))
+        fo = (i32(FLAG_RDY) + c * i32(MAX_TP)) * i32(4)
+        fl = fx.Vector(bld(rf, fo, 0, V4I, AUX_SYS))
+        fh = fx.Vector(bld(rf, fo + i32(16), 0, V4I, AUX_SYS))
+        r1 = fx.Boolean(True)
+        for p in range_constexpr(MAX_TP):
+            f = fx.Int32((fl if p < 4 else fh)[p % 4])
+            r1 = r1 & ((i32(p) >= a["tp"]) | (f >= epoch))
+        return r1
+
+    @traced
     def comm_work(L, tid, a, epoch):
         lane = tid % i32(64)
         w = tid // i32(64)
         cr = claim(L, lane, w, C_LRED, 0, a, epoch)
         if cr >= i32(0):
             push_chunk(L, tid, a, epoch, cr)
-        cp = claim(L, lane, w, C_PULL, 1, a, epoch)
+        cp = claim_final(L, lane, w, a, epoch)
         if cp >= i32(0):
             final_chunk(tid, a, cp)
         return ((cr >= i32(0)) | (cp >= i32(0))).select(i32(1), i32(0))
@@ -1765,10 +1925,12 @@ def compile_fused_tp(
         return (end > start).select(i32(1), i32(0))
 
     @traced
-    def _signal_one(a, lane, epoch, nblk, cidx):
+    def _signal_one(a, lane, epoch, nblk, cidx, n=1):
+        """Count n into chunk cidx; the count that completes it publishes it
+        (every CTA once, and every column slice covering the chunk once)."""
         cnt_addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(CTRL_CNT) + cidx) * i32(4))
-        old = g_add_agent(cnt_addr, 1)
-        if old == i32(nblk) + i32(XCOL_PER_CHUNK) - i32(1):
+        old = g_add_agent(cnt_addr, n)
+        if old + i32(n) == i32(gpu.grid_dim.x) + i32(XCOL_PER_CHUNK):
             g_st_sys(cnt_addr, i32(0))
             g_st_sys(
                 fx.Int64(a["ctrl"])
@@ -1781,7 +1943,8 @@ def compile_fused_tp(
         """The loader wave, once its A chunks are staged, only watches for
         finished chunks, so a chunk is signalled without waiting behind a push."""
         n = i32(0)
-        while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & (n < i32(POLL_LIMIT)):
+        t0 = _now()
+        while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & _alive(t0):
             if comm_signal(L, tid, a, epoch) == i32(0):
                 rocdl.s_sleep(1)
                 n = n + i32(1)
@@ -1789,21 +1952,27 @@ def compile_fused_tp(
     @traced
     def comm_wave(L, tid, a, epoch):
         n = i32(0)
+        t0 = _now()
         while (
             (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK))
+            | (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NCK))
             | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NCK))
-        ) & (n < i32(POLL_LIMIT)):
+        ) & _alive(t0):
             p1 = comm_signal(L, tid, a, epoch)
             p2 = comm_work(L, tid, a, epoch)
             if (p1 | p2) == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
                 n = n + i32(1)
-        _report_if(a, (n >= i32(POLL_LIMIT)) & ((tid % i32(64)) == i32(0)), ERR_COMM)
+        _report_if(a, (_now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)), ERR_COMM)
 
     @traced
     def comm_help(L, tid, a, epoch):
         n = i32(0)
-        while (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NCK)) & (n < i32(POLL_LIMIT)):
+        t0 = _now()
+        while (
+            (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NCK))
+            | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NCK))
+        ) & _alive(t0):
             p = comm_work(L, tid, a, epoch)
             if p == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
@@ -1826,11 +1995,47 @@ def compile_fused_tp(
     AG_SCB = AGR * AG_SROW
     assert AG_SCB + AGR * (H // 32) <= L_INTERS - L_INTER + RG * (I // 32)
 
+    NCHA = H // 256
+
+    def ag_split(a):
+        """S > 1 when there are fewer rows than CTAs: each row's chunks are
+        then dealt round-robin over S CTAs (CTA s: chunks s, s + S, ...), so
+        no wave runs a long serial chunk chain and every CTA's first chunk is
+        among the first S -- the peers' first A tiles are not held up."""
+        m = fx.max(a["m"], i32(1))
+        return fx.min(fx.max(i32(gpu.grid_dim.x) // m, i32(1)), i32(NCHA))
+
     def ag_rows(a):
+        """This CTA's rows row0 + r * stride (r < nrows) and its chunks
+        qb + k * qs (k < cnt)."""
         bid = i32(gpu.block_id("x"))
         nblk = i32(gpu.grid_dim.x)
-        nrows = fx.min(fx.max((a["m"] - bid + nblk - i32(1)) // nblk, i32(0)), i32(AGR))
-        return bid, nblk, nrows
+        S = ag_split(a)
+        nr = fx.min(fx.max((a["m"] - bid + nblk - i32(1)) // nblk, i32(0)), i32(AGR))
+        m = fx.max(a["m"], i32(1))
+        s = bid // m
+        split = S > i32(1)
+        live = s < S
+        row0 = split.select(bid - s * m, bid)
+        nrows = split.select(live.select(i32(1), i32(0)), nr)
+        qb = split.select(s, i32(0))
+        qs = split.select(S, i32(1))
+        cnt = split.select(
+            live.select((i32(NCHA) - s + S - i32(1)) // S, i32(0)), i32(NCHA)
+        )
+        return row0, nblk, nrows, qb, qs, cnt
+
+    def ag_owner(a, row, q):
+        """The CTA that sends chunk q of AllGather row `row` (of its rank)."""
+        S = ag_split(a)
+        nblk = i32(gpu.grid_dim.x)
+        return (S > i32(1)).select(row + (q % S) * a["m"], row % nblk)
+
+    def ag_group(a):
+        """Chunks per input-ReduceScatter group (AR): PRE_CH, or one when rows
+        are split (a CTA's chunks are not adjacent; each is on its own the
+        start of a peer's GEMM1)."""
+        return (ag_split(a) > i32(1)).select(i32(1), i32(PRE_CH))
 
     def _row32(rs, row, g, aux):
         """The 32 bf16 values of group g of a row, as floats."""
@@ -1865,20 +2070,23 @@ def compile_fused_tp(
         group's flag raised once its stores landed -- the owners start
         reducing / quantizing / all-gathering group 0 while the rest is on the
         wire, and the compute waves are never held up."""
-        bid, nblk, nrows = ag_rows(a)
+        row0, stride, nrows, qb, qs, cnt = ag_rows(a)
         rank, m = a["rank"], a["m"]
         rxl = rsrc(a["x"])
-        for g in range_constexpr(NPRE):
-            c0 = g * PRE_CH * 256
-            upg = (min(H, c0 + PRE_CH * 256) - c0) // 8  # 16 B units per row
+        pc = ag_group(a)
+        for g_ in range(i32(0), (cnt + pc - i32(1)) // pc, i32(1)):
+            g = i32(g_)
+            # the group's chunks: adjacent (whole rows) or a single one
+            lo = (qb + g * pc * qs) * i32(256)
+            upg = fx.min(pc, cnt - g * pc) * i32(32)  # 16 B units per row
             for p in range_constexpr(TPC):
                 if i32(p) != rank:
                     rd = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_pre"]))
-                    for q_ in range(lane, nrows * i32(upg), i32(64)):
+                    for q_ in range(lane, nrows * upg, i32(64)):
                         q = i32(q_)
-                        r = q // i32(upg)
-                        c = i32(c0) + (q - r * i32(upg)) * i32(8)
-                        i = bid + r * nblk
+                        r = q // upg
+                        c = lo + (q - r * upg) * i32(8)
+                        i = row0 + r * stride
                         v = bld(rxl, ((i32(p) * m + i) * i32(H) + c) * i32(2), 0, V4I, 0)
                         bst(v, rd, ((rank * a["mmax"] + i) * i32(H) + c) * i32(2), 0, AUX_SYS)
             wait_vm(0)
@@ -1887,7 +2095,7 @@ def compile_fused_tp(
     @traced
     def _pre_flag(a, lane, g):
         if lane == i32(0):
-            fo = (i32(FLAG_PRE) + (i32(g * MAX_TP) + a["rank"]) * i32(NCTA_MAX) + i32(gpu.block_id("x"))) * i32(4)
+            fo = (i32(FLAG_PRE) + (i32(g) * i32(MAX_TP) + a["rank"]) * i32(NCTA_MAX) + i32(gpu.block_id("x"))) * i32(4)
             for p in range_constexpr(TPC):
                 if i32(p) != a["rank"]:
                     g_st_sys(fx.Int64(a["peer"][p]) + fx.Int64(a["off_flag"]) + fx.Int64(fo), a["epoch"])
@@ -1900,13 +2108,14 @@ def compile_fused_tp(
         addr = (
             peer_sel(a, rank)
             + fx.Int64(a["off_flag"])
-            + fx.Int64((i32(FLAG_PRE) + (i32(g * MAX_TP) + src) * i32(NCTA_MAX) + i32(gpu.block_id("x"))) * i32(4))
+            + fx.Int64((i32(FLAG_PRE) + (i32(g) * i32(MAX_TP) + src) * i32(NCTA_MAX) + i32(gpu.block_id("x"))) * i32(4))
         )
         live = (lane < i32(TPC)) & (lane != rank)
         f = g_ld_sys(addr)
         pend = _wave_any((live & (f < a["epoch"])).select(i32(1), i32(0)), lane)
         n = i32(0)
-        while (pend != i32(0)) & (n < i32(POLL_LIMIT)):
+        t0 = _now()
+        while (pend != i32(0)) & _alive(t0):
             rocdl.s_sleep(1)
             f = g_ld_sys(addr)
             pend = _wave_any((live & (f < a["epoch"])).select(i32(1), i32(0)), lane)
@@ -1915,20 +2124,23 @@ def compile_fused_tp(
 
     @traced
     def ag_quant(L, tid, a):
-        quant_groups(L, tid, NTT, a, 0, H // 32)
+        quant_chunks(L, tid, NTT, a, i32(0), i32(NCHA))
 
     @traced
-    def quant_groups(L, t0, stride, a, g_lo, g_hi):
-        """MXFP4-quantize 32-column groups [g_lo, g_hi) of this CTA's AllGather
-        rows into the LDS staging, work items t0, t0 + stride, ..."""
-        NGQ = g_hi - g_lo
-        bid, nblk, nrows = ag_rows(a)
+    def quant_chunks(L, t0, stride, a, k_lo, k_hi):
+        """MXFP4-quantize this CTA's chunks k in [k_lo, k_hi) (chunk qb + k * qs,
+        eight 32-column groups each) of its AllGather rows into the LDS
+        staging, work items t0, t0 + stride, ..."""
+        row0, stride_r, nrows, qb, qstep, cnt = ag_rows(a)
+        k_hi = fx.min(k_hi, cnt)
+        nk = fx.max(k_hi - k_lo, i32(0))
         rxl = rsrc(a["x"])
-        for q_ in range(t0, nrows * i32(NGQ), i32(stride)):
+        for q_ in range(t0, nrows * nk * i32(8), i32(stride)):
             q = i32(q_)
-            r = q // i32(NGQ)
-            g = i32(g_lo) + q - r * i32(NGQ)
-            i = bid + r * nblk
+            r = q // (nk * i32(8))
+            e = q - r * nk * i32(8)
+            g = (qb + (k_lo + e // i32(8)) * qstep) * i32(8) + e % i32(8)
+            i = row0 + r * stride_r
             f = ag_row_vals(a, rxl, i, g)
             am = _fabs_f32(f[0])
             for j in range_constexpr(1, 32):
@@ -1965,23 +2177,26 @@ def compile_fused_tp(
         issues exactly 2 * TPC stores (dead rows read past num_records), so
         wait_vm(2 * TPC * AG_D) after chunk q means chunk q - AG_D landed and
         its counters may be bumped; AG_D chunks stay in flight."""
-        bid, nblk, nrows = ag_rows(a)
+        row0, stride, nrows, qb, qs, cnt = ag_rows(a)
         m = a["m"]
         rank = a["rank"]
         # let the (small) routing metadata out first: the payload would queue
-        # it behind a megabyte per peer
+        # it behind a megabyte per peer (not with split rows: a few hundred
+        # bytes per CTA, sent alongside)
         if const_expr(not AR):
-            mp = _meta_pending(a, lane, a["epoch"], own=True)
+            mp = (ag_split(a) > i32(1)).select(
+                i32(0), _meta_pending(a, lane, a["epoch"], own=True)
+            )
             n = i32(0)
-            while (mp != i32(0)) & (n < i32(POLL_LIMIT)):
+            t0 = _now()
+            while (mp != i32(0)) & _alive(t0):
                 rocdl.s_sleep(1)
                 mp = _meta_pending(a, lane, a["epoch"], own=True)
                 n = n + i32(1)
-        NCHA = H // 256
         r = lane // i32(8)
         j = lane - r * i32(8)
         rok = r < nrows
-        i = bid + fx.min(r, fx.max(nrows - i32(1), i32(0))) * nblk
+        i = row0 + fx.min(r, fx.max(nrows - i32(1), i32(0))) * stride
         gslot = rank * m + i
         x_bytes = a["ttot"] * i32(H // 2)
         xs_bytes = a["ttot"] * i32(H // 32)
@@ -1993,53 +2208,66 @@ def compile_fused_tp(
             rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_xs"]), xs_bytes)
             for p in range(TPC)
         ]
-        for q in range_constexpr(NCHA):
-            if const_expr(AR and q % PRE_CH == 0):
-                g = q // PRE_CH
-                pre_wait(L, lane, a, g)
-                quant_groups(L, lane, 64, a, g * PRE_CH * 8, min(H // 32, (g + 1) * PRE_CH * 8))
-                wait_lgkm0()
-                rocdl.sched_barrier(0)
-            rr = fx.min(r, i32(AGR - 1))
-            dv = lds_ld(
-                L, L_INTER + rr * i32(AG_SROW) + i32(q * 128) + j * i32(16), V4I, 16
-            )
-            sv = lds_ld(
-                L, L_INTER + i32(AG_SCB) + rr * i32(H // 32) + i32(q * 8), V2I, 8
-            )
-            for p in range_constexpr(TPC):
-                live = rok
-                bst(
-                    dv,
-                    rx[p],
-                    live.select(
-                        gslot * i32(H // 2) + i32(q * 128) + j * i32(16), x_bytes
-                    ),
-                    0,
-                    AUX_SYS,
-                )
-                bst(
-                    sv,
-                    rs[p],
-                    (live & (j == i32(0))).select(
-                        gslot * i32(H // 32) + i32(q * 8), xs_bytes
-                    ),
-                    0,
-                    AUX_SYS,
-                )
-            if const_expr(q == NCHA - 1):
+        pc = ag_group(a)
+        for k in range_constexpr(NCHA):
+            # this CTA's k-th chunk; past cnt (split rows) nothing is issued
+            kl = i32(k) < cnt
+            q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
+            if kl:
+                ag_chunk(L, lane, a, k, q, pc, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes)
+            if const_expr(k == NCHA - 1):
                 # every staged byte is in registers: GEMM2 may reuse its area
                 wait_lgkm0()
                 _ag_free(L, lane)
-            if const_expr(q >= AG_D):
-                wait_vm(2 * TPC * AG_D)
-                _ag_bump(a, lane, rank, i32(q - AG_D))
+            if const_expr(k >= AG_D):
+                # chunk k - AG_D landed (a chunk issues exactly 2 * TPC stores;
+                # after the last live one nothing else is in flight)
+                if i32(k - AG_D) < cnt:
+                    if kl:
+                        wait_vm(2 * TPC * AG_D)
+                    else:
+                        wait_vm(0)
+                    _ag_bump(a, lane, rank, qb + i32(k - AG_D) * qs)
             # keep the scheduler from hoisting every chunk's LDS reads (and
             # their registers) to the top of the fully unrolled loop
             rocdl.sched_barrier(0)
         wait_vm(0)
-        for q in range_constexpr(max(0, NCHA - AG_D), NCHA):
-            _ag_bump(a, lane, rank, i32(q))
+        for k in range_constexpr(max(0, NCHA - AG_D), NCHA):
+            if i32(k) < cnt:
+                _ag_bump(a, lane, rank, qb + i32(k) * qs)
+
+    @traced
+    def ag_chunk(L, lane, a, k, q, pc, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes):
+        """Send this CTA's k-th chunk (q) of its rows to every peer: exactly
+        2 * TPC stores (dead rows read past num_records)."""
+        if const_expr(AR):
+            if (i32(k) % pc) == i32(0):
+                pre_wait(L, lane, a, i32(k) // pc)
+                quant_chunks(L, lane, 64, a, i32(k), i32(k) + pc)
+            wait_lgkm0()
+            rocdl.sched_barrier(0)
+        rr = fx.min(r, i32(AGR - 1))
+        dv = lds_ld(
+            L, L_INTER + rr * i32(AG_SROW) + q * i32(128) + j * i32(16), V4I, 16
+        )
+        sv = lds_ld(
+            L, L_INTER + i32(AG_SCB) + rr * i32(H // 32) + q * i32(8), V2I, 8
+        )
+        for p in range_constexpr(TPC):
+            bst(
+                dv,
+                rx[p],
+                rok.select(gslot * i32(H // 2) + q * i32(128) + j * i32(16), x_bytes),
+                0,
+                AUX_SYS,
+            )
+            bst(
+                sv,
+                rs[p],
+                (rok & (j == i32(0))).select(gslot * i32(H // 32) + q * i32(8), xs_bytes),
+                0,
+                AUX_SYS,
+            )
 
     @traced
     def _ag_free(L, lane):
@@ -2156,7 +2384,8 @@ def compile_fused_tp(
             lane = tid % i32(64)
             pend = _meta_pending(a, lane, epoch)
             n = i32(0)
-            while (pend != i32(0)) & (n < i32(POLL_LIMIT)):
+            t0 = _now()
+            while (pend != i32(0)) & _alive(t0):
                 rocdl.s_sleep(1)
                 pend = _meta_pending(a, lane, epoch)
                 n = n + i32(1)
@@ -2174,7 +2403,7 @@ def compile_fused_tp(
                 TOPK
             )
             srank = tok // a["m"]
-            scta = (tok - srank * a["m"]) % nblk
+            scta = ag_owner(a, tok - srank * a["m"], cc)
             idx = i32(FLAG_AGC) + (cc * i32(MAX_TP) + srank) * i32(NCTA_MAX) + scta
             f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
             pend = fx.max(pend, (ok & (f < epoch)).select(i32(1), i32(0)))
@@ -2185,7 +2414,8 @@ def compile_fused_tp(
         """Loader: K-chunk cc of every row of this tile is in the arena."""
         pend = _ag_pending(L, lane, a, epoch, cc, r0, rows)
         n = i32(0)
-        while (pend != i32(0)) & (n < i32(POLL_LIMIT)):
+        t0 = _now()
+        while (pend != i32(0)) & _alive(t0):
             rocdl.s_sleep(1)
             pend = _ag_pending(L, lane, a, epoch, cc, r0, rows)
             n = n + i32(1)
@@ -2232,10 +2462,15 @@ def compile_fused_tp(
             vals = [ub, ue] + [g_ld_i32(ubase + fx.Int64(4 * k)) for k in range(4)]
             for k in range_constexpr(6):
                 lds_st(L, L_CTL + i32((C_UNIT + k) * 4), vals[k])
-        if (tid < i32(C_UNIT)) | ((tid >= i32(C_UNIT + 6)) & (tid < i32(64))):
+        if (tid < i32(C_UNIT)) | ((tid >= i32(C_UNIT + 6)) & (tid < i32(C_XC + C_XC_N))):
             is_done = (tid >= i32(C_DONE)) & (tid < i32(C_DONE + NW))
             ep = g_ld_rel(fx.Int64(a["ctrl"]), "agent") + i32(1)
             v = is_done.select(i32(-1), (tid == i32(C_EPOCH)).select(ep, i32(0)))
+            # a CTA without push units has nothing to claim, one without
+            # output rows no final
+            stage = (tid == i32(C_LRED)) | (tid == i32(C_PULL))
+            v = (stage & comm_idle(a)).select(i32(NCK), v)
+            v = ((tid == i32(C_PULL)) & (i32(gpu.block_id("x")) >= a["m"])).select(i32(NCK), v)
             lds_st(L, L_CTL + tid * i32(4), v)
 
     @traced
