@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 FlyDSL Project Contributors
 
-"""The downstream gfx950 Qlen8/GQA16 FP8 paged-attention schedule.
+"""gfx950 Qlen8/GQA16 FP8 paged full-attention schedule.
 
-This narrow full-attention path keeps Dqk=128/192 and Dv=128 separate. The
-optimized wave kernels are reused from the MiMo downstream integration; the
-shared AITER FlyDSL reducer combines their normalized partials on current main.
+This narrow path keeps Dqk=128/192 and Dv=128 separate. The shared FlyDSL
+reducer combines normalized partials from the small-grid and wave schedules.
 """
 
 import torch
@@ -17,7 +16,7 @@ from .kernels.pa_decode_fp8_wave import compile_pa_decode_fp8_wave
 from .kernels.tensor_shim import _run_compiled
 
 
-def pa_decode_mimo_fp8_qlen8(
+def pa_decode_fp8_qlen8(
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -36,7 +35,7 @@ def pa_decode_mimo_fp8_qlen8(
     from .pa_decode import launch_pa_decode_ps_reduce
 
     if get_gfx_runtime() != "gfx950":
-        raise NotImplementedError("MiMo FP8 Qlen8 decode requires gfx950")
+        raise NotImplementedError("FP8 Qlen8 decode requires gfx950")
     if context_lengths.ndim != 1 or context_lengths.numel() < 1:
         raise ValueError("context_lengths must be a nonempty [B] vector")
     batch = context_lengths.numel()
@@ -49,7 +48,7 @@ def pa_decode_mimo_fp8_qlen8(
         or query.stride(-1) != 1
     ):
         raise ValueError(
-            "MiMo FP8 Qlen8 requires BF16 query [B*8, 16, Dqk=128/192] "
+            "FP8 Qlen8 requires BF16 query [B*8, 16, Dqk=128/192] "
             f"with a contiguous head axis, got {query.shape}/{query.dtype}"
         )
     if (
@@ -57,20 +56,20 @@ def pa_decode_mimo_fp8_qlen8(
         or output.dtype != torch.bfloat16
         or output.stride(-1) != 1
     ):
-        raise ValueError("MiMo FP8 Qlen8 requires BF16 output [B*8, 16, 128]")
+        raise ValueError("FP8 Qlen8 requires BF16 output [B*8, 16, 128]")
     if (
         key_cache.ndim != 5
         or key_cache.shape[1:] != (1, head_dim // 16, 64, 16)
         or key_cache.dtype != torch.float8_e4m3fn
         or not key_cache.is_contiguous()
     ):
-        raise ValueError("MiMo FP8 Qlen8 requires vectorized page64 FP8 K")
+        raise ValueError("FP8 Qlen8 requires vectorized page64 FP8 K")
     if (
         value_cache.shape != (key_cache.shape[0], 1, 4, 128, 16)
         or value_cache.dtype != key_cache.dtype
         or not value_cache.is_contiguous()
     ):
-        raise ValueError("MiMo FP8 Qlen8 requires vectorized page64 FP8 V128")
+        raise ValueError("FP8 Qlen8 requires vectorized page64 FP8 V128")
     if (
         block_tables.shape[0] != batch
         or block_tables.ndim != 2
@@ -95,7 +94,7 @@ def pa_decode_mimo_fp8_qlen8(
             block_tables,
         )
     ):
-        raise ValueError("all MiMo decode tensors must be on the query device")
+        raise ValueError("all FP8 Qlen8 decode tensors must be on the query device")
     for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
         if (
             not isinstance(scale, torch.Tensor)
@@ -115,7 +114,7 @@ def pa_decode_mimo_fp8_qlen8(
         supplied = (max_logits, exp_sums, temporary_output)
         if any(tensor is None for tensor in supplied):
             if torch.cuda.is_current_stream_capturing():
-                raise ValueError("preallocate MiMo partials before graph capture")
+                raise ValueError("preallocate FP8 Qlen8 partials before graph capture")
             if any(tensor is not None for tensor in supplied):
                 raise ValueError("supply all partial buffers, or none")
             max_logits = torch.empty(scalar_shape, dtype=torch.float32, device=device)
@@ -135,7 +134,9 @@ def pa_decode_mimo_fp8_qlen8(
                 for tensor in (max_logits, exp_sums, temporary_output)
             )
         ):
-            raise ValueError("MiMo partial buffers have incompatible shape or dtype")
+            raise ValueError(
+                "FP8 Qlen8 partial buffers have incompatible shape or dtype"
+            )
 
     compile_kernel = (
         compile_pa_decode_fp8_small

@@ -82,6 +82,7 @@ class DecodeCase:
     num_kv_heads: int = 1
     query_group_size: int = 16
     head_dim: int = 128
+    value_dim: int | None = None
     block_size: int = 128
     trans_v: bool = True
     dtype: torch.dtype = torch.bfloat16
@@ -136,7 +137,10 @@ def run_torch(
     kv_heads, page_size = key_cache.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
+    value_dim = value_cache.shape[2]
+    output = torch.zeros(
+        (*queries.shape[:-1], value_dim), dtype=torch.float32, device=query.device
+    )
     positions = torch.arange(query_length, device=query.device)
 
     for seq, length in enumerate(context_lengths.cpu().tolist()):
@@ -168,12 +172,13 @@ def run_torch(
         probs = torch.exp(scores - log_denominator)
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
+    return output.reshape(batch * query_length, heads, value_dim)
 
 
 def _make_inputs(case, planned=False):
     torch.manual_seed(37 if case.sparse else 0)
     batch, page, dim = len(case.lengths), case.block_size, case.head_dim
+    value_dim = dim if case.value_dim is None else case.value_dim
     kv_heads, ql = case.num_kv_heads, case.query_length
     heads = kv_heads * case.query_group_size
     counts = [max(1, (length + page - 1) // page) for length in case.lengths]
@@ -187,7 +192,9 @@ def _make_inputs(case, planned=False):
     key = torch.empty((num_pages, kv_heads, page, dim), dtype=case.dtype).uniform_(
         -0.5, 0.5
     )
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        (num_pages, kv_heads, page, value_dim), dtype=case.dtype
+    ).uniform_(-0.5, 0.5)
     quantize = pertoken_quant if case.per_token else per_tensor_quant
     key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
     value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
@@ -252,7 +259,7 @@ def _make_inputs(case, planned=False):
         .contiguous()
     )
     value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
+        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, value_dim)
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case.trans_v
@@ -306,9 +313,9 @@ def _make_inputs(case, planned=False):
     )
     psum = torch.full(shape, float("nan"), dtype=torch.float32)
     pmax = torch.full_like(psum, float("nan"))
-    pout = torch.full((*shape, dim), float("nan"), dtype=case.dtype)
+    pout = torch.full((*shape, value_dim), float("nan"), dtype=case.dtype)
     args = (
-        torch.full_like(query, float("nan")),
+        torch.full((batch * ql, heads, value_dim), float("nan"), dtype=case.dtype),
         query,
         key_cache,
         value_cache,
@@ -531,6 +538,63 @@ LENS_1024 = (0, 1, 1025, 1281)
 LENS_4096 = (0, 1, 4097, 4353)
 LENS_8192 = (0, 1, 8193, 8449)
 CASES = [
+    _case(
+        "fp8-qlen8-full-d128-short",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=1,
+        lengths=(257,),
+    ),
+    _case(
+        "fp8-qlen8-full-d192-short",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=1,
+        value_dim=128,
+        lengths=(511,),
+    ),
+    _case(
+        "fp8-qlen8-full-d192-uneven",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        value_dim=128,
+        lengths=(2049, 1025),
+    ),
+    _case(
+        "fp8-qlen8-full-d192-wave",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        value_dim=128,
+        lengths=(1027,) * 9,
+    ),
+    _case(
+        "fp8-qlen8-full-d192-np64",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=64,
+        value_dim=128,
+        lengths=(65536,),
+    ),
+    _case(
+        "fp8-qlen8-window1024-sinks",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        lengths=(1023, 1024, 1025, 1031, 2051),
+    ),
+    _case(
+        "fp8-qlen8-window1024-long",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        lengths=(65536,),
+    ),
     *_cases(
         "shape cache parts window sink",
         [
@@ -874,6 +938,10 @@ CASES = [
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
     """Check numerics, contracts and graph replays."""
+    if get_gfx_runtime() != "gfx950" and case.value_dim not in (None, case.head_dim):
+        pytest.skip("asymmetric value widths require the gfx950 Qlen8 path")
+    if planned and case.value_dim not in (None, case.head_dim):
+        pytest.skip("asymmetric value widths use the static FP8 Qlen8 path")
     if planned and case.num_partitions is not None:
         context = torch.tensor(case.lengths, dtype=torch.int32)
         num_compute_units = torch.cuda.get_device_properties(
@@ -974,7 +1042,33 @@ def test_pa_decode(case, planned, monkeypatch):
         graph.replay()
         check(disabled_sink=step == 2)
 
-    _assert_contracts(args, options)
+    if case.query_length == 8 and case.sparse:
+        table = args[5]
+        original_table = table.clone()
+        context.copy_(torch.tensor(case.lengths, dtype=torch.int32))
+        if sinks is not None:
+            sinks.copy_(original_sinks)
+        for tensor in (output, *scratch):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        check()
+        original_output = output.clone()
+
+        table.copy_(original_table.roll(1, dims=1))
+        for tensor in (output, *scratch):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        check()
+        assert not torch.equal(output, original_output)
+
+        table.copy_(original_table)
+        for tensor in (output, *scratch):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, original_output, rtol=0, atol=0)
+
+    if case.value_dim in (None, case.head_dim):
+        _assert_contracts(args, options)
     if plan is not None:
         # Check int32 limits without allocating a matching KV cache.
         lengths = (-1, 0, 1, 257, 2**31 - 1)

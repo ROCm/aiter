@@ -212,7 +212,7 @@ def pa_decode(
 
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
     gfx950 Qlen8/GQA16/page64 full attention also supports Dqk192/V128 via
-    the optimized MiMo wave schedule.
+    the optimized FP8 wave schedule.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     ALiBi and externally quantized queries are unsupported.
 
@@ -308,9 +308,8 @@ def pa_decode(
             f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
         )
 
-    # Reuse the downstream Qlen8 wave kernels for the exact MiMo full-attention
-    # geometry. Keep SWA, sinks, per-token scales and other shapes on the
-    # existing dispatcher; the optimized path has its own strict validation.
+    # Use the Qlen8 wave kernels for this full-attention geometry. Keep SWA,
+    # sinks, per-token scales, and other shapes on the existing dispatcher.
     if (
         query_length == 8
         and sliding_window == 0
@@ -329,9 +328,9 @@ def pa_decode(
         and key_scale.numel() == value_scale.numel() == 1
         and 1 <= max_context_partition_num <= 64
     ):
-        from .pa_decode_mimo import pa_decode_mimo_fp8_qlen8
+        from .pa_decode_fp8_qlen8 import pa_decode_fp8_qlen8
 
-        return pa_decode_mimo_fp8_qlen8(
+        return pa_decode_fp8_qlen8(
             output,
             query,
             key_cache,
