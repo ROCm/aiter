@@ -391,13 +391,11 @@ def _fold_seqlen_indptr(indptr, fold_factor):
     return out
 
 
-# Kernels that read KV through a 32-bit buffer descriptor (num_records
-# 0xFFFFFFF0) and a 32-bit page offset can only reach this many bytes past ptr_KV.
+# Max kv_buffer bytes for kernels that address KV with 32-bit offsets.
 _MLA_KV_32BIT_SPAN = (1 << 32) - 16
 
 
 def _kv_span_bytes(kv_buffer):
-    """Bytes from kv_buffer's base pointer to the end of its last page."""
     return kv_buffer.size(0) * kv_buffer.stride(0) * kv_buffer.element_size()
 
 
@@ -418,8 +416,7 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype, kv_by
     if not is_regression_profile:
         return True
 
-    # The non-persistent kernel (mla_dec_stage1_bf16_a16w16_subQ16_mqa16) forms
-    # KV offsets in 32 bits and reads the wrong rows past 4 GiB from ptr_KV.
+    # The non-persistent fallback addresses KV with 32-bit offsets.
     if kv_bytes > _MLA_KV_32BIT_SPAN:
         return True
 
@@ -432,14 +429,12 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype, kv_by
 
 
 def _nps_needs_persistent(nhead, nhead_kv, max_seqlen_q, q_dtype, kv_dtype, kv_bytes):
-    """Whether a non-persistent decode must run on the persistent kernels instead.
-
-    On gfx950 the non-persistent kernels for these shapes address KV with 32-bit
-    offsets, while the persistent kernels they fold onto use 64-bit loads. Only
-    single-token decode is redirected: there the causal mask is a no-op, so both
-    paths compute the same attention.
-    """
+    """Whether a gfx950 non-persistent decode past the 32-bit KV span should run on
+    the persistent asm kernels, which use 64-bit KV addresses for these shapes.
+    Single-token only, where the causal mask is a no-op."""
     if get_gfx() != "gfx950" or kv_bytes <= _MLA_KV_32BIT_SPAN:
+        return False
+    if is_experimental_enabled() or os.environ.get("AITER_MLA_USE_OPUS", "0") == "1":
         return False
     if max_seqlen_q != 1 or nhead_kv != 1:
         return False
@@ -462,11 +457,15 @@ def _persistent_schedule(
     page_size,
     causal,
 ):
-    """Build the persistent work schedule that callers normally pass in."""
+    """Returns (work_meta_data, work_indptr, work_info_set, reduce_indptr,
+    reduce_final_map, reduce_partial_map)."""
     bs = qo_indptr.shape[0] - 1
     info = aiter.get_mla_metadata_info_v1(
         bs, max_seqlen_q, nhead, q_dtype, kv_dtype, is_sparse=False, fast_mode=True
     )
+    bufs = [
+        torch.empty(size, dtype=dtype, device=qo_indptr.device) for size, dtype in info
+    ]
     (
         work_meta_data,
         work_indptr,
@@ -474,9 +473,7 @@ def _persistent_schedule(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-    ) = [
-        torch.empty(size, dtype=dtype, device=qo_indptr.device) for size, dtype in info
-    ]
+    ) = bufs
     aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -498,14 +495,7 @@ def _persistent_schedule(
         dtype_q=q_dtype,
         dtype_kv=kv_dtype,
     )
-    return (
-        work_meta_data,
-        work_indptr,
-        work_info_set,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-    )
+    return bufs
 
 
 def mla_decode_fwd_ds32(

@@ -30,6 +30,13 @@ KV_LORA, ROPE = 512, 64
 D = KV_LORA + ROPE
 FOUR_GIB = 1 << 32
 TOL = 0.05
+REFUSED = "32-bit KV offsets"
+UNSUPPORTED = (
+    "cannot get heuristic kernel",
+    "cannot find suitable kernel",
+    "only support",
+    "not find kernel",
+)
 
 
 def _ref(q, rows, bs, qlen, ctx, sm_scale, causal):
@@ -111,7 +118,7 @@ def _decode(q, kv, idx, bs, qlen, ctx, persistent, sm_scale):
     return o.float()
 
 
-def test_mla_kv_4gib(kv, q_dtype, nhead, qlen, persistent, bs=4, ctx=256):
+def check_config(kv, q_dtype, nhead, qlen, persistent, bs=4, ctx=256):
     """Returns 'ok', 'refused', 'unsupported', or 'WRONG'."""
     dev = kv.device
     torch.manual_seed(0)
@@ -131,22 +138,23 @@ def test_mla_kv_4gib(kv, q_dtype, nhead, qlen, persistent, bs=4, ctx=256):
         try:
             out = _decode(q, kv, idx, bs, qlen, ctx, persistent, sm_scale)
             results.append([(out - r).abs().max().item() / scale for r in refs])
-        except Exception as e:  # noqa: BLE001
-            results.append("32-bit offsets" in str(e) or str(e)[:200])
+        except RuntimeError as e:
+            if REFUSED in str(e):
+                results.append("refused")
+            elif any(m in str(e) for m in UNSUPPORTED):
+                results.append("unsupported")
+            else:
+                raise
         finally:
             kv[base : base + need] = 0
     low, hi = results
+    if isinstance(low, str) and low == hi:
+        return low
     if isinstance(low, list) and isinstance(hi, list):
         pick = 0 if low[0] <= low[1] else 1
-        low, hi = low[pick], hi[pick]
-    if isinstance(low, float) and isinstance(hi, float):
-        if low > TOL:
-            return "unsupported"  # config is wrong at page 0 too; out of scope here
-        return "ok" if hi <= TOL else "WRONG"
-    if low is True and hi is True:
-        return "refused"
-    if isinstance(low, str) and isinstance(hi, str) and low == hi:
-        return "unsupported"
+        if low[pick] > TOL:
+            return "unsupported"  # wrong at page 0 too; out of scope here
+        return "ok" if hi[pick] <= TOL else "WRONG"
     return f"WRONG (low={low}, high={hi})"
 
 
@@ -186,9 +194,7 @@ def main():
                 and not (qd == "fp8" and qlen == 4)
             ):
                 continue  # get_mla_metadata_v1 aborts the process for these head counts
-            verdict = test_mla_kv_4gib(
-                kv, dtypes.d_dtypes[qd], nhead, qlen, mode == "ps"
-            )
+            verdict = check_config(kv, dtypes.d_dtypes[qd], nhead, qlen, mode == "ps")
             failures += verdict.startswith("WRONG")
             aiter.logger.info(
                 f"mla_kv_4gib q={qd} kv={kvd} nhead={nhead} qlen={qlen} {mode}: {verdict}"
