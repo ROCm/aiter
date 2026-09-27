@@ -19,6 +19,9 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .gemm_op_common import get_padded_m
+from .opus.policy import (
+    resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
+)
 
 
 def gen_batched_gemm_a8w8_fake_tensors(
@@ -88,7 +91,7 @@ def get_CKBatchedGEMM_config(
             get_CKBatchedGEMM_config.has_gfx = True
         else:
             logger.warning(
-                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column -- "
+                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column; "
                 "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
             )
             get_CKBatchedGEMM_config.ck_batched_gemm_dict = (
@@ -150,17 +153,9 @@ def batched_gemm_a8w8_CK(
 
 
 # ---------------------------------------------------------------------------
-# Shared tuned-CSV lookup for the mxscale batched GEMM.
-#
-# Shaped like tuned_gemm.py's multi-backend lookup: this layer locates the row
-# and never interprets the kernel identifier, since that differs per backend
-# (opus names kernels with an integer kernelId, flydsl with a kernelName). The
-# row comes back whole, libtype included, so a caller can dispatch on it;
-# libtype also filters up front for CSVs that carry one row per (shape, backend)
-# rather than a single cross-backend winner per shape.
-
-# Tuner bookkeeping rather than selection inputs, so the lookup log drops them
-# and stays readable.
+# gfx950 MXFP8 BMM high-level caller. Tuned-row and heuristic selection live
+# in ``opus.policy``; this module owns only the hot launch cache,
+# output allocation and split-one/workspace execution choice.
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
@@ -171,6 +166,15 @@ def _mxscale_bmm_tuned_path(bpreshuffle: bool) -> str:
         if bpreshuffle
         else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
     )
+
+
+@functools.cache
+def _get_mxscale_bmm_launchers():
+    """Resolve the checked split-1 launcher and workspace planner once."""
+    from .opus import opus_bmm
+    from .opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
+
+    return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
 
 
 @functools.cache
@@ -251,24 +255,14 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-# ---------------------------------------------------------------------------
-# fp8 e8m0 mxscale (block-scale) batched GEMM -- public entry for the family.
-#
-# This file is the per-family (a8w8 batched) public surface, not a CK-only
-# file: like aiter/ops/gemm_op_a8w8.py hosts gemm_a8w8 (CK rowwise) +
-# gemm_a8w8_blockscale (ck/cktile/triton/asm) side by side and lazy-imports
-# backend impls, we host the mxscale batched entry here too. The concrete
-# kernels stay in their backend dirs (opus -> aiter.ops.opus.bmm_op).
-#
-# Dispatch follows tuned_gemm.mm: look the shape up once here, then let the
-# winning row's libtype pick the backend, which is why the lookup runs
-# unfiltered -- the tuner writes one winning row per shape and its libtype says
-# who won. A second backend then only has to add rows and a branch below; it
-# does not repeat the lookup.
-
-# Untuned shapes go to opus: it is the backend carrying a shape heuristic for
-# rows the CSV does not have.
-_MXSCALE_BMM_DEFAULT_LIBTYPE = "opus"
+@functools.lru_cache(maxsize=1024)
+def _get_mxscale_bmm_launch_plan(
+    g: int,
+    m: int,
+    n: int,
+    k: int,
+) -> tuple[int, int]:
+    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k)
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -278,41 +272,43 @@ def _batched_gemm_a8w8_mxscale_impl(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
+    # This body executes behind the public custom-op boundary, so real eager
+    # tensors carry concrete integer dimensions here.  Avoid four redundant
+    # Python int() conversions on every short BMM launch.
+    m, g, k = x.shape
+    n = wo_a.shape[1]
+    raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k)
 
-    Kept unwrapped (plain Python) so tests can introspect the real dispatch
-    (which kernelId a shape resolves to) on meta tensors. The public
-    ``batched_gemm_a8w8_mxscale`` is the torch.compile-guarded custom op over
-    this; a caller that must write into its own (e.g. batch-major) output buffer
-    calls the opus backend (``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus``)
-    directly, which keeps the ``out=`` argument.
-    """
-    from .opus.bmm_op import bmm_a8w8_mxscale_opus
-
-    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
-    n = int(wo_a.shape[1])
-
-    cfg = lookup_mxscale_bmm_config(g, m, n, k)
-    libtype = cfg["libtype"] if cfg is not None else _MXSCALE_BMM_DEFAULT_LIBTYPE
-    if libtype != "opus":
-        raise NotImplementedError(
-            f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-            f"{libtype!r}, which does not take a raw [G, N, K] weight; "
-            f"{libtype!r} rows are served by batched_gemm_a8w8_mxscale_bpreshuffle"
+    Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
+    if split_k <= 1:
+        # The shape resolver already returns a final canonical global kid.
+        # Enter the checked C++ launcher directly for the common no-workspace
+        # path instead of repeating the unified public routing contract.  The
+        # C++ boundary still validates dtype, shape, device, stride, arch and
+        # exact kid.  Workspace cases retain the unified Python planner below.
+        raw_launch(
+            x,
+            wo_a,
+            Y,
+            x_scale,
+            w_scale,
+            None,
+            kid,
+            max(1, split_k),
         )
-
-    # Reading opus columns is this branch's job; whether that kernel can run
-    # this M, and what to do when it cannot, is the backend's.
-    return bmm_a8w8_mxscale_opus(
-        x,
+        return Y
+    opus_bmm(
+        x.transpose(0, 1),
         wo_a,
-        x_scale,
-        w_scale,
-        None,
-        dtype=dtype,
-        kernelId=int(cfg["kernelId"]) if cfg is not None else None,
-        splitK=int(cfg["splitK"]) if cfg is not None else None,
+        Y.transpose(0, 1),
+        kid=kid,
+        layout="mxscale_bmm",
+        x_scale=x_scale.transpose(0, 1),
+        w_scale=w_scale,
+        split_k=split_k,
     )
+    return Y
 
 
 def _batched_gemm_a8w8_mxscale_fake(
@@ -322,7 +318,6 @@ def _batched_gemm_a8w8_mxscale_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    # token-major [M, G, N]; mirrors the eager allocation in bmm_a8w8_mxscale_opus.
     return torch.empty(
         (x.shape[0], x.shape[1], wo_a.shape[1]),
         dtype=dtype,
@@ -338,31 +333,7 @@ def batched_gemm_a8w8_mxscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
-
-    mmajor DSV4 wo_a layout (matches the opus kernels + op test):
-
-    * ``x``       : [M, G, K] fp8 activation (per-token e8m0; transposed view
-                    of batch-major [G, M, K]).
-    * ``wo_a``    : [G, N, K] fp8 weight (batch-major).
-    * ``x_scale`` : [M, G, K/128] uint8 e8m0 activation scale.
-    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0 weight scale.
-
-    Returns a fresh **token-major** [M, G, N] output. This entry is
-    torch.compile-guarded (registered as an ``aiter::`` custom op with a meta
-    kernel), so a framework can call it inside a compiled graph without the
-    tuned-CSV lookup / heuristic being traced. A caller that must write into its
-    own preallocated (e.g. batch-major) buffer uses
-    ``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus`` directly (it keeps ``out=``).
-
-    Note this is *microscaling* (e8m0) block scale -- distinct from
-    ``gemm_a8w8_blockscale`` which uses fp32 block scale. Scale type is baked
-    into the name so a future fp32-block batched variant stays separate.
-
-    The shape is looked up in the tuned CSV and the winning row's libtype picks
-    the backend. No kernel override lives on this entry: how a kernel is named is
-    backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
-    """
+    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``."""
     return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
 
 

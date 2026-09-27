@@ -12,7 +12,17 @@ def get_dtype_max(dtype):
 
 
 def get_fp8_dtypes():
-    if arch_info.get_arch() in ("gfx950", "gfx1250", "gfx1200", "gfx1201"):
+    if arch_info.get_arch() in (
+        "gfx950",
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1150",
+        "gfx1151",
+        "gfx1200",
+        "gfx1201",
+        "gfx1250",
+    ):
         e5m2_dtype = torch.float8_e5m2
         e4m3_dtype = torch.float8_e4m3fn
     else:
@@ -23,11 +33,7 @@ def get_fp8_dtypes():
 
 
 def get_fp8_e4m3_dtype():
-    if arch_info.get_arch() in ("gfx950", "gfx1250", "gfx1200", "gfx1201"):
-        e4m3_dtype = torch.float8_e4m3fn
-    else:
-        e4m3_dtype = torch.float8_e4m3fnuz
-
+    _, e4m3_dtype = get_fp8_dtypes()
     return e4m3_dtype
 
 

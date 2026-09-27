@@ -559,3 +559,86 @@ def test_mla_prefill_fwd(
     torch.testing.assert_close(
         out, out_ref, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(out - out_ref))}"
+
+
+def _mla_gluon_decode(
+    mla_gluon, kv_c, kv_indices, kv_indptr, q_nope, q_pe, batch, nhead, min_kv
+):
+    kv_lora_rank = q_nope.shape[-1]
+    o = torch.empty((batch, nhead, kv_lora_rank), dtype=q_nope.dtype)
+    mla_gluon(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        kv_c=kv_c,
+        o=o,
+        page_table=kv_indices,  # 1-D kv_indices (as vLLM passes for decode)
+        seq_info=kv_indptr,  # 1-D kv_indptr
+        sm_scale=1.0 / (kv_c.shape[-1] ** 0.5),
+        k_pe=None,  # shared kv_c layout
+        kv_pe_offset=kv_lora_rank,
+        use_2d_view=False,
+        kv_scale=1.0,
+        min_kv_seq_len=min_kv,
+    )
+    torch.cuda.synchronize()
+    return o
+
+
+# Review: a num_iter==1 config reaches only the prologue loads; also cover the
+# loop-body and epilogue loads (num_iter = cdiv(per_split, BLOCK_N=64)):
+#   (8, 777)   -> num_iter 1 (prologue; last split is a partial block)
+#   (4, 33000) -> num_iter 9 (loop-body + epilogue partial block)
+@pytest.mark.parametrize("batch, ctx", [(8, 777), (4, 33000)])
+@pytest.mark.parametrize("nhead", [8])  # small-head Gluon decode (Kimi K2.6/K3 @ TP8)
+@pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
+def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head_dim):
+    """Gluon MLA decode with a >2 GB paged KV cache (gfx950).
+
+    A KV cache larger than 2 GB sets ``within_2gb=False`` so the kernel loads KV
+    through ``global_load_to_shared`` (64-bit offsets) instead of
+    ``buffer_load_to_shared``.  That path must carry the same bounds mask (+
+    ``other=0.0`` zero-fill) as the buffer path, or the last partial split block
+    reads out of bounds -> illegal memory access (garbage -> NaN).  Compares the
+    >2 GB (global_load) path against the <2 GB (buffer_load) reference on
+    identical KV content placed at high row indices.
+    """
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    free, _ = torch.cuda.mem_get_info()
+    if free < int(3.5 * 2**30):
+        pytest.skip("needs >3.5 GiB free for the >2 GB cache")
+
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    gb2 = 0x80000000
+    n_big = (gb2 // (head_dim * 2)) + 200_000  # ~2.2 GB cache -> within_2gb=False
+    dtype = torch.bfloat16
+
+    random.seed(0)
+    torch.manual_seed(0)
+    used = batch * ctx
+    kv_data = torch.randn((used, head_dim), dtype=dtype)
+    q_nope = torch.randn((batch, nhead, kv_lora_rank), dtype=dtype)
+    q_pe = torch.randn((batch, nhead, qk_rope_head_dim), dtype=dtype)
+    kv_indptr = torch.arange(0, (batch + 1) * ctx, ctx, dtype=torch.int32)
+
+    # reference: small cache (rows 0..used) -> within_2gb=True -> buffer_load path
+    idx_ref = torch.arange(used, dtype=torch.int32)
+    assert kv_data.shape[0] * kv_data.stride(0) * 2 <= gb2
+    o_ref = _mla_gluon_decode(
+        mla_gluon, kv_data, idx_ref, kv_indptr, q_nope, q_pe, batch, nhead, ctx
+    )
+
+    # under test: >2 GB cache, identical KV at the top -> global_load path
+    kv_big = torch.zeros((n_big, head_dim), dtype=dtype)
+    base = n_big - used
+    kv_big[base : base + used].copy_(kv_data)
+    idx_big = torch.arange(used, dtype=torch.int32) + base
+    assert kv_big.shape[0] * kv_big.stride(0) * 2 > gb2
+    o_big = _mla_gluon_decode(
+        mla_gluon, kv_big, idx_big, kv_indptr, q_nope, q_pe, batch, nhead, ctx
+    )
+
+    assert torch.isfinite(o_big.float()).all(), "NaN/Inf in the >2 GB global_load path"
+    torch.testing.assert_close(o_big, o_ref, atol=1e-2, rtol=1e-2)

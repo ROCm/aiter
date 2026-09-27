@@ -15,6 +15,17 @@ relevant rule — reviewers may not know these conventions yet.
   dedicated PR. A new kernel's own PR still carries its wrapper, unit test and
   benchmark (see *Tests and benchmarks*); those belong to the kernel and are
   not separate concerns.
+- **One kernel backend per PR.** Flag a PR whose changed files belong to more
+  than one backend -- Triton/Gluon (`aiter/ops/triton/`, `aiter/aot/triton/`;
+  Triton and Gluon are one backend, so a PR mixing the two is fine), HIP
+  (`csrc/`), ASM (`hsa/`, `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS
+  (`aiter/ops/opus/`), FlyDSL (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`) --
+  and list the files of the other backend, so the author knows what to move.
+  Ask for one PR per backend. When the parts depend on each other, suggest
+  stacked pull requests (the second PR based on the first one's branch and
+  targeting it instead of `main`) rather than one combined PR. Tests and
+  benchmarks belong to the backend they exercise; wrappers outside those
+  paths, docs and CI files do not count as a backend.
 - Keep PRs small and easy to review: one concern each, as granular as the
   change allows. Flag a PR that solves two or three independent problems at
   once — a bug fix plus a refactor, a new op plus a cleanup, retuning plus an
@@ -76,7 +87,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 - `import torch`, `from torch import ...` or any `torch.` use added to a
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
-  on both sides). `utils/_triton/tunning/` is exempt: standalone tuning
+  on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
   harnesses, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not
@@ -212,6 +223,32 @@ values for either backend live in JSON, never in Python. Flag:
   that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
   fallback is the one documented exception and it goes through the `arch=`
   override, not through a probe.
+- A raw config list handed to `@triton.autotune`. Route it through
+  `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
+
+  ```python
+  @triton.autotune(
+      configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+      key=[...],
+  )
+  ```
+
+  That returns every candidate only while `<FAMILY>_TRITON_AUTOTUNE=1`, and a
+  single config otherwise, so nothing benchmarks at launch. A raw list searches
+  on every new key: it costs compile time, breaks CUDA-graph capture, and leaves
+  a unit test's numerics dependent on whichever config the timing happened to
+  pick that run. Pass `default_config=` when the list's first entry is not the
+  one to pin.
+
+  A family that already published its own variable name keeps it by passing
+  `env=` (and `default=` for what unset means), as `flash_attn_triton_amd/` does
+  with `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` — it still goes through this helper.
+
+  There are no exemptions. A candidate list read from the config JSON is a
+  search space for a tuning build, not a launch-time list — handed to
+  `@triton.autotune` it still benchmarks every entry on every new key. Pass it
+  as `configs` and pin the launch with `default_config=`, as
+  `chunk_delta_attn/flash_kda.py` does with its published K2 candidates.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 
