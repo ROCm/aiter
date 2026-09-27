@@ -416,8 +416,8 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype, kv_by
     if not is_regression_profile:
         return True
 
-    # Non-persistent fallback uses 32-bit KV offsets; opus is unverified past 4 GiB.
-    if kv_bytes > _MLA_KV_32BIT_SPAN and os.environ.get("AITER_MLA_USE_OPUS") != "1":
+    # The non-persistent fallback addresses KV with 32-bit offsets.
+    if kv_bytes > _MLA_KV_32BIT_SPAN:
         return True
 
     max_batch = _persistent_mla_decode_max_batch()
@@ -434,7 +434,7 @@ def _nps_needs_persistent(nhead, nhead_kv, max_seqlen_q, q_dtype, kv_dtype, kv_b
     Single-token only, where the causal mask is a no-op."""
     if get_gfx() != "gfx950" or kv_bytes <= _MLA_KV_32BIT_SPAN:
         return False
-    if is_experimental_enabled() or os.environ.get("AITER_MLA_USE_OPUS", "0") == "1":
+    if is_experimental_enabled():  # HK also uses 32-bit KV offsets
         return False
     if max_seqlen_q != 1 or nhead_kv != 1:
         return False
