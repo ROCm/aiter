@@ -56,6 +56,9 @@ def _gfx950_config(monkeypatch):
 def test_glm5_qkv_a_decode_routes_to_expected_triton_tier(
     monkeypatch, m, expected_row, block_m, block_n, num_ksplit, num_warps
 ):
+    expected = gemm_mod.get_CKGEMM_config(expected_row, N, K, TUNED_FILE)
+    assert expected["libtype"] == "triton"
+
     selected_csv = {}
     selected = {}
     get_config = gemm_mod.get_CKGEMM_config
@@ -88,11 +91,7 @@ def test_glm5_qkv_a_decode_routes_to_expected_triton_tier(
     xq, wq, x_scale, w_scale = _make_meta_inputs(m)
     gemm_mod.gemm_a8w8_blockscale_bpreshuffle(xq, wq, x_scale, w_scale)
 
-    expected = gemm_mod._CKGEMM_CONFIG_CACHE[TUNED_FILE][
-        (GFX, CU_NUM, expected_row, N, K)
-    ]
     assert selected_csv == expected
-    assert expected["libtype"] == "triton"
     assert selected == {
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,
