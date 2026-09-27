@@ -21,6 +21,7 @@ import sys
 import traceback
 
 import torch
+import torch.distributed as dist
 
 import aiter
 from aiter.dist.parallel_state import get_tp_group
@@ -83,6 +84,16 @@ def _worker(
         )
         raise
     finally:
+        # Align ranks before the eager IPC/message-queue teardown in
+        # destroy_dist_env(); an unsynchronized free intermittently hangs the
+        # comm UTs when they run back-to-back in CI.
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            torch.cuda.synchronize()
         aiter.destroy_dist_env()
 
 
@@ -181,7 +192,7 @@ def test_cross_entropy_tp_grad(world_size: int = 2):
     print(
         f"PASSED test_cross_entropy_tp_grad  "
         f"world_size={world_size}  "
-        f"max_diffs={[f'{results[r][1].float().sub(ref_grad[..., r*V_local:(r+1)*V_local]).abs().max().item():.2e}' for r in range(world_size)]}"
+        f"max_diffs={[f'{results[r][1].float().sub(ref_grad[..., r * V_local : (r + 1) * V_local]).abs().max().item():.2e}' for r in range(world_size)]}"
     )
 
 
@@ -213,9 +224,9 @@ def test_cross_entropy_tp_ignore_index(world_size: int = 2):
     results = _run_tp(world_size, logits, target, ignore_idx, True, init_method)
 
     for rank, (loss_val, _) in enumerate(results):
-        assert (
-            abs(loss_val - ref_loss) < 1e-2
-        ), f"rank {rank}: TP loss {loss_val:.6f} != ref {ref_loss:.6f} with ignore_index"
+        assert abs(loss_val - ref_loss) < 1e-2, (
+            f"rank {rank}: TP loss {loss_val:.6f} != ref {ref_loss:.6f} with ignore_index"
+        )
 
     print(
         f"PASSED test_cross_entropy_tp_ignore_index  "

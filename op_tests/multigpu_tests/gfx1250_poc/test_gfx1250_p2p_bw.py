@@ -113,6 +113,14 @@ def _worker(
     _, latency_us = run_bw()
 
     if dist.is_initialized():
+        # Align ranks before the eager IPC/message-queue teardown below; an
+        # unsynchronized free intermittently hangs comm UTs back-to-back in CI.
+        torch.cuda.synchronize()
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        torch.cuda.synchronize()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
