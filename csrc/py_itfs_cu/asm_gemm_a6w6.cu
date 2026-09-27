@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
+#include <cstring>
 
 // Must follow aiter_tensor.h, which provides the HIP error-bridge dependencies.
 #include "aiter_ctypes_error.h"
@@ -111,7 +112,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int K,                   // padded contraction dim consumed by the packed layout
      const char* kernelName,
      float alpha,
-     aiter_tensor_t* bias,    // optional bias:[N] bf16, folded into the store epilogue
+     aiter_tensor_t* bias, // optional bias:[N] bf16, folded into the store epilogue
      hipStream_t stream),
     (A, B, A_scale, B_scale, out, K, kernelName, alpha, bias, stream))
 {
@@ -146,10 +147,33 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const size_t expected_B = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kPackedTileBytes;
     const size_t expected_scaleA = static_cast<size_t>(Mdim / kTileSize) * nk_pad * kScaleTileBytes;
     const size_t expected_scaleB = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kScaleTileBytes;
-    AITER_CHECK(A->numel() == expected_A && B->numel() == expected_B,
+    // A grouped kernel runs G independent GEMMs in one launch: the activations are stacked
+    // along M, so `Mdim` is the combined extent, while B carries G weight blocks against the
+    // *per-group* N. Its B buffer is therefore an exact multiple of expected_B, and the strict
+    // equality below would reject a correct launch.
+    //
+    // The relaxation is gated on the kernel name so every existing kernel keeps the strict
+    // check: an oversized B against a non-grouped kernel is still an error, which is what
+    // catches a mis-packed operand. Grouped kernels derive G from the buffer itself, so no
+    // ABI or signature change is needed.
+    const bool grouped = kernelName != nullptr && std::strstr(kernelName, "_grp") != nullptr;
+    size_t groups      = 1;
+    if(grouped)
+    {
+        AITER_CHECK(expected_B > 0 && (B->numel() % expected_B) == 0,
+                    __func__,
+                    " grouped launch: B must hold a whole number of per-group weight blocks");
+        groups = B->numel() / expected_B;
+        AITER_CHECK(groups >= 2, __func__, " grouped launch: expected at least 2 groups");
+        AITER_CHECK((Mdim % (kTileSize * groups)) == 0,
+                    __func__,
+                    " grouped launch: M must split evenly into G tile-aligned groups");
+    }
+
+    AITER_CHECK(A->numel() == expected_A && B->numel() == groups * expected_B,
                 __func__,
                 " packed operand buffer sizes must exactly match the launch dimensions");
-    AITER_CHECK(A_scale->numel() == expected_scaleA && B_scale->numel() == expected_scaleB,
+    AITER_CHECK(A_scale->numel() == expected_scaleA && B_scale->numel() == groups * expected_scaleB,
                 __func__,
                 " packed scale buffer sizes must exactly match the launch dimensions");
 
