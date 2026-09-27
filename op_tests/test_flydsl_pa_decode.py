@@ -632,6 +632,49 @@ CASES = [
         lengths=(257, 515),
     ),
     _case(
+        "bf16-qlen8-window128-asymmetric-sinks",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(0, 1, 7, 8, 127, 128, 129, 135, 257, 515),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-long",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(65536, 65529),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-np1",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=1,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(257, 515),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-no-sink",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(128, 257),
+    ),
+    _case(
         "fp8-qlen8-window1024-sinks",
         shape=(8, 1, 16, 128),
         cache=(64, 1, 0),
@@ -1184,19 +1227,28 @@ def test_pa_decode(case, planned, monkeypatch):
         _assert_plan(extreme_plan, lengths)
 
 
-def test_pa_decode_bf16_qlen8_window1024_large_physical_page():
+@pytest.mark.parametrize(
+    ("dim", "value_dim", "window"),
+    [(128, 128, 1024), (192, 128, 128)],
+    ids=["draft-d128-w1024", "target-d192-v128-w128"],
+)
+def test_pa_decode_bf16_qlen8_large_physical_page(dim, value_dim, window):
     """A selected BF16 K/V page beyond 2 GiB must retain its full address."""
     if get_gfx_runtime() != "gfx950":
         pytest.skip("BF16 page-offset regression is qualified on gfx950")
-    dim, page, query_length, heads, window, parts = 128, 64, 8, 16, 1024, 8
+    page, query_length, heads, parts = 64, 8, 16, 8
     physical_page = (1 << 31) // (dim * page * 2) + 3
     assert physical_page * dim * page * 2 > 1 << 31
     key = torch.empty((physical_page + 1, 1, dim // 8, page, 8), dtype=torch.bfloat16)
-    value = torch.empty((physical_page + 1, 1, page // 8, dim, 8), dtype=torch.bfloat16)
+    value = torch.empty(
+        (physical_page + 1, 1, page // 8, value_dim, 8), dtype=torch.bfloat16
+    )
     key[physical_page].zero_()
     value[physical_page].fill_(2)
     query = torch.zeros((query_length, heads, dim), dtype=torch.bfloat16)
-    output = torch.full_like(query, float("nan"))
+    output = torch.full(
+        (query_length, heads, value_dim), float("nan"), dtype=torch.bfloat16
+    )
     lengths = torch.tensor([1031], dtype=torch.int32)
     table = torch.full((1, 17), physical_page, dtype=torch.int32)
     plan = plan_pa_decode(
@@ -1209,7 +1261,7 @@ def test_pa_decode_bf16_qlen8_window1024_large_physical_page():
     shape = (1, plan.capacity, query_length * heads)
     pmax = torch.empty(shape, dtype=torch.float32)
     psum = torch.empty_like(pmax)
-    pout = torch.empty((*shape, dim), dtype=torch.bfloat16)
+    pout = torch.empty((*shape, value_dim), dtype=torch.bfloat16)
     pa_decode(
         output,
         query,
@@ -1231,6 +1283,36 @@ def test_pa_decode_bf16_qlen8_window1024_large_physical_page():
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(output, torch.full_like(output, 2), rtol=0, atol=0)
+
+
+def test_pa_decode_bf16_qlen8_window128_asymmetric_contract():
+    case = DecodeCase(
+        lengths=(257,),
+        query_length=8,
+        num_kv_heads=1,
+        query_group_size=16,
+        head_dim=192,
+        value_dim=128,
+        block_size=64,
+        trans_v=True,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_partitions=8,
+        per_token=False,
+        sliding_window=128,
+        sparse=False,
+    )
+    args, options, _reference = _make_inputs(case, planned=True)
+    scaled_args = list(args)
+    scaled_args[12] = torch.ones(1, dtype=torch.float32)
+    with pytest.raises(ValueError, match="BF16 KV is unscaled"):
+        pa_decode(*scaled_args, **options)
+
+    wrong_plan = plan_pa_decode(
+        args[4], 1, max_partitions=8, sliding_window=1024, query_length=8
+    )
+    with pytest.raises(NotImplementedError, match="asymmetric value width"):
+        pa_decode(*args, sliding_window=1024, work_plan=wrong_plan)
 
 
 @benchmark()

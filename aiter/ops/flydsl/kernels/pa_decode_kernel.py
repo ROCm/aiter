@@ -113,8 +113,8 @@ def compile_pa_decode_tile(
 
     Positive ``sliding_window`` requires a plan and includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
-    The qualified asymmetric planned shape is FP8 Q/K192-V128 with Qlen8,
-    page64, GQA16, and W128 on gfx950.
+    The qualified asymmetric planned shape supports FP8 or BF16 K/V with
+    Q/K192-V128, Qlen8, page64, GQA16, and W128 on gfx950.
     ``use_sinks`` adds a zero-value per-head logit only to direct NP=1 output;
     partitioned/planned output adds it once in the reducer, not in partials.
 
@@ -135,7 +135,7 @@ def compile_pa_decode_tile(
         raise ValueError("BF16 KV requires gfx942/gfx950 and a BF16 query")
     if value_dim != head_dim and not (
         arch == "gfx950"
-        and kv_dtype == "fp8"
+        and kv_dtype in ("fp8", "bf16")
         and query_dtype == "bf16"
         and head_dim == 192
         and value_dim == 128
@@ -149,7 +149,7 @@ def compile_pa_decode_tile(
         and not per_token_kv
     ):
         raise ValueError(
-            "asymmetric V requires gfx950 FP8 Qlen8/GQA16/page64 D192/V128 W128"
+            "asymmetric V requires gfx950 FP8/BF16 Qlen8/GQA16/page64 D192/V128 W128"
         )
     IS_BF16 = query_dtype == "bf16"
     TUNED_SHAPE = (

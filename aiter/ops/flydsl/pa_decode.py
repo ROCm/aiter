@@ -275,10 +275,10 @@ def pa_decode(
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
     gfx950 Qlen8/GQA16/page64 full attention also supports Dqk192/V128 via
     the optimized FP8 wave schedule.
-    Planned gfx950 Qlen8/GQA16/page64 W128 also supports FP8 Dqk192/V128
-    with optional sinks and scalar K/V scales.
-    Native BF16 K/V supports BF16 Qlen8/GQA16/page64/D128 with W1024,
-    vectorized-5D caches and a refreshed work plan. FP8 K/V scales are [1]
+    Planned gfx950 Qlen8/GQA16/page64 W128 supports FP8 or BF16 K/V with
+    Dqk192/V128, one KV head, and optional sinks. Native BF16 K/V also
+    supports D128/V128 with W1024. Both use vectorized-5D caches and a
+    refreshed work plan. FP8 K/V scales are [1]
     or [num_blocks, num_kv_heads, block_size, 1]; BF16 K/V is unscaled.
     ALiBi and externally quantized queries are unsupported.
 
@@ -680,7 +680,7 @@ def pa_decode(
     if asymmetric_value and not (
         arch == "gfx950"
         and query.dtype == torch.bfloat16
-        and key_cache.dtype == torch.float8_e4m3fn
+        and key_cache.dtype in (torch.float8_e4m3fn, torch.bfloat16)
         and query_length == 8
         and sliding_window == 128
         and head_dim == 192
@@ -693,23 +693,28 @@ def pa_decode(
         and not per_token_kv
     ):
         raise NotImplementedError(
-            "asymmetric value width requires gfx950 BF16 Q/O, FP8 K/V, "
+            "asymmetric value width requires gfx950 BF16 Q/O, FP8 or BF16 K/V, "
             "Qlen8, GQA16, one KV head, page64, Q/K192-V128, W128, "
-            "vectorized V, scalar scales, and a work plan"
+            "vectorized V, scalar scales for FP8, and a work plan"
         )
-    if is_bf16_kv and (
-        query_length != 8
-        or sliding_window != 1024
-        or head_dim != 128
-        or block_size != 64
-        or query_group_size != 16
-        or not trans_v
+    bf16_draft = (head_dim, value_dim, sliding_window) == (128, 128, 1024)
+    bf16_target = (head_dim, value_dim, sliding_window) == (
+        192,
+        128,
+        128,
+    ) and num_kv_heads == 1
+    if is_bf16_kv and not (
+        query_length == 8
+        and block_size == 64
+        and query_group_size == 16
+        and trans_v
+        and (bf16_draft or bf16_target)
     ):
         raise NotImplementedError(
             "BF16 KV currently supports BF16 Qlen8, GQA16, page64, "
-            "D128/V128, and sliding_window=1024; got "
-            f"qlen={query_length}, window={sliding_window}, D={head_dim}, "
-            f"page={block_size}, GQA={query_group_size}, trans_v={trans_v}"
+            "D128/V128 W1024 or one-KV-head D192/V128 W128; got "
+            f"qlen={query_length}, window={sliding_window}, D={head_dim}/{value_dim}, "
+            f"page={block_size}, GQA={query_group_size}, Hkv={num_kv_heads}, trans_v={trans_v}"
         )
     pmax = max_logits
     psum = exp_sums
