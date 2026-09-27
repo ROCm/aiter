@@ -156,7 +156,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // check: an oversized B against a non-grouped kernel is still an error, which is what
     // catches a mis-packed operand. Grouped kernels derive G from the buffer itself, so no
     // ABI or signature change is needed.
-    const bool grouped = kernelName != nullptr && std::strstr(kernelName, "_grp") != nullptr;
+    //
+    // Matched on "_wgrp" (weight-grouped), NOT "_grp". `GRP` in the generator is the
+    // grouped-M *rasterization* group size, and f6gemm_dmabig_grp16/grp64 are ordinary
+    // single-weight kernels that carry it in their names. Matching "_grp" silently dropped
+    // their B-size guard -- they were never passed an oversized B, so nothing failed, but
+    // the check this gate promises to preserve was gone for them.
+    const bool grouped = kernelName != nullptr && std::strstr(kernelName, "_wgrp") != nullptr;
     size_t groups      = 1;
     if(grouped)
     {
