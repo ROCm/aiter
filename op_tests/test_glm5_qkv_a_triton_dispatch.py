@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Dispatch coverage for the GLM-5 qkv_a_proj gfx950 tuning rows."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,11 @@ from aiter.ops.triton.utils import gemm_config_utils as triton_config_mod
 TUNED_FILE = str(
     Path(gemm_mod.__file__).resolve().parents[1]
     / "configs/model_configs/glm5_a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
+)
+TRITON_CONFIG = (
+    Path(triton_mod.__file__).resolve().parents[2]
+    / "configs/gfx950/triton/gemm/gemm_a8w8_blockscale_preshuffled"
+    / "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED-N=2624-K=6144.json"
 )
 GFX = "gfx950"
 CU_NUM = 256
@@ -40,24 +46,25 @@ def _gfx950_config(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("m", "expected_row", "block_m", "block_n", "num_ksplit", "num_warps"),
+    ("m", "expected_row", "json_bucket"),
     [
-        (1, 1, 16, 16, 8, 1),
-        (2, 16, 16, 16, 8, 1),
-        (4, 4, 16, 16, 8, 1),
-        (8, 8, 16, 32, 8, 2),
-        (16, 16, 16, 16, 8, 1),
-        (32, 32, 32, 32, 8, 2),
-        (33, 64, 64, 32, 4, 4),
-        (48, 64, 64, 32, 4, 4),
-        (64, 64, 64, 32, 4, 4),
+        (1, 1, "M_LEQ_4"),
+        (2, 16, "M_LEQ_4"),
+        (4, 4, "M_LEQ_4"),
+        (8, 8, "M_LEQ_8"),
+        (16, 16, "M_LEQ_16"),
+        (32, 32, "M_LEQ_32"),
+        (33, 64, "M_LEQ_64"),
+        (48, 64, "M_LEQ_64"),
+        (64, 64, "M_LEQ_64"),
     ],
 )
 def test_glm5_qkv_a_decode_routes_to_expected_triton_tier(
-    monkeypatch, m, expected_row, block_m, block_n, num_ksplit, num_warps
+    monkeypatch, m, expected_row, json_bucket
 ):
     expected = gemm_mod.get_CKGEMM_config(expected_row, N, K, TUNED_FILE)
     assert expected["libtype"] == "triton"
+    expected_json = json.loads(TRITON_CONFIG.read_text())[json_bucket]
 
     selected_csv = {}
     selected = {}
@@ -92,19 +99,7 @@ def test_glm5_qkv_a_decode_routes_to_expected_triton_tier(
     gemm_mod.gemm_a8w8_blockscale_bpreshuffle(xq, wq, x_scale, w_scale)
 
     assert selected_csv == expected
-    assert selected == {
-        "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": block_n,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
-        "num_warps": num_warps,
-        "num_stages": 3,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg",
-        "NUM_KSPLIT": num_ksplit,
-        "is_tuned": True,
-    }
+    assert selected == expected_json | {"is_tuned": True}
 
 
 def _make_meta_inputs(m):
