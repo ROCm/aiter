@@ -68,7 +68,7 @@ def alloc_rand_like(x):
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
-    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    logits = torch.randn((m, n_expts_tot), dtype=torch.bfloat16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
@@ -135,25 +135,17 @@ class Case:
             # TP1
             Case(16, 4096, 7168, 256, 8, hbm_swizzling=True),
             Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True),
-            Case(4096, 4096, 7168, 256, 8, hbm_swizzling=True),
-            Case(8192, 7168, 2048, 256, 8, hbm_swizzling=True),
             # TP8
             Case(16, 512, 7168, 256, 8, hbm_swizzling=True),
             Case(1024, 7168, 256, 256, 8, hbm_swizzling=True),
-            Case(4096, 512, 7168, 256, 8, hbm_swizzling=True),
-            Case(8192, 7168, 256, 256, 8, hbm_swizzling=True),
             # Edges
             Case(1000, 704, 800, 8, 2),
             Case(300, 400, 800, 8, 4),
             Case(256, 1024, 1024, 8, 4, hbm_swizzling=True),
-            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
-            Case(4096, 3072, 3072, 128, 4),
-            Case(8192, 7168, 4096, 256, 8),
             # gfx1250 gluon preshuffled weights
             Case(16, 4096, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 512, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
-            Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
             Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),

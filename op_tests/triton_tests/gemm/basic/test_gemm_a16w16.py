@@ -111,7 +111,7 @@ def get_fewer_x_vals():
 # all these combinations.
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])

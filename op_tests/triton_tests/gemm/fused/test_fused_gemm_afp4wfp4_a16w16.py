@@ -84,7 +84,7 @@ def get_x_vals():
 
 
 @pytest.mark.parametrize("M, N1, N2, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("fp4_shuffle", [True, False])

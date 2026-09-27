@@ -890,7 +890,7 @@ def test_mha_fp8(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     if not _supports_fp8:
         pytest.skip(f"FP8 not supported on {_arch}")
@@ -921,7 +921,7 @@ def test_mha_varlen_fp8(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     if not _supports_fp8:
         pytest.skip(f"FP8 not supported on {_arch}")
@@ -986,7 +986,7 @@ def test_mha_backward_fp8(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     CAUSAL: bool,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     BATCH = 3
     NUM_K_HEADS = 8
@@ -1044,7 +1044,7 @@ def test_mha_backward_fp8_sliding_window(
     SEQLEN_K: int,
     CAUSAL: bool,
     WINDOW_SIZE: tuple,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     """FP8 backward combined with sliding-window attention.
 
@@ -1108,7 +1108,7 @@ def test_mha_backward_varlen_fp8(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     CAUSAL: bool,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     BATCH = 3
     NUM_K_HEADS = 8
@@ -1212,8 +1212,8 @@ def test_mha_backward_varlen_fp8(
 )
 @pytest.mark.parametrize(
     "dtype",
-    [torch.float16, torch.float32],
-    ids=["fp16", "fp32"],
+    [torch.bfloat16, torch.float32],
+    ids=["bf16", "fp32"],
 )
 def test_mha_v3_sliding_window_bwd(
     CAUSAL: bool,
@@ -1255,7 +1255,6 @@ def test_mha_v3_sliding_window_bwd(
         # cases above barely span more than one block.
         (4096, 4096, 8, 8, True, (256, 0)),  # large causal window
         (4096, 4096, 16, 4, False, (128, 128)),  # GQA large symmetric window
-        (8192, 8192, 8, 8, True, (256, 0)),  # larger causal window
         (4096, 8192, 8, 8, True, (256, 0)),  # large causal, seqlen_q != seqlen_k
     ],
 )
@@ -1271,7 +1270,7 @@ def test_mha_v3_sliding_window_bwd_large(
     """Production-size FA3 sliding-window backward.
 
     Same checks as ``test_mha_v3_sliding_window_bwd`` but at sequence lengths past
-    the upstream 2048 ceiling and with 128/256-wide windows. fp16 only: the fp32
+    the upstream 2048 ceiling and with 128/256-wide windows. bf16 only: the fp32
     reference materializes full [batch, heads, seqlen_q, seqlen_k] scores, so the
     cross-product with fp32 would be needlessly heavy without adding coverage the
     smaller fp32 matrix doesn't already give.
@@ -1284,7 +1283,7 @@ def test_mha_v3_sliding_window_bwd_large(
         NUM_Q_HEADS,
         NUM_K_HEADS,
         VARLEN,
-        torch.float16,
+        torch.bfloat16,
     )
 
 

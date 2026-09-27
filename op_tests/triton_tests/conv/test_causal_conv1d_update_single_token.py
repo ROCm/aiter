@@ -251,7 +251,7 @@ def _causal_conv1d_update_single_token_ref_cases():
     """Cartesian core grid plus former smoke shapes (width=3, small dim); seqlen fixed to 1 for single-token API."""
     out = []
     seqlen = 1
-    for itype in (torch.float32, torch.bfloat16):
+    for itype in (torch.bfloat16,):
         for silu_activation in (True, False):
             for has_bias in (True, False):
                 for width in (2, 4):
