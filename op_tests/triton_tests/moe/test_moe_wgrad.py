@@ -62,7 +62,7 @@ def test_moe_wgrad_constant_inputs(num_tokens, E, N, K, c, d):
 
     dW[e, n, k] = (num_tokens // E) * c * d  for every (e, n, k).
     """
-    device, dtype = "cuda", torch.float32
+    device, dtype = "cuda", torch.bfloat16
     tpe = num_tokens // E
 
     grad = torch.full((num_tokens, N), c, dtype=dtype, device=device)
@@ -73,7 +73,7 @@ def test_moe_wgrad_constant_inputs(num_tokens, E, N, K, c, d):
     expected = tpe * c * d
     assert dW.shape == (E, N, K)
     assert dW.dtype == dtype
-    # Allow 1% relative tolerance for fp32 accumulation over many tokens
+    # Allow 1% relative tolerance for BF16 inputs and gradient storage
     assert torch.allclose(
         dW,
         torch.full_like(dW, expected),
@@ -85,7 +85,7 @@ def test_moe_wgrad_constant_inputs(num_tokens, E, N, K, c, d):
 @pytest.mark.parametrize("num_tokens, E, N, K", [(128, 2, 64, 64), (256, 4, 128, 128)])
 def test_moe_wgrad_linearity(num_tokens, E, N, K):
     """moe_wgrad is linear: wgrad(a) + wgrad(-a) = 0 over the same input."""
-    device, dtype = "cuda", torch.float32
+    device, dtype = "cuda", torch.bfloat16
     torch.manual_seed(0)
     grad = torch.randn(num_tokens, N, dtype=dtype, device=device) * 0.1
     inp = torch.randn(num_tokens, K, dtype=dtype, device=device) * 0.1
@@ -103,8 +103,8 @@ def test_moe_wgrad_linearity(num_tokens, E, N, K):
 def test_moe_wgrad_zero_padded_tokens():
     """num_tokens_post_padded=0 returns zero dW without error."""
     E, N, K, block_size = 4, 64, 64, 64
-    grad = torch.randn(64, N, dtype=torch.float32, device="cuda") * 0.1
-    inp = torch.randn(64, K, dtype=torch.float32, device="cuda") * 0.1
+    grad = torch.randn(64, N, dtype=torch.bfloat16, device="cuda") * 0.1
+    inp = torch.randn(64, K, dtype=torch.bfloat16, device="cuda") * 0.1
     sorted_ids = torch.full((block_size,), 64, dtype=torch.int32, device="cuda")
     expert_ids = torch.full((1,), -1, dtype=torch.int32, device="cuda")
     ntpp = torch.tensor([0], dtype=torch.int32, device="cuda")

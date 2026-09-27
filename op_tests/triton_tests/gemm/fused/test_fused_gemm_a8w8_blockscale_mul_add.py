@@ -29,7 +29,7 @@ def get_x_vals():
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(

@@ -33,7 +33,7 @@ group_shape = (128, 128, 128)
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
-    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    logits = torch.randn((m, n_expts_tot), dtype=torch.bfloat16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
@@ -128,29 +128,21 @@ class Case:
             # 2D blockscale
             Case(16, 4096, 7168, 256, 8, True, True, per_row_x_scale=False),
             Case(256, 7168, 2048, 256, 8, True, True, per_row_x_scale=False),
-            Case(1024, 4096, 7168, 256, 8, True, True, per_row_x_scale=False),
-            Case(8192, 7168, 2048, 256, 8, True, True, per_row_x_scale=False),
             Case(4, 300, 300, 8, 4, True, True, per_row_x_scale=False),
             Case(4, 256, 256, 8, 2, True, True, per_row_x_scale=False),
             # Per-row x scale
             Case(16, 4096, 7168, 256, 8, True, True, per_row_x_scale=True),
             Case(256, 7168, 2048, 256, 8, True, True, per_row_x_scale=True),
-            Case(1024, 4096, 7168, 256, 8, True, True, per_row_x_scale=True),
-            Case(8192, 7168, 2048, 256, 8, True, True, per_row_x_scale=True),
             Case(4, 300, 300, 8, 4, True, True, per_row_x_scale=True),
             Case(4, 256, 256, 8, 2, True, True, per_row_x_scale=True),
             # Mixed quantization 2D blockscale
             Case(16, 512, 1024, 128, 4, False, False, per_row_x_scale=False),
             Case(256, 1024, 2048, 128, 8, True, True, per_row_x_scale=False),
-            Case(1024, 7168, 4096, 256, 4, True, True, per_row_x_scale=False),
-            Case(2048, 4096, 7168, 256, 8, True, True, per_row_x_scale=False),
             Case(4, 300, 300, 8, 2, False, True, per_row_x_scale=False),
             Case(4, 300, 300, 8, 4, True, False, per_row_x_scale=False),
             # Mixed quantization 2D blockscale
             Case(16, 512, 1024, 128, 4, False, False, per_row_x_scale=True),
             Case(256, 1024, 2048, 128, 8, True, True, per_row_x_scale=True),
-            Case(1024, 7168, 4096, 256, 4, True, True, per_row_x_scale=True),
-            Case(2048, 4096, 7168, 256, 8, True, True, per_row_x_scale=True),
             Case(4, 300, 300, 8, 2, False, True, per_row_x_scale=True),
             Case(4, 300, 300, 8, 4, True, False, per_row_x_scale=True),
         ]

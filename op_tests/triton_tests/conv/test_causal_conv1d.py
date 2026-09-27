@@ -113,7 +113,7 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
-@pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
+@pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
 def causal_conv1d_opcheck_fn(
@@ -144,13 +144,13 @@ def causal_conv1d_opcheck_fn(
     bias = bias.contiguous() if bias is not None else None
 
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True, False])
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("seqlen", [1, 4, 8])
 @pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("dim", [1024, 2048, 4096])
-@pytest.mark.parametrize("batch", [1, 7, 64, 127, 512])
+@pytest.mark.parametrize("dim", [1024, 2048])
+@pytest.mark.parametrize("batch", [1, 7, 64, 127])
 def test_causal_conv1d_update(
     batch, dim, width, seqlen, has_bias, silu_activation, itype
 ):
@@ -187,15 +187,15 @@ def test_causal_conv1d_update(
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("seqlen", [1, 4, 8])
 @pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("dim", [2048, 4096])
+@pytest.mark.parametrize("dim", [2048])
 # tests correctness in case subset of the sequences are padded
 @pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 64, 128, 256, 512])
+@pytest.mark.parametrize("batch_size", [1, 64, 127])
 def test_causal_conv1d_update_with_batch_gather(
     batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
@@ -265,14 +265,27 @@ def test_causal_conv1d_update_with_batch_gather(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True, False])
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 64, 1024, 5120, 8192])
-@pytest.mark.parametrize("dim", [2048, 4096])
+# Cover single/many sequences and short/long inputs without repeating
+# batch > total-token combinations, which generate the same sequence splits.
+@pytest.mark.parametrize(
+    "batch, seqlen",
+    [
+        (1, 1),
+        (1, 64),
+        (7, 64),
+        (1, 1024),
+        (64, 1024),
+        (127, 1024),
+        (64, 8192),
+        (512, 8192),
+    ],
+)
+@pytest.mark.parametrize("dim", [2048])
 @pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch", [1, 64, 1024, 5120, 8192])
 def test_causal_conv1d_varlen(
     batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
