@@ -248,10 +248,10 @@ def _pa_decode_fp8_qlen8(
 
 
 def pa_decode(
-    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, value_head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, value_head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -264,7 +264,7 @@ def pa_decode(
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, head_size]
+    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, value_head_size]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -275,6 +275,8 @@ def pa_decode(
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
     gfx950 Qlen8/GQA16/page64 full attention also supports Dqk192/V128 via
     the optimized FP8 wave schedule.
+    Planned gfx950 Qlen8/GQA16/page64 W128 also supports FP8 Dqk192/V128
+    with optional sinks and scalar K/V scales.
     Native BF16 K/V supports BF16 Qlen8/GQA16/page64/D128 with W1024,
     vectorized-5D caches and a refreshed work plan. FP8 K/V scales are [1]
     or [num_blocks, num_kv_heads, block_size, 1]; BF16 K/V is unscaled.
@@ -408,11 +410,13 @@ def pa_decode(
             temporary_output,
         )
 
-    if output.shape != query.shape:
+    if output.shape[:2] != query.shape[:2]:
         raise ValueError(
-            f"output shape {tuple(output.shape)} must match "
-            f"query shape {tuple(query.shape)}"
+            f"output token/head shape {tuple(output.shape[:2])} must match "
+            f"query token/head shape {tuple(query.shape[:2])}"
         )
+    value_dim = output.shape[-1]
+    asymmetric_value = value_dim != head_dim
     if block_tables.shape[0] != num_seqs:
         raise ValueError(
             f"block_tables.shape[0] ({block_tables.shape[0]}) must match "
@@ -433,11 +437,11 @@ def pa_decode(
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
-        and (q_chunk <= 8 or q_chunk % 8 == 0)
+        and (q_chunk <= 8 or q_chunk % 8 == 0 or (asymmetric_value and q_chunk == 12))
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
-            "are 64 and multiples of 128 in [128, 1024]"
+            "are 64, multiples of 128 in [128, 1024], and qualified asymmetric D192/V128"
         )
     if num_hgroups != head_dim // kv_vector_width or hgroup_width != kv_vector_width:
         raise ValueError(
@@ -453,24 +457,24 @@ def pa_decode(
     trans_v = value_cache.dim() == 5
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
-        expected_v_tail = (block_size // kv_vector_width, head_dim, kv_vector_width)
+        expected_v_tail = (block_size // kv_vector_width, value_dim, kv_vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
             raise ValueError(
                 "transposed value_cache shape must be "
-                "[num_blocks, num_kv_heads, block_size // vector_width, head_dim, vector_width], "
+                "[num_blocks, num_kv_heads, block_size // vector_width, value_dim, vector_width], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"head_dim={head_dim}"
+                f"value_dim={value_dim}"
             )
     else:
         if is_bf16_kv:
             raise ValueError("BF16 KV requires vectorized-5D value_cache")
         v_num_blocks, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
-        if v_head_dim != head_dim or v_block_size != block_size:
+        if v_head_dim != value_dim or v_block_size != block_size:
             raise ValueError(
                 "value_cache shape must be "
-                "[num_blocks, num_kv_heads, head_dim, block_size], "
+                "[num_blocks, num_kv_heads, value_dim, block_size], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"head_dim={head_dim}"
+                f"value_dim={value_dim}"
             )
     # Packed V is a shifted view and may span fewer blocks than K.
     if v_num_blocks > num_blocks:
@@ -673,6 +677,26 @@ def pa_decode(
             raise ValueError("sliding_window must match work_plan.sliding_window")
         if sliding_window > 0 and work_plan.query_length != query_length:
             raise ValueError("query_length must match work_plan.query_length")
+    if asymmetric_value and not (
+        arch == "gfx950"
+        and query.dtype == torch.bfloat16
+        and key_cache.dtype == torch.float8_e4m3fn
+        and query_length == 8
+        and sliding_window == 128
+        and head_dim == 192
+        and value_dim == 128
+        and block_size == 64
+        and query_group_size == 16
+        and num_kv_heads == 1
+        and trans_v
+        and work_plan is not None
+        and not per_token_kv
+    ):
+        raise NotImplementedError(
+            "asymmetric value width requires gfx950 BF16 Q/O, FP8 K/V, "
+            "Qlen8, GQA16, one KV head, page64, Q/K192-V128, W128, "
+            "vectorized V, scalar scales, and a work plan"
+        )
     if is_bf16_kv and (
         query_length != 8
         or sliding_window != 1024
@@ -705,6 +729,7 @@ def pa_decode(
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
+            value_dim=value_dim,
             query_group_size=query_group_size,
             block_size=int(block_size),
             num_seqs=num_seqs,
@@ -747,7 +772,7 @@ def pa_decode(
                 )
             if pout is None:
                 pout = torch.empty(
-                    *expected_scalar_shape, head_dim, dtype=output.dtype, device=dev
+                    *expected_scalar_shape, value_dim, dtype=output.dtype, device=dev
                 )
         for name, tensor in (
             ("max_logits", pmax),
@@ -766,7 +791,7 @@ def pa_decode(
             raise ValueError(
                 f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
             )
-        expected_output_shape = (*expected_scalar_shape, head_dim)
+        expected_output_shape = (*expected_scalar_shape, value_dim)
         if pout.shape != expected_output_shape:
             raise ValueError(
                 f"temporary_output shape {tuple(pout.shape)} != {expected_output_shape}"
@@ -831,7 +856,7 @@ def pa_decode(
         )
         if num_partitions > 1 or work_plan is not None:
             output_5d = output.reshape(
-                num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+                num_seqs, query_length, num_kv_heads, query_group_size, value_dim
             )
             launch_pa_decode_ps_reduce(
                 output_5d,
@@ -852,7 +877,7 @@ def pa_decode(
                 pout.stride(3) if work_plan is None else pout.stride(2),
                 query_seq_len=query_length,
                 query_group_size=query_group_size,
-                head_size=head_dim,
+                head_size=value_dim,
                 context_partition_num=num_partitions,
                 stream=s,
                 reduce_info=work_plan.reduce_info if work_plan is not None else None,

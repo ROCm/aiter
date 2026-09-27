@@ -602,6 +602,36 @@ CASES = [
         lengths=(65536,),
     ),
     _case(
+        "fp8-qlen8-window128-asymmetric-sinks",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        lengths=(127, 128, 129, 135, 257, 515),
+    ),
+    _case(
+        "fp8-qlen8-window128-asymmetric-long",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        lengths=(65536, 65529),
+    ),
+    _case(
+        "fp8-qlen8-window128-asymmetric-np1",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=1,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        lengths=(257, 515),
+    ),
+    _case(
         "fp8-qlen8-window1024-sinks",
         shape=(8, 1, 16, 128),
         cache=(64, 1, 0),
@@ -1004,8 +1034,16 @@ def test_pa_decode(case, planned, monkeypatch):
     """Check numerics, contracts and graph replays."""
     if get_gfx_runtime() != "gfx950" and case.value_dim not in (None, case.head_dim):
         pytest.skip("asymmetric value widths require the gfx950 Qlen8 path")
-    if planned and case.value_dim not in (None, case.head_dim):
-        pytest.skip("asymmetric value widths use the static FP8 Qlen8 path")
+    if (
+        planned
+        and case.value_dim not in (None, case.head_dim)
+        and not (
+            case.query_length == 8
+            and case.sliding_window == 128
+            and (case.head_dim, case.value_dim) == (192, 128)
+        )
+    ):
+        pytest.skip("other asymmetric widths use the static FP8 Qlen8 path")
     if planned and case.num_partitions is not None:
         context = torch.tensor(case.lengths, dtype=torch.int32)
         num_compute_units = torch.cuda.get_device_properties(

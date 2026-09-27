@@ -17,12 +17,12 @@ Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, value_dim, x] (trans_v)
+                   or [num_blocks, num_kv_heads, value_dim, block_size] (FP8 plain)
                    where x=16 for FP8 and x=8 for BF16
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``context_lengths`` [num_seqs]  int32
-* ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
+* ``output``       [num_seqs, num_q_heads, value_dim]  same dtype as query
 * FP8 K/V scales  [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
 Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
@@ -75,6 +75,7 @@ _PA_DECODE_TILE_CACHE = {}
 def compile_pa_decode_tile(
     *,
     head_dim: int,
+    value_dim: int | None = None,
     query_group_size: int,
     block_size: int,
     num_seqs: int,
@@ -112,6 +113,8 @@ def compile_pa_decode_tile(
 
     Positive ``sliding_window`` requires a plan and includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    The qualified asymmetric planned shape is FP8 Q/K192-V128 with Qlen8,
+    page64, GQA16, and W128 on gfx950.
     ``use_sinks`` adds a zero-value per-head logit only to direct NP=1 output;
     partitioned/planned output adds it once in the reducer, not in partials.
 
@@ -122,6 +125,7 @@ def compile_pa_decode_tile(
     """
     if sliding_window > 0 and not use_work_plan:
         raise ValueError("positive sliding_window requires work_plan")
+    value_dim = head_dim if value_dim is None else value_dim
     arch = str(get_rocm_arch()).split(":", 1)[0]
     is_gfx950 = "gfx95" in arch
     if kv_dtype not in ("fp8", "bf16"):
@@ -129,6 +133,24 @@ def compile_pa_decode_tile(
     is_bf16_kv = kv_dtype == "bf16"
     if is_bf16_kv and (arch not in ("gfx942", "gfx950") or query_dtype != "bf16"):
         raise ValueError("BF16 KV requires gfx942/gfx950 and a BF16 query")
+    if value_dim != head_dim and not (
+        arch == "gfx950"
+        and kv_dtype == "fp8"
+        and query_dtype == "bf16"
+        and head_dim == 192
+        and value_dim == 128
+        and block_size == 64
+        and query_group_size == 16
+        and num_kv_heads == 1
+        and query_length == 8
+        and sliding_window == 128
+        and trans_v
+        and use_work_plan
+        and not per_token_kv
+    ):
+        raise ValueError(
+            "asymmetric V requires gfx950 FP8 Qlen8/GQA16/page64 D192/V128 W128"
+        )
     IS_BF16 = query_dtype == "bf16"
     TUNED_SHAPE = (
         not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
@@ -216,6 +238,7 @@ def compile_pa_decode_tile(
     )
     cache_key = (
         head_dim,
+        value_dim,
         query_group_size,
         block_size,
         num_partitions,
@@ -244,7 +267,7 @@ def compile_pa_decode_tile(
         and is_gfx950
         and head_dim == 128
         and IS_BF16
-        and 0 < TOTAL_ROWS * head_dim * 2 <= 0x7FFFFFFF
+        and 0 < TOTAL_ROWS * value_dim * 2 <= 0x7FFFFFFF
     )
     # Larger windows have identical visibility for int32 context lengths.
     sliding_window = min(sliding_window, 2**31 - 1)
@@ -321,8 +344,8 @@ def compile_pa_decode_tile(
     PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
     KV_EXTENT = (1 << 42) if wide_kv_addressing else (1 << 30)
     assert (
-        head_dim % (NWARP * MFMA_MNK) == 0
-    ), "head_dim must split across the 4 warps for PV"
+        value_dim % (NWARP * MFMA_MNK) == 0
+    ), "value_dim must split across the 4 warps for PV"
 
     # Four 16-element QK loads form each 64-element fetch group.
     RGROUP_QUARTERS = 4
@@ -341,16 +364,17 @@ def compile_pa_decode_tile(
     QCHUNK = (
         head_dim // NQCHUNK
     )  # f16 elements per lane's load chunk (8 for head_dim=128, 4 for head_dim=64)
-    # Loads are at most 128 bits; larger chunks must not leave an unloaded tail.
-    assert QCHUNK <= 8 or QCHUNK % 8 == 0, (
+    # D192 stages each lane's 12 elements with three 64-bit loads.
+    # Other loads are at most 128 bits and must not leave an unloaded tail.
+    assert QCHUNK <= 8 or QCHUNK % 8 == 0 or QCHUNK == 12, (
         f"head_dim {head_dim} is unsupported: head_dim//{NQCHUNK} ({QCHUNK}) must "
-        f"be <= 8 or a multiple of 8"
+        f"be <= 8, a multiple of 8, or 12"
     )
-    QLOAD_UNIT = min(8, QCHUNK)
+    QLOAD_UNIT = 4 if QCHUNK == 12 else min(8, QCHUNK)
     N_QLOADS = QCHUNK // QLOAD_UNIT
 
-    VHE_CHUNKS = head_dim // (NWARP * MFMA_MNK)  # 2 for head_dim=128, 1 for head_dim=64
-    VHE_SIZE = head_dim // VHE_CHUNKS
+    VHE_CHUNKS = value_dim // (NWARP * MFMA_MNK)
+    VHE_SIZE = value_dim // VHE_CHUNKS
     OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
     # Token operands are i64 packs: K32 FP8 or K16 BF16 per MFMA.
     NVOPS = TILE_TOK // PACK_K
@@ -419,7 +443,7 @@ def compile_pa_decode_tile(
         # Static partials: [B,H,NP,rows]; planned: [H,capacity,rows].
         pmax_ptr: fx.Pointer,  # Natural-log row max.
         psum_ptr: fx.Pointer,  # Row sum.
-        pout_ptr: fx.Pointer,  # Adds head_dim; Q_DTYPE normalized O_p/l_p.
+        pout_ptr: fx.Pointer,  # Adds value_dim; Q_DTYPE normalized O_p/l_p.
         query_ptr: fx.Pointer,
         key_cache_ptr: fx.Pointer,
         value_cache_ptr: fx.Pointer,
@@ -481,12 +505,12 @@ def compile_pa_decode_tile(
                 ) + fx.Int64(part)
             else:
                 pout_slot = fx.Int64(kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(part)
-            pout_slot_bytes = TOTAL_ROWS * head_dim * 2
+            pout_slot_bytes = TOTAL_ROWS * value_dim * 2
             pout_base = buf_base_i64(pout_ptr) + pout_slot * fx.Int64(pout_slot_bytes)
             pout_buffer = ptr_buf_tensor(
                 pout_base,
                 Q_DTYPE,
-                n=TOTAL_ROWS * head_dim,
+                n=TOTAL_ROWS * value_dim,
                 unit_elems=OP_ELEMS,
                 # BF16 views may be only 2-byte aligned, even for 8-byte stores.
                 unit_stride=1,
@@ -1080,9 +1104,9 @@ def compile_pa_decode_tile(
                     if const_expr(trans_v):
                         base = _kv_addr(
                             phys_row[sub],
-                            n_kv * (head_dim * block_size),
+                            n_kv * (value_dim * block_size),
                             (
-                                (kv_h * STEPS_PER_PAGE + page_step) * head_dim
+                                (kv_h * STEPS_PER_PAGE + page_step) * value_dim
                                 + head_element
                             )
                             * (8 if is_bf16_kv else 16),
@@ -1090,8 +1114,8 @@ def compile_pa_decode_tile(
                     else:
                         base = _kv_addr(
                             phys_row[sub],
-                            n_kv * (head_dim * block_size),
-                            (kv_h * head_dim + head_element) * block_size
+                            n_kv * (value_dim * block_size),
+                            (kv_h * value_dim + head_element) * block_size
                             + page_step * 16,
                         )
                     if const_expr(is_bf16_kv):
@@ -1102,7 +1126,7 @@ def compile_pa_decode_tile(
                         ops.extend([words[0], words[1]])
                     if const_expr(block_size == 16):
                         fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-            if const_expr(head_dim == 64):
+            if const_expr(value_dim == 64):
                 fx.rocdl.sched_vmem(len(ops) // 2)
             return ops  # NVOPS i64, the 64-token contiguous run for this head
 
@@ -2012,7 +2036,7 @@ def compile_pa_decode_tile(
                     fx.ptr_store(o_norm, fx.add_offset(output, out_offset))
                 elif const_expr(buffer_plan_output):
                     # Row guards keep the full 8-byte store within this slot.
-                    pout_offset = global_row * head_dim + sub * OP_ELEMS  # noqa: B023
+                    pout_offset = global_row * value_dim + sub * OP_ELEMS  # noqa: B023
                     buf_copy_store(
                         pout_buffer,
                         pout_offset,
@@ -2023,7 +2047,7 @@ def compile_pa_decode_tile(
                     )
                 else:
                     base = partial_slot * TOTAL_ROWS + global_row  # noqa: B023
-                    pout_offset = base * head_dim + sub * OP_ELEMS
+                    pout_offset = base * value_dim + sub * OP_ELEMS
                     fx.ptr_store(
                         o_norm,
                         fx.add_offset(pout, pout_offset),
