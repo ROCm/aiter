@@ -7,9 +7,18 @@ from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr.typing import T
 
-from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
+from .pa_decode_common import pa_decode_pointer_dtype as _flydsl_pointer_dtype
+from .tensor_shim import (
+    _run_compiled,
+    buf_base_i64,
+    buf_copy_load,
+    get_dtype_str,
+    ptr_arg,
+    ptr_buf_tensor,
+)
 from .utils import rcp_f32, udiv_const, urem_const
 
 # Static scheduling limit; work plans use their device's CU count instead.
@@ -867,3 +876,113 @@ def compile_pa_decode_ps_reduce(
         "launch": launch_pa_decode_ps_reduce_kernel,
         "kernel": pa_decode_ps_reduce_kernel,
     }
+
+
+def launch_pa_decode_ps_reduce(
+    output: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    logits: torch.Tensor,
+    sink_token: torch.Tensor | None,
+    stride_output_bs: int,
+    stride_output_len: int,
+    stride_output_kv_head: int,
+    stride_output_group_size: int,
+    stride_exp_sums_seq: int,
+    stride_exp_sums_head: int,
+    stride_exp_sums_part: int,
+    stride_logits_seq: int,
+    stride_logits_head: int,
+    stride_logits_part: int,
+    stride_logits_group: int,
+    *,
+    query_seq_len: int,
+    query_group_size: int,
+    head_size: int,
+    context_partition_num: int,
+    stream: torch.cuda.Stream,
+    reduce_info: torch.Tensor | None = None,
+) -> None:
+    use_work_plan = reduce_info is not None
+    partition_limit = (
+        torch.cuda.get_device_properties(output.device).multi_processor_count
+        if use_work_plan
+        else MAX_CONTEXT_PARTITIONS
+    )
+    if context_partition_num > partition_limit:
+        raise ImportError(
+            f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
+        )
+    use_sinks = sink_token is not None
+    # Bound all attempted i32 byte offsets, including inactive partitions,
+    # so out-of-bounds reads cannot wrap back into valid data.
+    bounded_plan_logits = (
+        use_work_plan
+        and context_partition_num <= 64
+        and query_seq_len > 0
+        and query_group_size > 0
+        and 0 <= stride_logits_head <= 2**31 - 1
+        and stride_logits_group == head_size
+        and stride_logits_part == query_seq_len * query_group_size * head_size
+        and 0
+        < context_partition_num * stride_logits_part * logits.element_size()
+        <= 2**31 - 1
+    )
+    # Paired loads need dword alignment; scalar output stores do not.
+    vectorize_plan_logits = (
+        bounded_plan_logits
+        and head_size == 128
+        and logits.dtype in (torch.bfloat16, torch.float16)
+        and logits.data_ptr() % 4 == 0
+        and stride_logits_head % 2 == 0
+        and stride_logits_part % 2 == 0
+        and stride_logits_group % 2 == 0
+    )
+    compiled = compile_pa_decode_ps_reduce(
+        max_context_partition_num=context_partition_num,
+        head_size=head_size,
+        output_dtype_str=get_dtype_str(output.dtype),
+        logits_dtype_str=get_dtype_str(logits.dtype),
+        sink_dtype_str=get_dtype_str(
+            output.dtype if sink_token is None else sink_token.dtype
+        ),
+        use_sinks=use_sinks,
+        use_work_plan=use_work_plan,
+        query_group_size=query_group_size,
+        bounded_plan_logits=bounded_plan_logits,
+        vectorize_plan_logits=vectorize_plan_logits,
+    )
+    sink_ptr = (
+        ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
+        if use_sinks
+        else flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
+    )
+    _run_compiled(
+        compiled["launch"],
+        ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+        ptr_arg(exp_sums, fx.Float32),
+        ptr_arg(max_logits, fx.Float32),
+        ptr_arg(logits, _flydsl_pointer_dtype(logits.dtype)),
+        sink_ptr,
+        stride_output_bs,
+        stride_output_len,
+        stride_output_kv_head,
+        stride_output_group_size,
+        stride_exp_sums_seq,
+        stride_exp_sums_head,
+        stride_exp_sums_part,
+        stride_logits_seq,
+        stride_logits_head,
+        stride_logits_part,
+        stride_logits_group,
+        query_seq_len,
+        query_group_size,
+        output.shape[0],
+        output.shape[2],
+        (
+            ptr_arg(reduce_info, fx.Int32)
+            if reduce_info is not None
+            else flyc.from_c_void_p(fx.Int32, 0)
+        ),
+        stream,
+    )

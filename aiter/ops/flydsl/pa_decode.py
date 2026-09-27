@@ -14,12 +14,18 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_common import pa_decode_pointer_dtype as _flydsl_pointer_dtype
+from .kernels.pa_decode_kernel import (
+    KV_COMPUTE_BLOCK,
+    compile_pa_decode_fp8_small,
+    compile_pa_decode_fp8_wave,
+    compile_pa_decode_tile,
+)
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     MAX_CONTEXT_PARTITIONS,
-    compile_pa_decode_ps_reduce,
+    launch_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
@@ -64,125 +70,181 @@ def get_recommended_splits(
     return max(4, min(n, max_partitions))
 
 
-def _flydsl_pointer_dtype(dtype: torch.dtype):
-    return {
-        torch.float32: fx.Float32,
-        torch.float16: fx.Float16,
-        torch.bfloat16: fx.BFloat16,
-        torch.float8_e4m3fn: fx.Float8E4M3FN,
-        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
-        torch.int32: fx.Int32,
-    }[dtype]
-
-
-def launch_pa_decode_ps_reduce(
+def _pa_decode_fp8_qlen8(
     output: torch.Tensor,
-    exp_sums: torch.Tensor,
-    max_logits: torch.Tensor,
-    logits: torch.Tensor,
-    sink_token: torch.Tensor | None,
-    stride_output_bs: int,
-    stride_output_len: int,
-    stride_output_kv_head: int,
-    stride_output_group_size: int,
-    stride_exp_sums_seq: int,
-    stride_exp_sums_head: int,
-    stride_exp_sums_part: int,
-    stride_logits_seq: int,
-    stride_logits_head: int,
-    stride_logits_part: int,
-    stride_logits_group: int,
-    *,
-    query_seq_len: int,
-    query_group_size: int,
-    head_size: int,
-    context_partition_num: int,
-    stream: torch.cuda.Stream,
-    reduce_info: torch.Tensor | None = None,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    num_partitions: int,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+    max_logits: torch.Tensor | None = None,
+    exp_sums: torch.Tensor | None = None,
+    temporary_output: torch.Tensor | None = None,
 ) -> None:
-    use_work_plan = reduce_info is not None
-    partition_limit = (
-        torch.cuda.get_device_properties(output.device).multi_processor_count
-        if use_work_plan
-        else MAX_CONTEXT_PARTITIONS
-    )
-    if context_partition_num > partition_limit:
-        raise ImportError(
-            f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
+    """Write [B*8, 16, 128] BF16 output from page64 vectorized FP8 KV."""
+    if get_gfx_runtime() != "gfx950":
+        raise NotImplementedError("FP8 Qlen8 decode requires gfx950")
+    if context_lengths.ndim != 1 or context_lengths.numel() < 1:
+        raise ValueError("context_lengths must be a nonempty [B] vector")
+    batch = context_lengths.numel()
+    head_dim = query.shape[-1]
+    expected_query = (batch * 8, 16, head_dim)
+    if (
+        head_dim not in (128, 192)
+        or query.shape != expected_query
+        or query.dtype != torch.bfloat16
+        or query.stride(-1) != 1
+    ):
+        raise ValueError(
+            "FP8 Qlen8 requires BF16 query [B*8, 16, Dqk=128/192] "
+            f"with a contiguous head axis, got {query.shape}/{query.dtype}"
         )
-    use_sinks = sink_token is not None
-    # Bound all attempted i32 byte offsets, including inactive partitions,
-    # so out-of-bounds reads cannot wrap back into valid data.
-    bounded_plan_logits = (
-        use_work_plan
-        and context_partition_num <= 64
-        and query_seq_len > 0
-        and query_group_size > 0
-        and 0 <= stride_logits_head <= 2**31 - 1
-        and stride_logits_group == head_size
-        and stride_logits_part == query_seq_len * query_group_size * head_size
-        and 0
-        < context_partition_num * stride_logits_part * logits.element_size()
-        <= 2**31 - 1
+    if (
+        output.shape != (batch * 8, 16, 128)
+        or output.dtype != torch.bfloat16
+        or output.stride(-1) != 1
+    ):
+        raise ValueError("FP8 Qlen8 requires BF16 output [B*8, 16, 128]")
+    if (
+        key_cache.ndim != 5
+        or key_cache.shape[1:] != (1, head_dim // 16, 64, 16)
+        or key_cache.dtype != torch.float8_e4m3fn
+        or not key_cache.is_contiguous()
+    ):
+        raise ValueError("FP8 Qlen8 requires vectorized page64 FP8 K")
+    if (
+        value_cache.shape != (key_cache.shape[0], 1, 4, 128, 16)
+        or value_cache.dtype != key_cache.dtype
+        or not value_cache.is_contiguous()
+    ):
+        raise ValueError("FP8 Qlen8 requires vectorized page64 FP8 V128")
+    if (
+        block_tables.shape[0] != batch
+        or block_tables.ndim != 2
+        or block_tables.dtype != torch.int32
+        or not block_tables.is_contiguous()
+    ):
+        raise ValueError("block_tables must be contiguous int32 [B, max_pages]")
+    if context_lengths.dtype != torch.int32 or not context_lengths.is_contiguous():
+        raise ValueError("context_lengths must be contiguous int32 [B]")
+    if not isinstance(num_partitions, int) or not 1 <= num_partitions <= 64:
+        raise ValueError("num_partitions must be in [1, 64]")
+    if not 0 < softmax_scale < float("inf"):
+        raise ValueError("softmax_scale must be finite and positive")
+    device = query.device
+    if device.type != "cuda" or any(
+        tensor.device != device
+        for tensor in (
+            output,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+        )
+    ):
+        raise ValueError("all FP8 Qlen8 decode tensors must be on the query device")
+    for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.shape != (1,)
+            or scale.dtype != torch.float32
+            or scale.device != device
+            or not scale.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be a contiguous float32 GPU scalar")
+
+    scalar_shape = (batch, 1, num_partitions, 128)
+    if num_partitions == 1:
+        max_logits = key_scale if max_logits is None else max_logits
+        exp_sums = key_scale if exp_sums is None else exp_sums
+        temporary_output = output if temporary_output is None else temporary_output
+    else:
+        supplied = (max_logits, exp_sums, temporary_output)
+        if any(tensor is None for tensor in supplied):
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError("preallocate FP8 Qlen8 partials before graph capture")
+            if any(tensor is not None for tensor in supplied):
+                raise ValueError("supply all partial buffers, or none")
+            max_logits = torch.empty(scalar_shape, dtype=torch.float32, device=device)
+            exp_sums = torch.empty_like(max_logits)
+            temporary_output = torch.empty(
+                (*scalar_shape, 128), dtype=torch.bfloat16, device=device
+            )
+        if (
+            max_logits.shape != scalar_shape
+            or exp_sums.shape != scalar_shape
+            or temporary_output.shape != (*scalar_shape, 128)
+            or max_logits.dtype != torch.float32
+            or exp_sums.dtype != torch.float32
+            or temporary_output.dtype != torch.bfloat16
+            or any(
+                not tensor.is_contiguous() or tensor.device != device
+                for tensor in (max_logits, exp_sums, temporary_output)
+            )
+        ):
+            raise ValueError(
+                "FP8 Qlen8 partial buffers have incompatible shape or dtype"
+            )
+
+    compile_kernel = (
+        compile_pa_decode_fp8_small
+        if batch * num_partitions <= 64
+        else compile_pa_decode_fp8_wave
     )
-    # Paired loads need dword alignment; scalar output stores do not.
-    vectorize_plan_logits = (
-        bounded_plan_logits
-        and head_size == 128
-        and logits.dtype in (torch.bfloat16, torch.float16)
-        and logits.data_ptr() % 4 == 0
-        and stride_logits_head % 2 == 0
-        and stride_logits_part % 2 == 0
-        and stride_logits_group % 2 == 0
-    )
-    compiled = compile_pa_decode_ps_reduce(
-        max_context_partition_num=context_partition_num,
-        head_size=head_size,
-        output_dtype_str=get_dtype_str(output.dtype),
-        logits_dtype_str=get_dtype_str(logits.dtype),
-        sink_dtype_str=get_dtype_str(
-            output.dtype if sink_token is None else sink_token.dtype
-        ),
-        use_sinks=use_sinks,
-        use_work_plan=use_work_plan,
-        query_group_size=query_group_size,
-        bounded_plan_logits=bounded_plan_logits,
-        vectorize_plan_logits=vectorize_plan_logits,
-    )
-    sink_ptr = (
-        ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
-        if use_sinks
-        else flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
-    )
-    _run_compiled(
-        compiled["launch"],
-        ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
-        ptr_arg(exp_sums, fx.Float32),
-        ptr_arg(max_logits, fx.Float32),
-        ptr_arg(logits, _flydsl_pointer_dtype(logits.dtype)),
-        sink_ptr,
-        stride_output_bs,
-        stride_output_len,
-        stride_output_kv_head,
-        stride_output_group_size,
-        stride_exp_sums_seq,
-        stride_exp_sums_head,
-        stride_exp_sums_part,
-        stride_logits_seq,
-        stride_logits_head,
-        stride_logits_part,
-        stride_logits_group,
-        query_seq_len,
-        query_group_size,
-        output.shape[0],
-        output.shape[2],
-        (
-            ptr_arg(reduce_info, fx.Int32)
-            if reduce_info is not None
-            else flyc.from_c_void_p(fx.Int32, 0)
-        ),
-        stream,
-    )
+    compiled = compile_kernel(head_dim, num_partitions, softmax_scale)
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            compiled["launch"],
+            output,
+            max_logits.view(-1),
+            exp_sums.view(-1),
+            temporary_output.view(-1),
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            int(block_tables.shape[1]),
+            batch,
+            1,
+            0,
+            0,
+            int(query.stride(0)),
+            int(query.stride(1)),
+            stream,
+        )
+        if num_partitions > 1:
+            output_5d = output.view(batch, 8, 1, 16, 128)
+            launch_pa_decode_ps_reduce(
+                output_5d,
+                exp_sums,
+                max_logits,
+                temporary_output,
+                None,
+                output_5d.stride(0),
+                output_5d.stride(1),
+                output_5d.stride(2),
+                output_5d.stride(3),
+                exp_sums.stride(0),
+                exp_sums.stride(1),
+                exp_sums.stride(2),
+                temporary_output.stride(0),
+                temporary_output.stride(1),
+                temporary_output.stride(2),
+                temporary_output.stride(3),
+                query_seq_len=8,
+                query_group_size=16,
+                head_size=128,
+                context_partition_num=num_partitions,
+                stream=stream,
+            )
 
 
 def pa_decode(
@@ -328,9 +390,7 @@ def pa_decode(
         and key_scale.numel() == value_scale.numel() == 1
         and 1 <= max_context_partition_num <= 64
     ):
-        from .pa_decode_fp8_qlen8 import pa_decode_fp8_qlen8
-
-        return pa_decode_fp8_qlen8(
+        return _pa_decode_fp8_qlen8(
             output,
             query,
             key_cache,

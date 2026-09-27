@@ -4,12 +4,26 @@
 """Shared math, layout loads, and native instruction boundaries for PA decode."""
 
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 
 from .dpp_utils import update_dpp_i32
+
+BF16_CONTEXT_LIMIT = 512
+
+
+def pa_decode_pointer_dtype(dtype: torch.dtype):
+    return {
+        torch.float32: fx.Float32,
+        torch.float16: fx.Float16,
+        torch.bfloat16: fx.BFloat16,
+        torch.float8_e4m3fn: fx.Float8E4M3FN,
+        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
+        torch.int32: fx.Int32,
+    }[dtype]
 
 
 def make_flat_loader(tensor, dtype, width, copy_op):
