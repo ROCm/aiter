@@ -26,10 +26,11 @@ GFX = "gfx950"
 CU_NUM = 256
 N = 2624
 K = 6144
+_GET_CKGEMM_CONFIG = gemm_mod.get_CKGEMM_config
 
 
 def _clear_config_cache():
-    gemm_mod.get_CKGEMM_config.cache_clear()
+    _GET_CKGEMM_CONFIG.cache_clear()
     gemm_mod._CKGEMM_CONFIG_CACHE.pop(TUNED_FILE, None)
     gemm_mod._CKGEMM_HAS_GFX.pop(TUNED_FILE, None)
     triton_config_mod._get_gemm_config_cached.cache_clear()
@@ -62,16 +63,15 @@ def _gfx950_config(monkeypatch):
 def test_glm5_qkv_a_decode_routes_to_expected_triton_tier(
     monkeypatch, m, expected_row, json_bucket
 ):
-    expected = gemm_mod.get_CKGEMM_config(expected_row, N, K, TUNED_FILE)
+    expected = _GET_CKGEMM_CONFIG(expected_row, N, K, TUNED_FILE)
     assert expected["libtype"] == "triton"
     expected_json = json.loads(TRITON_CONFIG.read_text())[json_bucket]
 
     selected_csv = {}
     selected = {}
-    get_config = gemm_mod.get_CKGEMM_config
 
     def capture_csv(*args, **kwargs):
-        config = get_config(*args, **kwargs)
+        config = _GET_CKGEMM_CONFIG(*args, **kwargs)
         selected_csv.update(config)
         return config
 
@@ -95,18 +95,18 @@ def test_glm5_qkv_a_decode_routes_to_expected_triton_tier(
         lambda *args, **kwargs: pytest.fail("decode shape routed to CK"),
     )
 
-    xq, wq, x_scale, w_scale = _make_meta_inputs(m)
+    xq, wq, x_scale, w_scale = _make_inputs(m)
     gemm_mod.gemm_a8w8_blockscale_bpreshuffle(xq, wq, x_scale, w_scale)
 
     assert selected_csv == expected
     assert selected == expected_json | {"is_tuned": True}
 
 
-def _make_meta_inputs(m):
-    xq = torch.empty((m, K), dtype=dtypes.fp8, device="meta")
-    wq = torch.empty((N, K), dtype=dtypes.fp8, device="meta")
-    x_scale = torch.empty((K // 128, m), dtype=torch.float32, device="meta")
-    w_scale = torch.empty((N // 128, K // 128), dtype=torch.float32, device="meta")
+def _make_inputs(m):
+    xq = torch.empty((m, K), dtype=dtypes.fp8)
+    wq = torch.empty((N, K), dtype=dtypes.fp8)
+    x_scale = torch.empty((K // 128, m), dtype=torch.float32)
+    w_scale = torch.empty((N // 128, K // 128), dtype=torch.float32)
     return xq, wq, x_scale, w_scale
 
 
@@ -123,7 +123,7 @@ def test_glm5_qkv_a_prefill_control_stays_on_ck(monkeypatch):
         lambda *args, **kwargs: pytest.fail("control shape routed to Triton"),
     )
 
-    xq, wq, x_scale, w_scale = _make_meta_inputs(128)
+    xq, wq, x_scale, w_scale = _make_inputs(128)
     gemm_mod.gemm_a8w8_blockscale_bpreshuffle(xq, wq, x_scale, w_scale)
     assert reached == ["ck"]
 
