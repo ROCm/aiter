@@ -783,6 +783,8 @@ class MegaMoEV2:
         # the default when the caller does not say.
         self.supports_combine_mask = True
         self._combine_mask = os.environ.get("AITER_MEGA_COMBINE_MASK", "0") == "1"
+        # Values per lane in the Stage2 peer scatter (8: 8/16-byte stores, 16: 16/32).
+        self._s2_scatter_vec = int(os.environ.get("AITER_MEGA_S2_SCATTER_VEC", "8"))
         self._g2_topk_ids = None
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
@@ -872,14 +874,14 @@ class MegaMoEV2:
         stream,
         *,
         runtime_pair_skip: bool = False,
-        scatter_vec: int = 8,
+        scatter_vec: int | None = None,
     ):
         self._fused_stage2_call(
             self._g2_preload,
             config,
             stream,
             runtime_pair_skip=runtime_pair_skip,
-            scatter_vec=scatter_vec,
+            scatter_vec=self._s2_scatter_vec if scatter_vec is None else scatter_vec,
         )
 
     def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
@@ -977,8 +979,10 @@ class MegaMoEV2:
         *,
         runtime_pair_skip: bool = False,
         combine: bool = True,
-        scatter_vec: int = 8,
+        scatter_vec: int | None = None,
     ):
+        if scatter_vec is None:
+            scatter_vec = self._s2_scatter_vec
         comb_op = self.comb_op
         if stream is None:
             stream = torch.cuda.current_stream()

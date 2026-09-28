@@ -241,6 +241,7 @@ def compile_mega_moe_stage1(
         f"{'' if LAUNCH_HANDSHAKE else '_nohs'}"
         f"{'' if PRODUCER_FENCE else '_nopf'}"
         f"{'_ol' if OWNER_LIGHT else ''}"
+        f"_ev{os.environ.get('AITER_MEGA_S1_EPI_EVEC', '8')}"
         f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
     TRACE_BASE = _trace.trace_base("stage1")
