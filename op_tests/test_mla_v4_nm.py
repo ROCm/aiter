@@ -1162,16 +1162,22 @@ def test_v4_nm_varlen_ragged_kv_tail_split_guard():
     ],
 )
 def test_v4_nm_split_planner_picks(num_seqs, kv_len, expected):
-    assert aiter.mla._v4_nm_pick_num_kv_splits(num_seqs, 2, kv_len, 256) == expected
+    cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
+    assert (
+        aiter.mla._v4_nm_pick_num_kv_splits(cost, num_seqs, 2, kv_len, 256) == expected
+    )
 
 
 @needs_gfx950
 def test_v4_nm_split_plan_fills_buffer_in_place():
     buf = torch.full((10,), -1, dtype=torch.int32, device="cuda")
-    splits, indptr = aiter.mla.get_mla_v4_nm_split_plan(7, 128, 1152, split_indptr=buf)
-    assert splits == aiter.mla._v4_nm_pick_num_kv_splits(7, 2, 1152, get_cu_num())
-    assert indptr.data_ptr() == buf.data_ptr()
-    assert buf.tolist() == [i * splits for i in range(8)] + [-1, -1]
+    plan = aiter.mla.get_mla_v4_nm_split_plan(7, 128, 1152, split_indptr=buf)
+    cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
+    assert plan.num_kv_splits == aiter.mla._v4_nm_pick_num_kv_splits(
+        cost, 7, 2, 1152, get_cu_num()
+    )
+    assert plan.split_indptr.data_ptr() == buf.data_ptr()
+    assert buf.tolist() == [i * plan.num_kv_splits for i in range(8)] + [-1, -1]
 
 
 @needs_gfx950
@@ -1184,11 +1190,8 @@ def test_v4_nm_split_plan_fills_buffer_in_place():
     ],
 )
 def test_v4_nm_split_plan_accuracy(kv_lens, kv_len):
-    splits, split_indptr = aiter.mla.get_mla_v4_nm_split_plan(len(kv_lens), 128, kv_len)
-    err, out = _run_varlen_point(
-        kv_lens,
-        split_kwargs={"num_kv_splits": splits, "split_indptr": split_indptr},
-    )
+    plan = aiter.mla.get_mla_v4_nm_split_plan(len(kv_lens), 128, kv_len)
+    err, out = _run_varlen_point(kv_lens, split_kwargs=plan._asdict())
     assert torch.isfinite(out).all()
     assert err < 0.02
 
@@ -1225,10 +1228,8 @@ def test_v4_nm_split_plan_cudagraph_replay():
     def set_lens(lens):
         kv_indptr.copy_(torch.tensor([0] + np.cumsum(lens).tolist(), dtype=torch.int32))
 
-    splits, split_indptr = aiter.mla.get_mla_v4_nm_split_plan(
-        n, gqa, kv_cap, split_indptr=split_buf
-    )
-    assert splits > 1  # exercise the stage-2 path under the graph
+    plan = aiter.mla.get_mla_v4_nm_split_plan(n, gqa, kv_cap, split_indptr=split_buf)
+    assert plan.num_kv_splits > 1  # exercise the stage-2 path under the graph
 
     def run():
         aiter.mla.mla_decode_fwd_v4_nm(
@@ -1243,8 +1244,7 @@ def test_v4_nm_split_plan_cudagraph_replay():
             1,
             sink=sink,
             sm_scale=sm_scale,
-            num_kv_splits=splits,
-            split_indptr=split_indptr,
+            **plan._asdict(),
         )
 
     set_lens([kv_cap] * n)

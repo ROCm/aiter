@@ -5,6 +5,7 @@
 
 import functools
 import os
+from typing import NamedTuple
 
 import torch
 import triton
@@ -359,60 +360,73 @@ def get_meta_param(
     return num_kv_splits, num_kv_splits_indptr
 
 
-# gfx950 v4 nm decode latency model used to pick `num_kv_splits`:
+# Per-arch v4 nm decode latency model used to pick `num_kv_splits`:
 #
 #   t(i) ~= L + W(i) * (C + A * kv_len / i) + [i > 1] * (S + D * num_seqs * i)
 #   W(i)  = ceil(num_seqs * tg_factor * i / cu_num)   (workgroup waves)
 #
 # A is the per-token KV cost of one workgroup, C the per-wave fixed cost, and
 # S + D * num_seqs * i the FP32 partial write + stage-2 merge that every split
-# launch pays. Least-squares fit (relative error) on MI355X, gqa=128, qSeqLen=1,
-# CUDA-graph replay, 1..16 splits over uniform-KV shapes (7..448 seqs,
-# kv_len 192..8320). The previous occupancy-only pick (ignore_total_kv=1)
-# rewards filling whole multiples of cu_num, e.g. 13-16 splits for 49-119 seqs
-# whose KV fits one wave.
-_V4_NM_SPLIT_COST_GFX950 = (12.74, 3.21, 0.0300, 3.38, 0.076)  # L, C, A, S, D (us)
+# launch pays. The occupancy-only pick (ignore_total_kv=1) instead rewards
+# filling whole multiples of cu_num, e.g. 13-16 splits for 49-119 seqs whose KV
+# fits one wave.
+#
+# gfx950: least-squares fit (relative error) on MI355X, gqa=128, qSeqLen=1,
+# CUDA-graph replay, 1..16 splits over uniform-KV shapes (7..448 seqs, kv_len
+# 192..8320). Archs without an entry keep the occupancy-only pick.
+_V4_NM_SPLIT_COST = {
+    "gfx950": (12.74, 3.21, 0.0300, 3.38, 0.076),  # L, C, A, S, D (us)
+}
 _V4_NM_MAX_SPLITS = 16
 
 
+class MlaV4NmSplitPlan(NamedTuple):
+    """KV split plan for `mla_decode_fwd_v4_nm`; the fields are its kwargs."""
+
+    num_kv_splits: int
+    split_indptr: torch.Tensor
+
+
 @functools.lru_cache(maxsize=1024)
-def _v4_nm_pick_num_kv_splits(num_seqs, tg_factor, kv_len, cu_num):
-    """Cost-model split count for gfx950 v4 nm decode (see model above)."""
-    L, C, A, S, D = _V4_NM_SPLIT_COST_GFX950
+def _v4_nm_pick_num_kv_splits(cost, num_seqs, tg_factor, kv_len, cu_num):
+    """Split count minimizing the latency model above with coefficients `cost`."""
+    L, C, A, S, D = cost
     kv_len = max(1, kv_len)
     best_cost, best_splits = None, 1
     for i in range(1, _V4_NM_MAX_SPLITS + 1):
         waves = -(-num_seqs * tg_factor * i // cu_num)
-        cost = L + waves * (C + A * kv_len / i)
+        t = L + waves * (C + A * kv_len / i)
         if i > 1:
-            cost += S + D * num_seqs * i
-        if best_cost is None or cost < best_cost:
-            best_cost, best_splits = cost, i
+            t += S + D * num_seqs * i
+        if best_cost is None or t < best_cost:
+            best_cost, best_splits = t, i
     return best_splits
 
 
 def get_mla_v4_nm_split_plan(
     num_seqs, num_heads, kv_len, *, split_indptr=None, device="cuda"
-):
-    """KV split plan for `mla_decode_fwd_v4_nm`: `(num_kv_splits, split_indptr)`.
+) -> MlaV4NmSplitPlan:
+    """KV split plan for `mla_decode_fwd_v4_nm`.
 
     `num_seqs` / `num_heads` are the decode call's `qo_indptr.shape[0] - 1`
     and `q.size(1)`; `kv_len` is the per-seq KV length to plan for (the
-    longest one the call can see). On gfx950 the split count minimizes the
-    latency model above; other archs keep the occupancy-only pick the
-    wrapper uses when no plan is passed.
+    longest one the call can see). The split count minimizes the latency
+    model above where the arch has coefficients, and is the wrapper's own
+    occupancy-only pick elsewhere.
 
     The split count is a host int that depends only on these arguments, and
     `split_indptr` is the uniform `[0, s, 2s, ..., num_seqs * s]`. Pass a
     persistent int32 `split_indptr` of at least `num_seqs + 1` entries to have
     it filled in place (one device launch, no host sync): CUDA-graph callers
     keep the buffer alive across replays and rebuild the plan with the same
-    arguments before each replay. Pass both results to the wrapper.
+    arguments before each replay. Pass the plan on as
+    `mla_decode_fwd_v4_nm(..., **plan._asdict())`.
     """
     tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
-    if get_gfx() == "gfx950":
+    cost = _V4_NM_SPLIT_COST.get(get_gfx())
+    if cost is not None:
         num_kv_splits = _v4_nm_pick_num_kv_splits(
-            num_seqs, tg_factor, int(kv_len), get_cu_num()
+            cost, num_seqs, tg_factor, int(kv_len), get_cu_num()
         )
     else:
         num_kv_splits, _ = get_meta_param(
@@ -437,7 +451,7 @@ def get_mla_v4_nm_split_plan(
         device=split_indptr.device,
         out=split_indptr,
     )
-    return num_kv_splits, split_indptr
+    return MlaV4NmSplitPlan(num_kv_splits, split_indptr)
 
 
 # Persistent MLA-decode kernel gate: the persistent kernel
@@ -1785,9 +1799,9 @@ def mla_decode_fwd_v4_nm(
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
       Callers that know their per-seq KV length (and CUDA-graph callers,
-      whose `kv_page_indices` is typically capacity-sized) should build the
-      plan with `get_mla_v4_nm_split_plan` and pass both `num_kv_splits` and
-      `split_indptr`.
+      whose `kv_page_indices` is typically capacity-sized) should build a
+      plan with `get_mla_v4_nm_split_plan` and pass it as
+      `**plan._asdict()`.
 
     Multi-pass mode (`num_kv_splits > 1`):
       1. If `split_indptr` is None, build a uniform one:
