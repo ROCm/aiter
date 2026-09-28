@@ -280,8 +280,7 @@ _use_symm_mem = env_flag(_USE_SYMM_MEM_ENV) and _is_gfx1250
 
 try:
     if _is_gfx1250:
-        # Just proves the module loads; 2 is any world size check_ngpus accepts.
-        ops.meta_size_gfx1250(2)
+        ops.meta_size_gfx1250()
     else:
         ops.meta_size()
     custom_ar = True
@@ -776,6 +775,12 @@ class _SymmMemBufferProxy:
                 count,
             )
 
+    def close(self):
+        # torch has no free API: mori frees a buffer on the last reference to
+        # its tensor, and deregisters the window on the last one to its handle.
+        # This proxy holds the only ones. Dropping _ca also breaks the cycle.
+        self._meta = self._input = self._hdls = self._ca = None
+
     def get_external_ipc_meta(self, tensor):
         """Unsupported on this transport.
 
@@ -1172,8 +1177,7 @@ class CustomAllreduce:
         self._ops_register_input_buffer(
             self._ptr, inp.data_ptr(), list(inp_hdl.buffer_ptrs)
         )
-        # Sole owner from here on. torch has no free API for symm_mem, so
-        # dropping this proxy is the only way to release the buffers.
+        # Sole owner from here on, so its close() releases the buffers.
         self._pool = _SymmMemBufferProxy(meta, inp, (meta_hdl, inp_hdl), self)
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
@@ -2408,12 +2412,6 @@ class CustomAllreduce:
         pool = getattr(self, "_pool", None)
         if pool is not None and hasattr(pool, "close"):
             pool.close()
-        # torch has no free API for symm_mem buffers: they live exactly as long
-        # as the last reference to their tensor. The proxy is the only holder,
-        # and dropping it also breaks the self -> _pool -> self cycle, so the
-        # release happens by refcount rather than waiting for the gc.
-        if isinstance(pool, _SymmMemBufferProxy):
-            self._pool = None
 
     def __del__(self):
         self.close()

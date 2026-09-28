@@ -57,6 +57,7 @@
     switch(ws) {                        \
         case 2: CALL(2); break;         \
         case 4: CALL(4); break;         \
+        case 6: CALL(6); break;         \
         case 8: CALL(8); break;         \
         default:                        \
             throw std::runtime_error(   \
@@ -95,10 +96,10 @@ struct __align__(16) RankSignals
 // collective. init_custom_ar* are public bindings called directly downstream.
 inline void check_ngpus(int world_size)
 {
-    if(world_size != 2 && world_size != 4 && world_size != 8)
+    if(world_size < 2 || world_size > kMaxNgpus || world_size % 2 != 0)
         throw std::invalid_argument(
             "gfx1250 custom allreduce: unsupported world size " +
-            std::to_string(world_size) + " (supported: 2, 4, 8)");
+            std::to_string(world_size) + " (supported: 2, 4, 6, 8)");
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +623,7 @@ __global__ void __launch_bounds__(256, 2) ag_gfx1250_warpsplit_unroll4(
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int unroll    = 4;
     constexpr int tnum_gpu = 256 / ngpus;
+    static_assert(256 % ngpus == 0, "tail threads would index ptrs[ngpus]");
     using P                 = typename opus::vector_t<T, pack_size>;
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
