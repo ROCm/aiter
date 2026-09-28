@@ -135,6 +135,8 @@ def test_static_per_head_quant_fp8_hip_graph_replay() -> None:
 
 def test_kimi_k3_fp8_prefill_reports_all_requirements(monkeypatch) -> None:
     monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx950")
+    # mha.py imports get_arch by name, so its copy must be patched as well.
+    monkeypatch.setattr("aiter.ops.triton.attention.mha.get_arch", lambda: "gfx950")
     with pytest.raises(
         NotImplementedError,
         match="requires gfx942 and torch.float8_e4m3fnuz support",
