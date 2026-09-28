@@ -432,7 +432,7 @@ def _run_real_destroy(owns: bool):
     comm.pynccl_comm = None
     comm.qr_comm = _RecordingComm()
     comm.ca_comm = _RecordingComm()
-    comm._owns_ar_comms = owns
+    comm._owns_comms = owns
     comm._all2all_manager = None
 
     qr, ca = comm.qr_comm, comm.ca_comm
@@ -530,8 +530,8 @@ def _gpu_worker(rank, world_size, port, topo, reuse):
             )
             assert ep.device_communicator.is_ep_communicator is True
             # ...and so each is responsible for closing its own allreduce slots.
-            assert ep.device_communicator._owns_ar_comms is True
-            assert tp.device_communicator._owns_ar_comms is True
+            assert ep.device_communicator._owns_comms is True
+            assert tp.device_communicator._owns_comms is True
             _gpu_teardown()
             if rank == 0:
                 print(f"[gpu:{topo}:noreuse] PASSED")
@@ -556,8 +556,8 @@ def _gpu_worker(rank, world_size, port, topo, reuse):
         # Shared handles, single owner. Both slots can hold IPC inboxes opened
         # against every peer, so if the borrower also claimed ownership its
         # destroy() would close them while the source is still reducing.
-        assert ep.device_communicator._owns_ar_comms is False
-        assert source.device_communicator._owns_ar_comms is True
+        assert ep.device_communicator._owns_comms is False
+        assert source.device_communicator._owns_comms is True
         assert ep.device_group is source.device_group
         # ...but cpu_group stays private for mori (see the GPU-free suite).
         assert ep.cpu_group is not source.cpu_group
