@@ -23,7 +23,7 @@ validated against are test fixtures in ``op_tests/qsa_shapes.py``.
 ``flydsl``, or ``triton``. The default is ``triton``: live AMD paged MQA,
 HIP top-k, expand+tail, and sparse GQA. Calling the wrapper without a
 backend leaves that path as it is. ``flydsl`` runs K1, the same vendored
-expand+tail, and K2. ``auto`` launches FlyDSL only for the one query shape
+expand+tail, and K2. ``auto`` launches FlyDSL only for the query shapes
 whose end-to-end layer was measured to beat live AMD; every other shape
 stays on Triton. Sigmoid and partial RoPE stay outside the layer.
 """
@@ -47,19 +47,26 @@ from .kernels.qsa import (
 from .kernels.qsa.k1 import qsa_k1_block_ids, qsa_k1_serves
 from .kernels.qsa.k2 import qsa_k2, qsa_k2_serves
 
-# The Flash-Next / qwen4_exp GQA query, as ``(n_q_heads, head_dim)``. K2
-# serves any structurally valid shape but its launch policy is fitted to
-# this one, so auto pins it here; K1's ``heads=(4,)`` gate pins the indexer.
-_MEASURED_GQA_QUERY = (24, 256)
+# GQA query ``(n_q_heads, head_dim)`` -> the indexer head counts swept with
+# it. K2 serves any structurally valid shape, so this table is the only
+# thing keeping auto off an untuned one. The measured thing is the pair:
+# 24x256 was never swept with an 8-head indexer, so admitting one there
+# would be a claim nobody made.
+_MEASURED_QUERIES = {
+    (24, 256): (4,),  # Flash-Next / qwen4_exp
+    (10, 128): (4, 8),
+}
 _BACKENDS = ("auto", "flydsl", "triton")
 
-# GPU 6 / gfx950, cold ``--rotate 0``, page_size 16. Every swept row beat
-# live AMD with err=0, by 1.05x to 1.64x: M in {1, 2, 8, 16, 32, 64, 128,
-# 256, 512} and L in {512, 2048, 8192, 32768}, covering the short emit rows
-# and the long score rows. That reaches every launch config the K2 policy
-# can pick, and M past 512 reuses M=512's BN32 single-split config with a
-# larger grid, so M does not filter this gate. Width does not either: every
-# measured L won. Re-sweep before widening ``_launch_config``'s bands.
+# GPU 6 / gfx950, cold ``--rotate 0``, page_size 16, L in {512, 2048, 8192,
+# 32768}. Every swept row beat live AMD with err=0. 24x256: M in {1, 2, 8,
+# 16, 32, 64, 128, 256, 512}, by 1.05x to 1.64x. 10x128: those M plus
+# {3, 4} at both indexer widths, by 1.17x to 2.33x. Between them that
+# reaches every launch config the K2 policy can pick, and M past 512 reuses
+# M=512's BN32 single-split config with a larger grid, so M does not filter
+# this gate. Width does not either: every measured L won. The bands in
+# ``_launch_config`` are fitted at D=256 and 10x128 rides them untuned, so
+# re-sweep both shapes before widening them.
 
 __all__ = [
     "QsaGqaSpec",
@@ -97,19 +104,19 @@ def normalize_qsa_backend(backend: str | None) -> str:
     return normalized
 
 
-def _measured_queries(q_indexer: torch.Tensor, q_gqa: torch.Tensor) -> bool:
-    """Whether both query tensors are the shape auto was measured on.
+def _measured_heads(
+    q_indexer: torch.Tensor, q_gqa: torch.Tensor
+) -> tuple[int, ...] | None:
+    """Indexer head counts swept with this GQA query, or None if untuned.
 
-    Only the GQA query is pinned here. The ``heads=(4,)`` K1 gate below
-    already restricts the indexer to bfloat16 ``[M, 4, 128]``, and the K2
-    gate re-checks the GQA dtype, but nothing downstream pins the GQA
-    shape or makes the two halves agree on ``M``.
+    Narrowing the head count is left to ``qsa_k1_serves`` below, which
+    checks it along with the indexer dtype and D. What only this level can
+    check is the GQA query shape, since K2 serves any structurally valid
+    one, and that the two halves of the layer agree on ``M``.
     """
-    return (
-        q_indexer.dim() == 3
-        and tuple(q_gqa.shape[1:]) == _MEASURED_GQA_QUERY
-        and q_indexer.shape[0] == q_gqa.shape[0]
-    )
+    if q_indexer.dim() != 3 or q_indexer.shape[0] != q_gqa.shape[0]:
+        return None
+    return _MEASURED_QUERIES.get(tuple(q_gqa.shape[1:]))
 
 
 def qsa_auto_uses_flydsl(
@@ -124,17 +131,15 @@ def qsa_auto_uses_flydsl(
 ) -> bool:
     """Whether ``auto`` may launch FlyDSL. Host shapes only; no device sync.
 
-    Any query shape but the measured one stays on Triton. So does a shape
-    the kernels cannot serve, which keeps ``auto`` from turning a dispatch
-    miss into an exception. ``M`` and the selection width are not filters:
-    the sweep above won at every one it measured.
+    Any query pair but a measured one stays on Triton. So does a shape the
+    kernels cannot serve, which keeps ``auto`` from turning a dispatch miss
+    into an exception. ``M`` and the selection width are not filters: the
+    sweep above won at every one it measured.
     """
-    if not _measured_queries(q_indexer, q_gqa):
+    heads = _measured_heads(q_indexer, q_gqa)
+    if heads is None:
         return False
-    if (
-        qsa_k1_serves(q_indexer, index_k_cache, index_page_table, heads=(4,))
-        is not None
-    ):
+    if qsa_k1_serves(q_indexer, index_k_cache, index_page_table, heads) is not None:
         return False
     return qsa_k2_serves(q_gqa, k_cache, v_cache, indices, kv_page_table) is None
 
