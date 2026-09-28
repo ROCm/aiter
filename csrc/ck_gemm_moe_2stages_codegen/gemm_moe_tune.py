@@ -1127,11 +1127,11 @@ class FmoeTuner(TunerCommon):
 
         token = ref2.shape[0]
         epilog = kparams["epilog"]
-        if epilog == "scatter":
-            raise NotImplementedError(
-                "v2 epilog='scatter' needs reverse_sorted; tune it via fused_moe"
-            )
         bm_s2 = kparams["tile_m"]
+        if epilog == "scatter" and bm_s2 != 128:
+            raise AssertionError(
+                f"epilog='scatter' supports only tile_m=128, got {bm_s2}"
+            )
         sbm = kparams["sort_block_m"]
         out = torch.empty((token, model_dim), dtype=dtypes.bf16, device=isq.device)
         inter = (
@@ -1139,7 +1139,14 @@ class FmoeTuner(TunerCommon):
             if epilog == "reduce"
             else None
         )
-        gemm2_out = inter if epilog == "reduce" else out
+        flat = (
+            torch.empty((max_sorted, model_dim), dtype=dtypes.bf16, device=isq.device)
+            if epilog == "scatter"
+            else None
+        )
+        gemm2_out = (
+            inter if epilog == "reduce" else (flat if epilog == "scatter" else out)
+        )
         if epilog != "reduce":
             out.zero_()
         mxfp4_moe_gemm2(
@@ -1169,6 +1176,28 @@ class FmoeTuner(TunerCommon):
             persist=kparams["persist"],
             n_sorted_padded=n,
         )
+        if epilog == "scatter":
+            n_valid = int(n)
+            packed = sti[:n_valid]
+            token_id = packed & 0x00FFFFFF
+            slot = packed >> 24
+            ok = (token_id < token) & (slot < topk)
+            reverse_sorted = torch.full(
+                (token * topk,), -1, dtype=torch.int32, device=sti.device
+            )
+            reverse_sorted[(token_id[ok] * topk + slot[ok]).long()] = torch.arange(
+                n_valid, device=sti.device, dtype=torch.int32
+            )[ok]
+            aiter.mxfp4_moe_scatter_reduce(
+                flat_out=flat,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=swt,
+                out=out,
+                NE=expert,
+                TOPK=topk,
+                D_HIDDEN=model_dim,
+                MB=bm_s2,
+            )
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
