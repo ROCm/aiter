@@ -11,7 +11,6 @@ from .mega_moe_tp_glm import (
     SCORE_LINE_WORDS,
     MegaMoeTpW8A8Glm,
     _ptr,
-    mega_moe_tp_w8a8_glm_supported,
     swizzle_256_bf16,
 )
 from .kernels.mega_moe_tp.mega_moe_tp_a4w4_glm import (
@@ -31,13 +30,11 @@ from .kernels.tensor_shim import _run_compiled
 __all__ = [
     "MegaMoeTpA4W4Glm",
     "mega_moe_tp_a4w4_glm",
-    "mega_moe_tp_a4w4_glm_supported",
     "pack_down_a4w4",
     "pack_up_gate_a4w4",
 ]
 
 E8M0_ONE = 127
-mega_moe_tp_a4w4_glm_supported = mega_moe_tp_w8a8_glm_supported
 
 
 @functools.cache

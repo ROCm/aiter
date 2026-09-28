@@ -18,7 +18,7 @@ import functools
 
 import torch
 
-from .mega_moe_tp_glm import UncachedSymmetricBuffer, _ptr, mega_moe_tp_w8a8_glm_supported
+from .mega_moe_tp_glm import UncachedSymmetricBuffer, _ptr
 from .kernels.mega_moe_tp.mega_moe_tp_kimi3 import (
     DN_BLOCKS,
     ERR_AR,
@@ -44,14 +44,12 @@ from .kernels.tensor_shim import _run_compiled
 __all__ = [
     "MegaMoeTpKimi3",
     "mega_moe_tp_kimi3",
-    "mega_moe_tp_kimi3_supported",
     "pack_down_kimi3",
     "pack_up_gate_kimi3",
 ]
 
 E8M0_ONE = 127
 MAX_SAMPLES = max(SUPPORTED_SAMPLES)
-mega_moe_tp_kimi3_supported = mega_moe_tp_w8a8_glm_supported
 
 
 @functools.cache

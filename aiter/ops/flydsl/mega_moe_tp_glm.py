@@ -32,7 +32,6 @@ __all__ = [
     "NUM_MOE_WEIGHTS",
     "SYM_BYTES",
     "mega_moe_tp_w8a8_glm",
-    "mega_moe_tp_w8a8_glm_supported",
     "swizzle_256_bf16",
     "swizzle_down_k128",
     "swizzle_pair_interleaved_k128",
@@ -41,14 +40,6 @@ __all__ = [
 NUM_MOE_WEIGHTS = NUM_EXPERTS + 1
 MAX_SAMPLES = max(SUPPORTED_SAMPLES)
 SCORE_LINE_WORDS = 32
-
-
-def mega_moe_tp_w8a8_glm_supported(gfx: str | None = None) -> bool:
-    if gfx is None:
-        from aiter.jit.utils.chip_info import get_gfx
-
-        gfx = get_gfx()
-    return gfx == "gfx950"
 
 
 def swizzle_256_bf16(w: torch.Tensor) -> torch.Tensor:

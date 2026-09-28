@@ -33,7 +33,6 @@ from aiter.ops.flydsl.mega_moe_tp_glm import (
     NUM_MOE_WEIGHTS,
     MegaMoeTpW8A8Glm,
     UncachedSymmetricBuffer,
-    mega_moe_tp_w8a8_glm_supported,
 )
 from aiter.ops.flydsl.mega_moe_tp_a4w4_glm import MegaMoeTpA4W4Glm
 from aiter.ops.flydsl.mega_moe_tp_kimi3 import MegaMoeTpKimi3
@@ -1085,7 +1084,7 @@ def main():
 
     rank, nproc, local_rank = setup_dist()
     try:
-        if get_gfx() not in SUPPORTED_GFX or not mega_moe_tp_w8a8_glm_supported():
+        if get_gfx() not in SUPPORTED_GFX:
             if rank == 0:
                 aiter.logger.warning("mega_moe_tp unsupported on %s; skipping", get_gfx())
             return
