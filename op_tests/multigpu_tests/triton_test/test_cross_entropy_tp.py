@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
+from aiter import logger
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.cross_entropy import cross_entropy_forward
@@ -91,8 +92,8 @@ def _worker(
             torch.cuda.synchronize()
             try:
                 dist.barrier()
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning("barrier before teardown failed: %s", e)
             torch.cuda.synchronize()
         aiter.destroy_dist_env()
 
@@ -224,9 +225,9 @@ def test_cross_entropy_tp_ignore_index(world_size: int = 2):
     results = _run_tp(world_size, logits, target, ignore_idx, True, init_method)
 
     for rank, (loss_val, _) in enumerate(results):
-        assert abs(loss_val - ref_loss) < 1e-2, (
-            f"rank {rank}: TP loss {loss_val:.6f} != ref {ref_loss:.6f} with ignore_index"
-        )
+        assert (
+            abs(loss_val - ref_loss) < 1e-2
+        ), f"rank {rank}: TP loss {loss_val:.6f} != ref {ref_loss:.6f} with ignore_index"
 
     print(
         f"PASSED test_cross_entropy_tp_ignore_index  "

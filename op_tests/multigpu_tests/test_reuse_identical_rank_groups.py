@@ -41,6 +41,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from aiter import logger
 from aiter.dist import parallel_state as ps
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
@@ -182,9 +183,9 @@ def _assert_reuse_invariants(groups):
             # ranks/rank_in_group are inherited verbatim, so the *ordered* rank
             # list must match -- not merely the same set. Asserting ordered
             # equality locks in the tuple(my_ranks) dedup key.
-            assert g.ranks == src.ranks, (
-                f"{name} reuses a source with a different rank order"
-            )
+            assert (
+                g.ranks == src.ranks
+            ), f"{name} reuses a source with a different rank order"
             assert g.rank_in_group == src.rank_in_group
             # ...and single-member groups never reuse (they hold no communicator).
             assert g.world_size > 1, f"{name} is single-rank yet reuses"
@@ -196,9 +197,9 @@ def _assert_reuse_invariants(groups):
             if name == "ep":
                 # mori assumes exclusive use of the EP cpu_group, so it stays
                 # private (a gloo PG holds none of the saved buffers).
-                assert g.cpu_group is not src.cpu_group, (
-                    "EP borrower must not share the source's cpu_group with mori"
-                )
+                assert (
+                    g.cpu_group is not src.cpu_group
+                ), "EP borrower must not share the source's cpu_group with mori"
                 assert g._owns_cpu_group, "EP borrower must own its private cpu_group"
                 assert dist.get_process_group_ranks(g.cpu_group) == list(g.ranks)
             else:
@@ -219,9 +220,9 @@ def _assert_reuse_invariants(groups):
                     is src.device_communicator.pynccl_comm
                 ), "EP borrower allocated a second pynccl comm"
             else:
-                assert g.device_communicator is src.device_communicator, (
-                    f"{name} allocated a second device communicator"
-                )
+                assert (
+                    g.device_communicator is src.device_communicator
+                ), f"{name} allocated a second device communicator"
                 assert not g._owns_device_communicator
                 assert not g.device_communicator.is_ep_communicator, (
                     f"{name} borrowed an EP communicator; its collectives would "
@@ -278,9 +279,9 @@ def _decision_worker(rank, world_size, port, topo, reuse):
                 assert g["dp"].reuse_from is None, "DP must be a separate source"
                 assert _rankset(g["dp"]) != _rankset(g["tp"])
                 # EP spans all ranks, matching no earlier group -> aliases nobody.
-                assert g["ep"].reuse_from is None, (
-                    "EP matches no prior rank set; must not reuse"
-                )
+                assert (
+                    g["ep"].reuse_from is None
+                ), "EP matches no prior rank set; must not reuse"
                 assert g["ep"].world_size == world_size
 
         # Real guarded teardown: a double destroy_process_group() would raise,
@@ -330,9 +331,9 @@ def _saving_worker(rank, world_size, port, topo):
         off_pg, off_comm, off_handles = counts[False]
         on_pg, on_comm, on_handles = counts[True]
         assert on_pg < off_pg, f"{topo}: no process groups saved ({on_pg} vs {off_pg})"
-        assert on_handles < off_handles, (
-            f"{topo}: no allreduce handles saved ({on_handles} vs {off_handles})"
-        )
+        assert (
+            on_handles < off_handles
+        ), f"{topo}: no allreduce handles saved ({on_handles} vs {off_handles})"
         assert on_comm <= off_comm
     finally:
         for undo in reversed(restore):
@@ -426,8 +427,8 @@ def _gpu_teardown():
         torch.cuda.synchronize()
         try:
             dist.barrier()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("barrier before teardown failed: %s", e)
         torch.cuda.synchronize()
     destroy_model_parallel()
     destroy_distributed_environment()
@@ -500,9 +501,9 @@ def _gpu_worker(rank, world_size, port, topo, reuse):
         t = torch.ones(8, device=dev)
         out = ep.device_communicator.pynccl_comm.all_reduce(t)
         torch.cuda.synchronize()
-        assert torch.allclose(out, torch.full_like(out, float(source.world_size))), (
-            f"reused all_reduce gave {out[0].item()}, expected {source.world_size}"
-        )
+        assert torch.allclose(
+            out, torch.full_like(out, float(source.world_size))
+        ), f"reused all_reduce gave {out[0].item()}, expected {source.world_size}"
 
         _gpu_teardown()
         if rank == 0:

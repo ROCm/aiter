@@ -107,8 +107,8 @@ def _worker(
         torch.cuda.synchronize()
         try:
             dist.barrier()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("barrier before teardown failed: %s", e)
         torch.cuda.synchronize()
         destroy_model_parallel()
         destroy_distributed_environment()

@@ -73,8 +73,8 @@ def _worker(tp_size, rankID, mode, shape):
         torch.cuda.synchronize()
         try:
             dist.barrier()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("barrier before teardown failed: %s", e)
         torch.cuda.synchronize()
 
     destroy_dist_env()
@@ -103,9 +103,9 @@ def test_init_dist_env(tp_size, shape, run_mode):
             msg=f"init_dist_env allreduce: {tp_size=} mode={run_mode} pool={mode}",
         )
     if run_mode == "raw_override":
-        assert modes == {"raw_cached"}, (
-            f"AITER_CUSTOM_AR_RAW_INPUT_POOL did not select the raw pool: {modes}"
-        )
+        assert modes == {
+            "raw_cached"
+        }, f"AITER_CUSTOM_AR_RAW_INPUT_POOL did not select the raw pool: {modes}"
     if run_mode == "expandable" and modes == {"torch"}:
         # The allocator snapshot is authoritative; a platform that does not
         # honor expandable segments falls back to the torch pool, and this run
