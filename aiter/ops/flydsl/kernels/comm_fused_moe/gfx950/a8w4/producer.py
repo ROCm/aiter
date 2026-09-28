@@ -38,7 +38,7 @@ def compile_megakernel_producer(config: MegakernelConfig, composition):
         BK=config.tile_k,
         use_nt=config.b_cache_modifier == 2,
         HIDDEN_MAX=shape.model_dim,
-        epilog=("atomic" if config.producer_mode == "atomic_shared" else "reduce"),
+        epilog="reduce",
         INTER_MAX=shape.inter_dim,
         a_dtype="fp8",
         b_dtype="fp4",
@@ -53,9 +53,7 @@ def compile_megakernel_producer(config: MegakernelConfig, composition):
         out_dtype="bf16",
         enable_bias=False,
         _composition=composition,
-        _reduce_store_cache_modifier=(
-            _ROUTE_STORE_CACHE_MODIFIER if config.producer_mode == "routes" else None
-        ),
+        _reduce_store_cache_modifier=_ROUTE_STORE_CACHE_MODIFIER,
         _input_row_resolver=_input_row_resolver_for(config),
     )
 

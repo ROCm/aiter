@@ -16,7 +16,7 @@ The production target is the DeepSeek-V4-Pro TP8 Stage2 shape:
 The test compares both the ordinary and communication-fused paths with an
 independent torch reference built from the unshuffled MXFP8/MXFP4 inputs.  It
 also exercises eager execution, graph replay, the model-facing runtime,
-separate-stream execution, and runtime padding from M=3 to M=4.
+separate-stream execution, M=3 to M=4 padding, and the exact-M Direct ABI.
 """
 
 from __future__ import annotations
@@ -63,13 +63,18 @@ from aiter.ops.flydsl.comm_fused_moe_host import (
     is_flydsl_comm_fused_moe_available,
     winners_for,
 )
+from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import WindowConfig
 from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
     per_1x32_f4_quant,
     per_1x32_f8_scale_f8_quant,
 )
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 
 SUPPORTED_GFX = ("gfx950",)
 TP_SIZE = 8
@@ -77,13 +82,14 @@ MODEL_DIM = 7168
 INTER_DIM = 384
 EXPERTS = 384
 TOPK = 6
-PRODUCTION_TOKENS = (1, 2, 4, 8, 16)
+PRODUCTION_TOKENS = (64, 1024, 4096, 32768)
 ROUTES = ("uniform", "skew")
 MODES = ("eager", "graph")
 
-# Accuracy limits used by the production tuner and host dispatch.
+# Accuracy limits enforced by this production-path validation.
 MAX_ABS = 1.0
 MAX_REL_L2 = 0.05
+MAX_MXFP4_REL_L2 = 0.2
 MAX_ERR_RATIO = 0.05
 
 # Performance is reported for visibility only; it is not a CI pass/fail gate.
@@ -97,6 +103,19 @@ class Stage2Weights:
     kernel_scale: torch.Tensor
     reference: torch.Tensor
     reference_scale: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class AccuracyLimits:
+    max_abs: float | None = MAX_ABS
+    max_rel_l2: float = MAX_REL_L2
+    max_err_ratio: float = MAX_ERR_RATIO
+
+
+DEFAULT_ACCURACY_LIMITS = AccuracyLimits()
+# MXFP4 is judged by aggregate rel-L2 plus the unchanged element mismatch ratio;
+# an isolated quantization outlier remains reported but is not a separate gate.
+MXFP4_ACCURACY_LIMITS = AccuracyLimits(max_abs=None, max_rel_l2=MAX_MXFP4_REL_L2)
 
 
 @dataclass(slots=True)
@@ -154,10 +173,13 @@ class TestSession:
     group: object
     gfx: str
     runners: dict
+    rs_runners: dict
     weights: Stage2Weights
     graph_replays: int
     stage2_fixtures: dict[tuple[int, str], Stage2Fixture] = field(default_factory=dict)
-    full_fixture: FullMoeFixture | None = None
+    full_fixtures: dict[tuple[int, str, str], FullMoeFixture] = field(
+        default_factory=dict
+    )
 
 
 # Keep distributed state out of the @benchmark signatures so the summary table
@@ -462,8 +484,8 @@ def _torch_stage2_allreduce(
     return output
 
 
-def _run_ordinary_stage2(
-    fixture: Stage2Fixture, weights: Stage2Weights
+def _run_ordinary_stage2_local(
+    fixture: Stage2Fixture, weights: Stage2Weights, *, add_shared: bool
 ) -> torch.Tensor:
     case = fixture.case
     if fixture.requires_output_zero:
@@ -482,8 +504,30 @@ def _run_ordinary_stage2(
         block_m=case.block_m,
         sorted_weights=case.sorted_weights,
     )
-    case.partial_out.add_(fixture.shared_partial)
-    return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
+    if add_shared:
+        case.partial_out.add_(fixture.shared_partial)
+    return case.partial_out
+
+
+def _run_ordinary_stage2(
+    fixture: Stage2Fixture, weights: Stage2Weights
+) -> torch.Tensor:
+    return get_tp_group().all_reduce(
+        _run_ordinary_stage2_local(fixture, weights, add_shared=True),
+        ca_fp8_quant=False,
+    )
+
+
+def _run_ordinary_stage2_reducescatter(
+    fixture: Stage2Fixture,
+    weights: Stage2Weights,
+    shared_partial: torch.Tensor,
+) -> torch.Tensor:
+    output = get_tp_group().reduce_scatter_tensor(
+        _run_ordinary_stage2_local(fixture, weights, add_shared=False)
+    )
+    output.add_(shared_partial)
+    return output
 
 
 def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixture:
@@ -518,8 +562,7 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
     return fixture
 
 
-def _make_full_moe_case(rank: int, device) -> FullMoeCase:
-    tokens = 3
+def _make_full_moe_case(tokens: int, route: str, rank: int, device) -> FullMoeCase:
     generator = torch.Generator(device=device).manual_seed(20260903 + rank)
     hidden_states = torch.randn(
         (tokens, MODEL_DIM),
@@ -527,7 +570,7 @@ def _make_full_moe_case(rank: int, device) -> FullMoeCase:
         device=device,
         generator=generator,
     ).mul_(MODEL_DIM**-0.25)
-    topk_ids, topk_weights = _make_routes(tokens, "skew", device)
+    topk_ids, topk_weights = _make_routes(tokens, route, device)
 
     # Only routed experts are initialized. Both the production kernel and torch
     # reference are forbidden from reading any other expert.
@@ -574,11 +617,9 @@ def _make_full_moe_case(rank: int, device) -> FullMoeCase:
 
 
 @torch.no_grad()
-def _torch_full_moe_allreduce(
+def _torch_full_moe_partial(
     case: FullMoeCase,
     weights: Stage2Weights,
-    shared_partial: torch.Tensor,
-    group,
 ) -> torch.Tensor:
     stage1 = torch_moe_stage1(
         case.hidden_states,
@@ -598,31 +639,55 @@ def _torch_full_moe_allreduce(
         quant_dtype=dtypes.fp8,
         scale_type=dtypes.fp8_e8m0,
     )
-    output = _torch_stage2_partial(
+    return _torch_stage2_partial(
         a2_q,
         a2_scale,
         case.topk_ids,
         case.topk_weights,
         weights,
     )
-    output.add_(shared_partial)
-    dist.all_reduce(output, group=group)
-    return output
 
 
-def _full_moe_fixture(session: TestSession) -> FullMoeFixture:
-    if session.full_fixture is not None:
-        return session.full_fixture
-    case = _make_full_moe_case(session.rank, session.device)
-    shared = _shared_partial(3, session.rank, session.device)
-    reference = _torch_full_moe_allreduce(case, session.weights, shared, session.group)
-    session.full_fixture = FullMoeFixture(
+def _torch_full_moe_collective(
+    case: FullMoeCase,
+    weights: Stage2Weights,
+    shared_partial: torch.Tensor,
+    group,
+    comm: str,
+) -> torch.Tensor:
+    output = _torch_full_moe_partial(case, weights)
+    if comm == "ar":
+        output.add_(shared_partial)
+        dist.all_reduce(output, group=group)
+        return output
+    if comm != "rs":
+        raise ValueError(f"unsupported full-MoE collective {comm!r}")
+    reduced = torch.empty_like(shared_partial)
+    dist.reduce_scatter_tensor(reduced, output, group=group)
+    reduced.add_(shared_partial)
+    return reduced
+
+
+def _full_moe_fixture(
+    session: TestSession, tokens: int, route: str, comm: str
+) -> FullMoeFixture:
+    key = (tokens, route, comm)
+    if key in session.full_fixtures:
+        return session.full_fixtures[key]
+    case = _make_full_moe_case(tokens, route, session.rank, session.device)
+    shared_rows = tokens if comm == "ar" else tokens // session.world
+    shared = _shared_partial(shared_rows, session.rank, session.device)
+    reference = _torch_full_moe_collective(
+        case, session.weights, shared, session.group, comm
+    )
+    fixture = FullMoeFixture(
         case=case,
         shared_partial=shared,
         reference=reference,
         stage2_stream=torch.cuda.Stream(device=session.device),
     )
-    return session.full_fixture
+    session.full_fixtures[key] = fixture
+    return fixture
 
 
 def _accuracy_metrics(
@@ -631,6 +696,7 @@ def _accuracy_metrics(
     *,
     session: TestSession,
     label: str,
+    limits: AccuracyLimits = DEFAULT_ACCURACY_LIMITS,
 ) -> dict[str, float]:
     if actual.shape != expected.shape or actual.dtype != torch.bfloat16:
         raise AssertionError(
@@ -660,7 +726,7 @@ def _accuracy_metrics(
         actual_f32,
         rtol=0.05,
         atol=MAX_ABS,
-        tol_err_ratio=MAX_ERR_RATIO,
+        tol_err_ratio=limits.max_err_ratio,
         msg=f"{label}: ",
         printLog=session.rank == 0,
     )
@@ -674,13 +740,16 @@ def _accuracy_metrics(
     )
     if (
         not int(finite.item())
-        or max_abs > MAX_ABS
-        or rel_l2 > MAX_REL_L2
-        or err_ratio > MAX_ERR_RATIO
+        or (limits.max_abs is not None and max_abs > limits.max_abs)
+        or rel_l2 > limits.max_rel_l2
+        or err_ratio > limits.max_err_ratio
     ):
+        max_abs_limit = "unbounded" if limits.max_abs is None else limits.max_abs
         raise AssertionError(
-            f"{label}: finite={bool(finite.item())} max_abs={max_abs:.6f} "
-            f"rel_l2={rel_l2:.6f} err={err_ratio:.6f}"
+            f"{label}: finite={bool(finite.item())} "
+            f"max_abs={max_abs:.6f}/{max_abs_limit} "
+            f"rel_l2={rel_l2:.6f}/{limits.max_rel_l2:.6f} "
+            f"err={err_ratio:.6f}/{limits.max_err_ratio:.6f}"
         )
     return {"err": err_ratio, "max_abs": max_abs, "rel_l2": rel_l2}
 
@@ -711,6 +780,7 @@ def _measure_candidate(
     mode: str,
     reference: torch.Tensor,
     session: TestSession,
+    accuracy_limits: AccuracyLimits = DEFAULT_ACCURACY_LIMITS,
 ) -> tuple[float, dict[str, float]]:
     if mode == "graph":
         graph, output = _capture_graph(run, session.group)
@@ -749,6 +819,7 @@ def _measure_candidate(
                 reference,
                 session=session,
                 label=f"{name} {mode} replay={replay + 1}",
+                limits=accuracy_limits,
             )
         )
 
@@ -799,6 +870,7 @@ def _record_candidates(
     flops: int,
     nbytes: int,
     session: TestSession,
+    accuracy_limits: dict[str, AccuracyLimits] | None = None,
 ) -> dict[str, float | str]:
     ret: dict[str, float | str] = {"gfx": session.gfx}
     for name, run in candidates.items():
@@ -808,6 +880,7 @@ def _record_candidates(
             mode=mode,
             reference=reference,
             session=session,
+            accuracy_limits=(accuracy_limits or {}).get(name, DEFAULT_ACCURACY_LIMITS),
         )
         ret[f"{name} us"] = latency_us
         ret[f"{name} TFLOPS"] = flops / latency_us / 1.0e6
@@ -818,22 +891,31 @@ def _record_candidates(
     return ret
 
 
+def _comm_fused_accuracy_limits(runner) -> AccuracyLimits:
+    config = runner.config
+    if isinstance(config, WindowConfig) and (
+        config.partial_payload_bits == 4
+        or (config.gather_output and config.reduced_payload_bits == 4)
+    ):
+        return MXFP4_ACCURACY_LIMITS
+    return DEFAULT_ACCURACY_LIMITS
+
+
 def _run_stage2_case(
     session: TestSession, tokens: int, route: str, mode: str
 ) -> dict[str, float | str]:
     fixture = _stage2_fixture(session, tokens, route)
     runner = session.runners[tokens]
-    if getattr(runner.config, "collective", None) != "direct":
-        raise AssertionError(
-            f"M={tokens} expected direct collective, got {runner.config!r}"
-        )
 
     def run_ordinary():
         return _run_ordinary_stage2(fixture, session.weights)
 
     def run_comm_fused():
         case = fixture.case
-        prepared = runner.prepare_shared_partial(fixture.shared_partial)
+        stage2_destination = runner.stage2_destination
+        if fixture.requires_output_zero and stage2_destination is not None:
+            stage2_destination.zero_()
+        prepared_shared = runner.prepare_shared_partial(fixture.shared_partial)
         return runner(
             stage2_args=(
                 case.kernel_inter_states,
@@ -851,7 +933,7 @@ def _run_stage2_case(
                 "block_m": case.block_m,
                 "sorted_weights": case.sorted_weights,
             },
-            shared_partial=prepared,
+            shared_partial=prepared_shared,
             ordinary_stage2=fixture.metadata.stage2,
         )
 
@@ -863,6 +945,7 @@ def _run_stage2_case(
         flops=flops,
         nbytes=nbytes,
         session=session,
+        accuracy_limits={"comm_fused": _comm_fused_accuracy_limits(runner)},
     )
     return {
         "ordinary kernel": fixture.ordinary_kernel,
@@ -872,16 +955,92 @@ def _run_stage2_case(
     }
 
 
+def _run_stage2_rs_case(
+    session: TestSession, tokens: int, route: str, mode: str
+) -> dict[str, float | str]:
+    fixture = _stage2_fixture(session, tokens, route)
+    runner = session.rs_runners[tokens]
+    case = fixture.case
+    local_reference = _torch_stage2_partial(
+        case.inter_states,
+        case.reference_a2_scale,
+        case.topk_ids,
+        case.topk_weights,
+        session.weights,
+    )
+    reference = torch.empty(
+        (tokens // session.world, MODEL_DIM),
+        dtype=local_reference.dtype,
+        device=session.device,
+    )
+    dist.reduce_scatter_tensor(reference, local_reference, group=session.group)
+    shared_partial = _shared_partial(
+        tokens // session.world, session.rank, session.device
+    )
+    reference.add_(shared_partial)
+
+    def run_comm_fused():
+        stage2_destination = runner.stage2_destination
+        if fixture.requires_output_zero and stage2_destination is not None:
+            stage2_destination.zero_()
+        prepared_shared = runner.prepare_shared_partial(shared_partial)
+        return runner(
+            stage2_args=(
+                case.kernel_inter_states,
+                None,
+                session.weights.kernel,
+                case.sorted_token_ids,
+                case.sorted_expert_ids,
+                case.num_valid_ids,
+                case.partial_out,
+                TOPK,
+            ),
+            stage2_kwargs={
+                "w2_scale": session.weights.kernel_scale.view(dtypes.fp8_e8m0),
+                "a2_scale": case.a2_scale,
+                "block_m": case.block_m,
+                "sorted_weights": case.sorted_weights,
+            },
+            shared_partial=prepared_shared,
+            ordinary_stage2=fixture.metadata.stage2,
+        )
+
+    flops, nbytes = _stage2_work(case, session.world)
+    result = _record_candidates(
+        candidates={
+            "ordinary_rs": lambda: _run_ordinary_stage2_reducescatter(
+                fixture, session.weights, shared_partial
+            ),
+            "comm_fused_rs": run_comm_fused,
+        },
+        mode=mode,
+        reference=reference,
+        flops=flops,
+        nbytes=nbytes,
+        session=session,
+        accuracy_limits={"comm_fused_rs": _comm_fused_accuracy_limits(runner)},
+    )
+    return {
+        "ordinary kernel": fixture.ordinary_kernel,
+        "comm_fused_rs kernel": config_name(runner.config),
+        **result,
+    }
+
+
 def _run_full_runtime_case(
     session: TestSession, tokens: int, route: str, mode: str
 ) -> dict[str, float | str]:
-    if tokens != 3 or route != "skew":
-        raise ValueError("the runtime-padding case is fixed to M=3, route=skew")
-    fixture = _full_moe_fixture(session)
+    if tokens not in (3, 64) or route != "skew":
+        raise ValueError("runtime cases are M=3 AR and M=64 RS with route=skew")
+    comm = "ar" if tokens == 3 else "rs"
+    runners = session.runners if comm == "ar" else session.rs_runners
+    fixture = _full_moe_fixture(session, tokens, route, comm)
     case = fixture.case
-    runtime = CommFusedMoeRuntime(runners=session.runners)
+    runtime = CommFusedMoeRuntime(runners=runners)
     if not runtime.supports(tokens):
-        raise AssertionError("M=3 must resolve through the production M=4 runner")
+        raise AssertionError(f"M={tokens} must resolve through a production runner")
+    bucket = int(get_padded_M(tokens))
+    runner = runners[bucket]
 
     moe_args = {
         "hidden_states": case.hidden_states,
@@ -901,13 +1060,24 @@ def _run_full_runtime_case(
 
     def run_ordinary():
         output = fused_moe(**moe_args)
-        output.add_(fixture.shared_partial)
-        return get_tp_group().all_reduce(output, ca_fp8_quant=False)
+        if comm == "ar":
+            output.add_(fixture.shared_partial)
+            return get_tp_group().all_reduce(output, ca_fp8_quant=False)
+        reduced = get_tp_group().reduce_scatter_tensor(output)
+        reduced.add_(fixture.shared_partial)
+        return reduced
+
+    def before_stage2(shared_ready: torch.Tensor | None):
+        # Tests use a device fill as a stand-in. Production shared-expert code
+        # must publish this target in its final epilogue, without another kernel.
+        if shared_ready is not None:
+            shared_ready.fill_(1)
+        return fixture.shared_partial
 
     def run_comm_fused(stage2_stream=None):
         return runtime.run(
             shared_partial=None,
-            before_stage2=lambda: fixture.shared_partial,
+            before_stage2=before_stage2,
             stage2_stream=stage2_stream,
             **moe_args,
         )
@@ -923,18 +1093,23 @@ def _run_full_runtime_case(
             fixture.stage2_stream
         )
 
+    # The M=64 case validates the Direct runtime ABI and output layout against
+    # the exact ordinary production path. Stage2-only tests retain the
+    # independent torch reference and the unchanged MXFP8 accuracy limits.
+    reference = fixture.reference if comm == "ar" else run_ordinary().clone()
     flops, nbytes = _full_moe_work(case, session.world)
     result = _record_candidates(
         candidates=candidates,
         mode=mode,
-        reference=fixture.reference,
+        reference=reference,
         flops=flops,
         nbytes=nbytes,
         session=session,
     )
     return {
         "ordinary kernel": "fused_moe",
-        "comm_fused kernel": config_name(session.runners[4].config),
+        "comm_fused kernel": config_name(runner.config),
+        "collective": comm,
         **result,
     }
 
@@ -947,8 +1122,15 @@ def test_comm_fused_stage2(tokens: int, route: str, mode: str):
 
 
 @benchmark()
+def test_comm_fused_stage2_reducescatter(tokens: int, route: str, mode: str):
+    """Benchmark DPA Stage2 + reduce-scatter against the ordinary path."""
+
+    return _run_stage2_rs_case(_session(), tokens, route, mode)
+
+
+@benchmark()
 def test_comm_fused_runtime(tokens: int, route: str, mode: str):
-    """Benchmark the model-facing M=3 -> M=4 runtime-padding path."""
+    """Benchmark the model-facing padded AR and exact-M Direct RS paths."""
 
     return _run_full_runtime_case(_session(), tokens, route, mode)
 
@@ -964,7 +1146,11 @@ def _parse_args():
         type=int,
         nargs="+",
         default=list(PRODUCTION_TOKENS),
-        help="Production token buckets to test (default: 1 2 4 8 16).",
+        help=(
+            "Production token buckets to test (default: "
+            + " ".join(map(str, PRODUCTION_TOKENS))
+            + ")."
+        ),
     )
     parser.add_argument(
         "-r",
@@ -990,9 +1176,48 @@ def _runtime_skip_reason() -> str | None:
     gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
         return f"requires one of {SUPPORTED_GFX}, got {gfx}"
-    if not is_flydsl_comm_fused_moe_available():
-        return "requires ROCm >= 7.2 and a compatible mori.cco installation"
     return None
+
+
+def _assert_window_coverage(requested_tokens, runners, rs_runners) -> None:
+    """Keep the default multi-GPU CI invocation on both Window collectives."""
+
+    if 4096 not in requested_tokens:
+        return
+
+    if 4096 not in runners:
+        raise AssertionError("M=4096 AR runner is missing")
+    ar = runners[4096]
+    assert isinstance(
+        ar.config, WindowConfig
+    ), f"M=4096 AR must select WindowConfig, got {ar!r}"
+    if not ar.config.gather_output:
+        raise AssertionError(
+            f"M=4096 AR must gather the full output, got {ar.config!r}"
+        )
+    expected_payload_bits = (
+        (8, 8)
+        if os.environ.get("AITER_COMM_FUSED_WINDOW_MXFP8_FALLBACK", "0") == "1"
+        else (4, 4)
+    )
+    actual_payload_bits = (
+        ar.config.partial_payload_bits,
+        ar.config.reduced_payload_bits,
+    )
+    if actual_payload_bits != expected_payload_bits:
+        raise AssertionError(
+            "M=4096 AR payload path mismatch: "
+            f"expected={expected_payload_bits}, got={actual_payload_bits}"
+        )
+
+    if 4096 not in rs_runners:
+        raise AssertionError("M=4096 RS runner is missing")
+    rs = rs_runners[4096]
+    assert isinstance(
+        rs.config, WindowConfig
+    ), f"M=4096 RS must select WindowConfig, got {rs!r}"
+    if rs.config.gather_output:
+        raise AssertionError(f"M=4096 RS must return a shard, got {rs.config!r}")
 
 
 def _log_summary(name: str, rows: list[dict]) -> None:
@@ -1013,16 +1238,14 @@ def main() -> None:
         if int(os.environ.get("LOCAL_RANK", "0")) == 0:
             aiter.logger.warning("comm-fused MoE test skipped: %s", skip_reason)
         return
+    if not is_flydsl_comm_fused_moe_available():
+        raise RuntimeError(
+            "comm-fused MoE on gfx950 requires ROCm >= 7.2 and a compatible "
+            "mori.cco installation"
+        )
 
     requested_tokens = tuple(dict.fromkeys(args.tokens))
     requested_routes = tuple(dict.fromkeys(args.routes))
-    invalid_tokens = sorted(set(requested_tokens).difference(PRODUCTION_TOKENS))
-    if invalid_tokens:
-        raise ValueError(
-            f"unsupported production token buckets: {invalid_tokens}; "
-            f"expected a subset of {list(PRODUCTION_TOKENS)}"
-        )
-
     rank, world, device, group = _setup_distributed(TP_SIZE)
     if rank != 0:
         aiter.logger.setLevel("WARNING")
@@ -1039,14 +1262,49 @@ def main() -> None:
             get_cu_num(),
         )
         configs = winners_for(shape)
-        missing = sorted(set(requested_tokens).difference(configs))
+        rs_shape = ShapeKey(
+            shape.gfx,
+            shape.model_dim,
+            shape.inter_dim,
+            shape.experts,
+            shape.topk,
+            shape.tp,
+            shape.cu_num,
+            add_shared=True,
+            comm="rs",
+        )
+        rs_configs = winners_for(rs_shape)
+        available_tokens = set(configs) | set(rs_configs)
+        missing = sorted(set(requested_tokens).difference(available_tokens))
         if missing:
             raise AssertionError(
                 f"production comm-fused rows are missing: {missing}; "
-                f"available={sorted(configs)}"
+                f"available={sorted(available_tokens)}"
             )
-        if 32 in configs:
+        if 32 in available_tokens:
             raise AssertionError("M=32 fallback unexpectedly created a fused runner")
+
+        runners = create_flydsl_comm_fused_runners(
+            tp_group=get_tp_group(),
+            model_dim=MODEL_DIM,
+            inter_dim=INTER_DIM,
+            experts=EXPERTS,
+            topk=TOPK,
+        )
+        rs_runners = (
+            create_flydsl_comm_fused_runners(
+                tp_group=get_tp_group(),
+                model_dim=MODEL_DIM,
+                inter_dim=INTER_DIM,
+                experts=EXPERTS,
+                topk=TOPK,
+                comm="rs",
+                add_shared=True,
+            )
+            if set(requested_tokens).intersection(rs_configs)
+            else {}
+        )
+        _assert_window_coverage(requested_tokens, runners, rs_runners)
 
         session = TestSession(
             rank=rank,
@@ -1054,13 +1312,8 @@ def main() -> None:
             device=device,
             group=group,
             gfx=shape.gfx,
-            runners=create_flydsl_comm_fused_runners(
-                tp_group=get_tp_group(),
-                model_dim=MODEL_DIM,
-                inter_dim=INTER_DIM,
-                experts=EXPERTS,
-                topk=TOPK,
-            ),
+            runners=runners,
+            rs_runners=rs_runners,
             weights=_make_stage2_weights(rank, device),
             graph_replays=args.graph_replays,
         )
@@ -1068,23 +1321,40 @@ def main() -> None:
 
         stage2_rows = []
         for tokens, route, mode in itertools.product(
-            requested_tokens, requested_routes, MODES
+            (token for token in requested_tokens if token in session.runners),
+            requested_routes,
+            MODES,
         ):
             row = test_comm_fused_stage2(tokens, route, mode)
             if rank == 0:
                 stage2_rows.append(row)
 
+        stage2_rs_rows = []
+        for tokens, route, mode in itertools.product(
+            (token for token in requested_tokens if token in session.rs_runners),
+            requested_routes,
+            MODES,
+        ):
+            row = test_comm_fused_stage2_reducescatter(tokens, route, mode)
+            if rank == 0:
+                stage2_rs_rows.append(row)
+
+        runtime_tokens = [3]
+        if 64 in requested_tokens and 64 in session.rs_runners:
+            runtime_tokens.append(64)
         runtime_rows = []
-        for mode in MODES:
-            row = test_comm_fused_runtime(3, "skew", mode)
+        for tokens, mode in itertools.product(runtime_tokens, MODES):
+            row = test_comm_fused_runtime(tokens, "skew", mode)
             if rank == 0:
                 runtime_rows.append(row)
 
         if rank == 0:
             _log_summary("comm-fused MoE Stage2", stage2_rows)
+            _log_summary("comm-fused MoE Stage2 reduce-scatter", stage2_rs_rows)
             _log_summary("comm-fused MoE runtime padding", runtime_rows)
             print(
                 f"COMM_FUSED_UT_OK stage2_cases={len(stage2_rows)} "
+                f"stage2_rs_cases={len(stage2_rs_rows)} "
                 f"runtime_cases={len(runtime_rows)}",
                 flush=True,
             )

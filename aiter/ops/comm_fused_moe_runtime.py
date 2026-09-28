@@ -9,35 +9,59 @@ from typing import Any
 
 import torch
 
+_BeforeStage2 = Callable[[int], torch.Tensor]
+_BeforeSharedAdd = Callable[[], None]
+
 
 class CommFusedMoeRuntime:
-    """Reuse ordinary MoE through Stage1, then run fused Stage2 + TP AR.
+    """Reuse ordinary MoE through Stage1, then run fused Stage2 + TP collective.
 
-    Each prepared runner owns one exact token bucket and returns the complete
-    replicated ``[M, H]`` output.
+    Each prepared runner owns one padded token bucket. Runners with
+    ``add_shared=True`` add a shared partial before TP reduction; the others
+    return only the routed result in their declared output layout.
+
+    Each runner owns its input-to-output row layout. Replicated collectives map
+    one input row to one output row, while sharded collectives may return only
+    a proportional subset. The runtime only consumes that layout contract and
+    does not need to identify the runner's collective implementation.
     """
 
-    def __init__(
-        self,
-        *,
-        runners: dict[int, Callable],
-    ) -> None:
+    def __init__(self, *, runners) -> None:
         self.runners = runners
 
     def supports(self, tokens: int) -> bool:
         from aiter.fused_moe import get_padded_M
 
-        return int(get_padded_M(tokens)) in self.runners
+        bucket = int(get_padded_M(tokens))
+        if bucket not in self.runners:
+            return False
+        try:
+            self.runners.output_rows_for(bucket, tokens)
+        except ValueError:
+            return False
+        return True
+
+    def supports_ragged_m(self, _tokens: int) -> bool:
+        """Current runners require rank-major DPA padding before all-gather."""
+
+        return False
 
     def run(
         self,
         *,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[], torch.Tensor] | None = None,
+        before_stage2: _BeforeStage2 | None = None,
+        before_shared_add: _BeforeSharedAdd | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
         **moe_args: Any,
     ) -> torch.Tensor:
-        """Run ordinary MoE through Stage1 and fuse the complete Stage2 result."""
+        """Run ordinary MoE through Stage1 and fuse Stage2 with TP reduction.
+
+        ``before_stage2`` receives the runner's required shared-output row count
+        so an asynchronous producer can perform any padding on its own stream.
+        ``before_shared_add`` joins that producer only when the selected runner
+        first consumes the shared output; no standalone ready kernel is used.
+        """
 
         from aiter.fused_moe import _fused_moe_impl, get_padded_M
 
@@ -47,7 +71,15 @@ class CommFusedMoeRuntime:
         if bucket < raw_tokens:
             raise KeyError(f"no comm_fused bucket for {raw_tokens} tokens")
         runner = self.runners[bucket]
-
+        output_rows = self.runners.output_rows_for(bucket, raw_tokens)
+        stage2_destination = runner.stage2_destination
+        final_output = None
+        if stage2_destination is not None:
+            if moe_args.get("output") is not None:
+                raise RuntimeError(
+                    "comm-fused Stage2 output is incompatible with output="
+                )
+            moe_args["output"] = stage2_destination
         if bucket != raw_tokens:
             topk_weight = moe_args["topk_weight"]
             topk_ids = moe_args["topk_ids"]
@@ -63,20 +95,33 @@ class CommFusedMoeRuntime:
 
         def stage2_override(**kwargs: Any):
             def launch():
+                nonlocal final_output
                 current_shared = shared_partial
                 if before_stage2 is not None:
-                    current_shared = before_stage2()
-                if current_shared is None:
+                    current_shared = before_stage2(runner.config.output_rows)
+                add_shared = runner.config.shape.add_shared
+                if add_shared and current_shared is None:
                     raise RuntimeError("comm-fused Stage2 requires shared_partial")
-                if bucket != raw_tokens:
-                    padded_shared = runner.output
-                    padded_shared[:raw_tokens].copy_(current_shared)
-                    padded_shared[raw_tokens:].zero_()
-                    current_shared = padded_shared
-                prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
-                if prepare_shared_partial is not None:
-                    current_shared = prepare_shared_partial(current_shared)
-                return runner(shared_partial=current_shared, **kwargs)
+                if (
+                    add_shared
+                    and bucket != raw_tokens
+                    and current_shared.shape[0] != runner.config.output_rows
+                ):
+                    current_shared = runner.prepare_padded_shared_partial(
+                        current_shared, raw_tokens
+                    )
+                if add_shared:
+                    current_shared = runner.prepare_shared_partial(current_shared)
+                final_output = runner(
+                    shared_partial=current_shared,
+                    before_shared_add=before_shared_add,
+                    **kwargs,
+                )
+                return (
+                    stage2_destination
+                    if stage2_destination is not None
+                    else final_output
+                )
 
             if stage2_stream is None:
                 return launch()
@@ -93,7 +138,9 @@ class CommFusedMoeRuntime:
             **moe_args,
             _stage2_override=stage2_override,
         )
-        return output if raw_tokens == bucket else output[:raw_tokens]
+        if final_output is not None:
+            output = final_output
+        return output if output_rows == output.shape[0] else output[:output_rows]
 
 
 __all__ = ["CommFusedMoeRuntime"]

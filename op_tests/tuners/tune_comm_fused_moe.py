@@ -36,10 +36,11 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.comm_fused_moe_host import (
     ShapeKey,
     config_name,
+    config_record,
     create_runner,
 )
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
-    AtomicConfig,
+    DirectConfig,
     MegakernelConfig,
     PipelineConfig,
     Shape,
@@ -295,6 +296,20 @@ def _run_ordinary_stage2_allreduce(
     return get_tp_group().all_reduce(partial, ca_fp8_quant=False)
 
 
+def _run_ordinary_stage2_reducescatter(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    partial = _run_ordinary_stage2_local(
+        case,
+        metadata,
+        requires_output_zero=requires_output_zero,
+    )
+    output = get_tp_group().reduce_scatter_tensor(partial)
+    if shared_partial is not None:
+        output.add_(shared_partial)
+    return output
+
+
 _BASE_KEY_FIELDS = (
     "gfx",
     "cu_num",
@@ -315,8 +330,9 @@ _WINNER_KEY_FIELDS = (
     *_BASE_KEY_FIELDS,
     "comm_tp",
     "comm_add_shared",
+    "comm_mode",
 )
-_COMM_MODES = ("ar",)
+_COMM_MODES = ("ar", "rs")
 _COMM_CONFIGS_FIELD = "comm_fused_configs"
 PROFILE_FIELDS = (
     *_WINNER_KEY_FIELDS,
@@ -420,16 +436,20 @@ def benchmark(
     runner = create_runner(tp_group, config)
     runner.output.fill_(float("nan"))
     candidate_shared = shared_partial.clone() if shared_partial is not None else None
-    prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
 
     def run():
-        current_shared = candidate_shared
-        if current_shared is not None and prepare_shared_partial is not None:
-            current_shared = prepare_shared_partial(current_shared)
+        stage2_destination = runner.stage2_destination
+        if stage2_destination is not None:
+            stage2_destination.zero_()
+        prepared_shared = (
+            None
+            if candidate_shared is None
+            else runner.prepare_shared_partial(candidate_shared)
+        )
         return runner(
             stage2_args=stage2_args,
             stage2_kwargs=stage2_kwargs,
-            shared_partial=current_shared,
+            shared_partial=prepared_shared,
             ordinary_stage2=ordinary_stage2,
         )
 
@@ -473,7 +493,7 @@ def benchmark(
 
 
 _CONFIG_TYPES = {
-    "atomic": AtomicConfig,
+    "direct": DirectConfig,
     "mega": MegakernelConfig,
     "window": WindowConfig,
 }
@@ -590,6 +610,7 @@ def _winner_key(shape: ShapeKey, token: int) -> dict:
         "doweight_stage1": shape.doweight_stage1,
         "comm_add_shared": int(shape.add_shared),
         "comm_tp": shape.tp,
+        "comm_mode": shape.comm,
     }
 
 
@@ -606,17 +627,17 @@ def _check_matching_block_m(row: dict, winner: dict, base_key) -> None:
         )
 
 
-def _comm_config(mode, tp, add_shared, kernel_name, latency):
+def _comm_config(mode, tp, add_shared, config, latency):
     if mode not in _COMM_MODES:
         raise ValueError(f"unsupported comm mode {mode!r}")
-    config = {
+    record = {
         "tp": int(tp),
         "add_shared": bool(int(add_shared)),
-        "kernel": str(kernel_name),
+        **config_record(config),
     }
     if latency not in (None, ""):
-        config["us"] = float(latency)
-    return config
+        record["us"] = float(latency)
+    return record
 
 
 def _comm_configs(row: dict) -> dict:
@@ -646,7 +667,7 @@ def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
     config = result.config
     block_m = getattr(config, "sort_block_m", result.block_m)
     if block_m is None:
-        raise ValueError("block_m is required for an atomic pipeline winner")
+        raise ValueError("block_m is required for a comm-fused pipeline winner")
     if result.block_m is not None and int(result.block_m) != int(block_m):
         raise ValueError(
             f"tuned block_m={result.block_m} does not match "
@@ -663,7 +684,7 @@ def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
     return {field: row.get(field, "") for field in PROFILE_FIELDS}
 
 
-def write_winner(path, row: dict) -> None:
+def write_winner(path, row: dict, config: PipelineConfig) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -681,12 +702,13 @@ def write_winner(path, row: dict) -> None:
     output_row = _find_output_row(rows, base_key)
     if output_row.get("block_m") not in (None, ""):
         _check_matching_block_m(output_row, row, base_key)
+    mode = row["comm_mode"]
     configs = _comm_configs(output_row)
-    configs["ar"] = _comm_config(
-        "ar",
+    configs[mode] = _comm_config(
+        mode,
         row["comm_tp"],
         row["comm_add_shared"],
-        row["comm_kernel_name"],
+        config,
         row["comm_stage2_tp_us"],
     )
     output_row[_COMM_CONFIGS_FIELD] = json.dumps(
@@ -716,7 +738,7 @@ def remove_winner(path, shape: ShapeKey, token: int) -> None:
     if matching:
         output_row = _find_output_row(rows, base_key)
         configs = _comm_configs(output_row)
-        if configs.pop("ar", None) is None:
+        if configs.pop(shape.comm, None) is None:
             return
         output_row[_COMM_CONFIGS_FIELD] = (
             json.dumps(configs, separators=(",", ":"), sort_keys=True)
@@ -739,6 +761,12 @@ def _parse_args():
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument(
+        "--comm-mode",
+        choices=("ar", "rs"),
+        default="ar",
+        help="Tune Stage2 + AllReduce or DPA Stage2 + ReduceScatter.",
+    )
     parser.add_argument(
         "--add-shared",
         type=int,
@@ -792,8 +820,11 @@ def main():
         )
         shared = None
         if args.add_shared:
+            shared_rows = (
+                args.token // args.tp if args.comm_mode == "rs" else args.token
+            )
             shared = (
-                torch.arange(args.token, device=device, dtype=torch.float32)
+                torch.arange(shared_rows, device=device, dtype=torch.float32)
                 .remainder(7)
                 .mul_(1.0 / 32.0)
                 .view(-1, 1)
@@ -803,7 +834,12 @@ def main():
                 .view(1, -1)
                 + float(rank + 1) / 16.0
             ).to(torch.bfloat16)
-        reference = _run_ordinary_stage2_allreduce(
+        run_ordinary_collective = (
+            _run_ordinary_stage2_allreduce
+            if args.comm_mode == "ar"
+            else _run_ordinary_stage2_reducescatter
+        )
+        reference = run_ordinary_collective(
             case,
             metadata,
             requires_output_zero=requires_zero,
@@ -811,7 +847,7 @@ def main():
         ).clone()
 
         def run_ordinary():
-            return _run_ordinary_stage2_allreduce(
+            return run_ordinary_collective(
                 case,
                 metadata,
                 requires_output_zero=requires_zero,
@@ -843,6 +879,7 @@ def main():
             args.tp,
             get_cu_num(),
             add_shared=bool(args.add_shared),
+            comm=args.comm_mode,
         )
         current = production_config(shape, args.token, args.family)
         candidates = candidate_configs(
@@ -852,18 +889,22 @@ def main():
             shape=shape.kernel_shape(),
             m=args.token,
         )
+        candidates = [
+            (
+                dataclasses.replace(config, gather_output=args.comm_mode == "ar")
+                if isinstance(config, WindowConfig)
+                else config
+            )
+            for config in candidates
+        ]
         if sorted_inter:
             candidates = [
-                (
-                    config
-                    if isinstance(config, AtomicConfig)
-                    else dataclasses.replace(config, sorted_input=True)
-                )
-                for config in candidates
+                dataclasses.replace(config, sorted_input=True) for config in candidates
             ]
         if rank == 0:
             print(
                 f"COMM_FUSED_TUNE_START M={args.token} route={args.route} "
+                f"comm={args.comm_mode} "
                 f"family={args.family} candidates={len(candidates)}",
                 flush=True,
             )
@@ -932,7 +973,7 @@ def main():
             else:
                 winner_data = winner_row(shape, winner)
                 if args.winner_output is not None:
-                    write_winner(args.winner_output, winner_data)
+                    write_winner(args.winner_output, winner_data, winner.config)
                 print(
                     f"COMM_FUSED_TUNE_WINNER us={winner.latency_us:.4f} "
                     f"ordinary_us={ordinary_us:.4f} "
