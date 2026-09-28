@@ -1,0 +1,38 @@
+{
+  "fused": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 8
+  },
+  "t_gt1_seq_heads_geq_3072": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 4
+  },
+  "t_gt1_seq_heads_geq_384": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 4
+  },
+  "t1_seq_heads_256_to_512": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 4
+  },
+  "t_gt1_default": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 4
+  },
+  "default": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 4
+  }
+}
