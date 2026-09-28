@@ -141,6 +141,12 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
 )
+# E8M0 block-scale GEMM rows (1x32/32x32 and 1x128/128x128) for (16, 16)-
+# preshuffled weights, keyed on the w_scale block as well.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv",
+)
 
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
@@ -185,8 +191,9 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
 # fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
 # (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
 # future fp32 rowwise-scale variant lands in a separate CSV and never collides
-# on key. The scale type is identified by the filename alone. The
-# per-model tuned data currently lives under model_configs/ (e.g.
+# on key. Within the family the e8m0 weight-scale block (32x32, 128x128, 1x32
+# or 1x128) is the w_scale_block key column. The per-model tuned data
+# currently lives under model_configs/ (e.g.
 # dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
 # get_config_file; this canonical path may not exist on disk.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
@@ -299,6 +306,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
             "a8w8_blockscale_group32_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
         )
 
     @property
