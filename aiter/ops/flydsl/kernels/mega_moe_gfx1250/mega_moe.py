@@ -908,25 +908,34 @@ class MegaMoEGfx1250:
         bound = inferred if recv_token_bound is None else int(recv_token_bound)
         return max(1, min(bound, int(self._config.max_recv)))
 
-    def _compact_plan_for(self, align_m: int, slot: int | None = None):
+    def _compact_plan_for(
+        self, align_m: int, slot: int | None = None, token_count: int | None = None
+    ):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
         Compiled per alignment and hist/done slot, because the plan and the
         expert GEMM must agree on the tile, and double-buffered plans must not
-        share a done counter.
+        share a done counter; and per workgroup count, which follows this
+        call's route count.
         """
-        from .compact_plan import compile_tdm_compact_plan
+        from .compact_plan import compact_plan_blocks, compile_tdm_compact_plan
 
         align_m = int(align_m)
         slot = int(self._compact_slot if slot is None else slot)
-        key = (align_m, slot)
+        tok = (
+            int(self._config.max_tokens_per_rank)
+            if token_count is None
+            else int(token_count)
+        )
+        blocks = compact_plan_blocks(tok * int(self._config.topk))
+        key = (align_m, slot, blocks)
         launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    f"compact plan for align_m={align_m} slot={slot} was not "
-                    "compiled before graph capture; warm this token bucket "
-                    "eagerly first"
+                    f"compact plan for align_m={align_m} slot={slot} "
+                    f"blocks={blocks} was not compiled before graph capture; "
+                    "warm this token bucket eagerly first"
                 )
             hist0 = self._arena.offset("compact_hist")
             done0 = self._arena.offset("compact_done")
@@ -944,6 +953,7 @@ class MegaMoEGfx1250:
                 hist_stride=self._compact_hist_stride,
                 max_routes=self._compact_max_routes,
                 hist_pingpong=False,
+                plan_blocks=blocks,
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -970,7 +980,7 @@ class MegaMoEGfx1250:
         )
         self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
         for slot in range(self._COMPACT_PLAN_SLOTS):
-            self._compact_plan_for(self._compact_step_align_m, slot)
+            self._compact_plan_for(self._compact_step_align_m, slot, tok)
 
     def prefetch_compact_plan(
         self,
@@ -1023,7 +1033,7 @@ class MegaMoEGfx1250:
         plan_stream = self._compact_plan_stream
         plan_stream.wait_stream(cur)
         with torch.cuda.stream(plan_stream):
-            self._compact_plan_for(self._compact_step_align_m, slot)(
+            self._compact_plan_for(self._compact_step_align_m, slot, token_count)(
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 bufs["tok_map"].data_ptr(),
@@ -1115,9 +1125,9 @@ class MegaMoEGfx1250:
             else config.dispatch_token_nbytes
         )
         from .compact_plan import (
-            PLAN_BLOCKS,
             compact_done_nbytes,
             compact_hist_stride,
+            compact_plan_blocks,
         )
 
         segs = config.world_size * config.experts_per_rank
@@ -1203,8 +1213,9 @@ class MegaMoEGfx1250:
                 torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
+            plan_blocks = compact_plan_blocks(max_routes)
             self._block_hists = [
-                torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
+                torch.empty(plan_blocks * segs, dtype=torch.int32, device=device)
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
             self._send_bases = [
