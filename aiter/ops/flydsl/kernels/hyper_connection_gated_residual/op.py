@@ -6,13 +6,7 @@
 The shipped, fully-fused two-stage kernel: ``K1`` = combine + grouped-RMSNorm +
 down GEMM (:func:`~.k1.flydsl_k1_combine_norm_down`), ``K2`` = silu + up GEMM +
 gated mean (:func:`~.k2.flydsl_up_gate_mix_norm`), with ``xn`` re-formed from the
-stored ``r2`` inside K2 so it never touches HBM. Collapses today's 5 launches to
-2 (modulo K1's split-K/decouple reduce).
-
-Three ticket entry points -- ``combine`` (write-only ``R2``), ``mix`` (no pending
-combine), and ``combine_and_mix`` -- all backed by the fused path. Only the fused
-two-stage ships here; the earlier composed / interim fused-K1 variants are not
-part of this package.
+stored ``r2`` inside K2 so it never touches HBM.
 """
 
 from __future__ import annotations

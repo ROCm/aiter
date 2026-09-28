@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Do NOT add `from __future__ import annotations`: PEP 563 stringifies the
-# annotations and defeats flydsl's runtime-arg detection in the JIT cache key.
-
 """Fused up-projection + gated-mean for the Gated-Residual mix.
 
 This is the memory-heavy tail of ``combine_and_mix``. The shipped path runs the
