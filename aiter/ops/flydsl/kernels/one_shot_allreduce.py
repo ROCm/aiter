@@ -78,15 +78,14 @@ DEFAULT_GRID_CAP = 64
 #                               to hold the tile narrow.
 #          block 256, atoms=4, cap 128 -- above 96 KiB the trade reverses and
 #                               the wider cap matters, because this window runs
-#                               to 1.5 MiB: at a 16 KiB tile that is 96 tiles,
-#                               so a cap of 64 would leave half the blocks
-#                               running two serialized handshake rounds.
+#                               to 64 MiB in exact mode: a cap of 64 would leave
+#                               half the blocks running twice the serialized
+#                               handshake rounds.
 #     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB,
 #                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
-#     TP8  block 256, atoms=4, cap 64 -- the fattest tile, one rung over the
-#                               whole 80 KiB window: the fanout is to 7 peers
-#                               and cutting the flag count matters more than
-#                               the handful of blocks lost.
+#     TP8  block 512, atoms=1/2 -- the 8 KiB tile to 16 KiB, then the 16 KiB
+#                               tile over the rest of the 80 KiB window. The
+#                               wide workgroup wins at every size.
 #
 #   TODO: xGMI needs to re-measured to see if self-skip is beneficial also here.
 #   xGMI
@@ -105,7 +104,10 @@ ONESHOT_LADDER = {
         (48 << 10, 2, 64, "atom", 256, True),
         (96 << 10, 4, 128, "peer", 256, True),
     ),
-    ("pcie", 8): ((0, 4, 64, "peer", 256, True),),
+    ("pcie", 8): (
+        (0, 1, 64, "peer", 512, True),
+        (16 << 10, 2, 64, "peer", 512, True),
+    ),
     ("xgmi", 2): ((0, 2, 64, "peer", 256, False),),
     ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
     ("xgmi", 8): ((0, 1, 64, "peer", 256, False),),

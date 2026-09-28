@@ -103,13 +103,12 @@ _RING_DEFAULT = {
     8: ((0, 16, 128, BLOCK, False), (48 << 20, 32, 128, BLOCK, False)),
 }
 
-# TODO: Run tuning for TP=8
 # ``(min_bytes, super_tile, grid_cap, block, skip_self)``
 RING_ST_LADDER = {
     **{("xgmi", ws): rungs for ws, rungs in _RING_DEFAULT.items()},
     ("pcie", 2): ((0, 16, 128, 512, False),),
     ("pcie", 4): ((0, 32, 128, 512, False),),
-    ("pcie", 8): _RING_DEFAULT[8],
+    ("pcie", 8): ((0, 32, 128, 512, False),),
 }
 
 
