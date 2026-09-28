@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Shared helpers for the FlyDSL HSTU attention forward and backward kernels.
+
+Two kinds of helpers live here so there is a single source of truth across the
+forward, the KV-owned (dV/dK) backward, and the Q-owned (dQ) backward kernels:
+
+* Host-side geometry constants and small host helpers (dtype mapping, per-arch
+  DMA/swizzle parameters, LDS capacity) shared by all HSTU kernel builders.
+* FlyDSL-expression indexing idioms (thread-coordinate decomposition, jagged
+  loaders, LDS column swizzle). These build FlyDSL expressions and must be
+  called from inside a @flyc.kernel body.
+"""
+
+from __future__ import annotations
+
+import functools
+import math as host_math
+
+import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import arith
+from flydsl.expr.typing import Vector as Vec
+from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+_LOG2E = host_math.log2(host_math.e)
+
+
+# ---- Kernel geometry constants (shared by forward and backward) ----
+
+WARP_SIZE = 64
+# grid decoded group-major for locality
+NUM_GRID_GROUPS = 8
+MFMA_M = 16
+MFMA_N = 16
+# Register-resident score/dS fragments feed the sequence-axis GEMMs directly.
+# Their accumulator layout is also the operand layout of a 16-deep MFMA, so
+# keep those chained GEMMs at K=16 on both architectures.
+MFMA_K = 16
+MFMA_LANE_K = 4
+MFMA_LANE_K_LOG2 = 2
+assert (1 << MFMA_LANE_K_LOG2) == MFMA_LANE_K
+# The accumulator layout is independent of the instruction's contraction depth:
+# both 16x16x16 and 16x16x32 produce four fp32 values per wave64 lane.
+MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE
+
+
+def _arch_mfma_params(arch: str | None = None):
+    """Return dimension-axis ``(mfma_k, operand_elems_per_lane, log2_operand_elems)``.
+
+    CDNA3 uses the native 16x16x16 f16/bf16 instruction. CDNA4 doubles the
+    contraction depth for QK and VdO with 16x16x32, so each lane supplies eight
+    operand elements while the four-element accumulator fragment remains
+    unchanged. Sequence-axis GEMMs retain the fixed constants above because
+    their inputs are reused accumulator fragments.
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    mfma_k = 16 if (arch or "").startswith("gfx942") else 32
+    lane_k = (MFMA_M * mfma_k) // WARP_SIZE
+    lane_k_log2 = int(host_math.log2(lane_k))
+    assert (1 << lane_k_log2) == lane_k
+    return mfma_k, lane_k, lane_k_log2
+
+
+def _mfma_params_for_dim(dim: int, arch: str | None = None):
+    """Use the preferred architecture MFMA depth when ``dim`` supports it."""
+    preferred = _arch_mfma_params(arch)
+    if dim % preferred[0] == 0:
+        return preferred
+    return MFMA_K, MFMA_LANE_K, MFMA_LANE_K_LOG2
+
+
+def _dtype_to_elem_type(dtype_str: str):
+    if dtype_str == "f16":
+        return fx.Float16
+    if dtype_str == "bf16":
+        return fx.BFloat16
+    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
+
+
+def _arch_dma_params(arch: str | None = None):
+    """K-staging params (DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT).
+
+    K columns are XOR-swizzled off LDS banks: swizzled_col = col ^ ((row & (ROWS-1)) << SHIFT).
+    gfx942: 32 banks -> dword DMA -> (16, 2); gfx950: 64 banks -> dwordx4 DMA -> (8, 3).
+    Both tile a 64-element block and the mask maxes < 64, so the XOR stays in-row (HEAD_DIM_K % 64 == 0).
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    if (arch or "").startswith("gfx942"):
+        dma_bytes, k_swz_rows, k_swz_shift = 4, 16, 2
+    else:
+        dma_bytes, k_swz_rows, k_swz_shift = 16, 8, 3
+    return dma_bytes, dma_bytes // 2, k_swz_rows, k_swz_shift
+
+
+@functools.lru_cache(maxsize=16384)
+def lds_cap_bytes(arch: str | None = None) -> int:
+    if arch is None:
+        arch = get_rocm_arch()
+    return get_lds_capacity_bytes(arch)
+
+
+def exp2_f32(x):
+    """Base-2 exponential of an fp32 lane via the raw ``llvm.amdgcn.exp2.f32``
+    intrinsic (lowers to ``v_exp_f32``).
+
+    Shared by the forward SiLU gate and both backward SiLU/derivative gates. The
+    raw intrinsic is used on purpose rather than the stable ``fx.math.exp2``,
+    which does not reach ``v_exp_f32`` performance even under a fastmath context.
+    Callers supply their own ``arith.fastmath`` / compile-hint scope.
+    """
+    return fx.Float32(
+        llvm.call_intrinsic(
+            fx.Float32.ir_type, "llvm.amdgcn.exp2.f32", [x.ir_value()], [], []
+        )
+    )
+
+
+def make_mfma_acc(mfma_k: int, lane_k: int, elem_dtype, c_rmem):
+    """Build one ``acc(a_pack, b_pack, c) -> c'`` for an MFMA of depth ``mfma_k``.
+
+    Must be called from inside a ``@flyc.kernel`` body: it allocates the atom and
+    the A/B register fragments. Callers share ``c_rmem`` (always the 4-wide C
+    fragment). Equal ``(mfma_k, lane_k)`` pairs should reuse the same acc so
+    gfx942 keeps a single 16x16x16 atom instead of three identical ones.
+    """
+    atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, mfma_k, elem_dtype))
+    a_rmem = fx.make_rmem_tensor(lane_k, elem_dtype)
+    b_rmem = fx.make_rmem_tensor(lane_k, elem_dtype)
+
+    def acc(a_pack, b_pack, c):
+        a_rmem.store(Vec(a_pack))
+        b_rmem.store(Vec(b_pack))
+        c_rmem.store(Vec(c))
+        fx.mma_atom_call(atom, c_rmem, a_rmem, b_rmem, c_rmem)
+        return c_rmem.load().ir_value()
+
+    return acc
+
+
+def bind_mfma_accs(elem_dtype, *shapes):
+    """Return one acc per ``(mfma_k, lane_k)``, reusing atoms for equal shapes."""
+    c_rmem = fx.make_rmem_tensor(MFMA_ELEMS_PER_LANE, fx.Float32)
+    cache = {}
+    accs = []
+    for mfma_k, lane_k in shapes:
+        key = (mfma_k, lane_k)
+        if key not in cache:
+            cache[key] = make_mfma_acc(mfma_k, lane_k, elem_dtype, c_rmem)
+        accs.append(cache[key])
+    return accs
+
+
+def pack_mfma_frag(vals, is_bf16: bool, elem_dtype):
+    """Pack 4 fp32 lane values into an MFMA operand fragment of ``elem_dtype``.
+
+    bf16: each fp32 is truncated to its high 16 bits and two are packed into one
+    i32 (low/high halves), then the i32 pair is bitcast to the bf16 vector. f16:
+    a straight per-element convert. Shared by the dV/dK and dQ backward kernels.
+    """
+    if is_bf16:
+        c16 = fx.Int32(16)
+        cmask = fx.Int32(0xFFFF0000)
+
+        def bf16_pair(lo_f32, hi_f32):
+            lo_i32 = fx.Float32(lo_f32).bitcast(fx.Int32)
+            hi_i32 = fx.Float32(hi_f32).bitcast(fx.Int32)
+            return (hi_i32 & cmask) | fx.Int32(arith.shrui(lo_i32, c16))
+
+        pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
+        return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+    elems = [fx.Float32(v).to(elem_dtype) for v in vals]
+    return Vec.from_elements(elems, elem_dtype).ir_value()
+
+
+def decode_lane(tid, num_waves: int, warp_size: int, mfma_n: int):
+    """Decompose a flat thread id into (wave_id, lane, lane_div_n, lane_mod_n).
+
+    Uses layout algebra: tid indexes a (num_waves, warp_size) layout to split
+    wave/lane, and the lane indexes a (warp_size/mfma_n, mfma_n) layout to split
+    the MFMA lane coordinate. Equivalent to tid//warp_size, tid%warp_size,
+    lane//mfma_n, lane%mfma_n, expressed as coordinate maps.
+    """
+    # get_/get_scalar yield a single coordinate mode; cast back to Int32 to match
+    # the kernels' i32 address arithmetic.
+    wave_lane = fx.idx2crd(tid, fx.make_layout((num_waves, warp_size), (warp_size, 1)))
+    wave_id = fx.Int32(fx.get_scalar(fx.get_(wave_lane, 0)))
+    lane = fx.Int32(fx.get_scalar(fx.get_(wave_lane, 1)))
+
+    lane_split = fx.idx2crd(
+        lane, fx.make_layout((warp_size // mfma_n, mfma_n), (mfma_n, 1))
+    )
+    lane_div_n = fx.Int32(fx.get_scalar(fx.get_(lane_split, 0)))
+    lane_mod_n = fx.Int32(fx.get_scalar(fx.get_(lane_split, 1)))
+    return wave_id, lane, lane_div_n, lane_mod_n
+
+
+def grouped_loader(t, dim: int, g: int):
+    """Return a loader that reads a contiguous g-wide vector from a jagged 3D
+    tensor t[row, head, :], grouping the trailing dim into (dim/g, g) via a
+    layout so the group index selects the vector.
+    """
+    in_row = fx.make_layout((dim // g, g), (g, 1))
+
+    def load(row_i64, head_val, colgrp):
+        sub = t[row_i64, head_val, None]
+        return fx.make_view(fx.get_iter(sub), in_row)[colgrp, None].load()
+
+    return load
+
+
+def swz_col(tile_row, col, swz_rows: int, swz_shift: int):
+    """XOR swizzle of an LDS column by the tile row (period swz_rows, shift
+    swz_shift), matching the forward kernel's K-swizzle. Shared by the streamed
+    Q (dV/dK kernel) and streamed K (dQ kernel) LDS tiles.
+    """
+    return col ^ ((tile_row & fx.Int32(swz_rows - 1)) << fx.Int32(swz_shift))
+
+
+def make_lds_dma(dma_bytes: int, elem_type):
+    """Build the global->LDS ``buffer_load_lds`` machinery shared by the backward
+    kernels' streamed loads (dV/dK streams Q/dO, dQ streams K).
+
+    Returns ``(dma_atom, lds_ptr_ty, rebased_buffer_div)``:
+
+    * ``dma_atom`` drives ``buffer_load_lds`` through the FlyDSL copy-atom API.
+      The atom hardcodes the cache-policy/aux operand to 0 (drops the raw path's
+      aux=1).
+    * ``lds_ptr_ty`` is the ``dma_bytes``-aligned LDS pointer type.
+    * ``rebased_buffer_div(base_iter, byte_off, n_elems)`` folds the (large)
+      seq/head byte base into the 48-bit descriptor base so the per-lane element
+      index stays a small 32-bit voffset; ``max_size`` records ``n_elems``.
+    """
+    dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(dma_bytes * 8), dma_bytes * 8)
+    lds_ptr_ty = fx.PointerType.get(elem_type, 2, dma_bytes)
+
+    def rebased_buffer_div(base_iter, byte_off, n_elems):
+        base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+        shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
+        buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
+        return fx.logical_divide(
+            fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
+            fx.make_layout(1, 1),
+        )
+
+    return dma_atom, lds_ptr_ty, rebased_buffer_div

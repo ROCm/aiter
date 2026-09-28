@@ -53,6 +53,21 @@ DEFAULT_SHAPES = (
 )
 
 
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
+
+
 def _make_inputs(m: int, hidden_size: int, rank: int, device: torch.device):
     torch.manual_seed(20260617)
     hc_mult = 4
@@ -301,6 +316,7 @@ def _profile_worker(
             iters=BENCH_ITERS,
         )
 
+    barrier_before_teardown()
     destroy_model_parallel()
     destroy_distributed_environment()
 
