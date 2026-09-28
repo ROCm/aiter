@@ -19,7 +19,7 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
 
 
 def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:
-    """Whether this backend can honor the call (otherwise retain the CK path)."""
+    """Whether this backend can honor the call; tuned dispatch asserts this."""
     if XQ.ndim != 2 or WQ.ndim != 2 or Out.ndim != 2:
         return False
     M, K = XQ.shape
