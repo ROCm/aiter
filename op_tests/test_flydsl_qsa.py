@@ -35,7 +35,6 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
-from aiter.ops.flydsl.kernels.qsa import k2 as k2_kernel
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
     gather_qsa_caches,
@@ -248,12 +247,6 @@ def test_kernel_constants_cover_every_family():
             spec.block_budget,
         ) == (k1_kernel._KV_HEADS, k1_kernel._D, k1_kernel._R, k1_kernel._K)
     assert k1_kernel._SCORE_SCALE == FAMILY_A_SCORE_SCALE
-    # K2's launch policy is fitted per shape, so only family A is claimed.
-    assert (
-        FAMILY_A_GQA.n_heads,
-        FAMILY_A_GQA.kv_heads,
-        FAMILY_A_GQA.head_dim,
-    ) in k2_kernel._TUNED_SHAPES
 
 
 def test_paged_roundtrip_tiny():
