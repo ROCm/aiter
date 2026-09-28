@@ -7,7 +7,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 8
     },
@@ -19,7 +18,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 8
     },
@@ -31,7 +29,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 8
     },
@@ -43,7 +40,6 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 8
     },
@@ -55,7 +51,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 8
     },
@@ -67,7 +62,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 8
     },
@@ -79,7 +73,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 8,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 4
     },
@@ -91,7 +84,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     },
@@ -103,7 +95,6 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     },
@@ -115,7 +106,6 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     },
@@ -127,7 +117,6 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     },
@@ -139,7 +128,6 @@
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 8,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     },
@@ -151,7 +139,6 @@
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 8,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     },
@@ -163,7 +150,6 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
     }
