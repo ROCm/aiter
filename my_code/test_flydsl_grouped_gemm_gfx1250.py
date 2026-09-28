@@ -1307,11 +1307,11 @@ def _run_grouped_via_fused_moe(
             stage_capture["gemm1_grouped_out"],
             stage_capture["topids_to_rows"],
         )
-        gemm2_output_hash128 = _tensor_hash128(
-            stage_capture["gemm2_grouped_out"]
-        )
+        gemm2_output_hash128 = _tensor_hash128(stage_capture["gemm2_grouped_out"])
     except KeyError as exc:
-        raise RuntimeError("grouped GEMM stage-output capture was not populated") from exc
+        raise RuntimeError(
+            "grouped GEMM stage-output capture was not populated"
+        ) from exc
 
     # Reference always uses GGUU logical inputs (layouts are numerically
     # equivalent; only physical packing differs).
@@ -1404,9 +1404,7 @@ def _indexed_tensor_hash128(
     )
     for offset in range(0, indices.numel(), rows_per_chunk):
         selected = rows.index_select(0, indices[offset : offset + rows_per_chunk])
-        digest.update(
-            selected.contiguous().view(torch.uint8).cpu().numpy().tobytes()
-        )
+        digest.update(selected.contiguous().view(torch.uint8).cpu().numpy().tobytes())
     return digest.hexdigest()
 
 

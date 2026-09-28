@@ -147,4 +147,8 @@ void quant_mxfp4(const aiter_tensor_t& inp,
 void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                           aiter_tensor_t& packed,
                           aiter_tensor_t& packed_scale);
+void quant_mxfp4_gemm_hip_out(const aiter_tensor_t& input,
+                              aiter_tensor_t& packed,
+                              aiter_tensor_t& packed_scale,
+                              int round_mode = 1);
 } // namespace aiter
