@@ -5,7 +5,7 @@
 #include "gdr_decode_packed_bf16.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     GDR_DECODE_PACKED_BF16_PYBIND;

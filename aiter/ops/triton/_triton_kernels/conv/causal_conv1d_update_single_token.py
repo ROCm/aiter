@@ -9,6 +9,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _ba_source_offsets(
@@ -74,7 +76,21 @@ def _feat_source_idx(
         return idx_feats.to(tl.int64)
 
 
-@triton.jit()
+_causal_conv1d_update_single_token_kernel_repr = make_kernel_repr(
+    "_causal_conv1d_update_single_token_kernel",
+    [
+        "BLOCK_N",
+        "KERNEL_WIDTH",
+        "NP2_STATELEN",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "IS_APC_ENABLED",
+        "USE_PAD_SLOT",
+    ],
+)
+
+
+@triton.jit(repr=_causal_conv1d_update_single_token_kernel_repr)
 def _causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
@@ -270,7 +286,24 @@ def _causal_conv1d_update_single_token_kernel(
     tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-@triton.jit()
+_reshape_causal_conv1d_update_single_token_kernel_repr = make_kernel_repr(
+    "_reshape_causal_conv1d_update_single_token_kernel",
+    [
+        "BLOCK_N",
+        "BLOCK_Z",
+        "HV",
+        "KERNEL_WIDTH",
+        "NP2_STATELEN",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "IS_APC_ENABLED",
+        "USE_PAD_SLOT",
+        "INTERLEAVED_QKVZ",
+    ],
+)
+
+
+@triton.jit(repr=_reshape_causal_conv1d_update_single_token_kernel_repr)
 def _reshape_causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
     x_ptr,  # (num_tokens, dim+z_dim, seqlen) where seqlen=1

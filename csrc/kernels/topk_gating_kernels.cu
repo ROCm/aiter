@@ -12,6 +12,11 @@
 // TUs under csrc/kernels/topk_gating/. This file only resolves the runtime
 // dtype/score_func pair to one of those instantiations.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so topk_gating_kernels.cuh's aiter_opus_plus.h include does not
+// pull in the c10 half/bfloat16 headers (the kernels use aiter::hip2opus, never
+// the t2opus<c10::*> specializations).
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"

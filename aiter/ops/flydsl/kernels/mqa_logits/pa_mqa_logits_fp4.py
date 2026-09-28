@@ -16,6 +16,7 @@ from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
 from .pa_mqa_logits_fp4_common import (
+    _NON_WRITER_LANE_OFF,
     _i32_buffer,
     _load_vec4_i32,
 )
@@ -259,10 +260,16 @@ def build_pa_mqa_logits_fp4_module(
         ZERO_F = fx.Float32(0.0)
         c0_i32 = fx.Int32(0)
 
-        batch_packed = cta_info_vec[0]
+        # Wave-uniform by construction, but they arrive in VGPRs via the buffer
+        # load; the V# below needs num_records in an SGPR or the store is wrapped
+        # in a waterfall loop.
+        def _uniform(v):
+            return fx.Int32(fx.rocdl.readfirstlane(T.i32, v.ir_value()))
+
+        batch_packed = _uniform(cta_info_vec[0])
         chunk_start = cta_info_vec[1]
         chunk_count = cta_info_vec[2]
-        context_len = cta_info_vec[3]
+        context_len = _uniform(cta_info_vec[3])
 
         # out row base folded into an f32 global pointer: sizeof(f32) = 4, so the
         # per-token store offset below stays small (no i32 overflow for large
@@ -272,6 +279,33 @@ def build_pa_mqa_logits_fp4_module(
 
         pid_b = batch_packed // fx.Int32(next_n)
         pid_next_n = batch_packed % fx.Int32(next_n)
+
+        # A V# spanning exactly this row's visible range: num_records then IS
+        # the `out_token + mask_off < context_len` test, in hardware. Lanes
+        # 16..63 hold redundant copies of the butterfly result and must not
+        # write; `lane_div_16 * win_len` puts them past num_records. The clamp
+        # matters: a negative length wraps to a huge unsigned bound.
+        _mask_off = fx.Int32(next_n - 1) - pid_next_n
+        _win_raw = context_len - _mask_off
+        win_len = (_win_raw < fx.Int32(0)).select(fx.Int32(0), _win_raw)
+        out_win = fx.rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.recast_iter(
+                    fx.PointerType.get(T.f32, out_base.memspace, 4), out_base
+                ),
+                fx.make_layout((win_len, 1), (1, 1)),
+            ),
+            max_size=False,
+            num_records_bytes=win_len * fx.Int32(4),
+        )
+        out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
+            fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+        )
+        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
+        out_reg_ty = fx.MemRefType.get(
+            T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
+        )
+        out_reg_lay = fx.make_layout(1, 1)
 
         # Scaled FP4 16x16x128 MMA (opsel 0/0); one e8m0 word per operand.
         mfma_atom = fx.make_mma_atom(
@@ -457,15 +491,14 @@ def build_pa_mqa_logits_fp4_module(
             thread_sum = _bperm_xor_add(thread_sum, 32)
             thread_sum = thread_sum * weight_scale
 
-            is_writer = lane_div_16 < fx.Int32(1)
-            out_token = token_base + lane_mod_16
-            mask_off = fx.Int32(next_n - 1) - pid_next_n
-            in_ctx = (out_token + mask_off) < context_len
-            # Sparse 1-writer scatter: guard the plain store instead of a V#
-            # OOB sentinel. Row base is folded into out_bt's pointer, so the
-            # store offset is just the (small) token index.
-            if is_writer & in_ctx:
-                fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
+            # Context bound and writer-lane guard both live in the V# built
+            # above; nothing is tested here.
+            off = token_base + out_lane_off
+            r_out = fx.memref_alloca(out_reg_ty, out_reg_lay)
+            fx.memref_store_vec(
+                fx.Vector.from_elements([thread_sum], dtype=fx.Float32), r_out
+            )
+            fx.copy(out_atom, r_out, fx.slice(out_win, (off, None)))
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             """Process chunk c using prefetched (kv, kvs_packed)."""

@@ -11,7 +11,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
     check_shared_mem,
-    chunk_delta_attn_autotune_configs,
     exp,
     input_guard,
     softplus,
@@ -19,6 +18,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -32,7 +32,8 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [triton.Config({"BS": BS}, num_warps=nw) for BS in BS_LIST for nw in [2, 4, 8]],
         default_config=triton.Config({"BS": 64}, num_warps=2),
     ),

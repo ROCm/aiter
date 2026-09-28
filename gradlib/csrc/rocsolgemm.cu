@@ -595,7 +595,7 @@ void rocb_destroy_extension()
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND;
     m.def("rocb_create_extension", &rocb_create_extension, "create_extension");

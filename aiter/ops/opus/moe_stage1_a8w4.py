@@ -87,7 +87,8 @@ def _make_out_scale(
     padded_rows = (sorted_size + 255) // 256 * 256
     scale_cols = inter_dim // _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP
     padded_cols = (scale_cols + 7) // 8 * 8
-    return torch.zeros(
+    # Stage1 writes every valid-route scale, and Stage2 discards padding-route results.
+    return torch.empty(
         (padded_rows, padded_cols),
         dtype=torch.float8_e8m0fnu,
         device=sorted_token_ids.device,

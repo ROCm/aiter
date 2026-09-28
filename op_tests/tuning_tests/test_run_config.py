@@ -289,6 +289,24 @@ TUNER_FAMILIES = {
         "exclude_patterns": [],
         "config_property": "AITER_CONFIG_GEMM_A4W4_FILE",
     },
+    "a6w6_blockscale": {
+        "script": "csrc/gemm_a6w6/gemm_a6w6_tune.py",
+        "csv_pattern": "a6w6_blockscale_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A6W6_FILE",
+    },
+    "a6w4_asm": {
+        "script": "csrc/gemm_a6w4/gemm_a6w4_tune.py",
+        "csv_pattern": "a6w4_asm_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A6W4_ASM_FILE",
+    },
+    "a4w6_asm": {
+        "script": "csrc/gemm_a4w6/gemm_a4w6_tune.py",
+        "csv_pattern": "a4w6_asm_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A4W6_ASM_FILE",
+    },
     "batched_a8w8": {
         "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
         "csv_pattern": "a8w8_tuned_batched_gemm",
@@ -407,6 +425,15 @@ class TestRunConfig(unittest.TestCase):
 
     def test_a4w4_blockscale(self):
         self._test_family("a4w4_blockscale")
+
+    def test_a6w6_blockscale(self):
+        self._test_family("a6w6_blockscale")
+
+    def test_a6w4_asm(self):
+        self._test_family("a6w4_asm")
+
+    def test_a4w6_asm(self):
+        self._test_family("a4w6_asm")
 
     def test_batched_a8w8(self):
         self._test_family("batched_a8w8")

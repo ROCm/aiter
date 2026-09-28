@@ -61,6 +61,10 @@ def chunk_kimi_delta_attn(
     disable_recompute: bool = False,
     chunk_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
+    out: torch.Tensor | None = None,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -96,11 +100,13 @@ def chunk_kimi_delta_attn(
             Scale factor for the attention scores. Default: `1 / sqrt(K)`.
         initial_state (torch.Tensor, optional):
             Initial state of shape `[N, HV, K, V]` (`[N, HV, V, K]` when
-            `state_v_first=True`) and dtype fp32, for `N` input sequences. For
+            `state_v_first=True`), for `N` input sequences. Any float dtype; the
+            recurrence accumulates in fp32 whatever the state is stored as. For
             equal-length inputs `N` equals the batch size `B`. Default: `None`.
         output_final_state (bool):
-            Whether to return the final state, same shape and dtype as
-            `initial_state`. Default: `False`.
+            Whether to return the final state, same shape as `initial_state`.
+            Its dtype is `initial_state`'s on the FlashKDA path and fp32 on the
+            default pipeline. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to L2-normalize `q` and `k` before the recurrence.
         use_gate_in_kernel (bool):
@@ -134,16 +140,34 @@ def chunk_kimi_delta_attn(
 
             FlashKDA agrees with the default pipeline to bf16 rather than
             exactly, as does 32 against 64 within the default pipeline itself.
-            Set `CHUNK_DELTA_ATTN_USE_FLASH_KDA=0` to pin the default pipeline.
+            Set `AITER_FDA_ENABLE=0` to pin the default pipeline.
         cu_seqlens (torch.LongTensor, optional):
             Cumulative sequence lengths of shape `[N+1]` for variable-length
             inputs, consistent with the FlashAttention API. Default: `None`.
+        out (torch.Tensor, optional):
+            Caller-owned output buffer, same shape as `v`, and contiguous.
+            Written in place rather than allocated and copied. Required with
+            `state_cache`. FlashKDA-only; the default pipeline rejects this
+            argument rather than ignoring it.
+        state_cache (torch.Tensor, optional):
+            Paged fp32 V-first cache `[slots, H, V, K]`. Replaces
+            `initial_state`: sequence `n` is row `state_indices[n]`. Each
+            slot's `[H, V, K]` plane must be dense; `stride(0)` may be padded.
+            FlashKDA-only; the default pipeline rejects this argument rather
+            than ignoring it.
+        state_indices (torch.Tensor, optional):
+            Int32 `[N]` cache row per sequence, each in `[0, slots)`. Required
+            with `state_cache`. Trusted as given, not range-checked.
+        has_initial_state (torch.Tensor, optional):
+            Bool `[N]`. False starts that sequence from zero. Required with
+            `state_cache`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
             - o (torch.Tensor): Outputs of shape `[B, T, HV, V]`.
             - final_state (torch.Tensor | None): Final state if
-              `output_final_state=True` else `None`.
+              `output_final_state=True` else `None`. `None` when
+              `state_cache` is given, because the cache already holds it.
 
     Examples:
         >>> import torch
@@ -196,12 +220,10 @@ def chunk_kimi_delta_attn(
                 f"of input sequences, i.e., {len(cu_seqlens) - 1} rather than "
                 f"{initial_state.shape[0]}."
             )
-    if initial_state is not None and initial_state.dtype != torch.float32:
+    if initial_state is not None and not initial_state.is_floating_point():
         raise ValueError(
-            f"`initial_state` must be fp32, got {initial_state.dtype}. The recurrence "
-            "accumulates in fp32 and the state is read back verbatim."
+            f"`initial_state` must be a float tensor, got {initial_state.dtype}."
         )
-
     if use_gate_in_kernel and A_log is None:
         raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
     if safe_gate and use_gate_in_kernel:
@@ -221,10 +243,15 @@ def chunk_kimi_delta_attn(
         raise ValueError(f"`scale` must be positive, got {scale}.")
 
     _LOGGER.info(
-        f"CHUNK_KIMI_DELTA_ATTN: q={tuple(q.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, chunk_size={chunk_size or 'auto'}, safe_gate={safe_gate}, "
-        f"lower_bound={lower_bound}, state_v_first={state_v_first}, "
-        f"varlen={cu_seqlens is not None}"
+        "CHUNK_KIMI_DELTA_ATTN: q=%s, v=%s, scale=%s, chunk_size=%s, safe_gate=%s, lower_bound=%s, state_v_first=%s, varlen=%s",
+        tuple(q.shape),
+        tuple(v.shape),
+        scale,
+        chunk_size or "auto",
+        safe_gate,
+        lower_bound,
+        state_v_first,
+        cu_seqlens is not None,
     )
 
     # Match fla, which puts `@input_guard` on its autograd Function. Several
@@ -242,6 +269,12 @@ def chunk_kimi_delta_attn(
         initial_state = initial_state.contiguous()
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.contiguous()
+    if state_indices is not None:
+        state_indices = state_indices.contiguous()
+    if has_initial_state is not None:
+        has_initial_state = has_initial_state.contiguous()
+    # state_cache is not packed: stride(0) may be padded. Packing it would
+    # copy the pool and write a clone.
 
     o, final_state, *_ = chunk_delta_attn_fwd(
         q=q,
@@ -265,5 +298,9 @@ def chunk_kimi_delta_attn(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         state_v_first=state_v_first,
+        out=out,
+        state_cache=state_cache,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
     )
     return o.to(q.dtype), final_state

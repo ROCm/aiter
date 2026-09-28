@@ -1,0 +1,525 @@
+name: AITER Release Automation
+
+on:
+  schedule:
+    # GitHub cron cannot express "every 14 days" directly. Trigger weekly and
+    # gate the release jobs below against a fixed 14-day cadence.
+    - cron: '0 6 * * 1'
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish. Empty creates the next scheduled tag from main, for example v0.1.20 -> v0.1.21.'
+        required: false
+        type: string
+      release_branch:
+        description: 'Release branch to validate or create. Empty uses release/<base-tag>, for example release/v0.1.20.'
+        required: false
+        type: string
+      release_ref:
+        description: 'Source ref for a new scheduled release branch/tag when release_tag is empty or missing. Defaults to main.'
+        required: false
+        type: string
+        default: main
+      create_missing_refs:
+        description: 'Create a missing scheduled release branch/tag from release_ref. Post-release tags must already exist.'
+        type: boolean
+        default: true
+      force_rebuild:
+        description: 'Build and upload even if the GitHub Release already has the expected wheel assets.'
+        type: boolean
+        default: false
+      skip_biweekly_gate:
+        description: 'For manual testing only, ignore the every-two-week schedule gate.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.release_tag || github.ref_name || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release target
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
+      skip_reason: ${{ steps.resolve.outputs.skip_reason }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_branch: ${{ steps.resolve.outputs.release_branch }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      release_kind: ${{ steps.resolve.outputs.release_kind }}
+      previous_tag: ${{ steps.resolve.outputs.previous_tag }}
+      expected_wheel_count: ${{ steps.resolve.outputs.expected_wheel_count }}
+    steps:
+      - name: Generate release GitHub App token
+        id: release_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AITER_CI_APP_ID }}
+          private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: aiter
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.release_app_token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Resolve release target
+        id: resolve
+        env:
+          GH_TOKEN: ${{ steps.release_app_token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+          INPUT_RELEASE_BRANCH: ${{ github.event.inputs.release_branch || '' }}
+          INPUT_RELEASE_REF: ${{ github.event.inputs.release_ref || 'main' }}
+          CREATE_MISSING_REFS: ${{ github.event.inputs.create_missing_refs || true }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || false }}
+          SKIP_BIWEEKLY_GATE: ${{ github.event.inputs.skip_biweekly_gate || false }}
+          EXPECTED_WHEEL_COUNT: '6'
+          RELEASE_CADENCE_ANCHOR: '2026-08-31'
+        run: |
+          set -euo pipefail
+
+          should_run=true
+          skip_reason=""
+
+          if [ "${EVENT_NAME}" = "schedule" ] && [ "${SKIP_BIWEEKLY_GATE}" != "true" ]; then
+            today="$(date -u +%Y-%m-%d)"
+            anchor_seconds="$(date -u -d "${RELEASE_CADENCE_ANCHOR}" +%s)"
+            today_seconds="$(date -u -d "${today}" +%s)"
+            days_since_anchor=$(( (today_seconds - anchor_seconds) / 86400 ))
+            cadence_offset=$(( days_since_anchor % 14 ))
+
+            if [ "${cadence_offset}" -ne 0 ]; then
+              should_run=false
+              skip_reason="Not on the 14-day release cadence anchored at ${RELEASE_CADENCE_ANCHOR}."
+            fi
+          fi
+
+          if [ "${should_run}" != "true" ]; then
+            {
+              echo "should_run=${should_run}"
+              echo "skip_reason=${skip_reason}"
+              echo "release_tag="
+              echo "release_branch="
+              echo "release_version="
+              echo "release_kind="
+              echo "previous_tag="
+              echo "expected_wheel_count=${EXPECTED_WHEEL_COUNT}"
+            } >> "${GITHUB_OUTPUT}"
+
+            {
+              echo "## Release Target"
+              echo "- Should run: ${should_run}"
+              echo "- Skip reason: ${skip_reason}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            exit 0
+          fi
+
+          git fetch --force --tags origin
+          git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+          latest_stable_tag="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+
+          release_tag=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            release_tag="${REF_NAME}"
+          elif [ -n "${INPUT_RELEASE_TAG}" ]; then
+            release_tag="${INPUT_RELEASE_TAG}"
+          else
+            if [ -z "${latest_stable_tag}" ]; then
+              echo "Unable to resolve the latest stable release tag."
+              exit 1
+            fi
+            version="${latest_stable_tag#v}"
+            IFS=. read -r major minor patch <<< "${version}"
+            release_tag="v${major}.${minor}.$((patch + 1))"
+          fi
+
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+            echo "Invalid release tag: ${release_tag}"
+            echo "Expected vX.Y.Z or vX.Y.Z.postN."
+            exit 1
+          fi
+
+          release_kind=scheduled
+          if [[ "${release_tag}" =~ \.post[0-9]+$ ]]; then
+            release_kind=post
+          fi
+
+          base_tag="${release_tag%%.post*}"
+          if [ -n "${INPUT_RELEASE_BRANCH}" ]; then
+            release_branch="${INPUT_RELEASE_BRANCH}"
+          else
+            release_branch="release/${base_tag}"
+          fi
+
+          branch_exists=false
+          if git show-ref --verify --quiet "refs/remotes/origin/${release_branch}"; then
+            branch_exists=true
+          fi
+
+          tag_exists=false
+          if git rev-parse -q --verify "refs/tags/${release_tag}^{commit}" >/dev/null; then
+            tag_exists=true
+          fi
+
+          if [ "${release_kind}" = "post" ] && { [ "${branch_exists}" != "true" ] || [ "${tag_exists}" != "true" ]; }; then
+            echo "Post release ${release_tag} must already exist on ${release_branch}; refusing to create it automatically."
+            exit 1
+          fi
+
+          if [ "${release_kind}" = "scheduled" ] && [ "${EVENT_NAME}" != "push" ] && [ "${CREATE_MISSING_REFS}" = "true" ]; then
+            target_commit=""
+            if git rev-parse -q --verify "refs/remotes/origin/${INPUT_RELEASE_REF}^{commit}" >/dev/null; then
+              target_commit="$(git rev-parse "refs/remotes/origin/${INPUT_RELEASE_REF}^{commit}")"
+            else
+              target_commit="$(git rev-parse "${INPUT_RELEASE_REF}^{commit}")"
+            fi
+
+            if [ "${branch_exists}" != "true" ]; then
+              git branch "${release_branch}" "${target_commit}"
+              git push origin "refs/heads/${release_branch}"
+              git fetch --force origin "refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
+              branch_exists=true
+            fi
+
+            if [ "${tag_exists}" != "true" ]; then
+              branch_commit="$(git rev-parse "refs/remotes/origin/${release_branch}^{commit}")"
+              git tag "${release_tag}" "${branch_commit}"
+              git push origin "refs/tags/${release_tag}"
+              tag_exists=true
+            fi
+          fi
+
+          if [ "${branch_exists}" != "true" ]; then
+            echo "Missing release branch: ${release_branch}"
+            exit 1
+          fi
+          if [ "${tag_exists}" != "true" ]; then
+            echo "Missing release tag: ${release_tag}"
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "${release_tag}^{commit}")"
+          branch_commit="$(git rev-parse "refs/remotes/origin/${release_branch}^{commit}")"
+
+          if [ "${tag_commit}" != "${branch_commit}" ]; then
+            echo "Tag ${release_tag} points to ${tag_commit}, but ${release_branch} points to ${branch_commit}."
+            echo "Release tags must point at the release branch HEAD."
+            exit 1
+          fi
+
+          previous_tag=""
+          if [ "${release_kind}" = "scheduled" ]; then
+            for tag in $(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V); do
+              if [ "${tag}" = "${release_tag}" ]; then
+                break
+              fi
+              previous_tag="${tag}"
+            done
+          else
+            previous_tag="${base_tag}"
+            for tag in $(git tag -l "${base_tag}.post*" | sort -V); do
+              if [ "${tag}" = "${release_tag}" ]; then
+                break
+              fi
+              previous_tag="${tag}"
+            done
+          fi
+
+          if [ -z "${previous_tag}" ]; then
+            echo "Unable to resolve previous tag for ${release_tag}."
+            exit 1
+          fi
+
+          if [ "${EVENT_NAME}" != "push" ] && [ "${FORCE_REBUILD}" != "true" ]; then
+            published_wheels="$(gh release view "${release_tag}" --json assets --jq '[.assets[].name | select(endswith(".whl"))] | length' 2>/dev/null || echo 0)"
+            if [ "${published_wheels}" -ge "${EXPECTED_WHEEL_COUNT}" ]; then
+              should_run=false
+              skip_reason="GitHub Release ${release_tag} already has ${published_wheels} wheel assets."
+            fi
+          fi
+
+          {
+            echo "should_run=${should_run}"
+            echo "skip_reason=${skip_reason}"
+            echo "release_tag=${release_tag}"
+            echo "release_branch=${release_branch}"
+            echo "release_version=${release_tag#v}"
+            echo "release_kind=${release_kind}"
+            echo "previous_tag=${previous_tag}"
+            echo "expected_wheel_count=${EXPECTED_WHEEL_COUNT}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Release Target"
+            echo "- Tag: ${release_tag}"
+            echo "- Branch: ${release_branch}"
+            echo "- Commit: ${tag_commit}"
+            echo "- Previous tag: ${previous_tag}"
+            echo "- Should run: ${should_run}"
+            if [ -n "${skip_reason}" ]; then
+              echo "- Skip reason: ${skip_reason}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build release wheels
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version:
+          - '7.0'
+          - '7.1'
+          - '7.2'
+    uses: ./.github/workflows/aiter-release.yaml
+    with:
+      release_type: none
+      docker_image_py310: pytorch/manylinux2_28-builder:rocm${{ matrix.rocm_version }}
+      docker_image_py312: pytorch/manylinux2_28-builder:rocm${{ matrix.rocm_version }}
+      build_py310: true
+      build_py312: true
+      gpu_archs: 'gfx942;gfx950'
+      runner: build-only-aiter
+      add_date_stamp: false
+      use_manylinux: true
+      docker_login: false
+      commit: ${{ needs.prepare.outputs.release_tag }}
+      artifact_suffix: rocm${{ matrix.rocm_version }}
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+  publish:
+    name: Publish GitHub Release assets
+    needs:
+      - prepare
+      - build
+    if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+      RELEASE_KIND: ${{ needs.prepare.outputs.release_kind }}
+      RELEASE_BRANCH: ${{ needs.prepare.outputs.release_branch }}
+      PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+      EXPECTED_WHEEL_COUNT: ${{ needs.prepare.outputs.expected_wheel_count }}
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aiter-whl-packages-py*
+          path: release-wheels
+          merge-multiple: true
+
+      - name: Validate wheel set
+        run: |
+          set -euo pipefail
+          wheel_count="$(find release-wheels -type f -name '*.whl' | wc -l | tr -d ' ')"
+          echo "Found ${wheel_count} wheel assets."
+          find release-wheels -type f -name '*.whl' -printf '%f\n' | sort
+
+          if [ "${wheel_count}" -ne "${EXPECTED_WHEEL_COUNT}" ]; then
+            echo "Expected exactly ${EXPECTED_WHEEL_COUNT} wheels, found ${wheel_count}."
+            exit 1
+          fi
+
+          for rocm in rocm7.0 rocm7.1 rocm7.2; do
+            for py in cp310 cp312; do
+              count="$(find release-wheels -type f -name "*${RELEASE_VERSION}+${rocm}.manylinux.2.28-*${py}-${py}-*.whl" | wc -l | tr -d ' ')"
+              if [ "${count}" -ne 1 ]; then
+                echo "Expected one ${rocm}/${py} wheel for ${RELEASE_VERSION}, found ${count}."
+                exit 1
+              fi
+            done
+          done
+
+      - name: Generate changelog
+        run: |
+          set -euo pipefail
+
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${RELEASE_TAG}" \
+            -f previous_tag_name="${PREVIOUS_TAG}" \
+            -f target_commitish="${RELEASE_BRANCH}" \
+            --jq .body > generated-notes.md
+
+          if [ "${RELEASE_KIND}" = "post" ]; then
+            heading="AITER ${RELEASE_TAG} - post release"
+            scope="Post release on top of the ${RELEASE_BRANCH} release line."
+          else
+            heading="AITER ${RELEASE_TAG} - bi-weekly release"
+            scope="Scheduled release from ${RELEASE_BRANCH}."
+          fi
+
+          {
+            echo "${heading}"
+            echo
+            echo "${scope}"
+            echo
+            echo "Diff base: ${PREVIOUS_TAG}"
+            echo
+            echo "## Wheels"
+            echo
+            echo "Prebuilt manylinux_2_28 wheels, \`GPU_ARCHS=gfx942;gfx950\`:"
+            echo "- ROCm 7.0 / 7.1 / 7.2 x cp310 / cp312 (${EXPECTED_WHEEL_COUNT} wheels)"
+            echo
+            echo "Wheel assets are uploaded after the release page is created."
+            echo
+            cat generated-notes.md
+          } > release-notes.md
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "AITER ${RELEASE_TAG}" \
+              --notes-file release-notes.md
+          else
+            gh release create "${RELEASE_TAG}" \
+              --verify-tag \
+              --target "${RELEASE_BRANCH}" \
+              --title "AITER ${RELEASE_TAG}" \
+              --notes-file release-notes.md
+          fi
+
+          while IFS= read -r wheel; do
+            echo "Uploading ${wheel}"
+            gh release upload "${RELEASE_TAG}" "${wheel}" --clobber
+          done < <(find release-wheels -type f -name '*.whl' | sort)
+
+      - name: Update release notes with asset links
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > release.json
+
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          release_tag = os.environ["RELEASE_TAG"]
+          release_version = os.environ["RELEASE_VERSION"]
+          release_kind = os.environ["RELEASE_KIND"]
+          release_branch = os.environ["RELEASE_BRANCH"]
+          previous_tag = os.environ["PREVIOUS_TAG"]
+          expected_wheel_count = int(os.environ["EXPECTED_WHEEL_COUNT"])
+
+          release = json.loads(Path("release.json").read_text())
+          wheels = [
+              asset
+              for asset in release.get("assets", [])
+              if asset.get("name", "").endswith(".whl")
+          ]
+          if len(wheels) != expected_wheel_count:
+              raise SystemExit(
+                  f"Expected {expected_wheel_count} wheel assets on the release, found {len(wheels)}."
+              )
+
+          rows = []
+          seen = set()
+          pattern = re.compile(
+              rf"{re.escape(release_version)}\+rocm(?P<rocm>7\.[0-2])\.manylinux\.2\.28-"
+              r"(?P<py>cp3(?:10|12))-(?P=py)-"
+          )
+          for asset in wheels:
+              name = asset["name"]
+              match = pattern.search(name)
+              if not match:
+                  raise SystemExit(f"Unexpected wheel asset name: {name}")
+              combo = (match.group("rocm"), match.group("py"))
+              if combo in seen:
+                  raise SystemExit(f"Duplicate wheel asset for ROCm {combo[0]} / {combo[1]}")
+              seen.add(combo)
+              rows.append((combo[0], combo[1], name, asset["browser_download_url"]))
+
+          expected = {
+              (rocm, py)
+              for rocm in ("7.0", "7.1", "7.2")
+              for py in ("cp310", "cp312")
+          }
+          missing = expected - seen
+          if missing:
+              raise SystemExit(f"Missing wheel assets: {sorted(missing)}")
+
+          rows.sort(key=lambda row: (row[0], row[1]))
+
+          generated = Path("generated-notes.md").read_text().strip()
+          generated = generated.replace("## What's Changed", "## Changes", 1)
+
+          if release_kind == "post":
+              heading = f"AITER {release_tag} - post release"
+              scope = f"Post release on top of the `{release_branch}` release line."
+          else:
+              heading = f"AITER {release_tag} - bi-weekly release"
+              scope = f"Scheduled release from `{release_branch}`."
+
+          lines = [
+              heading,
+              "",
+              scope,
+              "",
+              f"Diff base: `{previous_tag}`",
+              "",
+              "## Wheels",
+              "",
+              "Prebuilt manylinux_2_28 wheels, `GPU_ARCHS=gfx942;gfx950`:",
+              "",
+              "| ROCm | Python | Wheel |",
+              "|---|---|---|",
+          ]
+          for rocm, py, name, url in rows:
+              lines.append(f"| ROCm {rocm} | {py} | [{name}]({url}) |")
+
+          lines.extend(
+              [
+                  "",
+                  "<details>",
+                  "<summary>What's Changed</summary>",
+                  "",
+                  generated,
+                  "",
+                  "</details>",
+                  "",
+              ]
+          )
+
+          Path("release-notes.md").write_text("\n".join(lines))
+          PY
+
+          gh release edit "${RELEASE_TAG}" \
+            --title "AITER ${RELEASE_TAG}" \
+            --notes-file release-notes.md
+
+          {
+            echo "## Published Release"
+            echo "- Tag: ${RELEASE_TAG}"
+            echo "- Branch: ${RELEASE_BRANCH}"
+            echo "- Diff base: ${PREVIOUS_TAG}"
+            echo "- Wheels: $(find release-wheels -type f -name '*.whl' | wc -l | tr -d ' ')"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -8,22 +8,22 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `113`
-- with samples: `113`
-- added: `5`
-- updated: `67`
-- unchanged: `41`
-- defaulted (no history): `0`
-- removed stale entries: `0`
-- defaulted files list: `none`
+- discovered files: `144`
+- with samples: `143`
+- added: `14`
+- updated: `72`
+- unchanged: `58`
+- defaulted (no history): `1`
+- removed stale entries: `1`
+- defaulted files list: `op_tests/test_moe_mxfp4_inter_dim_dispatch.py`
 
 ### Triton
 - runs used: `10`
-- discovered files: `108`
-- with samples: `107`
-- added: `3`
-- updated: `85`
-- unchanged: `20`
+- discovered files: `121`
+- with samples: `120`
+- added: `14`
+- updated: `89`
+- unchanged: `18`
 - defaulted (no history): `1`
 - removed stale entries: `0`
 - defaulted files list: `op_tests/triton_tests/chunk_delta_attn/test_chunk_delta_attn_fwd.py`
