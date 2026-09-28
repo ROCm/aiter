@@ -1110,6 +1110,29 @@ def test_cli_invalid_args(argv):
     assert exc.value.code == 2
 
 
+def test_fp8_dtype_comes_from_aiter():
+    """The accepted fp8 flavour is the arch's, not a literal in the kernel.
+
+    e4m3fn and e4m3fnuz differ in exponent bias, so a kernel that names one
+    and runs on the other is silently off by a factor of two. Pinning this to
+    `aiter.dtypes` means the chip decides.
+    """
+    assert kernel._fp8_dtype() is dtypes.fp8
+    # gfx950 is the only arch this kernel accepts, and its fp8 is OCP e4m3fn.
+    assert dtypes.fp8 is torch.float8_e4m3fn
+
+
+def test_reject_fp8_fnuz_cache():
+    """The other architecture's fp8 is rejected, not reinterpreted."""
+    q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
+    fnuz = k.to(torch.float8_e4m3fnuz)
+    assert not kernel.index_score_supported(q, fnuz, 1, 1, mb, bt)
+    with pytest.raises(ValueError, match="cache"):
+        score_flydsl(q, fnuz, bt, lens, 1, 1, D**-0.5, mb)
+    with pytest.raises(ValueError, match="cache"):
+        kernel.shuffle_cache(fnuz)
+
+
 def test_cli_rejects_fp8_fnuz(monkeypatch):
     monkeypatch.setitem(dtypes.d_dtypes, "fp8", torch.float8_e4m3fnuz)
     with pytest.raises(SystemExit) as exc:
@@ -1530,6 +1553,10 @@ _GPU_TESTS = (
     test_noncurrent_device,
     test_build_map_invalid_config,
     test_narrow_block_table_rejected,
+    test_reject_fp8_fnuz_cache,
+    # Asserts which fp8 flavour this chip speaks, so it is arch-dependent even
+    # though it allocates nothing.
+    test_fp8_dtype_comes_from_aiter,
     # These build their inputs on the device even though what they assert is a
     # host-side property (map equality, spread coverage), so they need the gate
     # just as much as the tests that launch the scorer.

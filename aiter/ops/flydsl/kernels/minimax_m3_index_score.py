@@ -136,6 +136,27 @@ Remaining levers, in the order they are worth trying:
   3. Short sequence: bounded by wave supply, and token_waves caps at 4 because
      WAVES == 4. THREADS=512 would allow token_waves=8 (one panel per wave)
      and 2x the waves again at b16_q1_s8k. Untested.
+
+Why this is gfx950-only, and what a gfx942 port would actually cost
+-------------------------------------------------------------------
+Not a dtype switch. Three separate dependencies, each on the CDNA4 ISA:
+
+  1. `mfma_f32_16x16x32_bf16` is gfx950+ (FlyDSL raises `ROCDL op not found
+     ... (gfx950+)` for it). gfx942's widest bf16 tile is K=16, which doubles
+     KSTEPS to 8 and halves each lane's load to 8 B -- so `k_offset`, the
+     A/B fragment layout and the coalescing analysis in `score_panel` all
+     change, and with them the shuffled layout, which is derived from MFMA_K.
+     That layout is a written contract with the cache producer, so a second
+     MFMA means a second layout, not a recompile.
+  2. The fp8 path widens K to bf16 with `v_cvt_scalef32_pk_bf16_fp8`; the
+     scalef32 family is CDNA4. gfx942 would go through `v_cvt_pk_f32_fp8`.
+  3. gfx942's fp8 is `e4m3fnuz` (bias 8, no inf) against gfx950's OCP
+     `e4m3fn` (bias 7). The conversion has to match the format; reinterpreting
+     one as the other is off by a factor of two. `_fp8_dtype()` asks aiter
+     which one this chip speaks so that only the conversion is arch-specific.
+
+None of it is verifiable from this tree either -- there is no gfx942 part on
+the machine this kernel was developed and measured on.
 """
 
 import math
@@ -165,6 +186,25 @@ PANELS = PAGE // MFMA_M  # 8 token panels per page
 KSTEPS = HEAD_DIM // MFMA_K  # 4 k-steps per dot
 LOG2E = 1.4426950409
 NEG_INF = float("-inf")
+
+
+def _fp8_dtype():
+    """The 8-bit float this architecture speaks, from aiter rather than a literal.
+
+    gfx950 is OCP `e4m3fn`; gfx942 is `e4m3fnuz`, which has a different
+    exponent bias (8 vs 7) and no infinities. They are not relabelings of each
+    other -- reading one as the other is off by a factor of two -- so the
+    dtype, the widening instruction and the MFMA have to agree, and asking
+    aiter for the pair rather than naming one keeps that agreement in one
+    place.
+
+    This kernel is gfx950-only today (`_validate_metadata` enforces it), so in
+    practice this resolves to `e4m3fn`. What a gfx942 port would need is in
+    the module docstring; it is not a dtype switch.
+    """
+    from aiter import dtypes
+
+    return dtypes.fp8
 
 # rocdl.sched_group_barrier instruction-class masks (rocdl._SCHED_MASK_INT_TO_KW).
 _SCHED_MFMA = 8
@@ -1606,6 +1646,8 @@ def shuffle_cache(cache):
     """
     import torch
 
+    if cache.dtype not in (torch.bfloat16, _fp8_dtype()):
+        raise ValueError(f"cache: expected bfloat16 or {_fp8_dtype()}")
     fp8 = cache.dtype != torch.bfloat16
     npages = cache.shape[0]
     chunk_elems = 16 if fp8 else 8
@@ -2292,12 +2334,15 @@ def _validate_metadata(
     if not isinstance(S, int) or not isinstance(H, int) or S < 1 or H < 1:
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
-    _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
-    _validate_tensor(
-        cache, "cache", (torch.bfloat16, torch.float8_e4m3fn), 3, device, 16, False
-    )
+    # Arch first: on the wrong arch every other message would be a symptom.
+    # An `e4m3fnuz` cache on gfx942, for instance, is the right dtype for that
+    # chip and still unsupported here, and "requires gfx950" says so.
     if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx950":
         raise ValueError("index score requires gfx950")
+    _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
+    _validate_tensor(
+        cache, "cache", (torch.bfloat16, _fp8_dtype()), 3, device, 16, False
+    )
     if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
         raise ValueError("idx_q: expected [batch*S, H, 128]")
     if cache.shape[1:] != (PAGE, HEAD_DIM) or cache.shape[0] > 0x7FFFFFFF:
@@ -2485,7 +2530,7 @@ def score_flydsl(
     scaled = sm_scale * LOG2E
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError("sm_scale * LOG2E must be finite and positive in FP32")
-    fp8 = cache.dtype == torch.float8_e4m3fn
+    fp8 = cache.dtype == _fp8_dtype()
 
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
@@ -2503,6 +2548,9 @@ def score_flydsl(
         _run_compiled(
             launch,
             ptr_arg(idx_q, fx.BFloat16),
+            # gfx950's fp8 is OCP e4m3fn, which `_fp8_dtype()` has already
+            # matched the cache against; e4m3fnuz reaches neither this line
+            # nor the widening it feeds. See the module docstring.
             ptr_arg(cache, fx.Float8E4M3FN if fp8 else fx.BFloat16),
             ptr_arg(out, fx.Float32),
             ptr_arg(block_table, fx.Int32),
