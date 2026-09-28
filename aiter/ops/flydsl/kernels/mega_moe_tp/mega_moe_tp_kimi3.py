@@ -19,6 +19,25 @@ Per TP8 rank and launch of S = 1, 2 or 4 tokens:
 token (BPS = 256 / S per token). Cross-workgroup data (scores, mids) goes
 through tagged 8-byte pairs in global memory, the all-reduce through flag
 packets in a symmetric peer buffer.
+
+Fused ops (the whole routed MoE layer of the split path, one launch):
+  fused stage                                           replaces (split path)
+  1. router: logits = x @ Wr^T (f32 accumulate),        torch.mm + .float()
+     scores = sigmoid(logits)
+  2. top-16 of scores + bias (ties to the lower id),    aiter.biased_grouped_topk
+     probs = score / sum
+  3. activation quant of the latent                     fused_moe: activation quant
+     (MXFP4, 1x32 E8M0 scales)
+  4. expert dispatch of the 16 slots, in-kernel         fused_moe: moe_sorting
+  5. up/gate GEMM (MXFP4) + SiTUv2                      fused_moe: stage-1 GEMM
+                                                        + activation
+  6. mid quant (MXFP4 1x32) + down GEMM,                fused_moe: mid quant
+     prob-weighted sum over the 16 slots                + stage-2 GEMM + weighted sum
+  7. TP all-reduce of the bf16 partial                  all_reduce (one-shot P2P)
+     (16 B packets = 8 B data + 2 flags)
+  8. + residual (optional), bf16 out                    residual add
+Not fused (outside this layer): shared experts, latent down/up projections.
+Side outputs: scores, probs / indices, mids (for checking).
 """
 
 from __future__ import annotations

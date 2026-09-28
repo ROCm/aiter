@@ -4,6 +4,35 @@
 # TileRT shared/reuse MonoKernel reference (fusion-boundary comparison):
 # https://github.com/SemiAnalysisAI/InferenceX/tree/8ac98344b038a3f2da20a565fe9b974772a67ef9
 
+"""GLM-5 decode MoE + TP all-reduce in one launch (A4W4 MXFP4, gfx950).
+
+Fused ops (the whole MoE layer of the split path, one launch):
+  fused stage                                           replaces (split path)
+  1. RMSNorm(hidden) * gamma, eps 1e-5                  aiter.rms_norm
+  2. router: logits = norm @ Wr^T (f32 accumulate),     torch.mm + .float()
+     scores = sigmoid(logits)
+  3. top-8 of scores + bias (ties to the lower id),     aiter.biased_grouped_topk
+     probs = 2.5 * score / sum
+  4. activation quant of norm (MXFP4, 1x32 E8M0 scales) fused_moe: activation quant
+  5. expert dispatch: shared expert (weight 1)          fused_moe: moe_sorting
+     + 8 routed experts, in-kernel
+  6. up/gate GEMM (MXFP4, 1x32 E8M0 scales)             fused_moe: stage-1 GEMM
+     + SiLU(gate) * up                                  + act_and_mul
+  7. mid quant (MXFP4 1x32) + down GEMM,                fused_moe: mid quant
+     prob-weighted sum over the 9 slots                 + stage-2 GEMM + weighted sum
+  8. TP all-reduce of the bf16 partial over the peer    all_reduce (one-shot P2P)
+     ranks (proto 0: 16 B packets = 8 B data + 2
+     flags; proto 1: 64 B lines = 48 B data + flags)
+  9. + residual, bf16 out                               residual add
+
+Per TP rank and launch of S = 1, 2 or 4 tokens: hidden [S, 6144] bf16,
+Wr [256, 6144] bf16, 257 expert weights (slot 0 = shared expert), inter 256
+per rank. 256 workgroups x 512 threads, all resident; cross-workgroup data
+(scores, mids) goes through tagged 8-byte pairs in global memory, the
+all-reduce through a symmetric peer buffer. Side outputs: norm, scores,
+probs / indices, mids (for checking).
+"""
+
 from __future__ import annotations
 
 import functools

@@ -659,48 +659,65 @@ def batch_launches(tokens: int):
     return out
 
 
+def _ar_width(hidden: int, tp: int) -> int:
+    """Row width of the split's all-reduce view: the one-shot kernel runs one
+    CTA per row a rank owns, so a [T, H] output viewed as [T * H / W, W] keeps
+    a decode-sized all-reduce from running on a single CTA, and needs no
+    padding when every T gives a multiple of tp rows (elementwise, so the
+    result is the same)."""
+    return next(w for w in (256, 128, 64) if hidden % w == 0 and (hidden // w) % tp == 0)
+
+
+def split_ar_rows(tokens: int, tp: int) -> int:
+    """Largest all-reduce rows per rank over both models' split views."""
+    return max(-(-tokens * h // _ar_width(h, tp) // tp) for h in (HIDDEN, K3["H"]))
+
+
 class SplitGlm5A8W8:
     """RMSNorm -> router GEMM -> biased top-8 -> aiter fused_moe (FP8 block,
-    shared expert as slot 0 of 257) -> all-reduce -> + residual."""
+    shared expert as the last of 257) -> all-reduce -> + residual.
+
+    The shared expert moves from slot 0 (the fused kernel's layout) to slot
+    256, so the routed ids need no offset and top-k writes straight into
+    columns 0..7 of a [T, 9] buffer whose column 8 is (id 256, weight 1)."""
 
     def __init__(self, w, comm, device):
         from aiter.ops.shuffle import shuffle_weight
 
+        def last(t):
+            t = t.to(device)
+            return torch.cat([t[1:], t[:1]])
+
         self.gamma = w["gamma"].to(device, torch.bfloat16)
         self.router_w = w["router_w"].to(device)
         self.bias = w["bias"].to(device, torch.float32)
-        self.w1 = shuffle_weight(w["ug_w"].to(device), layout=(16, 16))
-        self.w2 = shuffle_weight(w["down_w"].to(device), layout=(16, 16))
-        self.s1, self.s2 = w["ug_scales"].to(device), w["down_scales"].to(device)
+        self.w1 = shuffle_weight(last(w["ug_w"]), layout=(16, 16))
+        self.w2 = shuffle_weight(last(w["down_w"]), layout=(16, 16))
+        self.s1, self.s2 = last(w["ug_scales"]), last(w["down_scales"])
         self.comm, self.device, self.bufs = comm, device, {}
+        self.width = _ar_width(HIDDEN, comm.tp_size)
 
     def __call__(self, x, residual, local=False):
         t = x.shape[0]
         b = self.bufs.get(t)
         if b is None:
-            tp = self.comm.tp_size
-            pad = (t + tp - 1) // tp * tp
+            ids = torch.full((t, TOP_K + 1), NUM_EXPERTS, dtype=torch.int32, device=self.device)
             b = self.bufs[t] = dict(
-                tw=torch.empty(t, TOP_K, dtype=torch.float32, device=self.device),
-                ids=torch.empty(t, TOP_K, dtype=torch.int32, device=self.device),
-                one=torch.ones(t, 1, dtype=torch.float32, device=self.device),
-                zero=torch.zeros(t, 1, dtype=torch.int32, device=self.device),
-                ypad=torch.zeros(pad, HIDDEN, dtype=torch.bfloat16, device=self.device),
-                red=torch.empty(pad, HIDDEN, dtype=torch.bfloat16, device=self.device),
+                tw=torch.ones(t, TOP_K + 1, dtype=torch.float32, device=self.device),
+                ids=ids,
+                red=torch.empty(t, HIDDEN, dtype=torch.bfloat16, device=self.device),
             )
         norm = aiter.rms_norm(x, self.gamma, RMS_EPS)
         logits = torch.mm(norm, self.router_w.t()).float()
-        aiter.biased_grouped_topk(logits, self.bias, b["tw"], b["ids"], 1, 1, True, ROUTE_SCALE)
-        ids = torch.cat([b["zero"], b["ids"] + 1], 1)
-        tw = torch.cat([b["one"], b["tw"]], 1)
+        aiter.biased_grouped_topk(logits, self.bias, b["tw"][:, :TOP_K], b["ids"][:, :TOP_K], 1, 1, True, ROUTE_SCALE)
         y = fused_moe(
-            norm, self.w1, self.w2, tw, ids, activation=aiter.ActivationType.Silu,
+            norm, self.w1, self.w2, b["tw"], b["ids"], activation=aiter.ActivationType.Silu,
             quant_type=aiter.QuantType.per_1x128, w1_scale=self.s1, w2_scale=self.s2,
         )
-        b["ypad"][:t].copy_(y)
-        if not local:
-            self.comm.all_reduce(b["ypad"], b["red"])
-        return b["red"][:t] + residual
+        if local:
+            return y + residual
+        self.comm.all_reduce(y.view(-1, self.width), b["red"].view(-1, self.width))
+        return b["red"] + residual
 
 
 class SplitKimi3A4W4:
@@ -721,18 +738,16 @@ class SplitKimi3A4W4:
         self.s1 = fp4_utils.e8m0_shuffle(w["ug_scales"].to(device).reshape(E * 2 * I, H // MX_BLOCK).view(e8))
         self.s2 = fp4_utils.e8m0_shuffle(w["down_scales"].to(device).reshape(E * H, I // MX_BLOCK).view(e8))
         self.comm, self.device, self.bufs = comm, device, {}
+        self.width = _ar_width(H, comm.tp_size)
 
     def __call__(self, x, latent, local=False):
         t = x.shape[0]
         b = self.bufs.get(t)
         if b is None:
-            tp = self.comm.tp_size
-            pad = (t + tp - 1) // tp * tp
             b = self.bufs[t] = dict(
                 tw=torch.empty(t, K3["TOPK"], dtype=torch.float32, device=self.device),
                 ids=torch.empty(t, K3["TOPK"], dtype=torch.int32, device=self.device),
-                ypad=torch.zeros(pad, K3["H"], dtype=torch.bfloat16, device=self.device),
-                red=torch.empty(pad, K3["H"], dtype=torch.bfloat16, device=self.device),
+                red=torch.empty(t, K3["H"], dtype=torch.bfloat16, device=self.device),
             )
         logits = torch.mm(x, self.router_w.t()).float()
         aiter.biased_grouped_topk(logits, self.bias, b["tw"], b["ids"], 1, 1, True, 1.0)
@@ -741,10 +756,10 @@ class SplitKimi3A4W4:
             quant_type=aiter.QuantType.per_1x32, w1_scale=self.s1, w2_scale=self.s2,
             beta=K3["beta"], linear_beta=K3["lbeta"],
         )
-        b["ypad"][:t].copy_(y)
-        if not local:
-            self.comm.all_reduce(b["ypad"], b["red"])
-        return b["red"][:t]
+        if local:
+            return y
+        self.comm.all_reduce(y.view(-1, self.width), b["red"].view(-1, self.width))
+        return b["red"]
 
 
 def _replay_threaded_us(ranks, graphs, reps, iters) -> float:
@@ -861,7 +876,8 @@ def sweep_batches(model, ranks, args):
         if not args.no_split:
             r0 = ranks[0]
             fi = _topk_sets(torch.cat([t for t in r0["sw"]["fused_ids"]], 0))
-            si = _topk_sets(r0["split"].bufs[tokens]["ids"])
+            # routed columns only (the GLM split's last column is the shared expert)
+            si = _topk_sets(r0["split"].bufs[tokens]["ids"][:, : fi.shape[1]])
             same = (fi == si).all(-1)
             same_frac = float(same.float().mean())
             if bool(same.any()):
@@ -960,7 +976,7 @@ def main_models(args, rank, world, devices):
     moes8 = MegaMoeTpW8A8Glm.peer_group(devices) if "glm5" in models else None
     k3s = MegaMoeTpKimi3.peer_group(devices) if "kimi3" in models else None
     mmax = max([max(args.batch, default=8)] + [8])
-    p2p = P2PGroup(devices, (mmax + world - 1) // world) if args.batch and not args.no_split else None
+    p2p = P2PGroup(devices, split_ar_rows(mmax, world)) if args.batch and not args.no_split else None
     ranks = []
     for i, dev in enumerate(devices):
         r = {"rank": i, "device": dev, "moe": {}}
