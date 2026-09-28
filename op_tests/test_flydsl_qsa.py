@@ -665,6 +665,67 @@ def test_k2_family_a_prefill_matches_oracle():
         raise AssertionError(f"K2 prefill diverged from the oracle (err={err})")
 
 
+def test_k2_page_past_4gib():
+    """A physical page at byte offset 2^32 must not alias page 0.
+
+    Family A pages are 16384 bytes (page 16, 2 KV heads, D=256, bf16), so
+    physical page 262144 starts at 4 GiB. Q is zero, so each live token
+    contributes its V with equal weight. Page 0 is ones and the far page
+    is twos. One row gathers both in a single tile.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    page_bytes = page_size * gqa.kv_heads * gqa.head_dim * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32:
+        raise AssertionError(f"page of {page_bytes} bytes does not divide 4 GiB")
+    n_pages = alias + 1
+    need = n_pages * page_bytes * 2
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip K2 4GiB page test: need %s bytes, %s free", need, free
+        )
+        return
+    q = torch.zeros(3, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k_cache = torch.empty(
+        n_pages,
+        page_size,
+        gqa.kv_heads,
+        gqa.head_dim,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    v_cache = torch.empty_like(k_cache)
+    k_cache[0].zero_()
+    k_cache[alias].zero_()
+    v_cache[0].fill_(1)
+    v_cache[alias].fill_(2)
+    page_table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
+    page_table[0, 0] = 0
+    page_table[0, alias] = alias
+    far_tok = alias * page_size
+    indices = torch.tensor(
+        [[far_tok, 0], [far_tok, -1], [0, -1]], dtype=dtypes.i32, device=device
+    )
+    token_to_req = torch.zeros(3, dtype=dtypes.i32, device=device)
+    out = qsa_k2(q, k_cache, v_cache, indices, page_table, token_to_req)
+    got = out.float()
+    expect = (
+        torch.tensor([1.5, 2.0, 1.0], dtype=torch.float32, device=device)
+        .view(3, 1, 1)
+        .expand_as(got)
+    )
+    if not torch.equal(got, expect):
+        raise AssertionError(
+            "K2 page past 4 GiB aliased or collapsed: "
+            f"row means {got.mean(dim=(1, 2)).tolist()}"
+        )
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
@@ -2082,6 +2143,7 @@ def _run_unit_cases():
     test_k1_family_b_set_equality_published_indexer_point()
     test_k2_family_a_decode_matches_oracle()
     test_k2_family_a_prefill_matches_oracle()
+    test_k2_page_past_4gib()
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_symbols_export_lazily()
