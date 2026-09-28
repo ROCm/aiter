@@ -511,7 +511,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_mul_u32_u24_e32 v9, 40, v197
 	v_mad_u32_u24 v10, 0x88, v13, v14
 	s_delay_alu instid0(VALU_DEP_2)
-	v_add3_u32 v9, v9, v15, 0x2200
+	v_add3_u32 v9, v9, v15, 0x3300
 	s_wait_loadcnt 0x2
 	ds_store_2addr_b64 v10, v[5:6], v[7:8] offset1:1
 	ds_store_2addr_b64 v9, v[1:2], v[3:4] offset1:1
@@ -633,6 +633,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_barrier_signal -1
 	s_branch .LBB0_37
 .LBB0_36:                               ;   in Loop: Header=BB0_37 Depth=1
+	s_setprio 1
 	s_wait_alu depctr_sa_sdst(0)
 	s_or_b32 exec_lo, exec_lo, s9
 	s_wait_dscnt 0x0
@@ -652,7 +653,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_cvt_pk_fp8_f32 v229.l, v137, v138
 	v_cvt_pk_fp8_f32 v232.l, v226, v227
 	v_cvt_pk_fp8_f32 v234.l, v133, v134
-	v_add_nc_u32_e32 v137, 0x2000, v219
+	v_add_nc_u32_e32 v137, 0x3100, v219
 	ds_load_2addr_b64 v[129:132], v137 offset0:64 offset1:66
 	v_cvt_pk_fp8_f32 v229.h, v139, v140
 	v_cvt_pk_fp8_f32 v227.l, v214, v215
@@ -668,14 +669,14 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_wait_dscnt 0x2
 	v_wmma_f32_16x16x16_fp8_fp8 v[121:128], v[129:130], v[227:228], v[121:128]
 	v_wmma_f32_16x16x16_fp8_fp8 v[57:64], v[129:130], v[233:234], v[57:64]
-	v_add_nc_u32_e32 v129, 0x2800, v219
+	v_add_nc_u32_e32 v129, 0x3900, v219
 	s_delay_alu instid0(VALU_DEP_3) | instskip(NEXT) | instid1(VALU_DEP_3)
 	v_wmma_f32_16x16x16_fp8_fp8 v[121:128], v[131:132], v[231:232], v[121:128]
 	v_wmma_f32_16x16x16_fp8_fp8 v[57:64], v[131:132], v[229:230], v[57:64]
 	ds_load_2addr_b64 v[141:144], v129 offset0:48 offset1:50
 	ds_load_2addr_b64 v[211:214], v129 offset0:128 offset1:130
 	ds_load_2addr_b64 v[215:218], v129 offset0:208 offset1:210
-	v_add_nc_u32_e32 v129, 0x3000, v219
+	v_add_nc_u32_e32 v129, 0x4100, v219
 	s_wait_dscnt 0x4
 	v_wmma_f32_16x16x16_fp8_fp8 v[113:120], v[133:134], v[227:228], v[113:120]
 	v_wmma_f32_16x16x16_fp8_fp8 v[49:56], v[133:134], v[233:234], v[49:56]
@@ -703,7 +704,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_wmma_f32_16x16x16_fp8_fp8 v[73:80], v[219:220], v[227:228], v[73:80]
 	v_wmma_f32_16x16x16_fp8_fp8 v[9:16], v[219:220], v[233:234], v[9:16]
 	s_wait_dscnt 0x0
-	s_barrier_signal -1
+	s_setprio 0
 	v_wmma_f32_16x16x16_fp8_fp8 v[65:72], v[223:224], v[227:228], v[65:72]
 	v_wmma_f32_16x16x16_fp8_fp8 v[1:8], v[223:224], v[233:234], v[1:8]
 	v_wmma_f32_16x16x16_fp8_fp8 v[89:96], v[213:214], v[231:232], v[89:96]
@@ -719,15 +720,27 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_cbranch_scc1 .LBB0_44
 .LBB0_37:                               ; =>This Inner Loop Header: Depth=1
 	s_wait_alu depctr_sa_sdst(0)
-	s_and_b32 s8, s6, 1
+	s_mul_hi_u32 s33, s6, 0xaaaaaaab
+	s_wait_alu depctr_sa_sdst(0)
+	s_lshr_b32 s33, s33, 1
+	s_wait_alu depctr_sa_sdst(0)
+	s_mul_i32 s33, s33, 3
+	s_wait_alu depctr_sa_sdst(0)
+	s_sub_co_i32 s8, s6, s33
+	s_wait_alu depctr_sa_sdst(0)
 	s_barrier_wait -1
+	s_setprio 3
 	s_wait_loadcnt 0x0
 	s_and_saveexec_b32 s9, s0
 	s_cbranch_execz .LBB0_39
 ; %bb.38:                               ;   in Loop: Header=BB0_37 Depth=1
 	s_add_co_i32 s1, s7, 64
 	s_wait_alu depctr_sa_sdst(0)
-	s_xor_b32 s10, s8, 1
+	s_add_co_i32 s10, s8, 1
+	s_wait_alu depctr_sa_sdst(0)
+	s_cmp_eq_u32 s10, 3
+	s_cselect_b32 s10, 0, s10
+	s_wait_alu depctr_sa_sdst(0)
 	s_cmp_lt_i32 s1, s12
 	s_cselect_b32 s1, s1, 0
 	s_wait_alu depctr_sa_sdst(0)
@@ -739,7 +752,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_mul_i32 s11, s10, 0x1400
 	v_mul_lo_u32 v131, v129, s27
 	s_wait_alu depctr_sa_sdst(0)
-	v_add3_u32 v134, v203, s11, 0x2200
+	v_add3_u32 v134, v203, s11, 0x3300
 	v_mul_lo_u32 v132, v130, s26
 	v_mad_co_u64_u32 v[129:130], null, v129, s26, s[28:29]
 	s_delay_alu instid0(VALU_DEP_1)
@@ -775,6 +788,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_wait_alu depctr_sa_sdst(0)
 	s_add_nc_u64 s[10:11], s[16:17], s[10:11]
 	s_wait_dscnt 0x2
+	s_barrier_signal -1
 	v_wmma_i32_16x16x16_iu8 v[223:230], v[231:232], v[169:170], v[244:251] neg_lo:[1,1,0]
 	v_wmma_i32_16x16x16_iu8 v[129:136], v[231:232], v[157:158], v[244:251] neg_lo:[1,1,0]
 	s_wait_dscnt 0x1
@@ -875,6 +889,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_mov_b32 s34, 0x4b400000
 	v_cmp_lt_f32_e64 s35, 0x3b2aaaab, v196
 	s_wait_alu depctr_va_sdst(0)
+	s_setprio 2
 	s_cmp_eq_u32 s35, 0
 	s_cbranch_scc1 .Lnocvt_fast
 	s_mov_b32 s34, 0
@@ -1192,20 +1207,32 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_barrier_signal -1
 .LBB0_44:
 	s_barrier_wait -1
+	s_setprio 0
 	s_ashr_i32 s1, s5, 5
 	s_wait_alu depctr_sa_sdst(0)
 	s_cmp_lt_i32 s4, s25
 	s_cbranch_scc0 .LBB0_52
 ; %bb.45:
 	s_wait_loadcnt_dscnt 0x0
-	s_and_b32 s24, s1, 1
+	s_mul_hi_u32 s33, s1, 0xaaaaaaab
+	s_wait_alu depctr_sa_sdst(0)
+	s_lshr_b32 s33, s33, 1
+	s_wait_alu depctr_sa_sdst(0)
+	s_mul_i32 s33, s33, 3
+	s_wait_alu depctr_sa_sdst(0)
+	s_sub_co_i32 s24, s1, s33
+	s_wait_alu depctr_sa_sdst(0)
 	s_and_saveexec_b32 s5, s0
 	s_cbranch_execz .LBB0_47
 ; %bb.46:
 	v_lshrrev_b32_e32 v129, 3, v0
 	v_lshlrev_b32_e32 v0, 4, v0
 	s_wait_alu depctr_sa_sdst(0)
-	s_xor_b32 s0, s24, 1
+	s_add_co_i32 s0, s24, 1
+	s_wait_alu depctr_sa_sdst(0)
+	s_cmp_eq_u32 s0, 3
+	s_cselect_b32 s0, 0, s0
+	s_wait_alu depctr_sa_sdst(0)
 	s_wait_alu depctr_sa_sdst(0)
 	s_mul_i32 s6, s0, 0x1400
 	v_mul_u32_u24_e32 v129, 0x88, v129
@@ -1217,7 +1244,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_wait_alu depctr_sa_sdst(0)
 	v_add3_u32 v129, s0, v129, v130
 	s_delay_alu instid0(VALU_DEP_2)
-	v_add3_u32 v0, v131, v0, 0x2200
+	v_add3_u32 v0, v131, v0, 0x3300
 	ds_store_2addr_b64 v129, v[145:146], v[147:148] offset1:1
 	ds_store_2addr_b64 v0, v[149:150], v[151:152] offset1:1
 .LBB0_47:
@@ -1681,7 +1708,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_mov_b16_e64 v183.h, v182.h
 	v_cvt_pk_fp8_f32 v183.l, v152, v163
 	s_wait_alu depctr_sa_sdst(0)
-	v_or_b32_e32 v152, s24, v161
+	v_add_nc_u32_e32 v152, s24, v161
 	v_cvt_pk_fp8_f32 v185.l, v0, v145
 	v_mov_b16_e64 v184.h, v182.h
 	v_mov_b16_e64 v185.h, v182.h
@@ -1691,9 +1718,9 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_mov_b16_e64 v186.h, v182.h
 	v_cvt_pk_fp8_f32 v187.l, v134, v135
 	v_cvt_pk_fp8_f32 v183.h, v164, v170
-	v_dual_mov_b32 v200, v190 :: v_dual_add_nc_u32 v157, 0x2000, v0
-	v_add_nc_u32_e32 v134, 0x2800, v0
-	v_add_nc_u32_e32 v0, 0x3000, v0
+	v_dual_mov_b32 v200, v190 :: v_dual_add_nc_u32 v157, 0x3100, v0
+	v_add_nc_u32_e32 v134, 0x3900, v0
+	v_add_nc_u32_e32 v0, 0x4100, v0
 	v_cvt_pk_fp8_f32 v184.h, v158, v159
 	v_cvt_pk_fp8_f32 v185.h, v146, v147
 	v_cvt_pk_fp8_f32 v186.l, v148, v149
@@ -2923,7 +2950,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
 	.amdhsa_kernel sage_hip_attn_bm128_bn32
-		.amdhsa_group_segment_fixed_size 18944
+		.amdhsa_group_segment_fixed_size 28416
 		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 72
 		.amdhsa_user_sgpr_count 2
@@ -3068,7 +3095,7 @@ amdhsa.kernels:
         .size:           4
         .value_kind:     by_value
     .gfx1250_revision: B0
-    .group_segment_fixed_size: 18944
+    .group_segment_fixed_size: 28416
     .kernarg_segment_align: 8
     .kernarg_segment_size: 72
     .language:       OpenCL C
