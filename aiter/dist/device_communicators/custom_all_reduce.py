@@ -15,6 +15,7 @@
 * limitations under the License.
 """
 
+import ctypes
 import os
 import pickle
 from contextlib import contextmanager
@@ -99,6 +100,62 @@ def _expandable_segments_enabled() -> bool:
         if raw:
             return _parse_expandable_segments(raw)
     return False
+
+
+# hip/driver_types.h: hipPointer_attribute
+_HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11
+
+_hip_rt = None
+
+
+def _loaded_hip_runtime():
+    """The HIP runtime torch already loaded, or None if it cannot be found.
+
+    Bound by the path mapped into this process: a second copy of the runtime
+    would not know about torch's allocations.
+    """
+    global _hip_rt
+    if _hip_rt is None:
+        from aiter.dist.cuda_wrapper import find_loaded_library
+
+        path = find_loaded_library("libamdhip64")
+        rt = ctypes.CDLL(path) if path else False
+        if rt:
+            rt.hipPointerGetAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            ]
+            rt.hipIpcGetMemHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _hip_rt = rt
+    return _hip_rt or None
+
+
+def _ipc_exportable(ptr: int) -> bool:
+    """Whether flush_graph_buffers will be able to export *ptr* (~1 us).
+
+    Mirrors get_graph_buffer_ipc_meta, which exports the allocation's base
+    address and aborts the process (HIP_CALL) if that fails. Checking at the
+    call site turns that into a Python error that points at the offending
+    collective. Legal while the stream is capturing.
+    """
+    rt = _loaded_hip_runtime()
+    if rt is None:
+        return True
+    base = ctypes.c_void_p()
+    handle = (ctypes.c_char * 64)()  # sizeof(hipIpcMemHandle_t)
+    ok = (
+        rt.hipPointerGetAttribute(
+            ctypes.byref(base), _HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR, ptr
+        )
+        == 0
+        and rt.hipIpcGetMemHandle(handle, base) == 0
+    )
+    if not ok:
+        # A failed HIP call leaves a sticky error that the next kernel launch
+        # would report as its own.
+        rt.hipGetLastError()
+    return ok
 
 
 # ROCm release at which hipIpc is reported to work on gfx1250. Below this we fall
@@ -618,25 +675,29 @@ class IPCBufferPool:
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
-    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
-        """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
+    def all_gather_object(self, obj) -> list:
+        """Gather a picklable *obj* from every rank via the TCP store.
 
-        Each rank writes its serialised *shard_data* under a unique key, then
-        reads every other rank's data.  ``store.get()`` blocks until the key
-        is available, providing natural barrier semantics without involving any
+        Each rank writes its serialised *obj* under a unique key, then reads
+        every other rank's.  ``store.get()`` blocks until the key is
+        available, providing natural barrier semantics without involving any
         collective communication backend.
         """
         seq = self._ipc_seq
         self._ipc_seq += 1
         prefix = f"{self._store_key_prefix}/{seq}"
 
-        self._store.set(f"{prefix}/r{self._rank}", pickle.dumps(shard_data))
+        self._store.set(f"{prefix}/r{self._rank}", pickle.dumps(obj))
+        return [
+            pickle.loads(self._store.get(f"{prefix}/r{r}"))
+            for r in range(self._world_size)
+        ]
 
+    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
+        """Exchange IPC metadata (handle + offset) across all ranks."""
         handles = []
         offsets = []
-        for r in range(self._world_size):
-            raw = self._store.get(f"{prefix}/r{r}")
-            h, o = pickle.loads(raw)
+        for h, o in self.all_gather_object(shard_data):
             handles.append(h)
             offsets.append(o)
         return handles, offsets
@@ -1124,27 +1185,72 @@ class CustomAllreduce:
         It records all the buffer addresses used in the CUDA graph.
         """
         prev_register = self.enable_register_for_capturing
-        if (
-            self._register_for_capturing_requested
-            and not self._use_vmm
-            and not self.enable_register_for_capturing
-            and not _expandable_segments_enabled()
-        ):
+        if not self.disabled and not self._use_vmm:
+            self.enable_register_for_capturing = self._agree_capture_path()
+        try:
+            self._IS_CAPTURING = True
+            try:
+                yield
+            finally:
+                self._IS_CAPTURING = False
+            # A failed capture is discarded; registering its buffers would
+            # only exchange a partial, possibly rank-dependent set.
+            if not self.disabled:
+                self._pool.flush_graph_buffers(self._ptr)
+        finally:
+            self.enable_register_for_capturing = prev_register
+
+    def _agree_capture_path(self) -> bool:
+        """Decide the capture path from the live allocator state, on every rank.
+
+        The registered path is used only if every rank can take it: the choice
+        changes the kernel's input source and the graph-buffer count, so ranks
+        that split would mismatch at flush and read the wrong peer buffers on
+        replay. Copy-in is always safe, so any dissent falls back to it.
+        """
+        # Set from constructor arguments and arch, so the same on every rank.
+        if not self._register_for_capturing_requested:
+            return False
+        decisions = self._pool.all_gather_object(not _expandable_segments_enabled())
+        agreed = all(decisions)
+        if len(set(decisions)) > 1:
+            logger.warning(
+                "Ranks disagree on the custom-allreduce capture path "
+                "(registered per rank: %s; expandable_segments off and "
+                "registration requested). Using copy-in on every rank.",
+                decisions,
+            )
+        elif agreed and not self.enable_register_for_capturing:
             logger.info(
                 "expandable_segments is off at capture time; using the "
                 "registered custom-allreduce capture path (no staging copy)."
             )
-            self.enable_register_for_capturing = True
-        try:
-            self._IS_CAPTURING = True
-            yield
-        finally:
-            self._IS_CAPTURING = False
-            try:
-                if not self.disabled:
-                    self._pool.flush_graph_buffers(self._ptr)
-            finally:
-                self.enable_register_for_capturing = prev_register
+        elif not agreed and self.enable_register_for_capturing:
+            logger.info(
+                "expandable_segments is on at capture time; using the "
+                "copy-in custom-allreduce capture path."
+            )
+        return agreed
+
+    def _capture_registered(self, inp: torch.Tensor) -> bool:
+        """Whether a collective captured now may bind *inp* directly.
+
+        Raises if the registered path is on but *inp* cannot be IPC-exported,
+        e.g. it was allocated while expandable_segments were still on. Every
+        rank then fails at the same collective, since capture() agreed on the
+        path and hosts allocate the same way on every rank.
+        """
+        if not self.enable_register_for_capturing:
+            return False
+        if not _ipc_exportable(inp.data_ptr()):
+            raise RuntimeError(
+                "Custom allreduce is capturing on the registered path, but a "
+                "collective buffer cannot be IPC-exported. It was most likely "
+                "allocated while expandable_segments were on (issue #4174). "
+                "Allocate every collective buffer inside the capture window, "
+                "after expandable_segments are turned off."
+            )
+        return True
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
@@ -1245,6 +1351,9 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
+        elif registered_input and torch.cuda.is_current_stream_capturing():
+            # The registered path records the output for export at flush too.
+            self._capture_registered(out)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
@@ -1271,7 +1380,7 @@ class CustomAllreduce:
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
-                    registered_input=self.enable_register_for_capturing,
+                    registered_input=self._capture_registered(input),
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -1384,7 +1493,7 @@ class CustomAllreduce:
                 # enable_register_for_capturing note in __init__); use the
                 # copy-in path so capture/replay reads the pre-registered pool.
                 return self.reduce_scatter(
-                    input, output, dim, registered=self.enable_register_for_capturing
+                    input, output, dim, registered=self._capture_registered(input)
                 )
             else:
                 # Warmup forward (pre-capture): run the REAL reduce_scatter via
@@ -1483,7 +1592,7 @@ class CustomAllreduce:
                 # gfx1250 cannot register graph buffers cross-rank (see
                 # enable_register_for_capturing note in __init__); use the
                 # copy-in path so capture/replay reads the pre-registered pool.
-                if self.enable_register_for_capturing:
+                if self._capture_registered(inp):
                     out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
                 else:
                     out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
@@ -1615,7 +1724,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
@@ -1719,7 +1828,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -1917,7 +2026,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(qkv_in),
                 )
             else:
                 return (
@@ -1986,7 +2095,7 @@ class CustomAllreduce:
                     head_dim,
                     rotary_dim,
                     eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(qkv_in),
                 )
             else:
                 return (
@@ -2088,7 +2197,7 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
@@ -2147,7 +2256,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )

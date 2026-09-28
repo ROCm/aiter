@@ -12,7 +12,8 @@ That decision used to be latched once in __init__. A host that disables
 expandable segments only for the duration of CUDA graph capture -- so that the
 graph pool's activations *are* exportable -- got no benefit from it, because
 the decision had already been made. capture() now re-reads the live allocator
-state, so the registered path is picked up.
+state, agrees on the result across ranks, and refuses a captured input that
+cannot be exported.
 
 Two axes that no existing test covers together: test_init_dist_env.py sets
 expandable segments but captures no graph, and test_custom_allreduce.py
@@ -32,24 +33,44 @@ logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
+# scenario -> (expandable_segments at __init__, which ranks flip them for
+# capture, expected registered path inside capture()).
+#   keep:    left on, the copy-in path is kept.
+#   toggle:  the host turns them off for capture, the registered path is used.
+#   mixed:   only rank 0 turns them off; ranks must agree, so all use copy-in.
+#   reverse: off at __init__, on at capture; the registered path is refused.
+#   stale:   turned off for capture, but the input was allocated before, so it
+#            is VMM-backed; the captured collective must raise, not abort, and
+#            leave the process usable.
+SCENARIOS = {
+    "keep": (True, "none", False),
+    "toggle": (True, "all", True),
+    "mixed": (True, "rank0", False),
+    "reverse": (False, "all", False),
+    "stale": (True, "all", True),
+}
+
 
 def _set_expandable_segments(enabled: bool) -> None:
     """What a host (e.g. vLLM) does around capture. Keep the environment in
     step with the live setting: _expandable_segments_enabled() falls back to
-    parsing it when the allocator snapshot cannot be read, and a rank that
-    read a stale value would pick a different path from its peers."""
+    parsing it when the allocator snapshot cannot be read."""
     value = "True" if enabled else "False"
     torch._C._accelerator_setAllocatorSettings(f"expandable_segments:{value}")
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = f"expandable_segments:{value}"
 
 
-def _worker(tp_size, rankID, toggle_for_capture, shape):
+def _worker(tp_size, rankID, scenario, shape):
+    at_init, flip_ranks, _ = SCENARIOS[scenario]
     # Programmatic, not just the environment: importing aiter has already
     # initialized CUDA in this process, so the allocator config is parsed and
     # a late PYTORCH_HIP_ALLOC_CONF write would be ignored.
-    _set_expandable_segments(True)
+    _set_expandable_segments(at_init)
 
     from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        _expandable_segments_enabled,
+    )
     from aiter.dist.parallel_state import get_tp_group, graph_capture
     from aiter.ops.communication import destroy_dist_env, init_dist_env
 
@@ -62,29 +83,49 @@ def _worker(tp_size, rankID, toggle_for_capture, shape):
     # A disabled communicator (e.g. an unsupported world size) is still
     # entered by graph_capture(); capture must keep working there.
     disabled = ca_comm.disabled
-    # The __init__ veto must still fire: expandable segments are on right now.
     latched = ca_comm.enable_register_for_capturing
     requested = getattr(ca_comm, "_register_for_capturing_requested", None)
+    # The allocator snapshot reports whether expandable_segments took effect.
+    at_init_seen = _expandable_segments_enabled()
+
+    flip = flip_ranks == "all" or (flip_ranks == "rank0" and rankID == 0)
+    fill = float(rankID + 1)
+    x = None
+    if scenario == "stale":
+        x = torch.full(shape, fill, dtype=torch.bfloat16, device=device)
 
     graph = torch.cuda.CUDAGraph()
     registered_during_capture = None
-    if toggle_for_capture:
-        _set_expandable_segments(False)
+    error = None
+    out_t = None
+    if flip:
+        _set_expandable_segments(not at_init)
+    at_capture_seen = _expandable_segments_enabled()
     try:
         # capture() must wrap the graph, as graph_capture() does: its exit
         # flushes the graph buffers, which cannot run on a capturing stream.
         # Allocate inside the toggled window, like a graph-pool activation.
         with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
             registered_during_capture = ca_comm.enable_register_for_capturing
-            x = torch.full(
-                shape, float(rankID + 1), dtype=torch.bfloat16, device=device
-            )
+            if x is None:
+                x = torch.full(shape, fill, dtype=torch.bfloat16, device=device)
             out_t = tensor_model_parallel_all_reduce(x)
+    except RuntimeError as e:
+        if scenario != "stale":
+            raise
+        error = str(e)
     finally:
-        if toggle_for_capture:
-            _set_expandable_segments(True)
+        if flip:
+            _set_expandable_segments(at_init)
 
-    graph.replay()
+    if error is None:
+        graph.replay()
+    else:
+        # A refused capture must leave the process usable: no sticky HIP error
+        # for the next launch to report, and a working communicator.
+        out_t = tensor_model_parallel_all_reduce(
+            torch.full(shape, fill, dtype=torch.bfloat16, device=device)
+        )
     torch.cuda.synchronize()
     out = out_t.cpu()
 
@@ -93,19 +134,22 @@ def _worker(tp_size, rankID, toggle_for_capture, shape):
     return {
         "latched": latched,
         "requested": requested,
+        "seen": (at_init_seen, at_capture_seen),
+        "flip": flip,
         "during_capture": registered_during_capture,
         "restored": restored,
         "disabled": disabled,
+        "error": error,
         "out": out,
     }
 
 
-def test_capture_registration(tp_size, shape, toggle_for_capture):
+def test_capture_registration(tp_size, shape, scenario, port):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49375"
+    os.environ["MASTER_PORT"] = str(port)
     pool = Pool(processes=tp_size)
     rets = [
-        pool.apply_async(_worker, args=(tp_size, i, toggle_for_capture, shape))
+        pool.apply_async(_worker, args=(tp_size, i, scenario, shape))
         for i in range(tp_size)
     ]
     pool.close()
@@ -113,58 +157,84 @@ def test_capture_registration(tp_size, shape, toggle_for_capture):
     rets = [r.get(timeout=600) for r in rets]
     pool.join()
 
-    # sum over ranks of full(rank+1) = n(n+1)/2
+    at_init, _, expected = SCENARIOS[scenario]
+    tag = f"{tp_size=} {scenario=}"
+    disabled = all(r["disabled"] for r in rets)
+    # No veto to exercise: gfx1250 and the VMM transport never register
+    # captured inputs, and a platform may ignore expandable_segments. Every
+    # rank must also see exactly the allocator state the scenario set up.
+    exercised = not disabled and all(
+        r["requested"] and r["seen"] == (at_init, at_init != r["flip"]) for r in rets
+    )
+    raises = scenario == "stale" and exercised
+
+    # sum over ranks of full(rank+1) = n(n+1)/2; for "stale", from the eager
+    # all-reduce run after the refused capture.
     ref = torch.full(shape, float(tp_size * (tp_size + 1) // 2), dtype=torch.bfloat16)
     for i, r in enumerate(rets):
-        checkAllclose(
-            ref,
-            r["out"],
-            msg=f"captured allreduce: {tp_size=} toggle={toggle_for_capture} rank={i}",
-        )
+        if raises:
+            assert r["error"] and "cannot be IPC-exported" in r["error"], (
+                f"{tag} rank {i}: a VMM-backed input on the registered path "
+                f"must raise a clear error, got {r['error']!r}"
+            )
+        else:
+            assert r["error"] is None, f"{tag} rank {i}: {r['error']}"
+        checkAllclose(ref, r["out"], msg=f"allreduce: {tag} rank={i}")
 
-    if all(r["disabled"] for r in rets):
+    if disabled:
         return {"disabled": True}
-    # No veto to re-take: gfx1250 and the VMM transport never veto, and a
-    # platform that ignores expandable_segments never sets it.
-    if not all(r["requested"] for r in rets) or any(r["latched"] for r in rets):
+    if not exercised:
         logger.warning(
-            "expandable_segments veto not exercised on this platform "
+            f"{tag}: expandable_segments veto not exercised on this platform "
             f"(requested={[r['requested'] for r in rets]}, "
-            f"latched={[r['latched'] for r in rets]}); checked the result only."
+            f"seen={[r['seen'] for r in rets]}); checked the result only."
         )
         return {"veto_exercised": False}
 
     for i, r in enumerate(rets):
-        assert r["latched"] is False, (
-            "expandable_segments is on at __init__, so the registered capture "
-            f"path must be vetoed there; rank {i} saw {r['latched']}"
+        assert r["latched"] is (not at_init), (
+            f"{tag} rank {i}: __init__ must veto the registered path exactly "
+            f"when expandable_segments are on; saw {r['latched']}"
         )
-        assert r["during_capture"] is toggle_for_capture, (
-            f"rank {i}: expected enable_register_for_capturing="
-            f"{toggle_for_capture} inside capture(), saw {r['during_capture']}"
+        # "mixed" also checks agreement: rank 0 alone could have registered.
+        assert r["during_capture"] is expected, (
+            f"{tag} rank {i}: expected enable_register_for_capturing="
+            f"{expected} inside capture(), saw {r['during_capture']}"
         )
-        assert (
-            r["restored"] is False
-        ), f"rank {i}: the capture-time decision must not leak out of capture()"
-
-    # Every rank must agree: the registered/unregistered choice changes the
-    # kernel algorithm and the graph-buffer count, so a split is a collective
-    # mismatch, not a local inefficiency.
-    decisions = {r["during_capture"] for r in rets}
-    assert len(decisions) == 1, f"ranks disagreed on the capture path: {rets}"
-    return {"during_capture": decisions.pop()}
+        assert r["restored"] is r["latched"], (
+            f"{tag} rank {i}: the capture-time decision must not leak out of "
+            "capture()"
+        )
+    return {"during_capture": expected, "raised": raises}
 
 
 if __name__ == "__main__":
     freeze_support()
     parser = argparse.ArgumentParser(description="config input of test")
-    parser.add_argument("-t", "--tp_size", type=int, default=2)
+    parser.add_argument(
+        "-t",
+        "--tp_size",
+        type=int,
+        nargs="*",
+        default=None,
+        help="TP sizes (default: 2 3 4 8, capped at the visible GPU count; "
+        "3 exercises a disabled communicator)",
+    )
+    parser.add_argument(
+        "-s",
+        "--scenario",
+        choices=list(SCENARIOS),
+        nargs="*",
+        default=list(SCENARIOS),
+    )
     args = parser.parse_args()
 
-    # toggle=False: expandable segments stay on, the copy-in path is kept.
-    # toggle=True:  the host turns them off for capture, the registered
-    #               (copy-free) path is picked up.
-    # -t 3 exercises a disabled communicator (unsupported world size).
-    for toggle in (False, True):
-        ret = test_capture_registration(args.tp_size, (128, 8192), toggle)
-        print(f"toggle_for_capture={toggle}: {ret}")
+    n_gpu = torch.cuda.device_count()
+    tp_sizes = args.tp_size or [tp for tp in (2, 3, 4, 8) if tp <= n_gpu]
+    port = 49375
+    for tp_size in tp_sizes:
+        for scenario in args.scenario:
+            # A fresh port per run: the previous store may still hold its own.
+            ret = test_capture_registration(tp_size, (128, 8192), scenario, port)
+            port += 1
+            print(f"tp_size={tp_size} scenario={scenario}: {ret}")
