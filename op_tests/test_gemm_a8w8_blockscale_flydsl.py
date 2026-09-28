@@ -75,7 +75,7 @@ def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
     # Keep guard storage adjacent to Out to catch over-stores on M/N tails.
     guarded_out = torch.full((m * n + 256,), 42, dtype=dtype, device="cuda")
     out = guarded_out[128:-128].view(m, n)
-    for name, ki in candidates.items():
+    for name in candidates:
         out.fill_(float("nan"))
         config = {"libtype": "flydsl", "kernelName": name, "splitK": 0}
         with patch.object(gemm_ops, "get_CKGEMM_config", return_value=config):
@@ -103,7 +103,7 @@ def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
             catastrophic_check=True,
         )
         assert err == 0, f"{name}: error ratio {err}"
-        tag = f"flydsl sm{int(ki.split_m)} tdma{int(ki.use_tile_dma)}"
+        tag = "flydsl"
         ret[f"{tag} us"] = us
         ret[f"{tag} TFLOPS"] = flops / us / 1e6
         ret[f"{tag} TB/s"] = nbytes / us / 1e6

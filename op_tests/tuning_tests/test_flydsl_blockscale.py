@@ -4,7 +4,9 @@
 """CPU checks for config routing, scale contracts and blockscale tuner wiring."""
 
 import importlib
+import inspect
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -99,7 +101,7 @@ def test_existing_routes_unchanged(preshuffle, libtype):
 
 
 @pytest.mark.parametrize("preshuffle", [False, True])
-def test_fp16_tuned_config_keeps_ck_fallback(preshuffle):
+def test_fp16_tuned_config_asserts_without_fallback(preshuffle):
     x, w, sa, sb, out = _inputs(torch.float16)
     config = {
         "libtype": "flydsl",
@@ -116,15 +118,14 @@ def test_fp16_tuned_config_keeps_ck_fallback(preshuffle):
         patch.object(ops, "get_CKGEMM_config", return_value=config),
         patch.object(ops, target, return_value=out) as fallback,
     ):
-        if preshuffle:
-            result = ops.gemm_a8w8_blockscale_bpreshuffle(
-                x, w, sa, sb, dtype=torch.float16, out=out
-            )
-            assert fallback.call_args.args[4] is out
-        else:
-            result = ops.gemm_a8w8_blockscale(x, w, sa, sb, dtype=torch.float16)
-        assert result is out
-        fallback.assert_called_once()
+        with pytest.raises(AssertionError, match="BF16 output"):
+            if preshuffle:
+                ops.gemm_a8w8_blockscale_bpreshuffle(
+                    x, w, sa, sb, dtype=torch.float16, out=out
+                )
+            else:
+                ops.gemm_a8w8_blockscale(x, w, sa, sb, dtype=torch.float16)
+        fallback.assert_not_called()
 
 
 def test_gfx1250_mxfp8_route_unchanged():
@@ -174,7 +175,10 @@ def test_invalid_scales_are_rejected(backend):
 
 
 def test_kernel_names_and_shape_gates(catalog):
-    assert len(catalog.kernels_by_name) == len(catalog.kernels_list) == 8
+    assert len(catalog.kernels_by_name) == len(catalog.kernels_list) == 2
+    assert set(catalog.kernels_list) == {2, 6}
+    assert catalog.kernels_list[2].name.endswith("_ps0_sm1_tdma0")
+    assert catalog.kernels_list[6].name.endswith("_ps1_sm1_tdma0")
     for ki in catalog.kernels_list.values():
         assert catalog.kernels_by_name[ki.name] is ki
         assert catalog.kernel_fits_shape(ki, 33, 384, 512, "gfx950")
@@ -184,14 +188,108 @@ def test_kernel_names_and_shape_gates(catalog):
         assert not catalog.kernel_fits_shape(ki, 0, 384, 512, "gfx950")
         assert not catalog.kernel_fits_shape(ki, 33, 383, 512, "gfx950")
         assert not catalog.kernel_fits_shape(ki, 33, 384, 524288, "gfx950")
-        assert not catalog.kernel_fits_shape(ki, 2**24, 384, 512, "gfx950")
+        assert not catalog.kernel_fits_shape(ki, 2**27, 384, 512, "gfx950")
 
 
-def test_i32_boundary_includes_speculative_prefetch(catalog):
+def test_i32_bounds_are_local_but_scales_remain_global(catalog):
     for ki in catalog.kernels_list.values():
-        # Logical storage fits, but the next padded tile/prefetch must not wrap.
-        assert not catalog.kernel_fits_shape(ki, 1, 2**22 - 16, 512, "gfx950")
+        # A/B/C matrices may exceed 4 GiB; bases are rebased before i32 offsets.
+        for shape in (
+            (262401, 272, 16384),
+            (257, 262416, 16384),
+            (32769, 65552, 512),
+            (2**24, 384, 512),
+        ):
+            assert catalog.kernel_fits_shape(ki, *shape, "gfx950")
+        assert catalog.kernel_fits_shape(ki, 1, 2**22 - 16, 512, "gfx950")
         assert catalog.kernel_fits_shape(ki, 1, 2**22 - 256, 512, "gfx950")
+        assert not catalog.kernel_fits_shape(ki, 1, 2**22, 512, "gfx950")
+        # ScaleA's final speculative offset, not M*K, bounds large M.
+        last_m = ((2**31 - 1) // (6 * 4)) // 256 * 256
+        assert catalog.kernel_fits_shape(ki, last_m, 256, 512, "gfx950")
+        assert not catalog.kernel_fits_shape(ki, last_m + 256, 256, 512, "gfx950")
+
+
+def test_removed_modes_are_not_catalog_aliases(catalog):
+    prefix = f"{catalog.KERNEL_PREFIX}256x256x128_F8_F8_B16_"
+    for ps in (0, 1):
+        for suffix in ("sm0_tdma0", "sm0_tdma1", "sm1_tdma1"):
+            assert f"{prefix}ps{ps}_{suffix}" not in catalog.kernels_by_name
+
+
+def test_compiler_signature_has_no_removed_flags(backend):
+    from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_8wave import (
+        compile_gemm_fp8_8wave,
+    )
+
+    signature = inspect.signature(compile_gemm_fp8_8wave)
+    assert list(signature.parameters) == [
+        "TILE_M",
+        "TILE_N",
+        "TILE_K",
+        "N",
+        "K",
+        "pid_swizzle",
+        "permlane_epilogue",
+        "preshuffle_b",
+    ]
+    for keyword in ("with_scale", "useTileDMA", "split_m"):
+        for value in (False, True):
+            with pytest.raises(TypeError, match=keyword):
+                compile_gemm_fp8_8wave(256, 256, 128, 256, 512, **{keyword: value})
+
+
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_compile_adapter_uses_fixed_raw_signature(backend, catalog, preshuffle):
+    from aiter.ops.flydsl.kernels import gemm_a8w8_blockscale_8wave as kernel
+
+    ki = catalog.kernels_list[6 if preshuffle else 2]
+    launch = SimpleNamespace(compile_hints={})
+    backend._compile_gemm.cache_clear()
+    try:
+        with patch.object(
+            kernel, "compile_gemm_fp8_8wave", return_value=launch
+        ) as compile:
+            assert backend._compile_gemm(384, 512, ki.name, 0) is launch
+            compile.assert_called_once_with(
+                256, 256, 128, 384, 512, preshuffle_b=preshuffle
+            )
+            assert launch.compile_hints == {"opt_level": 2}
+    finally:
+        backend._compile_gemm.cache_clear()
+
+
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_adapter_preserves_matrix_rank_for_large_address_abi(
+    backend, catalog, preshuffle
+):
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    x, w, sa, sb, out = _inputs()
+    ki = catalog.kernels_list[6 if preshuffle else 2]
+    stream = object()
+    with (
+        patch.object(backend, "is_supported", return_value=True),
+        patch.object(backend, "_compile_gemm", return_value=object()),
+        patch.object(torch.cuda, "device", return_value=nullcontext()),
+        patch.object(torch.cuda, "current_stream", return_value=None),
+        patch.object(fx, "Stream", return_value=stream),
+        patch.object(tensor_shim, "_run_compiled") as run,
+    ):
+        assert (
+            backend.run_gemm_a8w8_blockscale(x, w, sa, sb, out, ki.name, preshuffle)
+            is out
+        )
+    _, actual_a, actual_b, actual_c, actual_sa, actual_sb, m, actual_stream = (
+        run.call_args.args
+    )
+    assert actual_a.shape == x.shape and actual_a.dtype == torch.int8
+    assert actual_b.shape == w.shape and actual_b.dtype == torch.int8
+    assert actual_a.data_ptr() == x.data_ptr() and actual_b.data_ptr() == w.data_ptr()
+    assert actual_c is out and actual_sa.ndim == actual_sb.ndim == 1
+    assert m == 33 and actual_stream is stream
 
 
 @pytest.mark.parametrize("preshuffle", [False, True])
@@ -212,7 +310,8 @@ def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
     tuner.topk = 1
     shape = ("gfx950", 256, 33, 384, 512)
     tasks = tuner.get_gemm_a8w8_blockscale_flydsl_tune_task(shape, 0, preshuffle, {})
-    assert len(tasks) == 4
+    assert len(tasks) == 1
+    assert tasks[0][0][1] == (6 if preshuffle else 2)
     for task in tasks:
         info = task[0]
         _, kernel_id, split_k, name, libtype, ps = info
@@ -276,7 +375,7 @@ def test_tuner_includes_backend_without_changing_both(
 
 
 @pytest.mark.parametrize("preshuffle", [False, True])
-def test_missing_flydsl_keeps_ck_fallback(preshuffle):
+def test_missing_flydsl_asserts_without_fallback(preshuffle):
     x, w, sa, sb, out = _inputs()
     target = (
         "gemm_a8w8_blockscale_bpreshuffle_ck"
@@ -288,7 +387,7 @@ def test_missing_flydsl_keeps_ck_fallback(preshuffle):
         patch.dict(sys.modules, {"aiter.ops.flydsl.gemm_a8w8_blockscale": None}),
         patch.object(ops, target, return_value=out) as fallback,
     ):
-        assert (
+        with pytest.raises(AssertionError, match="import failed") as error:
             ops.gemm_a8w8_blockscale_flydsl(
                 x,
                 w,
@@ -298,14 +397,13 @@ def test_missing_flydsl_keeps_ck_fallback(preshuffle):
                 {"kernelName": "flydsl_blockscale_8w_test"},
                 preshuffle,
             )
-            is out
-        )
-        fallback.assert_called_once()
+        assert isinstance(error.value.__cause__, ImportError)
+        fallback.assert_not_called()
 
 
 def test_kernel_name_layout_mismatch_is_rejected(backend, catalog):
     x, w, sa, sb, out = _inputs()
-    plain = catalog.kernels_list[0].name
+    plain = catalog.kernels_list[2].name
     with pytest.raises(ValueError, match="B layout"):
         backend.run_gemm_a8w8_blockscale(x, w, sa, sb, out, plain, True)
     with pytest.raises(ValueError, match="Unknown"):
@@ -324,8 +422,8 @@ def test_codegen_ignores_flydsl_rows(catalog):
                 "N": 256,
                 "K": 512,
                 "libtype": "flydsl",
-                "kernelId": 0,
-                "kernelName": catalog.kernels_list[0].name,
+                "kernelId": 2,
+                "kernelName": catalog.kernels_list[2].name,
             }
         ]
     )
