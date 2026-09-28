@@ -172,17 +172,37 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     kval = _load(kp, src, fx.Vector.make_type(4, fx.Int32), 16)
                     vval = fx.Vector(
                         _load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)
-                    ).bitcast(fx.Int8)
+                    )
                     _store(
                         lds.k.ptr, slot * (32 * 260) + (off // 256) * 260 + d, kval, 4
                     )
-                    # Explicit transpose-on-write replaces gfx950 transpose reads.
-                    for j in range_constexpr(16):
+                    # Transpose four tokens in registers before writing a dword.
+                    # XOR depth bits into the bank index for both access orders.
+                    for j in range_constexpr(4):
+                        word = vval[j]
+                        peer = word.shuffle_xor(fx.Int32(16), fx.Int32(64))
+                        pair = fx.Int32(rocdl.perm_b32(
+                            peer, word,
+                            ((lane // 16) % 2 == 0).select(
+                                fx.Int32(0x06020400), fx.Int32(0x03070105)
+                            ),
+                        ))
+                        peer = pair.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                        packed = rocdl.perm_b32(
+                            peer, pair,
+                            (half == 0).select(
+                                fx.Int32(0x05040100), fx.Int32(0x03020706)
+                            ),
+                        )
+                        depth = d + j * 4 + lane // 16
+                        token4 = (off // 256) // 4
+                        bank = (depth % 32) ^ (depth // 8)
                         _store(
                             lds.v.ptr,
-                            slot * 8192 + (d + j) * 32 + off // 256,
-                            vval[j],
-                            1,
+                            slot * 8192 + (depth // 32) * 1024
+                            + token4 * 128 + bank * 4,
+                            packed,
+                            4,
                         )
 
             stage(start, fx.Int32(0))
@@ -249,25 +269,24 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     [(half == 0).select(words[2], peers[3]),
                      (half == 0).select(peers[2], words[3])], fx.Int32
                 ).bitcast(fx.Int64)[0]
+                def load_v(depth, token):
+                    bank = (depth % 32) ^ (depth // 8)
+                    offset = slot * 8192 + (depth // 32) * 1024 + bank * 4
+                    words = [
+                        fx.Int32(_load(lds.v.ptr, offset + (token // 4 + i) * 128, T.i32, 4))
+                        for i in range(2)
+                    ]
+                    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0]
+
                 accum = []
                 for dc in range_constexpr(8):
                     o = fx.Vector(state[dc + 2]) * fx.Vector.filled(
                         16, correction, fx.Float32
                     )
-                    v0 = _load(
-                        lds.v.ptr,
-                        slot * 8192 + (dc * 32 + lane % 32) * 32 + half * 8,
-                        T.i64,
-                        8,
-                    )
-                    o = _mfma(v0, p0.ir_value(), o)
-                    v1 = _load(
-                        lds.v.ptr,
-                        slot * 8192 + (dc * 32 + lane % 32) * 32 + 16 + half * 8,
-                        T.i64,
-                        8,
-                    )
-                    o = _mfma(v1, p1.ir_value(), o)
+                    v0 = load_v(dc * 32 + lane % 32, half * 8)
+                    o = _mfma(v0.ir_value(), p0.ir_value(), o)
+                    v1 = load_v(dc * 32 + lane % 32, 16 + half * 8)
+                    o = _mfma(v1.ir_value(), p1.ir_value(), o)
                     accum.append(o)
                 gpu.barrier()
                 result = yield [m, denom] + accum
