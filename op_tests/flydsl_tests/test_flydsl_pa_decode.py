@@ -20,10 +20,12 @@ The two candidates therefore read the same logical KV through different ABIs:
                   Flattens ``query_length * query_group_size`` onto M instead:
                   12 of 16 rows at Hq=24 / Hkv=2.
 
-``relayout`` times the permute+copy that turns the gathered scratch into that
-cache. SGLang's Stage-1 wiring pays it per call; folding the layout into the
-gather's destination index removes it, so it is reported separately rather than
-hidden inside either candidate.
+``relayout`` times materializing that cache from linear ``[token, head, dim]``
+scratch with a permute+copy. It is reported separately because it is a property
+of the *caller*, not of either kernel: a caller whose gather already writes the
+5D order pays none of it (SGLang's ``_compact_kv_paged`` does, for about 0.7us
+over a linear-destination gather), while one that has to convert pays roughly
+what the attention itself costs.
 """
 
 import argparse
@@ -194,9 +196,9 @@ def test_pa_decode(rows, budget, num_q_heads, num_kv_heads, head_dim, page, dtyp
         ret[f"{name} TB/s"] = nbytes / us / 1e6
 
     if "flydsl" in candidates:
-        # Stage-1 wiring cost, reported beside the kernels rather than inside one:
-        # SGLang pays this per call today, and folding the layout into the gather's
-        # destination index removes it without changing either kernel.
+        # Cost of materializing the 5D cache from linear scratch, for a caller
+        # that has to. Reported beside the kernels rather than inside one: a
+        # caller whose gather writes this order directly pays none of it.
         _, relayout_us = run_perftest(
             lambda: relayout_paged_kv(
                 strided_k, strided_v, num_blocks, page, num_kv_heads, head_dim
