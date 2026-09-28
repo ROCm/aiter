@@ -53,8 +53,6 @@ from typing import Any, Literal
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
 from flydsl.expr import (
     arith,
     as_ir_value,
@@ -750,18 +748,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             )
 
         def spin_until_slot_ge(elem_i32, target):
-            w = scf.WhileOp([T.i32], [as_ir_value(c_zero)])
-            before = ir.Block.create_at_start(w.before, [T.i32])
-            after = ir.Block.create_at_start(w.after, [T.i32])
-            with ir.InsertionPoint(before):
-                cur = before.arguments[0]
-                need_wait = arith.CmpIOp(
-                    arith.CmpIPredicate.slt, cur, as_ir_value(target)
-                ).result
-                scf.ConditionOp(need_wait, [cur])
-            with ir.InsertionPoint(after):
+            cur = c_zero
+            while cur < target:
                 rocdl.s_sleep(spin_sleep)
-                data = ws_poll(
+                cur = ws_poll(
                     elem_i32,
                     (
                         fx.AtomicOrdering.Monotonic
@@ -769,7 +759,6 @@ def create_topk_per_row_decode_adaptive_kernel(
                         else fx.AtomicOrdering.Acquire
                     ),
                 )
-                scf.YieldOp([as_ir_value(data)])
             if const_expr(poll_then_acquire):
                 # The loop's monotonic observation only decides when to stop. This
                 # acquire re-reads the same monotonically increasing token and pairs
@@ -937,30 +926,14 @@ def create_topk_per_row_decode_adaptive_kernel(
             """
             load_global_histogram(pass_id, coherent=True)
             choose_bucket_prefix(target_k)
-            w = scf.WhileOp([T.i32], [as_ir_value(c_zero)])
-            before = ir.Block.create_at_start(w.before, [T.i32])
-            after = ir.Block.create_at_start(w.after, [T.i32])
-            with ir.InsertionPoint(before):
-                spins = before.arguments[0]
-                total = fx.memref_load(s_meta, fx.Int32(SMEM_META_TOTAL))
-                short = arith.CmpIOp(
-                    arith.CmpIPredicate.ne,
-                    as_ir_value(total),
-                    as_ir_value(expected_total),
-                ).result
-                under_cap = arith.CmpIOp(
-                    arith.CmpIPredicate.slt,
-                    spins,
-                    as_ir_value(fx.Int32(CERTIFICATE_MAX_SPINS)),
-                ).result
-                scf.ConditionOp(arith.AndIOp(short, under_cap).result, [spins])
-            with ir.InsertionPoint(after):
+            spins = c_zero
+            while (
+                fx.memref_load(s_meta, fx.Int32(SMEM_META_TOTAL)) != expected_total
+            ) & (spins < fx.Int32(CERTIFICATE_MAX_SPINS)):
                 rocdl.s_sleep(spin_sleep)
                 load_global_histogram(pass_id, coherent=True)
                 choose_bucket_prefix(target_k)
-                scf.YieldOp(
-                    [arith.AddIOp(after.arguments[0], as_ir_value(c_one)).result]
-                )
+                spins = spins + c_one
 
         def flush_local_histogram(pass_id: int):
             for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
