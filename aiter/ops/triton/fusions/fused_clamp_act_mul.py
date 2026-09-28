@@ -15,24 +15,45 @@ from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import (
-    load_config_json,
-    resolve_config_dir,
-    select_leq_config,
-)
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+_CONFIG_NAME = "FUSED_CLAMP_ACT_MUL"
 
 
-def _is_gluon_available():
-    """Check if the gluon backend is supported for current GPU architecture."""
-    try:
-        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
-    except Exception:  # noqa: BLE001
-        return False
+def _is_gluon_available() -> bool:
+    """True when this arch has a Gluon port of the kernel."""
+    return get_arch() in _GLUON_SUPPORTED_ARCHS
+
+
+def _pick_largest_floor(table: dict, prefix: str, value: int) -> dict | None:
+    bounds = [int(k[len(prefix) :]) for k in table if k.startswith(prefix)]
+    hit = max((b for b in bounds if value >= b), default=None)
+    return dict(table[f"{prefix}{hit}"]) if hit is not None else None
+
+
+def _pick_smallest_ceil(
+    table: dict, prefix: str, value: int, fallback_key="any"
+) -> dict:
+    for bound in sorted(int(k[len(prefix) :]) for k in table if k.startswith(prefix)):
+        if value <= bound:
+            return dict(table[f"{prefix}{bound}"])
+    return dict(table[fallback_key])
+
+
+def _load_default(backend: str, *, arch_fallback: str | None = None) -> dict:
+    """``DEFAULT.json`` for the running arch, else ``arch_fallback``'s copy."""
+    cfg_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend=backend)
+    raw = load_config_json(f"{cfg_dir}/DEFAULT.json", required=arch_fallback is None)
+    if raw is None:
+        cfg_dir = resolve_config_dir(
+            "fusions", _CONFIG_NAME, backend=backend, arch=arch_fallback
+        )
+        raw = load_config_json(f"{cfg_dir}/DEFAULT.json", required=True)
+    return raw
 
 
 def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
@@ -46,55 +67,29 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     through to the default. A null ``BLOCK_SIZE_N`` means "keep the caller's
     width" (the whole row unless overridden).
 
-    triton takes the largest ``M_GEQ_<x> <= M`` from the N-specialized file when
-    one exists. The kernel runs one program per row, so at a large M the grid
-    saturates the GPU and the width table's small-M ``num_warps`` is too high.
-    Otherwise, it reads ``DEFAULT.json`` for the running arch, falling back to the
-    gfx950 copy and picks the smallest ``N_LEQ_<x> >= block_size_n``, else ``any``.
+    triton: the per-N file's smallest ``M_LEQ_<x> >= M`` wins, else ``any``;
+    ``DEFAULT.json`` is read only when no per-N file exists
 
     Returns:
         The config dict for this shape.
     """
-    base = resolve_config_dir("fusions", "FUSED_CLAMP_ACT_MUL", backend=backend)
+    cfg_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend=backend)
+    specialized = load_config_json(
+        f"{cfg_dir}/{_CONFIG_NAME}-N={N}.json", required=False
+    )
 
     if backend == "triton":
-        specialized = load_config_json(
-            f"{base}/FUSED_CLAMP_ACT_MUL-N={N}.json", required=False
-        )
         if specialized is not None:
-            # Largest ``M_GEQ_<x> <= M`` wins. If there is no match, fall through
-            # to the width table below.
-            bounds = [
-                int(k[len("M_GEQ_") :]) for k in specialized if k.startswith("M_GEQ_")
-            ]
-            hit = max((b for b in bounds if M >= b), default=None)
-            if hit is not None:
-                return dict(specialized[f"M_GEQ_{hit}"])
-
-        raw = load_config_json(f"{base}/DEFAULT.json", required=False)
-        if raw is None:
-            fallback = resolve_config_dir(
-                "fusions", "FUSED_CLAMP_ACT_MUL", backend=backend, arch="gfx950"
-            )
-            raw = load_config_json(f"{fallback}/DEFAULT.json", required=True)
-        return select_leq_config(raw, block_size_n)
+            return _pick_smallest_ceil(specialized, "M_LEQ_", M)
+        return _pick_smallest_ceil(
+            _load_default(backend, arch_fallback="gfx950"), "N_LEQ_", block_size_n
+        )
 
     config = None
-    specialized = load_config_json(
-        f"{base}/FUSED_CLAMP_ACT_MUL-N={N}.json", required=False
-    )
     if specialized is not None:
-        for bound in sorted(
-            int(k[len("M_LEQ_") :]) for k in specialized if k.startswith("M_LEQ_")
-        ):
-            if M >= bound:
-                config = dict(specialized[f"M_LEQ_{bound}"])
-            else:
-                break
-
+        config = _pick_largest_floor(specialized, "M_LEQ_", M)
     if config is None:
-        config = dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
-
+        config = dict(_load_default(backend)["any"])
     if config["BLOCK_SIZE_N"] is None:
         config["BLOCK_SIZE_N"] = block_size_n
     return config
@@ -363,7 +358,9 @@ def fused_clamp_act_mul(
         )
     else:
         # only for triton
-        num_warps = _get_config(M, n_half, BLOCK_SIZE_N, "triton")["num_warps"]
+        config = _get_config(M, n_half, BLOCK_SIZE_N, "triton")
+        num_warps = config["num_warps"]
+        waves_per_eu = config.get("waves_per_eu", 0)
 
         _fused_clamp_silu_mul_kernel[(M,)](
             inp,
@@ -394,6 +391,7 @@ def fused_clamp_act_mul(
             SHUFFLE=shuffle_scale,
             SCALE_N_PAD=scale_n_pad,
             num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
         )
 
     if HAS_QUANT:

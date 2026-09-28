@@ -1,8 +1,12 @@
 {
-    "M_GEQ_4096": {
+    "M_LEQ_3584": {
+        "num_warps": 4
+    },
+    "M_LEQ_7168": {
         "num_warps": 2
     },
-    "M_GEQ_16384": {
-        "num_warps": 1
+    "any": {
+        "num_warps": 1,
+        "waves_per_eu": 4
     }
 }

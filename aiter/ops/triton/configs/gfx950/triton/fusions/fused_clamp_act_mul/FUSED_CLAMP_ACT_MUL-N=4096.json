@@ -1,5 +1,8 @@
 {
-    "M_GEQ_4096": {
+    "M_LEQ_1024": {
+        "num_warps": 8
+    },
+    "any": {
         "num_warps": 4
     }
 }
