@@ -3281,7 +3281,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 int64_t block_size,
                                                 int64_t x,
                                                 int64_t rotary_dim,
-                                                bool v_norm)
+                                                bool v_norm,
+                                                std::optional<aiter_tensor_t> q_out_fp8,
+                                                std::optional<aiter_tensor_t> per_tensor_q_scale)
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -3298,6 +3300,13 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(positions.dim() == 1, "positions must be 1D");
     float per_tensor_k_scale_ = *reinterpret_cast<float*>(per_tensor_k_scale.data_ptr());
     float per_tensor_v_scale_ = *reinterpret_cast<float*>(per_tensor_v_scale.data_ptr());
+    // Optional fp8 Q output (static per-tensor scale). When q_out_fp8 is absent the
+    // kernel writes only bf16 q_out; the scale is unused in that case.
+    const bool quant_q = q_out_fp8.has_value();
+    float per_tensor_q_scale_ =
+        (quant_q && per_tensor_q_scale.has_value())
+            ? *reinterpret_cast<float*>(per_tensor_q_scale.value().data_ptr())
+            : 1.0f;
     // K/V cache indexing is stride-aware in block/token/head (innermost head_size
     // assumed contiguous), so most future KV layout changes need no change here.
     int64_t k_cache_block_stride = k_cache.stride(0);
@@ -3369,6 +3378,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                 ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(
                                       v_out.value().data_ptr())
                                 : nullptr;
+                        mrope_utils::fp8e4m3fn* q_out_fp8_ptr =
+                            quant_q ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(
+                                          q_out_fp8.value().data_ptr())
+                                    : nullptr;
                         mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fn>(
                             reinterpret_cast<T*>(qkv.data_ptr()),
                             reinterpret_cast<T*>(qw.data_ptr()),
@@ -3403,7 +3416,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_head_stride,
                             v_cache_token_stride,
                             v_cache_head_stride,
-                            v_norm);
+                            v_norm,
+                            q_out_fp8_ptr,
+                            per_tensor_q_scale_);
                     }
                     else
                     {
@@ -3417,6 +3432,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                 ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(
                                       v_out.value().data_ptr())
                                 : nullptr;
+                        mrope_utils::fp8e4m3fnuz* q_out_fp8_ptr =
+                            quant_q ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(
+                                          q_out_fp8.value().data_ptr())
+                                    : nullptr;
                         mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fnuz>(
                             reinterpret_cast<T*>(qkv.data_ptr()),
                             reinterpret_cast<T*>(qw.data_ptr()),
@@ -3451,7 +3470,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_head_stride,
                             v_cache_token_stride,
                             v_cache_head_stride,
-                            v_norm);
+                            v_norm,
+                            q_out_fp8_ptr,
+                            per_tensor_q_scale_);
                     }
                 }
                 else

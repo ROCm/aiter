@@ -7859,7 +7859,9 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int64_t k_head_stride    = 0,
                                           int64_t v_token_stride   = 0,
                                           int64_t v_head_stride    = 0,
-                                          bool v_norm              = false)
+                                          bool v_norm              = false,
+                                          KVT* q_out_fp8           = nullptr,
+                                          float per_tensor_q_scale = 1.0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -8060,6 +8062,19 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             T* q_ = &q_out[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
                            HEAD_SIZE];
             out_vec.store(q_ + access_id_in_head);
+            if(q_out_fp8 != nullptr)
+            {
+                // Fold the Q -> fp8 quantization (static per-tensor scale) into the
+                // kernel epilogue, mirroring the K/V path, so the caller can skip a
+                // separate scaled_quant launch. The bf16 q_out above is still written
+                // for callers that consume it.
+                vec_t<KVT, VEC_SIZE> out_q_fp8_vec;
+                out_q_fp8_vec.from_(out_vec, per_tensor_q_scale);
+                KVT* q_fp8_ =
+                    &q_out_fp8[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
+                               HEAD_SIZE];
+                out_q_fp8_vec.store(q_fp8_ + access_id_in_head);
+            }
         }
         else
         {
@@ -8366,7 +8381,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t k_head_stride    = 0,
                            int64_t v_token_stride   = 0,
                            int64_t v_head_stride    = 0,
-                           bool v_norm              = false)
+                           bool v_norm              = false,
+                           KVT* q_out_fp8           = nullptr,
+                           float per_tensor_q_scale = 1.0)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256 || head_size == 512);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
@@ -8431,7 +8448,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_head_stride,       \
                                                         v_token_stride,      \
                                                         v_head_stride,       \
-                                                        v_norm);             \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale); \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -8469,7 +8488,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_head_stride,       \
                                                         v_token_stride,      \
                                                         v_head_stride,       \
-                                                        v_norm);             \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale); \
     }
 
     switch(head_size)

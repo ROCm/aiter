@@ -252,6 +252,8 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     x: int,
     rotary_dim: int = 0,
     v_norm: bool = False,
+    q_out_fp8: Tensor | None = None,
+    per_tensor_q_scale: Tensor | None = None,
 ) -> None: ...
 
 
