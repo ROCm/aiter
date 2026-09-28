@@ -35,9 +35,7 @@ _DEFAULT_TUNED_FILE = (
     / "model_configs"
     / "flydsl_pa_decode_tuned.csv"
 )
-# Global head counts and tensor-parallel metadata describe the model, while
-# these fields describe the work performed by one device. Conflicting model
-# records for the same local problem cannot select a runtime recommendation.
+# Static geometry for one device, matching the offline tuner's shape keys.
 _TUNED_SHAPE_FIELDS = (
     "batch_size",
     "context_length",
@@ -64,9 +62,9 @@ class PADecodeTunedResults:
     def lookup_budget(self, shape: Mapping, architecture: str, num_cu: int):
         """Return a budget or None using host metadata, without files or GPU reads.
 
-        ``shape`` can be built with ``pa_decode_tuning.make_shape``. Its exact
-        context bound must be supplied by the caller; per-sequence lengths and
-        model-global head/TP metadata do not participate in runtime matching.
+        ``shape`` can be built with ``pa_decode_tuning.make_shape`` using
+        per-device head counts. The caller must supply its exact context bound;
+        per-sequence lengths do not participate in runtime matching.
         Pass the same bound to ``pa_decode(max_context_length=...)`` when using
         the selected budget with block tables that have extra padding.
         """
@@ -86,37 +84,25 @@ def _load_tuned_results_cached(path: str, best: bool, required: bool):
     if not required and not Path(path).is_file():
         return PADecodeTunedResults(MappingProxyType({}))
 
-    # Keep CSV parsing, source hashing and candidate validation out of decode's
+    # Keep CSV parsing and recommendation selection out of decode's
     # hot path and leave the legacy static/explicit-plan paths independent.
     from . import pa_decode_tuning as tuning
 
-    data = tuning.load_results(path)
-    sources = tuning.source_identity()
-    budgets = {}
-    conflicts = set()
-    for record in data["records"]:
-        key = record["key"]
-        if key["sources"] != sources:
-            continue
-        # Validate each record once instead of revalidating the complete table
-        # for every key. Preserve all accuracy, timing and provenance gates.
-        budget = tuning.lookup_budget(
-            {"schema_version": data["schema_version"], "records": [record]},
-            key,
-            best=best,
-        )
-        if budget is None:
-            continue
+    groups = {}
+    for row in tuning.load_results(path):
         problem = (
-            key["architecture"],
-            key["num_cu"],
-            *(key["shape"][field] for field in _TUNED_SHAPE_FIELDS),
+            row["architecture"],
+            row["num_cu"],
+            *(row[field] for field in _TUNED_SHAPE_FIELDS),
         )
-        if problem in budgets and budgets[problem] != budget:
-            conflicts.add(problem)
-        budgets[problem] = budget
-    for problem in conflicts:
-        budgets.pop(problem, None)
+        groups.setdefault(problem, []).append(row)
+
+    budgets = {}
+    for problem, rows in groups.items():
+        key = tuning.make_key(rows[0], problem[0], problem[1])
+        budget = tuning.lookup_budget(rows, key, best=best)
+        if budget is not None:
+            budgets[problem] = budget
     return PADecodeTunedResults(MappingProxyType(budgets))
 
 
@@ -127,12 +113,12 @@ def load_tuned_results(
 
     The default is ``aiter/configs/model_configs/flydsl_pa_decode_tuned.csv``;
     an absent default provides no recommendations. An explicit missing file or
-    a malformed CSV raises an error. Stale sources, failed records, unmatched
-    shapes and conflicting local recommendations do not provide a budget.
+    a malformed CSV raises an error. Loading validates shape, budget and timing
+    fields; unmatched shapes do not provide a budget.
 
     By default select the smallest budget reaching 97% of the best measured
     performance; ``best=True`` selects the fastest valid candidate. Call once
-    before capture, and use ``reload=True`` after replacing a file or sources.
+    before capture, and use ``reload=True`` after replacing a file.
     The returned index is immutable and can also be used to prepare an explicit
     ``plan_pa_decode(..., workgroup_budget=results.lookup_budget(shape, arch, cu))``.
     """

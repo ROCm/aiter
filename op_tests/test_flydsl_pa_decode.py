@@ -14,7 +14,7 @@ partitions override static recommendations. CLI timing includes the reducer.
 """
 
 import argparse
-import copy
+import csv
 import importlib
 import itertools
 from dataclasses import dataclass, replace
@@ -1220,21 +1220,25 @@ def _synthetic_tuning_results(
     *,
     architecture="gfx950",
     num_cu=256,
-    model=None,
+    num_query_heads=16,
+    num_kv_heads=1,
+    head_dim=128,
     context_length=512,
     query_length=1,
     window=0,
     dtype="bfloat16",
     per_token=True,
     trans_v=True,
+    small_budget_latency=5.1,
 ):
-    """Fabricated timings/accuracy for file and API tests, never GPU measurements."""
-    model = tuning.resolve_model("mqa-synthetic") if model is None else model
+    """Fabricated shape/performance rows for API tests, never GPU measurements."""
     shape = tuning.make_shape(
-        model,
         4,
         context_length,
         query_length,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
         page_size=128,
         dtype=dtype,
         per_token=per_token,
@@ -1242,77 +1246,101 @@ def _synthetic_tuning_results(
         window=window,
     )
     key = tuning.make_key(shape, architecture, num_cu)
-    candidates = tuning.candidate_groups((4, 8), 4, 1, num_cu)
-    accuracy = {
-        stage: {
-            "passed": True,
-            "finite": True,
-            "atol": tuning.ATOL,
-            "rtol": tuning.RTOL,
-            "elements": 4 * query_length * model["num_query_heads"] * model["head_dim"],
-            "max_abs_error": 0.0,
-            "max_tolerance_ratio": 0.0,
-        }
-        for stage in tuning.ACCURACY_STAGES
-    }
-    for candidate in candidates:
-        latency = {4: 5.1, 8: 5.0}.get(candidate["workgroup_budget"], 8.0)
-        candidate.update(
-            status="PASS",
-            plan_unchanged=True,
-            samples_us=[latency] * 3,
-            accuracy=copy.deepcopy(accuracy),
-            errors=[],
-        )
     kv_bytes = tuning.unique_kv_bytes(shape)
-    record = {
-        "key": key,
-        "key_sha256": tuning.fingerprint(key),
-        "benchmark_input": {field: shape[field] for field in tuning.BENCHMARK_FIELDS},
-        "status": "PASS",
-        "candidates": candidates,
-        "selection": tuning.summarize_candidates(candidates, kv_bytes),
-        "unique_kv_bytes": kv_bytes,
-        "sources_after": copy.deepcopy(key["sources"]),
-        "errors": [],
-    }
-    return {
-        "schema_version": tuning.SCHEMA_VERSION,
-        "scope": "test-only synthetic data; not measured accuracy or performance",
-        "records": [record],
-    }, shape
+    rows = [
+        {
+            "architecture": architecture,
+            "num_cu": num_cu,
+            **key["shape"],
+            "workgroup_budget": budget,
+            "median_us": latency,
+            "min_us": latency,
+            "max_us": latency,
+            "unique_kv_tb_s": kv_bytes / latency / 1e6,
+        }
+        for budget, latency in ((4, small_budget_latency), (8, 5.0))
+    ]
+    return rows, shape
 
 
 @pytest.mark.parametrize("empty", [False, True], ids=["records", "empty-run"])
 def test_pa_tuning_csv_roundtrip(tmp_path, empty):
-    data, _ = _synthetic_tuning_results()
+    data, shape = _synthetic_tuning_results()
     if empty:
-        data["records"] = []
+        data = []
     else:
-        for window, no_candidates in ((128, False), (257, True)):
-            failed, _ = _synthetic_tuning_results(window=window)
-            record = failed["records"][0]
-            record.update(status="OOM", selection=None)
-            record["errors"] = ['test diagnostic, "quoted"\nsecond line: 测试']
-            if no_candidates:
-                record["candidates"] = []
-            else:
-                record["candidates"][-1].update(status="OOM", samples_us=[])
-            data["records"].append(record)
+        for window in (128, 257):
+            other, _ = _synthetic_tuning_results(window=window)
+            data.extend(other)
     path = tmp_path / "results.csv"
     tuning.save_results(path, data)
     assert tuning.load_results(path) == data
     assert list(tmp_path.iterdir()) == [path]
     if not empty:
-        key = data["records"][0]["key"]
+        key = tuning.make_key(shape, "gfx950", 256)
         reloaded = tuning.load_results(path)
         assert tuning.lookup_budget(reloaded, key) == 4
         assert tuning.lookup_budget(reloaded, key, best=True) == 8
-        assert tuning.lookup_budget(reloaded, data["records"][1]["key"]) is None
     with pytest.raises(FileExistsError):
         tuning.save_results(path, data)
     tuning.save_results(path, data, overwrite=True)
     assert tuning.load_results(path) == data
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("workgroup_budget", 0),
+        ("page_size", 128.0),
+        ("median_us", float("nan")),
+        ("min_us", 10.0),
+    ],
+    ids=["budget", "page", "nonfinite-latency", "latency-range"],
+)
+def test_pa_tuning_csv_rejects_invalid_result(tmp_path, field, value):
+    data, _ = _synthetic_tuning_results()
+    path = tmp_path / "results.csv"
+    tuning.save_results(path, data)
+    data[0][field] = value
+    invalid = tmp_path / "invalid.csv"
+    with pytest.raises((TypeError, ValueError)):
+        tuning.save_results(invalid, data)
+    assert not invalid.exists()
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        fields, rows = reader.fieldnames, list(reader)
+    rows[0][field] = str(value)
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ValueError):
+        tuning.load_results(path)
+
+
+@pytest.mark.parametrize("evidence", ["valid", "failed", "missing", "nonfinite"])
+def test_pa_tuning_candidate_accuracy(evidence):
+    candidate = {
+        "status": "PASS",
+        "plan_unchanged": True,
+        "samples_us": [5.0] * 3,
+        "accuracy": {
+            "passed": True,
+            "finite": True,
+            "atol": tuning.ATOL,
+            "rtol": tuning.RTOL,
+            "elements": 512,
+            "max_abs_error": 0.0,
+            "max_tolerance_ratio": 0.0,
+        },
+    }
+    if evidence == "failed":
+        candidate["accuracy"]["passed"] = False
+    elif evidence == "missing":
+        candidate.pop("accuracy")
+    elif evidence == "nonfinite":
+        candidate["accuracy"]["finite"] = False
+    assert tuning.candidate_valid(candidate) is (evidence == "valid")
 
 
 def _tuned_runtime():
@@ -1340,18 +1368,13 @@ def test_pa_tuning_loader_cache(tmp_path, monkeypatch):
         result.budgets[()] = 1
 
     def unexpected_io(*_args, **_kwargs):
-        raise AssertionError("cached lookup must not read the CSV or source files")
+        raise AssertionError("cached lookup must not reread the CSV")
 
     with monkeypatch.context() as cached:
         cached.setattr(tuning, "load_results", unexpected_io)
-        cached.setattr(tuning, "source_identity", unexpected_io)
         assert module.load_tuned_results(path) is result
         assert result.lookup_budget(shape, "gfx950", 256) == 4
-    record = data["records"][0]
-    record["candidates"][0]["samples_us"] = [7.0] * 3
-    record["selection"] = tuning.summarize_candidates(
-        record["candidates"], record["unique_kv_bytes"]
-    )
+    data, _ = _synthetic_tuning_results(small_budget_latency=7.0)
     tuning.save_results(path, data, overwrite=True)
     assert module.load_tuned_results(path) is result
     refreshed = module.load_tuned_results(path, reload=True)
@@ -1368,29 +1391,17 @@ def test_pa_tuning_loader_cache(tmp_path, monkeypatch):
         module.load_tuned_results(path)
 
 
-@pytest.mark.parametrize(
-    "mismatch", ["architecture", "cu", "shape", "sources", "sources_after", "accuracy"]
-)
+@pytest.mark.parametrize("mismatch", ["architecture", "cu", "shape"])
 def test_pa_tuning_loader_mismatch(tmp_path, mismatch):
     module = _tuned_runtime()
     data, shape = _synthetic_tuning_results()
     architecture, num_cu = "gfx950", 256
-    record = data["records"][0]
     if mismatch == "architecture":
         architecture = "gfx942"
     elif mismatch == "cu":
         num_cu = 128
-    elif mismatch == "shape":
-        shape["context_length"] = 511
-    elif mismatch == "sources":
-        record["key"]["sources"]["kernels/pa_decode/op_epilog.py"] = "0" * 64
-        record["key_sha256"] = tuning.fingerprint(record["key"])
-        record["sources_after"] = copy.deepcopy(record["key"]["sources"])
-    elif mismatch == "sources_after":
-        record["sources_after"] = None
     else:
-        baseline = next(c for c in record["candidates"] if c["is_baseline"])
-        baseline["accuracy"]["graph"]["passed"] = False
+        shape["context_length"] = 511
     path = tmp_path / "results.csv"
     tuning.save_results(path, data)
     assert (
@@ -1399,30 +1410,23 @@ def test_pa_tuning_loader_mismatch(tmp_path, mismatch):
     )
 
 
-@pytest.mark.parametrize("conflicting", [False, True], ids=["agree", "conflict"])
-def test_pa_tuning_local_shape_projection(tmp_path, conflicting):
+@pytest.mark.parametrize("duplicate", [False, True], ids=["distinct", "duplicate"])
+def test_pa_tuning_shape_keys(tmp_path, duplicate):
     module = _tuned_runtime()
     data, shape = _synthetic_tuning_results()
-    model = tuning.resolve_model(num_query_heads=32, num_kv_heads=2, tp_size=2)
-    other, _ = _synthetic_tuning_results(model=model)
-    record = other["records"][0]
-    if conflicting:
-        record["candidates"][0]["samples_us"] = [7.0] * 3
-        record["selection"] = tuning.summarize_candidates(
-            record["candidates"], record["unique_kv_bytes"]
-        )
-    data["records"].append(record)
+    other, other_shape = _synthetic_tuning_results(
+        num_query_heads=16 if duplicate else 32, small_budget_latency=7.0
+    )
+    data.extend(other)
     path = tmp_path / "results.csv"
+    if duplicate:
+        with pytest.raises(ValueError, match="[Dd]uplicate"):
+            tuning.save_results(path, data)
+        return
     tuning.save_results(path, data)
-    for field in (
-        "global_num_query_heads",
-        "global_num_kv_heads",
-        "tp_size",
-        "kv_replication_factor",
-    ):
-        shape.pop(field)
-    result = module.load_tuned_results(path).lookup_budget(shape, "gfx950", 256)
-    assert result == (None if conflicting else 4)
+    result = module.load_tuned_results(path)
+    assert result.lookup_budget(shape, "gfx950", 256) == 4
+    assert result.lookup_budget(other_shape, "gfx950", 256) == 8
 
 
 @pytest.mark.parametrize(
@@ -1505,7 +1509,7 @@ def test_pa_tuning_auto_plan(
     _assert_close(args[0], reference())
 
     empty_path = tmp_path / "empty.csv"
-    tuning.save_results(empty_path, {**data, "records": []})
+    tuning.save_results(empty_path, [])
     table_bound = args[5].shape[1] * case.block_size
     for tuned_file, hint in ((path, None), (empty_path, context_bound)):
         module.pa_decode(
