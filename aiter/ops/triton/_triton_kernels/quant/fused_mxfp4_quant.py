@@ -1,9 +1,11 @@
+from functools import partial
+
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-from .quant import _mxfp4_quant_op
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 @triton.jit
@@ -41,10 +43,12 @@ _fused_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
     }
 )
 @triton.jit(repr=_fused_rms_mxfp4_quant_repr)
@@ -327,8 +331,13 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M1"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N1"] * args["NUM_ITER"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n,
+            block_m="BLOCK_SIZE_M1",
+            n="N1",
+            block_n="BLOCK_SIZE_N1",
+            num_iter="NUM_ITER",
+        ),
     }
 )
 @triton.jit(repr=_fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr)
@@ -567,12 +576,15 @@ _fused_reduce_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
-        "EVEN_M_N3": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N3"] % (args["BLOCK_SIZE_N3"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
+        "EVEN_M_N3": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+        ),
     }
 )
 @triton.jit(repr=_fused_reduce_rms_mxfp4_quant_repr)

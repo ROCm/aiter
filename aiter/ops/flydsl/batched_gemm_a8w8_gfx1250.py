@@ -24,7 +24,7 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
 
-from .mxfp8_128_bpreshuffle_gemm_gfx1250 import NAME_SUFFIX_RE
+from .mxfp8_128_bpreshuffle_gemm_gfx1250 import BASE_NAME_SUFFIX_RE
 
 BLOCK_K = 128
 BLOCK_N = 128
@@ -34,27 +34,29 @@ _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _PRELOAD_MIN_TILE_M = 128
 _MAX_HEURISTIC_TILE_M = 128
 _LDS_BYTES = get_lds_capacity_bytes("gfx1250")
-_SUFFIX_RE = NAME_SUFFIX_RE.removesuffix("$")
+_SUFFIX_RE = BASE_NAME_SUFFIX_RE
 _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"
 )
 
 _launch_gemm_a8w8 = None
 _ptr_arg = None
+_check_e8m0 = None
 _fx = None
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8, _ptr_arg, _fx
+    global _launch_gemm_a8w8, _ptr_arg, _check_e8m0, _fx
     if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
 
     from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
-    from .kernels.tensor_shim import ptr_arg
+    from .kernels.tensor_shim import check_e8m0, ptr_arg
 
     _launch_gemm_a8w8 = launch_gemm_a8w8
     _ptr_arg = ptr_arg
+    _check_e8m0 = check_e8m0
     _fx = fx_mod
 
 
@@ -172,24 +174,6 @@ def pick_bmm_kernel_name(b: int, m: int, n: int, k: int) -> str:
     )
 
 
-def _check_e8m0(scale: Tensor, shape: tuple[int, ...], name: str) -> Tensor:
-    """Validate an e8m0 scale operand."""
-    from aiter.utility import dtypes
-
-    if tuple(scale.shape) != shape:
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 bmm] {name} must have shape {shape}, "
-            f"got {tuple(scale.shape)}"
-        )
-    if scale.dtype not in (dtypes.fp8_e8m0, torch.uint8):
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 bmm] {name} must be e8m0/uint8, got {scale.dtype}"
-        )
-    if not scale.is_contiguous():
-        raise RuntimeError(f"[FlyDSL gfx1250 bmm] {name} must be contiguous")
-    return scale
-
-
 def run_bmm_a8w8_mxfp8_128_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
@@ -250,8 +234,8 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         raise RuntimeError("[FlyDSL gfx1250 bmm] WQ must be contiguous")
 
     k_blocks = k // BLOCK_K
-    _check_e8m0(x_scale, (m, b, k_blocks), "x_scale")
-    _check_e8m0(w_scale, (b, n // BLOCK_N, k_blocks), "w_scale")
+    _check_e8m0(x_scale, "x_scale", "FlyDSL gfx1250 bmm", (m, b, k_blocks))
+    _check_e8m0(w_scale, "w_scale", "FlyDSL gfx1250 bmm", (b, n // BLOCK_N, k_blocks))
 
     name = kernel_name or pick_bmm_kernel_name(b, m, n, k)
     cfg = parse_bmm_kernel_name(name)

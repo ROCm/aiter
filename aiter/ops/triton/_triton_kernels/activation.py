@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
 
-from .quant.fused_fp8_quant import _fp8_quant_op
-from .quant.quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 
 @triton.jit
@@ -13,6 +13,16 @@ def _silu_exp2(x):
 @triton.jit
 def _silu(x):
     return _silu_exp2(x)
+
+
+@triton.jit
+def _sigmoid_exp2(x):
+    return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))
+
+
+@triton.jit
+def _sigmoid(x):
+    return _sigmoid_exp2(x)
 
 
 @triton.jit
@@ -94,6 +104,8 @@ def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
         "gelu_tanh": _gelu_tanh,
+        "sigmoid": _sigmoid,
+        "sigmoid_exp2": _sigmoid_exp2,
         "silu": _silu,
         "silu_exp2": _silu_exp2,
         "relu": _relu,
@@ -108,6 +120,10 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _gelu(x)
     elif activation == "gelu_tanh":
         return _gelu_tanh(x)
+    elif activation == "sigmoid":
+        return _sigmoid(x)
+    elif activation == "sigmoid_exp2":
+        return _sigmoid_exp2(x)
     elif activation == "silu":
         return _silu(x)
     elif activation == "silu_exp2":

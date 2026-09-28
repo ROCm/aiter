@@ -28,7 +28,8 @@ Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 A section with no axes, like reduce above, is just a config.
 
 Tile size and number of splits (segments) are derived from the following parameters:
-TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU.
+TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
+and the SPLIT_MIN_* floors; see compute_segment_params.
 """
 
 import copy
@@ -38,6 +39,7 @@ import itertools
 import torch
 import triton
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
@@ -47,6 +49,13 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
+
+# Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
+_ARCH_ALIAS = {
+    "gfx1101": "gfx1100",
+    "gfx1102": "gfx1100",
+    "gfx1150": "gfx1151",
+}
 
 _SEP = "."
 
@@ -166,6 +175,9 @@ def compute_segment_params(config: dict, params) -> dict:
     cap = config.pop("MAX_SEGMENTS", None)
     tile_lo = config.pop("SEGMENT_TILE_MIN", 1)
     tile_hi = config.pop("SEGMENT_TILE_MAX", None)
+    mfma_dim = config.pop("MFMA_DIM", None)
+    min_tiles = config.pop("SPLIT_MIN_TILES", 0)
+    min_share = config.pop("SPLIT_MIN_SHARE", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
@@ -176,8 +188,18 @@ def compute_segment_params(config: dict, params) -> dict:
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
+    # this is specific to gfx950 gluon as the num waves depends on mfma dim there
+    if mfma_dim:
+        num_waves = max(
+            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
+        )
+        budget //= num_waves
     share = triton.cdiv(budget, prgms)
-    segments = triton.next_power_of_2(max(min(lo, limit), min(limit, max(1, share))))
+    if limit <= min_tiles or share < min_share:
+        segments = 1
+    else:
+        claim = max(min(lo, limit), min(limit, max(1, share)))
+        segments = triton.next_power_of_2(claim)
     if small_split_max is None:
         config["NUM_SEGMENTS"] = segments
     elif segments <= min(small_split_max, limit):
@@ -207,9 +229,13 @@ def _axis_values(
     }
 
 
-def _load(op: str, backend, arch) -> tuple:
+def _load(op: str, backend, arch: str | None) -> tuple:
     """Return ``(table, axes, cfg_dir)`` for one op."""
-    cfg_dir = resolve_config_dir("attention", _CONFIG_NAME, backend=backend, arch=arch)
+    if arch is None:
+        arch = arch_info.get_arch()
+    cfg_dir = resolve_config_dir(
+        "attention", _CONFIG_NAME, backend=backend, arch=_ARCH_ALIAS.get(arch, arch)
+    )
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     if config is None:
         raise AssertionError(

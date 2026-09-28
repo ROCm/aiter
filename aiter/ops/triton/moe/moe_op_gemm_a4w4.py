@@ -12,10 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     get_moe_a4w4_layouts_decode,
     get_moe_a4w4_layouts_prefill,
 )
-from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
-    _moe_gemm_a4w4,
-    _mxfp4_quant_kernel,
-)
+from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import _moe_gemm_a4w4
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import (
     EpCombineScatter,
@@ -23,9 +20,37 @@ from aiter.ops.triton.moe.reduce import (
     scatter_grouped,
     validate_reduce_out,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
+
+def _prefill_lds_bytes(config, x_scales_preload, xs_slab_cols):
+    # Check for prefill kernel's LDS budget, this determines if we can afford x_scales_preload without losing occupancy
+    # please keep in sync with whatever the layout the prefill kernel is using
+    bm, bn, bk = config["block_m"], config["block_n"], config["block_k"]
+    nb = config["num_buffers"]
+    mx_scale_block_k = bk // MXFP4_QUANT_BLOCK_SIZE
+    # x: [bm, bk//2] with 16 pad elements between each of the bm intervals
+    x_buf = nb * (bm * (bk // 2) + (bm - 1) * 16)
+    # w / w-scales: identity swizzle, so exactly their (preshuffled) extents
+    w_buf = nb * bn * (bk // 2)
+    w_scales_buf = nb * bn * mx_scale_block_k
+    if x_scales_preload:
+        x_scales_buf = bm * xs_slab_cols
+    else:
+        x_scales_buf = nb * bm * mx_scale_block_k
+    # +32 is inter-allocation alignment, measured at 16-32B. Rounded up so
+    # this never overstates how many workgroups fit.
+    return x_buf + w_buf + w_scales_buf + x_scales_buf + 32
+
+
+def _workgroups_per_wgp(lds_bytes):
+    cap = arch_info._LDS_CAP_BYTES[get_arch()]
+    return max(1, cap // max(1, lds_bytes))
+
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -220,52 +245,22 @@ MXFP4_QUANT_BLOCK_SIZE = 32
 
 def mxfp4_quant(
     x: torch.Tensor,
-    block_size_m: int = 16,
-    block_size_n: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize a 2D tensor `x` of shape [M, K] (bf16/fp16/fp32) to MXFP4 (E2M1) format
-    quantized along the K dimension.
-
     Returns:
     - A packed MXFP4 tensor `x_fp4` of shape [M, N // 2] (stored as uint8), where
         each byte stores two 4-bit values.
     - A block-scale tensor `x_scale` of shape [M, N / 32], where each entry
-        corresponds to one MXFP4 quantization block of 32 elements along the K dimension.
+        corresponds to one MXFP4 quantization block of 32 elements along the N dimension.
     """
     M, N = x.shape
     assert N % MXFP4_QUANT_BLOCK_SIZE == 0
-    assert block_size_n % MXFP4_QUANT_BLOCK_SIZE == 0
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     x_scale = torch.empty(
         (M, N // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
     )
-
-    grid = (
-        triton.cdiv(M, block_size_m),
-        triton.cdiv(N, block_size_n),
-    )
-
-    _mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        x_scale,
-        x.stride(0),
-        x.stride(1),
-        x_fp4.stride(0),
-        x_fp4.stride(1),
-        x_scale.stride(0),
-        x_scale.stride(1),
-        M,
-        N,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        EVEN_M_N=(M % block_size_m == 0) and (N % block_size_n == 0),
-    )
-
-    return x_fp4, x_scale
+    return dynamic_mxfp4_quant(x, x_fp4=x_fp4, blockscale_e8m0=x_scale)
 
 
 def moe_gemm_a4w4(
@@ -568,6 +563,42 @@ def moe_gemm_a4w4(
         clamp_bounds = (K % config["block_k"] != 0) or (
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
         )
+        XS_SLAB_MAX_BYTES = 32 * 1024
+        xs_slab_cols = triton.next_power_of_2(triton.cdiv(K, MXFP4_QUANT_BLOCK_SIZE))
+        x_scales_preload = (
+            not clamp_bounds
+            and config["block_m"] <= 32
+            and K > 1024
+            and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE) <= 256
+            and config["block_m"] * xs_slab_cols <= XS_SLAB_MAX_BYTES
+            and config["num_ctas"] == 1
+            and preshuffle_weights
+            and swizzle_mx_scale == "GFX1250_SCALE"
+        )
+        if x_scales_preload:
+            wgs_with = _workgroups_per_wgp(
+                _prefill_lds_bytes(config, True, xs_slab_cols)
+            )
+            wgs_without = _workgroups_per_wgp(
+                _prefill_lds_bytes(config, False, xs_slab_cols)
+            )
+            if wgs_with < wgs_without:
+                x_scales_preload = False
+        if not x_scales_preload:
+            xs_slab_cols = 0
+
+        # L2 prefetch distance, in K-tiles. The ramp is a fixed burst of
+        # prefetches before the K loop, so it only pays off once the loop is
+        # long enough to absorb it -- hence the 4x rule.
+        num_k_iter = triton.cdiv(K, config["block_k"])
+        l2_prefetch_distance = (
+            4 if preshuffle_weights and swizzle_mx_scale == "GFX1250_SCALE" else 0
+        )
+        if l2_prefetch_distance and (
+            num_k_iter < 4 * l2_prefetch_distance
+            or config["num_buffers"] + l2_prefetch_distance - 1 >= num_k_iter
+        ):
+            l2_prefetch_distance = 0
         # launch gluon kernel
         _moe_gemm_a4w4_prefill[(grid,)](
             y_ptr,
@@ -616,6 +647,9 @@ def moe_gemm_a4w4(
             UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
+            PRELOAD_X_SCALES=x_scales_preload,
+            XS_SLAB_COLS=xs_slab_cols,
+            L2_PREFETCH_DISTANCE=l2_prefetch_distance,
             **layouts,
             YMxScale=y_scale,
             stride_y_mx_m=stride_y_mx_m,

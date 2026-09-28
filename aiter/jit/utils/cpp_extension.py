@@ -1229,6 +1229,7 @@ def _jit_compile(
     torch_exclude=False,
     hipify=True,
     extra_cuda_cflags_per_source=None,
+    use_versioner=True,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1237,32 +1238,39 @@ def _jit_compile(
 
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
-    old_version = JIT_EXTENSION_VERSIONER.get_version(name)
-    version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(
-        name,
-        sources,
-        build_arguments=[
-            extra_cflags,
-            extra_cuda_cflags,
-            extra_ldflags,
-            extra_include_paths,
-            # Include per-source extras in the cache key so toggling them
-            # invalidates the cached .so on the next call.
-            extra_cuda_cflags_per_source,
-        ],
-        build_directory=build_directory,
-        with_cuda=with_cuda,
-        is_python_module=is_python_module,
-        is_standalone=is_standalone,
-    )
-    if version > 0:
-        if version != old_version and verbose:
-            print(
-                f"The input conditions for extension module {name} have changed. "
-                + f"Bumping to version {version} and re-building as {name}_v{version}...",
-                file=sys.stderr,
-            )
-        name = f"{name}_v{version}"
+    # Direct extension loaders retain versioned names. core.build_module instead
+    # installs a fixed <name>.so (including its PyInit_<name> symbol), so it must
+    # not produce <name>_vN.so or let a process-local cache skip Ninja. Ninja owns
+    # incremental checks there, including headers, deleted outputs and retries
+    # after a failed build; the versioner records inputs before compilation.
+    old_version = version = None
+    if use_versioner:
+        old_version = JIT_EXTENSION_VERSIONER.get_version(name)
+        version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(
+            name,
+            sources,
+            build_arguments=[
+                extra_cflags,
+                extra_cuda_cflags,
+                extra_ldflags,
+                extra_include_paths,
+                # Include per-source extras in the cache key so toggling them
+                # invalidates the cached .so on the next call.
+                extra_cuda_cflags_per_source,
+            ],
+            build_directory=build_directory,
+            with_cuda=with_cuda,
+            is_python_module=is_python_module,
+            is_standalone=is_standalone,
+        )
+        if version > 0:
+            if version != old_version and verbose:
+                print(
+                    f"The input conditions for extension module {name} have changed. "
+                    + f"Bumping to version {version} and re-building as {name}_v{version}...",
+                    file=sys.stderr,
+                )
+            name = f"{name}_v{version}"
 
     baton = FileBaton(os.path.join(build_directory, "lock"))
     need_build = True
@@ -1270,15 +1278,15 @@ def _jit_compile(
         if baton.try_acquire():
             break  # we own the lock; fall through and build below
         # Another process holds the lock. wait() returns True if that holder
-        # finished normally (module is built — just import it), or False if we
-        # broke a stale lock left by a dead holder, in which case we loop and
-        # re-acquire so we build it ourselves instead of importing nothing.
-        if baton.wait():
+        # finished normally, or False if we broke a stale lock left by a dead
+        # holder. Versioned loaders can import a peer's completed module;
+        # fixed-target callers re-acquire and let Ninja check their own inputs.
+        if baton.wait() and use_versioner:
             need_build = False
             break
     if need_build:
         try:
-            if version != old_version:
+            if not use_versioner or version != old_version:
                 with GeneratedFileCleaner(
                     keep_intermediates=keep_intermediates
                 ) as clean_ctx:
