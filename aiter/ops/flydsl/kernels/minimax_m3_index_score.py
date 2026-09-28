@@ -2338,10 +2338,18 @@ def _validate_metadata(
         _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
         if (
             block_table.shape[0] != batch
+            or block_table.shape[1] < max_block
             or block_table.stride(1) != 1
             or block_table.stride(0) < block_table.shape[1]
         ):
             raise ValueError("block_table: invalid shape or layout")
+        # Necessary, not sufficient, under context parallelism: the table is
+        # indexed by the GLOBAL block `p * cp_world + cp_rank`, so a rank whose
+        # shard is non-empty needs columns past its own local bound. How far
+        # past depends on seq_lens, which this metadata-only check never reads,
+        # so the width of a CP table stays the caller contract documented
+        # above. The one case that is decidable here is the empty shard, and
+        # the kernel handles it by clamping its speculative load to column 0.
     if seq_lens is not None:
         _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, device)
         if seq_lens.shape != (batch,) or seq_lens.stride() != (1,):
