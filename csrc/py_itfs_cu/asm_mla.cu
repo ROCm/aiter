@@ -896,6 +896,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
+    const uint64_t kv_bytes = static_cast<uint64_t>(KV->size(0)) * KV->stride(0) * KV->element_size();
     
     if(gqa_ratio == 128){
         config_max_seqlen_q = 0;
@@ -1031,7 +1032,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
         && ((gqa_ratio == 16 && (max_seqlen_q == 3 || max_seqlen_q == 4))
             || (gqa_ratio == 32 && (max_seqlen_q == 2 || max_seqlen_q == 3))
-            || (gqa_ratio == 32 && max_seqlen_q == 1)
+            || (gqa_ratio == 32 && max_seqlen_q == 1 && kv_bytes > 0xFFFFFFF0ull)
             || (gqa_ratio == 64 && max_seqlen_q == 1))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 16;
@@ -1057,7 +1058,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
-        const uint64_t kv_bytes = static_cast<uint64_t>(KV->size(0)) * KV->stride(0) * KV->element_size();
         AITER_CHECK(arch_id != "gfx950" || kv_bytes <= 0xFFFFFFF0ull || !kGfx950MlaKv32BitCo.count(cfg.co_name),
                     __func__, ": ", co_name, " uses 32-bit KV offsets but kv_buffer spans ", kv_bytes,
                     " bytes (max 4294967280)");
