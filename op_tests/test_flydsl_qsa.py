@@ -761,6 +761,59 @@ def test_k2_empty_first_tile_keeps_later_token():
             )
 
 
+def test_k2_default_out_ignores_query_strides():
+    """Default output matches the oracle for both review layouts.
+
+    Shape ``[2, 24, 256]``. The first query is contiguous, strides
+    ``(6144, 256, 1)``. The second holds the same values at strides
+    ``(6144, 1, 24)``. The plan cache keeps the first compile.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 2, 64, 16, 8
+    torch.manual_seed(0)
+    q_contig = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    if q_contig.stride() != (6144, 256, 1):
+        raise AssertionError(f"contiguous strides {q_contig.stride()}")
+    q_heads_last = q_contig.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    if q_heads_last.stride() != (6144, 1, 24):
+        raise AssertionError(f"transposed strides {q_heads_last.stride()}")
+    if not torch.equal(q_contig, q_heads_last):
+        raise AssertionError("the two query layouts do not hold the same values")
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+    v_cache, _kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    ref = qsa_sparse_gqa(q_contig, k, v, indices)
+    for name, q in (("contiguous", q_contig), ("heads-last", q_heads_last)):
+        out = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"flydsl K2 default out vs oracle ({name})",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"K2 default out diverged for {name} strides {tuple(q.stride())} "
+                f"(err={err})"
+            )
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
@@ -2180,6 +2233,7 @@ def _run_unit_cases():
     test_k2_family_a_prefill_matches_oracle()
     test_k2_page_past_4gib()
     test_k2_empty_first_tile_keeps_later_token()
+    test_k2_default_out_ignores_query_strides()
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_symbols_export_lazily()
