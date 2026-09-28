@@ -38,8 +38,9 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
+from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.act import _sigmoid_f32
+from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
@@ -179,8 +180,8 @@ def _build_down_norm_pipe(
         r2_buf = fx.rocdl.make_buffer_tensor(r2, max_size=True)
         wdn_buf = fx.rocdl.make_buffer_tensor(w_dn, max_size=True)
         out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
-        rrms_g = GTensor(rrms, fx.Float32, (1, hc_count))
-        w_g = GTensor(w, fx.Float32, (1, w_len))
+        rrms_g = GTensor(rrms, T.f32, (1, hc_count))
+        w_g = GTensor(w, T.f32, (1, w_len))
 
         @fx.struct
         class Smem:
@@ -366,7 +367,7 @@ def _build_down_norm_pipe(
         for i in range_constexpr(n_elems):
             raw_v = vc[i]
             sv = raw_v * fx.Float32(inv_hc)
-            silu_v = sv * _sigmoid_f32(sv)
+            silu_v = sv * sigmoid_f32(sv)
             if all_silu:
                 out_vals.append(silu_v)
             else:
@@ -508,8 +509,8 @@ def _build_down_norm_partial_pipe(
         r2_buf = fx.rocdl.make_buffer_tensor(r2, max_size=True)
         wdn_buf = fx.rocdl.make_buffer_tensor(w_dn, max_size=True)
         part_buf = fx.rocdl.make_buffer_tensor(partial, max_size=True)
-        rrms_g = GTensor(rrms, fx.Float32, (1, hc_count))
-        w_g = GTensor(w, fx.Float32, (1, w_len))
+        rrms_g = GTensor(rrms, T.f32, (1, hc_count))
+        w_g = GTensor(w, T.f32, (1, w_len))
 
         @fx.struct
         class Smem:
@@ -762,11 +763,11 @@ def _build_down_gemv_partial(
         stream = fx.block_idx.z
         n = bcol * waves_per_block + wid
 
-        r2_g = GTensor(r2, fx.BFloat16, (1, m_rows * hidden))
-        rrms_g = GTensor(rrms, fx.Float32, (1, m_rows * hc_count))
-        wdn_g = GTensor(w_dn, fx.BFloat16, (1, n_pad * hidden))
+        r2_g = GTensor(r2, T.bf16, (1, m_rows * hidden))
+        rrms_g = GTensor(rrms, T.f32, (1, m_rows * hc_count))
+        wdn_g = GTensor(w_dn, T.bf16, (1, n_pad * hidden))
         part_g = GTensor(
-            partial, fx.Float32, (1, hc_count * split_k_per_stream * m_rows * n_pad)
+            partial, T.f32, (1, hc_count * split_k_per_stream * m_rows * n_pad)
         )
 
         rr = [
@@ -857,12 +858,12 @@ def _build_up_gate_mix_gemv(
         lane = tid % WAVE
         c = fx.block_idx.x * waves_per_block + wid
 
-        lora_g = GTensor(lora, fx.BFloat16, (1, m_rows * lowrank))
-        r2_g = GTensor(r2, fx.BFloat16, (1, m_rows * hidden))
-        rrms_g = GTensor(rrms, fx.Float32, (1, m_rows * hc_count))
-        w_g = GTensor(w, fx.Float32, (1, w_len))
-        wup_g = GTensor(w_up, fx.BFloat16, (1, hidden * lowrank))
-        out_g = GTensor(block_input, fx.BFloat16, (1, m_rows * stream_dim))
+        lora_g = GTensor(lora, T.bf16, (1, m_rows * lowrank))
+        r2_g = GTensor(r2, T.bf16, (1, m_rows * hidden))
+        rrms_g = GTensor(rrms, T.f32, (1, m_rows * hc_count))
+        w_g = GTensor(w, T.f32, (1, w_len))
+        wup_g = GTensor(w_up, T.bf16, (1, hidden * lowrank))
+        out_g = GTensor(block_input, T.bf16, (1, m_rows * stream_dim))
 
         w_shared = w_g.load(c, vec_size=1) if shared_w else None
         xacc = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
@@ -892,7 +893,7 @@ def _build_up_gate_mix_gemv(
                 rr = rrms_g.load(m * hc_count + s, vec_size=1)
                 r2v = fx.BFloat16(r2_g.load(m * hidden + n, vec_size=1)).to(fx.Float32)
                 xn = fx.BFloat16(r2v * rr * onepw).to(fx.Float32)
-                xacc[m] = xacc[m] + _sigmoid_f32(a) * xn
+                xacc[m] = xacc[m] + sigmoid_f32(a) * xn
         for m in range_constexpr(m_rows):
             out_g.store(
                 m * stream_dim + c,
@@ -1050,16 +1051,16 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float):
         stream = fx.block_idx.x
         tok = fx.block_idx.y
         tid = fx.thread_idx.x
-        r = GTensor(residual, fx.BFloat16, (1, hidden))
-        y = GTensor(block_output, fx.BFloat16, (1, stream_dim))
-        inj = GTensor(injection, fx.BFloat16, (1, hc_count))
-        r2 = GTensor(r2_out, fx.BFloat16, (1, hidden))
-        rrms_g = GTensor(rrms_out, fx.Float32, (1, hc_count))
+        r = GTensor(residual, T.bf16, (1, hidden))
+        y = GTensor(block_output, T.bf16, (1, stream_dim))
+        inj = GTensor(injection, T.bf16, (1, hc_count))
+        r2 = GTensor(r2_out, T.bf16, (1, hidden))
+        rrms_g = GTensor(rrms_out, T.f32, (1, hc_count))
 
         inj_val = fx.BFloat16(inj.load(tok * hc_count + stream, vec_size=1)).to(
             fx.Float32
         )
-        gate = fx.Float32(2.0) * _sigmoid_f32(inj_val * fx.Float32(inv_hc))
+        gate = fx.Float32(2.0) * sigmoid_f32(inj_val * fx.Float32(inv_hc))
         row_r = tok * hidden + stream * stream_dim
         row_y = tok * stream_dim
         sq = fx.Float32(0.0)
@@ -1172,8 +1173,8 @@ def _build_down_norm_partial(
         r2_buf = fx.rocdl.make_buffer_tensor(r2, max_size=True)
         wdn_buf = fx.rocdl.make_buffer_tensor(w_dn, max_size=True)
         part_buf = fx.rocdl.make_buffer_tensor(partial, max_size=True)
-        rrms_g = GTensor(rrms, fx.Float32, (1, hc_count))
-        w_g = GTensor(w, fx.Float32, (1, w_len))
+        rrms_g = GTensor(rrms, T.f32, (1, hc_count))
+        w_g = GTensor(w, T.f32, (1, w_len))
 
         if const_expr(stage_rrms):
 
@@ -1397,7 +1398,7 @@ def flydsl_k1_combine_norm_down(
     # discardable zero output. Removes the caller-side pad memcpy.
     assert gemm_pad is None or gemm_pad >= tokens, "gemm_pad must be >= tokens"
     gemm_tokens = tokens if gemm_pad is None else gemm_pad
-    # Data-driven config (tuned_configs.json "k1" table): fill any dimension the
+    # Data-driven config (hc_gated_residual_tuned.json "k1" table): fill any dimension the
     # caller left unset -- precedence explicit arg > tuned plan > heuristic. An
     # absent entry -> plan is None -> pure heuristic (behavior-preserving). Keyed
     # on gemm_tokens so a padded low-M tail resolves like its padded size.

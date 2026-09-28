@@ -25,9 +25,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import range_constexpr
+from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.act import _sigmoid_f32
+from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor
 
 
@@ -152,8 +153,8 @@ def _build_reduce_silu(
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        part_g = GTensor(partial, fx.Float32, (1, total))
-        lora_g = GTensor(lora, fx.BFloat16, (1, total))
+        part_g = GTensor(partial, T.f32, (1, total))
+        lora_g = GTensor(lora, T.bf16, (1, total))
         for it in range_constexpr(n_iters):
             base = (
                 (bid * fx.Int32(n_iters) + it) * fx.Int32(block_threads) * fx.Int32(vec)
@@ -168,14 +169,14 @@ def _build_reduce_silu(
             for e in range_constexpr(vec):
                 v = acc[e] * fx.Float32(inv_hc)
                 if all_silu:
-                    out.append(v * _sigmoid_f32(v))
+                    out.append(v * sigmoid_f32(v))
                 else:
                     col = fx.get_scalar((off + e) % fx.Int32(row_width))
                     if isinstance(col, int):
-                        out.append((v * _sigmoid_f32(v)) if col < silu_cols else acc[e])
+                        out.append((v * sigmoid_f32(v)) if col < silu_cols else acc[e])
                     else:
                         is_lora = col < fx.Int32(silu_cols)
-                        out.append(is_lora.select(v * _sigmoid_f32(v), acc[e]))
+                        out.append(is_lora.select(v * sigmoid_f32(v), acc[e]))
             lora_g.store(
                 off,
                 fx.Vector.from_elements(out, dtype=fx.Float32).to(fx.BFloat16),

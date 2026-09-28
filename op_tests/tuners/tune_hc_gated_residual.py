@@ -11,7 +11,8 @@ invisible to it, §6.7d), so this sweeps the K1 GEMM dimensions jointly:
 For each token count it validates every candidate against the trusted heuristic
 default, times the K1 call (combine+norm+down, fold_w=True -- the shipped config),
 and keeps the fastest. ``--export`` writes the winners into the package's
-``tuned_configs.json`` "k1" table (which flydsl_k1_combine_norm_down consults:
+``aiter/configs/model_configs/hc_gated_residual_tuned.json`` "k1" table (which
+flydsl_k1_combine_norm_down consults:
 explicit arg > tuned plan > heuristic).
 
     HIP_VISIBLE_DEVICES=2 python tune_hc_gated_residual.py --tokens 4096 8192 --export
@@ -44,11 +45,9 @@ TABLE = os.path.join(
     "..",
     "..",
     "aiter",
-    "ops",
-    "flydsl",
-    "kernels",
-    "hyper_connection_gated_residual",
-    "tuned_configs.json",
+    "configs",
+    "model_configs",
+    "hc_gated_residual_tuned.json",
 )
 TABLE = os.path.normpath(TABLE)
 

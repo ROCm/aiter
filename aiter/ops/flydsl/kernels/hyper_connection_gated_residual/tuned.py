@@ -14,7 +14,7 @@ cutover) with the actual measurements. When the table is missing an arch or
 kernel the lookups return ``None`` so callers fall back to their heuristic
 defaults, keeping the kernels usable on untuned hardware.
 
-Table schema (``tuned_configs.json``)::
+Table schema (``aiter/configs/model_configs/hc_gated_residual_tuned.json``)::
 
     {
       "gfx950": {
@@ -34,7 +34,20 @@ import json
 import math
 import os
 
-_TABLE_PATH = os.path.join(os.path.dirname(__file__), "tuned_configs.json")
+# Tuned table lives with the other tuned model configs (aiter convention), not
+# in-package: aiter/configs/model_configs/ is four levels up from this kernel dir.
+_TABLE_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "..",
+        "configs",
+        "model_configs",
+        "hc_gated_residual_tuned.json",
+    )
+)
 
 
 @functools.lru_cache(maxsize=1)

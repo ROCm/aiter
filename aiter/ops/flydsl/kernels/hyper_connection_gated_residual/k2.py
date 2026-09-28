@@ -27,7 +27,7 @@ import torch
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.act import _sigmoid_f32
+from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
@@ -97,8 +97,8 @@ def _build_up_gate_mix_norm(
         wup_buf = fx.rocdl.make_buffer_tensor(w_up, max_size=True)
         out_buf = fx.rocdl.make_buffer_tensor(block_input, max_size=True)
         r2_g = GTensor(r2, T.bf16, (1, hidden))
-        rrms_g = GTensor(rrms, fx.Float32, (1, hc_count))
-        w_g = GTensor(w, fx.Float32, (1, w_len))
+        rrms_g = GTensor(rrms, T.f32, (1, hc_count))
+        w_g = GTensor(w, T.f32, (1, w_len))
 
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mma_m, mma_n, mma_k, fx.BFloat16))
         tiled_mma = fx.make_tiled_mma(
@@ -205,7 +205,7 @@ def _build_up_gate_mix_norm(
                         .to(fx.Float32)
                     )
                 for e in range_constexpr(VEC):
-                    acc[it][e] = acc[it][e] + _sigmoid_f32(gate_vec[e]) * xn_vec[e]
+                    acc[it][e] = acc[it][e] + sigmoid_f32(gate_vec[e]) * xn_vec[e]
 
         for it in range_constexpr(iters):
             v = it * block_threads + tid
