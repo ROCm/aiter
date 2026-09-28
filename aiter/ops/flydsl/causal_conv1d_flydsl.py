@@ -3,7 +3,7 @@
 """FlyDSL prefill causal-conv1d kernel with fused split q/k/v output."""
 
 import functools
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -533,20 +533,20 @@ def causal_conv1d_split_qkv_flydsl_fn(
 def causal_conv1d_prefill_flydsl_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_states: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
     seq_lens_cpu: Sequence[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
-    pad_slot_id: Optional[int] = -1,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int | None = -1,
     validate_data: bool = False,
     *,
     block: int = 128,
     tokens: int = 16,
     prefetch: int = 16,
-    channels_per_thread: Optional[int] = None,
+    channels_per_thread: int | None = None,
 ) -> torch.Tensor:
     """``causal_conv1d_fn`` contract: returns the output, updates ``conv_states``.
 
@@ -667,7 +667,7 @@ def causal_conv1d_prefill_flydsl_fn(
         )
     ss = conv_states.stride() if conv_states is not None else (0, 0, 0)
 
-    def span(t: Optional[torch.Tensor]) -> int:
+    def span(t: torch.Tensor | None) -> int:
         return (
             1
             if t is None

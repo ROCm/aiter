@@ -23,12 +23,13 @@ current (non-empty) sequence; those lanes never reach a valid output.
 """
 
 import functools
-from typing import Optional, Sequence
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr
+
+_DEFAULT_STREAM = fx.Stream(None)
 
 
 @functools.lru_cache(maxsize=128)
@@ -44,7 +45,7 @@ def create_causal_conv1d_prefill_kernel(
     has_indices: bool,
     has_initial: bool,
     silu: bool,
-    pad_slot: Optional[int],
+    pad_slot: int | None,
     block: int,
     tokens: int,
     dtype: torch.dtype,
@@ -113,7 +114,8 @@ def create_causal_conv1d_prefill_kernel(
             for j in range_constexpr(width - 1):
                 hvalue = fx.Vector.filled(lanes, 0.0, fx.Float32)
                 if chunk == 0:
-                    if const_expr(has_cache):
+                    # Keep compile-time and runtime branches separate for FlyDSL.
+                    if const_expr(has_cache):  # noqa: SIM102
                         if use_history != 0:
                             hvalue = load_channels(
                                 state,
@@ -133,7 +135,8 @@ def create_causal_conv1d_prefill_kernel(
                 base = load_channels(bias, fx.Int64(c), fx.Int64(1)).to(fx.Float32)
             # Snapshot the whole old window before any state stores (short
             # sequences must shift old history, not read overwritten values).
-            if const_expr(has_cache):
+            # Keep compile-time and runtime branches separate for FlyDSL.
+            if const_expr(has_cache):  # noqa: SIM102
                 if chunk == 0:
                     for j in range_constexpr(width - 1):
                         tail = length - (width - 1) + j
@@ -199,7 +202,7 @@ def create_causal_conv1d_prefill_kernel(
         w_span: fx.Int64,
         state_span: fx.Int64,
         out_span: fx.Int64,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = _DEFAULT_STREAM,
     ):
         kernel(
             x,

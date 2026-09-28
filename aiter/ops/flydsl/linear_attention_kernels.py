@@ -25,10 +25,10 @@ from .kernels.gdr_decode import (
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
+    "flydsl_gdn_decode_varlen",
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
     "flydsl_gdr_mtp_sglang",
-    "flydsl_gdn_decode_varlen",
 ]
 
 
@@ -1072,6 +1072,40 @@ def flydsl_gdr_mtp_sglang(
     )
 
 
+_GDN_VARLEN_VITER4_MIN_DRAFT = 4
+_GDN_VARLEN_VITER4_BLOCKS_PER_CU = 1.5
+_GDN_VARLEN_VITER2_BLOCKS_PER_CU = 12.0
+
+
+def _gdn_varlen_viter(n, tokens_per_seq, num_v_heads, head_v_dim, ksplit, block):
+    """Widest v-iteration this launch's grid can pay for.
+
+    A VITER that does not divide the head width is skipped rather than rounded,
+    since the kernel would refuse it.
+    """
+    vlanes = block // ksplit
+    num_sms = get_num_sms()
+    draft = max(1, tokens_per_seq)
+
+    def blocks(viter):
+        vtile = vlanes * viter
+        if head_v_dim % vtile:
+            return None
+        return n * num_v_heads * (head_v_dim // vtile)
+
+    wide = blocks(4)
+    if (
+        draft >= _GDN_VARLEN_VITER4_MIN_DRAFT
+        and wide is not None
+        and wide >= _GDN_VARLEN_VITER4_BLOCKS_PER_CU * num_sms
+    ):
+        return 4
+    mid = blocks(2)
+    if mid is not None and mid >= (_GDN_VARLEN_VITER2_BLOCKS_PER_CU / draft) * num_sms:
+        return 2
+    return 1
+
+
 def flydsl_gdn_decode_varlen(
     *,
     q: torch.Tensor,
@@ -1092,6 +1126,7 @@ def flydsl_gdn_decode_varlen(
     intermediate_state_indices: torch.Tensor | None = None,
     ksplit: int = 8,
     block: int = 256,
+    viter: int | None = None,
 ) -> torch.Tensor:
     """Gated Delta Net decode recurrence over a packed (varlen) batch.
 
@@ -1100,11 +1135,6 @@ def flydsl_gdn_decode_varlen(
     with ``cu_seqlens``, optional per-draft-step state snapshots, and an optional
     suppressed final write-back (EAGLE target-verify commits the accepted prefix
     itself).
-
-    q/k/v and the state pool are bf16; ``a``/``b``/``A_log``/``dt_bias`` may be
-    bf16 or fp32. ``head_k_dim`` must be 128. Every sequence must have the same
-    length -- speculative decode always does, and the token loop is unrolled on
-    it. Raises on anything unsupported rather than silently degrading.
 
     Returns ``out`` shaped ``[1, T, num_v_heads, head_v_dim]``.
     """
@@ -1116,13 +1146,7 @@ def flydsl_gdn_decode_varlen(
         raise ValueError(f"head_k_dim must be 128, got {K}")
     if HV % Hg:
         raise ValueError(f"num_v_heads {HV} must be a multiple of num_k_heads {Hg}")
-    # The kernel addresses these as ``tok * <x>_token_stride + head * D + d``,
-    # so it needs head-major contiguity *within* a token but the token stride is
-    # a free parameter. Requiring full contiguity here would reject the layout a
-    # fused QKV projection actually produces: a server that splits one
-    # ``[1, T, (Hg + Hg + HV) * D]`` buffer hands over three views whose token
-    # stride is the fused width (Qwen3.8-Flash-Next: 10240 = (16+16+48)*128),
-    # not the per-tensor width. Those views are exactly what the kernel handles.
+
     for name, t_, dim in (("q", q, K), ("k", k, K), ("v", v, V)):
         if t_.dtype != torch.bfloat16:
             raise ValueError(f"{name} must be bf16, got {t_.dtype}")
@@ -1141,10 +1165,6 @@ def flydsl_gdn_decode_varlen(
     if state.stride()[1:] != (V * K, K, 1):
         raise ValueError("state pool inner dims must be contiguous [HV, V, K]")
 
-    # Host-side arithmetic only: this runs inside CUDA-graph capture, where a
-    # device->host sync (.item()/.tolist()) raises
-    # hipErrorStreamCaptureUnsupported. T // n is how the caller derives the
-    # draft-token count in the first place.
     n = cu_seqlens.numel() - 1
     if n <= 0 or T % n:
         raise ValueError(f"ragged batch: T={T} is not divisible by n={n}")
@@ -1168,43 +1188,50 @@ def flydsl_gdn_decode_varlen(
         cache_steps = 0
 
     out = q.new_empty(1, T, HV, V)
-    launch = create_gdn_decode_verify_kernel(
-        HV,
-        Hg,
-        V,
-        tokens_per_seq,
-        out.numel() * out.element_size(),
-        state.stride(0),
-        q.stride()[1],
-        k.stride()[1],
-        v.stride()[1],
-        a.stride()[1] if a.ndim == 3 else a.stride()[-2],
-        b.stride()[1] if b.ndim == 3 else b.stride()[-2],
-        float(K**-0.5) if scale is None else float(scale),
-        float(softplus_beta),
-        float(softplus_threshold),
-        not disable_state_update,
-        cache_states,
-        int(cache_steps),
-        str(a.dtype),
-        str(b.dtype),
-        ksplit,
-        block,
-    )
-    launch(
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        state,
-        state_indices,
-        out,
-        cu_seqlens,
-        intermediate_states if cache_states else state,
-        intermediate_state_indices if cache_states else state_indices,
-        fx.Int32(n),
-    )
+
+    with CompilationContext.compile_hints({"fastmath": "fast"}):
+        launch = create_gdn_decode_verify_kernel(
+            HV,
+            Hg,
+            V,
+            tokens_per_seq,
+            out.numel() * out.element_size(),
+            state.stride(0),
+            q.stride()[1],
+            k.stride()[1],
+            v.stride()[1],
+            a.stride()[1] if a.ndim == 3 else a.stride()[-2],
+            b.stride()[1] if b.ndim == 3 else b.stride()[-2],
+            float(K**-0.5) if scale is None else float(scale),
+            float(softplus_beta),
+            float(softplus_threshold),
+            not disable_state_update,
+            cache_states,
+            int(cache_steps),
+            str(a.dtype),
+            str(b.dtype),
+            ksplit,
+            block,
+            (
+                _gdn_varlen_viter(n, tokens_per_seq, HV, V, ksplit, block)
+                if viter is None
+                else int(viter)
+            ),
+        )
+        launch(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            out,
+            cu_seqlens,
+            intermediate_states if cache_states else state,
+            intermediate_state_indices if cache_states else state_indices,
+            fx.Int32(n),
+        )
     return out
