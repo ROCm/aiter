@@ -745,11 +745,11 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int sf_panel_k_fit =
         ((max_lds_size_per_wg - prefetch_k_iter * per_block_iter_lds_size - 256)
          / SF_PANEL_ROWS - SF_PANEL_PAD) * GROUP_K / B_K * B_K;
-    // Less the LDS-B 128x128x128 tile, which stays on the ring. Its GROUP_K=32
-    // form is wrong on every path but the ring -- 9231/9232 (global scales) are
-    // held out of the catalogue for it, and 9229/9325 on this panel returned
-    // rel 0.03 at m16 and inf from m128, at any K, with the LDS as allocated
-    // (163,328) inside the CU. Its 128 mirror, 8229, is right on the panel.
+    // Less the LDS-B 128x128x128 tile, which stays on the ring. On the padded
+    // panel 9229/9325 spill part of an accumulator and ROCm 7.2.4's allocator
+    // drops one of its registers on the reload (see the 231/232 note in
+    // opus_gemm_common.py). The overlap panel happens to allocate cleanly, but
+    // the tile wins no cell, so that is not worth depending on.
     static constexpr bool SF_PANEL_FITS = SF_PER_MFMA_K > 1 && sf_panel_k_fit >= 4096
         && !(B_M == 128 && B_N == 128 && B_K == 128 && !B_DIRECT_REG_);
     static constexpr int SF_PRELOAD_K_MAX =

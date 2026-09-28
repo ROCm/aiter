@@ -1510,57 +1510,24 @@ _bmm_bpre_blds_local.update(
     # cause: GROUP_K=32 widens v_sfb (B_N=256 over GROUP_N=32 is eight groups)
     # and adds the lane's block index. Mirror 235 itself compiles.
     #
-    # 231 and 232 compile and return wrong answers, which is worse, so they are
-    # held out. They are 256x128x128x128 2x1 at WG_PER_CU=1, without and with
-    # scaleprefetch.
+    # 231 and 232 (256x128x128x128 2x1 at WG_PER_CU=1, without and with
+    # scaleprefetch) are held out because this tile hits a register-allocation
+    # defect in ROCm 7.2.4's clang 22, not a kernel bug. The tile fills all 512
+    # VGPR+AGPR; when the allocator spills part of one 4-register MFMA
+    # accumulator to scratch in the peeled K tail, the reload reassembles only
+    # three of the four, and the fourth keeps what the register last held (a B
+    # fragment). The next MFMA accumulates onto that. In every 128x128 tile the
+    # footprint is rows 0..31 and the four columns 4q+j of the first N subtile,
+    # j being the dropped register; with constant operands and unit scales those
+    # columns hold exactly the last K tile's contribution.
     #
-    # The failure is an accumulation, not an addressing one. In every 128-column
-    # tile, the four columns with n % 4 == 1 and n < 16 -- so the first N
-    # subtile, every fourth column -- hold exactly one K tile's contribution out
-    # of the K/B_K the kernel should sum. Measured, not inferred: with both
-    # operands constant and both scales unit, so that every output element is
-    # arithmetically the same number, the ratio to the reference on those
-    # columns is 0.25 at K=512 (4 tiles) and 0.03125 at K=4096 (32). The earlier
-    # note here guessed at "an e8m0 byte read outside its row"; that is wrong.
-    #
-    # What the experiments rule out, each against its own control:
-    #   * scale values. Forcing A's and B's scales to 1.0 on both the kernel and
-    #     the reference leaves the same four columns wrong.
-    #   * which element is fetched. Forcing both operands to a constant leaves
-    #     them wrong too, and reading the wrong element of a constant tensor
-    #     cannot differ from reading the right one.
-    #   * the compiler. Baseline, -greedy-reverse-local-assignment=0,
-    #     -enable-noalias-to-md-conversion=0 and -O2 all produce bit-identical
-    #     output, which a register-allocation defect would not.
-    #   * prefetch depth. 8231 and 9231 both solve to 4; the ring slot this
-    #     branch charges a non-preload GROUP_K=32 kid for does not change it.
-    #   * SF_USE_RING gating. It is only ever read to derive SF_PANEL/SF_RING.
-    #   * LDS layout. smem_a and smem_b are separate arrays and both sized the
-    #     same as the 128 mirror's.
-    #   * the opsel pack. Forcing this tile down the broadcast pack instead --
-    #     arithmetically the same thing at COM_REP_K == 1, and what the correct
-    #     229 already uses -- leaves it wrong, with 229 and the mirror still
-    #     clean under that build. So the defect is in what the two packs share.
-    #   * the MFMA stream itself. The 32 and 128 listings both hold 288
-    #     v_mfma_scale, of which the same 32 take a literal 0 as their C operand
-    #     and they are the first 32 in program order, i.e. the opening K tile's
-    #     initialisation in both.
-    #
-    # Not yet resolved, and the open question is which of two readings of the
-    # footprint is right: the main accumulate does not use mfma_adaptor_swap_ab
-    # (only the split-N store's mma_c1 does), so column n maps to lane % 16 and
-    # the four bad columns are four lanes' whole accumulators rather than one
-    # register of every lane. Those point at different things -- a lane-indexed
-    # address versus the slice arithmetic -- and the slice indices are all
-    # compile-time constants, which a per-lane footprint argues against.
-    #
-    # What is left is the intersection, and the catalogue holds exactly three
-    # kids in it -- 229, 231, 232, all this tile: blds, GROUP_K=32, prefetch
-    # depth 4, COM_REP_M=4, and the global scale path. 229 is the one with
-    # preload_sf, it takes the ring instead, and it is correct to 0.0015. The
-    # split-K family's 9137 is the same geometry without B_PRESHUFFLE and is
-    # correct to 0.0014. The other non-preload twins at B_N=128 (233, 247, 251,
-    # 252) are correct and differ only in lacking B_M=128.
+    # Whether a kid hits it depends on allocation alone. 229 and split-K 325
+    # hit it on the padded GROUP_K=32 panel (see SF_PANEL_FITS); 231/232 showed
+    # the same footprint under an earlier revision of this pipeline, and now
+    # compile without spills and match the reference.
+    # They stay out because the tile wins no cell at either group size, and
+    # the next allocation change can bring the drop back. A kid with a nonzero
+    # .vgpr_spill_count is the one to check against the reference first.
     #
     # Mirrors 231 and 232 are correct and keep their rows. So is the rest of the
     # 128 path: all 97 GROUP_K=128 kids that take row-major scales pass at
