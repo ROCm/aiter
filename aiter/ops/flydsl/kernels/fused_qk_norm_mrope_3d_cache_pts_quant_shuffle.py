@@ -85,6 +85,20 @@ def rms_reduce_add(x, lane, broadcast_half=True):
     return v
 
 
+def split_cos_sin_tables(cos_sin, rotary_cols):
+    """View the packed ``[cos, sin]`` row halves as separate tables."""
+    layout_rotary_table = fx.make_layout(
+        (cos_sin.shape[0], rotary_cols), cos_sin.stride
+    )
+    rotary_cols = layout_rotary_table.shape[1].unpack()
+    table_iter = fx.get_iter(cos_sin)
+    cos_t = fx.Tensor(fx.make_view(table_iter, layout_rotary_table))
+    sin_t = fx.Tensor(
+        fx.make_view(table_iter + rotary_cols, layout_rotary_table)
+    )
+    return cos_t, sin_t
+
+
 def mrope_cos_sin(
     col,
     tok,
@@ -165,14 +179,12 @@ def _build_q_kernel(
 ):
     D = head_size
     H_Q = num_heads_q
-    HALF = D // 2
     # One head is owned by one 32-lane RMSNorm group: lane ``rl`` holds the
     # ``D // RMS_GROUP`` contiguous columns starting at
     # ``(D // RMS_GROUP) * rl``.
     # The NEOX partner of every column that lane ``rl`` holds lives in lane
     # ``rl ^ 16``, so the pair values come from one lane shuffle rather than a
     # second read of the row.
-    PARTNER_XOR = RMS_GROUP // 2
     ROWS_PER_WAVE = WAVE // RMS_GROUP
     Q_THREADS = waves_per_block * WAVE
     HEADS_PER_BLOCK = waves_per_block * ROWS_PER_WAVE * head_iters
@@ -191,18 +203,7 @@ def _build_q_kernel(
         token_offset: fx.Int32,
     ):
         fm_fast = fx.FastMathFlags.fast
-        cos_t = fx.Tensor(
-            fx.make_view(
-                fx.get_iter(cos_sin),
-                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
-            )
-        )
-        sin_t = fx.Tensor(
-            fx.make_view(
-                fx.get_iter(cos_sin) + HALF,
-                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
-            )
-        )
+        cos_t, sin_t = split_cos_sin_tables(cos_sin, D // 2)
         layout_rms_tv = fx.make_ordered_layout(
             (RMS_GROUP, D // RMS_GROUP), (1, 0)
         )
@@ -210,21 +211,32 @@ def _build_q_kernel(
         rms_values_per_lane = fx.size(layout_rms_values.shape).unpack()
         # Q lanes own contiguous RMS vectors, but their NEOX outputs are
         # ordered by (lane-within-half, lane-half, pair, rotary-half).
-        layout_q_lane = fx.make_layout(
-            (PARTNER_XOR, 2), stride=(1, PARTNER_XOR)
+        layout_q_lane = fx.make_ordered_layout(
+            (RMS_GROUP // 2, 2), (0, 1)
         )
-        layout_q_pair_tv = fx.make_layout(
-            ((PARTNER_XOR, 2), ((D // RMS_GROUP) // 2, 2)),
-            stride=((D // RMS_GROUP, (D // RMS_GROUP) // 2), (1, HALF)),
+        partner_xor = layout_q_lane.shape[0].unpack()
+        layout_q_pair_tv = fx.make_ordered_layout(
+            ((partner_xor, 2), (rms_values_per_lane // 2, 2)),
+            ((2, 1), (0, 3)),
         )
         layout_q_pair_cols = fx.slice(
             layout_q_pair_tv, (None, (None, 0))
         )
         pairs_per_lane = layout_q_pair_cols.shape[1].unpack()
+        # [wave, row-within-wave, RMS lane] maps a linear workgroup thread
+        # directly to all three of its logical roles.
+        layout_thread_wave_row_rms = fx.make_ordered_layout(
+            (waves_per_block, ROWS_PER_WAVE, RMS_GROUP), (2, 1, 0)
+        )
         # [iteration, warp, row-within-wave] is the warp-value tiling of the
         # heads owned by one workgroup.
         layout_head_iter_wave_row = fx.make_ordered_layout(
-            (head_iters, waves_per_block, ROWS_PER_WAVE), (2, 1, 0)
+            (
+                head_iters,
+                layout_thread_wave_row_rms.shape[0],
+                layout_thread_wave_row_rms.shape[1],
+            ),
+            (2, 1, 0),
         )
         qkv_rms_view = fx.composition(qkv, fx.make_tile(None, None, layout_rms_tv))
         weight_pair_view = fx.composition(q_norm_w, layout_q_pair_tv)
@@ -240,12 +252,12 @@ def _build_q_kernel(
         bid_t = fx.block_idx.y
         tok = bid_t + token_offset
         t = fx.thread_idx.x
-        wid = t // WAVE
-        lane = t % WAVE
-        rl = lane % RMS_GROUP
-        row_in_wave = lane // RMS_GROUP
+        thread_coord = fx.idx2crd(t, layout_thread_wave_row_rms)
+        wid = fx.Int32(fx.get_(thread_coord, 0).unpack())
+        row_in_wave = fx.Int32(fx.get_(thread_coord, 1).unpack())
+        rl = fx.Int32(fx.get_(thread_coord, 2).unpack())
 
-        is_low = rl < PARTNER_XOR
+        is_low = rl < partner_xor
         q_lane_coord = fx.idx2crd(rl, layout_q_lane)
         lane_value_coord = (q_lane_coord, None)
         w_lane_pairs = fx.slice(weight_pair_view, lane_value_coord)
@@ -295,7 +307,7 @@ def _build_q_kernel(
 
             # The partner lane's columns complete this lane's NEOX pairs.
             peer = [
-                gpu.shuffle_xor(own[i], PARTNER_XOR, RMS_GROUP)
+                gpu.shuffle_xor(own[i], partner_xor, RMS_GROUP)
                 for i in range_constexpr(rms_values_per_lane)
             ]
 
@@ -382,11 +394,6 @@ def _build_kv_kernel(
 ):
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
-    PAIR_LANES = min(WAVE, HALF)
-    # A phase group must cover both the RMS reduction group and the active
-    # pair lanes. For D=64, the pair layout has 32 active lanes and lets each
-    # wave process two token rows without duplicating pair work.
-    COMPUTE_GROUP = max(RMS_GROUP, PAIR_LANES)
     CACHE_FX_TYPE = fx.Int8 if cache_is_fp8 else fx.BFloat16
 
     STAGE_ELEMS = block_size * D
@@ -427,24 +434,27 @@ def _build_kv_kernel(
         page_block_offset: fx.Int32,
     ):
         fm_fast = fx.FastMathFlags.fast
-        cos_t = fx.Tensor(
-            fx.make_view(
-                fx.get_iter(cos_sin),
-                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
-            )
-        )
-        sin_t = fx.Tensor(
-            fx.make_view(
-                fx.get_iter(cos_sin) + HALF,
-                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
-            )
-        )
+        cos_t, sin_t = split_cos_sin_tables(cos_sin, HALF)
         layout_thread_wave_lane = fx.make_layout(
             (KV_THREADS // WAVE, WAVE), stride=(WAVE, 1)
         )
+        # Active lanes own strided columns in [0, D/2), with [pair, half]
+        # retained as one value mode.
+        layout_pair_tv = fx.make_ordered_layout(
+            (
+                min(WAVE, HALF),
+                (HALF // min(WAVE, HALF), 2),
+            ),
+            (0, (1, 2)),
+        )
+        pair_lanes = layout_pair_tv.shape[0].unpack()
+        # A phase group must cover both the RMS reduction group and the active
+        # pair lanes. For D=64, 32 active lanes let each wave process two token
+        # rows without duplicating pair work.
+        compute_group_size = max(RMS_GROUP, pair_lanes)
         layout_thread_compute_pair_lane = fx.make_layout(
-            (KV_THREADS // COMPUTE_GROUP, COMPUTE_GROUP),
-            stride=(COMPUTE_GROUP, 1),
+            (KV_THREADS // compute_group_size, compute_group_size),
+            stride=(compute_group_size, 1),
         )
         compute_groups_per_block = (
             layout_thread_compute_pair_lane.shape[0].unpack()
@@ -462,19 +472,13 @@ def _build_kv_kernel(
             ),
             stride=(1, compute_groups_per_block),
         )
-        # Two logical ownership maps of D are used:
-        #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
-        #  * NEOX pairs: active lanes own strided columns in [0, D/2), with
-        #    [pair, half] kept as one value mode.
+        # RMSNorm uses a second ownership map: 32 lanes own contiguous
+        # D/32-element vectors.
         layout_rms_tv = fx.make_ordered_layout(
             (RMS_GROUP, D // RMS_GROUP), (1, 0)
         )
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
         rms_values_per_lane = fx.size(layout_rms_values.shape).unpack()
-        layout_pair_tv = fx.make_layout(
-            (PAIR_LANES, (HALF // PAIR_LANES, 2)),
-            stride=(1, (PAIR_LANES, HALF)),
-        )
         layout_pair_cols = fx.slice(layout_pair_tv, (None, (None, 0)))
         pairs_per_lane = layout_pair_cols.shape[1].unpack()
         layout_stage = fx.make_ordered_layout((block_size, D), (1, 0))
@@ -563,7 +567,9 @@ def _build_kv_kernel(
             )
             mapping_valid = valid_base.select(fx.Int32(1), fx.Int32(0))
             if full_page:
-                for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
+                for check_it in range_constexpr(
+                    layout_page_check_tv.shape[1].unpack()
+                ):
                     token_local = fx.crd2idx(
                         (lane, check_it), layout_page_check_tv
                     ).unpack()
@@ -694,7 +700,7 @@ def _build_kv_kernel(
                     sumsq = rms_reduce_add(
                         sumsq_local,
                         pair_lane,
-                        broadcast_half=PAIR_LANES > RMS_GROUP,
+                        broadcast_half=pair_lanes > RMS_GROUP,
                     )
                     rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
