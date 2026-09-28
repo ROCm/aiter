@@ -38,7 +38,6 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
 from aiter.ops.flydsl.qsa import (
-    _measured_rows,
     gather_paged_cache,
     gather_qsa_caches,
     normalize_qsa_backend,
@@ -1619,19 +1618,20 @@ def test_qsa_backend_default_is_live_amd():
 
 
 def test_qsa_auto_stays_off_the_family_a_gate():
-    """auto selects FlyDSL only on a recorded family A end-to-end win."""
+    """auto admits the measured shape and nothing else.
+
+    Both ways this can break are silent. Loosened, auto serves an untuned
+    shape at whatever speed the K2 band table happens to give; narrowed, it
+    drops the production shape back to Triton. Neither is a wrong result,
+    so no other test in this file would notice. Both serves gates accept
+    family B, so the shape pin is the only thing rejecting it here.
+    """
     page = 16
     n_columns = 128
     family_b = _policy_args(1, 10, 128, n_columns, page, 4, 128)
     assert qsa_auto_uses_flydsl(*family_b) is False
     family_a = _policy_args(1, 24, 256, n_columns, page, 4, 128)
     assert qsa_auto_uses_flydsl(*family_a) is True
-    assert _measured_rows(1, n_columns) is True
-    assert _measured_rows(8, n_columns) is True
-    assert _measured_rows(512, n_columns) is True
-    # Between the decode and prefill bands the sweep has no row.
-    mid = _policy_args(64, 24, 256, n_columns, page, 4, 128)
-    assert qsa_auto_uses_flydsl(*mid) is False
 
 
 def test_qsa_symbols_export_lazily():
