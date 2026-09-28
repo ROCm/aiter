@@ -221,6 +221,8 @@ def compile_mega_moe_stage1(
     LAUNCH_HANDSHAKE = not fixed_slot_dispatch or (
         os.environ.get("AITER_MEGA_S1_LAUNCH_HANDSHAKE", "1") == "1"
     )
+    PRODUCER_FENCE = os.environ.get("AITER_MEGA_S1_PRODUCER_FENCE", "1") == "1"
+    OWNER_LIGHT = os.environ.get("AITER_MEGA_S1_OWNER_LIGHT", "0") == "1"
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
@@ -237,6 +239,8 @@ def compile_mega_moe_stage1(
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
         f"{'' if LAUNCH_HANDSHAKE else '_nohs'}"
+        f"{'' if PRODUCER_FENCE else '_nopf'}"
+        f"{'_ol' if OWNER_LIGHT else ''}"
         f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
     TRACE_BASE = _trace.trace_base("stage1")
@@ -346,24 +350,47 @@ def compile_mega_moe_stage1(
                             launch_epoch - fx.Int32(1),
                         )
                         comm_ops.fence_system_acquire()
-                if tid == fx.Int32(0):
-                    work_head_rsrc = ptr_buf_tensor(a_work_head, fx.Int32)
-                    for shard in range_constexpr(WORK_SHARDS):
-                        work_head_rsrc[fx.Int32(shard * 16)] = fx.Int32(0)
-                    comm_ops.store_i32_system(
-                        a_work_tail, fx.Int32(0), fx.Int32(0)
-                    )
-                    group_done_rsrc = ptr_buf_tensor(a_group_done, fx.Int32)
-                    for destination in range_constexpr(fz_npes):
-                        group_done_rsrc[fx.Int32(destination)] = fx.Int32(0)
-                if tid == fx.Int32(0):
-                    fx.rocdl.s_waitcnt(0)
-                    comm_ops.fence_agent_release()
-                    parity_rsrc[fx.Int32(0)] = next_parity
-                    fx.rocdl.s_waitcnt(0)
-                    comm_ops.fence_agent_release()
-                    comm_ops.store_i32_system(gate_addr, fx.Int32(0), gate_epoch)
+                if const_expr(TRACE_BASE):
+                    if tid == fx.Int32(0):
+                        _trace.record(TRACE_BASE, fx.block_idx.x, 6, _trace.now())
+                if const_expr(OWNER_LIGHT):
+                    # Every value published here is read only on this GPU: one
+                    # agent release covers them all, and the gate itself is a
+                    # relaxed store (each release writes back L2).
+                    if tid == fx.Int32(0):
+                        work_head_rsrc = ptr_buf_tensor(a_work_head, fx.Int32)
+                        for shard in range_constexpr(WORK_SHARDS):
+                            work_head_rsrc[fx.Int32(shard * 16)] = fx.Int32(0)
+                        ptr_buf_tensor(a_work_tail, fx.Int32)[fx.Int32(0)] = fx.Int32(0)
+                        group_done_rsrc = ptr_buf_tensor(a_group_done, fx.Int32)
+                        for destination in range_constexpr(fz_npes):
+                            group_done_rsrc[fx.Int32(destination)] = fx.Int32(0)
+                        parity_rsrc[fx.Int32(0)] = next_parity
+                        fx.rocdl.s_waitcnt(0)
+                        comm_ops.fence_agent_release()
+                        comm_ops.store_i32_global_system_monotonic(gate_addr, gate_epoch)
+                else:
+                    if tid == fx.Int32(0):
+                        work_head_rsrc = ptr_buf_tensor(a_work_head, fx.Int32)
+                        for shard in range_constexpr(WORK_SHARDS):
+                            work_head_rsrc[fx.Int32(shard * 16)] = fx.Int32(0)
+                        comm_ops.store_i32_system(
+                            a_work_tail, fx.Int32(0), fx.Int32(0)
+                        )
+                        group_done_rsrc = ptr_buf_tensor(a_group_done, fx.Int32)
+                        for destination in range_constexpr(fz_npes):
+                            group_done_rsrc[fx.Int32(destination)] = fx.Int32(0)
+                    if tid == fx.Int32(0):
+                        fx.rocdl.s_waitcnt(0)
+                        comm_ops.fence_agent_release()
+                        parity_rsrc[fx.Int32(0)] = next_parity
+                        fx.rocdl.s_waitcnt(0)
+                        comm_ops.fence_agent_release()
+                        comm_ops.store_i32_system(gate_addr, fx.Int32(0), gate_epoch)
                 fx.rocdl.s_waitcnt(0)
+                if const_expr(TRACE_BASE):
+                    if tid == fx.Int32(0):
+                        _trace.record(TRACE_BASE, fx.block_idx.x, 7, _trace.now())
                 fx.barrier()
             else:
                 if tid == fx.Int32(0):
@@ -406,7 +433,8 @@ def compile_mega_moe_stage1(
                     fz_scale_n_i32=fz_scale_n_i32, fz_enable_scales=fz_enable_scales, addr_disp=addr_disp,
                     addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                     i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
-                    parity=payload_parity, expected=payload_expected,
+                    parity=payload_parity, expected=payload_expected, trace_base=TRACE_BASE,
+                    producer_fence=PRODUCER_FENCE,
                 )
             else:
                 if tid == fx.Int32(0):
@@ -648,6 +676,11 @@ def compile_mega_moe_stage1(
     )
     if _return_kernel_spec:
         return spec
+    # FlyDSL's JIT cache key only collects scalar closure values; ``spec`` is an
+    # object, so without these every Stage1 config would share one key and a
+    # cached launcher of another config could be reused.
+    _key_kernel = _jit_function_cache_key(kernel._original_func)
+    _key_geometry = (spec.grid_x, spec.block_x, spec.waves_per_eu_hint)
 
     @flyc.jit
     def launch(
@@ -657,6 +690,7 @@ def compile_mega_moe_stage1(
         addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
         addr_expected: fx.Int64, stream: fx.Stream,
     ):
+        _ = (_key_kernel, _key_geometry)
         spec.kernel(
             out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale, tokens,
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,

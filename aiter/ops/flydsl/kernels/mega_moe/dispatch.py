@@ -12,6 +12,7 @@ from flydsl.expr.typing import T
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
+from . import trace as _trace
 
 
 class DispatchSlot(IntEnum):
@@ -450,7 +451,8 @@ def _publish_tile_range(
 def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-    i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
+    i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, trace_base=0,
+    producer_fence=True,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots."""
@@ -510,6 +512,9 @@ def emit_direct_fixed_slot_payload(
                     )
                 )
         expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
+        if const_expr(trace_base):
+            if tid == fx.Int32(0):
+                _trace.record(trace_base, fx.block_idx.x, 6, _trace.now())
         publish = assigned & (expert_offset < fx.Int32(fz_cap))
         payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
 
@@ -554,8 +559,15 @@ def emit_direct_fixed_slot_payload(
 
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
+    if const_expr(trace_base):
+        if tid == fx.Int32(0):
+            _trace.record(trace_base, fx.block_idx.x, 7, _trace.now())
     if tid == fx.Int32(0):
-        comm_ops.fence_system_release()
+        # Remote payload stores are visible at the peer once acknowledged (the
+        # s_waitcnt above); without producer_fence only the last producer of a
+        # group releases, instead of every producer CTA writing back L2.
+        if const_expr(producer_fence):
+            comm_ops.fence_system_release()
         done = fx.Int32(
             comm_ops.atomic_add_agent(
                 a_producer_done + fx.Int64(producer_group) * fx.Int64(4), fx.Int32(1)
@@ -563,6 +575,8 @@ def emit_direct_fixed_slot_payload(
         )
         if done == fx.Int32(producers_per_group - 1):
             comm_ops.fence_agent_acquire()
+            if const_expr(not producer_fence):
+                comm_ops.fence_system_release()
             done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             for destination in range_constexpr(fz_npes):
                 if producer_group == fx.Int32(destination % destination_groups):
