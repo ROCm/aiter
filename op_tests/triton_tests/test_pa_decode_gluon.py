@@ -2210,6 +2210,48 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+def ps_decode_performance_test():
+    """Run PS decode performance test without sliding window.
+
+    Covers both PS kernels: kv_heads 1 selects
+    paged_attention_decode_sliding_window_head_1, kv_heads 8 selects
+    paged_attention_decode_sliding_window.
+    """
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+    global PS_OPTIONS
+
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
+
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    HEAD_DIMENSION_OPTIONS = [128]
+    HEAD_CONFIGURATIONS = [(16, 1), (8, 1), (64, 8)]
+    QUERY_LENGTH_OPTIONS = [1, 4]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
+    CONTEXT_LENGTH_OPTIONS = [2048, 8192]
+    BATCH_SIZE_OPTIONS = [16, 64, 128, 256]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    BLOCK_SIZE_OPTIONS = [16]
+    PS_OPTIONS = [True]
+    parse_arg_and_run_test()
+
+
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":
