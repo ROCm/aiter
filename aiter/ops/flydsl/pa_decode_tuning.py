@@ -668,7 +668,6 @@ def _prepare_candidate(
             inputs["table"],
             shape["softmax_scale"],
             shape["query_length"],
-            num_cu,
             compute_type=inputs["key"].dtype,
             key_scale=inputs["key_scale"],
             value_scale=inputs["value_scale"],

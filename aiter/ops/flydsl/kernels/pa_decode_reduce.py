@@ -12,8 +12,6 @@ from flydsl.expr.typing import T
 from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
 from .utils import rcp_f32, udiv_const, urem_const
 
-# Static scheduling limit; work plans use their device's CU count instead.
-MAX_CONTEXT_PARTITIONS = 256
 _DTYPE_MAP = {
     "f32": fx.Float32,
     "f16": fx.Float16,
@@ -28,15 +26,11 @@ def _validate_pa_decode_ps_reduce_config(
     output_dtype_str: str,
     logits_dtype_str: str,
     sink_dtype_str: str,
-    use_work_plan: bool = False,
 ) -> None:
     # The plan and launch wrappers validate the device-specific CU bound.
-    if max_context_partition_num < 1 or (
-        not use_work_plan and max_context_partition_num > MAX_CONTEXT_PARTITIONS
-    ):
-        bound = "positive" if use_work_plan else f"in [1, {MAX_CONTEXT_PARTITIONS}]"
+    if max_context_partition_num < 1:
         raise ValueError(
-            f"max_context_partition_num must be {bound}, "
+            "max_context_partition_num must be positive, "
             f"got {max_context_partition_num}"
         )
     if head_size <= 0 or head_size > 1024 or head_size % 64:
@@ -55,7 +49,6 @@ def is_pa_decode_ps_reduce_supported(
     output_dtype_str: str,
     logits_dtype_str: str,
     sink_dtype_str: str,
-    use_work_plan: bool = False,
 ) -> bool:
     """Return whether the FlyDSL reducer supports a dispatch configuration."""
     try:
@@ -65,7 +58,6 @@ def is_pa_decode_ps_reduce_supported(
             output_dtype_str=output_dtype_str,
             logits_dtype_str=logits_dtype_str,
             sink_dtype_str=sink_dtype_str,
-            use_work_plan=use_work_plan,
         )
     except ValueError:
         return False
@@ -81,7 +73,6 @@ def compile_pa_decode_ps_reduce(
     logits_dtype_str: str,
     sink_dtype_str: str,
     use_sinks: bool,
-    use_work_plan: bool = False,
     query_group_size: int | None = None,
     bounded_plan_logits: bool = False,
     vectorize_plan_logits: bool = False,
@@ -107,11 +98,10 @@ def compile_pa_decode_ps_reduce(
         output_dtype_str=output_dtype_str,
         logits_dtype_str=logits_dtype_str,
         sink_dtype_str=sink_dtype_str,
-        use_work_plan=use_work_plan,
     )
     if query_group_size is not None and query_group_size <= 0:
         raise ValueError("query_group_size must be positive when specified")
-    if bounded_plan_logits and (not use_work_plan or max_context_partition_num > 64):
+    if bounded_plan_logits and max_context_partition_num > 64:
         raise ValueError("bounded_plan_logits requires a planned NP<=64 reducer")
     if vectorize_plan_logits and (
         not bounded_plan_logits
@@ -121,9 +111,7 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(
             "vectorize_plan_logits requires bounded planned D=128 bf16/f16 logits"
         )
-    if compact_plan and (
-        not use_work_plan or head_size != 128 or max_context_partition_num <= 64
-    ):
+    if compact_plan and (head_size != 128 or max_context_partition_num <= 64):
         raise ValueError("compact_plan requires a planned D128 reducer with NP>64")
     static_query_group_size = query_group_size
     planned_elements_per_thread = 2 if vectorize_plan_logits else 1
@@ -180,10 +168,8 @@ def compile_pa_decode_ps_reduce(
         stride_output_len: fx.Int32,
         stride_output_kv_head: fx.Int32,
         stride_output_group_size: fx.Int32,
-        stride_exp_sums_seq: fx.Int32,
         stride_exp_sums_head: fx.Int32,
         stride_exp_sums_part: fx.Int32,
-        stride_logits_seq: fx.Int32,
         stride_logits_head: fx.Int32,
         stride_logits_part: fx.Int32,
         stride_logits_group: fx.Int32,
@@ -210,19 +196,14 @@ def compile_pa_decode_ps_reduce(
         zero_i = fx.Int32(0)
         c_warp_size = fx.Int32(warp_size)
         c_wave_mask = fx.Int32(warp_size - 1)
-        c_part_num = fx.Int32(max_context_partition_num)
-        if fx.const_expr(use_work_plan):
-            reduce_info = fx.recast_iter(fx.Int32, reduce_info_ptr)
-            first_part = fx.Int32(reduce_info[batch_idx * 2])
-            c_part_num = fx.Int32(reduce_info[batch_idx * 2 + 1])
-            # Empty rows may point past packed storage; clamped loads need slot 0.
-            # Mask every inactive value before arithmetic.
-            first_part = (c_part_num > zero_i).select(first_part, zero_i)
-            stats_seq_offset = first_part * stride_exp_sums_part
-            logits_seq_offset = first_part * stride_logits_part
-        else:
-            stats_seq_offset = batch_idx * stride_exp_sums_seq
-            logits_seq_offset = batch_idx * stride_logits_seq
+        reduce_info = fx.recast_iter(fx.Int32, reduce_info_ptr)
+        first_part = fx.Int32(reduce_info[batch_idx * 2])
+        c_part_num = fx.Int32(reduce_info[batch_idx * 2 + 1])
+        # Empty rows may point past packed storage; clamped loads need slot 0.
+        # Mask every inactive value before arithmetic.
+        first_part = (c_part_num > zero_i).select(first_part, zero_i)
+        stats_seq_offset = first_part * stride_exp_sums_part
+        logits_seq_offset = first_part * stride_logits_part
         if fx.const_expr(bounded_plan_logits):
             # Rebase in i64 before narrowing: packed storage can exceed 2 GiB.
             logits_item_bytes = logits_dtype.width // 8
@@ -244,7 +225,6 @@ def compile_pa_decode_ps_reduce(
                 unit_stride=1,
                 num_records_bytes=planned_logits_bytes,
             )
-        c_reduce_width = fx.Int32(reduce_width)
         c_four = fx.Int32(4)
         lane = tid & c_wave_mask
         if fx.const_expr(static_query_group_size is not None):
@@ -401,30 +381,18 @@ def compile_pa_decode_ps_reduce(
                 chunk_base = chunk_idx * warp_size
                 chunk_size = min(warp_size, max_context_partition_num - chunk_base)
                 part_idx = lane + fx.Int32(chunk_base)
-                if fx.const_expr(chunk_size == warp_size and not use_work_plan):
-                    stats_offset = (
-                        stats_seq_offset
-                        + kv_head_idx * stride_exp_sums_head
-                        + part_idx * stride_exp_sums_part
-                        + eqgs_idx
-                    )
+                lane_in_range = (lane < fx.Int32(chunk_size)) & (part_idx < c_part_num)
+                stats_offset = (
+                    stats_seq_offset
+                    + kv_head_idx * stride_exp_sums_head
+                    + part_idx * stride_exp_sums_part
+                    + eqgs_idx
+                )
+                part_sum = zero_f
+                part_max = neg_inf
+                if lane_in_range:
                     part_sum = fx.Float32(exp_sums[stats_offset])
                     part_max = fx.Float32(max_logits[stats_offset])
-                else:
-                    lane_in_range = (lane < fx.Int32(chunk_size)) & (
-                        part_idx < c_part_num
-                    )
-                    stats_offset = (
-                        stats_seq_offset
-                        + kv_head_idx * stride_exp_sums_head
-                        + part_idx * stride_exp_sums_part
-                        + eqgs_idx
-                    )
-                    part_sum = zero_f
-                    part_max = neg_inf
-                    if lane_in_range:
-                        part_sum = fx.Float32(exp_sums[stats_offset])
-                        part_max = fx.Float32(max_logits[stats_offset])
                 part_sums.append(part_sum)
                 part_maxes.append(part_max)
                 lane_max = lane_max.maximumf(part_max)
@@ -438,20 +406,11 @@ def compile_pa_decode_ps_reduce(
             lane_exp_sum = zero_f
             for chunk_idx in fx.range_constexpr(partitions_per_lane):
                 part_max = part_maxes[chunk_idx]
-                if fx.const_expr(use_work_plan):
-                    part_scale = zero_f
-                    if part_max > neg_inf:
-                        part_scale = fx.exp2(
-                            (part_max - safe_global_max) * c_log2e,
-                            fastmath="fast",
-                        )
-                else:
-                    part_scale = (part_max > neg_inf).select(
-                        fx.exp2(
-                            (part_max - safe_global_max) * c_log2e,
-                            fastmath="fast",
-                        ),
-                        zero_f,
+                part_scale = zero_f
+                if part_max > neg_inf:
+                    part_scale = fx.exp2(
+                        (part_max - safe_global_max) * c_log2e,
+                        fastmath="fast",
                     )
                 scaled_sum = part_sums[chunk_idx] * part_scale
                 scaled_sums.append(scaled_sum)
@@ -470,59 +429,34 @@ def compile_pa_decode_ps_reduce(
             for chunk_idx in fx.range_constexpr(partitions_per_lane):
                 chunk_base = chunk_idx * warp_size
                 chunk_size = min(warp_size, max_context_partition_num - chunk_base)
-                if fx.const_expr(use_work_plan):
-                    # Initialize per unrolled chunk so the dynamic-if rewriter
-                    # cannot reuse a stale value.
-                    weight_local_i32 = zero_f.bitcast(fx.Int32)
-                    if fx.Int32(chunk_base) < c_part_num:
-                        weight_local_i32 = (
-                            scaled_sums[chunk_idx] * striped_inv_exp_sum
-                        ).bitcast(fx.Int32)
-                        for part_lane in fx.range_constexpr(chunk_size):
-                            part_idx = chunk_base + part_lane
-                            c_part_idx = fx.Int32(part_idx)
-                            if c_part_idx < c_part_num:
-                                weight_i32 = fx.Int32(
-                                    fx.rocdl.ds_bpermute(
-                                        T.i32,
-                                        fx.Int32(part_lane) * c_four,
-                                        weight_local_i32,
-                                    )
-                                )
-                                weight = weight_i32.bitcast(fx.Float32)
-                                logits_offset = (
-                                    logits_seq_offset
-                                    + kv_head_idx * stride_logits_head
-                                    + c_part_idx * stride_logits_part
-                                    + eqgs_idx * stride_logits_group
-                                    + tid
-                                )
-                                part_logits = fx.Float32(logits[logits_offset])
-                                acc = acc + part_logits * weight
-                else:
+                # Initialize per unrolled chunk so the dynamic-if rewriter
+                # cannot reuse a stale value.
+                weight_local_i32 = zero_f.bitcast(fx.Int32)
+                if fx.Int32(chunk_base) < c_part_num:
                     weight_local_i32 = (
                         scaled_sums[chunk_idx] * striped_inv_exp_sum
                     ).bitcast(fx.Int32)
                     for part_lane in fx.range_constexpr(chunk_size):
                         part_idx = chunk_base + part_lane
                         c_part_idx = fx.Int32(part_idx)
-                        weight_i32 = fx.Int32(
-                            fx.rocdl.ds_bpermute(
-                                T.i32,
-                                fx.Int32(part_lane) * c_four,
-                                weight_local_i32,
+                        if c_part_idx < c_part_num:
+                            weight_i32 = fx.Int32(
+                                fx.rocdl.ds_bpermute(
+                                    T.i32,
+                                    fx.Int32(part_lane) * c_four,
+                                    weight_local_i32,
+                                )
                             )
-                        )
-                        weight = weight_i32.bitcast(fx.Float32)
-                        logits_offset = (
-                            logits_seq_offset
-                            + kv_head_idx * stride_logits_head
-                            + c_part_idx * stride_logits_part
-                            + eqgs_idx * stride_logits_group
-                            + tid
-                        )
-                        part_logits = fx.Float32(logits[logits_offset])
-                        acc = acc + part_logits * weight
+                            weight = weight_i32.bitcast(fx.Float32)
+                            logits_offset = (
+                                logits_seq_offset
+                                + kv_head_idx * stride_logits_head
+                                + c_part_idx * stride_logits_part
+                                + eqgs_idx * stride_logits_group
+                                + tid
+                            )
+                            part_logits = fx.Float32(logits[logits_offset])
+                            acc = acc + part_logits * weight
             return acc
 
         if fx.const_expr(use_parallel_lds):
@@ -543,30 +477,20 @@ def compile_pa_decode_ps_reduce(
                     chunk_base = chunk_idx * warp_size
                     chunk_size = min(warp_size, max_context_partition_num - chunk_base)
                     part_idx = lane + fx.Int32(chunk_base)
-                    if fx.const_expr(chunk_size == warp_size and not use_work_plan):
-                        stats_offset = (
-                            stats_seq_offset
-                            + kv_head_idx * stride_exp_sums_head
-                            + part_idx * stride_exp_sums_part
-                            + eqgs_idx
-                        )
+                    lane_in_range = (lane < fx.Int32(chunk_size)) & (
+                        part_idx < c_part_num
+                    )
+                    stats_offset = (
+                        stats_seq_offset
+                        + kv_head_idx * stride_exp_sums_head
+                        + part_idx * stride_exp_sums_part
+                        + eqgs_idx
+                    )
+                    part_sum = zero_f
+                    part_max = neg_inf
+                    if lane_in_range:
                         part_sum = fx.Float32(exp_sums[stats_offset])
                         part_max = fx.Float32(max_logits[stats_offset])
-                    else:
-                        lane_in_range = (lane < fx.Int32(chunk_size)) & (
-                            part_idx < c_part_num
-                        )
-                        stats_offset = (
-                            stats_seq_offset
-                            + kv_head_idx * stride_exp_sums_head
-                            + part_idx * stride_exp_sums_part
-                            + eqgs_idx
-                        )
-                        part_sum = zero_f
-                        part_max = neg_inf
-                        if lane_in_range:
-                            part_sum = fx.Float32(exp_sums[stats_offset])
-                            part_max = fx.Float32(max_logits[stats_offset])
                     part_sums.append(part_sum)
                     part_maxes.append(part_max)
                     lane_max = lane_max.maximumf(part_max)
@@ -580,21 +504,12 @@ def compile_pa_decode_ps_reduce(
                 lane_exp_sum = zero_f
                 for chunk_idx in fx.range_constexpr(partitions_per_lane):
                     part_max = part_maxes[chunk_idx]
-                    if fx.const_expr(use_work_plan):
-                        # select evaluates exp2 eagerly; branch around inactive parts.
-                        part_scale = zero_f
-                        if part_max > neg_inf:
-                            part_scale = fx.exp2(
-                                (part_max - safe_global_max) * c_log2e,
-                                fastmath="fast",
-                            )
-                    else:
-                        part_scale = (part_max > neg_inf).select(
-                            fx.exp2(
-                                (part_max - safe_global_max) * c_log2e,
-                                fastmath="fast",
-                            ),
-                            zero_f,
+                    # select evaluates exp2 eagerly; branch around inactive parts.
+                    part_scale = zero_f
+                    if part_max > neg_inf:
+                        part_scale = fx.exp2(
+                            (part_max - safe_global_max) * c_log2e,
+                            fastmath="fast",
                         )
                     scaled_sum = part_sums[chunk_idx] * part_scale
                     scaled_sums.append(scaled_sum)
@@ -613,21 +528,12 @@ def compile_pa_decode_ps_reduce(
                     chunk_base = chunk_idx * warp_size
                     chunk_size = min(warp_size, max_context_partition_num - chunk_base)
                     part_idx = lane + fx.Int32(chunk_base)
-                    if fx.const_expr(use_work_plan):
-                        lane_in_range = (lane < fx.Int32(chunk_size)) & (
-                            part_idx < c_part_num
-                        )
-                        if lane_in_range:
-                            weight = scaled_sums[chunk_idx] * parallel_inv_exp_sum
-                            lds_weights[part_idx] = weight
-                    else:
+                    lane_in_range = (lane < fx.Int32(chunk_size)) & (
+                        part_idx < c_part_num
+                    )
+                    if lane_in_range:
                         weight = scaled_sums[chunk_idx] * parallel_inv_exp_sum
-                        if fx.const_expr(chunk_size == warp_size):
-                            lds_weights[part_idx] = weight
-                        else:
-                            lane_in_range = lane < fx.Int32(chunk_size)
-                            if lane_in_range:
-                                lds_weights[part_idx] = weight
+                        lds_weights[part_idx] = weight
 
             fx.gpu.barrier()
 
@@ -636,27 +542,11 @@ def compile_pa_decode_ps_reduce(
             output_element = head_wave * c_warp_size + lane
             group_part_begin = partition_group * fx.Int32(parts_per_group)
             acc = zero_f
-            if fx.const_expr(use_work_plan):
-                group_in_range = group_part_begin < c_part_num
-                if group_in_range:
-                    for local_part in fx.range_constexpr(parts_per_group):
-                        part_idx = group_part_begin + fx.Int32(local_part)
-                        if part_idx < c_part_num:
-                            weight = fx.Float32(lds_weights[part_idx])
-                            logits_offset = (
-                                logits_seq_offset
-                                + kv_head_idx * stride_logits_head
-                                + part_idx * stride_logits_part
-                                + eqgs_idx * stride_logits_group
-                                + output_element
-                            )
-                            part_logits = fx.Float32(logits[logits_offset])
-                            acc = acc + part_logits * weight
-            else:
+            group_in_range = group_part_begin < c_part_num
+            if group_in_range:
                 for local_part in fx.range_constexpr(parts_per_group):
                     part_idx = group_part_begin + fx.Int32(local_part)
-                    part_in_range = part_idx < c_part_num
-                    if part_in_range:
+                    if part_idx < c_part_num:
                         weight = fx.Float32(lds_weights[part_idx])
                         logits_offset = (
                             logits_seq_offset
@@ -668,14 +558,8 @@ def compile_pa_decode_ps_reduce(
                         part_logits = fx.Float32(logits[logits_offset])
                         acc = acc + part_logits * weight
 
-            if partition_group > zero_i:
-                if fx.const_expr(use_work_plan):
-                    if group_in_range:
-                        partial_offset = (partition_group - fx.Int32(1)) * fx.Int32(
-                            head_size
-                        ) + output_element
-                        lds_partials[partial_offset] = acc
-                else:
+            if partition_group > zero_i:  # noqa: SIM102 - Preserve FlyDSL branches.
+                if group_in_range:
                     partial_offset = (partition_group - fx.Int32(1)) * fx.Int32(
                         head_size
                     ) + output_element
@@ -685,113 +569,32 @@ def compile_pa_decode_ps_reduce(
 
             if partition_group == zero_i:
                 for other_group in fx.range_constexpr(1, parallel_groups):
-                    if fx.const_expr(use_work_plan):
-                        if fx.Int32(other_group * parts_per_group) < c_part_num:
-                            partial_offset = (
-                                fx.Int32((other_group - 1) * head_size) + output_element
-                            )
-                            acc = acc + fx.Float32(lds_partials[partial_offset])
-                    else:
+                    if fx.Int32(other_group * parts_per_group) < c_part_num:
                         partial_offset = (
                             fx.Int32((other_group - 1) * head_size) + output_element
                         )
                         acc = acc + fx.Float32(lds_partials[partial_offset])
 
         elif fx.const_expr(max_context_partition_num <= warp_size):
-            if fx.const_expr(use_work_plan):
-                # Count branches must carry the same scalar/vector type.
-                if fx.const_expr(vectorize_plan_logits):
-                    acc = fx.Vector.filled(2, 0.0, fx.Float32)
-                else:
-                    acc = zero_f
-                if fx.const_expr(max_context_partition_num > 8):
-                    # Count is CTA-uniform; keep short-path loads and math inside it.
-                    if c_part_num <= c_four:
-                        acc = _reduce_planned_wave(4, (2, 1))
-                    elif c_part_num <= fx.Int32(8):
-                        acc = _reduce_planned_wave(8, (4, 2, 1))
-                    else:
-                        acc = _reduce_planned_wave(
-                            max_context_partition_num, reduce_shuffle_offsets
-                        )
+            # Count branches must carry the same scalar/vector type.
+            if fx.const_expr(vectorize_plan_logits):
+                acc = fx.Vector.filled(2, 0.0, fx.Float32)
+            else:
+                acc = zero_f
+            if fx.const_expr(max_context_partition_num > 8):
+                # Count is CTA-uniform; keep short-path loads and math inside it.
+                if c_part_num <= c_four:
+                    acc = _reduce_planned_wave(4, (2, 1))
+                elif c_part_num <= fx.Int32(8):
+                    acc = _reduce_planned_wave(8, (4, 2, 1))
                 else:
                     acc = _reduce_planned_wave(
                         max_context_partition_num, reduce_shuffle_offsets
                     )
             else:
-                if fx.const_expr(max_context_partition_num == reduce_width):
-                    # Full subgroups have no inactive lanes; tails use EXEC masks.
-                    lane_in_range = lane < c_part_num
-                    lane_in_reduce = lane < c_reduce_width
-                    part_sum = zero_f
-                    part_max = neg_inf
-                    if lane_in_reduce:
-                        part_idx = lane_in_range.select(lane, zero_i)
-                        stats_offset = (
-                            stats_seq_offset
-                            + kv_head_idx * stride_exp_sums_head
-                            + part_idx * stride_exp_sums_part
-                            + eqgs_idx
-                        )
-                        loaded_sum = fx.Float32(exp_sums[stats_offset])
-                        loaded_max = fx.Float32(max_logits[stats_offset])
-                        part_sum = lane_in_range.select(loaded_sum, zero_f)
-                        part_max = lane_in_range.select(loaded_max, neg_inf)
-                else:
-                    lane_in_range = lane < c_part_num
-                    stats_offset = (
-                        stats_seq_offset
-                        + kv_head_idx * stride_exp_sums_head
-                        + lane * stride_exp_sums_part
-                        + eqgs_idx
-                    )
-                    part_sum = zero_f
-                    part_max = neg_inf
-                    if lane_in_range:
-                        part_sum = fx.Float32(exp_sums[stats_offset])
-                        part_max = fx.Float32(max_logits[stats_offset])
-
-                global_max = _wave_reduce_max(part_max)
-                if fx.const_expr(use_sinks):
-                    sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
-                    global_max = global_max.maximumf(sink_value)
-                safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
-                part_scale = (part_max > neg_inf).select(
-                    fx.exp2((part_max - safe_global_max) * c_log2e, fastmath="fast"),
-                    zero_f,
+                acc = _reduce_planned_wave(
+                    max_context_partition_num, reduce_shuffle_offsets
                 )
-                scaled_sum = part_sum * part_scale
-                global_exp_sum = _wave_reduce_sum(scaled_sum)
-                if fx.const_expr(use_sinks):
-                    sink_scale = _sink_exp(sink_value, safe_global_max)
-                    global_exp_sum = global_exp_sum + sink_scale
-                safe_global_exp_sum = (global_exp_sum > zero_f).select(
-                    global_exp_sum, one_f
-                )
-                wave_inv_exp_sum = fx.Float32(rcp_f32(safe_global_exp_sum))
-                weight_local = scaled_sum * wave_inv_exp_sum
-                weight_local_i32 = weight_local.bitcast(fx.Int32)
-
-                acc = zero_f
-                for part_idx in fx.range_constexpr(max_context_partition_num):
-                    c_part_idx = fx.Int32(part_idx)
-                    weight_i32 = fx.Int32(
-                        fx.rocdl.ds_bpermute(
-                            T.i32,
-                            c_part_idx * c_four,
-                            weight_local_i32,
-                        )
-                    )
-                    weight = weight_i32.bitcast(fx.Float32)
-                    logits_offset = (
-                        logits_seq_offset
-                        + kv_head_idx * stride_logits_head
-                        + c_part_idx * stride_logits_part
-                        + eqgs_idx * stride_logits_group
-                        + tid
-                    )
-                    part_logits = fx.Float32(logits[logits_offset])
-                    acc = acc + part_logits * weight
         else:
             acc = zero_f
             if fx.const_expr(compact_plan) and c_part_num <= fx.Int32(32):
@@ -844,10 +647,8 @@ def compile_pa_decode_ps_reduce(
         stride_output_len: fx.Int32,
         stride_output_kv_head: fx.Int32,
         stride_output_group_size: fx.Int32,
-        stride_exp_sums_seq: fx.Int32,
         stride_exp_sums_head: fx.Int32,
         stride_exp_sums_part: fx.Int32,
-        stride_logits_seq: fx.Int32,
         stride_logits_head: fx.Int32,
         stride_logits_part: fx.Int32,
         stride_logits_group: fx.Int32,
@@ -868,10 +669,8 @@ def compile_pa_decode_ps_reduce(
             stride_output_len,
             stride_output_kv_head,
             stride_output_group_size,
-            stride_exp_sums_seq,
             stride_exp_sums_head,
             stride_exp_sums_part,
-            stride_logits_seq,
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,

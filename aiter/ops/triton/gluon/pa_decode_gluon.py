@@ -4550,6 +4550,20 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         sink_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(
             output_ptr.dtype if sink_token_ptr is None else sink_token_ptr.dtype
         )
+        matching_partition_strides = (
+            stride_exp_sums_part > 0
+            and stride_logits_part > 0
+            and stride_exp_sums_seq >= 0
+            and stride_logits_seq >= 0
+            and stride_exp_sums_seq % stride_exp_sums_part == 0
+            and stride_logits_seq % stride_logits_part == 0
+            and stride_exp_sums_seq // stride_exp_sums_part
+            == stride_logits_seq // stride_logits_part
+        )
+        slots_per_sequence = (
+            stride_logits_seq // stride_logits_part if matching_partition_strides else 0
+        )
+        batch_size = output_ptr.shape[0]
         flydsl_supported = (
             FLYDSL_PS_REDUCE_AVAILABLE
             and output_dtype_str is not None
@@ -4562,8 +4576,22 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 logits_dtype_str=logits_dtype_str,
                 sink_dtype_str=sink_dtype_str,
             )
+            and context_partition_num
+            <= torch.cuda.get_device_properties(output_ptr.device).multi_processor_count
+            and matching_partition_strides
+            and batch_size > 0
+            and (batch_size - 1) * slots_per_sequence + context_partition_num
+            <= 2**31 - 1
         )
         if flydsl_supported:
+            # Gluon stores [batch, kv_head, part, ...]. Express its sequence
+            # bases in partition slots for the work-plan reducer; no data moves.
+            reduce_info = torch.empty(
+                (batch_size, 2), dtype=torch.int32, device=output_ptr.device
+            )
+            torch.arange(batch_size, out=reduce_info[:, 0])
+            reduce_info[:, 0].mul_(slots_per_sequence)
+            reduce_info[:, 1].fill_(context_partition_num)
             launch_pa_decode_ps_reduce_flydsl(
                 output_ptr,
                 exp_sums_ptr,
@@ -4574,10 +4602,8 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 stride_output_len,
                 stride_output_kv_head,
                 stride_output_group_size,
-                stride_exp_sums_seq,
                 stride_exp_sums_head,
                 stride_exp_sums_part,
-                stride_logits_seq,
                 stride_logits_head,
                 stride_logits_part,
                 stride_logits_group,
@@ -4586,6 +4612,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 head_size=head_size,
                 context_partition_num=context_partition_num,
                 stream=torch.cuda.current_stream(output_ptr.device),
+                reduce_info=reduce_info,
             )
             return
         ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)

@@ -114,20 +114,14 @@ def _make_inputs(
 @pytest.mark.parametrize("trans_v", [False, True], ids=["plain-v", "transposed-v"])
 @pytest.mark.parametrize(
     "query_length,kv_heads,group_size,head_dim,block_size,"
-    "execution,window,sink_dtype,pattern",
+    "max_partitions,window,sink_dtype,pattern",
     [
-        pytest.param(1, 1, 8, 128, 16, "direct", 0, None, "random", id="decode"),
-        pytest.param(
-            3, 2, 4, 64, 64, "partitioned", 0, torch.float16, "random", id="mtp"
-        ),
-        pytest.param(
-            4, 1, 16, 128, 128, "planned", 257, torch.float32, "random", id="window"
-        ),
-        pytest.param(2, 2, 8, 256, 16, "planned", 0, None, "random", id="planned"),
-        pytest.param(1, 1, 16, 128, 128, "auto", 0, None, "random", id="auto"),
-        pytest.param(
-            1, 1, 4, 1024, 128, "direct", 0, torch.bfloat16, "random", id="head1024"
-        ),
+        pytest.param(1, 1, 8, 128, 16, 1, 0, None, "random", id="decode"),
+        pytest.param(3, 2, 4, 64, 64, 3, 0, torch.float16, "random", id="mtp"),
+        pytest.param(4, 1, 16, 128, 128, 7, 257, torch.float32, "random", id="window"),
+        pytest.param(2, 2, 8, 256, 16, 7, 0, None, "random", id="head256"),
+        pytest.param(1, 1, 16, 128, 128, None, 0, None, "random", id="auto"),
+        pytest.param(1, 1, 4, 1024, 128, 1, 0, torch.bfloat16, "random", id="head1024"),
         *[
             pytest.param(
                 1,
@@ -135,7 +129,7 @@ def _make_inputs(
                 group,
                 128,
                 page,
-                "direct",
+                1,
                 0,
                 None,
                 pattern,
@@ -152,7 +146,7 @@ def test_pa_decode(
     group_size,
     head_dim,
     block_size,
-    execution,
+    max_partitions,
     window,
     sink_dtype,
     pattern,
@@ -201,16 +195,15 @@ def test_pa_decode(
         if trans_v
         else value.permute(0, 1, 3, 2).contiguous()
     )
-    partitions = {"direct": 1, "partitioned": 3, "planned": 7, "auto": None}[execution]
     plan = (
         plan_pa_decode(
             context,
             kv_heads,
-            max_partitions=partitions,
+            max_partitions=max_partitions,
             query_length=query_length,
             sliding_window=window,
         )
-        if execution == "planned"
+        if max_partitions is not None
         else None
     )
     output = torch.full_like(query, float("nan"))
@@ -223,7 +216,6 @@ def test_pa_decode(
         table,
         softmax_scale=head_dim**-0.5,
         query_length=query_length,
-        max_context_partition_num=partitions,
         compute_type=fp8,
         key_scale=key_scale,
         value_scale=value_scale,

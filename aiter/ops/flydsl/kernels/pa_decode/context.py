@@ -10,7 +10,6 @@ Loop-carried softmax and output values are passed as SSA values, not stored here
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 
-from ..tensor_shim import ptr_buf_tensor
 from .traits import LOG2E, MFMA_MNK, WAVE
 
 
@@ -19,7 +18,6 @@ class PaDecodeContext:
         self,
         traits,
         shared_storage,
-        output_ptr,
         pmax_ptr,
         psum_ptr,
         pout_ptr,
@@ -27,15 +25,11 @@ class PaDecodeContext:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr,
-        context_lengths_ptr,
         key_scale_ptr,
         value_scale_ptr,
-        sinks_ptr,
         max_blocks_per_seq,
         stride_ks_block,
         stride_ks_head,
-        stride_o_row,
-        stride_o_head,
         stride_q_row,
         stride_q_head,
         num_sequences,
@@ -46,7 +40,6 @@ class PaDecodeContext:
     ):
         self.traits = traits
         self.shared_storage = shared_storage
-        self.output_ptr = output_ptr
         self.pmax_ptr = pmax_ptr
         self.psum_ptr = psum_ptr
         self.pout_ptr = pout_ptr
@@ -54,15 +47,11 @@ class PaDecodeContext:
         self.key_cache_ptr = key_cache_ptr
         self.value_cache_ptr = value_cache_ptr
         self.block_tables_ptr = block_tables_ptr
-        self.context_lengths_ptr = context_lengths_ptr
         self.key_scale_ptr = key_scale_ptr
         self.value_scale_ptr = value_scale_ptr
-        self.sinks_ptr = sinks_ptr
         self.max_blocks_per_seq = max_blocks_per_seq
         self.stride_ks_block = stride_ks_block
         self.stride_ks_head = stride_ks_head
-        self.stride_o_row = stride_o_row
-        self.stride_o_head = stride_o_head
         self.stride_q_row = stride_q_row
         self.stride_q_head = stride_q_head
         self.num_sequences = num_sequences
@@ -76,34 +65,24 @@ class PaDecodeContext:
         self.tid = fx.Int32(gpu.thread_id("x"))
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
-        self.seq = fx.Int32(gpu.block_id("x"))
+        self.seq = self.planned_seq
         self.kv_query = fx.Int32(gpu.block_id("y"))
         self.kv_h = self.kv_query // self.traits.query_splits
         self.query_begin = (
             self.kv_query % self.traits.query_splits
         ) * self.traits.QUERIES_PER_CTA
-        self.part = fx.Int32(gpu.block_id("z"))  # context partition handled by this CTA
         self.n_kv = fx.Int32(gpu.grid_dim.y) // self.traits.query_splits
-        if const_expr(self.traits.use_work_plan):
-            if const_expr(self.traits.batch_first_plan_grid):
-                self.part = fx.Int32(
-                    fx.Uint32(gpu.block_id("x")) * fx.Uint32(gpu.grid_dim.z)
-                    + fx.Uint32(gpu.block_id("z"))
-                )
-                # Physical x groups packed slots, not sequences.
-                self.seq = self.planned_seq
-                capacity = fx.Int32(
-                    fx.Uint32(gpu.grid_dim.x) * fx.Uint32(gpu.grid_dim.z)
-                )
-                self.partial_slot = self.kv_h * capacity + self.part
-            else:
-                self.part = self.seq  # Packed work slot, shared by all KV heads.
-                self.seq = self.planned_seq
-                self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
+        if const_expr(self.traits.batch_first_plan_grid):
+            self.part = fx.Int32(
+                fx.Uint32(gpu.block_id("x")) * fx.Uint32(gpu.grid_dim.z)
+                + fx.Uint32(gpu.block_id("z"))
+            )
+            # Physical x groups packed slots, not sequences.
+            capacity = fx.Int32(fx.Uint32(gpu.grid_dim.x) * fx.Uint32(gpu.grid_dim.z))
+            self.partial_slot = self.kv_h * capacity + self.part
         else:
-            self.partial_slot = (
-                self.seq * self.n_kv + self.kv_h
-            ) * self.traits.NP + self.part
+            self.part = fx.Int32(gpu.block_id("x"))
+            self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
 
     def init_query_mapping(self):
         self.rgroup = (
@@ -117,31 +96,14 @@ class PaDecodeContext:
         )  # 0..15: this thread's query row within an M-tile
 
     def init_context_length(self):
-        if const_expr(self.traits.use_work_plan):
-            self.context_len = self.planned_context
-        else:
-            ctx_buf = ptr_buf_tensor(self.context_lengths_ptr, fx.Int32)
-            ctx_tiled = fx.logical_divide(ctx_buf, fx.make_layout(1, 1))
-            ctx_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-            ctx_reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-            fx.copy(ctx_copy_atom, fx.slice(ctx_tiled, (None, self.seq)), ctx_reg)
-            self.context_len = fx.Int32(fx.Vector(fx.memref_load_vec(ctx_reg))[0])
+        self.context_len = self.planned_context
 
     def init_partition_bounds(self):
         self.num_pages = (
             self.context_len + self.traits.block_size - 1
         ) // self.traits.block_size  # pages this sequence really owns
-        if const_expr(self.traits.use_work_plan):
-            self.part_start = self.planned_start
-            self.part_end = self.planned_end
-        else:
-            num_tiles = (
-                self.context_len + self.traits.TILE_TOK - 1
-            ) // self.traits.TILE_TOK
-            tiles_per_part = (num_tiles + self.traits.NP - 1) // self.traits.NP
-            self.part_start = self.part * tiles_per_part
-            part_end_raw = self.part_start + tiles_per_part
-            self.part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
+        self.part_start = self.planned_start
+        self.part_end = self.planned_end
 
     def init_scales(self, key_scale, value_scale):
         if const_expr(self.traits.per_token_kv):

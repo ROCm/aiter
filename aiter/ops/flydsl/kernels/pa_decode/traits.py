@@ -38,6 +38,7 @@ class PaDecodeSchedule:
         num_seqs: int,
         num_kv_heads: int,
         num_compute_units: int,
+        work_capacity: int,
         num_partitions: int = 1,
         softmax_scale: float | None = None,
         query_dtype: str = "f16",
@@ -47,16 +48,14 @@ class PaDecodeSchedule:
         wide_kv_addressing: bool = False,
         kv_buffer_u32: bool = False,
         query_splits: int | None = None,
-        use_work_plan: bool = False,
-        work_capacity: int | None = None,
         max_context_length: int | None = None,
         sliding_window: int = 0,
-        use_sinks: bool = False,
-        sink_dtype_str: str = "f32",
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
-        if sliding_window > 0 and not use_work_plan:
-            raise ValueError("positive sliding_window requires work_plan")
+        if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
+            raise TypeError("work_capacity must be a positive int")
+        if work_capacity < 1:
+            raise ValueError("work_capacity must be positive")
         is_gfx950 = "gfx95" in get_rocm_arch()
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
@@ -64,36 +63,32 @@ class PaDecodeSchedule:
         # Scalar KV scheduling also supports FP16 queries and multiple query rows.
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
 
-        dense_workgroups = num_seqs * num_kv_heads * num_partitions
+        partition_workgroups = num_seqs * num_kv_heads * num_partitions
         assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
-        split_workgroups = dense_workgroups
+        split_workgroups = work_capacity * num_kv_heads
         single_tile_plan = False
-        if use_work_plan:
-            if work_capacity is not None:
-                split_workgroups = work_capacity * num_kv_heads
-            if sliding_window == 0 and max_context_length is not None:
-                context_tiles = (
-                    max_context_length + KV_COMPUTE_BLOCK - 1
-                ) // KV_COMPUTE_BLOCK
-                split_workgroups = min(
-                    split_workgroups, num_seqs * num_kv_heads * context_tiles
-                )
-            if sliding_window > 0:
-                # Bound the unaligned MTP window union, excluding padding CTAs.
-                window_tiles = (
-                    sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-                ) // KV_COMPUTE_BLOCK + 1
-                split_workgroups = min(
-                    split_workgroups, num_seqs * num_kv_heads * window_tiles
-                )
-                # For n nonempty sequences, T <= n * window_tiles and the budget
-                # leaves >= n * (window_tiles - 1) extras. Prefix apportionment
-                # therefore gives each visible tile its own task, even after refresh.
-                single_tile_plan = (
-                    work_capacity is not None
-                    and num_partitions >= window_tiles
-                    and work_capacity >= num_seqs * window_tiles
-                )
+        if sliding_window == 0 and max_context_length is not None:
+            context_tiles = (
+                max_context_length + KV_COMPUTE_BLOCK - 1
+            ) // KV_COMPUTE_BLOCK
+            split_workgroups = min(
+                split_workgroups, num_seqs * num_kv_heads * context_tiles
+            )
+        if sliding_window > 0:
+            # Bound the unaligned MTP window union, excluding padding CTAs.
+            window_tiles = (
+                sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+            ) // KV_COMPUTE_BLOCK + 1
+            split_workgroups = min(
+                split_workgroups, num_seqs * num_kv_heads * window_tiles
+            )
+            # For n nonempty sequences, T <= n * window_tiles and the budget
+            # leaves >= n * (window_tiles - 1) extras. Prefix apportionment
+            # therefore gives each visible tile its own task, even after refresh.
+            single_tile_plan = (
+                num_partitions >= window_tiles
+                and work_capacity >= num_seqs * window_tiles
+            )
         if query_splits is None:
             # Single-tile page128 MTP4 tolerates more split-query CTAs per CU.
             split_weight = (
@@ -107,7 +102,7 @@ class PaDecodeSchedule:
             query_splits = 1
             if (
                 TUNED_PER_TOKEN
-                and (num_kv_heads == 1 or (use_work_plan and sliding_window == 0))
+                and (num_kv_heads == 1 or sliding_window == 0)
                 and query_length in (2, 4)
                 and query_group_size == 16
                 and split_weight * split_workgroups <= 2 * num_compute_units
@@ -115,7 +110,6 @@ class PaDecodeSchedule:
                 query_splits = query_length
             elif (
                 TUNED_PER_TOKEN
-                and use_work_plan
                 and sliding_window == 0
                 and query_length == 4
                 and query_group_size == 8
@@ -147,7 +141,7 @@ class PaDecodeSchedule:
                 query_splits > 1
                 or block_size == 16
                 or not trans_v
-                or dense_workgroups <= num_compute_units
+                or partition_workgroups <= num_compute_units
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
@@ -155,7 +149,7 @@ class PaDecodeSchedule:
             TUNED_SCALAR
             and block_size == 128
             and TOTAL_ROWS <= MFMA_MNK
-            and num_compute_units < dense_workgroups <= 2 * num_compute_units
+            and num_compute_units < partition_workgroups <= 2 * num_compute_units
         )
         # Require an exact one-tile task budget and the small planned reducer.
         batch_first_plan_grid = (
@@ -185,12 +179,9 @@ class PaDecodeSchedule:
             BUFFER_KV,
             prefetch_v,
             query_splits,
-            use_work_plan,
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
-            use_sinks,
-            sink_dtype_str,
         )
         return cls(
             cache_key=cache_key,
@@ -219,7 +210,6 @@ class PaDecodeTraits:
     trans_v: bool
     wide_kv_addressing: bool
     query_splits: int
-    use_work_plan: bool
     sliding_window: int
     single_tile_plan: bool
     prefetch_v: bool
@@ -230,7 +220,6 @@ class PaDecodeTraits:
     FP8: type
     FP8_MAX: float
     Q_DTYPE: type
-    SINK_DTYPE: type
     Q_ABSMAX_F32: bool
     UNIQUE_SCALE_STAGING: bool
     WIDE_FP8_MFMA: bool
@@ -268,8 +257,6 @@ class PaDecodeTraits:
     NVOPS: int
     STEPS_PER_PAGE: int
     STEPS_PER_CHUNK: int
-    NP: int
-    DIRECT_SINKS: bool
     BLOCK_THREADS: int
     K_SLOT: int
     V_SLOT: int
@@ -308,7 +295,7 @@ class PaDecodeTraits:
             head_dim,
             query_group_size,
             block_size,
-            num_partitions,
+            _num_partitions,
             softmax_scale,
             query_dtype,
             per_token_kv,
@@ -318,12 +305,9 @@ class PaDecodeTraits:
             BUFFER_KV,
             prefetch_v,
             query_splits,
-            use_work_plan,
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
-            use_sinks,
-            sink_dtype_str,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         PER_TOKEN_M1 = schedule.PER_TOKEN_M1
@@ -335,8 +319,7 @@ class PaDecodeTraits:
         TOTAL_ROWS = query_length * query_group_size
 
         buffer_plan_output = (
-            use_work_plan
-            and is_gfx950
+            is_gfx950
             and head_dim == 128
             and IS_BF16
             and 0 < TOTAL_ROWS * head_dim * 2 <= 0x7FFFFFFF
@@ -455,16 +438,6 @@ class PaDecodeTraits:
 
         if softmax_scale is None:
             softmax_scale = 1.0 / (head_dim**0.5)
-        NP = int(num_partitions)  # context partitions (grid.z); compile-time constant
-        DIRECT_SINKS = use_sinks and NP == 1 and not use_work_plan
-        SINK_DTYPE = fx.Float32
-        if DIRECT_SINKS:
-            SINK_DTYPE = {
-                "f32": fx.Float32,
-                "f16": fx.Float16,
-                "bf16": fx.BFloat16,
-            }[sink_dtype_str]
-
         BLOCK_THREADS = NWARP * WAVE  # 256
 
         K_SLOT, V_SLOT = 0, 1
@@ -516,7 +489,6 @@ class PaDecodeTraits:
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             query_splits=query_splits,
-            use_work_plan=use_work_plan,
             sliding_window=sliding_window,
             single_tile_plan=single_tile_plan,
             prefetch_v=prefetch_v,
@@ -525,7 +497,6 @@ class PaDecodeTraits:
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
-            SINK_DTYPE=SINK_DTYPE,
             Q_ABSMAX_F32=Q_ABSMAX_F32,
             UNIQUE_SCALE_STAGING=UNIQUE_SCALE_STAGING,
             WIDE_FP8_MFMA=WIDE_FP8_MFMA,
@@ -561,8 +532,6 @@ class PaDecodeTraits:
             NVOPS=NVOPS,
             STEPS_PER_PAGE=STEPS_PER_PAGE,
             STEPS_PER_CHUNK=STEPS_PER_CHUNK,
-            NP=NP,
-            DIRECT_SINKS=DIRECT_SINKS,
             BLOCK_THREADS=BLOCK_THREADS,
             K_SLOT=K_SLOT,
             V_SLOT=V_SLOT,
