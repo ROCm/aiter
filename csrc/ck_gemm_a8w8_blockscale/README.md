@@ -80,6 +80,13 @@ it covers both public APIs, signed/random data, M/N tails, and packed/strided
 scales. CPU routing/tuner regressions are in
 [op_tests/tuning_tests/test_flydsl_blockscale.py](../../op_tests/tuning_tests/test_flydsl_blockscale.py).
 
+#### Recorded performance
+
+See [MI355X backend comparison and FlyDSL regression calibration (2026-09-28)](perf_gfx950_20260928.md)
+for same-GPU CK/CKTile/ASM/Triton/FlyDSL results, graph and event timing scopes,
+historical screenshot calibration, source fingerprints, and validation limits.
+These measurements do not install or change tuned dispatch configurations.
+
 ### Output Configuration
 
 #### `-o2, --profile_file`

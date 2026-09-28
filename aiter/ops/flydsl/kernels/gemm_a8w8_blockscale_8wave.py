@@ -199,94 +199,87 @@ def compile_gemm_fp8_8wave(
         ### 分配LDS
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
-        ### copied
-        # B采用得128x128 scale, BM*BK=256x256, 一次loop MFMA得Bscale是 2个Dword被不同的lane复用。
-        # 把所有的Bscale copy 进LDS. 一次dword copy就可以满足 32*1024*1024 的weight 元素个数，32*1024*1024
-        # 理论上大部分weight都可以通过一次buffer_load满足。所以放到LDS
-        #  copy type           一次copy需要LDS bytes       weight元素个数
-        # DWORDX4 copy          512*16 = 8KB              512*4*128*128=33554432 = BN* 131072
-        # DWORD copy             512*4 = 2KB              512*128*128=8388608 = BN*32768
-        # 131072 should be larger than most gemm K. 8KB is also
-        # Stage the complete ScaleB tile before constructing any tiled-MMA or
-        # accumulator fragments.
-        sB_rsrc = _buffer_resource(
-            argScaleB,
-            num_records_bytes=arith._to_raw(
-                fx.Int32(div_up(N, 128) * scaleA_stride * 4)
-            ),
-        )
-        scale_b_root_ptr = lds.scale_b.ptr
-        total_lanes = 512
-        elems_per_128b_scale = 4
-        elems_per_round_128b = total_lanes * elems_per_128b_scale
-        rounds_128b = scaleB_elems // elems_per_round_128b
-        loaded_128b = rounds_128b * elems_per_round_128b
-        remaining_elems = scaleB_elems - loaded_128b
-        rounds_32b = remaining_elems // total_lanes
-        loaded_32b = rounds_32b * total_lanes
-        tail_elems = remaining_elems - loaded_32b
-        scale_b_global_base = fx.Int32(bid_y * scaleB_elems * 4)
+        def _load_scale_b_to_lds():
+            """Enqueue the ScaleB tile into LDS and return its buffer descriptor."""
+            sB_rsrc = _buffer_resource(
+                argScaleB,
+                num_records_bytes=arith._to_raw(
+                    fx.Int32(div_up(N, 128) * scaleA_stride * 4)
+                ),
+            )
+            scale_b_root_ptr = lds.scale_b.ptr
+            total_lanes = 512
+            elems_per_128b_scale = 4
+            elems_per_round_128b = total_lanes * elems_per_128b_scale
+            rounds_128b = scaleB_elems // elems_per_round_128b
+            loaded_128b = rounds_128b * elems_per_round_128b
+            remaining_elems = scaleB_elems - loaded_128b
+            rounds_32b = remaining_elems // total_lanes
+            loaded_32b = rounds_32b * total_lanes
+            tail_elems = remaining_elems - loaded_32b
+            scale_b_global_base = fx.Int32(bid_y * scaleB_elems * 4)
 
-        # DWORDX4 copy B scale into LDS
-        # N * K >=32*1024*1024
-        if const_expr(rounds_128b > 0):
-            lane_byte_offset_128b = fx.Int32(tid * 16)
-            wave_offset_128b = rocdl.readfirstlane(
-                T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 16))
-            )
-            for copy_round in range_constexpr(rounds_128b):
-                round_elem_offset = copy_round * elems_per_round_128b
-                scale_b_dst = _lds_byte_ptr(
-                    scale_b_root_ptr,
-                    wave_offset_128b + round_elem_offset * 4,
+            # Full 128-bit rounds, followed by 32-bit rounds and a lane-masked tail.
+            if const_expr(rounds_128b > 0):
+                lane_byte_offset_128b = fx.Int32(tid * 16)
+                wave_offset_128b = rocdl.readfirstlane(
+                    T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 16))
                 )
-                rocdl.raw_ptr_buffer_load_lds(
-                    sB_rsrc,
-                    scale_b_dst,
-                    fx.Int32(16),
-                    lane_byte_offset_128b,
-                    fx.Int32(scale_b_global_base + round_elem_offset * 4),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                )
-        if const_expr(remaining_elems > 0):
-            lane_byte_offset_32b = fx.Int32(tid * 4)
-            wave_offset_32b = rocdl.readfirstlane(
-                T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
-            )
-            # 剩下的数据     8*1024*1024  <= remaining < 32*1024*1024
-            for copy_round in range_constexpr(rounds_32b):
-                round_elem_offset = loaded_128b + copy_round * total_lanes
-                scale_b_dst = _lds_byte_ptr(
-                    scale_b_root_ptr,
-                    wave_offset_32b + round_elem_offset * 4,
-                )
-                rocdl.raw_ptr_buffer_load_lds(
-                    sB_rsrc,
-                    scale_b_dst,
-                    fx.Int32(4),
-                    lane_byte_offset_32b,
-                    fx.Int32(scale_b_global_base + round_elem_offset * 4),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                )
-            # remaining < 8*1024*1024
-            if const_expr(tail_elems > 0):
-                if tid < tail_elems:
-                    tail_elem_offset = loaded_128b + loaded_32b
+                for copy_round in range_constexpr(rounds_128b):
+                    round_elem_offset = copy_round * elems_per_round_128b
                     scale_b_dst = _lds_byte_ptr(
                         scale_b_root_ptr,
-                        wave_offset_32b + tail_elem_offset * 4,
+                        wave_offset_128b + round_elem_offset * 4,
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        sB_rsrc,
+                        scale_b_dst,
+                        fx.Int32(16),
+                        lane_byte_offset_128b,
+                        fx.Int32(scale_b_global_base + round_elem_offset * 4),
+                        fx.Int32(0),
+                        fx.Int32(0),
+                    )
+            if const_expr(remaining_elems > 0):
+                lane_byte_offset_32b = fx.Int32(tid * 4)
+                wave_offset_32b = rocdl.readfirstlane(
+                    T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
+                )
+                for copy_round in range_constexpr(rounds_32b):
+                    round_elem_offset = loaded_128b + copy_round * total_lanes
+                    scale_b_dst = _lds_byte_ptr(
+                        scale_b_root_ptr,
+                        wave_offset_32b + round_elem_offset * 4,
                     )
                     rocdl.raw_ptr_buffer_load_lds(
                         sB_rsrc,
                         scale_b_dst,
                         fx.Int32(4),
                         lane_byte_offset_32b,
-                        fx.Int32(scale_b_global_base + tail_elem_offset * 4),
+                        fx.Int32(scale_b_global_base + round_elem_offset * 4),
                         fx.Int32(0),
                         fx.Int32(0),
                     )
+                if const_expr(tail_elems > 0):
+                    if tid < tail_elems:
+                        tail_elem_offset = loaded_128b + loaded_32b
+                        scale_b_dst = _lds_byte_ptr(
+                            scale_b_root_ptr,
+                            wave_offset_32b + tail_elem_offset * 4,
+                        )
+                        rocdl.raw_ptr_buffer_load_lds(
+                            sB_rsrc,
+                            scale_b_dst,
+                            fx.Int32(4),
+                            lane_byte_offset_32b,
+                            fx.Int32(scale_b_global_base + tail_elem_offset * 4),
+                            fx.Int32(0),
+                            fx.Int32(0),
+                        )
+            return sB_rsrc
+
+        # Stage ScaleB before constructing tiled-MMA or accumulator fragments.
+        sB_rsrc = _load_scale_b_to_lds()
 
         ### The wait/barrier closes this register lifetime,
         ### allowing the loader's address VGPRs to be reused by the MFMA pipeline.
