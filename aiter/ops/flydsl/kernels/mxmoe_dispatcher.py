@@ -135,6 +135,7 @@ def compile_gemm2_a4w4_port(
     g2_bf16_lds=None,
     out_dtype="bf16",
     enable_bias=False,
+    g2_prefetch_ids=False,
     _composition=None,
     _reduce_store_cache_modifier=None,
     _input_row_resolver=None,
@@ -209,6 +210,7 @@ def compile_gemm2_a4w4_port(
     if g2_bf16_lds is None:
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
+    g2_prefetch_ids = bool(g2_prefetch_ids and g2_bf16_lds)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
     if use_scatter:
@@ -298,8 +300,8 @@ def compile_gemm2_a4w4_port(
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
-    name = f"gemm2_a4w4_port_{tag}"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
+    name = f"gemm2_a4w4_port_{tag}" + ("_idpf" if g2_prefetch_ids else "")
 
     @fx.struct
     class SharedStorage:
@@ -420,6 +422,7 @@ def compile_gemm2_a4w4_port(
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
                 nonatomic=use_scatter,
+                g2_prefetch_ids=g2_prefetch_ids,
                 mn_idx=mn_idx,
                 reduce_store_cache_modifier=_reduce_store_cache_modifier,
                 resolved_input_rows=resolved_input_rows,
@@ -682,6 +685,7 @@ def get_g2(
     g2_bf16_lds=None,
     g2_spart=None,
     enable_bias=False,
+    g2_prefetch_ids=False,
 ):
     # Cache key uses compile-time buckets; runtime model_dim shares a launcher
     # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
@@ -719,6 +723,7 @@ def get_g2(
         g2_bf16_lds,
         out_dtype,
         enable_bias,
+        g2_prefetch_ids,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -742,6 +747,7 @@ def get_g2(
             g2_bf16_lds=g2_bf16_lds,
             out_dtype=out_dtype,
             enable_bias=enable_bias,
+            g2_prefetch_ids=g2_prefetch_ids,
         )
         G2_CACHE[key] = launch
     return launch
@@ -781,6 +787,7 @@ def mxfp4_moe_gemm2(
     g2_spart=None,
     stream=None,
     bias=None,
+    is_ep=False,
 ):
     """Stage-2 down-proj gemm for unpadded dimensions."""
     import torch
@@ -827,6 +834,16 @@ def mxfp4_moe_gemm2(
             bias = bias.to(torch.float32)
         if not bias.is_contiguous():
             bias = bias.contiguous()
+    g2_prefetch_ids = (
+        (BM, BN, BK) == (128, 256, 128)
+        and a_dtype == b_dtype == "fp4"
+        and epilog == "reduce"
+        and str(out_dtype).strip().lower() == "fp8"
+        and _kstatic
+        and not (persist or is_ep)
+        and bias is None
+        and os.environ.get("MXFP4_G2_PREFETCH_IDS", "1") == "1"
+    )
     launch = get_g2(
         BM,
         BN,
@@ -845,6 +862,7 @@ def mxfp4_moe_gemm2(
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
         enable_bias=bias is not None,
+        g2_prefetch_ids=g2_prefetch_ids,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

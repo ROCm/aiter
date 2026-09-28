@@ -175,12 +175,22 @@ def mhc(
     RES_PID_C = 0 if NUM_C_BLOCKS == 1 else 1
 
     _LOGGER.info(
-        f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} "
-        f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
-        f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
-        f"sinkhorn_iters={sinkhorn_iters} num_ksplit={num_ksplit} "
-        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} BLOCK_C={BLOCK_C} "
-        f"N_TOTAL_POW2={N_TOTAL_POW2} RES_PID_C={RES_PID_C}"
+        "MHC: x=%s phi=%s alpha_pre=%f alpha_post=%f alpha_res=%f hc_pre_eps=%f hc_post_mult_value=%f sinkhorn_iters=%d num_ksplit=%d BLOCK_M=%d BLOCK_N=%d BLOCK_K=%d BLOCK_C=%d N_TOTAL_POW2=%d RES_PID_C=%d",
+        tuple(x.shape),
+        tuple(phi.shape),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        hc_pre_eps,
+        hc_post_mult_value,
+        sinkhorn_iters,
+        num_ksplit,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        BLOCK_C,
+        N_TOTAL_POW2,
+        RES_PID_C,
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
@@ -449,10 +459,13 @@ def mhc_post(
     BLOCK_C = min(BLOCK_C, triton.next_power_of_2(C))
 
     _LOGGER.info(
-        f"MHC_POST: layer_input={tuple(layer_input.shape)} "
-        f"residual={tuple(residual.shape)} post_mix={tuple(post_mix.shape)} "
-        f"comb_mix={tuple(comb_mix.shape)} "
-        f"BLOCK_M={BLOCK_M} BLOCK_C={BLOCK_C}"
+        "MHC_POST: layer_input=%s residual=%s post_mix=%s comb_mix=%s BLOCK_M=%d BLOCK_C=%d",
+        tuple(layer_input.shape),
+        tuple(residual.shape),
+        tuple(post_mix.shape),
+        tuple(comb_mix.shape),
+        BLOCK_M,
+        BLOCK_C,
     )
 
     if out is None:
@@ -679,14 +692,22 @@ def mhc_post_pre(
     NUM_C_BLOCKS = triton.cdiv(C, BLOCK_C)
 
     _LOGGER.info(
-        f"MHC_POST_PRE: layer_input={tuple(layer_input.shape)} "
-        f"residual_in={tuple(residual_in.shape)} phi={tuple(phi.shape)} "
-        f"alphas={tuple(alphas.shape)}@{alphas.dtype} "
-        f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
-        f"sinkhorn_iters={sinkhorn_iters} "
-        f"BLOCK_M={BLOCK_M} BLOCK_K={BLOCK_K} BLOCK_C_SPLIT={BLOCK_C_SPLIT} "
-        f"BLOCK_C={BLOCK_C} NUM_KSPLIT={NUM_KSPLIT} NUM_C_BLOCKS={NUM_C_BLOCKS} "
-        f"N_TOTAL_POW2={N_TOTAL_POW2}"
+        "MHC_POST_PRE: layer_input=%s residual_in=%s phi=%s alphas=%s@%s hc_pre_eps=%f hc_post_mult_value=%f sinkhorn_iters=%d BLOCK_M=%d BLOCK_K=%d BLOCK_C_SPLIT=%d BLOCK_C=%d NUM_KSPLIT=%d NUM_C_BLOCKS=%d N_TOTAL_POW2=%d",
+        tuple(layer_input.shape),
+        tuple(residual_in.shape),
+        tuple(phi.shape),
+        tuple(alphas.shape),
+        alphas.dtype,
+        hc_pre_eps,
+        hc_post_mult_value,
+        sinkhorn_iters,
+        BLOCK_M,
+        BLOCK_K,
+        BLOCK_C_SPLIT,
+        BLOCK_C,
+        NUM_KSPLIT,
+        NUM_C_BLOCKS,
+        N_TOTAL_POW2,
     )
     assert alphas.shape == (
         3,

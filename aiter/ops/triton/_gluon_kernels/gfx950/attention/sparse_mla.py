@@ -113,6 +113,7 @@ def _scale_load(
     W_FULL: gl.constexpr,
     MASKED: gl.constexpr,
     OTHER: gl.constexpr,
+    CACHE: gl.constexpr = _CG,
 ):
     """Gather the NG per-group scales of each token and broadcast to W_FULL
     columns. Indexing the full row with offs // GROUP would build a
@@ -132,26 +133,26 @@ def _scale_load(
                 offsets=rows.to(gl.int32)[:, None] + cols[None, :],
                 mask=m,
                 other=OTHER,
-                cache=".cg",
+                cache=CACHE,
             )
         else:
             sc = gl.load(
                 (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
                 mask=m,
                 other=OTHER,
-                cache_modifier=".cg",
+                cache_modifier=CACHE,
             )
     else:
         if USE_BUFFER_LOAD:
             sc = gl.amd.cdna4.buffer_load(
                 ptr=ptr,
                 offsets=rows.to(gl.int32)[:, None] + cols[None, :],
-                cache=".cg",
+                cache=CACHE,
             )
         else:
             sc = gl.load(
                 (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
-                cache_modifier=".cg",
+                cache_modifier=CACHE,
             )
     wide = gl.expand_dims(sc, 2).broadcast_to([sc.shape[0], NG, W_FULL // NG])
     return gl.convert_layout(
@@ -260,6 +261,9 @@ class Cfg:
     ASYNC_LDS: gl.constexpr
     RELAXED_LOAD: gl.constexpr  # read LDS with the syncedViaAsyncWait hint
     ROPE_VEC: gl.constexpr  # bytes per lane in the rope buffer's copy
+    SLOT_U32: gl.constexpr  # pitches < 16 MB; -1 sentinels are clamped before the split
+    IDX_PREFETCH: gl.constexpr  # read the next tile's slot ids a trip early
+    UNPEEL: gl.constexpr  # the last tile runs in the loop body, not a peeled copy
     # operator layouts
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -299,6 +303,10 @@ class Cfg:
         ASYNC_LDS=False,
         RELAXED_LOAD=True,
         PAD_INTERVAL=1024,
+        SLOT_U32=False,
+        IDX_PREFETCH=False,
+        KV_LDS_PAD=0,
+        UNPEEL=False,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -321,6 +329,9 @@ class Cfg:
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
+        self.SLOT_U32 = gl.constexpr(SLOT_U32)
+        self.IDX_PREFETCH = gl.constexpr(IDX_PREFETCH)
+        self.UNPEEL = gl.constexpr(UNPEEL)
         ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
         MFMA_K = 32 if FP8_MFMA else 16
@@ -390,10 +401,11 @@ class Cfg:
             )
         )
         # Row pitch (KV_DIM + LDS_PAD) decides which banks the transposed K
-        # read (walks down a column) lands on.
+        # read (walks down a column) lands on. KV_LDS_PAD 16 removes those
+        # conflicts; it only pays when the loop is LDS-bound.
         self.kv_shared = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
-                [[KV_DIM, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                [[KV_DIM, KV_LDS_PAD or LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
             )
         )
         # The rope buffer (K-only) exists when ROPE_SEPARATE, dead otherwise.
@@ -562,10 +574,20 @@ class Seg:
     seg_start: gl.tensor
     cs0: gl.tensor
     num_rows: gl.tensor
+    target: gl.tensor  # HAS_INVALID: the slot invalid lanes gather
 
     @gluon.constexpr_function
     def __init__(
-        self, fmt, cache_ptr, alt_ptr, scl_ptr, indices_ptr, seg_start, cs0, num_rows
+        self,
+        fmt,
+        cache_ptr,
+        alt_ptr,
+        scl_ptr,
+        indices_ptr,
+        seg_start,
+        cs0,
+        num_rows,
+        target,
     ):
         self.fmt = fmt
         self.cache_ptr = cache_ptr
@@ -575,6 +597,7 @@ class Seg:
         self.seg_start = seg_start
         self.cs0 = cs0
         self.num_rows = num_rows
+        self.target = target
 
 
 @gluon.jit
@@ -666,6 +689,31 @@ def _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt):
 
 
 @gluon.jit
+def _read_slots(cfg, seg, off):
+    if cfg.IDX_BUFFER_LOAD:
+        return gl.amd.cdna4.buffer_load(
+            ptr=seg.indices_ptr + seg.seg_start, offsets=off, cache=cfg.IDX_CACHE
+        )
+    return gl.load(seg.indices_ptr + seg.seg_start + off, cache_modifier=cfg.IDX_CACHE)
+
+
+@gluon.jit
+def _split_slot(cfg, slot, BLOCK_SIZE: gl.constexpr):
+    if cfg.SLOT_U32:
+        slot = slot.to(gl.uint32)
+    return (slot // BLOCK_SIZE).to(gl.int32), (slot % BLOCK_SIZE).to(gl.int32)
+
+
+@gluon.jit
+def _next_slots(cfg, seg, k_start, seg_hi, k_rng_slot, k_rng_rope):
+    """A tile's slot ids in the row and rope layouts, clamped like _slots."""
+    return (
+        _read_slots(cfg, seg, gl.minimum(k_start + k_rng_slot, seg_hi - 1)),
+        _read_slots(cfg, seg, gl.minimum(k_start + k_rng_rope, seg_hi - 1)),
+    )
+
+
+@gluon.jit
 def _slots(
     cfg,
     seg,
@@ -678,7 +726,7 @@ def _slots(
     """Index-list read -> (block, pos, valid), in whatever layout k_pos carries.
     A masked gl.load predicates on exec while a masked buffer_load folds the
     mask into the offset, so the unmasked paths clamp the read in-range and
-    mask the score instead (UNI_TILE); -1 sentinels are handled the same way."""
+    mask the score instead (UNI_TILE); -1 sentinels gather seg.target."""
     indices_ptr = seg.indices_ptr
     seg_start = seg.seg_start
     BLOCK_SIZE: gl.constexpr = seg.fmt.BLOCK_SIZE
@@ -706,18 +754,17 @@ def _slots(
     else:
         # hi >= 1 whenever UNI_TILE runs (guarded by n_full > 0).
         off = gl.minimum(k_pos, hi - 1) if UNI_TILE else k_pos
-        if IDX_BUFFER_LOAD:
-            slot = gl.amd.cdna4.buffer_load(
-                ptr=indices_ptr + seg_start, offsets=off, cache=cfg.IDX_CACHE
-            )
-        else:
-            slot = gl.load(indices_ptr + seg_start + off, cache_modifier=cfg.IDX_CACHE)
+        slot = _read_slots(cfg, seg, off)
         valid = (k_pos < hi) if UNI_TILE else (slot >= 0)
         if HAS_INVALID:
             if UNI_TILE:
                 valid = valid & (slot >= 0)
-            slot = gl.where(valid, slot, 0)  # -1 sentinels: clamp, mask score below
-    return (slot // BLOCK_SIZE).to(gl.int32), (slot % BLOCK_SIZE).to(gl.int32), valid
+            # Invalid lanes gather a key this range attends anyway, so no load
+            # needs a mask and the score mask drops them. Slot 0 is not safe:
+            # it can hold NaN (the null block), which 0 * NaN carries into V.
+            slot = gl.where(valid, slot, seg.target)
+    block, pos = _split_slot(cfg, slot, BLOCK_SIZE)
+    return block, pos, valid
 
 
 @gluon.jit
@@ -878,24 +925,34 @@ def _gather_full(
     offs_rope,
     k_rng_slot,
     k_rng_rope,
+    pre=None,
 ):
     """Gather one full fp8 tile, split from the LDS-write/MFMA so it issues an
     iteration early. The prefetch stays in raw fp8: dequantizing here would
     double the loop-carried registers, so the consumer dequants in chunks.
+    pre: slot ids from _next_slots, or None to read them here.
     Returns (x, sc, k_rope, valid); unused slots carry a duplicate DCE removes."""
     fmt = seg.fmt
     cs0 = seg.cs0
     if not fmt.USE_BUFFER_LOAD:
         cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets
-    bg, pg, valid = _slots(
-        cfg,
-        seg,
-        k_start + k_rng_slot,
-        seg_hi,  # hi: unused unless UNI_TILE
-        0,
-        False,
-        cfg.UNI_TILE,
-    )
+    if pre is None:
+        bg, pg, valid = _slots(
+            cfg,
+            seg,
+            k_start + k_rng_slot,
+            seg_hi,  # hi: unused unless UNI_TILE
+            0,
+            False,
+            cfg.UNI_TILE,
+        )
+    else:
+        slot = pre[0]
+        valid = k_start + k_rng_slot < seg_hi
+        if cfg.HAS_INVALID:
+            valid = valid & (slot >= 0)
+            slot = gl.where(valid, slot, seg.target)  # as in _slots
+        bg, pg = _split_slot(cfg, slot, fmt.BLOCK_SIZE)
     if fmt.KIND == "fp8_g64":
         NGRP: gl.constexpr = cfg.KV_DIM // 64
         x_u8 = _cache_load(
@@ -961,6 +1018,7 @@ def _gather_full(
                 cfg.KV_DIM,
                 False,
                 0.0,
+                CACHE=cfg.GATHER_CACHE,
             )
         else:
             sc = _cache_load(
@@ -1009,6 +1067,7 @@ def _gather_full(
                 cfg.KV_DIM,
                 False,
                 127,
+                CACHE=cfg.GATHER_CACHE,
             )
         else:
             sc = _cache_load(
@@ -1038,15 +1097,22 @@ def _gather_full(
                 fmt.USE_BUFFER_LOAD,
                 CACHE=cfg.GATHER_CACHE,
             )
-        bgr, pgr, _ = _slots(
-            cfg,
-            seg,
-            k_start + k_rng_rope,
-            seg_hi,
-            0,
-            False,
-            cfg.UNI_TILE,
-        )
+        if pre is None:
+            bgr, pgr, _ = _slots(
+                cfg,
+                seg,
+                k_start + k_rng_rope,
+                seg_hi,
+                0,
+                False,
+                cfg.UNI_TILE,
+            )
+        else:
+            slot_r = pre[1]
+            if cfg.HAS_INVALID:
+                vr = (k_start + k_rng_rope < seg_hi) & (slot_r >= 0)
+                slot_r = gl.where(vr, slot_r, seg.target)
+            bgr, pgr = _split_slot(cfg, slot_r, fmt.BLOCK_SIZE)
         k_rope = _cache_load(
             seg.alt_ptr,
             bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
@@ -1236,8 +1302,8 @@ def _decode_tile(
     MASKED: gl.constexpr,
 ):
     """One KV tile -> online-softmax update. MASKED=True is the peeled tail
-    (fully predicated); full tiles clamp -1 sentinels and mask scores when
-    HAS_INVALID."""
+    (fully predicated); full tiles send -1 sentinels to seg.target and mask
+    scores when HAS_INVALID."""
     neg_inf = float("-inf")
     fmt = seg.fmt
     cs0 = seg.cs0
@@ -1315,6 +1381,7 @@ def _decode_tile(
                     cfg.KV_DIM,
                     True,
                     127,
+                    CACHE=cfg.GATHER_CACHE,
                 )
             else:
                 exps = _cache_load(
@@ -1364,6 +1431,7 @@ def _decode_tile(
                     cfg.KV_DIM,
                     False,
                     127,
+                    CACHE=cfg.GATHER_CACHE,
                 )
             else:
                 exps = _cache_load(
@@ -1537,6 +1605,31 @@ def _process_segment(
     k_rng_slot = gl.arange(0, cfg.BLOCK_K, layout=cfg.slot_l)
     k_rng_rope = gl.arange(0, cfg.BLOCK_K, layout=gl.SliceLayout(1, cfg.gather_rope_l))
 
+    if cfg.HAS_INVALID:
+        # The first valid slot of this program's range is the key invalid lanes
+        # gather. A range with none adds nothing, so it is skipped.
+        SEARCH_L: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+        rng_s = gl.arange(0, cfg.BLOCK_K, layout=SEARCH_L)
+        target = seg.seg_start * 0 - 1
+        k = lo
+        while (target < 0) & (k < hi):
+            first = _read_slots(cfg, seg, gl.minimum(k + rng_s, hi - 1))
+            target = gl.max(first, axis=0)
+            k += cfg.BLOCK_K
+        if target < 0:
+            hi = lo
+        seg = Seg(
+            seg.fmt,
+            seg.cache_ptr,
+            seg.alt_ptr,
+            seg.scl_ptr,
+            seg.indices_ptr,
+            seg.seg_start,
+            seg.cs0,
+            seg.num_rows,
+            target,
+        )
+
     # [lo, hi_full) are full mask-free tiles; only the peeled tail is masked.
     hi_full = lo + ((hi - lo) // cfg.BLOCK_K) * cfg.BLOCK_K
 
@@ -1559,7 +1652,19 @@ def _process_segment(
                 k_rng_slot,
                 k_rng_rope,
             )
-            for i in range(1, n_full):
+            pre = None
+            if cfg.IDX_PREFETCH:
+                # vmcnt is in-order, so read the ids a trip before their gather.
+                pre = _next_slots(
+                    cfg, seg, lo + cfg.BLOCK_K, hi, k_rng_slot, k_rng_rope
+                )
+            # UNPEEL: one more trip instead of the peeled stage + dots of the last
+            # tile after the loop. That trip prefetches past hi, which the
+            # clamped slot reads keep in range, and nothing consumes it.
+            n_trips = n_full
+            if cfg.UNPEEL:
+                n_trips = n_full + 1
+            for i in range(1, n_trips):
                 kn2, ks2, kr2, vld2 = _gather_full(
                     cfg,
                     seg,
@@ -1570,7 +1675,12 @@ def _process_segment(
                     offs_rope,
                     k_rng_slot,
                     k_rng_rope,
+                    pre,
                 )
+                if cfg.IDX_PREFETCH:
+                    pre = _next_slots(
+                        cfg, seg, lo + (i + 1) * cfg.BLOCK_K, hi, k_rng_slot, k_rng_rope
+                    )
                 m_i, l_i, acc = _qkpv(
                     cfg,
                     seg,
@@ -1592,26 +1702,27 @@ def _process_segment(
                     hi,
                 )
                 kn, ks, kr, vld = kn2, ks2, kr2, vld2
-            m_i, l_i, acc = _qkpv(
-                cfg,
-                seg,
-                kn,
-                ks,
-                kr,
-                vld,
-                q_dot,
-                q_rope_dot,
-                m_i,
-                l_i,
-                acc,
-                head_mask,
-                qk_scale,
-                v_scale,
-                kv_smem,
-                rope_smem,
-                lo + (n_full - 1) * cfg.BLOCK_K,
-                hi,
-            )
+            if not cfg.UNPEEL:
+                m_i, l_i, acc = _qkpv(
+                    cfg,
+                    seg,
+                    kn,
+                    ks,
+                    kr,
+                    vld,
+                    q_dot,
+                    q_rope_dot,
+                    m_i,
+                    l_i,
+                    acc,
+                    head_mask,
+                    qk_scale,
+                    v_scale,
+                    kv_smem,
+                    rope_smem,
+                    lo + (n_full - 1) * cfg.BLOCK_K,
+                    hi,
+                )
     else:
         for k_start in range(lo, hi_full, cfg.BLOCK_K):
             m_i, l_i, acc = _decode_tile(
@@ -1665,11 +1776,16 @@ def _process_segment(
 
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
-    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "NUM_SPLITS", "MAIN_FMT", "ROPE_SEPARATE"],
+    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
 )
 
 
-@gluon.jit(repr=_sparse_mla_repr)
+# Split counts follow the batch, so they (and the stride they scale) stay out of the
+# compile key.
+@gluon.jit(
+    repr=_sparse_mla_repr,
+    do_not_specialize=["pm_stride0", "num_splits", "main_num_splits"],
+)
 def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
     # R = ROPE_DIM, nnz = total gathered tokens in a segment's index list.
@@ -1688,12 +1804,12 @@ def _sparse_mla(
     extra_indices_ptr,  # [nnz_extra] int32
     extra_indptr_ptr,  # [C + 1] int32
     attn_sink_ptr,  # [H] f32, HAS_SINK only
-    out_ptr,  # [C, H, S] bf16, written when NUM_SPLITS == 1
-    # Split-K partials, written instead of out_ptr when NUM_SPLITS > 1 (unused
-    # placeholders otherwise).
-    part_m_ptr,  # [C, NUM_SPLITS, H] f32 row max, base-2 domain
-    part_l_ptr,  # [C, NUM_SPLITS, H] f32 row sum
-    part_acc_ptr,  # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
+    out_ptr,  # [C, H, S] bf16, written without SPLIT_K
+    # Split-K partials, one slot per launched split program (P >= num_splits),
+    # written instead of out_ptr with SPLIT_K (unused placeholders otherwise).
+    part_m_ptr,  # [C, P, H] f32 row max, base-2 domain
+    part_l_ptr,  # [C, P, H] f32 row sum
+    part_acc_ptr,  # [C, P, H, S] bf16 or f32, un-normalized
     # f32 side-channel per segment: scalar k_scale ("fp8_scalar") or f32 cache view
     # ("fp8_dsv32_mla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
@@ -1708,9 +1824,9 @@ def _sparse_mla(
     extra_cs0,
     main_num_rows,
     extra_num_rows,
-    pm_stride0: gl.constexpr,
+    pm_stride0,
     pm_stride_s: gl.constexpr,
-    pa_stride0: gl.constexpr,
+    pa_stride0,
     pa_stride_s: gl.constexpr,
     pa_stride_h: gl.constexpr,
     num_heads: gl.constexpr,
@@ -1727,7 +1843,8 @@ def _sparse_mla(
     ROPE_SEPARATE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    NUM_SPLITS: gl.constexpr,
+    num_splits,
+    SPLIT_K: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows,
     # 1 = columns); >= the tile's extent means one shot.
@@ -1737,10 +1854,10 @@ def _sparse_mla(
     UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
     Q_CACHE: gl.constexpr,
-    # MAIN_SPLITS <= NUM_SPLITS: splitting the SWA window past its tile count
+    # main_num_splits <= num_splits: splitting the SWA window past its tile count
     # only manufactures masked partial tiles, so main stops early and extra
     # keeps all programs (surplus ones get an empty main range).
-    MAIN_SPLITS: gl.constexpr,
+    main_num_splits,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
     ADAPTIVE_SPLITS: gl.constexpr,
     DEQ: gl.constexpr,  # see Fmt.DEQ
@@ -1765,10 +1882,14 @@ def _sparse_mla(
     ASYNC_LDS: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     PAD_INTERVAL: gl.constexpr = 1024,
+    SLOT_U32: gl.constexpr = False,
+    IDX_PREFETCH: gl.constexpr = False,
+    KV_LDS_PAD: gl.constexpr = 0,
+    UNPEEL: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
-    extra (top-k). NUM_SPLITS==1 writes the output directly; otherwise stores
-    un-normalized partials for the reduce kernel."""
+    extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
+    stores un-normalized partials for the reduce kernel."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
@@ -1821,9 +1942,26 @@ def _sparse_mla(
         "ASYNC_LDS requires FP8_MFMA + UNI_TILE, no -1 sentinels, one segment",
     )
     gl.static_assert(
+        (not IDX_PREFETCH)
+        or (
+            UNI_TILE
+            and MAIN_FMT == "fp8_dsv4_mla"
+            and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_dsv4_mla")
+        ),
+        "IDX_PREFETCH needs fp8_dsv4_mla and UNI_TILE",
+    )
+    gl.static_assert(
+        (not UNPEEL) or UNI_TILE,
+        "UNPEEL prefetches past the last tile, which only UNI_TILE's clamp keeps in range",
+    )
+    gl.static_assert(
         not (FP8_MFMA and HAS_EXTRA),
         "FP8_MFMA defers the V-side scale to the epilogue, so it needs one segment",
     )
+    if SLOT_U32:
+        # No-op given the pitch guarantee; lets block * cs0 use a 24-bit multiply.
+        main_cs0 = main_cs0 & 0xFFFFFF
+        extra_cs0 = extra_cs0 & 0xFFFFFF
     # Row bases are block*cs0 + pos*TOK with runtime block/pos, so divisibility
     # analysis sees 1-byte alignment unless the driver vouches for cs0.
     if CS0_ALIGN > 1:
@@ -1852,6 +1990,10 @@ def _sparse_mla(
         ASYNC_LDS,
         RELAXED_LOAD,
         PAD_INTERVAL,
+        SLOT_U32,
+        IDX_PREFETCH,
+        KV_LDS_PAD,
+        UNPEEL,
     )
     main_fmt = Fmt(
         cfg,
@@ -2000,12 +2142,13 @@ def _sparse_mla(
     # ragged batch the surplus programs would each gather a mostly-masked tile
     # and write a full partial. Recompute from this query's own lengths and let
     # those programs write a neutral partial (m = -inf) and leave. The reduce
-    # skips them, so their part_acc never has to be written.
+    # skips them, so their part_acc never has to be written. Programs past
+    # num_splits, which pad the launch, leave the same way.
     if ADAPTIVE_SPLITS:
         m_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
         e_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
         work_splits = gl.minimum(
-            gl.maximum(gl.maximum(m_tiles, e_tiles), 1), NUM_SPLITS
+            gl.maximum(gl.maximum(m_tiles, e_tiles), 1), num_splits
         )
         main_splits = gl.minimum(gl.maximum(m_tiles, 1), work_splits)
         if split_id >= work_splits:
@@ -2030,9 +2173,12 @@ def _sparse_mla(
                 mask=head_mask_pv,
             )
             return
+    elif SPLIT_K:
+        work_splits = num_splits
+        main_splits = main_num_splits
     else:
-        work_splits = NUM_SPLITS
-        main_splits = MAIN_SPLITS
+        work_splits = 1
+        main_splits = 1
 
     # main (SWA) segment
     main_seg = Seg(
@@ -2044,6 +2190,7 @@ def _sparse_mla(
         main_start,
         main_cs0,
         main_num_rows,
+        main_start,
     )
     main_chunk = (main_len + main_splits - 1) // main_splits
     main_lo = gl.minimum(split_id * main_chunk, main_len)
@@ -2093,6 +2240,7 @@ def _sparse_mla(
             extra_start,
             extra_cs0,
             extra_num_rows,
+            extra_start,
         )
         extra_chunk = (extra_len + work_splits - 1) // work_splits
         extra_lo = split_id * extra_chunk
@@ -2124,7 +2272,7 @@ def _sparse_mla(
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))
     l_pv = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.pv_layout))
 
-    if NUM_SPLITS == 1:
+    if not SPLIT_K:
         if HAS_SINK:
             # m_pv is in the base-2 exponent domain; lift the sink into it.
             sink = (
@@ -2195,6 +2343,11 @@ def _sparse_mla(
         )
 
 
+@gluon.constexpr_function
+def _next_pow2(n):
+    return 1 << (n - 1).bit_length()
+
+
 _sparse_mla_reduce_repr = make_kernel_repr(
     "_sparse_mla_reduce",
     ["BLOCK_M", "HEAD_SIZE", "NUM_SPLITS"],
@@ -2235,106 +2388,75 @@ def _sparse_mla_reduce(
     query_idx = gl.program_id(0)
     pid_h = gl.program_id(1)
 
-    # Lay the 64 lanes out so a small BLOCK_M spends them on the head dim.
-    TPW0: gl.constexpr = min(8, BLOCK_M)
-    TPW1: gl.constexpr = 64 // TPW0
-    BLK: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[TPW0, TPW1],
+    # Splits run along dim 0 of one [SPLITS_PAD, HEAD_SIZE] tile, so every
+    # split's partial is loaded at once and summed across lanes: one memory
+    # round trip per head, where walking the splits paid one per split.
+    SPLITS_PAD: gl.constexpr = _next_pow2(NUM_SPLITS)
+    TS: gl.constexpr = min(8, SPLITS_PAD)
+    TILE: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[SPLITS_PAD // TS, 8],
+        threads_per_warp=[TS, 64 // TS],
         warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )
-    row_l: gl.constexpr = gl.SliceLayout(1, BLK)  # [BLOCK_M]
-
-    h_off = pid_h * BLOCK_M
-    offs_m = gl.arange(0, BLOCK_M, layout=row_l)
-    h = h_off + offs_m
-    head_mask = h < num_heads
-    offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, BLK))
+    split_l: gl.constexpr = gl.SliceLayout(1, TILE)  # [SPLITS_PAD]
+    dim_l: gl.constexpr = gl.SliceLayout(0, TILE)  # [HEAD_SIZE]
+    offs_s = gl.arange(0, SPLITS_PAD, layout=split_l)
+    offs_d = gl.arange(0, HEAD_SIZE, layout=dim_l)
+    split_ok = offs_s < NUM_SPLITS
 
     neg_inf = float("-inf")
-    # Deliberately NOT bounded by the per-query split count: that would make
-    # these dynamic loops and lose the static unroll
-    m_final = gl.full([BLOCK_M], neg_inf, gl.float32, layout=row_l)
-    # pass 1: global max over splits
-    for s in range(NUM_SPLITS):
-        base = query_idx * pm_stride0 + s * pm_stride_s
+    for mi in gl.static_range(BLOCK_M):
+        h = pid_h * BLOCK_M + mi
+        live = split_ok & (h < num_heads)
+        stat_off = query_idx * pm_stride0 + offs_s * pm_stride_s + h
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-        )
-        m_final = _max2(m_final, m_s)  # m_s already in base-2 exponent domain
-    if HAS_SINK:
-        sink = gl.amd.cdna4.buffer_load(
-            ptr=attn_sink_ptr,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-            cache=".cg",
-        ).to(gl.float32)
-        scaled_sink = sink * RCP_LN2
-        m_final = _max2(m_final, scaled_sink)  # lift sink to base-2
-
-    # pass 2: weighted sums
-    l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)
-    acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=BLK)
-    for s in range(NUM_SPLITS):
-        base = query_idx * pm_stride0 + s * pm_stride_s
-        m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-            cache=".cg",
+            ptr=part_m_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
         )
         l_s = gl.amd.cdna4.buffer_load(
-            ptr=part_l_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=0.0,
-            cache=".cg",
+            ptr=part_l_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
         )
-        w = gl.exp2(m_s - m_final)
-        l_final = l_final + w * l_s
-        a_base = query_idx * pa_stride0 + s * pa_stride_s
-        a_off = (a_base + h[:, None] * pa_stride_h + offs_d[None, :]).to(gl.int32)
-        # split's part_acc can be uninitialized, so mask the load
-        if ADAPTIVE_SPLITS:
-            acc_mask = head_mask[:, None] & (m_s > neg_inf)[:, None]
-        else:
-            acc_mask = head_mask[:, None]
+        # Issued before the weights exist: nothing in the address depends on them.
+        a_off = (
+            query_idx * pa_stride0
+            + offs_s[:, None] * pa_stride_s
+            + h * pa_stride_h
+            + offs_d[None, :]
+        ).to(gl.int32)
         acc_s = gl.amd.cdna4.buffer_load(
             ptr=part_acc_ptr,
             offsets=a_off,
-            mask=acc_mask,
+            mask=live[:, None],
             other=0.0,
             cache=".cg",
         )
-        acc = acc + w[:, None] * acc_s.to(gl.float32)
 
-    if HAS_SINK:
-        l_final = l_final + gl.exp2(scaled_sink - m_final)
+        m_final = gl.max(m_s, axis=0)  # base-2 exponent domain
+        if HAS_SINK:
+            scaled_sink = gl.load(attn_sink_ptr + h).to(gl.float32) * RCP_LN2
+            m_final = _max2(m_final, scaled_sink)
+        # A split the adaptive count left unused keeps m = -inf and an
+        # uninitialized part_acc, so it must add exactly zero, not 0 * garbage.
+        used = m_s > neg_inf
+        w = gl.where(used, gl.exp2(m_s - m_final), 0.0)
+        l_final = gl.sum(w * l_s, axis=0)
+        if HAS_SINK:
+            l_final = l_final + gl.exp2(scaled_sink - m_final)
+        part = gl.where(used[:, None], w[:, None] * acc_s.to(gl.float32), 0.0)
+        acc = gl.sum(part, axis=0)
 
-    if HAS_LSE:
-        # Same base-2 -> natural conversion as the no-split epilogue.
+        if HAS_LSE:
+            gl.store(
+                lse_ptr + query_idx * num_heads + h,
+                (m_final + gl.log2(l_final)) * LN2,
+                mask=h < num_heads,
+            )
+        # One reciprocal per row instead of a per-element f32 divide.
+        out = acc * (1.0 / l_final)
+        o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
         gl.amd.cdna4.buffer_store(
-            (m_final + gl.log2(l_final)) * LN2,
-            ptr=lse_ptr + query_idx * num_heads,
-            offsets=h.to(gl.int32),
-            mask=head_mask,
+            out.to(out_ptr.dtype.element_ty),
+            ptr=out_ptr,
+            offsets=o_off,
+            mask=(offs_d < HEAD_SIZE) & (h < num_heads),
         )
-
-    # One reciprocal per row instead of a per-element f32 divide.
-    one_over_l = 1.0 / l_final
-    out = acc * one_over_l[:, None]
-    o_off = (query_idx * out_stride0 + h[:, None] * out_stride1 + offs_d[None, :]).to(
-        gl.int32
-    )
-    gl.amd.cdna4.buffer_store(
-        out.to(out_ptr.dtype.element_ty),
-        ptr=out_ptr,
-        offsets=o_off,
-        mask=head_mask[:, None],
-    )

@@ -454,10 +454,16 @@ class IPCBuffer:
     def uncached(self) -> bool:
         return self._uncached
 
-    def __del__(self):
+    def close(self):
         if (self._uncached or self._raw_cached) and self._raw_ptr:
             self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
+        # Drop the torch.empty backing (default pool) so the caching allocator
+        # can reclaim it without waiting for GC of this object.
+        self._buffer = None
+
+    def __del__(self):
+        self.close()
 
 
 class IPCBufferPool:
@@ -556,6 +562,12 @@ class IPCBufferPool:
         )
         self._buffers[key] = buf
         return buf
+
+    def close(self):
+        """Free all buffers this pool owns (meta + input)."""
+        for buf in self._buffers.values():
+            buf.close()
+        self._buffers = {}
 
     def __getitem__(self, key: str) -> IPCBuffer:
         return self._buffers[key]
@@ -2152,6 +2164,11 @@ class CustomAllreduce:
             except (AttributeError, RuntimeError):
                 pass
             self._ptr = 0
+        # Free the meta + input (max_size, up to 1 GB) buffers deterministically
+        # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
+        pool = getattr(self, "_pool", None)
+        if pool is not None and hasattr(pool, "close"):
+            pool.close()
 
     def __del__(self):
         self.close()
