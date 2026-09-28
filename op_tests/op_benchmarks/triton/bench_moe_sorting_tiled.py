@@ -13,17 +13,11 @@ from aiter.ops.triton.moe.moe_sorting_tiled import try_m3_tiled_sort
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 
-def benchmark(save_path=None):
-    torch.manual_seed(0)
-    routed = torch.rand((32768, 128), device="cuda").topk(4, dim=1).indices.int()
-    ids = torch.cat(
-        (routed, torch.full((32768, 1), 128, dtype=torch.int32, device="cuda")), dim=1
-    )
-    weights = torch.rand(ids.shape, device=ids.device)
-    weights[:, -1] = 1
+def benchmark(save_path=None, tokens=None, aux=False, distribution="uniform"):
+    tokens = tokens or [8192, 8193, 32768, 65537, 131072, 262144]
     config = triton.testing.Benchmark(
-        x_names=["aux"],
-        x_vals=[False, True],
+        x_names=["tokens"],
+        x_vals=tokens,
         line_arg="provider",
         line_vals=["existing", "tiled"],
         line_names=["existing dispatcher", "tiled"],
@@ -34,7 +28,22 @@ def benchmark(save_path=None):
     )
 
     @triton.testing.perf_report(config)
-    def run(aux, provider):
+    def run(tokens, provider):
+        # Reset the generator so both providers receive identical inputs.
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        choices = {"uniform": 128, "hot8": 8, "collapsed4": 4}[distribution]
+        routed = (
+            torch.rand((tokens, choices), generator=generator, device="cuda")
+            .topk(4, dim=1)
+            .indices.int()
+        )
+        ids = torch.cat(
+            (routed, torch.full((tokens, 1), 128, dtype=torch.int32, device="cuda")),
+            dim=1,
+        )
+        weights = torch.rand(ids.shape, generator=generator, device=ids.device)
+        weights[:, :4] /= weights[:, :4].sum(dim=1, keepdim=True)
+        weights[:, -1] = 1
         output_aux = "opus" if aux else False
         assert (
             try_m3_tiled_sort(
@@ -70,6 +79,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save-path", default=None, help="Optional perf_report output directory"
     )
+    parser.add_argument("--tokens", nargs="+", type=int)
+    parser.add_argument("--aux", action="store_true", help="Include auxiliary mappings")
+    parser.add_argument(
+        "--distribution", choices=["uniform", "hot8", "collapsed4"], default="uniform"
+    )
     args = parser.parse_args()
     if (
         not torch.cuda.is_available()
@@ -77,4 +91,4 @@ if __name__ == "__main__":
         or get_gfx_runtime() != "gfx950"
     ):
         parser.error("requires a gfx950 ROCm device")
-    benchmark(args.save_path)
+    benchmark(args.save_path, args.tokens, args.aux, args.distribution)

@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Stable MoE sorting for the M3 prefill contract selected by the caller.
 
-Three kernels: per-token-tile histogram, global offsets, parallel stable scatter.
+Per-token-tile histogram, prefix offsets, and parallel stable scatter. Large
+inputs split prefix work by expert to avoid a single oversized program.
 Contract: contiguous unique top-k routes, no expert mask/local-token indirection,
 no accumulation buffer. Matches the route-reduce M3 prefill contract and emits
 the same packed token IDs, padding, optional a4w4 indices and reverse mapping.
@@ -16,6 +17,8 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_sorting_tiled import (
     _histogram,
     _prefix,
+    _prefix_experts,
+    _prefix_tiles,
     _scatter,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -45,7 +48,7 @@ def tiled_sort(
     Return sorted packed IDs, weights, block expert IDs, valid/token counts and
     an empty MoE buffer. ``output_aux`` also returns token indices and a reverse
     mapping. Expert masks, local-token indirection and accumulation are not
-    supported; the M3 dispatcher adds the measured-shape guard.
+    supported; the M3 dispatcher adds the prefill threshold and contract guard.
     """
     if (
         topk_ids.ndim != 2
@@ -103,20 +106,43 @@ def tiled_sort(
         bins,
         num_warps=num_warps,
     )
-    _prefix[(1,)](
-        counts,
-        offsets,
-        expert_offsets,
-        expert_counts,
-        num_valid,
-        tokens,
-        num_experts,
-        tiles,
-        block_size,
-        triton.next_power_of_2(num_experts),
-        triton.next_power_of_2(tiles),
-        num_warps=config["prefix_num_warps"],
-    )
+    # Keep the combined prefix for short inputs; its expert-by-tile tensor
+    # becomes a bottleneck at larger sizes. Split that work across experts.
+    split_prefix = tiles > config["prefix_tile_limit"]
+    if split_prefix:
+        _prefix_tiles[(num_experts,)](
+            counts,
+            offsets,
+            expert_counts,
+            tiles,
+            triton.next_power_of_2(tiles),
+            num_warps=config["prefix_num_warps"],
+        )
+        _prefix_experts[(1,)](
+            expert_counts,
+            expert_offsets,
+            num_valid,
+            tokens,
+            num_experts,
+            block_size,
+            triton.next_power_of_2(num_experts),
+            num_warps=config["prefix_num_warps"],
+        )
+    else:
+        _prefix[(1,)](
+            counts,
+            offsets,
+            expert_offsets,
+            expert_counts,
+            num_valid,
+            tokens,
+            num_experts,
+            tiles,
+            block_size,
+            triton.next_power_of_2(num_experts),
+            triton.next_power_of_2(tiles),
+            num_warps=config["prefix_num_warps"],
+        )
     _scatter[(num_experts, tiles)](
         topk_ids,
         topk_weights,
@@ -136,6 +162,7 @@ def tiled_sort(
         tile,
         items,
         bool(output_aux),
+        split_prefix,
         num_warps=num_warps,
         num_stages=config["num_stages"],
     )
@@ -159,13 +186,17 @@ def try_m3_tiled_sort(
     flat=False,
     output_aux=False,
 ):
-    """Return None for any unmeasured or incompatible sorting contract.
+    """Select profitable M3 prefill sizes, or return None for legacy dispatch.
 
     Top-k routes must be unique within each token, as required by the native
     byte-mesh sorter. This preserves original top-k slots and expert/token order.
     """
     if not (
-        topk_ids.shape == (32768, 5)
+        topk_ids.ndim == 2
+        # Use a conservative cutoff: smaller partial tiles have little margin.
+        # The upper bound is the packed token-ID format, not a prefill bucket.
+        and 8192 <= topk_ids.shape[0] < 2**24
+        and topk_ids.shape[1] == 5
         and topk_weights.shape == topk_ids.shape
         and topk_ids.dtype == torch.int32
         and topk_weights.dtype == torch.float32

@@ -110,7 +110,14 @@ def _assert_result(ids, weights, result, block_size, aux):
 @pytest.mark.parametrize("aux", [False, True])
 @pytest.mark.parametrize(
     "tokens,block_size,skew",
-    [(16, 64, True), (2039, 32, False), (2039, 128, True), (32768, 64, False)],
+    [
+        (16, 64, True),
+        (2039, 32, False),
+        (2039, 128, True),
+        (32768, 64, False),
+        (65537, 64, False),
+        (131073, 64, True),
+    ],
 )
 def test_tiled_sort_stable_packed_routes(tokens, block_size, skew, aux):
     ids, weights = _routes(tokens, skew=skew)
@@ -132,8 +139,9 @@ def opus_dispatch(monkeypatch):
 
 
 @pytest.mark.parametrize("aux", [False, "opus"])
-def test_m3_opt_in_changed_input_graph(m3_routes, opus_dispatch, monkeypatch, aux):
-    ids, weights = m3_routes
+@pytest.mark.parametrize("tokens", [8192, 8193, 32768, 65536, 65537, 131073, 262144])
+def test_m3_opt_in_changed_input_graph(opus_dispatch, monkeypatch, aux, tokens):
+    ids, weights = _routes(tokens)
     original = tiled.tiled_sort
     calls = []
 
@@ -170,7 +178,7 @@ def test_m3_opt_in_changed_input_graph(m3_routes, opus_dispatch, monkeypatch, au
     with torch.cuda.graph(graph):
         captured = run(True)
     for seed, skew in [(7, True), (11, False)]:
-        new_ids, new_weights = _routes(32768, seed, skew)
+        new_ids, new_weights = _routes(tokens, seed, skew)
         assert not torch.equal(ids, new_ids) and not torch.equal(weights, new_weights)
         ids.copy_(new_ids)
         weights.copy_(new_weights)
@@ -269,11 +277,12 @@ def test_m3_gate_rejects_other_arch(m3_routes, monkeypatch):
     )
 
 
-def test_non_m3_opt_in_retains_native_sort(opus_dispatch, monkeypatch):
-    ids, weights = _routes(2039, seed=19)
+@pytest.mark.parametrize("tokens", [16, 2039, 4097, 8191])
+def test_below_threshold_opt_in_retains_native_sort(opus_dispatch, monkeypatch, tokens):
+    ids, weights = _routes(tokens, seed=19)
 
     def unexpected(*args, **kwargs):
-        pytest.fail("decode/other prefill shape must retain native sorting")
+        pytest.fail("below-threshold input must retain native sorting")
 
     monkeypatch.setattr(tiled, "tiled_sort", unexpected)
     result = fm.moe_sorting(
@@ -288,6 +297,24 @@ def test_non_m3_opt_in_retains_native_sort(opus_dispatch, monkeypatch):
         use_tiled_sort=True,
     )
     _assert_result(ids, weights, result, 64, True)
+
+
+@pytest.mark.parametrize("tokens", [0, 2**24])
+def test_m3_gate_rejects_invalid_token_extent(monkeypatch, tokens):
+    # Only metadata is inspected; no large input needs to be initialized.
+    ids = torch.empty((tokens, 5), dtype=torch.int32, device="cuda")
+    weights = torch.empty((tokens, 5), dtype=torch.float32, device="cuda")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid packed token extent launched tiled sorting")
+
+    monkeypatch.setattr(tiled, "tiled_sort", unexpected)
+    assert (
+        tiled.try_m3_tiled_sort(
+            ids, weights, EXPERTS, MODEL_DIM, torch.bfloat16, 64, accumulate=False
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("supplied_output", [False, True])
@@ -324,10 +351,11 @@ def test_default_and_supplied_output_keep_legacy_dispatch(
     )
 
 
-def test_fused_moe_m3_tiled_sort_is_exact(m3_routes, opus_dispatch, monkeypatch):
+@pytest.mark.parametrize("tokens", [8192, 32768, 65537])
+def test_fused_moe_m3_tiled_sort_is_exact(opus_dispatch, monkeypatch, tokens):
     """The route-reduce consumer must receive identical sorted data and scales."""
     torch.manual_seed(921)
-    tokens, hidden, intermediate = 32768, MODEL_DIM, 768
+    hidden, intermediate = MODEL_DIM, 768
     x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device="cuda")
     quant = get_hip_quant(QuantType.per_1x32)
     activation, activation_scale = quant(x, quant_dtype=dtypes.fp4x2)
@@ -345,7 +373,7 @@ def test_fused_moe_m3_tiled_sort_is_exact(m3_routes, opus_dispatch, monkeypatch)
     s2 = torch.full(
         (EXPERTS, hidden, intermediate // 32), 120, dtype=torch.uint8, device="cuda"
     ).view(dtypes.fp8_e8m0)
-    ids, weights = m3_routes
+    ids, weights = _routes(tokens)
     original = tiled.tiled_sort
     calls = []
 

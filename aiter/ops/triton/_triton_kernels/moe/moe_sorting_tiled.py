@@ -74,10 +74,59 @@ def _prefix(
     tl.store(NumValid + 1, T)
 
 
+@triton.jit(repr=make_kernel_repr("_prefix_tiles", ["NT", "BN", "num_warps"]))
+def _prefix_tiles(
+    Counts,
+    TileOffsets,
+    ExpertCounts,
+    NT: tl.constexpr,
+    BN: tl.constexpr,
+):
+    expert = tl.program_id(0)
+    tile = tl.arange(0, BN)
+    counts = tl.load(Counts + expert * NT + tile, mask=tile < NT, other=0)
+    tile_ends = tl.cumsum(counts, axis=0)
+    tl.store(TileOffsets + expert * NT + tile, tile_ends - counts, mask=tile < NT)
+    tl.store(ExpertCounts + expert, tl.sum(counts, axis=0))
+
+
+@triton.jit(
+    repr=make_kernel_repr("_prefix_experts", ["T", "E", "UNIT", "BE", "num_warps"])
+)
+def _prefix_experts(
+    ExpertCounts,
+    ExpertOffsets,
+    NumValid,
+    T: tl.constexpr,
+    E: tl.constexpr,
+    UNIT: tl.constexpr,
+    BE: tl.constexpr,
+):
+    expert = tl.arange(0, BE)
+    counts = tl.load(ExpertCounts + expert, mask=expert < E, other=0)
+    padded = tl.cdiv(counts, UNIT) * UNIT
+    expert_ends = tl.cumsum(padded, axis=0)
+    tl.store(ExpertOffsets + expert, expert_ends - padded, mask=expert < E)
+    tl.store(NumValid, tl.sum(padded, axis=0))
+    tl.store(NumValid + 1, T)
+
+
 @triton.jit(
     repr=make_kernel_repr(
         "_scatter",
-        ["T", "K", "E", "NT", "UNIT", "TILE", "BI", "AUX", "num_warps", "num_stages"],
+        [
+            "T",
+            "K",
+            "E",
+            "NT",
+            "UNIT",
+            "TILE",
+            "BI",
+            "AUX",
+            "LOCAL_OFFSETS",
+            "num_warps",
+            "num_stages",
+        ],
     )
 )
 def _scatter(
@@ -99,6 +148,7 @@ def _scatter(
     TILE: tl.constexpr,
     BI: tl.constexpr,
     AUX: tl.constexpr,
+    LOCAL_OFFSETS: tl.constexpr,
 ):
     expert = tl.program_id(0)
     tile = tl.program_id(1)
@@ -109,6 +159,9 @@ def _scatter(
     selected = valid & (ids == expert)
     local_end = tl.cumsum(selected.to(tl.int32), axis=0)
     tile_start = tl.load(TileOffsets + expert * NT + tile)
+    expert_start = tl.load(ExpertOffsets + expert)
+    if LOCAL_OFFSETS:
+        tile_start += expert_start
     destination = tile_start + local_end - 1
     token = positions // K
     slot = positions % K
@@ -120,7 +173,6 @@ def _scatter(
         tl.store(MIndices + destination, token, mask=selected)
         tl.store(Reverse + positions, destination, mask=selected)
 
-    expert_start = tl.load(ExpertOffsets + expert)
     count = tl.load(ExpertCounts + expert)
     padded_count = tl.cdiv(count, UNIT) * UNIT
     # Disjoint metadata writes. No atomics and no device-wide synchronization.
