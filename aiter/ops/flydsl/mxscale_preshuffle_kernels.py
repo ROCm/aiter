@@ -84,6 +84,7 @@ def flydsl_mxscale_preshuffle_gemm(
     xcd_swizzle: int = 0,
     split_k: int = 1,
     blockscale: bool = True,
+    splitk_workspace: torch.Tensor | None = None,
     stream=None,
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
@@ -260,7 +261,21 @@ def flydsl_mxscale_preshuffle_gemm(
         return Out
 
     # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
-    tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    # A caller-owned slab keeps the address stable for CUDA-graph replay.
+    if splitk_workspace is None:
+        tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    else:
+        if (
+            splitk_workspace.shape != (split_k, M, N)
+            or splitk_workspace.dtype != torch.float32
+            or splitk_workspace.device != A.device
+            or not splitk_workspace.is_contiguous()
+        ):
+            raise ValueError(
+                "splitk_workspace must be contiguous float32 on A's device "
+                f"with shape {(split_k, M, N)}"
+            )
+        tmp = splitk_workspace
     if isinstance(st, torch.cuda.Stream):
         tmp.record_stream(st)
     tmp_ptr = ptr_arg(tmp)
@@ -404,4 +419,170 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kerne
         xcd_swizzle=p["xcd_swizzle"],
         split_k=p["split_k"],
         blockscale=True,
+    )
+
+
+def _mx_scale_nbytes(rows: int, k: int) -> int:
+    return ((rows + 31) // 32 * 32) * (k // 32)
+
+
+_TUNED_CACHE: dict = {}
+
+
+def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
+    """Look up an exact (gfx, CU, shape, operand dtype) row."""
+    import pandas as pd
+
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+    tune_file = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE
+    if tune_file not in _TUNED_CACHE:
+        try:
+            frame = pd.read_csv(tune_file).drop_duplicates()
+            _TUNED_CACHE[tune_file] = frame.set_index(
+                ["gfx", "cu_num", "M", "N", "K", "a_dtype", "b_dtype"]
+            ).to_dict("index")
+        except (FileNotFoundError, KeyError, ValueError, pd.errors.EmptyDataError):
+            _TUNED_CACHE[tune_file] = None
+    table = _TUNED_CACHE[tune_file]
+    if not table:
+        return None
+    return table.get((get_gfx_runtime(), get_cu_num(), M, N, K, a_dtype, b_dtype))
+
+
+def get_mxscale_preshuffle_config(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp8",
+    tuned_file=None,
+):
+    """Return only an exact per-1x32 MX tune row; never approximate a signature."""
+    return _lookup_tuned(
+        int(M), int(N), int(K), a_dtype, b_dtype, tuned_file=tuned_file
+    )
+
+
+def gemm_mxscale_preshuffle(
+    A,
+    B,
+    a_scale,
+    b_scale,
+    Out,
+    *,
+    a_dtype,
+    b_dtype,
+    tile_m=None,
+    tile_n=None,
+    tile_k=None,
+    waves_per_eu=None,
+    xcd_swizzle=None,
+    split_k=None,
+    config=None,
+    require_tuned=False,
+    splitk_workspace=None,
+    stream=None,
+):
+    """Dispatch a per-1x32 MX preshuffle GEMM (blockscale=False).
+
+    The shared ``flydsl_mxscale_preshuffle_gemm`` defaults to coarse blockscale.
+    This entry is the MiniMax dense path: packed A, shuffled B, and
+    ``shuffle_scale_a16w4`` scales. Exact CSV rows win; ``require_tuned`` refuses
+    a heuristic when the signature is missing.
+    """
+    M = int(A.shape[0])
+    N = int(Out.shape[-1])
+    K = int(A.shape[-1]) * (2 if a_dtype == "fp4" else 1)
+
+    explicit_tiles = (tile_m, tile_n, tile_k)
+    if any(value is not None for value in explicit_tiles) and not all(
+        value is not None for value in explicit_tiles
+    ):
+        raise ValueError("tile_m, tile_n, and tile_k must be provided together")
+
+    if tile_m is None:
+        cfg = config if config is not None else _lookup_tuned(M, N, K, a_dtype, b_dtype)
+        if cfg is not None and cfg.get("kernelName"):
+            from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+                parse_kernel_name,
+            )
+
+            parsed = parse_kernel_name(cfg["kernelName"])
+            if parsed is not None:
+                out_dtype = _OUT_DTYPE_STR.get(Out.dtype)
+                encoded_signature = (
+                    parsed["a_dtype"],
+                    parsed["b_dtype"],
+                    parsed["out_dtype"],
+                )
+                runtime_signature = (a_dtype, b_dtype, out_dtype)
+                if encoded_signature != runtime_signature:
+                    raise ValueError(
+                        f"kernelName {cfg['kernelName']!r} encodes "
+                        f"{encoded_signature}, expected {runtime_signature}"
+                    )
+                tile_m = parsed["tile_m"]
+                tile_n = parsed["tile_n"]
+                tile_k = parsed["tile_k"]
+                if waves_per_eu is None:
+                    waves_per_eu = parsed["waves_per_eu"]
+                if xcd_swizzle is None:
+                    xcd_swizzle = parsed["xcd_swizzle"]
+                if split_k is None:
+                    split_k = parsed["split_k"]
+        if tile_m is None and require_tuned:
+            raise RuntimeError(
+                "no exact mxscale_preshuffle tune for "
+                f"M={M}, N={N}, K={K}, a_dtype={a_dtype}, b_dtype={b_dtype}"
+            )
+        if tile_m is None:
+            instance = _heuristic_tile(a_dtype, b_dtype, M, N, K)
+            if instance is None:
+                raise ValueError(
+                    f"no legal tile for M={M} N={N} K={K} "
+                    f"{a_dtype}/{b_dtype}; pass tile_m/n/k explicitly"
+                )
+            tile_m = instance.tile_m
+            tile_n = instance.tile_n
+            tile_k = instance.tile_k
+            if waves_per_eu is None:
+                waves_per_eu = instance.waves_per_eu
+            if xcd_swizzle is None:
+                xcd_swizzle = instance.xcd_swizzle
+            if split_k is None:
+                split_k = instance.split_k
+
+    expected_a_scale = _mx_scale_nbytes(M, K)
+    expected_b_scale = _mx_scale_nbytes(N, K)
+    if a_scale.numel() * a_scale.element_size() != expected_a_scale:
+        raise ValueError(
+            f"a_scale nbytes {a_scale.numel() * a_scale.element_size()} != "
+            f"ceil(M/32)*32*(K/32) ({expected_a_scale} bytes)"
+        )
+    if b_scale.numel() * b_scale.element_size() != expected_b_scale:
+        raise ValueError(
+            f"b_scale nbytes {b_scale.numel() * b_scale.element_size()} != "
+            f"ceil(N/32)*32*(K/32) ({expected_b_scale} bytes)"
+        )
+
+    return flydsl_mxscale_preshuffle_gemm(
+        A,
+        B,
+        a_scale,
+        b_scale,
+        Out,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        waves_per_eu=0 if waves_per_eu is None else waves_per_eu,
+        xcd_swizzle=0 if xcd_swizzle is None else xcd_swizzle,
+        split_k=1 if split_k is None else split_k,
+        blockscale=False,
+        splitk_workspace=splitk_workspace,
+        stream=stream,
     )

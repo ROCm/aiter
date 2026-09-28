@@ -103,6 +103,14 @@ _LAZY_IMPORTS = {
         ".gemm_kernels",
         "flydsl_preshuffle_gemm_a8",
     ),
+    "gemm_mxscale_preshuffle": (
+        ".mxscale_preshuffle_kernels",
+        "gemm_mxscale_preshuffle",
+    ),
+    "get_mxscale_preshuffle_config": (
+        ".mxscale_preshuffle_kernels",
+        "get_mxscale_preshuffle_config",
+    ),
     "flydsl_qk_norm_rope_quant": (
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
@@ -152,6 +160,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gemm_mxscale_preshuffle",
+    "get_mxscale_preshuffle_config",
     "make_fp4_mqa_plan",
     "pa_decode",
 ]
