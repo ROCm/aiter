@@ -22,6 +22,7 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 
+from . import trace as _trace
 from .gemm2 import (
     _resolve_g2_knobs,
     _spart_output_tile_index,
@@ -372,7 +373,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
         f"_rps{int(runtime_pair_skip)}_rtv3{int(runtime_pair_skip)}"
         f"_sv{scatter_vec}_tb2_rsm1"
+        f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
+    TRACE_BASE = _trace.trace_base("stage2")
 
     # fmt: off
     @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
@@ -387,6 +390,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         bx_i32 = fx.block_idx.x
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        if const_expr(TRACE_BASE):
+            if tx_i32 == fx.Int32(0):
+                _trace.record(TRACE_BASE, bx_i32, 1, _trace.now())
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
@@ -606,6 +612,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 fx.barrier()  # separate prev-iter epilog LDS reads from this iter's A-load into the LDS union
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unskipped_unit(unit_bx, m_block)
+
+        if const_expr(TRACE_BASE):
+            if tx_i32 == fx.Int32(0):
+                _trace.record(TRACE_BASE, bx_i32, 5, _trace.now())
 
     # fmt: off
     @flyc.jit

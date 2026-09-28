@@ -3,6 +3,7 @@
 """Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -25,6 +26,7 @@ from .dispatch import (
     emit_direct_fixed_slot_payload,
     emit_dispatch_payload,
 )
+from . import trace as _trace
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
@@ -210,6 +212,15 @@ def compile_mega_moe_stage1(
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
 
+    # The fixed-slot LAUNCH_READY round trip only orders this invocation's remote
+    # payload writes after every peer finished reading the previous one.  When
+    # each Stage1 is followed by Stage2 + combine_no_stage1 on every rank, the
+    # combine's cross-device barrier already provides that edge (a peer cannot
+    # enter combine before its own Stage1 consumers retire).  Keep it for any
+    # other call sequence (for example Stage1-only benchmarks).
+    LAUNCH_HANDSHAKE = not fixed_slot_dispatch or (
+        os.environ.get("AITER_MEGA_S1_LAUNCH_HANDSHAKE", "1") == "1"
+    )
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
@@ -225,7 +236,10 @@ def compile_mega_moe_stage1(
         f"_rc31_wb{WORK_BATCH}_adaptive"
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
+        f"{'' if LAUNCH_HANDSHAKE else '_nohs'}"
+        f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
+    TRACE_BASE = _trace.trace_base("stage1")
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
     def kernel(
@@ -236,6 +250,7 @@ def compile_mega_moe_stage1(
         addr_expected: fx.Int64,
     ):
         tid = fx.thread_idx.x
+        t_entry = _trace.now() if const_expr(TRACE_BASE) else fx.Int64(0)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_buf = lds.pool
         a_scale_lds = lds.A_scale
@@ -317,19 +332,20 @@ def compile_mega_moe_stage1(
                 launch_epoch = fx.Int32(
                     fx.rocdl.readfirstlane(T.i32, launch_epoch_lane)
                 )
-                if tid < fx.Int32(fz_npes):
-                    peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
-                    comm_ops.fence_system_release()
-                    launch_ready_table = ptr_buf_tensor(p_launch_ready, fx.Int64)
-                    remote_launch_ready = launch_ready_table[peer]
-                    comm_ops.store_i32_system(
-                        remote_launch_ready, fx.Int32(fz_rank), launch_epoch
-                    )
-                    comm_ops.wait_i32_until_greater_than(
-                        a_launch_ready + fx.Int64(peer) * fx.Int64(4),
-                        launch_epoch - fx.Int32(1),
-                    )
-                    comm_ops.fence_system_acquire()
+                if const_expr(LAUNCH_HANDSHAKE):
+                    if tid < fx.Int32(fz_npes):
+                        peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
+                        comm_ops.fence_system_release()
+                        launch_ready_table = ptr_buf_tensor(p_launch_ready, fx.Int64)
+                        remote_launch_ready = launch_ready_table[peer]
+                        comm_ops.store_i32_system(
+                            remote_launch_ready, fx.Int32(fz_rank), launch_epoch
+                        )
+                        comm_ops.wait_i32_until_greater_than(
+                            a_launch_ready + fx.Int64(peer) * fx.Int64(4),
+                            launch_epoch - fx.Int32(1),
+                        )
+                        comm_ops.fence_system_acquire()
                 if tid == fx.Int32(0):
                     work_head_rsrc = ptr_buf_tensor(a_work_head, fx.Int32)
                     for shard in range_constexpr(WORK_SHARDS):
@@ -355,6 +371,12 @@ def compile_mega_moe_stage1(
                     comm_ops.fence_agent_acquire()
                 fx.barrier()
 
+        if const_expr(TRACE_BASE):
+            if tid == fx.Int32(0):
+                role = is_owner.select(fx.Int32(1), is_producer.select(fx.Int32(2), fx.Int32(3)))
+                _trace.record(TRACE_BASE, fx.block_idx.x, 0, fx.Int64(ticket) | (fx.Int64(role) << fx.Int64(32)))
+                _trace.record(TRACE_BASE, fx.block_idx.x, 1, t_entry)
+                _trace.record(TRACE_BASE, fx.block_idx.x, 2, _trace.now())
         payload_parity = buf_copy_load(
             parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE
         )
@@ -427,6 +449,9 @@ def compile_mega_moe_stage1(
             addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
             addr_tile_ready = addr_tile_ready + tile_state_byte_offset
             addr_tile_expected = addr_tile_expected + tile_state_byte_offset
+        if const_expr(TRACE_BASE):
+            if tid == fx.Int32(0):
+                _trace.record(TRACE_BASE, fx.block_idx.x, 3, _trace.now())
         wave_id = fx.thread_idx.x // 64
 
         w_rsrc = ptr_buf_tensor(fx.get_iter(w), fx.Int32, unit_elems=4)
@@ -486,6 +511,9 @@ def compile_mega_moe_stage1(
             else:
                 comm_ops.fence_agent_acquire()
         fx.barrier()
+        if const_expr(TRACE_BASE):
+            if tid == fx.Int32(0):
+                _trace.record(TRACE_BASE, fx.block_idx.x, 4, _trace.now())
 
         num_valid = nv_rsrc[fx.Int32(0)]
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
@@ -611,6 +639,9 @@ def compile_mega_moe_stage1(
                     comm_ops.fence_system_acquire()
             _run_work_batch(first_work, scheduled_first)
             consumer_active = first_work < total_work
+        if const_expr(TRACE_BASE):
+            if tid == fx.Int32(0):
+                _trace.record(TRACE_BASE, fx.block_idx.x, 5, _trace.now())
 
     spec = _Stage1KernelSpec(
         kernel, launch_grid_x, TOTAL_THREADS, waves_per_eu_hint

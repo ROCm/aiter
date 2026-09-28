@@ -86,6 +86,23 @@ class MegaMoEV2:
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
             max_total_recv_tokens=self.world_size)
         # fmt: on
+        # Tuning aid: combine launch geometry by token count,
+        # "<min_tokens>:<blocks>,<warps>;..." (largest matching min_tokens wins;
+        # unmatched sizes use the tuning table). Without -1 masking the table is
+        # within 0.5% of the best geometry measured at 2K-8K tokens per rank.
+        self._combine_geom_rules = sorted(
+            (
+                (int(tok), tuple(int(v) for v in geom.split(",")))
+                for tok, geom in (
+                    rule.split(":")
+                    for rule in os.environ.get(
+                        "AITER_MEGA_COMBINE_GEOM", ""
+                    ).split(";")
+                    if rule
+                )
+            ),
+            reverse=True,
+        )
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
@@ -646,9 +663,16 @@ class MegaMoEV2:
         *,
         config=None,
         prepared=False,
+        mask_invalid_slots=None,
     ):
         if config is None:
             config = self._select_config(run_tokens)
+        # Combine skips top-k slots with id -1 (never dispatched, so their partial
+        # is stale). The check costs 9-12% of a prefill layer, so it runs only
+        # when the caller says ids may be -1.
+        if mask_invalid_slots is None:
+            mask_invalid_slots = self._combine_mask
+        self._g2_topk_ids = topk_ids if mask_invalid_slots else None
         self._run_fused_stage1(
             x,
             wts,
@@ -681,7 +705,11 @@ class MegaMoEV2:
             )
         return out_tok[:run_tokens] if slice_output else out_tok
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
+        """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
+        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -694,7 +722,8 @@ class MegaMoEV2:
         if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
+                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
             )
 
         config = self._select_config(run_tokens)
@@ -722,13 +751,19 @@ class MegaMoEV2:
             slice_output,
             config=config,
             prepared=True,
+            mask_invalid_slots=mask_invalid_slots,
         )
 
-    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward_prequant(
+        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        return self._run_joint(
+            x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+            mask_invalid_slots=mask_invalid_slots,
+        )
 
     forward_bf16 = forward
     __call__ = forward
@@ -744,6 +779,11 @@ class MegaMoEV2:
         )
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
+        # forward(mask_invalid_slots=...) masks -1 top-k slots in combine; this is
+        # the default when the caller does not say.
+        self.supports_combine_mask = True
+        self._combine_mask = os.environ.get("AITER_MEGA_COMBINE_MASK", "0") == "1"
+        self._g2_topk_ids = None
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
         k = comb_cfg.num_experts_per_token
@@ -776,6 +816,12 @@ class MegaMoEV2:
         self._g2_combine_placeholder = torch.empty(
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
         )
+
+    def _combine_geometry(self, tokens: int):
+        for min_tokens, geometry in self._combine_geom_rules:
+            if tokens >= min_tokens:
+                return geometry
+        return None
 
     def _fused_stage2_call(self, launcher, config, stream, *, runtime_pair_skip, scatter_vec):
         """Invoke one normal Stage2 variant through its shared ABI."""
@@ -911,6 +957,16 @@ class MegaMoEV2:
                 cur_tok=entry.token_bucket,
                 enable_weights=False,
                 stage2_p2p_quant=entry.config.p2p_quant,
+                mask_topk_ids=False,
+                geometry=self._combine_geometry(entry.token_bucket),
+            )
+            self.comb_op.preload_combine_no_stage1(
+                self._g2_combine_placeholder,
+                cur_tok=entry.token_bucket,
+                enable_weights=False,
+                stage2_p2p_quant=entry.config.p2p_quant,
+                mask_topk_ids=True,
+                geometry=self._combine_geometry(entry.token_bucket),
             )
 
     def _run_fused_stage2(
@@ -940,8 +996,9 @@ class MegaMoEV2:
         if not combine:
             return None
         return comb_op.combine_no_stage1(
-            self._g2_combine_placeholder, None, None, cur_tok=run_tokens, enable_weights=False,
-            stage2_p2p_quant=p2p_quant,
+            self._g2_combine_placeholder, None, self._g2_topk_ids, cur_tok=run_tokens,
+            enable_weights=False, stage2_p2p_quant=p2p_quant,
+            geometry=self._combine_geometry(run_tokens),
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -986,9 +1043,10 @@ class MegaMoEV2:
         result = self.comb_op.combine_no_stage1(
             self._g2_combine_placeholder,
             None,
-            None,
+            self._g2_topk_ids,
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,
+            geometry=self._combine_geometry(run_tokens),
         )
         return self._stage2_output(result, run_tokens, slice_output)

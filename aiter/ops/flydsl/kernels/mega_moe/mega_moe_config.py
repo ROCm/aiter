@@ -2,6 +2,8 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
+import json
+import os
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from functools import cache
@@ -25,7 +27,9 @@ TOKEN_BUCKETS = (
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-FIXED_SLOT_MAX_MTPR = 255
+# Fixed-slot (direct expert slots, no count exchange) is validated up to MTPR 128;
+# AITER_MEGA_FIXED_SLOT_MAX_MTPR=511 also admits the 256-token capacity.
+FIXED_SLOT_MAX_MTPR = int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", "255"))
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer
 # by roughly ``topk``.  Keep every smaller capacity on the historical layout.
@@ -349,8 +353,50 @@ def _select_large_stage2(
     )
 
 
+def _config_overrides():
+    """Parse AITER_MEGA_CFG_OVERRIDE (tuning aid).
+
+    JSON ``{"<path>:<bucket>": {"stage1": {...}, "stage2": {...}, "p2p_quant": ...}}``
+    where ``<path>`` is ``fixed``, ``bounded`` or ``large`` and ``<bucket>`` a
+    token bucket or ``*``.  Fields replace the selected defaults.
+    """
+    raw = os.environ.get("AITER_MEGA_CFG_OVERRIDE", "")
+    return json.loads(raw) if raw else {}
+
+
+def _apply_override(config: MegaMoEConfig, path: str, bucket: int) -> MegaMoEConfig:
+    overrides = _config_overrides()
+    for key in (f"{path}:*", f"{path}:{bucket}"):
+        patch = overrides.get(key)
+        if not patch:
+            continue
+        config = MegaMoEConfig(
+            stage1=replace(config.stage1, **patch.get("stage1", {})),
+            stage2=replace(config.stage2, **patch.get("stage2", {})),
+            p2p_quant=patch.get("p2p_quant", config.p2p_quant),
+        )
+    return config
+
+
 @cache
 def _select_bucket_config(
+    bucket: int,
+    mtpr_class: int,
+    model_dim: int,
+    inter_dim: int,
+    fixed_slot_dispatch: bool,
+) -> MegaMoEConfig:
+    config = _select_default_bucket_config(
+        bucket, mtpr_class, model_dim, inter_dim, fixed_slot_dispatch
+    )
+    if mtpr_class == MAX_MTPR_CLASS:
+        path = "large"
+    else:
+        path = "fixed" if fixed_slot_dispatch else "bounded"
+    return _apply_override(config, path, bucket)
+
+
+def _select_default_bucket_config(
     bucket: int,
     mtpr_class: int,
     model_dim: int,
@@ -405,7 +451,7 @@ def select_mega_moe_config(
         and world_size == 8
         and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
     )
-    if fixed_slot_dispatch and bucket > 128:
+    if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
     total_segments = world_size * experts_per_rank + world_size
     if total_segments > MAX_FANOUT_SEGMENTS:

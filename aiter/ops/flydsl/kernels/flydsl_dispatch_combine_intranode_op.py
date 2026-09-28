@@ -1250,7 +1250,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         return cur_tok
 
     def _run_combine_kernel(
-        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream
+        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream,
+        tok_map_ptr=None,
     ):
         """Compile once and reuse the cached combine launcher."""
         fixed = (
@@ -1258,7 +1259,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_comb_out,
             self._fx_xdb_mem,
             self._fx_xdev_flag,
-            self._fx_tok_map,
+            self._fx_tok_map if tok_map_ptr is None else fx.Int64(tok_map_ptr),
             self._fx_comb_bar,
             self._fx_trecv,
             self._fx_out_shmem_tok_id_to_src,
@@ -1302,8 +1303,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights,
         skip_stage1,
         stage2_p2p_quant=None,
+        geometry=None,
     ):
-        """Launch regular or skip-stage1 combine."""
+        """Launch regular or skip-stage1 combine.
+
+        ``geometry``: optional (block_num, warp_num_per_block) for this call,
+        overriding cfg and the tuning table.
+        """
         cfg = self.cfg
         stream = torch.cuda.current_stream()
         # skip_stage1 treats input as a placeholder -> relax the dtype check.
@@ -1325,6 +1331,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 f"Supported: {_SUPPORTED_STAGE2_P2P_QUANT_TYPES}"
             )
         blockwise_fp8 = skip_stage1 and p2p_quant == "fp8_blockwise_1x32"
+        # Fused-upstream combine: top-k ids mask never-dispatched (-1) slots.
+        mask_topk_ids = skip_stage1 and indices is not None and not cfg.zero_copy
+        if mask_topk_ids and (
+            indices.dtype != torch.int32 or not indices.is_contiguous()
+        ):
+            raise ValueError("combine_no_stage1 indices must be contiguous int32")
         if skip_stage1:
             # placeholder input: pre-cast to fp8 so the kernel dtype + out view match.
             if fp8_dc and input.dtype != torch.float8_e4m3fn:
@@ -1351,8 +1363,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         # Resolve geometry on cur_tok, not input.shape[0] (ws*M under zero_copy).
         bn, wpb = _resolve_launch_geometry(
             "combine",
-            cfg.combine_block_num,
-            cfg.combine_warp_num_per_block,
+            cfg.combine_block_num if geometry is None else geometry[0],
+            cfg.combine_warp_num_per_block if geometry is None else geometry[1],
             cfg.tuning_table,
             _cur_tok,
             _DEFAULT_COMBINE_BLOCK_NUM,
@@ -1385,6 +1397,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bn,
             wpb,
             bool(skip_stage1),
+            bool(mask_topk_ids),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1405,6 +1418,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 blockwise_fp8_transport=bool(blockwise_fp8),
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
+                mask_topk_ids=bool(mask_topk_ids),
             )
             self._comb_jit_cache[key] = fn
         self._run_combine_kernel(
@@ -1416,6 +1430,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             prx_ptr,
             _cur_tok,
             stream,
+            tok_map_ptr=indices.data_ptr() if mask_topk_ids else None,
         )
 
         mt = cfg.max_num_inp_token_per_rank
@@ -1461,8 +1476,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cur_tok=None,
         enable_weights: bool = True,
         stage2_p2p_quant=None,
+        geometry=None,
     ):
-        """Run combine after fused GEMM2 has populated the P2P input."""
+        """Run combine after fused GEMM2 has populated the P2P input.
+
+        ``indices``: optional int32 [cur_tok, topk] top-k ids; slots with id -1
+        (never dispatched) are skipped instead of summing a stale partial.
+        """
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
             raise NotImplementedError(
                 "combine_no_stage1 is reserved for the fused GEMM2+combine "
@@ -1479,6 +1499,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             enable_weights=enable_weights,
             skip_stage1=True,
             stage2_p2p_quant=stage2_p2p_quant,
+            geometry=geometry,
         )
 
     def preload_combine_no_stage1(
@@ -1488,6 +1509,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cur_tok,
         enable_weights: bool = False,
         stage2_p2p_quant=None,
+        mask_topk_ids: bool = False,
+        geometry=None,
     ):
         """Compile and load one fused-Stage2 combine geometry without launching it."""
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
@@ -1508,8 +1531,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
         block_num, warp_num = _resolve_launch_geometry(
             "combine",
-            cfg.combine_block_num,
-            cfg.combine_warp_num_per_block,
+            cfg.combine_block_num if geometry is None else geometry[0],
+            cfg.combine_warp_num_per_block if geometry is None else geometry[1],
             cfg.tuning_table,
             _cur_tok,
             _DEFAULT_COMBINE_BLOCK_NUM,
@@ -1525,6 +1548,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             block_num,
             warp_num,
             True,
+            bool(mask_topk_ids),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1544,6 +1568,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
                 max_recv=self._effective_max_recv,
+                mask_topk_ids=bool(mask_topk_ids),
             )
             self._comb_jit_cache[key] = fn
         fixed = (
