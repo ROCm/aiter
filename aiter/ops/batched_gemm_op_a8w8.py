@@ -204,7 +204,13 @@ def lookup_mxscale_bmm_config(
     from .opus.policy import lookup_mxscale_bmm_config as lookup
 
     return lookup(
-        b, m, n, k, w_scale_block=w_scale_block, libtype=libtype, bpreshuffle=bpreshuffle
+        b,
+        m,
+        n,
+        k,
+        w_scale_block=w_scale_block,
+        libtype=libtype,
+        bpreshuffle=bpreshuffle,
     )
 
 

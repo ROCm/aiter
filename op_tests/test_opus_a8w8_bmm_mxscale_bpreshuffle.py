@@ -110,13 +110,13 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
         break
 
     # The public entry end to end: guarded custom op -> the preshuffle table
-    # (the entry picks that one, nothing to set) -> a kid that wants the shuffled
-    # weight, tuned or, for a shape the table lacks, the fallback one.
+    # (the entry picks that one, nothing to set) -> the row's backend, opus or
+    # flydsl, or flydsl's heuristic for a shape the table lacks.
     err_pub = None
     if split_k == 1:  # the entry defaults splitK, so only compare where they agree
         err_pub = _rel_err(
             batched_gemm_a8w8_mxscale_bpreshuffle(
-                O_in, W_sh, xs_in, ws_mx, dtype=ydt
+                O_in.contiguous(), W_sh, xs_in.contiguous(), ws_mx, dtype=ydt
             ),
             ref,
         )
@@ -448,8 +448,10 @@ def _check_dispatch():
         got = _resolve(row, b_preshuffled, group, n_)
         good = want(got)
         ok &= good
-        shown = "ValueError" if isinstance(got, ValueError) else (
-            "flydsl" if got == "flydsl" else f"kid{got}"
+        shown = (
+            "ValueError"
+            if isinstance(got, ValueError)
+            else ("flydsl" if got == "flydsl" else f"kid{got}")
         )
         print(f"  {'ok  ' if good else 'FAIL'} {label}  [{shown}]", flush=True)
     return ok
