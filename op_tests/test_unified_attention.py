@@ -496,6 +496,9 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
             1, 31, 32, 33, 63, 64, 65, 1023,
             1024, 1025, 2047, 4095, 4096, 4097, 8191, 8192,
         ]
+    elif workload in ("decode-b16", "decode-b64"):
+        batch = int(workload.removeprefix("decode-b"))
+        query_lens, kv_lens = [1] * batch, [1025] * batch
     elif workload == "decode-boundary":
         query_lens, kv_lens = [1] * 3, [1023, 1024, 1025]
     elif workload == "window-boundary":
@@ -592,6 +595,7 @@ def main():
         workloads = [
             "prefill64", "prefill1024", "prefill4096",
             "mixed", "decode16", "window-boundary", "decode-boundary",
+            "decode-b16", "decode-b64",
         ]
         rows = [
             test_gfx942_sliding(page, workload)
@@ -610,7 +614,7 @@ def main():
             pd.DataFrame(rows).to_markdown(index=False),
         )
         aiter.logger.info(
-            "PASS: 19 gfx942 direct-launch cases (including forced splits 1/2/5/16); SKIP: eight gfx950-only groups"
+            "PASS: 23 gfx942 direct-launch cases (including forced splits 1/2/5/16); SKIP: eight gfx950-only groups"
         )
         return
     if get_gfx() != "gfx950" or arch != "gfx950":

@@ -5,7 +5,8 @@
 
 M64 packs two query heads per KV head; each wave owns 32 packed rows. K and
 transposed V use two N32 LDS slots. Legacy FP8 MFMA operands contain eight
-FNUZ bytes per lane. This is a direct-launch prototype, not a dispatch target.
+FNUZ bytes per lane. All-decode uses one wave and M16 with N32 staging.
+This is a direct-launch prototype, not a dispatch target.
 """
 
 from functools import lru_cache
@@ -49,6 +50,14 @@ def _mfma(a, b, c):
     )
 
 
+def _mfma16(a, b, c):
+    return fx.Vector(
+        rocdl.mfma_f32_16x16x32_fp8_fp8(
+            fx.Vector.make_type(4, fx.Float32), [a, b, c.ir_value(), 0, 0, 0],
+        )
+    )
+
+
 def _exp2(x):
     return fx.Float32(rocdl.exp2(T.f32, x.ir_value()))
 
@@ -75,11 +84,16 @@ def _decode_splits(batch, max_q, max_k, page_size, cu_count, forced=None):
             raise ValueError("forced split count must be in [1, 16]")
         return forced
     length = min(max_k, 1024) if max_k is not None else 0
-    # The second wave of split workgroups loses to unsplit at B16 on gfx942.
-    if length < 512 or batch >= 16 or batch * 16 >= cu_count:
+    if length < 512:
         return 1
-    return max(1, min(16, (cu_count + batch * 16 - 1) // (batch * 16),
-                      length // 64, (length + page_size - 1) // page_size))
+    # Small batches fill the CUs; large batches shorten the serial KV loop.
+    target = max(1, (cu_count + batch * 16 - 1) // (batch * 16))
+    if batch <= 4:
+        target = 1 << (target - 1).bit_length()
+    elif batch >= 32:
+        target = 4
+    return max(1, min(16, target, length // 64,
+                      (length + page_size - 1) // page_size))
 
 
 @lru_cache(maxsize=32)
@@ -400,6 +414,168 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
             grid=(16, batch, tiles), block=(128, 1, 1), stream=stream
         )
 
+    @fx.struct
+    class DecodeStorage:
+        k: fx.Array[fx.Int8, 32 * 260, 16]
+        v: fx.Array[fx.Int8, 256 * 32, 16]
+
+    @flyc.kernel(known_block_size=(64, 1, 1))
+    def decode(
+        Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
+        CuQ: fx.Tensor, UsedK: fx.Tensor, BT: fx.Tensor,
+        QD: fx.Tensor, KD: fx.Tensor, VD: fx.Tensor,
+        bt_stride: fx.Int32, scale: fx.Float32,
+    ):
+        lane = fx.Int32(gpu.thread_id("x"))
+        row, group = lane % 16, lane // 16
+        head = fx.Int32(gpu.block_id("x"))
+        seq = fx.Int32(gpu.block_id("y"))
+        split = fx.Int32(gpu.block_id("z"))
+        q0 = fx.Int64(fx.memref_load(CuQ, seq))
+        klen = fx.Int32(fx.memref_load(UsedK, seq))
+        lds = fx.SharedAllocator().allocate(DecodeStorage).peek()
+        qp, kp, vp, op = fx.get_iter(Q), fx.get_iter(K), fx.get_iter(V), fx.get_iter(O)
+        btp = fx.get_iter(BT)
+        log_scale = (fx.Float32(fx.memref_load(QD, 0))
+                     * fx.Float32(fx.memref_load(KD, 0)) * scale * 1.4426950408889634)
+        lower = klen - 1024
+        start = (lower > 0).select(lower, fx.Int32(0)) // 32
+        end = (klen + 31) // 32
+        if const_expr(_num_splits > 1):
+            page_lo = start * 32 // page_size
+            page_hi = (end * 32 + page_size - 1) // page_size
+            pages = page_hi - page_lo
+            p0 = page_lo + pages * split // _num_splits
+            p1 = page_lo + pages * (split + 1) // _num_splits
+            start = (start > p0 * (page_size // 32)).select(start, p0 * (page_size // 32))
+            end = (end < p1 * (page_size // 32)).select(end, p1 * (page_size // 32))
+        # Repeat the two valid heads in dead MFMA columns without overreading Q.
+        q_frag = [
+            _load(qp, (q0 * 32 + fx.Int64(head * 2 + row % 2)) * 256
+                  + fx.Int64(depth * 32 + group * 8), T.i64, 8)
+            for depth in range(8)
+        ]
+        init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
+            fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(16)
+        ]
+        for block, state in range(start, end, fx.Int32(1), init=init):
+            block = fx.Int32(block)
+            # An aligned N32 tile never straddles a cache page.
+            page = fx.Int32(_load(
+                btp, (fx.Int64(seq) * fx.Int64(bt_stride)
+                      + fx.Int64(block * 32 // page_size)) * 4, T.i32, 4))
+            ktiles, vtiles = [], []
+            for i in range_constexpr(8):
+                off = lane * 16 + i * 1024
+                token = block * 32 + off // 256
+                d = off % 256
+                safe_token = (token < klen).select(token, block * 32)
+                src = ((fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
+                       * 16 + fx.Int64(head)) * 256 + fx.Int64(d)
+                ktiles.append(_load(kp, src, fx.Vector.make_type(4, fx.Int32), 16))
+                vtiles.append(_load(vp, src, fx.Vector.make_type(4, fx.Int32), 16))
+            rocdl.sched_barrier(0)
+            for i in range_constexpr(8):
+                off = lane * 16 + i * 1024
+                d = off % 256
+                vval = fx.Vector(vtiles[i])
+                _store(lds.k.ptr, (off // 256) * 260 + d, ktiles[i], 4)
+                for j in range_constexpr(4):
+                    word = vval[j]
+                    peer = word.shuffle_xor(fx.Int32(16), fx.Int32(64))
+                    pair = fx.Int32(rocdl.perm_b32(
+                        peer, word, (group % 2 == 0).select(
+                            fx.Int32(0x06020400), fx.Int32(0x03070105))))
+                    peer = pair.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                    packed = rocdl.perm_b32(
+                        peer, pair, (group < 2).select(
+                            fx.Int32(0x05040100), fx.Int32(0x03020706)))
+                    depth = d + j * 4 + group
+                    bank = (depth % 32) ^ (depth // 8)
+                    _store(lds.v.ptr, (depth // 32) * 1024
+                           + ((off // 256) // 4) * 128 + bank * 4, packed, 4)
+            gpu.barrier()
+            scores = []
+            m = fx.Float32(state[0])
+            for n in range_constexpr(2):
+                score = fx.Vector.filled(4, 0.0, fx.Float32)
+                for depth in range_constexpr(8):
+                    a = _load(lds.k.ptr, (n * 16 + row) * 260
+                              + depth * 32 + group * 8, T.i64, 4)
+                    score = _mfma16(a, q_frag[depth], score)
+                for r in range_constexpr(4):
+                    col = block * 32 + n * 16 + group * 4 + r
+                    valid = (col < klen) & (col >= lower)
+                    s = valid.select(score[r] * log_scale, fx.Float32(-1.0e30))
+                    scores.append(s)
+                    m = m.maximumf(s)
+            for shift in (16, 32):
+                m = m.maximumf(m.shuffle_xor(fx.Int32(shift), fx.Int32(64)))
+            correction = _exp2(fx.Float32(state[0]) - m)
+            probs = []
+            psum = fx.Float32(0.0)
+            for r in range_constexpr(8):
+                col = block * 32 + (r // 4) * 16 + group * 4 + r % 4
+                valid = (col < klen) & (col >= lower)
+                p = valid.select(_exp2(scores[r] - m), fx.Float32(0.0))
+                psum = psum + p
+                probs.append(p * 240.0)
+            for shift in (16, 32):
+                psum = psum + psum.shuffle_xor(fx.Int32(shift), fx.Int32(64))
+            denom = fx.Float32(state[1]) * correction + psum
+            words = [_pack4(probs[g * 4 : g * 4 + 4]) for g in range(2)]
+            packed = []
+            for i in range_constexpr(2):
+                mask = (group ^ ((group % 2) * 2 + i)) * 16
+                w0 = words[0].shuffle_xor(mask, fx.Int32(64))
+                w1 = words[1].shuffle_xor(mask, fx.Int32(64))
+                packed.append((group < 2).select(w0, w1))
+            pfrag = fx.Vector.from_elements(packed, fx.Int32).bitcast(fx.Int64)[0]
+            accum = []
+            for dc in range_constexpr(16):
+                depth = dc * 16 + row
+                bank = (depth % 32) ^ (depth // 8)
+                offset = (depth // 32) * 1024 + bank * 4 + group * 256
+                words = [fx.Int32(_load(lds.v.ptr, offset + i * 128, T.i32, 4))
+                         for i in range(2)]
+                vfrag = fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0]
+                o = fx.Vector(state[dc + 2]) * fx.Vector.filled(4, correction, fx.Float32)
+                accum.append(_mfma16(vfrag.ir_value(), pfrag.ir_value(), o))
+            gpu.barrier()
+            result = yield [m, denom] + accum
+        if row < 2:
+            if const_expr(_num_splits > 1):
+                base = (((fx.Int64(seq) * 16 + fx.Int64(head)) * _num_splits
+                         + fx.Int64(split)) * 2 + fx.Int64(row)) * 258
+                for dc in range_constexpr(16):
+                    vals = fx.Vector(result[dc + 2])
+                    for r in range_constexpr(4):
+                        _store(op, (base + fx.Int64(dc * 16 + group * 4 + r)) * 4, vals[r], 4)
+                if group == 0:
+                    denom = fx.Float32(result[1])
+                    maximum = (denom > 0.0).select(fx.Float32(result[0]), fx.Float32(float("-inf")))
+                    _store(op, (base + 256) * 4, maximum, 4)
+                    _store(op, (base + 257) * 4, denom, 4)
+            else:
+                norm = fx.Float32(fx.memref_load(VD, 0)) / (240.0 * fx.Float32(result[1]))
+                for dc in range_constexpr(16):
+                    vals = fx.Vector(result[dc + 2])
+                    for r in range_constexpr(2):
+                        dest = ((q0 * 32 + fx.Int64(head * 2 + row)) * 256
+                                + fx.Int64(dc * 16 + group * 4 + r * 2)) * 2
+                        _store(op, dest, _pack_bf16_pair(vals[r * 2] * norm, vals[r * 2 + 1] * norm), 4)
+
+    @flyc.jit
+    def launch_decode(
+        Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
+        CuQ: fx.Tensor, UsedK: fx.Tensor, BT: fx.Tensor,
+        QD: fx.Tensor, KD: fx.Tensor, VD: fx.Tensor,
+        batch: fx.Int32, tiles: fx.Int32, bt_stride: fx.Int32, scale: fx.Float32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        decode(Q, K, V, O, CuQ, UsedK, BT, QD, KD, VD, bt_stride, scale).launch(
+            grid=(16, batch, tiles), block=(64, 1, 1), stream=stream)
+
     @flyc.kernel(known_block_size=(128, 1, 1))
     def combine(Part: fx.Tensor, O: fx.Tensor, CuQ: fx.Tensor, VD: fx.Tensor):
         tid = fx.Int32(gpu.thread_id("x"))
@@ -524,7 +700,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
             target = workspace.view(-1)[:needed].view(batch, 16, splits, 2, 258)
         # FlyDSL packs each dynamic extent as i32. Preserve axes instead of
         # flattening multi-GiB tensors; global byte offsets remain 64-bit.
-        launch(
+        attention_launch = launch_decode if max_seqlen_q == 1 else launch
+        attention_launch(
             q.view(torch.int8),
             k.view(torch.int8),
             v.view(torch.int8),
