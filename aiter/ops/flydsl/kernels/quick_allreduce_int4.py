@@ -160,7 +160,13 @@ _MESH_DEFAULT = {
 }
 #  ``(min_bytes, super_tile, grid_cap, block, skip_self)``
 MESH_ST_LADDER = {
-    **{("xgmi", ws): rungs for ws, rungs in _MESH_DEFAULT.items()},
+    ("xgmi", 2): ((0, 8, 128, 128, True),),
+    ("xgmi", 4): ((0, 1, 128, 64, True), (1 << 20, 8, 128, 256, True)),
+    ("xgmi", 8): (
+        (0, 8, 128, 256, True),
+        (2 << 20, 8, 128, 256, False),
+        (8 << 20, 8, 128, 512, True),
+    ),
     ("pcie", 2): ((0, 8, 128, 128, True), (6 << 20, 8, 128, 256, True)),
     ("pcie", 4): ((0, 1, 128, 256, True), (768 << 10, 8, 128, 512, True)),
     ("pcie", 8): ((0, 1, 128, 256, True), (96 << 10, 8, 128, 512, True)),

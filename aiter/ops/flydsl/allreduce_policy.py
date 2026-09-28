@@ -87,21 +87,20 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
         oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=24 << 20
     ),
     # --- xGMI: Policy from measurements (on gfx942) --------------------
-    #
     ("xgmi", 2): FamilyPolicy(
-        oneshot_max=512 << 10,
-        oneshot_max_exact=4 << 20,
-        mesh_max=NO_MAX,
+        oneshot_max=384 << 10,
+        oneshot_max_exact=24 << 20,
+        mesh_max=128 << 20,
     ),
     ("xgmi", 4): FamilyPolicy(
-        oneshot_max=512 << 10,
-        oneshot_max_exact=(160 << 10) - 1,
-        mesh_max=NO_MAX,
-    ),
-    ("xgmi", 8): FamilyPolicy(
         oneshot_max=256 << 10,
         oneshot_max_exact=256 << 10,
-        mesh_max=NO_MAX,
+        mesh_max=128 << 20,
+    ),
+    ("xgmi", 8): FamilyPolicy(
+        oneshot_max=192 << 10,
+        oneshot_max_exact=512 << 10,
+        mesh_max=128 << 20,
     ),
 }
 
