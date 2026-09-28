@@ -15,6 +15,32 @@ def is_gluon_supported():
     return _is_gluon_available()
 
 
+def _skip_unsupported_gluon(
+    backend, kernel_type, M, N, K, layout="TN", activation=None
+):
+    """Skip gluon cases that no gluon kernel on this architecture covers."""
+    if backend != "gluon":
+        return
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if "gfx950" in (get_arch() or ""):
+        # gfx950 has one gluon a16w16 kernel: compute_bound, TN, tile-aligned shapes.
+        if kernel_type != "compute_bound":
+            pytest.skip("gfx950 gluon a16w16 has only the compute_bound kernel")
+        if layout != "TN":
+            pytest.skip("gfx950 gluon a16w16 supports the TN layout only")
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+            unsupported_reason,
+        )
+
+        reason = unsupported_reason(M, N, K, activation=activation)
+        if reason:
+            pytest.skip(f"gfx950 gluon a16w16: {reason}")
+        return
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+
+
 def _skip_if_triton_on_gfx1250(backend):
     """gfx1250 only ships gluon-format a16w16 configs, so the triton backend has
     no usable config there; skip the triton backend on gfx1250."""
@@ -78,8 +104,7 @@ def get_x_vals():
 def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K)
     _skip_if_triton_on_gfx1250(backend)
 
     x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
@@ -120,8 +145,7 @@ def test_gemm_a16_w16_activation(
 ):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K, activation=activation)
     _skip_if_triton_on_gfx1250(backend)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -161,8 +185,7 @@ def test_gemm_a16_w16_activation(
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K, layout=layout)
     _skip_if_triton_on_gfx1250(backend)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -243,3 +266,23 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# The gfx950 gluon compute_bound kernel (llirSched-scheduled) at compute-bound shapes,
+# both dtypes, with and without a pre-allocated output.
+@pytest.mark.parametrize(
+    "M, N, K",
+    [(4096, 4096, 8192), (8192, 8192, 8192), (4096, 8192, 4096), (256, 1024, 1024)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound(M: int, N: int, K: int, dtype, output, bias):
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    b = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+    torch_out = F.linear(x, w, bias=b)
+    out = gemm_a16w16(
+        x, w, b, out_dtype, y, backend="gluon", kernel_type="compute_bound"
+    )
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
