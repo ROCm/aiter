@@ -603,17 +603,19 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
                  : "vcc");
 }
 
-// Last KV position the diagonal lets this wave's query rows attend to. Loop-invariant and
-// costs an integer division, so it is evaluated once on entry (the pipelined body inlines
-// this expression); the cheap valid_kv_len bound stays at the point of use instead, where
-// it need not be kept live across the pipeline.
+
 template <typename T>
-__device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_id)
+__device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_id, int lane_id)
 {
-    return (warp_id * T::W_M) / nhead + causal_diagonal;
+    int row = warp_id * T::W_M;
+    if constexpr(T::WAVE_SPANS_TOKENS)
+    {
+        row += lane_id % T::W_M;
+    }
+    return row / nhead + causal_diagonal;
 }
 
-// Masks every score column past `last_valid_kv_pos` to -inf.
+
 template <typename T, typename V>
 __device__ inline void
 attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t neg_inf_v)
@@ -695,7 +697,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
     int diag_kv_bound = 0;
     if constexpr(T::CAUSAL)
     {
-        diag_kv_bound = (warp_id * T::W_M) / kargs.H + causal_diagonal;
+        diag_kv_bound = causal_kv_bound<T>(causal_diagonal, kargs.H, warp_id, lane_id);
     }
 
     const D_K* kv_base = reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr);
@@ -945,17 +947,11 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
-    // Only the tiles that can actually contain invalid columns pay for a mask: the last
-    // partial tile of the request always, and for CAUSAL also the tile holding the
-    // diagonal, which is the range's last one since a decode query attends to its whole
-    // prefix. `bound` is the tighter of the two limits; the diagonal one is per-warp
-    // (readfirstlane'd warp_id) and the rest workgroup-uniform, so it all stays in SGPRs
-    // and the branch is scalar.
     auto mask_oob_scores = [&](auto& s, int tile_idx) {
         bool masked = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
         if constexpr(T::CAUSAL)
         {
-            masked = masked || (tile_idx == tile_end - 1);
+            masked = masked || (tile_idx >= tile_end - 2);
         }
         if(masked)
         {

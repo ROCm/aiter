@@ -78,7 +78,9 @@ def topk_per_row_argmax(
     rows, width = scores.shape
     vec = VEC_BY_ELEM[elem]
     splits = topk_per_row_argmax_splits(rows, width, vec)
-    slice_launch, fold_launch = build_topk_per_row_argmax_module(splits, elem)
+    # The count goes in as an argument, not as a build parameter: it follows the
+    # row count, so keying the build on it is keying it on the batch size.
+    slice_launch, fold_launch = build_topk_per_row_argmax_module(splits == 1, elem)
     stream = torch.cuda.current_stream(scores.device)
     vectors = (width + vec - 1) // vec
 
@@ -94,6 +96,7 @@ def topk_per_row_argmax(
             indices,
             indices,
             vectors,
+            splits,
             rows,
             stream,
         )
@@ -112,6 +115,7 @@ def topk_per_row_argmax(
         part_key,
         part_col,
         vectors,
+        splits,
         rows,
         stream,
     )
@@ -123,6 +127,7 @@ def topk_per_row_argmax(
         part_key,
         part_col,
         vectors,
+        splits,
         rows,
         stream,
     )
