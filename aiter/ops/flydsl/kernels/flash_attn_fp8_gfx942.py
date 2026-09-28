@@ -35,19 +35,6 @@ def _store(ptr, offset, value, alignment):
     )
 
 
-def _qk_offset(row, word):
-    bank_xor = (row % 16) * 2 + (row % 32) // 16
-    return row * 256 + (word ^ (word // 32) ^ bank_xor) * 4
-
-
-def _qk_load(ptr, row, depth, half, base=0):
-    words = [
-        fx.Int32(_load(ptr, base + _qk_offset(row, depth * 4 + half * 2 + i), T.i32, 4))
-        for i in range(2)
-    ]
-    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0].ir_value()
-
-
 def _mfma(a, b, c):
     return fx.Vector(
         rocdl.mfma_f32_32x32x16_fp8_fp8(
@@ -91,8 +78,8 @@ def build_flash_attn_fp8_gfx942(page_size=32):
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[fx.Int8, 64 * 256, 16]
-        k: fx.Array[fx.Int8, 2 * 32 * 256, 16]
+        q: fx.Array[fx.Int8, 64 * 260, 16]
+        k: fx.Array[fx.Int8, 2 * 32 * 260, 16]
         v: fx.Array[fx.Int8, 2 * 256 * 32, 16]
         bt: fx.Array[fx.Int32, 1024, 16]
 
@@ -159,10 +146,9 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     * 256
                     + fx.Int64(d)
                 )
-                data = fx.Vector(_load(qp, src, fx.Vector.make_type(4, fx.Int32), 16))
-                # Dword XOR spreads both coalesced writes and row-wise MFMA reads.
-                for j in range_constexpr(4):
-                    _store(lds.q.ptr, _qk_offset(r, d // 4 + j), data[j], 4)
+                data = _load(qp, src, fx.Vector.make_type(4, fx.Int32), 16)
+                # Like K, an odd dword row stride spreads MFMA reads over all banks.
+                _store(lds.q.ptr, r * 260 + d, data, 4)
             gpu.barrier()
 
             lower = tile * 32 + klen - qlen - 1023
@@ -184,15 +170,13 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                         * 16
                         + fx.Int64(head)
                     ) * 256 + fx.Int64(d)
-                    kval = fx.Vector(_load(kp, src, fx.Vector.make_type(4, fx.Int32), 16))
+                    kval = _load(kp, src, fx.Vector.make_type(4, fx.Int32), 16)
                     vval = fx.Vector(
                         _load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)
                     )
-                    for j in range_constexpr(4):
-                        _store(
-                            lds.k.ptr, slot * 8192 + _qk_offset(off // 256, d // 4 + j),
-                            kval[j], 4,
-                        )
+                    _store(
+                        lds.k.ptr, slot * (32 * 260) + (off // 256) * 260 + d, kval, 4
+                    )
                     # Transpose four tokens in registers before writing a dword.
                     # XOR depth bits into the bank index for both access orders.
                     for j in range_constexpr(4):
@@ -222,6 +206,10 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                             4,
                         )
 
+            q_frag = [
+                _load(lds.q.ptr, row * 260 + depth * 16 + half * 8, T.i64, 4)
+                for depth in range(16)
+            ]
             stage(start, fx.Int32(0))
             gpu.barrier()
             init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
@@ -234,8 +222,13 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     stage(block + 1, 1 - slot)
                 score = fx.Vector.filled(16, 0.0, fx.Float32)
                 for depth in range_constexpr(16):
-                    a = _qk_load(lds.k.ptr, lane % 32, depth, half, slot * 8192)
-                    b = _qk_load(lds.q.ptr, row, depth, half)
+                    a = _load(
+                        lds.k.ptr,
+                        slot * 8320 + (lane % 32) * 260 + depth * 16 + half * 8,
+                        T.i64,
+                        4,
+                    )
+                    b = q_frag[depth]
                     score = _mfma(a, b, score)
                 qpos = tile * 32 + row // 2 + klen - qlen
                 scores = []
