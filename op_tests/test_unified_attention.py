@@ -111,23 +111,51 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
-def make_case(query_lens, kv_lens, dtype, causal=True, seed=3):
+def make_case(
+    query_lens,
+    kv_lens,
+    dtype,
+    causal=True,
+    seed=3,
+    *,
+    page=PAGE,
+    num_heads=H,
+    num_kv_heads=HKV,
+    head_dim=D,
+):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    pages = [max(0, (n + PAGE - 1) // PAGE) for n in kv_lens]
+    pages = [max(0, (n + page - 1) // page) for n in kv_lens]
     n_pages = max(1, sum(pages))
     q, qs = q8(
         torch.randn(
-            sum(query_lens), H, D, device="cuda", dtype=dtypes.bf16, generator=g
+            sum(query_lens),
+            num_heads,
+            head_dim,
+            device="cuda",
+            dtype=dtypes.bf16,
+            generator=g,
         )
     )
     k, ks = q8(
         torch.randn(
-            n_pages, PAGE, HKV, D, device="cuda", dtype=dtypes.bf16, generator=g
+            n_pages,
+            page,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=dtypes.bf16,
+            generator=g,
         )
     )
     v, vs = q8(
         torch.randn(
-            n_pages, PAGE, HKV, D, device="cuda", dtype=dtypes.bf16, generator=g
+            n_pages,
+            page,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=dtypes.bf16,
+            generator=g,
         )
     )
     perm = torch.randperm(
@@ -152,7 +180,7 @@ def make_case(query_lens, kv_lens, dtype, causal=True, seed=3):
         "max_seqlen_q": max(query_lens),
         "seqused_k": torch.tensor(kv_lens, device="cuda", dtype=torch.int32),
         "max_seqlen_k": max(kv_lens),
-        "softmax_scale": D**-0.5,
+        "softmax_scale": head_dim**-0.5,
         "causal": causal,
         "window_size": (-1, -1),
         "block_table": bt,
@@ -450,8 +478,89 @@ def test_warm_cache_run_only(path):
         return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
 
 
+@benchmark()
+def test_gfx942_sliding(page, workload, scale=0.0625):
+    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
+        build_flash_attn_fp8_gfx942,
+    )
+
+    if workload.startswith("prefill"):
+        query_lens = [int(workload.removeprefix("prefill"))]
+        kv_lens = query_lens
+    elif workload == "mixed":
+        query_lens = [1, 17, 65, 1, 33, 1]
+        kv_lens = [8192, 1041, 4097, 31, 97, 2049]
+    elif workload == "decode16":
+        query_lens = [1] * 16
+        kv_lens = [
+            1, 31, 32, 33, 63, 64, 65, 1023,
+            1024, 1025, 2047, 4095, 4096, 4097, 8191, 8192,
+        ]
+    elif workload == "window-boundary":
+        query_lens, kv_lens = [33, 1], [1057, 1025]
+    else:
+        raise ValueError(f"unknown gfx942 workload: {workload}")
+
+    # Gemma-4-31B sliding layers: 32 Q heads, 16 KV heads, D256, window1024.
+    case = make_case(
+        query_lens,
+        kv_lens,
+        dtypes.bf16,
+        page=page,
+        num_heads=32,
+        num_kv_heads=16,
+        head_dim=256,
+    )
+    case["window_size"] = (1023, 0)
+    case["softmax_scale"] = scale
+    if workload == "window-boundary":
+        # Uniform scores isolate the per-row window and shuffled-page addressing.
+        case["q"] = torch.zeros(case["q"].shape, device="cuda").to(case["q"].dtype)
+        n = case["v"].shape[0] * page
+        token = torch.arange(n, device="cuda").view(-1, page, 1, 1)
+        head = torch.arange(16, device="cuda").view(1, 1, 16, 1)
+        depth = torch.arange(256, device="cuda").view(1, 1, 1, 256)
+        case["v"] = ((token % 127 - 63) / 64 + head / 16 + (depth % 7) / 32).to(
+            case["v"].dtype
+        )
+        case["q_descale"].fill_(0.5)
+        case["k_descale"].fill_(0.25)
+        case["v_descale"].fill_(0.75)
+
+    want = reference(case, query_lens, kv_lens)
+    got = build_flash_attn_fp8_gfx942(page)(**case).float()
+    error = (want - got).abs()
+    # Keep the existing FP8 global-scale tolerance. Timing is a separate sweep.
+    compare(want, got, 0.08 * want.abs().max().item(), "gfx942 sliding")
+    return {
+        "gfx": get_gfx_runtime(),
+        "max abs": error.max().item(),
+        "max rel": (error / want.abs().clamp_min(1e-6)).max().item(),
+        "global rel": (error.max() / want.abs().max()).item(),
+        "result": "PASS",
+    }
+
+
 def main():
     arch = get_gfx_runtime()
+    if arch == "gfx942":
+        workloads = [
+            "prefill64", "prefill1024", "prefill4096",
+            "mixed", "decode16", "window-boundary",
+        ]
+        rows = [
+            test_gfx942_sliding(page, workload)
+            for page, workload in itertools.product([32, 64], workloads)
+        ]
+        rows.append(test_gfx942_sliding(32, "mixed", scale=1.0))
+        aiter.logger.info(
+            "gfx942 sliding correctness summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+        aiter.logger.info(
+            "PASS: 13 gfx942 direct-launch cases; SKIP: eight gfx950-only groups"
+        )
+        return
     if get_gfx() != "gfx950" or arch != "gfx950":
         aiter.logger.warning(
             "FlyDSL unified attention requires gfx950; skipping (build=%s, attached=%s)",

@@ -28,14 +28,25 @@ def _load(ptr, offset, dtype, alignment):
 
 def _store(ptr, offset, value, alignment):
     p = buffer_ops.get_element_ptr(fx.to_llvm_ptr(ptr), byte_offset=offset)
-    llvm.StoreOp(value.ir_value() if hasattr(value, "ir_value") else value, p, alignment=alignment)
+    llvm.StoreOp(
+        value.ir_value() if hasattr(value, "ir_value") else value,
+        p,
+        alignment=alignment,
+    )
 
 
 def _mfma(a, b, c):
-    return fx.Vector(rocdl.mfma_f32_32x32x16_fp8_fp8(
-        fx.Vector.make_type(16, fx.Float32), a, b, c.ir_value(), 0, 0,
-        ir.Attribute.parse("#rocdl<mfma_perm_b none>")
-    ).result)
+    return fx.Vector(
+        rocdl.mfma_f32_32x32x16_fp8_fp8(
+            fx.Vector.make_type(16, fx.Float32),
+            a,
+            b,
+            c.ir_value(),
+            0,
+            0,
+            ir.Attribute.parse("#rocdl<mfma_perm_b none>"),
+        ).result
+    )
 
 
 def _exp2(x):
@@ -43,8 +54,14 @@ def _exp2(x):
 
 
 def _pack4(values):
-    lo = rocdl.cvt_pk_fp8_f32(T.i32, values[0].ir_value(), values[1].ir_value(), fx.Int32(0).ir_value(), 0)
-    return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, values[2].ir_value(), values[3].ir_value(), lo, 1))
+    lo = rocdl.cvt_pk_fp8_f32(
+        T.i32, values[0].ir_value(), values[1].ir_value(), fx.Int32(0).ir_value(), 0
+    )
+    return fx.Int32(
+        rocdl.cvt_pk_fp8_f32(
+            T.i32, values[2].ir_value(), values[3].ir_value(), lo, 1
+        )
+    )
 
 
 @lru_cache(maxsize=2)
@@ -68,10 +85,18 @@ def build_flash_attn_fp8_gfx942(page_size=32):
 
     @flyc.kernel(known_block_size=(128, 1, 1))
     def attention(
-        Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
-        CuQ: fx.Tensor, UsedK: fx.Tensor, BT: fx.Tensor,
-        QD: fx.Tensor, KD: fx.Tensor, VD: fx.Tensor,
-        bt_stride: fx.Int32, scale: fx.Float32,
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        CuQ: fx.Tensor,
+        UsedK: fx.Tensor,
+        BT: fx.Tensor,
+        QD: fx.Tensor,
+        KD: fx.Tensor,
+        VD: fx.Tensor,
+        bt_stride: fx.Int32,
+        scale: fx.Float32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid % 64
@@ -85,7 +110,12 @@ def build_flash_attn_fp8_gfx942(page_size=32):
         qlen = fx.Int32(fx.memref_load(CuQ, seq + 1)) - q0
         klen = fx.Int32(fx.memref_load(UsedK, seq))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        log_scale = fx.Float32(fx.memref_load(QD, 0)) * fx.Float32(fx.memref_load(KD, 0)) * scale * 1.4426950408889634
+        log_scale = (
+            fx.Float32(fx.memref_load(QD, 0))
+            * fx.Float32(fx.memref_load(KD, 0))
+            * scale
+            * 1.4426950408889634
+        )
         vscale = fx.Float32(fx.memref_load(VD, 0)) / 240.0
         qp, kp, vp, op = fx.get_iter(Q), fx.get_iter(K), fx.get_iter(V), fx.get_iter(O)
         btp = fx.get_iter(BT)
@@ -95,7 +125,12 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             for i in range_constexpr(8):
                 j = tid + i * 128
                 if j < (klen + page_size - 1) // page_size:
-                    page = _load(btp, (fx.Int64(seq) * fx.Int64(bt_stride) + fx.Int64(j)) * 4, T.i32, 4)
+                    page = _load(
+                        btp,
+                        (fx.Int64(seq) * fx.Int64(bt_stride) + fx.Int64(j)) * 4,
+                        T.i32,
+                        4,
+                    )
                     _store(lds.bt.ptr, j * 4, page, 4)
             for i in range_constexpr(8):
                 off = tid * 16 + i * 2048
@@ -103,7 +138,11 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                 d = off % 256
                 qr = tile * 32 + r // 2
                 safe_qr = (qr < qlen).select(qr, fx.Int32(0))
-                src = ((fx.Int64(q0 + safe_qr) * 32 + fx.Int64(head * 2 + r % 2)) * 256 + fx.Int64(d))
+                src = (
+                    (fx.Int64(q0 + safe_qr) * 32 + fx.Int64(head * 2 + r % 2))
+                    * 256
+                    + fx.Int64(d)
+                )
                 data = _load(qp, src, fx.Vector.make_type(4, fx.Int32), 16)
                 _store(lds.q.ptr, off, data, 16)
             gpu.barrier()
@@ -119,18 +158,35 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     token = block * 32 + off // 256
                     d = off % 256
                     safe_token = (token < klen).select(token, fx.Int32(0))
-                    page = fx.Int32(_load(lds.bt.ptr, (safe_token // page_size) * 4, T.i32, 4))
-                    src = ((fx.Int64(page) * page_size + fx.Int64(safe_token % page_size)) * 16 + fx.Int64(head)) * 256 + fx.Int64(d)
+                    page = fx.Int32(
+                        _load(lds.bt.ptr, (safe_token // page_size) * 4, T.i32, 4)
+                    )
+                    src = (
+                        (fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
+                        * 16
+                        + fx.Int64(head)
+                    ) * 256 + fx.Int64(d)
                     kval = _load(kp, src, fx.Vector.make_type(4, fx.Int32), 16)
-                    vval = fx.Vector(_load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)).bitcast(fx.Int8)
-                    _store(lds.k.ptr, slot * (32 * 260) + (off // 256) * 260 + d, kval, 4)
+                    vval = fx.Vector(
+                        _load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)
+                    ).bitcast(fx.Int8)
+                    _store(
+                        lds.k.ptr, slot * (32 * 260) + (off // 256) * 260 + d, kval, 4
+                    )
                     # Explicit transpose-on-write replaces gfx950 transpose reads.
                     for j in range_constexpr(16):
-                        _store(lds.v.ptr, slot * 8192 + (d + j) * 32 + off // 256, vval[j], 1)
+                        _store(
+                            lds.v.ptr,
+                            slot * 8192 + (d + j) * 32 + off // 256,
+                            vval[j],
+                            1,
+                        )
 
             stage(start, fx.Int32(0))
             gpu.barrier()
-            init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(8)]
+            init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
+                fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(8)
+            ]
             for block, state in range(start, end, fx.Int32(1), init=init):
                 block = fx.Int32(block)
                 slot = (block - start) % 2
@@ -138,7 +194,12 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     stage(block + 1, 1 - slot)
                 score = fx.Vector.filled(16, 0.0, fx.Float32)
                 for depth in range_constexpr(16):
-                    a = _load(lds.k.ptr, slot * 8320 + (lane % 32) * 260 + depth * 16 + half * 8, T.i64, 4)
+                    a = _load(
+                        lds.k.ptr,
+                        slot * 8320 + (lane % 32) * 260 + depth * 16 + half * 8,
+                        T.i64,
+                        4,
+                    )
                     b = _load(lds.q.ptr, row * 256 + depth * 16 + half * 8, T.i64, 8)
                     score = _mfma(a, b, score)
                 qpos = tile * 32 + row // 2 + klen - qlen
@@ -146,7 +207,12 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                 m = fx.Float32(state[0])
                 for r in range_constexpr(16):
                     col = block * 32 + half * 4 + (r // 4) * 8 + r % 4
-                    valid = (col <= qpos) & (col > qpos - 1024) & (col < klen) & (tile * 32 + row // 2 < qlen)
+                    valid = (
+                        (col <= qpos)
+                        & (col > qpos - 1024)
+                        & (col < klen)
+                        & (tile * 32 + row // 2 < qlen)
+                    )
                     s = valid.select(score[r] * log_scale, fx.Float32(-1.0e30))
                     scores.append(s)
                     m = m.maximumf(s)
@@ -156,21 +222,48 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                 psum = fx.Float32(0.0)
                 for r in range_constexpr(16):
                     col = block * 32 + half * 4 + (r // 4) * 8 + r % 4
-                    valid = (col <= qpos) & (col > qpos - 1024) & (col < klen) & (tile * 32 + row // 2 < qlen)
+                    valid = (
+                        (col <= qpos)
+                        & (col > qpos - 1024)
+                        & (col < klen)
+                        & (tile * 32 + row // 2 < qlen)
+                    )
                     p = valid.select(_exp2(scores[r] - m), fx.Float32(0.0))
                     psum = psum + p
                     probs.append(p * 240.0)
-                denom = fx.Float32(state[1]) * correction + psum + psum.shuffle_xor(fx.Int32(32), fx.Int32(64))
-                words = [_pack4(probs[g * 4:g * 4 + 4]) for g in range(4)]
+                denom = (
+                    fx.Float32(state[1]) * correction
+                    + psum
+                    + psum.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                )
+                words = [_pack4(probs[g * 4 : g * 4 + 4]) for g in range(4)]
                 peers = [w.shuffle_xor(fx.Int32(32), fx.Int32(64)) for w in words]
-                p0 = fx.Vector.from_elements([(half == 0).select(words[0], peers[1]), (half == 0).select(peers[0], words[1])], fx.Int32).bitcast(fx.Int64)[0]
-                p1 = fx.Vector.from_elements([(half == 0).select(words[2], peers[3]), (half == 0).select(peers[2], words[3])], fx.Int32).bitcast(fx.Int64)[0]
+                p0 = fx.Vector.from_elements(
+                    [(half == 0).select(words[0], peers[1]),
+                     (half == 0).select(peers[0], words[1])], fx.Int32
+                ).bitcast(fx.Int64)[0]
+                p1 = fx.Vector.from_elements(
+                    [(half == 0).select(words[2], peers[3]),
+                     (half == 0).select(peers[2], words[3])], fx.Int32
+                ).bitcast(fx.Int64)[0]
                 accum = []
                 for dc in range_constexpr(8):
-                    o = fx.Vector(state[dc + 2]) * fx.Vector.filled(16, correction, fx.Float32)
-                    v0 = _load(lds.v.ptr, slot * 8192 + (dc * 32 + lane % 32) * 32 + half * 8, T.i64, 8)
+                    o = fx.Vector(state[dc + 2]) * fx.Vector.filled(
+                        16, correction, fx.Float32
+                    )
+                    v0 = _load(
+                        lds.v.ptr,
+                        slot * 8192 + (dc * 32 + lane % 32) * 32 + half * 8,
+                        T.i64,
+                        8,
+                    )
                     o = _mfma(v0, p0.ir_value(), o)
-                    v1 = _load(lds.v.ptr, slot * 8192 + (dc * 32 + lane % 32) * 32 + 16 + half * 8, T.i64, 8)
+                    v1 = _load(
+                        lds.v.ptr,
+                        slot * 8192 + (dc * 32 + lane % 32) * 32 + 16 + half * 8,
+                        T.i64,
+                        8,
+                    )
                     o = _mfma(v1, p1.ir_value(), o)
                     accum.append(o)
                 gpu.barrier()
@@ -183,36 +276,71 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     vals = fx.Vector(result[dc + 2])
                     for r in range_constexpr(8):
                         d = dc * 32 + half * 4 + ((r * 2) // 4) * 8 + (r * 2) % 4
-                        dest = ((fx.Int64(q0 + qr) * 32 + fx.Int64(head * 2 + row % 2)) * 256 + fx.Int64(d)) * 2
-                        packed = _pack_bf16_pair(vals[r * 2] * norm, vals[r * 2 + 1] * norm)
+                        dest = (
+                            (fx.Int64(q0 + qr) * 32 + fx.Int64(head * 2 + row % 2))
+                            * 256
+                            + fx.Int64(d)
+                        ) * 2
+                        packed = _pack_bf16_pair(
+                            vals[r * 2] * norm, vals[r * 2 + 1] * norm
+                        )
                         _store(op, dest, packed, 4)
 
     @flyc.jit
-    def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
-               CuQ: fx.Tensor, UsedK: fx.Tensor, BT: fx.Tensor,
-               QD: fx.Tensor, KD: fx.Tensor, VD: fx.Tensor,
-               batch: fx.Int32, tiles: fx.Int32, bt_stride: fx.Int32,
-               scale: fx.Float32, stream: fx.Stream = fx.Stream(None)):
+    def launch(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        CuQ: fx.Tensor,
+        UsedK: fx.Tensor,
+        BT: fx.Tensor,
+        QD: fx.Tensor,
+        KD: fx.Tensor,
+        VD: fx.Tensor,
+        batch: fx.Int32,
+        tiles: fx.Int32,
+        bt_stride: fx.Int32,
+        scale: fx.Float32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
         attention(Q, K, V, O, CuQ, UsedK, BT, QD, KD, VD, bt_stride, scale).launch(
-            grid=(16, batch, tiles), block=(128, 1, 1), stream=stream)
+            grid=(16, batch, tiles), block=(128, 1, 1), stream=stream
+        )
 
-    def mod(q, k, v, out, *, cu_seqlens_q, seqused_k, max_seqlen_q,
-            block_table, softmax_scale, q_descale, k_descale, v_descale,
-            window_size=(1023, 0), causal=True, max_seqlen_k=None, softcap=0):
+    def mod(
+        q, k, v, out, *, cu_seqlens_q, seqused_k, max_seqlen_q,
+        block_table, softmax_scale, q_descale, k_descale, v_descale,
+        window_size=(1023, 0), causal=True, max_seqlen_k=None, softcap=0,
+    ):
         import torch
 
         if torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] != "gfx942":
             raise ValueError("this kernel requires gfx942")
-        if q.shape[1:] != (32, 256) or k.shape[1:] != (page_size, 16, 256) or v.shape != k.shape:
+        if (
+            q.shape[1:] != (32, 256)
+            or k.shape[1:] != (page_size, 16, 256)
+            or v.shape != k.shape
+        ):
             raise ValueError("expected Q[T,32,256], K/V[pages,page_size,16,256]")
         if not causal or window_size not in ((1023, 0), (1023, -1)) or softcap != 0:
             raise ValueError("only causal window1024 without softcap is supported")
-        if any(t.dtype != torch.float8_e4m3fnuz for t in (q, k, v)) or out.dtype != torch.bfloat16:
+        if (
+            any(t.dtype != torch.float8_e4m3fnuz for t in (q, k, v))
+            or out.dtype != torch.bfloat16
+        ):
             raise ValueError("expected FNUZ Q/K/V and BF16 output")
-        if any(not t.is_contiguous() for t in (q, k, v, out, cu_seqlens_q, seqused_k, block_table)):
+        if any(
+            not t.is_contiguous()
+            for t in (q, k, v, out, cu_seqlens_q, seqused_k, block_table)
+        ):
             raise ValueError("direct launcher requires contiguous tensors")
         batch = seqused_k.numel()
-        if out.shape != q.shape or cu_seqlens_q.shape != (batch + 1,) or seqused_k.ndim != 1:
+        if (
+            out.shape != q.shape
+            or cu_seqlens_q.shape != (batch + 1,)
+            or seqused_k.ndim != 1
+        ):
             raise ValueError("output and sequence metadata shapes do not match Q")
         if block_table.ndim != 2 or block_table.shape[0] != batch:
             raise ValueError("expected one block-table row per sequence")
@@ -221,16 +349,30 @@ def build_flash_attn_fp8_gfx942(page_size=32):
         descales = (q_descale, k_descale, v_descale)
         if any(t.dtype != torch.float32 or t.numel() != 1 for t in descales):
             raise ValueError("descales must be per-tensor FP32 scalars")
-        if any(t.device != q.device for t in (k, v, out, cu_seqlens_q, seqused_k, block_table) + descales):
+        if any(
+            t.device != q.device
+            for t in (k, v, out, cu_seqlens_q, seqused_k, block_table) + descales
+        ):
             raise ValueError("all tensors must be on the same device")
         if block_table.shape[1] > 1024:
             raise ValueError("block table exceeds the 1024-entry LDS capacity")
-        launch(q.view(torch.int8).reshape(-1), k.view(torch.int8).reshape(-1),
-               v.view(torch.int8).reshape(-1), out.reshape(-1), cu_seqlens_q,
-               seqused_k, block_table.reshape(-1), q_descale.reshape(1),
-               k_descale.reshape(1), v_descale.reshape(1), seqused_k.numel(),
-               (max_seqlen_q + 31) // 32, block_table.stride(0), softmax_scale,
-               stream=torch.cuda.current_stream(q.device))
+        launch(
+            q.view(torch.int8).reshape(-1),
+            k.view(torch.int8).reshape(-1),
+            v.view(torch.int8).reshape(-1),
+            out.reshape(-1),
+            cu_seqlens_q,
+            seqused_k,
+            block_table.reshape(-1),
+            q_descale.reshape(1),
+            k_descale.reshape(1),
+            v_descale.reshape(1),
+            seqused_k.numel(),
+            (max_seqlen_q + 31) // 32,
+            block_table.stride(0),
+            softmax_scale,
+            stream=torch.cuda.current_stream(q.device),
+        )
         return out
 
     return mod
