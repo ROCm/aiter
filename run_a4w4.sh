@@ -27,5 +27,5 @@
     --no-bias \
     --iters 32 \
     --no-check-aot-cache \
-    --data-init constant \
-    --scale-init constant
+    --data-init zero \
+    --scale-init zero
