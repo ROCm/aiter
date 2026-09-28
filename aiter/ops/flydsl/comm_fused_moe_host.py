@@ -1,35 +1,41 @@
 # SPDX-License-Identifier: MIT
-"""Production host runtime for communication-fused FlyDSL MoE."""
+"""Production host runtime for communication-fused FlyDSL MoE.
+
+Set ``AITER_COMM_FUSED_WINDOW_MXFP8_FALLBACK=1`` before runner creation to
+temporarily replay Window AR with dynamic MXFP8 partial and reduced payloads.
+"""
 
 import csv
 import json
 import logging
 import math
-import re
+import os
 from dataclasses import MISSING, dataclass, fields, replace
 from functools import cache
 from pathlib import Path
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 
 from aiter.dist.device_communicators.rocm_version import get_rocm_version
-from aiter.fused_moe import stage2_uses_route_reduce
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import (
-    atomic,
+    direct,
     megakernel,
     window,
 )
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.collectives import (
     FLAT_VA_RANK_STRIDE,
     compile_epoch_barrier,
+    compile_epoch_barrier_pair,
 )
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
+    DIRECT_GRID_CAP,
     SLOTS,
-    AtomicConfig,
+    DirectConfig,
     MegakernelConfig,
     PipelineConfig,
     Shape,
@@ -43,10 +49,8 @@ _DEFAULT_ACT_TYPE = "ActivationType.Silu"
 _DTYPE = "torch.bfloat16"
 _Q_DTYPE_A = "torch.float8_e4m3fn"
 _Q_DTYPE_W = "torch.float4_e2m1fn_x2"
-
 logger = logging.getLogger("aiter")
 _Q_TYPE = "QuantType.per_1x32"
-_ADD_SHARED = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,12 +69,10 @@ class ShapeKey:
     q_type: str = _Q_TYPE
     use_g1u1: int = 1
     doweight_stage1: int = 0
-    add_shared: bool | None = _ADD_SHARED
+    add_shared: bool = True
     comm: str = "ar"
 
     def kernel_shape(self) -> Shape:
-        if self.add_shared is None:
-            raise ValueError("kernel shape requires an explicit add_shared value")
         return Shape(
             self.model_dim,
             self.inter_dim,
@@ -82,8 +84,26 @@ class ShapeKey:
 
 
 _CONFIG_NAME_PREFIX = "flydsl_comm_moe2_afp8_wfp4_bf16_"
-_COMM_MODES = ("ar",)
+_COMM_MODES = ("ar", "rs")
 _RUNNER_CACHE = {}
+_CONFIG_FAMILIES = {
+    "direct": DirectConfig,
+    "mega": MegakernelConfig,
+    "window": WindowConfig,
+}
+_CONFIG_FAMILY_NAMES = {value: key for key, value in _CONFIG_FAMILIES.items()}
+_DERIVED_CONFIG_FIELDS = {"shape", "m", "gather_output"}
+
+
+def _window_mxfp8_fallback_enabled() -> bool:
+    """Temporarily roll the complete Window AR payload path back to MXFP8."""
+
+    value = os.environ.get("AITER_COMM_FUSED_WINDOW_MXFP8_FALLBACK", "0")
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"AITER_COMM_FUSED_WINDOW_MXFP8_FALLBACK must be 0 or 1, got {value!r}"
+        )
+    return value == "1"
 
 
 @cache
@@ -128,19 +148,59 @@ def _mega_defaults() -> dict:
 
 
 def config_name(config: PipelineConfig) -> str:
+    """Return a human-readable label; ``config_record`` is the config identity."""
+
     prefix = _CONFIG_NAME_PREFIX
-    if isinstance(config, AtomicConfig):
-        return (
-            f"{prefix}atomic_rs{config.reduce_scatter_grid}"
-            f"_ag{config.all_gather_grid}"
-        )
+    if isinstance(config, DirectConfig):
+        name = f"{prefix}direct_sbm{config.sort_block_m}"
+        if config.grid_cap != DIRECT_GRID_CAP:
+            name += f"_g{config.grid_cap}"
+        if config.vector_width != 8:
+            name += f"_v{config.vector_width}"
+        return name
     if isinstance(config, WindowConfig):
-        return (
+        name = (
             f"{prefix}window_t{config.tile_m}x{config.tile_n}x{config.tile_k}"
             f"_sbm{config.sort_block_m}_win{config.window}"
             f"_lw{config.local_workers}_rs{config.reduce_scatter_grid}"
             f"_ag{config.all_gather_grid}"
         )
+        if not config.gather_output:
+            name += "_sharded"
+        if config.sorted_input:
+            name += "_sorted"
+        if config.drain_reduce_scatter_grid:
+            name += f"_drs{config.drain_reduce_scatter_grid}"
+        if config.drain_all_gather_grid:
+            name += f"_dag{config.drain_all_gather_grid}"
+        if config.local_load_cache_modifier != 2:
+            name += f"_lrc{config.local_load_cache_modifier}"
+        if config.local_rows_per_cta != 1:
+            name += f"_lr{config.local_rows_per_cta}"
+        if config.producer_spatial_partition:
+            name += (
+                f"_spart{config.producer_spatial_partition // 100}"
+                f"x{config.producer_spatial_partition % 100}"
+            )
+        if config.producer_spatial_alt_partition:
+            name += (
+                f"to{config.producer_spatial_alt_partition // 100}"
+                f"x{config.producer_spatial_alt_partition % 100}"
+                f"gt{config.producer_spatial_switch_rows}"
+            )
+        if config.partial_payload_bits != 8:
+            name += f"_ppb{config.partial_payload_bits}"
+        if config.reduced_payload_bits != 8:
+            name += f"_rpb{config.reduced_payload_bits}"
+        if config.collective_order == "alternating":
+            name += "_stagger"
+        elif config.collective_order == "gather_first":
+            name += "_gather_first"
+        if config.reduce_scatter_load_cache_modifier != 2:
+            name += f"_rsc{config.reduce_scatter_load_cache_modifier}"
+        if config.all_gather_load_cache_modifier != 2:
+            name += f"_agc{config.all_gather_load_cache_modifier}"
+        return name
     if not isinstance(config, MegakernelConfig):
         raise TypeError(f"unsupported comm_fused config {type(config)!r}")
 
@@ -176,95 +236,60 @@ def config_name(config: PipelineConfig) -> str:
         parts.append(f"sg{config.service_groups}")
     if config.service_tile_group != defaults["service_tile_group"]:
         parts.append(f"stg{config.service_tile_group}")
-    if config.producer_mode != defaults["producer_mode"]:
-        parts.append("patomic")
     if config.flat_producer_grid:
         parts.append("flat")
+    if config.sorted_input:
+        parts.append("sorted")
+    if config.wide_partial_scales:
+        parts.append("wideps")
+    if config.coherent_direct_handoff:
+        parts.append("coherent")
     return "_".join(parts)
 
 
-def _parse_megakernel_name(name: str, shape: Shape, m: int):
-    prefix = _CONFIG_NAME_PREFIX
-    if not name.startswith(prefix):
-        return None
-    parts = name[len(prefix) :].split("_")
-    tile = re.fullmatch(r"t(\d+)x(\d+)x(\d+)", parts.pop(0))
-    if tile is None:
-        raise ValueError(f"invalid megakernel tile in {name!r}")
-    values = _mega_defaults()
-    values.update(
-        tile_m=int(tile.group(1)),
-        tile_n=int(tile.group(2)),
-        tile_k=int(tile.group(3)),
-    )
-    numeric_tags = {
-        "sbm": "sort_block_m",
-        "cg": "compute_groups",
-        "bt": "block_threads",
-        "v": "vector_width",
-        "w": "waves_per_eu",
-        "bnt": "b_cache_modifier",
-        "ll": "local_load_cache_modifier",
-        "rl": "remote_load_cache_modifier",
-        "gl": "gather_load_cache_modifier",
-        "rs": "remote_store_cache_modifier",
-        "ntc": "n_tile_cohort",
-        "sg": "service_groups",
-        "stg": "service_tile_group",
-    }
-    collective = values["collective"]
-    for part in parts:
-        if part in ("direct", "rsbcast", "rsag"):
-            if collective != values["collective"]:
-                raise ValueError(f"duplicate collective in {name!r}")
-            collective = {
-                "direct": "direct",
-                "rsbcast": "rs_broadcast",
-                "rsag": "rsag",
-            }[part]
-        elif part == "patomic":
-            values["producer_mode"] = "atomic_shared"
-        elif part == "flat":
-            values["flat_producer_grid"] = True
-        else:
-            for tag, field_name in sorted(
-                numeric_tags.items(), key=lambda item: -len(item[0])
-            ):
-                if part.startswith(tag):
-                    values[field_name] = _int_value(part[len(tag) :], field_name)
-                    break
-            else:
-                raise ValueError(f"unknown megakernel option {part!r} in {name!r}")
-    values["collective"] = collective
-    return MegakernelConfig(shape=shape, m=m, **values)
+def config_record(config: PipelineConfig) -> dict:
+    """Return the structured, model-independent representation stored in CSV."""
+
+    family = _CONFIG_FAMILY_NAMES.get(type(config))
+    if family is None:
+        raise TypeError(f"unsupported comm_fused config {type(config)!r}")
+    params = {}
+    for field in fields(config):
+        if field.name in _DERIVED_CONFIG_FIELDS:
+            continue
+        value = getattr(config, field.name)
+        if field.default is MISSING or value != field.default:
+            params[field.name] = value
+    return {"family": family, "params": params}
 
 
-def _config(row, shape: Shape) -> PipelineConfig:
-    name = row["comm_kernel_name"]
-    m = _int_value(row["token"], "token")
-    atomic = re.fullmatch(
-        rf"{re.escape(_CONFIG_NAME_PREFIX)}atomic_rs(\d+)_ag(\d+)", name
+def _config(entry: dict, shape: Shape, m: int, mode: str) -> PipelineConfig:
+    family = entry.get("family")
+    config_type = _CONFIG_FAMILIES.get(family)
+    if config_type is None:
+        raise ValueError(f"unsupported comm_fused family {family!r}")
+    params = entry.get("params")
+    if not isinstance(params, dict):
+        raise TypeError("comm_fused config params must be a JSON object")
+    allowed = {field.name for field in fields(config_type)}.difference(
+        _DERIVED_CONFIG_FIELDS
     )
-    if atomic is not None:
-        return AtomicConfig(shape, m, int(atomic.group(1)), int(atomic.group(2)))
-    window = re.fullmatch(
-        rf"{re.escape(_CONFIG_NAME_PREFIX)}window_"
-        r"t(\d+)x(\d+)x(\d+)_sbm(\d+)_win(\d+)_lw(\d+)_rs(\d+)_ag(\d+)",
-        name,
-    )
-    if window is not None:
-        config = WindowConfig(shape, m, *(int(value) for value in window.groups()))
-    else:
-        config = _parse_megakernel_name(name, shape, m)
-        if config is None:
-            raise ValueError(f"unknown comm_fused kernel name {name!r}")
+    unknown = set(params).difference(allowed)
+    if unknown:
+        raise ValueError(f"unsupported {family} config parameters: {sorted(unknown)}")
+    kwargs = dict(params)
+    if config_type is WindowConfig:
+        kwargs["gather_output"] = mode == "ar"
+    return config_type(shape=shape, m=m, **kwargs)
+
+
+def _check_block_m(config: PipelineConfig, row) -> None:
     block_m = _int_value(row["block_m"], "block_m")
     if config.sort_block_m != block_m:
         raise ValueError(
-            f"comm_kernel_name sort_block_m={config.sort_block_m} does not match "
+            f"comm_fused sort_block_m={config.sort_block_m} does not match "
             f"CSV block_m={block_m}"
         )
-    return config
 
 
 def _optional_float(row, name: str) -> float | None:
@@ -275,23 +300,17 @@ def _optional_float(row, name: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _optional_bool(row, name: str, default: bool) -> bool:
-    value = row.get(name)
-    return default if value in (None, "", "nan") else bool(_int_value(value, name))
-
-
-def _select_row(key, rows):
-    if len(rows) == 1:
-        return rows[0]
+def _select_candidate(key, candidates):
+    if len(candidates) == 1:
+        return candidates[0]
     measured = [
-        (latency, row)
-        for row in rows
-        if (latency := _optional_float(row, "comm_stage2_tp_us")) is not None
+        (latency, candidate)
+        for candidate in candidates
+        if (latency := _optional_float(candidate[1], "us")) is not None
     ]
-    if len(measured) != len(rows):
+    if len(measured) != len(candidates):
         raise ValueError(
-            "duplicate comm_fused configs require measured "
-            f"'comm_stage2_tp_us' for {key}"
+            f"duplicate comm_fused configs require measured 'us' for {key}"
         )
     return min(measured, key=lambda item: item[0])[1]
 
@@ -320,18 +339,14 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                     raise TypeError(
                         f"comm_fused_configs[{mode!r}] must be a JSON object"
                     )
-                name = entry.get("kernel")
-                if not isinstance(name, str):
-                    raise TypeError(
-                        f"comm_fused_configs[{mode!r}].kernel must be a string"
-                    )
-                if not name.startswith(_CONFIG_NAME_PREFIX):
+                unknown = set(entry).difference(
+                    {"family", "params", "tp", "add_shared", "us"}
+                )
+                if unknown:
                     raise ValueError(
-                        f"invalid comm_fused_configs[{mode!r}].kernel: {name!r}"
+                        f"unsupported comm_fused_configs[{mode!r}] fields: "
+                        f"{sorted(unknown)}"
                     )
-                normalized = dict(row)
-                normalized["comm_kernel_name"] = name
-                normalized["comm_stage2_tp_us"] = entry.get("us")
                 tp = _int_value(entry["tp"], f"comm_fused_configs.{mode}.tp")
                 add_shared = entry.get("add_shared")
                 if not isinstance(add_shared, bool):
@@ -357,11 +372,13 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                     mode,
                 )
                 key = (shape, _int_value(row["token"], "token"))
-                candidates.setdefault(key, []).append(normalized)
+                candidates.setdefault(key, []).append((row, entry))
     table = {}
-    for (shape, m), rows in candidates.items():
-        row = _select_row((shape, m), rows)
-        table.setdefault(shape, {})[m] = _config(row, shape.kernel_shape())
+    for (shape, m), entries in candidates.items():
+        row, entry = _select_candidate((shape, m), entries)
+        config = _config(entry, shape.kernel_shape(), m, shape.comm)
+        _check_block_m(config, row)
+        table.setdefault(shape, {})[m] = config
     return table
 
 
@@ -387,23 +404,8 @@ def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
             shape.add_shared,
             shape.comm,
         )
-    table = _winner_table()
-    if shape.add_shared is None:
-        matches = [
-            configs
-            for add_shared in (True, False)
-            if (configs := table.get(replace(shape, add_shared=add_shared)))
-        ]
-        if len(matches) != 1:
-            raise KeyError(
-                "comm_fused layout must match exactly one shared-add contract, "
-                f"got {len(matches)} for H={shape.model_dim}, "
-                f"I={shape.inter_dim}, E={shape.experts}, topk={shape.topk}, "
-                f"TP={shape.tp}"
-            )
-        return matches[0]
     try:
-        return table[shape]
+        return _winner_table()[shape]
     except KeyError:
         raise KeyError(f"unsupported comm_fused shape {shape}") from None
 
@@ -435,6 +437,104 @@ def _packed_symmetric(
     return workspace, tensors, tuple(offsets)
 
 
+@dataclass(slots=True)
+class _WindowWorkspaceLayout:
+    """Typed views and peer-flat addresses for one Window runner workspace."""
+
+    storage: torch.Tensor
+    phase_count: int
+    partials: tuple[torch.Tensor, ...]
+    reduced_payloads: tuple[torch.Tensor, ...]
+    reduced_scales: tuple[torch.Tensor, ...]
+    partial_ready: int
+    reduced_ready: int
+    partial_offsets: tuple[int, ...]
+    reduced_payload_offsets: tuple[int, ...]
+    reduced_scale_offsets: tuple[int, ...]
+    partial_bases: tuple[int, ...] = ()
+    reduced_payload_bases: tuple[int, ...] = ()
+    reduced_scale_bases: tuple[int, ...] = ()
+
+    @classmethod
+    def allocate(cls, device, config: WindowConfig):
+        phase_count = config.phase_count
+        partial_ready = config.partial_epoch_offset
+        reduced_ready = config.reduced_epoch_offset
+        sizes = (config.partial_buffer_bytes,) * phase_count
+        if config.gather_output:
+            sizes += (config.reduced_buffer_bytes,) * phase_count
+            sizes += (config.reduced_scale_bytes,) * phase_count
+
+        storage, tensors, offsets = _packed_symmetric(device, sizes)
+        partial_end = phase_count
+        reduced_end = 2 * phase_count if config.gather_output else partial_end
+        return cls(
+            storage=storage,
+            phase_count=phase_count,
+            partials=tensors[:partial_end],
+            reduced_payloads=tensors[partial_end:reduced_end],
+            reduced_scales=tensors[reduced_end:],
+            partial_ready=partial_ready,
+            reduced_ready=reduced_ready,
+            partial_offsets=offsets[:partial_end],
+            reduced_payload_offsets=offsets[partial_end:reduced_end],
+            reduced_scale_offsets=offsets[reduced_end:],
+        )
+
+    def bind_flat_base(self, flat_base: int) -> None:
+        self.partial_bases = tuple(
+            flat_base + offset for offset in self.partial_offsets
+        )
+        self.reduced_payload_bases = tuple(
+            flat_base + offset for offset in self.reduced_payload_offsets
+        )
+        self.reduced_scale_bases = tuple(
+            flat_base + offset for offset in self.reduced_scale_offsets
+        )
+
+    def clear_epochs(self) -> None:
+        for partial in self.partials:
+            partial[self.partial_ready : self.partial_ready + 8].zero_()
+        for payload in self.reduced_payloads:
+            payload[self.reduced_ready : self.reduced_ready + 8].zero_()
+
+
+def _optional_ptr(tensor: torch.Tensor | None):
+    if tensor is None:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return ptr_arg(tensor)
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowPhaseView:
+    """Arguments owned by the local, reduce, and gather phases of one launch."""
+
+    local_route: torch.Tensor | None
+    local_partial: torch.Tensor | None
+    shared: torch.Tensor | None
+    reduce_partial_base: int | None
+    reduced_shard: torch.Tensor | None
+    reduced_payload: torch.Tensor | None
+    reduced_scale: torch.Tensor | None
+    gather_payload_base: int | None
+    gather_scale_base: int | None
+    gathered_output: torch.Tensor | None
+
+    def launch_args(self) -> tuple:
+        return (
+            _optional_ptr(self.local_route),
+            _optional_ptr(self.local_partial),
+            _optional_ptr(self.shared),
+            fx.Int64(self.reduce_partial_base or 0),
+            _optional_ptr(self.reduced_shard),
+            _optional_ptr(self.reduced_payload),
+            _optional_ptr(self.reduced_scale),
+            fx.Int64(self.gather_payload_base or 0),
+            fx.Int64(self.gather_scale_base or 0),
+            _optional_ptr(self.gathered_output),
+        )
+
+
 def _register(tp_group, rank: int, tp: int, tensors):
     Communicator = _mori_communicator()
     uid = Communicator.get_unique_id() if rank == 0 else None
@@ -455,6 +555,28 @@ def _barrier(tensor, flat_base, ready_offset, tp_size, stream) -> None:
         ptr_arg(tensor),
         fx.Int64(flat_base),
         fx.Int64(ready_offset),
+        stream,
+    )
+
+
+def _barrier_pair(
+    first_tensor,
+    first_flat_base,
+    first_ready_offset,
+    second_tensor,
+    second_flat_base,
+    second_ready_offset,
+    tp_size,
+    stream,
+) -> None:
+    _run_compiled(
+        compile_epoch_barrier_pair(tp_size),
+        ptr_arg(first_tensor),
+        fx.Int64(first_flat_base),
+        fx.Int64(first_ready_offset),
+        ptr_arg(second_tensor),
+        fx.Int64(second_flat_base),
+        fx.Int64(second_ready_offset),
         stream,
     )
 
@@ -495,109 +617,36 @@ def _stage2_args(args, kwargs, config):
     )
 
 
-class _AtomicRunner:
-    def __init__(
-        self,
-        tp_group,
-        config: AtomicConfig,
-    ) -> None:
-        self.config = config
-        self.rank = int(tp_group.rank_in_group)
-        self.device = torch.device(tp_group.device)
-        shape = config.shape
-        self.partial_ready = config.m * (shape.model_dim + shape.model_dim // 32)
-        self.reduced_ready = config.shard_rows * shape.model_dim
-        sizes = (
-            (self.partial_ready + 8 + 255) // 256 * 256,
-            (self.reduced_ready + 8 + 255) // 256 * 256,
-            config.shard_rows * (shape.model_dim // 32),
-        )
-        self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
-        self.partial, self.reduced_payload, self.reduced_scale = tensors
-        self.partial[self.partial_ready : self.partial_ready + 8].zero_()
-        self.reduced_payload[self.reduced_ready : self.reduced_ready + 8].zero_()
-        self.output = torch.empty(
-            (config.m, shape.model_dim),
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self.comm, self.windows, (workspace_base,) = _register(
-            tp_group, self.rank, shape.tp_size, (self.workspace,)
-        )
-        tp_group.barrier()
-        (
-            self.partial_flat_base,
-            self.reduced_payload_base,
-            self.reduced_scale_base,
-        ) = tuple(workspace_base + offset for offset in offsets)
-        shard_begin = self.rank * config.shard_rows
-        self.reduced_shard = self.output[shard_begin : shard_begin + config.shard_rows]
+class _RuntimeLayoutRunner:
+    """Common model-runtime contract independent of collective type."""
 
-    def __call__(
-        self,
-        *,
-        stage2_args: tuple,
-        stage2_kwargs: dict,
-        shared_partial,
-        ordinary_stage2,
-    ):
-        config = self.config
-        stage2_reduces_routes = stage2_uses_route_reduce(ordinary_stage2)
-        add_shared = config.shape.add_shared and stage2_reduces_routes
-        if not stage2_reduces_routes:
-            if config.shape.add_shared:
-                self.output.copy_(shared_partial)
-            else:
-                self.output.zero_()
-        ordinary_stage2(
-            *stage2_args[:6],
-            self.output,
-            *stage2_args[7:],
-            **stage2_kwargs,
-        )
-        stream = torch.cuda.current_stream(self.device)
-        _run_compiled(
-            atomic.compile_quantize(config, add_shared),
-            ptr_arg(self.output),
-            ptr_arg(shared_partial if shared_partial is not None else self.output),
-            ptr_arg(self.partial),
-            stream,
-        )
-        _barrier(
-            self.partial,
-            self.partial_flat_base,
-            self.partial_ready,
-            config.shape.tp_size,
-            stream,
-        )
-        _run_compiled(
-            atomic.compile_reduce_scatter(config),
-            fx.Int64(self.partial_flat_base),
-            ptr_arg(self.reduced_shard),
-            ptr_arg(self.reduced_payload),
-            ptr_arg(self.reduced_scale),
-            self.rank,
-            stream,
-        )
-        _barrier(
-            self.reduced_payload,
-            self.reduced_payload_base,
-            self.reduced_ready,
-            config.shape.tp_size,
-            stream,
-        )
-        _run_compiled(
-            atomic.compile_all_gather(config),
-            fx.Int64(self.reduced_payload_base),
-            fx.Int64(self.reduced_scale_base),
-            ptr_arg(self.output),
-            self.rank,
-            stream,
-        )
-        return self.output
+    @property
+    def stage2_destination(self):
+        return None
+
+    def prepare_padded_shared_partial(
+        self, shared_partial: torch.Tensor, input_rows: int
+    ) -> torch.Tensor:
+        """Pad a full-layout shared contribution for this runner's bucket."""
+
+        if self.output.shape[0] == self.config.m:
+            padded = self.output
+        else:
+            padded = self._runtime_shared_stage
+            if padded is None:
+                padded = shared_partial.new_empty(
+                    (self.config.m, *shared_partial.shape[1:])
+                )
+                self._runtime_shared_stage = padded
+        padded[:input_rows].copy_(shared_partial)
+        padded[input_rows:].zero_()
+        return padded
+
+    def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
+        return shared_partial
 
 
-class _MegakernelRunner:
+class _MegakernelRunner(_RuntimeLayoutRunner):
     """Single-launch GEMM2 with per-N-tile TP collective services."""
 
     def __init__(
@@ -614,8 +663,9 @@ class _MegakernelRunner:
         self.output = (
             self.workspace.narrow(0, config.output_offset, config.payload_bytes)
             .view(torch.bfloat16)
-            .view(config.m, shape.model_dim)
+            .view(config.output_rows, shape.model_dim)
         )
+        self._runtime_shared_stage = None
         self.comm, self.windows, bases = _register(
             tp_group,
             self.rank,
@@ -639,8 +689,6 @@ class _MegakernelRunner:
             return self.output
         if not self.config.shared_bf16_partials:
             return shared_partial
-        if self.config.producer_mode == "atomic_shared":
-            return shared_partial
         if shared_partial.data_ptr() != self.output.data_ptr():
             self.output.copy_(shared_partial)
         return self.output
@@ -652,6 +700,7 @@ class _MegakernelRunner:
         stage2_kwargs: dict,
         shared_partial,
         ordinary_stage2,
+        before_shared_add=None,
     ):
         _bind_inter_layout(self, ordinary_stage2)
         stream = torch.cuda.current_stream(self.device)
@@ -662,11 +711,7 @@ class _MegakernelRunner:
                 self.shared_partial_flat_base = (
                     self.workspace_flat_base + self.config.output_offset
                 )
-        if (
-            self.config.shape.add_shared
-            and self.config.shared_bf16_partials
-            and self.config.producer_mode != "atomic_shared"
-        ):
+        if self.config.shape.add_shared and self.config.shared_bf16_partials:
             shared_partial_ptr = shared_partial.data_ptr()
             if shared_partial_ptr == self.output.data_ptr():
                 if self.shared_partial_ptr not in (None, shared_partial_ptr):
@@ -693,6 +738,8 @@ class _MegakernelRunner:
                     "GEMM2 TP megakernel shared_partial storage changed after "
                     "symmetric registration"
                 )
+        if before_shared_add is not None:
+            before_shared_add()
         common = _stage2_args(stage2_args, stage2_kwargs, self.config)
         _run_compiled(
             megakernel.compile_megakernel(self.config, self.rank),
@@ -706,7 +753,7 @@ class _MegakernelRunner:
         return self.output
 
 
-class _WindowRunner:
+class _WindowRunner(_RuntimeLayoutRunner):
     def __init__(
         self,
         tp_group,
@@ -717,97 +764,114 @@ class _WindowRunner:
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
         self.routes = tuple(
-            torch.empty(
+            torch.zeros(
                 (
                     config.m,
                     shape.topk,
-                    config.window + config.window // 8,
+                    config.route_row_bytes,
                 ),
                 dtype=torch.uint8,
                 device=self.device,
             )
             for _ in range(SLOTS)
         )
-        self.partial_ready = config.m * (config.window + config.window // 32)
-        self.reduced_ready = config.shard_rows * config.window
-        sizes = (
-            ((self.partial_ready + 8 + 255) // 256 * 256,) * SLOTS
-            + ((self.reduced_ready + 8 + 255) // 256 * 256,) * SLOTS
-            + (config.shard_rows * (config.window // 32),) * SLOTS
-        )
-        self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
-        self.partials = tensors[:SLOTS]
-        self.reduced_payloads = tensors[SLOTS : 2 * SLOTS]
-        self.reduced_scales = tensors[2 * SLOTS :]
-        for partial in self.partials:
-            partial[self.partial_ready : self.partial_ready + 8].zero_()
-        for payload in self.reduced_payloads:
-            payload[self.reduced_ready : self.reduced_ready + 8].zero_()
+        self.workspace = _WindowWorkspaceLayout.allocate(self.device, config)
+        self.workspace.clear_epochs()
+        # The symmetric workspace comes from torch.empty(), so peer-visible epoch
+        # words may contain stale values.  The host TP barrier below does not wait
+        # for these asynchronous device clears; complete them before any rank can
+        # register and observe the workspace.
+        torch.cuda.synchronize(self.device)
         self.output = torch.empty(
-            (config.m, shape.model_dim),
+            (config.output_rows, shape.model_dim),
             dtype=torch.bfloat16,
             device=self.device,
         )
+        self._runtime_shared_stage = None
         self.comm, self.windows, (workspace_base,) = _register(
-            tp_group, self.rank, shape.tp_size, (self.workspace,)
+            tp_group, self.rank, shape.tp_size, (self.workspace.storage,)
         )
         tp_group.barrier()
-        bases = tuple(workspace_base + offset for offset in offsets)
-        self.partial_bases = bases[:SLOTS]
-        self.reduced_payload_bases = bases[SLOTS : 2 * SLOTS]
-        self.reduced_scale_bases = bases[2 * SLOTS :]
-        shard_begin = self.rank * config.shard_rows
-        self.reduced_shards = tuple(
-            self.output[
-                shard_begin : shard_begin + config.shard_rows,
-                phase * config.window : (phase + 1) * config.window,
-            ]
-            for phase in range(shape.model_dim // config.window)
-        )
-        self.gathered_outputs = tuple(
-            self.output[:, phase * config.window : (phase + 1) * config.window]
-            for phase in range(shape.model_dim // config.window)
-        )
+        self.workspace.bind_flat_base(workspace_base)
+        shard_begin = self.rank * config.shard_rows if config.gather_output else 0
+        self.reduced_output = self.output[shard_begin : shard_begin + config.shard_rows]
 
-    def _local_args(self, phase, shared_partial):
-        slot = phase % SLOTS
-        shared = (
-            shared_partial[:, phase * self.config.window :]
-            if shared_partial is not None
-            else self.output[:, phase * self.config.window :]
-        )
-        return (
-            ptr_arg(self.routes[slot]),
-            ptr_arg(self.partials[slot]),
-            ptr_arg(shared),
-        )
+    def _shared_view(self, shared_partial):
+        if self.config.gather_output:
+            return shared_partial
+        elif shared_partial is None:
+            return None
+        elif shared_partial.shape[0] == self.config.m:
+            shard_begin = self.rank * self.config.shard_rows
+            return shared_partial[shard_begin : shard_begin + self.config.shard_rows]
+        elif shared_partial.shape[0] == self.config.shard_rows:
+            return shared_partial
+        else:
+            raise ValueError(
+                "window shared partial must use either the full or local-shard "
+                f"row layout, got {tuple(shared_partial.shape)}"
+            )
 
-    def _collective_args(self, reduce_scatter, all_gather):
-        reduce_slot = reduce_scatter % SLOTS
-        gather_slot = all_gather % SLOTS
-        return (
-            fx.Int64(self.partial_bases[reduce_slot]),
-            ptr_arg(self.reduced_shards[reduce_scatter]),
-            ptr_arg(self.reduced_payloads[reduce_slot]),
-            ptr_arg(self.reduced_scales[reduce_slot]),
-            fx.Int64(self.reduced_payload_bases[gather_slot]),
-            fx.Int64(self.reduced_scale_bases[gather_slot]),
-            ptr_arg(self.gathered_outputs[all_gather]),
+    def _phase_view(
+        self,
+        *,
+        local: int | None,
+        reduce_scatter: int | None,
+        all_gather: int | None,
+        shared_partial,
+    ) -> _WindowPhaseView:
+        workspace = self.workspace
+        gather_output = self.config.gather_output
+        return _WindowPhaseView(
+            local_route=None if local is None else self.routes[local % SLOTS],
+            local_partial=None if local is None else workspace.partials[local],
+            shared=self._shared_view(shared_partial),
+            reduce_partial_base=(
+                None
+                if reduce_scatter is None
+                else workspace.partial_bases[reduce_scatter]
+            ),
+            reduced_shard=self.reduced_output if reduce_scatter is not None else None,
+            reduced_payload=(
+                workspace.reduced_payloads[reduce_scatter]
+                if gather_output and reduce_scatter is not None
+                else None
+            ),
+            reduced_scale=(
+                workspace.reduced_scales[reduce_scatter]
+                if gather_output and reduce_scatter is not None
+                else None
+            ),
+            gather_payload_base=(
+                workspace.reduced_payload_bases[all_gather]
+                if gather_output and all_gather is not None
+                else None
+            ),
+            gather_scale_base=(
+                workspace.reduced_scale_bases[all_gather]
+                if gather_output and all_gather is not None
+                else None
+            ),
+            gathered_output=(
+                self.output if gather_output and all_gather is not None else None
+            ),
         )
 
     def _drain(self, local, reduce_scatter, all_gather, shared_partial, stream):
+        phase = self._phase_view(
+            local=local,
+            reduce_scatter=reduce_scatter,
+            all_gather=all_gather,
+            shared_partial=shared_partial,
+        )
         _run_compiled(
             window.compile_drain(
                 self.config,
-                local is not None,
-                reduce_scatter is not None,
-                all_gather is not None,
+                local,
+                reduce_scatter,
+                all_gather,
             ),
-            *self._local_args(0 if local is None else local, shared_partial),
-            *self._collective_args(
-                0 if reduce_scatter is None else reduce_scatter,
-                0 if all_gather is None else all_gather,
-            ),
+            *phase.launch_args(),
             self.rank,
             stream,
         )
@@ -819,10 +883,13 @@ class _WindowRunner:
         stage2_kwargs: dict,
         shared_partial,
         ordinary_stage2,
+        before_shared_add=None,
     ):
         k = window
         _bind_inter_layout(self, ordinary_stage2)
         config = self.config
+        workspace = self.workspace
+        phase_count = workspace.phase_count
         stream = torch.cuda.current_stream(self.device)
         common = _stage2_args(stage2_args, stage2_kwargs, config)
         _run_compiled(
@@ -831,9 +898,32 @@ class _WindowRunner:
             *common,
             stream,
         )
-        for local in range(len(self.reduced_shards) - 1):
+        shared_waited = before_shared_add is None or not config.shape.add_shared
+
+        def wait_for_shared_if_used(*, local, reduce_scatter):
+            nonlocal shared_waited
+            uses_shared = (config.gather_output and local is not None) or (
+                not config.gather_output and reduce_scatter is not None
+            )
+            if uses_shared and not shared_waited:
+                before_shared_add()
+                shared_waited = True
+
+        for local in range(phase_count - 1):
             reduce_scatter = local - 1
-            all_gather = local - 2
+            all_gather = local - 2 if config.gather_output else None
+            wait_for_shared_if_used(
+                local=local,
+                reduce_scatter=reduce_scatter if reduce_scatter >= 0 else None,
+            )
+            phase = self._phase_view(
+                local=local,
+                reduce_scatter=reduce_scatter if reduce_scatter >= 0 else None,
+                all_gather=(
+                    all_gather if all_gather is not None and all_gather >= 0 else None
+                ),
+                shared_partial=shared_partial,
+            )
             _run_compiled(
                 k.compile_cycle(
                     config,
@@ -841,86 +931,215 @@ class _WindowRunner:
                 ),
                 ptr_arg(self.routes[(local + 1) % SLOTS]),
                 *common,
-                *self._local_args(local, shared_partial),
-                *self._collective_args(max(reduce_scatter, 0), max(all_gather, 0)),
+                *phase.launch_args(),
                 self.rank,
                 stream,
             )
-            local_slot = local % SLOTS
-            _barrier(
-                self.partials[local_slot],
-                self.partial_bases[local_slot],
-                self.partial_ready,
-                config.shape.tp_size,
-                stream,
-            )
-            if reduce_scatter >= 0:
-                reduce_slot = reduce_scatter % SLOTS
+            if config.gather_output and reduce_scatter >= 0:
+                _barrier_pair(
+                    workspace.partials[local],
+                    workspace.partial_bases[local],
+                    workspace.partial_ready,
+                    workspace.reduced_payloads[reduce_scatter],
+                    workspace.reduced_payload_bases[reduce_scatter],
+                    workspace.reduced_ready,
+                    config.shape.tp_size,
+                    stream,
+                )
+            else:
                 _barrier(
-                    self.reduced_payloads[reduce_slot],
-                    self.reduced_payload_bases[reduce_slot],
-                    self.reduced_ready,
+                    workspace.partials[local],
+                    workspace.partial_bases[local],
+                    workspace.partial_ready,
                     config.shape.tp_size,
                     stream,
                 )
 
-        last = len(self.reduced_shards) - 1
-        self._drain(last, last - 1, last - 2, shared_partial, stream)
-        last_slot = last % SLOTS
-        reduce_slot = (last - 1) % SLOTS
-        _barrier(
-            self.partials[last_slot],
-            self.partial_bases[last_slot],
-            self.partial_ready,
-            config.shape.tp_size,
+        last = phase_count - 1
+        wait_for_shared_if_used(local=last, reduce_scatter=last - 1)
+        self._drain(
+            last,
+            last - 1,
+            last - 2 if config.gather_output else None,
+            shared_partial,
             stream,
         )
-        _barrier(
-            self.reduced_payloads[reduce_slot],
-            self.reduced_payload_bases[reduce_slot],
-            self.reduced_ready,
-            config.shape.tp_size,
+        if config.gather_output:
+            _barrier_pair(
+                workspace.partials[last],
+                workspace.partial_bases[last],
+                workspace.partial_ready,
+                workspace.reduced_payloads[last - 1],
+                workspace.reduced_payload_bases[last - 1],
+                workspace.reduced_ready,
+                config.shape.tp_size,
+                stream,
+            )
+        else:
+            _barrier(
+                workspace.partials[last],
+                workspace.partial_bases[last],
+                workspace.partial_ready,
+                config.shape.tp_size,
+                stream,
+            )
+        self._drain(
+            None,
+            last,
+            last - 1 if config.gather_output else None,
+            shared_partial,
             stream,
         )
-        self._drain(None, last, last - 1, shared_partial, stream)
-        _barrier(
-            self.reduced_payloads[last_slot],
-            self.reduced_payload_bases[last_slot],
-            self.reduced_ready,
-            config.shape.tp_size,
-            stream,
+        if config.gather_output:
+            _barrier(
+                workspace.reduced_payloads[last],
+                workspace.reduced_payload_bases[last],
+                workspace.reduced_ready,
+                config.shape.tp_size,
+                stream,
+            )
+            self._drain(None, None, last, shared_partial, stream)
+        # The workspace is private to this cached runner. Before either the
+        # final AR payload or the final RS partial can be overwritten, the next
+        # call reaches an earlier all-rank partial barrier. Stream ordering
+        # proves that every rank has completed the preceding consumer by then,
+        # so a trailing completion-only barrier is unnecessary.
+        return self.output
+
+
+class _DirectRunner(_RuntimeLayoutRunner):
+    """Run ordinary Stage2 followed by direct collective postprocessing."""
+
+    def __init__(
+        self,
+        tp_group,
+        config: DirectConfig,
+    ) -> None:
+        self.config = config
+        self.rank = int(tp_group.rank_in_group)
+        self.device = torch.device(tp_group.device)
+        self.workspace = _symmetric(self.device, config.workspace_bytes)
+        self.workspace.zero_()
+        self.partial = (
+            self.workspace.narrow(0, 0, config.partial_bytes)
+            .view(torch.bfloat16)
+            .view(config.m, config.shape.model_dim)
         )
-        self._drain(None, None, last, shared_partial, stream)
+        self.stage2_output = self.partial
+        self.output = torch.empty(
+            (config.output_rows, config.shape.model_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._runtime_shared_stage = None
+        self.comm, self.windows, (self.workspace_base,) = _register(
+            tp_group,
+            self.rank,
+            config.shape.tp_size,
+            (self.workspace,),
+        )
+        tp_group.barrier()
+        self.reduce_scatter_add = direct.compile_reduce_scatter_add(config)
+
+    @property
+    def stage2_destination(self):
+        return self.stage2_output
+
+    def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
+        expected = (self.config.output_rows, self.config.shape.model_dim)
+        if (
+            tuple(shared_partial.shape) != expected
+            or shared_partial.dtype != torch.bfloat16
+            or shared_partial.device != self.device
+            or not shared_partial.is_contiguous()
+        ):
+            raise ValueError(
+                f"shared output must be contiguous BF16 {expected} on {self.device}"
+            )
+        return shared_partial
+
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial: torch.Tensor | None,
+        ordinary_stage2,
+        before_shared_add=None,
+    ) -> torch.Tensor:
+        from aiter.fused_moe import stage2_uses_route_reduce
+
+        if stage2_uses_route_reduce(ordinary_stage2):
+            raise RuntimeError("direct collective requires an accumulating Stage2")
+        if int(stage2_args[6].shape[0]) != self.config.m:
+            raise RuntimeError(f"direct collective requires exact M={self.config.m}")
+        if int(stage2_kwargs["block_m"]) != self.config.sort_block_m:
+            raise RuntimeError("Stage2 sort block does not match direct collective")
+        if shared_partial is None:
+            raise RuntimeError("direct collective requires shared output")
+
+        ordinary_stage2(
+            *stage2_args[:6],
+            self.partial,
+            *stage2_args[7:],
+            **stage2_kwargs,
+        )
+        if before_shared_add is not None:
+            before_shared_add()
+        _run_compiled(
+            self.reduce_scatter_add,
+            ptr_arg(self.workspace),
+            fx.Int64(self.workspace_base),
+            ptr_arg(self.output),
+            ptr_arg(shared_partial),
+            self.rank,
+            torch.cuda.current_stream(self.device),
+        )
         return self.output
 
 
 _RUNNER_TYPES = {
-    AtomicConfig: _AtomicRunner,
     MegakernelConfig: _MegakernelRunner,
     WindowConfig: _WindowRunner,
+    DirectConfig: _DirectRunner,
 }
 
 
 def create_runner(tp_group, config: PipelineConfig):
-    return _RUNNER_TYPES[type(config)](tp_group, config)
+    runner_type = _RUNNER_TYPES[type(config)]
+    return runner_type(tp_group, config)
 
 
 class _LazyRunners:
     def __init__(
-        self, tp_group, shape: ShapeKey, configs: dict[int, PipelineConfig]
+        self,
+        tp_group,
+        shape: ShapeKey,
+        configs: dict[int, PipelineConfig],
     ) -> None:
         self.tp_group = tp_group
         self.shape = shape
         self.configs = configs
-        self.add_shared = next(iter(configs.values())).shape.add_shared
         self.instances = {}
+        self.activated = set()
+
+        # A Window runner creates a peer-VMM communicator and registers its
+        # symmetric workspace.  Doing that lazily from the first DPA request is
+        # unsafe: ranks may reach the first MoE layer at different times and
+        # enter a different collective while one rank is still broadcasting
+        # the communicator id.  Materialize only Window runners here, while
+        # model initialization is ordered identically on every rank.  Kernel
+        # compilation remains lazy.
+        for tokens, config in sorted(configs.items()):
+            if isinstance(config, WindowConfig):
+                self.instances[tokens] = create_runner(self.tp_group, config)
 
     def __contains__(self, tokens: int) -> bool:
         return tokens in self.configs
 
     def __getitem__(self, tokens: int):
-        if tokens not in self.instances:
-            config = self.configs[tokens]
+        config = self.configs[tokens]
+        if tokens not in self.activated:
             if int(self.tp_group.rank_in_group) == 0:
                 lookup_key = (
                     self.shape.gfx,
@@ -943,8 +1162,23 @@ class _LazyRunners:
                     config_name(config),
                     lookup_key,
                 )
+            self.activated.add(tokens)
+        if tokens not in self.instances:
             self.instances[tokens] = create_runner(self.tp_group, config)
         return self.instances[tokens]
+
+    def output_rows_for(self, bucket: int, input_rows: int) -> int:
+        config = self.configs[bucket]
+        if getattr(config, "requires_exact_m", False) and input_rows != config.m:
+            raise ValueError(f"{type(config).__name__} requires exact M={config.m}")
+        output_rows, remainder = divmod(input_rows * config.output_rows, config.m)
+        if remainder:
+            raise ValueError(
+                f"runner layout maps bucket M={config.m} to "
+                f"{config.output_rows} output rows and cannot represent "
+                f"input M={input_rows}"
+            )
+        return output_rows
 
 
 def create_flydsl_comm_fused_runners(
@@ -955,7 +1189,7 @@ def create_flydsl_comm_fused_runners(
     experts,
     topk,
     comm: str = "ar",
-    add_shared: bool | None = None,
+    add_shared: bool = True,
 ):
     if comm not in _COMM_MODES:
         raise ValueError(f"comm must be one of {_COMM_MODES}, got {comm!r}")
@@ -972,7 +1206,32 @@ def create_flydsl_comm_fused_runners(
     configs = winners_for(shape)
     if not configs:
         raise KeyError(f"unsupported comm_fused shape {shape}")
-    key = (id(tp_group), shape)
+    mxfp8_fallback = _window_mxfp8_fallback_enabled()
+    rewrite_window_payloads = any(
+        isinstance(config, WindowConfig)
+        and config.gather_output
+        and mxfp8_fallback
+        and (config.partial_payload_bits != 8 or config.reduced_payload_bits != 8)
+        for config in configs.values()
+    )
+    if rewrite_window_payloads:
+        configs = {
+            tokens: (
+                replace(
+                    config,
+                    partial_payload_bits=8,
+                    reduced_payload_bits=8,
+                )
+                if isinstance(config, WindowConfig) and config.gather_output
+                else config
+            )
+            for tokens, config in configs.items()
+        }
+    key = (
+        id(tp_group),
+        shape,
+        mxfp8_fallback,
+    )
     if key not in _RUNNER_CACHE:
         _RUNNER_CACHE[key] = _LazyRunners(tp_group, shape, configs)
     return _RUNNER_CACHE[key]

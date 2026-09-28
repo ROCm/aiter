@@ -19,6 +19,7 @@ from flydsl.expr.typing import ReductionOp, T, as_ir_value
 from .... import communication_ops_utils as comm_ops
 from ....mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr
 from .collectives import (
+    CPOL_COHERENT,
     buffer_tensor_from_addr,
     decode_scaled_fp8_f32,
     e8m0_scale,
@@ -34,8 +35,6 @@ from .collectives import (
 )
 from .config import PRODUCER_COUNTER_STRIDE, SLOTS, MegakernelConfig
 from .producer import compile_megakernel_producer
-
-CPOL_COHERENT = 0x1 | 0x10
 
 
 def _decode_scaled_fp8_bf16(words, scale):
@@ -169,8 +168,9 @@ def emit_service_tile(
         config.vector_width == 8 or config.wide_partial_scales
     )
     reduce_items = config.m * config.tile_n // config.vector_width
-    optimized_m8_direct = config.collective == "direct" and config.m == 8
-    partial_store_cache_modifier = CPOL_COHERENT if optimized_m8_direct else 0
+    partial_store_cache_modifier = (
+        CPOL_COHERENT if config.coherent_direct_handoff else 0
+    )
     local_workspace_base = fx.Int64(ptrtoint(workspace))
     state_n_tile = (n_tile // fx.Int32(config.service_tile_group)) * fx.Int32(
         config.service_tile_group
@@ -192,30 +192,11 @@ def emit_service_tile(
         fx.BFloat16,
         payload_bytes,
     )
-    route_resource = None
-    accumulator_resource = None
-    clear_accumulator_resource = None
-    if const_expr(config.producer_mode == "atomic_shared"):
-        accumulator_resource = buffer_tensor_from_addr(
-            local_workspace_base
-            + fx.Int64(config.route_offset)
-            + slot * fx.Int64(payload_bytes),
-            fx.BFloat16,
-            payload_bytes,
-        )
-        clear_accumulator_resource = buffer_tensor_from_addr(
-            local_workspace_base
-            + fx.Int64(config.route_offset)
-            + (slot ^ fx.Int64(1)) * fx.Int64(payload_bytes),
-            fx.BFloat16,
-            payload_bytes,
-        )
-    else:
-        route_resource = buffer_tensor_from_addr(
-            local_workspace_base + fx.Int64(config.route_offset),
-            fx.BFloat16,
-            config.route_bytes,
-        )
+    route_resource = buffer_tensor_from_addr(
+        local_workspace_base + fx.Int64(config.route_offset),
+        fx.BFloat16,
+        config.route_bytes,
+    )
     partial_resource = buffer_tensor_from_addr(
         local_workspace_base + slot * fx.Int64(partial_bytes),
         fx.Int32,
@@ -287,79 +268,46 @@ def emit_service_tile(
             + n_tile * fx.Int32(config.tile_n)
             + tile_item * fx.Int32(config.vector_width)
         )
-        if const_expr(config.producer_mode == "atomic_shared"):
+
+        def load_bf16_route(route_slot):
+            route_offset = (
+                (token * fx.Int32(topk) + fx.Int32(route_slot)) * fx.Int32(hidden_dim)
+                + n_tile * fx.Int32(config.tile_n)
+                + tile_item * fx.Int32(config.vector_width)
+            )
+            return load_bf16(
+                route_resource,
+                route_offset,
+                config.vector_width,
+                config.local_load_cache_modifier,
+            ).to(fx.Float32)
+
+        local_even = load_bf16_route(0)
+        if const_expr(config.shape.add_shared):
             shared_values = load_bf16(
                 shared_resource,
                 output_offset,
                 config.vector_width,
                 config.local_load_cache_modifier,
             ).to(fx.Float32)
-            reduced_f32 = shared_values + load_bf16(
-                accumulator_resource,
-                output_offset,
-                config.vector_width,
-                config.local_load_cache_modifier,
-            ).to(fx.Float32)
+            local_even = shared_values + local_even
+        if const_expr(topk == 1):
+            reduced_f32 = local_even
         else:
-            shared_values = load_bf16(
+            local_odd = load_bf16_route(1)
+            for route_slot in range_constexpr(2, topk):
+                if const_expr(route_slot == topk - 1 or route_slot % 2 == 0):
+                    local_odd = local_odd + load_bf16_route(route_slot)
+                else:
+                    local_even = local_even + load_bf16_route(route_slot)
+            reduced_f32 = local_even + local_odd
+        if const_expr(config.shared_bf16_partials):
+            store_bf16(
                 shared_resource,
                 output_offset,
+                reduced_f32.to(fx.BFloat16),
                 config.vector_width,
-                config.local_load_cache_modifier,
-            ).to(fx.Float32)
-
-            def load_bf16_route(route_slot):
-                route_offset = (
-                    (token * fx.Int32(topk) + fx.Int32(route_slot))
-                    * fx.Int32(hidden_dim)
-                    + n_tile * fx.Int32(config.tile_n)
-                    + tile_item * fx.Int32(config.vector_width)
-                )
-                return load_bf16(
-                    route_resource,
-                    route_offset,
-                    config.vector_width,
-                    config.local_load_cache_modifier,
-                ).to(fx.Float32)
-
-            local_even = shared_values + load_bf16_route(0)
-            if const_expr(topk == 1):
-                reduced_f32 = local_even
-            else:
-                local_odd = load_bf16_route(1)
-                for route_slot in range_constexpr(2, topk):
-                    if const_expr(route_slot == topk - 1 or route_slot % 2 == 0):
-                        local_odd = local_odd + load_bf16_route(route_slot)
-                    else:
-                        local_even = local_even + load_bf16_route(route_slot)
-                reduced_f32 = local_even + local_odd
-
-        if const_expr(config.shared_bf16_partials):
-            if const_expr(config.producer_mode == "atomic_shared"):
-                store_bf16(
-                    output_resource,
-                    output_offset,
-                    reduced_f32.to(fx.BFloat16),
-                    config.vector_width,
-                )
-                zero_bf16 = fx.Float32(0.0).to(fx.BFloat16)
-                store_bf16(
-                    clear_accumulator_resource,
-                    output_offset,
-                    fx.Vector.from_elements(
-                        [zero_bf16 for _ in range_constexpr(config.vector_width)],
-                        fx.BFloat16,
-                    ),
-                    config.vector_width,
-                    cache_modifier=2,
-                )
-            else:
-                store_bf16(
-                    shared_resource,
-                    output_offset,
-                    reduced_f32.to(fx.BFloat16),
-                    config.vector_width,
-                )
+            )
             return None
 
         partial_e8m0, quant_scale = _mxfp8_scale(
@@ -429,19 +377,11 @@ def emit_service_tile(
 
         def load_peer(peer, cache_modifier=None, use_retained=False):
             if const_expr(config.shared_bf16_partials):
-                if const_expr(config.producer_mode == "atomic_shared"):
-                    peer_resource = buffer_tensor_from_addr(
-                        peer_base(workspace_flat_base, peer)
-                        + fx.Int64(config.output_offset),
-                        fx.BFloat16,
-                        payload_bytes,
-                    )
-                else:
-                    peer_resource = buffer_tensor_from_addr(
-                        peer_base(shared_partial_flat_base, peer),
-                        fx.BFloat16,
-                        payload_bytes,
-                    )
+                peer_resource = buffer_tensor_from_addr(
+                    peer_base(shared_partial_flat_base, peer),
+                    fx.BFloat16,
+                    payload_bytes,
+                )
                 return load_bf16(
                     peer_resource,
                     offset,
@@ -616,17 +556,10 @@ def emit_service_tile(
 
     def reset_tile_state_values():
         for tile_delta in range_constexpr(config.service_tile_group):
-            counter_slot = fx.Int64(0)
-            if const_expr(config.producer_mode == "atomic_shared"):
-                counter_slot = slot ^ fx.Int64(1)
             counter_address = (
                 local_workspace_base
                 + fx.Int64(config.producer_done_offset)
-                + (
-                    fx.Int64(state_n_tile + fx.Int32(tile_delta))
-                    * fx.Int64(config.producer_counter_slots)
-                    + counter_slot
-                )
+                + (fx.Int64(state_n_tile + fx.Int32(tile_delta)))
                 * fx.Int64(PRODUCER_COUNTER_STRIDE)
             )
             fx.ptr_store(
@@ -678,29 +611,10 @@ def emit_service_tile(
             if const_expr(barrier):
                 gpu.barrier()
 
-        def wait_for_gather_acks():
-            if const_expr(
-                config.collective == "rs_broadcast"
-                and config.producer_mode == "atomic_shared"
-            ):
-                if tid < fx.Int32(tp_size):
-                    local_slot = state_n_tile * fx.Int32(tp_size) + tid
-                    comm_ops.spin_until_ge_i32_system(
-                        local_workspace_base
-                        + fx.Int64(config.gather_done_offset)
-                        + fx.Int64(local_slot) * fx.Int64(4),
-                        expected_i32,
-                    )
-                gpu.barrier()
-                if tid == fx.Int32(0):
-                    comm_ops.fence_system_acquire()
-                gpu.barrier()
-
         def publish_gather_completion():
             if const_expr(config.service_groups == 1):
                 if const_expr(config.collective == "rs_broadcast"):
                     emit_gather_ack()
-                    wait_for_gather_acks()
                 else:
                     if tid == fx.Int32(0):
                         comm_ops.fence_system_release()
@@ -730,7 +644,6 @@ def emit_service_tile(
                         comm_ops.fence_system_release()
                     gpu.barrier()
                     emit_gather_ack(barrier=False)
-                    wait_for_gather_acks()
                     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                     if tid == fx.Int32(0):
                         reset_tile_state_values()
@@ -1040,7 +953,7 @@ def emit_service_tile(
                 comm_ops.spin_until_ge_i32_system(
                     ready_address,
                     expected_i32,
-                    acquire=not optimized_m8_direct,
+                    acquire=not config.coherent_direct_handoff,
                     sleep=False,
                 )
             else:
@@ -1153,7 +1066,7 @@ def compile_megakernel(
         .replace("shape=Shape(", "shape=Gemm2TPShape(", 1)
     )
     cache_config = hashlib.sha256(
-        f"mxmoe_bf16_route_dynamic_scale_v5:{legacy_config_repr}".encode()
+        f"mxmoe_bf16_route_dynamic_scale_v6:{legacy_config_repr}".encode()
     ).hexdigest()[:16]
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
@@ -1208,21 +1121,6 @@ def compile_megakernel(
             producer_output_address = local_workspace_base + fx.Int64(
                 config.route_offset
             )
-            producer_counter_slot = fx.Int64(0)
-            if const_expr(config.producer_mode == "atomic_shared"):
-                producer_epoch = fx.Int64(
-                    comm_ops.load_i64_global(
-                        local_workspace_base
-                        + fx.Int64(config.epoch_offset)
-                        + fx.Int64(n_tile) * fx.Int64(8)
-                    )
-                )
-                producer_slot = (producer_epoch + fx.Int64(1)) & fx.Int64(1)
-                producer_counter_slot = producer_slot
-                producer_output_address = (
-                    producer_output_address
-                    + producer_slot * fx.Int64(config.payload_bytes)
-                )
             producer_output = global_typed_ptr(
                 producer_output_address,
                 T.i8,
@@ -1287,11 +1185,7 @@ def compile_megakernel(
                     comm_ops.atomic_add_agent_one_as(
                         local_workspace_base
                         + fx.Int64(config.producer_done_offset)
-                        + (
-                            fx.Int64(n_tile) * fx.Int64(config.producer_counter_slots)
-                            + producer_counter_slot
-                        )
-                        * fx.Int64(PRODUCER_COUNTER_STRIDE),
+                        + fx.Int64(n_tile) * fx.Int64(PRODUCER_COUNTER_STRIDE),
                         fx.Int32(1),
                     )
                 )
@@ -1313,12 +1207,7 @@ def compile_megakernel(
                         comm_ops.spin_until_ge_i32_agent(
                             local_workspace_base
                             + fx.Int64(config.producer_done_offset)
-                            + (
-                                fx.Int64(n_tile)
-                                * fx.Int64(config.producer_counter_slots)
-                                + producer_counter_slot
-                            )
-                            * fx.Int64(PRODUCER_COUNTER_STRIDE),
+                            + fx.Int64(n_tile) * fx.Int64(PRODUCER_COUNTER_STRIDE),
                             fx.Int32(config.compute_groups),
                         )
                         comm_ops.fence_agent_acquire()
