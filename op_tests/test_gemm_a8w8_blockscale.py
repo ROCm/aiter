@@ -295,6 +295,10 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
         f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
         f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
     )
+    assert ck_err < 0.05 and cktile_err < 0.05, (
+        f"split-K mismatch (m={m}, n={n}, k={k}, splitK={splitK}): "
+        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
+    )
 
 
 parser = argparse.ArgumentParser(
@@ -520,6 +524,9 @@ if args.table and not df.empty:
 print("\nRunning split-K correctness checks ...")
 for splitK in [1, 2]:
     test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+# Two K loops per split for the default CK-Tile tile, the shortest split it runs.
+for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
+    test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
 
 # Save results from benchmarks
 if args.output:
