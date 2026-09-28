@@ -1617,21 +1617,26 @@ def test_qsa_backend_default_is_live_amd():
     raise AssertionError("gluon is not a qsa_layer backend")
 
 
-def test_qsa_auto_stays_off_the_family_a_gate():
-    """auto admits the measured shape and nothing else.
+def test_qsa_auto_admits_only_measured_pairs():
+    """auto admits the swept (GQA query, indexer heads) pairs and no others.
 
     Both ways this can break are silent. Loosened, auto serves an untuned
     shape at whatever speed the K2 band table happens to give; narrowed, it
-    drops the production shape back to Triton. Neither is a wrong result,
-    so no other test in this file would notice. Both serves gates accept
-    family B, so the shape pin is the only thing rejecting it here.
+    drops a measured shape back to Triton. Neither is a wrong result, so no
+    other test in this file would notice. K2 serves any structurally valid
+    shape, so the table in ``qsa.py`` is the only thing doing the rejecting.
     """
     page = 16
     n_columns = 128
-    family_b = _policy_args(1, 10, 128, n_columns, page, 4, 128)
-    assert qsa_auto_uses_flydsl(*family_b) is False
-    family_a = _policy_args(1, 24, 256, n_columns, page, 4, 128)
-    assert qsa_auto_uses_flydsl(*family_a) is True
+    for hq, d_gqa, heads in ((24, 256, 4), (10, 128, 4), (10, 128, 8)):
+        swept = _policy_args(1, hq, d_gqa, n_columns, page, heads, 128)
+        assert qsa_auto_uses_flydsl(*swept) is True
+    # Family A was only ever swept with a 4-head indexer.
+    wide_indexer = _policy_args(1, 24, 256, n_columns, page, 8, 128)
+    assert qsa_auto_uses_flydsl(*wide_indexer) is False
+    # An untuned GQA query stays on Triton however it is indexed.
+    untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
+    assert qsa_auto_uses_flydsl(*untuned) is False
 
 
 def test_qsa_symbols_export_lazily():
@@ -1946,9 +1951,10 @@ def bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate=0):
 
 @benchmark()
 def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
-    """One family B QSA layer vs #4882 Triton and, on gfx950, Gluon.
+    """One family B QSA layer vs live AMD, #4882 Triton and, on gfx950, Gluon.
 
-    Separate table from family A. ``auto`` does not select this shape.
+    Separate table from family A. Live AMD is the column ``auto`` decides
+    against, so it is the one that governs the gate; the others are parity.
     """
     idx = _family_b_indexer(index_heads)
     gqa = FAMILY_B_GQA
@@ -1958,6 +1964,10 @@ def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
     fly, fly_us = _time_layer(case, idx, "flydsl", rotate)
     fly_err = checkAllclose(
         ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl family B e2e"
+    )
+    amd, amd_us = _time_layer(case, idx, "triton", rotate)
+    amd_err = checkAllclose(
+        ref, amd.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="vllm amd family B e2e"
     )
     triton, triton_us = _time(
         _qsa_4882_layer,
@@ -1982,6 +1992,7 @@ def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
         "valid%": 100.0 * w / w_alloc,
     }
     ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
+    ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
     ret.update(_e2e_cells("4882_triton_e2e", triton_us, triton_err, flops, nbytes))
     if get_gfx() == "gfx950" and gluon_qsa_available():
         gluon, gluon_us = _time(
@@ -2072,7 +2083,7 @@ def _run_unit_cases():
     test_k2_family_a_decode_matches_oracle()
     test_k2_family_a_prefill_matches_oracle()
     test_qsa_backend_default_is_live_amd()
-    test_qsa_auto_stays_off_the_family_a_gate()
+    test_qsa_auto_admits_only_measured_pairs()
     test_qsa_symbols_export_lazily()
     test_qsa_layer_family_a_matches_oracle()
     test_qsa_layer_family_b_matches_oracle()
