@@ -175,26 +175,28 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 )
 
             def stage(block):
+                page = fx.Int32(_load(
+                    btp, (fx.Int64(seq) * fx.Int64(bt_stride)
+                          + fx.Int64(block * 32 // page_size)) * 4, T.i32, 4))
+                ktiles, vtiles = [], []
                 for i in range_constexpr(4):
                     off = tid * 16 + i * 2048
                     token = block * 32 + off // 256
                     d = off % 256
                     safe_token = (token < klen).select(token, block * 32)
-                    page = fx.Int32(_load(
-                        btp, (fx.Int64(seq) * fx.Int64(bt_stride)
-                              + fx.Int64(block * 32 // page_size)) * 4, T.i32, 4))
                     src = (
                         (fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
-                        * 16
-                        + fx.Int64(head)
+                        * 16 + fx.Int64(head)
                     ) * 256 + fx.Int64(d)
-                    kval = _load(kp, src, fx.Vector.make_type(4, fx.Int32), 16)
-                    vval = fx.Vector(
-                        _load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)
-                    )
-                    _store(
-                        lds.k.ptr, (off // 256) * 260 + d, kval, 4
-                    )
+                    ktiles.append(_load(kp, src, fx.Vector.make_type(4, fx.Int32), 16))
+                    vtiles.append(_load(vp, src, fx.Vector.make_type(4, fx.Int32), 16))
+                # Issue the tile's loads before waiting on its transpose operands.
+                rocdl.sched_barrier(0)
+                for i in range_constexpr(4):
+                    off = tid * 16 + i * 2048
+                    d = off % 256
+                    vval = fx.Vector(vtiles[i])
+                    _store(lds.k.ptr, (off // 256) * 260 + d, ktiles[i], 4)
                     # Transpose four tokens in registers before writing a dword.
                     # XOR depth bits into the bank index for both access orders.
                     for j in range_constexpr(4):
