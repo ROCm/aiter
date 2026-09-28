@@ -15,9 +15,7 @@ visible so QK can run while V is in flight.  Softmax stays in registers
 (full-D QK on every wave, in-wave P transpose); LDS is MMA scratch only.
 Expand, partial RoPE, and the sigmoid output gate remain outside K2.
 
-The GQA shape is a build parameter rather than a constant -- the caller's
-tensors supply it -- but only the shapes in ``_TUNED_SHAPES`` have a
-measured launch policy, so the dispatch gate admits just those.
+The GQA shape is a build parameter: the caller's tensors supply it.
 """
 
 from functools import lru_cache
@@ -42,13 +40,6 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
-# GQA shapes whose launch policy has been measured, as
-# ``(n_q_heads, n_kv_heads, head_dim)``. The kernel body is shape-generic,
-# but the band table in ``_launch_config``, the prefill workgroup target and
-# the BLOCK_N choices are all fitted, so serving an untuned shape would be
-# correct and slow. Widen this only alongside a measurement; the test suite
-# asserts it still covers the shapes we validate against.
-_TUNED_SHAPES = frozenset({(24, 2, 256)})
 # 256 CUs on MI355X times the four BN32 prefill workgroups each keeps resident.
 _PREFILL_WGS = 256 * 4
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
@@ -1163,10 +1154,6 @@ def qsa_k2_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[3] != q.shape[2]:
         return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
-    shape = (int(q.shape[1]), int(k_cache.shape[2]), int(q.shape[2]))
-    if shape not in _TUNED_SHAPES:
-        tuned = ", ".join(str(s) for s in sorted(_TUNED_SHAPES))
-        return f"(Hq, Hk, D) {shape} has no tuned launch policy; tuned: {tuned}"
     if indices.dim() != 2 or indices.shape[0] != q.shape[0]:
         return "indices must be [M, W]"
     if indices.dtype != torch.int32:
