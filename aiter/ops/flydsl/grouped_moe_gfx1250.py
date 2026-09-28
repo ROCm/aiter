@@ -30,6 +30,13 @@ _GROUPED_WEIGHT_CACHE = {}
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
+# Opt-in correctness hook used by the grouped-MoE test.  When a dict is
+# installed here, the helper exposes GEMM1's logical BF16 output, its
+# route-to-grouped-row map, and GEMM2's raw grouped output.  The hook is
+# deliberately inactive in production and is populated only by an extra,
+# untimed diagnostic launch.
+stage_output_capture = None
+
 # fused_moe_ rebuilds Stage2ScatterContext without compact fields (custom-op
 # schema). MegaMoE stashes the live plan here for the grouped helper.
 _COMPACT_PLAN_TLS = threading.local()
@@ -570,6 +577,7 @@ def _grouped_a8w4_tdm_moe(
     )
 
     device = hidden_states.device
+    _stage_output_capture = stage_output_capture
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
     _compact_ctx = _tdm_compact_plan()
@@ -1023,7 +1031,14 @@ def _grouped_a8w4_tdm_moe(
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = (_b1 is None) and not (_is_fp4 and _gemm2_a_preshuffle)
+    # A diagnostic capture needs the canonical BF16 activation result.  Normal
+    # execution keeps the fused-quant epilogue unchanged; only the extra
+    # untimed test launch takes the BF16-output path when the hook is active.
+    _fuse_quant = (
+        (_b1 is None)
+        and not (_is_fp4 and _gemm2_a_preshuffle)
+        and _stage_output_capture is None
+    )
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1148,7 +1163,24 @@ def _grouped_a8w4_tdm_moe(
             expert_tile_m=_align_m,
         )
 
+    if _stage_output_capture is not None:
+        if topids_to_rows is None:
+            raise RuntimeError(
+                "GEMM stage-output capture requires the non-EP routed-row layout"
+            )
+        _stage_output_capture.update(
+            {
+                "gemm1_grouped_out": y,
+                "topids_to_rows": topids_to_rows,
+            }
+        )
+
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
+    if _stage_output_capture is not None:
+        # This diagnostic launch happens after torch.profiler has finished.
+        # Stabilize undefined padding bytes for a direct whole-buffer hash;
+        # every profiled/production launch retains the torch.empty fast path.
+        grouped_out.zero_()
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     flydsl_grouped_gemm_a8w4_masked(
@@ -1180,6 +1212,9 @@ def _grouped_a8w4_tdm_moe(
         a_preshuffle=_gemm2_a_preshuffle,
         **_ep_gemm2_kwargs,
     )
+
+    if _stage_output_capture is not None:
+        _stage_output_capture["gemm2_grouped_out"] = grouped_out
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
