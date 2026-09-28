@@ -135,6 +135,13 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
 
+# Native E8M0 group32 scales have a different operand contract from the
+# FP32 128x128 blockscale family, so shape-identical rows must stay separate.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -198,6 +205,14 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -206,6 +221,15 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
+
+# Head shapes to AOT-compile the gfx950 FlyDSL FP8 flash-attention forward for
+# (aiter/aot/flydsl/fmha_fp8.py). Per-model rows live under model_configs/
+# (*_fmha_fp8_aot.csv) and get merged into this canonical file, which ships
+# header-only like chunk_gdn_h_opt_tuned.csv.
+AITER_CONFIG_FMHA_FP8_AOT = os.getenv(
+    "AITER_CONFIG_FMHA_FP8_AOT",
+    f"{AITER_ROOT_DIR}/aiter/configs/fmha_fp8_aot.csv",
 )
 
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
@@ -267,6 +291,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
             "a8w8_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
+            "a8w8_blockscale_group32_tuned_gemm",
         )
 
     @property
@@ -336,11 +368,25 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_FMHA_FP8_AOT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMHA_FP8_AOT",
+            AITER_CONFIG_FMHA_FP8_AOT,
+            "fmha_fp8_aot",
         )
 
     @property

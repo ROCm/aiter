@@ -16,13 +16,14 @@ import os
 import sys
 from collections import namedtuple
 
+import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.inverse_rope_group_quant import (
     SCALE_LAYOUTS,
     scale_shape,
@@ -40,12 +41,15 @@ from aiter.test_common import (
 
 torch.set_default_device("cuda")
 
-# The HIP kernel widens its cross-lane amax reduction past a 16-lane DPP row with
-# __builtin_amdgcn_permlane16_swap / permlane32_swap, which are gfx950+. Those
-# instantiate whenever THREADS_PER_GROUP >= 32, i.e. the s <= 4 tier
-# (THREAD_DATA_SIZE=2 -> 64 lanes per group), so the module does not build on
-# gfx942 today.
-SUPPORTED_GFX = ["gfx950", "gfx1250", "gfx1201"]
+# The op needs no arch-specific instruction of its own. The amax reduction
+# reaches past a 16-lane DPP row through __shfl_xor, which the compiler lowers
+# per arch (row_bcast on gfx9, permlane on gfx10+), and the hardware scaled-FP8
+# converters are an opt-in fast path that falls back to the general chain
+# (kHwScaledFp8 / kNativeQuant). So this list is the set of verified targets
+# rather than a build constraint. gfx942 quantizes to E4M3_FNUZ rather than
+# E4M3 (kHwFp8E4m3 in the kernel); the reference tracks that through
+# dtypes.fp8, which is what _e8m0_round_up below takes its max_pos from.
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250", "gfx1201"]
 
 # Positions stay unique for every swept s, so cos/sin rows are not reused across
 # tokens -- reuse would inflate the L2 hit rate versus a real decode batch spread
@@ -562,6 +566,41 @@ def test_inverse_rope_group_quant(
     return ret
 
 
+def check_layout_rejected(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
+    """A wrong-family scale layout must raise, not abort.
+
+    The kernel refuses it too, but through AITER_CHECK -- which calls
+    std::abort(), so the process dies with SIGABRT and no traceback and nothing
+    can catch it. The wrapper's guard has to fire first; this asserts it does.
+    Deliberately does not reach the op, since getting there is the failure.
+    """
+    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
+    try:
+        inverse_rope_group_quant_cpp(
+            o,
+            positions,
+            cos,
+            sin,
+            num_groups=g,
+            quant_group_size=group_size,
+            scale_layout=scale_layout,
+        )
+    except ValueError as e:
+        assert scale_layout in str(e), f"unhelpful rejection message: {e}"
+        aiter.logger.info(
+            "inverse_rope_group_quant %s rejected on %s: %s",
+            scale_layout,
+            get_gfx(),
+            e,
+        )
+        return
+    raise AssertionError(
+        f"scale_layout={scale_layout!r} is not built for {get_gfx()} but the "
+        "wrapper let the call through -- the kernel's AITER_CHECK would have "
+        "aborted the process here"
+    )
+
+
 def check_graph(
     s,
     h,
@@ -661,6 +700,100 @@ def check_graph(
         f"graph replay diverged from eager at s={s} h={h} g={g} "
         f"group_size={group_size} scale_layout={scale_layout}"
     )
+
+
+def check_invalid_group(s, h, g, head_dim, rd, group_size, dtype, seed=0):
+    """A non-finite input invalidates its own quant group and no other.
+
+    The kernel folds every non-finite magnitude onto +Inf before the group
+    reduction, so the block scale lands on the 0xFF E8M0 NaN. On the hardware
+    scaled convert that also turns the whole group into FP8 NaNs.
+    slice_amax_native in csrc/kernels/inverse_rope_group_quant.cu has the
+    reasoning.
+
+    Inf reaches the 0xFF scale on both quantize paths, so that byte is
+    asserted outright. The payload NaNs only come from the hardware scaled
+    convert (kHwScaledFp8 / kNativeQuant: gfx950, gfx1250). gfx942 has
+    neither instruction, so it does ``inv_scale = 1/Inf = +0`` and
+    ``v_med3_f32`` drops NaN -- the group stores zeros, and the invalid
+    marker is the scale alone.
+
+    NaN only folds onto Inf on the native amax; the general f32 path reduces
+    with fmaxf, which drops a NaN operand, and folding it there costs far
+    more than the case is worth (the kernel comment carries the measurement).
+    Rather than restate the host's path choice here, NaN is held to whichever
+    of the two documented outcomes applies -- which still fails on any third
+    one.
+    """
+    # e4m3fnuz (gfx942) spells NaN 0x80; OCP e4m3fn uses 0xFF.
+    nan_byte = 0x80 if torch.finfo(dtypes.fp8).max == 240 else 0xFF
+    d = h * head_dim // g
+    ks = d // group_size
+
+    for name, poison in (("inf", float("inf")), ("nan", float("nan"))):
+        o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype, seed=seed)
+        # Group 0 of row 0, beside a finite value big enough that a scale
+        # computed from the survivors is clearly distinguishable from 0xFF.
+        o[0, 0, 0] = poison
+        o[0, 0, 1] = 3.0
+
+        fp8, scale = inverse_rope_group_quant_cpp(
+            o,
+            positions,
+            cos,
+            sin,
+            num_groups=g,
+            quant_group_size=group_size,
+            scale_layout="row",
+        )
+        bytes_ = _scale_bytes(scale).reshape(s, g, ks)
+        q = fp8.view(dtypes.u8).reshape(s, g, d)
+        hit_scale = int(bytes_[0, 0, 0])
+        hit_nans = int((q[0, 0, :group_size] == nan_byte).sum())
+        # The group next door shares the row and must be untouched either way.
+        nbr_scale = int(bytes_[0, 0, 1])
+        nbr_nans = int((q[0, 0, group_size : 2 * group_size] == nan_byte).sum())
+
+        # Mirrors kHwScaledFp8 / kNativeQuant in the kernel: only those
+        # instructions turn an Inf dq_scale into a group of FP8 NaNs.
+        hw_scaled_fp8 = get_gfx() in ("gfx950", "gfx1250")
+        invalidated = hit_scale == 0xFF and (
+            hit_nans == group_size if hw_scaled_fp8 else True
+        )
+        assert nbr_scale != 0xFF and nbr_nans == 0, (
+            f"{name} at s={s} h={h} g={g} gs={group_size} leaked into the next "
+            f"group: scale=0x{nbr_scale:02X} nan_elems={nbr_nans}"
+        )
+        if name == "inf":
+            assert invalidated, (
+                f"inf at s={s} h={h} g={g} gs={group_size} did not invalidate "
+                f"its group: scale=0x{hit_scale:02X} nan_elems={hit_nans}/"
+                f"{group_size}"
+            )
+        else:
+            # The general f32 path scales against the surviving lanes. The
+            # poisoned element itself is a NaN only if the convert preserves
+            # it; gfx942's v_med3_f32 clamp drops that NaN, so the count can
+            # be zero.
+            survived = hit_scale != 0xFF and hit_nans <= 1
+            assert invalidated or survived, (
+                f"nan at s={s} h={h} g={g} gs={group_size} matched neither "
+                f"documented outcome: scale=0x{hit_scale:02X} nan_elems="
+                f"{hit_nans}/{group_size}"
+            )
+        aiter.logger.info(
+            "invalid-group %-3s s=%-5d h=%-4d g=%-3d gs=%-3d  scale=0x%02X "
+            "nan_elems=%d/%d  (%s)",
+            name,
+            s,
+            h,
+            g,
+            group_size,
+            hit_scale,
+            hit_nans,
+            group_size,
+            "group invalidated" if invalidated else "scaled from survivors",
+        )
 
 
 def main():
@@ -798,6 +931,55 @@ def main():
     if args.opus_tree:
         check_opus_layout_identity(args.opus_tree)
 
+    def run_case(h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df):
+        # n32k4 only exists at group 32: its four packed k groups are one
+        # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
+        # anything else, so sweeping it here would only collect failures.
+        if scale_layout == "n32k4" and group_size != 32:
+            return
+        # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
+        # disjoint consumers, so the module builds each only for the family
+        # that can launch it -- see AITER_INVERSE_ROPE_MFMA_TILE / _N32K4.
+        # Skipping the wrong-family layout here would leave the rejection
+        # itself untested, and the kernel's own AITER_CHECK aborts the
+        # process rather than raising, so assert the python-level guard
+        # instead: that is the only thing standing between a caller passing
+        # a legal-looking string and a core dump.
+        is_cdna = get_gfx_runtime().startswith("gfx9")
+        if (scale_layout == "mfma_tile" and not is_cdna) or (
+            scale_layout == "n32k4" and is_cdna
+        ):
+            check_layout_rejected(
+                s, h, g, head_dim, rd, group_size, dtype, scale_layout
+            )
+            return
+        ret = test_inverse_rope_group_quant(
+            s,
+            h,
+            g,
+            head_dim,
+            rd,
+            group_size,
+            dtype,
+            scale_layout,
+            data_init=data_init,
+            seed=args.seed,
+        )
+        df.append(ret)
+        if args.graph:
+            check_graph(
+                s,
+                h,
+                g,
+                head_dim,
+                rd,
+                group_size,
+                dtype,
+                scale_layout,
+                data_init=data_init,
+                seed=args.seed,
+            )
+
     for dtype in args.dtype:
         df = []
         for (
@@ -817,38 +999,49 @@ def main():
             args.scale_layout,
             args.data_init,
         ):
-            # n32k4 only exists at group 32: its four packed k groups are one
-            # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
-            # anything else, so sweeping it here would only collect failures.
-            if scale_layout == "n32k4" and group_size != 32:
-                continue
-            ret = test_inverse_rope_group_quant(
-                s,
-                h,
-                g,
-                head_dim,
-                rd,
-                group_size,
-                dtype,
-                scale_layout,
-                data_init=data_init,
-                seed=args.seed,
+            run_case(
+                h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
             )
-            df.append(ret)
-            if args.graph:
-                check_graph(
-                    s,
-                    h,
-                    g,
-                    head_dim,
-                    rd,
-                    group_size,
-                    dtype,
-                    scale_layout,
-                    data_init=data_init,
-                    seed=args.seed,
+        # Rows whose Ks leaves the block a part wave, which is what sizes the
+        # TDM staging buffer: 9 heads (Ks=36 at GS=128) drives k_slots down to
+        # 4 against a wave's 8 slots, and 3 heads (Ks=12) lands on 12, one and
+        # a half waves. Every default shape above is a whole number of waves
+        # and so cannot reach either. Correctness gate, not a bandwidth case.
+        for (
+            (h, g),
+            s,
+            head_dim,
+            rd,
+            group_size,
+            scale_layout,
+            data_init,
+        ) in itertools.product(
+            [(18, 2), (36, 4), (48, 16)],
+            [1, 32, 512, 4096],
+            args.head_dim,
+            args.rope_dim,
+            args.group_size,
+            args.scale_layout,
+            args.data_init,
+        ):
+            run_case(
+                h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
+            )
+        # Cheap enough to run unconditionally, and worth it: the invalid-group
+        # policy has changed twice under optimisation with nothing watching it,
+        # because none of the DATA_DISTS can produce a non-finite input. (64, 8)
+        # is a D=4096 row, which takes the native quantize path; (16, 2) is the
+        # untiered f32 one.
+        for h, g in ((64, 8), (16, 2)):
+            for group_size in args.group_size:
+                check_invalid_group(
+                    512, h, g, args.head_dim[0], args.rope_dim[0], group_size, dtype
                 )
         print_json_table("inverse_rope_group_quant summary", df)
+        aiter.logger.info(
+            "inverse_rope_group_quant summary (markdown):\n%s",
+            pd.DataFrame(df).to_markdown(index=False),
+        )
         if args.graph:
             aiter.logger.info("all graph capture/replay checks passed")
 
