@@ -15,24 +15,40 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if os.path.isdir(os.path.join(_REPO_ROOT, "aiter")) and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+# split baseline: SiTUv2 on the a4w4 (fp4 activation) aiter MoE, and a4w4 below
+# M=256 too (the default bound would switch to bf16 activations)
+os.environ.setdefault("AITER_SITUV2_A4W4", "1")
+os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 
 import pandas as pd
 import torch
 import torch.distributed as dist
 
 import aiter
+from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose
 
-from aiter.ops.flydsl.fused_moe_allreduce import (
+from aiter.ops.flydsl.mega_moe_tp_glm import (
     NUM_MOE_WEIGHTS,
-    FusedMoeAllreduceW8A8,
+    MegaMoeTpW8A8Glm,
     UncachedSymmetricBuffer,
-    fused_moe_allreduce_w8a8_supported,
+    mega_moe_tp_w8a8_glm_supported,
 )
-from aiter.ops.flydsl.fused_moe_allreduce_a4w4 import FusedMoeAllreduceA4W4
+from aiter.ops.flydsl.mega_moe_tp_a4w4_glm import MegaMoeTpA4W4Glm
+from aiter.ops.flydsl.mega_moe_tp_kimi3 import MegaMoeTpKimi3
+from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp_kimi3 import (
+    HIDDEN as K3_HIDDEN,
+    INTER as K3_INTER,
+    NUM_EXPERTS as K3_EXPERTS,
+    ROUTER_HIDDEN as K3_ROUTER_HIDDEN,
+    SITU_BETA as K3_SITU_BETA,
+    SITU_LINEAR_BETA as K3_SITU_LINEAR_BETA,
+    SUPPORTED_SAMPLES as K3_SUPPORTED_SAMPLES,
+    TOP_K as K3_TOP_K,
+)
 from aiter.utility.fp4_utils import _f32_to_floatx_unpacked, mxfp4_to_f32, pack_uint4
-from aiter.ops.flydsl.kernels.fused_moe_allreduce.fused_moe_allreduce_w8a8 import (
+from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp_w8a8_glm import (
     HIDDEN,
     INTER,
     NUM_EXPERTS,
@@ -47,7 +63,7 @@ FP8_MAX = 448.0
 AMAX_EPS = 1e-4
 MX_BLOCK = 32
 INV_FP4_MAX = torch.tensor(0x3E2AAAAB, dtype=torch.int32).view(torch.float32).item()
-MODULES = {4: FusedMoeAllreduceA4W4, 8: FusedMoeAllreduceW8A8}
+MODULES = {4: MegaMoeTpA4W4Glm, 8: MegaMoeTpW8A8Glm}
 QUANT_NAME = {4: "a4w4", 8: "a8w8"}
 _TILERT_REL = ("tile_rt", "fused_moe_allreduce_w8a8_v4", "kernel", "fused_moe_allreduce_w8a8_v4.gfx950.hsaco")
 DEFAULT_TILERT_HSACO = next(
@@ -446,7 +462,7 @@ _CTX: dict = {}
 
 
 @benchmark()
-def test_fused_moe_allreduce(samples, tp, proto, quant):
+def test_mega_moe_tp_glm(samples, tp, proto, quant):
     ranks, args = _CTX["ranks"], _CTX["args"]
     names = ("norm", "scores", "mid", "probs", "indices", "out")
     ret = {"gfx": get_gfx()}
@@ -524,6 +540,496 @@ def test_fused_moe_allreduce(samples, tp, proto, quant):
     return ret
 
 
+# ---------------------------------------------------------------------------
+# Kimi-K3 (A4W4) and the batch sweep against the split MoE, both models
+# ---------------------------------------------------------------------------
+K3 = dict(
+    RH=K3_ROUTER_HIDDEN, H=K3_HIDDEN, I=K3_INTER, E=K3_EXPERTS, TOPK=K3_TOP_K,
+    beta=K3_SITU_BETA, lbeta=K3_SITU_LINEAR_BETA,
+)
+
+
+def make_kimi3_weights(rank: int, seed: int, device):
+    """router [896, 7168] bf16 and bias replicated; each rank's experts are its
+    own intermediate shard (MXFP4 codes + E8M0 scales, as the kernel packs)."""
+    g_rep = torch.Generator(device=device).manual_seed(seed)
+    g_rank = torch.Generator(device=device).manual_seed(seed + 1000 * (rank + 1))
+    E, H, I = K3["E"], K3["H"], K3["I"]
+    u8 = {"dtype": torch.uint8, "device": device}
+    w = {
+        "router_w": (torch.randn(E, K3["RH"], generator=g_rep, device=device) * 0.02).to(torch.bfloat16),
+        "bias": 0.01 * torch.randn(E, generator=g_rep, device=device),
+        "ug_w": torch.empty(E, 2 * I, H // 2, **u8),
+        "ug_scales": torch.empty(E, 2 * I, H // MX_BLOCK, **u8),
+        "down_w": torch.empty(E, H, I // 2, **u8),
+        "down_scales": torch.empty(E, H, I // MX_BLOCK, **u8),
+    }
+    for e0 in range(0, E, 64):
+        e1 = min(E, e0 + 64)
+        ug = torch.randn(e1 - e0, 2 * I, H, generator=g_rank, device=device) * 0.02
+        w["ug_w"][e0:e1], w["ug_scales"][e0:e1] = mxfp4_quant(ug)
+        del ug
+        dn = torch.randn(e1 - e0, H, I, generator=g_rank, device=device) * 0.02
+        w["down_w"][e0:e1], w["down_scales"][e0:e1] = mxfp4_quant(dn)
+        del dn
+    return w
+
+
+def make_kimi3_inputs(tokens: int, seed: int, device):
+    g = torch.Generator(device=device).manual_seed(seed + 7)
+    x = torch.randn(tokens, K3["RH"], generator=g, device=device).to(torch.bfloat16)
+    latent = torch.randn(tokens, K3["H"], generator=g, device=device).to(torch.bfloat16)
+    return x, latent
+
+
+def situ_ref(gate, up):
+    gate = K3["beta"] * torch.tanh(gate / K3["beta"]) * torch.sigmoid(gate)
+    up = K3["lbeta"] * torch.tanh(up / K3["lbeta"])
+    return gate * up
+
+
+def run_torch_kimi3(x, latent, w, idx=None):
+    """Golden of the A4W4 kernel: fp32 router, top-16 of sigmoid + bias,
+    MXFP4 activation / weights / mid, SiTUv2, bf16 mid and partial.
+    ``idx`` pins the routing (to check the experts on the kernel's own)."""
+    logits = x.float() @ w["router_w"].float().T
+    scores = torch.sigmoid(logits)
+    if idx is None:
+        idx = torch.topk(scores + w["bias"].float()[None], K3["TOPK"], dim=-1, sorted=True).indices
+    idx = idx.long()
+    vals = torch.gather(scores, 1, idx)
+    probs = vals / vals.sum(-1, keepdim=True)
+    act = mxfp4_dequant(*mxfp4_quant(latent.float()))
+    wug = mxfp4_dequant(w["ug_w"][idx], w["ug_scales"][idx])
+    acc = torch.einsum("sjrk,sk->sjr", wug, act)
+    mid = situ_ref(acc[..., : K3["I"]], acc[..., K3["I"]:]).to(torch.bfloat16)
+    midq = mxfp4_dequant(*mxfp4_quant(mid.float()))
+    wd = mxfp4_dequant(w["down_w"][idx], w["down_scales"][idx])
+    part = (torch.einsum("sjrk,sjk->sjr", wd, midq) * probs[..., None]).sum(1).to(torch.bfloat16)
+    return logits, probs, idx.to(torch.int32), mid, part
+
+
+@benchmark()
+def test_mega_moe_tp_kimi3(samples, tp):
+    """Kimi-K3 accuracy: router logits, top-16, probs and mids per rank; the
+    all-reduced output against the rank-ordered sum of every rank's golden."""
+    ranks = _CTX["ranks"]
+    ret = {"gfx": get_gfx(), "model": "kimi3", "quant": 4}
+    got = []
+    for r in ranks:
+        with torch.cuda.device(r["device"]):
+            x, lat = r["k3_inputs"][samples]
+            got.append(r["k3"](x, lat))
+    sync_all(ranks)
+    refs, ok, mid_err, route_ok = [], True, 0.0, True
+    for r, g in zip(ranks, got):
+        with torch.cuda.device(r["device"]):
+            x, lat = r["k3_inputs"][samples]
+            scores, mid, probs, idx, _ = g
+            free = run_torch_kimi3(x, lat, r["k3_w"])
+            route_ok &= torch.equal(idx, free[2])
+            ref = run_torch_kimi3(x, lat, r["k3_w"], idx)
+            refs.append(ref)
+            ok &= rel_l2(scores, ref[0]) < 1e-5 and rel_l2(probs, ref[1]) < 1e-5
+            mid_err = max(mid_err, rel_l2(mid, ref[3]))
+            stuck = r["k3"].poll_errors()
+            if stuck:
+                aiter.logger.error("[rank %d] poll watchdog fired: %s", r["rank"], stuck)
+            ok &= not stuck
+    zero = torch.zeros(samples, K3["H"], dtype=torch.bfloat16)
+    out_ref = reference_out(all_partials(ranks, [ref[4] for ref in refs]), zero)
+    worst = max(rel_l2(g[4], out_ref) for g in got)
+    ok &= route_ok and mid_err < MID_TOL[4] and worst < 1e-2
+    ret["routing == golden"] = proc_min(float(route_ok)) > 0
+    ret["fly mid rel_l2"] = proc_max(mid_err)
+    ret["fly out rel_l2"] = proc_max(worst)
+    ret["fly ok"] = bool(proc_min(float(ok)) > 0)
+    return ret
+
+
+E2E_TOL = 0.1
+
+
+def batch_launches(tokens: int):
+    """(offset, S) launches covering ``tokens`` with S in {4, 2, 1}."""
+    out, off = [], 0
+    while off < tokens:
+        s = 4 if tokens - off >= 4 else (2 if tokens - off >= 2 else 1)
+        out.append((off, s))
+        off += s
+    return out
+
+
+class SplitGlm5A8W8:
+    """RMSNorm -> router GEMM -> biased top-8 -> aiter fused_moe (FP8 block,
+    shared expert as slot 0 of 257) -> all-reduce -> + residual."""
+
+    def __init__(self, w, comm, device):
+        from aiter.ops.shuffle import shuffle_weight
+
+        self.gamma = w["gamma"].to(device, torch.bfloat16)
+        self.router_w = w["router_w"].to(device)
+        self.bias = w["bias"].to(device, torch.float32)
+        self.w1 = shuffle_weight(w["ug_w"].to(device), layout=(16, 16))
+        self.w2 = shuffle_weight(w["down_w"].to(device), layout=(16, 16))
+        self.s1, self.s2 = w["ug_scales"].to(device), w["down_scales"].to(device)
+        self.comm, self.device, self.bufs = comm, device, {}
+
+    def __call__(self, x, residual, local=False):
+        t = x.shape[0]
+        b = self.bufs.get(t)
+        if b is None:
+            tp = self.comm.tp_size
+            pad = (t + tp - 1) // tp * tp
+            b = self.bufs[t] = dict(
+                tw=torch.empty(t, TOP_K, dtype=torch.float32, device=self.device),
+                ids=torch.empty(t, TOP_K, dtype=torch.int32, device=self.device),
+                one=torch.ones(t, 1, dtype=torch.float32, device=self.device),
+                zero=torch.zeros(t, 1, dtype=torch.int32, device=self.device),
+                ypad=torch.zeros(pad, HIDDEN, dtype=torch.bfloat16, device=self.device),
+                red=torch.empty(pad, HIDDEN, dtype=torch.bfloat16, device=self.device),
+            )
+        norm = aiter.rms_norm(x, self.gamma, RMS_EPS)
+        logits = torch.mm(norm, self.router_w.t()).float()
+        aiter.biased_grouped_topk(logits, self.bias, b["tw"], b["ids"], 1, 1, True, ROUTE_SCALE)
+        ids = torch.cat([b["zero"], b["ids"] + 1], 1)
+        tw = torch.cat([b["one"], b["tw"]], 1)
+        y = fused_moe(
+            norm, self.w1, self.w2, tw, ids, activation=aiter.ActivationType.Silu,
+            quant_type=aiter.QuantType.per_1x128, w1_scale=self.s1, w2_scale=self.s2,
+        )
+        b["ypad"][:t].copy_(y)
+        if not local:
+            self.comm.all_reduce(b["ypad"], b["red"])
+        return b["red"][:t] + residual
+
+
+class SplitKimi3A4W4:
+    """Router GEMM -> biased top-16 -> aiter fused_moe (A4W4 MXFP4, SiTUv2)
+    on the latent -> all-reduce."""
+
+    def __init__(self, w, comm, device):
+        from aiter.ops.shuffle import shuffle_weight
+        from aiter.utility import fp4_utils
+
+        E, H, I = K3["E"], K3["H"], K3["I"]
+        self.router_w = w["router_w"].to(device)
+        self.bias = w["bias"].to(device, torch.float32)
+        fp4 = aiter.dtypes.fp4x2
+        e8 = aiter.dtypes.fp8_e8m0
+        self.w1 = shuffle_weight(w["ug_w"].to(device).view(fp4), layout=(16, 16))
+        self.w2 = shuffle_weight(w["down_w"].to(device).view(fp4), layout=(16, 16))
+        self.s1 = fp4_utils.e8m0_shuffle(w["ug_scales"].to(device).reshape(E * 2 * I, H // MX_BLOCK).view(e8))
+        self.s2 = fp4_utils.e8m0_shuffle(w["down_scales"].to(device).reshape(E * H, I // MX_BLOCK).view(e8))
+        self.comm, self.device, self.bufs = comm, device, {}
+
+    def __call__(self, x, latent, local=False):
+        t = x.shape[0]
+        b = self.bufs.get(t)
+        if b is None:
+            tp = self.comm.tp_size
+            pad = (t + tp - 1) // tp * tp
+            b = self.bufs[t] = dict(
+                tw=torch.empty(t, K3["TOPK"], dtype=torch.float32, device=self.device),
+                ids=torch.empty(t, K3["TOPK"], dtype=torch.int32, device=self.device),
+                ypad=torch.zeros(pad, K3["H"], dtype=torch.bfloat16, device=self.device),
+                red=torch.empty(pad, K3["H"], dtype=torch.bfloat16, device=self.device),
+            )
+        logits = torch.mm(x, self.router_w.t()).float()
+        aiter.biased_grouped_topk(logits, self.bias, b["tw"], b["ids"], 1, 1, True, 1.0)
+        y = fused_moe(
+            latent, self.w1, self.w2, b["tw"], b["ids"], activation=aiter.ActivationType.Situv2,
+            quant_type=aiter.QuantType.per_1x32, w1_scale=self.s1, w2_scale=self.s2,
+            beta=K3["beta"], linear_beta=K3["lbeta"],
+        )
+        b["ypad"][:t].copy_(y)
+        if not local:
+            self.comm.all_reduce(b["ypad"], b["red"])
+        return b["red"][:t]
+
+
+def _replay_threaded_us(ranks, graphs, reps, iters) -> float:
+    """Replay every rank's graph from its own host thread, started together:
+    one thread replaying rank after rank serializes eight graph launches
+    (~20 us each) and would time the host, not the GPUs."""
+    import threading
+
+    evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in ranks]
+    gate = threading.Barrier(len(ranks))
+
+    def run(i):
+        r, (g, s) = ranks[i], graphs[i]
+        torch.cuda.set_device(r["device"])
+        with torch.cuda.stream(s):
+            gate.wait()
+            evs[i][0].record(s)
+            for _ in range(iters):
+                g.replay()
+            evs[i][1].record(s)
+
+    ts = [threading.Thread(target=run, args=(i,)) for i in range(len(ranks))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    sync_all(ranks)
+    return max(e[0].elapsed_time(e[1]) for e in evs) * 1000.0 / (iters * reps)
+
+
+def _time_graph(ranks, launch, args, reps) -> float:
+    """Per-forward time: ``reps`` forwards per captured graph (amortizes the
+    graph launch for small batches), best of --rounds, slowest rank."""
+    graphs = _capture(ranks, launch, reps)
+    _replay_threaded_us(ranks, graphs, reps, 2)
+    best = min(_replay_threaded_us(ranks, graphs, reps, args.iters) for _ in range(args.rounds))
+    del graphs
+    gc.collect()
+    return best
+
+
+def _run_threaded(ranks, fn):
+    """Eager call of fn(rank) on every rank, one host thread each: a host sync
+    inside one rank's call (first-call JIT, lazy buffers) must not hold back
+    the launches its peers' collectives wait for."""
+    import threading
+
+    errs = []
+
+    def run(r):
+        try:
+            torch.cuda.set_device(r["device"])
+            fn(r)
+            torch.cuda.synchronize(r["device"])
+        except Exception as e:  # noqa: BLE001 - re-raised below
+            errs.append(e)
+
+    ts = [threading.Thread(target=run, args=(r,)) for r in ranks]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    if errs:
+        raise errs[0]
+
+
+def _topk_sets(ids):
+    return torch.sort(ids.long().cpu(), dim=-1).values
+
+
+def sweep_batches(model, ranks, args):
+    """Fused (ceil(T / 4) decode launches of 4, 2, 1 tokens) against the split
+    MoE for every batch size: per-batch time over one CUDA graph, slowest rank,
+    and the relative L2 between the two outputs (same weights, same tokens)."""
+    rows = []
+    for tokens in args.batch:
+        for r in ranks:
+            with torch.cuda.device(r["device"]):
+                if model == "kimi3":
+                    x, lat = make_kimi3_inputs(tokens, args.seed + tokens, r["device"])
+                    r["sw"] = dict(a=x, b=lat, fused=torch.empty(tokens, K3["H"], dtype=torch.bfloat16, device=r["device"]))
+                else:
+                    h, res = make_inputs(tokens, args.seed + tokens, r["device"])
+                    r["sw"] = dict(a=h, b=res, fused=torch.empty(tokens, HIDDEN, dtype=torch.bfloat16, device=r["device"]))
+        plan = batch_launches(tokens)
+
+        def fused(r):
+            sw = r["sw"]
+            ids = []
+            for off, s in plan:
+                sl = slice(off, off + s)
+                if model == "kimi3":
+                    ret = r["k3"](sw["a"][sl], sw["b"][sl], out=sw["fused"][sl])
+                else:
+                    ret = r["moe"][8](sw["a"][sl], sw["b"][sl], out=sw["fused"][sl])
+                ids.append(ret[-2])
+            sw["fused_ids"] = ids
+
+        def split(r):
+            sw = r["sw"]
+            sw["split"] = r["split"](sw["a"], sw["b"])
+
+        if not args.no_split:
+            # first use of a batch size JIT-loads its tuned kernels: do that
+            # outside the collective, or a slow rank times its peers out
+            _run_threaded(ranks, lambda r: r["split"](r["sw"]["a"], r["sw"]["b"], local=True))
+        fns = (fused,) if args.no_split else (fused, split)
+        for fn in fns:
+            _run_threaded(ranks, fn)
+        # routing: the split router rounds its logits to bf16 (the fused one
+        # keeps f32), so near-tied experts can differ; compare the outputs of
+        # the tokens both routed to the same expert set
+        same_frac, diff = float("nan"), float("nan")
+        if not args.no_split:
+            r0 = ranks[0]
+            fi = _topk_sets(torch.cat([t for t in r0["sw"]["fused_ids"]], 0))
+            si = _topk_sets(r0["split"].bufs[tokens]["ids"])
+            same = (fi == si).all(-1)
+            same_frac = float(same.float().mean())
+            if bool(same.any()):
+                diff = proc_max(max(rel_l2(r["sw"]["fused"][same.to(r["device"])], r["sw"]["split"][same.to(r["device"])]) for r in ranks))
+        stuck = [r["rank"] for r in ranks if (r["k3"] if model == "kimi3" else r["moe"][8]).poll_errors()]
+        row = {"model": model, "quant": "a4w4" if model == "kimi3" else "a8w8", "batch": tokens, "launches": len(plan)}
+        if not args.no_perf:
+            reps = max(1, 32 // len(plan))
+            row["fused us"] = _time_graph(ranks, fused, args, reps)
+            if not args.no_split:
+                row["split us"] = _time_graph(ranks, split, args, reps)
+                row["speedup (split/fused)"] = row["split us"] / row["fused us"]
+        row["same top-k tokens"] = same_frac
+        row["fused vs split rel_l2 (same top-k)"] = diff
+        row["watchdog"] = "ok" if not stuck else f"ranks {stuck}"
+        if _CTX["rank0"]:
+            aiter.logger.info("%s", row)
+        rows.append(row)
+    return rows
+
+
+def _flydsl_multi_device() -> None:
+    """Let every FlyDSL kernel launch on whichever GPU is current.
+
+    A compiled FlyDSL artifact loads its code object into the device that is
+    current when its execution engine is first built, and every cache above it
+    (call states, ``flyc.compile`` results kept by aiter) holds that engine's
+    entry point. One process driving several GPUs needs one engine per device,
+    so the entry point becomes a dispatcher that builds (a pickled copy of the
+    artifact, i.e. the same binary) and caches one engine per device."""
+    import pickle
+    import threading
+
+    from flydsl.compiler import jit_executor, jit_function
+
+    art_cls = jit_executor.CompiledArtifact
+    lock = threading.RLock()
+    jf_call = jit_function.JitFunction.__call__
+
+    def _locked_call(self, *a, **k):
+        # compiles and first launches from several rank threads at once
+        with lock:
+            return jf_call(self, *a, **k)
+
+    jit_function.JitFunction.__call__ = _locked_call
+    if getattr(art_cls, "_mega_moe_tp_multi_device", False):
+        return
+    orig = art_cls._get_func_exe
+
+    class _PerDevice:
+        def __init__(self, art):
+            self.art = art
+            self.home = torch.cuda.current_device()
+            self.fns = {}
+            self.keep = []
+
+        def __call__(self, packed):
+            dev = torch.cuda.current_device()
+            fn = self.fns.get(dev)
+            if fn is None:
+                with lock:
+                    fn = self._build(dev)
+            return fn(packed)
+
+        def _build(self, dev):
+            fn = self.fns.get(dev)
+            if fn is None:
+                if dev == self.home:
+                    fn = orig(self.art)
+                else:
+                    twin = pickle.loads(pickle.dumps(self.art))
+                    twin._post_load_processors = list(self.art._post_load_processors)
+                    fn = orig(twin)
+                    self.keep.append(twin)
+                self.fns[dev] = fn
+            return fn
+
+    def _get_func_exe(self):
+        disp = getattr(self, "_per_device_exe", None)
+        if disp is None:
+            disp = _PerDevice(self)
+            self._per_device_exe = disp
+        return disp
+
+    art_cls._get_func_exe = _get_func_exe
+    art_cls._mega_moe_tp_multi_device = True
+
+
+def main_models(args, rank, world, devices):
+    """--model kimi3 accuracy (samples) and --batch sweeps for every model."""
+    from p2p_collectives import P2PGroup
+
+    _flydsl_multi_device()
+
+    models = list(dict.fromkeys(args.model))
+    moes8 = MegaMoeTpW8A8Glm.peer_group(devices) if "glm5" in models else None
+    k3s = MegaMoeTpKimi3.peer_group(devices) if "kimi3" in models else None
+    mmax = max([max(args.batch, default=8)] + [8])
+    p2p = P2PGroup(devices, (mmax + world - 1) // world) if args.batch and not args.no_split else None
+    ranks = []
+    for i, dev in enumerate(devices):
+        r = {"rank": i, "device": dev, "moe": {}}
+        with torch.cuda.device(dev):
+            if moes8 is not None:
+                w = make_weights(i, args.seed, dev, [8])
+                moes8[i].load_weights(**w[8])
+                r["moe"][8] = moes8[i]
+                r["glm5_w"] = w[8]
+            if k3s is not None:
+                w = make_kimi3_weights(i, args.seed, dev)
+                k3s[i].load_weights(**w)
+                r["k3"], r["k3_w"] = k3s[i], w
+                r["k3_inputs"] = {s: make_kimi3_inputs(s, args.seed, dev) for s in args.samples}
+        ranks.append(r)
+    for r in ranks:
+        if 8 in r["moe"]:
+            r["moe"][8].warmup(K3_SUPPORTED_SAMPLES, (0,))
+        if "k3" in r:
+            r["k3"].warmup()
+    _CTX.update(ranks=ranks, args=args, rank0=rank == 0)
+    rows, failed = [], []
+    if "kimi3" in models:
+        for s in args.samples:
+            row = test_mega_moe_tp_kimi3(s, world)
+            rows.append(row)
+            failed += [] if row["fly ok"] else [f"kimi3 S={s}"]
+        if rank == 0:
+            aiter.logger.info("kimi3 accuracy (markdown):\n%s", pd.DataFrame(rows).to_markdown(index=False))
+    sweep = []
+    if args.batch:
+        for model in models:
+            for r in ranks:
+                if args.no_split:
+                    continue
+                with torch.cuda.device(r["device"]):
+                    comm = p2p.comm(r["rank"])
+                    if model == "kimi3":
+                        r["split"] = SplitKimi3A4W4(r["k3_w"], comm, r["device"])
+                    else:
+                        r["split"] = SplitGlm5A8W8(r["glm5_w"], comm, r["device"])
+            sweep += sweep_batches(model, ranks, args)
+            for r in ranks:
+                r.pop("split", None)
+            gc.collect()
+            torch.cuda.empty_cache()
+        df = pd.DataFrame(sweep)
+        if rank == 0:
+            aiter.logger.info("mega_moe_tp vs split MoE e2e (markdown):\n%s", df.to_markdown(index=False))
+            if args.csv:
+                df.to_csv(args.csv, index=False)
+        # fused and split quantize activations differently (kernel vs aiter
+        # MXFP4 / FP8 rounding): ~0.03-0.05 apart on tokens routed alike
+        failed += [
+            f"{r['model']} T={r['batch']}"
+            for r in sweep
+            if r["watchdog"] != "ok"
+            or (not args.no_split and not r["fused vs split rel_l2 (same top-k)"] < E2E_TOL)
+        ]
+    for r in ranks:
+        if 8 in r["moe"]:
+            r["moe"][8].close()
+        if "k3" in r:
+            r["k3"].close()
+    if failed:
+        raise SystemExit(f"failed: {failed}")
+
+
 def perf_table(df):
     out = []
     for (samples, proto), g in df.groupby(["samples", "proto"], sort=False):
@@ -547,8 +1053,17 @@ def perf_table(df):
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL fused MoE + all-reduce (GLM-5, TileRT op): accuracy and perf",
+        description="FlyDSL fused MoE + all-reduce (GLM-5 TileRT op, Kimi-K3): accuracy and perf",
     )
+    parser.add_argument("--model", nargs="*", choices=["glm5", "kimi3"], default=["glm5"],
+                        help="glm5: W8A8/A4W4 vs TileRT (default); kimi3: A4W4 Kimi-K3 routed MoE.\n"
+                             "With kimi3 or --batch the run checks kimi3 accuracy at --samples and\n"
+                             "sweeps --batch sizes against the split MoE (router + top-k + aiter\n"
+                             "fused_moe + all-reduce); glm5 there is the W8A8 kernel")
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[],
+                        help="tokens per forward for the fused vs split e2e sweep (e.g. 1 2 4 ... 2048)")
+    parser.add_argument("--no-split", action="store_true", help="skip the split baseline in the sweep")
+    parser.add_argument("--csv", default="", help="write the sweep table here")
     parser.add_argument("--tp", type=int, default=None,
                         help="ranks driven by this process when not under torchrun (default: all GPUs, max 8)")
     parser.add_argument("-s", "--samples", type=int, nargs="*", default=[1, 2, 4],
@@ -570,9 +1085,15 @@ def main():
 
     rank, nproc, local_rank = setup_dist()
     try:
-        if get_gfx() not in SUPPORTED_GFX or not fused_moe_allreduce_w8a8_supported():
+        if get_gfx() not in SUPPORTED_GFX or not mega_moe_tp_w8a8_glm_supported():
             if rank == 0:
-                aiter.logger.warning("fused_moe_allreduce unsupported on %s; skipping", get_gfx())
+                aiter.logger.warning("mega_moe_tp unsupported on %s; skipping", get_gfx())
+            return
+        if "kimi3" in args.model or args.batch:
+            if nproc > 1:
+                raise SystemExit("--model kimi3 / --batch run in one process driving every GPU")
+            world = args.tp or min(torch.cuda.device_count(), 8)
+            main_models(args, rank, world, [torch.device("cuda", i) for i in range(world)])
             return
         quants = sorted(set(args.quant), reverse=True)
         multi_process = nproc > 1
@@ -622,10 +1143,10 @@ def main():
         rows = []
         for samples, proto, quant in itertools.product(args.samples, args.proto, quants):
             barrier()
-            rows.append(test_fused_moe_allreduce(samples, world, proto, quant))
+            rows.append(test_mega_moe_tp_glm(samples, world, proto, quant))
         if rank == 0:
             df = pd.DataFrame(rows)
-            aiter.logger.info("fused_moe_allreduce summary (markdown):\n%s", df.to_markdown(index=False))
+            aiter.logger.info("mega_moe_tp summary (markdown):\n%s", df.to_markdown(index=False))
             if not args.no_perf:
                 aiter.logger.info("perf (us):\n%s", perf_table(df).to_markdown(index=False))
         failed = [r for r in rows if not r["fly ok"]]

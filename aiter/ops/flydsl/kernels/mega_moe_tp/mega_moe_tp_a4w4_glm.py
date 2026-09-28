@@ -40,7 +40,7 @@ __all__ = [
     "TOP_K",
     "UG_SC_EXPERT",
     "UG_SC_TILE",
-    "compile_fused_moe_allreduce_a4w4",
+    "compile_mega_moe_tp_a4w4_glm",
 ]
 
 HIDDEN = 6144
@@ -109,7 +109,7 @@ def _attr(v):
 
 
 @functools.cache
-def fused_moe_allreduce_a4w4_consts(samples: int, proto: int) -> dict:
+def mega_moe_tp_a4w4_glm_consts(samples: int, proto: int) -> dict:
     S = samples
     c = {"S": S, "BPS": GRID // S, "G": GRID // S // 32, "ROWS": 24 * S}
     c["N_ITEMS"] = SLOTS * S * 3
@@ -146,14 +146,14 @@ def fused_moe_allreduce_a4w4_consts(samples: int, proto: int) -> dict:
 
 
 @functools.cache
-def compile_fused_moe_allreduce_a4w4(
+def compile_mega_moe_tp_a4w4_glm(
     samples: int, proto: int = 0, timeline: bool = False, device: int = 0
 ):
     if samples not in SUPPORTED_SAMPLES:
         raise ValueError(f"samples must be one of {SUPPORTED_SAMPLES}, got {samples}")
     if proto not in SUPPORTED_PROTOS:
         raise ValueError(f"proto must be one of {SUPPORTED_PROTOS}, got {proto}")
-    c = fused_moe_allreduce_a4w4_consts(samples, proto)
+    c = mega_moe_tp_a4w4_glm_consts(samples, proto)
     S, BPS, G, ROWS = c["S"], c["BPS"], c["G"], c["ROWS"]
     N_ITEMS, IPW, WIRE = c["N_ITEMS"], c["ITEMS_PER_WAVE"], c["WIRE"]
     L_NORM, L_ACT, L_ASC, L_SSQ = c["L_NORM"], c["L_ACT"], c["L_ASC"], c["L_SSQ"]
@@ -163,7 +163,7 @@ def compile_fused_moe_allreduce_a4w4(
     L_P, L_PART, L_RECV, LDS_BYTES = c["L_P"], c["L_PART"], c["L_RECV"], c["LDS_BYTES"]
     PKTS = 6 * S
     LINE_LANES = 8 * S
-    name = f"fused_moe_allreduce_a4w4_s{S}_p{proto}" + ("_tl" if timeline else "")
+    name = f"mega_moe_tp_a4w4_glm_s{S}_p{proto}" + ("_tl" if timeline else "")
     const_expr = fx.const_expr
 
     def i32(v):
@@ -969,7 +969,7 @@ def compile_fused_moe_allreduce_a4w4(
     )
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
-    def fused_moe_allreduce_a4w4_kernel(
+    def mega_moe_tp_a4w4_glm_kernel(
         hidden: fx.Int64,
         gamma: fx.Int64,
         router_w: fx.Int64,
@@ -1123,7 +1123,7 @@ def compile_fused_moe_allreduce_a4w4(
         timeline_ptr: fx.Int64,
         stream: fx.Stream,
     ):
-        fused_moe_allreduce_a4w4_kernel(
+        mega_moe_tp_a4w4_glm_kernel(
             hidden,
             gamma,
             router_w,

@@ -7,14 +7,14 @@ import functools
 
 import torch
 
-from .fused_moe_allreduce import (
+from .mega_moe_tp_glm import (
     SCORE_LINE_WORDS,
-    FusedMoeAllreduceW8A8,
+    MegaMoeTpW8A8Glm,
     _ptr,
-    fused_moe_allreduce_w8a8_supported,
+    mega_moe_tp_w8a8_glm_supported,
     swizzle_256_bf16,
 )
-from .kernels.fused_moe_allreduce.fused_moe_allreduce_a4w4 import (
+from .kernels.mega_moe_tp.mega_moe_tp_a4w4_glm import (
     GRID,
     HIDDEN,
     INTER,
@@ -24,20 +24,20 @@ from .kernels.fused_moe_allreduce.fused_moe_allreduce_a4w4 import (
     RT_CH,
     RT_WAVES,
     SUPPORTED_SAMPLES,
-    compile_fused_moe_allreduce_a4w4,
+    compile_mega_moe_tp_a4w4_glm,
 )
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
-    "FusedMoeAllreduceA4W4",
-    "fused_moe_allreduce_a4w4",
-    "fused_moe_allreduce_a4w4_supported",
+    "MegaMoeTpA4W4Glm",
+    "mega_moe_tp_a4w4_glm",
+    "mega_moe_tp_a4w4_glm_supported",
     "pack_down_a4w4",
     "pack_up_gate_a4w4",
 ]
 
 E8M0_ONE = 127
-fused_moe_allreduce_a4w4_supported = fused_moe_allreduce_w8a8_supported
+mega_moe_tp_a4w4_glm_supported = mega_moe_tp_w8a8_glm_supported
 
 
 @functools.cache
@@ -96,7 +96,7 @@ def pack_down_a4w4(w_fp4: torch.Tensor, scales: torch.Tensor):
     return w8[:, w_idx].reshape(-1).contiguous(), ps.reshape(-1).contiguous()
 
 
-def fused_moe_allreduce_a4w4(
+def mega_moe_tp_a4w4_glm(
     hidden_in: torch.Tensor,
     gamma: torch.Tensor,
     router_w: torch.Tensor,
@@ -130,7 +130,7 @@ def fused_moe_allreduce_a4w4(
         raise ValueError(f"npes={npes} needs 1..{MAX_PES} and a symmetric table")
     if flags.numel() < 2 * GRID or score_lines.numel() < s_n * 32 * SCORE_LINE_WORDS:
         raise ValueError("flags / score_lines workspaces are too small")
-    exe = compile_fused_moe_allreduce_a4w4(
+    exe = compile_mega_moe_tp_a4w4_glm(
         s_n, int(proto), timeline is not None, hidden_in.device.index or 0
     )
     _run_compiled(
@@ -163,8 +163,8 @@ def fused_moe_allreduce_a4w4(
     )
 
 
-class FusedMoeAllreduceA4W4(FusedMoeAllreduceW8A8):
-    _op = staticmethod(fused_moe_allreduce_a4w4)
+class MegaMoeTpA4W4Glm(MegaMoeTpW8A8Glm):
+    _op = staticmethod(mega_moe_tp_a4w4_glm)
 
     def load_weights(
         self,

@@ -1,4 +1,4 @@
-# FlyDSL `fused_moe_allreduce` (GLM-5 W8A8 MoE + TP all-reduce, gfx950)
+# FlyDSL `mega_moe_tp` (GLM-5 W8A8 MoE + TP all-reduce, gfx950)
 
 This directory contains a FlyDSL monokernel for the whole GLM-5 decode MoE layer on one
 tensor-parallel rank, including the TP all-reduce. It is a drop-in counterpart of TileRT's
@@ -7,9 +7,9 @@ argument order, the same packed weight layouts and the same outputs.
 
 | file | contents |
 |---|---|
-| `fused_moe_allreduce_w8a8.py` | the kernel (`compile_fused_moe_allreduce(samples, proto)`) |
-| `../../fused_moe_allreduce.py` | host side: weight packers, `fused_moe_allreduce_w8a8(...)` (TileRT op signature), `FusedMoeAllreduceW8A8` module |
-| `op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py` | accuracy + benchmark against a torch golden and the TileRT code object; `-q 8` = A8W8, `-q 4` = A4W4 |
+| `mega_moe_tp_w8a8_glm.py` | the kernel (`compile_mega_moe_tp_glm(samples, proto)`) |
+| `../../mega_moe_tp_glm.py` | host side: weight packers, `mega_moe_tp_w8a8_glm(...)` (TileRT op signature), `MegaMoeTpW8A8Glm` module |
+| `op_tests/multigpu_tests/test_flydsl_mega_moe_tp.py` | accuracy + benchmark against a torch golden and the TileRT code object; `-q 8` = A8W8, `-q 4` = A4W4 |
 
 ## Shapes
 
@@ -62,7 +62,7 @@ used for both kernels, inside one graph.
 | 1024 | 256 | 9774.27 | 9662.23 | 1.012 | 9.55 |
 | 2048 | 512 | 19086.82 | 18945.74 | 1.007 | 9.32 |
 
-### Single launch, unit-test harness (`test_flydsl_fuse_moe_allreduce.py`, graph of 50 launches on the same tokens)
+### Single launch, unit-test harness (`test_flydsl_mega_moe_tp.py`, graph of 50 launches on the same tokens)
 
 | tokens (S) | FlyDSL (us) | TileRT (us) | FlyDSL / TileRT |
 |---:|---:|---:|---:|
@@ -84,7 +84,7 @@ shards, about 45 MB per token (about 180 MB per S=4 launch), which comes to abou
 - On a single GPU, `out` and `hidden_mid` are bit-identical to TileRT. With 8 GPUs they differ by
   at most 1 bf16 ulp.
 
-## A4W4 variant (`fused_moe_allreduce_a4w4.py`)
+## A4W4 variant (`mega_moe_tp_a4w4_glm.py`)
 
 This variant has the same fusion, arguments and outputs as W8A8, but uses MXFP4 for the expert
 weights and activations:
@@ -96,15 +96,15 @@ weights and activations:
 - **Scales in hardware:** `mfma_scale_f32_16x16x128_f8f6f4` runs in fp4 mode and applies the
   per-32 scales itself, so there is no separate block-dequant multiply.
 - **Traffic:** every token streams about 25 MB instead of about 45 MB.
-- **Host API:** `aiter.ops.flydsl.fused_moe_allreduce_a4w4`
-  - `FusedMoeAllreduceA4W4`, with the same interface as `FusedMoeAllreduceW8A8`;
-  - `fused_moe_allreduce_a4w4(...)`;
+- **Host API:** `aiter.ops.flydsl.mega_moe_tp_a4w4_glm`
+  - `MegaMoeTpA4W4Glm`, with the same interface as `MegaMoeTpW8A8Glm`;
+  - `mega_moe_tp_a4w4_glm(...)`;
   - the packers `pack_up_gate_a4w4` and `pack_down_a4w4`.
 - **Logical weights:**
   - `ug_w [257, 512, 3072]` u8 with `ug_scales [257, 512, 192]` e8m0;
   - `down_w [257, 6144, 128]` u8 with `down_scales [257, 6144, 8]` e8m0.
 
-Results from `op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py -q 4 8` (the `perf (us)` table it
+Results from `op_tests/multigpu_tests/test_flydsl_mega_moe_tp.py -q 4 8` (the `perf (us)` table it
 prints): 8x MI355X, TP8, CUDA graph, TileRT KI=8. Both FlyDSL variants are built from the same master
 weights.
 
@@ -131,24 +131,24 @@ Accuracy:
 ## Usage
 
 ```python
-from aiter.ops.flydsl.fused_moe_allreduce import FusedMoeAllreduceW8A8
+from aiter.ops.flydsl.mega_moe_tp_glm import MegaMoeTpW8A8Glm
 
-moes = FusedMoeAllreduceW8A8.peer_group([torch.device("cuda", i) for i in range(8)])
+moes = MegaMoeTpW8A8Glm.peer_group([torch.device("cuda", i) for i in range(8)])
 for moe, w in zip(moes, per_rank_weights):   # TP8 shards, see the host module docstring
     moe.load_weights(**w)                      # router_w, gamma, bias, ug_w, ug_scales, down_w, down_scales
 norm, scores, mid, probs, indices, out = moes[r](hidden, residual)   # hidden: [S, 6144] bf16, S in {1, 2, 4}
 ```
 
-Under `torchrun`, construct `FusedMoeAllreduceW8A8(rank=r, world_size=8)` once per process. It
+Under `torchrun`, construct `MegaMoeTpW8A8Glm(rank=r, world_size=8)` once per process. It
 exchanges an uncached symmetric buffer over HIP IPC.
 
 ```bash
 # accuracy + perf vs TileRT (single process, all GPUs)
-python op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py -s 1 2 4 --proto 0 1
+python op_tests/multigpu_tests/test_flydsl_mega_moe_tp.py -s 1 2 4 --proto 0 1
 # A4W4 and A8W8 side by side
-python op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py -q 4 8
+python op_tests/multigpu_tests/test_flydsl_mega_moe_tp.py -q 4 8
 # accuracy only
-python op_tests/multigpu_tests/test_flydsl_fuse_moe_allreduce.py --no-perf
+python op_tests/multigpu_tests/test_flydsl_mega_moe_tp.py --no-perf
 ```
 
 Notes for this platform:
@@ -156,3 +156,28 @@ Notes for this platform:
 - Multi-process HIP IPC exchange is much slower than single-process peer access, for both
   kernels.
 - Clear `~/.flydsl/cache` after editing the kernel.
+
+## Kimi-K3 (`mega_moe_tp_kimi3.py`, A4W4)
+
+Routed latent MoE + TP all-reduce of Kimi-K3 per TP8 rank (shapes from
+[FlyDSL PR 1204](https://github.com/ROCm/FlyDSL/pull/1204)): router `[896, 7168]` bf16 on the
+hidden state, top-16 of `sigmoid + bias` (f32, ties to the lower id), probabilities normalized
+(route scale 1), experts on the 3584-wide latent with MXFP4 weights/activations (E8M0 per 32),
+intermediate 384 per rank, SiTUv2 (beta 4, linear beta 25). Shared experts and the latent
+down/up projections around the block are separate ops. Host side:
+`aiter/ops/flydsl/mega_moe_tp_kimi3.py` (`MegaMoeTpKimi3`, packers).
+
+One launch of 256 workgroups x 512 threads per 1, 2 or 4 tokens: router logits (4 experts per
+workgroup, all tokens) -> tagged scores -> per-workgroup top-16 -> up/gate tiles (48 x 16 rows,
+K 3584) -> SiTUv2 mids (tagged) -> down (224 blocks of 16 rows) -> all-reduce packets.
+
+Tests / benchmarks (one process drives all GPUs; 8 when idle, else 4):
+
+```bash
+bash run_mega_moe_tp_ut.sh      # GLM-5 W8A8/A4W4 + Kimi-K3 accuracy, fused vs split e2e check
+bash run_mega_moe_tp_bench.sh   # fused vs split MoE e2e, GLM-5 and Kimi-K3, batch 1 .. 2048
+```
+
+TP8 results (2026-09-28): `mega_moe_tp_results/bench_0928/summary.txt`. The fused decode kernel wins
+at 1-8 tokens (GLM-5 4.7x at 1 token, Kimi-K3 3.0x) and loses from 16-32 tokens on, since a
+batch of T tokens runs as ceil(T/4) launches that each re-stream the selected experts.

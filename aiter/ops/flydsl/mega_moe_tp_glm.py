@@ -8,7 +8,7 @@ import functools
 
 import torch
 
-from .kernels.fused_moe_allreduce.fused_moe_allreduce_w8a8 import (
+from .kernels.mega_moe_tp.mega_moe_tp_w8a8_glm import (
     ERR_AR,
     ERR_MIDS,
     ERR_SCORES,
@@ -22,17 +22,17 @@ from .kernels.fused_moe_allreduce.fused_moe_allreduce_w8a8 import (
     SUPPORTED_SAMPLES,
     SYM_BYTES,
     TOP_K,
-    compile_fused_moe_allreduce,
+    compile_mega_moe_tp_glm,
 )
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
-    "FusedMoeAllreduceW8A8",
+    "MegaMoeTpW8A8Glm",
     "UncachedSymmetricBuffer",
     "NUM_MOE_WEIGHTS",
     "SYM_BYTES",
-    "fused_moe_allreduce_w8a8",
-    "fused_moe_allreduce_w8a8_supported",
+    "mega_moe_tp_w8a8_glm",
+    "mega_moe_tp_w8a8_glm_supported",
     "swizzle_256_bf16",
     "swizzle_down_k128",
     "swizzle_pair_interleaved_k128",
@@ -43,7 +43,7 @@ MAX_SAMPLES = max(SUPPORTED_SAMPLES)
 SCORE_LINE_WORDS = 32
 
 
-def fused_moe_allreduce_w8a8_supported(gfx: str | None = None) -> bool:
+def mega_moe_tp_w8a8_glm_supported(gfx: str | None = None) -> bool:
     if gfx is None:
         from aiter.jit.utils.chip_info import get_gfx
 
@@ -119,7 +119,7 @@ def _ptr(t: torch.Tensor | None) -> int:
     return 0 if t is None else int(t.data_ptr())
 
 
-def fused_moe_allreduce_w8a8(
+def mega_moe_tp_w8a8_glm(
     hidden_in: torch.Tensor,
     gamma: torch.Tensor,
     router_w: torch.Tensor,
@@ -153,7 +153,7 @@ def fused_moe_allreduce_w8a8(
         raise ValueError(f"npes={npes} needs 1..{MAX_PES} and a symmetric table")
     if flags.numel() < 2 * GRID or score_lines.numel() < s_n * 32 * SCORE_LINE_WORDS:
         raise ValueError("flags / score_lines workspaces are too small")
-    exe = compile_fused_moe_allreduce(
+    exe = compile_mega_moe_tp_glm(
         s_n, int(proto), timeline is not None, hidden_in.device.index or 0
     )
     _run_compiled(
@@ -223,8 +223,8 @@ class UncachedSymmetricBuffer:
                 self.base = 0
 
 
-class FusedMoeAllreduceW8A8:
-    _op = staticmethod(fused_moe_allreduce_w8a8)
+class MegaMoeTpW8A8Glm:
+    _op = staticmethod(mega_moe_tp_w8a8_glm)
 
     def __init__(
         self,
@@ -257,7 +257,7 @@ class FusedMoeAllreduceW8A8:
         self.ug_w = self.ug_scales = self.down_w = self.down_scales = None
 
     @classmethod
-    def peer_group(cls, devices, *, proto: int = 0) -> list[FusedMoeAllreduceW8A8]:
+    def peer_group(cls, devices, *, proto: int = 0) -> list[MegaMoeTpW8A8Glm]:
         devices = [torch.device(d) if not isinstance(d, torch.device) else d for d in devices]
         world = len(devices)
         if not 1 <= world <= MAX_PES:
