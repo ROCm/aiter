@@ -394,11 +394,8 @@ def _build_kv_kernel(
 
     STAGE_ELEMS = block_size * D
     K_TOTAL_RUNS = (D // x) * block_size
-    K_ITERS = _ceil_div(K_TOTAL_RUNS, KV_THREADS)
     V_TOTAL_RUNS = (block_size // x) * D
-    V_ITERS = _ceil_div(V_TOTAL_RUNS, KV_THREADS)
     SCATTER_ELEMS = block_size * D
-    SCATTER_ITERS = _ceil_div(SCATTER_ELEMS, KV_THREADS)
 
     @fx.struct
     class SharedStorage:
@@ -463,15 +460,17 @@ def _build_kv_kernel(
             (COMPUTE_GROUPS_PER_BLOCK, PHASE1_ITERS),
             stride=(1, COMPUTE_GROUPS_PER_BLOCK),
         )
-        layout_k_run_tv = fx.make_layout(
-            (KV_THREADS, K_ITERS), stride=(1, KV_THREADS)
-        )
-        layout_v_run_tv = fx.make_layout(
-            (KV_THREADS, V_ITERS), stride=(1, KV_THREADS)
-        )
-        layout_scatter_tv = fx.make_layout(
-            (KV_THREADS, SCATTER_ITERS), stride=(1, KV_THREADS)
-        )
+
+        def make_linear_tv(total_items):
+            """Map each thread/iteration pair to a linear work item."""
+            return fx.make_layout(
+                (KV_THREADS, _ceil_div(total_items, KV_THREADS)),
+                stride=(1, KV_THREADS),
+            )
+
+        layout_k_run_tv = make_linear_tv(K_TOTAL_RUNS)
+        layout_v_run_tv = make_linear_tv(V_TOTAL_RUNS)
+        layout_scatter_tv = make_linear_tv(SCATTER_ELEMS)
         # Two logical ownership maps of D are used:
         #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
         #  * NEOX pairs: active lanes own strided columns in [0, D/2), with
@@ -752,7 +751,7 @@ def _build_kv_kernel(
             v_lds_runs = fx.composition(
                 v_lds_view, fx.make_tile(layout_token_runs, None)
             )
-            for it in range_constexpr(K_ITERS):
+            for it in range_constexpr(layout_k_run_tv.shape[1].unpack()):
                 valid, chunk_k, block_off = owned_run(
                     t, it, layout_k_run_tv, K_TOTAL_RUNS, layout_k_runs
                 )
@@ -766,7 +765,7 @@ def _build_kv_kernel(
                     vec_k = fx.memref_load_vec(reg_k)
                     fx.ptr_store(vec_k, fx.get_iter(dst_k))
 
-            for it in range_constexpr(V_ITERS):
+            for it in range_constexpr(layout_v_run_tv.shape[1].unpack()):
                 valid, tile, d = owned_run(
                     t, it, layout_v_run_tv, V_TOTAL_RUNS, layout_v_runs
                 )
@@ -779,28 +778,27 @@ def _build_kv_kernel(
                     fx.ptr_store(vec_x, fx.get_iter(dst_v))
         else:
             # Generic scatter for arbitrary/decode mappings.
-            for it in range_constexpr(SCATTER_ITERS):
+            for it in range_constexpr(layout_scatter_tv.shape[1].unpack()):
                 elem = fx.crd2idx((t, it), layout_scatter_tv).unpack()
-                if elem < SCATTER_ELEMS:
-                    coord_stage = fx.idx2crd(elem, layout_stage)
-                    token_local = fx.get_(coord_stage, 0).unpack()
-                    d = fx.get_(coord_stage, 1).unpack()
-                    tok = tok0 + fx.Int32(token_local)
-                    if tok < num_tokens:
-                        slot = slot_mapping[tok]
-                        if slot >= 0:
-                            block_id = slot // block_size
-                            block_off = slot % block_size
-                            d_coord = fx.idx2crd(d, layout_d_runs)
-                            token_coord = fx.idx2crd(
-                                block_off, layout_token_runs
-                            )
-                            k_cache_view[
-                                block_id, head, d_coord, block_off
-                            ] = k_lds_view[token_local, d]
-                            v_cache_view[
-                                block_id, head, token_coord, d
-                            ] = v_lds_view[token_local, d]
+                coord_stage = fx.idx2crd(elem, layout_stage)
+                token_local = fx.get_(coord_stage, 0).unpack()
+                d = fx.get_(coord_stage, 1).unpack()
+                tok = tok0 + fx.Int32(token_local)
+                if tok < num_tokens:
+                    slot = slot_mapping[tok]
+                    if slot >= 0:
+                        block_id = slot // block_size
+                        block_off = slot % block_size
+                        d_coord = fx.idx2crd(d, layout_d_runs)
+                        token_coord = fx.idx2crd(
+                            block_off, layout_token_runs
+                        )
+                        k_cache_view[
+                            block_id, head, d_coord, block_off
+                        ] = k_lds_view[token_local, d]
+                        v_cache_view[
+                            block_id, head, token_coord, d
+                        ] = v_lds_view[token_local, d]
 
     @flyc.jit
     def launch(
