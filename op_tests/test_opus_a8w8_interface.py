@@ -218,8 +218,8 @@ def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
 def test_mxscale_launch_plan_cache_is_bounded(monkeypatch):
     calls = []
 
-    def resolve(g, m, n, k):
-        calls.append((g, m, n, k))
+    def resolve(g, m, n, k, *, group_size=128):
+        calls.append((g, m, n, k, group_size))
         return 8000, 1
 
     monkeypatch.setattr(

@@ -760,25 +760,92 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
-    """Choose a final global kid only when the tuned table has no usable row."""
+def _validate_mxscale_bmm_group_size(group_size: int) -> None:
+    if group_size not in (32, 128):
+        raise ValueError(f"group_size must be 32 or 128, got {group_size!r}")
+
+
+def _heuristic_mxscale_bmm_kid(
+    g: int, m: int, n: int, k: int, *, group_size: int = 128
+) -> int:
+    """Choose a final global row-major kid when the tuned table has no usable row.
+
+    GROUP_K=32 takes each pick's twin (kid + 1000). The 256x256 pipeline tile
+    has none, so large M at 32 falls through to the 64x64 flatmm tile.
+    """
+    _validate_mxscale_bmm_group_size(group_size)
+    offset = 1000 if group_size == 32 else 0
 
     def divisible(value: int, divisor: int) -> bool:
         return value % divisor == 0
 
     if (
-        divisible(n, 256)
+        group_size == 128
+        and divisible(n, 256)
         and divisible(k, 128)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
         return 8158 if 4096 <= k <= 8192 else 8150
     if m < 64:
-        return 8640 if divisible(n, 64) and divisible(k, 256) else 8653
+        return offset + (8640 if divisible(n, 64) and divisible(k, 256) else 8653)
     if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
-        return 8320
+        return offset + 8320
     if divisible(n, 64) and divisible(k, 128):
-        return 8653
-    return 8000
+        return offset + 8653
+    return offset + 8000
+
+
+# Preshuffled-B fallback candidates by M band, in local ids (GROUP_K=128 adds
+# 8000, GROUP_K=32 9000). The first of each band is what the tuned table picks
+# there most often at K=4096; the later ones only have to run where it cannot,
+# which is why each band ends in the 32-wide, 128-deep tiles that divide any N
+# and K the family accepts at all.
+# The launch plan does not model every family's prefetch depth (only flatmm's),
+# so the launcher can still reject a candidate for too few K tiles. The deepest
+# candidate prefetches 4 (the blds tile; the direct-B ones cap at 3), so a
+# candidate needs at least that many.
+_BPRESHUFFLE_FALLBACK_MIN_K_TILES = 4
+_BPRESHUFFLE_FALLBACK_BANDS = (
+    (64, (179, 398, 171, 338)),
+    (512, (171, 175, 338, 398)),
+    (None, (205, 348, 175, 338, 398)),
+)
+
+
+def _heuristic_mxscale_bmm_bpreshuffle_kid(
+    g: int, m: int, n: int, k: int, *, group_size: int = 128, output_dtype="bf16"
+) -> int | None:
+    """A preshuffled-B kid that runs this shape, for a shape the table lacks.
+
+    Not tuned, only admissible: the first candidate whose launch plan accepts
+    the shape. None when no candidate does.
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernels_list
+
+    _validate_mxscale_bmm_group_size(group_size)
+    base = 9000 if group_size == 32 else 8000
+    candidates = next(
+        c for bound, c in _BPRESHUFFLE_FALLBACK_BANDS if bound is None or m <= bound
+    )
+    for local in candidates:
+        kid = base + local
+        if not (
+            mxscale_bmm_kid_group(kid) == group_size
+            and mxscale_bmm_kid_takes_b_layout(kid, True)
+            and mxscale_bmm_kid_takes_plain_scales(kid)
+            and mxscale_bmm_kid_runs_m(kid, m)
+            and k // a8w8_mxscale_bmm_kernels_list[kid].B_K
+            >= _BPRESHUFFLE_FALLBACK_MIN_K_TILES
+        ):
+            continue
+        try:
+            _get_cached_a8w8_mxscale_bmm_plan(
+                get_gfx(), kid, output_dtype, m, g, n, k, 1
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return kid
+    return None
 
 
 # ---- kid admissibility -----------------------------------------------------
@@ -800,8 +867,8 @@ def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
 
 
 @cache
-def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool]]:
-    """kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales)."""
+def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool, int]]:
+    """kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales, GROUP_K)."""
     from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
 
     return {
@@ -809,6 +876,7 @@ def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool]]:
             int(inst.m_align),
             bool(inst.needs_preshuffled_b),
             bool(inst.needs_mpacked_sfa or inst.needs_shuffle_scale),
+            int(inst.GROUP_K),
         )
         for fam in a8w8_mxscale_bmm_kernel_lists
         for kid, inst in fam.items()
@@ -833,14 +901,23 @@ def mxscale_bmm_kid_takes_plain_scales(kid: int) -> bool:
     return entry is not None and not entry[2]
 
 
+def mxscale_bmm_kid_group(kid: int) -> int | None:
+    """The kid's quantisation block (GROUP_K), or None for an unknown kid."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return None if entry is None else entry[3]
+
+
 def resolve_a8w8_mxscale_bmm_plan(
     g: int,
     m: int,
     n: int,
     k: int,
+    *,
+    group_size: int = 128,
 ) -> tuple[int, int]:
-    """Resolve one final global kid/split pair for the high-level caller."""
-    config = lookup_mxscale_bmm_config(g, m, n, k)
+    """Resolve one final global kid/split pair for the caller's scale blocks."""
+    _validate_mxscale_bmm_group_size(group_size)
+    config = lookup_mxscale_bmm_config(g, m, n, k, group_size=group_size)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(
@@ -857,6 +934,8 @@ def resolve_a8w8_mxscale_bmm_plan(
                 raise ValueError(
                     f"kid {kid} wants a preshuffled B or host-rearranged scales"
                 )
+            if mxscale_bmm_kid_group(kid) != group_size:
+                raise ValueError(f"kid {kid} does not take group_size={group_size}")
             split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
             plan = _get_cached_a8w8_mxscale_bmm_plan(
                 get_gfx(),
@@ -884,13 +963,14 @@ def resolve_a8w8_mxscale_bmm_plan(
         else:
             return plan.resolved_kid, plan.abi_split_k
 
-    kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
+    kid = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
     return kid, 1
 
 
 __all__ = [
     "lookup_a16w16_opus_config",
     "lookup_mxscale_bmm_config",
+    "mxscale_bmm_kid_group",
     "mxscale_bmm_kid_runs_m",
     "mxscale_bmm_kid_takes_b_layout",
     "mxscale_bmm_kid_takes_plain_scales",

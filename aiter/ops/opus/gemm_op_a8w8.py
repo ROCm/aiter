@@ -569,12 +569,13 @@ def bmm_a8w8_mxscale_opus(
     kernelId: int | None = None,
     splitK: int | None = None,
     b_preshuffled: bool = False,
+    group_size: int = 128,
 ) -> Tensor:
     """Opus fp8 e8m0 mxscale BMM by kernel id, with admissibility checks.
 
     mmajor DSV4 wo_a layout: ``x`` [M, G, K] fp8, ``wo_a`` [G, N, K] fp8,
-    ``x_scale`` [M, G, K/128], ``w_scale`` [G, N/128, K/128], ``out`` optional
-    [M, G, N]. Returns the [M, G, N] output.
+    ``x_scale`` [M, G, K/group_size], ``w_scale`` [G, N/group_size,
+    K/group_size], ``out`` optional [M, G, N]. Returns the [M, G, N] output.
 
     This sits above :func:`_launch_a8w8_mxscale_bmm` rather than inside it
     because it answers a different question: not "how do I launch this kid" but
@@ -588,15 +589,18 @@ def bmm_a8w8_mxscale_opus(
     observable: the shuffled weight is the same shape, dtype and strides as the
     row-major one, so a mismatched kid returns a plausible wrong answer instead
     of failing. An id whose layout disagrees is dropped like one that cannot run
-    this M -- with row-major B the heuristic then answers correctly. Under True
-    there is nothing to fall back to (every heuristic kid reads B row-major), so
-    that raises rather than run one.
+    this M, and the fallback for the declared layout answers instead: the shape
+    heuristic for row-major B, the first preshuffled kid that runs the shape for
+    preshuffled B. Only a shape no preshuffled kid runs raises.
 
     Scales are always passed through as given, so an id wanting them rearranged
-    on the host is dropped too.
+    on the host is dropped too, and so is one tuned for the other
+    ``group_size``, which would read the scales at the wrong stride.
     """
     from .policy import (
+        _heuristic_mxscale_bmm_bpreshuffle_kid,
         _heuristic_mxscale_bmm_kid,
+        mxscale_bmm_kid_group,
         mxscale_bmm_kid_runs_m,
         mxscale_bmm_kid_takes_b_layout,
         mxscale_bmm_kid_takes_plain_scales,
@@ -615,20 +619,23 @@ def bmm_a8w8_mxscale_opus(
         mxscale_bmm_kid_runs_m(int(kernelId), m)
         and mxscale_bmm_kid_takes_b_layout(int(kernelId), b_preshuffled)
         and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
+        and mxscale_bmm_kid_group(int(kernelId)) == group_size
     ):
         kernelId = splitK = None
     if kernelId is None:
         if b_preshuffled:
-            raise ValueError(
-                f"no preshuffled-B kid this entry can run for (g={g}, m={m}, "
-                f"n={n}, k={k}): the tuned row is absent, names a row-major kid, "
-                "or wants host-rearranged scales, and every heuristic fallback "
-                "reads B row-major. Tune this shape into the preshuffle table "
-                "(AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE, "
-                "read only for b_preshuffled=True), or pass b_preshuffled=False "
-                "with row-major B."
+            kernelId = _heuristic_mxscale_bmm_bpreshuffle_kid(
+                g, m, n, k, group_size=group_size, output_dtype=Y.dtype
             )
-        kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k)
+            if kernelId is None:
+                raise ValueError(
+                    f"no preshuffled-B kid runs (g={g}, m={m}, n={n}, k={k}, "
+                    f"group_size={group_size}): the tuned row is absent or "
+                    "unusable and no fallback tile divides this N and K. Pass "
+                    "b_preshuffled=False with row-major B."
+                )
+        else:
+            kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
 
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
         x,

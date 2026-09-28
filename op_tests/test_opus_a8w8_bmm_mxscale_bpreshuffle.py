@@ -62,17 +62,19 @@ def _rel_err(y, ref):
     return (y.float() - ref).abs().mean().item() / (ref.abs().mean().item() + 1e-9)
 
 
-def _run(g, m, n, k, ydt, bench, split_k=1):
+def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     O_bf16 = _block_varied((g, m, k), k)
     W_bf16 = _block_varied((g, n, k), k)
-    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
-    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group)
     # Same bytes, 16x16-tiled: [G, N, K] -> [G][N/16][K/32][2][16 n][16 k].
     W_sh = shuffle_weight(W_mx, layout=(16, 16))
 
     O_in = O_mx.transpose(0, 1)  # [m, g, k] mmajor view
-    xs_in = xs_mx.transpose(0, 1)  # [m, g, k/128] view
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)  # [m, g, n]
+    xs_in = xs_mx.transpose(0, 1)  # [m, g, k/group] view
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group).transpose(
+        0, 1
+    )  # [m, g, n]
 
     scale_for = _scale_picker(xs_mx, ws_mx, n, k)
 
@@ -90,33 +92,38 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
     # K=1024 provides. Those are absent from the row, not failures.
     errs = {}
     skipped = []
+    kid_plain = KID_PLAIN + (1000 if group == 32 else 0)
     for kid in KIDS_BPRESHUFFLE:
+        if policy.mxscale_bmm_kid_group(kid) != group:
+            continue
         try:
             errs[kid] = _rel_err(_call(kid, W_sh), ref)
         except RuntimeError:
             skipped.append(kid)
-    err_plain = _rel_err(_call(KID_PLAIN, W_mx), ref)
+    # The row-major reference kid, or at a K too short for it the 128-deep one.
+    for cand in (kid_plain, kid_plain - KID_PLAIN + 8653):
+        try:
+            err_plain = _rel_err(_call(cand, W_mx), ref)
+        except RuntimeError:
+            continue
+        kid_plain = cand
+        break
 
     # The public entry end to end: guarded custom op -> the preshuffle table
     # (the entry picks that one, nothing to set) -> a kid that wants the shuffled
-    # weight. Only a shape that table covers can run it, since this entry raises
-    # by design rather than fall back; an uncovered shape is reported as off, not
-    # failed.
+    # weight, tuned or, for a shape the table lacks, the fallback one.
     err_pub = None
     if split_k == 1:  # the entry defaults splitK, so only compare where they agree
-        try:
-            err_pub = _rel_err(
-                batched_gemm_a8w8_mxscale_bpreshuffle(
-                    O_in, W_sh, xs_in, ws_mx, dtype=ydt
-                ),
-                ref,
-            )
-        except ValueError:
-            pass
+        err_pub = _rel_err(
+            batched_gemm_a8w8_mxscale_bpreshuffle(
+                O_in, W_sh, xs_in, ws_mx, dtype=ydt, group_size=group
+            ),
+            ref,
+        )
 
-    row = f"g={g:<3} m={m:<6} n={n:<6} k={k:<6} sk={split_k} "
+    row = f"G{group:<3} g={g:<3} m={m:<6} n={n:<6} k={k:<6} sk={split_k} "
     row += "  ".join(f"kid{kid}={e:.5f}" for kid, e in errs.items())
-    row += f"  kid{KID_PLAIN}={err_plain:.5f}"
+    row += f"  kid{kid_plain}={err_plain:.5f}"
     row += f"  public={'off' if err_pub is None else f'{err_pub:.5f}'}"
     if skipped:
         row += "  skipped=" + ",".join(str(k) for k in skipped)
@@ -142,7 +149,7 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
             return t
 
         times = [f"kid{kid}={_time(kid, W_sh):.2f}us" for kid in errs]
-        times.append(f"kid{KID_PLAIN}={_time(KID_PLAIN, W_mx):.2f}us")
+        times.append(f"kid{kid_plain}={_time(kid_plain, W_mx):.2f}us")
         for kid in KIDS_PLAIN_EXTRA:
             times.append(f"kid{kid}={_time(kid, W_mx):.2f}us")
         row += "  |  " + "  ".join(times)
@@ -191,19 +198,34 @@ def _check_tables():
             for key, row in rows.items()
             if key[0] == gfx and row.get("libtype") == "opus"
         }
+        # The key's last field is the row's groupSize; a kid of the other block
+        # would read the scales at the wrong stride.
+        bad_g = sorted(
+            {
+                int(row["kernelId"])
+                for key, row in rows.items()
+                if key[0] == gfx
+                and row.get("libtype") == "opus"
+                and policy.mxscale_bmm_kid_group(int(row["kernelId"])) != int(key[5])
+            }
+        )
         bad_b = sorted(
-            k for k in kids if not policy.mxscale_bmm_kid_takes_b_layout(k, b_preshuffled)
+            k
+            for k in kids
+            if not policy.mxscale_bmm_kid_takes_b_layout(k, b_preshuffled)
         )
         bad_sf = sorted(
             k for k in kids if not policy.mxscale_bmm_kid_takes_plain_scales(k)
         )
-        bad = bool(bad_b or bad_sf)
+        bad = bool(bad_b or bad_sf or bad_g)
         ok &= not bad
         label = f"b_preshuffled={b_preshuffled!s:<5} -> {len(kids)} kid(s)"
         if bad_b:
             note = f"wrong B layout: {bad_b}"
         elif bad_sf:
             note = f"wants host-rearranged scales: {bad_sf}"
+        elif bad_g:
+            note = f"groupSize disagrees with the kid: {bad_g}"
         else:
             note = os.path.basename(path)
         print(f"  {'FAIL' if bad else 'ok  '} {label}  [{note}]", flush=True)
@@ -227,26 +249,33 @@ def _check_dispatch():
     import aiter.ops.opus.gemm_op_a8w8 as bmm
 
     g, m, n, k = 2, 128, 1024, 4096
-    # kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales)
+    # kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales, GROUP_K)
     table = policy._mxscale_bmm_kid_table()
     pre = {kid: entry[1] for kid, entry in table.items()}
     kid_pre = next(
         kid
         for kid in KIDS_BPRESHUFFLE
-        if pre.get(kid) and policy.mxscale_bmm_kid_takes_plain_scales(kid)
+        if pre.get(kid)
+        and policy.mxscale_bmm_kid_takes_plain_scales(kid)
+        and policy.mxscale_bmm_kid_group(kid) == 128
+        and policy.mxscale_bmm_kid_group(kid + 1000) == 32
     )
+    kid_pre32 = kid_pre + 1000
     # Empty unless the catalogue builds the relaid-scale kids
     # (BMM_BUILD_RELAID_SCALE_KIDS); their refusal case is skipped then.
     host_scale_kids = sorted(kid for kid, entry in table.items() if entry[2])
 
-    args = (
-        torch.empty((m, g, k), dtype=dtypes.fp8, device="meta"),
-        torch.empty((g, n, k), dtype=dtypes.fp8, device="meta"),
-        torch.empty((m, g, k // GROUP), dtype=torch.uint8, device="meta"),
-        torch.empty((g, n // GROUP, k // GROUP), dtype=torch.uint8, device="meta"),
-    )
+    def _args(group, n_=n):
+        return (
+            torch.empty((m, g, k), dtype=dtypes.fp8, device="meta"),
+            torch.empty((g, n_, k), dtype=dtypes.fp8, device="meta"),
+            torch.empty((m, g, k // group), dtype=torch.uint8, device="meta"),
+            torch.empty(
+                (g, max(1, n_ // group), k // group), dtype=torch.uint8, device="meta"
+            ),
+        )
 
-    def _resolve(row, b_preshuffled):
+    def _resolve(row, b_preshuffled, group=128, n_=n):
         """The kid this tuned row dispatches to, or the ValueError it raises."""
         seen = {}
 
@@ -269,11 +298,9 @@ def _check_dispatch():
             c.cache_clear()
         with patch.object(
             bmm, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", _spy
-        ), patch.object(
-            policy, "lookup_mxscale_bmm_config", lambda *a, **kw: row
-        ):
+        ), patch.object(policy, "lookup_mxscale_bmm_config", lambda *a, **kw: row):
             try:
-                impl(*args)
+                impl(*_args(group, n_), group_size=group)
             except ValueError as err:
                 return err
             finally:
@@ -284,54 +311,128 @@ def _check_dispatch():
     def _row(kid):
         return {"libtype": "opus", "kernelId": kid, "splitK": 1}
 
-    def _row_major_kid(r):
-        return isinstance(r, int) and not pre.get(r)
+    def _row_major_kid(group):
+        return lambda r: (
+            isinstance(r, int)
+            and not pre.get(r)
+            and policy.mxscale_bmm_kid_group(r) == group
+        )
 
+    def _pre_fallback(group, not_kid=None):
+        return lambda r: (
+            isinstance(r, int)
+            and bool(pre.get(r))
+            and policy.mxscale_bmm_kid_takes_plain_scales(r)
+            and policy.mxscale_bmm_kid_group(r) == group
+            and r != not_kid
+        )
+
+    # (label, tuned row, b_preshuffled, group_size, N, expectation)
     cases = (
         (
             f"tuned kid{kid_pre} + declared preshuffled -> runs it",
             _row(kid_pre),
             True,
+            128,
+            n,
             lambda r: r == kid_pre,
         ),
         (
             f"tuned kid{kid_pre} + row-major B -> row-major fallback",
             _row(kid_pre),
             False,
-            _row_major_kid,
+            128,
+            n,
+            _row_major_kid(128),
         ),
         (
-            f"tuned kid{KID_PLAIN} (row-major) + declared preshuffled -> raises",
+            f"tuned kid{KID_PLAIN} (row-major) + declared preshuffled -> preshuffled fallback",
             _row(KID_PLAIN),
             True,
-            lambda r: isinstance(r, ValueError),
+            128,
+            n,
+            _pre_fallback(128),
         ),
         *(
             (
                 (
-                    f"tuned kid{host_scale_kids[0]} (host-rearranged scales) + declared -> raises",
+                    (
+                        f"tuned kid{host_scale_kids[0]} (host-rearranged scales) "
+                        "+ declared -> preshuffled fallback"
+                    ),
                     _row(host_scale_kids[0]),
                     True,
-                    lambda r: isinstance(r, ValueError),
+                    128,
+                    n,
+                    _pre_fallback(128, host_scale_kids[0]),
                 ),
             )
             if host_scale_kids
             else ()
         ),
         (
-            "no tuned row + declared preshuffled -> raises",
+            "no tuned row + declared preshuffled -> preshuffled fallback",
             None,
             True,
+            128,
+            n,
+            _pre_fallback(128),
+        ),
+        (
+            "no tuned row + row-major B -> heuristic",
+            None,
+            False,
+            128,
+            n,
+            _row_major_kid(128),
+        ),
+        (
+            f"group 32: tuned kid{kid_pre32} + declared preshuffled -> runs it",
+            _row(kid_pre32),
+            True,
+            32,
+            n,
+            lambda r: r == kid_pre32,
+        ),
+        (
+            f"group 32: tuned kid{kid_pre} (group 128) + declared preshuffled -> g32 fallback",
+            _row(kid_pre),
+            True,
+            32,
+            n,
+            _pre_fallback(32),
+        ),
+        (
+            "group 32: no tuned row + declared preshuffled -> g32 fallback",
+            None,
+            True,
+            32,
+            n,
+            _pre_fallback(32),
+        ),
+        (
+            "group 32: no tuned row + row-major B -> g32 heuristic",
+            None,
+            False,
+            32,
+            n,
+            _row_major_kid(32),
+        ),
+        (
+            "N=16, no preshuffled tile divides it -> raises",
+            None,
+            True,
+            128,
+            16,
             lambda r: isinstance(r, ValueError),
         ),
-        ("no tuned row + row-major B -> heuristic", None, False, _row_major_kid),
     )
 
     if not host_scale_kids:
         print("  skip host-rearranged-scale refusal: no such kid is built", flush=True)
     ok = True
-    for label, row, b_preshuffled, want in cases:
-        got = _resolve(row, b_preshuffled)
+    for label, row, b_preshuffled, group, n_, want in cases:
+        got = _resolve(row, b_preshuffled, group, n_)
         good = want(got)
         ok &= good
         shown = "ValueError" if isinstance(got, ValueError) else f"kid{got}"
@@ -344,7 +445,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-g", type=int, default=2, help="batch (group) count")
     p.add_argument("-n", type=int, default=1024, help="N (multiple of 32)")
-    p.add_argument("-k", type=int, default=4096, help="K (multiple of 256)")
+    p.add_argument(
+        "-k",
+        default="4096,2048,1024,512",
+        help="comma-separated K list (multiples of 256); only 4096 has tuned "
+        "rows, so the others run the public entry's fallback kid",
+    )
+    p.add_argument("--groups", default="128,32", help="comma-separated group sizes")
     p.add_argument(
         "-s",
         "--sizes",
@@ -382,16 +489,19 @@ def main():
         return 0
 
     ydt = dtypes.bf16 if args.dtype == "bf16" else dtypes.fp32
+    ks = [int(x) for x in args.k.split(",") if x]
+    groups = [int(x) for x in args.groups.split(",") if x]
     assert args.n % 32 == 0, "these kids tile N by 32"
-    assert args.k % 256 == 0, "these kids tile K by 256"
-    assert args.k % GROUP == 0
+    assert all(k % 256 == 0 for k in ks), "these kids tile K by 256"
 
     print("tables: one tuned CSV per B layout", flush=True)
     ok = _check_tables()
     print("dispatch: B-layout routing across the two public entries", flush=True)
     ok &= _check_dispatch()
-    for m in [int(x) for x in args.sizes.split(",")]:
-        ok &= _run(args.g, m, args.n, args.k, ydt, args.bench, args.split_k)
+    for group in groups:
+        for k in ks:
+            for m in [int(x) for x in args.sizes.split(",")]:
+                ok &= _run(args.g, m, args.n, k, ydt, args.bench, args.split_k, group)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
