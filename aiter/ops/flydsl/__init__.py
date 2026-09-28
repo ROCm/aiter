@@ -174,6 +174,11 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "normalize_qsa_backend": (".qsa", "normalize_qsa_backend"),
+    "qsa_auto_uses_flydsl": (".qsa", "qsa_auto_uses_flydsl"),
+    "qsa_k1_block_ids": (".qsa", "qsa_k1_block_ids"),
+    "qsa_k2": (".qsa", "qsa_k2"),
+    "qsa_layer": (".qsa", "qsa_layer"),
 }
 
 __all__ = [
@@ -221,9 +226,14 @@ __all__ = [
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
+    "normalize_qsa_backend",
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "qsa_auto_uses_flydsl",
+    "qsa_k1_block_ids",
+    "qsa_k2",
+    "qsa_layer",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
