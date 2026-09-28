@@ -52,61 +52,62 @@ class TestBaseTunerDefaults(unittest.TestCase):
         self.assertEqual(defaults["iters"], measurement.iters)
         self.assertEqual(defaults["errRatio"], measurement.err_ratio)
         self.assertEqual(defaults["timeout"], measurement.timeout)
+        self.assertEqual(defaults["batch"], policy.DEFAULT_RUN.batch)
         self.assertEqual(
-            defaults["min_improvement_pct"], policy.COMPARE_MIN_IMPROVEMENT_PCT
+            defaults["min_improvement_pct"],
+            policy.DEFAULT_PROMOTION.min_improvement_pct,
         )
 
 
+class TestRunPolicy(unittest.TestCase):
+    def test_rejects_an_empty_batch(self):
+        with self.assertRaises(ValueError):
+            policy.RunPolicy(batch=0)
+
+
 class TestPromotionPolicy(unittest.TestCase):
-    def test_family_override_keeps_the_other_defaults(self):
-        tighter = dataclasses.replace(policy.DEFAULT_PROMOTION, indifference_delta=0.01)
-        self.assertEqual(tighter.indifference_delta, 0.01)
-        self.assertEqual(tighter.finalists, policy.DEFAULT_PROMOTION.finalists)
+    def test_family_override(self):
+        tighter = dataclasses.replace(policy.DEFAULT_PROMOTION, min_improvement_pct=5.0)
+        self.assertEqual(tighter.min_improvement_pct, 5.0)
 
-    def test_rejects_a_delta_that_could_never_be_beaten(self):
+    def test_rejects_a_bar_that_could_never_be_cleared(self):
         with self.assertRaises(ValueError):
-            policy.PromotionPolicy(indifference_delta=1.0)
+            policy.PromotionPolicy(min_improvement_pct=100.0)
         with self.assertRaises(ValueError):
-            policy.PromotionPolicy(indifference_delta=-0.01)
-
-    def test_rejects_an_empty_finalist_round(self):
-        with self.assertRaises(ValueError):
-            policy.PromotionPolicy(finalists=0)
-        with self.assertRaises(ValueError):
-            policy.PromotionPolicy(finalist_rounds=0)
+            policy.PromotionPolicy(min_improvement_pct=-1.0)
 
 
 class TestGateAgainstIncumbent(unittest.TestCase):
-    DELTA = policy.PromotionPolicy(indifference_delta=0.02)
+    BAR = policy.PromotionPolicy(min_improvement_pct=3.0)
 
     def gate(self, incumbent_us, challenger_us):
-        return policy.gate_against_incumbent(incumbent_us, challenger_us, self.DELTA)
+        return policy.gate_against_incumbent(incumbent_us, challenger_us, self.BAR)
 
     def test_a_clear_win_is_promoted(self):
         decision = self.gate(100.0, 90.0)
         self.assertEqual(decision.outcome, policy.PROMOTE)
-        self.assertAlmostEqual(decision.margin, 0.10)
+        self.assertAlmostEqual(decision.margin_pct, 10.0)
 
-    def test_a_win_inside_the_delta_is_retained(self):
+    def test_a_win_below_the_bar_is_retained(self):
         decision = self.gate(100.0, 99.0)
         self.assertEqual(decision.outcome, policy.RETAIN)
-        self.assertAlmostEqual(decision.margin, 0.01)
+        self.assertAlmostEqual(decision.margin_pct, 1.0)
 
-    def test_a_margin_equal_to_the_delta_is_retained(self):
-        # The delta is the largest gap still treated as noise.
-        self.assertEqual(self.gate(100.0, 98.0).outcome, policy.RETAIN)
+    def test_a_margin_equal_to_the_bar_is_promoted(self):
+        # "At least this many percent", as --compare --update_improved reads it.
+        self.assertEqual(self.gate(100.0, 97.0).outcome, policy.PROMOTE)
 
     def test_a_slower_challenger_is_retained(self):
         decision = self.gate(100.0, 110.0)
         self.assertEqual(decision.outcome, policy.RETAIN)
-        self.assertLess(decision.margin, 0)
+        self.assertLess(decision.margin_pct, 0)
 
     def test_no_measured_incumbent_promotes_without_a_margin(self):
         for incumbent in (None, 0.0, -1.0, float("inf"), float("nan")):
             with self.subTest(incumbent=incumbent):
                 decision = self.gate(incumbent, 50.0)
                 self.assertEqual(decision.outcome, policy.PROMOTE)
-                self.assertIsNone(decision.margin)
+                self.assertIsNone(decision.margin_pct)
 
     def test_an_unmeasured_challenger_is_a_caller_error(self):
         for challenger in (None, 0.0, -1.0, float("inf")):
