@@ -50,8 +50,6 @@ MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
 DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
 WMMA_COLUMN_MAJOR = int(os.environ.get("AITER_FLYDSL_WMMA_COLUMN_MAJOR", "0"))
-SCALE_LO256 = int(os.environ.get("AITER_FLYDSL_SCALE_LO256", "0"))
-LDS_RMEM_LO256 = int(os.environ.get("AITER_FLYDSL_LDS_RMEM_LO256", "0"))
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
@@ -63,10 +61,6 @@ if DS_FIRST_N < 0:
     raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
 if WMMA_COLUMN_MAJOR not in (0, 1):
     raise ValueError("AITER_FLYDSL_WMMA_COLUMN_MAJOR must be 0 or 1")
-if SCALE_LO256 not in (0, 1, 2):
-    raise ValueError("AITER_FLYDSL_SCALE_LO256 must be 0, 1, or 2")
-if LDS_RMEM_LO256 not in (0, 1):
-    raise ValueError("AITER_FLYDSL_LDS_RMEM_LO256 must be 0 or 1")
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -227,8 +221,6 @@ def launch_gemm_a8w4_tdm(
         MMA_FIRST_GROUP,
         DS_FIRST_N,
         WMMA_COLUMN_MAJOR,
-        SCALE_LO256,
-        LDS_RMEM_LO256,
         EXPLICIT_VGPR_PARTITION,
         PLANAR_LDS,
         WAVE_LDS_ORDER,
@@ -403,8 +395,6 @@ def launch_gemm_a8w4_tdm(
     )
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
     _column_major = "_colmma" if WMMA_COLUMN_MAJOR else ""
-    _scale_lo256 = f"_slo256m{SCALE_LO256}" if SCALE_LO256 else ""
-    _lds_rmem_lo256 = "_ldsrmlo256" if LDS_RMEM_LO256 else ""
     _explicit_vgpr_partition = "_regpart" if EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if PLANAR_LDS else ""
     _wave_lds_order = "_interleavelds" if WAVE_LDS_ORDER else ""
@@ -415,8 +405,8 @@ def launch_gemm_a8w4_tdm(
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_as_prologue}"
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
-        f"{_mma_group}{_ds_first}{_column_major}{_scale_lo256}"
-        f"{_lds_rmem_lo256}{_explicit_vgpr_partition}{_planar_lds}"
+        f"{_mma_group}{_ds_first}{_column_major}"
+        f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_wave_lds_order}"
     )
 
@@ -629,8 +619,6 @@ def launch_gemm_a8w4_tdm(
             # empty side-effect asm is an ordering anchor only (zero ISA bytes).
             # It lets the pointer load join the existing prologue kernarg loads,
             # so they issue in one clause and share the already-required wait.
-            from flydsl._mlir.dialects import llvm as llvm_dialect
-
             llvm_dialect.InlineAsmOp(
                 res=None,
                 operands_=[_rm_addr.ir_value()],
@@ -1071,30 +1059,6 @@ def launch_gemm_a8w4_tdm(
         # least one group for the interleaved part.
         FENCE_COVER_MMA = min(8, max(0, n_acc - MMA_GROUP))
 
-        def scale_lo256(value):
-            raw = value.ir_value()
-            return fx.Int32(
-                llvm_dialect.inline_asm(
-                    raw.type,
-                    [raw],
-                    "",
-                    "=v,0",
-                    has_side_effects=False,
-                )
-            )
-
-        def vector_lo256(value):
-            raw = value.ir_value()
-            return Vec(
-                llvm_dialect.inline_asm(
-                    raw.type,
-                    [raw],
-                    "",
-                    "=v,0",
-                    has_side_effects=False,
-                )
-            )
-
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for outer in range_constexpr(
                 wmma_n_rep if WMMA_COLUMN_MAJOR else len(wm_list)
@@ -1109,21 +1073,9 @@ def launch_gemm_a8w4_tdm(
                     idx = wm * wmma_n_rep + wn
                     scale_a = sb_k[wn if a_is_fp4 else wn // 2]
                     scale_b = sa_k[wm // 2]
-                    if const_expr(SCALE_LO256 == 2 or LDS_RMEM_LO256):
-                        scale_a = scale_lo256(scale_a)
-                        scale_b = scale_lo256(scale_b)
                     if const_expr(a_is_fp4):
                         wt_value = wt[wn].load()
                         act_value = act[i].load()
-                        if const_expr(
-                            LDS_RMEM_LO256 and not EXPLICIT_VGPR_PARTITION
-                        ):
-                            # Constrain only the short WMMA-use intervals.  A
-                            # constraint immediately after every ds_read pins
-                            # the complete double-buffer lifetime to Lo256 and
-                            # forces the scheduler to wait on each load group.
-                            wt_value = vector_lo256(wt_value)
-                            act_value = vector_lo256(act_value)
                         c_frags[idx].store(
                             rocdl.wmma_scale_f32_32x16x128_f4(
                                 T.vec(16, T.f32),
@@ -1268,31 +1220,6 @@ def launch_gemm_a8w4_tdm(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            if const_expr(SCALE_LO256 == 1):
-                # On gfx1250 LLVM maps the inline-asm "v" constraint to an
-                # aligned Lo256 VGPR class.  Tying input/output preserves the
-                # values while giving current scales a short, explicit low-bank
-                # interval immediately before their constrained WMMA uses.
-                sa_v = sa_k.ir_value()
-                sb_v = sb_k.ir_value()
-                sa_k = Vec(
-                    llvm_dialect.inline_asm(
-                        sa_v.type,
-                        [sa_v],
-                        "",
-                        "=v,0",
-                        has_side_effects=False,
-                    )
-                )
-                sb_k = Vec(
-                    llvm_dialect.inline_asm(
-                        sb_v.type,
-                        [sb_v],
-                        "",
-                        "=v,0",
-                        has_side_effects=False,
-                    )
-                )
             if const_expr(WMMA_COLUMN_MAJOR):
                 mma_rows(
                     list(range(wmma_m_rep)), cur_rmem.a, cur_rmem.b, sa_k, sb_k
@@ -1654,87 +1581,33 @@ def launch_gemm_a8w4_tdm(
 
                     dispatch_wave_job(steady_mid)
 
-                    if const_expr(LDS_RMEM_LO256):
-
-                        def tail_carry_fence(j):
-                            # tensor_wait requires an immediate count. Keep only
-                            # this small selector static while the drain compute
-                            # stays in a runtime loop.
-                            for fence_j in range_constexpr(PRE - 1):
-                                if j == fence_j:
-                                    pipeline_fence(
-                                        outstanding=TDM_PER
-                                        * max(0, num_buffers - 2 - fence_j)
-                                    )
-
-                        if const_expr(next_stage_on):
-                            # Keep every drain tile in one runtime loop. The final
-                            # iteration loads one unused, valid LDS slot so the
-                            # compute body has one register-allocation shape.
-                            for j in range(PRE):
-                                kt = n_steady + j
-                                buf = kt % num_buffers
-                                next_stage_buf = (kt + 1) % num_buffers
-                                compute_ktile(
-                                    buf,
-                                    kt,
-                                    None,
-                                    next_stage_on,
-                                    next_stage_buf,
-                                    None,
-                                    None,
-                                    lambda j=j: tail_carry_fence(j),
-                                    interleave_ab,
-                                )
-                        else:
-                            # Select the immediate tensor_wait count at runtime but
-                            # keep a single compute body.
-                            for j in range(PRE):
-                                for fence_j in range_constexpr(PRE):
-                                    if j == fence_j:
-                                        pipeline_fence(
-                                            outstanding=TDM_PER
-                                            * max(0, num_buffers - 2 - fence_j)
-                                        )
-                                kt = n_steady + j
-                                buf = kt % num_buffers
-                                compute_ktile(
-                                    buf,
-                                    kt,
-                                    None,
-                                    next_stage_on,
-                                    None,
-                                    interleave_ab=interleave_ab,
-                                )
-                    else:
-                        for j in range_constexpr(PRE):
-                            kt = n_steady + j
-                            buf = kt % num_buffers
-                            has_next = next_stage_on and j + 1 < PRE
-                            if const_expr(not next_stage_on):
-                                pipeline_fence(
-                                    outstanding=TDM_PER
-                                    * max(0, num_buffers - 2 - j)
-                                )
-                            next_stage_buf = (
-                                (kt + 1) % num_buffers
+                    for j in range_constexpr(PRE):
+                        kt = n_steady + j
+                        buf = kt % num_buffers
+                        has_next = next_stage_on and j + 1 < PRE
+                        if const_expr(not next_stage_on):
+                            pipeline_fence(
+                                outstanding=TDM_PER * max(0, num_buffers - 2 - j)
+                            )
+                        next_stage_buf = (
+                            (kt + 1) % num_buffers
+                            if const_expr(has_next)
+                            else None
+                        )
+                        compute_ktile(
+                            buf,
+                            kt,
+                            None,
+                            next_stage_on,
+                            next_stage_buf,
+                            None,
+                            (
+                                TDM_PER * max(0, num_buffers - 2 - j)
                                 if const_expr(has_next)
                                 else None
-                            )
-                            compute_ktile(
-                                buf,
-                                kt,
-                                None,
-                                next_stage_on,
-                                next_stage_buf,
-                                None,
-                                (
-                                    TDM_PER * max(0, num_buffers - 2 - j)
-                                    if const_expr(has_next)
-                                    else None
-                                ),
-                                interleave_ab=interleave_ab,
-                            )
+                            ),
+                            interleave_ab=interleave_ab,
+                        )
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
