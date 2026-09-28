@@ -12,15 +12,11 @@ than restating the default.
 Standard library only, so the runtime and the tests can import it without
 pulling in torch or a device.
 
-Promotion bars in use today, which measure different things and are kept
-separate on purpose:
-
-- ``COMPARE_MIN_IMPROVEMENT_PCT``: ``--compare --update_improved`` benchmarks
-  the public operator before and after tuning and rewrites a shape only if it
-  got at least this many percent faster.
-- ``PromotionPolicy.indifference_delta``: a tuner that measures the incumbent
-  itself (``gate_against_incumbent``) publishes a challenger only if it beats
-  the incumbent by more than this fraction.
+``PromotionPolicy.min_improvement_pct`` is the one bar for replacing what a
+shape runs today. ``--compare --update_improved`` applies it after tuning, by
+timing each shape through the operator serving calls with the old and the new
+tuned CSV. A tuner that times the incumbent next to the challengers applies it
+during the search, through ``gate_against_incumbent``.
 """
 
 import math
@@ -43,29 +39,38 @@ class MeasurementPolicy:
 
 DEFAULT_MEASUREMENT = MeasurementPolicy()
 
-COMPARE_MIN_IMPROVEMENT_PCT = 3.0
+
+@dataclass(frozen=True)
+class RunPolicy:
+    """How a tuning run is split up. Nothing here changes which candidate wins."""
+
+    # Shapes tuned between writes of the tuned CSV, so a crash loses at most
+    # one batch.
+    batch: int = 100
+
+    def __post_init__(self):
+        if self.batch < 1:
+            raise ValueError(f"batch must be at least 1, got {self.batch}")
+
+
+DEFAULT_RUN = RunPolicy()
 
 
 @dataclass(frozen=True)
 class PromotionPolicy:
     """When a measured challenger replaces the configuration already serving."""
 
-    # A challenger must be faster than the incumbent by more than this
-    # fraction. Gaps inside it are run-to-run noise on one GPU, and publishing
-    # them churns the tuned table without making anything faster.
-    indifference_delta: float = 0.02
-    # Screening keeps this many of the fastest candidates per shape, and times
-    # them again this many times, before the winner is chosen.
-    finalists: int = 8
-    finalist_rounds: int = 3
+    # A challenger must be at least this many percent faster than the
+    # incumbent. Smaller gaps are within run-to-run noise on one GPU, and
+    # publishing them churns the tuned table without making anything faster.
+    min_improvement_pct: float = 3.0
 
     def __post_init__(self):
-        if not 0.0 <= self.indifference_delta < 1.0:
+        if not 0.0 <= self.min_improvement_pct < 100.0:
             raise ValueError(
-                f"indifference_delta must be in [0, 1), got {self.indifference_delta}"
+                "min_improvement_pct must be in [0, 100), "
+                f"got {self.min_improvement_pct}"
             )
-        if self.finalists < 1 or self.finalist_rounds < 1:
-            raise ValueError("finalists and finalist_rounds must be at least 1")
 
 
 DEFAULT_PROMOTION = PromotionPolicy()
@@ -77,9 +82,9 @@ RETAIN = "retain"
 @dataclass(frozen=True)
 class GateDecision:
     outcome: str
-    # (incumbent - challenger) / incumbent; None when there was no incumbent
-    # latency to compare against.
-    margin: float | None
+    # 100 * (incumbent - challenger) / incumbent; None when there was no
+    # incumbent latency to compare against.
+    margin_pct: float | None
 
 
 def _measured(latency_us) -> bool:
@@ -107,6 +112,6 @@ def gate_against_incumbent(
     if not _measured(incumbent_us):
         return GateDecision(PROMOTE, None)
     incumbent_us = float(incumbent_us)
-    margin = (incumbent_us - float(challenger_us)) / incumbent_us
-    outcome = PROMOTE if margin > policy.indifference_delta else RETAIN
-    return GateDecision(outcome, margin)
+    margin_pct = (incumbent_us - float(challenger_us)) / incumbent_us * 100.0
+    outcome = PROMOTE if margin_pct >= policy.min_improvement_pct else RETAIN
+    return GateDecision(outcome, margin_pct)

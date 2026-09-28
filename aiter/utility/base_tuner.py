@@ -16,7 +16,11 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.jit.utils import chip_info
-from aiter.utility.tuning_policy import COMPARE_MIN_IMPROVEMENT_PCT, DEFAULT_MEASUREMENT
+from aiter.utility.tuning_policy import (
+    DEFAULT_MEASUREMENT,
+    DEFAULT_PROMOTION,
+    DEFAULT_RUN,
+)
 
 INVALID_TIME = -1
 
@@ -48,14 +52,14 @@ class TunerCommon:
         "tune_file": "",
         "untune_file": "",
         "errRatio": DEFAULT_MEASUREMENT.err_ratio,
-        "batch": 100,
+        "batch": DEFAULT_RUN.batch,
         "profile_file": "",  # for all results
         # Override with --timeout for tighter/looser bounds.
         "timeout": DEFAULT_MEASUREMENT.timeout,
         "warmup": DEFAULT_MEASUREMENT.warmup,
         "iters": DEFAULT_MEASUREMENT.iters,
         # only write shapes improved by >= N%
-        "min_improvement_pct": COMPARE_MIN_IMPROVEMENT_PCT,
+        "min_improvement_pct": DEFAULT_PROMOTION.min_improvement_pct,
     }
     dtype2bpe_dict: ClassVar[dict[str, Any]] = {
         dtypes.fp16: 2,
@@ -240,7 +244,9 @@ class TunerCommon:
             "--min_improvement_pct",
             dest="min_improvement_pct",
             type=float,
-            default=defaults.get("min_improvement_pct", COMPARE_MIN_IMPROVEMENT_PCT),
+            default=defaults.get(
+                "min_improvement_pct", DEFAULT_PROMOTION.min_improvement_pct
+            ),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
 
