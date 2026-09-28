@@ -51,6 +51,11 @@ _COMBINE_CHUNKS_PER_ITER = 1
 # handful of bytes.
 _COMBINE_QUANT_TOKENS_PER_BLOCK = 8
 _COMBINE_QUANT_CHUNKS_PER_ITER = 4
+# Decode steps have too little expert GEMM to hide the compact plan if the plan
+# waits out dispatch first. At or below this token count the next layer's plan
+# starts before dispatch returns and overlaps both; larger steps keep the plan
+# off the fabric until the payload copy is done, then overlap it with the GEMM.
+_DECODE_PLAN_OVERLAP_TOKENS = 128
 
 
 def _combine_tile(*, topk, hidden_dim, quant_bits):
@@ -709,8 +714,11 @@ class MegaMoEGfx1250:
         their own.
 
         ``next_topk_ids`` (and optional ``next_recv_token_bound``) start the next
-        layer's compact plan on a side stream after this dispatch, so it overlaps
-        the expert GEMM. The two plans use independent hist/done slots and local
+        layer's compact plan on a side stream. Prefill waits until this layer's
+        dispatch has queued, then overlaps the plan with the expert GEMM. Decode
+        (``token_count <= _DECODE_PLAN_OVERLAP_TOKENS``) only waits for work
+        already queued before dispatch, so the plan overlaps dispatch and the
+        GEMM; the two plans use independent hist/done slots and local
         tok_map/psum buffers. Omit them to keep the plan sequential.
 
         ``combine_quant`` picks this step's combine wire out of the formats the
@@ -785,6 +793,16 @@ class MegaMoEGfx1250:
             # Compact cannot slice recv_x -- the rows are grouped per expert, not
             # token-major -- so the bound is spent on the geometry instead: it
             # picks the plan's alignment, the GEMM's tile and the GEMM's grid.
+            # Recorded before dispatch so a decode prefetch can wait for routing
+            # without also waiting for the payload copy.
+            if (
+                next_topk_ids is not None
+                and int(next_topk_ids.shape[0]) > 0
+                and self._overlap_plan_with_dispatch(token_count)
+            ):
+                self._compact_prefetch_events[self._compact_slot].record(
+                    torch.cuda.current_stream()
+                )
             self._begin_compact_step(
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
@@ -828,10 +846,13 @@ class MegaMoEGfx1250:
             and next_topk_ids is not None
             and int(next_topk_ids.shape[0]) > 0
         ):
-            # Dispatch of this layer is done, so tok_map[slot] is free. GEMM
-            # still reads psum/masked_m of this slot; the next plan writes the
-            # other slot and overlaps the expert GEMM (and later combine/RMS).
-            self._prefetch_next_compact_plan(next_topk_ids, next_recv_token_bound)
+            # Dispatch of this layer is queued, so tok_map[slot] is free once it
+            # finishes. GEMM still reads psum/masked_m of this slot; the next
+            # plan writes the other slot. Prefill overlaps that plan with the
+            # GEMM only. Decode also overlaps it with this dispatch.
+            self._prefetch_next_compact_plan(
+                next_topk_ids, next_recv_token_bound, token_count
+            )
         try:
             fused_moe(
                 recv_x,
@@ -908,28 +929,56 @@ class MegaMoEGfx1250:
         bound = inferred if recv_token_bound is None else int(recv_token_bound)
         return max(1, min(bound, int(self._config.max_recv)))
 
-    def _compact_plan_for(self, align_m: int, slot: int | None = None):
+    def _overlap_plan_with_dispatch(self, token_count: int) -> bool:
+        """Decode has too little GEMM to hide a plan that waits out dispatch."""
+        return int(token_count) <= _DECODE_PLAN_OVERLAP_TOKENS
+
+    def _plan_waves_for(self, token_count: int | None) -> int:
+        """Wave count for this step's route count.
+
+        The histogram layout stays on the arena capacity so every rank agrees
+        on the stride. Only the launch width follows the step: a decode step
+        would otherwise pay the prefill kernel's 32-wave barrier.
+        """
+        from .compact_plan import compact_plan_waves
+
+        routes = self._compact_max_routes
+        if token_count is not None:
+            routes = min(
+                routes,
+                max(1, int(token_count) * int(self._config.topk)),
+            )
+        return compact_plan_waves(npes=self._config.world_size, max_routes=routes)
+
+    def _compact_plan_for(
+        self, align_m: int, slot: int | None = None, token_count: int | None = None
+    ):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
-        Compiled per alignment and hist/done slot, because the plan and the
-        expert GEMM must agree on the tile, and double-buffered plans must not
-        share a done counter.
+        Compiled per alignment, hist/done slot, and wave width. The plan and
+        the expert GEMM must agree on the tile, double-buffered plans must not
+        share a done counter, and a decode step must not launch the wide
+        prefill grid.
         """
-        from .compact_plan import compile_tdm_compact_plan
+        from .compact_plan import compact_plan_waves, compile_tdm_compact_plan
 
         align_m = int(align_m)
         slot = int(self._compact_slot if slot is None else slot)
-        key = (align_m, slot)
+        waves = self._plan_waves_for(token_count)
+        key = (align_m, slot, waves)
         launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    f"compact plan for align_m={align_m} slot={slot} was not "
-                    "compiled before graph capture; warm this token bucket "
-                    "eagerly first"
+                    f"compact plan for align_m={align_m} slot={slot} "
+                    f"waves={waves} was not compiled before graph capture; "
+                    "warm this token bucket eagerly first"
                 )
             hist0 = self._arena.offset("compact_hist")
             done0 = self._arena.offset("compact_done")
+            full_waves = compact_plan_waves(
+                npes=self._config.world_size, max_routes=self._compact_max_routes
+            )
             launch = compile_tdm_compact_plan(
                 rank=self._config.rank,
                 npes=self._config.world_size,
@@ -944,6 +993,7 @@ class MegaMoEGfx1250:
                 hist_stride=self._compact_hist_stride,
                 max_routes=self._compact_max_routes,
                 hist_pingpong=False,
+                plan_waves=None if waves == full_waves else waves,
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -970,7 +1020,7 @@ class MegaMoEGfx1250:
         )
         self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
         for slot in range(self._COMPACT_PLAN_SLOTS):
-            self._compact_plan_for(self._compact_step_align_m, slot)
+            self._compact_plan_for(self._compact_step_align_m, slot, tok)
 
     def prefetch_compact_plan(
         self,
@@ -995,8 +1045,10 @@ class MegaMoEGfx1250:
         self,
         topk_ids: torch.Tensor,
         recv_token_bound: int | None,
+        live_tokens: int,
     ) -> None:
-        nxt = 1 - self._compact_slot
+        cur_slot = self._compact_slot
+        nxt = 1 - cur_slot
         saved = (
             self._compact_step_align_m,
             self._compact_step_rows,
@@ -1006,7 +1058,16 @@ class MegaMoEGfx1250:
         self._begin_compact_step(
             self._compact_recv_bound(token_count, recv_token_bound)
         )
-        self._launch_compact_plan_async(topk_ids, token_count, nxt)
+        # Prefill: the plan shares the fabric with dispatch, so it waits until
+        # that copy is queued and then overlaps the GEMM. Decode's GEMM is
+        # shorter than the plan, so waiting out dispatch puts the plan back on
+        # the critical path; wait only for routing already queued before it.
+        ready = (
+            self._compact_prefetch_events[cur_slot]
+            if self._overlap_plan_with_dispatch(live_tokens)
+            else None
+        )
+        self._launch_compact_plan_async(topk_ids, token_count, nxt, ready_event=ready)
         (
             self._compact_step_align_m,
             self._compact_step_rows,
@@ -1015,15 +1076,22 @@ class MegaMoEGfx1250:
         self._compact_slot = nxt
 
     def _launch_compact_plan_async(
-        self, topk_ids: torch.Tensor, token_count: int, slot: int | None = None
+        self,
+        topk_ids: torch.Tensor,
+        token_count: int,
+        slot: int | None = None,
+        ready_event: torch.cuda.Event | None = None,
     ) -> None:
         slot = int(self._compact_slot if slot is None else slot)
         bufs = self._compact_slot_bufs(slot)
         cur = torch.cuda.current_stream()
         plan_stream = self._compact_plan_stream
-        plan_stream.wait_stream(cur)
+        if ready_event is None:
+            plan_stream.wait_stream(cur)
+        else:
+            plan_stream.wait_event(ready_event)
         with torch.cuda.stream(plan_stream):
-            self._compact_plan_for(self._compact_step_align_m, slot)(
+            self._compact_plan_for(self._compact_step_align_m, slot, token_count)(
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 bufs["tok_map"].data_ptr(),
@@ -1226,6 +1294,9 @@ class MegaMoEGfx1250:
             self._compact_plan_stream = torch.cuda.Stream()
             self._compact_plan_event = torch.cuda.Event()
             self._compact_plan_pending = False
+            self._compact_prefetch_events = [
+                torch.cuda.Event() for _ in range(self._COMPACT_PLAN_SLOTS)
+            ]
             # Warm both hist/done slots and the capacity bucket: compiling
             # inside graph capture is not allowed.
             for slot in range(self._COMPACT_PLAN_SLOTS):
