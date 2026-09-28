@@ -315,7 +315,7 @@ def _shape(tokens: int, hidden: int = 7168, activation: str = "silu") -> Benchma
     shape = BenchmarkShape(
         tokens=int(tokens),
         hidden=int(hidden),
-        inter=3072,
+        inter=int(__import__("os").environ.get("MEGAMOE_INTER", "3072")),
         experts=int(__import__("os").environ.get("MEGAMOE_EXPERTS", "896")),
         topk=int(__import__("os").environ.get("MEGAMOE_TOPK", "16")),
         ep_size=int(__import__("os").environ.get("MEGAMOE_EP_SIZE", "16")),
@@ -1450,7 +1450,7 @@ class MoriStage2Path:
                     a1_scale=recv_scales,
                     num_local_tokens=recv_tokens,
                     dtype=torch.bfloat16,
-                    swiglu_limit=0.0,
+                    swiglu_limit=_swiglu_limit(),
                     gate_mode=base._gate_mode,
                 )
             except _Stage2Captured:
@@ -1787,7 +1787,7 @@ def _build_candidate(
         max_tok_per_rank=shape.tokens,
         max_routes_per_token_per_rank=max_routes_per_token_per_rank,
         mega_scheme="hierarchical",
-        swiglu_limit=0.0,
+        swiglu_limit=_swiglu_limit(),
         activation=shape.activation,
         device_generation=device_generation,
         # agent: sparse_wqeå½“å‰åªæœ‰æ¯QP 32-bit token bitmapï¼›å¤§capacity
@@ -1851,7 +1851,12 @@ def _build_candidate(
     return CandidateStage2Path(operator, shared, shape, device, mode)
 
 
-def main() -> int:
+def _swiglu_limit() -> float:
+    # DSV4 类 silu+clamp;0.0 = 不 clamp。candidate 与 MORI 参照必须一致。
+    return float(__import__("os").environ.get("MEGAMOE_SWIGLU_LIMIT", "0"))
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", choices=("candidate", "mori"), required=True)
     parser.add_argument("--candidate-mode", choices=CANDIDATE_MODES, default="full")
@@ -1862,7 +1867,7 @@ def main() -> int:
         default="none",
     )
     parser.add_argument("--tokens", type=int, default=128)
-    parser.add_argument("--hidden", type=int, choices=(3584, 7168), default=7168)
+    parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--activation", choices=("silu", "situv2"), default="silu")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--cuda-graph", action="store_true", help="Profile one full forward per graph replay; extract Stage2 device duration")
@@ -1878,7 +1883,7 @@ def main() -> int:
                         help="Synchronize/log phases of the first eager MORI reference; diagnostic runs are ineligible for performance")
     parser.add_argument("--graph-coalesce-reference-duplicates", action="store_true",
                         help="Candidate correctness only: coalesce repeated expert weights in eager MORI references; excludes performance acceptance")
-    parser.add_argument("--route-pattern", choices=("cross_node", "paired-rank-half-remote", "paired-rank-local-only", "rank-balanced-hot", "permuted-arbitrary-topk", "skewed-duplicate-topk"), default="paired-rank-half-remote")
+    parser.add_argument("--route-pattern", choices=("cross_node", "eplb-balanced", "paired-rank-half-remote", "paired-rank-local-only", "rank-balanced-hot", "permuted-arbitrary-topk", "skewed-duplicate-topk"), default="paired-rank-half-remote")
     parser.add_argument("--mori-block-num", type=int, default=96)
     parser.add_argument("--mori-rdma-block-num", type=int, default=64)
     parser.add_argument(
@@ -2098,7 +2103,11 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--tail-iters", type=int, default=20)
     parser.add_argument("--plan-only", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def prepare_run(args):
+    """Validate parsed arguments and build (shape, contract) without touching GPUs."""
     if args.device_timeline_history_depth:
         depth = args.device_timeline_history_depth
         if not (args.cuda_graph and args.device_timeline and 2 * args.iters <= depth <= 1024
@@ -2409,33 +2418,11 @@ def main() -> int:
             "graph_comparison_statistic": args.graph_comparison_statistic,
             "comparison_metric": "timing.metrics.stage2_span_us." + args.graph_comparison_statistic,
         })
-    if args.plan_only:
-        print("MEGAMOE_EP16_STAGE2_BREAKDOWN_PLAN " + json.dumps(contract, sort_keys=True))
-        return 0
-    if args.device_timeline and (
-        args.path != "candidate" or args.candidate_mode != "full"
-    ):
-        raise ValueError("--device-timeline requires --path candidate --candidate-mode full")
+    return shape, contract
 
-    rank, world, _local_rank, device = _setup_dist(
-        needs_mori=args.path == "mori" or args.cuda_graph,
-        gpu_preflight_dir=args.torch_profiler_dir if args.cuda_graph else None,
-    )
-    if world != shape.ep_size:
-        raise ValueError(
-            f"Stage2 breakdown requires world={shape.ep_size}, got {world}")
-    profiler_pause()
-    shared = _shared_inputs(
-        shape,
-        rank,
-        world,
-        device,
-        route_pattern=args.route_pattern,
-        seed=args.seed,
-        direct_packed_weights=(
-            (args.device_timeline and not args.cuda_graph) or args.direct_packed_weights
-        ),
-    )
+
+def build_path(args, shape, shared, rank, world, device):
+    """Construct the candidate or MORI path exactly as the CLI does."""
     if args.path == "candidate":
         path = _build_candidate(
             shape,
@@ -2525,6 +2512,42 @@ def main() -> int:
                 "exact_capacity": True} if args.cuda_graph else {}),
         )
         path = MoriStage2Path(baseline, args.mori_mode)
+    return path
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    shape, contract = prepare_run(args)
+    if args.plan_only:
+        print("MEGAMOE_EP16_STAGE2_BREAKDOWN_PLAN " + json.dumps(contract, sort_keys=True))
+        return 0
+    if args.device_timeline and (
+        args.path != "candidate" or args.candidate_mode != "full"
+    ):
+        raise ValueError("--device-timeline requires --path candidate --candidate-mode full")
+
+    rank, world, _local_rank, device = _setup_dist(
+        needs_mori=args.path == "mori" or args.cuda_graph,
+        gpu_preflight_dir=args.torch_profiler_dir if args.cuda_graph else None,
+    )
+    if world != shape.ep_size:
+        raise ValueError(
+            f"Stage2 breakdown requires world={shape.ep_size}, got {world}")
+    profiler_pause()
+    shared = _shared_inputs(
+        shape,
+        rank,
+        world,
+        device,
+        route_pattern=args.route_pattern,
+        seed=args.seed,
+        direct_packed_weights=(
+            (args.device_timeline and not args.cuda_graph) or args.direct_packed_weights
+        ),
+    )
+    path = build_path(args, shape, shared, rank, world, device)
+
 
     try:
         if args.cuda_graph:

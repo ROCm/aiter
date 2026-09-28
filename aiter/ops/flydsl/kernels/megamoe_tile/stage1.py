@@ -168,6 +168,7 @@ def compile_megamoe_tile_ep16_stage1(
     expert_major_output: bool = False,
     activation: str = "silu",
     device_generation: bool = False,
+    swiglu_limit: float | None = None,
 ):
     """Compile one EP16 Stage-1 persistent-kernel shape specialization.
 
@@ -249,6 +250,8 @@ def compile_megamoe_tile_ep16_stage1(
         raise ValueError("Stage-1 requires BN=256 and BM in (32, 64, 128)")
     if activation not in ("silu", "situv2"):
         raise ValueError("Stage-1 activation must be silu or situv2")
+    if swiglu_limit is not None and (activation != "silu" or not float(swiglu_limit) > 0.0):
+        raise ValueError("Stage-1 swiglu_limit applies to silu only and must be positive")
     if device_generation and diagnostic_phase != "full":
         raise ValueError("device generation requires full Stage-1")
     # agent: token capacity来自arena specialization；producer CTA池保持固定，
@@ -687,7 +690,9 @@ def compile_megamoe_tile_ep16_stage1(
 
     transport_tag = "cco" if enable_cco else "stub"
     kernel_name = (
-        f"megamoe_tile_ep16_stage1_k3_a4w4_{activation}_r{rank}_"
+        f"megamoe_tile_ep16_stage1_k3_a4w4_{activation}"
+        + ("" if swiglu_limit is None else f"_swl{float(swiglu_limit):g}".replace(".", "p"))
+        + f"_r{rank}_"
         f"mt{MAX_TOKENS}_rpc{layout.max_routes_per_token_per_rank}_"
         f"wb{worker_blocks}_ws{work_shards}_{transport_tag}_{MXFP4_SCALE_LAYOUT_TAG}_"
         "scoreboard_v14_tilequeue_rankslots_payload2_qpballot4_no_send_atomic_inputscale_abi3"
@@ -3289,7 +3294,14 @@ def compile_megamoe_tile_ep16_stage1(
         # 每批 4 个 barrier;批末不需要 barrier:下一批 P0/P1 只写 CNT/HIT,
         # 它们的读者(P2/P3)都在本批 P3 末的 barrier 之前;P4 只读 ROW,
         # 而 ROW 只在下一批 P3 写,中间隔着三个 barrier。
-        _GB_NB = THREADS // TOPK
+        # 每批 token 数:受 THREADS//TOPK(每线程一个 (token, slot))和 GROUP_ROWS(一批每
+        # expert 最多跨一个组头)两头限制,并取 WAVES 的倍数(P3 按 wave 均分 record)。
+        # TOPK 不整除 THREADS 时末尾 THREADS-_GB_LANES 个线程在 P1 里不参与。
+        _GB_NB = min(THREADS // TOPK, GROUP_ROWS) // WAVES * WAVES
+        _GB_LANES = _GB_NB * TOPK
+        # weights 相对 ids 的 dword 距离:record 内是 16B 补齐后的 REC_W-REC_I,
+        # ids_first 的连续 [ids|weights] 数组里是 TOPK。
+        _GB_WDW_REC = (REC_W - REC_I) // 4
         _GB_CNT = 16
         _GB_BASE = _GB_CNT + LOCAL_EXPERTS
         _GB_HIT = _GB_BASE + LOCAL_EXPERTS
@@ -3303,7 +3315,8 @@ def compile_megamoe_tile_ep16_stage1(
         _GB_IT = (_GB_UNITS + 63) // 64
         _GB_SP = (_GB_NB * scale_bytes + THREADS - 1) // THREADS
         if const_expr(route_gbatch):
-            assert THREADS % TOPK == 0 and _GB_NB % WAVES == 0
+            assert _GB_NB >= WAVES and _GB_NB % WAVES == 0 and _GB_LANES <= THREADS
+            assert LOCAL_EXPERTS + _GB_NB <= THREADS, "P0 clears HIT with threads [LE, LE+_GB_NB)"
             assert _GB_OWNB + LOCAL_EXPERTS <= TS_LDS, "route_gbatch LDS overlaps TS accumulators"
             assert _GB_NB <= GROUP_ROWS, "one batch may cross at most one group head per expert"
             assert payload_dwords % 4 == 0
@@ -3346,15 +3359,19 @@ def compile_megamoe_tile_ep16_stage1(
             slot = tx % fx.Int32(TOPK)
             tok = tok0 + r * tstride
             live = tok < ntokens
+            if const_expr(_GB_LANES < THREADS):
+                # 多出的线程 r == _GB_NB 会落到下一批的 token 上,必须整体失效。
+                live = live & (tx < fx.Int32(_GB_LANES))
             rec_dw = live.select(tok, fx.Int32(0)) * fx.Int32(REC_BYTES // 4)
-            # ids/weights 的 dword 基址:record 内([REC_I, REC_W) 相距 TOPK 个 dword),
-            # 或 ids_first 的连续数组(每 token [ids|weights],同样相距 TOPK)。
+            # ids 的 dword 基址:record 内的 REC_I,或 ids_first 的连续数组(每 token
+            # [ids|weights])。weights 在其后 _gb_wdw 个 dword(record 内 ids 段 16B 补齐)。
             if const_expr(ids_side):
                 id0 = fx.Int32(SIDE_OFF // 4) + live.select(tok, fx.Int32(0)) * fx.Int32(
                     SIDE_REC // 4
                 )
             else:
                 id0 = rec_dw + fx.Int32(REC_I // 4)
+            _gb_wdw = TOPK if ids_side else _GB_WDW_REC
             expert = buffer_ops.buffer_load(
                 rs, id0 + slot, vec_width=1, dtype=T.i32
             )
@@ -3574,7 +3591,7 @@ def compile_megamoe_tile_ep16_stage1(
                         )
                         grow = phys * fx.Int32(BM) + row_slot % fx.Int32(BM)
                     weight = buffer_ops.buffer_load(
-                        rs, id0 + fx.Int32(TOPK) + slot, vec_width=1, dtype=T.f32
+                        rs, id0 + fx.Int32(_gb_wdw) + slot, vec_width=1, dtype=T.f32
                     )
                     src = src_base + tok
                     buffer_ops.buffer_store(
@@ -3661,7 +3678,7 @@ def compile_megamoe_tile_ep16_stage1(
                     )
                     grow = phys * fx.Int32(BM) + row_slot % fx.Int32(BM)
                     weight = buffer_ops.buffer_load(
-                        rs, id0 + fx.Int32(TOPK) + slot, vec_width=1, dtype=T.f32
+                        rs, id0 + fx.Int32(_gb_wdw) + slot, vec_width=1, dtype=T.f32
                     )
                     src = src_base + tok
                     buffer_ops.buffer_store(
@@ -5835,7 +5852,7 @@ def compile_megamoe_tile_ep16_stage1(
                 NE=LOCAL_EXPERTS,
                 interleave=False,
                 act=activation,
-                swiglu_limit=None,
+                swiglu_limit=swiglu_limit,
                 # Match fused_moe's FlyDSL defaults and the Kimi K3 reference.
                 # The standalone legacy GEMM helper defaults to 4/25 instead.
                 situ_beta=1.0,

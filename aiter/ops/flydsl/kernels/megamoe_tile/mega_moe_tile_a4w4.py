@@ -873,9 +873,12 @@ class MegaMoETileA4W4:
             raise ValueError(
                 "mega_scheme must be fixedslot, hierarchical, or internode_v1"
             )
-        if float(swiglu_limit) != 0.0:
+        # 0.0 = 不 clamp;>0 只对 silu 有意义(DSV4:gate<=L, -L<=up<=L)。
+        if float(swiglu_limit) != 0.0 and (
+            str(activation) != "silu" or not float(swiglu_limit) > 0.0
+        ):
             raise ValueError(
-                "swiglu_limit must remain 0.0 for silu/situv2"
+                "swiglu_limit must be 0.0, or positive with silu"
             )
         if str(stage1_transport) not in ("chunked", "sparse_wqe"):
             raise ValueError(
@@ -1021,6 +1024,7 @@ class MegaMoETileA4W4:
             cco_geometry=self.stage1_transport,
             diagnostic_phase=getattr(self, "stage1_diagnostic_phase", "full"),
             activation=self.activation,
+            swiglu_limit=(self.swiglu_limit or None),
             device_generation=self.device_generation,
             tile_pipeline=sparse,
             tile_pipeline_fanout_shards=16,

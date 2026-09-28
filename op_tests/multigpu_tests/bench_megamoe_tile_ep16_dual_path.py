@@ -79,21 +79,12 @@ class BenchmarkShape:
         # kernel1 是否回到单节点的数值"。生产路径仍是 EP16。
         if self.ep_size not in (8, 16) or self.gpus_per_node != 8:
             raise ValueError("this benchmark targets EP16 as two 8-GPU nodes")
-        # (ep_size, experts) 白名单:EP16/896 是生产配置;EP8/448 只用于
-        # "同脚本只改 EP" 的对照,两者都是 56 experts/rank。E=384 仍被挡。
-        if (self.ep_size, self.experts) not in ((16, 896), (8, 448)):
-            raise ValueError(
-                "this benchmark requires E=896; E=384 is the DSV4 expert "
-                "configuration and must not be mixed into this run"
-            )
-        if self.experts % self.ep_size:
-            raise ValueError("experts must divide EP size")
-        if self.local_experts != 56:
-            raise ValueError("E896/EP16 must produce exactly 56 experts/rank")
-        if self.topk != self.ep_size:
-            raise ValueError(
-                "the current EP16 specialization requires topk=16"
-            )
+        # Shape comes from the model config; route fixtures that only make
+        # sense for a particular topk validate that themselves.
+        if self.experts <= 0 or self.experts % self.ep_size:
+            raise ValueError("experts must be a positive multiple of the EP size")
+        if not 1 <= self.topk <= 16:
+            raise ValueError("topk must be in [1, 16] for the rank-slot ABI")
         if self.activation not in ("silu", "situv2"):
             raise ValueError("the benchmark activation must be silu or situv2")
 
@@ -480,6 +471,8 @@ def _shared_inputs(
     if route_pattern == "cross_node":
         # Same balanced EP16 routing as TestWideEpMoe: one route per rank,
         # alternating nodes, with expert selection rotated by global token.
+        if shape.topk != shape.ep_size:
+            raise ValueError("cross_node needs topk == ep_size; use eplb-balanced")
         generator = torch.Generator(device=device).manual_seed(seed + rank)
         x.normal_(generator=generator)
         token = rank * shape.tokens + torch.arange(shape.tokens, device=device)
@@ -488,6 +481,27 @@ def _shared_inputs(
             token[:, None] + slot // 2
         ) % shape.gpus_per_node
         expert = (token[:, None] * (shape.topk // 2) + slot // 2) % shape.local_experts
+        topk_ids = (owner * shape.local_experts + expert).to(torch.int32)
+        route_weights = torch.rand(
+            (shape.tokens, shape.topk), generator=generator, device=device
+        ).softmax(dim=-1)
+    elif route_pattern == "eplb-balanced":
+        # cross_node's owner rotation (topk distinct ranks, topk/2 per node,
+        # equal routes per rank) with the expert rotated per group of
+        # gpus_per_node tokens, so every local expert gets equal load for
+        # topk < ep_size as well.
+        if shape.topk % 2 or shape.topk // 2 > shape.gpus_per_node:
+            raise ValueError("eplb-balanced needs even topk <= 2 * gpus_per_node")
+        generator = torch.Generator(device=device).manual_seed(seed + rank)
+        x.normal_(generator=generator)
+        token = rank * shape.tokens + torch.arange(shape.tokens, device=device)
+        slot = torch.arange(shape.topk, device=device)
+        owner = (slot % 2)[None, :] * shape.gpus_per_node + (
+            token[:, None] + slot // 2
+        ) % shape.gpus_per_node
+        expert = (
+            (token[:, None] // shape.gpus_per_node) * (shape.topk // 2) + slot // 2
+        ) % shape.local_experts
         topk_ids = (owner * shape.local_experts + expert).to(torch.int32)
         route_weights = torch.rand(
             (shape.tokens, shape.topk), generator=generator, device=device

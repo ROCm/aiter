@@ -13,6 +13,8 @@ from aiter.ops.flydsl.kernels import dpp_utils
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
+    fclamp_f32,
+    fmin_f32,
     situv2_consts,
 )
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
@@ -128,6 +130,16 @@ def _gate_up_batch(
 
     if act == "silu" and swiglu_limit is None:
         return _silu_mul_batch(gs, us)
+    if act == "silu":
+        # silu + clamp(DSV4):gate<=L, -L<=up<=L 后走同一个 exp2+rcp 的 SiLU。
+        # batched_silu_swiglu 用 v_tanh(gfx1250 才有),gfx950 编译失败。
+        limit = float(swiglu_limit)
+        if math.isinf(limit):
+            return _silu_mul_batch(gs, us)
+        hi, lo = fx.Float32(limit), fx.Float32(-limit)
+        return _silu_mul_batch(
+            [fmin_f32(g, hi) for g in gs], [fclamp_f32(u, lo, hi) for u in us]
+        )
 
     pairs = list(zip(gs, us))
     if act in ("silu", "swiglu"):

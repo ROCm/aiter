@@ -582,7 +582,7 @@ class MoriFusedMoeBaselinePath:
             a1_scale=recv_scales,
             num_local_tokens=recv_tokens,
             dtype=torch.bfloat16,
-            swiglu_limit=0.0,
+            swiglu_limit=float(os.environ.get("MEGAMOE_SWIGLU_LIMIT", "0")),
             gate_mode=self._gate_mode,
         )
         debug_phase("fused_moe", completed=True)
@@ -890,7 +890,7 @@ def _build_candidate(
         w2_scale=weights.w2_scale,
         max_tok_per_rank=shape.tokens,
         mega_scheme="hierarchical",
-        swiglu_limit=0.0,
+        swiglu_limit=float(os.environ.get("MEGAMOE_SWIGLU_LIMIT", "0")),
         **extra,
     )
     try:

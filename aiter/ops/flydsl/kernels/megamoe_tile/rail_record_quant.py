@@ -23,7 +23,8 @@ def rail_record_layout(hidden: int, topk: int):
     off_q = 0
     off_s = off_q + hidden // 2
     off_i = off_s + hidden // 32
-    off_w = off_i + topk * 4
+    # ids 段补齐到 16B:topk*4 不是 16 的倍数时(如 topk=6),weights 起点仍对齐。
+    off_w = off_i + (topk * 4 + 15) // 16 * 16
     end = off_w + topk * 4
     rec = (end + 255) // 256 * 256
     for v in (off_s, off_i, off_w, rec):
