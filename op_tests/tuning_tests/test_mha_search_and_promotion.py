@@ -63,8 +63,8 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
         self.assertIn("beat incumbent", winner["detail"])
 
-    def test_a_winner_inside_the_delta_does_not_displace_the_incumbent(self):
-        """The margin here is 0.1%, far under the 2% indifference delta, so
+    def test_a_winner_below_the_bar_does_not_displace_the_incumbent(self):
+        """The margin here is 0.1%, far under the 3% minimum improvement, so
         the two configurations have not been told apart and the run should
         change nothing rather than churn the published table."""
         winner = self._tuner()._gate_against_incumbent(
@@ -110,11 +110,18 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
         self.assertIn("nothing measured beat it", winner["detail"])
 
-    def test_a_margin_equal_to_the_delta_is_not_enough(self):
+    def test_a_margin_just_below_the_bar_is_not_enough(self):
         winner = self._tuner()._gate_against_incumbent(
-            self.KEY, self._frame(challenger_us=980.0, incumbent_us=1000.0)
+            self.KEY, self._frame(challenger_us=971.0, incumbent_us=1000.0)
         )
         self.assertEqual(winner["backend_config"], self.INCUMBENT_CONFIG)
+
+    def test_a_margin_equal_to_the_bar_is_enough(self):
+        # "At least", as --compare --update_improved reads --min_improvement_pct.
+        winner = self._tuner()._gate_against_incumbent(
+            self.KEY, self._frame(challenger_us=970.0, incumbent_us=1000.0)
+        )
+        self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
 
     def test_a_winner_slower_than_auto_select_publishes_no_row(self):
         """The incumbent is whatever dispatch resolves, which for some shapes
@@ -144,8 +151,8 @@ class TestIncumbentGate(unittest.TestCase):
         self.assertEqual(winner["backend_config"], self.CHALLENGER_CONFIG)
         self.assertIn("beat auto-select opus", winner["detail"])
 
-    def test_an_auto_select_win_inside_delta_still_publishes_no_row(self):
-        """1% against a 2% indifference delta is not a result. Publishing it
+    def test_an_auto_select_win_below_the_bar_still_publishes_no_row(self):
+        """1% against a 3% minimum improvement is not a result. Publishing it
         would pin a configuration that is indistinguishable from the one the
         shape already reaches without any row at all."""
         tuner = self._tuner()

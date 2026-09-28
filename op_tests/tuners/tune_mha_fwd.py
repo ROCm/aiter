@@ -44,9 +44,9 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_ERROR_ATOL,
     MHA_FWD_ERROR_METRIC,
     MHA_FWD_ERROR_RTOL,
-    MHA_FWD_INDIFFERENCE_DELTA,
     MHA_FWD_MAX_ERROR_RATIO,
     MHA_FWD_METRIC_FIELDS,
+    MHA_FWD_MIN_IMPROVEMENT,
     MHA_FWD_PROBLEM_KEY_FIELDS,
     MHA_FWD_RUNTIME_CSV_FIELDS,
     MHA_FWD_SAMPLE_SEED,
@@ -947,8 +947,8 @@ class MhaFwdTuner(TunerCommon):
 
         Publishing a winner that sits inside measurement noise of the
         incumbent buys nothing and risks shipping a regression a contended
-        sweep happened to rank first, so a winner has to beat the incumbent by
-        more than the indifference delta.
+        sweep happened to rank first, so a winner has to be at least
+        MHA_FWD_MIN_IMPROVEMENT faster than the incumbent.
         """
         fastest = valid.iloc[0].copy()
         incumbents = self._incumbents_by_key.get(key, set())
@@ -968,17 +968,17 @@ class MhaFwdTuner(TunerCommon):
         margin = (float(incumbent["us"]) - float(fastest["us"])) / float(
             incumbent["us"]
         )
-        delta = MHA_FWD_INDIFFERENCE_DELTA
-        if margin <= delta:
+        bar = MHA_FWD_MIN_IMPROVEMENT
+        if margin < bar:
             kept = incumbent.copy()
             kept["detail"] = (
                 f"incumbent retained: winner was {margin:+.2%} against the "
-                f"{delta:.2%} indifference delta"
+                f"{bar:.2%} minimum improvement"
             )
             return kept
         fastest["detail"] = (
-            f"beat incumbent by {margin:.2%} against the {delta:.2%} "
-            "indifference delta"
+            f"beat incumbent by {margin:.2%} against the {bar:.2%} "
+            "minimum improvement"
         )
         return fastest
 
@@ -1001,17 +1001,17 @@ class MhaFwdTuner(TunerCommon):
         latency = float(latency)
         backend = selection["identity"][0]
         margin = (latency - float(fastest["us"])) / latency
-        delta = MHA_FWD_INDIFFERENCE_DELTA
-        if margin <= delta:
+        bar = MHA_FWD_MIN_IMPROVEMENT
+        if margin < bar:
             print(
                 f"leaving {key} on auto-select: {backend} at {latency:.1f} us "
-                f"was not beaten by {delta:.2%}",
+                f"was not beaten by {bar:.2%}",
                 flush=True,
             )
             return None
         fastest["detail"] = (
             f"beat auto-select {backend} by {margin:.2%} against the "
-            f"{delta:.2%} indifference delta"
+            f"{bar:.2%} minimum improvement"
         )
         return fastest
 

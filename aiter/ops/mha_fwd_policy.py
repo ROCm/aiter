@@ -523,12 +523,13 @@ MHA_FWD_TASK_TIMEOUT_S = 7200
 # are measurement and promotion policy that other families need unchanged,
 # and they are candidates for a central tuning-policy module.
 
-# The margin a winner must beat the configuration already in use by, as a
-# fraction of the incumbent's latency. This is a reproducibility threshold
-# rather than a taste parameter: an unchanged configuration moves by roughly
-# this much between sessions on this hardware, so a smaller win is not one
-# the next run would reproduce.
-MHA_FWD_INDIFFERENCE_DELTA = 0.02
+# How much faster a winner must be than the configuration already in use, as
+# a fraction of the incumbent's latency. It is the same bar as
+# --min_improvement_pct, which --all --compare --update_improved applies to
+# the public operator, so the search and the protected re-tune agree on what
+# is worth a row. It also stays above the ~2% an unchanged configuration moves
+# between sessions on this hardware.
+MHA_FWD_MIN_IMPROVEMENT = 0.03
 
 # Seeds --candidate-sample, so a run is repeatable.
 MHA_FWD_SAMPLE_SEED = 20240917
