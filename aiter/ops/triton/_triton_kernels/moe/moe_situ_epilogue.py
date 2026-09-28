@@ -52,13 +52,13 @@ def _moe_situ_epilogue_kernel(
 
     if tile_idx < SHARED_TILES:
         pair_offsets = tile_idx * (TILE // 2) + tl.arange(0, TILE // 2)
-        mask = pair_offsets < SHARED_INTERMEDIATE
+        shared_mask = pair_offsets < SHARED_INTERMEDIATE
         gate_cols = pair_offsets
         up_cols = pair_offsets + SHARED_INTERMEDIATE
         gate = (
             tl.load(
                 projection_ptr + row * stride_projection_m + gate_cols,
-                mask=mask,
+                mask=shared_mask,
                 other=0.0,
             )
             .to(tl.bfloat16)
@@ -67,7 +67,7 @@ def _moe_situ_epilogue_kernel(
         up = (
             tl.load(
                 projection_ptr + row * stride_projection_m + up_cols,
-                mask=mask,
+                mask=shared_mask,
                 other=0.0,
             )
             .to(tl.bfloat16)
@@ -78,35 +78,35 @@ def _moe_situ_epilogue_kernel(
         tl.store(
             shared_ptr + row * stride_shared_m + pair_offsets,
             gate * up,
-            mask=mask,
+            mask=shared_mask,
         )
     elif tile_idx < SHARED_TILES + ROUTER_TILES:
         offsets = (tile_idx - SHARED_TILES) * TILE + tl.arange(0, TILE)
-        mask = offsets < NUM_EXPERTS
+        router_mask = offsets < NUM_EXPERTS
         values = tl.load(
             projection_ptr + row * stride_projection_m + shared_gate_up + offsets,
-            mask=mask,
+            mask=router_mask,
             other=0.0,
         )
         tl.store(
             router_ptr + row * stride_router_m + offsets,
             values,
-            mask=mask,
+            mask=router_mask,
         )
     else:
         offsets = (tile_idx - SHARED_TILES - ROUTER_TILES) * TILE + tl.arange(0, TILE)
-        mask = offsets < ROUTED_LATENT
+        routed_mask = offsets < ROUTED_LATENT
         values = tl.load(
             projection_ptr
             + row * stride_projection_m
             + shared_gate_up
             + NUM_EXPERTS
             + offsets,
-            mask=mask,
+            mask=routed_mask,
             other=0.0,
         )
         tl.store(
             routed_ptr + row * stride_routed_m + offsets,
             values,
-            mask=mask,
+            mask=routed_mask,
         )
