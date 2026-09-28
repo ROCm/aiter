@@ -2,12 +2,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from aiter import logger
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-
-DEBUG_MODE = False
 
 
 def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
@@ -105,8 +104,7 @@ def test_act_mul_and_mxfp4_quant(
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 
-    if DEBUG_MODE:
-        print(f"x.shape={x.shape} x={x}")
+    logger.debug("x.shape=%s x=%s", x.shape, x)
 
     triton_out, triton_scale = act_mul_and_mxfp4_quant(
         x,
@@ -114,9 +112,10 @@ def test_act_mul_and_mxfp4_quant(
         shuffle=shuffle,
         scale_shuffle_padding=scale_shuffle_padding,
     )
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
-        print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
+    logger.debug("triton_out.shape=%s triton_out=%s", triton_out.shape, triton_out)
+    logger.debug(
+        "triton_scale.shape=%s triton_scale=%s", triton_scale.shape, triton_scale
+    )
 
     torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(
         x, activation=activation, shuffle=shuffle
@@ -130,9 +129,8 @@ def test_act_mul_and_mxfp4_quant(
             torch_scale.view(torch_scale.shape[0] // 32, -1), arch="gfx950"
         )
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
-        print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
+    logger.debug("torch_out.shape=%s torch_out=%s", torch_out.shape, torch_out)
+    logger.debug("torch_scale.shape=%s torch_scale=%s", torch_scale.shape, torch_scale)
 
     scaleN_valid = (N // 2 + 31) // 32
     triton_scale = triton_scale[:M, :scaleN_valid]

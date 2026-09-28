@@ -2,18 +2,18 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     RCP_LN2,
     autotune_cache_kwargs,
-    gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
 @triton.jit
@@ -163,7 +163,8 @@ _CUMSUM_KKT_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         _CUMSUM_KKT_CONFIGS,
         default_config=_CUMSUM_KKT_DEFAULT_CONFIG,
     ),

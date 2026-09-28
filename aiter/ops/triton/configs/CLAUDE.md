@@ -31,7 +31,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 
 | Segment     | Values                                                      |
 | ----------- | ----------------------------------------------------------- |
-| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
+| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1101`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon`                                          |
 | `<op>`      | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`  |
 | `<d_type>`  | `config_name.lower().replace("-", "_")` — `GEMM-AFP4WFP4` → `gemm_afp4wfp4`. The transform is `config_utils._dtype_dir()` |
@@ -191,7 +191,9 @@ The returned config is a fresh deep copy, safe to mutate.
 - `M_LEQ_x` is searched over `STANDARD_M_BOUNDS =
   (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`. A caller may
   override with `bounds=(...)`, which must be strictly increasing positive
-  ints.
+  ints. A file may instead declare a top-level `M_BOUNDS` list to keep
+  nonstandard tuning boundaries in JSON. Explicit `bounds=` wins; files
+  without `M_BOUNDS` retain the standard bounds.
 - `any` must exist unless every reachable `M` is covered by an explicit bound.
   A `KeyError` at lookup time usually means it is missing.
 - The deprecated `{"large": …, "small": …}` shape must not be introduced.

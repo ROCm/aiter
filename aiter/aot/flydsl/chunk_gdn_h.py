@@ -72,7 +72,7 @@ _FIXED_SWITCHES: dict[str, bool] = {
 
 def _parse_bool(s: str) -> bool:
     """CSV-friendly bool parser. Tolerates ``"True"``/``"False"`` (Python
-    ``str(bool)`` style, used by gdr_decode_tuned.csv) plus the more
+    ``str(bool)`` style, which is what a tuner writes) plus the more
     permissive ``"1"/"0"``, ``"yes"/"no"`` for handwritten csvs."""
     s = s.strip()
     if s in ("True", "true", "1", "yes"):

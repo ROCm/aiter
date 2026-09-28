@@ -2,11 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
-    gated_delta_rule_autotune_configs,
     input_guard,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
 def is_cuda():
@@ -39,7 +39,7 @@ def get_autotune_config():
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(get_autotune_config()),
+    configs=autotune_configs("GATED_DELTA_RULE", get_autotune_config()),
     key=["K", "V"],
     **autotune_cache_kwargs,
 )

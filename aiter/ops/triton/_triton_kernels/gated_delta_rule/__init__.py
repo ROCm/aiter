@@ -17,21 +17,31 @@ Note: Only forward pass is implemented. Backward pass is not supported in aiter.
       For training with gradients, please use the flash-linear-attention library.
 """
 
-from . import gated_delta_rule_utils
-from .decode.fused_recurrent import _fused_recurrent_gated_delta_rule_fwd_kernel
-from .prefill.chunk import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule import gated_delta_rule_utils
+from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_recurrent import (
+    _fused_recurrent_gated_delta_rule_fwd_kernel,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
     chunk_gated_delta_rule_fwd,
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
-from .prefill.chunk_delta_h import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h_opt,
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
-from .prefill.chunk_o import chunk_fwd_o, chunk_fwd_o_opt, chunk_fwd_o_opt_vk
-from .prefill.fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
-from .prefill.fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+    chunk_fwd_o,
+    chunk_fwd_o_opt,
+    chunk_fwd_o_opt_vk,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_cumsum_kkt import (
+    fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_solve_tril_recompute import (
+    fused_solve_tril_recompute_w_u,
+)
 
 __all__ = [
     "_fused_recurrent_gated_delta_rule_fwd_kernel",

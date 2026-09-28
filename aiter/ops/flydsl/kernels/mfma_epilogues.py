@@ -38,9 +38,8 @@ from collections.abc import Callable
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl.expr import arith, gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
 
 
 def default_epilog(
@@ -243,30 +242,41 @@ def c_shuffle_epilog(
                     col_pair0_local = col_base_nr + (n_lane_s * c_evec)
                     lds_idx = row_base_lds + col_pair0_local
 
-                    # Select the per-group LDS source buffer, then issue a single
-                    # load. Both buffers share the same `lds_idx`, so selecting the
-                    # source (not the loaded value) keeps this to one ds_read;
-                    # loading from both and selecting the result would double LDS
-                    # traffic. A memref-typed ternary is a hard boundary with no
-                    # numeric-`fx` wrapper, so the raw `arith` select is localized
-                    # here (a value-returning `@flyc.jit` mis-merges the two
-                    # branches and drifts numerically on multi-row tiles).
-                    src = arith.ArithValue(_is_group_b.ir_value()).select(
-                        lds_out_split, lds_out
-                    )
-                    frag = Vec.load(vec_frag, src, [lds_idx]).ir_value()
-
-                    col_pair0 = col_pair0_local + _is_group_b.select(
-                        _half_n_idx, _zero_idx
-                    )
-                    store_pair(
-                        row_local=row_local,
+                    # Per-group LDS source is a distinct fly buffer (separate
+                    # global), so branch on the group predicate and issue the
+                    # load+store inside the taken arm (each thread belongs to one
+                    # group). This keeps one ds_read per thread without a
+                    # pointer-typed select or a value-merging region boundary.
+                    @flyc.jit
+                    def _grp_load_store(
+                        lds_idx=lds_idx,
+                        col_pair0_local=col_pair0_local,
                         row=row,
                         row_ctx=row_ctx,
-                        col_pair0=col_pair0,
-                        col_g0=by_n_v + col_pair0,
-                        frag=frag,
-                    )
+                        row_local=row_local,
+                    ):
+                        if _is_group_b:
+                            frag = fx.ptr_load(
+                                lds_out_split + fx.Int32(lds_idx),
+                                result_type=vec_frag,
+                            ).ir_value()
+                            col_pair0 = col_pair0_local + _half_n_idx
+                        else:
+                            frag = fx.ptr_load(
+                                lds_out + fx.Int32(lds_idx),
+                                result_type=vec_frag,
+                            ).ir_value()
+                            col_pair0 = col_pair0_local + _zero_idx
+                        store_pair(
+                            row_local=row_local,
+                            row=row,
+                            row_ctx=row_ctx,
+                            col_pair0=col_pair0,
+                            col_g0=by_n_v + col_pair0,
+                            frag=frag,
+                        )
+
+                    _grp_load_store()
 
             if row_pred is not None:
 
@@ -377,7 +387,9 @@ def c_shuffle_epilog(
                 col_pair0 = col_base_nr + (n_lane * c_evec)  # even col within tile
 
                 lds_idx_pair = row_base_lds + col_pair0
-                frag = Vec.load(vec_frag, lds_out, [lds_idx_pair]).ir_value()
+                frag = fx.ptr_load(
+                    lds_out + fx.Int32(lds_idx_pair), result_type=vec_frag
+                ).ir_value()
 
                 store_pair(
                     row_local=row_local,

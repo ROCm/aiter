@@ -28,6 +28,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_attention": {
@@ -51,6 +52,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m pa --output_dir {{}}'"
     },
     "module_pa_metadata": {
@@ -65,6 +67,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_ps_metadata": {
@@ -79,6 +82,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_mla_asm": {
@@ -90,6 +94,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'"
     },
     "module_mla_v4_asm": {
@@ -101,6 +106,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla_v4 --output_dir {{}}'"
     },
     "module_mla_sparse_prefill_asm": {
@@ -112,6 +118,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla_v4 --output_dir {{}}'"
     },
     "module_cache": {
@@ -126,6 +133,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_custom_all_reduce": {
@@ -138,6 +146,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_custom_all_reduce_gfx1250": {
@@ -150,6 +159,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_quick_all_reduce": {
@@ -162,6 +172,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_custom": {
@@ -175,6 +186,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_gemm_common": {
@@ -186,6 +198,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_batched_gemm_bf16": {
@@ -356,9 +369,10 @@
             "f'{AITER_CSRC_DIR}/opus_gemm/include'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "is_python_module": "True",
         "is_standalone": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv:{AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE} --compiled_kids_sidecar={{0}}/../../compiled_kids_opus.json'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv:{AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE} --compiled_kids_sidecar={{0}}/compiled_kids_opus.json'"
     },
     "module_gemm_a8w8_bpreshuffle_cktile": {
         "srcs": [
@@ -388,6 +402,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m i8gemm --output_dir {{}}'"
     },
     "module_gemm_a16w16_asm": {
@@ -399,6 +414,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m bf16gemm --output_dir {{}}'"
     },
     "module_gemm_a4w4_asm": {
@@ -410,6 +426,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4gemm --output_dir {{}}'"
     },
     "module_gemm_a6w6_asm": {
@@ -421,7 +438,32 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f6gemm --output_dir {{}}'"
+    },
+    "module_gemm_a6w4_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a6w4.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f6f4gemm --output_dir {{}}'"
+    },
+    "module_gemm_a4w6_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w6.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4f6gemm --output_dir {{}}'"
     },
     "module_f4gemm_asm": {
         "srcs": [
@@ -432,6 +474,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4gemm --output_dir {{}}'"
     },
     "module_mxfp8fp4gemm_asm": {
@@ -443,6 +486,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mxfp8fp4gemm --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_asm": {
@@ -454,6 +498,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle_asm": {
@@ -465,6 +510,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m fp8gemm_blockscale --output_dir {{}}'"
     },
     "module_moe_asm": {
@@ -481,7 +527,8 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
-        "verbose": "False"
+        "verbose": "False",
+        "torch_exclude": "True"
     },
     "module_moe_topksoftmax_asm": {
         "srcs": [
@@ -492,6 +539,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
         ]
@@ -506,6 +554,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
@@ -570,6 +619,21 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_pa_mqa_logits_mxfp4_gfx1250_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_mqa_logits_mxfp4_gfx1250_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/pa_mqa_logits_mxfp4_gfx1250_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-fno-finite-math-only'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_sorting_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/moe_sorting_opus_kernels.cu'",
@@ -582,6 +646,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_moe_opus": {
@@ -601,14 +666,15 @@
             "f'{AITER_CSRC_DIR}/opus_gemm/include'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "is_python_module": "True",
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_moe/gen_instances.py --working_path {{0}}'"
     },
-    "module_pa_sparse_prefill_opus": {
+    "module_mla_v4_prefill_opus": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/pa_sparse_prefill_opus_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/mla_v4_prefill_opus_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mla_v4_prefill_opus_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -616,13 +682,14 @@
             "'-mllvm -enable-post-misched=1'"
         ],
         "flags_extra_hip_per_source": {
-            "*pa_sparse_prefill_opus_kernels.cu": [
+            "*mla_v4_prefill_opus_kernels.cu": [
                 "-mllvm -amdgpu-early-inline-all=false"
             ]
         },
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_moe_mxfp4_aux": {
@@ -640,6 +707,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_aux/codegen'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py --working_path {{}}'"
     },
     "module_fmha_fwd_bf16_opus": {
@@ -667,6 +735,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_moe_topk_ck": {
@@ -709,6 +778,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rmsnorm": {
@@ -726,6 +796,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rmsnorm_quant": {
@@ -741,6 +812,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fused_qk_rmsnorm_group_quant": {
@@ -758,6 +830,7 @@
             "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_gated_rmsnorm_quant": {
@@ -774,6 +847,7 @@
             "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_smoothquant": {
@@ -810,6 +884,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_batched_gemm_bf16_tune": {
@@ -946,6 +1021,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/generate_binaryop.py --working_path {{}} --optype all --dtypes all'"
     },
     "module_aiter_unary": {
@@ -958,6 +1034,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_quant": {
@@ -965,12 +1042,26 @@
             "f'{AITER_CSRC_DIR}/pybind/quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_mxfp4.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quant_mxfp4_gemm.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_mxfp6_gemm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DENABLE_FP8'"
         ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_dsv4_dequant_gather_k": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/dsv4_dequant_gather_k_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/dsv4_dequant_gather_k.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -986,6 +1077,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_sample": {
@@ -1002,6 +1094,7 @@
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_uncached_fwd": {
@@ -1015,6 +1108,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_2c_uncached_fwd": {
@@ -1028,6 +1122,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_cached_fwd": {
@@ -1041,6 +1136,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_2c_cached_fwd": {
@@ -1054,6 +1150,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_thd_fwd": {
@@ -1067,6 +1164,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_2d_fwd": {
@@ -1080,6 +1178,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_uncached_bwd": {
@@ -1093,6 +1192,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_2c_uncached_bwd": {
@@ -1106,6 +1206,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_cached_bwd": {
@@ -1119,6 +1220,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_2c_cached_bwd": {
@@ -1132,6 +1234,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_thd_bwd": {
@@ -1145,6 +1248,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_2d_bwd": {
@@ -1158,6 +1262,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_cached_positions_fwd": {
@@ -1171,6 +1276,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_2c_cached_positions_fwd": {
@@ -1184,6 +1290,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_1c_cached_positions_offsets_fwd": {
@@ -1197,6 +1304,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_rope_2c_cached_positions_offsets_fwd": {
@@ -1210,6 +1318,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fused_qk_norm_mrope_cache_quant_shuffle": {
@@ -1223,6 +1332,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fused_qknorm_idxrqknorm": {
@@ -1240,6 +1350,7 @@
             "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fused_qk_norm_rope_cache_quant_shuffle": {
@@ -1259,6 +1370,7 @@
             "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_inverse_rope_group_quant": {
@@ -1275,6 +1387,7 @@
             "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fmha_fwd_with_sink_asm": {
@@ -1288,6 +1401,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16 --output_dir {{}}'"
         ]
@@ -1303,6 +1417,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16_varlen --output_dir {{}}'"
         ]
@@ -1318,6 +1433,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_mxfp8 --output_dir {{}}'"
         ]
@@ -1333,6 +1449,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m pa_decode_bf16 --output_dir {{}}'"
         ]
@@ -1359,7 +1476,6 @@
     "module_fmha_v4_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_v4_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mha_v4_quant.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_v4_fwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -1370,6 +1486,19 @@
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v4_fwd --output_dir {{}}'"
         ]
+    },
+    "module_mha_v4_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_v4_quant.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_v4_quant_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     },
     "module_vsa_sparse_attention": {
         "srcs": [
@@ -1389,10 +1518,27 @@
             "f'{CK_DIR}/include/ck_tile/ops/sparse_attn'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/50_sparse_attn/generate.py -d fwd_vsa --receipt 600 --output_dir {{}}'"
         ]
+    },
+    "module_pa_mqa_logits_mxfp4_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_mqa_logits_mxfp4_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/pa_mqa_logits_mxfp4_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-fno-finite-math-only'",
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     },
     "module_mha_fwd": {
         "srcs": [
@@ -1637,6 +1783,7 @@
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_hipbsolgemm": {
@@ -1655,6 +1802,7 @@
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_top_k_per_row": {
@@ -1669,6 +1817,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_mla_metadata": {
@@ -1684,6 +1833,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_mla_reduce": {
@@ -1696,6 +1846,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_hk_mla_v32_fwd_mi3xx": {
@@ -1714,6 +1865,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''",
         "third_party": ["'HipKittens'", "'ComposableKernel'"],
         "is_experimental": "True"
@@ -1732,44 +1884,13 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''",
         "third_party": [
             "'HipKittens'",
             "'ComposableKernel'"
         ],
         "is_experimental": "True"
-    },
-    "module_ds32_mla": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/dsa_v32_splitkv.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/defs.h'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-ffast-math'"
-        ],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "blob_gen_cmd": "''"
-    },
-    "module_opus_mla": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/mla/mla_decode_fwd_opus.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_fp8fp8_def.h'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-ffast-math'"
-        ],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "blob_gen_cmd": "''"
     },
     "module_topk_plain": {
         "srcs": [
@@ -1782,6 +1903,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_groupnorm": {
@@ -1794,6 +1916,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fused_ar_mhc": {
@@ -1810,6 +1933,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_mhc": {
@@ -1822,6 +1946,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_causal_conv1d_update": {
@@ -1834,6 +1959,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_mha_fwd_native_splitkv": {
@@ -1853,6 +1979,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_native'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_gdr_decode_packed_bf16": {
@@ -1870,6 +1997,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_fused_split_gdr_update": {
@@ -1884,6 +2012,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_chunk_gdr_fwd_h": {
@@ -1899,6 +2028,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_causal_conv1d_fwd_split_qkv": {
@@ -1913,6 +2043,25 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_decode_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_mxfp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_traits.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     }
 }

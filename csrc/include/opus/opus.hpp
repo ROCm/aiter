@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "dtypes.hpp"
+
 #ifndef OPUS_ENABLE_RUNTIME_QUERY
 #define OPUS_ENABLE_RUNTIME_QUERY 0
 #endif
@@ -1007,17 +1009,8 @@ template<typename T> struct is_dtype : false_type {};
 template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::value;    // use this!
 
 REGISTER_DTYPE(fp32, float)
-// clang>=24 types the half operands of the fp16 matrix-core builtins (wmma_*_f16, mfma_*f16) and of raw_ptr_buffer_atomic_fadd_v2f16 as _Float16, and an __fp16 ext_vector no longer converts to a _Float16 one -- every fp16 mfma/wmma dispatch below is a hard error under __fp16 there. _Float16 is what opus used before clang 20 and what ck_tile still uses; the cost of respelling it is that arithmetic on fp16_t becomes a native half fma (v_fma_f16) instead of the fp32-intermediate v_fma_mixlo_f16, so keep __fp16 on the older compilers rather than shifting their numerics.
-#if __clang_major__ >= 24
-REGISTER_DTYPE(bf16, __bf16)
-REGISTER_DTYPE(fp16, _Float16)
-#elif __clang_major__ >= 20   // enable for rocm 7.0+
-REGISTER_DTYPE(bf16, __bf16)
-REGISTER_DTYPE(fp16, __fp16)
-#else
-REGISTER_DTYPE(bf16, unsigned short)
-REGISTER_DTYPE(fp16, _Float16)
-#endif
+REGISTER_DTYPE(bf16, dtypes::bf16)
+REGISTER_DTYPE(fp16, dtypes::fp16)
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int)
