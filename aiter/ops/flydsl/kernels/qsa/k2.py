@@ -885,6 +885,12 @@ def build_qsa_k2_module(
             tile_max = tile_max.maximumf(tile_peer)
             m_new = m_prev.maximumf(tile_max)
             alpha = _exp2(m_prev - m_new)
+            # No mass yet: -inf - -inf is NaN, and a zero denominator has
+            # nothing to carry. A finite max with a positive denominator
+            # keeps the exp2 result.
+            alpha = ((m_prev == _neg_inf()) | (l_prev == Float32(0.0))).select(
+                Float32(0.0), alpha
+            )
             p_sum = Float32(0.0)
             p_vecs = []
             for ng in range_constexpr(n_subtiles):
