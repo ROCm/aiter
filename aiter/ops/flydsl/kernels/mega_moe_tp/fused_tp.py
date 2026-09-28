@@ -936,7 +936,7 @@ def compile_fused_tp(
                     if k == KCS - 1:
                         release_a_chunk(L, lane, buf)
                 res = yield acc
-            ag_stage_free(L, lane)
+            ag_stage_free(L, lane, a)
             act_quant_store(L, lane, w, res[: 2 * MT], res[2 * MT :], pas)
         _store_qbase(L, lane, w, qbase + nnb * i32(NCH))
         wait_vm(0)
@@ -1472,7 +1472,7 @@ def compile_fused_tp(
                 a["epoch"],
                 a,
             )
-        ag_stage_free(L, tid % i32(64))
+        ag_stage_free(L, tid % i32(64), a)
         cbar(L, tid)
         u16 = I // 2 // 16
         rx = rsrc(a["xg"])
@@ -2072,23 +2072,36 @@ def compile_fused_tp(
         wire, and the compute waves are never held up."""
         row0, stride, nrows, qb, qs, cnt = ag_rows(a)
         rank, m = a["rank"], a["m"]
-        rxl = rsrc(a["x"])
+        x_bytes = a["tp"] * m * i32(H * 2)
+        rxl = rsrc(a["x"], x_bytes)
         pc = ag_group(a)
         for g_ in range(i32(0), (cnt + pc - i32(1)) // pc, i32(1)):
             g = i32(g_)
             # the group's chunks: adjacent (whole rows) or a single one
             lo = (qb + g * pc * qs) * i32(256)
             upg = fx.min(pc, cnt - g * pc) * i32(32)  # 16 B units per row
-            for p in range_constexpr(TPC):
-                if i32(p) != rank:
-                    rd = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_pre"]))
-                    for q_ in range(lane, nrows * upg, i32(64)):
-                        q = i32(q_)
-                        r = q // upg
-                        c = lo + (q - r * upg) * i32(8)
-                        i = row0 + r * stride
-                        v = bld(rxl, ((i32(p) * m + i) * i32(H) + c) * i32(2), 0, V4I, 0)
-                        bst(v, rd, ((rank * a["mmax"] + i) * i32(H) + c) * i32(2), 0, AUX_SYS)
+            # every peer's loads before any store: one memory latency per
+            # round, not one per peer (the own rank's slot reads past the end)
+            pre_bytes = a["tp"] * a["mmax"] * i32(H * 2)
+            for q_ in range(lane, nrows * upg, i32(64)):
+                q = i32(q_)
+                r = q // upg
+                c = lo + (q - r * upg) * i32(8)
+                i = row0 + r * stride
+                vs = [
+                    bld(
+                        rxl,
+                        (i32(p) != rank).select(((i32(p) * m + i) * i32(H) + c) * i32(2), x_bytes),
+                        0,
+                        V4I,
+                        0,
+                    )
+                    for p in range(TPC)
+                ]
+                for p in range_constexpr(TPC):
+                    rd = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_pre"]), pre_bytes)
+                    off = ((rank * a["mmax"] + i) * i32(H) + c) * i32(2)
+                    bst(vs[p], rd, (i32(p) != rank).select(off, pre_bytes), 0, AUX_SYS)
             wait_vm(0)
             _pre_flag(a, lane, g)
 
@@ -2171,19 +2184,26 @@ def compile_fused_tp(
                 L, L_INTER + i32(AG_SCB) + r * i32(H // 32) + g, fx.Int8(e8), align=1
             )
 
+    def ag_npar(a):
+        """Waves sending a CTA's AllGather chunks: AR with split rows reduces,
+        quantizes and sends each chunk after its inputs arrive, a serial
+        chain per chunk -- a push wave takes every other chunk."""
+        return ((ag_split(a) > i32(1)) & fx.Boolean(AR)).select(i32(2), i32(1))
+
     @traced
-    def ag_send(L, lane, a):
-        """Comm wave: ids/weights, then the payload chunk by chunk. Every chunk
-        issues exactly 2 * TPC stores (dead rows read past num_records), so
-        wait_vm(2 * TPC * AG_D) after chunk q means chunk q - AG_D landed and
-        its counters may be bumped; AG_D chunks stay in flight."""
+    def ag_send(L, lane, a, par=0):
+        """Comm wave (and, see ag_npar, push wave 1 with par=1): ids/weights,
+        then the payload chunk by chunk. Every chunk issues exactly 2 * TPC
+        stores (dead rows read past num_records), so wait_vm(2 * TPC * AG_D)
+        after chunk q means chunk q - AG_D landed and its counters may be
+        bumped; AG_D chunks stay in flight."""
         row0, stride, nrows, qb, qs, cnt = ag_rows(a)
         m = a["m"]
         rank = a["rank"]
         # let the (small) routing metadata out first: the payload would queue
         # it behind a megabyte per peer (not with split rows: a few hundred
         # bytes per CTA, sent alongside)
-        if const_expr(not AR):
+        if const_expr(not AR and par == 0):
             mp = (ag_split(a) > i32(1)).select(
                 i32(0), _meta_pending(a, lane, a["epoch"], own=True)
             )
@@ -2209,20 +2229,36 @@ def compile_fused_tp(
             for p in range(TPC)
         ]
         pc = ag_group(a)
+        # AR with split rows counts each chunk as soon as it landed, before
+        # waiting for the next chunk's inputs; otherwise AG_D stay in flight
+        split = ag_split(a) > i32(1)
+        pipe = (split & fx.Boolean(AR)) == fx.Boolean(False)
+        npar = ag_npar(a)
+        part = i32(par) < npar
         for k in range_constexpr(NCHA):
-            # this CTA's k-th chunk; past cnt (split rows) nothing is issued
-            kl = i32(k) < cnt
+            # this CTA's k-th chunk (if this wave's); past cnt (split rows)
+            # nothing is issued
+            mine = (i32(k) % npar) == i32(par)
+            kl = (i32(k) < cnt) & mine
             q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
+            if const_expr(AR and k >= 1):
+                # AR, split rows: count this wave's previous chunk before
+                # waiting for chunk k's inputs (whole rows keep AG_D chunks in
+                # flight instead)
+                if split & mine & (i32(k) >= npar) & (i32(k) - npar < cnt):
+                    wait_vm(0)
+                    _ag_bump(a, lane, rank, qb + (i32(k) - npar) * qs)
             if kl:
                 ag_chunk(L, lane, a, k, q, pc, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes)
             if const_expr(k == NCHA - 1):
                 # every staged byte is in registers: GEMM2 may reuse its area
                 wait_lgkm0()
-                _ag_free(L, lane)
+                if part:
+                    _ag_free(L, lane)
             if const_expr(k >= AG_D):
                 # chunk k - AG_D landed (a chunk issues exactly 2 * TPC stores;
                 # after the last live one nothing else is in flight)
-                if i32(k - AG_D) < cnt:
+                if pipe & part & (i32(k - AG_D) < cnt):
                     if kl:
                         wait_vm(2 * TPC * AG_D)
                     else:
@@ -2232,8 +2268,8 @@ def compile_fused_tp(
             # their registers) to the top of the fully unrolled loop
             rocdl.sched_barrier(0)
         wait_vm(0)
-        for k in range_constexpr(max(0, NCHA - AG_D), NCHA):
-            if i32(k) < cnt:
+        for k in range_constexpr(NCHA - AG_D, NCHA):
+            if pipe & part & (i32(k) < cnt):
                 _ag_bump(a, lane, rank, qb + i32(k) * qs)
 
     @traced
@@ -2272,7 +2308,7 @@ def compile_fused_tp(
     @traced
     def _ag_free(L, lane):
         if lane == i32(0):
-            lds_st_rel(L, L_CTL + C_AGFREE * 4, i32(1))
+            lds_atomic_add(L, L_CTL + C_AGFREE * 4, 1, _llvm.AtomicOrdering.release)
 
     NMETA_MAX = 32  # CTAs that send routing metadata, 1 KB each (FLAG_AGM stride)
 
@@ -2354,11 +2390,11 @@ def compile_fused_tp(
         return _wave_any(pend, lane)
 
     @traced
-    def ag_stage_free(L, lane):
+    def ag_stage_free(L, lane, a):
         """GEMM1 is about to write the GEMM2 operand: the AllGather staging
         that shares the area must have been read out."""
         if lane == i32(0):
-            spin_lds_ge(L, L_CTL + C_AGFREE * 4, i32(1))
+            spin_lds_ge(L, L_CTL + C_AGFREE * 4, ag_npar(a))
         rocdl.sched_barrier(0)
 
     def _ag_ctr(a, p, idx):
@@ -2492,6 +2528,8 @@ def compile_fused_tp(
                 if const_expr(AR):
                     if tid < i32(NT + 192):
                         pre_send(L, tid % i32(64), a)
+                    else:
+                        ag_send(L, tid % i32(64), a, 1)
                 comm_help(L, tid, a, epoch)
 
     # Explicit annotation: the module's postponed annotations cannot see LDS_BYTES.

@@ -273,9 +273,11 @@ class FusedTpMegaMoe:
             return k | (groups << 8) | (j << XQ_SHIFT)
 
         # cost model in weight bytes; a unit's fixed cost (route scan, import
-        # or export, pipeline refill) as the bytes streamed meanwhile
-        full, g1x, grp = 3 * I * H // 2, 128 * H + 48 * 1024, 256 * I // 2
-        over = 96 * 1024
+        # or export, pipeline refill) as the bytes streamed meanwhile, fitted
+        # on dsv4 at TP8 (a column slice's import and its chunk counting cost
+        # far more than its column groups' weights)
+        full, g1x, grp = 3 * I * H // 2, 128 * H + 150 * 1024, 256 * I // 2
+        over = 400 * 1024
         load = [full * len(lst) for lst in per]
         for idx in range(rem * nslice):
             j, k = divmod(idx, nslice)
