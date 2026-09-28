@@ -198,6 +198,53 @@ def test_pick_flydsl_stage2_tile_k():
     assert resolve_flydsl_stage2_tile_k(512, 128) == 128
 
 
+@pytest.mark.parametrize("token", [128, 32768])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage1_a8w4_live_grid_matches_standard(token):
+    """A CU-sized grid must cover both short and multi-iteration route lists."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    model_dim, inter_dim, experts, topk, block_m = 512, 256, 8, 2, 64
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, experts, topk, block_m, seed=37
+    )
+    kwargs = {
+        "a": data["a_q"],
+        "w1": data["w1_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 128,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "fp8",
+        "act": "silu",
+        "w1_scale": data["w1_scale_shuf"],
+        "a1_scale": data["a_scale_sort"],
+        "gate_mode": "interleave",
+        "use_async_copy": True,
+    }
+    standard, _ = flydsl_moe_stage1(persist_m=1, **kwargs)
+    live_grid, _ = flydsl_moe_stage1(persist_m=-1, **kwargs)
+    torch.cuda.synchronize()
+
+    num_sorted = int(data["num_valid_ids"][0].item())
+    sorted_ids = data["sorted_ids"][:num_sorted].to(torch.int64)
+    token_ids = sorted_ids & 0xFFFFFF
+    slot_ids = sorted_ids >> 24
+    valid = (token_ids < token) & (slot_ids < topk)
+    route_ids = token_ids[valid] * topk + slot_ids[valid]
+    torch.testing.assert_close(
+        live_grid.view(-1, inter_dim)[route_ids],
+        standard.view(-1, inter_dim)[route_ids],
+        atol=0,
+        rtol=0,
+    )
+
+
 @pytest.mark.parametrize(
     "inter_dim,seed",
     [

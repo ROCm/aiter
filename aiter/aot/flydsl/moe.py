@@ -235,6 +235,7 @@ def _precompile_to_cache(
     gate_mode: str = "separated",
     mode: str = "atomic",
     persist=None,
+    persist_m: int = 0,
     sort_block_m: int = 0,
     cu_num: int = 0,
     token_num: int = 0,
@@ -532,6 +533,11 @@ def _precompile_to_cache(
                 else torch.empty(0, device=dev, dtype=torch.float32)
             )
             _grid_y = min(max_num_m_blocks, tokens * topk)
+            _persist_m = (
+                -1
+                if int(persist_m) == -1
+                else resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+            )
             _kernel_out = tmp_out if _is_splitk else out
             kernel_bias = None if _is_splitk else bias
             _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
@@ -614,6 +620,7 @@ def _precompile_to_cache(
                 b_dtype=b_dtype,
                 out_dtype=_gemm_out_dtype,
                 act=act,
+                persist_m=_persist_m,
                 use_async_copy=True,
                 k_batch=k_batch,
                 waves_per_eu=waves_per_eu,
@@ -736,7 +743,7 @@ def _precompile_to_cache(
                 _persist_m = 4 if m_blocks > 256 else 1
             else:
                 _persist_m = -1 if m_blocks > 256 else 1
-            if a_dtype == "fp8":
+            if a_dtype == "fp8" and persist is not True:
                 _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
             _n_in = model_dim

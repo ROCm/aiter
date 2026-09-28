@@ -289,6 +289,20 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+                                        if (
+                                            a_dtype == "fp8"
+                                            and is_fp4_b
+                                            and out_dtype == "bf16"
+                                            and (tm, tn, tk, wpe, kb, bnt, go, xcd, kw)
+                                            in (
+                                                (64, 128, 256, 3, 1, 2, False, 0, 1),
+                                                (128, 256, 256, 1, 1, 0, False, 0, 1),
+                                            )
+                                        ):
+                                            kernels[name + "_persist"] = {
+                                                **kernels[name],
+                                                "persist_m": -1,
+                                            }
     return kernels
 
 
@@ -1625,7 +1639,11 @@ def _flydsl_moe_stage1_impl(
     )
     _grid_y = min(_dense_blks, _all_blks)
 
-    _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+    _persist_m = (
+        -1
+        if int(persist_m) == -1
+        else resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+    )
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
@@ -2172,8 +2190,8 @@ def _flydsl_moe_stage2_impl(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+    if a_dtype == "fp8" and persist is not True:
+        # Preserve a tuned persistent request; cap the default FP8 grid.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
