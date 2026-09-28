@@ -21,7 +21,12 @@ def inputs(m, k=10240, r=320, scale=0.02):
 def reference(x, d, u):
     # CuTe casts after SiLU, then keeps logits, sigmoid and weighted sum FP32.
     t = F.silu(x.double() @ d.double().T / 4).bfloat16().double()
-    return ((t @ u.double().T).sigmoid() * x.double()).view(x.shape[0], 4, -1).mean(1).bfloat16()
+    return (
+        ((t @ u.double().T).sigmoid() * x.double())
+        .view(x.shape[0], 4, -1)
+        .mean(1)
+        .bfloat16()
+    )
 
 
 @pytest.mark.parametrize("m", [1, 2, 4, 7, 15, 16])
@@ -38,7 +43,9 @@ def test_correctness(m, k, r):
 def test_gate_range(scale):
     x, d, u = inputs(4, scale=scale)
     dp, up = pack_hc_weights(d, u)
-    torch.testing.assert_close(hc_mix(x, dp, up), reference(x, d, u), atol=0.005, rtol=0.01)
+    torch.testing.assert_close(
+        hc_mix(x, dp, up), reference(x, d, u), atol=0.005, rtol=0.01
+    )
 
 
 def test_graph_and_stream_isolation():

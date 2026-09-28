@@ -283,9 +283,7 @@ def create_gdn_decode_verify_kernel(
         if const_expr(update_state):
             if slot >= 0:
                 for j in range_constexpr(NHALF):
-                    _store_vec(
-                        ss, sbase + j * HALF, h[j].to(fx.BFloat16), fx.BFloat16
-                    )
+                    _store_vec(ss, sbase + j * HALF, h[j].to(fx.BFloat16), fx.BFloat16)
 
     @flyc.jit
     def launch(
