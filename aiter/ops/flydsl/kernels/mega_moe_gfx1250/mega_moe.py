@@ -955,24 +955,35 @@ class MegaMoEGfx1250:
     ):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
-        Compiled per alignment, hist/done slot, and wave width. The plan and
-        the expert GEMM must agree on the tile, double-buffered plans must not
-        share a done counter, and a decode step must not launch the wide
-        prefill grid.
+        Compiled per alignment, hist/done slot, wave width, and workgroup count.
+        The plan and the expert GEMM must agree on the tile, double-buffered
+        plans must not share a done counter, a decode step must not launch the
+        wide prefill grid, and the workgroup count follows this call's route
+        count.
         """
-        from .compact_plan import compact_plan_waves, compile_tdm_compact_plan
+        from .compact_plan import (
+            compact_plan_blocks,
+            compact_plan_waves,
+            compile_tdm_compact_plan,
+        )
 
         align_m = int(align_m)
         slot = int(self._compact_slot if slot is None else slot)
         waves = self._plan_waves_for(token_count)
-        key = (align_m, slot, waves)
+        tok = (
+            int(self._config.max_tokens_per_rank)
+            if token_count is None
+            else int(token_count)
+        )
+        blocks = compact_plan_blocks(tok * int(self._config.topk))
+        key = (align_m, slot, waves, blocks)
         launch = self._compact_plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     f"compact plan for align_m={align_m} slot={slot} "
-                    f"waves={waves} was not compiled before graph capture; "
-                    "warm this token bucket eagerly first"
+                    f"waves={waves} blocks={blocks} was not compiled before "
+                    "graph capture; warm this token bucket eagerly first"
                 )
             hist0 = self._arena.offset("compact_hist")
             done0 = self._arena.offset("compact_done")
@@ -994,6 +1005,7 @@ class MegaMoEGfx1250:
                 max_routes=self._compact_max_routes,
                 hist_pingpong=False,
                 plan_waves=None if waves == full_waves else waves,
+                plan_blocks=blocks,
             )
             self._compact_plan_launches[key] = launch
         return launch
@@ -1183,9 +1195,9 @@ class MegaMoEGfx1250:
             else config.dispatch_token_nbytes
         )
         from .compact_plan import (
-            PLAN_BLOCKS,
             compact_done_nbytes,
             compact_hist_stride,
+            compact_plan_blocks,
         )
 
         segs = config.world_size * config.experts_per_rank
@@ -1271,8 +1283,9 @@ class MegaMoEGfx1250:
                 torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
+            plan_blocks = compact_plan_blocks(max_routes)
             self._block_hists = [
-                torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
+                torch.empty(plan_blocks * segs, dtype=torch.int32, device=device)
                 for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
             self._send_bases = [
