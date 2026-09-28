@@ -40,19 +40,36 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
 
-# 256 CUs on MI355X times the four BN32 prefill workgroups each keeps resident.
+# 256 CUs on MI355X times four BN32 prefill workgroups each. Unlike the decode
+# bands below this one does not move with head_dim: halving D halves the LDS
+# tile, so residency alone predicts eight, but 8 per CU measured slower than 4
+# at D=128 on every M from 16 to 512. Whatever sets this number, it is not the
+# LDS footprint, and it is the same number at both head widths.
 _PREFILL_WGS = 256 * 4
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
 # rather than per lane, so this is free to move between 128 and 256. BN16 is a
 # single subtile, so qk_split never engages and every wave recomputes the whole
 # QK; halving the waves halves that duplication. It costs 42 VGPRs of extra PV
-# accumulator per wave and still wins by 1-12%, more as L and M grow.
+# accumulator per wave and still wins by 1-12%, more as L and M grow. 128 also
+# held at D=128, so like BN16 it needs no head_dim term.
 _DECODE_THREADS = 128
-# Splits for M=1, the only batch where the grid alone cannot fill the machine:
-# 64 splits leaves half the SIMDs of half the CUs idle and costs ~12% in the
-# split kernel. M=2 already reaches that wave count, and doubling its splits
-# only buys a bigger merge, so the wider band stops here.
+# Splits for the batches where the grid alone cannot fill the machine: 64
+# leaves half the SIMDs of half the CUs idle and costs ~12% in the split
+# kernel. Past the band ceiling below, doubling splits only buys a bigger
+# merge.
 _TINY_SPLITS = 128
+# Decode band ceilings on ``base_programs``, as (128-split, 64-split), for a
+# narrow (D <= 128) and a wide (D > 128) KV head. A narrower head is less work
+# per program, so the grid needs more programs before it covers the machine
+# and both ceilings move out. Fitted on gfx950 over D in {128, 256} crossed
+# with 10 and 24 query heads, five repeats per point: the crossovers track
+# head_dim and not the query count. Each ladder is exact for its own D and
+# within ~1% on the other shapes, where the two split counts measured tied.
+# Note the 64-split ceilings are 12 and 16, not 12 and 24 -- the doubling is
+# the direction, not the law.
+_NARROW_HEAD_DIM = 128
+_DECODE_BANDS_NARROW = (4, 16)
+_DECODE_BANDS_WIDE = (2, 12)
 _LSE_EMPTY = -1.0e20
 _LOG2E = 1.4426950408889634
 
@@ -83,14 +100,22 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
     )
 
 
-def _launch_config(rows: int, n_sel: int, n_kv_heads: int) -> tuple[int, int, int]:
-    """Return ``(BLOCK_N, threads, splits)`` using the tuned AMD-shaped policy."""
+def _launch_config(
+    rows: int, n_sel: int, n_kv_heads: int, head_dim: int
+) -> tuple[int, int, int]:
+    """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
     base_programs = rows * n_kv_heads
-    # Live AMD: base_programs <= 4 -> 64 splits / 128 WGs; 4 < base < 32
-    # -> 32 splits / 512 WGs. Same BN16 / 4-wave tile in both bands.
-    if base_programs <= 2:
+    # These bands used to mirror live AMD's (64 splits to base_programs 4,
+    # then 32) and were fitted only at D=256. Both ceilings measured too low
+    # at both head widths: 64 splits wins out to base_programs 12 at D=256
+    # and 16 at D=128, by 1.6-9.1%, and the 128-split band reaches 4 rather
+    # than 2 at D=128. BLOCK_N and the wave count did not move with D.
+    tiny_max, mid_max = (
+        _DECODE_BANDS_NARROW if head_dim <= _NARROW_HEAD_DIM else _DECODE_BANDS_WIDE
+    )
+    if base_programs <= tiny_max:
         block_n, target_splits, threads = 16, _TINY_SPLITS, _DECODE_THREADS
-    elif base_programs <= 4:
+    elif base_programs <= mid_max:
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
         block_n, target_splits, threads = 16, 32, _DECODE_THREADS
@@ -100,9 +125,10 @@ def _launch_config(rows: int, n_sel: int, n_kv_heads: int) -> tuple[int, int, in
     # reason: the grid is unchanged, so the extra residency headroom BN32
     # unlocks goes unused at these shapes.
     #
-    # Split so the grid lands on the four workgroups per CU that the BN32
-    # K-plus-V LDS footprint keeps resident. Splitting past that point buys
-    # no extra parallelism and still pays merge and address-chase duplication.
+    # Split so the grid lands on four workgroups per CU. Past that point
+    # splitting buys no extra parallelism and still pays merge and
+    # address-chase duplication. See ``_PREFILL_WGS``: four is measured, and
+    # it is not the LDS residency limit it was once read as.
     else:
         block_n, threads = 32, 128
         target_splits = max(1, _PREFILL_WGS // base_programs)
@@ -1215,7 +1241,7 @@ def qsa_k2(
         "gfx950"
     )
     n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads)
+    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
     if n_splits == 1:
         partial_out = out
         partial_lse = out

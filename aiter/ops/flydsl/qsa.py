@@ -58,15 +58,15 @@ _MEASURED_QUERIES = {
 }
 _BACKENDS = ("auto", "flydsl", "triton")
 
-# GPU 6 / gfx950, cold ``--rotate 0``, page_size 16, L in {512, 2048, 8192,
-# 32768}. Every swept row beat live AMD with err=0. 24x256: M in {1, 2, 8,
-# 16, 32, 64, 128, 256, 512}, by 1.05x to 1.64x. 10x128: those M plus
-# {3, 4} at both indexer widths, by 1.17x to 2.33x. Between them that
-# reaches every launch config the K2 policy can pick, and M past 512 reuses
-# M=512's BN32 single-split config with a larger grid, so M does not filter
-# this gate. Width does not either: every measured L won. The bands in
-# ``_launch_config`` are fitted at D=256 and 10x128 rides them untuned, so
-# re-sweep both shapes before widening them.
+# GPU 6 / gfx950, cold ``--rotate 0``, page_size 16, M in {1, 2, 3, 4, 6, 8,
+# 12, 16, 32, 64, 128, 256, 512} crossed with L in {512, 2048, 8192, 32768}.
+# All 104 rows beat live AMD with err=0: 24x256 by 1.03x to 1.67x, 10x128 by
+# 1.17x to 2.66x, and 10x128 also won at both indexer widths. That reaches
+# every launch config the K2 policy can pick, and M past 512 reuses M=512's
+# BN32 single-split config with a larger grid, so neither M nor the
+# selection width filters this gate. The ``_launch_config`` decode bands are
+# now fitted at both head widths, so a new GQA query shape needs its own
+# sweep only if its head_dim is one neither ladder was fitted on.
 
 __all__ = [
     "QsaGqaSpec",
