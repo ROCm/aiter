@@ -110,7 +110,8 @@ production gates leave on the table.
 
 Examples::
 
-    # default sweep: TP4 only, DSv4 shapes plus every dispatch boundary
+    # default sweep: TP4 only, DSv4 shapes plus every dispatch boundary, and
+    # hidden-4096 shapes filling in the payload sizes between them
     python3 op_tests/op_benchmarks/flydsl/bench_comm_allreduce.py
 
     # also cover the 1stage-only TP2 case, decode shapes only
@@ -138,7 +139,7 @@ Examples::
 
     # dispatch-threshold sweep: a byte ladder too long for a command line
     # (an M,K CSV, see load_shapes_csv), plus a CSV of the raw numbers. The
-    # default shape list jumps 168 KiB -> 1.75 MiB -> 14 MiB and both family
+    # default shape list roughly doubles per step above 168 KiB and both family
     # crossovers hide in those gaps -- pinned fly_1stage* rows survive across
     # the whole ladder by default (see _FLY1S_DEFAULT_CEILING);
     # AITER_BENCH_FLY1S_MAX_KB would only be needed to narrow the window.
@@ -986,9 +987,19 @@ DSV4_HIDDEN = 7168
 #   4681         the 64 MiB AITER_CUSTOM_AR_MAX_SIZE cutoff, to the token
 #   8192         past the cutoff: production diverts to RCCL here, this row
 #                measures what that costs
-L_SHAPE = [
-    (m, DSV4_HIDDEN) for m in (1, 2, 4, 5, 6, 8, 11, 12, 128, 1024, 4096, 4681, 8192)
-]
+#
+# Hidden 4096 (8 KiB per token) fills in the payload sizes between the DSv4
+# rows: 8 KiB-1 MiB across the one-shot and mesh windows, and 8/32/64 MiB
+# prefill, where 8192 x 4096 lands exactly on the 64 MiB cutoff. Sorted by
+# payload so the report reads as one size ladder.
+L_SHAPE = sorted(
+    [
+        (m, DSV4_HIDDEN)
+        for m in (1, 2, 4, 5, 6, 8, 11, 12, 128, 1024, 4096, 4681, 8192)
+    ]
+    + [(m, 4096) for m in (1, 2, 4, 6, 8, 16, 32, 64, 128, 1024, 4096, 8192)],
+    key=lambda s: s[0] * s[1],
+)
 
 
 def load_shapes_csv(path: str) -> list[tuple[int, int]]:
@@ -1975,6 +1986,7 @@ ID_COLUMNS = [
     "dtype",
     "TP",
     "M",
+    "K",
     "payload size (KiB)",
     "kernel",
     "naive",
@@ -2041,6 +2053,7 @@ def case_tables(df, keys, baseline: str):
             f"TP{int(r['TP'])}",
             r["dtype"],
             f"M={int(r['M'])}",
+            f"K={int(r['K'])}",
             f"{r['payload size (KiB)']:.4g} KiB",
             f"kernel={r['kernel']}",
         ]
