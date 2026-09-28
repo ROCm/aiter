@@ -213,6 +213,16 @@ BLOCKSCALE_BPRESHUFFLE_BACKENDS = {
 
 
 @functools.cache
+def _warn_untuned_flydsl_fallback(gfx: str, op: str, n: int, k: int) -> None:
+    """Warn once per (arch, op, N, K) that a shape has no tuned row."""
+    logger.warning(
+        f"[{gfx}] {op}: no tuned row for N={n}, K={k}; falling back to a "
+        f"heuristic flydsl kernel. Tune this shape to remove the guess. "
+        f"(logged once per N/K; AITER_LOG_TUNED_CONFIG=1 for per-call detail)"
+    )
+
+
+@functools.cache
 def _warn_unknown_scaletype(scaletype: str) -> None:
     logger.warning(
         f"a8w8 blockscale-bpreshuffle: unknown scaletype {scaletype!r}; no backend "
@@ -1128,9 +1138,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 f"gemm_a8w8_blockscale_bpreshuffle: no legal gfx950 MX tile for "
                 f"M={m}, N={n}, K={k} (needs N%128==0 and K%128==0)"
             )
-        logger.warning(
-            f"[gfx950] gemm_a8w8_blockscale_bpreshuffle untuned "
-            f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
+        _warn_untuned_flydsl_fallback(
+            "gfx950", "gemm_a8w8_blockscale_bpreshuffle", n, k
         )
         return gemm_a8w8_mxscale_preshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
