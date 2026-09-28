@@ -17,6 +17,8 @@ row-major, w row-major (N, K)) with M and N multiples of 256 and K a multiple of
 of at least 256. ``unsupported_reason`` says why a problem is outside that.
 """
 
+import inspect
+
 import torch
 import triton
 from triton.experimental import gluon
@@ -479,8 +481,20 @@ def _gemm_a16w16_compute_bound_kernel(
     gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_br_offsets, stored_value=c_br)
 
 
+# The kernel pins its accumulators with mfma(..., cd_regclass="a")
+# (triton-lang/triton#11792); older Triton releases cannot compile it.
+_TRITON_HAS_CD_REGCLASS = (
+    "cd_regclass" in inspect.signature(gl.amd.cdna3.mfma).parameters
+)
+
+
 def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None):
     """Why this kernel cannot run the problem, or None if it can."""
+    if not _TRITON_HAS_CD_REGCLASS:
+        return (
+            f"Triton {triton.__version__} has no mfma cd_regclass "
+            "(needs triton-lang/triton#11792)"
+        )
     if activation:
         return "no activation support yet"
     if M % BLOCK_M or N % BLOCK_N:
