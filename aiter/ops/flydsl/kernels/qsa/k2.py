@@ -1271,7 +1271,9 @@ def qsa_k2(
     if token_to_req.shape != (rows,) or token_to_req.dtype != torch.int32:
         raise ValueError(f"token_to_req must be int32 [{rows}]")
     if out is None:
-        out = torch.empty_like(q)
+        # The plan cache keeps the first compile, and that compile bakes
+        # the output stride. empty_like would copy a non-contiguous q.
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     elif out.shape != q.shape or out.dtype != q.dtype:
         raise ValueError(f"out must match q, got {tuple(out.shape)} {out.dtype}")
     elif not out.is_contiguous():
