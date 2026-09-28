@@ -27,6 +27,7 @@ def test_sub_blocks_of_one_allocation_share_a_base():
     head, tail = buf[:16], buf[2 * _MiB :]
 
     base = _ipc_base_ptr(head.data_ptr())
+    assert base <= head.data_ptr() < tail.data_ptr()
     assert _ipc_base_ptr(tail.data_ptr()) == base
     assert tail.data_ptr() - base == (head.data_ptr() - base) + 2 * _MiB
 

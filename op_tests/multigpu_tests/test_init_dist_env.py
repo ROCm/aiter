@@ -16,11 +16,9 @@ modes are exercised here and share one allreduce-correctness check.
 
 The "dirty" mode covers a second, separate bug in the same area: _broadcast_ipc
 used to pin the IPC offset to 0, which is only correct when the pool pointer is
-an allocation base. With a fresh caching allocator it always is, so a first
-engine is fine; once the allocator holds a cached large segment (a co-resident
-second engine, or simply an earlier alloc/free) the pool lands as a sub-block
-and peers addressed the segment base instead -- wrong allreduce results, no
-error. Dirtying the allocator before init_dist_env reproduces that shape.
+an allocation base. A cached segment with a live allocation at its head can
+place the pool at a non-zero offset. Peers then address the wrong region.
+Dirtying the allocator before init_dist_env exercises this case.
 
 The existing test_custom_allreduce.py does not cover this: it performs its own
 init and never runs init_dist_env.
@@ -32,8 +30,6 @@ import os
 from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
-
-from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
 
@@ -62,8 +58,7 @@ def _worker(tp_size, rankID, mode, shape):
         # Make the IPC pool that init_dist_env allocates next come back as a
         # sub-block of an existing allocation rather than as its own segment:
         # hold a few GiB of "weights", free a large activation segment, and
-        # keep one live block at its head. This is the shape a loaded,
-        # co-resident engine produces incidentally.
+        # keep one live block at its head.
         #
         # Scale matters. A 512 MiB segment is not enough -- the allocations
         # init_dist_env makes on the way to the pool consume the remainder and
@@ -131,9 +126,11 @@ def test_init_dist_env(tp_size, shape, run_mode):
     modes = {mode for mode, _, _ in rets}
     offsets = [off for _, off, _ in rets]
     for mode, off, out in rets:
-        checkAllclose(
-            ref,
+        torch.testing.assert_close(
             out,
+            ref,
+            rtol=0,
+            atol=0,
             msg=(
                 f"init_dist_env allreduce: {tp_size=} mode={run_mode} "
                 f"pool={mode} ipc_offset={off}"
@@ -151,13 +148,13 @@ def test_init_dist_env(tp_size, shape, run_mode):
             "expandable_segments requested but the input pool is not raw_cached; "
             "raw path NOT exercised on this platform"
         )
-    if run_mode == "dirty" and modes == {"torch"} and not any(offsets):
-        # Nothing was exercised: this allocator handed out a fresh segment
-        # anyway, so the sub-block path never came up.
+    if run_mode == "dirty" and (modes != {"torch"} or not all(offsets)):
+        # Do not report a regression pass if a rank bypassed the sub-block path.
         logger.warning(
-            "dirty mode did not produce a sub-block pool (all offsets 0); "
+            "dirty mode did not produce a torch sub-block pool on every rank; "
             "the IPC offset path was NOT exercised on this platform"
         )
+        return {"pool_modes": sorted(modes), "ipc_offsets": offsets, "skipped": True}
     return {"pool_modes": sorted(modes), "ipc_offsets": offsets}
 
 

@@ -1095,17 +1095,9 @@ class CustomAllreduce:
         # PyTorch caching allocator (its memory accounting is what downstream
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
-        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
-        # expandable segments. It remains as an escape hatch only. It used to
-        # be the mitigation for co-resident engines on one node, where a second
-        # engine's torch.empty pool lands as a sub-block of an already-cached
-        # allocator segment; the real bug there was _broadcast_ipc pinning the
-        # IPC offset to 0, so peers addressed the segment base instead of the
-        # pool. That is fixed in _broadcast_ipc / _ipc_base_ptr, and the
-        # default torch.empty pool is correct for sub-block pointers again --
-        # which matters because a raw hipMalloc pool is invisible to torch's
-        # memory accounting, so engines that size their KV cache from it
-        # over-estimate free memory.
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL also permits opting into a raw pool.
+        # It is not needed for ordinary caching-allocator sub-blocks: their
+        # allocation offsets are included in _broadcast_ipc.
         raw_cached = _expandable_segments_enabled() or env_flag(
             "AITER_CUSTOM_AR_RAW_INPUT_POOL"
         )
