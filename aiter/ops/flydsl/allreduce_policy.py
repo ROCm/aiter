@@ -224,7 +224,7 @@ def quant_family_range(family: str, policy: QuantPolicy) -> tuple[int, int]:
     if family == "mesh":
         return policy.floor + 1, min(policy.mesh_max, policy.max_bytes)
     if family == "ring":
-        # The ring algorithm is beneficial for large messages, i.e., 
+        # The ring algorithm is beneficial for large messages, i.e.,
         # it comes after the mesh with increasing message size.
         return policy.mesh_max + 1, policy.max_bytes
     raise ValueError(f"family must be 'mesh' or 'ring', got {family!r}")

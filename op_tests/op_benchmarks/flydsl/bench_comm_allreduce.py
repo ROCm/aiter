@@ -993,10 +993,7 @@ DSV4_HIDDEN = 7168
 # prefill, where 8192 x 4096 lands exactly on the 64 MiB cutoff. Sorted by
 # payload so the report reads as one size ladder.
 L_SHAPE = sorted(
-    [
-        (m, DSV4_HIDDEN)
-        for m in (1, 2, 4, 5, 6, 8, 11, 12, 128, 1024, 4096, 4681, 8192)
-    ]
+    [(m, DSV4_HIDDEN) for m in (1, 2, 4, 5, 6, 8, 11, 12, 128, 1024, 4096, 4681, 8192)]
     + [(m, 4096) for m in (1, 2, 4, 6, 8, 16, 32, 64, 128, 1024, 4096, 8192)],
     key=lambda s: s[0] * s[1],
 )

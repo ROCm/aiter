@@ -216,7 +216,7 @@ TRANSPORT_GRID_CAP = 64
 # with both knobs overridden on every rung.
 #
 # The TP4 mesh rows at blocks 64 and 128 without skip_self are the ones that
-# caught the VMEM store-data hazard in ``_store_v4i32_peer``: 
+# caught the VMEM store-data hazard in ``_store_v4i32_peer``:
 # INT4's peer-major fanout at those widths is where the register
 # allocator recycles the store's data VGPRs. The fp16 transport rows at the
 # same geometry never did. Those two run by default; no production rung uses

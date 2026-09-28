@@ -19,6 +19,16 @@ from flydsl.expr.typing import Int32, Int64, Stream
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .allreduce_policy import FAMILY_POLICY
+from .allreduce_shared import (
+    _SUPPORTED_ARCHS,
+    _cuda_index,
+    _resolve_inbox_flags,
+    _StEngine,
+    _validate_ipc_process_group,
+    has_xgmi_peer_links,
+    kernel_symbol,
+    payload_probes,
+)
 from .kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
@@ -32,17 +42,6 @@ from .kernels.one_shot_allreduce import (
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _run_compiled
-
-from .allreduce_shared import (
-    _SUPPORTED_ARCHS,
-    _cuda_index,
-    _resolve_inbox_flags,
-    _StEngine,
-    _validate_ipc_process_group,
-    has_xgmi_peer_links,
-    kernel_symbol,
-    payload_probes,
-)
 
 logger = logging.getLogger("aiter")
 

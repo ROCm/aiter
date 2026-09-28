@@ -469,8 +469,7 @@ def test_rank_tile_regions_are_whole_sectors(codec_name, block):
 def test_default_block_keeps_the_original_geometry():
     """``block=256`` is the geometry every kernel shipped with."""
     geometry = {
-        n: (c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32)
-        for n, c in CODECS.items()
+        n: (c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32) for n, c in CODECS.items()
     }
     assert geometry == {
         "int4": (None, 256, 288),

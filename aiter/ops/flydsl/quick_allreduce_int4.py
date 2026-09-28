@@ -30,6 +30,16 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
+from .allreduce_shared import (
+    _SUPPORTED_ARCHS,
+    _cuda_index,
+    _resolve_inbox_flags,
+    _StEngine,
+    _validate_ipc_process_group,
+    has_xgmi_peer_links,
+    kernel_symbol,
+    payload_probes,
+)
 from .kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
 from .kernels.quick_allreduce_int4 import (
     MESH_CODECS,
@@ -54,17 +64,6 @@ from .kernels.quick_allreduce_shared import (
     has_release_fence,
 )
 from .kernels.tensor_shim import _run_compiled
-
-from .allreduce_shared import (
-    _SUPPORTED_ARCHS,
-    _cuda_index,
-    _resolve_inbox_flags,
-    _StEngine,
-    _validate_ipc_process_group,
-    has_xgmi_peer_links,
-    kernel_symbol,
-    payload_probes,
-)
 
 logger = logging.getLogger("aiter")
 
@@ -438,7 +437,8 @@ class QuickAllReduceInt4:
 
         self._batch_publishes = (
             batches_publishes(resolved_inbox, algorithm, link)
-            if batch_publishes is None else bool(batch_publishes)
+            if batch_publishes is None
+            else bool(batch_publishes)
         )
 
         self.min_bytes = (

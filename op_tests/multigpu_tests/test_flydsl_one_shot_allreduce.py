@@ -396,9 +396,7 @@ def _key(tp: int, engine_kw: dict) -> tuple:
 
 def _ranks(key: tuple) -> list[dict]:
     if key not in _RESULTS:
-        _RESULTS[key] = _spawn(
-            key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key)
-        )
+        _RESULTS[key] = _spawn(key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key))
     return _RESULTS[key]
 
 

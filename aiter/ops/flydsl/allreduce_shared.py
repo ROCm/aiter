@@ -1,20 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared assets for all-reduce host wrappers.
-"""
+"""Shared assets for all-reduce host wrappers."""
+
+import ctypes
+import logging
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import ctypes
-from pathlib import Path
+
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
+
+logger = logging.getLogger("aiter")
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
 # mode; only the memory type changes.
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
+
 
 def _cuda_index(device) -> int:
     if isinstance(device, str):
@@ -27,14 +32,15 @@ def _cuda_index(device) -> int:
         return int(device.index)
     return int(device)
 
+
 def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
     """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``.
 
     ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
     TP2, where it is ``uncached`` on PCIe too. The PCIe rule exists because
     uncached peer writes serialize per destination and collapse as the fanout
-    widens. At TP2 every schedule rites to a single remote peer, 
-    so there is nothing to collapse, and an uncached inbox skips the L2 writeback 
+    widens. At TP2 every schedule rites to a single remote peer,
+    so there is nothing to collapse, and an uncached inbox skips the L2 writeback
     a cacheable one pays at every publish.
     """
     if mode not in INBOX_MEMORY_MODES:
@@ -50,6 +56,7 @@ def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
         "default": UncachedIpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
     }[mode]
     return flags, mode
+
 
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
@@ -150,6 +157,7 @@ class _StEngine:
                 pass
             self._buf_ptr = None
 
+
 def _validate_ipc_process_group(group, *, rank: int) -> None:
     """Reject groups that cannot exchange HIP IPC handles or CPU-side metadata."""
     # Keep parallel_state lazy: this module is imported while aiter's AOT setup
@@ -172,9 +180,11 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
             f"IPC handles are node-local (ranks not on rank 0's node: {off_node})."
         )
 
+
 # KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
 _HSA_IOLINK_TYPE_XGMI = 11
 _KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+
 
 def has_xgmi_peer_links() -> bool:
     """Whether any GPU-to-GPU link on this host is xGMI rather than PCIe.
@@ -219,12 +229,14 @@ def has_xgmi_peer_links() -> bool:
         )
         return True
 
+
 def kernel_symbol(launch) -> str:
     """The JIT symbol a kernel factory stamped on its launch wrapper."""
     name = getattr(getattr(launch, "func", None), "__name__", None)
     if not name:
         return "?"
     return name.removeprefix("launch_")
+
 
 def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
     """Payload sizes that between them select every config a ladder with rung
