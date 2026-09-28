@@ -78,7 +78,7 @@ def build_flash_attn_fp8_gfx942(page_size=32):
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[fx.Int8, 64 * 256, 16]
+        q: fx.Array[fx.Int8, 64 * 260, 16]
         k: fx.Array[fx.Int8, 2 * 32 * 260, 16]
         v: fx.Array[fx.Int8, 2 * 256 * 32, 16]
         bt: fx.Array[fx.Int32, 1024, 16]
@@ -147,7 +147,8 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     + fx.Int64(d)
                 )
                 data = _load(qp, src, fx.Vector.make_type(4, fx.Int32), 16)
-                _store(lds.q.ptr, off, data, 16)
+                # Like K, an odd dword row stride spreads MFMA reads over all banks.
+                _store(lds.q.ptr, r * 260 + d, data, 4)
             gpu.barrier()
 
             lower = tile * 32 + klen - qlen - 1023
@@ -223,7 +224,7 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                         T.i64,
                         4,
                     )
-                    b = _load(lds.q.ptr, row * 256 + depth * 16 + half * 8, T.i64, 8)
+                    b = _load(lds.q.ptr, row * 260 + depth * 16 + half * 8, T.i64, 4)
                     score = _mfma(a, b, score)
                 qpos = tile * 32 + row // 2 + klen - qlen
                 scores = []
