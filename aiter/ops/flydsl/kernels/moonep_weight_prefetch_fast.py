@@ -90,25 +90,25 @@ def make_moonep_weight_prefetch_fast_jit(
     block_num: int = 128,
     block_threads: int = 256,
     loads_in_flight: int = DEFAULT_LOADS_IN_FLIGHT,
-    experts_per_rank_padded: int | None = None,
+    row_stride: int | None = None,
 ):
     """Build the tuned prefetch launcher.
 
     The copy is untyped -- only ``weight_numel * elem_bytes`` matters -- so fp8
     weights and their scale blocks go through unchanged.
 
-    The source is one **row-contiguous** pool base spanning every rank's experts
-    (``moonep_vmm_pool.MoonEPVmmPool``): global expert ``e`` sits at row
-    ``(e // epn) * epn_padded + e % epn``, so a peer's weight is reached by
-    arithmetic instead of a per-owner pointer table.
-    ``experts_per_rank_padded`` defaults to ``experts_per_rank`` -- the case on
-    gfx950, where the 4 KiB VMM granularity leaves every real row aligned.
+    The source is one **row-contiguous** pool base spanning every rank's
+    ``[epn | B]`` segment (``moonep_vmm_pool.MoonEPVmmPool``): global expert
+    ``e`` sits at row ``(e // epn) * row_stride + e % epn``, so a peer's weight
+    is reached by arithmetic instead of a per-owner pointer table.
+    ``row_stride`` defaults to ``experts_per_rank + prefetch_slots`` -- the case
+    on gfx950, where the 4 KiB VMM granularity leaves every real row aligned.
     """
 
-    if experts_per_rank_padded is None:
-        experts_per_rank_padded = experts_per_rank
-    if experts_per_rank_padded < experts_per_rank:
-        raise ValueError("padded expert count cannot be smaller than the real one")
+    if row_stride is None:
+        row_stride = experts_per_rank + prefetch_slots
+    if row_stride < experts_per_rank:
+        raise ValueError("row stride cannot be smaller than the experts per rank")
 
     if experts_per_rank <= 0 or prefetch_slots <= 0:
         raise ValueError("expert and slot counts must be positive")
@@ -130,21 +130,20 @@ def make_moonep_weight_prefetch_fast_jit(
     passes = (weight_i32 + stride - 1) // stride
     batch = min(loads_in_flight, passes)
     span = stride * batch
-    # ``pp`` and the ``pool`` marker are part of the cache key on purpose: this
-    # builder changed ABI (peer-pointer table -> single row-contiguous base), and
-    # a stale JIT artefact under the old name would be loaded with the new
-    # argument list.
+    # The ``seg`` marker and ``rs`` stride are part of the cache key on purpose:
+    # the row formula changed between pool layouts while the argument list did
+    # not, so a stale JIT artefact would otherwise read the wrong rows silently.
     name = (
-        f"moonep_weight_prefetch_fast_pool_epr{experts_per_rank}"
-        f"pp{experts_per_rank_padded}_b{prefetch_slots}"
+        f"moonep_weight_prefetch_fast_seg_epr{experts_per_rank}"
+        f"rs{row_stride}_b{prefetch_slots}"
         f"_n{weight_numel}x{elem_bytes}_g{block_num}_t{block_threads}_f{batch}"
     )
 
     @flyc.kernel(name=name, known_block_size=[block_threads, 1, 1])
     def prefetch_kernel(
         addr_experts_to_copy: fx.Int64,  # INT32 [B], global expert ids, -1 = idle
-        addr_pool_base: fx.Int64,  # row-contiguous [(R+1)*epn_padded] pool base
-        addr_prefetched_weights: fx.Int64,  # BF16 [B, weight_numel]
+        addr_pool_base: fx.Int64,  # row-contiguous [R * row_stride] pool base
+        addr_prefetched_weights: fx.Int64,  # [B, weight_numel] prefetch slots
     ):
         tid = fx.Int32(fx.thread_idx.x)
         gid = fx.Int32(fx.block_idx.x) * fx.Int32(block_threads) + tid
@@ -163,7 +162,7 @@ def make_moonep_weight_prefetch_fast_jit(
                 # falls in. No pointer-table load, no per-owner view.
                 owner = expert // fx.Int32(experts_per_rank)
                 local_expert = expert % fx.Int32(experts_per_rank)
-                row = owner * fx.Int32(experts_per_rank_padded) + local_expert
+                row = owner * fx.Int32(row_stride) + local_expert
                 # num_records bounds both sides to one weight, so the final
                 # batch's out-of-range lanes are dropped in hardware and no tail
                 # predicate is needed.

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -103,6 +105,45 @@ def test_prefill_plan_is_deterministic_on_every_source_rank():
     assert torch.equal(observed, expected_alloc)
 
 
+def _uneven_routing(seed=0):
+    # R=4, E=16, top-2; ranks prefill different token counts and half of every
+    # rank's routes hit rank 0's experts, so balancing has to migrate.
+    g = torch.Generator().manual_seed(seed)
+    rows = [37, 5, 20, 64]
+    all_topk = []
+    for s in rows:
+        t = torch.stack([torch.randperm(16, generator=g)[:2] for _ in range(s)])
+        t[: max(1, s // 2)] %= 4
+        all_topk.append(t.to(torch.int32))
+    histogram = torch.stack(
+        [torch.bincount(t.reshape(-1).long(), minlength=16) for t in all_topk]
+    ).to(torch.int32)
+    return all_topk, histogram
+
+
+def test_prefill_plans_agree_across_ranks_with_uneven_token_counts():
+    all_topk, histogram = _uneven_routing()
+    plans = [
+        build_prefill_reference_plan(
+            MoonEPPlanConfig(
+                rank=rank,
+                world_size=4,
+                num_tokens=topk.shape[0],
+                top_k=2,
+                num_experts=16,
+                prefetch_slots=2,
+            ),
+            topk,
+            histogram,
+        )
+        for rank, topk in enumerate(all_topk)
+    ]
+    for plan in plans[1:]:
+        assert torch.equal(plan.alloc, plans[0].alloc)
+        assert torch.equal(plan.expert_to_slot, plans[0].expert_to_slot)
+        assert torch.equal(plan.experts_to_copy, plans[0].experts_to_copy)
+
+
 def test_prefill_policy_runs_histogram_exchange_before_planning():
     all_topk, histogram = _overflow_routing()
     cfg = MoonEPPlanConfig(
@@ -175,3 +216,32 @@ def test_gpu_prefill_planner_matches_reference():
         "residual_imbalance",
     ):
         assert torch.equal(getattr(actual, field), getattr(reference, field))
+
+
+def test_gpu_prefill_planner_serves_every_row_count_in_its_bucket():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+
+    all_topk, histogram = _uneven_routing()
+    device = torch.device("cuda")
+    tpe = histogram.to(device)
+    bucket = MoonEPPlanConfig(
+        rank=0, world_size=4, num_tokens=64, top_k=2, num_experts=16, prefetch_slots=2
+    )
+    planners = {}
+    for rank, topk in enumerate(all_topk):
+        cfg = MoonEPPlanConfig(
+            rank=rank,
+            world_size=4,
+            num_tokens=topk.shape[0],
+            top_k=2,
+            num_experts=16,
+            prefetch_slots=2,
+        )
+        reference = build_prefill_reference_plan(cfg, topk.to(device), tpe)
+        planner = planners.setdefault(
+            rank, MoonEPPrefillPlanner(dataclasses.replace(bucket, rank=rank), device)
+        )
+        actual = planner.build(topk.to(device).contiguous(), tpe).clone()
+        for field in ("planned_topk_ids", "experts_to_copy", "alloc", "expert_to_slot"):
+            assert torch.equal(getattr(actual, field), getattr(reference, field)), field

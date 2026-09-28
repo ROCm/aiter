@@ -1,34 +1,36 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Row-contiguous ``[R * epn_padded + B, ...]`` expert-weight pool over HIP VMM.
+"""Row-contiguous ``[R * stride, ...]`` expert-weight pool over HIP VMM.
 
-MoonEP's group GEMM addresses experts purely by row index, so the whole world's
-expert weights have to sit in one contiguous virtual range::
+Every rank owns one segment of ``stride`` rows holding its resident experts
+followed by its own prefetch slots, and the segments of all ranks are stitched
+into one contiguous virtual range::
 
-    slot 0 .. R-1   peer pe's home experts   row = pe * epn_padded + k
-    tail            this rank's B prefetch slots, at row R * epn_padded + b
+    segment pe      rows [pe * stride, pe * stride + epn)          home experts
+                    rows [pe * stride + epn, pe * stride + epn + B) prefetch slots
 
-The tail keeps the group *stride* (so the row formula holds) but is only backed
-by ``B`` rows of real memory, not a whole group -- backing a full group would
-cost ``(epn_padded - B)`` rows per matrix per layer, tens of GB on a deep model.
+``stride`` is ``epn + B`` rounded up to the VMM granularity, which on gfx950
+means ``stride == epn + B``.  The segment layout is the MoRI/EPLB virtual-id
+layout ``physical_id = dest * (epn + B) + slot``, so this rank's
+``[epn + B]`` window is exactly the weight tensor a single ``fused_moe`` call
+needs under a virtual-id ``expert_mask``, and its ``[epn]`` prefix is the
+ordinary owner-only weight tensor.
 
-Rows ``[0, E)`` are *other ranks' physical memory*, mapped here over XGMI; only
-``epn_padded + B`` rows per rank are actually resident.  That is what lets a
-single ``fused_moe`` call reach every expert, and what turns ``B`` back into a
-cache size instead of a correctness bound -- an expert with no prefetch slot is
-still addressable at its home row, just slower to read.
+Other ranks' segments are *their* physical memory, mapped here over XGMI, so a
+prefetch kernel reaches any expert by row arithmetic on one base pointer.  Only
+``stride`` rows per rank are actually resident.
 
 Modelled on mori's CCO (``src/cco/cco_init.cpp``: one ``hipMemAddressReserve``,
 then ``mapPeer`` maps each imported peer handle at ``flatBase + pe * stride``).
 CCO itself is unusable here because it rounds its per-rank stride up to 4 GiB so
 the device side can pack it into ``stride >> 32``, which leaves 4 GiB holes
-between peers; our stride is exactly one expert group, so rows stay contiguous
+between peers; our stride is exactly one segment, so rows stay contiguous
 across the seam.
 
 Verified on gfx950 (8x MI355X): granularity is 4 KiB, so every real weight and
-scale row is already aligned and ``epn_padded == epn``; a stitched pool feeds
-mxfp4 a8w4 2-stage ``fused_moe`` bit-identically to a fully local reference.
+scale row is already aligned; a stitched pool feeds mxfp4 a8w4 2-stage
+``fused_moe`` bit-identically to a fully local reference.
 
 Two constraints from mori's own experience with these APIs:
 
@@ -140,23 +142,19 @@ def vmm_granularity(dev: int) -> int:
     return g.value
 
 
-def _align_up(n: int, a: int) -> int:
-    return (n + a - 1) // a * a
+def pad_experts(rows: int, row_bytes: int, granularity: int) -> int:
+    """Smallest ``padded >= rows`` whose segment is a whole granularity multiple.
 
-
-def pad_experts(experts_per_rank: int, row_bytes: int, granularity: int) -> int:
-    """Smallest ``epn_padded >= epn`` whose group is a whole granularity multiple.
-
-    The group is the unit we map, so it must be granularity-aligned, and it must
-    hold a whole number of rows or the next peer's slot starts mid-row and
-    ``row = pe * epn_padded + k`` stops being true.  Rows *inside* a group need
-    no alignment of their own, which is why this is far weaker than it looks:
-    at the measured 4 KiB granularity every real weight/scale row divides it
-    exactly and ``epn_padded == epn``.
+    The segment is the unit we map, so it must be granularity-aligned, and it
+    must hold a whole number of rows or the next peer's segment starts mid-row
+    and ``row = pe * stride + k`` stops being true.  Rows *inside* a segment
+    need no alignment of their own, which is why this is far weaker than it
+    looks: at the measured 4 KiB granularity every real weight/scale row
+    divides it exactly and no padding is added.
     """
 
     step = granularity // math.gcd(row_bytes, granularity)
-    return ((experts_per_rank + step - 1) // step) * step
+    return ((rows + step - 1) // step) * step
 
 
 class _RawBuf:
@@ -173,7 +171,7 @@ class _RawBuf:
 
 
 class MoonEPVmmPool:
-    """One row-contiguous ``[R * epn_padded + B]`` range of expert-weight rows."""
+    """One row-contiguous ``[R * stride]`` range of per-rank ``[epn | B]`` segments."""
 
     def __init__(
         self,
@@ -198,34 +196,26 @@ class MoonEPVmmPool:
         self._group = group
         self._closed = False
 
+        if experts_per_rank <= 0 or prefetch_slots < 0:
+            raise ValueError("experts_per_rank must be positive and prefetch_slots non-negative")
+
         gran = vmm_granularity(dev)
         self.granularity = gran
-        self.epn_padded = pad_experts(experts_per_rank, row_bytes, gran)
-        if self.epn_padded > max_pad_ratio * experts_per_rank:
+        segment_rows = experts_per_rank + prefetch_slots
+        self.stride = pad_experts(segment_rows, row_bytes, gran)
+        if self.stride > max_pad_ratio * segment_rows:
             raise ValueError(
                 f"row_bytes={row_bytes} is nearly coprime with the VMM "
                 f"granularity {gran} (gcd={math.gcd(row_bytes, gran)}), so a "
-                f"whole-row group would need {self.epn_padded} rows for "
-                f"{experts_per_rank} experts. Pad each row up to a divisor of "
-                f"the granularity before pooling it."
-            )
-        if prefetch_slots > self.epn_padded:
-            raise ValueError(
-                f"prefetch_slots={prefetch_slots} exceeds the tail slot capacity "
-                f"{self.epn_padded}; the tail is one expert group wide"
+                f"whole-row segment would need {self.stride} rows for "
+                f"{segment_rows} rows of experts and prefetch slots. Pad each "
+                f"row up to a divisor of the granularity before pooling it."
             )
 
-        self.slot_bytes = self.epn_padded * row_bytes
-        # The tail is only B rows, not a whole group: backing a full group would
-        # cost (epn_padded - B) rows of real memory per matrix per layer, which
-        # on a 43-layer model is tens of GB for nothing. Only the VA *stride*
-        # has to be a whole group, so that row = pe * epn_padded + k holds.
-        self.tail_bytes = _align_up(prefetch_slots * row_bytes, gran)
-        self.rows = world_size * self.epn_padded + prefetch_slots
-        self.total_bytes = world_size * self.slot_bytes + self.tail_bytes
-        # Rows the caller may view; the mapped range can be slightly longer
-        # because the tail is rounded up to the granularity.
-        self.tensor_bytes = self.rows * row_bytes
+        self.segment_bytes = self.stride * row_bytes
+        self.rows = world_size * self.stride
+        self.total_bytes = world_size * self.segment_bytes
+        self.tensor_bytes = self.total_bytes
 
         self._handles: list[ctypes.c_void_p] = []
         self._peer_fds: list[int] = []
@@ -257,22 +247,21 @@ class MoonEPVmmPool:
 
     def _map_local(self, dev: int) -> None:
         prop = _prop(dev)
-        for slot, nbytes in (
-            (self.rank, self.slot_bytes),          # our home experts
-            (self.world_size, self.tail_bytes),    # B prefetch rows, not a group
-        ):
-            h = _P(0)
-            _check(
-                _hip.hipMemCreate(ctypes.byref(h), nbytes, ctypes.byref(prop), 0),
-                "hipMemCreate",
-            )
-            self._handles.append(h)
-            _check(
-                _hip.hipMemMap(
-                    _P(self._base.value + slot * self.slot_bytes), nbytes, 0, h, 0
-                ),
-                "hipMemMap (local)",
-            )
+        h = _P(0)
+        _check(
+            _hip.hipMemCreate(
+                ctypes.byref(h), self.segment_bytes, ctypes.byref(prop), 0
+            ),
+            "hipMemCreate",
+        )
+        self._handles.append(h)
+        _check(
+            _hip.hipMemMap(
+                _P(self._base.value + self.rank * self.segment_bytes),
+                self.segment_bytes, 0, h, 0,
+            ),
+            "hipMemMap (local)",
+        )
 
     def _map_peers(self, dev: int) -> None:
         if self.world_size <= 1:
@@ -308,8 +297,8 @@ class MoonEPVmmPool:
             self._handles.append(h)
             _check(
                 _hip.hipMemMap(
-                    _P(self._base.value + pe * self.slot_bytes),
-                    self.slot_bytes, 0, h, 0,
+                    _P(self._base.value + pe * self.segment_bytes),
+                    self.segment_bytes, 0, h, 0,
                 ),
                 f"hipMemMap (peer {pe})",
             )
@@ -319,17 +308,17 @@ class MoonEPVmmPool:
     def global_row(self, expert: int) -> int:
         """Pool row holding global expert ``expert``, on every rank alike."""
         epn = self.experts_per_rank
-        return (expert // epn) * self.epn_padded + (expert % epn)
+        return (expert // epn) * self.stride + (expert % epn)
 
     def prefetch_row(self, slot: int) -> int:
-        """Pool row of local prefetch slot ``slot``; these live past row E."""
+        """Pool row of this rank's prefetch slot ``slot``, right after its home rows."""
         if not 0 <= slot < self.prefetch_slots:
             raise IndexError(f"prefetch slot {slot} out of range")
-        return self.world_size * self.epn_padded + slot
+        return self.rank * self.stride + self.experts_per_rank + slot
 
     @property
     def home_row_begin(self) -> int:
-        return self.rank * self.epn_padded
+        return self.rank * self.stride
 
     # ---------------------------------------------------------------- tensors
 

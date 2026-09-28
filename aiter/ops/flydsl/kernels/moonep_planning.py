@@ -52,6 +52,7 @@ from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -110,11 +111,10 @@ def _lds_store(ptr, val, idx):
 
 def _lds_atomic_add(base_i64, idx, val):
     """Workgroup-scope ``atomicrmw add`` on an i32 LDS slot."""
-    ptr = buffer_ops.create_llvm_ptr(base_i64 + fx.Int64(idx) * 4, address_space=3)
-    raw_ptr = ptr._value if hasattr(ptr, "_value") else ptr
+    ptr = create_llvm_ptr(base_i64 + fx.Int64(idx) * 4, address_space=3)
     return llvm.AtomicRMWOp(
         llvm.AtomicBinOp.add,
-        raw_ptr,
+        ptr,
         _unwrap(val),
         llvm.AtomicOrdering.monotonic,
         syncscope="workgroup",
@@ -258,9 +258,12 @@ class MoonEPPlanGeometry:
         self.G = num_experts + prefetch_slots
 
         # One wavefront owns one vblock, so num_vblocks must tile the grid.
-        self.hist_waves_per_block = hist_waves_per_block
         nv = min(num_vblocks, max(1, _ceil_div(self.N, WAVE_SIZE)))
-        nv = max(1, (nv // hist_waves_per_block) * hist_waves_per_block)
+        # A block must not carry more waves than there are vblocks, or small
+        # batches get a zero-block grid and the histogram never runs.
+        hist_waves_per_block = min(hist_waves_per_block, nv)
+        self.hist_waves_per_block = hist_waves_per_block
+        nv = (nv // hist_waves_per_block) * hist_waves_per_block
         self.NV = nv
         self.hist_blocks = nv // hist_waves_per_block
         # Entries per vblock, rounded up to a whole wave batch.
@@ -328,7 +331,6 @@ def make_moonep_plan_order_hist_kernel(geo: MoonEPPlanGeometry):
 
     E = geo.E
     EPV = geo.EPV
-    N = geo.N
     BATCHES = geo.hist_batches
     WPB = geo.hist_waves_per_block
     BLOCK = WPB * WAVE_SIZE
@@ -347,6 +349,7 @@ def make_moonep_plan_order_hist_kernel(geo: MoonEPPlanGeometry):
         topk_experts: fx.Int64,  # int32 [S, K] flattened
         order: fx.Int64,  # int32 [N] out
         local_hist: fx.Int64,  # int32 [NV, E] out
+        num_entries: fx.Int32,  # routed entries this call, <= N
     ):
         tid = fx.Int32(fx.thread_idx.x)
         lane = tid & fx.Int32(WAVE_SIZE - 1)
@@ -366,7 +369,7 @@ def make_moonep_plan_order_hist_kernel(geo: MoonEPPlanGeometry):
         vblock_begin = vblock * fx.Int32(EPV)
         for batch in range_constexpr(BATCHES):
             idx = vblock_begin + fx.Int32(batch * WAVE_SIZE) + lane
-            in_range = idx < fx.Int32(N)
+            in_range = idx < num_entries
             # Keep every lane active for ds_bpermute: clamp the load and mask the
             # expert id instead of branching.
             safe_idx = in_range.select(idx, fx.Int32(0))
@@ -430,7 +433,6 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
     E = geo.E
     B = geo.B
     epn = geo.epn
-    CAP = geo.CAP
     NO_MIG = geo.NO_MIG
     VIRTUAL_IDS = geo.VIRTUAL_IDS
     NV = geo.NV
@@ -457,6 +459,9 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
         rem: fx.Array[fx.Int32, R * REM_STRIDE, 16]
         quota: fx.Array[fx.Int32, R * R, 16]
         bal: fx.Array[fx.Int32, R, 16]
+        # Per-destination routed-entry target, derived from the all-rank
+        # histogram so that every rank balances towards the same numbers.
+        target: fx.Array[fx.Int32, R, 16]
         rstat0: fx.Array[fx.Int32, R, 16]
         rstat1: fx.Array[fx.Int32, R, 16]
         etc: fx.Array[fx.Int32, R * B, 16]
@@ -493,6 +498,7 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
         p_rem = lds.rem.ptr
         p_quota = lds.quota.ptr
         p_bal = lds.bal.ptr
+        p_target = lds.target.ptr
         p_rstat0 = lds.rstat0.ptr
         p_rstat1 = lds.rstat1.ptr
         p_etc = lds.etc.ptr
@@ -553,11 +559,20 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
             group_total = fx.Int32(0)
             for j in range(fx.Int32(0), fx.Int32(epn), 1):
                 group_total = group_total + _lds_load(p_ecount, tid * fx.Int32(epn) + j)
+            routes_total = fx.Int32(0)
+            for ej in range(fx.Int32(0), fx.Int32(E), 1):
+                routes_total = routes_total + _lds_load(p_ecount, ej)
+            # Ranks may prefill different token counts, so the target is the
+            # all-rank average with the remainder on the lowest ranks.
+            rank_target = routes_total // fx.Int32(R) + (
+                tid < routes_total % fx.Int32(R)
+            ).select(fx.Int32(1), fx.Int32(0))
+            _lds_store(p_target, rank_target, tid)
             # NO_MIG is a Python bool, so this is a compile-time branch: the
             # balance is pinned to zero and the quota loop below never activates.
             _lds_store(
                 p_bal,
-                fx.Int32(0) if NO_MIG else group_total - fx.Int32(CAP),
+                fx.Int32(0) if NO_MIG else group_total - rank_target,
                 tid,
             )
 
@@ -665,6 +680,9 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
                 )
                 q_slot = home * fx.Int32(R) + dest
                 _lds_store(p_quota, _lds_load(p_quota, q_slot) - move, q_slot)
+            # Lane 0's stores must land before every lane reloads quota and rem
+            # next round; without a fence the compiler may hoist those loads.
+            gpu.barrier()
 
         gpu.barrier()
 
@@ -753,12 +771,12 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
                 expert = i - dest * fx.Int32(E)
                 owner = expert // fx.Int32(epn)
                 remote = owner != dest
-                selected = _lds_load(
+                prefetched = _lds_load(
                     p_key, dest * fx.Int32(E + 1) + expert
                 ) == fx.Int32(_KEY_SELECTED)
                 alloc_slot = expert * fx.Int32(R) + dest
                 count = _lds_load(p_alloc, alloc_slot)
-                rollback = remote & (~selected) & (count > fx.Int32(0))
+                rollback = remote & (~prefetched) & (count > fx.Int32(0))
                 if rollback:
                     _lds_store(p_alloc, fx.Int32(0), alloc_slot)
                     _lds_atomic_add(
@@ -811,7 +829,9 @@ def make_moonep_plan_meta_kernel(geo: MoonEPPlanGeometry):
                     )
                 buffer_ops.buffer_store(route_count, rank_route_counts_rsrc, tid)
                 buffer_ops.buffer_store(
-                    route_count - fx.Int32(CAP), residual_imbalance_rsrc, tid
+                    route_count - _lds_load(p_target, tid),
+                    residual_imbalance_rsrc,
+                    tid,
                 )
 
         if not VIRTUAL_IDS:
@@ -1046,10 +1066,11 @@ def make_moonep_plan_jit(geo: MoonEPPlanGeometry):
         topk_experts: fx.Int64,
         order: fx.Int64,
         local_hist: fx.Int64,
+        num_entries: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = _key
-        order_hist_kernel(topk_experts, order, local_hist).launch(
+        order_hist_kernel(topk_experts, order, local_hist, num_entries).launch(
             grid=(hist_blocks, 1, 1),
             block=(hist_block_threads, 1, 1),
             stream=stream,

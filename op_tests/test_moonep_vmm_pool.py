@@ -3,12 +3,15 @@
 
 """Multi-rank test for MoonEPVmmPool: row addressing + fused_moe consumption.
 
-Asserts (not prints) the two properties the [E+B] layout rests on:
+Asserts (not prints) the properties the per-rank ``[epn | B]`` layout rests on:
 
   1. every rank reads global expert ``e`` at row ``global_row(e)`` and gets the
-     owning rank's bytes, and its own prefetch tail is private
+     owning rank's bytes, and its own prefetch slots are private
   2. a ``fused_moe`` over the stitched range is bit-identical to one over a
      fully local copy of the same weights
+  3. a single ``fused_moe`` over this rank's ``[epn + B]`` window under a
+     virtual-id ``expert_mask`` is bit-identical to the same call on a local
+     copy of the window
 
 Run:
     torchrun --nproc-per-node 8 op_tests/test_moonep_vmm_pool.py
@@ -54,8 +57,9 @@ def main() -> int:
                        rank=rank, world_size=world)
     p2 = MoonEPVmmPool(row_bytes=w2_row, experts_per_rank=EPN, prefetch_slots=B,
                        rank=rank, world_size=world)
-    assert p1.epn_padded == EPN, f"unexpected padding {p1.epn_padded}"
-    assert p1.rows == (world + 1) * EPN
+    assert p1.stride == EPN + B, f"unexpected padding {p1.stride}"
+    assert p1.rows == world * (EPN + B)
+    assert p1.prefetch_row(0) == rank * (EPN + B) + EPN
 
     t1 = p1.tensor(torch.bfloat16, w1_shape)
     t2 = p2.tensor(torch.bfloat16, w2_shape)
@@ -108,10 +112,37 @@ def main() -> int:
         f"max|d|={(out_ref.float() - out_vmm.float()).abs().max():.3e}"
     )
 
+    # (3) one call over the [epn + B] window, ids in the virtual-id space
+    width = EPN + B
+    lo = rank * p1.stride
+    for b in range(B):
+        e = (rank * EPN + EPN + b) % E
+        t1[p1.prefetch_row(b)].copy_(ref1[p1.global_row(e)])
+        t2[p2.prefetch_row(b)].copy_(ref2[p2.global_row(e)])
+    torch.cuda.synchronize()
+    win1, win2 = t1[lo : lo + width], t2[lo : lo + width]
+    mask = torch.zeros(world * width, dtype=torch.int32, device=devs)
+    mask[rank * width : (rank + 1) * width] = 1
+    vids = torch.randint(0, world * width, (TOKENS, 2), generator=g,
+                         device=devs, dtype=torch.int32)
+    vtw = torch.full((TOKENS, 2), 0.5, dtype=torch.float32, device=devs)
+
+    def run_window(a, b):
+        return fused_moe(x, a, b, vtw, vids, mask, ActivationType.Silu,
+                         quant_type=QuantType.No)
+
+    win_ref = run_window(win1.clone(), win2.clone())
+    win_vmm = run_window(win1, win2)
+    torch.cuda.synchronize()
+    assert torch.equal(win_ref, win_vmm), (
+        f"rank {rank}: fused_moe over the [epn + B] window differs from local; "
+        f"max|d|={(win_ref.float() - win_vmm.float()).abs().max():.3e}"
+    )
+
     ok = torch.tensor([1], dtype=torch.int32, device=devs)
     dist.all_reduce(ok)
     if rank == 0:
-        print(f"PASS: {int(ok.item())}/{world} ranks -- addressing + fused_moe")
+        print(f"PASS: {int(ok.item())}/{world} ranks -- addressing + fused_moe + window")
     dist.barrier()
 
     del t1, t2

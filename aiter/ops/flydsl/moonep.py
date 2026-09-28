@@ -249,11 +249,6 @@ def _validate_planning_inputs(
     if bool((tokens_per_expert < 0).any()):
         raise ValueError("tokens_per_expert must be non-negative")
 
-    row_totals = tokens_per_expert.to(torch.int64).sum(dim=1)
-    expected_total = torch.full_like(row_totals, config.capacity)
-    if not torch.equal(row_totals.cpu(), expected_total.cpu()):
-        raise ValueError("every tokens_per_expert row must sum to num_tokens * top_k")
-
     local_hist = torch.bincount(
         topk_experts.reshape(-1).to(torch.int64).cpu(),
         minlength=config.num_experts,
@@ -265,6 +260,19 @@ def _validate_planning_inputs(
         raise ValueError(
             "topk_experts histogram does not match tokens_per_expert[rank]"
         )
+
+
+def _balance_targets(expert_count: torch.Tensor, world_size: int) -> torch.Tensor:
+    """Per-destination routed-entry targets, identical on every rank.
+
+    Ranks may prefill different token counts, so the target is derived from the
+    all-rank histogram rather than from this rank's own ``num_tokens``.
+    """
+
+    total = int(expert_count.sum().item())
+    targets = torch.full((world_size,), total // world_size, dtype=torch.int64)
+    targets[: total % world_size] += 1
+    return targets
 
 
 def _build_balanced_alloc_cpu(
@@ -285,7 +293,7 @@ def _build_balanced_alloc_cpu(
     )
 
     group_tokens = expert_count.view(world_size, experts_per_rank).sum(dim=1)
-    balance = group_tokens - config.capacity
+    balance = group_tokens - _balance_targets(expert_count, world_size)
 
     alloc = torch.zeros(config.num_experts, world_size, dtype=torch.int64)
     for expert in range(config.num_experts):
@@ -400,7 +408,7 @@ def build_prefill_reference_plan(
         raise AssertionError("non-zero allocation has no destination weight slot")
 
     rank_route_counts = alloc.sum(dim=0)
-    residual_imbalance = rank_route_counts - config.capacity
+    residual_imbalance = rank_route_counts - _balance_targets(expert_count, R)
     alloc_cumsum = alloc.cumsum(dim=1)
 
     local_seen = torch.zeros(E, dtype=torch.int64)
@@ -924,7 +932,15 @@ class MoonEPGpuPlanner:
         self, topk_experts: torch.Tensor, tokens_per_expert: torch.Tensor
     ) -> None:
         cfg = self.config
-        if tuple(topk_experts.shape) != (cfg.num_tokens, cfg.top_k):
+        rows, width = topk_experts.shape
+        # A ragged planner is compiled for up to ``num_tokens`` rows and takes
+        # the real row count at launch time.
+        rows_ok = (
+            rows <= cfg.num_tokens
+            if getattr(self, "_ragged_tokens", False)
+            else rows == cfg.num_tokens
+        )
+        if not rows_ok or width != cfg.top_k:
             raise ValueError(
                 f"topk_experts must have shape {(cfg.num_tokens, cfg.top_k)}, "
                 f"got {tuple(topk_experts.shape)}"
@@ -973,11 +989,13 @@ class MoonEPGpuPlanner:
         """Launch arguments for one stage; also used by the stage benchmark."""
 
         p = fx.Int64
+        rows = topk_experts.shape[0]
         if slot == 0:
             return (
                 p(topk_experts.data_ptr()),
                 p(self._order.data_ptr()),
                 p(self._local_hist.data_ptr()),
+                rows * self.config.top_k,
                 stream,
             )
         if slot == 1:
@@ -1007,7 +1025,7 @@ class MoonEPGpuPlanner:
             p(self._expert_off.data_ptr()),
             p(self.expert_to_slot.data_ptr()),
             p(self.dst.data_ptr()),
-            self.config.num_tokens,
+            rows,
             stream,
         )
 
@@ -1047,7 +1065,14 @@ class MoonEPGpuPlanner:
 
 
 class MoonEPPrefillPlanner(MoonEPGpuPlanner):
-    """Three-launch GPU planner that emits MoRI/EPLB-style physical ids."""
+    """Three-launch GPU planner that emits MoRI/EPLB-style physical ids.
+
+    ``config.num_tokens`` is a capacity: one compiled planner serves every
+    prefill with at most that many rows, so callers can bucket token counts
+    instead of compiling per shape.
+    """
+
+    _ragged_tokens = True
 
     def __init__(
         self,
@@ -1071,7 +1096,7 @@ class MoonEPPrefillPlanner(MoonEPGpuPlanner):
 
         return MoonEPPrefillRoutePlan(
             config=self.config,
-            planned_topk_ids=self.dst,
+            planned_topk_ids=self.dst[: topk_experts.shape[0]],
             experts_to_copy=self.experts_to_copy,
             alloc=self.alloc,
             expert_to_slot=self.expert_to_slot,
@@ -1374,11 +1399,11 @@ class MoonEPPrefillPolicy:
         return self.config.virtual_experts_per_rank
 
     def plan(self, topk_experts: torch.Tensor) -> MoonEPPrefillRoutePlan:
-        expected = (self.config.num_tokens, self.config.top_k)
-        if tuple(topk_experts.shape) != expected:
+        rows, width = topk_experts.shape
+        if rows > self.config.num_tokens or width != self.config.top_k:
             raise ValueError(
-                f"topk_experts must have shape {expected}, got "
-                f"{tuple(topk_experts.shape)}"
+                f"topk_experts must have at most {self.config.num_tokens} rows "
+                f"and {self.config.top_k} columns, got {tuple(topk_experts.shape)}"
             )
         if topk_experts.device != self.device:
             raise ValueError(f"topk_experts must live on {self.device}")
@@ -1386,7 +1411,9 @@ class MoonEPPrefillPolicy:
         topk_i32 = topk_experts.to(torch.int32).contiguous()
         flat = topk_i32.reshape(-1).to(torch.int64)
         self.local_histogram.zero_()
-        self.local_histogram.scatter_add_(0, flat, self._histogram_ones)
+        self.local_histogram.scatter_add_(
+            0, flat, self._histogram_ones[: flat.numel()]
+        )
         tokens_per_expert = self.histogram_exchange.publish(self.local_histogram)
         return self.planner.build(topk_i32, tokens_per_expert)
 

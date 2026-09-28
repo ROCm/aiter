@@ -219,7 +219,7 @@ def main() -> int:
     # row-contiguous across ranks, so home experts, borrowed ones in the
     # prefetch tail and any overflow expert read in place at its owner's row all
     # come out of the same weight tensor. Slot ids are global pool rows.
-    slot_ids = op.row_slot_ids(pw1.epn_padded)
+    slot_ids = op.row_slot_ids(pw1.stride)
     out = op.get_expert_output_buffer()
 
     def seg(p):

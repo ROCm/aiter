@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Row-contiguous expert-weight pool for MoonEP: the whole world's experts plus
-this rank's prefetch slots in one virtual range, indexed by global row.
+"""Row-contiguous expert-weight pool for MoonEP: every rank's ``[epn | B]``
+segment in one virtual range, indexed by global row.
 
-Layout per matrix: ``((R + 1) * epn_padded, *shape)`` over HIP VMM
+Layout per matrix: ``(R * stride, *shape)`` over HIP VMM
 (``aiter.ops.flydsl.moonep_vmm_pool.MoonEPVmmPool``)::
 
-    slot 0 .. R-1   rank pe's home experts   row = pe * epn_padded + k
-    slot R          this rank's B prefetch slots, past row E
+    rank pe home experts      row = pe * stride + k,        k in [0, epn)
+    rank pe prefetch slots    row = pe * stride + epn + b,  b in [0, B)
 
-Only ``epn_padded + B`` rows per rank are physically resident; rows ``[0, E)``
-that belong to other ranks are *their* memory, mapped here over XGMI.  A grouped
-GEMM therefore reaches **every** expert by row index in a single call, and an
-expert that got no prefetch slot is still addressable at its home row -- so
-``B`` is a cache size, not a correctness bound.
+``stride`` is ``epn + B`` on gfx950, so the pool rows are the MoRI/EPLB
+virtual physical ids ``dest * (epn + B) + slot``.  This rank's ``local`` view is
+its ``[epn + B]`` window -- one ``fused_moe`` covers resident and prefetched
+experts under a virtual-id ``expert_mask`` -- and its ``home`` view is the
+``[epn]`` prefix used for owner-only routing.
 
-ATOM's ``w1``/``w2`` are ordinary local tensors and are not reachable by peers,
-so they must be staged into ``home`` once after loading.
+Only ``stride`` rows per rank are physically resident; other ranks' segments are
+*their* memory, mapped here over XGMI so the prefetch kernel reaches any expert
+by row arithmetic.  ATOM's ``w1``/``w2`` are ordinary local tensors and are not
+reachable by peers, so they must be staged into ``home`` once after loading.
 
 The pool is dtype-transparent: staging and prefetch are byte copies, so it
 holds ATOM's expert weights in whatever layout and dtype the experts kernel
@@ -39,7 +41,7 @@ from aiter.ops.flydsl.moonep_vmm_pool import MoonEPVmmPool
 
 
 class MoonEPWeightPool:
-    """One row-contiguous ``((R+1)*epn_padded, *shape)`` pool + prefetch launcher."""
+    """One row-contiguous ``(R * stride, *shape)`` pool + prefetch launcher."""
 
     def __init__(
         self,
@@ -85,32 +87,32 @@ class MoonEPWeightPool:
             world_size=world_size,
             device=self.device,
         )
-        self.epn_padded = self._vmm.epn_padded
+        self.stride = self._vmm.stride
         self.rows = self._vmm.rows
         self._raw = self._vmm.tensor(torch.uint8, (numel * elem_bytes,))
         self.pool = self._vmm.tensor(dtype, tuple(weight_shape))
 
-        self._home0 = self._vmm.home_row_begin
-        self._pf0 = self.world_size * self.epn_padded
-        self.home = self.pool[self._home0 : self._home0 + experts_per_rank]
-        self.prefetched = self.pool[self._pf0 : self._pf0 + prefetch_slots]
-        # Zero only what we own -- the rest of the range is peer memory and
+        self._seg0 = self._vmm.home_row_begin
+        window = experts_per_rank + prefetch_slots
+        self.local = self.pool[self._seg0 : self._seg0 + window]
+        self.home = self.local[:experts_per_rank]
+        self.prefetched = self.local[experts_per_rank:]
+        # Zero only our own segment -- the rest of the range is peer memory and
         # clearing it would wipe their weights. Through the byte view, never the
         # typed one: the narrow dtypes this pool carries (fp4x2, e8m0) have no
         # fill_ kernel in torch and zero_() on them raises NotImplementedError.
-        self._raw[self._home0 : self._home0 + experts_per_rank].zero_()
-        self._raw[self._pf0 : self._pf0 + prefetch_slots].zero_()
+        self._raw[self._seg0 : self._seg0 + self.stride].zero_()
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
 
         self._jit = make_moonep_weight_prefetch_fast_jit(
             experts_per_rank=experts_per_rank,
-            experts_per_rank_padded=self.epn_padded,
             prefetch_slots=prefetch_slots,
             weight_numel=numel,
             elem_bytes=elem_bytes,
             block_num=block_num,
             block_threads=block_threads,
+            row_stride=self.stride,
         )
         self._compiled = None
 
@@ -134,7 +136,7 @@ class MoonEPWeightPool:
         # both raise on them -- so an elementwise copy_ is not something to
         # rely on, and the pool only ever needs the bytes anyway.
         src = weights.contiguous()
-        lo = self._home0
+        lo = self._seg0
         self._raw[lo : lo + self.experts_per_rank].copy_(
             src.view(torch.uint8).reshape(self.experts_per_rank, -1)
         )
@@ -156,7 +158,7 @@ class MoonEPWeightPool:
             raise ValueError("experts_to_copy must be int32")
         stream = torch.cuda.current_stream(self.device)
         sel = experts_to_copy_row.contiguous()
-        # One base for the whole world now: the kernel turns a global expert id
+        # One base for the whole world: the kernel turns a global expert id
         # into a row itself, so there is no per-owner pointer table to pass.
         raw = (
             sel.data_ptr(),
@@ -180,7 +182,8 @@ class MoonEPWeightPool:
 
         Home groups map to the expert's global row -- identical on every rank --
         rather than to a rank-local slot, which is what lets one ``fused_moe``
-        call span the whole range.  Migration groups map to the prefetch tail.
+        call span the whole range.  Migration groups map to this rank's
+        prefetch slots.
         """
         if group < num_experts:
             return self._vmm.global_row(expert)
@@ -192,7 +195,8 @@ class MoonEPWeightPool:
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
         # Drop the views before the mapping they borrow from.
-        self.home = self.prefetched = self.pool = self._raw = None
+        self.home = self.prefetched = self.local = None
+        self.pool = self._raw = None
         self._vmm.close()
         self._closed = True
 

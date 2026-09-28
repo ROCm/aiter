@@ -321,7 +321,7 @@ class MoonEPDispatchCombineIntraNodeOp:
 
         return not self._act_cfg.no_migration
 
-    def row_slot_ids(self, experts_per_rank_padded: int | None = None) -> torch.Tensor:
+    def row_slot_ids(self, row_stride: int | None = None) -> torch.Tensor:
         """Per-row weight-pool **row**, shaped ``[NvS, 1]`` for a topk-1 MoE.
 
         MoonEP's rows are already grouped by expert, which is what a grouped
@@ -330,16 +330,16 @@ class MoonEPDispatchCombineIntraNodeOp:
         turns that pass into a no-op reordering of an already-correct order,
         and lets the whole quantised experts path stay untouched.
 
-        Ids are **global pool rows**, identical on every rank: a home group maps
-        to its expert's row ``(e // epn) * epn_padded + e % epn`` and a migration
-        group to the prefetch tail at ``R * epn_padded + slot``.  That is what
-        lets one ``fused_moe`` span the whole ``[E + B]`` range instead of one
+        Ids are **global pool rows**: a home group maps to its expert's row
+        ``(e // epn) * row_stride + e % epn`` and a migration group to this
+        rank's prefetch slot at ``rank * row_stride + epn + slot``.  That is
+        what lets one ``fused_moe`` span every rank's experts instead of one
         call per weight slab.
 
-        ``experts_per_rank_padded`` comes from the weight pool
-        (``MoonEPWeightPool.epn_padded``); it equals ``epn`` unless the VMM
-        granularity forced the per-rank group to be padded, which it does not on
-        gfx950.  Defaulting to ``epn`` keeps callers that hold no pool working.
+        ``row_stride`` comes from the weight pool (``MoonEPWeightPool.stride``);
+        it equals ``epn + B`` unless the VMM granularity forced the per-rank
+        segment to be padded, which it does not on gfx950.  Defaulting to
+        ``epn + B`` keeps callers that hold no pool working.
 
         ``searchsorted`` rather than ``repeat_interleave`` because the latter
         needs the row total on the host, and a device sync per MoE layer would
@@ -350,13 +350,13 @@ class MoonEPDispatchCombineIntraNodeOp:
         cu = plan.cu_seqlens
         e = self.cfg.num_experts
         epn = self.cfg.num_experts_per_rank
-        epp = experts_per_rank_padded or epn
-        world = e // epn
+        stride = row_stride or (epn + int(self.plan_config.prefetch_slots))
         g = cu.numel()
         gidx = torch.arange(g, device=cu.device, dtype=torch.int32)
         gid = plan.group_expert_ids.to(torch.int32)
-        home_row = (gid // epn) * epp + (gid % epn)
-        slot = torch.where(gidx < e, home_row, world * epp + (gidx - e))
+        home_row = (gid // epn) * stride + (gid % epn)
+        prefetch_row = self.cfg.rank * stride + epn + (gidx - e)
+        slot = torch.where(gidx < e, home_row, prefetch_row)
         rows = torch.arange(
             self._act_cfg.num_dispatch_rows, device=cu.device, dtype=torch.int32
         )
