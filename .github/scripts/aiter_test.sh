@@ -125,20 +125,6 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
-        op_tests/test_pa_ps.py)
-            test_cmd=(
-                timeout 60m
-                bash -c '
-                    set -euo pipefail
-                    python3 "$1"
-                    python3 -m pytest -q op_tests/triton_tests/attention/test_pa_ps_metadata.py
-                '
-                _ "$file"
-            )
-            ;;
-        op_tests/test_pa_ps_reduce_dispatch.py)
-            test_cmd=(timeout 60m python3 -m pytest -q "$file")
-            ;;
         op_tests/test_flydsl_pa_decode.py)
             # The CLI sweep is separate from the compact parametrized regression.
             test_cmd=(
