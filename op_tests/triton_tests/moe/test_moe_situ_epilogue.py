@@ -4,19 +4,14 @@
 import pytest
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.moe.moe_situ_epilogue import (
     moe_situ_epilogue,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def _gfx950_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return get_gfx_runtime() == "gfx950"
-    except (AssertionError, KeyError, RuntimeError):
-        return False
+    return torch.cuda.is_available() and get_arch() == "gfx950"
 
 
 pytestmark = pytest.mark.skipif(
