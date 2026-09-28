@@ -5,6 +5,7 @@
 
 import functools
 import os
+from typing import NamedTuple
 
 import torch
 import triton
@@ -357,6 +358,100 @@ def get_meta_param(
     )
 
     return num_kv_splits, num_kv_splits_indptr
+
+
+# Per-arch v4 nm decode latency model used to pick `num_kv_splits`:
+#
+#   t(i) ~= L + W(i) * (C + A * kv_len / i) + [i > 1] * (S + D * num_seqs * i)
+#   W(i)  = ceil(num_seqs * tg_factor * i / cu_num)   (workgroup waves)
+#
+# A is the per-token KV cost of one workgroup, C the per-wave fixed cost, and
+# S + D * num_seqs * i the FP32 partial write + stage-2 merge that every split
+# launch pays. The occupancy-only pick (ignore_total_kv=1) instead rewards
+# filling whole multiples of cu_num, e.g. 13-16 splits for 49-119 seqs whose KV
+# fits one wave.
+#
+# gfx950: least-squares fit (relative error) on MI355X, gqa=128, qSeqLen=1,
+# CUDA-graph replay, 1..16 splits over uniform-KV shapes (7..448 seqs, kv_len
+# 192..8320). Archs without an entry keep the occupancy-only pick.
+_V4_NM_SPLIT_COST = {
+    "gfx950": (12.74, 3.21, 0.0300, 3.38, 0.076),  # L, C, A, S, D (us)
+}
+_V4_NM_MAX_SPLITS = 16
+
+
+class MlaV4NmSplitPlan(NamedTuple):
+    """KV split plan for `mla_decode_fwd_v4_nm`; the fields are its kwargs."""
+
+    num_kv_splits: int
+    split_indptr: torch.Tensor
+
+
+@functools.lru_cache(maxsize=1024)
+def _v4_nm_pick_num_kv_splits(cost, num_seqs, tg_factor, kv_len, cu_num):
+    """Split count minimizing the latency model above with coefficients `cost`."""
+    L, C, A, S, D = cost
+    kv_len = max(1, kv_len)
+    best_cost, best_splits = None, 1
+    for i in range(1, _V4_NM_MAX_SPLITS + 1):
+        waves = -(-num_seqs * tg_factor * i // cu_num)
+        t = L + waves * (C + A * kv_len / i)
+        if i > 1:
+            t += S + D * num_seqs * i
+        if best_cost is None or t < best_cost:
+            best_cost, best_splits = t, i
+    return best_splits
+
+
+def get_mla_v4_nm_split_plan(
+    num_seqs, num_heads, kv_len, *, split_indptr=None, device="cuda"
+) -> MlaV4NmSplitPlan:
+    """KV split plan for `mla_decode_fwd_v4_nm`.
+
+    `num_seqs` / `num_heads` are the decode call's `qo_indptr.shape[0] - 1`
+    and `q.size(1)`; `kv_len` is the per-seq KV length to plan for (the
+    longest one the call can see). The split count minimizes the latency
+    model above where the arch has coefficients, and is the wrapper's own
+    occupancy-only pick elsewhere.
+
+    The split count is a host int that depends only on these arguments, and
+    `split_indptr` is the uniform `[0, s, 2s, ..., num_seqs * s]`. Pass a
+    persistent int32 `split_indptr` of at least `num_seqs + 1` entries to have
+    it filled in place (one device launch, no host sync): CUDA-graph callers
+    keep the buffer alive across replays and rebuild the plan with the same
+    arguments before each replay. Pass the plan on as
+    `mla_decode_fwd_v4_nm(..., **plan._asdict())`.
+    """
+    tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+    cost = _V4_NM_SPLIT_COST.get(get_gfx())
+    if cost is not None:
+        num_kv_splits = _v4_nm_pick_num_kv_splits(
+            cost, num_seqs, tg_factor, int(kv_len), get_cu_num()
+        )
+    else:
+        num_kv_splits, _ = get_meta_param(
+            None,
+            num_seqs,
+            num_seqs * max(1, int(kv_len)),
+            num_heads,
+            1,
+            dtypes.fp8,
+            tg_factor,
+            1,  # ignore_total_kv, as in mla_decode_fwd_v4_nm
+        )
+    if split_indptr is None:
+        split_indptr = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    else:
+        split_indptr = split_indptr[: num_seqs + 1]
+    torch.arange(
+        0,
+        (num_seqs + 1) * num_kv_splits,
+        num_kv_splits,
+        dtype=torch.int32,
+        device=split_indptr.device,
+        out=split_indptr,
+    )
+    return MlaV4NmSplitPlan(num_kv_splits, split_indptr)
 
 
 # Persistent MLA-decode kernel gate: the persistent kernel
@@ -1703,6 +1798,10 @@ def mla_decode_fwd_v4_nm(
       for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
+      Callers that know their per-seq KV length (and CUDA-graph callers,
+      whose `kv_page_indices` is typically capacity-sized) should build a
+      plan with `get_mla_v4_nm_split_plan` and pass it as
+      `**plan._asdict()`.
 
     Multi-pass mode (`num_kv_splits > 1`):
       1. If `split_indptr` is None, build a uniform one:
@@ -1921,7 +2020,12 @@ def mla_decode_fwd_v4_nm(
             0,  # stride_lse_bs (unused, HAS_FINAL_LSE=False)
             page_size=1,  # v4 nm KV cache is page_size=1
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
-            MAYBE_FINAL_OUT=True,
+            # The kernel only writes the packed-BF16 result in place when
+            # num_kv_splits == 1, which never reaches this merge. A
+            # caller-supplied split_indptr with one split per seq on a wider
+            # grid still gets FP32 partials, so the in-place copy (keyed on
+            # split_indptr[-1] == num_seqs) must stay off.
+            MAYBE_FINAL_OUT=False,
             HAS_FINAL_LSE=False,
             USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
             BATCH_NUM=num_seqs,

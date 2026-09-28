@@ -17,7 +17,7 @@ import torch
 import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1023,9 @@ def test_v4_nm_accuracy_and_perf():
     _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
 
 
-def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
+def _run_varlen_point(
+    kv_lens, gqa_ratio=128, seed=0, attn_sink=True, split_kwargs=None
+):
     """Accuracy at a RAGGED (per-seq variable kv_len) decode shape with
     auto-split (num_kv_splits=None).
 
@@ -1094,12 +1096,11 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
         kv_last_page_lens=kv_last_page_lens,
-        split_indptr=None,
         max_seqlen_q=1,
         sink=sink,
         sm_scale=sm_scale,
         out_16_nosplit=0,
-        num_kv_splits=None,
+        **(split_kwargs or {"split_indptr": None, "num_kv_splits": None}),
     )
     # Single/multi-split output contract (see ATOM paged_decode.py:986): the
     # merged result lands in `output` for resolved splits > 1; the single-pass
@@ -1111,7 +1112,7 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         f"\n[v4 nm varlen] gqa={gqa} kv_lens={kv_lens} total_kv={total_kv} "
         f"resolved_splits={resolved}"
     )
-    checkAllclose(
+    err = checkAllclose(
         out_ref.float(),
         out_asm,
         rtol=3e-2,
@@ -1119,6 +1120,7 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         tol_err_ratio=0.02,
         msg=f"mla_v4_nm varlen [fp8_dequant_ref vs asm] kv_lens={kv_lens}",
     )
+    return float(err or 0), out_asm
 
 
 @needs_gfx950
@@ -1139,6 +1141,162 @@ def test_v4_nm_varlen_ragged_kv_tail_split_guard():
     _run_varlen_point([516, 516, 516, 516])  # uniform max (split=16, ~32/split)
     _run_varlen_point([500, 250, 100, 40])  # more extreme ragged
     _run_varlen_point([66, 50, 40, 33])  # all-short
+
+
+@pytest.mark.parametrize(
+    "num_seqs,kv_len,expected",
+    [
+        # One wave of workgroups: split only when KV is long enough to pay
+        # for the partial write + stage-2 merge.
+        (7, 1152, 8),
+        (7, 384, 5),
+        (35, 1152, 3),
+        (56, 1152, 2),
+        # 49..119 seqs with short KV: the occupancy-only pick chose 13-16
+        # splits (5-14 waves) here and ran 3-7x slower than one split.
+        (49, 384, 1),
+        (119, 384, 1),
+        (126, 1152, 1),
+        # Past one wave, long KV still splits to even out the tail wave.
+        (140, 8320, 4),
+    ],
+)
+def test_v4_nm_split_planner_picks(num_seqs, kv_len, expected):
+    cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
+    assert (
+        aiter.mla._v4_nm_pick_num_kv_splits(cost, num_seqs, 2, kv_len, 256) == expected
+    )
+
+
+@needs_gfx950
+def test_v4_nm_split_plan_fills_buffer_in_place():
+    buf = torch.full((10,), -1, dtype=torch.int32, device="cuda")
+    plan = aiter.mla.get_mla_v4_nm_split_plan(7, 128, 1152, split_indptr=buf)
+    cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
+    assert plan.num_kv_splits == aiter.mla._v4_nm_pick_num_kv_splits(
+        cost, 7, 2, 1152, get_cu_num()
+    )
+    assert plan.split_indptr.data_ptr() == buf.data_ptr()
+    assert buf.tolist() == [i * plan.num_kv_splits for i in range(8)] + [-1, -1]
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "kv_lens,kv_len",
+    [
+        ([1152, 900, 64, 1152], 1152),  # planned for the longest seq
+        ([8320, 200], 8320),
+        ([100, 60, 128], 128),  # short, window-sized KV
+    ],
+)
+def test_v4_nm_split_plan_accuracy(kv_lens, kv_len):
+    plan = aiter.mla.get_mla_v4_nm_split_plan(len(kv_lens), 128, kv_len)
+    err, out = _run_varlen_point(kv_lens, split_kwargs=plan._asdict())
+    assert torch.isfinite(out).all()
+    assert err < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_split_plan_cudagraph_replay():
+    """Plan built once into a persistent buffer, captured, then replayed with
+    different per-seq KV lengths written into the same kv_indptr."""
+    device, gqa, n, kv_cap = "cuda", 128, 14, 1152
+    torch.manual_seed(0)
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    qp, qr = _native_to_2buff_for_asm(
+        torch.randn(n, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+    )
+    kp, kr = _native_to_2buff_for_asm(
+        torch.randn(
+            n * kv_cap,
+            PAGE_SIZE,
+            NUM_KV_HEADS,
+            _QUANT_D,
+            dtype=dtypes.bf16,
+            device=device,
+        )
+    )
+    qr, kr = qr.contiguous(), kr.contiguous()
+    sink = torch.randn(gqa, dtype=torch.float32, device=device)
+    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    kv_page_indices = torch.randperm(n * kv_cap, device=device).to(torch.int32)
+    kv_last_page_lens = torch.ones(n, dtype=torch.int32, device=device)
+    output = torch.empty((n, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+    split_buf = torch.empty(n + 1, dtype=torch.int32, device=device)
+
+    def set_lens(lens):
+        kv_indptr.copy_(torch.tensor([0] + np.cumsum(lens).tolist(), dtype=torch.int32))
+
+    plan = aiter.mla.get_mla_v4_nm_split_plan(n, gqa, kv_cap, split_indptr=split_buf)
+    assert plan.num_kv_splits > 1  # exercise the stage-2 path under the graph
+
+    def run():
+        aiter.mla.mla_decode_fwd_v4_nm(
+            qp,
+            qr,
+            kp,
+            kr,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            1,
+            sink=sink,
+            sm_scale=sm_scale,
+            **plan._asdict(),
+        )
+
+    set_lens([kv_cap] * n)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for lens in ([kv_cap] * n, [1 + 83 * i for i in range(n)], [64] * n):
+        set_lens(lens)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref, _ = _torch_attn_decode_fp8_dequant_ref(
+            qp,
+            qr,
+            kp,
+            kr,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            sm_scale,
+            attn_sink=sink,
+        )
+        assert torch.isfinite(output).all()
+        err = checkAllclose(
+            ref.float(),
+            output.float(),
+            rtol=3e-2,
+            atol=3e-2,
+            tol_err_ratio=0.02,
+            msg=f"mla_v4_nm split plan graph replay lens={lens[:3]}...",
+        )
+        assert float(err or 0) < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_one_split_per_seq_on_wide_grid():
+    """Every seq on one split while the grid has 4: the kernel still writes
+    FP32 partials, so the stage-2 merge must not take its in-place BF16 copy
+    (it used to, keyed on split_indptr[-1] == num_seqs, and returned NaN)."""
+    kv_lens = [384, 384, 384, 384]
+    split_indptr = torch.arange(len(kv_lens) + 1, dtype=torch.int32, device="cuda")
+    err, out = _run_varlen_point(
+        kv_lens, split_kwargs={"num_kv_splits": 4, "split_indptr": split_indptr}
+    )
+    assert torch.isfinite(out).all()
+    assert err < 0.02
 
 
 @needs_gfx950
