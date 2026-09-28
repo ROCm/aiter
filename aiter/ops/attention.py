@@ -365,6 +365,19 @@ def pa_ps_fwd_asm(
     kernelName: str | None = None,
     quant_type: Enum | None = QuantType.per_Token.value,
 ) -> torch.Tensor:
+    num_heads, num_kv_heads = Q.shape[1], K.shape[1]
+    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads:
+        raise ValueError(
+            "query/KV head counts must be positive and query heads divisible by KV heads"
+        )
+    if (
+        work_indptr is not None
+        and K.shape[3] == 16
+        and num_heads // num_kv_heads == 16
+        and K.dtype == Q.dtype
+        and mask != 1
+    ):
+        raise ValueError("page16 PS GQA16 noquant requires causal masking")
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_ps_fwd_asm(
         Q,
@@ -589,7 +602,8 @@ def pa_persistent_fwd(
     the reducer launch. With preallocated GPU maps, the reducer is launched
     and exits on the device when the reduction map end is zero; no metadata
     is read back to the host. Mixed batches still merge their partial rows.
-    Direct-output rows do not populate the returned final LSE.
+    The returned final LSE is valid only for reduced rows; direct-output
+    rows contain NaN because the forward kernel does not compute their LSE.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -605,7 +619,9 @@ def pa_persistent_fwd(
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.full(
+        (total_s, nhead), float("nan"), dtype=dtypes.fp32, device=device
+    )
 
     pa_ps_fwd_asm(
         Q,
@@ -636,7 +652,8 @@ def pa_persistent_fwd(
         and v_head_dim == 128
         and output.dtype in (dtypes.bf16, dtypes.fp16)
         and reduce_final_map is not None
-        and get_gfx() == "gfx950"
+        and torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+        == "gfx950"
     ):
         reduce_fn = _pa_ps_reduce_asm
     reduce_fn(
@@ -945,8 +962,15 @@ def mla_prefill_asm_fwd(
 def get_pa_metadata_info_v1(
     batch_size: int,
     num_head_k: int = 1,
+    *,
+    max_seqlen_qo: int = 1,
+    num_heads_per_head_k: int = 1,
 ):
     """
+    Size PA metadata for the maximum packed query length. Pass the same
+    max_seqlen_qo and num_heads_per_head_k as get_pa_metadata_v1 when queries
+    span multiple 128-element packed query tiles.
+
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -956,13 +980,16 @@ def get_pa_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
+    if batch_size < 0 or min(num_head_k, max_seqlen_qo, num_heads_per_head_k) < 1:
+        raise ValueError("batch must be nonnegative and query/head counts positive")
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
-    tile_cnt = batch_size
-    max_work = (tile_cnt + cu_num - 1) * num_head_k
-    max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
+    query_tiles = (max_seqlen_qo * num_heads_per_head_k + 127) // 128
+    tile_cnt = batch_size * query_tiles
+    max_work = (batch_size + cu_num - 1) * query_tiles * num_head_k
+    max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2) * query_tiles
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs

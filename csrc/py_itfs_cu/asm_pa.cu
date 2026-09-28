@@ -345,6 +345,8 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     int head_size       = Q->size(2);
     int num_kv_heads    = K->size(1);
     int block_size      = K->size(3);
+    AITER_CHECK(num_heads > 0 && num_kv_heads > 0 && num_heads % num_kv_heads == 0,
+                __func__, ": query/KV head counts must be positive and query heads divisible by KV heads");
     const int gqa_ratio = num_heads / num_kv_heads;
 
     int dim            = head_size;
@@ -468,6 +470,8 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
         AITER_CHECK(head_size == 128 && (gqa_ratio == 8 || gqa_ratio == 16) &&
                         max_qlen >= 1 && max_qlen <= 4,
                     __func__, ": page16 PS requires D128, GQA8/16 and query length 1..4");
+        AITER_CHECK(kv_type != q_type || gqa_ratio != 16 || mask == 1,
+                    __func__, ": page16 PS GQA16 noquant requires causal masking");
         gqa = gqa_ratio;
         mtp = (max_qlen > 2 || mask == 0) ? 1 : 0;
         if(kv_type == q_type && gqa_ratio == 16)

@@ -4,7 +4,9 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit(repr=make_kernel_repr("_pa_ps_tile_scan", ["BLOCK_SIZE", "num_warps"]))
+@triton.jit(
+    repr=make_kernel_repr("_pa_ps_tile_scan", ["NUM_SEQS", "BLOCK_SIZE", "num_warps"])
+)
 def _pa_ps_tile_scan(
     context_lengths,
     tile_prefix,
@@ -27,7 +29,10 @@ def _pa_ps_tile_scan(
             "NUM_SEQS",
             "NUM_GROUPS",
             "MAX_PARTS",
+            "MAX_QLEN",
             "WORK_OVERHEAD",
+            "NUM_CHUNKS",
+            "BLOCK_CHUNKS",
             "BLOCK_SIZE",
             "num_warps",
         ],
@@ -93,7 +98,11 @@ def _pa_ps_sequence_scan(
     tl.store(chunk_prefix + block * 3 + 2, tl.sum(costs, 0))
 
 
-@triton.jit(repr=make_kernel_repr("_pa_ps_chunk_scan", ["BLOCK_CHUNKS", "num_warps"]))
+@triton.jit(
+    repr=make_kernel_repr(
+        "_pa_ps_chunk_scan", ["NUM_CHUNKS", "BLOCK_CHUNKS", "num_warps"]
+    )
+)
 def _pa_ps_chunk_scan(
     chunk_prefix, NUM_CHUNKS: tl.constexpr, BLOCK_CHUNKS: tl.constexpr
 ):
@@ -118,7 +127,16 @@ def _pa_ps_sequence_prefix(
 @triton.jit(
     repr=make_kernel_repr(
         "_pa_ps_write_metadata",
-        ["NUM_HEADS", "GQA", "MAX_QLEN", "PAGE_SIZE", "BLOCK_PARTS", "num_warps"],
+        [
+            "NUM_CHUNKS",
+            "NUM_HEADS",
+            "GQA",
+            "MAX_QLEN",
+            "PAGE_SIZE",
+            "BLOCK_SIZE",
+            "BLOCK_PARTS",
+            "num_warps",
+        ],
     )
 )
 def _pa_ps_write_metadata(
@@ -202,7 +220,19 @@ def _pa_ps_write_metadata(
 @triton.jit(
     repr=make_kernel_repr(
         "_pa_ps_schedule",
-        ["NUM_SEQS", "NUM_CU", "NUM_GROUPS", "WORK_OVERHEAD", "BLOCK_CU", "num_warps"],
+        [
+            "NUM_SEQS",
+            "NUM_CU",
+            "NUM_GROUPS",
+            "NUM_CHUNKS",
+            "QUERY_PARALLEL",
+            "WORK_OVERHEAD",
+            "LOG_SEQS",
+            "LOG_PARTS",
+            "BLOCK_SIZE",
+            "BLOCK_CU",
+            "num_warps",
+        ],
     )
 )
 def _pa_ps_schedule(

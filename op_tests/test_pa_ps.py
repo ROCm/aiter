@@ -13,7 +13,7 @@ import torch.profiler as tpf
 import aiter
 from aiter import dtypes, pertoken_quant
 from aiter.ops.enum import QuantType
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -455,6 +455,8 @@ def test_pa_ps(
     kv_dtype, mask = (aiter.dtypes.fp8, 1) if test_case is None else test_case
     if test_case is not None:
         quant_type = QuantType.No if kv_dtype == dtype else QuantType.per_Token
+    ret["kv_dtype"] = str(kv_dtype)
+    ret["mask"] = mask
 
     assert num_query_heads % num_kv_heads == 0
 
@@ -573,7 +575,12 @@ def test_pa_ps(
         (reduce_indptr_size, reduce_indptr_type),
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
-    ) = aiter.get_pa_metadata_info_v1(batch_size, num_kv_heads)
+    ) = aiter.get_pa_metadata_info_v1(
+        batch_size,
+        num_kv_heads,
+        max_seqlen_qo=int(max_qlen),
+        num_heads_per_head_k=num_query_heads // num_kv_heads,
+    )
     work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
     work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
@@ -876,7 +883,7 @@ def test_pa_ps(
         assert torch.isfinite(
             output
         ).all(), f"Non-finite output: {kv_dtype}, mask={mask}"
-        assert err == 0, f"Accuracy check failed: {kv_dtype}, mask={mask} ({err})"
+        assertAllclose(out_ref, output, msg=f"{kv_dtype}, mask={mask}")
         ret["err"] = ret.pop("err fp8")
         if "us_asm_fp8" in ret:
             ret["us_asm"] = ret.pop("us_asm_fp8")
@@ -905,7 +912,7 @@ parser.add_argument(
     "--num_heads",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(10, 1), (16, 2)],
+    default=None,
     help="""Number of heads.
     e.g. -n 8,1""",
 )
@@ -1005,6 +1012,11 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+if args.num_heads is None:
+    args.num_heads = [(16, 2), (32, 2)] if 16 in args.block_size else [(10, 1), (16, 2)]
+if args.mask == 0 and any(block_size != 16 for block_size in args.block_size):
+    parser.error("--mask 0 requires --block_size 16")
+
 # Convert string to QuantType enum
 quant_type_map = {
     "per_Token": QuantType.per_Token,
@@ -1038,8 +1050,6 @@ for dtype in args.dtype:
                     "The page16 PS matrix requires BF16/FP16, GQA8/16 and query length 1..4"
                 )
             kv_dtypes = [dtype, aiter.dtypes.fp8, torch.int8]
-            if qlen > 2 and num_heads[0] // num_heads[1] == 16:
-                kv_dtypes = [aiter.dtypes.fp8, torch.int8]
             test_cases = [
                 (kv_dtype, mask)
                 for kv_dtype in kv_dtypes
@@ -1047,6 +1057,11 @@ for dtype in args.dtype:
                     [args.mask]
                     if args.mask is not None
                     else ([0, 1] if qlen > 2 else [1])
+                )
+                if not (
+                    kv_dtype == dtype
+                    and num_heads[0] // num_heads[1] == 16
+                    and mask == 0
                 )
             ]
         if args.kv_dtype is not None:
