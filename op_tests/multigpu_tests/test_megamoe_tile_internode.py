@@ -78,7 +78,7 @@ FUSED_BEST_ENV = {
     "MEGAMOE_TK_S1_KERNEL_SPLIT": "0",
     "MEGAMOE_TK_S1_GATE_SLEEP": "127",
     "MEGAMOE_TK_S1_EARLY_LOCAL_GMM": "1",
-    "MEGAMOE_TK_S1_FAN2_SHARDS": "8",
+    "MEGAMOE_TK_S1_FAN2_SHARDS": "16",
     "MEGAMOE_TK_S1_COMPUTE_FIRST": "8",
     "MEGAMOE_TK_GMM1_LDS_SCOPES": "1",
     "MEGAMOE_TK_GMM1_EPI_SWZ": "1",
@@ -90,7 +90,7 @@ FUSED_BEST_ENV = {
 FUSED_BEST_STAGE1_FRAGMENTS = (
     "_widewait", "_widefan", "_cf8", "_f1d", "_t0nf", "_cra", "_soa4", "_pcta",
     "_gb", "_asg", "_pofft0", "_sck2", "_gp2", "_mo1", "_slg", "_h1p",
-    "_gs127", "_elg", "_f2s8", "_tg4", "_expertmajor", "_fos32", "_defrecv",
+    "_gs127", "_elg", "_f2s16", "_tg4", "_expertmajor", "_fos32", "_defrecv",
     "_hoistwait", "_lsc_nfb", "_esw", "_nxc2", "_pnf",
 )
 
