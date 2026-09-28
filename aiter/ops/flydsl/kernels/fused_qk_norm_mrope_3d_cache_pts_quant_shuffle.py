@@ -208,6 +208,18 @@ def _build_q_kernel(
             (RMS_GROUP, PROD_VEC_SIZE), stride=(PROD_VEC_SIZE, 1)
         )
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
+        # Q lanes own contiguous RMS vectors, but their NEOX outputs are
+        # ordered by (lane-within-half, lane-half, pair, rotary-half).
+        layout_q_lane = fx.make_layout(
+            (PARTNER_XOR, 2), stride=(1, PARTNER_XOR)
+        )
+        layout_q_pair_tv = fx.make_layout(
+            ((PARTNER_XOR, 2), (PAIRS_PER_LANE, 2)),
+            stride=((PROD_VEC_SIZE, PAIRS_PER_LANE), (1, HALF)),
+        )
+        layout_q_pair_cols = fx.slice(
+            layout_q_pair_tv, (None, (None, 0))
+        )
         # [iteration, warp, row-within-wave] is the warp-value tiling of the
         # heads owned by one workgroup.
         layout_head_wv = fx.make_layout(
@@ -215,6 +227,10 @@ def _build_q_kernel(
             stride=(waves_per_block * ROWS_PER_WAVE, ROWS_PER_WAVE, 1),
         )
         qkv_rms_view = fx.composition(qkv, fx.make_tile(None, None, layout_rms_tv))
+        weight_pair_view = fx.composition(q_norm_w, layout_q_pair_tv)
+        q_out_pair_view = fx.composition(
+            q_out, fx.make_tile(None, None, layout_q_pair_tv)
+        )
         copy_rms = fx.make_copy_atom(
             fx.UniversalCopy(PROD_VEC_SIZE * fx.BFloat16.width), fx.BFloat16
         )
@@ -229,15 +245,20 @@ def _build_q_kernel(
         row_in_wave = lane // RMS_GROUP
 
         is_low = rl < PARTNER_XOR
-        pair_base = (rl % PARTNER_XOR) * PROD_VEC_SIZE + is_low.select(
-            fx.Int32(0), fx.Int32(PAIRS_PER_LANE)
+        q_lane_coord = fx.idx2crd(rl, layout_q_lane)
+        lane_value_coord = (q_lane_coord, None)
+        w_lane_pairs = fx.slice(weight_pair_view, lane_value_coord)
+        q_out_lane_pairs = fx.slice(
+            q_out_pair_view, (None, None, lane_value_coord)
         )
 
         # Head-independent work, hoisted out of the head loop: every head of
         # this token shares the same mrope cos/sin gather and norm weights.
-        cols, cos_vs, sin_vs, w0s, w1s = [], [], [], [], []
+        cos_vs, sin_vs, w0s, w1s = [], [], [], []
         for p in range_constexpr(PAIRS_PER_LANE):
-            col = pair_base + p
+            col = fx.Int32(
+                fx.crd2idx((q_lane_coord, p), layout_q_pair_cols).unpack()
+            )
             cos_v, sin_v = mrope_cos_sin(
                 col,
                 tok,
@@ -247,11 +268,10 @@ def _build_q_kernel(
                 mrope_section,
                 is_interleaved,
             )
-            cols.append(col)
             cos_vs.append(cos_v)
             sin_vs.append(sin_v)
-            w0 = fx.Float32(q_norm_w[col])
-            w1 = fx.Float32(q_norm_w[col + HALF])
+            w0 = fx.Float32(w_lane_pairs[p, 0])
+            w1 = fx.Float32(w_lane_pairs[p, 1])
             if const_expr(gemma_norm):
                 w0 = w0 + 1.0
                 w1 = w1 + 1.0
@@ -260,6 +280,7 @@ def _build_q_kernel(
 
         def compute_head(head):
             rms_tile = fx.slice(qkv_rms_view, (tok, head, (rl, None)))
+            out_pairs = fx.slice(q_out_lane_pairs, (tok, head, None))
             rms_reg = fx.make_rmem_tensor(layout_rms_values, fx.BFloat16)
             fx.copy_atom_call(copy_rms, rms_tile, rms_reg)
             own = rms_reg.load().to(fx.Float32)
@@ -284,8 +305,8 @@ def _build_q_kernel(
                 xn1 = x1 * rstd * w1s[p]
                 o0 = xn0 * cos_vs[p] - xn1 * sin_vs[p]
                 o1 = xn1 * cos_vs[p] + xn0 * sin_vs[p]
-                q_out[tok, head, cols[p]] = o0.to(fx.BFloat16)
-                q_out[tok, head, cols[p] + HALF] = o1.to(fx.BFloat16)
+                out_pairs[p, 0] = o0.to(fx.BFloat16)
+                out_pairs[p, 1] = o1.to(fx.BFloat16)
 
         for i in range_constexpr(head_iters):
             # Waves of a block sit on adjacent heads at every step, so their
@@ -606,6 +627,19 @@ def _build_kv_kernel(
         w_lane_pairs = fx.slice(weight_pair_view, lane_coord)
         k_lds_lane_pairs = fx.slice(k_lds_pair_view, (None, lane_coord))
         v_lds_lane_pairs = fx.slice(v_lds_pair_view, (None, lane_coord))
+        pair_cols, w0s, w1s = [], [], []
+        for p in range_constexpr(PAIRS_PER_LANE):
+            col = fx.Int32(
+                fx.crd2idx((pair_lane, p), layout_pair_lane).unpack()
+            )
+            w0 = fx.Float32(w_lane_pairs[p, 0])
+            w1 = fx.Float32(w_lane_pairs[p, 1])
+            if const_expr(gemma_norm):
+                w0 = w0 + 1.0
+                w1 = w1 + 1.0
+            pair_cols.append(col)
+            w0s.append(w0)
+            w1s.append(w1)
         if const_expr(emit_flat_kv):
             k_out_pair_view = fx.composition(
                 k_out, fx.make_tile(None, None, layout_pair_tv)
@@ -658,22 +692,14 @@ def _build_kv_kernel(
                         else None
                     )
                     for p in range_constexpr(PAIRS_PER_LANE):
-                        col = fx.Int32(
-                            fx.crd2idx((pair_lane, p), layout_pair_lane).unpack()
-                        )
                         k0 = fx.Float32(k_pairs[p, 0])
                         k1 = fx.Float32(k_pairs[p, 1])
-                        w0 = fx.Float32(w_lane_pairs[p, 0])
-                        w1 = fx.Float32(w_lane_pairs[p, 1])
-                        if const_expr(gemma_norm):
-                            w0 = w0 + 1.0
-                            w1 = w1 + 1.0
 
-                        xn0 = k0 * rstd * w0
-                        xn1 = k1 * rstd * w1
+                        xn0 = k0 * rstd * w0s[p]
+                        xn1 = k1 * rstd * w1s[p]
 
                         cos_v, sin_v = mrope_cos_sin(
-                            col,
+                            pair_cols[p],
                             tok,
                             positions,
                             cos_t,
