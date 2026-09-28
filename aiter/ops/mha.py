@@ -3201,6 +3201,153 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
+def _flash_attn_varlen_forward_functional_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor | None,
+    cu_seqlens_k_padded: torch.Tensor | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    logits_soft_cap: float,
+    window_size_left: int,
+    window_size_right: int,
+    sink_size: int,
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    return_lse: bool,
+    return_softmax: bool,
+    how_v3_bf16_cvt: int | None,
+    block_table: torch.Tensor | None,
+    zero_tensors: bool,
+    sink_ptr: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    out, softmax_lse, dropout_randval, rng_state = gen_mha_varlen_fwd_fake_tensor(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        min_seqlen_q,
+        dropout_p,
+        softmax_scale,
+        logits_soft_cap,
+        zero_tensors,
+        causal,
+        window_size_left,
+        window_size_right,
+        sink_size,
+        return_lse,
+        return_softmax,
+        out=None,
+        block_table=block_table,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
+        sink_ptr=sink_ptr,
+    )
+    # Dropout is off on this path, so the mask is an unused placeholder. Backends
+    # disagree on its dtype (CK/ASM hand back q.dtype, OPUS/gfx1250 fp32); the runtime
+    # wrapper pins it to the empty fp32 tensor modelled here.
+    dropout_randval = torch.empty((0,), dtype=torch.float32, device=q.device)
+    return out, softmax_lse, dropout_randval, rng_state
+
+
+@torch_compile_guard(
+    mutates_args=[],
+    device="cuda",
+    gen_fake=_flash_attn_varlen_forward_functional_fake,
+)
+def _flash_attn_varlen_forward_functional(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor | None,
+    cu_seqlens_k_padded: torch.Tensor | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    logits_soft_cap: float,
+    window_size_left: int,
+    window_size_right: int,
+    sink_size: int,
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    return_lse: bool,
+    return_softmax: bool,
+    how_v3_bf16_cvt: int | None,
+    block_table: torch.Tensor | None,
+    zero_tensors: bool,
+    sink_ptr: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    # The op is registered without torch.Tag.nondeterministic_seeded, so it must not
+    # consume RNG; FlashAttnVarlenFunc.forward only routes dropout-free calls here.
+    assert dropout_p == 0.0, "functional varlen forward requires dropout_p == 0"
+    out, softmax_lse, dropout_randval, rng_state = _flash_attn_varlen_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_padded,
+        cu_seqlens_k_padded,
+        max_seqlen_q,
+        max_seqlen_k,
+        min_seqlen_q,
+        dropout_p,
+        softmax_scale,
+        causal,
+        logits_soft_cap,
+        window_size_left,
+        window_size_right,
+        sink_size,
+        bias,
+        alibi_slopes,
+        q_descale,
+        k_descale,
+        v_descale,
+        return_lse,
+        return_softmax,
+        how_v3_bf16_cvt,
+        block_table,
+        out=None,
+        zero_tensors=zero_tensors,
+        sink_ptr=sink_ptr,
+    )
+    # Without dropout the kernels never fill rng_state, and the unused dropout mask
+    # comes back with a backend-dependent dtype. Pin both so the op's outputs match
+    # its fake and never expose uninitialized memory. The gfx1250 ASM path likewise
+    # always produces an LSE, so drop it when the caller did not ask for one.
+    rng_state.zero_()
+    dropout_randval = torch.empty((0,), dtype=torch.float32, device=q.device)
+    if not return_lse:
+        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+    return out, softmax_lse, dropout_randval, rng_state
+
+
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -3493,7 +3640,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+        forward_args = (
             q,
             k,
             v,
@@ -3506,23 +3653,50 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             min_seqlen_q,
             dropout_p,
             softmax_scale,
-            causal=causal,
-            logits_soft_cap=logits_soft_cap,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            sink_size=window_size[2] if len(window_size) > 2 else 0,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            return_lse=return_lse,
-            return_softmax=return_softmax and dropout_p > 0,
-            how_v3_bf16_cvt=how_v3_bf16_cvt,
-            block_table=block_table,
-            out=out,
-            sink_ptr=sink_ptr,
         )
+        forward_kwargs = {
+            "causal": causal,
+            "logits_soft_cap": logits_soft_cap,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
+            "sink_size": window_size[2] if len(window_size) > 2 else 0,
+            "bias": bias,
+            "alibi_slopes": alibi_slopes,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+            "return_lse": return_lse,
+            "return_softmax": return_softmax and dropout_p > 0,
+            "how_v3_bf16_cvt": how_v3_bf16_cvt,
+            "block_table": block_table,
+            "zero_tensors": False,
+            "sink_ptr": sink_ptr,
+        }
+        # The functional op exists so dropout-free inference can be captured in a CUDA
+        # graph; everything else keeps the in-place forward. Dropout would consume RNG
+        # the op is not registered as nondeterministic-seeded to consume, backward
+        # gains nothing because it writes dq/dk/dv in place, and padded cu_seqlens are
+        # validated by a host-side read that a capturing graph forbids.
+        capturable_inference = (
+            out is None
+            and dropout_p == 0.0
+            and not is_grad
+            and cu_seqlens_q_padded is None
+            and cu_seqlens_k_padded is None
+        )
+        if capturable_inference:
+            out_padded, softmax_lse, S_dmask, rng_state = (
+                _flash_attn_varlen_forward_functional(
+                    *forward_args,
+                    **forward_kwargs,
+                )
+            )
+        else:
+            out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+                *forward_args,
+                out=out,
+                **forward_kwargs,
+            )
         if is_grad:
             assert return_lse
             ctx.save_for_backward(

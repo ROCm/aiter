@@ -657,6 +657,212 @@ def flash_attn_varlen_func_benchmark(
     )
 
 
+def _skip_unless_varlen_fwd_device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    if get_gfx() not in ("gfx942", "gfx950"):
+        pytest.skip("varlen forward paths under test are gfx942/gfx950")
+
+
+def _cumulative_seqlens(lens):
+    return torch.nn.functional.pad(
+        torch.tensor(lens, dtype=torch.int32, device="cuda").cumsum(
+            0, dtype=torch.int32
+        ),
+        (1, 0),
+    )
+
+
+def _clone_result(result):
+    if isinstance(result, torch.Tensor):
+        return result.clone()
+    return tuple(t.clone() for t in result)
+
+
+def _compile_and_replay(fn, inputs, *, fullgraph, require_cudagraphs):
+    """Compile fn with CUDA graphs on and call it once per set of inputs.
+
+    cudagraph trees warms up on the first call and records on the second, so at least
+    three sets of inputs are needed for a call to replay a recorded graph. Results live
+    in the cudagraph memory pool and are overwritten by the next call, so they are
+    copied out before the next one. With require_cudagraphs, a region that cannot be
+    captured raises instead of silently falling back.
+    """
+    cfg = torch._inductor.config.triton
+    saved = (cfg.cudagraphs, cfg.cudagraph_trees, cfg.cudagraph_or_error)
+    torch.compiler.reset()
+    try:
+        cfg.cudagraphs = True
+        cfg.cudagraph_trees = True
+        cfg.cudagraph_or_error = require_cudagraphs
+        compiled = torch.compile(fn, fullgraph=fullgraph)
+        results = [_clone_result(compiled(*args)) for args in inputs]
+        torch.cuda.synchronize()
+        return results
+    finally:
+        cfg.cudagraphs, cfg.cudagraph_trees, cfg.cudagraph_or_error = saved
+        torch.compiler.reset()
+
+
+# Every backend the functional forward can reach must be capturable. bf16 head-dim 128
+# takes the fmha v3 varlen path, fp16 fails v3's bf16 gate and lands on the CK fallback,
+# and bf16 D_QK=192 / D_V=128 is claimed by OPUS on gfx950. return_lse=False also covers
+# the branch that discards an LSE the caller did not ask for, which the gfx1250 ASM path
+# produces regardless; that backend itself needs hardware this test cannot assume.
+@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize(
+    "dtype, headdim_q, headdim_v",
+    [(dtypes.bf16, 128, 128), (dtypes.fp16, 128, 128), (dtypes.bf16, 192, 128)],
+)
+def test_flash_attn_varlen_func_without_out_is_cudagraph_capturable(
+    dtype, headdim_q, headdim_v, return_lse
+):
+    """Dropout-free varlen inference without out= is CUDA-graph capturable."""
+    _skip_unless_varlen_fwd_device()
+
+    torch.random.manual_seed(0)
+    batch, seqlen, nheads = 2, 32, 4
+    total = batch * seqlen
+    cu_seqlens = _cumulative_seqlens([seqlen] * batch)
+
+    def attn(q, k, v, cu):
+        return aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=seqlen,
+            max_seqlen_k=seqlen,
+            dropout_p=0.0,
+            causal=False,
+            return_lse=return_lse,
+        )
+
+    def randn(headdim):
+        return torch.randn(total, nheads, headdim, device="cuda", dtype=dtype)
+
+    inputs = [
+        (randn(headdim_q), randn(headdim_q), randn(headdim_v), cu_seqlens)
+        for _ in range(3)
+    ]
+    expected = [attn(*args) for args in inputs]
+    actual = _compile_and_replay(attn, inputs, fullgraph=True, require_cudagraphs=True)
+
+    for result, reference in zip(actual, expected):
+        if return_lse:
+            out, lse = result
+            out_ref, lse_ref = reference
+            assert lse.shape == (nheads, total)
+            torch.testing.assert_close(lse, lse_ref, atol=0, rtol=0)
+        else:
+            assert isinstance(result, torch.Tensor), "return_lse=False returns out only"
+            out, out_ref = result, reference
+        assert out.shape == (total, nheads, headdim_v)
+        torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
+
+
+# Padded cu_seqlens are validated by reading cu_seqlens_*_padded[0] on the host, which
+# is an illegal synchronization inside a capturing graph, so these calls deliberately
+# keep the in-place forward and are never captured. The same host read breaks the graph,
+# so the call cannot be compiled with fullgraph; what matters is that it still compiles
+# and computes correctly instead of aborting a recording graph.
+def test_flash_attn_varlen_func_with_padded_cu_seqlens_compiles_without_capture():
+    """Padded varlen inference compiles and matches eager, without being captured."""
+    _skip_unless_varlen_fwd_device()
+
+    torch.random.manual_seed(0)
+    nheads, headdim = 4, 128
+    padded_seqlens = [32, 32]
+    seqlens = [24, 16]
+    total = sum(padded_seqlens)
+    cu_seqlens = _cumulative_seqlens(seqlens)
+    cu_seqlens_padded = _cumulative_seqlens(padded_seqlens)
+
+    def attn(q, k, v, cu):
+        return aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            causal=False,
+            return_lse=True,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_k_padded=cu_seqlens_padded,
+        )
+
+    # fp16 closes the v3 and OPUS gates, so the padded offsets reach the CK fallback.
+    inputs = [
+        tuple(
+            torch.randn(total, nheads, headdim, device="cuda", dtype=dtypes.fp16)
+            for _ in range(3)
+        )
+        + (cu_seqlens,)
+        for _ in range(3)
+    ]
+    expected = [attn(*args) for args in inputs]
+    actual = _compile_and_replay(
+        attn, inputs, fullgraph=False, require_cudagraphs=False
+    )
+
+    # Rows past a batch entry's real length are physical padding that no kernel writes,
+    # so they hold whatever the fresh allocation contained and are not comparable.
+    real_rows = torch.zeros(total, dtype=torch.bool, device="cuda")
+    row = 0
+    for seqlen, padded_seqlen in zip(seqlens, padded_seqlens):
+        real_rows[row : row + seqlen] = True
+        row += padded_seqlen
+
+    for (out, lse), (out_ref, lse_ref) in zip(actual, expected):
+        assert out.shape == (total, nheads, headdim)
+        assert lse.shape == (nheads, total)
+        torch.testing.assert_close(out[real_rows], out_ref[real_rows], atol=0, rtol=0)
+        torch.testing.assert_close(
+            lse[:, real_rows], lse_ref[:, real_rows], atol=0, rtol=0
+        )
+
+
+def test_flash_attn_varlen_func_with_out_writes_in_place():
+    """Passing out= still fills that exact buffer, matching the allocating call."""
+    _skip_unless_varlen_fwd_device()
+
+    torch.random.manual_seed(0)
+    batch, seqlen, nheads, headdim = 2, 32, 4, 128
+    total = batch * seqlen
+    cu_seqlens = _cumulative_seqlens([seqlen] * batch)
+    q, k, v = (
+        torch.randn(total, nheads, headdim, device="cuda", dtype=dtypes.bf16)
+        for _ in range(3)
+    )
+
+    def attn(out):
+        return aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen_q=seqlen,
+            max_seqlen_k=seqlen,
+            dropout_p=0.0,
+            causal=False,
+            return_lse=True,
+            out=out,
+        )
+
+    preallocated = torch.empty_like(q)
+    out, lse = attn(preallocated)
+    out_ref, lse_ref = attn(None)
+
+    assert out.data_ptr() == preallocated.data_ptr()
+    torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
+    torch.testing.assert_close(lse, lse_ref, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
