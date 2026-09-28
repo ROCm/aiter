@@ -204,8 +204,8 @@ def _build_q_kernel(
                 fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
             )
         )
-        layout_rms_tv = fx.make_layout(
-            (RMS_GROUP, PROD_VEC_SIZE), stride=(PROD_VEC_SIZE, 1)
+        layout_rms_tv = fx.make_ordered_layout(
+            (RMS_GROUP, PROD_VEC_SIZE), (1, 0)
         )
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
         # Q lanes own contiguous RMS vectors, but their NEOX outputs are
@@ -222,9 +222,8 @@ def _build_q_kernel(
         )
         # [iteration, warp, row-within-wave] is the warp-value tiling of the
         # heads owned by one workgroup.
-        layout_head_wv = fx.make_layout(
-            (head_iters, waves_per_block, ROWS_PER_WAVE),
-            stride=(waves_per_block * ROWS_PER_WAVE, ROWS_PER_WAVE, 1),
+        layout_head_iter_wave_row = fx.make_ordered_layout(
+            (head_iters, waves_per_block, ROWS_PER_WAVE), (2, 1, 0)
         )
         qkv_rms_view = fx.composition(qkv, fx.make_tile(None, None, layout_rms_tv))
         weight_pair_view = fx.composition(q_norm_w, layout_q_pair_tv)
@@ -312,7 +311,7 @@ def _build_q_kernel(
             # Waves of a block sit on adjacent heads at every step, so their
             # concurrent loads stay within one contiguous qkv region.
             head_in_block = fx.crd2idx(
-                (i, wid, row_in_wave), layout_head_wv
+                (i, wid, row_in_wave), layout_head_iter_wave_row
             ).unpack()
             head = bid_head * HEADS_PER_BLOCK + fx.Int32(
                 head_in_block
@@ -477,20 +476,20 @@ def _build_kv_kernel(
         #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
         #  * NEOX pairs: active lanes own strided columns in [0, D/2), with
         #    [pair, half] kept as one value mode.
-        layout_rms_tv = fx.make_layout(
-            (RMS_GROUP, PROD_VEC_SIZE), stride=(PROD_VEC_SIZE, 1)
+        layout_rms_tv = fx.make_ordered_layout(
+            (RMS_GROUP, PROD_VEC_SIZE), (1, 0)
         )
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
         layout_pair_tv = fx.make_layout(
             (PAIR_LANES, (PAIRS_PER_LANE, 2)),
             stride=(1, (PAIR_LANES, HALF)),
         )
-        layout_pair_lane = fx.slice(layout_pair_tv, (None, (None, 0)))
-        layout_stage = fx.make_layout((block_size, D), stride=(D, 1))
+        layout_pair_cols = fx.slice(layout_pair_tv, (None, (None, 0)))
+        layout_stage = fx.make_ordered_layout((block_size, D), (1, 0))
         layout_run = fx.make_layout(x, stride=1)
         # Group D or the token axis of layout_stage into x-runs.
-        layout_d_runs = fx.make_layout((D // x, x), stride=(x, 1))
-        layout_token_runs = fx.make_layout((block_size // x, x), stride=(x, 1))
+        layout_d_runs = fx.make_ordered_layout((D // x, x), (1, 0))
+        layout_token_runs = fx.make_ordered_layout((block_size // x, x), (1, 0))
         # Keep each physical x-run nested inside its logical D/token mode and
         # encode the possibly-strided physical block mode in the same view.
         # K is indexed as [block, head, d, token], and V as
@@ -617,11 +616,13 @@ def _build_kv_kernel(
 
         # Partition phase-1 tensors by their RMS and NEOX-pair ownership,
         # then retain only this thread's pair lane across all token rows.
+        pair_tile_3d = fx.make_tile(None, None, layout_pair_tv)
+        pair_tile_2d = fx.make_tile(None, layout_pair_tv)
         qkv_rms_view = fx.composition(qkv, fx.make_tile(None, None, layout_rms_tv))
-        qkv_pair_view = fx.composition(qkv, fx.make_tile(None, None, layout_pair_tv))
+        qkv_pair_view = fx.composition(qkv, pair_tile_3d)
         weight_pair_view = fx.composition(k_norm_w, layout_pair_tv)
-        k_lds_pair_view = fx.composition(k_lds_view, fx.make_tile(None, layout_pair_tv))
-        v_lds_pair_view = fx.composition(v_lds_view, fx.make_tile(None, layout_pair_tv))
+        k_lds_pair_view = fx.composition(k_lds_view, pair_tile_2d)
+        v_lds_pair_view = fx.composition(v_lds_view, pair_tile_2d)
         lane_coord = (pair_lane, None)
         qkv_lane_pairs = fx.slice(qkv_pair_view, (None, None, lane_coord))
         w_lane_pairs = fx.slice(weight_pair_view, lane_coord)
@@ -630,7 +631,7 @@ def _build_kv_kernel(
         pair_cols, w0s, w1s = [], [], []
         for p in range_constexpr(PAIRS_PER_LANE):
             col = fx.Int32(
-                fx.crd2idx((pair_lane, p), layout_pair_lane).unpack()
+                fx.crd2idx((pair_lane, p), layout_pair_cols).unpack()
             )
             w0 = fx.Float32(w_lane_pairs[p, 0])
             w1 = fx.Float32(w_lane_pairs[p, 1])
@@ -641,12 +642,8 @@ def _build_kv_kernel(
             w0s.append(w0)
             w1s.append(w1)
         if const_expr(emit_flat_kv):
-            k_out_pair_view = fx.composition(
-                k_out, fx.make_tile(None, None, layout_pair_tv)
-            )
-            v_out_pair_view = fx.composition(
-                v_out, fx.make_tile(None, None, layout_pair_tv)
-            )
+            k_out_pair_view = fx.composition(k_out, pair_tile_3d)
+            v_out_pair_view = fx.composition(v_out, pair_tile_3d)
             k_out_lane_pairs = fx.slice(k_out_pair_view, (None, None, lane_coord))
             v_out_lane_pairs = fx.slice(v_out_pair_view, (None, None, lane_coord))
         for it in range_constexpr(PHASE1_ITERS):
