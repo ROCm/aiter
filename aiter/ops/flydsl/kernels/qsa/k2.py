@@ -343,7 +343,6 @@ def build_qsa_k2_module(
         )
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
         fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
-        q_buf = fx.rocdl.make_buffer_tensor(q, max_size=False)
         # A V# voffset is 32 bits. A cache that fits in 4 GiB keeps one
         # uniform descriptor. A larger cache is a separate compile: each
         # gathered row rebases its page in 64-bit, then a descriptor covers
@@ -550,12 +549,31 @@ def build_qsa_k2_module(
         # Issue the loads, then the page-table load, then mask: the masking is
         # the only prologue work long enough to cover a page-table round trip.
         q_live = lane_m < Int32(group_size)
+        # The MFMA tile is 16 rows. A shorter group would address the next
+        # group's heads, or past q, and only mask them after the load.
+        # One uniform descriptor covers this row's live group; the 16-row
+        # copy is unchanged and hardware-zeros the padding rows.
+        q_head = row * Int32(n_q_heads) + kv_h * Int32(group_size)
+        q_ptr_ty = fx.PointerType.get(
+            BFloat16.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=16,
+        )
+        q_group = fx.rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.inttoptr(
+                    q_ptr_ty,
+                    buf_base_i64(q) + Int64(q_head) * Int64(head_dim * 2),
+                ),
+                fx.make_layout((group_size, head_dim), (head_dim, 1)),
+            ),
+            max_size=False,
+            num_records_bytes=group_size * head_dim * 2,
+        )
         q_frags = []
         for ks in range_constexpr(qk_steps):
-            q_head = row * Int32(n_q_heads) + kv_h * Int32(group_size)
-            q_base = q_head * Int32(head_dim) + Int32(ks * qk_k)
             q_tile = fx.make_view(
-                fx.get_iter(q_buf) + q_base,
+                fx.get_iter(q_group) + Int32(ks * qk_k),
                 fx.make_layout((16, qk_k), (head_dim, 1)),
             )
             q_src = qk_q_copy.partition_S(q_tile)
