@@ -186,7 +186,9 @@ def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
 
     monkeypatch.setattr(general_a8w8, "get_gfx", lambda: "gfx942")
     monkeypatch.setattr(general_a8w8, "_hip_blockscale_supported", lambda: True)
-    monkeypatch.setattr(general_a8w8, "get_CKGEMM_config", lambda *_args: config)
+    monkeypatch.setattr(
+        general_a8w8, "get_CKGEMM_config", lambda *_args, **_kwargs: config
+    )
     monkeypatch.setattr(
         general_a8w8,
         "gemm_a8w8_blockscale_bpreshuffle_ck",
