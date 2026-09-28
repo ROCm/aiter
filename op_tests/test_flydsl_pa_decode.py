@@ -120,7 +120,7 @@ def _make_inputs(
         pytest.param(3, 2, 4, 64, 64, 3, 0, torch.float16, "random", id="mtp"),
         pytest.param(4, 1, 16, 128, 128, 7, 257, torch.float32, "random", id="window"),
         pytest.param(2, 2, 8, 256, 16, 7, 0, None, "random", id="head256"),
-        pytest.param(1, 1, 16, 128, 128, None, 0, None, "random", id="auto"),
+        pytest.param(1, 1, 16, 128, 128, None, 0, None, "random", id="default-cap"),
         pytest.param(1, 1, 4, 1024, 128, 1, 0, torch.bfloat16, "random", id="head1024"),
         *[
             pytest.param(
@@ -195,16 +195,12 @@ def test_pa_decode(
         if trans_v
         else value.permute(0, 1, 3, 2).contiguous()
     )
-    plan = (
-        plan_pa_decode(
-            context,
-            kv_heads,
-            max_partitions=max_partitions,
-            query_length=query_length,
-            sliding_window=window,
-        )
-        if max_partitions is not None
-        else None
+    plan = plan_pa_decode(
+        context,
+        kv_heads,
+        max_partitions=max_partitions,
+        query_length=query_length,
+        sliding_window=window,
     )
     output = torch.full_like(query, float("nan"))
     pa_decode(

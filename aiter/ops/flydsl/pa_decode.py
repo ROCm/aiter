@@ -262,8 +262,7 @@ def pa_decode(
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
-    work_plan: PADecodePlan | None = None,
-    tuned_file: str | Path | None = None,
+    work_plan: PADecodePlan,
     max_context_length: int | None = None,
 ) -> None:
     """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
@@ -277,19 +276,11 @@ def pa_decode(
     query_length=1. Positive ``sliding_window`` includes each query's own
     position; 0 and -1 disable it.
 
-    All execution uses a work plan. Omit ``work_plan`` for automatic planning,
-    which loads ``tuned_file`` (or the default tuning CSV) and matches the
-    host-provided ``max_context_length`` and local tensor geometry. No length
-    hint, no matching valid recommendation, or sinks uses a budget of twice the
-    device CU count. A hint is the declared context bound, including MTP tokens;
-    block-table capacity is not used as a substitute and GPU lengths are not read
-    back. The tuner currently measures attention without sinks.
-
-    Automatic planning allocates and refreshes metadata on each eager call. For
-    graph capture or preallocated scratch, load recommendations and build a plan
-    beforehand, then pass ``work_plan``. An explicit plan takes precedence over
-    tuning. Set its partition cap with ``plan_pa_decode(max_partitions=...)``;
-    even a cap of one uses packed scratch and reduction.
+    ``work_plan`` is required and must be built with ``plan_pa_decode`` before
+    calling decode. Use ``load_tuned_results`` to select an offline-tuned
+    workgroup budget when creating a plan. Build the plan before graph capture.
+    Set its partition cap with ``plan_pa_decode(max_partitions=...)``; even a
+    cap of one uses packed scratch and reduction.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -301,7 +292,7 @@ def pa_decode(
     windowed plans, query_length. Scratch is [KV heads, capacity, query rows
     (, D)], with query rows = query_length * query_group_size.
 
-    ``max_context_length`` also selects the scheduling bound, rounded up to
+    ``max_context_length`` selects the scheduling bound, rounded up to
     whole pages as in tuning. This keeps the selected specialization independent
     of extra block-table padding. Callers must ensure
     every GPU context length is at most ``max_context_length`` when supplying it.
@@ -310,11 +301,8 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
-    auto_plan = work_plan is None
-    if auto_plan and any(
-        scratch is not None for scratch in (exp_sums, max_logits, temporary_output)
-    ):
-        raise ValueError("preallocated scratch requires an explicit work_plan")
+    if not isinstance(work_plan, PADecodePlan):
+        raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
             "pa_decode only supports context_partition_size=256, "
@@ -369,14 +357,6 @@ def pa_decode(
     total_q_rows, num_q_heads, head_dim = query.shape
     if query.device.type != "cuda":
         raise ValueError(f"query must be on a CUDA device, got {query.device}")
-    if auto_plan:
-        with torch.cuda.device(query.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "automatic PA planning is unavailable during graph capture; "
-                    "call load_tuned_results and plan_pa_decode before capture, "
-                    "then pass work_plan"
-                )
     if num_q_heads < 1:
         raise ValueError(f"query must contain at least one head, got {num_q_heads}")
     if total_q_rows != num_seqs * query_length:
@@ -631,41 +611,6 @@ def pa_decode(
         schedule_context_length = (
             (max_context_length + block_size - 1) // block_size * block_size
         )
-    if auto_plan:
-        recommendations = load_tuned_results(tuned_file)
-        device_info = torch.cuda.get_device_properties(dev)
-        num_cu = device_info.multi_processor_count
-        budget = None
-        if max_context_length is not None and sinks is None:
-            shape = {
-                "batch_size": num_seqs,
-                "context_length": max_context_length,
-                "query_length": query_length,
-                "num_query_heads": num_q_heads,
-                "num_kv_heads": num_kv_heads,
-                "query_group_size": query_group_size,
-                "head_dim": head_dim,
-                "page_size": block_size,
-                "query_dtype": (
-                    "bfloat16" if query.dtype == torch.bfloat16 else "float16"
-                ),
-                "per_token_kv": per_token_kv,
-                "trans_v": trans_v,
-                "sliding_window": sliding_window,
-                "softmax_scale": softmax_scale,
-            }
-            budget = recommendations.lookup_budget(
-                shape, device_info.gcnArchName.split(":")[0], num_cu
-            )
-        work_plan = plan_pa_decode(
-            context_lengths,
-            num_kv_heads,
-            workgroup_budget=budget,
-            sliding_window=sliding_window,
-            query_length=query_length,
-        )
-    if not isinstance(work_plan, PADecodePlan):
-        raise TypeError("work_plan must be a PADecodePlan")
     work_plan.validate(num_seqs, num_kv_heads, dev)
     if work_plan.sliding_window != sliding_window:
         raise ValueError("sliding_window must match work_plan.sliding_window")
