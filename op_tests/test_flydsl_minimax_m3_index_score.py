@@ -250,6 +250,20 @@ def test_reject_misaligned_cache():
     assert not kernel.index_score_supported(q, k, 1, 1, mb, bt)
 
 
+def test_narrow_block_table_rejected():
+    """Fewer columns than max_block is an out-of-bounds table load.
+
+    Only the row count and the strides used to be checked, so a table narrower
+    than the capacity it is paired with was accepted and read past its end.
+    """
+    q, k, bt, lens, mb = make_case(2, 4, 4, [4096, 4096], torch.bfloat16)
+    assert bt.shape[1] == mb > 1
+    narrow = bt[:, : mb - 1].contiguous()
+    assert not kernel.index_score_supported(q, k, 4, 4, mb, narrow)
+    with pytest.raises(ValueError, match="block_table"):
+        score_flydsl(q, k, narrow, lens, 4, 4, D**-0.5, mb)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("shuffled", [False, True])
 def test_large_cache(dtype, shuffled):
@@ -1515,6 +1529,15 @@ _GPU_TESTS = (
     test_scale_fp32_range,
     test_noncurrent_device,
     test_build_map_invalid_config,
+    test_narrow_block_table_rejected,
+    # These build their inputs on the device even though what they assert is a
+    # host-side property (map equality, spread coverage), so they need the gate
+    # just as much as the tests that launch the scorer.
+    test_chunk_map_kernel_matches_reference,
+    test_spread_map_kernel_matches_reference,
+    test_spread_scores,
+    test_spread_graph_replay,
+    test_auto_token_legacy_map,
 )
 
 
