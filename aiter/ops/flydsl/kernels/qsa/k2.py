@@ -186,6 +186,9 @@ def build_qsa_k2_module(
     # 32 tokens * 4 elements * 2 B = 256 B apart, a round advances by
     # col_owners chunks, and an st64 unit is 512 B.
     v_round_st64 = col_owners * 256 // 512
+    # d+4 half of an 8-wide vector: 16*D elements, in st64 units. 16 at D=256
+    # (AMD's offset), 8 at D=128. A fixed +16 stores past the V tile at D=128.
+    v_half_st64 = head_dim // 16
     # K LDS image, following the live AMD prefill lowering. A dim chunk is
     # split three ways: ``owner`` picks one of the col_owners threads sharing
     # a token, and the rest splits into a quarter and a group whose radices
@@ -728,14 +731,14 @@ def build_qsa_k2_module(
                         ).bitcast(fx.Int64)[0]
                         # One base VGPR. Round gr advances d by col_owners
                         # chunks, i.e. col_owners * 256 B, which is
-                        # col_owners/2 st64 units; hi is the d+4 half at a
-                        # fixed +16 st64 (8192 B). Matches AMD's offset pairs.
+                        # col_owners/2 st64 units; hi is the d+4 half at
+                        # v_half_st64 (16*D elements).
                         _ds_write2st64_b64(
                             store_addr,
                             lo,
                             hi,
                             offset0=gr * v_round_st64,
-                            offset1=gr * v_round_st64 + 16,
+                            offset1=gr * v_round_st64 + v_half_st64,
                         )
                 gpu.barrier()
             elif const_expr(not use_k32):
