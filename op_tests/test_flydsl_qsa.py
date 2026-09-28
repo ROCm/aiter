@@ -726,6 +726,41 @@ def test_k2_page_past_4gib():
         )
 
 
+def _k2_one_live_token(m, width, live_col):
+    """Q/K zero, V one, every index -1 except ``live_col``."""
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    q = torch.zeros(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k_cache = torch.zeros(
+        1, 16, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v_cache = torch.ones_like(k_cache)
+    page_table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
+    indices = torch.full((m, width), -1, dtype=dtypes.i32, device=device)
+    indices[:, live_col] = 0
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    return qsa_k2(q, k_cache, v_cache, indices, page_table, token_to_req)
+
+
+def test_k2_empty_first_tile_keeps_later_token():
+    """A masked tile ahead of the only live token must not zero the output.
+
+    The live token's score is zero and its V is one, so the output is one.
+    These are the review's columns: 16 inside M=1/W=2048, and 64 inside
+    M=512/W=128.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    cases = ((1, 2048, 16), (512, 128, 64))
+    for m, width, live_col in cases:
+        out = _k2_one_live_token(m, width, live_col).float()
+        if not torch.allclose(out, torch.ones_like(out)):
+            raise AssertionError(
+                f"K2 empty-to-valid M={m} W={width} column {live_col} "
+                f"mean {out.mean().item()} expected 1"
+            )
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
@@ -2144,6 +2179,7 @@ def _run_unit_cases():
     test_k2_family_a_decode_matches_oracle()
     test_k2_family_a_prefill_matches_oracle()
     test_k2_page_past_4gib()
+    test_k2_empty_first_tile_keeps_later_token()
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_symbols_export_lazily()
