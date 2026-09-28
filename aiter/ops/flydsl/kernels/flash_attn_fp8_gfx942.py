@@ -75,7 +75,8 @@ def _decode_splits(batch, max_q, max_k, page_size, cu_count, forced=None):
             raise ValueError("forced split count must be in [1, 16]")
         return forced
     length = min(max_k, 1024) if max_k is not None else 0
-    if length < 512 or batch * 16 >= cu_count:
+    # The second wave of split workgroups loses to unsplit at B16 on gfx942.
+    if length < 512 or batch >= 16 or batch * 16 >= cu_count:
         return 1
     return max(1, min(16, (cu_count + batch * 16 - 1) // (batch * 16),
                       length // 64, (length + page_size - 1) // page_size))

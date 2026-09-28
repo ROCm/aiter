@@ -502,6 +502,8 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
         query_lens, kv_lens = [33, 1], [1057, 1025]
     elif workload in ("cache-over-2gib", "cache-over-4gib"):
         query_lens, kv_lens = [1, 33], [65, 1057]
+    elif workload in ("decode-over-2gib", "decode-over-4gib"):
+        query_lens, kv_lens = [1, 1], [65, 1057]
     else:
         raise ValueError(f"unknown gfx942 workload: {workload}")
 
@@ -532,8 +534,8 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
         case["v_descale"].fill_(0.75)
 
     want = reference(case, query_lens, kv_lens)
-    if workload in ("cache-over-2gib", "cache-over-4gib"):
-        boundary = 2**31 if workload == "cache-over-2gib" else 2**32
+    if workload in ("cache-over-2gib", "cache-over-4gib", "decode-over-2gib", "decode-over-4gib"):
+        boundary = 2**31 if workload.endswith("2gib") else 2**32
         first_page = boundary // (page * 16 * 256) + 1
         small_pages = case["k"].shape[0]
         # Relocate the small oracle's shuffled pages above the byte boundary.
@@ -598,14 +600,17 @@ def main():
         rows.append(test_gfx942_sliding(32, "mixed", scale=1.0))
         rows.extend(
             test_gfx942_sliding(page, workload)
-            for page, workload in [(32, "cache-over-2gib"), (64, "cache-over-4gib")]
+            for page, workload in [
+                (32, "cache-over-2gib"), (64, "cache-over-4gib"),
+                (32, "decode-over-2gib"), (64, "decode-over-4gib"),
+            ]
         )
         aiter.logger.info(
             "gfx942 sliding correctness summary (markdown):\n%s",
             pd.DataFrame(rows).to_markdown(index=False),
         )
         aiter.logger.info(
-            "PASS: 17 gfx942 direct-launch cases (including forced splits 1/2/5/16); SKIP: eight gfx950-only groups"
+            "PASS: 19 gfx942 direct-launch cases (including forced splits 1/2/5/16); SKIP: eight gfx950-only groups"
         )
         return
     if get_gfx() != "gfx950" or arch != "gfx950":
