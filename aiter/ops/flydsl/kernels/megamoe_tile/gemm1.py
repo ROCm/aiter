@@ -11,6 +11,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import dpp_utils
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    atomic_add_agent as _nc_atomic_add_agent,
+)
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
@@ -216,6 +219,10 @@ def _gemm1_body_sc2(
     i32_ntok,
     i32_total_m_blocks,
     arg_tile_perm,
+    arg_nc_head,
+    arg_nc_list,
+    i32_nc_bound,
+    i32_nc_off,
     *,
     BM,
     BN,
@@ -231,6 +238,9 @@ def _gemm1_body_sc2(
     swiglu_limit=None,
     situ_beta=4.0,
     situ_linear_beta=25.0,
+    next_claim=False,
+    next_claim_lds_dw=0,
+    next_claim_lead=2,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -255,6 +265,25 @@ def _gemm1_body_sc2(
     NJ = BN // 64
     assert BN in (128, 256), f"GMM1 BN must be 128 or 256, got {BN}"
     assert BN == 256 or not (interleave or inline_quant), "BN=128 needs the non-interleave, non-inline path"
+
+    # next_claim(MEGAMOE_TK_GMM1_NEXT_CLAIM,stage1 early_local_gmm 专用):在本 job 的第
+    # K_TILES_TOTAL-lead 步开头由 tx0 发下一个 job 的领位原子(arg_nc_head),结果留在 VGPR
+    # 里跨过最后 lead 步;K 循环后的 barrier 之后查组表 arg_nc_list,epilogue 末尾把映射好的
+    # 物理 job 号(越界 = -1)写进 LDS 信箱 dword next_claim_lds_dw。调用方在 job 后的 barrier
+    # 之后直接读信箱,省掉逐 job 的「barrier + 原子 + 系统 load + LDS 广播 + barrier + 组表 load」。
+    # 信箱必须在 A 环/scale/累加器复用区之外(调用方多分配 16B)。
+    # 原子是 monotonic、只在 wave0 发:它排在已计数的 vmem 之后,_wait_lds_barrier 的 vmcnt
+    # 只会变松不会变错(in-order 返回,A(kt+1) 之后的条数只多不少)。
+    if const_expr(next_claim):
+        assert not inline_quant, "next_claim only on the production (non-inline) pipeline"
+        _nc_lds_min = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL)[3]
+        assert next_claim_lds_dw * 4 >= _nc_lds_min, "next_claim mailbox aliases the GMM1 LDS"
+        assert next_claim_lead >= 1
+        _NC_STEP = max(0, K_TILES_TOTAL - int(next_claim_lead))
+
+        nc_tx0 = fx.Int32(gpu.thread_id("x")) == fx.Int32(0)
+        # 非 tx0 线程的占位值:保证 < bound 为假,组表只读第 0 项(不越界)。
+        nc_raw = fx.Int32(0x7FFFFFFF)
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
@@ -809,11 +838,25 @@ def _gemm1_body_sc2(
     # 每个 K 步 B 发出的 vmem 条数:4 个 j x 2 个 half 的 dwordx4 + 2 条 B-scale。
     _B_VMEM_PER_STEP = NJ * 2 + 2
 
+    # 裸 s_barrier(MEGAMOE_TK_GMM1_NOFENCE_BAR=1,仅 scoped 路径)。gpu.barrier() 降成
+    # fence release(workgroup, LDS) + s_barrier + fence acquire;SIMemoryLegalizer 在该
+    # release fence 上发 S_WAITCNT_lds_direct,SIInsertWaitcnts 把它换成「等全部在途 LDS DMA」
+    # (通用 LDS 槽,不看 alias scope),并入前面那条显式 s_waitcnt:vmcnt(24) 被收紧成
+    # vmcnt(10),即 A(kt+2) 被迫提前一步落地(ISA 28 处全是 vmcnt(10) lgkmcnt(0))。
+    # 这里跨 wave 可见性已由显式 vmcnt(N)+lgkmcnt(0) 保证,fence 不提供额外必需的顺序。
+    _nofence_bar = (
+        _lds_scoped
+        and __import__("os").environ.get("MEGAMOE_TK_GMM1_NOFENCE_BAR", "1") != "0"
+    )
+
     def _wait_lds_barrier(vmcnt):
         # 同 mega_moe/gemm_util.wait_lds_barrier:lgkmcnt(0) 等本 wave 的 ds_read 读完,
         # vmcnt(N) 等本步开头发出的 A DMA 落地(之后发的 N 条 B 预取继续飞),再 barrier。
         rocdl.s_waitcnt((vmcnt & 0xF) | ((vmcnt & 0x30) << 10) | (7 << 4))
-        gpu.barrier()
+        if const_expr(_nofence_bar):
+            rocdl.s_barrier()
+        else:
+            gpu.barrier()
 
     if const_expr(not inline_quant):
         # MegaMoEv2 do_tile 的同步写法(每步末尾一把 wait_lds_barrier),A 三级、DMA 提前两步:
@@ -850,6 +893,13 @@ def _gemm1_body_sc2(
             has_next = kt + 1 < K_TILES_TOTAL
             refill = kt + kStages < K_TILES_TOTAL
             slot_b = kt % kStages
+            if const_expr(next_claim and kt == _NC_STEP):
+                rocdl.sched_barrier(0)
+                if nc_tx0:
+                    nc_raw = fx.Int32(
+                        _nc_atomic_add_agent(arg_nc_head, fx.Int32(1))
+                    )
+                rocdl.sched_barrier(0)
             if const_expr(refill):
                 rocdl.sched_barrier(0)
                 issue_a_load_lds((kt + kStages) % 3, kt + kStages)
@@ -963,8 +1013,22 @@ def _gemm1_body_sc2(
 
     gpu.barrier()
 
+    if const_expr(next_claim):
+        # 下一个 job 的组表项在 epilogue 期间飞;原子此时早已返回(K 循环末尾 vmem 已排空)。
+        nc_valid = nc_raw < i32_nc_bound
+        nc_j = nc_raw + i32_nc_off
+        nc_g = nc_valid.select(nc_j // fx.Int32(NUM_N_BLOCKS), fx.Int32(0))
+        nc_p = _global_i32_at(arg_nc_list, nc_g)
+
     # lds_acc reuses the s_aq region (offset 0) as an f32 accumulator.
-    acc_layout = fx.make_layout((BM, BN), (BN, 1))
+    _epi_swz = _epi_swz_on(BN)
+    if const_expr(_epi_swz):
+        # 见 _epi_swz_on 上方注释:只把行距改成 BN+4(不做列异或)。_bm_constants 已按 BN+4 定 LDS。
+        _epi_swz_selfcheck(BM, BN)
+        ACC_STRIDE = BN + _EPI_ACC_PAD
+    else:
+        ACC_STRIDE = BN
+    acc_layout = fx.make_layout((BM, BN), (ACC_STRIDE, 1))
 
     def acc_idx(row, col):
         return _layout_idx(acc_layout, row, col)
@@ -972,7 +1036,7 @@ def _gemm1_body_sc2(
     acc_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
     acc_reg_lay = fx.make_layout(1, 1)
     acc_flat_view = fx.make_view(
-        fx.recast_iter(fx.Float32, lds_raw_ptr), fx.make_layout(BM * BN, 1)
+        fx.recast_iter(fx.Float32, lds_raw_ptr), fx.make_layout(BM * ACC_STRIDE, 1)
     )
     acc_flat_tiles = fx.logical_divide(acc_flat_view, fx.make_layout(1, 1))
 
@@ -1161,11 +1225,105 @@ def _gemm1_body_sc2(
                         ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16
                     )
 
+    if const_expr(next_claim):
+        nc_job = nc_valid.select(
+            fx.Int32(nc_p) * fx.Int32(NUM_N_BLOCKS)
+            + nc_j
+            - nc_g * fx.Int32(NUM_N_BLOCKS),
+            fx.Int32(-1),
+        )
+        if nc_tx0:
+            fx.ptr_store(
+                Vec.from_elements([nc_job], fx.Int32),
+                fx.add_offset(
+                    fx.recast_iter(fx.Int32, lds_raw_ptr),
+                    next_claim_lds_dw,  # add_offset 按元素(i32)计
+                ),
+            )
+
 
 # Preserve the private import spelling used by the fused wrappers while making
 # the JIT function name itself layout-versioned.  FlyDSL keys its persistent
 # cache by JIT function, not only by the emitted GPU symbol.
 _gemm1_body = _gemm1_body_sc2
+
+
+# 尾声 f32 累加器的 LDS 去 bank 冲突排布(MEGAMOE_TK_GMM1_EPI_SWZ=1,默认开,=0 关;只作用于 BN=256)。
+# 旧排布 (BM,BN):(BN,1):写(每 lane 1 个 f32,16 列 x 4 行、行距 4)四行同 bank -> 64 bank 下 4 路;
+# 读(ds_read_b128)按 CDNA4 文档的 4 相位(每相位 16 lane:T0-3,T12-15,T20-23,T24-27 等,
+# 即两行 m、各两个 wave_grp)-> 2 路。
+# 新排布:只把行距改成 BN+4 dword,不做列异或。行 r 相对 r+1 错开 4 bank(一个 16B 块):
+#   写:行 4k 错开 16k bank,64 lane 覆盖 64 个不同 bank;
+#   读:每相位两行各占偶数/奇数 16B 块,正好铺满 64 bank(CDNA3 32 bank 的 8 相位分组也无冲突)。
+# 注意:按 wave_grp 做 16B 块异或在文档相位分组下会把读冲突重新引回 2 路(已用 selfcheck 模型核过)。
+# 逻辑位置不变,数值逐位不变;地址仍是「lane 基址 + 编译期常量」。LDS 多 BM*4*4 字节(BM=128: +2KB)。
+_EPI_ACC_PAD = 4
+
+# ds_read_b128 的相位 lane 分组(nod-ai amdgpu_kernel_optimization_guide.md,实测所得)。
+_B128_PHASES_CDNA4 = (
+    (0, 1, 2, 3, 12, 13, 14, 15, 20, 21, 22, 23, 24, 25, 26, 27),
+    (32, 33, 34, 35, 44, 45, 46, 47, 52, 53, 54, 55, 56, 57, 58, 59),
+    (4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 28, 29, 30, 31),
+    (36, 37, 38, 39, 40, 41, 42, 43, 48, 49, 50, 51, 60, 61, 62, 63),
+)
+_B128_PHASES_CDNA3 = tuple(
+    tuple(b + a + i for i in range(4)) + tuple(b + c + i for i in range(4))
+    for b in (0, 32)
+    for a, c in ((0, 20), (4, 16), (8, 28), (12, 24))
+)
+
+
+def _epi_swz_on(BN):
+    return BN == 256 and __import__("os").environ.get("MEGAMOE_TK_GMM1_EPI_SWZ", "1") != "0"
+
+
+_EPI_SWZ_CHECKED = set()
+
+
+def _epi_swz_selfcheck(BM, BN):
+    """编译期(纯 python 整数)核对:按 _gemm1_body_sc2 尾声的写/读地址公式、行距 BN+4,
+    b128 读 16B 对齐,写(b32,64 lane 单相位 / 32 lane 两相位)与读(CDNA4 4 相位 / CDNA3 8 相位)无冲突。"""
+    key = (BM, BN)
+    if key in _EPI_SWZ_CHECKED:
+        return
+    stride = BN + _EPI_ACC_PAD
+    assert BN == 256 and BM % 16 == 0, (BM, BN)
+    assert (stride * 4) % 16 == 0
+
+    def _ways(addrs, width, banks, groups):
+        worst = 1
+        for g in groups:
+            cnt = {}
+            for l in g:
+                for d in range(width):
+                    a = addrs[l] + d
+                    cnt.setdefault(a % banks, set()).add(a)
+            worst = max(worst, max(len(v) for v in cnt.values()))
+        return worst
+
+    for wave in range(4):
+        for J in range(BN // 64):
+            up = BN // 2 if J % 2 == 1 else 0
+            for v in range(4):
+                addrs = [
+                    ((lane // 16) * 4 + v) * stride + wave * (BN // 8) + (J // 2) * 16 + lane % 16 + up
+                    for lane in range(64)
+                ]
+                assert _ways(addrs, 1, 64, (range(64),)) == 1, "epi store conflict 64"
+                assert _ways(addrs, 1, 32, (range(32), range(32, 64))) == 1, "epi store conflict 32"
+        for up in (0, 128):
+            for h in (0, 1):
+                addrs = []
+                for lane in range(64):
+                    tx = wave * 64 + lane
+                    m, n = tx // 16, tx % 16
+                    wg, kk = n // 4, n % 4
+                    a = m * stride + up + wg * 32 + kk * 8 + 4 * h
+                    assert a % 4 == 0
+                    addrs.append(a)
+                assert _ways(addrs, 4, 64, _B128_PHASES_CDNA4) == 1, "epi load conflict cdna4"
+                assert _ways(addrs, 4, 32, _B128_PHASES_CDNA3) == 1, "epi load conflict cdna3"
+    _EPI_SWZ_CHECKED.add(key)
 
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
@@ -1175,7 +1333,10 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = kAStages * BM * KH_TILE
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
-    lds_acc_bytes = lds_acc_bytes_for(BM, BN)
+    if _epi_swz_on(BN):
+        lds_acc_bytes = lds_acc_bytes_for(BM, BN + _EPI_ACC_PAD)
+    else:
+        lds_acc_bytes = lds_acc_bytes_for(BM, BN)
     lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
@@ -1275,6 +1436,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_xcd{xcd_swizzle}"
     if persistent:
         name_suffix += "_persistent"
+    if _epi_swz_on(BN):
+        name_suffix += "_esw"
 
     @fx.struct
     class SharedStorage:
@@ -1350,6 +1513,10 @@ def compile_gemm1_a4w4_port(
                 i32_ntok,
                 total_m_blocks,
                 fx.Int64(0),
+                fx.Int64(0),
+                fx.Int64(0),
+                fx.Int32(0),
+                fx.Int32(0),
                 BM=BM,
                 BN=BN,
                 BK=BK,

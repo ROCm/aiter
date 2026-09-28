@@ -81,13 +81,16 @@ FUSED_BEST_ENV = {
     "MEGAMOE_TK_S1_FAN2_SHARDS": "8",
     "MEGAMOE_TK_S1_COMPUTE_FIRST": "8",
     "MEGAMOE_TK_GMM1_LDS_SCOPES": "1",
+    "MEGAMOE_TK_GMM1_EPI_SWZ": "1",
+    "MEGAMOE_TK_GMM1_NOFENCE_BAR": "1",
+    "MEGAMOE_TK_GMM1_NEXT_CLAIM": "1",
 }
 # Kernel-name fragments the best configuration must produce.
 FUSED_BEST_STAGE1_FRAGMENTS = (
     "_widewait", "_widefan", "_cf8", "_f1d", "_t0nf", "_cra", "_soa4", "_pcta",
     "_gb", "_asg", "_pofft0", "_sck2", "_gp2", "_mo1", "_slg", "_h1p",
     "_gs127", "_elg", "_f2s8", "_tg4", "_expertmajor", "_fos32", "_defrecv",
-    "_hoistwait", "_lsc",
+    "_hoistwait", "_lsc_nfb", "_esw", "_nxc2",
 )
 
 SMALLOP_ENV = {

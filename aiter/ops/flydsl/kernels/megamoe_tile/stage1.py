@@ -38,7 +38,7 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
 )
 from .gemm_common import MXFP4_SCALE_LAYOUT_TAG, k_tiles_total_for
 # gemm1.py 的改动不进本文件 kernel 的 flydsl 缓存 key;改 gemm1 时同步改这行强制重编。
-# gemm1 rev: megamoev2-style wait_lds_barrier pipeline
+# gemm1 rev: megamoev2-style wait_lds_barrier pipeline, nofence barrier v1, next_claim v1
 from .gemm1 import (
     _bm_constants,
     _gemm1_body,
@@ -627,6 +627,22 @@ def compile_megamoe_tile_ep16_stage1(
     # _gemm1_body 以 BM*G 行跑,累加器要 BM*G*BN*4 字节。按 BM 算会
     # 静默写越界(G=2 实测 relL2=1.55)。
     _, _, _, lds_bytes = _bm_constants(GBM, BN, kh_tile, k_tiles_total)
+    # MEGAMOE_TK_GMM1_NEXT_CLAIM=1(只在 early_local_gmm 下生效):GMM1 体内提前领下一个 job,
+    # 映射好的 job 号经 LDS 信箱(GMM1 LDS 之后多分配的 16B,dword0=job,1=本段上界,2=本段偏移)
+    # 交回领取循环。lead = 在倒数第几个 K 步开头发领位原子。
+    gmm1_next_claim = bool(early_local_gmm) and (
+        __import__("os").environ.get("MEGAMOE_TK_GMM1_NEXT_CLAIM", "1") != "0"
+    )
+    gmm1_next_claim_lead = (
+        int(__import__("os").environ.get("MEGAMOE_TK_GMM1_NEXT_CLAIM_LEAD", "2"))
+        if gmm1_next_claim
+        else 2
+    )
+    if gmm1_next_claim:
+        assert lds_bytes % 16 == 0
+        assert gmm1_next_claim_lead >= 1
+    NC_MBOX_DW = lds_bytes // 4  # 信箱在全部 GMM1 LDS(A 环/scale/累加器)之后
+    lds_alloc_bytes = lds_bytes + (16 if gmm1_next_claim else 0)
 
     # Compile-time region helpers.  CCO offsets are relative to the physical
     # window; local addresses add arena_ptr at runtime.
@@ -686,7 +702,7 @@ def compile_megamoe_tile_ep16_stage1(
 
     @fx.struct
     class SharedStorage:
-        raw: fx.Array[fx.Uint8, lds_bytes, 16]
+        raw: fx.Array[fx.Uint8, lds_alloc_bytes, 16]
 
     transport_tag = "cco" if enable_cco else "stub"
     kernel_name = (
@@ -803,6 +819,13 @@ def compile_megamoe_tile_ep16_stage1(
     # gemm1.py 读同一个开关;flydsl 缓存 key 不含 env,名字区分两份二进制。
     if __import__("os").environ.get("MEGAMOE_TK_GMM1_LDS_SCOPES", "1") != "0":
         kernel_name = kernel_name + "_lsc"
+        if __import__("os").environ.get("MEGAMOE_TK_GMM1_NOFENCE_BAR", "1") != "0":
+            kernel_name = kernel_name + "_nfb"
+    # gemm1.py 尾声累加器去 bank 冲突排布(只对 BN=256 生效;LDS 由 _bm_constants 同步加大)。
+    if BN == 256 and __import__("os").environ.get("MEGAMOE_TK_GMM1_EPI_SWZ", "1") != "0":
+        kernel_name = kernel_name + "_esw"
+    if gmm1_next_claim:
+        kernel_name = kernel_name + f"_nxc{gmm1_next_claim_lead}"
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -5797,7 +5820,8 @@ def compile_megamoe_tile_ep16_stage1(
                         local_addr("h1_queue_eos"), generation
                     )
 
-        def _run_gemm1_job(job):
+        def _run_gemm1_job(job, nc=None):
+            # nc = (领位头地址, 本段上界, 本段偏移):GMM1 体内提前领下一个 job(next_claim)。
             if const_expr(k2_sorted_jobs):
                 sj_s = job // fx.Int32(GNB)
                 sj_n = job - sj_s * fx.Int32(GNB)
@@ -5808,7 +5832,7 @@ def compile_megamoe_tile_ep16_stage1(
                     dtype=T.i32,
                 ) // fx.Int32(GG)
                 job = fx.Int32(rocdl.readfirstlane(T.i32, sj_p * fx.Int32(GNB) + sj_n))
-            # gemm1 rev: 3-stage A, 2-ahead DMA, wait_lds_barrier(vmcnt 24), ascale_gather v2, BN128 v2, lds alias scopes v1(改 gemm1.py 时改这行,
+            # gemm1 rev: 3-stage A, 2-ahead DMA, wait_lds_barrier(vmcnt 24), ascale_gather v2, BN128 v2, lds alias scopes v1, epi acc pad4 v2, nofence barrier v1, next_claim v1(改 gemm1.py 时改这行,
             # 否则 flydsl 缓存 key 不变、继续跑旧 GMM1)
             _gemm1_body(
                 lds_raw,
@@ -5844,6 +5868,10 @@ def compile_megamoe_tile_ep16_stage1(
                     if expert_major_output
                     else fx.Int64(0)
                 ),
+                nc[0] if nc is not None else fx.Int64(0),
+                local_addr("gmm1_group_list") if nc is not None else fx.Int64(0),
+                nc[1] if nc is not None else fx.Int32(0),
+                nc[2] if nc is not None else fx.Int32(0),
                 BM=GBM,
                 expert_major=expert_major_output and not h1_phys,
                 ascale_gather=ascale_gather,
@@ -5860,6 +5888,9 @@ def compile_megamoe_tile_ep16_stage1(
                 # The standalone legacy GEMM helper defaults to 4/25 instead.
                 situ_beta=1.0,
                 situ_linear_beta=1.0,
+                next_claim=nc is not None,
+                next_claim_lds_dw=NC_MBOX_DW,
+                next_claim_lead=gmm1_next_claim_lead,
             )
 
         # ------------------------------------------------------------------
@@ -6060,16 +6091,19 @@ def compile_megamoe_tile_ep16_stage1(
                         gpu.barrier()
                         comm_ops.fence_system_acquire()
                         _ts(3)
-                        el_la = fx.Int32(1) == fx.Int32(1)
-                        while el_la:
-                            gpu.barrier()
+                        if const_expr(gmm1_next_claim):
+                            # 首领(过门后,不能提前):tx0 领位 + 本段上界 + 组表映射,写信箱。
+                            # 之后每个 job 的下一领在 GMM1 体内发,job 后那一把 barrier 同时
+                            # 发布信箱,省掉循环顶的 barrier + 领位 + 广播 barrier。
+                            el_mbox = fx.add_offset(el_scr, NC_MBOX_DW)  # 按元素(i32)计
+                            el_mview = fx.make_view(el_mbox, fx.make_layout(2, 1))
                             if tx == fx.Int32(0):
-                                el_lj = fx.Int32(
+                                el_nj = fx.Int32(
                                     comm_ops.atomic_add_agent(
                                         local_addr("gmm1_job_head"), fx.Int32(1)
                                     )
                                 )
-                                el_ln = (
+                                el_nn = (
                                     fx.Int32(
                                         comm_ops.load_i32_global_system(
                                             local_addr("tile_alloc") + fx.Int64(4)
@@ -6077,31 +6111,87 @@ def compile_megamoe_tile_ep16_stage1(
                                     )
                                     // fx.Int32(G)
                                 ) * fx.Int32(GNB)
+                                el_nv = el_nj < el_nn
+                                el_ng = el_nv.select(el_nj // fx.Int32(GNB), fx.Int32(0))
+                                el_np = buffer_ops.buffer_load(
+                                    el_list, el_ng, vec_width=1, dtype=T.i32
+                                )
                                 fx.ptr_store(
                                     Vec.from_elements(
-                                        [(el_lj < el_ln).select(el_lj, fx.Int32(-1))],
+                                        [
+                                            el_nv.select(
+                                                el_np * fx.Int32(GNB) + el_nj - el_ng * fx.Int32(GNB),
+                                                fx.Int32(-1),
+                                            ),
+                                            el_nn,
+                                        ],
                                         fx.Int32,
                                     ),
-                                    el_scr,
+                                    el_mbox,
                                 )
                             gpu.barrier()
-                            el_ljob = fx.Int32(Vec(el_view.load())[0])
-                            el_lhas = el_ljob >= fx.Int32(0)
-                            if el_lhas:
-                                el_lg = el_ljob // fx.Int32(GNB)
-                                el_lp = buffer_ops.buffer_load(
-                                    el_list, el_lg, vec_width=1, dtype=T.i32
-                                )
-                                _run_gemm1_job(
-                                    fx.Int32(
-                                        rocdl.readfirstlane(
-                                            T.i32,
-                                            el_lp * fx.Int32(GNB) + el_ljob - el_lg * fx.Int32(GNB),
-                                        )
+                            el_nbound = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(Vec(el_mview.load())[1])))
+                            el_na = fx.Int32(1) == fx.Int32(1)
+                            while el_na:
+                                el_njob = fx.Int32(
+                                    rocdl.readfirstlane(
+                                        T.i32, fx.Int32(Vec(el_mview.load())[0])
                                     )
                                 )
+                                el_nhas = el_njob >= fx.Int32(0)
+                                if el_nhas:
+                                    _run_gemm1_job(
+                                        el_njob,
+                                        (local_addr("gmm1_job_head"), el_nbound, fx.Int32(0)),
+                                    )
+                                    gpu.barrier()
+                                el_na = el_nhas
+                        else:
+                            el_la = fx.Int32(1) == fx.Int32(1)
+                            while el_la:
                                 gpu.barrier()
-                            el_la = el_lhas
+                                if tx == fx.Int32(0):
+                                    el_lj = fx.Int32(
+                                        comm_ops.atomic_add_agent(
+                                            local_addr("gmm1_job_head"), fx.Int32(1)
+                                        )
+                                    )
+                                    el_ln = (
+                                        fx.Int32(
+                                            comm_ops.load_i32_global_system(
+                                                local_addr("tile_alloc") + fx.Int64(4)
+                                            )
+                                        )
+                                        // fx.Int32(G)
+                                    ) * fx.Int32(GNB)
+                                    fx.ptr_store(
+                                        Vec.from_elements(
+                                            [(el_lj < el_ln).select(el_lj, fx.Int32(-1))],
+                                            fx.Int32,
+                                        ),
+                                        el_scr,
+                                    )
+                                gpu.barrier()
+                                el_ljob = fx.Int32(Vec(el_view.load())[0])
+                                # dword0 同时是 A 槽 0 的第 0 行:全体 wave 读完 job 号之前,不能让任何 wave 的
+                                # A DMA(序章写槽 0)覆盖它,否则慢 wave 读到激活字节,各 wave 对 has 的判断分叉 → barrier 死锁。
+                                gpu.barrier()
+                                el_lhas = el_ljob >= fx.Int32(0)
+                                if el_lhas:
+                                    el_lg = el_ljob // fx.Int32(GNB)
+                                    el_lp = buffer_ops.buffer_load(
+                                        el_list, el_lg, vec_width=1, dtype=T.i32
+                                    )
+                                    _run_gemm1_job(
+                                        fx.Int32(
+                                            rocdl.readfirstlane(
+                                                T.i32,
+                                                el_lp * fx.Int32(GNB) + el_ljob - el_lg * fx.Int32(GNB),
+                                            )
+                                        )
+                                    )
+                                    gpu.barrier()
+                                el_la = el_lhas
                         _ts(5)
                         if tx == fx.Int32(0):
                             comm_ops.spin_until_ge_i64_sleep(
@@ -6110,55 +6200,128 @@ def compile_megamoe_tile_ep16_stage1(
                         gpu.barrier()
                         comm_ops.fence_system_acquire()
                         _ts(6)
-                        el_ra = fx.Int32(1) == fx.Int32(1)
-                        while el_ra:
-                            gpu.barrier()
+                        if const_expr(gmm1_next_claim):
+                            el_rbox = fx.add_offset(el_scr, NC_MBOX_DW)  # 按元素(i32)计
+                            el_rview = fx.make_view(el_rbox, fx.make_layout(4, 1))
                             if tx == fx.Int32(0):
-                                el_rj = fx.Int32(
+                                el_mj = fx.Int32(
                                     comm_ops.atomic_add_agent(
                                         local_addr("gmm1_job_head") + fx.Int64(16 * 4),
                                         fx.Int32(1),
                                     )
                                 )
-                                el_rlg = fx.Int32(
+                                el_mlg = fx.Int32(
                                     comm_ops.load_i32_global_system(
                                         local_addr("tile_alloc") + fx.Int64(4)
                                     )
                                 ) // fx.Int32(G)
-                                el_rn = (
+                                el_mn = (
                                     fx.Int32(
                                         comm_ops.load_i32_global_system(
                                             local_addr("tile_alloc")
                                         )
                                     )
                                     // fx.Int32(G)
-                                    - el_rlg
+                                    - el_mlg
                                 ) * fx.Int32(GNB)
+                                el_mo = el_mlg * fx.Int32(GNB)
+                                el_mv = el_mj < el_mn
+                                el_mjj = el_mj + el_mo
+                                el_mg = el_mv.select(el_mjj // fx.Int32(GNB), fx.Int32(0))
+                                el_mp = buffer_ops.buffer_load(
+                                    el_list, el_mg, vec_width=1, dtype=T.i32
+                                )
                                 fx.ptr_store(
                                     Vec.from_elements(
-                                        [(el_rj < el_rn).select(el_rj + el_rlg * fx.Int32(GNB), fx.Int32(-1))],
+                                        [
+                                            el_mv.select(
+                                                el_mp * fx.Int32(GNB) + el_mjj - el_mg * fx.Int32(GNB),
+                                                fx.Int32(-1),
+                                            ),
+                                            el_mn,
+                                            el_mo,
+                                            fx.Int32(0),
+                                        ],
                                         fx.Int32,
                                     ),
-                                    el_scr,
+                                    el_rbox,
                                 )
                             gpu.barrier()
-                            el_rjob = fx.Int32(Vec(el_view.load())[0])
-                            el_rhas = el_rjob >= fx.Int32(0)
-                            if el_rhas:
-                                el_rg = el_rjob // fx.Int32(GNB)
-                                el_rp = buffer_ops.buffer_load(
-                                    el_list, el_rg, vec_width=1, dtype=T.i32
-                                )
-                                _run_gemm1_job(
-                                    fx.Int32(
-                                        rocdl.readfirstlane(
-                                            T.i32,
-                                            el_rp * fx.Int32(GNB) + el_rjob - el_rg * fx.Int32(GNB),
-                                        )
+                            el_rvals = Vec(el_rview.load())
+                            el_mbound = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(el_rvals[1])))
+                            el_moff = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(el_rvals[2])))
+                            el_ma = fx.Int32(1) == fx.Int32(1)
+                            while el_ma:
+                                el_mjob = fx.Int32(
+                                    rocdl.readfirstlane(
+                                        T.i32, fx.Int32(Vec(el_rview.load())[0])
                                     )
                                 )
+                                el_mhas = el_mjob >= fx.Int32(0)
+                                if el_mhas:
+                                    _run_gemm1_job(
+                                        el_mjob,
+                                        (
+                                            local_addr("gmm1_job_head") + fx.Int64(16 * 4),
+                                            el_mbound,
+                                            el_moff,
+                                        ),
+                                    )
+                                    gpu.barrier()
+                                el_ma = el_mhas
+                        else:
+                            el_ra = fx.Int32(1) == fx.Int32(1)
+                            while el_ra:
                                 gpu.barrier()
-                            el_ra = el_rhas
+                                if tx == fx.Int32(0):
+                                    el_rj = fx.Int32(
+                                        comm_ops.atomic_add_agent(
+                                            local_addr("gmm1_job_head") + fx.Int64(16 * 4),
+                                            fx.Int32(1),
+                                        )
+                                    )
+                                    el_rlg = fx.Int32(
+                                        comm_ops.load_i32_global_system(
+                                            local_addr("tile_alloc") + fx.Int64(4)
+                                        )
+                                    ) // fx.Int32(G)
+                                    el_rn = (
+                                        fx.Int32(
+                                            comm_ops.load_i32_global_system(
+                                                local_addr("tile_alloc")
+                                            )
+                                        )
+                                        // fx.Int32(G)
+                                        - el_rlg
+                                    ) * fx.Int32(GNB)
+                                    fx.ptr_store(
+                                        Vec.from_elements(
+                                            [(el_rj < el_rn).select(el_rj + el_rlg * fx.Int32(GNB), fx.Int32(-1))],
+                                            fx.Int32,
+                                        ),
+                                        el_scr,
+                                    )
+                                gpu.barrier()
+                                el_rjob = fx.Int32(Vec(el_view.load())[0])
+                                # dword0 同时是 A 槽 0 的第 0 行:全体 wave 读完 job 号之前,不能让任何 wave 的
+                                # A DMA(序章写槽 0)覆盖它,否则慢 wave 读到激活字节,各 wave 对 has 的判断分叉 → barrier 死锁。
+                                gpu.barrier()
+                                el_rhas = el_rjob >= fx.Int32(0)
+                                if el_rhas:
+                                    el_rg = el_rjob // fx.Int32(GNB)
+                                    el_rp = buffer_ops.buffer_load(
+                                        el_list, el_rg, vec_width=1, dtype=T.i32
+                                    )
+                                    _run_gemm1_job(
+                                        fx.Int32(
+                                            rocdl.readfirstlane(
+                                                T.i32,
+                                                el_rp * fx.Int32(GNB) + el_rjob - el_rg * fx.Int32(GNB),
+                                            )
+                                        )
+                                    )
+                                    gpu.barrier()
+                                el_ra = el_rhas
                     if tx == fx.Int32(0):
                         if const_expr(gate_sleep > 0):
                             # 融合版里 248 个 CTA 做完 fanout 就停在这里等全局封尾;
