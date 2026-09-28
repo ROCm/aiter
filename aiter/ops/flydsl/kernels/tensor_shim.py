@@ -263,17 +263,31 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
-def _run_compiled(exe, *args):
+def _run_compiled(exe, *args, specialization_key=None):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    A specialization key gives a multi-constexpr JitFunction one compiled
+    callable per configuration. Factory-style launchers should leave it unset.
     """
-    cf = getattr(exe, "_cf", None)
+    if specialization_key is None:
+        cf = getattr(exe, "_cf", None)
+    else:
+        cache = getattr(exe, "_cf_by_specialization", None)
+        cf = cache.get(specialization_key) if cache is not None else None
     if cf is not None:
         cf(*args)
         return
     try:
         cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        if specialization_key is None:
+            exe._cf = cf
+        else:
+            cache = getattr(exe, "_cf_by_specialization", None)
+            if cache is None:
+                cache = {}
+                exe._cf_by_specialization = cache
+            cache[specialization_key] = cf
     except Exception:
         # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
         try:

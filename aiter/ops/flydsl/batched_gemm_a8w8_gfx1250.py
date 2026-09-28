@@ -24,7 +24,7 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
 
-from .mxfp8_128_bpreshuffle_gemm_gfx1250 import BASE_NAME_SUFFIX_RE
+from .mxfp8_bpreshuffle_gemm_gfx1250 import BASE_NAME_SUFFIX_RE
 
 BLOCK_K = 128
 BLOCK_N = 128
@@ -40,20 +40,23 @@ _BMM_KERNEL_NAME_RE = re.compile(
 )
 
 _launch_gemm_a8w8 = None
+_run_compiled = None
 _ptr_arg = None
 _fx = None
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8, _ptr_arg, _fx
+    global _launch_gemm_a8w8, _run_compiled, _ptr_arg, _fx
     if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
 
     from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+    from .kernels.tensor_shim import _run_compiled as run_compiled
     from .kernels.tensor_shim import ptr_arg
 
     _launch_gemm_a8w8 = launch_gemm_a8w8
+    _run_compiled = run_compiled
     _ptr_arg = ptr_arg
     _fx = fx_mod
 
@@ -282,7 +285,26 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
             f"got {k // tile_k}"
         )
 
-    _launch_gemm_a8w8(
+    bmm_spec = (
+        cfg["tile_m"],
+        tile_n,
+        tile_k,
+        cfg["m_warp"],
+        cfg["n_warp"],
+        1 if out_dtype == "f16" else 0,
+        cfg["num_buffers"],
+        1,  # cluster_m
+        1,  # cluster_n
+        True,  # is_mxscale
+        BLOCK_K,
+        1,  # split_k
+        True,  # batched
+        preload_ks,
+        False,  # a_preshuffle
+    )
+    # Cached CompiledFunction per constexpr set; see _run_compiled.
+    _run_compiled(
+        _launch_gemm_a8w8,
         _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -310,6 +332,7 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         True,  # batched
         preload_ks,
         b,
+        specialization_key=bmm_spec,
     )
     return Out
 
