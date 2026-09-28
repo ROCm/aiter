@@ -88,13 +88,11 @@ DEFAULT_GRID_CAP = 64
 #                               and cutting the flag count matters more than
 #                               the handful of blocks lost.
 #
-#   TODO: xGMI needs to re-measured to see if self-skip is beneficial also here.
 #   xGMI
-#     TP2  atoms=2, cap 64   -- one rung over the whole 4 MiB window.
-#     TP4  atoms=1, cap 128  -- the narrow tile wins throughout, and the extra
-#                               blocks matter more than tile width because peer
-#                               bandwidth is not the constraint.
-#     TP8  atoms=1, cap 64   -- one rung over the whole 256 KiB window.
+#
+#     TP2  atoms=1 cap128 b128 to 768 KiB, then atoms=2 cap64 b256
+#     TP4  atoms=1 cap256 b64  -- one rung over the whole 256 KiB window
+#     TP8  atoms=1 cap128 b128 to 128 KiB, then cap128 b256
 ONESHOT_LADDER = {
     ("pcie", 2): (
         (0, 2, 64, "peer", 128, True),
@@ -106,9 +104,15 @@ ONESHOT_LADDER = {
         (96 << 10, 4, 128, "peer", 256, True),
     ),
     ("pcie", 8): ((0, 4, 64, "peer", 256, True),),
-    ("xgmi", 2): ((0, 2, 64, "peer", 256, False),),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
-    ("xgmi", 8): ((0, 1, 64, "peer", 256, False),),
+    ("xgmi", 2): (
+        (0, 1, 128, "peer", 128, False),
+        (768 << 10, 2, 64, "peer", 256, False),
+    ),
+    ("xgmi", 4): ((0, 1, 256, "peer", 64, False),),
+    ("xgmi", 8): (
+        (0, 1, 128, "peer", 128, False),
+        (128 << 10, 1, 128, "peer", 256, False),
+    ),
 }
 
 

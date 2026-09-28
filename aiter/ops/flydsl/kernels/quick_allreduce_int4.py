@@ -158,10 +158,16 @@ _MESH_DEFAULT = {
     4: ((0, 8, 128, BLOCK, False),),
     8: ((0, 1, 128, BLOCK, False), (768 << 10, 8, 128, BLOCK, False)),
 }
-# TODO: Measure the TP=8 case.
+# TODO: Measure the TP=8 case for PCIe.
 #  ``(min_bytes, super_tile, grid_cap, block, skip_self)``
 MESH_ST_LADDER = {
-    **{("xgmi", ws): rungs for ws, rungs in _MESH_DEFAULT.items()},
+    ("xgmi", 2): ((0, 8, 128, 128, True),),
+    ("xgmi", 4): ((0, 1, 128, 64, True), (1 << 20, 8, 128, 256, True)),
+    ("xgmi", 8): (
+        (0, 8, 128, 256, True),
+        (2 << 20, 8, 128, 256, False),
+        (8 << 20, 8, 128, 512, True),
+    ),
     ("pcie", 2): ((0, 1, 128, 128, True), (1536 << 10, 8, 128, 256, True)),
     ("pcie", 4): ((0, 1, 128, 256, True), (384 << 10, 8, 128, 512, True)),
     ("pcie", 8): _MESH_DEFAULT[8],
