@@ -8,12 +8,6 @@ OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA specialization details.
 """
 
-from collections.abc import Mapping
-from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
-from types import MappingProxyType
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -25,106 +19,6 @@ from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
-
-_DEFAULT_TUNED_FILE = (
-    Path(__file__).resolve().parents[2]
-    / "configs"
-    / "model_configs"
-    / "flydsl_pa_decode_tuned.csv"
-)
-# Static geometry for one device, matching the offline tuner's shape keys.
-_TUNED_SHAPE_FIELDS = (
-    "batch_size",
-    "context_length",
-    "query_length",
-    "num_query_heads",
-    "num_kv_heads",
-    "query_group_size",
-    "head_dim",
-    "page_size",
-    "query_dtype",
-    "per_token_kv",
-    "trans_v",
-    "sliding_window",
-    "softmax_scale",
-)
-
-
-@dataclass(frozen=True)
-class PADecodeTunedResults:
-    """Validated CSV recommendations, indexed by device-local static geometry."""
-
-    budgets: Mapping[tuple, int]
-
-    def lookup_budget(self, shape: Mapping, architecture: str, num_cu: int):
-        """Return a budget or None using host metadata, without files or GPU reads.
-
-        ``shape`` can be built with ``pa_decode_tuning.make_shape`` using
-        per-device head counts. The caller must supply its exact context bound;
-        per-sequence lengths do not participate in runtime matching.
-        Pass the same bound to ``pa_decode(max_context_length=...)`` when using
-        the selected budget with block tables that have extra padding.
-        """
-        try:
-            key = (
-                architecture,
-                num_cu,
-                *(shape[field] for field in _TUNED_SHAPE_FIELDS),
-            )
-            return self.budgets.get(key)
-        except (KeyError, TypeError):
-            return None
-
-
-@lru_cache(maxsize=16)
-def _load_tuned_results_cached(path: str, best: bool, required: bool):
-    if not required and not Path(path).is_file():
-        return PADecodeTunedResults(MappingProxyType({}))
-
-    # Keep CSV parsing and recommendation selection out of decode's hot path.
-    from . import pa_decode_tuning as tuning
-
-    groups = {}
-    for row in tuning.load_results(path):
-        problem = (
-            row["architecture"],
-            row["num_cu"],
-            *(row[field] for field in _TUNED_SHAPE_FIELDS),
-        )
-        groups.setdefault(problem, []).append(row)
-
-    budgets = {}
-    for problem, rows in groups.items():
-        key = tuning.make_key(rows[0], problem[0], problem[1])
-        budget = tuning.lookup_budget(rows, key, best=best)
-        if budget is not None:
-            budgets[problem] = budget
-    return PADecodeTunedResults(MappingProxyType(budgets))
-
-
-def load_tuned_results(
-    tuned_file: str | Path | None = None, *, best: bool = False, reload: bool = False
-) -> PADecodeTunedResults:
-    """Load and cache PA workgroup-budget recommendations from a tuning CSV.
-
-    The default is ``aiter/configs/model_configs/flydsl_pa_decode_tuned.csv``;
-    an absent default provides no recommendations. An explicit missing file or
-    a malformed CSV raises an error. Loading validates shape, budget and timing
-    fields; unmatched shapes do not provide a budget.
-
-    By default select the smallest budget reaching 97% of the best measured
-    performance; ``best=True`` selects the fastest valid candidate. Call once
-    before capture, and use ``reload=True`` after replacing a file.
-    The returned index is immutable and can also be used to prepare an explicit
-    ``plan_pa_decode(..., workgroup_budget=results.lookup_budget(shape, arch, cu))``.
-    """
-    if reload:
-        _load_tuned_results_cached.cache_clear()
-    # absolute() is lexical: cached calls do not stat or open the file.
-    path = str(
-        Path(_DEFAULT_TUNED_FILE if tuned_file is None else tuned_file).absolute()
-    )
-    return _load_tuned_results_cached(path, best, tuned_file is not None)
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -277,10 +171,12 @@ def pa_decode(
     position; 0 and -1 disable it.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
-    calling decode. Use ``load_tuned_results`` to select an offline-tuned
-    workgroup budget when creating a plan. Build the plan before graph capture.
-    Set its partition cap with ``plan_pa_decode(max_partitions=...)``; even a
-    cap of one uses packed scratch and reduction.
+    calling decode. Use ``pa_decode_tuning.get_cached_budget`` to read an
+    offline-tuned budget from FlyDSL's cache when creating a plan. Cache lookup
+    returns twice the device CU count on a miss and never benchmarks. Build the
+    plan before graph capture; decode does not access the tuning cache. Set its
+    partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
+    uses packed scratch and reduction.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.

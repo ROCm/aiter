@@ -1,28 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Offline PA-decode budget tuning and explicit, static-shape lookup.
+"""Offline PA-decode tuning backed by FlyDSL's Autotuner and config cache.
 
-CPU-only: --help, --dry-run, shape/key/selection helpers.
-Torch and the native PA implementation are imported only by the GPU runner.
-Candidates are checked in eager mode before graph-based timing.
-Each CSV row contains device-local shape, workgroup budget, and performance.
-Only successful measurements are saved; dry-run previews leave timings blank.
+Run this file with --help for the shape sweep options. --help and --dry-run
+need only Python. GPU runs search on a cache miss; FLYDSL_AUTOTUNE=1 forces
+a fresh search. FLYDSL_AUTOTUNE_CACHE_DIR controls FlyDSL's cache directory.
+An optional CSV is a measurement report, not a runtime configuration file.
+
+Each candidate uses a fixed plan and a graph containing decode plus reduction.
+FlyDSL validates candidates, measures them, and caches the smallest budget
+within 97% of the fastest measured performance. Runtime lookup never benchmarks.
+See docs/flydsl_pa_decode_tuning.md for cache and explicit-plan usage.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib
-import io
 import itertools
 import math
+import os
 import random
 import statistics
 import sys
-import tempfile
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 ATOL = RTOL = 0.005
@@ -207,20 +212,6 @@ def candidate_groups(budgets, batch_size, kv_heads, num_cu):
     ]
 
 
-def rotated_order(count, round_index):
-    positive_int(count, "candidate count")
-    positive_int(round_index, "round index", 0)
-    shift = round_index % count
-    order = list(range(shift, count)) + list(range(shift))
-    return order[::-1] if (round_index // count) % 2 else order
-
-
-def unique_kv_bytes(shape):
-    window, ql = shape["sliding_window"], shape["query_length"]
-    tokens = sum(min(n, window + ql - 1) if window else n for n in shape["lengths"])
-    return 2 * shape["num_kv_heads"] * shape["head_dim"] * tokens
-
-
 def _finite(value):
     try:
         return (
@@ -236,237 +227,198 @@ def _finite_positive(value):
     return _finite(value) and value > 0
 
 
-def candidate_valid(candidate):
-    if not isinstance(candidate, dict):
-        return False
-    accuracy = candidate.get("accuracy")
+def unique_kv_bytes(shape):
+    window, ql = shape["sliding_window"], shape["query_length"]
+    tokens = sum(min(n, window + ql - 1) if window else n for n in shape["lengths"])
+    return 2 * shape["num_kv_heads"] * shape["head_dim"] * tokens
+
+
+def _contiguous_strides(shape):
+    return tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
+
+
+def _synthetic_storage_key(shape):
+    h, d, page = (shape[k] for k in ("num_kv_heads", "head_dim", "page_size"))
+    pages = sum((n + page - 1) // page for n in shape["lengths"])
+    extent = pages * h * d * page
+    vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
+    scales = _contiguous_strides((pages, h, page)) if shape["per_token_kv"] else ()
     return (
-        isinstance(accuracy, dict)
-        and accuracy.get("passed") is True
-        and accuracy.get("finite") is True
-        and accuracy.get("atol") == ATOL
-        and accuracy.get("rtol") == RTOL
-        and isinstance(accuracy.get("elements"), int)
-        and _finite_positive(accuracy.get("elements"))
-        and _finite(accuracy.get("max_abs_error"))
-        and accuracy.get("max_abs_error", -1) >= 0
-        and _finite(accuracy.get("max_tolerance_ratio"))
-        and 0 <= accuracy.get("max_tolerance_ratio", -1) <= 1
-        and candidate.get("status") == "PASS"
-        and candidate.get("plan_unchanged") is True
-        and isinstance(candidate.get("samples_us"), list)
-        and bool(candidate["samples_us"])
-        and all(_finite_positive(value) for value in candidate["samples_us"])
+        (shape["num_query_heads"] * d, d, 1),
+        _contiguous_strides((pages, h, d // 16, page, 16)),
+        _contiguous_strides(vshape),
+        scales,
+        scales,
+        extent >= 2**31,
+        extent < 2**32,
     )
 
 
-def summarize_candidates(candidates, kv_bytes):
-    """Populate descriptive metrics; never recommend after baseline failure."""
-    positive_int(kv_bytes, "kv_bytes")
-    baseline = [c for c in candidates if c.get("is_baseline") is True]
-    if len(baseline) != 1 or not candidate_valid(baseline[0]):
-        return None
-    baseline = baseline[0]
-    base_median = statistics.median(baseline["samples_us"])
-    if not _finite_positive(base_median):
-        return None
-    valid = []
-    for c in candidates:
-        if not candidate_valid(c) or len(c["samples_us"]) != len(
-            baseline["samples_us"]
-        ):
-            continue
-        median = statistics.median(c["samples_us"])
-        if not _finite_positive(median):
-            continue
-        speedup = base_median / median
-        bandwidth = kv_bytes / median / 1e6
-        ratios = [b / t for b, t in zip(baseline["samples_us"], c["samples_us"])]
-        if not all(_finite_positive(value) for value in (speedup, bandwidth, *ratios)):
-            continue
-        c.update(
-            median_us=median,
-            min_us=min(c["samples_us"]),
-            max_us=max(c["samples_us"]),
-            unique_kv_tb_s=bandwidth,
-            baseline_speedup=speedup,
-            round_speedups=ratios,
+def storage_key(query, key, value, key_scale, value_scale):
+    """Host-only layout/address specialization shared by search and lookup."""
+
+    def scale_strides(scale):
+        if scale.numel() == 1:
+            return ()
+        strides = tuple(scale.stride())
+        # pa_decode normalizes (..., page, 1) per-token scales with squeeze(-1).
+        return strides[:-1] if scale.ndim == 4 and scale.shape[-1] == 1 else strides
+
+    extent = max(key.numel(), value.numel())
+    return (
+        tuple(query.stride()),
+        tuple(key.stride()),
+        tuple(value.stride()),
+        scale_strides(key_scale),
+        scale_strides(value_scale),
+        extent >= 2**31,
+        extent < 2**32,
+    )
+
+
+@lru_cache(maxsize=1)
+def _implementation_hash():
+    # FlyDSL supplies compiler/environment fingerprints. Include the PA sources
+    # as well: a budget measured before a kernel/policy change must not be reused.
+    root = Path(__file__).resolve().parent
+    files = sorted((root / "kernels" / "pa_decode").glob("*.py"))
+    files += [root / "pa_decode.py", Path(__file__).resolve()]
+    files += [
+        root / "kernels" / name
+        for name in (
+            "pa_decode_kernel.py",
+            "pa_decode_reduce.py",
+            "pa_decode_plan.py",
+            "buffer_ops.py",
+            "tensor_shim.py",
+            "kernels_common.py",
+            "dpp_utils.py",
+            "utils.py",
         )
-        valid.append(c)
-    if baseline not in valid:
-        return None
-    best = max(valid, key=lambda c: (c["baseline_speedup"], -c["workgroup_budget"]))
-    near = [
-        c
-        for c in valid
-        if c["baseline_speedup"] >= NEAR_BEST * best["baseline_speedup"] - 1e-12
     ]
-    conservative = min(near, key=lambda c: c["workgroup_budget"])
-    return {
-        "best_budget": best["workgroup_budget"],
-        "best_capacity": best["capacity"],
-        "best_speedup": best["baseline_speedup"],
-        "conservative_budget": conservative["workgroup_budget"],
-        "conservative_capacity": conservative["capacity"],
-        "near_optimal_budgets": sorted(b for c in near for b in c["budget_aliases"]),
-        "near_optimal_capacities": sorted(c["capacity"] for c in near),
-        "valid_capacities": len(valid),
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+class _OfflineTuningRequired(RuntimeError):
+    pass
+
+
+def _pa_decode_budget(
+    shape_key,
+    architecture,
+    num_cu,
+    implementation,
+    storage_key,
+    *,
+    workgroup_budget,
+    tuning_session=None,
+):
+    tuning_session.launch(workgroup_budget)
+
+
+def _configs(*args, tuning_session=None, **kwargs):
+    if tuning_session is None:
+        # FLYDSL_AUTOTUNE bypasses even a runtime default. Keep budget lookup
+        # a lookup-only operation when that flag is inherited.
+        raise _OfflineTuningRequired("Run the offline PA tuner to measure budgets")
+    return tuning_session.configs()
+
+
+@contextmanager
+def _validate_config(arguments):
+    with arguments["tuning_session"].validate(arguments["workgroup_budget"]):
+        yield
+
+
+def _select_config(results):
+    """Prefer the smallest budget within the existing 97% performance band."""
+    best = min(elapsed for _, elapsed in results)
+    return min(
+        (
+            (config, elapsed)
+            for config, elapsed in results
+            if best / elapsed >= NEAR_BEST - 1e-12
+        ),
+        key=lambda pair: pair[0].kwargs["workgroup_budget"],
+    )
+
+
+def _default_config(*args, num_cu, **kwargs):
+    from flydsl.autotune import Config
+
+    return Config(workgroup_budget=2 * num_cu)
+
+
+def _make_autotuner(session=None):
+    from flydsl.autotune import autotune
+
+    return autotune(
+        configs=_configs,
+        key=["shape_key", "architecture", "num_cu", "implementation", "storage_key"],
+        warmup=0,
+        rep=session.rounds if session is not None else 1,
+        validate_hook=_validate_config,
+        do_bench=session.benchmark if session is not None else None,
+        select_config=session.select if session is not None else _select_config,
+        default=None if session is not None else _default_config,
+    )(_pa_decode_budget)
+
+
+@lru_cache(maxsize=8)
+def _get_runtime_tuner(cache_dir):
+    return _make_autotuner()
+
+
+def _resolve_config(shape, architecture, num_cu, session=None, *, storage_key=None):
+    arguments = {
+        "shape_key": tuple(shape[field] for field in STATIC_SHAPE_FIELDS),
+        "architecture": architecture,
+        "num_cu": num_cu,
+        "implementation": _implementation_hash(),
+        "storage_key": (
+            _synthetic_storage_key(shape) if storage_key is None else storage_key
+        ),
     }
-
-
-def _validate_results(rows):
-    """Validate flat shape/performance rows and reject duplicate budgets."""
-    if not isinstance(rows, list):
-        raise TypeError("Tuning results must be a list of CSV rows")
-    seen = set()
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != set(CSV_FIELDS):
-            raise ValueError(
-                "Tuning rows require exactly the shape/performance columns"
-            )
-        make_key(row, row["architecture"], row["num_cu"])
-        positive_int(row["workgroup_budget"], "workgroup_budget")
-        for field in ("median_us", "min_us", "max_us", "unique_kv_tb_s"):
-            if not _finite_positive(row[field]):
-                raise ValueError(f"{field} must be finite and positive")
-        if not row["min_us"] <= row["median_us"] <= row["max_us"]:
-            raise ValueError("Timings must satisfy min_us <= median_us <= max_us")
-        identity = (
-            row["architecture"],
-            row["num_cu"],
-            *(row[field] for field in STATIC_SHAPE_FIELDS),
-            row["workgroup_budget"],
-        )
-        if identity in seen:
-            raise ValueError("Duplicate tuning row for the same shape and budget")
-        seen.add(identity)
-
-
-def _csv_row(key, candidate):
-    return {
-        "architecture": key["architecture"],
-        "num_cu": key["num_cu"],
-        **key["shape"],
-        "workgroup_budget": candidate["workgroup_budget"],
-        "median_us": candidate.get("median_us", ""),
-        "min_us": candidate.get("min_us", ""),
-        "max_us": candidate.get("max_us", ""),
-        "unique_kv_tb_s": candidate.get("unique_kv_tb_s", ""),
-    }
-
-
-def _write_results_csv(stream, rows):
-    _validate_results(rows)
-    writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS, lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-
-
-def _read_results_csv(stream):
-    reader = csv.DictReader(stream, strict=True)
+    cache_dir = os.environ.get("FLYDSL_AUTOTUNE_CACHE_DIR")
+    tuner = (
+        _get_runtime_tuner(cache_dir) if session is None else _make_autotuner(session)
+    )
+    config = tuner.resolve_config(**arguments, tuning_session=session)
+    values = config.all_kwargs()
     if (
-        reader.fieldnames is None
-        or len(reader.fieldnames) != len(CSV_FIELDS)
-        or set(reader.fieldnames) != set(CSV_FIELDS)
+        set(values) != {"workgroup_budget"}
+        or type(values["workgroup_budget"]) is not int
+        or values["workgroup_budget"] <= 0
+        or config.compiler_opts()
+        or config.pre_hook is not None
     ):
-        raise ValueError("Unexpected tuning CSV columns")
-    rows = []
-    for raw in reader:
-        if None in raw or any(value is None for value in raw.values()):
-            raise ValueError("Malformed tuning CSV row width")
-        row = {}
-        for field, value in raw.items():
-            if field in ("architecture", "query_dtype"):
-                row[field] = value
-            elif field in ("per_token_kv", "trans_v"):
-                row[field] = {"true": True, "false": False, "1": True, "0": False}[
-                    value.strip().lower()
-                ]
-            elif field in (
-                "softmax_scale",
-                "median_us",
-                "min_us",
-                "max_us",
-                "unique_kv_tb_s",
-            ):
-                row[field] = float(value)
-            else:
-                row[field] = int(value)
-        rows.append(row)
-    _validate_results(rows)
-    return rows
-
-
-def load_results(path):
-    """Load a flat shape/performance CSV without GPU imports."""
-    try:
-        with Path(path).open(newline="", encoding="utf-8-sig") as stream:
-            return _read_results_csv(stream)
-    except (csv.Error, KeyError, TypeError, AttributeError) as exc:
-        raise ValueError("Malformed tuning-result CSV") from exc
-
-
-def lookup_budget(rows, key, *, best=False):
-    """Select a measured budget for an exact device and shape."""
-    try:
-        _validate_results(rows)
-        if key != make_key(key["shape"], key["architecture"], key["num_cu"]):
-            return None
-        matches = [
-            row
-            for row in rows
-            if row["architecture"] == key["architecture"]
-            and row["num_cu"] == key["num_cu"]
-            and all(row[field] == key["shape"][field] for field in STATIC_SHAPE_FIELDS)
-        ]
-        if not matches:
-            return None
-        fastest = min(
-            matches, key=lambda row: (row["median_us"], row["workgroup_budget"])
+        raise ValueError(
+            "Invalid PA budget in FlyDSL cache; use FLYDSL_AUTOTUNE=1 to retune"
         )
-        if best:
-            return fastest["workgroup_budget"]
-        return min(
-            row["workgroup_budget"]
-            for row in matches
-            if fastest["median_us"] / row["median_us"] >= NEAR_BEST - 1e-12
-        )
-    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
-        return None
+    if session is not None:
+        # Both objects use FlyDSL's cache/key format. Make a completed search
+        # visible to a runtime resolver already constructed in this process.
+        _get_runtime_tuner(cache_dir).cache.update(tuner.cache)
+    return config
 
 
-def save_results(path, rows, *, overwrite=False):
-    """Save flat CSV rows; create exclusively or replace atomically."""
-    path = Path(path)
-    if path.suffix.lower() != ".csv":
-        raise ValueError("Tuning results require a .csv output path")
-    buffer = io.StringIO(newline="")
-    _write_results_csv(buffer, rows)
-    payload = buffer.getvalue()
-    if not overwrite:
-        with path.open("x", newline="", encoding="utf-8") as stream:
-            stream.write(payload)
-        return
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        dir=path.parent,
-        prefix=path.name + ".",
-        delete=False,
-        newline="",
-        encoding="utf-8",
-    ) as stream:
-        temporary = Path(stream.name)
-        try:
-            stream.write(payload)
-            stream.close()
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+def get_cached_budget(shape, architecture, num_cu, *, storage_key=None):
+    """Read FlyDSL's config cache, or use 2*CU; never compile or benchmark.
 
-
-def save_csv(path, rows, *, overwrite=False):
-    """Alias for saving the shape/performance CSV."""
-    save_results(path, rows, overwrite=overwrite)
+    Call before graph capture when preparing an explicit work plan. Pass the
+    actual tensor storage key to distinguish packed or padded caches from the
+    tuner's synthetic contiguous inputs. Use the current CUDA device's metadata.
+    """
+    try:
+        return _resolve_config(
+            shape, architecture, num_cu, storage_key=storage_key
+        ).kwargs["workgroup_budget"]
+    except (_OfflineTuningRequired, ValueError):
+        return 2 * num_cu
 
 
 def _make_inputs(torch, shape, device, fp8):
@@ -733,6 +685,148 @@ def _full_fp32(torch):
         ]
 
 
+class _BaselineFailed(ArithmeticError):
+    pass
+
+
+class _TuningSession:
+    """PA resources and correctness hooks for one FlyDSL config search."""
+
+    def __init__(
+        self, torch, pa, shape, info, candidates, rounds, iterations, warmup, stream
+    ):
+        self.torch, self.pa, self.problem, self.info = torch, pa, shape, info
+        self.candidates = {c["workgroup_budget"]: c for c in candidates}
+        self.rounds, self.iterations, self.warmup = rounds, iterations, warmup
+        self.stream = stream
+        self.resources = {}
+        self.current = None
+        self.baseline = next(c for c in candidates if c["is_baseline"])
+
+    def _prepare(self, candidate):
+        budget = candidate["workgroup_budget"]
+        try:
+            self.resources[budget] = _prepare_candidate(
+                self.torch,
+                self.pa,
+                self.inputs,
+                self.problem,
+                candidate,
+                self.reference,
+                self.info["num_cu"],
+                self.iterations,
+                self.warmup,
+                self.stream,
+            )
+            candidate["status"] = "READY"
+        except Exception as exc:
+            self._failure(candidate, exc)
+            raise
+
+    def _failure(self, candidate, exc):
+        candidate["status"] = _error_status(self.torch, exc)
+        candidate["errors"].append(f"{type(exc).__name__}: {exc}")
+
+    def configs(self):
+        from flydsl.autotune import Config
+
+        torch = self.torch
+        device = torch.device("cuda", self.info["device"])
+        fp8 = (
+            torch.float8_e4m3fn
+            if self.info["architecture"] == "gfx950"
+            else torch.float8_e4m3fnuz
+        )
+        self.inputs = _make_inputs(torch, self.problem, device, fp8)
+        actual = storage_key(
+            *(
+                self.inputs[name]
+                for name in ("query", "key", "value", "key_scale", "value_scale")
+            )
+        )
+        if actual != _synthetic_storage_key(self.problem):
+            raise RuntimeError("Synthetic storage key disagrees with allocated inputs")
+        self.reference = _reference(torch, self.inputs, self.problem)
+        if not bool(torch.isfinite(self.reference).all().item()):
+            raise RuntimeError("FP32 reference is nonfinite")
+        # A failed baseline aborts before FlyDSL starts searching other configs.
+        try:
+            self._prepare(self.baseline)
+        except Exception as exc:
+            raise _BaselineFailed("Baseline preparation failed") from exc
+        return [
+            Config(workgroup_budget=c["workgroup_budget"])
+            for c in sorted(
+                self.candidates.values(), key=lambda c: not c["is_baseline"]
+            )
+        ]
+
+    @contextmanager
+    def validate(self, budget):
+        candidate = self.candidates[budget]
+        self.current = candidate
+        if budget not in self.resources:
+            self._prepare(candidate)
+        try:
+            yield
+            self.torch.cuda.synchronize()
+            candidate["graph_accuracy"] = _accuracy(
+                self.torch, self.resources[budget]["output"], self.reference
+            )
+            if not candidate["graph_accuracy"]["passed"]:
+                raise ArithmeticError("graph accuracy failed")
+        except Exception as exc:
+            self._failure(candidate, exc)
+            raise
+
+    def launch(self, budget):
+        self.resources[budget]["graph"].replay()
+
+    def benchmark(self, fn, *, warmup, rep):
+        from flydsl.autotune import do_bench
+
+        candidate = self.current
+        try:
+            # Every replay contains iterations native decode+reduce calls.
+            # FlyDSL supplies the GPU backlog and event timing. Search order
+            # is owned by Autotuner; these are per-config repeated samples.
+            for _ in range(rep):
+                elapsed = do_bench(fn, warmup=warmup, rep=1) * 1000 / self.iterations
+                if not _finite_positive(elapsed):
+                    raise RuntimeError("Nonfinite or nonpositive FlyDSL timing")
+                candidate["samples_us"].append(elapsed)
+            resource = self.resources[candidate["workgroup_budget"]]
+            plan = resource["plan"]
+            candidate["plan_unchanged"] = bool(
+                self.torch.equal(plan.work_info, resource["snapshots"][0])
+                and self.torch.equal(plan.reduce_info, resource["snapshots"][1])
+            )
+            if not candidate["plan_unchanged"]:
+                raise ArithmeticError("Work plan changed during benchmarking")
+            samples = candidate["samples_us"]
+            candidate.update(
+                status="PASS",
+                median_us=statistics.median(samples),
+                min_us=min(samples),
+                max_us=max(samples),
+                unique_kv_tb_s=unique_kv_bytes(self.problem)
+                / statistics.median(samples)
+                / 1e6,
+            )
+            return candidate["median_us"] / 1000
+        except Exception as exc:
+            self._failure(candidate, exc)
+            raise
+
+    def select(self, results):
+        if not any(
+            config.kwargs["workgroup_budget"] == self.baseline["workgroup_budget"]
+            for config, _ in results
+        ):
+            raise _BaselineFailed("Baseline validation or measurement failed")
+        return _select_config(results)
+
+
 def tune_shape(
     torch,
     pa,
@@ -744,7 +838,7 @@ def tune_shape(
     iterations=100,
     warmup=5,
 ):
-    """GPU-only. Each graph contains only native decode+reducer; no refresh."""
+    """Search on a FlyDSL cache miss; cached results allocate no benchmark data."""
     for value, name, minimum in (
         (rounds, "rounds", 1),
         (iterations, "iterations", 1),
@@ -756,23 +850,16 @@ def tune_shape(
     candidates = candidate_groups(
         budgets, shape["batch_size"], shape["num_kv_heads"], device_info["num_cu"]
     )
-    for c in candidates:
-        c.update(
-            status="NOT_RUN",
-            accuracy={},
-            samples_us=[],
-            errors=[],
-            plan_unchanged=False,
-        )
+    for candidate in candidates:
+        candidate.update(status="NOT_RUN", samples_us=[], errors=[])
     record = {
         "key": key,
         "status": "RUNNING",
         "candidates": candidates,
         "selection": None,
         "errors": [],
-        "unique_kv_bytes": unique_kv_bytes(shape),
     }
-    live = {}
+    session = None
     try:
         device = torch.device("cuda", device_info["device"])
         props = torch.cuda.get_device_properties(device)
@@ -785,65 +872,47 @@ def tune_shape(
         with _full_fp32(torch), torch.no_grad(), torch.cuda.device(
             device
         ), torch.cuda.stream(stream):
-            inputs = _make_inputs(torch, shape, device, getattr(torch, key["kv_dtype"]))
-            reference = _reference(torch, inputs, shape)
-            if not bool(torch.isfinite(reference).all().item()):
-                raise RuntimeError("FP32 reference is nonfinite")
-            for c in sorted(candidates, key=lambda c: not c["is_baseline"]):
-                try:
-                    live[c["capacity"]] = _prepare_candidate(
-                        torch,
-                        pa,
-                        inputs,
-                        shape,
-                        c,
-                        reference,
-                        device_info["num_cu"],
-                        iterations,
-                        warmup,
-                        stream,
-                    )
-                    c["status"] = "READY"
-                except Exception as exc:  # noqa: BLE001 - Record candidate failures.
-                    c["status"] = _error_status(torch, exc)
-                    c["errors"].append(f"{type(exc).__name__}: {exc}")
-                    if c["is_baseline"]:
-                        record["status"] = "BASELINE_FAILED"
-                        return record
-            ready = [c for c in candidates if c["status"] == "READY"]
-            for r in range(rounds):
-                order = [ready[i] for i in rotated_order(len(ready), r)]
-                for c in order:
-                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                        enable_timing=True
-                    )
-                    start.record(stream)
-                    live[c["capacity"]]["graph"].replay()
-                    end.record(stream)
-                    end.synchronize()
-                    elapsed = start.elapsed_time(end) * 1000 / iterations
-                    if not _finite_positive(elapsed):
-                        raise RuntimeError("Nonfinite or nonpositive event timing")
-                    c["samples_us"].append(elapsed)
-            for c in ready:
-                resource = live[c["capacity"]]
-                plan = resource["plan"]
-                c["plan_unchanged"] = bool(
-                    torch.equal(plan.work_info, resource["snapshots"][0])
-                    and torch.equal(plan.reduce_info, resource["snapshots"][1])
-                )
-                c["status"] = "PASS" if c["plan_unchanged"] else "FAIL"
-        record["selection"] = summarize_candidates(
-            candidates, record["unique_kv_bytes"]
+            session = _TuningSession(
+                torch,
+                pa,
+                shape,
+                device_info,
+                candidates,
+                rounds,
+                iterations,
+                warmup,
+                stream,
+            )
+            config = _resolve_config(shape, key["architecture"], key["num_cu"], session)
+            record.update(
+                status="PASS",
+                cache_hit=not bool(session.resources),
+                selection={"workgroup_budget": config.kwargs["workgroup_budget"]},
+            )
+    except Exception as exc:  # noqa: BLE001 - Preserve the failed search report.
+        record["status"] = (
+            "BASELINE_FAILED"
+            if isinstance(exc, _BaselineFailed)
+            else _error_status(torch, exc)
         )
-        record["status"] = "PASS" if record["selection"] else "BASELINE_FAILED"
-    except Exception as exc:  # noqa: BLE001 - Preserve partial results on failure.
-        record["status"] = _error_status(torch, exc)
         record["errors"].append(f"{type(exc).__name__}: {exc}")
-        record["selection"] = None
     finally:
-        live.clear()
+        if session is not None:
+            session.resources.clear()
     return record
+
+
+def _csv_row(key, candidate):
+    return {
+        "architecture": key["architecture"],
+        "num_cu": key["num_cu"],
+        **key["shape"],
+        "workgroup_budget": candidate["workgroup_budget"],
+        "median_us": candidate.get("median_us", ""),
+        "min_us": candidate.get("min_us", ""),
+        "max_us": candidate.get("max_us", ""),
+        "unique_kv_tb_s": candidate.get("unique_kv_tb_s", ""),
+    }
 
 
 def _list_arg(text, converter=int, *, unique=True):
@@ -913,7 +982,12 @@ def main(argv=None):
     budgets = parser.add_mutually_exclusive_group()
     budgets.add_argument("--budgets", type=_list_arg)
     budgets.add_argument("--budget-cu", type=lambda s: _list_arg(s, float))
-    parser.add_argument("--rounds", type=int, default=16)
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=16,
+        help="Repeated graph measurements per candidate",
+    )
     parser.add_argument(
         "--iterations",
         type=int,
@@ -926,7 +1000,9 @@ def main(argv=None):
     parser.add_argument("--num-cu", type=int)
     result_output = parser.add_mutually_exclusive_group()
     result_output.add_argument(
-        "--output", type=Path, help="Shape, budget, and performance in a new .csv file"
+        "--output",
+        type=Path,
+        help="Optional measurement report; runtime configurations use FlyDSL cache",
     )
     result_output.add_argument(
         "--csv", dest="output", type=Path, help="Alias for --output"
@@ -987,19 +1063,15 @@ def main(argv=None):
                 )
             info = {"architecture": args.architecture, "num_cu": args.num_cu}
         else:
-            if args.output is None:
-                raise ValueError(
-                    "GPU tuning requires --output; existing files are never overwritten"
-                )
-            if args.output.suffix.lower() != ".csv":
-                raise ValueError("Tuning results require a .csv output path")
-            if args.output.exists() or args.output.is_symlink():
-                raise FileExistsError("Output CSV must be a new path")
-            if not args.output.parent.is_dir():
-                raise FileNotFoundError(
-                    "Output CSV parent directory must already exist"
-                )
-            args.output = args.output.resolve()
+            if args.output is not None:
+                if args.output.suffix.lower() != ".csv":
+                    raise ValueError("Measurement reports require a .csv output path")
+                if args.output.exists() or args.output.is_symlink():
+                    raise FileExistsError("Output CSV must be a new path")
+                if not args.output.parent.is_dir():
+                    raise FileNotFoundError(
+                        "Output CSV parent directory must already exist"
+                    )
             torch, pa, info = _load_gpu(args)
         candidates = args.budgets or list(DEFAULT_BUDGETS)
         if args.budget_cu is not None:
@@ -1029,8 +1101,16 @@ def main(argv=None):
         writer.writerows(preview)
         return 0
 
-    rows = []
-    save_results(args.output, rows)
+    report = (
+        args.output.open("x", newline="", encoding="utf-8") if args.output else None
+    )
+    writer = (
+        csv.DictWriter(report, fieldnames=CSV_FIELDS, lineterminator="\n")
+        if report
+        else None
+    )
+    if writer:
+        writer.writeheader()
     all_passed = True
     try:
         for index, shape in enumerate(shapes, 1):
@@ -1048,16 +1128,18 @@ def main(argv=None):
                 iterations=args.iterations,
                 warmup=args.warmup,
             )
-            if result["status"] == "PASS":
-                rows.extend(
+            all_passed &= result["status"] == "PASS"
+            if writer and result["status"] == "PASS":
+                writer.writerows(
                     _csv_row(result["key"], candidate)
                     for candidate in result["candidates"]
-                    if candidate_valid(candidate)
+                    if candidate["status"] == "PASS"
                 )
-            else:
-                all_passed = False
-            save_results(args.output, rows, overwrite=True)
-            print(f"RESULT {result['status']} {result['selection']}", flush=True)
+                report.flush()
+            print(
+                f"RESULT {result['status']} cache_hit={result.get('cache_hit', False)} {result['selection']}",
+                flush=True,
+            )
             for candidate in result["candidates"]:
                 for error in candidate["errors"]:
                     print(
@@ -1068,7 +1150,8 @@ def main(argv=None):
                 print(f"ERROR {error}", file=sys.stderr)
             torch.cuda.empty_cache()
     finally:
-        save_results(args.output, rows, overwrite=True)
+        if report:
+            report.close()
     return 0 if all_passed else 1
 
 
