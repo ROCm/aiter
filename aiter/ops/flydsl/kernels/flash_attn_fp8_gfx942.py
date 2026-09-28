@@ -139,7 +139,10 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                 qr = tile * 32 + r // 2
                 safe_qr = (qr < qlen).select(qr, fx.Int32(0))
                 src = (
-                    (fx.Int64(q0 + safe_qr) * 32 + fx.Int64(head * 2 + r % 2))
+                    (
+                        (fx.Int64(q0) + fx.Int64(safe_qr)) * 32
+                        + fx.Int64(head * 2 + r % 2)
+                    )
                     * 256
                     + fx.Int64(d)
                 )
@@ -277,7 +280,10 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     for r in range_constexpr(8):
                         d = dc * 32 + half * 4 + ((r * 2) // 4) * 8 + (r * 2) % 4
                         dest = (
-                            (fx.Int64(q0 + qr) * 32 + fx.Int64(head * 2 + row % 2))
+                            (
+                                (fx.Int64(q0) + fx.Int64(qr)) * 32
+                                + fx.Int64(head * 2 + row % 2)
+                            )
                             * 256
                             + fx.Int64(d)
                         ) * 2
@@ -356,14 +362,16 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             raise ValueError("all tensors must be on the same device")
         if block_table.shape[1] > 1024:
             raise ValueError("block table exceeds the 1024-entry LDS capacity")
+        # FlyDSL packs each dynamic extent as i32. Preserve axes instead of
+        # flattening multi-GiB tensors; global byte offsets remain 64-bit.
         launch(
-            q.view(torch.int8).reshape(-1),
-            k.view(torch.int8).reshape(-1),
-            v.view(torch.int8).reshape(-1),
-            out.reshape(-1),
+            q.view(torch.int8),
+            k.view(torch.int8),
+            v.view(torch.int8),
+            out,
             cu_seqlens_q,
             seqused_k,
-            block_table.reshape(-1),
+            block_table,
             q_descale.reshape(1),
             k_descale.reshape(1),
             v_descale.reshape(1),

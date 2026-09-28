@@ -498,6 +498,8 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
         ]
     elif workload == "window-boundary":
         query_lens, kv_lens = [33, 1], [1057, 1025]
+    elif workload in ("cache-over-2gib", "cache-over-4gib"):
+        query_lens, kv_lens = [1, 33], [65, 1057]
     else:
         raise ValueError(f"unknown gfx942 workload: {workload}")
 
@@ -528,6 +530,23 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
         case["v_descale"].fill_(0.75)
 
     want = reference(case, query_lens, kv_lens)
+    if workload in ("cache-over-2gib", "cache-over-4gib"):
+        boundary = 2**31 if workload == "cache-over-2gib" else 2**32
+        first_page = boundary // (page * 16 * 256) + 1
+        small_pages = case["k"].shape[0]
+        # Relocate the small oracle's shuffled pages above the byte boundary.
+        # Only referenced pages and low-address wraparound decoys are touched.
+        for name in ("k", "v"):
+            small = case[name]
+            large = torch.empty(
+                (first_page + small_pages, page, 16, 256),
+                device=small.device,
+                dtype=small.dtype,
+            )
+            large[: small_pages + 1].view(torch.int8).zero_()
+            large[first_page:].copy_(small)
+            case[name] = large
+        case["block_table"] = case["block_table"] + first_page
     got = build_flash_attn_fp8_gfx942(page)(**case).float()
     error = (want - got).abs()
     # Keep the existing FP8 global-scale tolerance. Timing is a separate sweep.
@@ -553,12 +572,16 @@ def main():
             for page, workload in itertools.product([32, 64], workloads)
         ]
         rows.append(test_gfx942_sliding(32, "mixed", scale=1.0))
+        rows.extend(
+            test_gfx942_sliding(page, workload)
+            for page, workload in [(32, "cache-over-2gib"), (64, "cache-over-4gib")]
+        )
         aiter.logger.info(
             "gfx942 sliding correctness summary (markdown):\n%s",
             pd.DataFrame(rows).to_markdown(index=False),
         )
         aiter.logger.info(
-            "PASS: 13 gfx942 direct-launch cases; SKIP: eight gfx950-only groups"
+            "PASS: 15 gfx942 direct-launch cases; SKIP: eight gfx950-only groups"
         )
         return
     if get_gfx() != "gfx950" or arch != "gfx950":
