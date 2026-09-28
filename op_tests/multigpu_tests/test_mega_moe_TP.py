@@ -257,6 +257,7 @@ class ModelShape:
     # True when ``tuned_csv`` was tuned for a different activation dtype, so the
     # a4w4 sweep will fall back to untuned kernel selection.
     a4w4_untuned: bool = False
+    x_scale: float = 1.0
 
     def local_inter_dim(self, tp: int) -> int:
         if self.inter_dim % tp:
@@ -314,6 +315,16 @@ MODELS: dict[str, ModelShape] = {
         topk=9,
         act_type=aiter.ActivationType.Silu,
         tuned_csv="glm5_fp4_tuned_fmoe.csv",
+    ),
+    "m3": ModelShape(
+        name="m3",
+        model_dim=6144,
+        inter_dim=3072,
+        experts=129,
+        topk=5,
+        act_type=aiter.ActivationType.Swiglu,
+        tuned_csv="minimax_m3_fp4_tuned_fmoe.csv",
+        x_scale=0.25,
     ),
 }
 
@@ -623,7 +634,7 @@ def make_inputs(
     if comm_mode == "ar_ar":
         return _make_inputs_ar(shape, ctx, tp_size, global_tokens, seed, route)
     gen = torch.Generator(device=ctx.device).manual_seed(seed + ctx.rank)
-    x = torch.randn(
+    x = shape.x_scale * torch.randn(
         (m, shape.model_dim), dtype=dtypes.bf16, device=ctx.device, generator=gen
     )
     if route == "balanced":
@@ -667,12 +678,12 @@ def make_inputs(
 
 def _make_inputs_ar(shape, ctx, tp_size, global_tokens, seed, route) -> TpMoeInputs:
     """AR/AR inputs: a bf16 partial of all M tokens per rank (their sum is the
-    layer input, ~N(0, 1) like the AG/RS inputs) and one routing shared by
-    every rank, drawn from a rank-independent generator."""
+    layer input, ~N(0, x_scale**2) like the AG/RS inputs) and one routing shared
+    by every rank, drawn from a rank-independent generator."""
     M = global_tokens
     gen = torch.Generator(device=ctx.device).manual_seed(seed + 7919 * (ctx.rank + 1))
     x = torch.randn((M, shape.model_dim), dtype=torch.float32, device=ctx.device, generator=gen)
-    x = (x * tp_size**-0.5).to(dtypes.bf16)
+    x = (x * (shape.x_scale * tp_size**-0.5)).to(dtypes.bf16)
     shared = torch.Generator(device=ctx.device).manual_seed(seed + 104729)
     if route == "balanced":
         score = torch.zeros((M, shape.experts), dtype=dtypes.bf16, device=ctx.device)

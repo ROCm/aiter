@@ -82,6 +82,9 @@ class MegaMoeTP:
         if cfg.comm_mode not in COMM_MODES:
             raise ValueError(f"comm_mode must be one of {COMM_MODES}, got {cfg.comm_mode!r}")
         situ = cfg.activation == ActivationType.Situv2
+        act = {ActivationType.Situv2: "situv2", ActivationType.Swiglu: "swiglu"}.get(
+            cfg.activation, "silu"
+        )
         self.cfg = cfg
         self.engine = FusedTpMegaMoe(
             rank=cfg.rank,
@@ -95,7 +98,7 @@ class MegaMoeTP:
             w1_scale=w1_scale,
             w2=w2,
             w2_scale=w2_scale,
-            activation="situv2" if situ else "silu",
+            activation=act,
             situ_beta=cfg.beta if situ and cfg.beta is not None else 1.0,
             situ_linear_beta=(
                 cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0

@@ -22,7 +22,7 @@
 set -u
 AITER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS="dsv3 glm5 kimi3 dsv4"
-TOKENS="256 512 1024 2048"
+TOKENS="8 16 32 64 96 128 256 512 1024 2048"
 NP=4
 MODES="ag_rs ar_ar"
 SP=0
