@@ -49,7 +49,13 @@ def _pack4(values):
 
 @lru_cache(maxsize=2)
 def build_flash_attn_fp8_gfx942(page_size=32):
-    """Build D256, Hq32/Hkv16, causal window1024 attention for page32/64."""
+    """Build D256, Hq32/Hkv16, causal window1024 attention for page32/64.
+
+    Each sequence has 1 <= q_len <= kv_len; decode and prefix-cached chunks
+    share one launch. Lengths and page IDs are device metadata supplied by the
+    caller. max_seqlen_q must bound every q_len, and each block-table row must
+    cover its kv_len. Descales are per-tensor FP32, not per-head or per-page.
+    """
     if page_size not in (32, 64):
         raise ValueError("gfx942 sliding attention requires page size 32 or 64")
 
@@ -205,6 +211,18 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             raise ValueError("expected FNUZ Q/K/V and BF16 output")
         if any(not t.is_contiguous() for t in (q, k, v, out, cu_seqlens_q, seqused_k, block_table)):
             raise ValueError("direct launcher requires contiguous tensors")
+        batch = seqused_k.numel()
+        if out.shape != q.shape or cu_seqlens_q.shape != (batch + 1,) or seqused_k.ndim != 1:
+            raise ValueError("output and sequence metadata shapes do not match Q")
+        if block_table.ndim != 2 or block_table.shape[0] != batch:
+            raise ValueError("expected one block-table row per sequence")
+        if any(t.dtype != torch.int32 for t in (cu_seqlens_q, seqused_k, block_table)):
+            raise ValueError("sequence metadata must be int32")
+        descales = (q_descale, k_descale, v_descale)
+        if any(t.dtype != torch.float32 or t.numel() != 1 for t in descales):
+            raise ValueError("descales must be per-tensor FP32 scalars")
+        if any(t.device != q.device for t in (k, v, out, cu_seqlens_q, seqused_k, block_table) + descales):
+            raise ValueError("all tensors must be on the same device")
         if block_table.shape[1] > 1024:
             raise ValueError("block table exceeds the 1024-entry LDS capacity")
         launch(q.view(torch.int8).reshape(-1), k.view(torch.int8).reshape(-1),
