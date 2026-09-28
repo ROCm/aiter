@@ -6,6 +6,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.test_common import benchmark, perftest
 
 
@@ -159,10 +161,26 @@ def run_top_k_per_row_prefill(
     stride_row: int,
     stride_col: int,
     k: int = 2048,
+    flydsl: bool = False,
+    stable: bool = False,
 ) -> None:
     """
-    Run the top_k_per_row kernel.
+    Run the top_k_per_row kernel. `flydsl=True` bypasses dispatch and calls the
+    one-block radix kernel directly.
     """
+    if flydsl:
+        return aiter.flydsl_radix_topk_one_block_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            values,
+            num_rows,
+            stride_row,
+            stride_col,
+            k,
+            stable,
+        )
     return aiter.top_k_per_row_prefill(
         logits,
         row_starts,
@@ -173,6 +191,7 @@ def run_top_k_per_row_prefill(
         stride_row,
         stride_col,
         k=k,
+        stable=stable,
     )
 
 
@@ -241,7 +260,13 @@ def run_top_k_per_row_decode(
 
 @benchmark()
 def test_top_k_per_row_prefill(
-    num_rows: int, num_prefix: int, top_k: int, data_generation: str = "random"
+    num_rows: int,
+    num_prefix: int,
+    top_k: int,
+    data_generation: str = "random",
+    flydsl: bool = False,
+    stable: bool = False,
+    write_values: bool = False,
 ) -> dict:
     """
     Test topk_per_row_prefill.
@@ -252,13 +277,21 @@ def test_top_k_per_row_prefill(
     # Create test data
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
     logits = create_random_logits(
-        row_starts, row_ends, torch.float32, 42, data_generation
+        row_starts,
+        row_ends,
+        torch.float32,
+        42,
+        data_generation,
+        physical_width=max(int(max(row_ends)), top_k) if flydsl else None,
     )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-
-    torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    values = (
+        torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
@@ -266,11 +299,13 @@ def test_top_k_per_row_prefill(
         row_starts,
         row_ends,
         indices,
-        None,  # values
+        values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
         k=top_k,
+        flydsl=flydsl,
+        stable=stable,
     )
 
     # Run reference implementation
@@ -282,7 +317,14 @@ def test_top_k_per_row_prefill(
 
     # Compare results
     all_close = compare_topk_results(
-        logits, indices, torch_indices, row_starts, row_ends, top_k
+        logits,
+        indices,
+        torch_indices,
+        row_starts,
+        row_ends,
+        top_k,
+        stable=stable,
+        values=values,
     )
 
     # measure performance
@@ -495,6 +537,12 @@ args = parser.parse_args()
 test_mb_workspace_reuse()
 
 
+# Ask each path which arches it serves rather than keeping a second copy
+# here: a copy drifts, and a test that drives a kernel production never
+# dispatches reports on something nobody runs.
+one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
+
 df = []
 for data_generation in args.data_generation:
     for m in args.context_len:
@@ -502,14 +550,30 @@ for data_generation in args.data_generation:
             for num_prefix in args.num_prefix:
                 ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
                 df.append(ret)
+                # Cover the one-block radix kernel directly, so a dispatch
+                # change cannot hide a kernel regression.
+                if not one_block_available:
+                    continue
+                for stable in (False, True):
+                    for write_values in (False, True):
+                        ret = test_top_k_per_row_prefill(
+                            m,
+                            num_prefix,
+                            k,
+                            data_generation,
+                            flydsl=True,
+                            stable=stable,
+                            write_values=write_values,
+                        )
+                        df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
+assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
 
 
 df = []
-flydsl_available = get_gfx() in ("gfx942", "gfx950")
 for data_generation in args.data_generation:
     for m in args.decode_batch_size:
         for ctx in args.context_len:
@@ -527,7 +591,7 @@ for data_generation in args.data_generation:
                                 write_values=write_values,
                             )
                             df.append(ret)
-                            if flydsl_available:
+                            if flydsl_decode_available:
                                 ret = test_top_k_per_row_decode(
                                     m,
                                     ctx,
@@ -554,3 +618,4 @@ for data_generation in args.data_generation:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
+assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"

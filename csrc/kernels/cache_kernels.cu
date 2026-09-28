@@ -622,6 +622,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
     }
 
     k_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(k_max_val, f_max_f32);
+    // block_reduce's only barrier sits after its cross-wave smem write, so
+    // two rounds of one instantiation must be separated by the caller.
+    __syncthreads();
     v_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(v_max_val, f_max_f32);
 
     float k_block_scale = k_max_val / dtypeMax;
@@ -870,6 +873,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
     }
 
     k_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(k_max_val, f_max_f32);
+    // block_reduce's only barrier sits after its cross-wave smem write, so
+    // two rounds of one instantiation must be separated by the caller.
+    __syncthreads();
     v_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(v_max_val, f_max_f32);
 
     float k_block_scale = k_max_val / dtypeMax;
@@ -1508,12 +1514,59 @@ using indexer_qk_out_t = std::conditional_t<FP4_OUT, uint8_t, cache_t>;
 template <bool FP4_OUT, typename scalar_t>
 using indexer_weights_out_t = std::conditional_t<FP4_OUT, scalar_t, float>;
 
+// One wave per block: the Q phase gives each lane VEC elements of a q row, the K
+// phase spans the whole wave. The dispatch also instantiates 4-byte scalars, so
+// per-lane element counts have to follow sizeof(scalar_t).
+constexpr int INDEXER_VEC_BYTES_WIDE = 16;
+// Measured crossover of the two instantiations.
+constexpr int INDEXER_NARROW_MAX_TOKENS = 256;
+
+// WARP_SIZE is a device-pass constant; a constant-evaluated read of it always
+// answers 64, whatever the target. It must therefore never reach a template
+// argument or a const host variable, or a wave32 build registers a host stub
+// under a kernel name its device binary does not define. The kernel is templated
+// on NARROW alone and both passes recompute the shape from the wave they see.
+__host__ __device__ constexpr int
+indexer_vec_elems(bool narrow, int threads, int head_dim, int elem_bytes)
+{
+    return narrow ? head_dim / threads : INDEXER_VEC_BYTES_WIDE / elem_bytes;
+}
+
+__host__ __device__ constexpr int
+indexer_heads_per_block(int threads, int head_dim, int vec_elems)
+{
+    return threads * vec_elems / head_dim;
+}
+
+// Folds the per-element wave results in element order, so the caller's
+// dim-to-lane mapping fixes the summation order. The K layernorm must keep the
+// strided split dim = lane + e*THREADS, which reproduces the 128-thread kernel's
+// wave-0 / wave-1 pairing; a contiguous split changes FP4 output.
+template <typename T, typename F, int THREADS, int ELEMS>
+__device__ __forceinline__ T indexer_lane_reduce(const T (&v)[ELEMS], F reduce_op)
+{
+    T acc = wave_reduce<T, F, THREADS, true>(v[0], reduce_op);
+#pragma unroll
+    for(int e = 1; e < ELEMS; ++e)
+    {
+        acc = reduce_op(acc, wave_reduce<T, F, THREADS, true>(v[e], reduce_op));
+    }
+    return acc;
+}
+
+template <typename T, int N>
+struct alignas(sizeof(T) * N) indexer_vec
+{
+    T v[N];
+};
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
           int HEAD_DIM,
           int ROPE_DIM,
-          bool FP4_OUT>
+          bool FP4_OUT,
+          bool NARROW>
 __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const scalar_t* __restrict__ q,           // [num_tokens, n_heads, head_dim]
     indexer_qk_out_t<FP4_OUT, cache_t>* __restrict__ q_out,
@@ -1559,11 +1612,37 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
 {
     static_assert(HEAD_DIM == 128, "Indexer fused qk cache currently supports head_dim=128");
     static_assert(ROPE_DIM == 64, "Indexer fused qk cache currently supports rope_dim=64");
+    constexpr int THREADS = WARP_SIZE;
+    static_assert(HEAD_DIM % THREADS == 0,
+                  "every reduction here is wave-level, so a block is exactly one wave");
+    static_assert((ROPE_DIM / 2) % THREADS == 0 || THREADS % (ROPE_DIM / 2) == 0,
+                  "K splits as dim = lane + e * THREADS, so dim ^ (ROPE_DIM / 2) has to fall "
+                  "wholly on the lane axis or wholly on the element axis");
+    constexpr int ELEMS = HEAD_DIM / THREADS;
+
+    constexpr int VEC =
+        indexer_vec_elems(NARROW, THREADS, HEAD_DIM, static_cast<int>(sizeof(scalar_t)));
+    constexpr int LANES_PER_HEAD = HEAD_DIM / VEC;
+    // Only the narrow instantiation keeps shared memory: its 1-64 token band is
+    // latency-bound, where a lane exchange costs more than a shared round trip.
+    constexpr bool SHARED_ROPE    = NARROW;
+    constexpr int HEADS_PER_BLOCK = indexer_heads_per_block(THREADS, HEAD_DIM, VEC);
+    static_assert(HEAD_DIM % VEC == 0 && THREADS % LANES_PER_HEAD == 0,
+                  "the wave must split evenly into whole head rows");
+    static_assert(HEADS_PER_BLOCK >= 1, "a wave must cover at least one head row");
+    static_assert(ROPE_DIM % VEC == 0, "a lane must sit wholly on one side of ROPE_DIM");
+    static_assert(!SHARED_ROPE || HEADS_PER_BLOCK == 1,
+                  "the shared path barriers under active_q, block-uniform only at one head per block");
+    static_assert(INDEXER_FP4_GROUP_SIZE % VEC == 0,
+                  "an FP4 group must be a whole number of lanes");
 
     const int64_t token_idx = blockIdx.x;
-    const int head_idx      = blockIdx.y;
-    const int dim           = threadIdx.x;
-    if(token_idx >= num_tokens || head_idx >= n_heads)
+    const int lane          = threadIdx.x;
+    const int head_slot     = lane / LANES_PER_HEAD;
+    const int vec_id        = lane % LANES_PER_HEAD;
+    const int dim0          = vec_id * VEC;
+    const int head_idx      = blockIdx.y * HEADS_PER_BLOCK + head_slot;
+    if(token_idx >= num_tokens)
         return;
 
     const int64_t slot_idx = slot_mapping[token_idx];
@@ -1575,173 +1654,272 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
 
-    __shared__ float q_vals[HEAD_DIM];
-    const scalar_t* q_row = q + token_idx * q_stride_t + head_idx * q_stride_h;
-    float q_val = dim < HEAD_DIM ? static_cast<float>(q_row[dim * q_stride_d]) : 0.0f;
-    q_vals[dim] = q_val;
-    __syncthreads();
-
-    if(dim < ROPE_DIM)
+    auto max_func = [](float a, float b) { return fmaxf(a, b); };
+    // Uniform across a head's lane group, so the group-wide reductions still see
+    // every lane when a tail block overhangs n_heads.
+    const bool active_q = head_idx < n_heads;
+    float q_val[VEC];
+    if(active_q)
     {
-        if(is_neox)
+        const scalar_t* q_row = q + token_idx * q_stride_t + head_idx * q_stride_h;
+        const auto qv = *reinterpret_cast<const indexer_vec<scalar_t, VEC>*>(q_row + dim0);
+#pragma unroll
+        for(int j = 0; j < VEC; ++j)
         {
-            constexpr int HALF = ROPE_DIM / 2;
-            const int pair_dim = dim < HALF ? dim + HALF : dim - HALF;
-            const float pair_val = q_vals[pair_dim];
-            const int cos_idx = dim < HALF ? dim : dim - HALF;
-            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
-            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
-            q_val = dim < HALF ? (q_val * cos_v - pair_val * sin_v)
-                               : (q_val * cos_v + pair_val * sin_v);
+            q_val[j] = static_cast<float>(qv.v[j]);
+        }
+
+        // Partners are gathered before any rotation, so the rotation runs in place.
+        constexpr int ROPE_HALF_LANES = (ROPE_DIM / 2) / VEC;
+        constexpr int HALF            = ROPE_DIM / 2;
+        float pair[VEC];
+        if constexpr(SHARED_ROPE)
+        {
+            __shared__ float q_sh[HEADS_PER_BLOCK][HEAD_DIM];
+#pragma unroll
+            for(int j = 0; j < VEC; ++j)
+            {
+                q_sh[head_slot][dim0 + j] = q_val[j];
+            }
+            __syncthreads();
+#pragma unroll
+            for(int j = 0; j < VEC; ++j)
+            {
+                pair[j] = q_sh[head_slot][(dim0 + j) ^ (is_neox ? HALF : 1)];
+            }
         }
         else
         {
-            const int pair_dim = (dim % 2 == 0) ? dim + 1 : dim - 1;
-            const float pair_val = q_vals[pair_dim];
-            const int cos_idx = dim / 2;
-            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
-            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
-            q_val = (dim % 2 == 0) ? (q_val * cos_v - pair_val * sin_v)
-                                   : (q_val * cos_v + pair_val * sin_v);
+#pragma unroll
+            for(int j = 0; j < VEC; ++j)
+            {
+                pair[j] = is_neox ? __shfl_xor(q_val[j], ROPE_HALF_LANES) : q_val[j ^ 1];
+            }
         }
-        // Match the separate RoPE path, which materializes q_pe before FP8 quant.
-        q_val = static_cast<float>(static_cast<scalar_t>(q_val));
-    }
-    auto max_func = [](float a, float b) { return fmaxf(a, b); };
-    if constexpr(FP4_OUT)
-    {
-        const int group_idx = dim / INDEXER_FP4_GROUP_SIZE;
-        const float q_amax  = multithread_reduce<float, decltype(max_func)>(
-            fabsf(q_val), max_func, INDEXER_FP4_GROUP_SIZE);
-        const uint8_t q_scale_e8m0 = indexer_fp4_scale_e8m0(q_amax);
 
-        const float q_partner = __shfl_down(q_val, 1);
-        if((dim & 1) == 0)
+        if(dim0 < ROPE_DIM)
         {
-            q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h +
-                  (dim / 2) * q_out_stride_d] = indexer_fp4_pack_pair(
-                q_val, q_partner, indexer_fp4_scale_from_e8m0(q_scale_e8m0));
+#pragma unroll
+            for(int j = 0; j < VEC; ++j)
+            {
+                const int dim     = dim0 + j;
+                const bool lead   = is_neox ? (dim < HALF) : (dim % 2 == 0);
+                const int cos_idx = is_neox ? (dim < HALF ? dim : dim - HALF) : dim / 2;
+                const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
+                const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
+                q_val[j] = lead ? (q_val[j] * cos_v - pair[j] * sin_v)
+                                : (q_val[j] * cos_v + pair[j] * sin_v);
+                // Match the separate RoPE path, which materializes q_pe before FP8 quant.
+                q_val[j] = static_cast<float>(static_cast<scalar_t>(q_val[j]));
+            }
         }
-        if(dim % INDEXER_FP4_GROUP_SIZE == 0)
+
+        float lane_amax = fabsf(q_val[0]);
+#pragma unroll
+        for(int j = 1; j < VEC; ++j)
         {
-            indexer_fp4_store_q_scale(q_scale_out,
-                                      q_scale_e8m0,
-                                      token_idx,
-                                      head_idx,
-                                      n_heads,
-                                      group_idx,
-                                      HEAD_DIM / INDEXER_FP4_GROUP_SIZE);
+            lane_amax = max_func(lane_amax, fabsf(q_val[j]));
         }
-        if(dim == 0)
+
+        if constexpr(FP4_OUT)
         {
-            weights_out[token_idx * weights_out_stride_t + head_idx * weights_out_stride_h] =
-                weights[token_idx * weights_stride_t + head_idx * weights_stride_h];
+            constexpr int LANES_PER_GROUP = INDEXER_FP4_GROUP_SIZE / VEC;
+            static_assert(LANES_PER_HEAD % LANES_PER_GROUP == 0,
+                          "an FP4 group must not span two head rows");
+            const float q_amax = multithread_reduce<float, decltype(max_func)>(
+                lane_amax, max_func, LANES_PER_GROUP);
+            const uint8_t q_scale_e8m0 = indexer_fp4_scale_e8m0(q_amax);
+            const float q_scale_f      = indexer_fp4_scale_from_e8m0(q_scale_e8m0);
+
+            uint8_t* q_dst = q_out + token_idx * q_out_stride_t +
+                             head_idx * q_out_stride_h + (dim0 / 2) * q_out_stride_d;
+#pragma unroll
+            for(int j = 0; j < VEC / 2; ++j)
+            {
+                q_dst[j * q_out_stride_d] =
+                    indexer_fp4_pack_pair(q_val[2 * j], q_val[2 * j + 1], q_scale_f);
+            }
+            if(vec_id % LANES_PER_GROUP == 0)
+            {
+                indexer_fp4_store_q_scale(q_scale_out,
+                                          q_scale_e8m0,
+                                          token_idx,
+                                          head_idx,
+                                          n_heads,
+                                          dim0 / INDEXER_FP4_GROUP_SIZE,
+                                          HEAD_DIM / INDEXER_FP4_GROUP_SIZE);
+            }
+            if(vec_id == 0)
+            {
+                weights_out[token_idx * weights_out_stride_t +
+                            head_idx * weights_out_stride_h] =
+                    weights[token_idx * weights_stride_t + head_idx * weights_stride_h];
+            }
+        }
+        else
+        {
+            const float q_amax = multithread_reduce<float, decltype(max_func)>(
+                lane_amax, max_func, LANES_PER_HEAD);
+
+            const float q_fp8_max     = static_cast<float>(opus::finfo<cache_t>::max());
+            const float q_inv_fp8_max = 1.0f / q_fp8_max;
+            float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
+            if(use_ue8m0)
+            {
+                q_scale = exp2f(ceilf(log2f(q_scale)));
+            }
+            const float q_inv_scale = 1.0f / q_scale;
+            cache_t* q_dst = q_out + token_idx * q_out_stride_t +
+                             head_idx * q_out_stride_h + dim0 * q_out_stride_d;
+#pragma unroll
+            for(int j = 0; j < VEC; ++j)
+            {
+                q_dst[j * q_out_stride_d] = opus::cast<cache_t>(q_val[j] * q_inv_scale);
+            }
+            if(vec_id == 0)
+            {
+                const float w = static_cast<float>(
+                    weights[token_idx * weights_stride_t + head_idx * weights_stride_h]);
+                weights_out[token_idx * weights_out_stride_t +
+                            head_idx * weights_out_stride_h] =
+                    w * q_scale * weights_scale;
+            }
+        }
+    }
+
+    if(blockIdx.y != 0 || slot_idx < 0)
+        return;
+
+    const scalar_t* k_row = k + token_idx * k_stride_t;
+
+    float x[ELEMS];
+#pragma unroll
+    for(int e = 0; e < ELEMS; ++e)
+    {
+        x[e] = static_cast<float>(k_row[(lane + e * THREADS) * k_stride_d]);
+    }
+    auto sum_func = [](float a, float b) { return a + b; };
+    float k_val[ELEMS];
+    {
+        // Leave contraction at the default; forcing it off here moves fp8
+        // kv_cache away from the pre-rewrite kernel, not toward it.
+        const float sum =
+            indexer_lane_reduce<float, decltype(sum_func), THREADS, ELEMS>(x, sum_func);
+        const float mean = sum / static_cast<float>(HEAD_DIM);
+
+        float centered[ELEMS], sq[ELEMS];
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
+        {
+            centered[e] = x[e] - mean;
+            sq[e]       = centered[e] * centered[e];
+        }
+        const float ss =
+            indexer_lane_reduce<float, decltype(sum_func), THREADS, ELEMS>(sq, sum_func);
+        const float inv_std = rsqrtf(ss / static_cast<float>(HEAD_DIM) + epsilon);
+
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
+        {
+            const int dim = lane + e * THREADS;
+            k_val[e]      = centered[e] * inv_std * norm_weight[dim] + norm_bias[dim];
+            k_val[e]      = static_cast<float>(static_cast<scalar_t>(k_val[e]));
+        }
+    }
+    constexpr int K_HALF = ROPE_DIM / 2;
+    float k_pair[ELEMS];
+    if constexpr(SHARED_ROPE)
+    {
+        __shared__ float normed[HEAD_DIM];
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
+        {
+            normed[lane + e * THREADS] = k_val[e];
+        }
+        __syncthreads();
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
+        {
+            k_pair[e] = normed[(lane + e * THREADS) ^ (is_neox ? K_HALF : 1)];
+        }
+    }
+    else if constexpr(K_HALF >= THREADS)
+    {
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
+        {
+            k_pair[e] = is_neox ? k_val[e ^ (K_HALF / THREADS)] : __shfl_xor(k_val[e], 1);
         }
     }
     else
     {
-        float q_amax = fabsf(q_val);
-        q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
-
-        const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
-        const float q_inv_fp8_max = 1.0f / q_fp8_max;
-        float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
-        if(use_ue8m0)
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
         {
-            q_scale = exp2f(ceilf(log2f(q_scale)));
-        }
-        const float q_inv_scale = 1.0f / q_scale;
-        q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h + dim * q_out_stride_d] =
-            opus::cast<cache_t>(q_val * q_inv_scale);
-        if(dim == 0)
-        {
-            const float w = static_cast<float>(
-                weights[token_idx * weights_stride_t + head_idx * weights_stride_h]);
-            weights_out[token_idx * weights_out_stride_t + head_idx * weights_out_stride_h] =
-                w * q_scale * weights_scale;
+            k_pair[e] = __shfl_xor(k_val[e], is_neox ? K_HALF : 1);
         }
     }
 
-    if(head_idx != 0 || slot_idx < 0)
-        return;
-
-    __shared__ float normed[HEAD_DIM];
-    const scalar_t* k_row = k + token_idx * k_stride_t;
-
-    float x = dim < HEAD_DIM ? static_cast<float>(k_row[dim * k_stride_d]) : 0.0f;
-    auto sum_func = [](float a, float b) { return a + b; };
-    float sum = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(x, sum_func);
-    const float mean = sum / static_cast<float>(HEAD_DIM);
-
-    float centered = x - mean;
-    float ss = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(centered * centered, sum_func);
-    const float inv_std = rsqrtf(ss / static_cast<float>(HEAD_DIM) + epsilon);
-
-    float k_val = centered * inv_std * norm_weight[dim] + norm_bias[dim];
-    k_val = static_cast<float>(static_cast<scalar_t>(k_val));
-    normed[dim] = k_val;
-    __syncthreads();
-
-    if(dim < ROPE_DIM)
+#pragma unroll
+    for(int e = 0; e < ELEMS; ++e)
     {
-        if(is_neox)
+        const int dim = lane + e * THREADS;
+        if(dim < ROPE_DIM)
         {
-            constexpr int HALF = ROPE_DIM / 2;
-            const int pair_dim = dim < HALF ? dim + HALF : dim - HALF;
-            const float pair_val = normed[pair_dim];
-            const int cos_idx = dim < HALF ? dim : dim - HALF;
+            const bool lead   = is_neox ? (dim < K_HALF) : (dim % 2 == 0);
+            const int cos_idx = is_neox ? (dim < K_HALF ? dim : dim - K_HALF) : dim / 2;
             const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
             const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
-            k_val = dim < HALF ? (k_val * cos_v - pair_val * sin_v)
-                               : (k_val * cos_v + pair_val * sin_v);
+            k_val[e] = lead ? (k_val[e] * cos_v - k_pair[e] * sin_v)
+                            : (k_val[e] * cos_v + k_pair[e] * sin_v);
+            k_val[e] = static_cast<float>(static_cast<scalar_t>(k_val[e]));
         }
-        else
-        {
-            const int pair_dim = (dim % 2 == 0) ? dim + 1 : dim - 1;
-            const float pair_val = normed[pair_dim];
-            const int cos_idx = dim / 2;
-            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
-            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
-            k_val = (dim % 2 == 0) ? (k_val * cos_v - pair_val * sin_v)
-                                   : (k_val * cos_v + pair_val * sin_v);
-        }
-        k_val = static_cast<float>(static_cast<scalar_t>(k_val));
-        normed[dim] = k_val;
     }
-    __syncthreads();
 
     if constexpr(FP4_OUT)
     {
         // cache_block_size carries kv_cache.size(3) in FP4 mode.
         constexpr int K_TILES = HEAD_DIM / 128;
-        const float kv_val    = normed[dim];
-        const int group_idx   = dim / INDEXER_FP4_GROUP_SIZE;
-        const float k_amax    = multithread_reduce<float, decltype(max_func)>(
-            fabsf(kv_val), max_func, INDEXER_FP4_GROUP_SIZE);
-        const uint8_t k_scale_e8m0 = indexer_fp4_scale_e8m0(k_amax);
 
         const int64_t fp4_block_idx = slot_idx / cache_block_size;
         const int fp4_pos_in_block  = static_cast<int>(slot_idx % cache_block_size);
 
-        const float kv_partner = __shfl_down(kv_val, 1);
-        if((dim & 1) == 0)
+#pragma unroll
+        for(int e = 0; e < ELEMS; ++e)
         {
-            kv_cache[indexer_fp4_kv_data_offset(
-                fp4_block_idx, fp4_pos_in_block, dim / 2, K_TILES, cache_block_size)] =
-                indexer_fp4_pack_pair(
-                    kv_val, kv_partner, indexer_fp4_scale_from_e8m0(k_scale_e8m0));
-        }
-        if(dim % INDEXER_FP4_GROUP_SIZE == 0)
-        {
-            kv_cache_scale[indexer_fp4_kv_scale_offset(
-                fp4_block_idx, fp4_pos_in_block, group_idx, K_TILES, cache_block_size)] =
-                k_scale_e8m0;
+            const int dim         = lane + e * THREADS;
+            const float kv_val    = k_val[e];
+            const int group_idx   = dim / INDEXER_FP4_GROUP_SIZE;
+            const float k_amax    = multithread_reduce<float, decltype(max_func)>(
+                fabsf(kv_val), max_func, INDEXER_FP4_GROUP_SIZE);
+            const uint8_t k_scale_e8m0 = indexer_fp4_scale_e8m0(k_amax);
+
+            const float kv_partner = __shfl_down(kv_val, 1);
+            if((dim & 1) == 0)
+            {
+                kv_cache[indexer_fp4_kv_data_offset(
+                    fp4_block_idx, fp4_pos_in_block, dim / 2, K_TILES, cache_block_size)] =
+                    indexer_fp4_pack_pair(
+                        kv_val, kv_partner, indexer_fp4_scale_from_e8m0(k_scale_e8m0));
+            }
+            if(dim % INDEXER_FP4_GROUP_SIZE == 0)
+            {
+                kv_cache_scale[indexer_fp4_kv_scale_offset(
+                    fp4_block_idx, fp4_pos_in_block, group_idx, K_TILES, cache_block_size)] =
+                    k_scale_e8m0;
+            }
         }
         return;
     }
 
-    float k_amax = fabsf(normed[dim]);
-    k_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(k_amax, max_func);
+    float k_abs[ELEMS];
+#pragma unroll
+    for(int e = 0; e < ELEMS; ++e)
+    {
+        k_abs[e] = fabsf(k_val[e]);
+    }
+    const float k_amax =
+        indexer_lane_reduce<float, decltype(max_func), THREADS, ELEMS>(k_abs, max_func);
 
     const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
     float k_scale = fmaxf(k_amax, 1e-4f) / q_fp8_max;
@@ -1752,27 +1930,8 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
 
     const int64_t block_idx    = slot_idx / cache_block_size;
     const int64_t block_offset = slot_idx % cache_block_size;
-    int64_t dst_offset;
-    if(preshuffle)
-    {
-        constexpr int TILE       = 16;
-        const int token_tile_id  = block_offset / TILE;
-        const int token_in_tile  = block_offset % TILE;
-        const int col_tile_id    = dim / TILE;
-        const int col_in_tile    = dim % TILE;
-        dst_offset = block_idx * cache_block_size * cache_stride
-                   + token_tile_id * (TILE * HEAD_DIM)
-                   + col_tile_id   * (TILE * TILE)
-                   + token_in_tile * TILE
-                   + col_in_tile;
-    }
-    else
-    {
-        dst_offset =
-            block_idx * cache_block_size * cache_stride + block_offset * HEAD_DIM + dim;
-    }
 
-    if(dim == 0)
+    if(lane == 0)
     {
         const int64_t dst_scale_idx =
             block_idx * cache_block_size * cache_stride + cache_block_size * HEAD_DIM +
@@ -1781,7 +1940,31 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     }
 
     const float k_inv_scale = 1.0f / k_scale;
-    kv_cache[dst_offset] = opus::cast<cache_t>(normed[dim] * k_inv_scale);
+#pragma unroll
+    for(int e = 0; e < ELEMS; ++e)
+    {
+        const int dim = lane + e * THREADS;
+        int64_t dst_offset;
+        if(preshuffle)
+        {
+            constexpr int TILE       = 16;
+            const int token_tile_id  = block_offset / TILE;
+            const int token_in_tile  = block_offset % TILE;
+            const int col_tile_id    = dim / TILE;
+            const int col_in_tile    = dim % TILE;
+            dst_offset = block_idx * cache_block_size * cache_stride
+                       + token_tile_id * (TILE * HEAD_DIM)
+                       + col_tile_id   * (TILE * TILE)
+                       + token_in_tile * TILE
+                       + col_in_tile;
+        }
+        else
+        {
+            dst_offset =
+                block_idx * cache_block_size * cache_stride + block_offset * HEAD_DIM + dim;
+        }
+        kv_cache[dst_offset] = opus::cast<cache_t>(k_val[e] * k_inv_scale);
+    }
 }
 
 template <int BLOCK_X_SIZE, int BLOCK_Y_SIZE>
@@ -3701,10 +3884,18 @@ void reshape_and_cache_flash(
                                      use_ue8m0,                                                   \
                                      do_preshuffle);
 
-#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(                                                \
-    KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T)                                           \
-    aiter::indexer_qk_rope_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, 128, 64, FP4_OUT>      \
-        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(q.data_ptr()),                       \
+#define INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, NARROW)         \
+    aiter::indexer_qk_rope_quant_and_cache_kernel<KV_T,                                           \
+                                                 CACHE_T,                                         \
+                                                 KV_DTYPE,                                        \
+                                                 128,                                             \
+                                                 64,                                              \
+                                                 FP4_OUT,                                         \
+                                                 NARROW>                                          \
+        <<<dim3(num_tokens, (n_heads + heads_per_block - 1) / heads_per_block),                   \
+           block,                                                                                 \
+           0,                                                                                     \
+           stream>>>(reinterpret_cast<KV_T*>(q.data_ptr()),                                       \
                                      reinterpret_cast<Q_OUT_T*>(q_out.data_ptr()),                \
                                      reinterpret_cast<KV_T*>(weights.data_ptr()),                  \
                                      reinterpret_cast<W_OUT_T*>(weights_out.data_ptr()),           \
@@ -3744,6 +3935,17 @@ void reshape_and_cache_flash(
                                      is_neox,                                                      \
                                      max_position,                                                \
                                      compute_all_q_rope);
+
+#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(                                                \
+    KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T)                                           \
+    if(narrow)                                                                                    \
+    {                                                                                             \
+        INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, true)           \
+    }                                                                                             \
+    else                                                                                          \
+    {                                                                                             \
+        INDEXER_QK_LAUNCH_ONE(KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T, false)          \
+    }
 
 #define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                             \
     CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(KV_T, CACHE_T, KV_DTYPE, false, CACHE_T, float)
@@ -4401,8 +4603,32 @@ void indexer_qk_rope_quant_and_cache(
         }
     }
 
-    dim3 grid(num_tokens, n_heads);
-    dim3 block(head_dim);
+    // q is the only vector-accessed tensor, and the launch picks the vector width
+    // from num_tokens, so the alignment it needs follows that choice. The address
+    // is q + token * stride0 + head * stride1 + dim0, and dim0 is already a
+    // multiple of the width, so both strides have to be too.
+    const int64_t q_elem_bytes = q.dtype() == AITER_DTYPE_fp32 ? 4 : 2;
+    int threads                = WARP_SIZE;
+    const bool narrow          = num_tokens <= aiter::INDEXER_NARROW_MAX_TOKENS;
+    const int64_t q_vec_elems  = aiter::indexer_vec_elems(
+        narrow, threads, static_cast<int>(head_dim), static_cast<int>(q_elem_bytes));
+    AITER_CHECK(q.stride(2) == 1, "q must be contiguous along head_dim");
+    AITER_CHECK(q.stride(0) % q_vec_elems == 0 && q.stride(1) % q_vec_elems == 0,
+                "q strides must be multiples of the vector width ",
+                q_vec_elems,
+                ", got ",
+                q.stride(0),
+                " and ",
+                q.stride(1));
+    AITER_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % (q_vec_elems * q_elem_bytes) == 0,
+                "q must be aligned to ",
+                q_vec_elems * q_elem_bytes,
+                " bytes");
+
+    // grid.y counts head groups, whose size follows the vector width.
+    const int heads_per_block = aiter::indexer_heads_per_block(
+        threads, static_cast<int>(head_dim), static_cast<int>(q_vec_elems));
+    dim3 block(threads);
     HipDeviceGuard device_guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     float eps = static_cast<float>(epsilon);
