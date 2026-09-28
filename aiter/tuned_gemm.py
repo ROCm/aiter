@@ -23,7 +23,15 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
+from aiter import (
+    dtypes,
+    flydsl_gemm_registry,
+    gemm_a16w16_asm,
+    hipb_create_extension,
+    hipb_mm,
+    logger,
+)
+from aiter.flydsl_gemm_registry import A16W16
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -35,11 +43,40 @@ except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_launch = None
 
 
-@functools.lru_cache(maxsize=1)
-def _get_flydsl_gemm_kernels():
-    from aiter.ops.flydsl import gemm_kernels
+@functools.lru_cache(maxsize=1024)
+def _flydsl_kernel(kernel_name: str, gfx: str):
+    """The registered family and parsed params for a FlyDSL kernel name."""
+    family = flydsl_gemm_registry.family_for_kernel(A16W16, kernel_name, gfx)
+    params = None if family is None else family.parse(kernel_name)
+    return (family, params) if params is not None else (None, None)
 
-    return gemm_kernels
+
+def _check_flydsl_row(config, problem, padded_M):
+    """Return the tuned row if its FlyDSL kernel fits this call, else None."""
+    name = config["kernelName"]
+    family, params = _flydsl_kernel(name, problem.arch)
+    if family is not None and family.exact_m and padded_M != problem.m:
+        # Exact-M specializations are never reused for a padded M.
+        return None
+    if family is None:
+        reason = "is not a registered FlyDSL kernel for this architecture"
+    else:
+        reason = family.check_row(params, problem, config)
+    if reason is None:
+        return config
+    logger.warning(
+        f"FlyDSL kernel '{name}' from tuned config {reason}; "
+        "falling back to next candidate."
+    )
+    return None
+
+
+def is_flydsl_decode_config(config: dict | None) -> bool:
+    """True when a tuned row selects a FlyDSL exact-M decode kernel.
+
+    For callers outside aiter (vLLM) that must not match on libtype labels.
+    """
+    return flydsl_gemm_registry.is_exact_m_decode_row(config, get_gfx_runtime())
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -143,72 +180,28 @@ def get_GEMM_A16W16_config(
             None,
         )
         if config is not None:
-            if config["libtype"] == "flydsl":
-                flydsl_config = (
-                    _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
-                        config["kernelName"]
-                    )
+            if config["libtype"] == "flydsl_decode":
+                # Pre-registry label of the decode family. Rows now carry
+                # "flydsl"; an old CSV must not crash dispatch on a solMap miss.
+                logger.warning(
+                    f"Tuned row for M={padded_M} N={N} K={K} uses the retired "
+                    "libtype 'flydsl_decode'; relabel it 'flydsl'. Ignoring it."
                 )
-                name_n = None if flydsl_config is None else flydsl_config.get("n")
-                name_k = None if flydsl_config is None else flydsl_config.get("k")
-                shape_mismatch = (
-                    name_n is not None
-                    and name_k is not None
-                    and (name_n != N or name_k != K)
+                config = None
+            elif config["libtype"] == flydsl_gemm_registry.FLYDSL_LIBTYPE:
+                problem = flydsl_gemm_registry.GemmProblem(
+                    m=M,
+                    n=N,
+                    k=K,
+                    arch=gfx,
+                    in_dtype=eval(dtype),
+                    out_dtype=eval(otype),
+                    has_bias=bias,
+                    scale_kind="per_tensor" if scaleAB else "none",
+                    weight_layout="preshuffle" if bpreshuffle else "plain",
+                    cu_num=cu_num,
                 )
-                # A None config means the tuned CSV names a kernel absent from
-                # this catalog version; it is unrelated to FlyDSL import
-                # availability. The remaining checks reject a row whose kernel
-                # name disagrees with the architecture, shape or split-K we are
-                # actually dispatching for.
-                if (
-                    flydsl_config is None
-                    or flydsl_config.get("target_gfx") != gfx
-                    or shape_mismatch
-                    or int(config["splitK"]) != flydsl_config.get("split_k")
-                ):
-                    logger.warning(
-                        f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                        "recognized or has incompatible architecture/split-K metadata; "
-                        "falling back to next candidate."
-                    )
-                    config = None
-            elif config["libtype"] == "flydsl_decode":
-                if padded_M != M:
-                    # Decode kernels are exact-M specializations. Never reuse a
-                    # padded CSV row or introduce a runtime M-tail.
-                    config = None
-                else:
-                    # A missing FlyDSL install surfaces as ImportError below,
-                    # so no separate availability probe is needed here.
-                    try:
-                        from aiter.ops.flydsl.gemm_kernels import (
-                            parse_gemm_decode_kernel_name,
-                        )
-
-                        name_arch, name_m, name_n, name_k, _, name_has_bias = (
-                            parse_gemm_decode_kernel_name(config["kernelName"])
-                        )
-                        if (
-                            name_arch,
-                            name_m,
-                            name_n,
-                            name_k,
-                            name_has_bias,
-                        ) != (
-                            gfx,
-                            M,
-                            N,
-                            K,
-                            bias,
-                        ):
-                            logger.warning(
-                                "FlyDSL decode tuned row does not match the "
-                                "runtime architecture/exact shape; ignoring it."
-                            )
-                            config = None
-                    except (ImportError, ValueError):
-                        config = None
+                config = _check_flydsl_row(config, problem, padded_M)
             if config is None:
                 continue
             if config["libtype"] == "opus":
@@ -586,98 +579,26 @@ def flydsl_gemm(
     bpreshuffle=False,
     config: dict | None = None,
 ):
-    assert (
-        scale_a is None and scale_b is None and scale_c is None
-    ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
-    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
-        config["kernelName"]
-    )
-    fused_bias = None
-    if (
-        bias is not None
-        and (otype is None or otype == inp.dtype)
-        and bias.dtype == inp.dtype
-    ):
-        fused_bias = bias
-    out = flydsl_gemm_kernels.flydsl_hgemm(
-        inp,
-        weights,
-        bias=fused_bias,
-        block_m=flydsl_config["block_m"],
-        block_n=flydsl_config["block_n"],
-        block_k=flydsl_config["block_k"],
-        split_k=flydsl_config["split_k"],
-        m_waves=flydsl_config["m_waves"],
-        n_waves=flydsl_config["n_waves"],
-        k_waves=flydsl_config["k_waves"],
-        stages=flydsl_config["stages"],
-        group_m=flydsl_config["group_m"],
-        policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
-        out_dtype=otype,
-    )
-
-    if bias is not None and fused_bias is None:
-        out = out.to(bias.dtype) + bias
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
-
-
-def flydsl_decode_gemm(
-    inp: Tensor,
-    weights: Tensor,
-    solidx: int,
-    bias: Tensor | None = None,
-    otype: torch.dtype | None = None,
-    scale_a: Tensor | None = None,
-    scale_b: Tensor | None = None,
-    scale_c: Tensor | None = None,
-    bpreshuffle=False,
-    config: dict | None = None,
-):
-    """Launch an exact-M/N/K decode kernel selected by the BF16 CSV."""
+    """Launch the FlyDSL kernel a tuned row names, through its registered family."""
     del solidx
     if config is None or not config.get("kernelName"):
-        raise ValueError("FlyDSL decode dispatch requires kernelName")
-    if any(scale is not None for scale in (scale_a, scale_b, scale_c)):
-        raise ValueError("FlyDSL decode does not support scaling")
-    if bpreshuffle:
-        raise ValueError("FlyDSL decode does not support preshuffled weights")
-    if (otype or inp.dtype) != torch.bfloat16:
-        raise ValueError("FlyDSL decode requires BF16 output")
-    from aiter.ops.flydsl.gemm_kernels import (
-        gemm_decode_bf16,
-        parse_gemm_decode_kernel_name,
-    )
-
-    arch, m, n, k, decode_config, has_bias = parse_gemm_decode_kernel_name(
-        config["kernelName"]
-    )
-    expected = (
-        get_gfx_runtime(),
-        int(inp.shape[0]),
-        int(weights.shape[0]),
-        int(inp.shape[1]),
-    )
-    if (arch, m, n, k) != expected:
+        raise ValueError("FlyDSL dispatch requires kernelName")
+    gfx = get_gfx_runtime()
+    family, params = _flydsl_kernel(config["kernelName"], gfx)
+    if family is None:
         raise ValueError(
-            "FlyDSL decode tuned kernel does not match the runtime "
-            f"exact identity: kernel={(arch, m, n, k)}, runtime={expected}"
+            f"FlyDSL kernel {config['kernelName']!r} is not registered for {gfx}"
         )
-    if has_bias != (bias is not None):
-        raise ValueError("FlyDSL decode kernel bias identity does not match launch")
-    output = torch.empty(
-        (m, n),
-        dtype=torch.bfloat16,
-        device=inp.device,
-    )
-    return gemm_decode_bf16(
+    return family.launch(
         inp,
         weights,
-        output,
-        decode_config,
+        params,
         bias=bias,
+        out_dtype=otype,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        scale_c=scale_c,
+        bpreshuffle=bpreshuffle,
     )
 
 
@@ -758,7 +679,6 @@ solMap = {
     "asm": asm_gemm,
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
-    "flydsl_decode": flydsl_decode_gemm,
     "opus": opus_gemm,
 }
 

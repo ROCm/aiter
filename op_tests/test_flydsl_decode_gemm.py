@@ -29,7 +29,12 @@ from aiter.ops.flydsl.gemm_kernels import (
     gemm_decode_bf16,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_, tgemm
+from aiter.tuned_gemm import (
+    get_GEMM_A16W16_config,
+    get_GEMM_A16W16_config_,
+    is_flydsl_decode_config,
+    tgemm,
+)
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
@@ -241,14 +246,12 @@ def test_gemm_decode(m, n, k, dtype):
 
 
 def _shipped_decode_rows() -> list[tuple]:
-    """Every `flydsl_decode` key in the merged tuned config for this card."""
+    """Every decode-kernel key in the merged tuned config for this card."""
     cu_num = get_cu_num()
     return sorted(
         key
         for key, row in get_GEMM_A16W16_config_().items()
-        if row.get("libtype") == "flydsl_decode"
-        and key[0] == ARCH
-        and int(key[1]) == cu_num
+        if is_flydsl_decode_config(row) and key[0] == ARCH and int(key[1]) == cu_num
     )
 
 
@@ -256,7 +259,7 @@ def check_tuned_rows_dispatch() -> None:
     """Every shipped decode row is selected by the dispatcher and runs.
 
     The cases above call `gemm_decode_bf16` with hand-built configs, so they
-    never touch the tuned CSV. The dispatcher drops a `flydsl_decode` row
+    never touch the tuned CSV. The dispatcher drops a decode row
     silently -- no log, no error -- when its kernelName fails to parse or names
     another shape, and falls through to a different backend. A typo in any
     shipped row would therefore pass every other check here. This one asks the
@@ -265,7 +268,7 @@ def check_tuned_rows_dispatch() -> None:
     rows = _shipped_decode_rows()
     if not rows:
         aiter.logger.warning(
-            "no flydsl_decode rows for %s/cu_num=%s; skipping", ARCH, get_cu_num()
+            "no decode rows for %s/cu_num=%s; skipping", ARCH, get_cu_num()
         )
         return
 
@@ -276,12 +279,12 @@ def check_tuned_rows_dispatch() -> None:
         shipped = get_GEMM_A16W16_config_()[key]["kernelName"]
         if (
             cfg is None
-            or cfg.get("libtype") != "flydsl_decode"
+            or not is_flydsl_decode_config(cfg)
             or cfg.get("kernelName") != shipped
         ):
             dropped.append((m, n, k, None if cfg is None else cfg.get("libtype")))
     assert not dropped, (
-        f"{len(dropped)} of {len(rows)} flydsl_decode rows are not selected by "
+        f"{len(dropped)} of {len(rows)} decode rows are not selected by "
         f"the dispatcher (M, N, K, got): {dropped[:10]}"
     )
 

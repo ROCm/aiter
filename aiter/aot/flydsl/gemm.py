@@ -45,6 +45,7 @@ from contextlib import nullcontext
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
+from aiter import flydsl_gemm_registry
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
@@ -53,6 +54,7 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
+from aiter.flydsl_gemm_registry import A16W16
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
@@ -64,8 +66,6 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     compile_gemm_decode_bf16,
-    get_flydsl_hgemm_kernel_params,
-    parse_gemm_decode_kernel_name,
 )
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -176,48 +176,6 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
     }
 
 
-def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
-    m = int(row["M"])
-    n = int(row["N"])
-    k = int(row["K"])
-    cu_num = int(row["cu_num"])
-    csv_arch = (row.get("gfx") or "").strip()
-    name_arch, name_m, name_n, name_k, config, name_has_bias = (
-        parse_gemm_decode_kernel_name(kernel_name)
-    )
-    if (name_m, name_n, name_k) != (m, n, k):
-        raise ValueError(
-            "FlyDSL decode kernel name shape does not match CSV row: "
-            f"name={(name_m, name_n, name_k)}, row={(m, n, k)}"
-        )
-    if csv_arch and csv_arch != name_arch:
-        raise ValueError(
-            f"FlyDSL decode architecture mismatch: name={name_arch}, csv={csv_arch}"
-        )
-    has_bias = _parse_bool(row.get("bias"))
-    if name_has_bias != has_bias:
-        raise ValueError("FlyDSL decode CSV bias metadata does not match kernel name")
-    if (row.get("dtype") or "").strip() != "torch.bfloat16":
-        raise ValueError("FlyDSL decode AOT requires BF16 input dtype")
-    if (row.get("outdtype") or "").strip() != "torch.bfloat16":
-        raise ValueError("FlyDSL decode AOT requires BF16 output dtype")
-    if _parse_bool(row.get("scaleAB")):
-        raise ValueError("FlyDSL decode AOT does not support scaling")
-    if _parse_bool(row.get("bpreshuffle")):
-        raise ValueError("FlyDSL decode AOT does not support preshuffled weights")
-
-    return {
-        "kind": "decode",
-        "config": config,
-        "m": m,
-        "n": n,
-        "k": k,
-        "cu_num": cu_num,
-        "gfx": csv_arch or name_arch,
-        "has_bias": has_bias,
-    }
-
-
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
@@ -228,13 +186,29 @@ def parse_csv(csv_path: str):
         for row in reader:
             kernel_name = (row.get("kernelName") or "").strip()
             libtype = (row.get("libtype") or "").strip()
-            if libtype == "flydsl_decode":
-                if not kernel_name:
-                    raise ValueError("FlyDSL decode CSV row requires kernelName")
-                params = _parse_decode_row(row, kernel_name)
+            family = None
+            if libtype == flydsl_gemm_registry.FLYDSL_LIBTYPE:
+                family = flydsl_gemm_registry.family_for_kernel(
+                    A16W16, kernel_name, (row.get("gfx") or "").strip() or None
+                )
+            if family is not None:
+                if family.aot_job is None:
+                    continue
+                if family.parse(kernel_name) is None:
+                    print(
+                        f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
+                    )
+                    continue
+                params = family.aot_job(row, kernel_name)
                 job = {
-                    "kernel_name": kernel_name,
                     **params,
+                    "kernel_name": kernel_name,
+                    "m": int(row["M"]),
+                    "n": int(row["N"]),
+                    "k": int(row["K"]),
+                    "cu_num": int(row.get("cu_num", "0")),
+                    "gfx": params.get("gfx") or (row.get("gfx") or "").strip(),
+                    "has_bias": _parse_bool(row.get("bias")),
                 }
                 key = job_identity(job)
                 if key not in seen:
@@ -272,15 +246,6 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "ptpc_wmma"
-            elif kernel_name.startswith("flydsl_hgemm"):
-                params = get_flydsl_hgemm_kernel_params(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = (
-                        "a16w16_gfx1250"
-                        if params["target_gfx"] == "gfx1250"
-                        else "hgemm"
-                    )
             else:
                 params = None
 
@@ -289,23 +254,6 @@ def parse_csv(csv_path: str):
                     f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
                 )
                 continue
-            if (
-                params.get("kind") == "hgemm"
-                and int(row.get("splitK", "0")) != params["split_k"]
-            ):
-                raise ValueError("FlyDSL HGEMM CSV splitK does not match kernel name")
-            if params.get("kind") == "hgemm" and params.get("target_gfx") != gfx:
-                raise ValueError(
-                    "FlyDSL HGEMM CSV architecture does not match kernel name"
-                )
-            if (
-                params.get("kind") == "hgemm"
-                and params.get("n") is not None
-                and params.get("k") is not None
-                and (params.get("n"), params.get("k")) != (n, k)
-            ):
-                raise ValueError("FlyDSL HGEMM CSV N/K does not match kernel name")
-
             job = {
                 **params,
                 "kernel_name": kernel_name,

@@ -21,16 +21,9 @@ import torch
 import torch.nn.functional as F
 
 import aiter
-from aiter import dtypes, logger
+from aiter import dtypes, flydsl_gemm_registry, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-from aiter.ops.flydsl.gemm_a16w16_policy import (
-    get_flydsl_a16w16_configs,
-)
-from aiter.ops.flydsl.gemm_kernels import (
-    flydsl_hgemm,
-    flydsl_hgemm_kernel_name,
-)
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -39,26 +32,6 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 # Optional backend imports
 # ---------------------------------------------------------------------------
-
-FLYDSL_TUNE_ERROR = None
-try:
-    from aiter.ops.flydsl.gemm_kernels import (
-        SPLIT_K_SEMAPHORE_MAX_LEN,
-        WaveDecodeConfig,
-        flydsl_hgemm,
-        gemm_decode_bf16,
-        gemm_decode_kernel_name,
-        iter_gemm_decode_configs,
-    )
-except ImportError as exc:
-    flydsl_hgemm = None
-    SPLIT_K_SEMAPHORE_MAX_LEN = 256
-    WaveDecodeConfig = None
-    gemm_decode_bf16 = None
-    gemm_decode_kernel_name = None
-    iter_gemm_decode_configs = None
-    FLYDSL_TUNE_ERROR = str(exc)
-
 
 OPUS_TUNE_ERROR = None
 try:
@@ -296,101 +269,15 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
     return native_skinny_gemm(input, weight, 2, bias=bias, otype=otype)
 
 
-def run_flydsl_gemm_bf16(
-    input,
-    weight,
-    out,
-    bias=None,
-    otype=dtypes.bf16,
-    config=None,
-):
-    if config is None:
-        raise ValueError("flydsl tuning requires a kernel config")
-    fused_bias = None
-    if (
-        bias is not None
-        and (otype is None or otype == input.dtype)
-        and bias.dtype == input.dtype
-    ):
-        fused_bias = bias
-    out = flydsl_hgemm(
-        input,
-        weight,
-        out=out,
-        bias=fused_bias,
-        block_m=config["block_m"],
-        block_n=config["block_n"],
-        block_k=config["block_k"],
-        split_k=config["split_k"],
-        m_waves=config["m_waves"],
-        n_waves=config["n_waves"],
-        k_waves=config["k_waves"],
-        stages=config["stages"],
-        group_m=config["group_m"],
-        policy="ht" if config["use_half_tile_interleaved"] else "ft",
-        out_dtype=otype,
-    )
-    if bias is not None and fused_bias is None:
-        out = out.to(bias.dtype) + bias
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
-
-
-def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
-    """Run one exact-shape unified decode candidate for the shared tuner."""
-    del arch
-    if gemm_decode_bf16 is None:
-        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
-    if otype != dtypes.bf16:
-        raise ValueError("FlyDSL decode candidates require BF16 output")
-    # Launch directly, like every other provider. Wrapping the kernel in a
-    # one-launch HIP graph made each timed sample carry a full graph replay,
-    # which dominates any decode shape below roughly 14 us.
-    gemm_decode_bf16(input, weight, output, config, bias=bias)
-    return output
+def run_flydsl_registered(input, weight, out, bias, otype, family_name, params):
+    """Run one candidate of a registered FlyDSL GEMM family for the shared tuner."""
+    family = flydsl_gemm_registry.get_family(family_name)
+    return family.launch(input, weight, params, bias=bias, out_dtype=otype, out=out)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-@lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog(
-    m: int,
-    n: int,
-    k: int,
-    out_dtype: torch.dtype,
-    has_bias: bool,
-):
-    if flydsl_hgemm_kernel_name is None:
-        return []
-    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
-    configs = get_flydsl_a16w16_configs(
-        m,
-        n,
-        k,
-        torch.bfloat16,
-        out_dtype,
-        fused_bias,
-    )
-    kernels = {
-        flydsl_hgemm_kernel_name(
-            dtype=torch.bfloat16,
-            out_dtype=out_dtype,
-            config=config,
-            has_bias=fused_bias,
-        ): config
-        for config in configs
-    }
-    catalog = [
-        (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
-    ]
-    logger.info(
-        f"FlyDSL bf16 catalog size for M={m}, N={n}, K={k}: {len(catalog)} kernels"
-    )
-    return catalog
 
 
 @functools.lru_cache(maxsize=1024)
@@ -422,7 +309,6 @@ ALL_LIBTYPES = [
     "hipblaslt",
     "triton",
     "flydsl",
-    "flydsl_decode",
     "torch",
     "skinny",
     "opus",
@@ -435,83 +321,6 @@ def libtype_list(string):
         if value not in ALL_LIBTYPES:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
-
-
-def _round_robin_representatives(items, *, limit, bucket_key, priority_key):
-    buckets = {}
-    for item in items:
-        buckets.setdefault(bucket_key(item), []).append(item)
-    for bucket in buckets.values():
-        bucket.sort(key=priority_key)
-
-    keys = sorted(buckets, key=str)
-    offsets = {key: 0 for key in keys}
-    selected = []
-    while keys and len(selected) < limit:
-        next_keys = []
-        for key in keys:
-            offset = offsets[key]
-            bucket = buckets[key]
-            if offset >= len(bucket):
-                continue
-            selected.append(bucket[offset])
-            offsets[key] = offset + 1
-            if offsets[key] < len(bucket):
-                next_keys.append(key)
-            if len(selected) >= limit:
-                break
-        keys = next_keys
-    return selected
-
-
-def _bounded_decode_configs(configs, limit=12):
-    """Pick a small but representative set of decode candidates.
-
-    The registry enumerates every Wave configuration before any BlockMFMA one,
-    so a plain prefix (`list(configs)[:limit]`) is not a sample: it is always
-    Wave-only, and BlockMFMA is never timed. Measured on gfx950, that excluded
-    38% of the registry on all 84 shape/M cells; on gfx942 the excluded family
-    turned out to win 81 of 84 cells.
-
-    Bucketing by family first and round-robining across buckets keeps the same
-    candidate budget while guaranteeing both families are represented.
-    """
-
-    def bucket(config):
-        if WaveDecodeConfig is not None and isinstance(config, WaveDecodeConfig):
-            return ("wave", config.contraction.value)
-        return (
-            "block",
-            config.activation_source.value,
-            bool(config.persistent_n),
-        )
-
-    def priority(config):
-        if WaveDecodeConfig is not None and isinstance(config, WaveDecodeConfig):
-            return (
-                -config.m_per_wave,
-                config.n_per_wave != 1,
-                config.kvec != 8,
-                config.prefetch_depth != 1,
-                config.waves_per_eu != 2,
-                config.b_cache_modifier != 0,
-                config.reduction.value != "dpp",
-                repr(config),
-            )
-        return (
-            config.waves_per_workgroup != 8,
-            config.columns_per_wave != 1,
-            config.b_load_width != 8,
-            config.k_unroll != 2,
-            config.waves_per_eu != 2,
-            config.workgroups_per_cu != 1,
-            config.b_cache_modifier != 0,
-            repr(config),
-        )
-
-    return _round_robin_representatives(
-        configs, limit=limit, bucket_key=bucket, priority_key=priority
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +382,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default=["all"],
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, "
-            "flydsl_decode, torch, skinny, opus. ",
+            "torch, skinny, opus. ",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -589,6 +398,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default="bounded",
             help="Decode candidate breadth. 'bounded' keeps a small default set; "
             "'deep' times the full decode registry.",
+        )
+        self.parser.add_argument(
+            "--flydsl-family",
+            type=lambda value: value.split(","),
+            default=None,
+            dest="flydsl_family",
+            help="restrict FlyDSL candidates to these registered families, e.g. "
+            "'decode' or 'hgemm_gfx950' (see aiter.flydsl_gemm_registry). "
+            "Default: every family registered for this GPU.",
         )
 
     def _clear_op_caches(self):
@@ -852,139 +670,94 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return tasks
 
     def _get_flydsl_tasks(
-        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+        self,
+        info_keys,
+        has_bias,
+        indtype,
+        outdtype,
+        scaleAB,
+        is_shuffle,
+        run_kwargs,
+        libtype,
     ):
-        if scaleAB or is_shuffle or indtype != dtypes.bf16:
+        """Candidates of every registered FlyDSL family for this GPU.
+
+        ``--flydsl-family`` narrows the families; all of them write libtype
+        ``flydsl``, and the kernel name tells them apart.
+        """
+        if "all" not in libtype and flydsl_gemm_registry.FLYDSL_LIBTYPE not in libtype:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
-        rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
-        tasks = []
-        for solidx, kernel_name, config in flydsl_catalog:
-            info = (
-                info_keys,
-                solidx,
-                config["split_k"],
-                kernel_name,
-                "flydsl",
-                is_shuffle,
-            )
-            task_config = dict(config)
-            task_config["kernelName"] = kernel_name
-            tasks.append(
-                (
-                    info,
-                    generate_data,
-                    (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
-                    run_flydsl_gemm_bf16,
-                    (["inp", "weights", "out_asm", "bias"], outdtype, config),
-                    dict(run_kwargs),
-                    get_gemm_ref,
-                    (
-                        ["inp", "weights", "bias", "x_scale", "w_scale"],
-                        indtype,
-                        outdtype,
-                    ),
-                    {},
-                    None,
-                    rtol,
-                    atol,
-                    None,
-                    None,
-                    ("out_asm",),
-                )
-            )
-        logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
-        return tasks
-
-    def _get_flydsl_decode_tasks(
-        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
-    ):
-        if (
-            gemm_decode_bf16 is None
-            or iter_gemm_decode_configs is None
-            or gemm_decode_kernel_name is None
-        ):
-            logger.warning(
-                f"FlyDSL decode not available, skip. reason: {FLYDSL_TUNE_ERROR}"
-            )
-            return []
-        M, N, K = map(int, info_keys[2:5])
-        if (
-            not 1 <= M <= 5
-            or scaleAB
-            or is_shuffle
-            or indtype != dtypes.bf16
-            or outdtype != dtypes.bf16
-        ):
-            return []
-        arch = str(info_keys[0])
-        runtime_arch = get_gfx_runtime()
-        if arch != runtime_arch:
-            raise ValueError(
-                f"FlyDSL decode tuner row targets {arch}, "
-                f"but the runtime device is {runtime_arch}"
-            )
-        tasks = []
-        # Decode shares the tuner's timing settings with every other provider.
-        # Giving it its own timing backend and iteration counts made its numbers
-        # incomparable to the candidates it is ranked against.
-        decode_run_kwargs = dict(run_kwargs)
-        # Decode has a deliberately stricter absolute/relative correctness gate
-        # than the general GEMM catalog. Every candidate is rejected independently.
-        configs = list(
-            iter_gemm_decode_configs(M, N, K, arch, num_cus=int(info_keys[1]))
+        problem = flydsl_gemm_registry.GemmProblem(
+            m=M,
+            n=N,
+            k=K,
+            arch=str(info_keys[0]),
+            in_dtype=indtype,
+            out_dtype=outdtype,
+            has_bias=bool(has_bias),
+            scale_kind="per_tensor" if scaleAB else "none",
+            weight_layout="preshuffle" if is_shuffle else "plain",
+            cu_num=int(info_keys[1]),
         )
-        if getattr(self, "candidate_policy", "bounded") == "bounded":
-            configs = _bounded_decode_configs(configs)
-        for solidx, config in enumerate(configs):
-            kernel_name = gemm_decode_kernel_name(
-                arch,
-                M,
-                N,
-                K,
-                config,
-                has_bias=has_bias,
-            )
-            info = (
-                info_keys,
-                solidx,
-                0,
-                kernel_name,
-                "flydsl_decode",
-                False,
-            )
-            tasks.append(
-                (
-                    info,
-                    generate_data,
-                    (M, N, K, indtype, outdtype, False, False, 0, has_bias),
-                    run_flydsl_decode_bf16,
-                    (
-                        ["inp", "weights", "out_asm", "bias"],
-                        outdtype,
-                        arch,
-                        config,
-                    ),
-                    decode_run_kwargs,
-                    get_gemm_ref,
-                    (
-                        ["inp", "weights", "bias", "x_scale", "w_scale"],
-                        indtype,
-                        outdtype,
-                    ),
-                    {},
-                    None,
-                    0.01,
-                    0.125,
-                    None,
-                    None,
-                    ("out_asm",),
+        policy = getattr(self, "candidate_policy", "bounded")
+        tasks = []
+        for family in flydsl_gemm_registry.families(
+            flydsl_gemm_registry.A16W16, problem.arch
+        ):
+            wanted = getattr(self, "flydsl_family", None)
+            if wanted is not None and family.name not in wanted:
+                continue
+            if family.candidates is None:
+                logger.info(f"FlyDSL {family.name}: no tuner candidates yet, skipped")
+                continue
+            try:
+                candidates = family.candidates(problem, policy)
+            except ImportError as exc:
+                logger.warning(f"FlyDSL {family.name} not available, skip: {exc}")
+                continue
+            rtol, atol = family.tuner_tolerance or _default_tol(outdtype)
+            for cand in candidates:
+                info = (
+                    info_keys,
+                    cand.solidx,
+                    cand.split_k,
+                    cand.kernel_name,
+                    flydsl_gemm_registry.FLYDSL_LIBTYPE,
+                    is_shuffle,
                 )
+                tasks.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
+                        run_flydsl_registered,
+                        (
+                            ["inp", "weights", "out_asm", "bias"],
+                            outdtype,
+                            family.name,
+                            cand.params,
+                        ),
+                        dict(run_kwargs),
+                        get_gemm_ref,
+                        (
+                            ["inp", "weights", "bias", "x_scale", "w_scale"],
+                            indtype,
+                            outdtype,
+                        ),
+                        {},
+                        None,
+                        rtol,
+                        atol,
+                        None,
+                        None,
+                        ("out_asm",),
+                    )
+                )
+            logger.info(
+                f"FlyDSL {family.name} candidate count for M={M}, N={N}, K={K}: "
+                f"{len(candidates)}"
             )
-        logger.info(
-            f"FlyDSL decode candidate count for M={M}, N={N}, K={K}: {len(tasks)}"
-        )
         return tasks
 
     def _get_skinny_tasks(
@@ -1130,6 +903,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         self.candidate_policy = getattr(args, "candidate_policy", "bounded")
+        self.flydsl_family = getattr(args, "flydsl_family", None)
+        known = {
+            f.name for f in flydsl_gemm_registry.families(flydsl_gemm_registry.A16W16)
+        }
+        unknown = set(self.flydsl_family or ()) - known
+        if unknown:
+            raise ValueError(
+                f"unknown --flydsl-family {sorted(unknown)}; known: {sorted(known)}"
+            )
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         # Time every provider on the shared profiler path, which reports
@@ -1180,10 +962,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             prev_count = len(task)
             if "all" in libtype or "asm" in libtype:
                 task.extend(self._get_asm_tasks(*common))
-            if "all" in libtype or "flydsl" in libtype:
-                task.extend(self._get_flydsl_tasks(*common))
-            if "all" in libtype or "flydsl_decode" in libtype:
-                task.extend(self._get_flydsl_decode_tasks(*common))
+            task.extend(self._get_flydsl_tasks(*common, libtype))
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:
