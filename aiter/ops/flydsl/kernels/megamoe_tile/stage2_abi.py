@@ -57,6 +57,31 @@ STAGE2_TIMELINE_FIELDS = (
     "stage2_return_request_done",
     "stage2_init_clear_done",
     "stage2_init_count_done",
+    # 诊断:GMM1 消费者越过 h1_queue_eos 门的时刻。追加在末尾,既有索引不变。
+    "stage1_gmm_gate_done",
+    # 诊断:defer 模式下发送相位结束的时刻,用来把传输段拆成
+    # 「发射成本」与「等对端」两半。
+    "stage1_dispatch_send_done",
+    # 诊断:staging 等待结束、第一个 WQE 即将发射的时刻。flush_pre
+    # 戳在 staging 等待**之前**,所以原来的「传输段」把等生产者
+    # 的时间算进了发射成本。
+    "stage1_dispatch_stage_ready",
+    # 诊断:第一个 producer CTA 发布**第一个** token 的时刻。
+    # staging_wait 只说了最后一个 token 何时就绪(785us),分不清
+    # 「每个 token 本身就慢」和「producer 被饿着/被串行化」。
+    "stage1_producer_t0_done",
+    # 同一个 CTA(ticket=PRODUCER_FIRST)每个 token 都覆写一次,最终值
+    # 就是它做完自己 4 个 token 的时刻。与 stage_ready 一比即可分辨
+    # 「后面几轮变慢」和「别的 producer 拖尾」。
+    "stage1_producer_last_done",
+    # 最后一个 producer CTA 的首/末 token:与第一个 producer 对比,
+    # 区分「晚启动」和「跑得慢」。
+    "stage1_producer_late_first",
+    "stage1_producer_late_done",
+    # ticket==COMPUTE_FIRST 这个 CTA 做完**自己那份** fanout 的时刻。
+    # 它同时也是写 stage1_gmm_gate_done 的那个 CTA,所以两戳之间
+    # 是同一个 CTA 的**纯等待**(等 8 个 comm 角色 EOS)。
+    "stage1_fanout_self_done",
 )
 STAGE2_TIMELINE_INDEX = {
     name: index for index, name in enumerate(STAGE2_TIMELINE_FIELDS)

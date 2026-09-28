@@ -186,8 +186,13 @@ def gemm2_compute_v2(
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
+    explicit_a_row=None,
 ):
-    """Run GEMM2, optionally using an explicitly selected expert row/tile."""
+    """Run GEMM2, optionally using an explicitly selected expert row/tile.
+
+    explicit_a_row: A/A-scale rows live at this (physical) row instead of the
+    sorted m_row; expert id and the returned m_row stay on the sorted row.
+    """
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -245,6 +250,7 @@ def gemm2_compute_v2(
             e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
     if const_expr(expert_offset != 0):
         e = e - fx.Int32(expert_offset)
+    a_row = m_row if explicit_a_row is None else fx.Int32(explicit_a_row)
 
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
@@ -267,7 +273,7 @@ def gemm2_compute_v2(
             s_aq_base,
             slot,
             kt,
-            m_row,
+            a_row,
             wave,
             lane,
             is_f8_a,
@@ -324,7 +330,7 @@ def gemm2_compute_v2(
 
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
     asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
-    scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
+    scale_chunk0 = m_block_idx if const_expr(is_bm16) else a_row // 32
 
     def make_ascale_view(sub):
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw

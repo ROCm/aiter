@@ -25,6 +25,10 @@ def classify(event):
         return "d2d"
     if "megamoe_tile_ep16_stage1" in name:
         return "fused_stage1"
+    # bf16 -> fp4 的独立量化 kernel(与 MegaMoEv2 同形式)。单列一组:
+    # MORI 那侧的 bf16_to_a4 也不计入 dispatch,两边 stage1 才同口径。
+    if name.startswith("per_1x32_mx_quant"):
+        return "input_quant"
     if "megamoe_tile_ep16_stage2" in name:
         return "fused_stage2"
     # 两 kernel 路径:kernel1(GEMM2+push) 与 kernel2(node 归约+rail+combine)
@@ -82,8 +86,25 @@ def parse_trace(trace, *, path, tokens, iterations=40, tail=20):
             raise ValueError(f"iteration {iteration}: incomplete graph children, missing {absent}")
         import os as _os
         _two_kernel = _os.environ.get("MEGAMOE_TWO_KERNEL") == "1"
-        _want = {"fused_stage1": 1, "fused_stage2": 2 if _two_kernel else 1}
-        _total = 3 if _two_kernel else 2
+        # stage1 也可以拆成两个 kernel(k1=打包+rail+本地 push,
+        # k2=rail push+GMM1)。两者的 kernel 名里都含
+        # megamoe_tile_ep16_stage1,所以 classify 仍把它们归成 fused_stage1、
+        # 时长相加,与融合版口径可比;这里只要把期望的 kernel 个数放开。
+        _s1_split = _os.environ.get("MEGAMOE_TK_S1_KERNEL_SPLIT") == "1"
+        # plan 打开时 stage1 还多一次 k0 发射(只做计数交换)。
+        _s1_n = (2 if _s1_split else 1) + (
+            1 if _s1_split and _os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0" else 0
+        )
+        _want = {"fused_stage1": _s1_n, "fused_stage2": 2 if _two_kernel else 1}
+        # bf16 输入时 forward 先发射一次 input_quant;fp4 输入直接进通信。
+        _n_quant = (
+            0 if _os.environ.get("MEGAMOE_TK_BENCH_FP4_INPUT", "0") != "0" else 1
+        )
+        _total = _s1_n + (2 if _two_kernel else 1) + _n_quant
+        if path == "candidate" and len(groups.get("input_quant", ())) != _n_quant:
+            raise ValueError(
+                f"iteration {iteration}: expected {_n_quant} input_quant "
+                f"kernels, got {len(groups.get('input_quant', ()))}")
         if path == "candidate" and (
             any(len(groups[name]) != _want[name] for name in required)
             or sum(e.get("cat") == "kernel" for e in active) != _total
@@ -112,7 +133,15 @@ def parse_trace(trace, *, path, tokens, iterations=40, tail=20):
         if any(classify(e) in ("dispatch", "sorting", "gemm1", "fused_stage1") for e in pair_activities):
             raise ValueError(f"iteration {iteration}: invalid Stage2 ordering")
         durations = {name + "_us": sum(float(e["dur"]) for e in group) for name, group in groups.items()}
-        for name in ("fused_stage1", "fused_stage2", "dispatch", "sorting", "gemm1", "gemm2", "combine", "d2d", "other", "memcpy_other"):
+        # 拆分模式下再按 kernel 名里的 _k1_/_k2_ 分别汇总一份,这样两半能
+        # **各自**被测量和调优 —— 融合在一个 kernel 里角色互相重叠,归因不了。
+        for _sub in ("k1", "k2"):
+            durations["fused_stage1_%s_us" % _sub] = sum(
+                float(e["dur"])
+                for e in groups.get("fused_stage1", ())
+                if "_%s_" % _sub in e.get("name", "")
+            )
+        for name in ("fused_stage1", "input_quant", "fused_stage2", "dispatch", "sorting", "gemm1", "gemm2", "combine", "d2d", "other", "memcpy_other"):
             durations.setdefault(name + "_us", 0.0)
         samples.append({
             "iteration": iteration,

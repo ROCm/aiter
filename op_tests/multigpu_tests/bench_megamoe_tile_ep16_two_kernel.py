@@ -30,6 +30,7 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+import os
 import torch
 import torch.distributed as dist
 
@@ -430,7 +431,38 @@ class MoriFusedMoeBaselinePath:
         from aiter.ops.flydsl.moe_common import GateMode
         from aiter.ops.quant import dynamic_per_group_scaled_quant
 
-        kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+        # 对比用:MORI_KERNEL_TYPE ∈ {InterNode, InterNodeV1, InterNodeV1LL};
+        # MORI_AUTO_CONFIG=1 时不传 warp_num_per_block/block_num/rdma_block_num,
+        # 由 mori 自己选(auto config)。
+        _kt_name = os.environ.get("MORI_KERNEL_TYPE", "InterNodeV1LL")
+        kernel_type = getattr(mori.ops.EpDispatchCombineKernelType, _kt_name)
+        # mori 官方测试给三个 kernel 的配置互不通用 —— InterNode 要 16 blocks /
+        # 16 warps 且不用 rdma_block_num,V1/V1LL 用 96/64/8 和 256/128/8。
+        # 所以"一个 auto 覆盖三个 kernel"不成立,必须按 kernel 给参数。
+        # 来源:mori/tests/python/ops/test_dispatch_combine_internode{,_v1}.py
+        _OFFICIAL = {
+            "InterNode": dict(block_num=16, warp_num_per_block=16),
+            "InterNodeV1": dict(
+                block_num=96, rdma_block_num=64, warp_num_per_block=8
+            ),
+            "InterNodeV1LL": dict(
+                block_num=256, rdma_block_num=128, warp_num_per_block=8
+            ),
+        }
+        _mode = os.environ.get(
+            "MORI_CONFIG_MODE",
+            "auto" if os.environ.get("MORI_AUTO_CONFIG", "0") != "0" else "manual",
+        )
+        if _mode == "auto":
+            _tune = {}
+        elif _mode == "official":
+            _tune = dict(_OFFICIAL[_kt_name])
+        else:
+            _tune = dict(
+                warp_num_per_block=8,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+            )
         config = mori.ops.EpDispatchCombineConfig(
             data_type=shared.a_quant.dtype,
             rank=rank,
@@ -443,10 +475,8 @@ class MoriFusedMoeBaselinePath:
             max_total_recv_tokens=0,
             num_experts_per_rank=shape.local_experts,
             num_experts_per_token=shape.topk,
-            warp_num_per_block=8,
-            block_num=block_num,
             kernel_type=kernel_type,
-            rdma_block_num=rdma_block_num,
+            **_tune,
             gpu_per_node=shape.gpus_per_node,
             quant_type=combine_quant_type,
         )

@@ -95,6 +95,58 @@ TIMELINE_INTERVALS = {
         "stage1_dispatch_flush_post",
     ),
     "s1_entry_to_s1_done": ("stage1_entry", "stage1_done_publish"),
+    "s1_flush_post_to_gmm_gate": (
+        "stage1_dispatch_flush_post",
+        "stage1_gmm_gate_done",
+    ),
+    "s1_gmm_gate_to_done": (
+        "stage1_gmm_gate_done",
+        "stage1_done_publish",
+    ),
+    "s1_send_issue": (
+        "stage1_dispatch_flush_pre",
+        "stage1_dispatch_send_done",
+    ),
+    # flush_pre 戳在 staging 等待之前,所以 s1_send_issue 是「等生产者 +
+    # 发 WQE」。这两条把它切开。
+    # 第一个 producer 的第一个 token:与 s1_staging_wait 一比就知道
+    # 785us 是「每 token 慢」还是「producer 被串行化」。
+    "s1_fanout_work": (
+        "stage1_dispatch_flush_post",
+        "stage1_fanout_self_done",
+    ),
+    "s1_eos_wait": (
+        "stage1_fanout_self_done",
+        "stage1_gmm_gate_done",
+    ),
+    "s1_producer_late_start": (
+        "stage1_entry",
+        "stage1_producer_late_first",
+    ),
+    "s1_producer_late_span": (
+        "stage1_entry",
+        "stage1_producer_late_done",
+    ),
+    "s1_producer_cta_span": (
+        "stage1_entry",
+        "stage1_producer_last_done",
+    ),
+    "s1_producer_first_token": (
+        "stage1_entry",
+        "stage1_producer_t0_done",
+    ),
+    "s1_staging_wait": (
+        "stage1_dispatch_flush_pre",
+        "stage1_dispatch_stage_ready",
+    ),
+    "s1_wqe_post": (
+        "stage1_dispatch_stage_ready",
+        "stage1_dispatch_send_done",
+    ),
+    "s1_wait_for_peer": (
+        "stage1_dispatch_send_done",
+        "stage1_dispatch_flush_post",
+    ),
     "s1_done_to_s2_entry": ("stage1_done_publish", "stage2_entry"),
     "s2_entry_to_stage1_gate": ("stage2_entry", "stage2_stage1_gate_done"),
     "s2_stage1_gate_to_init_gate": (
@@ -1027,6 +1079,15 @@ class CandidateStage2Path:
                 and "all_payloads" not in name
             )
         self.timeline_interval_names = timeline_names
+        import os as _os_tl
+        if _os_tl.environ.get("MEGAMOE_TK_TIMELINE_STAGE1_ONLY", "0") != "0":
+            # 两 kernel 路径下融合版 stage2 不发射,它那半的戳恒为 0。只保留
+            # **两个端点都在 stage1** 的区间 —— 按名字前缀过滤不行:
+            # s1_entry_to_all_gmm_done 之类名字以 s1_ 开头但端点在 stage2。
+            self.timeline_interval_names = [
+                n for n in self.timeline_interval_names
+                if all(ep.startswith("stage1_") for ep in TIMELINE_INTERVALS[n])
+            ]
         self.timeline_fields = (
             tuple(f"{name}_us" for name in timeline_names)
             if operator.timeline_instrument
@@ -1827,10 +1888,8 @@ def main() -> int:
         "--stage1-diagnostic-phase",
         choices=(
             "full",
-            "quant_pack_only",
             "transport_only",
             "fanout_only",
-            "quant_core_only",
             "dispatch_only",
         ),
         default="full",

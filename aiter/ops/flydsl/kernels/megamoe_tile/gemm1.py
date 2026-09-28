@@ -207,6 +207,7 @@ def _gemm1_body_sc2(
     BK,
     expert_major=False,
     inline_quant=False,
+    ascale_gather=False,
     K,
     N_OUT,
     NE,
@@ -234,6 +235,11 @@ def _gemm1_body_sc2(
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
     M_REPS = BM // 16
+    # 每 wave 的 16 列 N 子块数:BN=256 为 4(gate/up 各两个),BN=128 为 2(gate/up 各一个,
+    # 与小算子 t128 同为每 wave 32 列)。BN=128 只支持生产路径(非 interleave、非 inline_quant)。
+    NJ = BN // 64
+    assert BN in (128, 256), f"GMM1 BN must be 128 or 256, got {BN}"
+    assert BN == 256 or not (interleave or inline_quant), "BN=128 needs the non-interleave, non-inline path"
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
@@ -325,13 +331,13 @@ def _gemm1_body_sc2(
     # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
     N0_HALF = N_OUT // 32
     b_load_s_base = []
-    for j in range_constexpr(4):
+    for j in range_constexpr(NJ):
         if const_expr(interleave):
             col = (
                 n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
             )
         else:
-            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+            tile_il = n_block_idx * fx.Int32(BN // 16) + wave * fx.Int32(NJ) + fx.Int32(j)
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
@@ -343,7 +349,11 @@ def _gemm1_body_sc2(
         mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
         np_list = [mni_base, mni_base + fx.Int32(1)]
     else:
-        np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+        # B-scale 一个字覆盖相邻两个 16 列 n0。BN=256:本 wave 的两个 n0 正好一对;
+        # BN=128:本 wave 只有一个 n0 = n_block*4+wave,取所在的那一对,字节在 issue_b_scale_load 里按 wave&1 移位。
+        np_gate = n_block_idx * fx.Int32(BN // 64) + (
+            wave if BN == 256 else wave // fx.Int32(2)
+        )
         np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
@@ -354,8 +364,8 @@ def _gemm1_body_sc2(
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
-    accm = [[None] * 4 for _ in range(kMChunks)]
-    b = [[[None, None] for _ in range(4)] for _ in range(kStages)]
+    accm = [[None] * NJ for _ in range(kMChunks)]
+    b = [[[None, None] for _ in range(NJ)] for _ in range(kStages)]
     b_scale_v = [[None, None] for _ in range(kStages)]
 
     def issue_a_load_lds(slot, kt):
@@ -459,6 +469,73 @@ def _gemm1_body_sc2(
             )
             out.append(_raw(_global_i32_load(asc_i32_tiles, lds_dw)))
         return out
+
+    # ascale_gather:A-scale 按源 token 行主序存放(每行 K/32 字节,由 stage1
+    # 每 (token, dest) 连续写一次),这里按 arg_mind 取两行(n_lane、n_lane+16)
+    # 各 8 字节,拼成 DMA 版本在 LDS 里的 BM32 预排布:
+    #   dword(ku, k_lane, n_lane) = [A[8ku+k], B[8ku+k], A[8ku+4+k], B[8ku+4+k]]
+    # (字节序 = ikxdl*2 + im_a,与 stage1 fanout 的散写同一公式)。
+    # global load 在序章最前面发、LDS 写在序章之后,由序章末尾的
+    # _wait_lds_barrier(lgkmcnt(0)+barrier)保证先写后读。
+    _GS_ITEMS = kSubBlocks * 16 * K_TILES_TOTAL
+    _GS_PASS = (_GS_ITEMS + 255) // 256
+    _GS_ROW_DW = K // 32 // 4
+
+    def gather_a_scale_issue():
+        tid = wave * fx.Int32(64) + lane
+        loads = []
+        for p in range_constexpr(_GS_PASS):
+            w = tid + fx.Int32(p * 256)
+            w = (w < fx.Int32(_GS_ITEMS)).select(w, fx.Int32(0))
+            sub = w // fx.Int32(16 * K_TILES_TOTAL)
+            rem = w % fx.Int32(16 * K_TILES_TOTAL)
+            n_lane = rem % fx.Int32(16)
+            ku = rem // fx.Int32(16)
+            row0 = m_row + sub * fx.Int32(32) + n_lane
+            ra = _global_i32_at(arg_mind, row0)
+            rb = _global_i32_at(arg_mind, row0 + fx.Int32(16))
+            da = ra * fx.Int32(_GS_ROW_DW) + ku * fx.Int32(2)
+            db = rb * fx.Int32(_GS_ROW_DW) + ku * fx.Int32(2)
+            loads.append(
+                (
+                    sub, n_lane, ku,
+                    _global_i32_at(arg_ascale, da),
+                    _global_i32_at(arg_ascale, da + fx.Int32(1)),
+                    _global_i32_at(arg_ascale, db),
+                    _global_i32_at(arg_ascale, db + fx.Int32(1)),
+                )
+            )
+        return loads
+
+    def gather_a_scale_write(loads):
+        m8 = fx.Int32(0xFF)
+        # 越界的工作项已夹到第 0 项:写同一位置同一值,无分支。
+        for sub, n_lane, ku, a_lo, a_hi, b_lo, b_hi in loads:
+            if True:
+                for k in range_constexpr(4):
+                    sh = fx.Int32(8 * k)
+                    v = (
+                        ((a_lo >> sh) & m8)
+                        | (((b_lo >> sh) & m8) << fx.Int32(8))
+                        | (((a_hi >> sh) & m8) << fx.Int32(16))
+                        | (((b_hi >> sh) & m8) << fx.Int32(24))
+                    )
+                    lds_dw = (
+                        sub * fx.Int32(kAS_per_chunk_dw)
+                        + ku * fx.Int32(64)
+                        + fx.Int32(k * 16)
+                        + n_lane
+                    )
+                    fx.ptr_store(
+                        fx.Vector.from_elements([v], fx.Int32),
+                        fx.add_offset(
+                            fx.recast_iter(
+                                fx.Int32,
+                                fx.add_offset(lds_raw_ptr, kAStages * BM * KH_TILE),
+                            ),
+                            lds_dw,  # add_offset 按元素(i32)计,不是字节
+                        ),
+                    )
 
     lib = lane & fx.Int32(3)
     lane_shr2_and3 = (lane >> fx.Int32(2)) & fx.Int32(3)
@@ -576,7 +653,11 @@ def _gemm1_body_sc2(
                 r,
                 soffset=s_off // fx.Int32(4),
             )
-            bs_slot[mw] = r.load()[0]
+            if const_expr(BN == 128):
+                # 本 wave 的 n0 是这一对里的第 (wave&1) 个:右移一个字节后按 in_b=0 取。
+                bs_slot[mw] = r.load()[0].shrui((wave & fx.Int32(1)) * fx.Int32(8))
+            else:
+                bs_slot[mw] = r.load()[0]
 
     mfma_ty = T.f32x4
     zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -585,6 +666,9 @@ def _gemm1_body_sc2(
         if const_expr(interleave):
             mni = J // 2
             in_b = J % 2
+        elif const_expr(BN == 128):
+            mni = J
+            in_b = 0
         else:
             mni = J % 2
             in_b = J // 2
@@ -629,87 +713,160 @@ def _gemm1_body_sc2(
                     mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
                 )
 
-    _relax_prologue = (BM == 128) and not inline_quant
+    # 每个 K 步 B 发出的 vmem 条数:4 个 j x 2 个 half 的 dwordx4 + 2 条 B-scale。
+    _B_VMEM_PER_STEP = NJ * 2 + 2
+
+    def _wait_lds_barrier(vmcnt):
+        # 同 mega_moe/gemm_util.wait_lds_barrier:lgkmcnt(0) 等本 wave 的 ds_read 读完,
+        # vmcnt(N) 等本步开头发出的 A DMA 落地(之后发的 N 条 B 预取继续飞),再 barrier。
+        rocdl.s_waitcnt((vmcnt & 0xF) | ((vmcnt & 0x30) << 10) | (7 << 4))
+        gpu.barrier()
+
     if const_expr(not inline_quant):
-        issue_a_scale_load()
-    for K_C in range_constexpr(kStages):
-        if const_expr(inline_quant):
-            scale_accum = fx.Int32(0)
-            scale_accum = inline_quant_kt(
-                0, 0, K_C, K_C, cached_row_inline, scale_accum
-            )
-            issue_b_load_j(b[K_C], K_C, 0)
-            issue_b_load_j(b[K_C], K_C, 1)
-            scale_accum = inline_quant_kt(
-                1, 0, K_C, K_C, cached_row_inline, scale_accum
-            )
-            issue_b_load_j(b[K_C], K_C, 2)
-            issue_b_load_j(b[K_C], K_C, 3)
-            inline_quant_pack_write(K_C, scale_accum)
+        # MegaMoEv2 do_tile 的同步写法(每步末尾一把 wait_lds_barrier),A 三级、DMA 提前两步:
+        #   第 kt 步开头把 A(kt+2) 搬进槽 (kt+2)%3 —— 该槽上一步已被全体 wave 读完
+        #   (上一步末尾的 lgkmcnt(0)+barrier 保证);
+        #   第 kt 步末尾只等 A(kt+1) 落地,它之后发出的 B(kt+1)、A(kt+2)、B(kt+2) 继续飞。
+        # A 走 LDS DMA,每个 wave 只搬 1/4 行却读全部行,两个条件缺一不可。
+        _A_DMA_PER_STEP = kSubBlocks
+
+        def _vmcnt_after_a(kt_next):
+            # A(kt_next) 之后按程序序发出的 vmem 条数:B(kt_next),以及(若存在)A(kt_next+1)、B(kt_next+1)
+            n = _B_VMEM_PER_STEP
+            if kt_next + 1 < K_TILES_TOTAL:
+                n += _A_DMA_PER_STEP + _B_VMEM_PER_STEP
+            return n
+
+        if const_expr(ascale_gather):
+            gs_loads = gather_a_scale_issue()
         else:
-            issue_a_load_lds(K_C, K_C)
+            issue_a_scale_load()
+        for K_C in range_constexpr(kStages):
+            if const_expr(K_C < K_TILES_TOTAL):
+                rocdl.sched_barrier(0)
+                issue_a_load_lds(K_C % 3, K_C)
+                rocdl.sched_barrier(0)
+                for j in range_constexpr(NJ):
+                    issue_b_load_j(b[K_C], K_C, j)
+                issue_b_scale_load(b_scale_v[K_C], K_C)
+                rocdl.sched_barrier(0)
+        if const_expr(ascale_gather):
+            gather_a_scale_write(gs_loads)
+        _wait_lds_barrier(_vmcnt_after_a(0))
+        for kt in range_constexpr(K_TILES_TOTAL):
+            has_next = kt + 1 < K_TILES_TOTAL
+            refill = kt + kStages < K_TILES_TOTAL
+            slot_b = kt % kStages
+            if const_expr(refill):
+                rocdl.sched_barrier(0)
+                issue_a_load_lds((kt + kStages) % 3, kt + kStages)
+                rocdl.sched_barrier(0)
+            if const_expr(BM == 128):
+                asc_cur = issue_a_scale_ds_read(kt)
+                a_cur = issue_a_ds_read(kt % 3)
+            else:
+                a_cur = issue_a_ds_read(kt % 3)
+                asc_cur = issue_a_scale_ds_read(kt)
+            for J in range_constexpr(NJ):
+                if const_expr(BM != 128):
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                mfma_cluster(
+                    b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(kt == 0)
+                )
+                if const_expr(BM != 128):
+                    rocdl.s_setprio(0)
+                rocdl.sched_barrier(0)
+                if const_expr(refill):
+                    issue_b_load_j(b[slot_b], kt + kStages, J)
+                rocdl.sched_barrier(0)
+            if const_expr(refill):
+                issue_b_scale_load(b_scale_v[slot_b], kt + kStages)
+            if const_expr(has_next):
+                _wait_lds_barrier(_vmcnt_after_a(kt + 1))
+    else:
+        # inline_quant 变体(独立 gemm1)保留原流水。
+        _relax_prologue = (BM == 128) and not inline_quant
+        if const_expr(not inline_quant):
+            issue_a_scale_load()
+        for K_C in range_constexpr(kStages):
+            if const_expr(inline_quant):
+                scale_accum = fx.Int32(0)
+                scale_accum = inline_quant_kt(
+                    0, 0, K_C, K_C, cached_row_inline, scale_accum
+                )
+                issue_b_load_j(b[K_C], K_C, 0)
+                issue_b_load_j(b[K_C], K_C, 1)
+                scale_accum = inline_quant_kt(
+                    1, 0, K_C, K_C, cached_row_inline, scale_accum
+                )
+                issue_b_load_j(b[K_C], K_C, 2)
+                issue_b_load_j(b[K_C], K_C, 3)
+                inline_quant_pack_write(K_C, scale_accum)
+            else:
+                issue_a_load_lds(K_C, K_C)
+                if const_expr(not _relax_prologue):
+                    for j in range_constexpr(4):
+                        issue_b_load_j(b[K_C], K_C, j)
             if const_expr(not _relax_prologue):
+                issue_b_scale_load(b_scale_v[K_C], K_C)
+        if const_expr(_relax_prologue):
+            rocdl.sched_barrier(0)
+            for K_C in range_constexpr(kStages):
                 for j in range_constexpr(4):
                     issue_b_load_j(b[K_C], K_C, j)
-        if const_expr(not _relax_prologue):
-            issue_b_scale_load(b_scale_v[K_C], K_C)
-    if const_expr(_relax_prologue):
-        rocdl.sched_barrier(0)
-        for K_C in range_constexpr(kStages):
-            for j in range_constexpr(4):
-                issue_b_load_j(b[K_C], K_C, j)
-            issue_b_scale_load(b_scale_v[K_C], K_C)
+                issue_b_scale_load(b_scale_v[K_C], K_C)
 
-    for OFFSET in range_constexpr(kUnroll):
-        K_C = kStages + OFFSET
-        read_slot = OFFSET % kAStages
-        write_slot = K_C % kAStages
-        slot_b = OFFSET % kStages
-        gpu.barrier()
-        if const_expr(BM == 128):
-            asc_cur = issue_a_scale_ds_read(K_C - kStages)
-            a_cur = issue_a_ds_read(read_slot)
-        else:
-            a_cur = issue_a_ds_read(read_slot)
-            asc_cur = issue_a_scale_ds_read(K_C - kStages)
-        if const_expr(not inline_quant):
-            issue_a_load_lds(write_slot, K_C)
-        if const_expr(inline_quant):
-            h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
-            h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
-            rocdl.sched_barrier(0)
-        for J in range_constexpr(4):
-            if const_expr(BM != 128):
+        for OFFSET in range_constexpr(kUnroll):
+            K_C = kStages + OFFSET
+            read_slot = OFFSET % kAStages
+            write_slot = K_C % kAStages
+            slot_b = OFFSET % kStages
+            gpu.barrier()
+            if const_expr(BM == 128):
+                asc_cur = issue_a_scale_ds_read(K_C - kStages)
+                a_cur = issue_a_ds_read(read_slot)
+            else:
+                a_cur = issue_a_ds_read(read_slot)
+                asc_cur = issue_a_scale_ds_read(K_C - kStages)
+            if const_expr(not inline_quant):
+                issue_a_load_lds(write_slot, K_C)
+            if const_expr(inline_quant):
+                h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
+                h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
-            mfma_cluster(
-                b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(OFFSET == 0)
-            )
-            if const_expr(BM != 128):
-                rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
-            issue_b_load_j(b[slot_b], K_C, J)
-            rocdl.sched_barrier(0)
-        issue_b_scale_load(b_scale_v[slot_b], K_C)
-        if const_expr(inline_quant):
-            scale_accum = _inline_quant_core_batch(
-                [(0, 0, h_v0), (1, 0, h_v1)], write_slot, fx.Int32(0)
-            )
-            inline_quant_pack_write(K_C, scale_accum)
+            for J in range_constexpr(4):
+                if const_expr(BM != 128):
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                mfma_cluster(
+                    b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(OFFSET == 0)
+                )
+                if const_expr(BM != 128):
+                    rocdl.s_setprio(0)
+                rocdl.sched_barrier(0)
+                issue_b_load_j(b[slot_b], K_C, J)
+                rocdl.sched_barrier(0)
+            issue_b_scale_load(b_scale_v[slot_b], K_C)
+            if const_expr(inline_quant):
+                scale_accum = _inline_quant_core_batch(
+                    [(0, 0, h_v0), (1, 0, h_v1)], write_slot, fx.Int32(0)
+                )
+                inline_quant_pack_write(K_C, scale_accum)
 
-    for S in range_constexpr(kStages):
-        kt = K_TILES_TOTAL - kStages + S
-        gpu.barrier()
-        if const_expr(BM == 128):
-            asc_cur = issue_a_scale_ds_read(kt)
-            a_cur = issue_a_ds_read(kt % kAStages)
-        else:
-            a_cur = issue_a_ds_read(kt % kAStages)
-            asc_cur = issue_a_scale_ds_read(kt)
-        for J in range_constexpr(4):
-            mfma_cluster(
-                b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
-            )
+        for S in range_constexpr(kStages):
+            kt = K_TILES_TOTAL - kStages + S
+            gpu.barrier()
+            if const_expr(BM == 128):
+                asc_cur = issue_a_scale_ds_read(kt)
+                a_cur = issue_a_ds_read(kt % kAStages)
+            else:
+                a_cur = issue_a_ds_read(kt % kAStages)
+                asc_cur = issue_a_scale_ds_read(kt)
+            for J in range_constexpr(4):
+                mfma_cluster(
+                    b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
+                )
 
     gpu.barrier()
 
@@ -738,11 +895,11 @@ def _gemm1_body_sc2(
 
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
-        for J in range_constexpr(4):
+        for J in range_constexpr(NJ):
             is_up = (J % 2) == 1
             J_local = J // 2
-            col_local = wave * fx.Int32(32) + fx.Int32(J_local * 16) + lane_mod_16
-            lds_col = (fx.Int32(128) + col_local) if is_up else col_local
+            col_local = wave * fx.Int32(BN // 8) + fx.Int32(J_local * 16) + lane_mod_16
+            lds_col = (fx.Int32(BN // 2) + col_local) if is_up else col_local
             vec = fx.Vector(accm[i][J])
             for v in range_constexpr(4):
                 idx = acc_idx(row_base + fx.Int32(v), lds_col)
@@ -750,93 +907,166 @@ def _gemm1_body_sc2(
 
     gpu.barrier()
 
-    tx_i32 = fx.Int32(gpu.thread_id("x"))
-    m_lane = tx_i32 // fx.Int32(16)
-    n_lane = tx_i32 % fx.Int32(16)
-    wave_grp = n_lane // fx.Int32(4)
-    kk = n_lane % fx.Int32(4)
-
-    aqout_layout = fx.make_layout((BM, K_G2_HALF), (K_G2_HALF, 1))
-    # UniversalCopy has no nontemporal/cache-hint knob; dropped (perf-neutral).
-    aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
-    scales_per_mr = [None] * M_REPS
-
-    for mr in range_constexpr(M_REPS):
-        row_local = fx.Int32(mr * 16) + m_lane
-
-        gate_vs = [None] * 8
-        up_vs = [None] * 8
-        for ee in range_constexpr(8):
-            col_in_grp = fx.Int32(8) * kk + fx.Int32(ee)
-            gate_col = wave_grp * fx.Int32(32) + col_in_grp
-            up_col = fx.Int32(128) + gate_col
-            gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
-            up_vs[ee] = acc_load(acc_idx(row_local, up_col))
-        result = _gate_up_batch(
-            gate_vs,
-            up_vs,
-            act=act,
-            swiglu_limit=swiglu_limit,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
+    if const_expr(BN == 128):
+        # BN=128:每块 64 个输出列 = 2 个 1x32 scale 组。256 线程 = 32 行 x 8 线程,
+        # 线程 (wave_grp_b, kk_b) 管 [wave_grp_b*32 + kk_b*8, +8) 列;每遍 32 行 = 一个 scale chunk_b。
+        tx_i32_b = fx.Int32(gpu.thread_id("x"))
+        m_lane_b = tx_i32_b // fx.Int32(8)
+        n_lane_b = tx_i32_b % fx.Int32(8)
+        wave_grp_b = n_lane_b // fx.Int32(4)
+        kk_b = n_lane_b % fx.Int32(4)
+        aqout_layout_b = fx.make_layout((BM, K_G2_HALF), (K_G2_HALF, 1))
+        aqout_tiles_b = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
+        ascaleout_layout_b = fx.make_layout(
+            (1 << 20, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
         )
-
-        local_max = _fabs_f32(result[0])
-        for ee in range_constexpr(1, 8):
-            local_max = local_max.maximumf(_fabs_f32(result[ee]))
-        lm_i = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
-        local_max = fx.Float32(_raw(lm_i).bitcast(T.f32))
-
-        e8m0, qscale = _e8m0_from_amax(local_max)
-        scales_per_mr[mr] = e8m0
-
-        packed_i32 = _raw(fx.Int32(0))
-        qscale_raw = _raw(qscale)
-        for w in range_constexpr(4):
-            packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32,
-                packed_i32,
-                _raw(result[2 * w]),
-                _raw(result[2 * w + 1]),
-                qscale_raw,
-                w,
+        ascaleout_i8_tiles_b = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
+        # 按 BN=256 的预排布定位:全局 32 列组 sg_b = n_block*2 + wave_grp_b,
+        # 对应旧块 old_nb_b = sg_b//4、旧 wave_grp_b = sg_b%4;ku_b/ikxdl_b 同 BN=256 的公式。
+        sg_b = n_block_idx * fx.Int32(2) + wave_grp_b
+        old_nb_b = sg_b // fx.Int32(4)
+        old_wg_b = sg_b % fx.Int32(4)
+        ku_b = old_nb_b >> fx.Int32(1)
+        ikxdl_b = old_nb_b & fx.Int32(1)
+        for mr in range_constexpr(BM // 32):
+            row_local_b = fx.Int32(mr * 32) + m_lane_b
+            gate_vs_b = [None] * 8
+            up_vs_b = [None] * 8
+            for ee in range_constexpr(8):
+                gate_col_b = wave_grp_b * fx.Int32(32) + fx.Int32(8) * kk_b + fx.Int32(ee)
+                gate_vs_b[ee] = acc_load(acc_idx(row_local_b, gate_col_b))
+                up_vs_b[ee] = acc_load(acc_idx(row_local_b, fx.Int32(64) + gate_col_b))
+            result_b = _gate_up_batch(
+                gate_vs_b,
+                up_vs_b,
+                act=act,
+                swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
-        packed = fx.Int32(packed_i32)
+            local_max_b = _fabs_f32(result_b[0])
+            for ee in range_constexpr(1, 8):
+                local_max_b = local_max_b.maximumf(_fabs_f32(result_b[ee]))
+            lm_i_b = _inline_dpp_quad_amax(fx.Int32(_raw(local_max_b).bitcast(T.i32)))
+            local_max_b = fx.Float32(_raw(lm_i_b).bitcast(T.f32))
+            e8m0_b, qscale_b = _e8m0_from_amax(local_max_b)
+            packed_i32_b = _raw(fx.Int32(0))
+            qscale_raw_b = _raw(qscale_b)
+            for w in range_constexpr(4):
+                packed_i32_b = rocdl.cvt_scalef32_pk_fp4_f32(
+                    T.i32,
+                    packed_i32_b,
+                    _raw(result_b[2 * w]),
+                    _raw(result_b[2 * w + 1]),
+                    qscale_raw_b,
+                    w,
+                )
+            byte_pos_b = (
+                n_block_idx * fx.Int32(BN_INT // 2)
+                + wave_grp_b * fx.Int32(16)
+                + kk_b * fx.Int32(4)
+            )
+            store_off_b = _layout_idx(aqout_layout_b, m_row_out + row_local_b, byte_pos_b)
+            _scalar_store(aqout_tiles_b, store_off_b // fx.Int32(4), fx.Int32(packed_i32_b), fx.Int32)
+            if kk_b == fx.Int32(0):
+                chunk_b = m_block_out * fx.Int32(kSubBlocks) + fx.Int32(mr)
+                dword_off_b = _layout_idx(
+                    ascaleout_layout_b, chunk_b, ku_b, old_wg_b, m_lane_b % fx.Int32(16)
+                )
+                addr_b = (
+                    dword_off_b * fx.Int32(4)
+                    + ikxdl_b * fx.Int32(2)
+                    + m_lane_b // fx.Int32(16)
+                )
+                _scalar_store(ascaleout_i8_tiles_b, addr_b, e8m0_b, fx.Int8)
+    else:
+        tx_i32 = fx.Int32(gpu.thread_id("x"))
+        m_lane = tx_i32 // fx.Int32(16)
+        n_lane = tx_i32 % fx.Int32(16)
+        wave_grp = n_lane // fx.Int32(4)
+        kk = n_lane % fx.Int32(4)
 
-        byte_pos = (
-            n_block_idx * fx.Int32(BN_INT // 2)
-            + wave_grp * fx.Int32(16)
-            + kk * fx.Int32(4)
+        aqout_layout = fx.make_layout((BM, K_G2_HALF), (K_G2_HALF, 1))
+        # UniversalCopy has no nontemporal/cache-hint knob; dropped (perf-neutral).
+        aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
+        scales_per_mr = [None] * M_REPS
+
+        for mr in range_constexpr(M_REPS):
+            row_local = fx.Int32(mr * 16) + m_lane
+
+            gate_vs = [None] * 8
+            up_vs = [None] * 8
+            for ee in range_constexpr(8):
+                col_in_grp = fx.Int32(8) * kk + fx.Int32(ee)
+                gate_col = wave_grp * fx.Int32(32) + col_in_grp
+                up_col = fx.Int32(128) + gate_col
+                gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
+                up_vs[ee] = acc_load(acc_idx(row_local, up_col))
+            result = _gate_up_batch(
+                gate_vs,
+                up_vs,
+                act=act,
+                swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
+
+            local_max = _fabs_f32(result[0])
+            for ee in range_constexpr(1, 8):
+                local_max = local_max.maximumf(_fabs_f32(result[ee]))
+            lm_i = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
+            local_max = fx.Float32(_raw(lm_i).bitcast(T.f32))
+
+            e8m0, qscale = _e8m0_from_amax(local_max)
+            scales_per_mr[mr] = e8m0
+
+            packed_i32 = _raw(fx.Int32(0))
+            qscale_raw = _raw(qscale)
+            for w in range_constexpr(4):
+                packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
+                    T.i32,
+                    packed_i32,
+                    _raw(result[2 * w]),
+                    _raw(result[2 * w + 1]),
+                    qscale_raw,
+                    w,
+                )
+            packed = fx.Int32(packed_i32)
+
+            byte_pos = (
+                n_block_idx * fx.Int32(BN_INT // 2)
+                + wave_grp * fx.Int32(16)
+                + kk * fx.Int32(4)
+            )
+            out_row = m_row_out + row_local
+            store_off = _layout_idx(aqout_layout, out_row, byte_pos)
+            _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
+
+        # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
+        ascaleout_layout = fx.make_layout(
+            (1 << 20, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
         )
-        out_row = m_row_out + row_local
-        store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-        _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
-
-    # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
-    ascaleout_layout = fx.make_layout(
-        (1 << 20, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
-    )
-    ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
-    ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
-    if kk == fx.Int32(0):
-        ku = n_block_idx >> fx.Int32(1)
-        ikxdl = n_block_idx & fx.Int32(1)
-        if const_expr(BM == 16):
-            chunk = m_block_out
-            dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
-            addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-            _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
-        else:
-            for sub in range_constexpr(kSubBlocks):
-                chunk = m_block_out * fx.Int32(kSubBlocks) + fx.Int32(sub)
+        ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
+        ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
+        if kk == fx.Int32(0):
+            ku = n_block_idx >> fx.Int32(1)
+            ikxdl = n_block_idx & fx.Int32(1)
+            if const_expr(BM == 16):
+                chunk = m_block_out
                 dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
-                pair_i32 = scales_per_mr[sub * 2 + 0] | (
-                    scales_per_mr[sub * 2 + 1] << fx.Int32(8)
-                )
                 addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-                _scalar_store(
-                    ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16
-                )
+                _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
+            else:
+                for sub in range_constexpr(kSubBlocks):
+                    chunk = m_block_out * fx.Int32(kSubBlocks) + fx.Int32(sub)
+                    dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
+                    pair_i32 = scales_per_mr[sub * 2 + 0] | (
+                        scales_per_mr[sub * 2 + 1] << fx.Int32(8)
+                    )
+                    addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
+                    _scalar_store(
+                        ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16
+                    )
 
 
 # Preserve the private import spelling used by the fused wrappers while making
@@ -846,7 +1076,8 @@ _gemm1_body = _gemm1_body_sc2
 
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
-    kAStages = 2 if BM == 128 else 3
+    # 生产流水 A 三级(DMA 提前两步)。LDS 不涨:A 三级+scale = BM*496B < 累加器复用区 BM*BN*4。
+    kAStages = 3
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = kAStages * BM * KH_TILE
@@ -879,7 +1110,9 @@ def compile_gemm1_a4w4_port(
         (32, True, False),
         (32, False, False),
         (64, False, False),
+        (64, True, False),
         (128, False, False),
+        (128, True, False),
         (16, True, True),
     }:
         raise AssertionError(

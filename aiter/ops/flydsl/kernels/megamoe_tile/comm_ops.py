@@ -6,8 +6,11 @@ The acquire polling and last-arriver operations required by this operator live
 here so MegaMoE Tile does not alter shared kernels merely for its own protocol.
 """
 
+import os as _os_spin
+
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import rocdl as _mlir_rocdl
 from flydsl import expr as fx
 from flydsl.expr import arith
 
@@ -52,6 +55,7 @@ __all__ = [
     "load_i64_global_system",
     "load_i64_global_system_relaxed",
     "read_hw_id",
+    "read_xcc_id",
     "read_wall_clock",
     "store_i32_system",
     "store_i64_global_relaxed",
@@ -214,6 +218,18 @@ def read_hw_id():
     )
 
 
+def read_xcc_id():
+    """Read gfx94x/gfx950 XCC_ID (HW_REG_XCC_ID): XCC[3:0]. 与 read_hw_id 合起来定位物理 CU。"""
+
+    return _llvm_d.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [],
+        "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)",
+        "=s",
+        has_side_effects=True,
+    )
+
+
 def store_i64_global_relaxed(addr_i64, value):
     """Store a diagnostic timestamp without adding a system fence."""
 
@@ -285,6 +301,13 @@ def atomic_add_agent_acq_rel(addr_i64, value):
     ).res
 
 
+# 诊断:stage1 有约 120 个 CTA 在生产阶段就坐在这个无退避的自旋里,每次
+# 迭代都是一条 system scope(非缓存、device coherent)的 load。怀疑它们把
+# producer 的访存带宽挤掉了。s_sleep 在循环里插一个硬件级退避,是检验这件事
+# 的单变量。0 = 保持原来的紧自旋。
+_SPIN_SLEEP = int(_os_spin.environ.get("MEGAMOE_TK_SPIN_SLEEP", "0") or 0)
+
+
 @traced
 def spin_until_ge_i64_system(addr_i64, expected):
     """Poll a monotonic u64 ready/credit word written by a peer's NIC.
@@ -294,5 +317,40 @@ def spin_until_ge_i64_system(addr_i64, expected):
     """
     cur = fx.Int64(load_i64_global_system(addr_i64))
     while cur < fx.Int64(expected):
+        if _SPIN_SLEEP:
+            _mlir_rocdl.s_sleep(_SPIN_SLEEP)
         cur = fx.Int64(load_i64_global_system(addr_i64))
     return cur
+
+
+@traced
+def spin_until_ge_i64_sleep(addr_i64, expected, sleep):
+    """spin_until_ge_i64_system,但每次轮询之间固定 s_sleep(sleep)(编译期常量)。
+    给「入口就停着等」的大批 CTA 用(融合版 GMM1 门),不让它们的 system load 挤占
+    还在干活的 CTA 的访存。"""
+    cur = fx.Int64(load_i64_global_system(addr_i64))
+    while cur < fx.Int64(expected):
+        _mlir_rocdl.s_sleep(sleep)
+        cur = fx.Int64(load_i64_global_system(addr_i64))
+    return cur
+
+
+@traced
+def spin_until_ge_i64_bounded(addr_i64, expected, cycles):
+    """spin_until_ge_i64_system 的限时版:超过 `cycles` 个 wall-clock 周期就
+    放弃。返回的是真实观测值,调用方用 `< expected` 判断是否超时。
+
+    退出条件必须是单个比较 —— 复合的 `a & b` 在 while 里没法 trace,所以把
+    deadline 折进被比较的值:超时后 `_el // cycles >= 1`,循环变量被顶到
+    expected 之上,自然退出。
+    """
+    t0 = fx.Int64(read_wall_clock())
+    cur = fx.Int64(load_i64_global_system(addr_i64))
+    while cur < fx.Int64(expected):
+        if _SPIN_SLEEP:
+            _mlir_rocdl.s_sleep(_SPIN_SLEEP)
+        _el = fx.Int64(read_wall_clock()) - t0
+        cur = fx.Int64(load_i64_global_system(addr_i64)) + (
+            _el // fx.Int64(cycles)
+        ) * fx.Int64(expected)
+    return fx.Int64(load_i64_global_system(addr_i64))

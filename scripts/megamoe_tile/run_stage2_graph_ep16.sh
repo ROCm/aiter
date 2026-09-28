@@ -71,10 +71,12 @@ export MEGAMOE_TILE_PROFILE_REGIONS=0
 # per_tile are separate pending GPU ablations after general-route validation.
 # Full design and parameter costs: FUSED_STAGE2_REDUCE_PUSH_DESIGN_20260910.md.
 set +e
-timeout --signal=TERM --kill-after=30s 1800s \
+# 诊断用:挂住的跑会占满 16 卡直到超时,默认 30 分钟太贵。
+timeout --signal=TERM --kill-after=30s "${MEGAMOE_RUN_TIMEOUT:-1800s}" \
   python3 -u -m torch.distributed.run \
   --nnodes=2 --nproc-per-node=8 --node-rank="${node_rank}" \
   --master-addr=10.2.80.17 --master-port="${master_port}" --max-restarts=0 \
+  ${MEGAMOE_ATT:+--no-python /home/hzm/att_wrap.sh} \
   op_tests/multigpu_tests/bench_megamoe_tile_ep16_stage2_breakdown.py \
   --path "${bench_path}" --candidate-mode full --mori-mode gmm2_combine \
   --cuda-graph --hidden 3584 --activation situv2 --tokens 128 \

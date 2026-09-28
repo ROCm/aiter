@@ -228,6 +228,26 @@ def _bw_probe(nbytes, rank, label_pairs, reduce_shape=None):
             "slowdown_vs_plain": round(best2 / best, 2)}), flush=True)
 
 
+class _CudaArrayView:
+    """最小 __cuda_array_interface__ 包装:在注册窗口里开 torch 视图。"""
+
+    def __init__(self, ptr: int, shape, typestr: str, strides=None):
+        self.__cuda_array_interface__ = {
+            "data": (int(ptr), False),
+            "shape": tuple(shape),
+            "typestr": typestr,
+            "version": 3,
+            "strides": None if strides is None else tuple(strides),
+        }
+
+
+def _window_view(ptr: int, shape, typestr: str, strides=None) -> torch.Tensor:
+    """strides 以字节计(__cuda_array_interface__ 约定)。"""
+    return torch.as_tensor(
+        _CudaArrayView(ptr, shape, typestr, strides), device="cuda"
+    )
+
+
 @dataclass(frozen=True)
 class _CcoRuntime:
     context: Any
@@ -459,6 +479,9 @@ class MegaMoETileA4W4:
             topk=self.topk,
             max_tokens=self.mtpr,
             max_routes_per_token_per_rank=self.max_routes_per_token_per_rank,
+            block_m=int(os.environ.get("MEGAMOE_TK_S1_BLOCK_M", "32")),
+            tile_group=int(os.environ.get("MEGAMOE_TK_S1_TILE_GROUP", "1")),
+            dispatch_plan=os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0",
         )
         stage2_node_accumulation_mode = getattr(
             self, "stage2_node_accumulation_mode", "rank_local"
@@ -660,7 +683,96 @@ class MegaMoETileA4W4:
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
-            self._stage1 = self._compile_stage1()
+            # stage1 入口形式与 MegaMoEv2 一致:k1 不做量化,只吃 fp4+e8m0。
+            # bf16 输入由 forward 先发射一个独立的 per_1x32_mx_quant(fp4);
+            # 已经是 fp4 的输入直接进通信。
+            from ..mega_moe.quant import BLOCK as _QBLOCK, _get_launcher
+
+            self._s1_quant_launch = _get_launcher(self.model_dim, "fp4")
+            self._s1_quant_grid = (
+                self.mtpr * (self.model_dim // 32) + _QBLOCK - 1
+            ) // _QBLOCK
+            self._s1_quant_x = torch.empty(
+                (self.mtpr, self.model_dim // 2),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self._s1_quant_scale = torch.empty(
+                (self.mtpr, self.model_dim // 32),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            # rail_soa:k1 的 T0 在入口直接从注册窗口 RDMA 发送 SoA
+            # [q | scale | ids | weights]。发送源固定在 dispatch_staging 的
+            # parity-0 平面(graph 捕获的是固定指针,parity 由 device epoch 定,
+            # host 不知道);本次 PUT 在 k1 末尾就被回收,下一次量化在其后。
+            # 量化直接写进窗口:单 CTA 往窗口里拷 1MB 实测 ~340k 周期。
+            self._rail_soa = (
+                os.environ.get("MEGAMOE_TK_S1_RAIL_SOA", "0") != "0"
+            )
+            self._s1_ts_buf = None
+            if os.environ.get("MEGAMOE_TK_S1_TSTAMP", "0") != "0":
+                self._s1_ts_buf = torch.zeros(
+                    (int(self.stage1_worker_blocks), 32),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            if self._rail_soa:
+                # 量化直接写成按 token 连续的 rail record [q|scale|ids|weights|pad],
+                # k1 每个 QP 整段一个 PUT。record 基址作为 x_q 传给 k1。
+                from .rail_record_quant import get_rail_record_quant
+
+                _hid, _mt, _tk = self.model_dim, self.mtpr, self.topk
+                # rail_ids_first:record 区之后([mt*rec, +mt*tk*8))另放连续的 [ids|weights]。
+                self._rail_ids_first = (
+                    os.environ.get("MEGAMOE_TK_S1_RAIL_IDS_FIRST", "0") != "0"
+                )
+                from .rail_record_quant import rail_record_layout as _rrl
+
+                _side = _mt * _rrl(_hid, _tk)[0] if self._rail_ids_first else 0
+                self._rail_rec_quant = get_rail_record_quant(_hid, _tk, _side)
+                _rec, _oq, _os, _oi, _ow = self._rail_rec_quant.layout
+                _base = int(self._runtime.window.local_ptr) + int(
+                    self.stage1_layout.offset("dispatch_staging", parity=0)
+                )
+                self._s1_quant_x = _window_view(
+                    _base + _oq, (_mt, _hid // 2), "|u1", (_rec, 1)
+                )
+                self._s1_quant_scale = _window_view(
+                    _base + _os, (_mt, _hid // 32), "|u1", (_rec, 1)
+                )
+                self._s1_rec_ids = _window_view(
+                    _base + _oi, (_mt, _tk), "<i4", (_rec, 4)
+                )
+                self._s1_rec_weights = _window_view(
+                    _base + _ow, (_mt, _tk), "<f4", (_rec, 4)
+                )
+                if self._rail_ids_first:
+                    self._s1_side_ids = _window_view(
+                        _base + _side, (_mt, _tk), "<i4", (_tk * 8, 4)
+                    )
+                    self._s1_side_weights = _window_view(
+                        _base + _side + _tk * 4, (_mt, _tk), "<f4", (_tk * 8, 4)
+                    )
+            # 两 kernel 拆分:k1 = 打包+rail+本地 push,k2 = rail push+GMM1。
+            # 拆开是为了能**分别**测量和调优 —— 融合在一个 kernel 里角色叠着
+            # 角色,归因不了(加 GMM1 消费者让 GMM1 段 -30% 却让总时间 +287%,
+            # 到现在说不清亏在哪)。默认关,走原来的融合路径。
+            self._stage1_split = (
+                os.environ.get("MEGAMOE_TK_S1_KERNEL_SPLIT", "0") != "0"
+            )
+            if self._stage1_split:
+                self._stage1_k1 = self._compile_stage1("k1")
+                self._stage1_k2 = self._compile_stage1("k2")
+                # k0 只做 plan 的计数交换。必须是独立一次发射:放在 k1 里
+                # 等齐 16 个源会和 k1 自己的跨 rank 依赖链成环(实测死锁)。
+                if os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0":
+                    self._stage1_k0 = self._compile_stage1("k0")
+                self._stage1 = self._stage1_k1
+            else:
+                self._stage1_k1 = None
+                self._stage1_k2 = None
+                self._stage1 = self._compile_stage1()
             self._stage2 = self._compile_stage2()
             self._validate_launcher_contracts()
             self.stage1_kernel_name = getattr(
@@ -854,9 +966,17 @@ class MegaMoETileA4W4:
             requirements.gda_connection_type = GDA_CONNECTION_RAIL
             if self.stage1_layout.num_qp != self.stage2_layout.num_qp:
                 raise AssertionError("Stage1/Stage2 must use the same CCO QP count")
-            requirements.gda_context_count = max(
+            _ctx_base = max(
                 self.stage1_layout.num_qp,
                 self._two_kernel_qp if self._two_kernel_stage2 else 0,
+            )
+            # dispatch plan 的计数必须走**专属** ctx:token 发送用
+            # qp_id = token % num_qp 占了 0..num_qp-1,而 CCO 的
+            # flush_async/wait 是按请求句柄轮询 CQ 的 —— 在同一条队列上多插
+            # WQE 会让它消费到别人的完成,表现为数值漂移和标志丢失。
+            self._plan_rail_ctx = _ctx_base
+            requirements.gda_context_count = _ctx_base + (
+                1 if os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0" else 0
             )
             requirements.gda_signal_count = 0
             requirements.gda_counter_count = 0
@@ -884,9 +1004,12 @@ class MegaMoETileA4W4:
                 context.__exit__(None, None, None)
             raise
 
-    def _compile_stage1(self):
+    def _compile_stage1(self, kernel_role="fused"):
         factory = _import_factory(_STAGE1_MODULE, _STAGE1_FACTORY)
         sparse = self.stage1_transport == "sparse_wqe"
+        # 角色分区(inter 128 / intra 128)原本只跟着 sparse 开;拆出独立开关,
+        # 好在 chunked + expert_major 下也能用 —— 那才是生产路径。
+        _split = sparse or os.environ.get("MEGAMOE_TK_S1_SPLIT_FANOUT", "0") != "0"
         return factory(
             self.stage1_layout,
             self.stage2_layout,
@@ -894,7 +1017,7 @@ class MegaMoETileA4W4:
             stage2_window_offset=self.layout.stage2_offset,
             worker_blocks=self.stage1_worker_blocks,
             waves_per_eu_hint=2,
-            diagnostic_split_fanout=sparse,
+            diagnostic_split_fanout=_split,
             cco_geometry=self.stage1_transport,
             diagnostic_phase=getattr(self, "stage1_diagnostic_phase", "full"),
             activation=self.activation,
@@ -906,6 +1029,116 @@ class MegaMoETileA4W4:
             ),
             expert_major_output=bool(
                 getattr(self, "_two_kernel_expert_major", False)
+            ),
+            gmm1_batch_completion=(
+                os.environ.get("MEGAMOE_TK_S1_BATCH_DONE", "1") != "0"
+            ),
+            fanout_shards=int(
+                os.environ.get("MEGAMOE_TK_S1_FANOUT_SHARDS", "1") or 1
+            ),
+            cco_chunks_per_flush=int(
+                os.environ.get("MEGAMOE_TK_S1_CHUNKS_PER_FLUSH", "1") or 1
+            ),
+            # chunked 路径默认让 4 个 wave 各敲各的 ctx 门铃,而 sparse_wqe
+            # 分支是 wave0 串行敲 —— Ionic 的 QP 共享 doorbell 映射。开这个
+            # 开关把 chunked 收成串行,用来量并发门铃有没有争用。默认关。
+            rail_serial_doorbell=(
+                os.environ.get("MEGAMOE_TK_S1_RAIL_SERIAL_DB", "0") != "0"
+            ),
+            cco_defer_reciprocal_wait=(
+                os.environ.get("MEGAMOE_TK_S1_DEFER_RECV", "0") != "0"
+            ),
+            cco_hoist_staging_wait=(
+                os.environ.get("MEGAMOE_TK_S1_HOIST_WAIT", "0") != "0"
+            ),
+            wave_fanout=(
+                os.environ.get("MEGAMOE_TK_S1_WAVE_FANOUT", "0") != "0"
+            ),
+            producer_ctas=int(
+                os.environ.get("MEGAMOE_TK_S1_PRODUCER_CTAS", "0") or 0
+            ),
+            wide_staging_wait=(
+                os.environ.get("MEGAMOE_TK_S1_WIDE_WAIT", "0") != "0"
+            ),
+            wide_fanout_wait=(
+                os.environ.get("MEGAMOE_TK_S1_WIDE_FANOUT_WAIT", "0") != "0"
+            ),
+            compute_first=int(
+                os.environ.get("MEGAMOE_TK_S1_COMPUTE_FIRST", "-1")
+            ),
+            lean_waitcnt=(
+                os.environ.get("MEGAMOE_TK_S1_LEAN_WAITCNT", "0") != "0"
+            ),
+            fan1_direct=(
+                os.environ.get("MEGAMOE_TK_S1_FAN1_DIRECT", "0") != "0"
+            ),
+            t0_no_fanout=(
+                os.environ.get("MEGAMOE_TK_S1_T0_NOFAN", "0") != "0"
+            ),
+            credit_async=(
+                os.environ.get("MEGAMOE_TK_S1_CREDIT_ASYNC", "0") != "0"
+            ),
+            rail_soa=(
+                os.environ.get("MEGAMOE_TK_S1_RAIL_SOA", "0") != "0"
+            ),
+            rail_qps=int(os.environ.get("MEGAMOE_TK_S1_RAIL_QPS", "1")),
+            rail_post_ctas=(
+                os.environ.get("MEGAMOE_TK_S1_RAIL_POST_CTAS", "0") != "0"
+            ),
+            route_gbatch=(
+                os.environ.get("MEGAMOE_TK_S1_ROUTE_GBATCH", "0") != "0"
+            ),
+            ascale_gather=(
+                os.environ.get("MEGAMOE_TK_S1_ASCALE_GATHER", "0") != "0"
+            ),
+            rail_post_off_t0=(
+                os.environ.get("MEGAMOE_TK_S1_RAIL_POST_OFFT0", "0") != "0"
+            ),
+            sortcopy_k2=(
+                os.environ.get("MEGAMOE_TK_S1_SORTCOPY_K2", "0") != "0"
+            ),
+            gb_p3=int(os.environ.get("MEGAMOE_TK_S1_GB_P3", "0")),
+            rail_ids_first=(
+                os.environ.get("MEGAMOE_TK_S1_RAIL_IDS_FIRST", "0") != "0"
+            ),
+            meta_opt=int(os.environ.get("MEGAMOE_TK_S1_META_OPT", "0")),
+            split_local=os.environ.get("MEGAMOE_TK_S1_SPLIT_LOCAL", "0") == "1",
+            h1_phys=os.environ.get("MEGAMOE_TK_H1_PHYS", "0") == "1",
+            k2_sorted_jobs=os.environ.get("MEGAMOE_TK_S1_K2_SORTED_JOBS", "0") == "1",
+            gmm1_bn=int(os.environ.get("MEGAMOE_TK_S1_GMM1_BN", "0")),
+            gate_sleep=int(os.environ.get("MEGAMOE_TK_S1_GATE_SLEEP", "0")),
+            finisher_off_t0=os.environ.get("MEGAMOE_TK_S1_FINISHER_OFF_T0", "0") == "1",
+            early_local_gmm=os.environ.get("MEGAMOE_TK_S1_EARLY_LOCAL_GMM", "0") == "1",
+            fan2_shards=int(os.environ.get("MEGAMOE_TK_S1_FAN2_SHARDS", "0")),
+            post_nofan=os.environ.get("MEGAMOE_TK_S1_POST_NOFAN", "0") == "1",
+            gmm1_use_nt=(
+                os.environ.get("MEGAMOE_TK_S1_GMM_NT", "1") != "0"
+            ),
+            gmm_tile_group=int(
+                os.environ.get("MEGAMOE_TK_S1_GMM_GROUP", "0")
+            ),
+            dispatch_plan=(
+                os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0"
+            ),
+            plan_stage=int(os.environ.get("MEGAMOE_TK_S1_PLAN_STAGE", "1")),
+            plan_rail_ctx=int(getattr(self, "_plan_rail_ctx", 0)),
+            plan_spin_cycles=int(os.environ.get("MEGAMOE_TK_S1_PLAN_SPIN", "0")),
+            claim_agent_probe=os.environ.get("MEGAMOE_TK_S1_CLAIM_PROBE", "0") != "0",
+            fanout_probe=int(os.environ.get("MEGAMOE_TK_S1_FANOUT_PROBE", "0")),
+            spin_deadline_cycles=int(os.environ.get("MEGAMOE_TK_S1_SPIN_DEADLINE", "0")),
+            live_mark=os.environ.get("MEGAMOE_TK_S1_LIVE_DUMP", "0") != "0",
+            split_fanout_only=int(os.environ.get("MEGAMOE_TK_S1_SPLIT_ONLY", "0")),
+            kernel_role=kernel_role,
+            kernel_split_at=os.environ.get(
+                "MEGAMOE_TK_S1_SPLIT_AT", "source"
+            ),
+            launches_per_forward=(
+                (
+                    2
+                    + (1 if os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0" else 0)
+                )
+                if os.environ.get("MEGAMOE_TK_S1_KERNEL_SPLIT", "0") != "0"
+                else 1
             ),
         )
 
@@ -1002,10 +1235,13 @@ class MegaMoETileA4W4:
                 )
         if not getattr(self, "diagnostic_only", False):
             sparse = self.stage1_transport == "sparse_wqe"
+            # 角色分区(inter 128 / intra 128)原本只跟着 sparse 开;拆出独立开关,
+            # 好在 chunked + expert_major 下也能用 —— 那才是生产路径。
+            _split = sparse or os.environ.get("MEGAMOE_TK_S1_SPLIT_FANOUT", "0") != "0"
             expected_stage1 = {
                 "cco_geometry": self.stage1_transport,
                 "worker_blocks": self.stage1_worker_blocks,
-                "diagnostic_split_fanout": sparse,
+                "diagnostic_split_fanout": _split,
                 "diagnostic_wave_fanout": False,
                 "diagnostic_comm_only": False,
                 "tile_pipeline": sparse,
@@ -1139,7 +1375,7 @@ class MegaMoETileA4W4:
         runtime = self._runtime
         if runtime is None:
             raise RuntimeError("CCO runtime is closed")
-        self._stage1(
+        _args = (
             runtime.dev_comm.ptr,
             runtime.window.handle,
             runtime.window.local_ptr,
@@ -1151,8 +1387,19 @@ class MegaMoETileA4W4:
             self._w1_scale.data_ptr(),
             run_tokens,
             generation,
-            stream=stream,
+            # 诊断打点输出(MEGAMOE_TK_S1_TSTAMP):[worker_blocks, 32] int64;不开时为 0。
+            0 if getattr(self, "_s1_ts_buf", None) is None else self._s1_ts_buf.data_ptr(),
         )
+        if getattr(self, "_stage1_split", False):
+            # 同一条 stream 顺序发射:k2 依赖 k1 写进 arena 的 record 与 tile,
+            # 靠 stream 序,不需要额外的 device 端握手。
+            if getattr(self, "_stage1_k0", None) is not None:
+                self._stage1_k0(*_args, stream=stream)
+            self._stage1_k1(*_args, stream=stream)
+            self._mid_dump(generation)
+            self._stage1_k2(*_args, stream=stream)
+        else:
+            self._stage1(*_args, stream=stream)
 
     def _launch_stage2(
         self,
@@ -1202,6 +1449,11 @@ class MegaMoETileA4W4:
         ]
         self._k1_filled = set()
         self._k1_fill = peer_table_launcher(self.gpus_per_node, self.world_size)
+        # device-epoch 模式:两个 parity 的 peer 表连着放,kernel1 按
+        # generation & 1 取 [parity * npes + pe]。
+        self._k1_table2 = _torch.zeros(
+            2 * self.world_size, dtype=_torch.int64, device=dev)
+        self._k1_table2_filled = False
         self._k2_scratch = _torch.zeros(1024, dtype=_torch.int32, device=dev)   # 256 槽位 + [2][max_chunks] 的 chunk 完成计数
         # cta_stamp 的时间线单独一块 GM,不挤 scratch:[CTA_STAMP_MAX_CTAS][SLOTS] i64。
         # 不开 CTASTAMP 时也分配(2048 个 i64 = 16 KB),省掉一条空指针分支。
@@ -1233,15 +1485,38 @@ class MegaMoETileA4W4:
         window = runtime.window
         arena = self.layout
         s2 = arena.stage2
-        parity = int(generation) & 1
+        # generation/parity 若按 host 整数传,CUDA graph capture 后就被冻结:
+        # stage1 每次 replay 在 device 上前进,stage2 却一直用 capture 时的
+        # parity,偶数代读到上一代的 stage1 输出,">= generation" 的就绪/信用
+        # 判断也全部失效。device-epoch 模式下 host 一律给 parity 0 的基址,
+        # 两个 kernel 自己从 epoch_gate 读 generation 并选平面。
+        device_epoch = os.environ.get("MEGAMOE_TK_S2_DEVICE_EPOCH", "1") != "0"
+        parity = 0 if device_epoch else (int(generation) & 1)
+        epoch_off = int(arena.stage1.offset("epoch_gate"))
+        # 纯诊断:stage2 自己的区域(inbox/arrival/kernel2 缓冲)固定单平面,
+        # stage1 派生的指针仍按真实 parity。用来归因 device-epoch 的耗时。
+        s2_single = (
+            device_epoch
+            and os.environ.get("MEGAMOE_TK_S2_DE_DIAG_SINGLE", "0") != "0"
+        )
         # `stream` 已经过 _flydsl_stream,是 fx.Stream;再包一层会炸。
         s_fx = stream
 
         _k1_cu = self._two_kernel_k1_cu or self.worker_blocks
 
         # ---- kernel1: GEMM2 + push 到各 peer 的 plane_slot_inbox ----------
-        k1_table = self._k1_tables[parity]
-        if parity not in self._k1_filled:
+        if device_epoch:
+            if not self._k1_table2_filled:
+                for _p in (0, 1):
+                    self._k1_fill(
+                        fx.Int64(window.handle),
+                        fx.Int64(self._k1_table2.data_ptr() + _p * self.world_size * 8),
+                        fx.Int64(plane_slot_offset(arena, 0 if s2_single else _p)), s_fx)
+                self._k1_table2_filled = True
+            k1_table = self._k1_table2
+        else:
+            k1_table = self._k1_tables[parity]
+        if not device_epoch and parity not in self._k1_filled:
             # 表内容跨代不变,只在每个 parity 第一次用时填。
             self._k1_fill(fx.Int64(window.handle), fx.Int64(k1_table.data_ptr()),
                           fx.Int64(plane_slot_offset(arena, parity)), s_fx)
@@ -1380,11 +1655,39 @@ class MegaMoETileA4W4:
             ep16_arrival_publish=self._two_kernel_arrival,
             arrival_delta=arrival_delta(arena, parity),
             arrival_count=int(self._k1_arrival_count.data_ptr()),
-            generation=int(generation),
+            generation=(
+                int(window.local_ptr) + epoch_off if device_epoch
+                else int(generation)
+            ),
+            device_epoch=device_epoch,
+            epoch_planes=tuple(
+                arena.stage1.region(_n).nbytes // 2
+                for _n in (
+                    "h1_output_q", "h1_output_scale",
+                    "tile_expert_sorted" if self._two_kernel_expert_major
+                    else "tile_expert",
+                    "num_valid",
+                    "tile_row_source_sorted" if self._two_kernel_expert_major
+                    else "tile_row_source",
+                    "tile_row_weight_sorted" if self._two_kernel_expert_major
+                    else "tile_row_weight",
+                )
+            ),
+            arrival_delta_step=(
+                0 if s2_single
+                else arrival_delta(arena, 1) - arrival_delta(arena, 0)
+            ),
             arrival_sc_store=self._two_kernel_arrival_scst,
             arrival_diag=self._two_kernel_arrival_diag,
             pay_cm_override=self._two_kernel_paycm,
         )
+        if __import__("os").environ.get("MEGAMOE_TK_H1_PHYS", "0") == "1":
+            # h1 按物理 tile 存放;stage2 经 tile_src_of_dst 间接读 A(与 stage1 的 h1_phys 成对)。
+            _rinv = arena.stage1.region("tile_src_of_dst")
+            _k1_kw["a_tile_map"] = (
+                int(window.local_ptr) + _rinv.offset + int(parity) * (_rinv.nbytes // 2)
+            )
+            _k1_kw["a_tile_map_plane"] = _rinv.nbytes // 2
         run_mega_moe_stage2(*_k1_args, *_k1_pos, s_fx, **_k1_kw)
 
         # ---- 可选:隔离计时 kernel1(与单节点 harness 同方法) -------------
@@ -1455,6 +1758,20 @@ class MegaMoETileA4W4:
         def s2_bytes(name):
             return s2.region(name).nbytes // s2.parity_depth
 
+        _k2_epoch_kw = (
+            dict(
+                epoch_off=epoch_off,
+                parity_planes=tuple(
+                    (0 if s2_single and _n != "node_dest_slot_mask" else s2_bytes(_n))
+                    for _n in (
+                    "plane_slot_inbox", "node_dest_slot_mask",
+                    "node_accumulator", "remote_partial_rx",
+                    "node_partial_ready", "return_group_ready",
+                    "return_consumed", "plane_slot_arrived")),
+            )
+            if device_epoch else {}
+        )
+
         if not getattr(self, "_nv_logged", False):
             self._nv_logged = True
             import torch as _t
@@ -1498,6 +1815,7 @@ class MegaMoETileA4W4:
                           and not self._two_kernel_arrival_nowait),
             arrival_probe=self._two_kernel_arrival_probe,
             s2_window_off=int(arena.stage2_offset),
+            **_k2_epoch_kw,
         )
 
         # ---- 可选:隔离计时 kernel2(与 MEGAMOE_TK_K1_TIME 同方法) ---------
@@ -1543,6 +1861,7 @@ class MegaMoETileA4W4:
                           and not self._two_kernel_arrival_nowait),
             arrival_probe=self._two_kernel_arrival_probe,
             s2_window_off=int(arena.stage2_offset),
+            **_k2_epoch_kw,
                 )
 
             for _ in range(3):
@@ -1659,10 +1978,17 @@ class MegaMoETileA4W4:
         wts: torch.Tensor,
         topk_ids: torch.Tensor,
         *,
+        x_scale: torch.Tensor | None = None,
         stream=None,
         slice_output: bool = True,
     ) -> torch.Tensor:
-        """Launch Stage1 then Stage2 and return this source rank's BF16 rows."""
+        """Launch Stage1 then Stage2 and return this source rank's BF16 rows.
+
+        ``x_bf16`` is either BF16 ``[tokens, hidden]`` (quantized here by a
+        separate MXFP4 kernel) or packed FP4 ``[tokens, hidden // 2]`` with
+        ``x_scale`` E8M0 ``[tokens, hidden // 32]``, which goes straight to
+        dispatch.
+        """
 
         if self._closed:
             raise RuntimeError("MegaMoETileA4W4 is closed")
@@ -1674,14 +2000,58 @@ class MegaMoETileA4W4:
         # hot path.  Until the device check lands, compact capacities are a
         # trusted-input contract: callers must bound the number of expert IDs
         # owned by any one EP rank for every source token.
-        run_tokens = validate_public_stage1_contract(
-            x_bf16,
-            wts,
-            topk_ids,
-            hidden=self.model_dim,
-            topk=self.topk,
-            max_tokens=self.mtpr,
+        input_is_fp4 = x_bf16.dtype in (
+            torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         )
+        if input_is_fp4:
+            if x_scale is None:
+                raise ValueError("FP4 input requires x_scale")
+            run_tokens = int(x_bf16.shape[0])
+            if (
+                x_bf16.ndim != 2
+                or x_bf16.shape[1] != self.model_dim // 2
+                or not x_bf16.is_contiguous()
+            ):
+                raise ValueError(
+                    f"FP4 x must be contiguous [tokens, {self.model_dim // 2}]"
+                )
+            if (
+                tuple(x_scale.shape) != (run_tokens, self.model_dim // 32)
+                or x_scale.dtype != torch.uint8
+                or not x_scale.is_contiguous()
+            ):
+                raise ValueError(
+                    "x_scale must be contiguous uint8 E8M0 "
+                    f"[{run_tokens}, {self.model_dim // 32}]"
+                )
+            validate_public_stage1_contract(
+                torch.empty(
+                    (run_tokens, self.model_dim),
+                    dtype=torch.bfloat16,
+                    device="meta",
+                ),
+                wts,
+                topk_ids,
+                hidden=self.model_dim,
+                topk=self.topk,
+                max_tokens=self.mtpr,
+            )
+        else:
+            if x_bf16.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"x must be bfloat16 or packed FP4, got {x_bf16.dtype}; "
+                    "FP8 activations are not supported by the A4W4 GMM1"
+                )
+            if x_scale is not None:
+                raise ValueError("x_scale is only valid with FP4 input")
+            run_tokens = validate_public_stage1_contract(
+                x_bf16,
+                wts,
+                topk_ids,
+                hidden=self.model_dim,
+                topk=self.topk,
+                max_tokens=self.mtpr,
+            )
         if run_tokens != self.mtpr:
             raise ValueError(
                 "the current fused EP16 protocol requires run_tokens to equal "
@@ -1711,17 +2081,225 @@ class MegaMoETileA4W4:
         else:
             _skip_s1 = False
             self._solo_s1_runs = _seen + 1
+        self._live_dump(generation)
         if not _skip_s1:
+            x_in, s_in = x_bf16, x_scale
+            if self._rail_soa:
+                if topk_ids.dtype != torch.int32 or wts.dtype != torch.float32:
+                    raise ValueError("rail_soa record expects int32 topk_ids and fp32 weights")
+                if input_is_fp4:
+                    # 已量化输入(诊断 harness):按 record 跨度拷进窗口,必须同一条流。
+                    if stream is not None and not isinstance(stream, torch.cuda.Stream):
+                        raise ValueError("rail_soa needs stream=None or a torch.cuda.Stream")
+                    with torch.cuda.stream(
+                        stream if stream is not None else torch.cuda.current_stream()
+                    ):
+                        self._s1_quant_x[:run_tokens].copy_(x_bf16.view(torch.uint8))
+                        self._s1_quant_scale[:run_tokens].copy_(x_scale)
+                        self._s1_rec_ids[:run_tokens].copy_(topk_ids)
+                        self._s1_rec_weights[:run_tokens].copy_(wts)
+                        if self._rail_ids_first:
+                            self._s1_side_ids[:run_tokens].copy_(topk_ids)
+                            self._s1_side_weights[:run_tokens].copy_(wts)
+                else:
+                    # 一次发射同时完成量化和 record 打包(替换原 quant,kernel 数不变)。
+                    self._rail_rec_quant(
+                        x_bf16.data_ptr(),
+                        topk_ids.data_ptr(),
+                        wts.data_ptr(),
+                        self._s1_quant_x.data_ptr(),
+                        run_tokens,
+                        self._s1_quant_grid,
+                        stream=launch_stream,
+                    )
+                x_in, s_in = self._s1_quant_x, self._s1_quant_scale
+            elif not input_is_fp4:
+                self._s1_quant_launch(
+                    x_bf16,
+                    self._s1_quant_x,
+                    self._s1_quant_scale,
+                    run_tokens,
+                    self._s1_quant_grid,
+                    stream=launch_stream,
+                )
+                x_in, s_in = self._s1_quant_x, self._s1_quant_scale
             self._launch_stage1(
-                x_bf16,
+                x_in,
                 wts,
                 topk_ids,
                 run_tokens,
                 generation,
                 launch_stream,
+                input_scale=s_in,
             )
-        self._launch_stage2(run_tokens, generation, launch_stream)
+        # 诊断:只跑 fused_stage1(quant+k1+k2),不发 stage2。用于 ATT 等只看 stage1 的场合。
+        if os.environ.get("MEGAMOE_TK_S1_ONLY", "0") == "0":
+            self._launch_stage2(run_tokens, generation, launch_stream)
+        self._dump_plan_debug(generation)
         return self._output[:run_tokens] if slice_output else self._output
+
+    def _mid_dump(self, generation: int) -> None:
+        """k1 之后、k2 之前同步一次,看 k1 交给 k2 的计数有没有超界。
+
+        k2 用 tile_alloc 推 job 数、用 arg_mind 做 gather,任何一个超界都会让
+        k2 读飞。序列化模式下 k1 已完成而 k2 还没发,这里读到的是干净现场。
+        """
+        if os.environ.get("MEGAMOE_TK_S1_MID_DUMP", "0") == "0":
+            return
+        seen = int(getattr(self, "_mid_dumps", 0))
+        if seen >= 2 or torch.cuda.is_current_stream_capturing():
+            return
+        self._mid_dumps = seen + 1
+        _w = os.environ.get("MEGAMOE_TK_S1_MID_NOSYNC", "0")
+        if _w != "0":
+            # k1 挂死时 synchronize 永不返回。CCO window 的 local_ptr host 可读,
+            # 所以直接 sleep 后读运行中的 arena —— 读到的是当下的进度快照。
+            import time
+            time.sleep(float(_w))
+        else:
+            torch.cuda.synchronize()
+        base = int(self._runtime.window.local_ptr)
+        par = int(generation) & 1
+        lay = self.stage1_layout
+        out = {}
+        for name, n in (("tile_alloc", 1), ("expert_count", lay.local_experts)):
+            try:
+                off = lay.offset(name, parity=par)
+                v = [int(x) for x in _read_window_u32(base + int(off), n)]
+                out[name] = v if n == 1 else (min(v), max(v), sum(v))
+            except Exception as exc:                      # noqa: BLE001
+                out[name] = "err %r" % (exc,)
+        for nm in ("h1_queue_eos", "comm_eos"):
+            try:
+                off = lay.offset(nm, parity=par)
+                n = 1 if nm == "h1_queue_eos" else self.gpus_per_node
+                out[nm] = [int(x) for x in _read_window_u64(base + int(off), n)]
+            except Exception as exc:                      # noqa: BLE001
+                out[nm] = "err %r" % (exc,)
+        try:
+            off = lay.offset("dispatch_staging_ready", parity=par)
+            v = [int(x) for x in _read_window_u64(base + int(off), self.mtpr)]
+            ok = [k for k, x in enumerate(v) if x >= generation]
+            out["staging_ready"] = "%d/%d set, first_missing=%s" % (
+                len(ok), self.mtpr,
+                next((k for k in range(self.mtpr) if v[k] < generation), None))
+        except Exception as exc:                          # noqa: BLE001
+            out["staging_ready"] = "err %r" % (exc,)
+        try:
+            off = lay.offset("plan_debug", parity=par)
+            pd = [int(x) for x in _read_window_u64(base + int(off), 128)]
+            out["spin_timeouts"] = [(k, v) for k, v in enumerate(pd) if v]
+        except Exception as exc:                          # noqa: BLE001
+            out["spin_timeouts"] = "err %r" % (exc,)
+        print("[mid] rank=%d gen=%d cap(max_route_tiles)=%d %s"
+              % (self.rank, generation, lay.max_route_tiles, out), flush=True)
+
+    def _live_dump(self, generation: int) -> None:
+        """起一个后台线程周期性读 arena,看 kernel 卡住时哪些角色到达了。
+
+        必须是线程:host 可能阻塞在 launch 内部,根本走不到 forward 末尾。
+        CCO window 的 local_ptr host 可读,所以不同步也能读出现场。
+        """
+        d = os.environ.get(
+            "MEGAMOE_TK_S1_LIVE_POLL",
+            os.environ.get("MEGAMOE_TK_S1_LIVE_DUMP", "0"),
+        )
+        if d == "0":
+            return
+        if getattr(self, "_live_thread", None) is not None:
+            # 观测的那一代已经过去 = 没卡住,收工。留着它会在 graph
+            # capture 期间继续发设备读,报成 illegal memory access。
+            if int(generation) != int(getattr(self, "_live_gen0", -1)):
+                self._live_stop = True
+            return
+        import threading
+        import time
+
+        base = int(self._runtime.window.local_ptr)
+        layout, rank = self.stage1_layout, self.rank
+        mtpr = int(self.mtpr)
+        names = {49: "CTAs", 50: "init", 51: "cco", 52: "inter_fan",
+                 53: "intra_fan", 54: "producer", 55: "comm"}
+        for i in range(6):
+            names[56 + 2 * i] = "rail%d_in" % i
+            names[57 + 2 * i] = "rail%d_out" % i
+
+        def _loop():
+            for _ in range(30):
+                time.sleep(float(d))
+                if getattr(self, "_live_stop", False):
+                    return
+                try:
+                    acc = [0] * 128
+                    for par in (0, 1):
+                        off = layout.offset("plan_debug", parity=par)
+                        for k, v in enumerate(_read_window_u64(base + int(off), 128)):
+                            acc[k] += int(v)
+                except Exception as exc:          # noqa: BLE001
+                    print("[live] rank=%d read failed: %r" % (rank, exc), flush=True)
+                    return
+                got = {names.get(k, "t%d" % k): v for k, v in enumerate(acc) if v}
+                # 进度计数不依赖 kernel 端 marker,所以不需要 live_mark ——
+                # 这是 k1 阻塞时唯一能看到真实进度的读数。
+                for nm, n in (("dispatch_staging_ready", mtpr),
+                              ("expert_count", None)):
+                    try:
+                        for par in (0, 1):
+                            off = layout.offset(nm, parity=par)
+                            if n is None:
+                                v = [int(x) for x in _read_window_u32(
+                                    base + int(off), layout.local_experts)]
+                                key, val = nm, (max(v), sum(v))
+                            else:
+                                v = [int(x) for x in _read_window_u64(
+                                    base + int(off), n)]
+                                key, val = "staging", "%d/%d" % (
+                                    sum(1 for x in v if x), n)
+                            if (val[1] if isinstance(val, tuple) else
+                                    int(val.split("/")[0])):
+                                got[key] = val
+                                break
+                    except Exception as e2:               # noqa: BLE001
+                        got[nm] = "err %r" % (e2,)
+                print("[live] rank=%d %s" % (rank, got), flush=True)
+
+        self._live_gen0 = int(generation)
+        self._live_stop = False
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        self._live_thread = t
+
+    def _dump_plan_debug(self, generation: int) -> None:
+        """planner 限时自旋的现场:哪个 flag 没到、观测到的值是多少。
+
+        只在头几次 forward 打印 —— 每次迭代都打会把 run.log 冲掉。
+        """
+        if (os.environ.get("MEGAMOE_TK_S1_PLAN_SPIN", "0") == "0"
+                and os.environ.get("MEGAMOE_TK_S1_SPIN_DEADLINE", "0") == "0"):
+            return
+        seen = int(getattr(self, "_plan_debug_prints", 0))
+        if seen >= int(os.environ.get("MEGAMOE_TK_S1_PLAN_SPIN_PRINTS", "2")):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return          # 捕获中不能同步,跳过这一次
+        self._plan_debug_prints = seen + 1
+        torch.cuda.synchronize()
+        base = int(self._runtime.window.local_ptr)
+        off = self.stage1_layout.offset("plan_debug", parity=int(generation) & 1)
+        pd = [int(v) for v in _read_window_u64(base + int(off), 128)]
+        hot = [(k, v) for k, v in enumerate(pd) if v]
+        # tag 41 等的是 h1_compute_done 收满 (tiles//GG)*h1_n_blocks。
+        # 把这三个数一起读出来才能判断是「没收满」还是「目标值本身错了」。
+        extra = {}
+        for nm in ("tile_alloc", "h1_compute_done", "expert_count"):
+            try:
+                o = self.stage1_layout.offset(nm, parity=int(generation) & 1)
+                n = 8 if nm == "expert_count" else 4
+                extra[nm] = [int(v) for v in _read_window_u32(base + int(o), n)]
+            except Exception as e:            # noqa: BLE001
+                extra[nm] = "err %r" % (e,)
+        print("[spin_dbg] rank=%d gen=%d timeouts=%s %s"
+              % (self.rank, generation, hot, extra), flush=True)
 
     forward_bf16 = forward
     __call__ = forward
@@ -1802,11 +2380,14 @@ class MegaMoETileA4W4:
             int(raw_arrived[index]) if index < tile_alloc else 0
             for index in range(self.stage1_layout.max_route_tiles)
         ]
-        expert_count = list(
+        # [0,LE) 本地来源(或全部)+ [LE,2LE) split_local 的远端来源;按 expert 合并。
+        _ec2 = list(
             _read_window_u32(
-                s1_ptr("expert_count"), self.stage1_layout.local_experts
+                s1_ptr("expert_count"), 2 * self.stage1_layout.local_experts
             )
         )
+        _le = self.stage1_layout.local_experts
+        expert_count = [int(_ec2[e]) + int(_ec2[_le + e]) for e in range(_le)]
         comm_eos = list(
             _read_window_u64(s1_ptr("comm_eos"), self.gpus_per_node)
         )
@@ -2683,6 +3264,24 @@ class MegaMoETileA4W4:
             name: int(value)
             for name, value in zip(STAGE2_TIMELINE_FIELDS, values)
         }
+        # 诊断:两 kernel 路径下融合版 stage2 不发射,它那半的 CTA 完成戳恒为 0,
+        # 下面每一个完整性检查都会抛。stage1 的四个戳此刻已经在 ticks 里,直接返回。
+        # stage2_* 字段在这个模式下无意义,调用方只取 s1_* 区间。
+        if os.environ.get("MEGAMOE_TK_TIMELINE_STAGE1_ONLY", "0") != "0":
+            # 派生键补 0:两个消费者(bench 的 timeline_interval_names 和
+            # megamoe_stage2_graph.py 自己遍历 TIMELINE_INTERVALS)都用
+            # `ticks[x] > 0` 做保护,补 0 就会被它们各自跳过,不必到处打补丁。
+            for _k in ("stage2_first_gmm_worker_done", "stage2_all_gmm_done",
+                       "stage2_all_ctas_done"):
+                ticks.setdefault(_k, 0)
+            for _role in ("rail", "rank_push", "node_reduce", "final", "gemm"):
+                ticks.setdefault(f"stage2_{_role}_first_done", 0)
+                ticks.setdefault(f"stage2_{_role}_last_done", 0)
+            return {
+                "generation": generation,
+                "ticks": ticks,
+                "role_completion_ticks": {},
+            }
         if not gmm_worker_done or any(value <= 0 for value in gmm_worker_done):
             raise RuntimeError("incomplete Stage2 GMM worker timeline")
         if depth and (ticks["stage1_entry"] <= 0 or ticks["stage2_entry"] <= 0

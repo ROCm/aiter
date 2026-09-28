@@ -432,9 +432,23 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     ep16_plane_slots: bool = False, gpus_per_node: int = 8,
     ep16_arrival_publish: bool = False, arrival_delta: int = 0,
     arrival_sc_store: bool = False, arrival_diag: int = 0,
-    pay_cm_override: int = -1):
+    pay_cm_override: int = -1,
+    device_epoch: bool = False, epoch_planes: tuple = (0, 0, 0, 0, 0, 0),
+    arrival_delta_step: int = 0, a_tile_map: bool = False, a_tile_map_plane: int = 0):
 # fmt: on
-    """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
+    """Compile fused GEMM2 and weighted cross-rank P2P scatter.
+
+    device_epoch: ``i64_generation`` carries the address of the Stage-1
+    ``epoch_gate`` word instead of a value.  The kernel loads the generation
+    there and selects the parity plane itself, so a captured CUDA graph sees
+    a fresh generation/parity on every replay.  ``epoch_planes`` are the
+    parity-plane byte sizes of (aq, ascale, eids, cumsum, stids, sweights);
+    the host passes parity-0 pointers, a p2p table holding both parities
+    back to back, and ``arrival_delta`` for parity 0 plus the per-parity step.
+    """
+    epoch_planes = tuple(int(v) for v in epoch_planes)
+    if len(epoch_planes) != 6:
+        raise ValueError("epoch_planes must hold six plane sizes")
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
         raise RuntimeError(f"MegaMoE v2 stage2 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
@@ -512,6 +526,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         + ("_scst" if arrival_sc_store else "")
         + (f"_pcm{pay_cm_override}" if int(pay_cm_override) >= 0 else "")
         + (f"_dg{arrival_diag}" if arrival_diag else "")
+        + (
+            "_de_" + "_".join(str(v) for v in epoch_planes)
+            # 符号名里不能有 '-':负步长写成 m 前缀
+            + f"_ad{'m' if arrival_delta_step < 0 else ''}{abs(arrival_delta_step)}"
+            if device_epoch else ""
+        )
+        + (f"_atm{int(a_tile_map_plane)}" if a_tile_map else "")
     )
 
     # fmt: off
@@ -522,12 +543,36 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         arg_count_matrix: fx.Int64, arg_pair_config: fx.Int64, arg_parity: fx.Int64,
         arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32,
-        arg_arrival_count: fx.Int64, i64_generation: fx.Int64):
+        arg_arrival_count: fx.Int64, i64_generation: fx.Int64, arg_a_tile_map: fx.Int64):
     # fmt: on
         tx_i32 = fx.thread_idx.x
         bx_i32 = fx.block_idx.x
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+
+        if const_expr(device_epoch):
+            # Stage-1 k1 wrote epoch_gate earlier on this stream.
+            # relaxed、agent scope:epoch_gate 是同一 stream 上更早的 kernel 写的,
+            # kernel 边界已保证可见。system acquire 会带 buffer_inv,每个 CTA 入口
+            # 冲一次 L2,persistent GEMM2 靠 L2 复用 w2,实测 +97us。
+            i64_generation = fx.Int64(rocdl.readfirstlane(
+                T.i64,
+                fx.Int64(comm_ops.load_i64_global_agent_relaxed(i64_generation)).ir_value()))
+            _par = i64_generation & fx.Int64(1)
+            arg_aq = arg_aq + _par * fx.Int64(epoch_planes[0])
+            arg_ascale = arg_ascale + _par * fx.Int64(epoch_planes[1])
+            arg_eids = arg_eids + _par * fx.Int64(epoch_planes[2])
+            arg_cumsum = arg_cumsum + _par * fx.Int64(epoch_planes[3])
+            arg_stids = arg_stids + _par * fx.Int64(epoch_planes[4])
+            arg_sweights = arg_sweights + _par * fx.Int64(epoch_planes[5])
+            if const_expr(a_tile_map):
+                arg_a_tile_map = arg_a_tile_map + _par * fx.Int64(a_tile_map_plane)
+            arrival_delta_rt = fx.Int64(arrival_delta) + _par * fx.Int64(
+                arrival_delta_step)
+            p2p_shift = fx.Int32(_par) * fx.Int32(npes)
+        else:
+            arrival_delta_rt = arrival_delta
+            p2p_shift = fx.Int32(0)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
@@ -591,7 +636,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             skip_rows = fx.Int32(rocdl.readfirstlane(T.i32, skip_rows_lane))
         p2p_table = ptr_buf_tensor(arg_p2p_comb_inp, fx.Int64)
         if tx_i32 < fx.Int32(npes):
-            peer_base = p2p_table[tx_i32]
+            peer_base = p2p_table[tx_i32 + p2p_shift]
             fx.ptr_store(
                 peer_base,
                 lds_typed_ptr(
@@ -606,7 +651,12 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
                     is_f8, KH_TILE_A, k_bytes, BM=BM)
 
-        def run_unit(unit_bx, m_block_idx):
+        # a_tile_map:A(h1)按物理 tile 存放,排序后的第 t 个 32 行 tile 的数据在
+        # 物理 tile a_tile_map[t]。只有 A/A-scale 走这层间接;expert id、srcmap、
+        # 输出位置仍按排序后的行号。
+        a_map_buf = ptr_buf_tensor(arg_a_tile_map, fx.Int32)
+
+        def run_unit(unit_bx, m_block_idx, a_row):
             # Map each Stage2 BM sub-tile to its Stage1 SBM metadata row.
             m_row = m_block_idx * fx.Int32(BM)
             sort_block_idx = m_row // fx.Int32(SBM)
@@ -640,7 +690,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
                 i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
                 a_dtype=a_dtype, has_pad=has_pad, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-                expert_offset=_expert_offset)
+                expert_offset=_expert_offset,
+                explicit_a_row=(a_row if a_tile_map else None))
             p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT,
                 BM=BM, BN=BN, npes=npes, topk=topk,
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=_recv_cap,
@@ -649,7 +700,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 p2p_quant_type=p2p_quant_type, scatter_vec=scatter_vec,
                 ep16_plane_slots=ep16_plane_slots, gpus_per_node=gpus_per_node,
                 ep16_arrival_publish=ep16_arrival_publish,
-                arrival_delta=arrival_delta, arrival_count_ptr=arg_arrival_count,
+                arrival_delta=arrival_delta_rt, arrival_count_ptr=arg_arrival_count,
                 num_n_blocks=num_n_blocks, generation=i64_generation,
                 arrival_sc_store=arrival_sc_store, arrival_diag=arrival_diag,
                 pay_cm_override=pay_cm_override)
@@ -674,9 +725,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 )
                 skip = (in_a | in_b).select(fx.Int32(1), fx.Int32(0))
             if skip == fx.Int32(0):
-                issue_all_a_loads(m_block_idx * fx.Int32(BM))
+                m_row0 = m_block_idx * fx.Int32(BM)
+                a_row = (
+                    a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+                    if a_tile_map else m_row0
+                )
+                issue_all_a_loads(a_row)
                 rocdl.sched_barrier(0)
-                run_unit(unit_bx, m_block_idx)
+                run_unit(unit_bx, m_block_idx, a_row)
 
         cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
         total_m_blocks = (cumsum0 + fx.Int32(BM - 1)) // fx.Int32(BM)
@@ -763,7 +819,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
         i32_grid_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
         i32_npad: fx.Int32, arg_arrival_count: fx.Int64, i64_generation: fx.Int64,
-        stream: fx.Stream):
+        arg_a_tile_map: fx.Int64, stream: fx.Stream):
     # fmt: on
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         grid_x = i32_grid_blocks * num_n_blocks
@@ -772,7 +828,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             arg_stids, arg_sweights, arg_trb, arg_expert_tile_end, arg_count_matrix,
             arg_pair_config, arg_parity,
             arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
-            i32_hidden, i32_kpad, i32_npad, arg_arrival_count, i64_generation,
+            i32_hidden, i32_kpad, i32_npad, arg_arrival_count, i64_generation, arg_a_tile_map,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch
@@ -804,7 +860,8 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
     ep16_plane_slots=False, gpus_per_node=8, a_dtype="fp8",
     ep16_arrival_publish=False, arrival_delta=0,
     arrival_count=0, generation=0, arrival_sc_store=False, arrival_diag=0,
-    pay_cm_override=-1):
+    pay_cm_override=-1, device_epoch=False, epoch_planes=(0, 0, 0, 0, 0, 0),
+    arrival_delta_step=0, a_tile_map=0, a_tile_map_plane=0):
     # fmt: on
     """Compile or reuse one fused Stage2 configuration and launch it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -822,8 +879,11 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         arrival_delta=arrival_delta, arrival_sc_store=arrival_sc_store,
         pay_cm_override=pay_cm_override,
         arrival_diag=arrival_diag,
+        device_epoch=bool(device_epoch), epoch_planes=tuple(epoch_planes),
+        arrival_delta_step=int(arrival_delta_step),
         gpus_per_node=gpus_per_node,
         a_dtype=a_dtype,
+        a_tile_map=bool(a_tile_map), a_tile_map_plane=int(a_tile_map_plane) if a_tile_map else 0,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
@@ -832,7 +892,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_expert_tile_end,
         arg_count_matrix, arg_pair_config, arg_parity, arg_p2p, fx.Int32(max_m_blocks),
         fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0),
-        fx.Int64(int(arrival_count)), fx.Int64(int(generation)), stream,
+        fx.Int64(int(arrival_count)), fx.Int64(int(generation)), fx.Int64(int(a_tile_map)), stream,
     )
 
 
@@ -849,7 +909,8 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     ep16_plane_slots=False, gpus_per_node=8, a_dtype="fp8",
     ep16_arrival_publish=False, arrival_delta=0,
     arrival_count=0, generation=0, arrival_sc_store=False, arrival_diag=0,
-    pay_cm_override=-1):
+    pay_cm_override=-1, device_epoch=False, epoch_planes=(0, 0, 0, 0, 0, 0),
+    arrival_delta_step=0, a_tile_map=0, a_tile_map_plane=0):
 # fmt: on
     """Compile and load one fused Stage2 variant without dispatching it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -867,8 +928,11 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
         arrival_delta=arrival_delta, arrival_sc_store=arrival_sc_store,
         pay_cm_override=pay_cm_override,
         arrival_diag=arrival_diag,
+        device_epoch=bool(device_epoch), epoch_planes=tuple(epoch_planes),
+        arrival_delta_step=int(arrival_delta_step),
         gpus_per_node=gpus_per_node,
         a_dtype=a_dtype,
+        a_tile_map=bool(a_tile_map), a_tile_map_plane=int(a_tile_map_plane) if a_tile_map else 0,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
@@ -878,5 +942,5 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
         arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_expert_tile_end,
         arg_count_matrix, arg_pair_config, arg_parity, arg_p2p, fx.Int32(max_m_blocks),
         fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0),
-        fx.Int64(int(arrival_count)), fx.Int64(int(generation)), stream,
+        fx.Int64(int(arrival_count)), fx.Int64(int(generation)), fx.Int64(int(a_tile_map)), stream,
     )

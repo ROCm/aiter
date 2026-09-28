@@ -227,8 +227,21 @@ def compile_stage2_node_combine(
     arrival_probe: bool = False,
     s2_window_off: int,
     team: str = TEAM_RAIL,
+    epoch_off: int = 0,
+    parity_planes: tuple = (),
 ):
-    """构建 kernel2。所有 *_off 是相对 window local_ptr 的字节偏移。"""
+    """构建 kernel2。所有 *_off 是相对 window local_ptr 的字节偏移。
+
+    epoch_off > 0 时 generation 不用 host 传的值,而是从 window 里 stage1 的
+    epoch_gate 读(同一条 stream 上 stage1 已写好),*_off 传 parity 0 的偏移,
+    kernel 自己按 generation & 1 加上 parity_planes 里对应的平面大小。
+    CUDA graph capture 后每次 replay 才能拿到当代的 generation/parity。
+    parity_planes 顺序: inbox, slot_mask, accumulator, rx, partial_ready,
+    group_ready, consumed, arrival。
+    """
+    parity_planes = tuple(int(v) for v in parity_planes)
+    if epoch_off > 0 and len(parity_planes) != 8:
+        raise ValueError("epoch_off needs eight parity_planes")
 
     if hidden <= 0 or hidden % 512:
         # 512 而非 256:一个 wave 一次覆盖 64 lane x 8 bf16 = 512 列,不整除时
@@ -346,6 +359,10 @@ def compile_stage2_node_combine(
         + ("_st" if stamp else "")
         + ("_cs" if cta_stamp else "")
         + ("_ap1" if arrival_probe else "")
+        + (
+            f"_de{epoch_off}_" + "_".join(str(v) for v in parity_planes)
+            if epoch_off > 0 else ""
+        )
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
@@ -364,14 +381,38 @@ def compile_stage2_node_combine(
         tx = fx.Int32(gpu.thread_id("x"))
         wave = tx // fx.Int32(64)
         lane = tx % fx.Int32(64)
+        if const_expr(epoch_off > 0):
+            # 同 kernel1:relaxed 读(不带 buffer_inv),readfirstlane 留在 SGPR。
+            generation = fx.Int64(rocdl.readfirstlane(
+                T.i64,
+                fx.Int64(comm_ops.load_i64_global_agent_relaxed(
+                    arena_ptr + fx.Int64(epoch_off))).ir_value()))
+            _par = generation & fx.Int64(1)
+            _inbox_off = fx.Int64(inbox_off) + _par * fx.Int64(parity_planes[0])
+            _slot_mask_off = fx.Int64(slot_mask_off) + _par * fx.Int64(parity_planes[1])
+            _accumulator_off = fx.Int64(accumulator_off) + _par * fx.Int64(parity_planes[2])
+            _rx_off = fx.Int64(rx_off) + _par * fx.Int64(parity_planes[3])
+            _partial_ready_off = fx.Int64(partial_ready_off) + _par * fx.Int64(parity_planes[4])
+            _group_ready_off = fx.Int64(group_ready_off) + _par * fx.Int64(parity_planes[5])
+            _consumed_off = fx.Int64(consumed_off) + _par * fx.Int64(parity_planes[6])
+            _arrival_off = fx.Int64(arrival_off) + _par * fx.Int64(parity_planes[7])
+        else:
+            _inbox_off = fx.Int64(inbox_off)
+            _slot_mask_off = fx.Int64(slot_mask_off)
+            _accumulator_off = fx.Int64(accumulator_off)
+            _rx_off = fx.Int64(rx_off)
+            _partial_ready_off = fx.Int64(partial_ready_off)
+            _group_ready_off = fx.Int64(group_ready_off)
+            _consumed_off = fx.Int64(consumed_off)
+            _arrival_off = fx.Int64(arrival_off)
 
-        inbox_ptr = arena_ptr + fx.Int64(inbox_off)
-        accum_ptr = arena_ptr + fx.Int64(accumulator_off)
-        rx_ptr = arena_ptr + fx.Int64(rx_off)
-        mask_ptr = arena_ptr + fx.Int64(slot_mask_off)
-        ready_ptr = arena_ptr + fx.Int64(partial_ready_off)
-        arrival_ptr = arena_ptr + fx.Int64(arrival_off)
-        group_ready_ptr = arena_ptr + fx.Int64(group_ready_off)
+        inbox_ptr = arena_ptr + _inbox_off
+        accum_ptr = arena_ptr + _accumulator_off
+        rx_ptr = arena_ptr + _rx_off
+        mask_ptr = arena_ptr + _slot_mask_off
+        ready_ptr = arena_ptr + _partial_ready_off
+        arrival_ptr = arena_ptr + _arrival_off
+        group_ready_ptr = arena_ptr + _group_ready_off
 
         # node_dest_slot_mask 是**本 rank 的 stage1** 写的(stage1.py:891/:1487
         # 都是本地 buffer_store),和 kernel2 同 rank 同 stream 串行 —— 没有任何
@@ -649,10 +690,10 @@ def compile_stage2_node_combine(
                           _qp = ck % fx.Int32(NUM_QP)
                           _rail.put(dev_comm, _qp, fx.Int32(remote_node),
                               arena_win,
-                              fx.Int64(rx_off)
+                              _rx_off
                               + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
                               arena_win,
-                              fx.Int64(accumulator_off)
+                              _accumulator_off
                               + fx.Int64(remote_plane * MAX_TOKENS)
                               * fx.Int64(RECORD_BYTES)
                               + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
@@ -700,7 +741,7 @@ def compile_stage2_node_combine(
              for chunk in range(bx, total_chunks, fx.Int32(NUM_QP)):
                  _rail.put_value(
                      dev_comm, bx, fx.Int32(remote_node), arena_win,
-                     fx.Int64(group_ready_off) + fx.Int64(chunk) * fx.Int64(8),
+                     _group_ready_off + fx.Int64(chunk) * fx.Int64(8),
                      generation, aggregate=True)
              # 原来是 flush_async 拿 request、下一行立刻 wait_request —— 中间
              # 什么都没做,拆成两步没有收益。同步 flush 就是它。
@@ -841,14 +882,14 @@ def compile_stage2_node_combine(
             if wave == fx.Int32(0):
                 # "你发给我的那块我读完了" -> 对端可以复用它的发送源。
                 _rail.put_value(dev_comm, fx.Int32(0), fx.Int32(remote_node),
-                                arena_win, fx.Int64(consumed_off), generation,
+                                arena_win, _consumed_off, generation,
                                 aggregate=True)
                 _rail.flush_peer(dev_comm, fx.Int32(0), fx.Int32(remote_node))
                 if lane == fx.Int32(0):
                     # 反过来等对端的信用:确认我们写进它 rx 的那块已被读完,
                     # 下一代才可以再往同一个 parity 槽写。system-acquire 是
                     # 必须的:这个字是对端 NIC 写的。
-                    _credit_ptr = arena_ptr + fx.Int64(consumed_off)
+                    _credit_ptr = arena_ptr + _consumed_off
                     _credit = fx.Int64(
                         comm_ops.load_i64_global_system(_credit_ptr))
                     while _credit < generation:

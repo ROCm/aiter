@@ -8,7 +8,16 @@ import subprocess
 import time
 
 
-def assess_snapshot(cards, expected_gpus=8, max_idle_vram_bytes=2 << 30):
+import os as _os_pf
+
+
+def _default_max_idle_vram():
+    return int(_os_pf.environ.get("MEGAMOE_PREFLIGHT_MAX_IDLE_VRAM", 2 << 30))
+
+
+def assess_snapshot(cards, expected_gpus=8, max_idle_vram_bytes=None):
+    if max_idle_vram_bytes is None:
+        max_idle_vram_bytes = _default_max_idle_vram()
     """Zero utilization alone does not exclude an idle inference server."""
     if not isinstance(cards, dict):
         return ["GPU inventory is not a JSON object"]
