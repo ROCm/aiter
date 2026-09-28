@@ -437,8 +437,6 @@ class PaDecodeSoftmax:
                     else v_scale_vecs[a]
                 )
                 p_scaled = Pa * v_scale_this * norm_factor_b
-            elif const_expr(self.traits.SCALAR_FP8_DECODE):
-                p_scaled = Pa
             else:
                 p_scaled = Pa * fx.Vector.filled(4, self.traits.FP8_MAX, fx.Float32)
             words.append(self.gemm.fp8_words(p_scaled)[0])

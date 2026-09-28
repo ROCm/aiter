@@ -134,47 +134,37 @@ class PaDecodeQueryLoader:
     @flyc.jit
     def quantize_row(self, m, q_row_off, q_units):
         """Each M-tile owns disjoint rows; only scale publication needs a lane guard."""
-        if const_expr(self.traits.SCALAR_FP8_DECODE):
-            for u in range_constexpr(self.traits.N_QLOADS):
-                self.lds.store_words(
-                    q_row_off
-                    + self.ctx.qh_local * self.traits.head_dim
-                    + self.ctx.lane16 * self.traits.QCHUNK
-                    + u * self.traits.QLOAD_UNIT,
-                    self.gemm.fp8_words(q_units[u].to(fx.Float32)),
-                )
-        else:
-            absmax = self.local_absmax(q_units[0])
-            for u in range_constexpr(1, self.traits.N_QLOADS):
-                absmax = fx.maxnumf(
-                    absmax,
-                    self.local_absmax(q_units[u]),
-                )
-            for sh in (8, 4, 2, 1):
-                absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
-
-            q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
-            inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
-            inv_b = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
-                self.traits.QLOAD_UNIT
+        absmax = self.local_absmax(q_units[0])
+        for u in range_constexpr(1, self.traits.N_QLOADS):
+            absmax = fx.maxnumf(
+                absmax,
+                self.local_absmax(q_units[u]),
             )
+        for sh in (8, 4, 2, 1):
+            absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
 
-            for u in range_constexpr(self.traits.N_QLOADS):
-                q_scaled_unit = q_units[u].to(fx.Float32) * inv_b
-                self.lds.store_words(
-                    q_row_off
-                    + self.ctx.qh_local * self.traits.head_dim
-                    + self.ctx.lane16 * self.traits.QCHUNK
-                    + u * self.traits.QLOAD_UNIT,
-                    self.gemm.fp8_words(q_scaled_unit),
-                )
-            if self.ctx.lane16 == 0:
-                # Transposed [qh][m] enables one vector read across M-tiles.
-                self.lds.store_scalar(
-                    self.traits.sQscale_off,
-                    self.ctx.qh_local * self.traits.M_TILES + m,
-                    q_scale,
-                )
+        q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
+        inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
+        inv_b = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
+            self.traits.QLOAD_UNIT
+        )
+
+        for u in range_constexpr(self.traits.N_QLOADS):
+            q_scaled_unit = q_units[u].to(fx.Float32) * inv_b
+            self.lds.store_words(
+                q_row_off
+                + self.ctx.qh_local * self.traits.head_dim
+                + self.ctx.lane16 * self.traits.QCHUNK
+                + u * self.traits.QLOAD_UNIT,
+                self.gemm.fp8_words(q_scaled_unit),
+            )
+        if self.ctx.lane16 == 0:
+            # Transposed [qh][m] enables one vector read across M-tiles.
+            self.lds.store_scalar(
+                self.traits.sQscale_off,
+                self.ctx.qh_local * self.traits.M_TILES + m,
+                q_scale,
+            )
 
     @flyc.jit
     def stage(self, q_units_prefetched):
@@ -200,10 +190,7 @@ class PaDecodeQueryLoader:
                     + self.ctx.lane16 * self.traits.QCHUNK,
                     fx.Vector.filled(self.traits.QCHUNK // 4, 0, fx.Int32),
                 )
-                if (
-                    const_expr(not self.traits.SCALAR_FP8_DECODE)
-                    and self.ctx.lane16 == 0
-                ):
+                if self.ctx.lane16 == 0:
                     self.lds.store_scalar(
                         self.traits.sQscale_off,
                         self.ctx.qh_local * self.traits.M_TILES + m,

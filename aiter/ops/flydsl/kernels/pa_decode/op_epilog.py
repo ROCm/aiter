@@ -120,9 +120,6 @@ class PaDecodeEpilogue:
                 inv_l = kv_mass * fx.Float32(rcp_f32(safe_denominator))
             if const_expr(self.traits.per_token_kv):
                 o_scale = inv_l
-            elif const_expr(self.traits.SCALAR_FP8_DECODE):
-                # Direct P conversion needs no compensating 1/FP8_MAX.
-                o_scale = inv_l * self.ctx.v_scale_f
             else:
                 o_scale = inv_l * (self.ctx.v_scale_f * inv_fp8)
             o_scale_b = fx.Vector.from_elements(

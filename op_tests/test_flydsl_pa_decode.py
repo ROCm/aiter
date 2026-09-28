@@ -1061,6 +1061,87 @@ CASES = [
 ]
 
 
+@pytest.mark.parametrize(
+    "block_size,query_group_size",
+    [(16, 8), (128, 16)],
+    ids=["page16-g8", "page128-g16"],
+)
+@pytest.mark.parametrize("precision_case", ["probability_tail", "small_query"])
+@pytest.mark.usefixtures("_default_cuda_device")
+def test_pa_decode_scalar_precision(block_size, query_group_size, precision_case):
+    """Preserve attention mass when Q or P needs FP8 range normalization."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("Regression for gfx950 BF16 scalar-scale decode")
+
+    dim, length = 128, 1024
+    pages = length // block_size
+    quant_dtype = torch.float8_e4m3fn
+    query = torch.zeros((1, query_group_size, dim), dtype=BF16)
+    key = torch.zeros((pages, 1, block_size, dim), dtype=BF16)
+    value = torch.full_like(key, 3.5)
+    if precision_case == "probability_tail":
+        # Each tail P is below half the smallest FP8 value, but their combined
+        # attention mass is substantial. Put the maximum first so every tile
+        # shares it, and keep a single partition to retain all 1023 tails.
+        query[..., 0] = 8
+        query[..., 1] = 1
+        key[..., 0] = -10
+        key[..., 1] = -0.15625
+        key[..., 2] = -14
+        key[0, 0, 0].zero_()
+        value[0, 0, 0].zero_()
+    else:
+        # Direct FP8 conversion zeros Q and makes attention uniform. With
+        # normalized Q, positive keys receive more mass; P itself stays large.
+        query.fill_(2**-12)
+        key.fill_(14)
+        key[:, :, 1::2, :] = -14
+        value[:, :, 1::2, :] = 0
+
+    key_quant, key_scale = per_tensor_quant(key, quant_dtype=quant_dtype)
+    value_quant, value_scale = per_tensor_quant(value, quant_dtype=quant_dtype)
+    # Both caches use the full FP8 range with exact, non-unit absmax scales.
+    assert key_scale.item() == 1 / 32
+    assert value_scale.item() == 1 / 128
+    key_cache = (
+        key_quant.reshape(pages, 1, block_size, dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value_quant.reshape(pages, 1, block_size // 16, 16, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    table = torch.arange(pages, dtype=torch.int32).reshape(1, pages)
+    context = torch.tensor([length], dtype=torch.int32)
+    reference = run_torch(
+        query,
+        key_quant,
+        value_quant.permute(0, 1, 3, 2),
+        table,
+        context,
+        key_scale,
+        value_scale,
+    )
+    output = torch.full_like(query, float("nan"))
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        softmax_scale=dim**-0.5,
+        query_length=1,
+        max_context_partition_num=1,
+        compute_type=quant_dtype,
+        key_scale=key_scale,
+        value_scale=value_scale,
+    )
+    _assert_close(output, reference)
+
+
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.usefixtures("_default_cuda_device")

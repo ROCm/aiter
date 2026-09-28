@@ -61,7 +61,7 @@ class PaDecodeSchedule:
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
-        # Scalar scheduling is broader than the BF16 single-query numerical fast path.
+        # Scalar KV scheduling also supports FP16 queries and multiple query rows.
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
 
         dense_workgroups = num_seqs * num_kv_heads * num_partitions
@@ -233,7 +233,6 @@ class PaDecodeTraits:
     SINK_DTYPE: type
     Q_ABSMAX_F32: bool
     UNIQUE_SCALE_STAGING: bool
-    SCALAR_FP8_DECODE: bool
     WIDE_FP8_MFMA: bool
     PACKS_PER_MFMA: int
     MTP4_FUSED: bool
@@ -382,12 +381,6 @@ class PaDecodeTraits:
             and query_length == 1
             and single_tile_plan == prefetch_v
         )
-        SCALAR_FP8_DECODE = (
-            TUNED_SCALAR
-            and IS_BF16
-            and query_length == 1
-            and query_group_size in (8, 16)
-        )
         # K128 consumes four K32 packs without changing cache/LDS layouts.
         WIDE_FP8_MFMA = (
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
@@ -405,7 +398,7 @@ class PaDecodeTraits:
             WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
         )
         # Scale before masking to avoid -inf * 0 and a second mask.
-        M1_SCALE_BEFORE_MASK = REUSE_KV_PAGES or SCALAR_FP8_DECODE
+        M1_SCALE_BEFORE_MASK = REUSE_KV_PAGES
         P_BUFFERS = M_TILES if MTP4_FUSED else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
         # PV uses V=A, P=B: output [head-dim, query-row=lane16].
         NWARP = 4  # 4 waves / CTA
@@ -490,7 +483,7 @@ class PaDecodeTraits:
         SP_ROW_BYTES = TILE_TOK + 16
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
         sQscale_off = max(sQ_bytes, sP_bytes)
-        sQscale_bytes = 0 if SCALAR_FP8_DECODE else ROWS_PADDED * f32
+        sQscale_bytes = ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
         NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
         # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
@@ -535,7 +528,6 @@ class PaDecodeTraits:
             SINK_DTYPE=SINK_DTYPE,
             Q_ABSMAX_F32=Q_ABSMAX_F32,
             UNIQUE_SCALE_STAGING=UNIQUE_SCALE_STAGING,
-            SCALAR_FP8_DECODE=SCALAR_FP8_DECODE,
             WIDE_FP8_MFMA=WIDE_FP8_MFMA,
             PACKS_PER_MFMA=PACKS_PER_MFMA,
             MTP4_FUSED=MTP4_FUSED,

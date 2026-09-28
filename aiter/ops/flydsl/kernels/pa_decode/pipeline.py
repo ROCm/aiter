@@ -497,11 +497,8 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
-        scale = (
-            self.ctx.scale_qk
-            if const_expr(self.traits.SCALAR_FP8_DECODE)
-            else self.ctx.scale_qk
-            * self.lds.load_scalar(self.traits.sQscale_off, self.ctx.lane16)
+        scale = self.ctx.scale_qk * self.lds.load_scalar(
+            self.traits.sQscale_off, self.ctx.lane16
         )  # per-qhead positive score scale
         masked_chunks, v_scale_vecs = self.softmax.single_scores(
             frag_Ss, scale, tile_valid, window_left, cur_kv_buf, scale_bounds
