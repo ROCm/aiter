@@ -621,10 +621,6 @@ def _build_kv_kernel(
                         o0 = xn0 * cos_v - xn1 * sin_v
                         o1 = xn1 * cos_v + xn0 * sin_v
                         if const_expr(cache_is_fp8):
-                            # Production assigns RoPE output to vec_t<bf16>
-                            # before converting that vector to FP8.
-                            o0 = o0.to(fx.BFloat16)
-                            o1 = o1.to(fx.BFloat16)
                             kb0, kb1 = quant_pair_fp8(o0, o1, k_scale_value)
                         else:
                             kb0 = o0.to(fx.BFloat16)
