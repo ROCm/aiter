@@ -40,7 +40,7 @@ from .kernels.bmm_a8w8_mxscale_gfx950 import (
     launch_bmm_a8w8_mxscale,
 )
 from .kernels.kernels_common import ceildiv
-from .kernels.tensor_shim import check_e8m0, ptr_arg
+from .kernels.tensor_shim import _compile_and_run, check_e8m0, ptr_arg
 
 BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 
@@ -273,7 +273,7 @@ def _launch(tensors, m, stream, constexprs: tuple) -> None:
     if compiled is not None:
         compiled(*args)
         return
-    compiled = flyc.compile(launch_bmm_a8w8_mxscale, *args)
+    compiled = _compile_and_run(launch_bmm_a8w8_mxscale, *args)
     if compiled is not None:
         _COMPILED[constexprs] = compiled
 

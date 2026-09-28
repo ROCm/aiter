@@ -492,8 +492,9 @@ def launch_bmm_a8w8_mxscale(
             load_b16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if b_nt else 0), 32)
 
             # B's stage copies and the byte copies of a row-major scale panel go
-            # through the raw async LDS load, which takes a size and a cache
-            # policy (bit 1: nt); the other copies keep the copy atoms.
+            # through the raw async LDS load: the BufferLoadAsyncLDS atom has
+            # neither a 1-byte size nor a cache policy (bit 1: nt). The other
+            # copies keep the copy atoms.
             b_rsrc = create_buffer_resource_from_addr(
                 fx.Int64(b_base), num_records_bytes=fx.Int64(N * K)
             )
@@ -506,14 +507,11 @@ def launch_bmm_a8w8_mxscale(
                 sb_rsrc = create_buffer_resource_from_addr(
                     fx.Int64(sb_base), num_records_bytes=sb_records
                 )
-            lds_base = fx.Int32(fx.ptrtoint(lds_i8))
 
             def _raw_dma(rsrc, size, byte, lds_off, aux=0):
+                # Lane l lands at lds_off + l * 4: the base is wave-uniform.
                 lds_ptr = fx.to_llvm_ptr(
-                    fx.inttoptr(
-                        fx.PointerType.get(T.i8, fx.AddressSpace.Shared),
-                        fx.Int64(lds_base + rocdl.readfirstlane(T.i32, lds_off)),
-                    )
+                    fx.add_offset(lds_i8, rocdl.readfirstlane(T.i32, lds_off))
                 )
                 rocdl_ir.raw_ptr_buffer_load_async_lds(
                     rsrc,
@@ -757,14 +755,14 @@ def launch_bmm_a8w8_mxscale(
 
             def _load_global(off_i32):
                 frag = fx.make_rmem_tensor(4, Int32)
-                fx.copy_atom_call(load_b16, fx.slice(b_words, (None, off_i32)), frag)
+                fx.copy(load_b16, fx.slice(b_words, (None, off_i32)), frag)
                 return Vec(frag.load())
 
             byte8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), 8)
 
             def _load_byte(src, off):
                 frag = fx.make_rmem_tensor(1, Int8)
-                fx.copy_atom_call(byte8, fx.slice(src, (None, off)), frag)
+                fx.copy(byte8, fx.slice(src, (None, off)), frag)
                 return fx.Uint8(Vec(frag.load())[0]).to(Int32)
 
             # A column-major x_scale's last column ends mid dword unless M is a
@@ -1005,7 +1003,7 @@ def launch_bmm_a8w8_mxscale(
                             )
                             fx.copy(read16, src, frag)
                             grow = part * c_rows + row
-                            fx.copy_atom_call(
+                            fx.copy(
                                 global16,
                                 frag,
                                 fx.slice(c_dst, (None, (grow * ldc + chunk * 8) // 2)),
@@ -1048,7 +1046,7 @@ def launch_bmm_a8w8_mxscale(
                 for f in range_constexpr(n_acc):
                     frag = fx.make_rmem_tensor(4, Int32)
                     frag.store(vals[f].bitcast(Int32))
-                    fx.copy_atom_call(
+                    fx.copy(
                         global16,
                         frag,
                         fx.slice(
@@ -1082,7 +1080,7 @@ def launch_bmm_a8w8_mxscale(
                     for s in range_constexpr(splits):
                         for f in range_constexpr(n_acc):
                             frag = fx.make_rmem_tensor(4, Int32)
-                            fx.copy_atom_call(
+                            fx.copy(
                                 load16_cv,
                                 fx.slice(
                                     slots,

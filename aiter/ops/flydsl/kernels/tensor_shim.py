@@ -280,17 +280,11 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
-def _run_compiled(exe, *args):
-    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
-    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
-    """
-    cf = getattr(exe, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
+def _compile_and_run(exe, *args):
+    """``flyc.compile(exe, *args)``: compiles **and** executes the kernel, and
+    returns its ``CompiledFunction`` (None under compile-only)."""
     try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        return flyc.compile(exe, *args)
     except Exception:
         # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
         try:
@@ -299,6 +293,17 @@ def _run_compiled(exe, *args):
         except Exception:  # noqa: BLE001, S110
             pass
         raise
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is not None:
+        cf(*args)
+        return
+    exe._cf = _compile_and_run(exe, *args)
 
 
 def _preload_compiled(exe, *args):
