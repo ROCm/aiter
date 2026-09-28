@@ -376,3 +376,21 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     )
 
     triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize("M", [16, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_gemm_afp4wfp4_preshuffle_backend(M, backend):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("Both preshuffle backends are available on gfx1250")
+    dtype = torch.bfloat16
+    x, w, shuffled_w, xs, ws, shuffled_xs, shuffled_ws, _, y = (
+        generate_gemm_afp4wfp4_inputs(
+            M, 256, 512, dtype, shuffle_scales_fg=True, shuffle_weight_fg=True
+        )
+    )
+    expected = run_torch(x, w, xs, ws, dtype).to(dtype)
+    actual = gemm_afp4wfp4_preshuffle(
+        x, shuffled_w, shuffled_xs, shuffled_ws, dtype, y, backend=backend
+    )
+    triton.testing.assert_close(expected, actual)

@@ -88,7 +88,7 @@ their tuned configs can be imported by a framework that is not PyTorch
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
   on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
-  harnesses, not importable library code.
+  scripts, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not
   require torch.
@@ -145,10 +145,11 @@ Flag, inside GEMM-family config JSON:
   `M_GEQ_<x>` / `"any"`.
 - A new config file with no `"any"` entry (lookup raises `KeyError` for
   uncovered M unless every reachable M hits an explicit bound).
-- Entries missing required params: `BLOCK_SIZE_M`, `BLOCK_SIZE_N`,
-  `BLOCK_SIZE_K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
-  `matrix_instr_nonkdim`, `cache_modifier`, `NUM_KSPLIT`. (Loader backfill of
-  `NUM_KSPLIT`/`cache_modifier` is a last resort, not a license to omit.)
+- Entries missing keys required by their kernel on the selected architecture
+  and backend. The kernel author maintains this contract in `DEFAULT.json`;
+  Triton and Gluon do not have to use the same keys. Loader backfill of
+  `NUM_KSPLIT`/`cache_modifier` is a last resort, not a license to omit keys
+  the kernel requires.
 - MOE dispatch keys (`bm<block_m>_n<N>_k<K>`) in a GEMM config or GEMM
   `M_LEQ_x`/`M_GEQ_y` keys in a MOE dispatch table — the schemes must not mix.
 - For `*AFP4WFP4*` specialized filenames: `K` must be the logical K
@@ -397,6 +398,28 @@ All weight/scale pre-shuffle helpers are unified in
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from
   `aiter.ops.triton.utils.shuffle`.
+- A GEMM also ships a tuning case in `utils/_triton/tuning/gemm_cases.py`.
+  The shared driver benchmarks the current config, tries candidates through
+  `get_gemm_config()`, logs failures, and saves the best config if it is faster
+  or the lookup reports no tuned M bucket. rocprofv3 measures selected GPU
+  GEMM/reduction kernels; wrapper overhead and resets are excluded. Each config
+  runs in a fresh process with a timeout, and failures do not stop the sweep.
+  Flag:
+  - A new public GEMM wrapper under `gemm/` with no case in `gemm_cases.py`,
+    or a case not named after the wrapper or its configurable variant.
+    Document composed/deprecated wrapper exceptions in the coverage inventory.
+  - A case passing `config=`, dropping an exposed `backend` or configurable
+    variant, returning only some outputs, or failing to reset accumulators.
+  - A case whose `kernels` filter misses a GEMM/reduction launch or includes
+    unrelated work, or whose inputs are not repeatable with the worker's seed.
+  - A backend/architecture path that bypasses `get_gemm_config()` or lacks a
+    valid implementation and `DEFAULT.json` on its target GPU.
+  - `DEFAULT.json` keys that do not match what the selected kernel reads.
+    The author owns this contract; architectures and backends may differ.
+    New keys need candidate values in family JSON, case `space`, or `--space`.
+  - New author requirements without updates to the tuning README, coverage
+    inventory, Triton README and these instructions. Composed feed-forward
+    ops tune their constituent GEMMs; MoE tables have a separate lookup.
 
 ## Keeping this file and the README current
 

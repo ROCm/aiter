@@ -1,4 +1,2 @@
-*.csv
-*.log
-*.json
-.rocprofv3/
+errors-*.txt
+results-*.jsonl

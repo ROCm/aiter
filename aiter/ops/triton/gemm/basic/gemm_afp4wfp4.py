@@ -494,6 +494,7 @@ def gemm_afp4wfp4_preshuffle(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    backend: str | None = None,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -523,13 +524,26 @@ def gemm_afp4wfp4_preshuffle(
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
+        backend (Optional[str]): "triton", "gluon", or None to select the
+            default for this architecture. Explicit choices never fall back.
 
     Returns:
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() in _GLUON_PRESHUFFLE_ARCHS
+    arch = arch_info.get_arch()
+    if backend is None:
+        backend = "gluon" if arch in _GLUON_PRESHUFFLE_ARCHS else "triton"
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    if backend == "gluon":
+        assert (
+            arch in _GLUON_PRESHUFFLE_ARCHS
+        ), f"Gluon preshuffle requires one of {_GLUON_PRESHUFFLE_ARCHS}, got '{arch}'"
+    use_gluon = backend == "gluon"
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
