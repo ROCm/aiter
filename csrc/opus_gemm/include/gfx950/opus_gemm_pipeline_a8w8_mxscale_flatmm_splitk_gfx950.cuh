@@ -2174,12 +2174,16 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 }
             };
 
+        // Direct B goes global -> registers and owes the stage-0 barrier
+        // nothing, so its first tile is issued before it: the consumer would
+        // otherwise idle there behind the producers' prologue and then wait a
+        // full B round trip after it. 2-4% at m<=64 on the 16x32x512 tile.
+        if constexpr (T::B_DIRECT_REG) issue_b_direct(v_b0, 0);
         stage_barrier(0);
         {
             auto sa0 = make_smem(smem_a_at(0, 0, 0));
             v_a0 = load<T::VEC_A>(sa0, u_ra);
             read_b_lds(v_b0, 0);
-            issue_b_direct(v_b0, 0);
         }
 
         opus::static_for<T::prefetch_k_iter - 2>([&](auto i_c) {
