@@ -319,7 +319,7 @@ def decode_adaptive_config(
     k: int = MEASURED_PARTS_K,
     *,
     compact_cap_mult: int = 16,
-    tiered_short_max: int | None = None,
+    short_max: int | None = None,
     ordered: bool = True,
     early_stop: bool | None = None,
     cu_count: int = FITTED_CU,
@@ -332,11 +332,8 @@ def decode_adaptive_config(
     """
     parts = decode_adaptive_parts(rows, seq, cu_count)
     grid = decode_adaptive_grid(rows, decode_adaptive_want(rows, seq), seq, cu_count)
-    short_max = (
-        decode_adaptive_short_max(rows)
-        if tiered_short_max is None
-        else tiered_short_max
-    )
+    if short_max is None:
+        short_max = decode_adaptive_short_max(rows)
     compact = decode_compact_compacts(rows, seq, parts, short_max, ordered=ordered)
     kw = {
         "blocks_per_row": grid,
@@ -344,9 +341,9 @@ def decode_adaptive_config(
         # Not "auto" when every row fits: at one part the cooperating path folds
         # away at compile time and "auto" has nowhere to send a long row.
         "tier_mode": "short" if seq <= short_max else "auto",
-        "tiered_mid_cap": max(2, parts),
-        "tiered_long_cap": max(2, parts),
-        "tiered_short_max": short_max,
+        "mid_cap": max(2, parts),
+        "long_cap": max(2, parts),
+        "short_max": short_max,
         "ordered": ordered,
         # Poll with monotonic loads, then one acquire once the token lands.
         "poll_then_acquire": True,
@@ -383,7 +380,7 @@ def topk_workspace_slots(
     compact: bool = False,
     compact_cap: int = 0,
 ) -> int:
-    """Return int32 workspace slots for the tiered path (row-major, per row)."""
+    """Return int32 workspace slots for the multi-block tiers (row-major, per row)."""
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
     row_slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
@@ -417,10 +414,10 @@ def create_topk_per_row_decode_adaptive_kernel(
     bits_per_pass: int = 11,
     scan_stages: int = SCAN_STAGES,
     tier_mode: Literal["auto", "short", "mid", "long"] = "auto",
-    tiered_short_max: int = 16384,
-    tiered_mid_cap: int = 16,
-    tiered_mid_max: int = 65536,
-    tiered_long_cap: int = 32,
+    short_max: int = 16384,
+    mid_cap: int = 16,
+    mid_max: int = 65536,
+    long_cap: int = 32,
     mask_non_finite: bool = False,
     early_stop: bool = False,
     ordered: bool = False,
@@ -449,16 +446,11 @@ def create_topk_per_row_decode_adaptive_kernel(
       never correctness: a row that overflows rescans instead.
     - `early_stop` is silently dropped under `ordered` or `compact`, which are the
       two ways the last pass stops being a row walk it can replace.
-    - `tiered_mid_cap` / `tiered_long_cap` are clamped to `blocks_per_row`.
+    - `mid_cap` / `long_cap` are clamped to `blocks_per_row`.
 
     The module docstring describes what each tier, the candidate buffer and the
     histogram certificate actually do.
     """
-    short_max = tiered_short_max
-    mid_cap = tiered_mid_cap
-    mid_max = tiered_mid_max
-    long_cap = tiered_long_cap
-
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
     if compact and compact_cap_mult < 1:
@@ -569,10 +561,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     _cap_tag = (
         ""
         if tier_mode == "short"
-        else (
-            f"_s{tiered_short_max}_mc{tiered_mid_cap}"
-            f"_mm{tiered_mid_max}_lc{tiered_long_cap}"
-        )
+        else f"_s{short_max}_mc{mid_cap}_mm{mid_max}_lc{long_cap}"
     )
     kernel_name = (
         f"topk_per_row_decode_adaptive_k{top_k}_"

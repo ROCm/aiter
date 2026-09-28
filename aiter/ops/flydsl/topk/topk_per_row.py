@@ -439,7 +439,7 @@ def _run_adaptive(
     if _adaptive.needs_workspace_zero(
         cfg_width,
         k,
-        kw["tiered_short_max"],
+        kw["short_max"],
         tier_mode=kw.get("tier_mode", "auto"),
         bits_per_pass=11,
     ):
