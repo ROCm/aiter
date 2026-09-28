@@ -54,7 +54,7 @@ from typing import Any, Literal
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import scf
 from flydsl.expr import (
     arith,
     as_ir_value,
@@ -67,7 +67,11 @@ from flydsl.expr.typing import T
 
 # buffer_ops comes from aiter's own shim; flydsl.expr's stable interface lacks it.
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
+
+# A row's parts run on different CUs and meet only in the workspace, so its
+# atomics are agent-scoped; the LDS histogram is private to one workgroup.
+_AGENT = rocdl.SyncScope.Agent
+_WORKGROUP = rocdl.SyncScope.Workgroup
 
 # HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins)
 # and the occupancy=2 deadlock guard. Changing it breaks both.
@@ -652,8 +656,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         )
         workspace_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
 
-        hist_base_ptr = fx.ptrtoint(lds.s_hist.ptr)
-        meta_base_ptr = fx.ptrtoint(lds.s_meta.ptr)
+        hist_ptr = lds.s_hist.ptr
+        meta_ptr = lds.s_meta.ptr
 
         # Decode row geometry.
         seq_row = row // next_n
@@ -727,78 +731,23 @@ def create_topk_per_row_decode_adaptive_kernel(
         def compact_key_slot(entry_i32):
             return row_ws_base + fx.Int32(compact_data + 1) + entry_i32 * c_two
 
-        def global_i32_ptr(elem_i32):
-            # Same address arithmetic `kernels_common.atomic_add_i32` does; spelled
-            # out because the atomics below need orderings it does not take.
-            ptr = fx.to_llvm_ptr(fx.get_iter(workspace) + fx.Int32(elem_i32))
-            return ptr._value if const_expr(hasattr(ptr, "_value")) else ptr
-
-        def lds_i32_ptr(base, elem_i32):
-            # `create_llvm_ptr` inttoptrs what it is given, so the address stays an
-            # integer here; an index reaches `fly.inttoptr` as the wrong type.
-            addr = fx.Int64(base) + fx.Int64(elem_i32) * fx.Int64(4)
-            ptr = create_llvm_ptr(addr, address_space=3)
-            return ptr._value if const_expr(hasattr(ptr, "_value")) else ptr
+        def ws_ptr(elem_i32):
+            return fx.get_iter(workspace) + fx.Int32(elem_i32)
 
         def ws_load(elem_i32):
             return buffer_ops.buffer_load(
                 workspace_rsrc, elem_i32, vec_width=1, dtype=T.i32
             )
 
-        def global_atomic_add_i32(
-            elem_i32, value, ordering=llvm.AtomicOrdering.monotonic
-        ):
-            return llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                global_i32_ptr(elem_i32),
-                as_ir_value(value),
-                ordering,
-                syncscope="agent",
-                alignment=4,
-            ).result
-
-        def global_atomic_xchg_i32(elem_i32, value, ordering):
-            return llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.xchg,
-                global_i32_ptr(elem_i32),
-                as_ir_value(value),
-                ordering,
-                syncscope="agent",
-                alignment=4,
-            ).result
-
-        def global_atomic_load_i32_acquire(elem_i32):
-            # Volatile agent-scoped acquire load for the row-barrier spin. The
-            # matching release publish below makes histogram updates visible to
-            # peer workgroups without issuing a read-modify-write on the polled slot.
-            return llvm.LoadOp(
-                T.i32,
-                global_i32_ptr(elem_i32),
-                alignment=4,
-                volatile_=True,
-                ordering=llvm.AtomicOrdering.acquire,
-                syncscope="agent",
-            ).result
-
-        def global_atomic_load_i32_monotonic(elem_i32):
-            return llvm.LoadOp(
-                T.i32,
-                global_i32_ptr(elem_i32),
-                alignment=4,
-                volatile_=True,
-                ordering=llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-            ).result
-
-        def lds_atomic_add_i32(base, elem_i32, value):
-            return llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                lds_i32_ptr(base, elem_i32),
-                as_ir_value(value),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            ).result
+        def ws_poll(elem_i32, ordering):
+            # Volatile, so the spin re-reads the slot rather than a hoisted value;
+            # a load rather than an RMW, so polling peers do not contend on it.
+            return fx.generic_load(
+                ws_ptr(elem_i32),
+                memory_order=ordering,
+                syncscope=_AGENT,
+                volatile=True,
+            )
 
         def spin_until_slot_ge(elem_i32, target):
             w = scf.WhileOp([T.i32], [as_ir_value(c_zero)])
@@ -812,18 +761,21 @@ def create_topk_per_row_decode_adaptive_kernel(
                 scf.ConditionOp(need_wait, [cur])
             with ir.InsertionPoint(after):
                 rocdl.s_sleep(spin_sleep)
-                data = (
-                    global_atomic_load_i32_monotonic(elem_i32)
-                    if const_expr(poll_then_acquire)
-                    else global_atomic_load_i32_acquire(elem_i32)
+                data = ws_poll(
+                    elem_i32,
+                    (
+                        fx.AtomicOrdering.Monotonic
+                        if const_expr(poll_then_acquire)
+                        else fx.AtomicOrdering.Acquire
+                    ),
                 )
-                scf.YieldOp([data])
+                scf.YieldOp([as_ir_value(data)])
             if const_expr(poll_then_acquire):
                 # The loop's monotonic observation only decides when to stop. This
                 # acquire re-reads the same monotonically increasing token and pairs
                 # with the last workgroup's release publish before any histogram
                 # data is consumed.
-                global_atomic_load_i32_acquire(elem_i32)
+                ws_poll(elem_i32, fx.AtomicOrdering.Acquire)
 
         def row_barrier(token):
             # Intentional no-drain acquire/release protocol: workgroup barriers
@@ -837,17 +789,19 @@ def create_topk_per_row_decode_adaptive_kernel(
             target_arrivals = token_value * active_parts
             gpu.barrier()
             if tid == c_zero:
-                prev = global_atomic_add_i32(
-                    counter_slot(COUNTER_ARRIVALS),
+                prev = fx.atomic_add(
+                    ws_ptr(counter_slot(COUNTER_ARRIVALS)),
                     c_one,
-                    llvm.AtomicOrdering.acq_rel,
+                    syncscope=_AGENT,
+                    ordering=fx.AtomicOrdering.AcqRel,
                 )
                 last = (prev + c_one) == target_arrivals
                 if last:
-                    global_atomic_xchg_i32(
-                        counter_slot(COUNTER_PASS_DONE),
+                    fx.atomic_xchg(
+                        ws_ptr(counter_slot(COUNTER_PASS_DONE)),
                         token_value,
-                        llvm.AtomicOrdering.release,
+                        syncscope=_AGENT,
+                        ordering=fx.AtomicOrdering.Release,
                     )
                 else:
                     spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
@@ -1013,7 +967,11 @@ def create_topk_per_row_decode_adaptive_kernel(
                 hist_i32 = fx.Int32(hist_idx)
                 count = fx.memref_load(s_hist, hist_i32)
                 if count != c_zero:
-                    global_atomic_add_i32(histogram_slot(pass_id, hist_i32), count)
+                    fx.atomic_add(
+                        ws_ptr(histogram_slot(pass_id, hist_i32)),
+                        count,
+                        syncscope=_AGENT,
+                    )
             # s_hist is read here and written by load_global_histogram, which follows
             # with no barrier of its own on the certified path -- the uncertified one
             # has the row barrier in between. Without this, a thread still walking its
@@ -1075,8 +1033,10 @@ def create_topk_per_row_decode_adaptive_kernel(
                         prefix_for_key(key, previous_start_bit) == current_bits
                     )
                 if matches_prefix:
-                    lds_atomic_add_i32(
-                        hist_base_ptr, bucket_for_key(key, start_bit), c_one
+                    fx.atomic_add(
+                        hist_ptr + bucket_for_key(key, start_bit),
+                        c_one,
+                        syncscope=_WORKGROUP,
                     )
 
             over_chunk(col_base, body)
@@ -1117,8 +1077,10 @@ def create_topk_per_row_decode_adaptive_kernel(
                         c_zero,
                     )
                     if (prefix == current_bits) & in_run:
-                        lds_atomic_add_i32(
-                            hist_base_ptr, bucket_for_key(key, start_bit), c_one
+                        fx.atomic_add(
+                            hist_ptr + bucket_for_key(key, start_bit),
+                            c_one,
+                            syncscope=_WORKGROUP,
                         )
                     keeps.append((col_i32, key, keep))
                     n_keep = n_keep + keep
@@ -1482,16 +1444,19 @@ def create_topk_per_row_decode_adaptive_kernel(
             )
             if tid == c_zero:
                 fx.memref_store(
-                    global_atomic_add_i32(
-                        counter_slot(COUNTER_OUT_FRONT),
+                    fx.atomic_add(
+                        ws_ptr(counter_slot(COUNTER_OUT_FRONT)),
                         packed_total.shrui(c_sixteen),
+                        syncscope=_AGENT,
                     ),
                     s_run,
                     c_zero,
                 )
                 fx.memref_store(
-                    global_atomic_add_i32(
-                        counter_slot(COUNTER_OUT_BACK), packed_total & c_low16
+                    fx.atomic_add(
+                        ws_ptr(counter_slot(COUNTER_OUT_BACK)),
+                        packed_total & c_low16,
+                        syncscope=_AGENT,
                     ),
                     s_run,
                     c_one,
@@ -1641,7 +1606,11 @@ def create_topk_per_row_decode_adaptive_kernel(
             # Surface overflow to the host: the buffer is per part, so a row is only
             # trustworthy if no part ran out of slice.
             if (tid == c_zero) & (fx.memref_load(s_run, c_seven) == c_one):
-                global_atomic_add_i32(compact_hdr_slot(COMPACT_HDR_OVERFLOW), c_one)
+                fx.atomic_add(
+                    ws_ptr(compact_hdr_slot(COMPACT_HDR_OVERFLOW)),
+                    c_one,
+                    syncscope=_AGENT,
+                )
             gpu.barrier()
 
         def compact_rescan(start_bit: int, previous_start_bit: int, current_bits):
@@ -1661,8 +1630,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             ):
                 key = ws_load(compact_key_slot(fx.Int32(entry)))
                 if prefix_for_key(key, previous_start_bit) == current_bits:
-                    lds_atomic_add_i32(
-                        hist_base_ptr, bucket_for_key(key, start_bit), c_one
+                    fx.atomic_add(
+                        hist_ptr + bucket_for_key(key, start_bit),
+                        c_one,
+                        syncscope=_WORKGROUP,
                     )
                 yield [rescan_state[0]]
 
@@ -1990,7 +1961,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             def hist_pass1_chunk(col_base, vec):
                 def body(j, col_i32):
                     val = vec[j]
-                    lds_atomic_add_i32(hist_base_ptr, ordered_bucket(val), c_one)
+                    fx.atomic_add(
+                        hist_ptr + ordered_bucket(val), c_one, syncscope=_WORKGROUP
+                    )
 
                 over_chunk(col_base, body)
 
@@ -1998,10 +1971,10 @@ def create_topk_per_row_decode_adaptive_kernel(
                 def body(j, col_i32):
                     val = vec[j]
                     if ordered_bucket(val) == first_threshold:
-                        lds_atomic_add_i32(
-                            hist_base_ptr,
-                            radix_bucket(val, c_mid_shift, c_bin_mask),
+                        fx.atomic_add(
+                            hist_ptr + radix_bucket(val, c_mid_shift, c_bin_mask),
                             c_one,
+                            syncscope=_WORKGROUP,
                         )
 
                 over_chunk(col_base, body)
@@ -2011,7 +1984,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                     val = vec[j]
                     key = ordered_key(val)
                     if key.shrui(c_mid_shift) == high_mid_prefix:
-                        lds_atomic_add_i32(hist_base_ptr, key & c_low_mask, c_one)
+                        fx.atomic_add(
+                            hist_ptr + (key & c_low_mask), c_one, syncscope=_WORKGROUP
+                        )
 
                 over_chunk(col_base, body)
 
@@ -2022,17 +1997,17 @@ def create_topk_per_row_decode_adaptive_kernel(
                     strictly_above = key > kth_signed
                     at_boundary = key == kth_signed
                     if strictly_above:
-                        pos = lds_atomic_add_i32(
-                            meta_base_ptr,
-                            fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
+                        pos = fx.atomic_add(
+                            meta_ptr + SMEM_META_SHORT_FRONT_COUNT,
                             c_one,
+                            syncscope=_WORKGROUP,
                         )
                         buffer_ops.buffer_store(col_i32, indices_rsrc, row_out + pos)
                     if at_boundary:
-                        back = lds_atomic_add_i32(
-                            meta_base_ptr,
-                            fx.Int32(SMEM_META_SHORT_BACK_COUNT),
+                        back = fx.atomic_add(
+                            meta_ptr + SMEM_META_SHORT_BACK_COUNT,
                             c_one,
+                            syncscope=_WORKGROUP,
                         )
                         if back < num_needed:
                             out_pos = c_top_k - c_one - back
