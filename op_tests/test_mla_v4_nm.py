@@ -703,6 +703,22 @@ def _build_bf16_inputs(
     }
 
 
+def _gated_allclose(a, b, msg, rtol=3e-2, atol=3e-2, tol_err_ratio=0.02):
+    """checkAllclose that fails the test on a `failed!` result.
+
+    checkAllclose only raises on a catastrophic delta; otherwise it logs
+    `failed!` and returns the mismatch fraction, so an ungated call lets a bad
+    accuracy result pass silently in both pytest and the script-mode sweep.
+    """
+    err = checkAllclose(
+        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=msg
+    )
+    assert err <= tol_err_ratio, (
+        f"{msg}: {err:.1%} of elements outside rtol={rtol} atol={atol} "
+        f"(limit {tol_err_ratio:.0%})"
+    )
+
+
 def _run_one_point(
     batch=2,
     kv_seq_lens=64,
@@ -962,23 +978,17 @@ def _run_one_point(
         f"\n[v4 nm accuracy] batch={batch} kv_seq_lens={kv_seq_lens} "
         f"q_seq_logical={q_seq_logical} num_kv_splits={num_kv_splits} seed={seed}"
     )
-    # Per-element check at checkAllclose's default 1% tolerance (rtol=atol=1e-2).
-    # checkAllclose prints pass/warning/failed with the offending-element ratio +
-    # max delta (it does not raise).
-    checkAllclose(
+    # Both are gated: golden vs fp8_ref catches a broken quant pipeline (e.g.
+    # all-zero e8m0 scales) that fp8_ref vs asm alone would miss, since the
+    # kernel and fp8_ref consume the same quantized bytes.
+    _gated_allclose(
         out_golden.float(),
         out_fp8_ref.float(),
-        rtol=3e-2,
-        atol=3e-2,
-        tol_err_ratio=0.02,
         msg="mla_v4_nm [golden_bf16 vs fp8_ref]",
     )
-    checkAllclose(
+    _gated_allclose(
         out_fp8_ref.float(),
         out_asm.float(),
-        rtol=3e-2,
-        atol=3e-2,
-        tol_err_ratio=0.02,
         msg="mla_v4_nm [fp8_dequant_ref vs asm]",
     )
 
@@ -1104,12 +1114,9 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         f"\n[v4 nm varlen] gqa={gqa} kv_lens={kv_lens} total_kv={total_kv} "
         f"resolved_splits={resolved}"
     )
-    checkAllclose(
+    _gated_allclose(
         out_ref.float(),
         out_asm,
-        rtol=3e-2,
-        atol=3e-2,
-        tol_err_ratio=0.02,
         msg=f"mla_v4_nm varlen [fp8_dequant_ref vs asm] kv_lens={kv_lens}",
     )
 
@@ -1488,12 +1495,9 @@ def _run_pad_poison_point(fill, poison_q, poison_kv, gqa_ratio, kv_seq_lens, bat
         f"kernel is reading past the {_QUANT_NUM_SCALE_BYTES}-byte scale field "
         f"at offset {_QUANT_D_NOPE} into the padding at {pad_off}."
     )
-    checkAllclose(
+    _gated_allclose(
         out_ref.float(),
         out_asm,
-        rtol=3e-2,
-        atol=3e-2,
-        tol_err_ratio=0.02,
         msg=f"mla_v4_nm {who} pad=0x{fill:02X} [fp8_dequant_ref vs asm]",
     )
 
@@ -2549,6 +2553,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     perf_rows = []
+    failures = []
     for batch, kv_seq_lens, q_seq_logical in itertools.product(
         args.batch, args.kv_seq_lens, args.q_seq_logical
     ):
@@ -2556,18 +2561,24 @@ if __name__ == "__main__":
             f"\n========== batch={batch} kv_seq_lens={kv_seq_lens} "
             f"q_seq_logical={q_seq_logical} =========="
         )
-        us_asm, us_ref = _run_one_point(
-            batch=batch,
-            kv_seq_lens=kv_seq_lens,
-            q_seq_logical=q_seq_logical,
-            seed=args.seed,
-            num_iters=args.iters,
-            num_warmup=args.warmup,
-            num_kv_splits=args.split_kv,
-            gqa_ratio=args.gqa_ratio,
-            attn_sink=args.attn_sink,
-            out_16_nosplit=args.out_16_nosplit,
-        )
+        try:
+            us_asm, us_ref = _run_one_point(
+                batch=batch,
+                kv_seq_lens=kv_seq_lens,
+                q_seq_logical=q_seq_logical,
+                seed=args.seed,
+                num_iters=args.iters,
+                num_warmup=args.warmup,
+                num_kv_splits=args.split_kv,
+                gqa_ratio=args.gqa_ratio,
+                attn_sink=args.attn_sink,
+                out_16_nosplit=args.out_16_nosplit,
+            )
+        except AssertionError as e:
+            # Keep sweeping so one bad shape doesn't hide the rest; the exit
+            # code below is what fails CI (aiter_test.sh runs this as a script).
+            failures.append(((batch, kv_seq_lens, q_seq_logical), str(e)))
+            continue
         perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))
 
     print("\n[v4 nm perf summary] (us; speedup = fp8_ref / asm_kernel)")
@@ -2577,3 +2588,9 @@ if __name__ == "__main__":
     )
     for b, k, q, ua, ur in perf_rows:
         print(f"  {b:>6d} {k:>8d} {q:>6d} {ua:>10.2f} {ur:>12.2f} {ur / ua:>8.1f}x")
+
+    if failures:
+        print(f"\n[v4 nm accuracy] {len(failures)} shape(s) FAILED:")
+        for (b, k, q), reason in failures:
+            print(f"  batch={b} kv_seq_lens={k} q_seq_logical={q}: {reason}")
+        sys.exit(1)
