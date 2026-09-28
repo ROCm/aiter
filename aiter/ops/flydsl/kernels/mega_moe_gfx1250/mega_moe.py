@@ -1567,9 +1567,7 @@ class MegaMoEGfx1250:
                     total_recv_token_num=addr_total_recv,
                     grid_barrier=addr_disp_bar,
                     tok_off_peers=(
-                        None
-                        if self._tokoff_ext is None
-                        else self._tokoff_ext.peers
+                        None if self._tokoff_ext is None else self._tokoff_ext.peers
                     ),
                     num_tokens=inp_cur_tok,
                     # Read off self rather than through the variant's argument
