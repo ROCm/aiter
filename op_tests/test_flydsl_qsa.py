@@ -10,7 +10,9 @@ Two layers:
     ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
     ``bench_qsa_family_b_k1`` (emit; long-``L`` uses family A scorer; published point),
-    ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table).
+    ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table),
+    ``bench_qsa_family_a_e2e`` / ``bench_qsa_family_b_e2e`` (indexer through GQA),
+    ``bench_qsa_family_a_e2e_graph`` (HIP graph replay at decode).
 
 Usage::
 
@@ -36,13 +38,17 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
 from aiter.ops.flydsl.qsa import (
+    _measured_rows,
     gather_paged_cache,
     gather_qsa_caches,
+    normalize_qsa_backend,
     pack_paged_cache,
+    qsa_auto_uses_flydsl,
     qsa_expand_tail,
     qsa_indexer_scores,
     qsa_k1_block_ids,
     qsa_k2,
+    qsa_layer,
     qsa_oracle,
     qsa_sparse_gqa,
     qsa_topk_blocks,
@@ -1576,6 +1582,476 @@ def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads, rot
     )
 
 
+def _policy_args(m, hq, d_gqa, n_columns, page_size, n_heads, d_idx):
+    """Host-only tensors for the auto-backend predicate. Nothing is launched."""
+    n_pages = n_columns // page_size
+    q_indexer = torch.zeros(m, n_heads, d_idx, dtype=torch.bfloat16)
+    q_gqa = torch.zeros(m, hq, d_gqa, dtype=torch.bfloat16)
+    index_cache = torch.zeros(n_pages, page_size, 1, d_idx, dtype=torch.bfloat16)
+    index_table = torch.zeros(1, n_pages, dtype=torch.int32)
+    k_cache = torch.zeros(n_pages, page_size, 2, d_gqa, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    kv_table = torch.zeros(1, n_pages, dtype=torch.int32)
+    indices = torch.zeros(m, 2051, dtype=torch.int32)
+    return (
+        q_indexer,
+        index_cache,
+        index_table,
+        q_gqa,
+        k_cache,
+        v_cache,
+        kv_table,
+        indices,
+    )
+
+
+def test_qsa_backend_default_is_live_amd():
+    """The opt-in defaults to Triton, and unknown names are rejected."""
+    assert normalize_qsa_backend(None) == "triton"
+    assert normalize_qsa_backend("TRITON") == "triton"
+    assert normalize_qsa_backend("FlyDSL") == "flydsl"
+    assert normalize_qsa_backend("auto") == "auto"
+    try:
+        normalize_qsa_backend("gluon")
+    except ValueError:
+        return
+    raise AssertionError("gluon is not a qsa_layer backend")
+
+
+def test_qsa_auto_stays_off_the_family_a_gate():
+    """auto selects FlyDSL only on a recorded family A end-to-end win."""
+    page = 16
+    n_columns = 128
+    family_b = _policy_args(1, 10, 128, n_columns, page, 4, 128)
+    assert qsa_auto_uses_flydsl(*family_b) is False
+    family_a = _policy_args(1, 24, 256, n_columns, page, 4, 128)
+    assert qsa_auto_uses_flydsl(*family_a) is True
+    assert _measured_rows(1, n_columns) is True
+    assert _measured_rows(8, n_columns) is True
+    assert _measured_rows(512, n_columns) is True
+    # Between the decode and prefill bands the sweep has no row.
+    mid = _policy_args(64, 24, 256, n_columns, page, 4, 128)
+    assert qsa_auto_uses_flydsl(*mid) is False
+
+
+def test_qsa_symbols_export_lazily():
+    """K1, K2, and the layer are on ``aiter.ops.flydsl`` without a side import."""
+    from aiter.ops import flydsl
+
+    assert flydsl.qsa_k1_block_ids is qsa_k1_block_ids
+    assert flydsl.qsa_k2 is qsa_k2
+    assert flydsl.qsa_layer is qsa_layer
+    assert flydsl.normalize_qsa_backend is normalize_qsa_backend
+
+
+def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype):
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device).contiguous()
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        k_bar, k, v, page_size, device
+    )
+    index_cache = index_cache.contiguous()
+    index_table = index_table.contiguous()
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    kv_table = kv_table.contiguous()
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=idx.head_dim**-0.5,
+        out_dtype=dtypes.fp32,
+    )
+    return {
+        "n_blocks": n_blocks,
+        "q_indexer": q_indexer,
+        "index_cache": index_cache,
+        "index_table": index_table,
+        "q_gqa": q_gqa,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "kv_table": kv_table,
+        "token_to_req": token_to_req,
+        "qpos": qpos,
+        "slen": slen,
+        "ref": ref,
+    }
+
+
+def _layer_args(case):
+    return (
+        case["q_indexer"],
+        case["index_cache"],
+        case["index_table"],
+        case["q_gqa"],
+        case["k_cache"],
+        case["v_cache"],
+        case["kv_table"],
+        case["token_to_req"],
+        case["qpos"],
+        case["slen"],
+    )
+
+
+def _layer_kwargs(idx, backend, **extra):
+    return {
+        "token_topk": idx.token_budget,
+        "compress_ratio": idx.compress_ratio,
+        "score_scale": idx.head_dim**-0.5,
+        "backend": backend,
+        **extra,
+    }
+
+
+def test_qsa_layer_family_a_matches_oracle():
+    """FlyDSL and the default Triton opt-in both match the oracle on one layer."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
+    ref = case["ref"].output
+    fly = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, "flydsl"))
+    err = checkAllclose(
+        ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl layer vs oracle"
+    )
+    if err != 0:
+        raise AssertionError(f"FlyDSL QSA layer diverged from the oracle (err={err})")
+    default = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, None))
+    named = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, "triton"))
+    for label, out in (("default", default), ("triton", named)):
+        err = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"{label} layer vs oracle",
+        )
+        if err != 0:
+            raise AssertionError(f"{label} QSA layer diverged (err={err})")
+
+
+def test_qsa_layer_family_b_matches_oracle():
+    """Family B FlyDSL layer matches the oracle (group 5, D=128)."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx, gqa = FAMILY_B_INDEXER, FAMILY_B_GQA
+    case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, "flydsl"))
+    err = checkAllclose(
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="family B flydsl layer vs oracle",
+    )
+    if err != 0:
+        raise AssertionError(f"family B QSA layer diverged (err={err})")
+
+
+def _capture_replay_us(fn) -> float:
+    """Warm up, capture one HIP graph, and time ``replay``. Replay stays hot."""
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            graph.capture_begin()
+            fn()
+            graph.capture_end()
+    except RuntimeError:
+        torch.cuda.current_stream().wait_stream(stream)
+        raise
+    torch.cuda.current_stream().wait_stream(stream)
+    _ignored, us = run_perftest(graph.replay, num_rotate_args=1)
+    graph.replay()
+    torch.cuda.synchronize()
+    return us
+
+
+def test_qsa_layer_decode_graph_replays():
+    """Decode capture of K1 + expand + K2 replays and still matches the oracle."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    # n_blocks=1024 forces the long-row score buffer, not the emit fast path.
+    case = _prepare_qsa_layer(idx, gqa, 1, 4096, 16, dtypes.bf16)
+    device = case["q_gqa"].device
+    indices = torch.empty((1, idx.index_width), dtype=dtypes.i32, device=device)
+    block_ids = torch.empty((1, idx.block_budget), dtype=dtypes.i32, device=device)
+    out = torch.empty_like(case["q_gqa"])
+
+    def launch():
+        return qsa_layer(
+            *_layer_args(case),
+            indices=indices,
+            block_ids=block_ids,
+            out=out,
+            **_layer_kwargs(idx, "flydsl"),
+        )
+
+    _capture_replay_us(launch)
+    err = checkAllclose(
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl graph replay vs oracle",
+    )
+    if err != 0:
+        raise AssertionError(f"graph replay diverged from the oracle (err={err})")
+
+
+def _qsa_4882_layer(
+    q_indexer,
+    index_cache,
+    index_table,
+    q_gqa,
+    k_cache,
+    v_cache,
+    kv_table,
+    token_to_req,
+    qpos,
+    slen,
+    token_topk,
+    compress_ratio,
+    backend,
+):
+    indices, _blocks = qsa_4882_select_paged_tokens(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        token_topk,
+        compress_ratio,
+        backend=backend,
+    )
+    return qsa_sparse_paged_gqa(
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        backend=backend,
+    )
+
+
+def _e2e_counts(case, idx, gqa, dtype):
+    indices = case["ref"].indices
+    w_alloc = indices.shape[1]
+    w = _selected_width(indices)
+    m = case["q_gqa"].shape[0]
+    flops = (
+        2 * m * idx.n_heads * idx.head_dim * case["n_blocks"]
+        + 4 * m * gqa.n_heads * gqa.head_dim * w
+    )
+    nbytes = (
+        m * idx.n_heads * idx.head_dim
+        + case["n_blocks"] * idx.head_dim
+        + m * gqa.n_heads * gqa.head_dim * 2
+        + 2 * w * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    return w_alloc, w, flops, nbytes
+
+
+def _e2e_cells(name, us, err, flops, nbytes):
+    return {
+        f"{name} us": us,
+        f"{name} TFLOPS": flops / us / 1e6,
+        f"{name} TB/s": nbytes / us / 1e6,
+        f"{name} err": err,
+    }
+
+
+def _time_layer(case, idx, backend, rotate):
+    out, us = _time(
+        qsa_layer,
+        *_layer_args(case),
+        rotate=rotate,
+        **_layer_kwargs(idx, backend),
+    )
+    return out, us
+
+
+@benchmark()
+def bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate=0):
+    """One family A QSA layer: FlyDSL K1+expand+K2 vs live AMD and #4882 Triton.
+
+    Expand stays the vendored Triton kernel. Oracle is not timed. Same
+    ``rotate`` on every column. HIP graph replay is a separate table.
+    """
+    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype)
+    ref = case["ref"].output
+    w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
+
+    fly, fly_us = _time_layer(case, idx, "flydsl", rotate)
+    fly_err = checkAllclose(
+        ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl e2e vs oracle"
+    )
+    amd, amd_us = _time_layer(case, idx, "triton", rotate)
+    amd_err = checkAllclose(
+        ref, amd.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="vllm amd e2e vs oracle"
+    )
+    t4882, t4882_us = _time(
+        _qsa_4882_layer,
+        *_layer_args(case),
+        idx.token_budget,
+        idx.compress_ratio,
+        "triton",
+        rotate=rotate,
+    )
+    t4882_err = checkAllclose(
+        ref,
+        t4882.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 triton e2e vs oracle",
+    )
+    ret = {
+        "gfx": get_gfx(),
+        "n_blocks": case["n_blocks"],
+        "width": w_alloc,
+        "valid%": 100.0 * w / w_alloc,
+    }
+    ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
+    ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
+    ret.update(_e2e_cells("4882_triton_e2e", t4882_us, t4882_err, flops, nbytes))
+    return ret
+
+
+@benchmark()
+def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
+    """One family B QSA layer vs #4882 Triton and, on gfx950, Gluon.
+
+    Separate table from family A. ``auto`` does not select this shape.
+    """
+    idx = _family_b_indexer(index_heads)
+    gqa = FAMILY_B_GQA
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype)
+    ref = case["ref"].output
+    w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
+    fly, fly_us = _time_layer(case, idx, "flydsl", rotate)
+    fly_err = checkAllclose(
+        ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl family B e2e"
+    )
+    triton, triton_us = _time(
+        _qsa_4882_layer,
+        *_layer_args(case),
+        idx.token_budget,
+        idx.compress_ratio,
+        "triton",
+        rotate=rotate,
+    )
+    triton_err = checkAllclose(
+        ref,
+        triton.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 triton family B e2e",
+    )
+    ret = {
+        "gfx": get_gfx(),
+        "index_heads": idx.n_heads,
+        "n_blocks": case["n_blocks"],
+        "width": w_alloc,
+        "valid%": 100.0 * w / w_alloc,
+    }
+    ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
+    ret.update(_e2e_cells("4882_triton_e2e", triton_us, triton_err, flops, nbytes))
+    if get_gfx() == "gfx950" and gluon_qsa_available():
+        gluon, gluon_us = _time(
+            _qsa_4882_layer,
+            *_layer_args(case),
+            idx.token_budget,
+            idx.compress_ratio,
+            "gluon",
+            rotate=rotate,
+        )
+        gluon_err = checkAllclose(
+            ref,
+            gluon.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg="4882 gluon family B e2e",
+        )
+        ret.update(_e2e_cells("4882_gluon_e2e", gluon_us, gluon_err, flops, nbytes))
+    return ret
+
+
+@benchmark()
+def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype):
+    """HIP graph replay of one family A decode layer. Not combined with rotate.
+
+    Each candidate is captured once, then ``replay`` is timed hot. The
+    output buffer after replay is the correctness check.
+    """
+    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype)
+    ref = case["ref"].output
+    _w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
+    device = case["q_gqa"].device
+    width = idx.index_width
+
+    def _replay(backend, out):
+        indices = torch.empty((m, width), dtype=dtypes.i32, device=device)
+        block_ids = torch.empty((m, idx.block_budget), dtype=dtypes.i32, device=device)
+
+        def launch():
+            return qsa_layer(
+                *_layer_args(case),
+                indices=indices,
+                block_ids=block_ids,
+                out=out,
+                **_layer_kwargs(idx, backend),
+            )
+
+        us = _capture_replay_us(launch)
+        err = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"{backend} graph replay vs oracle",
+        )
+        return us, err
+
+    fly_us, fly_err = _replay("flydsl", torch.empty_like(case["q_gqa"]))
+    amd_us, amd_err = _replay("triton", torch.empty_like(case["q_gqa"]))
+    ret = {
+        "gfx": get_gfx(),
+        "n_blocks": case["n_blocks"],
+        "valid%": 100.0 * w / width,
+    }
+    ret.update(_e2e_cells("flydsl_graph", fly_us, fly_err, flops, nbytes))
+    ret.update(_e2e_cells("vllm_amd_graph", amd_us, amd_err, flops, nbytes))
+    return ret
+
+
 def _run_unit_cases():
     test_indexer_hand_checked_one_row()
     test_topk_smaller_index_wins_ties()
@@ -1595,7 +2071,13 @@ def _run_unit_cases():
     test_k1_family_b_set_equality_published_indexer_point()
     test_k2_family_a_decode_matches_oracle()
     test_k2_family_a_prefill_matches_oracle()
-    aiter.logger.info("QSA oracle + K1 + K2 unit cases passed")
+    test_qsa_backend_default_is_live_amd()
+    test_qsa_auto_stays_off_the_family_a_gate()
+    test_qsa_symbols_export_lazily()
+    test_qsa_layer_family_a_matches_oracle()
+    test_qsa_layer_family_b_matches_oracle()
+    test_qsa_layer_decode_graph_replays()
+    aiter.logger.info("QSA oracle + K1 + K2 + layer unit cases passed")
 
 
 def main():
@@ -1603,7 +2085,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Family A QSA + vLLM AMD + #4882 + FlyDSL K1/K2; family B #4882 + K1",
+        description="Family A/B QSA sweeps, FlyDSL K1/K2, and the end-to-end layer opt-in",
     )
     parser.add_argument(
         "-d",
@@ -1857,6 +2339,52 @@ def main():
             df = pd.DataFrame(rows)
             aiter.logger.info(
                 "QSA family B FlyDSL K1 long-L summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate
+        ):
+            if m > seq_len:
+                continue
+            rows.append(bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate))
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family A end-to-end summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size in itertools.product(
+            [b for b in args.batch if b <= 8], args.seq, args.page_size
+        ):
+            if m > seq_len:
+                continue
+            rows.append(bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype))
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family A decode HIP-graph summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size, index_heads, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, (4, 8), args.rotate
+        ):
+            if m > seq_len:
+                continue
+            rows.append(
+                bench_qsa_family_b_e2e(
+                    m, seq_len, page_size, dtype, index_heads, rotate
+                )
+            )
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family B end-to-end summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
