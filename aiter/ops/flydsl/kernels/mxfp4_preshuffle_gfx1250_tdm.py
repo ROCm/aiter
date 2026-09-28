@@ -908,8 +908,10 @@ def launch_gemm_a8w4_tdm(
                                 emit(j)
 
         def dispatch_wave_job(fn):
-            """Run ``fn`` once; ``issue`` filters jobs by wave owner."""
-            fn(None)
+            """Run ``fn`` with the current wave's jobs."""
+            for g in range_constexpr(len(job_waves)):
+                if owns(job_waves[g]):
+                    fn([j for j in jobs if j.waves == job_waves[g]])
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
