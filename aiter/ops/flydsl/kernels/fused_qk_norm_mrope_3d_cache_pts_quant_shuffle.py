@@ -33,8 +33,7 @@ from aiter.utility import dtypes as aiter_dtypes
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
-# RMSNorm uses the production kernel's 32-lane logical groups on both wave32
-# and wave64 targets.
+# RMSNorm uses 32-lane logical groups on both wave32 and wave64 targets.
 WAVE = get_warp_size()
 _LOG2_WAVE = int(math.log2(WAVE))
 
@@ -168,8 +167,7 @@ def _build_q_kernel(
     H_Q = num_heads_q
     HALF = D // 2
     # One head is owned by one 32-lane RMSNorm group: lane ``rl`` holds the
-    # ``PROD_VEC_SIZE`` contiguous columns starting at ``PROD_VEC_SIZE * rl``,
-    # which is the distribution the production reduction order is defined on.
+    # ``PROD_VEC_SIZE`` contiguous columns starting at ``PROD_VEC_SIZE * rl``.
     # The NEOX partner of every column that lane ``rl`` holds lives in lane
     # ``rl ^ 16``, so the pair values come from one lane shuffle rather than a
     # second read of the row.
