@@ -336,6 +336,29 @@ def spin_until_ge_i64_sleep(addr_i64, expected, sleep):
 
 
 @traced
+def spin_until_ge_i64_system_rx(addr_i64, expected):
+    """spin_until_ge_i64_system,但轮询用 relaxed system load(不带 buffer_inv),
+    看到目标值之后再做一次 acquire load。语义不变:acquire 仍然发生在观察到值之后、
+    读任何被它保护的数据之前;只是把「每次轮询一次 L2 失效」变成「每次等待一次」。"""
+    cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    while cur < fx.Int64(expected):
+        if _SPIN_SLEEP:
+            _mlir_rocdl.s_sleep(_SPIN_SLEEP)
+        cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    return fx.Int64(load_i64_global_system(addr_i64))
+
+
+@traced
+def spin_until_ge_i64_sleep_rx(addr_i64, expected, sleep):
+    """spin_until_ge_i64_sleep 的 relaxed 轮询版,退出时一次 acquire load(见 _system_rx)。"""
+    cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    while cur < fx.Int64(expected):
+        _mlir_rocdl.s_sleep(sleep)
+        cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    return fx.Int64(load_i64_global_system(addr_i64))
+
+
+@traced
 def spin_until_ge_i64_bounded(addr_i64, expected, cycles):
     """spin_until_ge_i64_system 的限时版:超过 `cycles` 个 wall-clock 周期就
     放弃。返回的是真实观测值,调用方用 `< expected` 判断是否超时。

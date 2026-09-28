@@ -155,6 +155,8 @@ def compile_megamoe_tile_ep16_stage1(
     lazy_pad: bool = False,
     pub_relaxed: bool = False,
     claim_relaxed: bool = False,
+    extra_consumers: bool = False,
+    spin_relaxed: bool = False,
     gmm1_use_nt: bool = True,
     gmm_tile_group: int = 0,
     dispatch_plan: bool = False,
@@ -553,6 +555,18 @@ def compile_megamoe_tile_ep16_stage1(
     # lazy_pad:段 1 不补本地组的尾行就发布 h1_local_eos,改由段 2 的 sealer 补。GMM1 只经
     # tile_row_input 取 A,且是带界 buffer load;补齐前那些行里是上一代/初值的合法行号,
     # 算出来的 h1 行只会被 stage2 用 INVALID_SOURCE/权重 0 丢掉,而这两项在 stage1_done 前补齐。
+    # extra_consumers:ticket 1..COMPUTE_FIRST-1 里除 finisher(sealer+publisher,它要等 h1_compute_done
+    # 收满,自己不能再算 job)以外的 CTA 做完 fan 也进 GMM1。GMM1 是按吞吐摊的,每多一个 CTA 约 1/248。
+    # consumer_index 仍是 [0, 消费者数) 上的双射:额外的排在原来那段之后。
+    _FIN_TICKET = (1 + local_rank % 7) if finisher_off_t0 else local_rank
+    _XC = (
+        [t for t in range(1, COMPUTE_FIRST) if t != _FIN_TICKET]
+        if extra_consumers
+        else []
+    )
+    N_CONSUMERS = worker_blocks - COMPUTE_FIRST + len(_XC)
+    if extra_consumers and not (early_local_gmm and not diagnostic_split_fanout and kernel_role == "fused"):
+        raise ValueError("extra_consumers needs early_local_gmm and a single fused kernel")
     if lazy_pad and not (early_local_gmm and h1_phys and split_local):
         raise ValueError("lazy_pad needs early_local_gmm + h1_phys + split_local")
     if seal_fast and not (early_local_gmm and h1_phys and not diagnostic_no_arrival_rmw and not dispatch_plan):
@@ -781,6 +795,8 @@ def compile_megamoe_tile_ep16_stage1(
         + ("_lp" if lazy_pad else "")
         + ("_prx" if pub_relaxed else "")
         + ("_crx" if claim_relaxed else "")
+        + ("_xc" if extra_consumers else "")
+        + ("_srx" if spin_relaxed else "")
         + (f"_bm{BM}" if BM != 32 else "")
         + (f"_tg{G}" if G != 1 else "")
         + ("_plan" if dispatch_plan else "")
@@ -1108,6 +1124,13 @@ def compile_megamoe_tile_ep16_stage1(
         _never = fx.Int32(0) == fx.Int32(1)
         # 挂死定位:每个自旋点编号,超时就把 generation 写进 plan_debug[tag]
         # 并放行,让 kernel 正常退出把现场带回 host。默认 0 = 原样死等。
+        # spin_relaxed:轮询用 relaxed load,循环外补一次 acquire(调用方负责)。
+        _pl32 = (
+            comm_ops.load_i32_global_system_relaxed
+            if spin_relaxed
+            else comm_ops.load_i32_global_system
+        )
+
         def _mk_spin(tag):
             def _f(addr, expected):
                 if const_expr(_SPIN_DEADLINE > 0):
@@ -1119,6 +1142,8 @@ def compile_megamoe_tile_ep16_stage1(
                             local_addr("plan_debug") + fx.Int64(tag * 8),
                             generation,
                         )
+                elif const_expr(spin_relaxed):
+                    comm_ops.spin_until_ge_i64_system_rx(addr, expected)
                 else:
                     comm_ops.spin_until_ge_i64_system(addr, expected)
             return _f
@@ -5384,7 +5409,7 @@ def compile_megamoe_tile_ep16_stage1(
                         _wdl45 = fx.Int64(comm_ops.read_wall_clock())
                         while consumed_count < fx.Int32(GPUS_PER_NODE):
                             consumed_count = fx.Int32(
-                                comm_ops.load_i32_global_system(
+                                _pl32(
                                     local_addr("sparse_remote_consumed")
                                 )
                             )
@@ -5393,6 +5418,8 @@ def compile_megamoe_tile_ep16_stage1(
                                     _SPIN_DEADLINE
                                 )
                                 consumed_count = consumed_count + fx.Int32(_over) * fx.Int32(GPUS_PER_NODE)
+                        if const_expr(spin_relaxed):
+                            comm_ops.fence_system_acquire()
                         if const_expr(_SPIN_DEADLINE > 0):
                             if (fx.Int64(comm_ops.read_wall_clock()) - _wdl45) >= fx.Int64(
                                 _SPIN_DEADLINE
@@ -5477,7 +5504,7 @@ def compile_megamoe_tile_ep16_stage1(
                         _wdl44 = fx.Int64(comm_ops.read_wall_clock())
                         while consumed_count < fx.Int32(GPUS_PER_NODE):
                             consumed_count = fx.Int32(
-                                comm_ops.load_i32_global_system(
+                                _pl32(
                                     local_addr("remote_chunk_consumed")
                                     + fx.Int64(half) * fx.Int64(4)
                                 )
@@ -5487,6 +5514,8 @@ def compile_megamoe_tile_ep16_stage1(
                                     _SPIN_DEADLINE
                                 )
                                 consumed_count = consumed_count + fx.Int32(_over) * fx.Int32(GPUS_PER_NODE)
+                        if const_expr(spin_relaxed):
+                            comm_ops.fence_system_acquire()
                         if const_expr(_SPIN_DEADLINE > 0):
                             if (fx.Int64(comm_ops.read_wall_clock()) - _wdl44) >= fx.Int64(
                                 _SPIN_DEADLINE
@@ -5577,7 +5606,7 @@ def compile_megamoe_tile_ep16_stage1(
                         _wdl43 = fx.Int64(comm_ops.read_wall_clock())
                         while consumed_count < fx.Int32(GPUS_PER_NODE):
                             consumed_count = fx.Int32(
-                                comm_ops.load_i32_global_system(
+                                _pl32(
                                     local_addr("remote_chunk_consumed")
                                     + fx.Int64(consume_index) * fx.Int64(4)
                                 )
@@ -5587,6 +5616,8 @@ def compile_megamoe_tile_ep16_stage1(
                                     _SPIN_DEADLINE
                                 )
                                 consumed_count = consumed_count + fx.Int32(_over) * fx.Int32(GPUS_PER_NODE)
+                        if const_expr(spin_relaxed):
+                            comm_ops.fence_system_acquire()
                         if const_expr(_SPIN_DEADLINE > 0):
                             if (fx.Int64(comm_ops.read_wall_clock()) - _wdl43) >= fx.Int64(
                                 _SPIN_DEADLINE
@@ -5689,7 +5720,7 @@ def compile_megamoe_tile_ep16_stage1(
                 # 段 1 由 ticket 8+local_rank 的 fan CTA 在它的 fan1 之后做(见 fanout 段);
                 # 段 2 的置换/sortcopy 读本地 pad 行,必须排在段 1 之后。
                 if tx == fx.Int32(0):
-                    comm_ops.spin_until_ge_i64_sleep(
+                    (comm_ops.spin_until_ge_i64_sleep_rx if spin_relaxed else comm_ops.spin_until_ge_i64_sleep)(
                         local_addr("h1_local_eos"), generation, 127
                     )
                 gpu.barrier()
@@ -5959,6 +5990,8 @@ def compile_megamoe_tile_ep16_stage1(
                 if const_expr(diagnostic_split_fanout or COMPUTE_FIRST == 0)
                 else ticket >= fx.Int32(COMPUTE_FIRST)
             )
+            for _xt in _XC:
+                is_compute = is_compute | (ticket == fx.Int32(_xt))
             if not _do_compute:
                 is_compute = _never
             if is_compute:
@@ -6132,7 +6165,7 @@ def compile_megamoe_tile_ep16_stage1(
                             local_addr("gmm1_group_list")
                         )
                         if tx == fx.Int32(0):
-                            comm_ops.spin_until_ge_i64_sleep(
+                            (comm_ops.spin_until_ge_i64_sleep_rx if spin_relaxed else comm_ops.spin_until_ge_i64_sleep)(
                                 local_addr("h1_local_eos"), generation, el_sl
                             )
                         gpu.barrier()
@@ -6241,7 +6274,7 @@ def compile_megamoe_tile_ep16_stage1(
                                 el_la = el_lhas
                         _ts(5)
                         if tx == fx.Int32(0):
-                            comm_ops.spin_until_ge_i64_sleep(
+                            (comm_ops.spin_until_ge_i64_sleep_rx if spin_relaxed else comm_ops.spin_until_ge_i64_sleep)(
                                 local_addr("h1_queue_eos"), generation, el_sl
                             )
                         gpu.barrier()
@@ -6373,7 +6406,7 @@ def compile_megamoe_tile_ep16_stage1(
                         if const_expr(gate_sleep > 0):
                             # 融合版里 248 个 CTA 做完 fanout 就停在这里等全局封尾;
                             # 退避轮询,不和仍在 fanout/发 credit 的 CTA 抢访存。
-                            comm_ops.spin_until_ge_i64_sleep(
+                            (comm_ops.spin_until_ge_i64_sleep_rx if spin_relaxed else comm_ops.spin_until_ge_i64_sleep)(
                                 local_addr("h1_queue_eos"), generation, int(gate_sleep)
                             )
                         else:
@@ -6401,10 +6434,14 @@ def compile_megamoe_tile_ep16_stage1(
                         if const_expr(diagnostic_split_fanout)
                         else ticket - fx.Int32(COMPUTE_FIRST)
                     )
+                    for _xi, _xt in enumerate(_XC):
+                        consumer_index = (ticket == fx.Int32(_xt)).select(
+                            fx.Int32(worker_blocks - COMPUTE_FIRST + _xi), consumer_index
+                        )
                     consumer_count = (
                         fx.Int32(256)
                         if const_expr(diagnostic_split_fanout)
-                        else fx.Int32(worker_blocks - COMPUTE_FIRST)
+                        else fx.Int32(N_CONSUMERS)
                     )
                     # 诊断:消费者在做任何 job 之前要先等 h1_queue_eos(全部 8 个
                     # 通信角色 EOS)。这个戳把 flush_post->done 切成
@@ -6526,18 +6563,20 @@ def compile_megamoe_tile_ep16_stage1(
                     ) * fx.Int32(h1_n_blocks if tile_pipeline else GNB)
                     if const_expr(early_local_gmm):
                         # 每个 GMM1 消费者 CTA 退出时 +1。
-                        expected_jobs = fx.Int32(worker_blocks - COMPUTE_FIRST)
+                        expected_jobs = fx.Int32(N_CONSUMERS)
                     completed = fx.Int32(0)
                     _wdl41 = fx.Int64(comm_ops.read_wall_clock())
                     while completed < expected_jobs:
                         completed = fx.Int32(
-                            comm_ops.load_i32_global_system(local_addr("h1_compute_done"))
+                            _pl32(local_addr("h1_compute_done"))
                         )
                         if const_expr(_SPIN_DEADLINE > 0):
                             _over = (fx.Int64(comm_ops.read_wall_clock()) - _wdl41) // fx.Int64(
                                 _SPIN_DEADLINE
                             )
                             completed = completed + fx.Int32(_over) * expected_jobs
+                    if const_expr(spin_relaxed):
+                        comm_ops.fence_system_acquire()
                     if const_expr(_SPIN_DEADLINE > 0):
                         if (fx.Int64(comm_ops.read_wall_clock()) - _wdl41) >= fx.Int64(
                             _SPIN_DEADLINE

@@ -1121,6 +1121,8 @@ class MegaMoETileA4W4:
             lazy_pad=os.environ.get("MEGAMOE_TK_S1_LAZY_PAD", "0") == "1",
             pub_relaxed=os.environ.get("MEGAMOE_TK_S1_PUB_RELAXED", "0") == "1",
             claim_relaxed=os.environ.get("MEGAMOE_TK_S1_CLAIM_RELAXED", "0") == "1",
+            extra_consumers=os.environ.get("MEGAMOE_TK_S1_EXTRA_CONSUMERS", "0") == "1",
+            spin_relaxed=os.environ.get("MEGAMOE_TK_S1_SPIN_RELAXED", "0") == "1",
             gmm1_use_nt=(
                 os.environ.get("MEGAMOE_TK_S1_GMM_NT", "1") != "0"
             ),
