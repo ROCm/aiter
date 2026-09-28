@@ -743,6 +743,7 @@ class CustomAllreduce:
             # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_reduce_add = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
@@ -764,6 +765,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_reduce_add = ops.all_reduce_add
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_dispose = ops.dispose
@@ -1266,6 +1268,67 @@ class CustomAllreduce:
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
             )
+
+    @property
+    def supports_all_reduce_add(self) -> bool:
+        return self._ops_all_reduce_add is not None
+
+    def should_custom_ar_add(self, inp: torch.Tensor, addend: torch.Tensor) -> bool:
+        return (
+            self.supports_all_reduce_add
+            and self.should_custom_ar(inp)
+            and addend.shape == inp.shape
+            and addend.dtype == inp.dtype
+            and is_weak_contiguous(addend)
+            and inp.data_ptr() % 16 == 0
+            and addend.data_ptr() % 16 == 0
+        )
+
+    def all_reduce_add(
+        self,
+        inp: torch.Tensor,
+        addend: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+    ) -> torch.Tensor:
+        """Out-of-place all-reduce of (inp + addend).
+
+        Neither input needs to be IPC-registered: the small-message kernels
+        read them locally, and the other paths stage the sum into the
+        pre-registered input buffer.
+        """
+        if out is None:
+            out = torch.empty_like(inp)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        self._ops_all_reduce_add(
+            self._ptr,
+            inp,
+            addend,
+            out,
+            use_new,
+            open_fp8_quant,
+            self._pool["input"].data_ptr,
+            self._pool["input"].max_size,
+        )
+        return out
+
+    def custom_all_reduce_add(
+        self,
+        input: torch.Tensor,
+        addend: torch.Tensor,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+    ) -> torch.Tensor | None:
+        if self.disabled or not self.should_custom_ar_add(input, addend):
+            return None
+        if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+            # warm up: mimic the allocation pattern
+            return torch.zeros_like(input)
+        return self.all_reduce_add(
+            input, addend, use_new=use_new, open_fp8_quant=open_fp8_quant
+        )
 
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.

@@ -36,6 +36,19 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_add(
+    _fa: int,
+    inp: torch.Tensor,
+    addend: torch.Tensor,
+    out: torch.Tensor,
+    use_new: bool,
+    open_fp8_quant: bool,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,
