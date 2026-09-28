@@ -8,6 +8,8 @@ import os
 
 import torch
 
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
 logger = logging.getLogger("aiter")
 
 _reported_routes = set()
@@ -80,9 +82,6 @@ def _launch_core(prepared, batch, sequence, heads, device, dtype):
     return output[:, :sequence].contiguous()
 
 
-@torch.library.custom_op(
-    "aiter::gfx1201_sage_attention", mutates_args=(), device_types="cuda"
-)
 def gfx1201_sage_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 ) -> torch.Tensor:
@@ -103,10 +102,17 @@ def gfx1201_sage_attention(
         )
 
 
-@gfx1201_sage_attention.register_fake
 def _gfx1201_sage_attention_fake(query, key, value):
     _validate(query, key, value)
     return torch.empty_like(query)
+
+
+direct_register_custom_op(
+    op_name="gfx1201_sage_attention",
+    op_func=gfx1201_sage_attention,
+    mutates_args=[],
+    fake_impl=_gfx1201_sage_attention_fake,
+)
 
 
 def _validate_norm_rope(query, key, value, query_weight, key_weight, cosine, sine):
@@ -135,9 +141,6 @@ def _validate_norm_rope(query, key, value, query_weight, key_weight, cosine, sin
             )
 
 
-@torch.library.custom_op(
-    "aiter::gfx1201_norm_rope_attention", mutates_args=(), device_types="cuda"
-)
 def gfx1201_norm_rope_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -165,9 +168,16 @@ def gfx1201_norm_rope_attention(
         )[0]
 
 
-@gfx1201_norm_rope_attention.register_fake
 def _gfx1201_norm_rope_attention_fake(
     query, key, value, query_weight, key_weight, cosine, sine
 ):
     _validate_norm_rope(query, key, value, query_weight, key_weight, cosine, sine)
     return torch.empty_like(query)
+
+
+direct_register_custom_op(
+    op_name="gfx1201_norm_rope_attention",
+    op_func=gfx1201_norm_rope_attention,
+    mutates_args=[],
+    fake_impl=_gfx1201_norm_rope_attention_fake,
+)

@@ -3,8 +3,8 @@
 
 """gfx1201 SageAttention operators.
 
-``torch.ops.aiter.gfx1201_sage_attention`` and
-``torch.ops.aiter.gfx1201_norm_rope_attention`` are the public entry points.
+``gfx1201_sage_attention`` and ``gfx1201_norm_rope_attention`` are the public
+entry points. They are registered on aiter's operator library.
 HIP sources are built through ``compile_ops`` (``module_gfx1201_sage_attention``
 and ``module_gfx1201_norm_rope_prepare``). The specialized code object lives in
 ``hsa/gfx1201/sage_attention/``.
