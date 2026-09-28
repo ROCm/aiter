@@ -54,10 +54,12 @@ _MEASURED_GQA_QUERY = (24, 256)
 _BACKENDS = ("auto", "flydsl", "triton")
 
 # GPU 6 / gfx950, cold ``--rotate 0``, page_size 16. Every swept row beat
-# live AMD with err=0: M in {1, 8, 512} and L in {512, 2048, 8192, 32768},
-# both the short emit rows and the long score rows. M strictly between 8
-# and 512 was not in that sweep, so auto leaves it on Triton. n_columns is
-# not a filter: every measured width won.
+# live AMD with err=0, by 1.05x to 1.64x: M in {1, 2, 8, 16, 32, 64, 128,
+# 256, 512} and L in {512, 2048, 8192, 32768}, covering the short emit rows
+# and the long score rows. That reaches every launch config the K2 policy
+# can pick, and M past 512 reuses M=512's BN32 single-split config with a
+# larger grid, so M does not filter this gate. Width does not either: every
+# measured L won. Re-sweep before widening ``_launch_config``'s bands.
 
 __all__ = [
     "QsaGqaSpec",
@@ -110,16 +112,6 @@ def _measured_queries(q_indexer: torch.Tensor, q_gqa: torch.Tensor) -> bool:
     )
 
 
-def _measured_rows(rows: int, n_columns: int) -> bool:
-    """Whether this row count is inside the recorded end-to-end win.
-
-    ``n_columns`` is accepted so the predicate stays host-side and explicit.
-    The sweep won at every measured width, so it does not exclude a row.
-    """
-    del n_columns
-    return rows <= 8 or rows >= 512
-
-
 def qsa_auto_uses_flydsl(
     q_indexer: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -132,18 +124,12 @@ def qsa_auto_uses_flydsl(
 ) -> bool:
     """Whether ``auto`` may launch FlyDSL. Host shapes only; no device sync.
 
-    Any query shape but the measured one stays on Triton, as does the
-    measured one when ``M`` falls between the swept decode band
-    (``M <= 8``) and prefill band (``M >= 512``). A shape the kernels
-    cannot serve stays on Triton too, so ``auto`` does not turn a dispatch
-    miss into an exception.
+    Any query shape but the measured one stays on Triton. So does a shape
+    the kernels cannot serve, which keeps ``auto`` from turning a dispatch
+    miss into an exception. ``M`` and the selection width are not filters:
+    the sweep above won at every one it measured.
     """
     if not _measured_queries(q_indexer, q_gqa):
-        return False
-    if index_k_cache.dim() != 4 or index_page_table.dim() != 2:
-        return False
-    n_columns = int(index_page_table.shape[1]) * int(index_k_cache.shape[1])
-    if not _measured_rows(int(q_indexer.shape[0]), n_columns):
         return False
     if (
         qsa_k1_serves(q_indexer, index_k_cache, index_page_table, heads=(4,))
