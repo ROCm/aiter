@@ -814,6 +814,53 @@ def test_k2_default_out_ignores_query_strides():
             )
 
 
+def test_k2_empty_cache_or_table_returns_zeros():
+    """No pages and a nonempty index list returns zeros without launching.
+
+    The cache geometry has zero physical pages. The table geometry has
+    zero logical pages. Either one used to clamp the index to 0 and load.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    from aiter.ops.flydsl.kernels.qsa import k2 as k2_kernel
+
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    q = torch.randn(1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    indices = torch.zeros(1, 4, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(1, dtype=dtypes.i32, device=device)
+    pages = torch.zeros(
+        1, 16, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    empty_cache = torch.empty(
+        0, 16, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    one_page = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
+    no_pages = torch.empty(1, 0, dtype=dtypes.i32, device=device)
+    cases = (
+        ("empty cache", empty_cache, empty_cache, one_page),
+        ("empty table", pages, pages, no_pages),
+    )
+    launched = []
+
+    def _record_launch(*_args, **_kwargs):
+        launched.append(1)
+        raise AssertionError("qsa_k2 launched with no pages")
+
+    original = k2_kernel._run_compiled
+    k2_kernel._run_compiled = _record_launch
+    try:
+        for name, k_cache, v_cache, page_table in cases:
+            launched.clear()
+            out = qsa_k2(q, k_cache, v_cache, indices, page_table, token_to_req)
+            if launched:
+                raise AssertionError(f"K2 launched for {name}")
+            if not torch.equal(out, torch.zeros_like(out)):
+                raise AssertionError(f"K2 {name} output was not zeros")
+    finally:
+        k2_kernel._run_compiled = original
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
@@ -2234,6 +2281,7 @@ def _run_unit_cases():
     test_k2_page_past_4gib()
     test_k2_empty_first_tile_keeps_later_token()
     test_k2_default_out_ignores_query_strides()
+    test_k2_empty_cache_or_table_returns_zeros()
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_symbols_export_lazily()
