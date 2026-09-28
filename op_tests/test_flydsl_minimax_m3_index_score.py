@@ -17,6 +17,7 @@ Run:
 import argparse
 import itertools
 import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -1110,6 +1111,148 @@ def test_cli_invalid_args(argv):
     assert exc.value.code == 2
 
 
+def force_arch(monkeypatch, arch):
+    """Report `arch` to the kernel while still running on this device.
+
+    CDNA4 kept both the 16x16x16 MFMA and `v_cvt_pk_f32_fp8`, so the entire
+    gfx942 code path -- offsets, loop counts, fragment widths, instruction
+    selection -- builds and executes correctly on a gfx950 box. What this
+    cannot answer is whether a gfx942 binary loads and runs on gfx942 silicon;
+    that needs the part. Everything above the ISA is checked here.
+
+    Only gcnArchName is substituted: the CU count has to stay real or
+    `_occupancy_depth_cap` would resolve a different config and the comparison
+    would no longer be about the arch.
+    """
+    real = torch.cuda.get_device_properties
+
+    def fake(device):
+        p = real(device)
+        return SimpleNamespace(
+            gcnArchName=arch, multi_processor_count=p.multi_processor_count
+        )
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", fake)
+
+
+@pytest.mark.parametrize("arch", kernel.SUPPORTED_ARCHS)
+@pytest.mark.parametrize("fp8", [False, True])
+def test_arch_traits_are_consistent(arch, fp8):
+    """The k-axis map is a bijection and the derived counts are self-consistent."""
+    tr = kernel.arch_traits(arch, fp8)
+    covered = sorted(
+        tr.k_offset(ks, g) + v
+        for ks in range(tr.ksteps)
+        for g in range(kernel.LANE_GROUPS)
+        for v in range(tr.lane_k)
+    )
+    # Every head-dim position reaches exactly one (k-step, lane group, slot).
+    # A permutation of the k axis is free because the dot sums over it, but
+    # only if it really is a permutation.
+    assert covered == list(range(D))
+    assert tr.ksteps * tr.lane_k * kernel.LANE_GROUPS == D
+    assert tr.lane_k * (1 if fp8 else 2) * tr.k_per_load == kernel.ACCESS_BYTES
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_gfx942_changes_only_the_mfma_shape(fp8):
+    """What must move between the two generations, and what must not.
+
+    The invariant half is the point: K's addressing and the shuffled layout
+    are built from `k_loads`, `chunk_elems`, `block_k` and `lane_block`, and
+    halving the MFMA's k doubles the k-steps one 16 B access covers, so all
+    four cancel out. That is what keeps gfx942 a small change and keeps one
+    shuffled cache readable by both.
+    """
+    a = kernel.arch_traits("gfx950", fp8)
+    b = kernel.arch_traits("gfx942", fp8)
+    for field in ("k_loads", "chunk_elems", "q_loads", "block_k", "lane_block"):
+        assert getattr(a, field) == getattr(b, field), field
+    assert (b.mfma_k, b.lane_k, b.ksteps) == (
+        a.mfma_k // 2,
+        a.lane_k // 2,
+        a.ksteps * 2,
+    )
+    assert b.k_per_load == a.k_per_load * 2
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_shuffle_layout_is_arch_independent(fp8):
+    """ATOM writes this layout, so it must not depend on who reads it.
+
+    Recomputed from each arch's traits rather than compared against a constant,
+    so a future arch that *would* move the layout fails here instead of
+    silently breaking a producer that cannot see this file.
+    """
+
+    def destination(tr):
+        row = torch.arange(P)
+        kk = torch.arange(D)
+        panel, u = row // 16, row % 16
+        i = kk // tr.block_k
+        g = (kk % tr.block_k) // tr.lane_block
+        v = kk % tr.lane_block
+        slot = panel[:, None] * tr.k_loads + i[None, :]
+        return (slot * 64 + (16 * g[None, :] + u[:, None])) * tr.chunk_elems + v[
+            None, :
+        ]
+
+    assert torch.equal(
+        destination(kernel.arch_traits("gfx950", fp8)),
+        destination(kernel.arch_traits("gfx942", fp8)),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        IndexScoreConfig(pages_per_wave=1),
+        IndexScoreConfig(pages_per_wave=2, feat_waves=2),
+        IndexScoreConfig(pages_per_wave=2, token_waves=2),
+        IndexScoreConfig(pages_per_wave=2, q_to_lds=True),
+        IndexScoreConfig(pages_per_wave=2, shuffled=True),
+    ],
+)
+def test_gfx942_path_matches_oracle(monkeypatch, dtype, cfg):
+    """The CDNA3 shapes produce the same scores, on every staging path.
+
+    This is also what proves the 16x16x16 MFMA really ran rather than the
+    16x16x32 one under a different name: the gfx942 fragment is four bf16 per
+    lane, and four elements fed through a k=32 MFMA cannot come out right. So
+    a pass here means the shape, the k-axis map and the widening all agree.
+
+    q_to_lds and the shuffled layout are in the list because they are where
+    the two generations could diverge silently: the LDS fill indexes by Q
+    access rather than k-step, and the shuffled reader bypasses k_offset
+    entirely.
+    """
+    # S=8 H=4 is two feature tiles, so feat_waves=2 is actually exercised
+    # rather than skipped.
+    S, H = 8, 4
+    assert not selection_filter(S, H, cfg) or kernel.feature_tiles(S, H) > 1
+    q, cache, bt, lens, mb = make_case(3, S, H, [0, 129, 2305], dtype)
+    ref = score_oracle(q, cache, bt, lens, S, H, D**-0.5, mb)
+    k = shuffle_cache(cache) if cfg.shuffled else cache
+    force_arch(monkeypatch, "gfx942")
+    got = score_flydsl(q, k, bt, lens, S, H, D**-0.5, mb, cfg=cfg)
+    ok, reason = compare(got, ref)
+    assert ok, reason
+
+
+def test_arch_separates_the_kernel_name():
+    """Two generations of the same config are two binaries, not one."""
+    cfg = IndexScoreConfig(pages_per_wave=1)
+    names = {kernel.kernel_name(4, 4, False, cfg, a) for a in kernel.SUPPORTED_ARCHS}
+    assert len(names) == len(kernel.SUPPORTED_ARCHS)
+    # The default arch keeps the name it had before the port, so gfx950's
+    # existing JIT cache entries are not orphaned.
+    assert kernel.kernel_name(4, 4, False, cfg) == kernel.kernel_name(
+        4, 4, False, cfg, "gfx950"
+    )
+    assert "gfx950" not in kernel.kernel_name(4, 4, False, cfg)
+
+
 def test_fp8_dtype_comes_from_aiter():
     """The accepted fp8 flavour is the arch's, not a literal in the kernel.
 
@@ -1208,16 +1351,17 @@ def test_fp8_panel_pipeline(S, cfg):
 
 
 def test_arch_rejected(monkeypatch):
+    """An arch with neither MFMA generation is refused before anything else."""
     from types import SimpleNamespace
 
     q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda device: SimpleNamespace(gcnArchName="gfx942"),
+        lambda device: SimpleNamespace(gcnArchName="gfx90a"),
     )
     assert not kernel.index_score_supported(q, k, 1, 1, mb, bt)
-    with pytest.raises(ValueError, match="gfx950"):
+    with pytest.raises(ValueError, match="requires one of"):
         score_flydsl(q, k, bt, lens, 1, 1, D**-0.5, mb)
 
 
@@ -1557,6 +1701,9 @@ _GPU_TESTS = (
     # Asserts which fp8 flavour this chip speaks, so it is arch-dependent even
     # though it allocates nothing.
     test_fp8_dtype_comes_from_aiter,
+    # Builds and runs the CDNA3 shapes on whatever part is present; see
+    # force_arch for what that does and does not establish.
+    test_gfx942_path_matches_oracle,
     # These build their inputs on the device even though what they assert is a
     # host-side property (map equality, spread coverage), so they need the gate
     # just as much as the tests that launch the scorer.

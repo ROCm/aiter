@@ -137,26 +137,41 @@ Remaining levers, in the order they are worth trying:
      WAVES == 4. THREADS=512 would allow token_waves=8 (one panel per wave)
      and 2x the waves again at b16_q1_s8k. Untested.
 
-Why this is gfx950-only, and what a gfx942 port would actually cost
--------------------------------------------------------------------
-Not a dtype switch. Three separate dependencies, each on the CDNA4 ISA:
+gfx942 (CDNA3) alongside gfx950 (CDNA4)
+---------------------------------------
+Three things differ between the generations, and ArchTraits carries all of
+them as compile-time constants:
 
   1. `mfma_f32_16x16x32_bf16` is gfx950+ (FlyDSL raises `ROCDL op not found
-     ... (gfx950+)` for it). gfx942's widest bf16 tile is K=16, which doubles
-     KSTEPS to 8 and halves each lane's load to 8 B -- so `k_offset`, the
-     A/B fragment layout and the coalescing analysis in `score_panel` all
-     change, and with them the shuffled layout, which is derived from MFMA_K.
-     That layout is a written contract with the cache producer, so a second
-     MFMA means a second layout, not a recompile.
-  2. The fp8 path widens K to bf16 with `v_cvt_scalef32_pk_bf16_fp8`; the
-     scalef32 family is CDNA4. gfx942 would go through `v_cvt_pk_f32_fp8`.
+     ... (gfx950+)` for it). gfx942's widest 16x16 bf16 tile is
+     `mfma_f32_16x16x16bf16_1k`, so `ksteps` doubles to 8 and each lane's
+     MFMA fragment halves to 4 bf16.
+  2. The fp8 path widens K to bf16 with `v_cvt_scalef32_pk_bf16_fp8`, which is
+     CDNA4. gfx942 goes through `v_cvt_pk_f32_fp8` and then to bf16. The
+     detour is exact -- e4m3's 3 mantissa and 4 exponent bits both fit bf16 --
+     so it costs instructions, not accuracy.
   3. gfx942's fp8 is `e4m3fnuz` (bias 8, no inf) against gfx950's OCP
-     `e4m3fn` (bias 7). The conversion has to match the format; reinterpreting
-     one as the other is off by a factor of two. `_fp8_dtype()` asks aiter
-     which one this chip speaks so that only the conversion is arch-specific.
+     `e4m3fn` (bias 7). Each chip's conversion instruction speaks its own
+     chip's format, and `_fp8_dtype()` asks aiter which that is, so nothing
+     here reinterprets one as the other.
 
-None of it is verifiable from this tree either -- there is no gfx942 part on
-the machine this kernel was developed and measured on.
+What does *not* differ is the surprise, and it is why this is a small change
+rather than a second kernel: halving the MFMA's k doubles the number of
+k-steps one 16 B access covers, and the two cancel in every product the
+addressing is built from. `k_loads`, `chunk_elems`, `q_loads`, and the whole
+shuffled layout come out identical, so K's addressing is untouched, the LDS
+budget is untouched, and *one shuffled cache is readable by both chips* --
+which matters because the producer of that layout lives in another component.
+
+Verification status: the gfx942 shapes are built and run on gfx950 in
+`test_gfx942_path_matches_oracle`, which is possible because CDNA4 kept both
+the 16x16x16 MFMA and `v_cvt_pk_f32_fp8`. Offsets, loop counts, fragment
+widths and the widening are therefore checked against the oracle on real
+hardware, and the k=16 shapes measure within 0-2% of the k=32 ones at
+b32_q8_s128k (the kernel is memory-bound, so the extra MFMAs hide). What that
+cannot establish is whether a gfx942 binary loads and runs on gfx942 silicon,
+and what its bandwidth is there -- there is no CDNA3 part on the machine this
+kernel was developed on, so that check is still outstanding.
 """
 
 import math
@@ -181,11 +196,118 @@ THREADS = WAVE * WAVES
 PAGE = 128  # SPARSE_BLOCK_SIZE
 HEAD_DIM = 128  # the only supported head dim; asserted on the host
 MFMA_M = MFMA_N = 16
-MFMA_K = 32
 PANELS = PAGE // MFMA_M  # 8 token panels per page
-KSTEPS = HEAD_DIM // MFMA_K  # 4 k-steps per dot
 LOG2E = 1.4426950409
 NEG_INF = float("-inf")
+
+# The widest 16x16 bf16 MFMA each supported generation has. This single number
+# is the whole ISA difference the kernel body sees; ArchTraits derives the
+# rest, and `k_loads`, `chunk_elems` and the shuffled layout come out the same
+# on both -- see ArchTraits for why that is not a coincidence.
+_MFMA_K_BY_ARCH = {"gfx950": 32, "gfx942": 16}
+SUPPORTED_ARCHS = tuple(_MFMA_K_BY_ARCH)
+DEFAULT_ARCH = "gfx950"
+
+# Every K and Q access is one 16 B dwordx4; the element counts below follow.
+ACCESS_BYTES = 16
+# The four lane groups g = lane // 16 tile the k axis of one access block, so a
+# lane holds mfma_k // LANE_GROUPS of the k axis per k-step.
+LANE_GROUPS = 4
+
+
+@dataclass(frozen=True)
+class ArchTraits:
+    """Compile-time constants for one (architecture, cache dtype) pair.
+
+    All of it is derived from `mfma_k`, the k of this generation's 16x16 bf16
+    MFMA: 32 on gfx950 (CDNA4's `mfma_f32_16x16x32_bf16`) and 16 on gfx942
+    (CDNA3's `mfma_f32_16x16x16bf16_1k`).
+
+    A lane holds `lane_k = mfma_k // 4` of the k axis per k-step, so one k-step
+    is `lane_k * elem_bytes` bytes of cache and a 16 B access covers
+    `k_per_load` whole k-steps. Those are packed contiguously per lane by the
+    k-axis permutation below, which is why this stays one dwordx4 everywhere:
+
+        k_offset(ks, g) = (ks // k_per_load) * block_k     # which access block
+                        + g * lane_block                   # which lane group
+                        + (ks % k_per_load) * lane_k       # which k-step in it
+
+    This permutes the k axis, and A and B are both indexed through it, so the
+    dot product's sum is reordered and not otherwise changed. Q's layout is
+    ours to choose and K's is the shuffled layout's contract, so both follow it.
+
+    The consequence worth stating, because it is what makes gfx942 a small
+    change: `block_k` and `lane_block` depend on `mfma_k * k_per_load` and
+    `lane_k * k_per_load`, and both products are invariant -- halving mfma_k
+    doubles k_per_load. So K's addressing, `k_loads`, `chunk_elems`, `q_loads`
+    and the entire shuffled layout are *identical* across the two generations.
+    Only `ksteps` (the MFMA loop count) and `lane_k` (the fragment width) move.
+    """
+
+    arch: str
+    fp8: bool
+    mfma_k: int  # k of this arch's 16x16 bf16 MFMA
+    lane_k: int  # k elements one lane holds per k-step = MFMA fragment width
+    ksteps: int  # MFMA k-steps per 128-wide dot = the inner loop count
+    k_per_load: int  # whole k-steps covered by one 16 B K access
+    k_loads: int  # 16 B K accesses per token panel
+    chunk_elems: int  # cache elements in 16 B
+    q_per_load: int  # whole k-steps covered by one 16 B Q access
+    q_loads: int  # 16 B Q accesses per feature tile
+    block_k: int  # k positions one access block spans, over all four lane groups
+    lane_block: int  # k positions one lane group takes inside that block
+    # CDNA4 widens fp8 straight to bf16 (`v_cvt_scalef32_pk_bf16_fp8`); CDNA3
+    # has to go via f32 (`v_cvt_pk_f32_fp8`). The detour is exact, so this
+    # costs instructions and not accuracy -- see convert_k.
+    fp8_to_bf16_direct: bool
+
+    def k_offset(self, ks, g):
+        """Host-side twin of the kernel's k-axis map; see the class docstring.
+
+        Kept here so `shuffle_cache` and the tests invert the same arithmetic
+        the kernel emits instead of a second copy of it -- a disagreement here
+        is silent wrong numbers, not a crash.
+        """
+        return (
+            (ks // self.k_per_load) * self.block_k
+            + g * self.lane_block
+            + (ks % self.k_per_load) * self.lane_k
+        )
+
+
+def arch_traits(arch: str = DEFAULT_ARCH, fp8: bool = False) -> ArchTraits:
+    """Resolve one (arch, dtype) pair to its compile-time constants."""
+    if arch not in _MFMA_K_BY_ARCH:
+        raise ValueError(f"unsupported arch {arch!r}; expected {SUPPORTED_ARCHS}")
+    mfma_k = _MFMA_K_BY_ARCH[arch]
+    lane_k = mfma_k // LANE_GROUPS
+    elem_bytes = 1 if fp8 else 2
+    k_per_load = ACCESS_BYTES // (lane_k * elem_bytes)
+    # Q is bf16 whatever the cache is, so it may span fewer k-steps per access
+    # than K does -- but never more, or it would read past the access block.
+    q_per_load = min(k_per_load, ACCESS_BYTES // (lane_k * 2))
+    tr = ArchTraits(
+        arch=arch,
+        fp8=fp8,
+        mfma_k=mfma_k,
+        lane_k=lane_k,
+        ksteps=HEAD_DIM // mfma_k,
+        k_per_load=k_per_load,
+        k_loads=(HEAD_DIM // mfma_k) // k_per_load,
+        chunk_elems=ACCESS_BYTES // elem_bytes,
+        q_per_load=q_per_load,
+        q_loads=(HEAD_DIM // mfma_k) // q_per_load,
+        block_k=mfma_k * k_per_load,
+        lane_block=lane_k * k_per_load,
+        fp8_to_bf16_direct=arch == "gfx950",
+    )
+    # The invariants the kernel body relies on, asserted once rather than
+    # re-derived at each use.
+    assert tr.lane_block * LANE_GROUPS == tr.block_k  # lane groups tile a block
+    assert tr.k_loads * tr.k_per_load == tr.ksteps  # no partial K access
+    assert tr.q_loads * tr.q_per_load == tr.ksteps  # no partial Q access
+    assert tr.q_loads * WAVE == THREADS  # the Q LDS fill is a perfect assignment
+    return tr
 
 
 def _fp8_dtype():
@@ -198,13 +320,13 @@ def _fp8_dtype():
     aiter for the pair rather than naming one keeps that agreement in one
     place.
 
-    This kernel is gfx950-only today (`_validate_metadata` enforces it), so in
-    practice this resolves to `e4m3fn`. What a gfx942 port would need is in
-    the module docstring; it is not a dtype switch.
+    See the module docstring for the rest of what the two generations do not
+    share; `convert_k` is where the format and the instruction meet.
     """
     from aiter import dtypes
 
     return dtypes.fp8
+
 
 # rocdl.sched_group_barrier instruction-class masks (rocdl._SCHED_MASK_INT_TO_KW).
 _SCHED_MFMA = 8
@@ -347,12 +469,17 @@ def _tiling(S: int, H: int, cfg: "IndexScoreConfig"):
 def q_lds_bytes(S: int, H: int, cfg: "IndexScoreConfig") -> int:
     """LDS held by the Q staging buffer, 0 when Q stays in registers.
 
-    One 16 B fragment per (feature tile, k-step, lane), which is exactly
+    One 16 B fragment per (feature tile, Q access, lane), which is exactly
     FT*16 features x 128 head-dim elements with nothing duplicated.
+
+    `q_loads` is 4 on both architectures (gfx942 halves the fragment width and
+    doubles the k-steps an access covers), so this is arch-independent and
+    takes the default traits rather than threading an arch through every LDS
+    accounting path. `arch_traits` asserts the equality it rests on.
     """
     if not cfg.q_to_lds:
         return 0
-    return _tiling(S, H, cfg)[2] * KSTEPS * WAVE * 16
+    return _tiling(S, H, cfg)[2] * arch_traits().q_loads * WAVE * ACCESS_BYTES
 
 
 def reduce_lds_bytes(S: int, H: int, cfg: "IndexScoreConfig") -> int:
@@ -758,10 +885,16 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
     return True
 
 
-def kernel_name(S: int, H: int, fp8: bool, cfg: IndexScoreConfig) -> str:
+def kernel_name(
+    S: int, H: int, fp8: bool, cfg: IndexScoreConfig, arch: str = DEFAULT_ARCH
+) -> str:
     """Config -> kernel name. Non-default knobs append a suffix, so the default
     config keeps the name it had before the knobs existed."""
     name = f"m3_index_score_S{S}_H{H}_{'fp8' if fp8 else 'bf16'}_L{cfg.pages_per_wave}"
+    if arch != DEFAULT_ARCH:
+        # A different MFMA generation is a different binary from the same
+        # config, so it cannot share a JIT cache entry with gfx950's.
+        name += f"_{arch}"
     if cfg.shuffled:
         name += "_shuf"
     if cfg.feat_waves > 1:
@@ -786,14 +919,23 @@ def kernel_name(S: int, H: int, fp8: bool, cfg: IndexScoreConfig) -> str:
     return name
 
 
-def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
-    """Compile a score kernel specialised on (S, H, cache dtype, config).
+def build_index_score(
+    S: int, H: int, fp8: bool, cfg: IndexScoreConfig, arch: str = DEFAULT_ARCH
+):
+    """Compile a score kernel specialised on (S, H, cache dtype, config, arch).
 
     S = max query tokens per request (num_spec + 1), H = index heads.
     F = S*H is the feature count, laid out as column n = tok*H + head.
+
+    `arch` selects the MFMA generation through ArchTraits. It is a parameter
+    rather than a lookup of the running device so the gfx942 shapes can be
+    built and numerically checked on a gfx950 box -- CDNA4 kept both the
+    16x16x16 MFMA and `v_cvt_pk_f32_fp8`, so the only part of the gfx942 path
+    that genuinely needs gfx942 silicon is whether the binary loads there.
     """
-    if not selection_filter(S, H, cfg, arch="gfx950"):
+    if not selection_filter(S, H, cfg, arch=arch):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
+    tr = arch_traits(arch, fp8)
     pages_per_wave = cfg.pages_per_wave
     shuffled = cfg.shuffled
     q_to_lds = cfg.q_to_lds
@@ -817,18 +959,20 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
     PAGE_WAVES = WAVES // (FEAT_WAVES * TOKEN_WAVES)
     PANELS_W = PANELS // TOKEN_WAVES  # token panels one wave walks
     CHUNK = PAGE_WAVES * pages_per_wave
-    # One lane's K fragment for a given (panel, load): 8 elements for bf16
-    # (16 B, one k-step) or 16 for fp8 (16 B, two k-steps). Both are 16 B, so
-    # a shuffled page is WAVE*16 = 1024 B per load slot either way.
-    CHUNK_ELEMS = 16 if fp8 else 8
-    # K load instructions per panel. bf16 issues one dwordx4 per k-step; fp8
-    # issues one per *pair* of k-steps, so both dtypes move 16 B per
-    # instruction and fp8 halves the instruction count along with the bytes.
-    K_LOADS = KSTEPS // 2 if fp8 else KSTEPS
-    # Q staging buffer: one 16 B fragment per (tile, k-step, lane). Laid out so
-    # the hot-loop read is a single ds_read_b128 with the 64 lanes covering
+    # One lane's K access for a given (panel, load) is 16 elements for fp8 or 8
+    # for bf16 -- 16 B either way, so a shuffled page is WAVE*16 = 1024 B per
+    # load slot. How many k-steps that covers is the arch's business, not this
+    # layout's, which is why the shuffled cache is the same on both.
+    CHUNK_ELEMS = tr.chunk_elems
+    # K load instructions per panel: 4 for bf16, 2 for fp8, on both
+    # architectures. gfx942 halves mfma_k and doubles the k-steps one access
+    # covers, and the two cancel -- see ArchTraits.
+    K_LOADS = tr.k_loads
+    KSTEPS = tr.ksteps  # MFMA k-steps per dot: 4 on gfx950, 8 on gfx942
+    # Q staging buffer: one 16 B fragment per (tile, Q access, lane). Laid out
+    # so the hot-loop read is a single ds_read_b128 with the 64 lanes covering
     # 1024 contiguous bytes, which is conflict-free.
-    Q_LDS_SLOTS = FT_PAD * KSTEPS * WAVE if q_to_lds else 0
+    Q_LDS_SLOTS = FT_PAD * tr.q_loads * WAVE if q_to_lds else 0
     # Cross-wave partial-max exchange, one fp32 per (wave, tile, lane).
     RED_SLOTS = WAVES * FTW * WAVE if TOKEN_WAVES > 1 else 0
 
@@ -846,7 +990,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
     )
 
     @flyc.kernel(
-        name=kernel_name(S, H, fp8, cfg),
+        name=kernel_name(S, H, fp8, cfg, arch),
         known_block_size=[THREADS, 1, 1],
     )
     def score_kernel(
@@ -1000,51 +1144,64 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
             return tok, f - tok * fx.Int32(H)
 
         # -- where in Q does one fragment live? -------------------------------
-        # Lane needs Q[row(u), head(u), 32*ks + 8*g + v], v = 0..7.
         # Strides come from the host: a CP parity test passes q[:, h:h+1],
         # whose token stride is still that of the full tensor.
-        # Which 8 head-dim elements does lane (g, ks) carry? The dot runs over
+        # Which head-dim elements does lane (g, ks) carry? The dot runs over
         # all 128 and the kernel controls both gathers, so any bijection
         # (g, ks, v) -> k works provided Q and K use the same one. Pick the one
         # that makes every load instruction read 64 contiguous bytes:
         #
-        #     byte offset of load j, lane g  =  64*j + 16*g
+        #     byte offset of access j, lane g  =  64*j + 16*g
         #
         # so the four g-lanes tile one full 64 B cache line. bf16 needs 4 such
-        # loads per panel (256 B row), fp8 needs 2 (128 B row) -- fp8 moves half
-        # the bytes in half the instructions, which is the whole point of fp8.
+        # accesses per panel (256 B row), fp8 needs 2 (128 B row) -- fp8 moves
+        # half the bytes in half the instructions, which is the point of fp8.
+        # That holds on both architectures: gfx942's narrower MFMA packs more
+        # k-steps into the same 16 B rather than shrinking the access.
         #
-        # In elements that is k = 32*ks + 8*g for bf16, and for fp8 one 16 B
-        # load covers 16 elements = two k-steps, so
-        # k = 64*(ks//2) + 16*g + 8*(ks%2).
+        # In elements this is ArchTraits.k_offset, which on gfx950 reads
+        # k = 32*ks + 8*g for bf16 and k = 64*(ks//2) + 16*g + 8*(ks%2) for fp8.
         #
         # This replaced an earlier fp8 map of k = 32*g + 8*ks. That one also
         # merged two k-steps into one dwordx4, but at byte 32*g + 16*i: the four
         # lanes landed 32 B apart, so each instruction used only half of every
         # cache line it touched and fp8 never reached bf16's bandwidth.
         #
-        # `ks` is a Python int on the register path (so this folds to a
+        # Q is addressed by *access* index j, not k-step: one 16 B access holds
+        # q_per_load whole k-steps, so k_offset(j * q_per_load) is the base and
+        # the k-steps inside it are consecutive lane_k-element slices.
+        # `j` is a Python int on the register path (so this folds to a
         # constant) and an Int32 on the LDS fill path, where each wave stages a
-        # different k-step and the step index is therefore the wave id.
-        def k_offset(ks):
-            if const_expr(isinstance(ks, int)):
-                if const_expr(fp8):
-                    return (
-                        fx.Int32(64 * (ks // 2))
-                        + g * fx.Int32(16)
-                        + fx.Int32(8 * (ks % 2))
-                    )
-                return fx.Int32(ks * MFMA_K) + g * fx.Int32(8)
-            if const_expr(fp8):
+        # different access and the access index is therefore the wave id.
+        Q_BLOCK = tr.block_k // (tr.k_per_load // tr.q_per_load)  # k per Q access
+        Q_SPLIT = tr.k_per_load // tr.q_per_load  # Q accesses per K access block
+
+        def q_load_offset(j):
+            """k position of lane group g's 16 B Q access `j`.
+
+            Equal to `tr.k_offset(j * q_per_load, g)`, with the floor division
+            folded: Q_SPLIT is 1 when a Q access spans a whole access block and
+            2 when two Q accesses share one.
+            """
+            if const_expr(Q_SPLIT == 1):
+                if const_expr(isinstance(j, int)):
+                    return fx.Int32(j * Q_BLOCK) + g * fx.Int32(tr.lane_block)
+                return j * fx.Int32(Q_BLOCK) + g * fx.Int32(tr.lane_block)
+            half = tr.lane_block // Q_SPLIT
+            if const_expr(isinstance(j, int)):
                 return (
-                    (ks // fx.Int32(2)) * fx.Int32(64)
-                    + g * fx.Int32(16)
-                    + (ks % fx.Int32(2)) * fx.Int32(8)
+                    fx.Int32((j // Q_SPLIT) * tr.block_k)
+                    + g * fx.Int32(tr.lane_block)
+                    + fx.Int32((j % Q_SPLIT) * half)
                 )
-            return ks * fx.Int32(MFMA_K) + g * fx.Int32(8)
+            return (
+                (j // fx.Int32(Q_SPLIT)) * fx.Int32(tr.block_k)
+                + g * fx.Int32(tr.lane_block)
+                + (j % fx.Int32(Q_SPLIT)) * fx.Int32(half)
+            )
 
         def load_q_frag(i, ks, all_tiles=False):
-            """One lane's 16 B of Q for (feature tile, k-step), from gmem."""
+            """One lane's 16 B of Q for (feature tile, Q access), from gmem."""
             tok, head = tok_head_of(i, all_tiles)
             row = b * fx.Int32(S) + tok
             # Columns past F are padding; clamp them to row 0 so the load stays
@@ -1053,7 +1210,7 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
             in_range = f < fx.Int32(F)
             row = in_range.select(row, fx.Int32(0))
             head = in_range.select(head, fx.Int32(0))
-            off = row * i32_stride_q_n + head * i32_stride_q_h + k_offset(ks)
+            off = row * i32_stride_q_n + head * i32_stride_q_h + q_load_offset(ks)
             # 8 bf16 = 16 B = one dwordx4.
             return fx.Vector(
                 fx.add_offset(fx.get_iter(q_buf), off >> fx.Int32(1)).load(
@@ -1061,9 +1218,28 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
                 )
             )
 
-        def as_bf16_frag(raw16):
-            t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-            t.store(raw16.bitcast(fx.BFloat16))
+        def as_bf16_frag(raw16, sub=0):
+            """MFMA B-fragment `sub` of a 16 B Q access.
+
+            One access holds q_per_load k-steps of lane_k bf16 each, laid out
+            back to back by q_load_offset, so k-step `sub` is the slice
+            [sub*lane_k, +lane_k). On gfx950 q_per_load is 1 and this is the
+            whole 16 B; on gfx942 it is one of two halves.
+            """
+            t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), fx.BFloat16)
+            wide = raw16.bitcast(fx.BFloat16)
+            if const_expr(tr.q_per_load == 1):
+                t.store(wide)
+            else:
+                t.store(
+                    fx.Vector.from_elements(
+                        [
+                            fx.BFloat16(wide[sub * tr.lane_k + v])
+                            for v in range_constexpr(tr.lane_k)
+                        ],
+                        fx.BFloat16,
+                    )
+                )
             return t
 
         # One allocation covers both users (Q staging and the token-wave
@@ -1084,14 +1260,16 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
             #
             # The fill is a perfect assignment with no division: slot index
             # ci = t*THREADS + tid decomposes as lane = ci % WAVE,
-            # ks = (ci // WAVE) % KSTEPS, ft = ci // (WAVE*KSTEPS), and since
-            # THREADS == WAVE*KSTEPS those collapse to lane = lane, ks = wave,
-            # ft = t. So thread `tid` on iteration t stages tile t, k-step
+            # j = (ci // WAVE) % q_loads, ft = ci // (WAVE*q_loads), and since
+            # THREADS == WAVE*q_loads those collapse to lane = lane, j = wave,
+            # ft = t. So thread `tid` on iteration t stages tile t, Q access
             # `wave`, its own lane -- the same (g, u) the gmem math already
             # assumes, and exactly FT_PAD iterations with no remainder.
+            # q_loads is 4 on both architectures, so this holds on both;
+            # arch_traits asserts it.
             for ft in range_constexpr(FT_PAD):
                 raw = load_q_frag(ft, wave, all_tiles=True)
-                off = fx.Int32(ft * KSTEPS * WAVE * 16) + (
+                off = fx.Int32(ft * tr.q_loads * WAVE * 16) + (
                     wave * fx.Int32(WAVE * 16) + lane * fx.Int32(16)
                 )
                 dst = fx.Tensor(
@@ -1108,10 +1286,13 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
 
             q_read_base = lane * fx.Int32(16)
             if const_expr(FEAT_WAVES > 1):
-                q_read_base = q_read_base + fw * fx.Int32(FTW * KSTEPS * WAVE * 16)
+                q_read_base = q_read_base + fw * fx.Int32(FTW * tr.q_loads * WAVE * 16)
 
             def q_operand(i, ks):
-                off = q_read_base + fx.Int32((i * KSTEPS + ks) * WAVE * 16)
+                # k-step ks lives in Q access ks // q_per_load, as the slice
+                # ks % q_per_load of it.
+                j = ks // tr.q_per_load
+                off = q_read_base + fx.Int32((i * tr.q_loads + j) * WAVE * 16)
                 src = fx.Tensor(
                     fx.make_view(
                         fx.recast_iter(
@@ -1120,18 +1301,29 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
                         fx.make_layout(16, 1),
                     )
                 )
-                return as_bf16_frag(src.load())
+                return as_bf16_frag(src.load(), ks % tr.q_per_load)
 
         else:
+            # One 16 B gmem access per (tile, Q access), hoisted so the extra
+            # k-steps gfx942 needs cost register slicing and not extra loads.
+            q_raw = [
+                [load_q_frag(i, j) for j in range_constexpr(tr.q_loads)]
+                for i in range_constexpr(FTW)
+            ]
             q_frag = [
-                [as_bf16_frag(load_q_frag(i, ks)) for ks in range_constexpr(KSTEPS)]
+                [
+                    as_bf16_frag(q_raw[i][ks // tr.q_per_load], ks % tr.q_per_load)
+                    for ks in range_constexpr(KSTEPS)
+                ]
                 for i in range_constexpr(FTW)
             ]
 
             def q_operand(i, ks):
                 return q_frag[i][ks]
 
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16))
+        mma_atom = fx.make_mma_atom(
+            fx.rocdl.MFMA(MFMA_M, MFMA_N, tr.mfma_k, fx.BFloat16)
+        )
         zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
         neg_inf = fx.Float32(NEG_INF)
 
@@ -1250,55 +1442,79 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
                 return load_k16(page, base >> shift)
             tok_row = fx.Int32(MFMA_M * panel) + tw_tok + u
             base = tok_row * i32_stride_k_pos
-            if const_expr(fp8):
-                # k_offset(2i) = 64*i + 16*g and k_offset(2i+1) = that + 8, so
-                # the two k-steps are 16 contiguous bytes: one dwordx4, and the
-                # four g-lanes tile exactly one 64 B line.
-                base = base + fx.Int32(64 * i) + g * fx.Int32(16)
-                return load_k16(page, base >> fx.Int32(4))
-            base = base + fx.Int32(i * MFMA_K) + g * fx.Int32(8)
-            return load_k16(page, base >> fx.Int32(3))
+            # Access block i starts at k = i*block_k and lane group g takes
+            # lane_block of it, so the whole block is one dwordx4 per lane and
+            # the four g-lanes tile exactly one 64 B line. block_k and
+            # lane_block are 64/16 for fp8 and 32/8 for bf16 on *both*
+            # architectures -- see ArchTraits -- so K's addressing, unlike its
+            # k-step count, does not depend on the arch at all.
+            base = base + fx.Int32(i * tr.block_k) + g * fx.Int32(tr.lane_block)
+            shift = fx.Int32(4) if const_expr(fp8) else fx.Int32(3)
+            return load_k16(page, base >> shift)
 
         def convert_k(raws, ks):
-            """Widen the raw load holding k-step ks into a bf16 A-fragment.
+            """Widen the raw access holding k-step ks into a bf16 A-fragment.
 
             fp8 is widened here rather than fed to a native fp8 MFMA: decode
             deliberately lifts K to Q's precision instead of rounding Q down,
             and matching that is what makes this a rewrite of the existing
             operator rather than a different one.
+
+            One access holds k_per_load k-steps of lane_k elements each, laid
+            out back to back by the k_offset map, so this takes slice
+            `ks % k_per_load`. On gfx950 bf16 that slice is the whole access
+            and this is a bitcast, exactly as before.
             """
-            t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-            if const_expr(fp8):
-                # Load ks//2 holds k-steps 2n and 2n+1 in dwords [0:2] and
-                # [2:4]. Two v_cvt_scalef32_pk_bf16_fp8 per dword; the cache is
-                # unit-scale, hence scale 1.0.
-                raw = raws[ks // 2]
-                lo = 2 * (ks % 2)
-                one = _to_raw(fx.Float32(1.0))
-                pairs = [
-                    fx.Vector(
-                        fx.rocdl.cvt_scalef32_pk_bf16_fp8(
-                            T.vec(2, T.bf16),
-                            _to_raw(fx.Int32(raw[lo + d])),
-                            one,
-                            bool(half),
+            raw = raws[ks // tr.k_per_load]
+            sub = ks % tr.k_per_load
+            t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), fx.BFloat16)
+            if const_expr(not fp8):
+                wide = raw.bitcast(fx.BFloat16)
+                if const_expr(tr.k_per_load == 1):
+                    t.store(wide)
+                else:
+                    t.store(
+                        fx.Vector.from_elements(
+                            [
+                                fx.BFloat16(wide[sub * tr.lane_k + v])
+                                for v in range_constexpr(tr.lane_k)
+                            ],
+                            fx.BFloat16,
                         )
                     )
-                    for d in range_constexpr(2)
-                    for half in range_constexpr(2)
-                ]
-                t.store(
-                    fx.Vector.from_elements(
-                        [
-                            fx.BFloat16(pairs[i][j])
-                            for i in range_constexpr(4)
-                            for j in range_constexpr(2)
-                        ],
-                        fx.BFloat16,
-                    )
-                )
-            else:
-                t.store(raws[ks].bitcast(fx.BFloat16))
+                return t
+            # fp8: lane_k elements are lane_k//4 whole dwords, and each dword
+            # converts in two halves. gfx950 lands 8 elements from 2 dwords,
+            # gfx942 4 elements from 1.
+            dwords = tr.lane_k // 4
+            lo = sub * dwords
+            one = _to_raw(fx.Float32(1.0))
+            elems = []
+            for d in range_constexpr(dwords):
+                word = _to_raw(fx.Int32(raw[lo + d]))
+                for half in range_constexpr(2):
+                    if const_expr(tr.fp8_to_bf16_direct):
+                        # The cache is unit-scale, hence scale 1.0.
+                        pair = fx.Vector(
+                            fx.rocdl.cvt_scalef32_pk_bf16_fp8(
+                                T.vec(2, T.bf16), word, one, bool(half)
+                            )
+                        )
+                        elems += [fx.BFloat16(pair[0]), fx.BFloat16(pair[1])]
+                    else:
+                        # CDNA3 has no fp8->bf16, so go through f32. The detour
+                        # is exact and the rounding mode is irrelevant: e4m3
+                        # carries 3 mantissa bits and 4 exponent bits, both of
+                        # which fit bf16's 7 and 8, so every value is
+                        # representable and nothing is rounded.
+                        pair = fx.Vector(
+                            fx.rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), word, bool(half))
+                        )
+                        elems += [
+                            fx.BFloat16(fx.Float32(pair[0])),
+                            fx.BFloat16(fx.Float32(pair[1])),
+                        ]
+            t.store(fx.Vector.from_elements(elems, fx.BFloat16))
             return t
 
         # ==================== MAIN LOOP ====================
@@ -1622,10 +1838,12 @@ def build_index_score(S: int, H: int, fp8: bool, cfg: IndexScoreConfig):
 _CACHE = {}
 
 
-def _get(S, H, fp8, cfg, device):
-    key = (S, H, fp8, cfg, device)  # IndexScoreConfig is frozen, hence hashable
+def _get(S, H, fp8, cfg, device, arch=DEFAULT_ARCH):
+    # IndexScoreConfig is frozen, hence hashable. The arch is in the key
+    # because it changes the emitted code, not just where it runs.
+    key = (S, H, fp8, cfg, device, arch)
     if key not in _CACHE:
-        _CACHE[key] = build_index_score(S, H, fp8, cfg)
+        _CACHE[key] = build_index_score(S, H, fp8, cfg, arch)
     return _CACHE[key]
 
 
@@ -1642,6 +1860,14 @@ def shuffle_cache(cache):
     that map rather than written independently, because the two must agree
     exactly -- a mismatch here is silent wrong numbers, not a crash.
 
+    The layout is the *same on gfx950 and gfx942*, so a producer that writes
+    it does not have to know which chip will read it. That is not luck: the
+    shuffled address is built from `k_loads`, `chunk_elems` and `block_k`,
+    and all three are invariant because halving the MFMA's k doubles the
+    k-steps one 16 B access covers. See ArchTraits. `test_shuffle_layout_is_
+    arch_independent` holds it to that, since ATOM writes this layout and a
+    silent divergence would be a cross-component break.
+
     This is a one-off cost paid when the cache is written, not per decode step.
     """
     import torch
@@ -1650,24 +1876,22 @@ def shuffle_cache(cache):
         raise ValueError(f"cache: expected bfloat16 or {_fp8_dtype()}")
     fp8 = cache.dtype != torch.bfloat16
     npages = cache.shape[0]
-    chunk_elems = 16 if fp8 else 8
-    k_loads = KSTEPS // 2 if fp8 else KSTEPS
+    tr = arch_traits(DEFAULT_ARCH, fp8)
+    chunk_elems = tr.chunk_elems
+    k_loads = tr.k_loads
 
     dev = cache.device
     row = torch.arange(PAGE, device=dev)
     kk = torch.arange(HEAD_DIM, device=dev)
     # For each (row, k), which lane/slot/offset does it belong to?
     panel, u = row // MFMA_M, row % MFMA_M
-    if fp8:
-        # k = 64*i + 16*g + 8*(ks%2), v in [0,16)
-        i = kk // 64
-        g = (kk % 64) // 16
-        v = kk % 16
-    else:
-        # k = 32*ks + 8*g, v in [0,8)
-        i = kk // MFMA_K
-        g = (kk % MFMA_K) // 8
-        v = kk % 8
+    # Invert k_offset: an access block is block_k wide and lane group g owns
+    # lane_block of it, so k = i*block_k + g*lane_block + v with v in
+    # [0, chunk_elems). That is k = 64*i + 16*g + v for fp8 and
+    # k = 32*i + 8*g + v for bf16, on either architecture.
+    i = kk // tr.block_k
+    g = (kk % tr.block_k) // tr.lane_block
+    v = kk % tr.lane_block
     slot = panel[:, None] * k_loads + i[None, :]
     fx_lane = 16 * g[None, :] + u[:, None]
     dst = (slot * WAVE + fx_lane) * chunk_elems + v[None, :]
@@ -2334,11 +2558,11 @@ def _validate_metadata(
     if not isinstance(S, int) or not isinstance(H, int) or S < 1 or H < 1:
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
-    # Arch first: on the wrong arch every other message would be a symptom.
-    # An `e4m3fnuz` cache on gfx942, for instance, is the right dtype for that
-    # chip and still unsupported here, and "requires gfx950" says so.
-    if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx950":
-        raise ValueError("index score requires gfx950")
+    # Arch first: on an unsupported arch every other message would be a
+    # symptom, and the accepted fp8 flavour depends on the answer.
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    if arch not in SUPPORTED_ARCHS:
+        raise ValueError(f"index score requires one of {SUPPORTED_ARCHS}, got {arch}")
     _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
     _validate_tensor(
         cache, "cache", (torch.bfloat16, _fp8_dtype()), 3, device, 16, False
@@ -2377,7 +2601,7 @@ def _validate_metadata(
     rows = _validate_bounds(batch, max_block, cfg)
     if cfg.shuffled and cache.stride(1) != HEAD_DIM:
         raise ValueError("shuffled cache must be packed within each page")
-    if not selection_filter(S, H, cfg, arch="gfx950"):
+    if not selection_filter(S, H, cfg, arch=arch):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
     if block_table is not None:
         _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
@@ -2413,7 +2637,7 @@ def _validate_metadata(
         raise ValueError("out: address span exceeds 32-bit addressing")
     if work_map is not None:
         _validate_map(work_map, rows, device, exact=True)
-    return batch, cfg
+    return batch, cfg, arch
 
 
 def index_score_supported(
@@ -2522,7 +2746,7 @@ def score_flydsl(
     elif cfg_kwargs:
         raise TypeError("pass either cfg or its fields as keywords, not both")
 
-    batch, cfg = _validate_metadata(
+    batch, cfg, arch = _validate_metadata(
         idx_q, cache, S, H, max_block, block_table, cfg, seq_lens, out, work_map
     )
     if block_table is None or seq_lens is None:
@@ -2535,7 +2759,7 @@ def score_flydsl(
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
 
-    launch, _chunk = _get(S, H, fp8, cfg, idx_q.device.index)
+    launch, _chunk = _get(S, H, fp8, cfg, idx_q.device.index, arch)
     # Grid depends only on launch-time bounds, never on seq_lens contents, so
     # it stays valid across a cudagraph replay with different lengths.
     chunks = _grid_chunks(max_block, cfg)
