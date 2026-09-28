@@ -1401,6 +1401,7 @@ def _pa_decode_sparse_v4_2buff(
     MAIN_BLOCK_SIZE: gl.constexpr,  # paged page size; 1 for a flat ATOM pool
     EXTRA_BLOCK_SIZE: gl.constexpr,
     HAS_EXTRA: gl.constexpr,
+    TDM_PARTIALS: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
@@ -1580,6 +1581,10 @@ def _pa_decode_sparse_v4_2buff(
     OUT_PIECE: gl.constexpr = BLOCK_D // 2
     out_piece_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[OUT_PIECE, 8]], [BLOCK_H, OUT_PIECE], [1, 0], CGA_H
+    )
+    # fp32 partials: 4 elements is the same 16-byte pad the bf16 tiles use.
+    acc_piece_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[OUT_PIECE, 4]], [BLOCK_H, OUT_PIECE], [1, 0], CGA_H
     )
     qs_shared: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_H
@@ -2221,25 +2226,48 @@ def _pa_decode_sparse_v4_2buff(
             mask=h_mask_ml,
         )
         ab = acc_partial_ptr + t * ap_stride_t + pid_k * ap_stride_k
-        _v4_store_acc(
-            a0,
-            0,
-            PV_HALF,
-            ab,
-            h_offs_o_eff,
-            h_mask_o,
-            ap_stride_h,
-            ap_stride_d,
-            OUT_BLOCKED_LAYOUT,
-        )
-        _v4_store_acc(
-            a1,
-            PV_HALF,
-            PV_HALF,
-            ab,
-            h_offs_o_eff,
-            h_mask_o,
-            ap_stride_h,
-            ap_stride_d,
-            OUT_BLOCKED_LAYOUT,
-        )
+        if TDM_PARTIALS:
+            # Same shape as the KV_SPLITS==1 epilogue: stage in LDS, leave by
+            # descriptor. The descriptor's row extent is H, so out-of-range
+            # heads clip and the head mask is not needed.
+            acc_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=ab,
+                shape=[H, BLOCK_D],
+                strides=[ap_stride_h, ap_stride_d],
+                block_shape=[BLOCK_H, OUT_PIECE],
+                layout=acc_piece_shared,
+            )
+            p0 = gl.allocate_shared_memory(
+                gl.float32, [BLOCK_H, OUT_PIECE], acc_piece_shared
+            )
+            p1 = gl.allocate_shared_memory(
+                gl.float32, [BLOCK_H, OUT_PIECE], acc_piece_shared
+            )
+            p0.store(a0)
+            gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, 0], p0)
+            p1.store(a1)
+            gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, OUT_PIECE], p1)
+            gl.amd.gfx1250.tdm.async_wait(0)
+        else:
+            _v4_store_acc(
+                a0,
+                0,
+                PV_HALF,
+                ab,
+                h_offs_o_eff,
+                h_mask_o,
+                ap_stride_h,
+                ap_stride_d,
+                OUT_BLOCKED_LAYOUT,
+            )
+            _v4_store_acc(
+                a1,
+                PV_HALF,
+                PV_HALF,
+                ab,
+                h_offs_o_eff,
+                h_mask_o,
+                ap_stride_h,
+                ap_stride_d,
+                OUT_BLOCKED_LAYOUT,
+            )

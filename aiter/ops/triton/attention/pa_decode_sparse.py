@@ -10,6 +10,8 @@ TODO: add details once API has settled
 import math
 
 import torch
+import functools
+import os
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
@@ -128,6 +130,7 @@ def pa_decode_sparse(
     kv_splits: int | None = None,
     has_invalid: bool | None = True,
     skip_reduce: bool | None = False,
+    use_lru_cache_partials: bool = False,
     USE_EXP2: bool | None = None,
     *,
     extra_cache: torch.Tensor | None = None,
@@ -165,6 +168,13 @@ def pa_decode_sparse(
             ``kv_splits == 1`` (the single-CTA path already produces the final
             ``out`` directly). Useful for profiling the main kernel in
             isolation and for callers that fold the reduce into a downstream op.
+        use_lru_cache_partials: reuse the split-K partial buffers across calls
+            rather than allocating them per call. They run to tens of MB per
+            layer, so a per-step forward churns gigabytes through the
+            allocator, and the caller's runtime cannot account for them.
+            Cached entries are never freed -- a captured CUDA graph records
+            their addresses. Ignored under ``skip_reduce``, where the caller
+            owns the partials.
         extra_cache/extra_indices/extra_indptr: a second cache and ragged index
             set attended over in the same pass. vLLM's decode splits its keys
             this way and these follow its naming: the FIRST (positional) cache
@@ -271,6 +281,7 @@ def pa_decode_sparse(
             kv_splits=kv_splits,
             has_invalid=has_invalid,
             skip_reduce=skip_reduce,
+            use_lru_cache_partials=use_lru_cache_partials,
             out=out,
             extra_cache=extra_cache,
             extra_cache_rope=extra_cache_rope,
@@ -1002,6 +1013,26 @@ def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
     return rows, blk_stride // row_stride, block_size, nb * block_size
 
 
+
+@functools.lru_cache(maxsize=None)
+def _v4_decode_partials(t_cap, kv_splits, h_padded, d, device_index):
+    """Persistent fp32 partials for the split-K decode path.
+
+    maxsize=None so entries are never evicted and the storage is never freed:
+    a captured CUDA graph holds these addresses, and handing that memory back
+    to the allocator would let a later allocation land underneath a replay.
+    Sized at a power-of-two token count so the number of distinct buffers stays
+    small; callers slice to their actual T.
+    """
+    dev = torch.device("cuda", device_index)
+    m = torch.empty((t_cap, kv_splits, h_padded), dtype=torch.float32, device=dev)
+    l = torch.empty_like(m)
+    acc = torch.empty(
+        (t_cap, kv_splits, h_padded, d), dtype=torch.float32, device=dev
+    )
+    return m, l, acc
+
+
 def _pa_decode_sparse_v4_2buff(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -1023,6 +1054,7 @@ def _pa_decode_sparse_v4_2buff(
     kv_splits: int | None = None,
     has_invalid: bool = True,
     skip_reduce: bool = False,
+    use_lru_cache_partials: bool = False,
     out: torch.Tensor | None = None,
 ):
     """gfx1250 driver for the DSv4 "2buff" packed-fp8 KV pool.
@@ -1128,7 +1160,13 @@ def _pa_decode_sparse_v4_2buff(
             else:
                 block_h = 16
         elif H >= 32:
-            block_h = 32 if T >= 256 else 16
+            # [TEMPORARY] pinned to 32. BLOCK_H=16 is miscompiled by upstream
+            # Triton on the single-stream KV_SPLITS==1 path -- the epilogue's
+            # tdm.async_store reads an LDS tile the wave has not finished
+            # writing, giving ~1e38 garbage (plan section 27 / 30.4). BLOCK_H=32
+            # is clean on both compilers, so pin it until the compiler fix
+            # lands, then restore: block_h = 32 if T >= 256 else 16
+            block_h = 32
         else:
             block_h = triton.next_power_of_2(H)
     else:
@@ -1200,21 +1238,32 @@ def _pa_decode_sparse_v4_2buff(
         kv_splits = min(max_kv_splits, kv_splits)
         # DOWN to a power of two: rounding up puts back what the ceiling removed.
         kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
+        # CAP. Occupancy is only half the story: every split also writes and
+        # then re-reads T * H_padded * D fp32 of partials, so past the point
+        # where the attention kernel stops speeding up, the splits cost more
+        # than they buy -- and they slow the ATTENTION down too, not just the
+        # reduce. Measured, main + reduce, kv_len 384:
+        #
+        #   H=32  T=16   32 splits 17.26us -> 8 splits 13.63us   (main 10.89
+        #                -> 10.41, reduce 6.37 -> 3.23)
+        #   H=128 T=16   16 splits 52.15us -> 8 splits 43.54us
+        #   H=32/128, T >= 64: the heuristic already picks <= 4, unchanged.
+        #
+        # Only small T can reach past 8, because the occupancy term is
+        # max_num_wg // (T * n_head_blocks).
+        kv_splits = min(kv_splits, 8)
 
     _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
     _lds_cap = max(1, _lds_budget // (block_d * 4))
     kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
     # KV_SPLITS == 1 takes a different output path: the accumulators are
     # reassembled in LDS and pushed out with tdm.async_store, rather than the
-    # reduce writing `out` from the partials. That path RACES -- ~0.3% of
-    # tokens corrupted at T=1024 and ~5.7% at T=2437, garbage magnitudes
-    # (~1e38), single-stream as well as two-stream, and the rate swings with
-    # any timing perturbation. Everything at 2+ splits is clean, so stay off
-    # it until that store is fixed. Cost is one reduce launch and the partial
-    # buffers; at the batch sizes that reach 1 split those are small next to
-    # the KV cache.
-    # [test] clamp removed so KV_SPLITS==1 is reachable
-    kv_splits = kv_splits
+    # reduce writing `out` from the partials. That path is CORRECT -- an
+    # earlier comment here called it a race, which it is not. It is
+    # miscompiled by upstream Triton 3.8.0 at BLOCK_H=16 only (the
+    # `s_wait_dscnt` before `tensor_store_from_lds` is dropped), and BLOCK_H
+    # is pinned to 32 above precisely so that tile is unreachable. The
+    # internal build is correct at every BLOCK_H.
     if kv_splits > 8:
         reduce_num_warps = 4
         reduce_waves_per_eu = 1
@@ -1225,17 +1274,47 @@ def _pa_decode_sparse_v4_2buff(
         lp_strides = (0, 0, 0)
         ap_strides = (0, 0, 0, 0)
     else:
-        m_partial = torch.empty(
-            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+        # skip_reduce hands the partials back to the caller, who then owns
+        # them; a shared buffer would be overwritten under it next call.
+        _cache_ok = (
+            use_lru_cache_partials and not skip_reduce and q.device.type == "cuda"
         )
-        l_partial = torch.empty_like(m_partial)
-        acc_partial = torch.empty(
-            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
-        )
+        if _cache_ok:
+            m_full, l_full, acc_full = _v4_decode_partials(
+                triton.next_power_of_2(T), kv_splits, h_padded, D, q.device.index
+            )
+            m_partial = m_full[:T]
+            l_partial = l_full[:T]
+            acc_partial = acc_full[:T]
+        else:
+            m_partial = torch.empty(
+                (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+            )
+            l_partial = torch.empty_like(m_partial)
+            acc_partial = torch.empty(
+                (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+            )
         mp_strides = m_partial.stride()
         lp_strides = l_partial.stride()
         ap_strides = acc_partial.stride()
 
+    # Route the fp32 acc partials through LDS + tdm.async_store instead of
+    # buffer_store, but only at small T. Measured main-kernel time, kv_len 384:
+    #
+    #        H=32                      H=128
+    #   T=16  10.31 -> 8.69  (-1.62)   38.42 -> 39.02 (+0.60)
+    #   T=64  15.00 -> 15.08           80.93 -> 84.52 (+3.59)
+    #   T=256 31.02 -> 30.36 (-0.66)  203.23 -> 207.45 (+4.22)
+    #
+    # It pays only where there is little else to overlap the staging with; at
+    # larger T the LDS round trip costs more than the wider store buys.
+    #
+    # NEVER at BLOCK_H=16: upstream Triton 3.8.0 drops the `s_wait_dscnt`
+    # before `tensor_store_from_lds`, so the TDM engine reads an LDS tile the
+    # wave has not finished writing. That bug is not specific to the
+    # KV_SPLITS==1 epilogue -- this store hits it too (4 op-test failures at
+    # H=16 when it was unguarded). See plan section 27.
+    _tdm_partials = T <= 16 and block_h != 16
     grid_attn = (T, n_head_blocks, kv_splits)
     gluon_pa_decode_sparse_v4_2buff[grid_attn](
         q,
@@ -1299,6 +1378,7 @@ def _pa_decode_sparse_v4_2buff(
         MAIN_BLOCK_SIZE=main_block_size,
         EXTRA_BLOCK_SIZE=extra_block_size,
         HAS_EXTRA=has_extra,
+        TDM_PARTIALS=_tdm_partials,
         num_warps=attn_num_warps,
         num_stages=2,
         waves_per_eu=waves_per_eu,
