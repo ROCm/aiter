@@ -6,11 +6,8 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
@@ -196,7 +193,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
 
         def _tr8(imm):
             r = _ds_read_tr8_b64_imm(self.v2i32_type, base, imm)
-            return llvm.bitcast(T.i64, as_mlir_value(Vec(r)))
+            return Vec(r).bitcast(fx.Int64)[0].ir_value()
 
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]
         for dc in range_constexpr(traits.D_CHUNKS):
