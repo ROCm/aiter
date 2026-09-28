@@ -149,6 +149,12 @@ def compile_megamoe_tile_ep16_stage1(
     early_local_gmm: bool = False,
     fan2_shards: int = 0,
     post_nofan: bool = False,
+    remote_rev: bool = False,
+    local_defer: int = 0,
+    seal_fast: bool = False,
+    lazy_pad: bool = False,
+    pub_relaxed: bool = False,
+    claim_relaxed: bool = False,
     gmm1_use_nt: bool = True,
     gmm_tile_group: int = 0,
     dispatch_plan: bool = False,
@@ -542,6 +548,15 @@ def compile_megamoe_tile_ep16_stage1(
     # fan1 晚起跑 ~55µs,拖住 local_eos。它们仍留在 fan 块里(要在发布分片前等自己 QP 的完成,
     # 见 rail_post_ctas 段)、仍计入 fanout_shard_done,但不分 token:这些 dest 的 token 步长
     # 变成 shards-1,其余分片号减 1。
+    if local_defer and not (early_local_gmm and h1_phys and 0 < local_defer < layout.local_experts):
+        raise ValueError("local_defer needs early_local_gmm + h1_phys and 0 < D < local_experts")
+    # lazy_pad:段 1 不补本地组的尾行就发布 h1_local_eos,改由段 2 的 sealer 补。GMM1 只经
+    # tile_row_input 取 A,且是带界 buffer load;补齐前那些行里是上一代/初值的合法行号,
+    # 算出来的 h1 行只会被 stage2 用 INVALID_SOURCE/权重 0 丢掉,而这两项在 stage1_done 前补齐。
+    if lazy_pad and not (early_local_gmm and h1_phys and split_local):
+        raise ValueError("lazy_pad needs early_local_gmm + h1_phys + split_local")
+    if seal_fast and not (early_local_gmm and h1_phys and not diagnostic_no_arrival_rmw and not dispatch_plan):
+        raise ValueError("seal_fast needs early_local_gmm + h1_phys (parallel pad/perm skip the diagnostic and plan branches)")
     if post_nofan and not (
         rail_post_ctas and route_gbatch and fanout_shards > 1 and not wave_fanout and fan1_direct
     ):
@@ -760,6 +775,12 @@ def compile_megamoe_tile_ep16_stage1(
         + ("_elg" if early_local_gmm else "")
         + (f"_f2s{int(fan2_shards)}" if fan2_shards else "")
         + ("_pnf" if post_nofan else "")
+        + ("_rr" if remote_rev else "")
+        + (f"_ld{int(local_defer)}" if local_defer else "")
+        + ("_sf" if seal_fast else "")
+        + ("_lp" if lazy_pad else "")
+        + ("_prx" if pub_relaxed else "")
+        + ("_crx" if claim_relaxed else "")
         + (f"_bm{BM}" if BM != 32 else "")
         + (f"_tg{G}" if G != 1 else "")
         + ("_plan" if dispatch_plan else "")
@@ -1366,11 +1387,17 @@ def compile_megamoe_tile_ep16_stage1(
             gpu.barrier()
             if tx == fx.Int32(0):
                 comm_ops.fence_system_release()
-                comm_ops.store_i64_global_system(
+                # pub_relaxed:一次 fence 放行全部清零,两条门值不必各自再做整 L2 写回。
+                _pub_st = (
+                    comm_ops.store_i64_global_system_relaxed
+                    if pub_relaxed
+                    else comm_ops.store_i64_global_system
+                )
+                _pub_st(
                     arena_ptr + fx.Int64(off("epoch_gate")),
                     control_generation,
                 )
-                comm_ops.store_i64_global_system(
+                _pub_st(
                     local_addr("launch_ready"), control_generation
                 )
         else:
@@ -2737,7 +2764,8 @@ def compile_megamoe_tile_ep16_stage1(
                 buffer_ops.buffer_store(local_expert, expert_res, phys)
             comm_ops.fence_system_release()
             for j in range_constexpr(G):
-                comm_ops.store_i64_global_system(
+                # claim_relaxed:上面一次 fence 已放行 map/tile_expert,G 条 release store 各带一次整 L2 写回。
+                (comm_ops.store_i64_global_system_relaxed if claim_relaxed else comm_ops.store_i64_global_system)(
                     map_ready + fx.Int64(j * 8), generation
                 )
             return base
@@ -4488,11 +4516,15 @@ def compile_megamoe_tile_ep16_stage1(
                         buffer_ops.buffer_store(fx.Int32(INVALID_SOURCE), sources, dst)
                         buffer_ops.buffer_store(fx.Float32(0.0), weights, dst)
 
-        def _seal_perm(segs, base_segs, check_tiles, publish_seg):
+        def _seal_perm(segs, base_segs, check_tiles, publish_seg, par=False):
             """expert-major 置换。segs:每个 expert 依次拼接的 map 行段(0=本地/全部,
             LE=远端);base_segs:排在整个视图前面的段(split_local 非 h1_phys 的远端段
             以本地段总数为基址)。h1_phys+split_local 时 segs=(0, LE):每个 expert 连续,
-            组内先本地组后远端组。"""
+            组内先本地组后远端组。par:线程 (e, l) 做 expert e 的第 l, l+SPL, ... 个 tile/组
+            (每条 lane 自己重算前缀和),把每 expert 串行的 load→store 依赖链缩成 1/SPL。"""
+            PS = SPL if par else 1
+            pe = tx // fx.Int32(PS)
+            pl = tx - pe * fx.Int32(PS)
             counts_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("expert_count")
             )
@@ -4514,7 +4546,7 @@ def compile_megamoe_tile_ep16_stage1(
             inv_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("tile_src_of_dst")
             )
-            if tx < fx.Int32(LOCAL_EXPERTS):
+            if tx < fx.Int32(LOCAL_EXPERTS * PS):
                 my_base = seg_base
                 all_tiles = fx.Int32(0)
                 # range_constexpr, not a runtime loop: the accumulator is
@@ -4527,7 +4559,7 @@ def compile_megamoe_tile_ep16_stage1(
                             counts_res, fx.Int32(so + e), vec_width=1, dtype=T.i32
                         )
                         n = _alloc_tiles_for(c)
-                        my_base = my_base + (fx.Int32(e) < tx).select(
+                        my_base = my_base + (fx.Int32(e) < pe).select(
                             n, fx.Int32(0)
                         )
                         all_tiles = all_tiles + n
@@ -4556,13 +4588,13 @@ def compile_megamoe_tile_ep16_stage1(
                 run_base = my_base
                 for si in range_constexpr(len(segs)):
                     so = segs[si]
-                    map0 = (tx + fx.Int32(so)) * fx.Int32(max_tiles_per_expert)
+                    map0 = (pe + fx.Int32(so)) * fx.Int32(max_tiles_per_expert)
                     my_tiles = _alloc_tiles_for(
                         buffer_ops.buffer_load(
-                            counts_res, tx + fx.Int32(so), vec_width=1, dtype=T.i32
+                            counts_res, pe + fx.Int32(so), vec_width=1, dtype=T.i32
                         )
                     )
-                    for j in range(fx.Int32(0), my_tiles, fx.Int32(1)):
+                    for j in range(pl, my_tiles, fx.Int32(PS)):
                         map_index = map0 + j
                         _spin_dbg_37(
                             local_addr("expert_tile_map_ready")
@@ -4574,7 +4606,7 @@ def compile_megamoe_tile_ep16_stage1(
                         )
                         dst = run_base + j
                         buffer_ops.buffer_store(dst, perm_res, src)
-                        buffer_ops.buffer_store(tx, sorted_e_res, dst)
+                        buffer_ops.buffer_store(pe, sorted_e_res, dst)
                         if const_expr(h1_phys):
                             buffer_ops.buffer_store(src, inv_res, dst)
                     if const_expr(G > 1):
@@ -4583,7 +4615,7 @@ def compile_megamoe_tile_ep16_stage1(
                         # 认领得到,所以两边都对齐到 G。单独一个按组的循环:
                         # 不在归纳变量上做 %,也不在循环体里做条件写。
                         for jg in range(
-                            fx.Int32(0), my_tiles // fx.Int32(G), fx.Int32(1)
+                            pl, my_tiles // fx.Int32(G), fx.Int32(PS)
                         ):
                             j0 = jg * fx.Int32(G)
                             head_src = buffer_ops.buffer_load(
@@ -4595,12 +4627,13 @@ def compile_megamoe_tile_ep16_stage1(
                                 group_perm_res,
                                 head_group,
                             )
-                            buffer_ops.buffer_store(tx, group_e_res, head_group)
+                            buffer_ops.buffer_store(pe, group_e_res, head_group)
                     run_base = run_base + my_tiles
 
-        def _seal_group_list(EO, base_segs):
+        def _seal_group_list(EO, base_segs, rev=False):
             """early_local_gmm:把 expert_count[EO:EO+LE] 这一类的物理组号(组首物理 tile // G)
-            按 expert 顺序写进 gmm1_group_list;base_segs 的组数之和是本段起点(远端段接在本地段后)。"""
+            按 expert 顺序写进 gmm1_group_list;base_segs 的组数之和是本段起点(远端段接在本地段后)。
+            rev:按 expert 倒序排(远端段用;本地段最后读的权重还在 MALL 里)。"""
             counts_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("expert_count")
             )
@@ -4616,7 +4649,7 @@ def compile_megamoe_tile_ep16_stage1(
                             )
                         ) // fx.Int32(G)
                 for e in range_constexpr(LOCAL_EXPERTS):
-                    my_base = my_base + (fx.Int32(e) < ge).select(
+                    my_base = my_base + ((fx.Int32(e) > ge) if rev else (fx.Int32(e) < ge)).select(
                         _alloc_tiles_for(
                             buffer_ops.buffer_load(
                                 counts_res, fx.Int32(EO + e), vec_width=1, dtype=T.i32
@@ -4672,7 +4705,8 @@ def compile_megamoe_tile_ep16_stage1(
             comm_ops.fence_system_acquire()
             if const_expr(early_local_gmm):
                 _ts(7)
-                _seal_pad_par(0)
+                if const_expr(not lazy_pad):
+                    _seal_pad_par(0)
             else:
                 _seal_pad(0)
             rocdl.s_waitcnt(0)
@@ -4689,7 +4723,10 @@ def compile_megamoe_tile_ep16_stage1(
                     _cr = buffer_ops.create_buffer_resource_from_addr(
                         local_addr("expert_count")
                     )
-                    for e in range_constexpr(LOCAL_EXPERTS):
+                    # local_defer:末尾 D 个 expert 的本地组不进本地段。消费者的本地上界和远端段起点
+                    # 都由 tile_alloc[1] 推出,组表布局不变,这些组就落在远端段开头,
+                    # 和它们的远端组一起在同一次权重读里做(远端段本来就要把权重全读一遍)。
+                    for e in range_constexpr(LOCAL_EXPERTS - int(local_defer)):
                         _lt = _lt + _alloc_tiles_for(
                             buffer_ops.buffer_load(_cr, fx.Int32(e), vec_width=1, dtype=T.i32)
                         )
@@ -4705,7 +4742,8 @@ def compile_megamoe_tile_ep16_stage1(
             if const_expr(early_local_gmm):
                 if tx == fx.Int32(0):
                     comm_ops.fence_system_release()
-                    comm_ops.store_i64_global_system(
+                    # fence 已经把前面的写整体放行;release store 会再做一次整 L2 写回。
+                    (comm_ops.store_i64_global_system_relaxed if pub_relaxed else comm_ops.store_i64_global_system)(
                         local_addr("h1_local_eos"), generation
                     )
                 _ts(9)
@@ -4954,7 +4992,7 @@ def compile_megamoe_tile_ep16_stage1(
                                 fx.Int32(1),
                             )
                     comm_ops.fence_system_release()
-                    comm_ops.store_i64_global_system(
+                    (comm_ops.store_i64_global_system_relaxed if pub_relaxed else comm_ops.store_i64_global_system)(
                         _peer_addr(dest, "comm_eos")
                         + fx.Int64(local_rank) * 8,
                         generation,
@@ -5138,7 +5176,7 @@ def compile_megamoe_tile_ep16_stage1(
                         if _lprev + fx.Int32(1) == fan_stride:
                             comm_ops.atomic_add_agent(_ldone, fx.Int32(0) - fan_stride)
                             comm_ops.fence_system_release()
-                            comm_ops.store_i64_global_system(
+                            (comm_ops.store_i64_global_system_relaxed if pub_relaxed else comm_ops.store_i64_global_system)(
                                 _peer_addr(dest, "comm_eos")
                                 + fx.Int64((GPUS_PER_NODE + local_rank) * 8),
                                 generation,
@@ -5304,7 +5342,7 @@ def compile_megamoe_tile_ep16_stage1(
                                 + fx.Int64(consume_index * 4),
                                 fx.Int32(1),
                             )
-                        comm_ops.store_i64_global_system(
+                        (comm_ops.store_i64_global_system_relaxed if pub_relaxed else comm_ops.store_i64_global_system)(
                             _peer_addr(dest, "comm_eos")
                             + fx.Int64(local_rank) * 8,
                             generation,
@@ -5667,7 +5705,14 @@ def compile_megamoe_tile_ep16_stage1(
             gpu.barrier()
             comm_ops.fence_system_acquire()
             _ts(11)
-            _seal_pad(LOCAL_EXPERTS if split_local else 0)
+            if const_expr(seal_fast):
+                _seal_pad_par(LOCAL_EXPERTS if split_local else 0)
+                if const_expr(lazy_pad):
+                    _seal_pad_par(0)
+            else:
+                _seal_pad(LOCAL_EXPERTS if split_local else 0)
+                if const_expr(lazy_pad):
+                    _seal_pad(0)
             rocdl.s_waitcnt(0)
             gpu.barrier()
             # sealer 内部分段(槽 5..7 本是 T0 专用;rank0 的 sealer 就是 T0,会覆盖,分析时丢掉 rank0/8)
@@ -5693,9 +5738,9 @@ def compile_megamoe_tile_ep16_stage1(
                 # rather than running a scan: the counts are one cache line
                 # deep and this costs no LDS and no extra barrier.
                 if const_expr(split_local and h1_phys):
-                    _seal_perm((0, LOCAL_EXPERTS), (), tiles, False)
+                    _seal_perm((0, LOCAL_EXPERTS), (), tiles, False, seal_fast)
                     if const_expr(early_local_gmm):
-                        _seal_group_list(LOCAL_EXPERTS, (0,))
+                        _seal_group_list(LOCAL_EXPERTS, (0,), remote_rev)
                 elif const_expr(split_local):
                     _seal_perm((LOCAL_EXPERTS,), (0,), tiles, False)
                 else:
@@ -5791,7 +5836,8 @@ def compile_megamoe_tile_ep16_stage1(
                         fx.Int32(0),
                     )
                     comm_ops.fence_system_release()
-                    comm_ops.store_i64_global_system(
+                    # fence 已经把前面的写整体放行;release store 会再做一次整 L2 写回。
+                    (comm_ops.store_i64_global_system_relaxed if pub_relaxed else comm_ops.store_i64_global_system)(
                         local_addr("h1_queue_eos"), generation
                     )
             else:
@@ -5816,7 +5862,8 @@ def compile_megamoe_tile_ep16_stage1(
                         fx.Int32(0),
                     )
                     comm_ops.fence_system_release()
-                    comm_ops.store_i64_global_system(
+                    # fence 已经把前面的写整体放行;release store 会再做一次整 L2 写回。
+                    (comm_ops.store_i64_global_system_relaxed if pub_relaxed else comm_ops.store_i64_global_system)(
                         local_addr("h1_queue_eos"), generation
                     )
 

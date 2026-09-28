@@ -1115,6 +1115,12 @@ class MegaMoETileA4W4:
             early_local_gmm=os.environ.get("MEGAMOE_TK_S1_EARLY_LOCAL_GMM", "0") == "1",
             fan2_shards=int(os.environ.get("MEGAMOE_TK_S1_FAN2_SHARDS", "0")),
             post_nofan=os.environ.get("MEGAMOE_TK_S1_POST_NOFAN", "0") == "1",
+            remote_rev=os.environ.get("MEGAMOE_TK_S1_REMOTE_REV", "0") == "1",
+            local_defer=int(os.environ.get("MEGAMOE_TK_S1_LOCAL_DEFER", "0")),
+            seal_fast=os.environ.get("MEGAMOE_TK_S1_SEAL_FAST", "0") == "1",
+            lazy_pad=os.environ.get("MEGAMOE_TK_S1_LAZY_PAD", "0") == "1",
+            pub_relaxed=os.environ.get("MEGAMOE_TK_S1_PUB_RELAXED", "0") == "1",
+            claim_relaxed=os.environ.get("MEGAMOE_TK_S1_CLAIM_RELAXED", "0") == "1",
             gmm1_use_nt=(
                 os.environ.get("MEGAMOE_TK_S1_GMM_NT", "1") != "0"
             ),
