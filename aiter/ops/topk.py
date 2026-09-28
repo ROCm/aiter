@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
 
@@ -782,6 +782,15 @@ def _decode_cu_count(device_index: int) -> int:
     return min(override, physical) if override > 0 else physical
 
 
+@functools.lru_cache(maxsize=8)
+def _decode_arch(device_index: int) -> str:
+    """Arch of the device the logits live on, read like `_decode_cu_count`.
+
+    Not `get_gfx()`, which honours the build-time `GPU_ARCHS` and ignores the device.
+    """
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
+
+
 def decode_adaptive_width(width: int, max_row_len: int) -> int:
     """The row length the adaptive path should be gated and configured on.
 
@@ -835,11 +844,11 @@ def decode_backend_for_call(
     ):
         return BACKEND_UPSTREAM
 
-    arch = get_gfx()
+    device_index = logits.device.index
     width = logits.shape[1]
     backend = _decode_backend(
-        arch,
-        _decode_cu_count(logits.device.index),
+        _decode_arch(device_index),
+        _decode_cu_count(device_index),
         stable,
         width,
         num_rows,
