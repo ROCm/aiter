@@ -215,7 +215,7 @@ def _triton_call(case, out):
     return call, _positional(case, out)
 
 
-def _flydsl_call(case, out):
+def _flydsl_call(case, out, force_splits=None):
     from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
         build_flash_attn_fp8_gfx942,
     )
@@ -238,17 +238,18 @@ def _flydsl_call(case, out):
             window_size=(1023, 0),
             causal=True,
             softcap=0,
+            _force_splits=force_splits,
         )
 
     return call, _positional(case, out)
 
 
-def _timing_row(case, backend, tier, iterations):
+def _timing_row(case, backend, tier, iterations, force_splits=None):
     out = torch.empty(
         case["q"].shape, device="cuda", dtype=torch.bfloat16
     )
     call, positional = (
-        _flydsl_call(case, out) if backend == "flydsl" else _triton_call(case, out)
+        _flydsl_call(case, out, force_splits) if backend == "flydsl" else _triton_call(case, out)
     )
     footprint = sum(t.numel() * t.element_size() for t in positional)
     copies = max(2, math.ceil(CACHE_TARGET_BYTES / footprint))
@@ -347,7 +348,7 @@ def run_sliding_suite(args, specs, outputs):
                 backend = args.backend
                 _select_triton_tier(args.tier)
                 tier_name = "flydsl" if backend == "flydsl" else args.tier
-                row = _timing_row(case, backend, tier_name, args.iterations)
+                row = _timing_row(case, backend, tier_name, args.iterations, args.force_splits)
                 key = backend
                 if writers[key] is None:
                     writers[key] = csv.DictWriter(files[key], fieldnames=list(row))
@@ -372,6 +373,8 @@ def main():
     parser.add_argument("--output-dir", help="output directory when --backend all")
     parser.add_argument("--iterations", type=int, default=101)
     parser.add_argument("--case", help="run one named sliding-d256 case")
+    parser.add_argument("--force-splits", type=int, choices=range(1, 17), default=None,
+                        help="test-only FlyDSL decode split override")
     parser.add_argument("--page-size", type=int, choices=(32, 64), default=None)
     parser.add_argument(
         "--profile-once", action="store_true",
@@ -397,7 +400,7 @@ def main():
             parser.error(f"selected case not found: {args.case} page={args.page_size}")
         case = _make_case(specs[0])
         out = torch.empty(case["q"].shape, device="cuda", dtype=torch.bfloat16)
-        call, positional = _flydsl_call(case, out)
+        call, positional = _flydsl_call(case, out, args.force_splits)
         call(*positional)
         torch.cuda.synchronize()
         print(f"profile dispatch: FlyDSL {args.case} page={args.page_size}", flush=True)

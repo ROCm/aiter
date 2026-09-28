@@ -14,7 +14,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -64,8 +64,25 @@ def _pack4(values):
     )
 
 
-@lru_cache(maxsize=2)
-def build_flash_attn_fp8_gfx942(page_size=32):
+_workspaces = {}
+
+
+def _decode_splits(batch, max_q, max_k, page_size, cu_count, forced=None):
+    if max_q != 1:
+        return 1
+    if forced is not None:
+        if not isinstance(forced, int) or not 1 <= forced <= 16:
+            raise ValueError("forced split count must be in [1, 16]")
+        return forced
+    length = min(max_k, 1024) if max_k is not None else 0
+    if length < 512 or batch * 16 >= cu_count:
+        return 1
+    return max(1, min(16, (cu_count + batch * 16 - 1) // (batch * 16),
+                      length // 64, (length + page_size - 1) // page_size))
+
+
+@lru_cache(maxsize=32)
+def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
     """Build D256, Hq32/Hkv16, causal window1024 attention for page32/64.
 
     Each sequence has 1 <= q_len <= kv_len; decode and prefix-cached chunks
@@ -105,7 +122,8 @@ def build_flash_attn_fp8_gfx942(page_size=32):
         row = wave * 32 + lane % 32
         head = fx.Int32(gpu.block_id("x"))
         seq = fx.Int32(gpu.block_id("y"))
-        tile = fx.Int32(gpu.block_id("z"))
+        split = fx.Int32(gpu.block_id("z"))
+        tile = fx.Int32(0) if const_expr(_num_splits > 1) else split
         q0 = fx.Int32(fx.memref_load(CuQ, seq))
         qlen = fx.Int32(fx.memref_load(CuQ, seq + 1)) - q0
         klen = fx.Int32(fx.memref_load(UsedK, seq))
@@ -122,9 +140,21 @@ def build_flash_attn_fp8_gfx942(page_size=32):
 
         if tile * 32 < qlen:
             # A block-uniform guard keeps both waves participating in barriers.
+            if const_expr(_num_splits > 1):
+                lower = klen - 1024
+                start = (lower > 0).select(lower, fx.Int32(0)) // 32
+                end = (klen + 31) // 32
+                page_lo = start * 32 // page_size
+                page_hi = (end * 32 + page_size - 1) // page_size
+                pages = page_hi - page_lo
+                p0 = page_lo + pages * split // _num_splits
+                p1 = page_lo + pages * (split + 1) // _num_splits
             for i in range_constexpr(8):
                 j = tid + i * 128
-                if j < (klen + page_size - 1) // page_size:
+                copy_page = j < (klen + page_size - 1) // page_size
+                if const_expr(_num_splits > 1):
+                    copy_page = (j >= p0) & (j < p1)
+                if copy_page:
                     page = _load(
                         btp,
                         (fx.Int64(seq) * fx.Int64(bt_stride) + fx.Int64(j)) * 4,
@@ -155,6 +185,13 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             start = (lower > 0).select(lower, fx.Int32(0)) // 32
             upper = (tile * 32 + 32 < qlen).select(tile * 32 + 32, qlen)
             end = (upper + klen - qlen + 31) // 32
+            if const_expr(_num_splits > 1):
+                start = (start > p0 * (page_size // 32)).select(
+                    start, p0 * (page_size // 32)
+                )
+                end = (end < p1 * (page_size // 32)).select(
+                    end, p1 * (page_size // 32)
+                )
 
             def stage(block, slot):
                 for i in range_constexpr(4):
@@ -162,6 +199,9 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                     token = block * 32 + off // 256
                     d = off % 256
                     safe_token = (token < klen).select(token, fx.Int32(0))
+                    if const_expr(_num_splits > 1):
+                        # Tail lanes must read an initialized split-local page ID.
+                        safe_token = (token < klen).select(token, start * 32)
                     page = fx.Int32(
                         _load(lds.bt.ptr, (safe_token // page_size) * 4, T.i32, 4)
                     )
@@ -210,7 +250,11 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                 _load(lds.q.ptr, row * 260 + depth * 16 + half * 8, T.i64, 4)
                 for depth in range(16)
             ]
-            stage(start, fx.Int32(0))
+            if const_expr(_num_splits > 1):
+                if start < end:
+                    stage(start, fx.Int32(0))
+            else:
+                stage(start, fx.Int32(0))
             gpu.barrier()
             init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
                 fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(8)
@@ -296,25 +340,42 @@ def build_flash_attn_fp8_gfx942(page_size=32):
                 gpu.barrier()
                 result = yield [m, denom] + accum
 
-            qr = tile * 32 + row // 2
-            if qr < qlen:
-                norm = vscale / fx.Float32(result[1])
-                for dc in range_constexpr(8):
-                    vals = fx.Vector(result[dc + 2])
-                    for r in range_constexpr(8):
-                        d = dc * 32 + half * 4 + ((r * 2) // 4) * 8 + (r * 2) % 4
-                        dest = (
-                            (
-                                (fx.Int64(q0) + fx.Int64(qr)) * 32
-                                + fx.Int64(head * 2 + row % 2)
-                            )
-                            * 256
-                            + fx.Int64(d)
-                        ) * 2
-                        packed = _pack_bf16_pair(
-                            vals[r * 2] * norm, vals[r * 2 + 1] * norm
+            if const_expr(_num_splits > 1):
+                if row < 2:
+                    base = (((fx.Int64(seq) * 16 + fx.Int64(head)) * _num_splits
+                             + fx.Int64(split)) * 2 + fx.Int64(row)) * 258
+                    for dc in range_constexpr(8):
+                        vals = fx.Vector(result[dc + 2])
+                        for r in range_constexpr(16):
+                            d = dc * 32 + half * 4 + (r // 4) * 8 + r % 4
+                            _store(op, (base + fx.Int64(d)) * 4, vals[r], 4)
+                    if half == 0:
+                        denom = fx.Float32(result[1])
+                        maximum = (denom > 0.0).select(
+                            fx.Float32(result[0]), fx.Float32(float("-inf"))
                         )
-                        _store(op, dest, packed, 4)
+                        _store(op, (base + 256) * 4, maximum, 4)
+                        _store(op, (base + 257) * 4, denom, 4)
+            else:
+                qr = tile * 32 + row // 2
+                if qr < qlen:
+                    norm = vscale / fx.Float32(result[1])
+                    for dc in range_constexpr(8):
+                        vals = fx.Vector(result[dc + 2])
+                        for r in range_constexpr(8):
+                            d = dc * 32 + half * 4 + ((r * 2) // 4) * 8 + (r * 2) % 4
+                            dest = (
+                                (
+                                    (fx.Int64(q0) + fx.Int64(qr)) * 32
+                                    + fx.Int64(head * 2 + row % 2)
+                                )
+                                * 256
+                                + fx.Int64(d)
+                            ) * 2
+                            packed = _pack_bf16_pair(
+                                vals[r * 2] * norm, vals[r * 2 + 1] * norm
+                            )
+                            _store(op, dest, packed, 4)
 
     @flyc.jit
     def launch(
@@ -338,10 +399,57 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             grid=(16, batch, tiles), block=(128, 1, 1), stream=stream
         )
 
+    @flyc.kernel(known_block_size=(128, 1, 1))
+    def combine(Part: fx.Tensor, O: fx.Tensor, CuQ: fx.Tensor, VD: fx.Tensor):
+        tid = fx.Int32(gpu.thread_id("x"))
+        lane, row = tid % 64, tid // 64
+        head = fx.Int32(gpu.block_id("x"))
+        seq = fx.Int32(gpu.block_id("y"))
+        pp, op = fx.get_iter(Part), fx.get_iter(O)
+        base = ((fx.Int64(seq) * 16 + fx.Int64(head)) * _num_splits * 2
+                + fx.Int64(row)) * 258
+        maximum = fx.Float32(float("-inf"))
+        maxima, denoms = [], []
+        for s in range_constexpr(_num_splits):
+            offset = base + s * 2 * 258
+            m = fx.Float32(_load(pp, (offset + 256) * 4, T.f32, 4))
+            l = fx.Float32(_load(pp, (offset + 257) * 4, T.f32, 4))
+            maxima.append(m)
+            denoms.append(l)
+            maximum = maximum.maximumf((l > 0.0).select(m, fx.Float32(float("-inf"))))
+        total = fx.Float32(0.0)
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for s in range_constexpr(_num_splits):
+            valid = denoms[s] > 0.0
+            delta = valid.select(maxima[s], fx.Float32(0.0)) - valid.select(
+                maximum, fx.Float32(0.0)
+            )
+            weight = valid.select(_exp2(delta), fx.Float32(0.0))
+            total = total + weight * denoms[s]
+            vals = fx.Vector(_load(pp, (base + s * 2 * 258 + fx.Int64(lane * 4)) * 4,
+                                   fx.Vector.make_type(4, fx.Float32), 4))
+            acc = acc + vals * fx.Vector.filled(4, weight, fx.Float32)
+        norm = fx.Float32(fx.memref_load(VD, 0)) / (240.0 * (total > 0.0).select(
+            total, fx.Float32(1.0)
+        ))
+        norm = (total > 0.0).select(norm, fx.Float32(0.0))
+        q0 = fx.Int64(fx.memref_load(CuQ, seq))
+        dest = ((q0 * 32 + fx.Int64(head * 2 + row)) * 256 + fx.Int64(lane * 4)) * 2
+        for i in range_constexpr(2):
+            _store(op, dest + i * 4, _pack_bf16_pair(acc[i * 2] * norm,
+                                                   acc[i * 2 + 1] * norm), 4)
+
+    @flyc.jit
+    def launch_combine(Part: fx.Tensor, O: fx.Tensor, CuQ: fx.Tensor,
+                       VD: fx.Tensor, batch: fx.Int32,
+                       stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        combine(Part, O, CuQ, VD).launch(grid=(16, batch), block=(128, 1, 1), stream=stream)
+
     def mod(
         q, k, v, out, *, cu_seqlens_q, seqused_k, max_seqlen_q,
         block_table, softmax_scale, q_descale, k_descale, v_descale,
         window_size=(1023, 0), causal=True, max_seqlen_k=None, softcap=0,
+        workspace=None, _force_splits=None,
     ):
         import torch
 
@@ -386,13 +494,40 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             raise ValueError("all tensors must be on the same device")
         if block_table.shape[1] > 1024:
             raise ValueError("block table exceeds the 1024-entry LDS capacity")
+        splits = _decode_splits(
+            batch, max_seqlen_q, max_seqlen_k, page_size,
+            torch.cuda.get_device_properties(q.device).multi_processor_count, _force_splits,
+        )
+        if splits != _num_splits:
+            return build_flash_attn_fp8_gfx942(page_size, splits)(
+                q, k, v, out, cu_seqlens_q=cu_seqlens_q, seqused_k=seqused_k,
+                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+                block_table=block_table, softmax_scale=softmax_scale,
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                window_size=window_size, causal=causal, softcap=softcap,
+                workspace=workspace, _force_splits=_force_splits,
+            )
+        stream = torch.cuda.current_stream(q.device)
+        target = out
+        if splits > 1:
+            needed = batch * 16 * splits * 2 * 258
+            if workspace is None:
+                key = (q.device, stream.cuda_stream)
+                workspace = _workspaces.get(key)
+                if workspace is None or workspace.numel() < needed:
+                    workspace = torch.empty(needed, device=q.device, dtype=torch.float32)
+                    _workspaces[key] = workspace
+            if (workspace.device != q.device or workspace.dtype != torch.float32
+                    or not workspace.is_contiguous() or workspace.numel() < needed):
+                raise ValueError("workspace must be contiguous FP32 on Q's device with sufficient capacity")
+            target = workspace.view(-1)[:needed].view(batch, 16, splits, 2, 258)
         # FlyDSL packs each dynamic extent as i32. Preserve axes instead of
         # flattening multi-GiB tensors; global byte offsets remain 64-bit.
         launch(
             q.view(torch.int8),
             k.view(torch.int8),
             v.view(torch.int8),
-            out,
+            target,
             cu_seqlens_q,
             seqused_k,
             block_table,
@@ -400,11 +535,13 @@ def build_flash_attn_fp8_gfx942(page_size=32):
             k_descale.reshape(1),
             v_descale.reshape(1),
             seqused_k.numel(),
-            (max_seqlen_q + 31) // 32,
+            splits if splits > 1 else (max_seqlen_q + 31) // 32,
             block_table.stride(0),
             softmax_scale,
-            stream=torch.cuda.current_stream(q.device),
+            stream=stream,
         )
+        if splits > 1:
+            launch_combine(target, out, cu_seqlens_q, v_descale.reshape(1), batch, stream=stream)
         return out
 
     return mod

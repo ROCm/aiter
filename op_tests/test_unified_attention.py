@@ -496,6 +496,8 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
             1, 31, 32, 33, 63, 64, 65, 1023,
             1024, 1025, 2047, 4095, 4096, 4097, 8191, 8192,
         ]
+    elif workload == "decode-boundary":
+        query_lens, kv_lens = [1] * 3, [1023, 1024, 1025]
     elif workload == "window-boundary":
         query_lens, kv_lens = [33, 1], [1057, 1025]
     elif workload in ("cache-over-2gib", "cache-over-4gib"):
@@ -515,7 +517,7 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
     )
     case["window_size"] = (1023, 0)
     case["softmax_scale"] = scale
-    if workload == "window-boundary":
+    if workload in ("window-boundary", "decode-boundary"):
         # Uniform scores isolate the per-row window and shuffled-page addressing.
         case["q"] = torch.zeros(case["q"].shape, device="cuda").to(case["q"].dtype)
         n = case["v"].shape[0] * page
@@ -547,12 +549,34 @@ def test_gfx942_sliding(page, workload, scale=0.0625):
             large[first_page:].copy_(small)
             case[name] = large
         case["block_table"] = case["block_table"] + first_page
-    got = build_flash_attn_fp8_gfx942(page)(**case).float()
+    launch = build_flash_attn_fp8_gfx942(page)
+    got = launch(**case).float()
+    split_error = 0.0
+    if max(query_lens) == 1:
+        unsplit = launch(**case, _force_splits=1).float()
+        workspace = torch.full(
+            (len(kv_lens), 16, 16, 2, 258), 123.0, device="cuda", dtype=torch.float32
+        )
+        for splits in (1, 2, 5, 16):
+            for repeat in range(2):
+                workspace.fill_(123.0 + repeat)
+                split_out = launch(**case, workspace=workspace, _force_splits=splits).float()
+                tolerance = 0.08 * want.abs().max().item()
+                compare(want, split_out, tolerance, f"gfx942 split{splits} reference")
+                compare(unsplit, split_out, tolerance, f"gfx942 split{splits} unsplit")
+                split_error = max(split_error, (unsplit - split_out).abs().max().item())
+    else:
+        from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import _decode_splits
+
+        assert _decode_splits(len(kv_lens), max(query_lens), max(kv_lens), page, 304, 16) == 1
+        unchanged = launch(**case, _force_splits=16).float()
+        compare(got, unchanged, 0, "gfx942 mixed/prefill remains unsplit")
     error = (want - got).abs()
     # Keep the existing FP8 global-scale tolerance. Timing is a separate sweep.
     compare(want, got, 0.08 * want.abs().max().item(), "gfx942 sliding")
     return {
         "gfx": get_gfx_runtime(),
+        "split vs unsplit": split_error,
         "max abs": error.max().item(),
         "max rel": (error / want.abs().clamp_min(1e-6)).max().item(),
         "global rel": (error.max() / want.abs().max()).item(),
@@ -565,7 +589,7 @@ def main():
     if arch == "gfx942":
         workloads = [
             "prefill64", "prefill1024", "prefill4096",
-            "mixed", "decode16", "window-boundary",
+            "mixed", "decode16", "window-boundary", "decode-boundary",
         ]
         rows = [
             test_gfx942_sliding(page, workload)
@@ -581,7 +605,7 @@ def main():
             pd.DataFrame(rows).to_markdown(index=False),
         )
         aiter.logger.info(
-            "PASS: 15 gfx942 direct-launch cases; SKIP: eight gfx950-only groups"
+            "PASS: 17 gfx942 direct-launch cases (including forced splits 1/2/5/16); SKIP: eight gfx950-only groups"
         )
         return
     if get_gfx() != "gfx950" or arch != "gfx950":
