@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Explicitly opted-in stable MoE sorting for the measured M3 prefill contract.
+"""Stable MoE sorting for the M3 prefill contract selected by the caller.
 
 Three kernels: per-token-tile histogram, global offsets, parallel stable scatter.
 Contract: contiguous unique top-k routes, no expert mask/local-token indirection,
@@ -143,9 +143,6 @@ def tiled_sort(
     return (*result, m_indices, reverse) if output_aux else result
 
 
-_reported = False
-
-
 def try_m3_tiled_sort(
     topk_ids,
     topk_weights,
@@ -189,18 +186,10 @@ def try_m3_tiled_sort(
         and output_aux in (False, "opus")
     ):
         return None
-    from aiter import logger
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     if get_gfx_runtime() != "gfx950":
         return None
-    global _reported
-    if not _reported:
-        logger.info(
-            "M3 tiled MoE sort: tokens=32768, experts=129, topk=5, " "block=64, aux=%s",
-            output_aux,
-        )
-        _reported = True
     return tiled_sort(
         topk_ids,
         topk_weights,

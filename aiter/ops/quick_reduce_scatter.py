@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Experimental single-phase INT4 reduce-scatter using QuickReduce IPC state."""
+"""Single-phase INT4 reduce-scatter using QuickReduce IPC state."""
 
 import torch
 

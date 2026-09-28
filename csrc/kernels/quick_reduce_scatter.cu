@@ -144,8 +144,6 @@ void launch_quick_rs(DeviceComms* comm,
     HIP_CHECK(hipGetLastError());
 }
 
-// Kept in its own JIT module so developing this candidate never rebuilds or
-// replaces the all-reduce module used by the measured TP4 baseline.
 void qr_reduce_scatter(int64_t handle,
                        const aiter_tensor_t& input,
                        const aiter_tensor_t& output,
@@ -155,7 +153,7 @@ void qr_reduce_scatter(int64_t handle,
     if(!comm || !comm->initialized)
         throw std::invalid_argument("qr_reduce_scatter: uninitialized communicator");
     if(comm->world_size != 4)
-        throw std::invalid_argument("qr_reduce_scatter: experimental kernel supports SP4 only");
+        throw std::invalid_argument("qr_reduce_scatter: requires four ranks");
     if(!input.is_gpu() || input.device_id != output.device_id || input.dtype() != output.dtype() ||
        !input.is_contiguous() || !output.is_contiguous())
         throw std::invalid_argument("qr_reduce_scatter: device/dtype/contiguity mismatch");
