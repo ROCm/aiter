@@ -167,12 +167,11 @@ def _build_q_kernel(
     H_Q = num_heads_q
     HALF = D // 2
     # One head is owned by one 32-lane RMSNorm group: lane ``rl`` holds the
-    # ``PROD_VEC_SIZE`` contiguous columns starting at ``PROD_VEC_SIZE * rl``.
+    # ``D // RMS_GROUP`` contiguous columns starting at
+    # ``(D // RMS_GROUP) * rl``.
     # The NEOX partner of every column that lane ``rl`` holds lives in lane
     # ``rl ^ 16``, so the pair values come from one lane shuffle rather than a
     # second read of the row.
-    PROD_VEC_SIZE = D // RMS_GROUP
-    PAIRS_PER_LANE = PROD_VEC_SIZE // 2
     PARTNER_XOR = RMS_GROUP // 2
     ROWS_PER_WAVE = WAVE // RMS_GROUP
     Q_THREADS = waves_per_block * WAVE
@@ -205,21 +204,23 @@ def _build_q_kernel(
             )
         )
         layout_rms_tv = fx.make_ordered_layout(
-            (RMS_GROUP, PROD_VEC_SIZE), (1, 0)
+            (RMS_GROUP, D // RMS_GROUP), (1, 0)
         )
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
+        rms_values_per_lane = fx.size(layout_rms_values.shape).unpack()
         # Q lanes own contiguous RMS vectors, but their NEOX outputs are
         # ordered by (lane-within-half, lane-half, pair, rotary-half).
         layout_q_lane = fx.make_layout(
             (PARTNER_XOR, 2), stride=(1, PARTNER_XOR)
         )
         layout_q_pair_tv = fx.make_layout(
-            ((PARTNER_XOR, 2), (PAIRS_PER_LANE, 2)),
-            stride=((PROD_VEC_SIZE, PAIRS_PER_LANE), (1, HALF)),
+            ((PARTNER_XOR, 2), ((D // RMS_GROUP) // 2, 2)),
+            stride=((D // RMS_GROUP, (D // RMS_GROUP) // 2), (1, HALF)),
         )
         layout_q_pair_cols = fx.slice(
             layout_q_pair_tv, (None, (None, 0))
         )
+        pairs_per_lane = layout_q_pair_cols.shape[1].unpack()
         # [iteration, warp, row-within-wave] is the warp-value tiling of the
         # heads owned by one workgroup.
         layout_head_iter_wave_row = fx.make_ordered_layout(
@@ -231,7 +232,8 @@ def _build_q_kernel(
             q_out, fx.make_tile(None, None, layout_q_pair_tv)
         )
         copy_rms = fx.make_copy_atom(
-            fx.UniversalCopy(PROD_VEC_SIZE * fx.BFloat16.width), fx.BFloat16
+            fx.UniversalCopy(rms_values_per_lane * fx.BFloat16.width),
+            fx.BFloat16,
         )
 
         bid_head = fx.block_idx.x
@@ -254,7 +256,7 @@ def _build_q_kernel(
         # Head-independent work, hoisted out of the head loop: every head of
         # this token shares the same mrope cos/sin gather and norm weights.
         cos_vs, sin_vs, w0s, w1s = [], [], [], []
-        for p in range_constexpr(PAIRS_PER_LANE):
+        for p in range_constexpr(pairs_per_lane):
             col = fx.Int32(
                 fx.crd2idx((q_lane_coord, p), layout_q_pair_cols).unpack()
             )
@@ -285,7 +287,7 @@ def _build_q_kernel(
             own = rms_reg.load().to(fx.Float32)
 
             sumsq_local = fx.Float32(0.0)
-            for i in range_constexpr(PROD_VEC_SIZE):
+            for i in range_constexpr(rms_values_per_lane):
                 value = own[i]
                 sumsq_local = sumsq_local + value * value
             sumsq = rms_reduce_add(sumsq_local, rl, broadcast_half=False)
@@ -294,12 +296,12 @@ def _build_q_kernel(
             # The partner lane's columns complete this lane's NEOX pairs.
             peer = [
                 gpu.shuffle_xor(own[i], PARTNER_XOR, RMS_GROUP)
-                for i in range_constexpr(PROD_VEC_SIZE)
+                for i in range_constexpr(rms_values_per_lane)
             ]
 
-            for p in range_constexpr(PAIRS_PER_LANE):
-                x0 = is_low.select(own[p], peer[PAIRS_PER_LANE + p])
-                x1 = is_low.select(peer[p], own[PAIRS_PER_LANE + p])
+            for p in range_constexpr(pairs_per_lane):
+                x0 = is_low.select(own[p], peer[pairs_per_lane + p])
+                x1 = is_low.select(peer[p], own[pairs_per_lane + p])
                 xn0 = x0 * rstd * w0s[p]
                 xn1 = x1 * rstd * w1s[p]
                 o0 = xn0 * cos_vs[p] - xn1 * sin_vs[p]
@@ -380,22 +382,14 @@ def _build_kv_kernel(
 ):
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
-    PROD_VEC_SIZE = D // RMS_GROUP
     PAIR_LANES = min(WAVE, HALF)
-    PAIRS_PER_LANE = HALF // PAIR_LANES
-    WAVES_PER_BLOCK = KV_THREADS // WAVE
     # A phase group must cover both the RMS reduction group and the active
     # pair lanes. For D=64, the pair layout has 32 active lanes and lets each
     # wave process two token rows without duplicating pair work.
     COMPUTE_GROUP = max(RMS_GROUP, PAIR_LANES)
-    COMPUTE_GROUPS_PER_BLOCK = KV_THREADS // COMPUTE_GROUP
-    PHASE1_ITERS = _ceil_div(block_size, COMPUTE_GROUPS_PER_BLOCK)
     CACHE_FX_TYPE = fx.Int8 if cache_is_fp8 else fx.BFloat16
 
     STAGE_ELEMS = block_size * D
-    K_TOTAL_RUNS = (D // x) * block_size
-    V_TOTAL_RUNS = (block_size // x) * D
-    SCATTER_ELEMS = block_size * D
 
     @fx.struct
     class SharedStorage:
@@ -445,10 +439,15 @@ def _build_kv_kernel(
                 fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
             )
         )
-        layout_tx_wave_lane = fx.make_layout((WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1))
-        layout_tx_compute_pair_lane = fx.make_layout(
-            (COMPUTE_GROUPS_PER_BLOCK, COMPUTE_GROUP),
+        layout_thread_wave_lane = fx.make_layout(
+            (KV_THREADS // WAVE, WAVE), stride=(WAVE, 1)
+        )
+        layout_thread_compute_pair_lane = fx.make_layout(
+            (KV_THREADS // COMPUTE_GROUP, COMPUTE_GROUP),
             stride=(COMPUTE_GROUP, 1),
+        )
+        compute_groups_per_block = (
+            layout_thread_compute_pair_lane.shape[0].unpack()
         )
         # Explicit thread-value maps for each linear cooperative walk. Keeping
         # the thread mode unit-stride makes ownership visible as
@@ -457,66 +456,92 @@ def _build_kv_kernel(
             (WAVE, _ceil_div(block_size, WAVE)), stride=(1, WAVE)
         )
         layout_phase1_token_tv = fx.make_layout(
-            (COMPUTE_GROUPS_PER_BLOCK, PHASE1_ITERS),
-            stride=(1, COMPUTE_GROUPS_PER_BLOCK),
+            (
+                compute_groups_per_block,
+                _ceil_div(block_size, compute_groups_per_block),
+            ),
+            stride=(1, compute_groups_per_block),
         )
-
-        def make_linear_tv(total_items):
-            """Map each thread/iteration pair to a linear work item."""
-            return fx.make_layout(
-                (KV_THREADS, _ceil_div(total_items, KV_THREADS)),
-                stride=(1, KV_THREADS),
-            )
-
-        layout_k_run_tv = make_linear_tv(K_TOTAL_RUNS)
-        layout_v_run_tv = make_linear_tv(V_TOTAL_RUNS)
-        layout_scatter_tv = make_linear_tv(SCATTER_ELEMS)
         # Two logical ownership maps of D are used:
         #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
         #  * NEOX pairs: active lanes own strided columns in [0, D/2), with
         #    [pair, half] kept as one value mode.
         layout_rms_tv = fx.make_ordered_layout(
-            (RMS_GROUP, PROD_VEC_SIZE), (1, 0)
+            (RMS_GROUP, D // RMS_GROUP), (1, 0)
         )
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
+        rms_values_per_lane = fx.size(layout_rms_values.shape).unpack()
         layout_pair_tv = fx.make_layout(
-            (PAIR_LANES, (PAIRS_PER_LANE, 2)),
+            (PAIR_LANES, (HALF // PAIR_LANES, 2)),
             stride=(1, (PAIR_LANES, HALF)),
         )
         layout_pair_cols = fx.slice(layout_pair_tv, (None, (None, 0)))
+        pairs_per_lane = layout_pair_cols.shape[1].unpack()
         layout_stage = fx.make_ordered_layout((block_size, D), (1, 0))
         layout_run = fx.make_layout(x, stride=1)
         # Group D or the token axis of layout_stage into x-runs.
         layout_d_runs = fx.make_ordered_layout((D // x, x), (1, 0))
         layout_token_runs = fx.make_ordered_layout((block_size // x, x), (1, 0))
+        # Compact scans of cache rest after dropping the inner x-run
+        # (token/D fastest).
+        layout_k_runs = fx.make_ordered_layout((D // x, block_size), (1, 0))
+        layout_v_runs = fx.make_ordered_layout((block_size // x, D), (1, 0))
+        # Per-head cache layouts are the source of truth for the nested shape
+        # and physical strides: x is fastest, followed by token/D, then the
+        # outer D/token tile.
+        layout_k_head = fx.make_ordered_layout(
+            ((D // x, x), block_size), ((2, 0), 1)
+        )
+        layout_v_head = fx.make_ordered_layout(
+            ((block_size // x, x), D), ((2, 0), 1)
+        )
         # Keep each physical x-run nested inside its logical D/token mode and
         # encode the possibly-strided physical block mode in the same view.
         # K is indexed as [block, head, d, token], and V as
         # [block, head, token, d].
         layout_k_cache = fx.make_layout(
-            (k_cache.shape[0], H_KV, (D // x, x), block_size),
+            (
+                k_cache.shape[0],
+                H_KV,
+                layout_k_head.shape[0],
+                layout_k_head.shape[1],
+            ),
             stride=(
                 k_cache_block_stride,
-                D * block_size,
-                (block_size * x, 1),
-                x,
+                fx.cosize(layout_k_head),
+                layout_k_head.stride[0],
+                layout_k_head.stride[1],
             ),
         )
         layout_v_cache = fx.make_layout(
-            (v_cache.shape[0], H_KV, (block_size // x, x), D),
+            (
+                v_cache.shape[0],
+                H_KV,
+                layout_v_head.shape[0],
+                layout_v_head.shape[1],
+            ),
             stride=(
                 v_cache_block_stride,
-                block_size * D,
-                (D * x, 1),
-                x,
+                fx.cosize(layout_v_head),
+                layout_v_head.stride[0],
+                layout_v_head.stride[1],
             ),
         )
-        # Compact scans of cache rest after dropping the inner x-run
-        # (token/D fastest).
-        layout_k_runs = fx.make_ordered_layout((D // x, block_size), (1, 0))
-        layout_v_runs = fx.make_ordered_layout((block_size // x, D), (1, 0))
+
+        def make_linear_tv(item_layout):
+            """Map each thread/iteration pair over an item's layout."""
+            total_items = fx.size(item_layout.shape).unpack()
+            return fx.make_layout(
+                (KV_THREADS, _ceil_div(total_items, KV_THREADS)),
+                stride=(1, KV_THREADS),
+            )
+
+        layout_k_run_tv = make_linear_tv(layout_k_runs)
+        layout_v_run_tv = make_linear_tv(layout_v_runs)
+        layout_scatter_tv = make_linear_tv(layout_stage)
         copy_rms = fx.make_copy_atom(
-            fx.UniversalCopy(PROD_VEC_SIZE * fx.BFloat16.width), fx.BFloat16
+            fx.UniversalCopy(rms_values_per_lane * fx.BFloat16.width),
+            fx.BFloat16,
         )
         copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), CACHE_FX_TYPE)
 
@@ -525,7 +550,7 @@ def _build_kv_kernel(
             fx.copy_atom_call(copy_rms, tile, reg)
             values = reg.load().to(fx.Float32)
             acc = fx.Float32(0.0)
-            for i in range_constexpr(PROD_VEC_SIZE):
+            for i in range_constexpr(rms_values_per_lane):
                 value = values[i]
                 acc = acc + value * value
             return acc
@@ -555,12 +580,12 @@ def _build_kv_kernel(
                 mapping_valid = mapping_valid & peer_valid
             return mapping_valid
 
-        def owned_run(thread, it, tv_layout, total_runs, run_layout):
+        def owned_run(thread, it, tv_layout, run_layout):
             """Map one thread iteration to ``(valid, mode0, mode1)``."""
             run = fx.crd2idx((thread, it), tv_layout).unpack()
             coord = fx.idx2crd(run, run_layout)
             return (
-                run < total_runs,
+                run < fx.size(run_layout.shape).unpack(),
                 fx.get_(coord, 0).unpack(),
                 fx.get_(coord, 1).unpack(),
             )
@@ -606,10 +631,12 @@ def _build_kv_kernel(
 
         # The final logical page may be partial, so guard token-sized inputs
         # and outputs. Phase 2 sends partial pages through the scatter path.
-        coord_wl = fx.idx2crd(t, layout_tx_wave_lane)
+        coord_wl = fx.idx2crd(t, layout_thread_wave_lane)
         wid = fx.Int32(fx.get_(coord_wl, 0).unpack())
         lane = fx.Int32(fx.get_(coord_wl, 1).unpack())
-        coord_compute_pair_lane = fx.idx2crd(t, layout_tx_compute_pair_lane)
+        coord_compute_pair_lane = fx.idx2crd(
+            t, layout_thread_compute_pair_lane
+        )
         compute_group = fx.Int32(fx.get_(coord_compute_pair_lane, 0).unpack())
         pair_lane = fx.Int32(fx.get_(coord_compute_pair_lane, 1).unpack())
 
@@ -628,7 +655,7 @@ def _build_kv_kernel(
         k_lds_lane_pairs = fx.slice(k_lds_pair_view, (None, lane_coord))
         v_lds_lane_pairs = fx.slice(v_lds_pair_view, (None, lane_coord))
         pair_cols, w0s, w1s = [], [], []
-        for p in range_constexpr(PAIRS_PER_LANE):
+        for p in range_constexpr(pairs_per_lane):
             col = fx.Int32(
                 fx.crd2idx((pair_lane, p), layout_pair_cols).unpack()
             )
@@ -645,7 +672,7 @@ def _build_kv_kernel(
             v_out_pair_view = fx.composition(v_out, pair_tile_3d)
             k_out_lane_pairs = fx.slice(k_out_pair_view, (None, None, lane_coord))
             v_out_lane_pairs = fx.slice(v_out_pair_view, (None, None, lane_coord))
-        for it in range_constexpr(PHASE1_ITERS):
+        for it in range_constexpr(layout_phase1_token_tv.shape[1].unpack()):
             token_local = fx.crd2idx(
                 (compute_group, it), layout_phase1_token_tv
             ).unpack()
@@ -687,7 +714,7 @@ def _build_kv_kernel(
                         if const_expr(emit_flat_kv)
                         else None
                     )
-                    for p in range_constexpr(PAIRS_PER_LANE):
+                    for p in range_constexpr(pairs_per_lane):
                         k0 = fx.Float32(k_pairs[p, 0])
                         k1 = fx.Float32(k_pairs[p, 1])
 
@@ -753,7 +780,7 @@ def _build_kv_kernel(
             )
             for it in range_constexpr(layout_k_run_tv.shape[1].unpack()):
                 valid, chunk_k, block_off = owned_run(
-                    t, it, layout_k_run_tv, K_TOTAL_RUNS, layout_k_runs
+                    t, it, layout_k_run_tv, layout_k_runs
                 )
                 if valid:
                     src_k = fx.slice(k_lds_runs, (block_off, (chunk_k, None)))
@@ -767,7 +794,7 @@ def _build_kv_kernel(
 
             for it in range_constexpr(layout_v_run_tv.shape[1].unpack()):
                 valid, tile, d = owned_run(
-                    t, it, layout_v_run_tv, V_TOTAL_RUNS, layout_v_runs
+                    t, it, layout_v_run_tv, layout_v_runs
                 )
                 if valid:
                     src_v = fx.slice(v_lds_runs, ((tile, None), d))
