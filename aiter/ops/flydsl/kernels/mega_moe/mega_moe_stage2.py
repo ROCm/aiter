@@ -3,6 +3,8 @@
 # ruff: noqa: B023, I001
 """Fused GEMM2 and weighted cross-rank P2P scatter."""
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -34,6 +36,29 @@ from .gemm2 import (
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 
 
+def _quad_xor_f32(src, offset):
+    """``src`` from lane ``lane ^ offset`` (offset 1 or 2) via a quad-permute DPP move."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    ctrl = {1: 0xB1, 2: 0x4E}[offset]  # quad_perm [1,0,3,2] / [2,3,0,1]
+    src_i32 = fx.Float32(src).bitcast(fx.Int32)
+    out = _llvm.call_intrinsic(
+        fx.Int32.ir_type,
+        "llvm.amdgcn.update.dpp.i32",
+        [
+            src_i32.ir_value(),
+            src_i32.ir_value(),
+            fx.Int32(ctrl).ir_value(),
+            fx.Int32(0xF).ir_value(),
+            fx.Int32(0xF).ir_value(),
+            fx.Boolean(False).ir_value(),
+        ],
+        [],
+        [],
+    )
+    return fx.Int32(out).bitcast(fx.Float32)
+
+
 @flyc.jit
 def _fp8_scale_for_leader(is_leader, local_max):
     e8m0 = fx.Int32(0)
@@ -53,7 +78,7 @@ def _fp8_scale_for_leader(is_leader, local_max):
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", scatter_vec=8):
+    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", scatter_vec=8, fast_fp8=False):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers."""
     kMChunks = BM // 16
@@ -167,7 +192,86 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             )
             if const_expr(not quant_fp8):
                 pk = weighted_v8.to(fx.BFloat16)
-        if const_expr(quant_fp8):
+        if const_expr(quant_fp8 and fast_fp8):
+            # Every lane of a 1x32 group (4 lanes of 8 values) reduces the group
+            # max with two quad DPP moves and derives the same E8M0 itself; the
+            # group scales of the row are then packed into one 4/8-byte store
+            # instead of one peer byte store per group.
+            vals = [
+                fx.Float32(weighted_v8[i]) for i in range_constexpr(scatter_vec)
+            ]
+            local_max = fabs_f32(vals[0])
+            for q in range_constexpr(1, scatter_vec):
+                local_max = local_max.maximumf(fabs_f32(vals[q]))
+            for xor_lane in (1, 2):
+                if xor_lane < 32 // scatter_vec:
+                    local_max = local_max.maximumf(
+                        _quad_xor_f32(local_max, xor_lane)
+                    )
+            e8m0 = _fp8_scale_for_leader(fx.Boolean(True), local_max)
+            block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+            pk_ty = T.vec(2, T.i16)
+            packed_words = []
+            for word in range_constexpr(scatter_vec // 4):
+                packed_word = fx.Vector.filled(2, 0, fx.Int16).ir_value()
+                for pair in range_constexpr(2):
+                    value = word * 4 + pair * 2
+                    packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
+                        pk_ty,
+                        packed_word,
+                        vals[value].ir_value(),
+                        vals[value + 1].ir_value(),
+                        block_scale.ir_value(),
+                        pair,
+                    )
+                packed_words.append(fx.Vector(packed_word).bitcast(fx.Int32)[0])
+            payload = fx.Vector.from_elements(packed_words, fx.Int32)
+            payload_off = (valid & active).select(row_off + col, fx.Int32(comb_inp_nbytes))
+            payload_words = scatter_vec // 4
+            payload_buf = ptr_buf_tensor(
+                peer_base,
+                fx.Int32,
+                unit_elems=payload_words,
+                num_records_bytes=comb_inp_nbytes,
+            )
+            buf_copy_store(
+                payload_buf,
+                payload_off // fx.Int32(scatter_vec),
+                payload,
+                fx.Int32,
+                unit_elems=payload_words,
+                cache_modifier=2,
+            )
+            scale_group_lanes = 32 // scatter_vec
+            n_groups = BN // 32
+            group_scales = [
+                fx.Int32(rocdl.readlane(T.i32, e8m0, g * scale_group_lanes))
+                for g in range_constexpr(n_groups)
+            ]
+            scale_words = []
+            for w in range_constexpr((n_groups + 3) // 4):
+                word = fx.Int32(0)
+                for b in range_constexpr(min(4, n_groups - w * 4)):
+                    word = word | (group_scales[w * 4 + b] << fx.Int32(8 * b))
+                scale_words.append(word)
+            scale_base = row_base + fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN // 32)
+            scale_lane = lane == fx.Int32(0)
+            scale_off = (valid & scale_lane).select(scale_base, fx.Int32(comb_inp_nbytes))
+            scale_buf = ptr_buf_tensor(
+                peer_base,
+                fx.Int32,
+                unit_elems=len(scale_words),
+                num_records_bytes=comb_inp_nbytes,
+            )
+            buf_copy_store(
+                scale_buf,
+                scale_off // fx.Int32(4 * len(scale_words)),
+                fx.Vector.from_elements(scale_words, fx.Int32) if len(scale_words) > 1 else scale_words[0],
+                fx.Int32,
+                unit_elems=len(scale_words),
+                cache_modifier=2,
+            )
+        elif const_expr(quant_fp8):
             vals = [
                 fx.Float32(weighted_v8[i]) for i in range_constexpr(scatter_vec)
             ]
@@ -363,6 +467,15 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     class SharedStorage:
         buf: fx.Array[Int8, lds_bytes, 16]
 
+    # FP8 peer scatter: DPP group max computed by every lane, one packed scale
+    # store per row (instead of ds_bpermute max/broadcast and a byte per group).
+    FAST_FP8 = p2p_quant_type == "fp8_blockwise_1x32" and (
+        os.environ.get("AITER_MEGA_S2_FAST_FP8", "0") == "1"
+    )
+    # Fully unrolled GEMM2 K loop (K = INTER_MAX, the weights' inter_dim).
+    STATIC_K = (not has_pad) and os.environ.get("AITER_MEGA_S2_STATIC_K", "0") == "1"
+    # Occupancy hint (the unrolled static-K loop otherwise grows past 256 VGPRs).
+    S2_WPE = int(os.environ.get("AITER_MEGA_S2_WPE", "0"))
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     kernel_name = (
         f"megamoe_stage2_{dispatch_path}_t{BM}x{BN}x{BK}"
@@ -373,6 +486,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
         f"_rps{int(runtime_pair_skip)}_rtv3{int(runtime_pair_skip)}"
         f"_sv{scatter_vec}_tb2_rsm1"
+        f"{'_ff8' if FAST_FP8 else ''}"
+        f"{'_stk' if STATIC_K else ''}"
+        f"{f'_wpe{S2_WPE}' if S2_WPE else ''}"
         f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
     TRACE_BASE = _trace.trace_base("stage2")
@@ -505,13 +621,19 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
                 i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
                 a_dtype=a_dtype, has_pad=has_pad, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-                expert_offset=_expert_offset)
+                expert_offset=_expert_offset, static_k=STATIC_K)
+            if const_expr(TRACE_BASE):
+                if tx_i32 == fx.Int32(0):
+                    _trace.record(TRACE_BASE, bx_i32, 3, _trace.now())
             p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT,
                 BM=BM, BN=BN, npes=npes, topk=topk,
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=_recv_cap,
                 comb_inp_nbytes=_comb_inp_nbytes, lds_packed_off=lds_packed_off,
                 lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
-                p2p_quant_type=p2p_quant_type, scatter_vec=scatter_vec)
+                p2p_quant_type=p2p_quant_type, scatter_vec=scatter_vec, fast_fp8=FAST_FP8)
+            if const_expr(TRACE_BASE):
+                if tx_i32 == fx.Int32(0):
+                    _trace.record(TRACE_BASE, bx_i32, 4, _trace.now())
             # fmt: on
 
         def run_unskipped_unit(unit_bx, m_block_idx):
@@ -635,6 +757,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             arg_pair_config, arg_parity,
             arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
             i32_hidden, i32_kpad, i32_npad,
+            **({"value_attrs": {"rocdl.waves_per_eu": S2_WPE,
+                                "rocdl.flat_work_group_size": "256,256"}} if S2_WPE else {}),
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch

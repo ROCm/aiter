@@ -223,6 +223,9 @@ def compile_mega_moe_stage1(
     )
     PRODUCER_FENCE = os.environ.get("AITER_MEGA_S1_PRODUCER_FENCE", "1") == "1"
     OWNER_LIGHT = os.environ.get("AITER_MEGA_S1_OWNER_LIGHT", "0") == "1"
+    # Compact producers read two route ids back to back and keep both rows' loads
+    # in flight before storing (instead of ~4 dependent load round trips per row).
+    DISPATCH_FAST_COPY = os.environ.get("AITER_MEGA_DISPATCH_FAST_COPY", "0") == "1"
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
@@ -242,6 +245,7 @@ def compile_mega_moe_stage1(
         f"{'' if PRODUCER_FENCE else '_nopf'}"
         f"{'_ol' if OWNER_LIGHT else ''}"
         f"_ev{os.environ.get('AITER_MEGA_S1_EPI_EVEC', '8')}"
+        f"{'_fc' if DISPATCH_FAST_COPY and not fixed_slot_dispatch else ''}"
         f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
     TRACE_BASE = _trace.trace_base("stage1")
@@ -465,6 +469,7 @@ def compile_mega_moe_stage1(
                     chunks_per_destination=chunks_per_destination,
                     tile_state_stride=tile_state_stride,
                     indexed_payload=indexed_payload,
+                    fast_copy=DISPATCH_FAST_COPY,
                 )
         if const_expr(fixed_slot_dispatch):
             if is_owner:
