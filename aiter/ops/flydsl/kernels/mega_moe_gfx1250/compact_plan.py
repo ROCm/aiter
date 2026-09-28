@@ -131,6 +131,7 @@ def compile_tdm_compact_plan(
     hist_stride: int,
     max_routes: int,
     hist_pingpong: bool = True,
+    plan_waves: int | None = None,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -138,6 +139,12 @@ def compile_tdm_compact_plan(
     arena by ``gen & 1``. Double-buffered callers pass a slot-specific
     ``off_hist`` / ``off_done`` and set this False so two in-flight plans do
     not share a done counter.
+
+    ``max_routes`` sizes the histogram layout and the LDS route table, which
+    every rank of a step must share. ``plan_waves`` is only the launch width:
+    a decode step passes the wave count for its own route count so the plan
+    stays one small block beside the expert GEMM. Omit it to use the width
+    ``max_routes`` itself selects.
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -152,8 +159,17 @@ def compile_tdm_compact_plan(
     max_routes = max(1, int(max_routes))
     hist_pingpong = bool(hist_pingpong)
     plan_blocks = PLAN_BLOCKS
-    plan_waves = compact_plan_waves(npes=npes, max_routes=max_routes)
+    default_waves = compact_plan_waves(npes=npes, max_routes=max_routes)
+    if plan_waves is None:
+        plan_waves = default_waves
+    else:
+        plan_waves = max(int(npes), int(plan_waves))
     plan_threads = plan_waves * WAVE
+    kernel_name = (
+        "tdm_compact_plan"
+        if plan_waves == default_waves
+        else f"tdm_compact_plan_w{plan_waves}"
+    )
     peer_bits = max(1, (int(npes) - 1).bit_length())
     peer_mask = (1 << peer_bits) - 1
     if compact_cap >= (1 << (31 - peer_bits)):
@@ -178,7 +194,7 @@ def compile_tdm_compact_plan(
         route_vec = 1
     dropped = -1
 
-    @flyc.kernel(name="tdm_compact_plan", known_block_size=[plan_threads, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[plan_threads, 1, 1])
     def kernel(
         arena: Int64,
         addr_inp_idx: Int64,
