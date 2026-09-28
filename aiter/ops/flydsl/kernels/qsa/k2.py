@@ -1305,6 +1305,9 @@ def qsa_k2(
         softmax_scale = head_dim**-0.5
     if not rows or not indices.shape[1]:
         return out.zero_()
+    # Nothing to gather. Clamping the index to 0 would still load.
+    if k_cache.shape[0] == 0 or page_table.shape[1] == 0:
+        return out.zero_()
 
     q = q.contiguous()
     k_cache = k_cache.contiguous()
