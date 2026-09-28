@@ -218,8 +218,8 @@ def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
 def test_mxscale_launch_plan_cache_is_bounded(monkeypatch):
     calls = []
 
-    def resolve(g, m, n, k, *, group_size=128):
-        calls.append((g, m, n, k, group_size))
+    def resolve(g, m, n, k, *, w_scale_block="128x128"):
+        calls.append((g, m, n, k, w_scale_block))
         return 8000, 1
 
     monkeypatch.setattr(
@@ -251,9 +251,9 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
 
     config_path = tmp_path / "mxscale.csv"
     config_path.write_text(
-        "gfx,b,m,n,k,libtype,kernelId,splitK\n"
-        "gfx950,2,1,1024,4096,opus,8001,1\n"
-        "gfx950,3,1,1024,4096,other,42,1\n"
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,2,1,1024,4096,128x128,opus,8001,1\n"
+        "gfx950,3,1,1024,4096,128x128,other,42,1\n"
     )
     warnings = []
     monkeypatch.setattr(
@@ -274,17 +274,13 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     policy.lookup_mxscale_bmm_config.cache_clear()
     try:
         rows = policy._load_mxscale_bmm_tuned(None, False)
-        assert rows[("gfx950", 3, 1, 1024, 4096, 128)]["kernelId"] == 42
+        assert rows[("gfx950", 3, 1, 1024, 4096, "128x128")]["kernelId"] == 42
         assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
             8640,
             1,
         )
-        assert len(warnings) == 2
-        assert any("assuming groupSize=128" in warning[0] for warning in warnings)
-        assert any(
-            warning[0].startswith("Skipping %d invalid OPUS row")
-            for warning in warnings
-        )
+        assert len(warnings) == 1
+        assert warnings[0][0].startswith("Skipping %d invalid OPUS row")
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()

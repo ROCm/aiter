@@ -18,6 +18,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .gemm_op_common import mxscale_w_scale_block
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
@@ -158,6 +159,15 @@ def batched_gemm_a8w8_CK(
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
+def _mxscale_bmm_tuned_path(bpreshuffle: bool) -> str:
+    """Tuned table for one weight layout; preshuffled rows live in their own CSV."""
+    return (
+        AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+        if bpreshuffle
+        else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    )
+
+
 @functools.cache
 def _get_mxscale_bmm_launchers():
     """Resolve the checked split-1 launcher and workspace planner once."""
@@ -167,15 +177,51 @@ def _get_mxscale_bmm_launchers():
     return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
 
 
+# One implementation, in opus.policy: two lookups reading one table is exactly
+# the drift that picks a kid for the wrong B layout. These names stay for the
+# callers of this module.
+def _load_mxscale_bmm_tuned(
+    libtype: str | None = None, bpreshuffle: bool = False
+) -> dict:
+    """{(gfx,b,m,n,k,w_scale_block): row} from the mxscale BMM tuned CSV."""
+    from .opus.policy import _load_mxscale_bmm_tuned as load
+
+    return load(libtype, bpreshuffle)
+
+
+def lookup_mxscale_bmm_config(
+    b: int,
+    m: int,
+    n: int,
+    k: int,
+    *,
+    w_scale_block: str = "128x128",
+    libtype: str | None = None,
+    bpreshuffle: bool = False,
+):
+    """Exact tuned row for this shape and weight-scale block, else one at a
+    padded M; None when no level hits. The row is shared: treat it as read-only."""
+    from .opus.policy import lookup_mxscale_bmm_config as lookup
+
+    return lookup(
+        b, m, n, k, w_scale_block=w_scale_block, libtype=libtype, bpreshuffle=bpreshuffle
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _w_scale_block_of(w_scale_shape: tuple, n: int, k: int) -> str:
+    return mxscale_w_scale_block(w_scale_shape, n, k)
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_mxscale_bmm_launch_plan(
     g: int,
     m: int,
     n: int,
     k: int,
-    group_size: int = 128,
+    w_scale_block: str = "128x128",
 ) -> tuple[int, int]:
-    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k, group_size=group_size)
+    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k, w_scale_block=w_scale_block)
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -184,7 +230,6 @@ def _batched_gemm_a8w8_mxscale_impl(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    group_size: int = 128,
 ) -> Tensor:
     # This body executes behind the public custom-op boundary, so real eager
     # tensors carry concrete integer dimensions here.  Avoid four redundant
@@ -192,7 +237,8 @@ def _batched_gemm_a8w8_mxscale_impl(
     m, g, k = x.shape
     n = wo_a.shape[1]
     raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
-    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, group_size)
+    w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, w_scale_block)
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:
@@ -231,7 +277,6 @@ def _batched_gemm_a8w8_mxscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    group_size: int = 128,
 ) -> Tensor:
     return torch.empty(
         (x.shape[0], x.shape[1], wo_a.shape[1]),
@@ -247,17 +292,14 @@ def batched_gemm_a8w8_mxscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    group_size: int = 128,
 ) -> Tensor:
     """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``.
 
-    ``group_size`` is the quantisation block of ``x_scale`` / ``w_scale``, 128
-    or 32 (MX); it picks the tuned row and the kernel, since a kernel built for
-    the other block reads the scales at the wrong stride.
+    The w_scale block (``[G, N/block, K/block]``, 128x128 or 32x32) picks the
+    tuned row and the kernel, since a kernel built for the other block reads the
+    scales at the wrong stride.
     """
-    return _batched_gemm_a8w8_mxscale_impl(
-        x, wo_a, x_scale, w_scale, dtype=dtype, group_size=group_size
-    )
+    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
 
 
 # Same family, preshuffled weight.
@@ -267,32 +309,25 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    group_size: int = 128,
 ) -> Tensor:
     """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
 
-    Two backends carry a preshuffled B and they want different activation scale
-    layouts, so the tuned row's libtype decides both which kernel runs and which
-    ``x_scale`` the caller must have produced -- see the public entry.
+    The preshuffle table holds both backends' kernels -- each row names the
+    faster of opus and flydsl for its shape and w_scale block -- so the row's
+    libtype picks the backend. A shape without a row runs flydsl's heuristic.
     """
-    # One implementation, in policy.py: this module used to carry a second copy
-    # that differed only by the bpreshuffle switch, and two lookups reading two
-    # tables is exactly the drift that picks a kid for the wrong B layout.
-    from .opus.policy import lookup_mxscale_bmm_config
-
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
+    w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
 
-    cfg = lookup_mxscale_bmm_config(g, m, n, k, bpreshuffle=True, group_size=group_size)
-    if cfg is not None:
-        libtype = cfg["libtype"]
-    else:
-        # Untuned shapes: opus carries a shape heuristic, the gfx1250 flydsl path
-        # does not, so the arch picks the fallback.
-        libtype = "flydsl" if get_gfx() == "gfx1250" else "opus"
+    cfg = lookup_mxscale_bmm_config(
+        g, m, n, k, w_scale_block=w_scale_block, bpreshuffle=True
+    )
+    libtype = cfg["libtype"] if cfg is not None else "flydsl"
 
     if libtype == "opus":
         from .opus.gemm_op_a8w8 import bmm_a8w8_mxscale_opus
+        from .opus.policy import mxscale_bmm_group_of_block
 
         # Whether the tuned kernel can run this M, whether it reads B in the
         # declared layout, and what to do when it cannot, is the backend's job.
@@ -303,20 +338,24 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
             w_scale,
             None,
             dtype=dtype,
-            kernelId=int(cfg["kernelId"]) if cfg is not None else None,
-            splitK=int(cfg["splitK"]) if cfg is not None else None,
+            kernelId=int(cfg["kernelId"]),
+            splitK=int(cfg["splitK"]),
             b_preshuffled=True,
-            group_size=group_size,
+            group_size=mxscale_bmm_group_of_block(w_scale_block),
         )
 
     if libtype == "flydsl":
-        if group_size != 128:
-            raise NotImplementedError(
-                f"the gfx1250 flydsl preshuffled-B BMM has no group_size={group_size} kernel"
-            )
-        from .flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_128_gfx1250
+        from .flydsl.batched_gemm_a8w8 import (
+            bmm_a8w8_mxfp8_supported,
+            run_bmm_a8w8_mxfp8,
+        )
 
-        return run_bmm_a8w8_mxfp8_128_gfx1250(
+        if not bmm_a8w8_mxfp8_supported(w_scale_block):
+            raise NotImplementedError(
+                f"no preshuffled mxscale BMM kernel reads a {w_scale_block} w_scale "
+                f"on {get_gfx()}"
+            )
+        return run_bmm_a8w8_mxfp8(
             x,
             wo_a,
             x_scale,
@@ -339,39 +378,38 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    group_size: int = 128,
 ) -> Tensor:
-    """fp8 e8m0 mxscale batched GEMM whose ``wo_a`` is already preshuffled.
+    """fp8 e8m0 mxscale batched GEMM with a preshuffled weight.
 
     Same math as ``batched_gemm_a8w8_mxscale``, but ``wo_a`` was baked into the
-    (16, 16) MFMA-fragment layout (``aiter.ops.shuffle.shuffle_weight``) at load
-    time, which a serving stack does offline and cannot express any other way.
-    That is why it is a separate entry rather than a flag: the shuffled weight
-    has the same shape, dtype and strides as the row-major one, so a mismatched
-    kernel reads the right bytes in the wrong order and returns a plausible wrong
-    answer instead of failing. The entry also picks the tuned CSV, so the two
-    layouts cannot pull each other's rows.
+    (16, 16) MFMA-fragment layout at load time. That is why it is a separate
+    entry rather than a flag: the shuffled weight has the same shape, dtype and
+    strides as the row-major one, so a mismatched kernel reads the right bytes in
+    the wrong order and returns a plausible wrong answer instead of failing. The
+    entry also picks the tuned CSV, so the two layouts cannot pull each other's
+    rows.
 
-    * ``x``          : [M, G, K] fp8 activation, token-major and contiguous.
-    * ``wo_a``       : [G, N, K] fp8 weight, preshuffled as above.
-    * ``w_scale``    : [G, N/group_size, K/group_size] uint8 e8m0.
-    * ``x_scale``    : [M, G, K/group_size] uint8 e8m0, row-major, i.e.
-                       ``inverse_rope_group_quant(..., scale_layout="row")``.
-                       Both backends read it that way; the opus kernels that
-                       wanted a rearranged scale are not built.
-    * ``group_size`` : the scales' quantisation block, 128 or 32 (MX, gfx950
-                       opus only). It picks the tuned row and the kernel.
+    * ``x``       : [M, G, K] fp8 activation, token-major and contiguous.
+    * ``wo_a``    : [G, N, K] fp8 weight, ``shuffle_weight(w, layout=(16, 16))``.
+    * ``x_scale`` : [M, G, K/block] uint8 e8m0, row-major, i.e.
+                    ``inverse_rope_group_quant(..., scale_layout="row")``; every
+                    backend reads it that way.
+    * ``w_scale`` : [G, N/block, K/block] uint8 e8m0.
 
-    A shape the table lacks runs the first preshuffled opus kernel that accepts
-    it -- correct, not tuned -- and raises only if none does.
+    The arch and the w_scale block select the kernels:
+
+    * gfx950, 32x32 or 128x128: the tuned row's libtype, opus or flydsl,
+      whichever was faster at that shape; flydsl's heuristic off the table.
+      DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run
+      as is.
+    * gfx1250, 128x128: flydsl.
 
     Returns a fresh token-major [M, G, N]. A caller that must write into its own
-    buffer calls the backend directly (both keep ``out=``):
-    ``run_bmm_a8w8_mxfp8_128_gfx1250`` or
-    ``aiter.ops.opus.gemm_op_a8w8.bmm_a8w8_mxscale_opus``.
+    buffer calls a backend directly (both keep ``out=``): the arch's
+    ``run_bmm_a8w8_mxfp8_*`` or ``aiter.ops.opus.gemm_op_a8w8.bmm_a8w8_mxscale_opus``.
     """
     return _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
-        x, wo_a, x_scale, w_scale, dtype=dtype, group_size=group_size
+        x, wo_a, x_scale, w_scale, dtype=dtype
     )
 
 

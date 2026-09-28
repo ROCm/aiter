@@ -28,7 +28,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..gemm_op_common import get_padded_m
+from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
@@ -626,17 +626,11 @@ def _load_mxscale_bmm_tuned(
         logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
 
-    if "groupSize" not in df.columns:
-        logger.warning(
-            "Legacy MXFP8 BMM tuned CSV %s has no groupSize; assuming groupSize=128",
-            path,
-        )
-        df["groupSize"] = 128
-
     required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
+    df = with_mxscale_w_scale_block(df, path)
 
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype].copy()
@@ -692,13 +686,13 @@ def _load_mxscale_bmm_tuned(
         )
         df = df.loc[~invalid_opus_rows].copy()
 
-    # groupSize is part of the key, not a note on the row: the same shape has
-    # a best 128-block kid and a best 32-block kid, and they are different
+    # w_scale_block is part of the key, not a note on the row: the same shape
+    # has a best 128x128 kid and a best 32x32 kid, and they are different
     # kernels. Without it the two collide as duplicate shapes, and a lookup
-    # could hand a 128 kid a scale buffer with four times the entries -- not a
-    # shape error downstream, just the wrong stride, so a plausible wrong
+    # could hand a 128 kid a scale buffer with sixteen times the entries -- not
+    # a shape error downstream, just the wrong stride, so a plausible wrong
     # answer at full speed.
-    shape_keys = ["gfx", "b", "m", "n", "k", "groupSize"]
+    shape_keys = ["gfx", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
         rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
@@ -713,7 +707,7 @@ def lookup_mxscale_bmm_config(
     n: int,
     k: int,
     *,
-    group_size: int = 128,
+    w_scale_block: str = "128x128",
     libtype: str | None = None,
     bpreshuffle: bool = False,
 ):
@@ -722,26 +716,27 @@ def lookup_mxscale_bmm_config(
     ``bpreshuffle`` picks the table, and therefore B's layout; see
     _load_mxscale_bmm_tuned for why the two are separate files.
 
-    ``group_size`` is the quantisation block the caller's scales are in, 128 or
-    32, and it selects among kids rather than describing them: a row tuned for
-    one block is meaningless for the other.
+    ``w_scale_block`` is the caller's weight-scale block ("128x128" or "32x32"
+    for OPUS), and it selects among rows rather than describing them: a row
+    tuned for one block is meaningless for the other.
     """
     gfx = get_gfx()
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, b, padded_m, n, k, group_size))
+        row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
         if row is not None:
             break
 
     if row is None:
         logger.info(
-            "shape B:%s M:%s N:%s K:%s has no MXFP8 BMM tuned row",
+            "shape B:%s M:%s N:%s K:%s w_scale %s has no MXFP8 BMM tuned row",
             b,
             m,
             n,
             k,
+            w_scale_block,
         )
         return None
     if AITER_LOG_TUNED_CONFIG:
@@ -763,6 +758,17 @@ def lookup_mxscale_bmm_config(
 def _validate_mxscale_bmm_group_size(group_size: int) -> None:
     if group_size not in (32, 128):
         raise ValueError(f"group_size must be 32 or 128, got {group_size!r}")
+
+
+def mxscale_bmm_group_of_block(w_scale_block: str) -> int:
+    """The OPUS kid group (GROUP_N == GROUP_K) that reads this w_scale block."""
+    group = {"32x32": 32, "128x128": 128}.get(w_scale_block)
+    if group is None:
+        raise ValueError(
+            f"no OPUS MXFP8 BMM kernel reads a {w_scale_block!r} w_scale; "
+            "it takes 32x32 or 128x128"
+        )
+    return group
 
 
 def _heuristic_mxscale_bmm_kid(
@@ -913,11 +919,11 @@ def resolve_a8w8_mxscale_bmm_plan(
     n: int,
     k: int,
     *,
-    group_size: int = 128,
+    w_scale_block: str = "128x128",
 ) -> tuple[int, int]:
     """Resolve one final global kid/split pair for the caller's scale blocks."""
-    _validate_mxscale_bmm_group_size(group_size)
-    config = lookup_mxscale_bmm_config(g, m, n, k, group_size=group_size)
+    group_size = mxscale_bmm_group_of_block(w_scale_block)
+    config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(
@@ -970,6 +976,7 @@ def resolve_a8w8_mxscale_bmm_plan(
 __all__ = [
     "lookup_a16w16_opus_config",
     "lookup_mxscale_bmm_config",
+    "mxscale_bmm_group_of_block",
     "mxscale_bmm_kid_group",
     "mxscale_bmm_kid_runs_m",
     "mxscale_bmm_kid_takes_b_layout",

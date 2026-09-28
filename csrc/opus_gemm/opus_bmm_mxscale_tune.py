@@ -14,10 +14,11 @@ in both directions -- it hid kid326, which is really arbitrary-M, from every
 unaligned shape while the runtime dispatched it there anyway.
 
 Runtime schema (what the tuner emits, and what the runtime reads back):
-    gfx,b,m,n,k,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+    gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 ``aiter/ops/opus/policy.py:lookup_mxscale_bmm_config`` indexes on
-``["gfx","b","m","n","k"]``, dispatches to a backend on the winning row's
-``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
+``["gfx","b","m","n","k","w_scale_block"]`` (OPUS kids read a 128x128 or a
+32x32 w_scale, and each block gets its own row), dispatches to a backend
+on the winning row's ``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
 the batch-first ``opus_bmm`` entry, so
 those columns must match exactly.
 
@@ -125,7 +126,7 @@ def _kid_group(kid):
     inst = _KID_INSTANCE.get(kid) or _KID_INSTANCE[bmm_mxscale_global_kid(kid)]
     assert inst.GROUP_N == inst.GROUP_K, (
         f"kid {kid} quantises N and K on different blocks "
-        f"({inst.GROUP_N}/{inst.GROUP_K}); the tuned schema carries one groupSize"
+        f"({inst.GROUP_N}/{inst.GROUP_K}); the tuned schema carries one w_scale_block"
     )
     return inst.GROUP_K
 from test_opus_a8w8_bmm import (
@@ -506,7 +507,7 @@ _SHUF_POLICY = {kid: _TUNE_POLICY[plain] for kid, plain in _SHUF_TWIN_OF.items()
 # tables, so a literal list would go stale exactly when a twin is added, and the
 # one thing worse than an untuned kid is a kid nobody noticed was untuned.
 #
-# groupSize is part of the tuned key, so a twin competes only against other 32
+# w_scale_block is part of the tuned key, so a twin competes only against other 32
 # kids for its shape and gets its own winning row.
 _TUNE_POLICY.update({
     twin: factors
@@ -716,6 +717,8 @@ SHIPPED_CSV = os.path.join(
     "dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
 )
 DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
+# The w_scale block every OPUS MXFP8 BMM kernel reads (a tuned-CSV key column).
+W_SCALE_BLOCK = "128x128"
 
 # The same dsv4 shapes retuned with the preshuffled-B families in the pool, kept
 # as a second table rather than applied over the first.
@@ -1015,7 +1018,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
-    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "groupSize"]
+    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "w_scale_block"]
     RESULTS: ClassVar[list[str]] = [
         "libtype",
         "kernelId",
@@ -1039,8 +1042,8 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             description="Tune opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a)",
         )
         # sort N before M like the GEMM tuners (cosmetic ordering of the CSV),
-        # then groupSize, so a shape's 32 and 128 rows land next to each other.
-        self.sort_keys = ["gfx", "b", "n", "m", "k", "groupSize"]
+        # then w_scale_block, so a shape's 32x32 and 128x128 rows land together.
+        self.sort_keys = ["gfx", "b", "n", "m", "k", "w_scale_block"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -1051,9 +1054,6 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         info, time, _err = results
         if time == self.INVALID_TIME:
             return 0, 0
-        # info[0] is the key tuple, and the tuned schema gained groupSize, so it
-        # carries six fields now. Unpacking five names off it raised for every
-        # single candidate, which is why the sweep reported "tune 0 shapes".
         shape = dict(zip(self.keys, info[0]))
         b, m, n, k = (int(shape[name]) for name in ("b", "m", "n", "k"))
         us_s = time * 1e-6
@@ -1216,7 +1216,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             shapes = self._shapes_from_shipped()
         shapes = _validate_tune_shapes(shapes)
 
-        # One row per (shape, group), because groupSize is part of the key. Left
+        # One row per (shape, block), because w_scale_block is part of the key. Left
         # out, every row carried NaN there while tune() reported results under
         # the kid's real group, so the base tuner matched no result to any
         # input and wrote an empty table however many candidates passed.
@@ -1225,11 +1225,17 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             else {_kid_group(kid) for kid in _CANDIDATE_KIDS}
         )
         self.untunedf = pd.DataFrame(
-            [{"gfx": gfx, "b": g, "m": m, "n": n, "k": k, "groupSize": grp}
-             for (g, m, n, k) in shapes for grp in groups],
+            [
+                {"gfx": gfx, "b": g, "m": m, "n": n, "k": k, "w_scale_block": f"{grp}x{grp}"}
+                for (g, m, n, k) in shapes
+                for grp in groups
+            ],
             columns=self.keys,
         )
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+        if len(self.tunedf) and "w_scale_block" not in self.tunedf.columns:
+            # A tuned CSV from before the column holds only OPUS 128x128 rows.
+            self.tunedf = self.tunedf.assign(w_scale_block=W_SCALE_BLOCK)
 
         # Skip shapes already present in the tuned CSV (unless --all forces retune).
         if not args.all and len(self.tunedf) and len(self.untunedf):
@@ -1403,7 +1409,8 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             m = int(untunedf.loc[i, "m"])
             n = int(untunedf.loc[i, "n"])
             k = int(untunedf.loc[i, "k"])
-            row_group = int(untunedf.loc[i, "groupSize"])
+            row_block = str(untunedf.loc[i, "w_scale_block"])
+            row_group = int(row_block.split("x")[1])
             # Per shape, not per sweep: the graph is a win only where the
             # eager per-dispatch floor is a material fraction of the kernel.
             # Whatever this resolves to, it is the same for every candidate on
@@ -1422,7 +1429,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                 group = _kid_group(kid)
                 if group != row_group:
                     continue
-                info_keys = (gfx, b, m, n, k, group)
+                info_keys = (gfx, b, m, n, k, row_block)
                 for sk in _applicable(kid, b, m, n, k, args.pool):
                     info = (info_keys, kid, sk, "")
                     task.append(

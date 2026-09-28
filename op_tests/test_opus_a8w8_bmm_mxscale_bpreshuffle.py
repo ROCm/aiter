@@ -116,7 +116,7 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     if split_k == 1:  # the entry defaults splitK, so only compare where they agree
         err_pub = _rel_err(
             batched_gemm_a8w8_mxscale_bpreshuffle(
-                O_in, W_sh, xs_in, ws_mx, dtype=ydt, group_size=group
+                O_in, W_sh, xs_in, ws_mx, dtype=ydt
             ),
             ref,
         )
@@ -198,15 +198,16 @@ def _check_tables():
             for key, row in rows.items()
             if key[0] == gfx and row.get("libtype") == "opus"
         }
-        # The key's last field is the row's groupSize; a kid of the other block
-        # would read the scales at the wrong stride.
+        # The key's last field is the row's w_scale_block; a kid of the other
+        # block would read the scales at the wrong stride.
         bad_g = sorted(
             {
                 int(row["kernelId"])
                 for key, row in rows.items()
                 if key[0] == gfx
                 and row.get("libtype") == "opus"
-                and policy.mxscale_bmm_kid_group(int(row["kernelId"])) != int(key[5])
+                and policy.mxscale_bmm_kid_group(int(row["kernelId"]))
+                != policy.mxscale_bmm_group_of_block(key[5])
             }
         )
         bad_b = sorted(
@@ -225,7 +226,7 @@ def _check_tables():
         elif bad_sf:
             note = f"wants host-rearranged scales: {bad_sf}"
         elif bad_g:
-            note = f"groupSize disagrees with the kid: {bad_g}"
+            note = f"w_scale_block disagrees with the kid: {bad_g}"
         else:
             note = os.path.basename(path)
         print(f"  {'FAIL' if bad else 'ok  '} {label}  [{note}]", flush=True)
@@ -286,6 +287,10 @@ def _check_dispatch():
         def _spy(x, wo_a, Y, sfa, sfb, workspace=None, kid=0, split_k=1):
             seen["kid"] = int(kid)
 
+        def _spy_flydsl(x, wo_a, x_scale, w_scale, out, kernel_name=None, **_kw):
+            seen["kid"] = "flydsl"
+            return out
+
         impl = (
             bg._batched_gemm_a8w8_mxscale_bpreshuffle_impl
             if b_preshuffled
@@ -296,11 +301,16 @@ def _check_dispatch():
         caches = (bg._get_mxscale_bmm_launchers, bg._get_mxscale_bmm_launch_plan)
         for c in caches:
             c.cache_clear()
+        import aiter.ops.flydsl.batched_gemm_a8w8 as fly
+
         with patch.object(
             bmm, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", _spy
-        ), patch.object(policy, "lookup_mxscale_bmm_config", lambda *a, **kw: row):
+        ), patch.object(fly, "run_bmm_a8w8_mxfp8", _spy_flydsl), patch.object(
+            policy, "lookup_mxscale_bmm_config", lambda *a, **kw: row
+        ):
             try:
-                impl(*_args(group, n_), group_size=group)
+                # The w_scale shape carries the block the entry reads.
+                impl(*_args(group, n_))
             except ValueError as err:
                 return err
             finally:
@@ -310,6 +320,9 @@ def _check_dispatch():
 
     def _row(kid):
         return {"libtype": "opus", "kernelId": kid, "splitK": 1}
+
+    def _is_flydsl(r):
+        return r == "flydsl"
 
     def _row_major_kid(group):
         return lambda r: (
@@ -327,7 +340,7 @@ def _check_dispatch():
             and r != not_kid
         )
 
-    # (label, tuned row, b_preshuffled, group_size, N, expectation)
+    # (label, tuned row, b_preshuffled, scale group, N, expectation)
     cases = (
         (
             f"tuned kid{kid_pre} + declared preshuffled -> runs it",
@@ -371,12 +384,12 @@ def _check_dispatch():
             else ()
         ),
         (
-            "no tuned row + declared preshuffled -> preshuffled fallback",
+            "no tuned row + declared preshuffled -> flydsl",
             None,
             True,
             128,
             n,
-            _pre_fallback(128),
+            _is_flydsl,
         ),
         (
             "no tuned row + row-major B -> heuristic",
@@ -403,12 +416,12 @@ def _check_dispatch():
             _pre_fallback(32),
         ),
         (
-            "group 32: no tuned row + declared preshuffled -> g32 fallback",
+            "group 32: no tuned row + declared preshuffled -> flydsl",
             None,
             True,
             32,
             n,
-            _pre_fallback(32),
+            _is_flydsl,
         ),
         (
             "group 32: no tuned row + row-major B -> g32 heuristic",
@@ -419,8 +432,8 @@ def _check_dispatch():
             _row_major_kid(32),
         ),
         (
-            "N=16, no preshuffled tile divides it -> raises",
-            None,
+            f"N=16, tuned kid{KID_PLAIN}, no preshuffled opus tile divides it -> raises",
+            _row(KID_PLAIN),
             True,
             128,
             16,
@@ -435,7 +448,9 @@ def _check_dispatch():
         got = _resolve(row, b_preshuffled, group, n_)
         good = want(got)
         ok &= good
-        shown = "ValueError" if isinstance(got, ValueError) else f"kid{got}"
+        shown = "ValueError" if isinstance(got, ValueError) else (
+            "flydsl" if got == "flydsl" else f"kid{got}"
+        )
         print(f"  {'ok  ' if good else 'FAIL'} {label}  [{shown}]", flush=True)
     return ok
 
