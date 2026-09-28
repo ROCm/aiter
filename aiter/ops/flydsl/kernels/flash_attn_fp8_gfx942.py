@@ -249,33 +249,27 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     )
                     b = q_frag[depth]
                     score = _mfma(a, b, score)
-                qpos = tile * 32 + row // 2 + klen - qlen
-                scores = []
+                qbase = tile * 32 + klen - qlen
+                qpos = qbase + row // 2
+                scores = score * fx.Vector.filled(16, log_scale, fx.Float32)
+                # Only the window and causal boundaries need per-element masks.
+                # Dead query rows never store; live rows imply col < klen.
+                if (block * 32 < qbase - 992) | (block * 32 + 31 > qbase):
+                    masked = []
+                    for r in range_constexpr(16):
+                        col = block * 32 + half * 4 + (r // 4) * 8 + r % 4
+                        valid = (col <= qpos) & (col > qpos - 1024)
+                        masked.append(valid.select(scores[r], fx.Float32(float("-inf"))))
+                    scores = fx.Vector.from_elements(masked, fx.Float32)
                 m = fx.Float32(state[0])
                 for r in range_constexpr(16):
-                    col = block * 32 + half * 4 + (r // 4) * 8 + r % 4
-                    valid = (
-                        (col <= qpos)
-                        & (col > qpos - 1024)
-                        & (col < klen)
-                        & (tile * 32 + row // 2 < qlen)
-                    )
-                    s = valid.select(score[r] * log_scale, fx.Float32(-1.0e30))
-                    scores.append(s)
-                    m = m.maximumf(s)
+                    m = m.maximumf(scores[r])
                 m = m.maximumf(m.shuffle_xor(fx.Int32(32), fx.Int32(64)))
                 correction = _exp2(fx.Float32(state[0]) - m)
                 probs = []
                 psum = fx.Float32(0.0)
                 for r in range_constexpr(16):
-                    col = block * 32 + half * 4 + (r // 4) * 8 + r % 4
-                    valid = (
-                        (col <= qpos)
-                        & (col > qpos - 1024)
-                        & (col < klen)
-                        & (tile * 32 + row // 2 < qlen)
-                    )
-                    p = valid.select(_exp2(scores[r] - m), fx.Float32(0.0))
+                    p = _exp2(scores[r] - m)
                     psum = psum + p
                     probs.append(p * 240.0)
                 denom = (
