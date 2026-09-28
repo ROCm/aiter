@@ -1227,37 +1227,9 @@ def _run_one_bs(
                 strict_elementwise=strict_elementwise,
             )
         else:
-            _d = (out.float() - diagnostic_out.float()).abs()
-            _tol = 2.5e-1 + 1e-2 * diagnostic_out.float().abs()
-            _bad = (_d > _tol)
-            _msg = (
-                f"bs={bs} public/staged A4W4 outputs differ: "
-                f"max_abs={_d.max().item():.6g} "
-                f"mismatch={_bad.sum().item()}/{_bad.numel()} "
-                f"({100.0 * _bad.float().mean().item():.4f}%) "
-                f"ref_absmax={diagnostic_out.float().abs().max().item():.6g} "
-                f"relL2_pub_vs_staged="
-                f"{(torch.linalg.vector_norm(out.float() - diagnostic_out.float()) / torch.linalg.vector_norm(diagnostic_out.float())).item():.6g}"
-            )
-            _ac_bf16 = bool(torch.allclose(out, diagnostic_out, rtol=1e-2, atol=2.5e-1))
-            _ac_fp32 = bool(torch.allclose(out.float(), diagnostic_out.float(),
-                                           rtol=1e-2, atol=2.5e-1))
-            _nan = int((~torch.isfinite(out.float())).sum().item())
-            _nan_d = int((~torch.isfinite(diagnostic_out.float())).sum().item())
-            _k = int(_d.argmax().item())
-            _a_flat = out.reshape(-1).float()
-            _b_flat = diagnostic_out.reshape(-1).float()
-            _msg += (
-                f" | allclose_bf16={_ac_bf16} allclose_fp32={_ac_fp32}"
-                f" nonfinite_pub={_nan} nonfinite_staged={_nan_d}"
-                f" dtypes={out.dtype}/{diagnostic_out.dtype}"
-                f" worst: a={_a_flat[_k].item():.6g} b={_b_flat[_k].item():.6g}"
-                f" tol={(2.5e-1 + 1e-2 * abs(_b_flat[_k].item())):.6g}"
-            )
-            print("[EP16-diag] " + _msg, flush=True)
             _collective_require(
                 torch.allclose(out, diagnostic_out, rtol=1e-2, atol=2.5e-1),
-                _msg,
+                f"bs={bs} public/staged A4W4 outputs differ",
             )
 
     def _time_captured_kernel(call):
