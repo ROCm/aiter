@@ -148,13 +148,31 @@ def test_init_dist_env(tp_size, shape, run_mode):
             "expandable_segments requested but the input pool is not raw_cached; "
             "raw path NOT exercised on this platform"
         )
-    if run_mode == "dirty" and (modes != {"torch"} or not all(offsets)):
-        # Do not report a regression pass if a rank bypassed the sub-block path.
-        logger.warning(
-            "dirty mode did not produce a torch sub-block pool on every rank; "
-            "the IPC offset path was NOT exercised on this platform"
+    if run_mode == "dirty":
+        if modes != {"torch"}:
+            # A raw hipMalloc pool (expandable segments / raw override in the
+            # environment) or a disabled custom allreduce is its own base by
+            # construction; the sub-block path does not apply, so skip rather
+            # than fail.
+            logger.warning(
+                "dirty mode: input pool is %s on some rank, sub-block path not "
+                "applicable; skipping",
+                sorted(modes),
+            )
+            return {
+                "pool_modes": sorted(modes),
+                "ipc_offsets": offsets,
+                "skipped": True,
+            }
+        # Memory was sufficient and the pool is torch-managed: the allocator
+        # shape in _worker must have placed it at a non-zero offset on every
+        # rank, or this run proved nothing about the regression.
+        assert all(offsets), (
+            f"dirty mode did not place the torch input pool at a non-zero IPC "
+            f"offset on every rank ({offsets=}); the regression path was NOT "
+            f"exercised -- adjust the allocator shape in _worker for this "
+            f"torch/ROCm"
         )
-        return {"pool_modes": sorted(modes), "ipc_offsets": offsets, "skipped": True}
     return {"pool_modes": sorted(modes), "ipc_offsets": offsets}
 
 
