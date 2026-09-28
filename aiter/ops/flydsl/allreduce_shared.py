@@ -69,7 +69,6 @@ class _StEngine:
         rank: int,
         world_size: int,
         inbox_flags: int,
-        device_index: int,
     ):
         self.spec = spec
         self.launch = spec["launch"]
@@ -91,9 +90,7 @@ class _StEngine:
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
-            self._buf_ptr = UncachedIpcHeap.alloc(
-                self.buf_bytes, inbox_flags, expected_device=device_index
-            )
+            self._buf_ptr = UncachedIpcHeap.alloc(self.buf_bytes, inbox_flags)
             my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
             all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
                 group, (my_handle, 0)
@@ -115,9 +112,7 @@ class _StEngine:
             # and by this rank's own kernel, never by a peer. Stays uncached in
             # every mode -- no cross-GPU visibility question, and it is a few
             # KiB.
-            self._meta_ptr = UncachedIpcHeap.alloc_uncached(
-                peer_bytes + color_bytes, expected_device=device_index
-            )
+            self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
             self._gpu_peer_ptrs = self._meta_ptr
             self._colors = self._meta_ptr + peer_bytes
             UncachedIpcHeap.copy_host_to_device(

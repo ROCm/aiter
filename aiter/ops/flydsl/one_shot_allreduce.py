@@ -217,7 +217,6 @@ class OneShotAllReduce:
                             rank=self.rank,
                             world_size=self.world_size,
                             inbox_flags=inbox_flags,
-                            device_index=self._device_index,
                         ),
                         spec,
                     )
