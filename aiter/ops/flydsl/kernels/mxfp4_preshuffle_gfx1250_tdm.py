@@ -1312,42 +1312,53 @@ def launch_gemm_a8w4_tdm(
 
                     # With the carry, a tile's only fence is at its last k128 (see
                     # k_step); buffer 0 and the first drain tile use the prologue's.
-                    def steady_mid(my_jobs):
-                        for kt in range(n_steady):
-                            s = kt % num_buffers
-                            buf = s
-                            if const_expr(not next_stage_on):
-                                pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-                                rocdl.sched_barrier(0)
-                                issue(
-                                    (kt + PRE) % num_buffers,
-                                    kt + PRE,
-                                    my_jobs,
-                                )
-                                rocdl.sched_barrier(0)
-                            next_stage_buf = (
-                                (kt + 1) % num_buffers
+                    def steady_mid_iteration(my_jobs, kt, s):
+                        buf = s
+                        if const_expr(not next_stage_on):
+                            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                            rocdl.sched_barrier(0)
+                            issue(
+                                (kt + PRE) % num_buffers,
+                                kt + PRE,
+                                my_jobs,
+                            )
+                            rocdl.sched_barrier(0)
+                        next_stage_buf = (
+                            (s + 1) % num_buffers
+                            if const_expr(next_stage_on)
+                            else None
+                        )
+                        compute_ktile(
+                            buf,
+                            kt + PRE if const_expr(next_stage_on) else None,
+                            next_stage_on,
+                            next_stage_buf,
+                            my_jobs,
+                            # At the fence, before this tile's issue: kt+PRE tiles
+                            # are out and everything through kt+1 must have landed.
+                            (
+                                TDM_PER * (num_buffers - 2)
                                 if const_expr(next_stage_on)
                                 else None
-                            )
-                            compute_ktile(
-                                buf,
-                                kt + PRE if const_expr(next_stage_on) else None,
-                                next_stage_on,
-                                next_stage_buf,
-                                my_jobs,
-                                # At the fence, before this tile's issue: kt+PRE tiles
-                                # are out and everything through kt+1 must have landed.
-                                (
-                                    TDM_PER * (num_buffers - 2)
-                                    if const_expr(next_stage_on)
-                                    else None
-                                ),
-                                interleave_ab=interleave_ab,
-                            )
-                            if const_expr(cluster_m > 1):
-                                if (kt + 1) % num_buffers == 0:
-                                    cluster_sync()
+                            ),
+                            interleave_ab=interleave_ab,
+                        )
+
+                    def steady_mid(my_jobs):
+                        if const_expr(cluster_m > 1):
+                            for ring in range(n_steady // num_buffers):
+                                for phase in range_constexpr(num_buffers):
+                                    kt = ring * num_buffers + phase
+                                    steady_mid_iteration(my_jobs, kt, phase)
+                                cluster_sync()
+                            for phase in range_constexpr(n_steady % num_buffers):
+                                kt = (n_steady // num_buffers) * num_buffers + phase
+                                steady_mid_iteration(my_jobs, kt, phase)
+                        else:
+                            for kt in range(n_steady):
+                                steady_mid_iteration(
+                                    my_jobs, kt, kt % num_buffers
+                                )
 
                     dispatch_wave_job(steady_mid)
 
