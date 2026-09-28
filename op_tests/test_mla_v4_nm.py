@@ -944,20 +944,13 @@ def _run_one_point(
         num_rotate_args=1,
     )
 
-    # Resolve the asm output to compare against. Three cases, all reading the
-    # buffer the wrapper actually populated (the 2b call above):
-    #   out_16_nosplit=1   -> kernel writes packed-BF16 into the logits region;
-    #                         the wrapper unpacks it into output_buf (see
-    #                         mla_decode_fwd_v4_nm). Read output_buf directly.
-    #   single-pass (fp32) -> kernel writes one FP32 partial to logits[:, 0],
-    #                         no stage2; cast it to BF16.
-    #   multi-pass         -> stage2 merge wrote merged BF16 to output_buf.
-    if out_16_nosplit != 0:
-        out_asm = output_buf  # wrapper unpacked packed-BF16 here
-    elif num_kv_splits == 1:
-        out_asm = logits_buf[:, 0].to(dtypes.bf16)  # [total_q, num_heads, dv]
-    else:
-        out_asm = output_buf  # already [total_q, num_heads, dv] BF16
+    # output_buf is the authoritative result for every split count: single-pass
+    # writes packed BF16 straight into it, multi-pass gets it from the stage2
+    # merge. logits_buf must not be read here -- the dispatcher derives
+    # out_16_nosplit from num_kv_splits (ignoring the caller's value), so for a
+    # single split the raw kernel call above fills logits_buf with packed BF16,
+    # not FP32 partials.
+    out_asm = output_buf  # [total_q, num_heads, dv] BF16
 
     # ---- accuracy ----
     # Two comparisons, run for BOTH single- and multi-split (split-kv is a perf
