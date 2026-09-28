@@ -2190,6 +2190,7 @@ class FmoeTuner(TunerCommon):
         fuse_fp8=False,
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        swiglu_limit=None,
         output_sorted=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
@@ -2216,6 +2217,7 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -2484,6 +2486,7 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        swiglu_limit=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2499,6 +2502,7 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            swiglu_limit=swiglu_limit,
         )
         AQDType = hidden_states.dtype
 
@@ -4586,6 +4590,8 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
             # fused_moe overrides the activation quant dtype at runtime for
             # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
             # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
@@ -4822,6 +4828,7 @@ class FmoeTuner(TunerCommon):
                         if act_type == ActivationType.Situv2
                         else None
                     ),
+                    swiglu_limit=swiglu_limit,
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
@@ -4849,6 +4856,7 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    swiglu_limit=swiglu_limit,
                 )
                 if not _all_finite(out) or not _all_finite(ref):
                     diag = tensor_compare_diagnostics(ref, out)
@@ -6673,7 +6681,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=None):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         atomic = _g2["atomic"]
@@ -6738,6 +6746,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             situ_linear_beta=(
                 DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
             ),
+            swiglu_limit=swiglu_limit,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6757,7 +6766,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _torch_ref(data, topk, dtype, activation):
+    def _torch_ref(data, topk, dtype, activation, swiglu_limit=None):
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
@@ -6771,6 +6780,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
             topk=topk,
+            swiglu_limit=swiglu_limit,
         )
         return FmoeTuner.run_torch_moe_stage2(
             ref1,
@@ -6797,16 +6807,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "swiglu": ActivationType.Swiglu,
             "silu": ActivationType.Silu,
         }[self._row_act(row)]
+        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        swiglu_limit = None if limit_env in (None, "") else float(limit_env)
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
-        ref = self._torch_ref(data, topk, dtype, activation)
+        out = self._port_e2e(
+            data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+        )
+        ref = self._torch_ref(data, topk, dtype, activation, swiglu_limit=swiglu_limit)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         # NaN must reject explicitly: `nan > errRatio` is False, so a candidate
         # producing garbage would otherwise pass the gate and, being fast, win.
         if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            lambda: self._port_e2e(
+                data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+            ),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
