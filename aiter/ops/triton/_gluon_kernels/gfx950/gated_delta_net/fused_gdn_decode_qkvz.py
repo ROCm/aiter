@@ -28,6 +28,7 @@ guard and the optional FP8 epilogue. Do not hand-edit; see build_aiter_kernel.py
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._triton_kernels.activation import _sigmoid_exp2
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Config-aware names so a trace row maps to the exact specialization
@@ -47,15 +48,7 @@ def _exp(value):
 
 @gluon.jit
 def _sigmoid(value):
-    denominator = 1.0 + _exp(-value)
-    return gl.inline_asm_elementwise(
-        "v_rcp_f32 $0, $1",
-        "=v,v",
-        (denominator,),
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    return _sigmoid_exp2(value)
 
 
 @gluon.jit
@@ -931,13 +924,7 @@ def _decode_group(
     q = q * (gl.rsqrt(gl.sum(q * q, 0) + 1.0e-6) * scale)
     key = key * gl.rsqrt(gl.sum(key * key, 0) + 1.0e-6)
     head = group * ratio + v // V
-    ba_offset = token * 2 * VH + group * 2 * ratio + v // V
-    a = gl.load(BA + ba_offset + ratio).to(gl.float32)
-    b = gl.load(BA + ba_offset).to(gl.float32)
-    arg = a + gl.load(DtBias + head).to(gl.float32)
-    softplus = gl.where(arg <= 20.0, gl.log(1.0 + gl.exp(arg)), arg)
-    decay = gl.exp(-gl.exp(gl.load(ALog + head)) * softplus)
-    beta = (1.0 / (1.0 + gl.exp(-b))).to(gl.bfloat16).to(gl.float32)
+    decay, beta = _head_dynamics(BA, ALog, DtBias, token, head, VH, False)
     state_base = State + (slot * VH + group * ratio) * V * K
     state_offset = v[:, None] * K + k[None, :]
     # The full state tile stays in registers through both matrix-vector products.
@@ -972,7 +959,8 @@ def _decode_group(
     if HAS_FP8:
         # FP8 scales must consume the rounded BF16 output, not the FP32 precursor.
         values = normalized.to(gl.float32)
-        quant_scale = gl.maximum(gl.max(gl.abs(values), 1), 1.0e-10) / fp8_max
+        maximum = gl.maximum(gl.max(gl.abs(values), 1), 1.0e-10)
+        quant_scale = _quantization_scale(maximum, fp8_max, False)
         gl.store(Scales + token_group * ratio + h, quant_scale)
         gl.store(
             Quantized + out_offset,
