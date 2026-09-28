@@ -43,9 +43,11 @@ for the B-preshuffled operator and select its output CSV with `-o`.
 - Supported calls use gfx950, FP8 E4M3FN operands, FP32 block scales and BF16
   output, with positive M/N, K >= 256, K divisible by 256, and N divisible by
   8 (plain B) or 16 (preshuffled B). LDS and signed-i32 address limits are checked
-  before launch. M/N tile tails are supported. Unsupported output types/shapes
-  and missing FlyDSL retain the existing CK fallback; actual compile/runtime
-  errors are not hidden by a fallback.
+  before launch. M/N tile tails are supported. When a tuned row selects FlyDSL,
+  unsupported output types/shapes/devices or non-FP32 scales raise an assertion.
+  Import failures also raise `AssertionError`, preserving the original exception
+  as the cause. No CK fallback is taken for a selected FlyDSL row; the original
+  no-config default path is unchanged. Other compile/runtime errors propagate.
 - Plain B uses row-major `x_scale[M,K/128]`; its transpose cost is included in
   tuning. Preshuffled B consumes the existing `(16,16)` weight shuffle and
   column-major scale storage, either packed back into shape `[M,K/128]` or a
