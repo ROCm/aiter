@@ -38,7 +38,11 @@ from flydsl.expr import math as fxmath
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    buf_base_i64,
+    buf_copy_atom,
+)
 
 # 256 CUs on MI355X times four BN32 prefill workgroups each. Unlike the decode
 # bands below this one does not move with head_dim: halving D halves the LDS
@@ -147,6 +151,7 @@ def build_qsa_k2_module(
     block_n: int,
     block_threads: int,
     n_splits: int,
+    wide_cache: bool,
 ):
     if n_kv_heads < 1 or n_q_heads % n_kv_heads:
         raise ValueError(
@@ -295,6 +300,7 @@ def build_qsa_k2_module(
             blk=block_threads,
             ns=n_splits,
             qkk=qk_k,
+            wide=int(wide_cache),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -338,8 +344,43 @@ def build_qsa_k2_module(
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
         fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
         q_buf = fx.rocdl.make_buffer_tensor(q, max_size=False)
-        k_buf = fx.rocdl.make_buffer_tensor(k_cache)
-        v_buf = fx.rocdl.make_buffer_tensor(v_cache)
+        # A V# voffset is 32 bits. A cache that fits in 4 GiB keeps one
+        # uniform descriptor. A larger cache is a separate compile: each
+        # gathered row rebases its page in 64-bit, then a descriptor covers
+        # only that row. The two bodies are not both traced.
+        if const_expr(wide_cache):
+            k_base = buf_base_i64(k_cache)
+            v_base = buf_base_i64(v_cache)
+            row_ptr_ty = fx.PointerType.get(
+                BFloat16.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=16,
+            )
+            page_elems64 = Int64(page_size * n_kv_heads * head_dim)
+            token_elems64 = Int64(n_kv_heads * head_dim)
+            head_elems64 = Int64(head_dim)
+            row_bytes = head_dim * 2
+
+            def kv_row(base, phys, page_off):
+                addr = base + (
+                    Int64(phys) * page_elems64
+                    + Int64(page_off) * token_elems64
+                    + Int64(kv_h) * head_elems64
+                ) * Int64(2)
+                view = fx.make_view(
+                    fx.inttoptr(row_ptr_ty, addr),
+                    fx.make_layout((head_dim,), (1,)),
+                )
+                return fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(
+                        view, max_size=False, num_records_bytes=row_bytes
+                    ),
+                    vec_layout,
+                )
+
+        else:
+            k_buf = fx.rocdl.make_buffer_tensor(k_cache)
+            v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_arr = getattr(storage, _k_field)
@@ -560,12 +601,15 @@ def build_qsa_k2_module(
         def tile_body(safe_phys, page_off_i, live, state):
             gpu.barrier()
 
-            # One V address view for every gather path below. It has to live
-            # at function scope: the frontend does not leak names assigned
-            # inside a const_expr branch out to later code.
-            v_row = fx.logical_divide(
-                fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
-            )
+            # Both sides assign the row. A const_expr branch that assigns
+            # only one side does not leak the name to the code below.
+            if const_expr(wide_cache):
+                v_row = kv_row(v_base, safe_phys, page_off_i)
+            else:
+                v_row = fx.logical_divide(
+                    fx.slice(v_buf, (safe_phys, page_off_i, kv_h, None)),
+                    vec_layout,
+                )
 
             v_frags = []
             if const_expr(decode_tr_pv):
@@ -576,9 +620,13 @@ def build_qsa_k2_module(
                     fx.copy(g_copy, v_src, v_frag)
                     v_frags.append(v_frag)
 
-            k_row = fx.logical_divide(
-                fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)), vec_layout
-            )
+            if const_expr(wide_cache):
+                k_row = kv_row(k_base, safe_phys, page_off_i)
+            else:
+                k_row = fx.logical_divide(
+                    fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)),
+                    vec_layout,
+                )
             for gc in range_constexpr(n_gather_chunks):
                 k_frags = []
                 for j in range_constexpr(gather_chunk):
@@ -1152,6 +1200,7 @@ def _plan(
     block_n: int,
     block_threads: int,
     n_splits: int,
+    wide_cache: bool,
 ):
     return build_qsa_k2_module(
         n_q_heads,
@@ -1162,6 +1211,7 @@ def _plan(
         block_n,
         block_threads,
         n_splits,
+        wide_cache,
     )
 
 
@@ -1236,6 +1286,9 @@ def qsa_k2(
     indices = indices.contiguous()
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
+    # Unsigned 32-bit V# span. Exactly 4 GiB still fits: the last byte
+    # offset is 2^32 - 1. Python ints do not wrap.
+    wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
     page_size = k_cache.shape[1]
     use_k32 = torch.cuda.get_device_properties(q.device).gcnArchName.startswith(
         "gfx950"
@@ -1263,6 +1316,7 @@ def qsa_k2(
             block_n,
             block_threads,
             n_splits,
+            wide_cache,
         ),
         q,
         k_cache,
