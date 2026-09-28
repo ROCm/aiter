@@ -31,8 +31,9 @@ PAGE, H, HKV, D = 64, 64, 4, 128
 
 
 def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(x.device)
+    dtype = dtypes.get_dtype_fp8()
+    s = x.abs().amax().clamp(min=1e-4) / torch.finfo(dtype).max
+    return (x / s).to(dtype), s.reshape(1).float().to(x.device)
 
 
 def ref_paged_attn(

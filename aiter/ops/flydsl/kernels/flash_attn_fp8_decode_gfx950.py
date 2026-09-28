@@ -55,11 +55,11 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
     _make_page_view,
+    dtype_to_elem_type,
     waitcnt_vm_n,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw, ptr_arg
 
-FP8 = fx.Float8E4M3FN
 WARP = 64
 PAGE = 64  # block/page size, structural (matches the 5D shuffled cache)
 HEAD_DIM = 128
@@ -394,6 +394,7 @@ def build_flash_attn_fp8_decode_module(
                 )
             )
 
+        FP8 = dtype_to_elem_type("fp8")
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, FP8))
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()

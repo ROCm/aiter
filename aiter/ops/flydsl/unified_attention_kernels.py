@@ -40,6 +40,8 @@ from functools import cache, lru_cache
 
 import torch
 
+from aiter import dtypes
+
 from .kernels.flash_attn_dualwave_common import dualwave_splitk_workspace_elems
 from .kernels.flash_attn_fp8_decode_gfx950 import (
     build_flash_attn_fp8_decode_module,
@@ -133,7 +135,7 @@ _BLOCK_M = 256
 # the KV length must be capped here: 2048 pages * 64 tokens = 131072 tokens.
 _MAX_KV_TILES = 2048
 
-_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_DTYPE = dtypes.get_dtype_fp8()
 
 # Minimum decode-half context depth (KV length) at which the mixed-batch
 # dispatch split is taken. Below this the decode half's split-K does not

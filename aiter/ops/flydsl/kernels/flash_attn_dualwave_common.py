@@ -34,10 +34,12 @@ from flydsl._mlir.dialects import fly, llvm, vector
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
+from flydsl.expr.numeric import Numeric
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels import buffer_ops, kernels_common
 
 
@@ -57,10 +59,21 @@ def dtype_to_elem_type(dtype_str: str):
     if dtype_str == "bf16":
         return fx.BFloat16
     if dtype_str == "fp8":
-        return fx.Float8E4M3FN
+        return Numeric.from_ir_type(kernels_common.default_f8_type())
     raise ValueError(
         f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', 'bf16', or 'fp8')"
     )
+
+
+def _pack_bf16_pair(a, b):
+    # gfx942 has no packed BF16 conversion; preserve RNE and low/high word order.
+    if get_gfx_runtime() == "gfx942":
+        pair = Vec.from_elements(
+            [fx.Float32(a).to(fx.BFloat16), fx.Float32(b).to(fx.BFloat16)],
+            fx.BFloat16,
+        )
+        return as_mlir_value(pair.bitcast(fx.Int32)[0])
+    return rocdl.cvt_pk_bf16_f32(a, b)
 
 
 _LOG2E = host_math.log2(host_math.e)
@@ -1515,7 +1528,7 @@ class DualwaveFp8KernelContext:
         # DTYPE_STR and would take the fp16 path for fp8, so keep this bf16-only pack.)
         pairs = []
         for j in range_constexpr(4):
-            pairs.append(rocdl.cvt_pk_bf16_f32(f32_vals[j * 2], f32_vals[j * 2 + 1]))
+            pairs.append(_pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1]))
         return Vec.from_elements(pairs, fx.Int32).bitcast(fx.BFloat16).ir_value()
 
     def buffer_load_128(self, elem_index):
@@ -2697,7 +2710,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
                 Vec.make_type(2, fx.Float16), as_mlir_value(a), as_mlir_value(b)
             )
             return as_mlir_value(Vec(v2, (2,), fx.Float16).bitcast(fx.Int32)[0])
-        return rocdl.cvt_pk_bf16_f32(a, b)
+        return _pack_bf16_pair(a, b)
 
     def _o_pack_2dw(self, v_o, dc, store_group):
         r_base = store_group * 4
@@ -3075,8 +3088,8 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         out4 = Vec(_fmul(acc, inv4, self.fm_fast), (4,), fx.Float32)
         # part_dtype, not elem_dtype -- an fp8 kernel still writes bf16 out.
         if const_expr(self.part_dtype is fx.BFloat16):
-            lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
-            hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
+            lo = _pack_bf16_pair(out4[0], out4[1])
+            hi = _pack_bf16_pair(out4[2], out4[3])
         else:
             o_f16 = []
             for i in range_constexpr(4):
