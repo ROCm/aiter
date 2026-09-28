@@ -248,6 +248,13 @@ def chunk_kda_prepare_kernel(
     n2 = gl.zeros([NB, BC, BC], gl.float32, MB)
     n3 = gl.zeros([NB, BC, BC], gl.float32, MB)
     ws_a = tok * (H * BT) + i_h * BT
+    # outputs leave through TDM stores from LDS: aqk from its own tile (a column band per J),
+    # w and u from staging tiles allocated after the solve, qg and kg_t from registers
+    SA: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    aqk_s = gl.allocate_shared_memory(aqk_ptr.dtype.element_ty, [BT, BT], SA)
+    aqk_3 = aqk_s._reinterpret(
+        aqk_ptr.dtype.element_ty, [NB, BC, BT], gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
+    )
     for J in gl.static_range(NB):
         k_j = (
             ki_s.slice(J * BC, BC)
@@ -261,11 +268,8 @@ def chunk_kda_prepare_kernel(
         akk = gl.amd.gfx1250.wmma(kn, b_j, gl.zeros([NB, BC, BC], gl.float32, MB))
         aqk = gl.amd.gfx1250.wmma(qn, b_j, gl.zeros([NB, BC, BC], gl.float32, MB))
         col = J * BC + c_m
-        gl.amd.gfx1250.buffer_store(
-            gl.where(r_m >= col, aqk, 0.0).to(aqk_ptr.dtype.element_ty),
-            aqk_ptr + ws_a + J * BC,
-            r_m * (H * BT) + c_m,
-            mask=r_m < n,
+        aqk_3.slice(J * BC, BC, dim=2).store(
+            gl.where(r_m >= col, aqk, 0.0).to(aqk_ptr.dtype.element_ty)
         )
         # N = -beta L, kept by block diagonal: n_d[b] = N_{b, b - d}
         akk = gl.where(r_m > col, -beta * akk, 0.0)
@@ -324,23 +328,37 @@ def chunk_kda_prepare_kernel(
 
     # w, u by column chunk, keeping the replicated B operand small
     inv = inv_s.load(A_OP)
-    ro = gl.arange(0, BT, gl.SliceLayout(1, MMA))[:, None]
-    wu_off = ro * (H * K) + gl.arange(0, NC, gl.SliceLayout(0, MMA))[None, :]
     ws_u = tok * (H * V) + i_h * V
+    # the staging tiles start after the solve, so they reuse dead buffers without raising
+    # the LDS peak, and no column chunk waits on reads of the one before
+    w_s = gl.allocate_shared_memory(w_ptr.dtype.element_ty, [BT, K], SL)
+    u_s = gl.allocate_shared_memory(u_ptr.dtype.element_ty, [BT, V], SL)
     for c in gl.static_range(K // NC):
         w = gl.amd.gfx1250.wmma(
             inv,
             kb_s.slice(c * NC, NC, dim=1).load(B_OP),
             gl.zeros([BT, NC], gl.float32, MMA),
         )
-        gl.amd.gfx1250.buffer_store(
-            w.to(w_ptr.dtype.element_ty), w_ptr + ws_q + c * NC, wu_off, mask=ro < n
-        )
+        w_s.slice(c * NC, NC, dim=1).store(w.to(w_ptr.dtype.element_ty))
         u = gl.amd.gfx1250.wmma(
             inv,
             v_s.slice(c * NC, NC, dim=1).load(B_OP),
             gl.zeros([BT, NC], gl.float32, MMA),
         )
-        gl.amd.gfx1250.buffer_store(
-            u.to(u_ptr.dtype.element_ty), u_ptr + ws_u + c * NC, wu_off, mask=ro < n
-        )
+        u_s.slice(c * NC, NC, dim=1).store(u.to(u_ptr.dtype.element_ty))
+
+    # rows past the sequence fall outside the descriptors, so the stores drop them;
+    # .wt: write-through, the outputs are read by the next kernel, not by this CU
+    ow = _TDM.make_tensor_descriptor(
+        base=w_ptr + ws_q, shape=(n, K), strides=(H * K, 1), block_shape=(BT, K), layout=SL
+    )
+    ou = _TDM.make_tensor_descriptor(
+        base=u_ptr + ws_u, shape=(n, V), strides=(H * V, 1), block_shape=(BT, V), layout=SL
+    )
+    oa = _TDM.make_tensor_descriptor(
+        base=aqk_ptr + ws_a, shape=(n, BT), strides=(H * BT, 1), block_shape=(BT, BT), layout=SA
+    )
+    _TDM.async_store(ow, [0, 0], w_s, cache_modifier=".wt")
+    _TDM.async_store(ou, [0, 0], u_s, cache_modifier=".wt")
+    _TDM.async_store(oa, [0, 0], aqk_s, cache_modifier=".wt")
+    _TDM.async_wait(0)

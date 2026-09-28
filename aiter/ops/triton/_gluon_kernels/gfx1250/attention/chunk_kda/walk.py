@@ -28,11 +28,13 @@ def _load_chunk(
     dk,
     du,
     da,
+    dd,
     w_s,
     q_s,
     k_s,
     u_s,
     a_s,
+    d_s,
     i,
     H: gl.constexpr,
     K: gl.constexpr,
@@ -48,6 +50,7 @@ def _load_chunk(
     )
     uu = _TDM.update_tensor_descriptor(du, add_offsets=[i * BT, 0], clamp_bounds=True)
     ua = _TDM.update_tensor_descriptor(da, add_offsets=[i * BT, 0], clamp_bounds=True)
+    ud = _TDM.update_tensor_descriptor(dd, add_offsets=[i, 0], clamp_bounds=True)
     if NUM_WARPS == 4:
         _TDM.async_load_fused(
             [
@@ -57,10 +60,16 @@ def _load_chunk(
                 (uu, u_s.index(s), 0b1000),
             ]
         )
-    else:
+    elif NUM_WARPS == 2:
         _TDM.async_load_fused([(uw, w_s.index(s), 0b01), (uq, q_s.index(s), 0b10)])
         _TDM.async_load_fused([(uk, k_s.index(s), 0b01), (uu, u_s.index(s), 0b10)])
+    else:
+        _TDM.async_load(uw, dest=w_s.index(s))
+        _TDM.async_load(uq, dest=q_s.index(s))
+        _TDM.async_load(uk, dest=k_s.index(s))
+        _TDM.async_load(uu, dest=u_s.index(s))
     _TDM.async_load(ua, dest=a_s.index(s))
+    _TDM.async_load(ud, dest=d_s.index(s))
 
 
 @gluon.jit
@@ -118,6 +127,54 @@ def _chunk(
 
 
 @gluon.jit
+def _step(
+    S,
+    i,
+    d_1,
+    w_s,
+    q_s,
+    k_s,
+    u_s,
+    a_s,
+    o_s,
+    o_p,
+    og_p,
+    nw,
+    T_n,
+    norm_eps,
+    stride_o_token: gl.constexpr,
+    stride_og_token: gl.constexpr,
+    scale: gl.constexpr,
+    MMA: gl.constexpr,
+    A_OP: gl.constexpr,
+    B_OP: gl.constexpr,
+    BV: gl.constexpr,
+    BT: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    FUSE_NORM: gl.constexpr,
+):
+    s = i % NUM_STAGES
+    dec = d_1.index(s).load(gl.SliceLayout(0, MMA))
+    S = _chunk(S, dec, w_s, q_s, k_s, u_s, a_s, o_s, s, scale, MMA, A_OP, B_OP, BV, BT)
+    t = (i * BT).to(gl.int64)
+    _store_o(
+        o_s,
+        o_p + t * stride_o_token,
+        og_p + t * stride_og_token,
+        nw,
+        T_n - i * BT,
+        norm_eps,
+        stride_o_token,
+        stride_og_token,
+        A_OP,
+        BT,
+        BV,
+        FUSE_NORM,
+    )
+    return S
+
+
+@gluon.jit
 def _store_o(
     o_s,
     o_p,
@@ -155,7 +212,11 @@ _chunk_kda_walk_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_chunk_kda_walk_repr)
+@gluon.jit(
+    do_not_specialize=["num_slots"],
+    do_not_specialize_on_alignment=["state_indices_ptr", "has_initial_state_ptr"],
+    repr=_chunk_kda_walk_repr,
+)
 def chunk_kda_walk_kernel(
     qg_ptr,
     w_ptr,
@@ -175,6 +236,7 @@ def chunk_kda_walk_kernel(
     norm_eps,
     stride_state_n,
     stride_state_out_n,
+    num_slots,
     stride_o_token: gl.constexpr,
     stride_og_token: gl.constexpr,
     scale: gl.constexpr,
@@ -195,14 +257,15 @@ def chunk_kda_walk_kernel(
     gl.static_assert(
         BT == 64 and K == 128 and V == 128, "specialised to BT=64, K=V=128"
     )
-    gl.static_assert(NUM_WARPS == 2 or NUM_WARPS == 4)
+    gl.static_assert(NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4)
     gl.static_assert(BV % (16 * NUM_WARPS) == 0, "warps split the state rows")
     gl.static_assert((not FUSE_NORM) or BV == V, "FUSE_NORM needs the whole head")
     MMA: gl.constexpr = _state_mma(NUM_WARPS)
     A_OP: gl.constexpr = gl.DotOperandLayout(0, MMA, 8)
     B_OP: gl.constexpr = gl.DotOperandLayout(1, MMA, 8)
     NV: gl.constexpr = V // BV
-    STAGE_OPS: gl.constexpr = 2 if NUM_WARPS == 4 else 3  # TDM ops per warp per chunk
+    STAGE_OPS: gl.constexpr = 3 if NUM_WARPS == 4 else (4 if NUM_WARPS == 2 else 6)  # TDM ops per warp
+    P: gl.constexpr = NUM_STAGES - 1  # chunks in flight ahead of the one computing
 
     pid = gl.program_id(0)
     i_v = pid % NV
@@ -218,6 +281,8 @@ def chunk_kda_walk_kernel(
     s_off = rv[:, None] * K + ck[None, :]
     if IS_PAGED:
         slot = gl.load(state_indices_ptr + i_n).to(gl.int64)
+        # a pad (-1) or out-of-range slot never touches the cache: zeros in, final state dropped
+        valid = (slot >= 0) & (slot < num_slots)
     else:
         slot = i_n.to(gl.int64)
     # rows step by the cache's own slot stride: vLLM's hybrid pages pad and share each slot
@@ -226,7 +291,7 @@ def chunk_kda_walk_kernel(
     if USE_INITIAL_STATE:
         m = s_off >= 0
         if IS_PAGED:
-            m = m & (gl.load(has_initial_state_ptr + i_n) != 0)
+            m = m & (valid & (gl.load(has_initial_state_ptr + i_n) != 0))
         S = gl.amd.gfx1250.buffer_load(state_ptr + s_row, s_off, mask=m, other=0.0)
     else:
         S = gl.zeros([BV, K], gl.float32, MMA)
@@ -246,6 +311,13 @@ def chunk_kda_walk_kernel(
     )
     o_s = gl.allocate_shared_memory(
         o_ptr.dtype.element_ty, [BV, BT], _smem([BV, BT], 8)
+    )
+    # the chunk decay rides in the ring: every lane needs 64 of its 128 values, so a
+    # direct load costs 16 address registers per chunk
+    SL_D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    d_s = gl.allocate_shared_memory(gl.float32, [NUM_STAGES, 1, K], SL_D)
+    d_1 = d_s._reinterpret(
+        gl.float32, [NUM_STAGES, K], gl.SwizzledSharedLayout(1, 1, 1, [0])
     )
     # descriptors span the sequence, so the clamp zero-fills a partial last chunk
     tok = bos.to(gl.int64)
@@ -284,7 +356,13 @@ def chunk_kda_walk_kernel(
         block_shape=(BT, BT),
         layout=SL_A,
     )
-    dec_p = decay_ptr + (c0 * H + i_h).to(gl.int64) * K
+    dd = _TDM.make_tensor_descriptor(
+        base=decay_ptr + (c0 * H + i_h).to(gl.int64) * K,
+        shape=(nc, K),
+        strides=(H * K, 1),
+        block_shape=(1, K),
+        layout=SL_D,
+    )
     o_p = o_ptr + tok * stride_o_token + i_h * V + i_v * BV
     if FUSE_NORM:
         og_p = out_gate_ptr + tok * stride_og_token + i_h * V
@@ -295,83 +373,68 @@ def chunk_kda_walk_kernel(
         og_p = o_p
         nw = 0.0
 
-    if nc > 0:
-        _load_chunk(
-            dw,
-            dq,
-            dk,
-            du,
-            da,
-            w_s,
-            q_s,
-            k_s,
-            u_s,
-            a_s,
-            0,
-            H,
-            K,
-            BT,
-            NUM_STAGES,
-            NUM_WARPS,
-        )
-    for i in range(nc):
-        dec = gl.amd.gfx1250.buffer_load(dec_p + i * (H * K), ck)
-        if i + 1 < nc:  # prefetch chunk i + 1 under chunk i
+    for j in gl.static_range(P):
+        if j < nc:
             _load_chunk(
                 dw,
                 dq,
                 dk,
                 du,
                 da,
+                dd,
                 w_s,
                 q_s,
                 k_s,
                 u_s,
                 a_s,
-                i + 1,
+                d_s,
+                j,
                 H,
                 K,
                 BT,
                 NUM_STAGES,
                 NUM_WARPS,
             )
-            _TDM.async_wait(STAGE_OPS)
-        else:
-            _TDM.async_wait(0)
-        S = _chunk(
-            S,
-            dec,
+    # steady state: chunk i + P is issued in the same block as the wait, so the
+    # wait count stays exact; the tail drains what is left
+    for i in range(nc - P):
+        _load_chunk(
+            dw,
+            dq,
+            dk,
+            du,
+            da,
+            dd,
             w_s,
             q_s,
             k_s,
             u_s,
             a_s,
-            o_s,
-            i % NUM_STAGES,
-            scale,
-            MMA,
-            A_OP,
-            B_OP,
-            BV,
+            d_s,
+            i + P,
+            H,
+            K,
             BT,
+            NUM_STAGES,
+            NUM_WARPS,
         )
-        t = (i * BT).to(gl.int64)
-        _store_o(
-            o_s,
-            o_p + t * stride_o_token,
-            og_p + t * stride_og_token,
-            nw,
-            T_n - i * BT,
-            norm_eps,
-            stride_o_token,
-            stride_og_token,
-            A_OP,
-            BT,
-            BV,
+        _TDM.async_wait(P * STAGE_OPS)
+        S = _step(
+            S, i, d_1, w_s, q_s, k_s, u_s, a_s, o_s, o_p, og_p, nw, T_n, norm_eps,
+            stride_o_token, stride_og_token, scale, MMA, A_OP, B_OP, BV, BT, NUM_STAGES,
+            FUSE_NORM,
+        )
+    for i in range(gl.maximum(nc - P, 0), nc):
+        _TDM.async_wait(0)
+        S = _step(
+            S, i, d_1, w_s, q_s, k_s, u_s, a_s, o_s, o_p, og_p, nw, T_n, norm_eps,
+            stride_o_token, stride_og_token, scale, MMA, A_OP, B_OP, BV, BT, NUM_STAGES,
             FUSE_NORM,
         )
 
     if STORE_FINAL_STATE:
-        gl.amd.gfx1250.buffer_store(
-            S, state_out_ptr + slot * stride_state_out_n + s_head, s_off
-        )
+        s_out = state_out_ptr + slot * stride_state_out_n + s_head
+        if IS_PAGED:
+            gl.amd.gfx1250.buffer_store(S, s_out, s_off, mask=(s_off >= 0) & valid)
+        else:
+            gl.amd.gfx1250.buffer_store(S, s_out, s_off)

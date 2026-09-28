@@ -5,10 +5,6 @@ import logging
 
 import torch
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
@@ -24,6 +20,7 @@ _ARCH = arch_info.get_arch()
 
 CHUNK_SIZE = 64
 HEAD_DIM = 128
+_INDEX_DTYPES = (torch.int32, torch.int64)
 
 chunk_kda_prepare_kernel = chunk_kda_walk_kernel = None
 if _ARCH == "gfx1250":
@@ -35,21 +32,76 @@ if _ARCH == "gfx1250":
     )
 
 
+def _tuned() -> dict:
+    return load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-CHUNK_KDA-DEFAULT.json")
+
+
 def get_chunk_kda_config(num_seqs: int, H: int, overrides: dict | None = None) -> dict:
-    tuned = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-CHUNK_KDA-DEFAULT.json"
-    )
-    # the walk is serial in chunks: when (seq, head) pairs cannot fill the GPU at
-    # BV=64, a narrower BV buys programs
-    few = num_seqs * H * (HEAD_DIM // 64) < get_num_sms()
-    config = dict(tuned["walk_few_seq_heads" if few else "walk_default"])
+    """Walk launch config: one tier per value-block width BV in the tuned JSON.
+
+    The walk is serial in chunks, so its time is one program's chain: take the narrowest
+    BV whose num_seqs * H * (HEAD_DIM / BV) programs still get a CU each (the widest when
+    none does). An override naming BV starts from that tier.
+    """
+    tiers = sorted(_tuned()["walk"], key=lambda c: c["BV"])
+    if overrides and "BV" in overrides:
+        base = next((c for c in tiers if c["BV"] == overrides["BV"]), {})
+    else:
+        fits = [c for c in tiers if num_seqs * H * (HEAD_DIM // c["BV"]) <= get_num_sms()]
+        base = fits[0] if fits else tiers[-1]
+    config = dict(base)
     config.update(overrides or {})
     return config
+
+
+def get_chunk_kda_prepare_config(overrides: dict | None = None) -> dict:
+    config = dict(_tuned().get("prepare", {}))
+    config.update(overrides or {})
+    return config
+
+
+def _launch_opts(config: dict) -> dict:
+    """waves_per_eu / sched_strategy from a config, as kernel launch options."""
+    opts = {}
+    if config.get("waves_per_eu"):
+        opts["waves_per_eu"] = config["waves_per_eu"]
+    if config.get("sched_strategy"):
+        opts["llvm_fn_attrs"] = f"amdgpu-sched-strategy={config['sched_strategy']}"
+    return opts
+
+
+def prepare_chunk_kda_metadata(
+    cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """int32 chunk_indices [NT, 2] of (sequence, chunk) and int64 chunk_offsets [N + 1].
+
+    A zero-length sequence owns no chunk and the ones after it keep their ids
+    (``prepare_chunk_indices`` shifts them). Reads NT back to the host, so callers
+    on a hot path (vLLM) pass their own device-built metadata.
+    """
+    counts = torch.div(
+        (cu_seqlens[1:] - cu_seqlens[:-1]).long() + CHUNK_SIZE - 1,
+        CHUNK_SIZE,
+        rounding_mode="floor",
+    )
+    chunk_offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    NT = int(chunk_offsets[-1])
+    seq = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=counts.device), counts, output_size=NT
+    )
+    chunk = torch.arange(NT, device=counts.device) - chunk_offsets[seq]
+    return torch.stack([seq, chunk], 1).int(), chunk_offsets
 
 
 def _check_tokens(name: str, x: torch.Tensor, D: int) -> None:
     assert x.ndim == 4 and x.shape[0] == 1, f"{name} must be [1, T, H, {D}]"
     assert x.stride()[2:] == (D, 1), f"{name} must be dense in [H, {D}]"
+
+
+def _check_index(name: str, x: torch.Tensor, shape: tuple) -> None:
+    assert (
+        x.shape == shape and x.dtype in _INDEX_DTYPES and x.is_contiguous()
+    ), f"{name} must be a contiguous int32 / int64 {list(shape)}"
 
 
 def chunk_kda_prepare(
@@ -64,6 +116,7 @@ def chunk_kda_prepare(
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor | None = None,
     scale: float | None = None,
+    config: dict | None = None,
 ) -> dict[str, torch.Tensor]:
     """Per-chunk operands of the chunked KDA walk, one launch (gfx1250 Gluon).
 
@@ -80,9 +133,12 @@ def chunk_kda_prepare(
         A_log: [H] gate parameter.
         dt_bias: [H * 128] gate bias.
         lower_bound: gate floor; g = lower_bound * sigmoid(exp(A_log) (g + dt_bias)).
-        cu_seqlens: [N + 1] varlen offsets.
-        chunk_indices: [NT, 2] (sequence, chunk) pairs for 64-token chunks.
+        cu_seqlens: int32 / int64 [N + 1] varlen offsets.
+        chunk_indices: int [NT, 2] (sequence, chunk) pairs for 64-token chunks;
+            ``prepare_chunk_kda_metadata`` if None.
         scale: q scale, K**-0.5 by default.
+        config: launch overrides (waves_per_eu, sched_strategy) over the tuned
+            ``prepare`` entry.
     """
     if chunk_kda_prepare_kernel is None:
         raise RuntimeError(f"chunk kda gluon requires gfx1250 (found {_ARCH})")
@@ -100,22 +156,22 @@ def chunk_kda_prepare(
     assert (
         dt_bias.numel() == H * K and dt_bias.is_contiguous()
     ), "dt_bias must be [H * K]"
-    assert cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous"
+    _check_index("cu_seqlens", cu_seqlens, (cu_seqlens.numel(),))
     if scale is None:
         scale = K**-0.5
     if chunk_indices is None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-    assert chunk_indices.is_contiguous(), "chunk_indices must be contiguous"
+        chunk_indices, _ = prepare_chunk_kda_metadata(cu_seqlens)
     NT = chunk_indices.shape[0]
+    _check_index("chunk_indices", chunk_indices, (NT, 2))
 
-    ws = dict(
-        qg=q.new_empty(1, T, H, K),
-        w=q.new_empty(1, T, H, K),
-        u=q.new_empty(1, T, H, V),
-        kg_t=q.new_empty(NT, H, K, CHUNK_SIZE),
-        aqk=q.new_empty(1, T, H, CHUNK_SIZE),
-        decay=q.new_empty(NT, H, K, dtype=torch.float32),
-    )
+    ws = {
+        "qg": q.new_empty(1, T, H, K),
+        "w": q.new_empty(1, T, H, K),
+        "u": q.new_empty(1, T, H, V),
+        "kg_t": q.new_empty(NT, H, K, CHUNK_SIZE),
+        "aqk": q.new_empty(1, T, H, CHUNK_SIZE),
+        "decay": q.new_empty(NT, H, K, dtype=torch.float32),
+    }
     if _LOG_INFO:
         _LOGGER.info(f"CHUNK_KDA_PREPARE: T={T} NT={NT} H={H}")
     chunk_kda_prepare_kernel[(NT, H)](
@@ -146,6 +202,7 @@ def chunk_kda_prepare(
         V=V,
         BT=CHUNK_SIZE,
         num_warps=4,
+        **_launch_opts(get_chunk_kda_prepare_config(config)),
     )
     return ws
 
@@ -177,6 +234,8 @@ def chunk_kda_walk(
     v_new = u - w S^T, o = scale qg S^T + aqk v_new, S = S diag(decay) + v_new^T kg.
 
     Args:
+        chunk_offsets: int32 / int64 [N + 1] first chunk of each sequence;
+            ``prepare_chunk_kda_metadata`` if None.
         out: [1, T, H, 128] destination, may alias the dead v; allocated if None.
         initial_state: fp32 [N, H, V, K] per-sequence start state, zeros if None.
         output_final_state: return a fresh fp32 [N, H, V, K] final state.
@@ -184,10 +243,14 @@ def chunk_kda_walk(
             any slot stride (vLLM pads and shares hybrid cache pages); read and
             written in place at ``state_indices``; replaces initial_state /
             output_final_state.
-        state_indices: int32 [N] cache row per sequence.
-        has_initial_state: bool [N]; False starts that sequence from zeros.
+        state_indices: int32 / int64 [N] cache row per sequence, any stride (vLLM
+            passes a block-table column; it is copied dense). Valid rows must be
+            distinct. A row outside [0, slots), e.g. PAD_SLOT_ID -1, is never read
+            or written: that sequence starts from zeros whatever has_initial_state
+            says, its output is still written, and its final state is dropped.
+        has_initial_state: bool [N], any stride; False starts that sequence from zeros.
         out_gate, norm_weight: fuse o = rmsnorm(o) * norm_weight * sigmoid(out_gate).
-        config: overrides for BV, num_warps, num_stages, waves_per_eu.
+        config: overrides for BV, num_warps, num_stages, waves_per_eu, sched_strategy.
 
     Returns:
         (out, final_state); final_state is None when the state lives in state_cache.
@@ -197,50 +260,81 @@ def chunk_kda_walk(
     _, T, H, K = qg.shape
     V = u.shape[-1]
     N = cu_seqlens.numel() - 1
+    NT = kg_t.shape[0]
     paged = state_cache is not None
     fuse_norm = out_gate is not None
+    _check_index("cu_seqlens", cu_seqlens, (N + 1,))
+    # the TDM descriptors assume the dense workspace chunk_kda_prepare allocates
+    for name, x, shape in (
+        ("qg", qg, (1, T, H, K)),
+        ("w", w, (1, T, H, K)),
+        ("u", u, (1, T, H, V)),
+        ("aqk", aqk, (1, T, H, CHUNK_SIZE)),
+        ("kg_t", kg_t, (NT, H, K, CHUNK_SIZE)),
+        ("decay", decay, (NT, H, K)),
+    ):
+        assert x.shape == shape and x.is_contiguous(), f"{name} must be dense {shape}"
+    assert decay.dtype == torch.float32, "decay must be fp32"
     if scale is None:
         scale = K**-0.5
     if chunk_offsets is None:
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, CHUNK_SIZE)
+        _, chunk_offsets = prepare_chunk_kda_metadata(cu_seqlens)
+    _check_index("chunk_offsets", chunk_offsets, (N + 1,))
     if out is None:
         out = qg.new_empty(1, T, H, V)
     _check_tokens("out", out, V)
+    assert (
+        out.shape == (1, T, H, V) and out.dtype == qg.dtype
+    ), f"out must be [1, {T}, {H}, {V}] {qg.dtype}"
     state_shape = (H, V, K)
     if paged:
         assert (
             initial_state is None and not output_final_state
         ), "state_cache replaces initial_state / output_final_state"
-        assert state_indices is not None and has_initial_state is not None
-        assert state_indices.numel() == N and state_indices.is_contiguous()
-        assert has_initial_state.numel() == N and has_initial_state.is_contiguous()
+        assert (
+            state_indices is not None and has_initial_state is not None
+        ), "state_cache needs state_indices and has_initial_state"
+        assert (
+            state_indices.numel() == N and state_indices.dtype in _INDEX_DTYPES
+        ), "state_indices must be int32 / int64 [N]"
+        assert has_initial_state.numel() == N, "has_initial_state must be [N]"
+        # vLLM passes block_table[:, 0] of an [N, 1 + num_spec] table; the kernel
+        # reads unit stride, and N elements copy without a sync
+        state_indices = state_indices.contiguous()
+        has_initial_state = has_initial_state.contiguous()
         state_in = state_out = state_cache
+        num_slots = state_cache.shape[0]
         final_state = None
     else:
+        assert (
+            initial_state is None or initial_state.shape[0] == N
+        ), "initial_state must be [N, H, V, K]"
         state_in = initial_state
         state_out = final_state = (
             qg.new_empty(N, *state_shape, dtype=torch.float32)
             if output_final_state
             else None
         )
+        num_slots = N
     for s in (state_in, state_out):
         if s is not None:
-            assert s.dtype == torch.float32 and s.shape[1:] == state_shape
+            assert (
+                s.dtype == torch.float32 and s.shape[1:] == state_shape
+            ), f"state must be fp32 [*, {H}, {V}, {K}]"
             assert s.stride()[1:] == (V * K, K, 1), "state must be dense [*, H, V, K]"
     if fuse_norm:
         _check_tokens("out_gate", out_gate, V)
         assert norm_weight.numel() == V and norm_weight.is_contiguous()
 
-    config = get_chunk_kda_config(N, H, config)
+    # the fused norm reduces over whole value rows, so it takes the BV == V tier
+    config = get_chunk_kda_config(N, H, {"BV": V, **(config or {})} if fuse_norm else config)
     BV = config["BV"]
     num_warps = config["num_warps"]
     assert (
         V % BV == 0 and BV % (16 * num_warps) == 0
     ), f"illegal BV={BV}, warps={num_warps}"
     assert not fuse_norm or BV == V, "the fused norm needs BV == V"
-    opts = (
-        {"waves_per_eu": config["waves_per_eu"]} if config.get("waves_per_eu") else {}
-    )
+    opts = _launch_opts(config)
 
     if _LOG_INFO:
         _LOGGER.info(
@@ -266,6 +360,7 @@ def chunk_kda_walk(
         norm_eps=norm_eps,
         stride_state_n=state_in.stride(0) if state_in is not None else 0,
         stride_state_out_n=state_out.stride(0) if state_out is not None else 0,
+        num_slots=num_slots,
         stride_o_token=out.stride(1),
         stride_og_token=out_gate.stride(1) if fuse_norm else 0,
         scale=scale,
@@ -317,6 +412,10 @@ def chunk_kda(
     """
     if scale is None:
         scale = q.shape[-1] ** -0.5
+    if chunk_indices is None or chunk_offsets is None:
+        ci, co = prepare_chunk_kda_metadata(cu_seqlens)
+        chunk_indices = ci if chunk_indices is None else chunk_indices
+        chunk_offsets = co if chunk_offsets is None else chunk_offsets
     ws = chunk_kda_prepare(
         q, k, v, g, beta, A_log, dt_bias, lower_bound, cu_seqlens, chunk_indices, scale
     )

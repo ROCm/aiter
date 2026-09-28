@@ -11,8 +11,12 @@ from aiter.ops.triton.attention.chunk_kda import (
     CHUNK_SIZE,
     chunk_kda,
     chunk_kda_prepare,
+    chunk_kda_walk,
+    get_chunk_kda_config,
+    prepare_chunk_kda_metadata,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_sms
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref, kda_gate_ref, l2norm_ref
 
 pytestmark = pytest.mark.skipif(
@@ -26,12 +30,27 @@ LOWER_BOUND = -5.0
 # CPU mirror of this exact algorithm lands at 0.003-0.0045 against the fp32 token loop
 RATIO = 0.008
 POISON = 1e30
+# Kimi-K3 at TP4 as vLLM lays it out: 24 local heads, fp32 recurrent state in hybrid cache
+# pages of K3_PAGE elements (bf16 conv state first, so the state view starts K3_STATE_OFF in)
+K3_H = 24
+K3_PAGE = 442368
+K3_STATE_OFF = 13824
+K3_SLOTS = 64  # 909 in serving: same geometry, fewer pages
+# the tuned walk tiers (gfx1250-CHUNK_KDA-DEFAULT.json): config None takes the narrowest whose
+# N * H * (D / BV) programs get a CU each; WALK_WIDE is forced where few sequences pick another
+WALK_TIERS = [
+    {"BV": 16, "num_warps": 1},
+    {"BV": 32, "num_warps": 2},
+    {"BV": 64, "num_warps": 4, "waves_per_eu": 2},
+    {"BV": 128, "num_warps": 4},
+]
+WALK_WIDE = WALK_TIERS[-1]
 
 WALK_CONFIGS = [
     None,
-    {"BV": 32, "num_warps": 2},
-    {"BV": 64, "num_warps": 4},
-    {"BV": 128, "num_warps": 4},
+    *WALK_TIERS,
+    {"BV": 64, "num_warps": 4, "waves_per_eu": 3},
+    {"BV": 128, "num_warps": 2},
 ]
 
 
@@ -66,9 +85,117 @@ def make_inputs(seqlens, H, seed=0, dup_keys=False, gate_shift=0.0):
     cu = torch.tensor(
         [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=DEVICE
     )
-    return dict(
-        q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias, cu_seqlens=cu
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "cu_seqlens": cu,
+    }
+
+
+def cdiv(a, b):
+    return (a + b - 1) // b
+
+
+def make_vllm_inputs(seqlens, H=K3_H, nd_tok=0, spec=False, pad_tok=3, seed=0):
+    """The operands vLLM's K3 layer hands the prefill (kda.py _forward).
+
+    q/k/v are dense conv outputs and g the f_b_proj output, viewed past nd_tok decode rows;
+    beta is a column slice of the in_proj row (stride 12448 at H = 24); out is
+    core_attn_out[:, nd_tok:num_actual_tokens] of a buffer with padding rows. On the spec path
+    they are index_select copies (beta stride H) and out is None. vLLM's chunk metadata:
+    int32 indices, int64 offsets. Returns (inputs, extra kwargs, core_attn_out).
+    """
+    torch.manual_seed(seed)
+    T = sum(seqlens)
+    width = 4 * H * D + D + H  # q | k | v | g2 | f_a | beta, padded to 16 columns
+    width += -width % 16
+    num_actual = 2 * T if spec else nd_tok + T  # spec: a draft token after each one
+    num_tokens = num_actual + pad_tok
+    proj = torch.randn(num_tokens, width, dtype=torch.bfloat16, device=DEVICE)
+    beta = proj[:, 4 * H * D + D : 4 * H * D + D + H][None, :num_actual]
+    g = torch.randn(1, num_tokens, H, D, dtype=torch.bfloat16, device=DEVICE)
+    g = g[:, :num_actual]
+    q, k, v = (
+        torch.randn(1, num_actual, H, D, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
     )
+    core = torch.randn(1, num_tokens, H, D, dtype=torch.bfloat16, device=DEVICE)
+    if spec:
+        idx = torch.arange(0, num_actual, 2, device=DEVICE)
+        q, k, v, g, beta = (x.index_select(1, idx) for x in (q, k, v, g, beta))
+        out = None
+    else:
+        q, k, v, g, beta = (x[:, nd_tok:num_actual] for x in (q, k, v, g, beta))
+        out = core[:, nd_tok:num_actual]
+        assert beta.stride(1) == width and beta.storage_offset() == (
+            4 * H * D + D + nd_tok * width
+        )
+        assert q.stride(1) == H * D and q.storage_offset() == nd_tok * H * D
+    chunk_indices = torch.tensor(
+        [[n, c] for n, s in enumerate(seqlens) for c in range(cdiv(s, CHUNK_SIZE))],
+        dtype=torch.int32,
+        device=DEVICE,
+    ).view(-1, 2)
+    chunk_offsets = torch.tensor(
+        [0, *itertools.accumulate(cdiv(s, CHUNK_SIZE) for s in seqlens)],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    inp = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "A_log": torch.log(torch.empty(H, device=DEVICE).uniform_(1, 16)),
+        "dt_bias": torch.randn(H * D, device=DEVICE),
+        "cu_seqlens": torch.tensor(
+            [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=DEVICE
+        ),
+    }
+    return (
+        inp,
+        {"chunk_indices": chunk_indices, "chunk_offsets": chunk_offsets, "out": out},
+        core,
+    )
+
+
+def make_page_cache(num_slots, H=K3_H, guard=0):
+    """vLLM's hybrid cache pages: conv state, the [H, 128, 128] recurrent state at K3_STATE_OFF,
+    padding. ``guard`` POISON pages on each side keep a stray -1 / num_slots row inside the
+    allocation, where the POISON check sees it."""
+    raw = torch.full(((num_slots + 2 * guard) * K3_PAGE,), POISON, device=DEVICE)
+    cache = raw.as_strided(
+        (num_slots, H, D, D), (K3_PAGE, D * D, D, 1), guard * K3_PAGE + K3_STATE_OFF
+    )
+    return raw, cache
+
+
+def seed_slots(raw, cache, slots, has_init):
+    """Random states in the valid slots. Returns the start state the kernel must use (zeros
+    for has_init False or an invalid slot), the mask of raw it may write, and the valid rows.
+    """
+    valid = (slots >= 0) & (slots < cache.shape[0])
+    rows = slots[valid].long()
+    cache[rows] = torch.randn(len(rows), *cache.shape[1:], device=DEVICE)
+    h0 = torch.zeros(len(slots), *cache.shape[1:], device=DEVICE)
+    h0[valid & has_init] = cache[slots[valid & has_init].long()]
+    written = torch.zeros_like(raw, dtype=torch.bool)
+    written.as_strided(cache.shape, cache.stride(), cache.storage_offset())[rows] = True
+    return h0, written, valid
+
+
+def check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid):
+    assert_close("o", o_ref, o)
+    assert_close("final_state", s_ref[valid], cache[slots[valid].long()])
+    assert (
+        raw[~written] == POISON
+    ).all(), "cache memory outside the used slots was written"
 
 
 def run_ref(inp, initial_state=None):
@@ -99,14 +226,14 @@ def workspace_ref(inp, scale):
     ].double() / math.log(2)
     beta = torch.sigmoid(inp["beta"][0].double())
     T, H, _ = q.shape
-    out = dict(
-        qg=torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
-        w=torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
-        u=torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
-        aqk=torch.zeros(T, H, CHUNK_SIZE, dtype=torch.float64, device=DEVICE),
-        kg_t=[],
-        decay=[],
-    )
+    out = {
+        "qg": torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
+        "w": torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
+        "u": torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
+        "aqk": torch.zeros(T, H, CHUNK_SIZE, dtype=torch.float64, device=DEVICE),
+        "kg_t": [],
+        "decay": [],
+    }
     for bos, eos in itertools.pairwise(inp["cu_seqlens"].tolist()):
         for t0 in range(bos, eos, CHUNK_SIZE):
             t1 = min(t0 + CHUNK_SIZE, eos)
@@ -137,7 +264,7 @@ def workspace_ref(inp, scale):
 
 @pytest.mark.parametrize(
     "seqlens",
-    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000]],
+    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [5, 0, 70]],
 )
 @pytest.mark.parametrize("config", WALK_CONFIGS)
 def test_chunk_kda(seqlens, config):
@@ -162,11 +289,12 @@ def test_chunk_kda_workspace(seqlens):
     assert_close("decay", ref["decay"], ws["decay"])
 
 
+@pytest.mark.parametrize("config", [None, WALK_WIDE])
 @pytest.mark.parametrize("padded", [False, True])
-def test_chunk_kda_paged(padded):
+def test_chunk_kda_paged(padded, config):
     """vLLM path: state cache read and written in place, out aliasing the dead v. ``padded`` lays the
     cache out like vLLM's hybrid pages: each slot's page holds the conv state first, then the
-    recurrent state, then padding, so the slot stride is not H * D * D."""
+    recurrent state, then padding, so the slot stride is not H * D * D (nor a multiple of 16)."""
     seqlens, H = [130, 1, 64, 257], 24
     inp = make_inputs(seqlens, H, seed=1)
     N = len(seqlens)
@@ -188,11 +316,14 @@ def test_chunk_kda_paged(padded):
         state_cache=cache,
         state_indices=slots,
         has_initial_state=has_init,
+        config=config,
     )
     assert s is None and o.data_ptr() == inp["v"].data_ptr()
     assert_close("o", o_ref, o)
     assert_close("final_state", s_ref, cache[slots.long()])
-    assert (raw[~written] == POISON).all(), "cache memory outside the used slots was written"
+    assert (
+        raw[~written] == POISON
+    ).all(), "cache memory outside the used slots was written"
 
 
 def test_chunk_kda_fused_norm():
@@ -231,3 +362,301 @@ def test_chunk_kda_stress(dup_keys, gate_shift):
     o, s = run_kernel(inp, initial_state=h0, output_final_state=True)
     assert_close("o", o_ref, o, 1.25 * RATIO)
     assert_close("final_state", s_ref, s, 1.25 * RATIO)
+
+
+VLLM_CASES = {
+    # the run-2 crash step: 114 decode rows ahead of four ~1k-token prompts, one continuing
+    "split_4x1k": {
+        "seqlens": [1030, 990, 956, 1005],
+        "nd_tok": 114,
+        "has_init": [False, True, False, False],
+    },
+    # a 4096-token chunk continuing a cached prefix: 64 chunks in one program
+    "single_4096": {"seqlens": [4096], "has_init": [True]},
+    # long walks through the widest tier, which two sequences would not select
+    "long_default": {
+        "seqlens": [2048, 2048],
+        "nd_tok": 7,
+        "has_init": [False, True],
+        "config": WALK_WIDE,
+    },
+    # six prefills at H = 24 overfill the GPU at BV 64, so config None takes BV 128
+    "split_6": {
+        "seqlens": [2, 130, 1, 64, 257, 3],
+        "nd_tok": 5,
+        "has_init": [True, False, True, True, False, False],
+    },
+    # spec path: index_select copies, out None, reclassified 1-token decodes, an empty row
+    "spec": {
+        "seqlens": [1] * 10 + [300, 0, 65],
+        "spec": True,
+        "has_init": [True] * 10 + [False, True, False],
+    },
+}
+
+
+@pytest.mark.parametrize("case", list(VLLM_CASES))
+def test_chunk_kda_vllm_layout(case):
+    """Operands in the exact forms vLLM passes (strided beta column, decode-row offsets, out as
+    a core_attn_out slice, int64 chunk_offsets, padded hybrid pages): o and the state against the
+    fp32 token loop, and no write outside the used slots' states or the out slice."""
+    c = VLLM_CASES[case]
+    seqlens, nd_tok = c["seqlens"], c.get("nd_tok", 0)
+    N, T = len(seqlens), sum(seqlens)
+    inp, kw, core = make_vllm_inputs(seqlens, nd_tok=nd_tok, spec=c.get("spec", False))
+    raw, cache = make_page_cache(K3_SLOTS)
+    assert cache.stride(0) == K3_PAGE and cache.storage_offset() == K3_STATE_OFF
+    slots = (torch.randperm(K3_SLOTS - 1, device=DEVICE)[:N] + 1).int()
+    has_init = torch.tensor(c["has_init"], device=DEVICE)
+    h0, written, valid = seed_slots(raw, cache, slots, has_init)
+    o_ref, s_ref = run_ref(inp, h0)
+    core_before = core.clone()
+
+    o, s = run_kernel(
+        inp,
+        **kw,
+        state_cache=cache,
+        state_indices=slots,
+        has_initial_state=has_init,
+        config=c.get("config"),
+    )
+    assert s is None
+    check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid)
+    if kw["out"] is not None:
+        assert o.data_ptr() == kw["out"].data_ptr()
+        rest = torch.ones(core.shape[1], dtype=torch.bool, device=DEVICE)
+        rest[nd_tok : nd_tok + T] = False
+        assert torch.equal(core[:, rest], core_before[:, rest]), "wrote outside out"
+
+
+@pytest.mark.parametrize("nd_tok", [0, 3])
+def test_chunk_kda_strided_state_indices(nd_tok):
+    """With spec decode configured, a step without drafts passes block_table[:, 0] of an
+    [R, 1 + num_spec] table, sliced past the decodes when mixed: stride 3 here."""
+    seqlens = [130, 2, 64, 257]
+    N = len(seqlens)
+    inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=nd_tok, seed=4)
+    raw, cache = make_page_cache(K3_SLOTS)
+    ids = torch.randperm(K3_SLOTS - 1, device=DEVICE)[: 3 * (nd_tok + N)] + 1
+    bt = ids.int().view(nd_tok + N, 3)
+    slots = bt[nd_tok:, 0]
+    init = torch.tensor([True, False, True, True], device=DEVICE)
+    has_init = torch.stack([init, ~init], 1)[:, 0]
+    assert slots.stride() == (3,) and has_init.stride() == (2,)
+    h0, written, valid = seed_slots(raw, cache, slots, has_init)
+    o_ref, s_ref = run_ref(inp, h0)
+    bt_before = bt.clone()
+
+    o, _ = run_kernel(
+        inp, **kw, state_cache=cache, state_indices=slots, has_initial_state=has_init
+    )
+    check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid)
+    assert torch.equal(bt, bt_before)
+
+
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        [300, 1, 64, 130, 7, 1000, 65, 63],
+        # spec decode reclassifying 1-token decodes as prefills, around a few prompts
+        [1] * 36 + [700, 1, 129, 64],
+    ],
+    ids=["mixed_8", "spec_40"],
+)
+@pytest.mark.parametrize("config", [None, WALK_WIDE])
+def test_chunk_kda_paged_many_seqs(seqlens, config):
+    """Enough prefills at H = 24 to overfill the GPU at BV 64: config None must select the
+    widest tier (BV 128, 4 warps) in the paged specialisation vLLM runs."""
+    N = len(seqlens)
+    assert N * K3_H * (D // 64) > get_num_sms(), "too few pairs for the widest tier"
+    assert get_chunk_kda_config(N, K3_H)["BV"] == 128
+    inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=2, seed=6)
+    raw, cache = make_page_cache(K3_SLOTS)
+    slots = (torch.randperm(K3_SLOTS - 1, device=DEVICE)[:N] + 1).int()
+    has_init = torch.arange(N, device=DEVICE) % 3 != 1
+    h0, written, valid = seed_slots(raw, cache, slots, has_init)
+    o_ref, s_ref = run_ref(inp, h0)
+
+    o, _ = run_kernel(
+        inp,
+        **kw,
+        state_cache=cache,
+        state_indices=slots,
+        has_initial_state=has_init,
+        config=config,
+    )
+    check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_chunk_kda_invalid_slots(dtype):
+    """Slots -1 (PAD_SLOT_ID) and num_slots: those sequences start from zeros although
+    has_initial_state is set, still write o, and leave the cache and its guard pages alone.
+    """
+    seqlens = [130, 64, 1, 257, 65]
+    N = len(seqlens)
+    inp, kw, _ = make_vllm_inputs(seqlens, seed=5)
+    raw, cache = make_page_cache(K3_SLOTS, guard=1)
+    ok = torch.randperm(K3_SLOTS, device=DEVICE)[:3].tolist()
+    slots = torch.tensor(
+        [-1, ok[0], K3_SLOTS, ok[1], ok[2]], dtype=dtype, device=DEVICE
+    )
+    has_init = torch.ones(N, dtype=torch.bool, device=DEVICE)
+    h0, written, valid = seed_slots(raw, cache, slots, has_init)
+    assert valid.tolist() == [False, True, False, True, True]
+    o_ref, s_ref = run_ref(inp, h0)
+
+    o, _ = run_kernel(
+        inp, **kw, state_cache=cache, state_indices=slots, has_initial_state=has_init
+    )
+    check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid)
+
+
+def test_chunk_kda_chunked_prefill():
+    """Prompts split at a 1536-token mamba block: the second call continues from the states the
+    first left in the cache (has_initial_state True), as chunked prefill or a prefix hit does. The
+    first call starts from zeros without reading the POISON rows."""
+    first, rest = [1536, 300], [500, 1]
+    inp = make_inputs([a + b for a, b in zip(first, rest)], K3_H, seed=7)
+    o_ref, s_ref = run_ref(inp)
+    raw, cache = make_page_cache(8)
+    slots = torch.tensor([5, 2], dtype=torch.int32, device=DEVICE)
+    written = torch.zeros_like(raw, dtype=torch.bool)
+    written.as_strided(cache.shape, cache.stride(), cache.storage_offset())[
+        slots.long()
+    ] = True
+    cu = inp["cu_seqlens"].tolist()
+    for has_init, spans in (
+        (False, [(cu[n], cu[n] + first[n]) for n in range(2)]),
+        (True, [(cu[n] + first[n], cu[n + 1]) for n in range(2)]),
+    ):
+        idx = torch.cat([torch.arange(a, b, device=DEVICE) for a, b in spans])
+        part = {n: inp[n].index_select(1, idx) for n in ("q", "k", "v", "g", "beta")}
+        part.update(
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            cu_seqlens=torch.tensor(
+                [0, *itertools.accumulate(b - a for a, b in spans)],
+                dtype=torch.int32,
+                device=DEVICE,
+            ),
+        )
+        o, _ = run_kernel(
+            part,
+            state_cache=cache,
+            state_indices=slots,
+            has_initial_state=torch.full((2,), has_init, device=DEVICE),
+        )
+        assert_close("o", o_ref.index_select(1, idx), o)
+    assert_close("final_state", s_ref, cache[slots.long()])
+    assert (
+        raw[~written] == POISON
+    ).all(), "cache memory outside the used slots was written"
+
+
+@pytest.mark.parametrize(
+    "seqlens", [[5, 0, 70], [0, 64, 0, 0, 129, 1], [0], [64, 0], [1000]]
+)
+def test_chunk_kda_metadata(seqlens):
+    """The chunk_indices=None fallback keeps sequence ids across zero-length sequences."""
+    cu = torch.tensor(
+        [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=DEVICE
+    )
+    chunk_indices, chunk_offsets = prepare_chunk_kda_metadata(cu)
+    assert chunk_indices.dtype == torch.int32 and chunk_offsets.dtype == torch.int64
+    assert chunk_indices.shape[1] == 2 and chunk_indices.is_contiguous()
+    assert chunk_indices.tolist() == [
+        [n, c] for n, s in enumerate(seqlens) for c in range(cdiv(s, CHUNK_SIZE))
+    ]
+    assert chunk_offsets.tolist() == [
+        0,
+        *itertools.accumulate(cdiv(s, CHUNK_SIZE) for s in seqlens),
+    ]
+
+
+HOST_CHECK_CASES = [
+    "offsets_short",
+    "offsets_float",
+    "offsets_2d",
+    "offsets_strided",
+    "indices_3_cols",
+    "indices_float",
+    "indices_strided",
+    "out_short",
+    "out_heads",
+    "out_dtype",
+    "state_indices_short",
+    "state_indices_float",
+    "has_init_short",
+    "initial_state_rows",
+]
+
+
+@pytest.mark.parametrize("bad", HOST_CHECK_CASES)
+def test_chunk_kda_host_checks(bad):
+    """Malformed metadata, out or state operands fail on the host, before the walk launches."""
+    seqlens, H = [65, 1, 130], 4
+    N, T = len(seqlens), sum(seqlens)
+    inp = make_inputs(seqlens, H)
+    ci, co = prepare_chunk_kda_metadata(inp["cu_seqlens"])
+    slots = torch.arange(N, dtype=torch.int32, device=DEVICE)
+    paged = {
+        "state_cache": torch.zeros(N, H, D, D, device=DEVICE),
+        "state_indices": slots,
+        "has_initial_state": torch.ones(N, dtype=torch.bool, device=DEVICE),
+    }
+    kw = {"chunk_indices": ci, "chunk_offsets": co}
+    kw.update(
+        {
+            "offsets_short": {"chunk_offsets": co[:-1]},
+            "offsets_float": {"chunk_offsets": co.float()},
+            "offsets_2d": {"chunk_offsets": co[None]},
+            "offsets_strided": {"chunk_offsets": torch.stack([co, co], 1)[:, 0]},
+            "indices_3_cols": {"chunk_indices": torch.cat([ci, ci[:, :1]], 1)},
+            "indices_float": {"chunk_indices": ci.float()},
+            "indices_strided": {"chunk_indices": ci.t().contiguous().t()},
+            "out_short": {"out": inp["v"][:, 1:]},
+            "out_heads": {"out": inp["v"][:, :, 1:]},
+            "out_dtype": {"out": torch.empty(1, T, H, D, device=DEVICE)},
+            "state_indices_short": dict(paged, state_indices=slots[1:]),
+            "state_indices_float": dict(paged, state_indices=slots.float()),
+            "has_init_short": dict(
+                paged, has_initial_state=paged["has_initial_state"][1:]
+            ),
+            "initial_state_rows": {
+                "initial_state": torch.zeros(N - 1, H, D, D, device=DEVICE)
+            },
+        }[bad]
+    )
+    with pytest.raises(AssertionError):
+        run_kernel(inp, **kw)
+
+
+@pytest.mark.parametrize("bad", ["kg_t_rows", "decay_rows", "w_strided"])
+def test_chunk_kda_walk_host_checks(bad):
+    """The walk rejects a workspace that does not match its shapes or is not dense."""
+    inp = make_inputs([65, 1, 130], 4)
+    ws = chunk_kda_prepare(**inp, lower_bound=LOWER_BOUND)
+    ws.update(
+        {
+            "kg_t_rows": {"kg_t": ws["kg_t"][1:]},
+            "decay_rows": {"decay": ws["decay"][:-1]},
+            "w_strided": {"w": ws["w"].transpose(1, 2).contiguous().transpose(1, 2)},
+        }[bad]
+    )
+    with pytest.raises(AssertionError):
+        chunk_kda_walk(**ws, cu_seqlens=inp["cu_seqlens"])
+
+
+@pytest.mark.parametrize("N", [1, 2, 3, 5, 6, 11, 40])
+def test_chunk_kda_walk_config_tiers(N):
+    """config None: the narrowest tier whose N * H * (D / BV) programs get a CU each, else
+    the widest; an override naming BV starts from that tier's warps."""
+    cus = get_num_sms()
+    fits = [t["BV"] for t in WALK_TIERS if N * K3_H * (D // t["BV"]) <= cus]
+    expect = fits[0] if fits else WALK_TIERS[-1]["BV"]
+    config = get_chunk_kda_config(N, K3_H)
+    tier = next(t for t in WALK_TIERS if t["BV"] == config["BV"])
+    assert config["BV"] == expect and config["num_warps"] == tier["num_warps"]
+    assert get_chunk_kda_config(N, K3_H, {"BV": 16})["num_warps"] == 1
+    assert get_chunk_kda_config(N, K3_H, {"BV": 64, "num_warps": 2})["num_warps"] == 2
