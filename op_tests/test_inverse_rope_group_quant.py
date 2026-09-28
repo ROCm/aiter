@@ -300,10 +300,11 @@ def _check_scale_layout(scale, s, g, ks, scale_layout, group_size, name):
     ), f"{name}: {scale_layout} scale should be {expect}, got {tuple(scale.shape)}"
 
 
-def _make_inputs(s, h, head_dim, rd, dtype, data_init="norm", seed=0):
+def _make_inputs(s, h, head_dim, rd, dtype, data_init="norm", seed=0, cos_dtype=None):
     """Build (o, positions, cos, sin) for one config.
 
-    cos/sin are the 2D [max_pos, rd//2] the op takes. A model holding the
+    cos/sin are the 2D [max_pos, rd//2] the op takes, in cos_dtype (default:
+    the dtype of o; fp32 is DeepSeek-V4.1's table). A model holding the
     singleton batch/head dims (atom deepseek_v4._build_cos_sin_cache does
     unsqueeze(-2) twice, landing on [max_pos, 1, 1, rd//2] -- aiter
     rope_cached_positions' layout, not [max_pos, rd//2, 1, 1]) reshapes at its
@@ -320,8 +321,8 @@ def _make_inputs(s, h, head_dim, rd, dtype, data_init="norm", seed=0):
         .div_(10)
     )
     theta = fill((MAX_POS, rd // 2), data_init, gen, dtype=dtypes.fp32)
-    cos = torch.cos(theta).to(dtype).contiguous()
-    sin = torch.sin(theta).to(dtype).contiguous()
+    cos = torch.cos(theta).to(cos_dtype or dtype).contiguous()
+    sin = torch.sin(theta).to(cos_dtype or dtype).contiguous()
     return o, positions, cos, sin
 
 
@@ -459,12 +460,13 @@ def test_inverse_rope_group_quant(
     scale_layout,
     data_init="norm",
     seed=0,
+    cos_dtype=None,
 ):
     d = h * head_dim // g
     scale_n = d // group_size
 
     o, positions, cos, sin = _make_inputs(
-        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed, cos_dtype=cos_dtype
     )
 
     ref = run_torch(o, positions, cos, sin, g, group_size, rd)
@@ -506,10 +508,12 @@ def test_inverse_rope_group_quant(
 
     funcs = {
         "cpp": Cand(fused, fused, ref, scale_layout, FUSED_TOL, FUSED_SCALE_TOL),
-        "unfused": Cand(
-            unfused_once, unfused_bench, ref_rt, "row", UNFUSED_TOL, UNFUSED_SCALE_TOL
-        ),
     }
+    # The triton rope baseline takes a table in o's dtype only.
+    if cos.dtype == o.dtype:
+        funcs["unfused"] = Cand(
+            unfused_once, unfused_bench, ref_rt, "row", UNFUSED_TOL, UNFUSED_SCALE_TOL
+        )
 
     # inverse RoPE: 2 mul + 1 add per rope-tail element.
     # group quant: one |x| compare for the group amax + one scale multiply, per element.
@@ -612,6 +616,7 @@ def check_graph(
     scale_layout,
     data_init="norm",
     seed=0,
+    cos_dtype=None,
 ):
     """Capture the op in a HIP graph, replay on fresh data, compare against eager.
 
@@ -620,7 +625,7 @@ def check_graph(
     """
     d = h * head_dim // g
     o, positions, cos, sin = _make_inputs(
-        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed, cos_dtype=cos_dtype
     )
     x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_layout=scale_layout)
     kwargs = {
@@ -644,7 +649,14 @@ def check_graph(
 
     # Replay on new data, then compare against an eager run on the same data.
     o2, positions2, cos2, sin2 = _make_inputs(
-        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed + 7
+        s,
+        h,
+        head_dim,
+        rd,
+        dtype,
+        data_init=data_init,
+        seed=seed + 7,
+        cos_dtype=cos_dtype,
     )
     o.copy_(o2)
     positions.copy_(positions2)
@@ -918,6 +930,13 @@ def main():
         help="RNG seed for o and the RoPE cache source (default: 0)",
     )
     parser.add_argument(
+        "--cos-fp32",
+        action="store_true",
+        help="""Hold cos/sin in fp32, as DeepSeek-V4.1 does. Only the row-major
+        layout reads an fp32 table, so the other layouts are skipped.
+        e.g.: --cos-fp32 -l row --group-size 32""",
+    )
+    parser.add_argument(
         "--opus-tree",
         default=os.environ.get("AITER_OPUS_TREE"),
         help="""Path to the opus aiter checkout. Round-trips this op's
@@ -936,6 +955,9 @@ def main():
         # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
         # anything else, so sweeping it here would only collect failures.
         if scale_layout == "n32k4" and group_size != 32:
+            return
+        cos_dtype = dtypes.fp32 if args.cos_fp32 else None
+        if cos_dtype is not None and scale_layout != "row":
             return
         # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
         # disjoint consumers, so the module builds each only for the family
@@ -964,6 +986,7 @@ def main():
             scale_layout,
             data_init=data_init,
             seed=args.seed,
+            cos_dtype=cos_dtype,
         )
         df.append(ret)
         if args.graph:
@@ -978,6 +1001,7 @@ def main():
                 scale_layout,
                 data_init=data_init,
                 seed=args.seed,
+                cos_dtype=cos_dtype,
             )
 
     for dtype in args.dtype:
