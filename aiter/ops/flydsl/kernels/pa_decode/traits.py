@@ -132,11 +132,14 @@ class PaDecodeSchedule:
             kv_buffer_u32 and MTP4_FUSED and wide_kv_addressing and block_size == 128
         )
 
-        # Prefetch single-M-tile queries; large multi-tile grids favor fewer registers.
+        # Prefetch supported single-M query tiles independently of grid size.
+        prefetch_v = (
+            TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
+        ) or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+        # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
-            TUNED_PER_TOKEN
-            and QUERIES_PER_CTA == 1
-            and 8 <= query_group_size <= 16
+            prefetch_v
+            and per_token_kv
             and (
                 query_splits > 1
                 or block_size == 16
@@ -144,12 +147,6 @@ class PaDecodeSchedule:
                 or partition_workgroups <= num_compute_units
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
-        )
-        prefetch_v = PER_TOKEN_M1 or (
-            TUNED_SCALAR
-            and block_size == 128
-            and TOTAL_ROWS <= MFMA_MNK
-            and num_compute_units < partition_workgroups <= 2 * num_compute_units
         )
         # Require an exact one-tile task budget and the small planned reducer.
         batch_first_plan_grid = (
@@ -164,6 +161,10 @@ class PaDecodeSchedule:
             and num_partitions <= 64
             and work_capacity == num_seqs * window_tiles
             and split_workgroups <= 2 * num_compute_units
+            # Flat grids avoid regressions for these even batch/tile combinations.
+            and not (
+                num_seqs > 8 and num_seqs % 8 in (2, 4, 6) and window_tiles % 2 == 0
+            )
         )
         cache_key = (
             head_dim,
@@ -178,6 +179,7 @@ class PaDecodeSchedule:
             wide_kv_addressing,
             BUFFER_KV,
             prefetch_v,
+            PER_TOKEN_M1,
             query_splits,
             single_tile_plan,
             batch_first_plan_grid,
@@ -304,13 +306,13 @@ class PaDecodeTraits:
             wide_kv_addressing,
             BUFFER_KV,
             prefetch_v,
+            PER_TOKEN_M1,
             query_splits,
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
-        PER_TOKEN_M1 = schedule.PER_TOKEN_M1
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
