@@ -11,6 +11,8 @@
 #   --mode perf --network dsv4 --skip-fused --tpr-list 512
 #   --mode func --network kimi_k3 --tpr-list 128,512 --fixtures eplb,permuted
 #   --mode op   --network kimi_k3 --tpr-list 512 --part stage1
+# ATT_WRAP=<wrapper script>: torchrun --no-python wrapper (e.g. one that runs
+# rocprofv3 --att on a single rank); the test script path and args follow it.
 set -euo pipefail
 node_rank="${1:?node rank (0 or 1) required}"
 master_addr="${2:?master address required}"
@@ -53,6 +55,7 @@ timeout --signal=TERM --kill-after=30s "${MEGAMOE_RUN_TIMEOUT:-3600s}" \
   python3 -u -m torch.distributed.run \
   --nnodes=2 --nproc-per-node=8 --node-rank="${node_rank}" \
   --master-addr="${master_addr}" --master-port="${master_port}" --max-restarts=0 \
+  ${ATT_WRAP:+--no-python "${ATT_WRAP}"} \
   op_tests/multigpu_tests/test_megamoe_tile_internode.py \
   --out-dir trace_data/internode --tag "${tag}" "$@" >"${out_dir}/node${node_rank}.log" 2>&1
 rc=$?

@@ -80,13 +80,14 @@ FUSED_BEST_ENV = {
     "MEGAMOE_TK_S1_EARLY_LOCAL_GMM": "1",
     "MEGAMOE_TK_S1_FAN2_SHARDS": "8",
     "MEGAMOE_TK_S1_COMPUTE_FIRST": "8",
+    "MEGAMOE_TK_GMM1_LDS_SCOPES": "1",
 }
 # Kernel-name fragments the best configuration must produce.
 FUSED_BEST_STAGE1_FRAGMENTS = (
     "_widewait", "_widefan", "_cf8", "_f1d", "_t0nf", "_cra", "_soa4", "_pcta",
     "_gb", "_asg", "_pofft0", "_sck2", "_gp2", "_mo1", "_slg", "_h1p",
     "_gs127", "_elg", "_f2s8", "_tg4", "_expertmajor", "_fos32", "_defrecv",
-    "_hoistwait",
+    "_hoistwait", "_lsc",
 )
 
 SMALLOP_ENV = {
@@ -141,6 +142,9 @@ def parse_args(argv=None):
                    help="op mode: whole fused op, or fused Stage1 only")
     p.add_argument("--config", choices=("best", "env"), default="best",
                    help="best: force the best-known fused env; env: use the caller's env")
+    p.add_argument("--set", dest="env_set", action="append", default=[], metavar="KEY=VALUE",
+                   help="env override applied after --config best (repeatable); disables the "
+                        "kernel-name guard, since the variant is deliberately not the best config")
     p.add_argument("--rail-fp8", dest="rail_fp8", action="store_true", default=True)
     p.add_argument("--no-rail-fp8", dest="rail_fp8", action="store_false")
     p.add_argument("--smallop-quant", choices=("a4w4", "a8w4"))
@@ -183,6 +187,11 @@ def apply_env(args, net):
             os.environ["MEGAMOE_TK_COMM_QUANT_RAIL"] = "fp8"
         else:
             os.environ.pop("MEGAMOE_TK_COMM_QUANT_RAIL", None)
+    for item in args.env_set:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        os.environ[key] = value
     os.environ["MEGAMOE_EXPERTS"] = str(net["experts"])
     os.environ["MEGAMOE_TOPK"] = str(net["topk"])
     os.environ["MEGAMOE_INTER"] = str(net["inter_dim"])
@@ -366,7 +375,7 @@ def kernel_names(trace_dir, rank):
 def check_fused_config(names, args):
     """Kernel-name guard for --config best (rank 0 only)."""
     problems = []
-    if args.config != "best":
+    if args.config != "best" or args.env_set:
         return problems
     stage1 = names.get("fused_stage1", [])
     if len(stage1) != 1:
@@ -592,7 +601,7 @@ def main(argv=None):
     tprs = [int(v) for v in args.tpr_list.split(",") if v]
     runner = Runner(args, net)
     runner.log(f"[CONFIG] mode={args.mode} network={args.network} shape={net} "
-               f"config={args.config} rail_fp8={args.rail_fp8} tpr={tprs}")
+               f"config={args.config} rail_fp8={args.rail_fp8} tpr={tprs} set={args.env_set}")
     failed = False
     try:
         for tpr in tprs:

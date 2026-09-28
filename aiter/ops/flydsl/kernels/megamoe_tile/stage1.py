@@ -800,6 +800,9 @@ def compile_megamoe_tile_ep16_stage1(
         kernel_name = kernel_name + "_hwid"
     if _DIAG_TS:
         kernel_name = kernel_name + "_ts"
+    # gemm1.py 读同一个开关;flydsl 缓存 key 不含 env,名字区分两份二进制。
+    if __import__("os").environ.get("MEGAMOE_TK_GMM1_LDS_SCOPES", "1") != "0":
+        kernel_name = kernel_name + "_lsc"
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -5805,7 +5808,7 @@ def compile_megamoe_tile_ep16_stage1(
                     dtype=T.i32,
                 ) // fx.Int32(GG)
                 job = fx.Int32(rocdl.readfirstlane(T.i32, sj_p * fx.Int32(GNB) + sj_n))
-            # gemm1 rev: 3-stage A, 2-ahead DMA, wait_lds_barrier(vmcnt 24), ascale_gather v2, BN128 v2(改 gemm1.py 时改这行,
+            # gemm1 rev: 3-stage A, 2-ahead DMA, wait_lds_barrier(vmcnt 24), ascale_gather v2, BN128 v2, lds alias scopes v1(改 gemm1.py 时改这行,
             # 否则 flydsl 缓存 key 不变、继续跑旧 GMM1)
             _gemm1_body(
                 lds_raw,

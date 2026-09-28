@@ -8,6 +8,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import dpp_utils
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
@@ -20,6 +21,8 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from .gemm_common import (
     MXFP4_SCALE_LAYOUT_TAG,
+    _buffer_rsrc,
+    _lds_ptr3,
     _e8m0_from_amax,
     _e8m0_roundup,
     _fabs_f32,
@@ -309,6 +312,43 @@ def _gemm1_body_sc2(
     bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     bscale_reg_lay = fx.make_layout(1, 1)
 
+    # LDS alias scopes(生产路径:ascale_gather 且非 inline_quant)。A 的 LDS DMA 计入 vmcnt;
+    # LLVM 在任何 LDS 读写前,对没有 alias.scope 的访问保守地等全部在途的 LDS DMA,
+    # 于是每步 A 的 ds_read 前被插 vmcnt(0)(ATT:GMM1 41% 周期),A 两步预取形同虚设。
+    # 每个 A 槽一个 scope、A-scale 区一个 scope,读写都带上,LLVM 只等同槽的 DMA。
+    _lds_scoped = (
+        ascale_gather
+        and not inline_quant
+        and __import__("os").environ.get("MEGAMOE_TK_GMM1_LDS_SCOPES", "1") != "0"
+    )
+    if const_expr(_lds_scoped):
+        from flydsl._mlir import ir as _ir
+
+        _dom = "#llvm.alias_scope_domain<id = distinct[0]<>, description = \"gmm1_lds\">"
+        _sc = _ir.ArrayAttr(
+            _ir.Attribute.parse(
+                "["
+                + ", ".join(
+                    f"#llvm.alias_scope<id = distinct[{i + 1}]<>, domain = {_dom}>"
+                    for i in range(kAStages + 1)
+                )
+                + "]"
+            )
+        )
+        _scopes = [_sc[i] for i in range(kAStages + 1)]  # [A 槽 0..kAStages-1, A-scale]
+
+        def _scope_attrs(idx):
+            return dict(
+                alias_scopes=_ir.ArrayAttr.get([_scopes[idx]]),
+                noalias_scopes=_ir.ArrayAttr.get(
+                    [_scopes[j] for j in range(kAStages + 1) if j != idx]
+                ),
+            )
+
+        _lds_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+        _asc_base_i32 = _lds_base_i32 + fx.Int32(kAStages * BM * KH_TILE)
+        aq_rsrc = _buffer_rsrc(arg_aq, aq_num_records)
+
     # aq/ascale: global->LDS async DMA (no register fragment), via BufferCopyLDS.
     aq_buf = _global_i32_buffer_view(arg_aq, aq_num_records)
     aq_dma_tiles4 = fx.logical_divide(aq_buf, fx.make_layout(4, 1))
@@ -388,12 +428,25 @@ def _gemm1_body_sc2(
                 sub
             ] * fx.Int32(K_HALF)
             off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            fx.copy(
-                aq_dma_atom,
-                fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
-                fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
-                soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
-            )
+            if const_expr(_lds_scoped):
+                # 同 mxfp4_gemm2._issue_a_load_lds:LDS 基址 wave 一致,每 lane 16B 依次落位。
+                rocdl.raw_ptr_buffer_load_lds(
+                    aq_rsrc,
+                    _lds_ptr3(_lds_base_i32, off),
+                    fx.Int32(16),
+                    voffset,
+                    fx.Int32(kt * KH_TILE),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    **_scope_attrs(slot),
+                )
+            else:
+                fx.copy(
+                    aq_dma_atom,
+                    fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
+                    fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
+                    soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
+                )
 
     # s_aq as flat i32, divided into 4-element (128-bit) and 1-element tiles.
     s_aq_i32_flat = fx.make_view(
@@ -424,7 +477,17 @@ def _gemm1_body_sc2(
                     + lds_row * fx.Int32(KH_TILE)
                     + lds_col
                 )
-                a[i][k] = _lds_i32x4_load(off // fx.Int32(16))
+                if const_expr(_lds_scoped):
+                    a[i][k] = Vec(
+                        llvm.LoadOp(
+                            Vec.make_type(4, fx.Int32),
+                            _lds_ptr3(_lds_base_i32, off),
+                            alignment=16,
+                            **_scope_attrs(slot),
+                        ).result
+                    )
+                else:
+                    a[i][k] = _lds_i32x4_load(off // fx.Int32(16))
         return a
 
     def issue_a_scale_load():
@@ -479,7 +542,17 @@ def _gemm1_body_sc2(
                 + lane_div_16 * fx.Int32(16)
                 + lane_mod_16
             )
-            out.append(_raw(_global_i32_load(asc_i32_tiles, lds_dw)))
+            if const_expr(_lds_scoped):
+                out.append(
+                    llvm.LoadOp(
+                        T.i32,
+                        _lds_ptr3(_asc_base_i32, lds_dw * fx.Int32(4)),
+                        alignment=4,
+                        **_scope_attrs(kAStages),
+                    ).result
+                )
+            else:
+                out.append(_raw(_global_i32_load(asc_i32_tiles, lds_dw)))
         return out
 
     # ascale_gather:A-scale 按源 token 行主序存放(每行 K/32 字节,由 stage1
@@ -538,16 +611,24 @@ def _gemm1_body_sc2(
                         + fx.Int32(k * 16)
                         + n_lane
                     )
-                    fx.ptr_store(
-                        fx.Vector.from_elements([v], fx.Int32),
-                        fx.add_offset(
-                            fx.recast_iter(
-                                fx.Int32,
-                                fx.add_offset(lds_raw_ptr, kAStages * BM * KH_TILE),
+                    if const_expr(_lds_scoped):
+                        llvm.StoreOp(
+                            _raw(v),
+                            _lds_ptr3(_asc_base_i32, lds_dw * fx.Int32(4)),
+                            alignment=4,
+                            **_scope_attrs(kAStages),
+                        )
+                    else:
+                        fx.ptr_store(
+                            fx.Vector.from_elements([v], fx.Int32),
+                            fx.add_offset(
+                                fx.recast_iter(
+                                    fx.Int32,
+                                    fx.add_offset(lds_raw_ptr, kAStages * BM * KH_TILE),
+                                ),
+                                lds_dw,  # add_offset 按元素(i32)计,不是字节
                             ),
-                            lds_dw,  # add_offset 按元素(i32)计,不是字节
-                        ),
-                    )
+                        )
 
     lib = lane & fx.Int32(3)
     lane_shr2_and3 = (lane >> fx.Int32(2)) & fx.Int32(3)
