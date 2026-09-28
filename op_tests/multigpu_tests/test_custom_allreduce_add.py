@@ -95,7 +95,11 @@ def _check_size(ca, rank, tp_size, dtype, numel, iterations, gen, keep):
             ("graph all_reduce_add", replay(g_add, out_add), ref_add),
         ):
             torch.testing.assert_close(
-                got, ref, rtol=0, atol=0, msg=lambda m: f"{ctx} {name}\n{m}"
+                got,
+                ref,
+                rtol=0,
+                atol=0,
+                msg=lambda m, label=f"{ctx} {name}": f"{label}\n{m}",
             )
 
         rnd = torch.randn((2, tp_size, numel), generator=gen).to(dtype)
