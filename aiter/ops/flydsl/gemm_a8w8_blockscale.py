@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Aiter tensor/launch adapter for the unmodified pyhip blockscale kernel."""
+"""Aiter adapter for the rebased half-M, raw-DMA FP8 blockscale kernel."""
 
 import functools
 
@@ -34,7 +34,7 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
     if Out.dtype != torch.bfloat16:
         return False
     gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
-    return kernel_fits_shape(kernelInstance(preshuffle_b, False, False), M, N, K, gfx)
+    return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
 
 
 def _prepare_scales(
@@ -85,9 +85,6 @@ def _compile_gemm(N: int, K: int, kernel_name: str, device_index: int):
         N,
         K,
         preshuffle_b=ki.preshuffle_b,
-        with_scale=True,
-        useTileDMA=ki.use_tile_dma,
-        split_m=ki.split_m,
     )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
@@ -129,11 +126,13 @@ def run_gemm_a8w8_blockscale(
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
         launch = _compile_gemm(N, K, kernel_name, XQ.device.index)
         out_contiguous = Out.contiguous()
+        # Keep matrix dimensions separate in the launch ABI: flattening a
+        # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
         _run_compiled(
             launch,
-            XQ.contiguous().view(torch.int8).view(-1),
-            WQ.contiguous().view(torch.int8).view(-1),
-            out_contiguous.view(-1),
+            XQ.contiguous().view(torch.int8),
+            WQ.contiguous().view(torch.int8),
+            out_contiguous,
             sa,
             sb,
             M,

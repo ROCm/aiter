@@ -37,13 +37,19 @@ for the B-preshuffled operator and select its output CSV with `-o`.
   keep their signatures and default backends. A winning row with
   `libtype=flydsl` and a `flydsl_blockscale_8w_...` name selects the new backend.
   No FlyDSL default or tuned rows are installed by this integration.
-- The candidate table fixes the original 256x256x128 tile and sweeps
-  `split_m` (full/half-M) and raw/tiled DMA, four candidates per B layout.
-  The name records the B layout and both pipeline flags; `splitK` remains zero.
+- The candidate table fixes the 256x256x128 tile, half-M pipeline and raw DMA,
+  with one candidate per B layout. The surviving IDs/names stay stable:
+  ID 2 ends in `ps0_sm1_tdma0`; ID 6 ends in `ps1_sm1_tdma0`.
+  `splitK` remains zero. Full-M and tiled-DMA names are no longer accepted;
+  retune external CSVs selecting those removed modes rather than aliasing them
+  to a different implementation.
 - Supported calls use gfx950, FP8 E4M3FN operands, FP32 block scales and BF16
   output, with positive M/N, K >= 256, K divisible by 256, and N divisible by
-  8 (plain B) or 16 (preshuffled B). LDS and signed-i32 address limits are checked
-  before launch. M/N tile tails are supported. When a tuned row selects FlyDSL,
+  8 (plain B) or 16 (preshuffled B). LDS, workgroup-local signed-i32 spans and
+  unrebased scale/grid limits are checked before launch. A/B/C descriptor bases
+  are rebased per workgroup with i64 arithmetic, so whole matrices may exceed
+  4 GiB; matrix arguments keep their two-dimensional launch ABI. M/N tile tails
+  are supported. When a tuned row selects FlyDSL,
   unsupported output types/shapes/devices or non-FP32 scales raise an assertion.
   Import failures also raise `AssertionError`, preserving the original exception
   as the cause. No CK fallback is taken for a selected FlyDSL row; the original
@@ -53,10 +59,14 @@ for the B-preshuffled operator and select its output CSV with `-o`.
   column-major scale storage, either packed back into shape `[M,K/128]` or a
   strided column-major view. Both use `w_scale[ceil(N/128),K/128]`. The
   preshuffle API continues to honor a caller-supplied `out`.
-- Kernel implementation and scheduling were copied without changes; only the
-  standalone pyhip test driver/imports were removed. Aiter does not acquire a
-  pyhip runtime dependency. The tensor adapter and tune table are separate from
-  the copied kernel. The existing gfx1250 MXFP8_128 path is unaffected.
+- The kernel is ported from pyhip commit
+  `a3a94c5a34fc525c118649418b76221cd6d91579`, preserving its half-M blockscale
+  compute and raw-DMA scheduling. The compiler accepts only `TILE_M`, `TILE_N`,
+  `TILE_K`, `N`, `K`, `pid_swizzle`, `permlane_epilogue`, and `preshuffle_b`.
+  `with_scale`, `split_m`, and `useTileDMA` parameters and alternative branches
+  are removed; scales/half-M are mandatory and tiled DMA is unsupported.
+  Aiter does not acquire a pyhip runtime dependency. The tensor adapter and tune
+  table remain separate. The existing gfx1250 MXFP8_128 path is unaffected.
 
 Use `-o2` to retain every candidate result, and `--run_config` with the resulting
 CSV (plus `--preshuffle` for that layout) to validate the production dispatch.
