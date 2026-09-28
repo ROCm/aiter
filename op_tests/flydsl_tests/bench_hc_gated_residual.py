@@ -53,26 +53,45 @@ def make_inputs(tokens, seed=0):
 
 def _run(inp):
     return flydsl_gr_two_stage_combine_and_mix(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS,
-        w_down_merged=inp["_w_folded"], fold_w=True,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        w_down_merged=inp["_w_folded"],
+        fold_w=True,
     )
 
 
 def _validate(inp, tokens):
-    r2, x, inj = _run(inp)
+    _r2, x, _inj = _run(inp)
     torch.cuda.synchronize()
-    r2o, xo, injo = gr_combine_and_mix(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS, round_bf16=True,
+    _r2o, xo, _injo = gr_combine_and_mix(
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        round_bf16=True,
     )
     ex = (x.float() - xo).abs().max().item()
     if x.isnan().any() or ex > 0.2:
-        print(f"  [WARN] M={tokens}: x max-abs-err {ex:.3f} (nan={x.isnan().any().item()})")
+        print(
+            f"  [WARN] M={tokens}: x max-abs-err {ex:.3f} (nan={x.isnan().any().item()})"
+        )
 
 
 def _time_us(inp, iters, warmup_s):
     import time
+
     torch.cuda.synchronize()
     deadline = time.perf_counter() + warmup_s
     while time.perf_counter() < deadline:
@@ -93,8 +112,12 @@ def _time_us(inp, iters, warmup_s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tokens", type=int, nargs="+",
-                    default=[1, 8, 32, 128, 512, 2048, 4096, 8192, 16384, 32768])
+    ap.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[1, 8, 32, 128, 512, 2048, 4096, 8192, 16384, 32768],
+    )
     ap.add_argument("--iters", type=int, default=60)
     ap.add_argument("--warmup-s", type=float, default=1.0)
     args = ap.parse_args()
@@ -104,9 +127,11 @@ def main():
         print(f"[skip] requires gfx950/gfx942 FlyDSL, got {arch}")
         sys.exit(0)
 
-    print(f"device={torch.cuda.get_device_name(0)} ({arch})  "
-          f"HIDDEN={HIDDEN} LOWRANK={LOWRANK} HC={HC}  "
-          f"iters={args.iters} warmup={args.warmup_s}s  fused two-stage (fold_w=True)")
+    print(
+        f"device={torch.cuda.get_device_name(0)} ({arch})  "
+        f"HIDDEN={HIDDEN} LOWRANK={LOWRANK} HC={HC}  "
+        f"iters={args.iters} warmup={args.warmup_s}s  fused two-stage (fold_w=True)"
+    )
     print(f"  {'tokens':>7} {'fk2+fold':>10}")
     print("  " + "-" * 20)
     for tokens in args.tokens:

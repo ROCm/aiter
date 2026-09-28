@@ -77,19 +77,35 @@ def _ref(inp, which):
     """Oracle output for the given entry point (production bf16 numerics)."""
     if which == "combine_and_mix":
         return gr_combine_and_mix(
-            inp["residual"], inp["block_output"], inp["injection"],
-            inp["norm_weight"], inp["w_down"], inp["w_up"], inp["w_inject"],
-            HC, EPS, round_bf16=True,
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            inp["norm_weight"],
+            inp["w_down"],
+            inp["w_up"],
+            inp["w_inject"],
+            HC,
+            EPS,
+            round_bf16=True,
         )
     if which == "mix":
         block_input, inj_next = gr_mix(
-            inp["residual"], inp["norm_weight"], inp["w_down"], inp["w_up"],
-            inp["w_inject"], HC, EPS, round_bf16=True,
+            inp["residual"],
+            inp["norm_weight"],
+            inp["w_down"],
+            inp["w_up"],
+            inp["w_inject"],
+            HC,
+            EPS,
+            round_bf16=True,
         )
         return inp["residual"].float(), block_input, inj_next
     if which == "combine":
         return gr_combine(
-            inp["residual"], inp["block_output"], inp["injection"], HC,
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            HC,
             round_bf16=True,
         )
     raise ValueError(which)
@@ -107,36 +123,71 @@ def test_combine_and_mix(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS,
-        w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        w_down_merged=_merged(inp, fold_w),
+        fold_w=fold_w,
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
     _check(r2_ref.to(r2.dtype), r2, f"cmix[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02)
     _check(x_ref.to(x.dtype), x, f"cmix[{tag}][M={tokens}] x")
-    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"cmix[{tag}][M={tokens}] inj", atol=0.05)
+    _check(
+        inj_ref.to(inj.dtype),
+        inj.contiguous(),
+        f"cmix[{tag}][M={tokens}] inj",
+        atol=0.05,
+    )
 
 
 def test_mix(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, seed=1)
     r2, x, inj = flydsl_gr_two_stage_mix(
-        inp["residual"], inp["norm_weight"], inp["w_down"], inp["w_up"],
-        inp["w_inject"], HC, EPS, w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
+        inp["residual"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        w_down_merged=_merged(inp, fold_w),
+        fold_w=fold_w,
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, inj_ref = _ref(inp, "mix")
-    _check(r2_ref.to(r2.dtype), r2, f"mix[{tag}][M={tokens}] r2 (==residual)", atol=0.0, rtol=0.0)
+    _check(
+        r2_ref.to(r2.dtype),
+        r2,
+        f"mix[{tag}][M={tokens}] r2 (==residual)",
+        atol=0.0,
+        rtol=0.0,
+    )
     _check(x_ref.to(x.dtype), x, f"mix[{tag}][M={tokens}] x")
-    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"mix[{tag}][M={tokens}] inj", atol=0.05)
+    _check(
+        inj_ref.to(inj.dtype),
+        inj.contiguous(),
+        f"mix[{tag}][M={tokens}] inj",
+        atol=0.05,
+    )
 
 
 def test_combine(tokens):
     inp = _make_inputs(tokens, seed=2)
     r2 = flydsl_gr_two_stage_combine(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        HC, EPS,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        HC,
+        EPS,
     )
     torch.cuda.synchronize()
     r2_ref = _ref(inp, "combine")
@@ -148,16 +199,30 @@ def test_final_mixer_no_inject(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, with_inject=False, seed=3)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["w_down"], inp["w_up"], None, HC, EPS,
-        w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        None,
+        HC,
+        EPS,
+        w_down_merged=_merged(inp, fold_w),
+        fold_w=fold_w,
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, _ = _ref(inp, "combine_and_mix")
     if inj is not None:
         print(f"[FAIL] final_mixer[{tag}][M={tokens}]: must not emit inject logits")
         _FAILURES.append(f"final_mixer[{tag}][M={tokens}] inj")
-    _check(r2_ref.to(r2.dtype), r2, f"final_mixer[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(
+        r2_ref.to(r2.dtype),
+        r2,
+        f"final_mixer[{tag}][M={tokens}] r2",
+        atol=0.05,
+        rtol=0.02,
+    )
     _check(x_ref.to(x.dtype), x, f"final_mixer[{tag}][M={tokens}] x")
 
 
@@ -169,15 +234,30 @@ def test_decode(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, seed=7)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS,
-        w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        w_down_merged=_merged(inp, fold_w),
+        fold_w=fold_w,
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
-    _check(r2_ref.to(r2.dtype), r2, f"decode[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(
+        r2_ref.to(r2.dtype), r2, f"decode[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02
+    )
     _check(x_ref.to(x.dtype), x, f"decode[{tag}][M={tokens}] x")
-    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"decode[{tag}][M={tokens}] inj", atol=0.05)
+    _check(
+        inj_ref.to(inj.dtype),
+        inj.contiguous(),
+        f"decode[{tag}][M={tokens}] inj",
+        atol=0.05,
+    )
 
 
 def test_full_norm_weight(tokens, fold_w):
@@ -187,33 +267,56 @@ def test_full_norm_weight(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, full_norm=True, seed=5)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["w_down"], inp["w_up"], inp["w_inject"], HC, EPS,
-        w_down_merged=_merged(inp, fold_w), fold_w=fold_w,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        w_down_merged=_merged(inp, fold_w),
+        fold_w=fold_w,
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
-    _check(r2_ref.to(r2.dtype), r2, f"fullw[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(
+        r2_ref.to(r2.dtype), r2, f"fullw[{tag}][M={tokens}] r2", atol=0.05, rtol=0.02
+    )
     _check(x_ref.to(x.dtype), x, f"fullw[{tag}][M={tokens}] x")
-    _check(inj_ref.to(inj.dtype), inj.contiguous(), f"fullw[{tag}][M={tokens}] inj", atol=0.05)
+    _check(
+        inj_ref.to(inj.dtype),
+        inj.contiguous(),
+        f"fullw[{tag}][M={tokens}] inj",
+        atol=0.05,
+    )
 
 
 parser = argparse.ArgumentParser(
     description="Correctness test for the two-stage HC Gated-Residual op (SILOTIGER-1042)."
 )
 parser.add_argument(
-    "--tokens", type=int, nargs="+", default=[512, 2048, 4096],
+    "--tokens",
+    type=int,
+    nargs="+",
+    default=[512, 2048, 4096],
     help="tile-aligned token counts (spans split-K <3072 and decouple >=3072).",
 )
 parser.add_argument(
-    "--decode-tokens", type=int, nargs="+", default=[1, 3, 4, 5, 8, 32],
+    "--decode-tokens",
+    type=int,
+    nargs="+",
+    default=[1, 3, 4, 5, 8, 32],
     help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
 )
 args = parser.parse_args()
 
 _arch = get_gfx()
 if _arch not in ("gfx950", "gfx942"):
-    print(f"[skip] two-stage HC gated-residual requires gfx950/gfx942 FlyDSL, got {_arch}")
+    print(
+        f"[skip] two-stage HC gated-residual requires gfx950/gfx942 FlyDSL, got {_arch}"
+    )
     sys.exit(0)
 
 for m in args.tokens:

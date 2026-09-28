@@ -40,8 +40,15 @@ MMA_N = MMA_M = 16  # gfx950 bf16 mma tile
 K_TILES = HIDDEN // 64  # 160
 
 TABLE = os.path.join(
-    os.path.dirname(__file__), "..", "..", "aiter", "ops", "flydsl", "kernels",
-    "hyper_connection_gated_residual", "tuned_configs.json",
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "aiter",
+    "ops",
+    "flydsl",
+    "kernels",
+    "hyper_connection_gated_residual",
+    "tuned_configs.json",
 )
 TABLE = os.path.normpath(TABLE)
 
@@ -84,8 +91,17 @@ def k1(inp, **cfg):
     # reflects the metric _k1_then_k2 actually runs.
     cfg = {k: v for k, v in cfg.items() if k != "method"}
     return flydsl_k1_combine_norm_down(
-        inp["residual"], inp["block_output"], inp["injection"], inp["norm_weight"],
-        inp["_w_folded"], LOWRANK, HC, EPS, fold_w=True, use_tuned=False, **cfg,
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["_w_folded"],
+        LOWRANK,
+        HC,
+        EPS,
+        fold_w=True,
+        use_tuned=False,
+        **cfg,
     )
 
 
@@ -106,9 +122,17 @@ def decouple_candidates(M):
                         continue
                     if bm * bk < threads * 8:  # async-LDS coverage
                         continue
-                    cfgs.append(dict(method="decouple", split_k=1, block_k=bk,
-                                     dn_block_m=bm, dn_block_n=bn,
-                                     dn_m_waves=mw, dn_n_waves=nw))
+                    cfgs.append(
+                        {
+                            "method": "decouple",
+                            "split_k": 1,
+                            "block_k": bk,
+                            "dn_block_m": bm,
+                            "dn_block_n": bn,
+                            "dn_m_waves": mw,
+                            "dn_n_waves": nw,
+                        }
+                    )
     return cfgs
 
 
@@ -129,9 +153,17 @@ def splitk_candidates(M):
                         continue
                     if skbm * 64 < threads * 8:  # async-LDS coverage (block_k=64)
                         continue
-                    cfgs.append(dict(method="splitk", split_k=sk, sk_block_m=skbm,
-                                     block_k=64, dn_block_n=bn,
-                                     dn_m_waves=mw, dn_n_waves=nw))
+                    cfgs.append(
+                        {
+                            "method": "splitk",
+                            "split_k": sk,
+                            "sk_block_m": skbm,
+                            "block_k": 64,
+                            "dn_block_n": bn,
+                            "dn_m_waves": mw,
+                            "dn_n_waves": nw,
+                        }
+                    )
     return cfgs
 
 
@@ -144,13 +176,22 @@ def candidates(M):
 def _entry_from_cfg(cfg, us):
     e = {"method": cfg["method"], "_us": round(us, 3)}
     if cfg["method"] == "decouple":
-        e.update(block_k=cfg["block_k"], dn_block_m=cfg["dn_block_m"],
-                 dn_block_n=cfg["dn_block_n"], dn_m_waves=cfg["dn_m_waves"],
-                 dn_n_waves=cfg["dn_n_waves"])
+        e.update(
+            block_k=cfg["block_k"],
+            dn_block_m=cfg["dn_block_m"],
+            dn_block_n=cfg["dn_block_n"],
+            dn_m_waves=cfg["dn_m_waves"],
+            dn_n_waves=cfg["dn_n_waves"],
+        )
     else:
-        e.update(split_k=cfg["split_k"], sk_block_m=cfg["sk_block_m"],
-                 block_k=cfg["block_k"], dn_block_n=cfg["dn_block_n"],
-                 dn_m_waves=cfg["dn_m_waves"], dn_n_waves=cfg["dn_n_waves"])
+        e.update(
+            split_k=cfg["split_k"],
+            sk_block_m=cfg["sk_block_m"],
+            block_k=cfg["block_k"],
+            dn_block_n=cfg["dn_block_n"],
+            dn_m_waves=cfg["dn_m_waves"],
+            dn_n_waves=cfg["dn_n_waves"],
+        )
     return e
 
 
@@ -163,9 +204,27 @@ def validate(inp, cfg, ref_r2, ref_packed):
 
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--tokens", type=int, nargs="+",
-                default=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 12288,
-                         16384, 24576, 32768, 49152, 65536])
+ap.add_argument(
+    "--tokens",
+    type=int,
+    nargs="+",
+    default=[
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        12288,
+        16384,
+        24576,
+        32768,
+        49152,
+        65536,
+    ],
+)
 ap.add_argument("--export", action="store_true")
 ap.add_argument("--tol", type=float, default=0.3)
 args = ap.parse_args()
@@ -176,7 +235,7 @@ for M in args.tokens:
     inp = make_inputs(M)
     ref_r2, ref_packed = k1(inp)  # trusted heuristic default (use_tuned=False)
     torch.cuda.synchronize()
-    t_def = timeit(lambda: k1(inp))
+    t_def = timeit(lambda inp=inp: k1(inp))
     print(f"\nM={M}  heuristic-default={t_def:.1f}u")
     best = (t_def, None)
     for cfg in candidates(M):
@@ -184,7 +243,7 @@ for M in args.tokens:
             err = validate(inp, cfg, ref_r2, ref_packed)
             if err > args.tol:
                 continue
-            t = timeit(lambda: k1(inp, **cfg))
+            t = timeit(lambda inp=inp, cfg=cfg: k1(inp, **cfg))
             if cfg["method"] == "decouple":
                 tag = f"dec bk{cfg['block_k']} bm{cfg['dn_block_m']} bn{cfg['dn_block_n']} {cfg['dn_m_waves']}x{cfg['dn_n_waves']}"
             else:

@@ -17,9 +17,9 @@ part of this package.
 
 from __future__ import annotations
 
+import flydsl.expr as fx
 import torch
 
-import flydsl.expr as fx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .common import arch_name, merge_down_inject, split_down_inject
@@ -71,7 +71,11 @@ def fold_norm_weight(
     hidden = w_down_merged.shape[1]
     w = norm_weight.reshape(-1).float()
     w_full = w.repeat(hidden // w.numel()) if w.numel() != hidden else w
-    return (w_down_merged.float() * (1.0 + w_full)[None, :]).to(w_down_merged.dtype).contiguous()
+    return (
+        (w_down_merged.float() * (1.0 + w_full)[None, :])
+        .to(w_down_merged.dtype)
+        .contiguous()
+    )
 
 
 def _resolve_merged(w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w):
@@ -120,8 +124,17 @@ def _k1_then_k2(
         arch = arch_name(residual.device)
         if arch != "gfx950":
             return flydsl_k1k2_skinny_decode(
-                residual, block_output, injection, norm_weight, w_up,
-                w_down_merged, lowrank, hc_count, eps, need_inj, stream=stream,
+                residual,
+                block_output,
+                injection,
+                norm_weight,
+                w_up,
+                w_down_merged,
+                lowrank,
+                hc_count,
+                eps,
+                need_inj,
+                stream=stream,
             )
     # Low-M tail path: when tokens is not a tile multiple, run the GEMM stages
     # over a padded row count P while the combine prologue reads only the true
@@ -132,8 +145,17 @@ def _k1_then_k2(
     gemm_pad = None if pad_tokens == tokens else pad_tokens
     rrms = residual.new_empty((pad_tokens, hc_count), dtype=torch.float32)
     r2, packed = flydsl_k1_combine_norm_down(
-        residual, block_output, injection, norm_weight, w_down_merged,
-        lowrank, hc_count, eps, rrms_out=rrms, fold_w=fold_w, gemm_pad=gemm_pad,
+        residual,
+        block_output,
+        injection,
+        norm_weight,
+        w_down_merged,
+        lowrank,
+        hc_count,
+        eps,
+        rrms_out=rrms,
+        fold_w=fold_w,
+        gemm_pad=gemm_pad,
         stream=stream,
     )
     if need_inj:
@@ -175,10 +197,22 @@ def flydsl_gr_two_stage_combine_and_mix(
     build it. ``fold_w=False`` (default) applies the affine inside K1.
     """
     lowrank = w_down.shape[0]
-    merged = _resolve_merged(w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w)
+    merged = _resolve_merged(
+        w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w
+    )
     return _k1_then_k2(
-        residual, block_output, injection, norm_weight, w_up, merged,
-        lowrank, hc_count, eps, w_inject is not None, stream, fold_w=fold_w,
+        residual,
+        block_output,
+        injection,
+        norm_weight,
+        w_up,
+        merged,
+        lowrank,
+        hc_count,
+        eps,
+        w_inject is not None,
+        stream,
+        fold_w=fold_w,
     )
 
 
@@ -205,10 +239,22 @@ def flydsl_gr_two_stage_mix(
     stream_dim = hidden // hc_count
     zero_y = residual.new_zeros((tokens, stream_dim))
     zero_inj = residual.new_zeros((tokens, hc_count))
-    merged = _resolve_merged(w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w)
+    merged = _resolve_merged(
+        w_down, w_inject, w_down_merged, norm_weight, hc_count, fold_w
+    )
     _r2, block_input, inj_next = _k1_then_k2(
-        residual, zero_y, zero_inj, norm_weight, w_up, merged,
-        lowrank, hc_count, eps, w_inject is not None, stream, fold_w=fold_w,
+        residual,
+        zero_y,
+        zero_inj,
+        norm_weight,
+        w_up,
+        merged,
+        lowrank,
+        hc_count,
+        eps,
+        w_inject is not None,
+        stream,
+        fold_w=fold_w,
     )
     return residual, block_input, inj_next
 
@@ -235,5 +281,7 @@ def flydsl_gr_two_stage_combine(
     r2 = torch.empty_like(residual)
     rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=residual.device)
     launch = _build_combine_rms(hc_count, stream_dim, float(eps))
-    _run_compiled(launch, residual, block_output, injection, r2, rrms, fx.Stream(stream))
+    _run_compiled(
+        launch, residual, block_output, injection, r2, rrms, fx.Stream(stream)
+    )
     return r2

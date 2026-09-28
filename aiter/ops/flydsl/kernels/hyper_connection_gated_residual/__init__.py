@@ -9,6 +9,8 @@ HBM -- cutting the 5-launch path down to the K1+K2 pair (modulo K1's
 split-K/decouple reduce).
 """
 
+from .k1 import flydsl_k1_combine_norm_down
+from .k2 import flydsl_up_gate_mix_norm
 from .op import (
     flydsl_gr_two_stage_combine,
     flydsl_gr_two_stage_combine_and_mix,
@@ -16,8 +18,6 @@ from .op import (
     fold_norm_weight,
     merge_gr_two_stage_weight,
 )
-from .k1 import flydsl_k1_combine_norm_down
-from .k2 import flydsl_up_gate_mix_norm
 from .reference import (
     gr_combine,
     gr_combine_and_mix,
@@ -27,16 +27,16 @@ from .reference import (
 )
 
 __all__ = [
+    "flydsl_gr_two_stage_combine",
     "flydsl_gr_two_stage_combine_and_mix",
     "flydsl_gr_two_stage_mix",
-    "flydsl_gr_two_stage_combine",
-    "merge_gr_two_stage_weight",
-    "fold_norm_weight",
     "flydsl_k1_combine_norm_down",
     "flydsl_up_gate_mix_norm",
+    "fold_norm_weight",
     "gr_combine",
     "gr_combine_and_mix",
     "gr_grouped_rmsnorm",
     "gr_mix",
     "gr_mix_body",
+    "merge_gr_two_stage_weight",
 ]

@@ -19,17 +19,16 @@ per-instruction K packing the tiled-MMA layout expects.
 """
 
 from dataclasses import dataclass
-
-import flydsl.expr as fx
-
-from aiter.jit.utils.chip_info import get_gfx
 from functools import lru_cache
+
 import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 from flydsl.expr import range_constexpr
-from flydsl.expr.typing import T
+
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.act import _sigmoid_f32
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import GTensor
 
 
 @dataclass(frozen=True)
@@ -139,9 +138,9 @@ def _build_reduce_silu(
     # CUs; a single grid-strided workgroup (the naive grid) serializes the whole
     # output and dominates wall time at large M.
     n_iters = 1
-    assert total % (block_threads * vec) == 0, (
-        f"total={total} must be a multiple of block_threads*vec={block_threads * vec}"
-    )
+    assert (
+        total % (block_threads * vec) == 0
+    ), f"total={total} must be a multiple of block_threads*vec={block_threads * vec}"
 
     @flyc.kernel(
         name=f"gr_down_reduce_t{total}_sk{split_k}_s{silu_cols}_w{row_width}",
@@ -156,7 +155,9 @@ def _build_reduce_silu(
         part_g = GTensor(partial, fx.Float32, (1, total))
         lora_g = GTensor(lora, fx.BFloat16, (1, total))
         for it in range_constexpr(n_iters):
-            base = (bid * fx.Int32(n_iters) + it) * fx.Int32(block_threads) * fx.Int32(vec)
+            base = (
+                (bid * fx.Int32(n_iters) + it) * fx.Int32(block_threads) * fx.Int32(vec)
+            )
             off = base + tid * fx.Int32(vec)
             acc = fx.Vector(part_g.load(off, vec_size=vec))
             for k in range_constexpr(1, split_k):
@@ -176,7 +177,8 @@ def _build_reduce_silu(
                         is_lora = col < fx.Int32(silu_cols)
                         out.append(is_lora.select(v * _sigmoid_f32(v), acc[e]))
             lora_g.store(
-                off, fx.Vector.from_elements(out, dtype=fx.Float32).to(fx.BFloat16),
+                off,
+                fx.Vector.from_elements(out, dtype=fx.Float32).to(fx.BFloat16),
                 vec_size=vec,
             )
 

@@ -28,6 +28,7 @@ Table schema (``tuned_configs.json``)::
 The ``_us`` field is provenance only (the measured latency) and is ignored at
 runtime.
 """
+
 import functools
 import json
 import math

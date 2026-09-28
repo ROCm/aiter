@@ -40,9 +40,13 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 
 from aiter.ops.flydsl.kernels.act import _sigmoid_f32
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
-from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import ab_k_perm, arch_name, mfma_bf16
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
+    ab_k_perm,
+    arch_name,
+    mfma_bf16,
+)
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import k1_plan
+from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
 
 WAVE = 64
 CHUNK = 8  # bf16 elements per 128-bit buffer access
@@ -86,26 +90,28 @@ def _build_down_norm_pipe(
     Small B tiles shrink the LDS panel (higher occupancy) and give more workgroups
     -- the mid-M ~1.85x the full-width (block_n=n_pad) tile left on the table.
     """
-    assert n_pad % block_n == 0, f"n_pad={n_pad} must be a multiple of block_n={block_n}"
+    assert (
+        n_pad % block_n == 0
+    ), f"n_pad={n_pad} must be a multiple of block_n={block_n}"
     n_cblocks = n_pad // block_n
     if mma_k == 16:  # gfx942/CDNA3 -> HC-internal adapted GEMM (see package copy)
         from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.gemm_a16w16_gfx942 import (
-        GEMM_A16W16_DTYPE_BF16,
-        AsyncLoadTile,
-        async_load_to_lds,
-        make_gemm_a16w16_gfx950_param,
-        make_gemm_ab_load_context,
-        make_gemm_ab_lds_layouts,
-    )
+            GEMM_A16W16_DTYPE_BF16,
+            AsyncLoadTile,
+            async_load_to_lds,
+            make_gemm_a16w16_gfx950_param,
+            make_gemm_ab_lds_layouts,
+            make_gemm_ab_load_context,
+        )
     else:  # gfx950/CDNA4 -> aiter GEMM (rides upstream)
         from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
-        GEMM_A16W16_DTYPE_BF16,
-        AsyncLoadTile,
-        async_load_to_lds,
-        make_gemm_a16w16_gfx950_param,
-        make_gemm_ab_load_context,
-        make_gemm_ab_lds_layouts,
-    )
+            GEMM_A16W16_DTYPE_BF16,
+            AsyncLoadTile,
+            async_load_to_lds,
+            make_gemm_a16w16_gfx950_param,
+            make_gemm_ab_lds_layouts,
+            make_gemm_ab_load_context,
+        )
 
     inv_hc = 1.0 / hc_count
     stream_dim = hidden // hc_count
@@ -118,13 +124,12 @@ def _build_down_norm_pipe(
     assert block_k % mma_k == 0 and hidden % block_k == 0
     assert stream_dim % block_k == 0
     assert stages >= 2
-    assert block_m * block_k >= block_threads * 8, (
-        "async-LDS pipe needs block_m*block_k >= block_threads*async_vec"
-    )
+    assert (
+        block_m * block_k >= block_threads * 8
+    ), "async-LDS pipe needs block_m*block_k >= block_threads*async_vec"
     assert w_len % block_threads == 0
     k_tiles = hidden // block_k
     w_stage_iters = w_len // block_threads
-    k_group = mma_k // 4
     # Stage this M-tile's rrms ([block_m, hc]) in LDS once: the A-transform
     # otherwise re-loads rrms from global for every fragment element on every
     # k-tile. Only when the tile divides the workgroup evenly (it does for the
@@ -135,10 +140,19 @@ def _build_down_norm_pipe(
     param = make_gemm_a16w16_gfx950_param(
         in_dtype_id=GEMM_A16W16_DTYPE_BF16,
         out_dtype_id=GEMM_A16W16_DTYPE_BF16,
-        block_m=block_m, block_n=block_n, block_k=block_k, stages=stages,
-        split_k=1, m_waves=m_waves, n_waves=n_waves, k_waves=1,
-        a_is_transposed=False, b_is_transposed=True,
-        mma_m=mma_m, mma_n=mma_n, mma_k=mma_k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        split_k=1,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=1,
+        a_is_transposed=False,
+        b_is_transposed=True,
+        mma_m=mma_m,
+        mma_n=mma_n,
+        mma_k=mma_k,
     )
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
@@ -208,8 +222,12 @@ def _build_down_norm_pipe(
         a_lds_layout, b_lds_layout = make_gemm_ab_lds_layouts(
             block_m, block_n, block_k, False, True
         )
-        thr_copy_A = fx.make_tiled_copy_A(ctx.a_tiled_copy_atom, tiled_mma).get_slice(tid)
-        thr_copy_B = fx.make_tiled_copy_B(ctx.b_tiled_copy_atom, tiled_mma).get_slice(tid)
+        thr_copy_A = fx.make_tiled_copy_A(ctx.a_tiled_copy_atom, tiled_mma).get_slice(
+            tid
+        )
+        thr_copy_B = fx.make_tiled_copy_B(ctx.b_tiled_copy_atom, tiled_mma).get_slice(
+            tid
+        )
 
         c_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
         thr_copy_C = fx.make_tiled_copy_C(c_copy_atom, tiled_mma).get_slice(tid)
@@ -243,7 +261,9 @@ def _build_down_norm_pipe(
                     leading_stride=fx.Int32(hidden),
                     k_tile=k_tile,
                 ),
-                context=ctx, load_iters=ldg_a_iters, is_k_major=False,
+                context=ctx,
+                load_iters=ldg_a_iters,
+                is_k_major=False,
             )
 
         def load_b(k_tile, stage):
@@ -258,7 +278,9 @@ def _build_down_norm_pipe(
                     leading_stride=fx.Int32(hidden),
                     k_tile=k_tile,
                 ),
-                context=ctx, load_iters=ldg_b_iters, is_k_major=False,
+                context=ctx,
+                load_iters=ldg_b_iters,
+                is_k_major=False,
             )
 
         scale_frag = fx.make_fragment_like(frag_A, fx.Float32)
@@ -297,7 +319,11 @@ def _build_down_norm_pipe(
             if const_expr(not _skip_norm):
                 transform(kt)
             fx.gemm(
-                tiled_mma, frag_C, frag_A, frag_B, frag_C,
+                tiled_mma,
+                frag_C,
+                frag_A,
+                frag_B,
+                frag_C,
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
 
@@ -313,7 +339,7 @@ def _build_down_norm_pipe(
         rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles - (stages - 1)
-        for k_tile in range(0, main_loop_end):
+        for k_tile in range(main_loop_end):
             current_stage = k_tile % stages
             write_stage = (current_stage + stages - 1) % stages
             rocdl.wait_asyncmark(stages - 2)
@@ -351,7 +377,9 @@ def _build_down_norm_pipe(
                 is_lora = gcol < fx.Int32(silu_cols)
                 out_vals.append(is_lora.select(silu_v, raw_v))
         frag_out = fx.make_fragment_like(frag_C, fx.BFloat16)
-        frag_out.store(fx.Vector.from_elements(out_vals, dtype=fx.Float32).to(fx.BFloat16))
+        frag_out.store(
+            fx.Vector.from_elements(out_vals, dtype=fx.Float32).to(fx.BFloat16)
+        )
         fx.copy(c_copy_atom, thr_copy_C.retile(frag_out), thr_copy_C.partition_S(gC))
 
     @flyc.jit
@@ -400,22 +428,22 @@ def _build_down_norm_partial_pipe(
     """
     if mma_k == 16:  # gfx942/CDNA3 -> HC-internal adapted GEMM (see package copy)
         from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.gemm_a16w16_gfx942 import (
-        GEMM_A16W16_DTYPE_BF16,
-        AsyncLoadTile,
-        async_load_to_lds,
-        make_gemm_a16w16_gfx950_param,
-        make_gemm_ab_load_context,
-        make_gemm_ab_lds_layouts,
-    )
+            GEMM_A16W16_DTYPE_BF16,
+            AsyncLoadTile,
+            async_load_to_lds,
+            make_gemm_a16w16_gfx950_param,
+            make_gemm_ab_lds_layouts,
+            make_gemm_ab_load_context,
+        )
     else:  # gfx950/CDNA4 -> aiter GEMM (rides upstream)
         from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
-        GEMM_A16W16_DTYPE_BF16,
-        AsyncLoadTile,
-        async_load_to_lds,
-        make_gemm_a16w16_gfx950_param,
-        make_gemm_ab_load_context,
-        make_gemm_ab_lds_layouts,
-    )
+            GEMM_A16W16_DTYPE_BF16,
+            AsyncLoadTile,
+            async_load_to_lds,
+            make_gemm_a16w16_gfx950_param,
+            make_gemm_ab_lds_layouts,
+            make_gemm_ab_load_context,
+        )
 
     assert n_pad % block_n == 0
     n_cblocks = n_pad // block_n
@@ -432,17 +460,25 @@ def _build_down_norm_partial_pipe(
     k_tiles_local = k_tiles // split_k
     assert k_tiles_local >= stages - 1, "split-K slice too short for the pipeline"
     w_stage_iters = w_len // block_threads
-    k_group = mma_k // 4
     stage_rrms = (block_m * hc_count) % block_threads == 0
     rr_stage_iters = (block_m * hc_count) // block_threads if stage_rrms else 0
 
     param = make_gemm_a16w16_gfx950_param(
         in_dtype_id=GEMM_A16W16_DTYPE_BF16,
         out_dtype_id=GEMM_A16W16_DTYPE_BF16,
-        block_m=block_m, block_n=block_n, block_k=block_k, stages=stages,
-        split_k=1, m_waves=m_waves, n_waves=n_waves, k_waves=1,
-        a_is_transposed=False, b_is_transposed=True,
-        mma_m=mma_m, mma_n=mma_n, mma_k=mma_k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        split_k=1,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=1,
+        a_is_transposed=False,
+        b_is_transposed=True,
+        mma_m=mma_m,
+        mma_n=mma_n,
+        mma_k=mma_k,
     )
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
@@ -515,8 +551,12 @@ def _build_down_norm_partial_pipe(
         a_lds_layout, b_lds_layout = make_gemm_ab_lds_layouts(
             block_m, block_n, block_k, False, True
         )
-        thr_copy_A = fx.make_tiled_copy_A(ctx.a_tiled_copy_atom, tiled_mma).get_slice(tid)
-        thr_copy_B = fx.make_tiled_copy_B(ctx.b_tiled_copy_atom, tiled_mma).get_slice(tid)
+        thr_copy_A = fx.make_tiled_copy_A(ctx.a_tiled_copy_atom, tiled_mma).get_slice(
+            tid
+        )
+        thr_copy_B = fx.make_tiled_copy_B(ctx.b_tiled_copy_atom, tiled_mma).get_slice(
+            tid
+        )
 
         c_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         thr_copy_C = fx.make_tiled_copy_C(c_copy_atom, tiled_mma).get_slice(tid)
@@ -552,7 +592,9 @@ def _build_down_norm_partial_pipe(
                     leading_stride=fx.Int32(hidden),
                     k_tile=k_tile,
                 ),
-                context=ctx, load_iters=ldg_a_iters, is_k_major=False,
+                context=ctx,
+                load_iters=ldg_a_iters,
+                is_k_major=False,
             )
 
         def load_b(k_tile, stage):
@@ -567,7 +609,9 @@ def _build_down_norm_partial_pipe(
                     leading_stride=fx.Int32(hidden),
                     k_tile=k_tile,
                 ),
-                context=ctx, load_iters=ldg_b_iters, is_k_major=False,
+                context=ctx,
+                load_iters=ldg_b_iters,
+                is_k_major=False,
             )
 
         scale_frag = fx.make_fragment_like(frag_A, fx.Float32)
@@ -602,7 +646,11 @@ def _build_down_norm_partial_pipe(
             fx.copy(ctx.b_s2r_copy_atom, thr_sB, frag_B_ret)
             transform(gkt)
             fx.gemm(
-                tiled_mma, frag_C, frag_A, frag_B, frag_C,
+                tiled_mma,
+                frag_C,
+                frag_A,
+                frag_B,
+                frag_C,
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
 
@@ -618,7 +666,7 @@ def _build_down_norm_partial_pipe(
         rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles_local - (stages - 1)
-        for kt in range(0, main_loop_end):
+        for kt in range(main_loop_end):
             current_stage = kt % stages
             write_stage = (current_stage + stages - 1) % stages
             rocdl.wait_asyncmark(stages - 2)
@@ -685,9 +733,9 @@ def _build_down_gemv_partial(
     shared :func:`common._build_reduce_silu` sums the ``hc_count*spk`` blocks and
     applies ``silu(down/nr)`` (inject columns kept raw).
     """
-    assert n_pad % waves_per_block == 0, (
-        f"n_pad={n_pad} must be a multiple of waves_per_block={waves_per_block}"
-    )
+    assert (
+        n_pad % waves_per_block == 0
+    ), f"n_pad={n_pad} must be a multiple of waves_per_block={waves_per_block}"
     assert stream_dim % split_k_per_stream == 0
     kslice = stream_dim // split_k_per_stream
     assert kslice % WAVE == 0, f"kslice={kslice} must be a multiple of WAVE={WAVE}"
@@ -717,9 +765,14 @@ def _build_down_gemv_partial(
         r2_g = GTensor(r2, fx.BFloat16, (1, m_rows * hidden))
         rrms_g = GTensor(rrms, fx.Float32, (1, m_rows * hc_count))
         wdn_g = GTensor(w_dn, fx.BFloat16, (1, n_pad * hidden))
-        part_g = GTensor(partial, fx.Float32, (1, hc_count * split_k_per_stream * m_rows * n_pad))
+        part_g = GTensor(
+            partial, fx.Float32, (1, hc_count * split_k_per_stream * m_rows * n_pad)
+        )
 
-        rr = [rrms_g.load(m * hc_count + stream, vec_size=1) for m in range_constexpr(m_rows)]
+        rr = [
+            rrms_g.load(m * hc_count + stream, vec_size=1)
+            for m in range_constexpr(m_rows)
+        ]
         acc = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
         k_base = stream * stream_dim + sk * kslice + lane
         # MMA-free scalar GEMV: lanes stride the K-slice with 1-element bf16 loads
@@ -823,7 +876,9 @@ def _build_up_gate_mix_gemv(
                 r = lane + i * WAVE
                 wu = fx.BFloat16(wup_g.load(n * lowrank + r, vec_size=1)).to(fx.Float32)
                 for m in range_constexpr(m_rows):
-                    lo = fx.BFloat16(lora_g.load(m * lowrank + r, vec_size=1)).to(fx.Float32)
+                    lo = fx.BFloat16(lora_g.load(m * lowrank + r, vec_size=1)).to(
+                        fx.Float32
+                    )
                     g[m] = g[m] + lo * wu
             onepw = (
                 (fx.Float32(1.0) + w_shared)
@@ -914,19 +969,22 @@ def flydsl_k1k2_skinny_decode(
     weight here produces silently wrong output (no shape/dtype tripwire catches it).
     The op only routes here when ``fold_w=True``; do not call it directly otherwise.
     """
-    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import _build_reduce_silu
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
+        _build_reduce_silu,
+    )
 
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
     # Can't verify "folded" numerically (no unfolded ref here), but pin the
     # checkable half of the contract so a wrong-tensor call fails loudly.
-    assert w_down_merged.dtype == torch.bfloat16 and w_down_merged.is_contiguous(), (
-        "skinny decode needs a bf16 contiguous merged down weight"
-    )
-    assert w_down_merged.shape == (n_pad, hidden), (
-        f"w_down_merged {tuple(w_down_merged.shape)} must be (n_pad, {hidden})"
-    )
+    assert (
+        w_down_merged.dtype == torch.bfloat16 and w_down_merged.is_contiguous()
+    ), "skinny decode needs a bf16 contiguous merged down weight"
+    assert w_down_merged.shape == (
+        n_pad,
+        hidden,
+    ), f"w_down_merged {tuple(w_down_merged.shape)} must be (n_pad, {hidden})"
     w = norm_weight.reshape(-1).float().contiguous()
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -954,7 +1012,9 @@ def flydsl_k1k2_skinny_decode(
     _run_compiled(red, partial, packed, fxs)
     lora = packed[:, :lowrank].contiguous()
     _run_compiled(gu, lora, r2, rrms, w, w_up, x, fxs)
-    inj_next = packed[:, lowrank:lowrank + hc_count].contiguous() if need_inj else None
+    inj_next = (
+        packed[:, lowrank : lowrank + hc_count].contiguous() if need_inj else None
+    )
     return r2, x, inj_next
 
 
@@ -977,7 +1037,8 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float):
     log2_wave = int(math.log2(WAVE))
 
     @flyc.kernel(
-        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}", known_block_size=[WAVE, 1, 1]
+        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}",
+        known_block_size=[WAVE, 1, 1],
     )
     def kernel(
         residual: fx.Tensor,  # [M, hidden] bf16
@@ -1072,7 +1133,9 @@ def _build_down_norm_partial(
     ``n_pad//block_n`` column blocks over ``grid.z``, and this M-tile's ``rrms``
     is staged in LDS once instead of a per-element global load in ``norm_A``.
     """
-    assert n_pad % block_n == 0, f"n_pad={n_pad} must be a multiple of block_n={block_n}"
+    assert (
+        n_pad % block_n == 0
+    ), f"n_pad={n_pad} must be a multiple of block_n={block_n}"
     n_cblocks = n_pad // block_n
     stream_dim = hidden // hc_count
     block_threads = m_waves * n_waves * 64
@@ -1081,11 +1144,10 @@ def _build_down_norm_partial(
     assert block_k % mma_k == 0 and hidden % block_k == 0
     assert stream_dim % block_k == 0
     k_tiles = hidden // block_k
-    assert k_tiles % split_k == 0, (
-        f"k_tiles={k_tiles} must be a multiple of split_k={split_k}"
-    )
+    assert (
+        k_tiles % split_k == 0
+    ), f"k_tiles={k_tiles} must be a multiple of split_k={split_k}"
     k_tiles_local = k_tiles // split_k
-    k_group = mma_k // 4
     stage_rrms = (block_m * hc_count) % block_threads == 0
     rr_stage_iters = (block_m * hc_count) // block_threads if stage_rrms else 0
 
@@ -1114,6 +1176,7 @@ def _build_down_norm_partial(
         w_g = GTensor(w, fx.Float32, (1, w_len))
 
         if const_expr(stage_rrms):
+
             @fx.struct
             class Smem:
                 rr: fx.Array[fx.Float32, block_m * hc_count, 16]
@@ -1189,8 +1252,16 @@ def _build_down_norm_partial(
             )
 
         def load_k(kt, stage):
-            fx.copy(copy_atom, thr_copy_A.partition_S(gA[None, None, k_base + kt]), frag_A_ret[stage])
-            fx.copy(copy_atom, thr_copy_B.partition_S(gB[None, None, k_base + kt]), frag_B_ret[stage])
+            fx.copy(
+                copy_atom,
+                thr_copy_A.partition_S(gA[None, None, k_base + kt]),
+                frag_A_ret[stage],
+            )
+            fx.copy(
+                copy_atom,
+                thr_copy_B.partition_S(gB[None, None, k_base + kt]),
+                frag_B_ret[stage],
+            )
             norm_A(kt, stage)
 
         frag_C.fill(0.0)
@@ -1200,7 +1271,11 @@ def _build_down_norm_partial(
             if kt + 1 < k_tiles_local:
                 load_k(kt + 1, (kt + 1) % 2)
             fx.gemm(
-                tiled_mma, frag_C, frag_A[cur], frag_B[cur], frag_C,
+                tiled_mma,
+                frag_C,
+                frag_A[cur],
+                frag_B[cur],
+                frag_C,
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
         # Raw f32 partial; SiLU / inject-split happen in the cross-K reduction.
@@ -1345,7 +1420,9 @@ def flydsl_k1_combine_norm_down(
     _plan_sk_block_m = None
     if plan is not None:
         if split_k == "auto":
-            split_k = 1 if plan.get("method") == "decouple" else int(plan.get("split_k", 1))
+            split_k = (
+                1 if plan.get("method") == "decouple" else int(plan.get("split_k", 1))
+            )
         if block_k is None:
             block_k = plan.get("block_k")
         if dn_block_n is None:
@@ -1399,12 +1476,13 @@ def flydsl_k1_combine_norm_down(
     assert block_output.shape == (tokens, stream_dim)
     assert injection.shape == (tokens, hc_count)
     w_len = norm_weight.numel()
-    assert w_len in (stream_dim, hidden), (
-        f"norm_weight must be [{stream_dim}] (shared) or [{hidden}], got {w_len}"
-    )
-    assert gemm_tokens % block_m == 0, (
-        f"gemm_tokens={gemm_tokens} must be a multiple of block_m={block_m}"
-    )
+    assert w_len in (
+        stream_dim,
+        hidden,
+    ), f"norm_weight must be [{stream_dim}] (shared) or [{hidden}], got {w_len}"
+    assert (
+        gemm_tokens % block_m == 0
+    ), f"gemm_tokens={gemm_tokens} must be a multiple of block_m={block_m}"
     # GEMM-facing buffers are sized to gemm_tokens; the true-M prologue fills rows
     # [:tokens] and the pad rows [tokens:gemm_tokens] stay uninitialized -- they
     # flow through down/K2 as garbage but every op here is per-token (RMS, GEMM
@@ -1412,20 +1490,30 @@ def flydsl_k1_combine_norm_down(
     # the caller slices them off. torch.empty (no memset) keeps decode M cheap.
     w = norm_weight.reshape(-1).float().contiguous()
     if r2_out is None:
-        r2_out = torch.empty(gemm_tokens, hidden, dtype=residual.dtype, device=residual.device)
+        r2_out = torch.empty(
+            gemm_tokens, hidden, dtype=residual.dtype, device=residual.device
+        )
     if out is None:
-        out = torch.empty(gemm_tokens, n_pad, dtype=torch.bfloat16, device=residual.device)
+        out = torch.empty(
+            gemm_tokens, n_pad, dtype=torch.bfloat16, device=residual.device
+        )
     if stream is None:
         stream = torch.cuda.current_stream()
+
     # rrms is the per-stream 1/rms K2 needs to re-form xn from r2 (see
     # flydsl_up_gate_mix_norm). The combine_rms-based paths (split-K / decouple,
     # which "auto" always selects) fill it; the single-kernel pipe path keeps
     # rrms in LDS only, so rrms_out is left untouched there.
     def _rrms_buf():
         if rrms_out is not None:
-            assert rrms_out.shape == (gemm_tokens, hc_count) and rrms_out.dtype == torch.float32
+            assert (
+                rrms_out.shape == (gemm_tokens, hc_count)
+                and rrms_out.dtype == torch.float32
+            )
             return rrms_out
-        return torch.empty(gemm_tokens, hc_count, dtype=torch.float32, device=residual.device)
+        return torch.empty(
+            gemm_tokens, hc_count, dtype=torch.float32, device=residual.device
+        )
 
     mma = mfma_bf16(arch)
 
@@ -1433,9 +1521,10 @@ def flydsl_k1_combine_norm_down(
         from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
             _build_reduce_silu,
         )
-        assert k_tiles % split_k == 0, (
-            f"k_tiles={k_tiles} must be a multiple of split_k={split_k}"
-        )
+
+        assert (
+            k_tiles % split_k == 0
+        ), f"k_tiles={k_tiles} must be a multiple of split_k={split_k}"
         rrms = _rrms_buf()
         partial = torch.empty(
             split_k * gemm_tokens, n_pad, dtype=torch.float32, device=residual.device
@@ -1459,20 +1548,47 @@ def flydsl_k1_combine_norm_down(
         _sk_nw = dn_n_waves if dn_n_waves is not None else 2
         if _gfx942_regp_partial:
             part = _build_down_norm_partial(
-                hidden, n_pad, sk_bn, hc_count, w_len, sk_block_m, block_k, split_k,
-                _sk_mw, _sk_nw, mma.mma_m, mma.mma_n, mma.mma_k, fold_w=fold_w,
+                hidden,
+                n_pad,
+                sk_bn,
+                hc_count,
+                w_len,
+                sk_block_m,
+                block_k,
+                split_k,
+                _sk_mw,
+                _sk_nw,
+                mma.mma_m,
+                mma.mma_n,
+                mma.mma_k,
+                fold_w=fold_w,
             )
         else:
             part = _build_down_norm_partial_pipe(
-                hidden, n_pad, sk_bn, hc_count, w_len, sk_block_m, block_k, split_k,
-                _sk_mw, _sk_nw, stages, mma.mma_m, mma.mma_n, mma.mma_k, fold_w=fold_w,
+                hidden,
+                n_pad,
+                sk_bn,
+                hc_count,
+                w_len,
+                sk_block_m,
+                block_k,
+                split_k,
+                _sk_mw,
+                _sk_nw,
+                stages,
+                mma.mma_m,
+                mma.mma_n,
+                mma.mma_k,
+                fold_w=fold_w,
             )
         total = gemm_tokens * n_pad
         # f32 partials: buffer loads are 128-bit max, so vec<=4 (v8f32 won't isel).
         vec = 4 if total % (256 * 4) == 0 else 2
         reduce = _build_reduce_silu(total, split_k, lowrank, n_pad, hc_count, 256, vec)
         fx_stream = fx.Stream(stream)
-        _run_compiled(prologue, residual, block_output, injection, r2_out, rrms, fx_stream)
+        _run_compiled(
+            prologue, residual, block_output, injection, r2_out, rrms, fx_stream
+        )
         _run_compiled(part, r2_out, rrms, w, w_dn_merged, partial, fx_stream)
         _run_compiled(reduce, partial, out, fx_stream)
         return r2_out, out
@@ -1506,12 +1622,26 @@ def flydsl_k1_combine_norm_down(
         _dn_mw = dn_m_waves if dn_m_waves is not None else 2
         _dn_nw = dn_n_waves if dn_n_waves is not None else 2
         downpipe = _build_down_norm_pipe(
-            hidden, n_pad, _dn_bn, lowrank, hc_count, w_len, _dn_bm, block_k,
-            _dn_mw, _dn_nw, stages, mma.mma_m, mma.mma_n, mma.mma_k,
+            hidden,
+            n_pad,
+            _dn_bn,
+            lowrank,
+            hc_count,
+            w_len,
+            _dn_bm,
+            block_k,
+            _dn_mw,
+            _dn_nw,
+            stages,
+            mma.mma_m,
+            mma.mma_n,
+            mma.mma_k,
             fold_w=fold_w,
         )
         fx_stream = fx.Stream(stream)
-        _run_compiled(prologue, residual, block_output, injection, r2_out, rrms, fx_stream)
+        _run_compiled(
+            prologue, residual, block_output, injection, r2_out, rrms, fx_stream
+        )
         _run_compiled(downpipe, r2_out, rrms, w, w_dn_merged, out, fx_stream)
         return r2_out, out
 

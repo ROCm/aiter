@@ -31,9 +31,15 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.act import _sigmoid_f32
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
+    ab_k_perm,
+    arch_name,
+    mfma_bf16,
+)
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
+    up_gate_mix_config,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
-from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import ab_k_perm, arch_name, mfma_bf16
-from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import up_gate_mix_config
 
 
 @lru_cache(maxsize=16)
@@ -69,7 +75,6 @@ def _build_up_gate_mix_norm(
     assert lowrank % mma_k == 0
     assert stream_dim % block_n == 0
     n_cblocks = stream_dim // block_n
-    k_group = mma_k // 4
     VEC = 8
     assert block_n % VEC == 0
     assert (block_m * (block_n // VEC)) % block_threads == 0
@@ -151,7 +156,11 @@ def _build_up_gate_mix_norm(
             frag_gate.fill(0.0)
             if not _skip_gemm:
                 fx.gemm(
-                    tiled_mma, frag_gate, frag_A, frag_B, frag_gate,
+                    tiled_mma,
+                    frag_gate,
+                    frag_A,
+                    frag_B,
+                    frag_gate,
                     traversal_order=fx.GemmTraversalOrder.KNM,
                 )
             fx.gpu.barrier()
@@ -172,9 +181,9 @@ def _build_up_gate_mix_norm(
                 )
                 # Re-form xn on the fly: widen r2, * rrms * (1+w), re-round to bf16
                 # (reference order), then back to f32 for the gated-mean multiply.
-                r2_vec = fx.Vector(
-                    r2_g.load(g_m * hidden + col, vec_size=VEC)
-                ).to(fx.Float32)
+                r2_vec = fx.Vector(r2_g.load(g_m * hidden + col, vec_size=VEC)).to(
+                    fx.Float32
+                )
                 # Measurement-only: skip the rrms*(1+w) reform + bf16 round to
                 # isolate the K2 normalize tax (mirrors K1's _skip_norm).
                 xn_vec = r2_vec
@@ -184,18 +193,20 @@ def _build_up_gate_mix_norm(
                     # the VEC-wide (1+w) slice in dwordx4 chunks.
                     wv = []
                     for c4 in range_constexpr(VEC // 4):
-                        w4 = fx.Vector(
-                            w_g.load((col + c4 * 4) % w_len, vec_size=4)
-                        ).to(fx.Float32)
+                        w4 = fx.Vector(w_g.load((col + c4 * 4) % w_len, vec_size=4)).to(
+                            fx.Float32
+                        )
                         for e4 in range_constexpr(4):
                             wv.append(w4[e4])
                     xn_e = [
                         (r2_vec[e] * rr * (fx.Float32(1.0) + wv[e]))
                         for e in range_constexpr(VEC)
                     ]
-                    xn_vec = fx.Vector.from_elements(xn_e, dtype=fx.Float32).to(
-                        fx.BFloat16
-                    ).to(fx.Float32)
+                    xn_vec = (
+                        fx.Vector.from_elements(xn_e, dtype=fx.Float32)
+                        .to(fx.BFloat16)
+                        .to(fx.Float32)
+                    )
                 for e in range_constexpr(VEC):
                     acc[it][e] = acc[it][e] + _sigmoid_f32(gate_vec[e]) * xn_vec[e]
 
@@ -271,24 +282,42 @@ def flydsl_up_gate_mix_norm(
     arch = arch_name(lora.device)
     tuned = up_gate_mix_config(arch, tokens)
     block_m, block_n, m_waves, n_waves = _resolve_up_gate_cfg(
-        tuned, tokens, block_m, block_n, m_waves, n_waves,
+        tuned,
+        tokens,
+        block_m,
+        block_n,
+        m_waves,
+        n_waves,
     )
     assert tokens % block_m == 0
     if block_input is None:
-        block_input = torch.empty(tokens, stream_dim, dtype=torch.bfloat16, device=lora.device)
+        block_input = torch.empty(
+            tokens, stream_dim, dtype=torch.bfloat16, device=lora.device
+        )
     if stream is None:
         stream = torch.cuda.current_stream()
 
     mma = mfma_bf16(arch)
     launch = _build_up_gate_mix_norm(
-        hc_count, stream_dim, lowrank, w_len, block_m, block_n, m_waves, n_waves,
-        mma.mma_m, mma.mma_n, mma.mma_k, _skip_norm, _skip_gemm,
+        hc_count,
+        stream_dim,
+        lowrank,
+        w_len,
+        block_m,
+        block_n,
+        m_waves,
+        n_waves,
+        mma.mma_m,
+        mma.mma_n,
+        mma.mma_k,
+        _skip_norm,
+        _skip_gemm,
     )
     _run_compiled(launch, lora, r2, rrms, w, w_up, block_input, fx.Stream(stream))
     return block_input
 
 
-_UP_GATE_DEFAULTS = dict(block_m=64, block_n=64, m_waves=1, n_waves=2)
+_UP_GATE_DEFAULTS = {"block_m": 64, "block_n": 64, "m_waves": 1, "n_waves": 2}
 
 
 def _resolve_up_gate_cfg(tuned, tokens, block_m, block_n, m_waves, n_waves):
@@ -302,7 +331,12 @@ def _resolve_up_gate_cfg(tuned, tokens, block_m, block_n, m_waves, n_waves):
         base.update(tuned)
         if tokens % base["block_m"]:
             base = dict(_UP_GATE_DEFAULTS)
-    override = dict(block_m=block_m, block_n=block_n, m_waves=m_waves, n_waves=n_waves)
+    override = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "m_waves": m_waves,
+        "n_waves": n_waves,
+    }
     for k, v in override.items():
         if v is not None:
             base[k] = v

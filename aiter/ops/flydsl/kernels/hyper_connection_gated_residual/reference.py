@@ -41,10 +41,10 @@ import torch.nn.functional as F
 
 __all__ = [
     "gr_combine",
-    "gr_grouped_rmsnorm",
-    "gr_mix_body",
-    "gr_mix",
     "gr_combine_and_mix",
+    "gr_grouped_rmsnorm",
+    "gr_mix",
+    "gr_mix_body",
 ]
 
 
