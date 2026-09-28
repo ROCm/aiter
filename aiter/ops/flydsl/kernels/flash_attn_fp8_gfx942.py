@@ -4,7 +4,7 @@
 """Gfx942 plain-paged Gemma sliding attention, independent of the gfx950 bodies.
 
 M64 packs two query heads per KV head; each wave owns 32 packed rows. K and
-transposed V use two N32 LDS slots. Legacy FP8 MFMA operands contain eight
+transposed V share one N32 staging step; Q stays in registers. Legacy FP8 MFMA operands contain eight
 FNUZ bytes per lane. All-decode uses one wave and M16 with N32 staging.
 This is a direct-launch prototype, not a dispatch target.
 """
@@ -110,10 +110,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[fx.Int8, 64 * 260, 16]
-        k: fx.Array[fx.Int8, 2 * 32 * 260, 16]
-        v: fx.Array[fx.Int8, 2 * 256 * 32, 16]
-        bt: fx.Array[fx.Int32, 1024, 16]
+        k: fx.Array[fx.Int8, 32 * 260, 16]
+        v: fx.Array[fx.Int8, 256 * 32, 16]
 
     @flyc.kernel(known_block_size=(128, 1, 1))
     def attention(
@@ -164,38 +162,6 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 pages = page_hi - page_lo
                 p0 = page_lo + pages * split // _num_splits
                 p1 = page_lo + pages * (split + 1) // _num_splits
-            for i in range_constexpr(8):
-                j = tid + i * 128
-                copy_page = j < (klen + page_size - 1) // page_size
-                if const_expr(_num_splits > 1):
-                    copy_page = (j >= p0) & (j < p1)
-                if copy_page:
-                    page = _load(
-                        btp,
-                        (fx.Int64(seq) * fx.Int64(bt_stride) + fx.Int64(j)) * 4,
-                        T.i32,
-                        4,
-                    )
-                    _store(lds.bt.ptr, j * 4, page, 4)
-            for i in range_constexpr(8):
-                off = tid * 16 + i * 2048
-                r = off // 256
-                d = off % 256
-                qr = tile * 32 + r // 2
-                safe_qr = (qr < qlen).select(qr, fx.Int32(0))
-                src = (
-                    (
-                        (fx.Int64(q0) + fx.Int64(safe_qr)) * 32
-                        + fx.Int64(head * 2 + r % 2)
-                    )
-                    * 256
-                    + fx.Int64(d)
-                )
-                data = _load(qp, src, fx.Vector.make_type(4, fx.Int32), 16)
-                # Like K, an odd dword row stride spreads MFMA reads over all banks.
-                _store(lds.q.ptr, r * 260 + d, data, 4)
-            gpu.barrier()
-
             lower = tile * 32 + klen - qlen - 1023
             start = (lower > 0).select(lower, fx.Int32(0)) // 32
             upper = (tile * 32 + 32 < qlen).select(tile * 32 + 32, qlen)
@@ -208,18 +174,15 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     end, p1 * (page_size // 32)
                 )
 
-            def stage(block, slot):
+            def stage(block):
                 for i in range_constexpr(4):
                     off = tid * 16 + i * 2048
                     token = block * 32 + off // 256
                     d = off % 256
-                    safe_token = (token < klen).select(token, fx.Int32(0))
-                    if const_expr(_num_splits > 1):
-                        # Tail lanes must read an initialized split-local page ID.
-                        safe_token = (token < klen).select(token, start * 32)
-                    page = fx.Int32(
-                        _load(lds.bt.ptr, (safe_token // page_size) * 4, T.i32, 4)
-                    )
+                    safe_token = (token < klen).select(token, block * 32)
+                    page = fx.Int32(_load(
+                        btp, (fx.Int64(seq) * fx.Int64(bt_stride)
+                              + fx.Int64(block * 32 // page_size)) * 4, T.i32, 4))
                     src = (
                         (fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
                         * 16
@@ -230,7 +193,7 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                         _load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)
                     )
                     _store(
-                        lds.k.ptr, slot * (32 * 260) + (off // 256) * 260 + d, kval, 4
+                        lds.k.ptr, (off // 256) * 260 + d, kval, 4
                     )
                     # Transpose four tokens in registers before writing a dword.
                     # XOR depth bits into the bank index for both access orders.
@@ -255,35 +218,32 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                         bank = (depth % 32) ^ (depth // 8)
                         _store(
                             lds.v.ptr,
-                            slot * 8192 + (depth // 32) * 1024
+                            (depth // 32) * 1024
                             + token4 * 128 + bank * 4,
                             packed,
                             4,
                         )
 
+            qr = tile * 32 + row // 2
+            safe_qr = (qr < qlen).select(qr, fx.Int32(0))
+            q_base = ((fx.Int64(q0) + fx.Int64(safe_qr)) * 32
+                      + fx.Int64(head * 2 + row % 2)) * 256
             q_frag = [
-                _load(lds.q.ptr, row * 260 + depth * 16 + half * 8, T.i64, 4)
+                _load(qp, q_base + fx.Int64(depth * 16 + half * 8), T.i64, 8)
                 for depth in range(16)
             ]
-            if const_expr(_num_splits > 1):
-                if start < end:
-                    stage(start, fx.Int32(0))
-            else:
-                stage(start, fx.Int32(0))
-            gpu.barrier()
             init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
                 fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(8)
             ]
             for block, state in range(start, end, fx.Int32(1), init=init):
                 block = fx.Int32(block)
-                slot = (block - start) % 2
-                if block + 1 < end:
-                    stage(block + 1, 1 - slot)
+                stage(block)
+                gpu.barrier()
                 score = fx.Vector.filled(16, 0.0, fx.Float32)
                 for depth in range_constexpr(16):
                     a = _load(
                         lds.k.ptr,
-                        slot * 8320 + (lane % 32) * 260 + depth * 16 + half * 8,
+                        (lane % 32) * 260 + depth * 16 + half * 8,
                         T.i64,
                         4,
                     )
@@ -335,7 +295,7 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 ).bitcast(fx.Int64)[0]
                 def load_v(depth, token):
                     bank = (depth % 32) ^ (depth // 8)
-                    offset = slot * 8192 + (depth // 32) * 1024 + bank * 4
+                    offset = (depth // 32) * 1024 + bank * 4
                     words = [
                         fx.Int32(_load(lds.v.ptr, offset + (token // 4 + i) * 128, T.i32, 4))
                         for i in range(2)
