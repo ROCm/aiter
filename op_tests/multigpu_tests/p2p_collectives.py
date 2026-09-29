@@ -53,14 +53,13 @@ def _attr(v):
 
 
 @functools.cache
-def compile_p2p(kind: int, row_bytes: int, tp: int, device: int, push_aux: int = AUX_SYS, ncta: int = 0, nt: int = 0, unr: int = 4):
-    """``kind``: 0 AllGather (any bytes), 1 ReduceScatter / 2 AllReduce (bf16)."""
+def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
+    """``kind``: 0 AllGather (any bytes), 1 ReduceScatter / 2 AllReduce (bf16).
+    ``device`` keys the cache: one launcher per GPU."""
     UB = 16 if row_bytes % 16 == 0 else (8 if row_bytes % 8 == 0 else 4)
     UPR = row_bytes // UB
     TP = int(tp)
-    NCTA_K = ncta or NCTA
-    NT_K = nt or NT
-    UNR = unr
+    NCTA_K, NT_K, UNR, push_aux = NCTA, NT, 4, AUX_SYS
     name = f"p2p_{['ag', 'rs', 'ar'][kind]}_r{row_bytes}_tp{TP}_a{push_aux}_c{NCTA_K}_t{NT_K}_u{UNR}"
     assert kind == KIND_AG or UB == 16
     const_expr = fx.const_expr
@@ -347,15 +346,10 @@ class P2PGroup:
 
 
 class P2PComm:
-    enabled = True
-    fell_back = False
-    error = ""
-
     def __init__(self, group: P2PGroup, rank: int):
         self.group, self.rank = group, rank
         self.tp_size = group.tp
         self.device = group.devices[rank]
-        self._calls = 0
 
     def describe(self) -> str:
         return "p2p-single-process"
@@ -365,15 +359,12 @@ class P2PComm:
         key = (kind, row_bytes, x.dtype, tuple(out.shape[1:]))
         s = self.group.site(key, kind, row_bytes)
         r = self.rank
-        import os
-
-        knobs = [int(os.environ.get(k, d)) for k, d in (("P2P_AUX", AUX_SYS), ("P2P_NCTA", 0), ("P2P_NT", 0), ("P2P_UNR", 4))]
-        exe = compile_p2p(kind, row_bytes, self.tp_size, self.device.index, *knobs)
+        exe = compile_p2p(kind, row_bytes, self.tp_size, self.device.index)
         _run_compiled(
             exe,
             x.data_ptr(), out.data_ptr(), s.stage_tab[r].data_ptr(), s.flag_tab[r].data_ptr(),
             s.eflag[r].data_ptr(), r, rows_per_rank, self.group.mmax,
-            max(1, min(knobs[1] or NCTA, rows_per_rank)),
+            max(1, min(NCTA, rows_per_rank)),
             torch.cuda.current_stream(self.device),
         )
         return out

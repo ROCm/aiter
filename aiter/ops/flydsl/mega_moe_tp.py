@@ -18,7 +18,7 @@ inter slice (the intermediate stays in LDS), dispatched on ``comm_mode``:
     y = moe(x_partial, topk_weights, topk_ids)       # [M, H] -> [M, H]
 
 Weights are MXFP4 (``shuffle_weight(16, 16)`` + ``e8m0_shuffle`` scales), the
-layout the flydsl MoE kernels take. See ``kernels/mega_moe_tp/fused_tp.py``.
+layout the flydsl MoE kernels take. See ``kernels/mega_moe_tp/mega_moe_tp_kernel.py``.
 """
 
 from __future__ import annotations
@@ -29,11 +29,16 @@ import torch
 
 from aiter import ActivationType
 
-from .kernels.mega_moe_tp.fused_tp_engine import FusedTpMegaMoe, fused_tp_supported
+from .kernels.mega_moe_tp.mega_moe_tp import MegaMoeTPEngine
 
 __all__ = ["COMM_MODES", "MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
 
 COMM_MODES = ("ag_rs", "ar_ar")
+_ACTS = {
+    ActivationType.Silu: "silu",
+    ActivationType.Swiglu: "swiglu",
+    ActivationType.Situv2: "situv2",
+}
 
 
 def mega_moe_tp_supported(gfx: str | None = None) -> bool:
@@ -74,19 +79,12 @@ class MegaMoeTP:
         group=None,
         device: torch.device | None = None,
     ):
-        if not fused_tp_supported(cfg.model_dim, cfg.inter_dim, cfg.world_size):
-            raise ValueError(
-                f"MegaMoeTP does not tile model_dim={cfg.model_dim} "
-                f"inter_dim={cfg.inter_dim} tp={cfg.world_size}"
-            )
-        if cfg.comm_mode not in COMM_MODES:
-            raise ValueError(f"comm_mode must be one of {COMM_MODES}, got {cfg.comm_mode!r}")
-        situ = cfg.activation == ActivationType.Situv2
-        act = {ActivationType.Situv2: "situv2", ActivationType.Swiglu: "swiglu"}.get(
-            cfg.activation, "silu"
-        )
+        act = _ACTS.get(cfg.activation)
+        if act is None:
+            raise ValueError(f"MegaMoeTP: unsupported activation {cfg.activation}")
+        situ = act == "situv2"
         self.cfg = cfg
-        self.engine = FusedTpMegaMoe(
+        self.engine = MegaMoeTPEngine(
             rank=cfg.rank,
             world_size=cfg.world_size,
             model_dim=cfg.model_dim,
@@ -100,9 +98,7 @@ class MegaMoeTP:
             w2_scale=w2_scale,
             activation=act,
             situ_beta=cfg.beta if situ and cfg.beta is not None else 1.0,
-            situ_linear_beta=(
-                cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0
-            ),
+            situ_linear_beta=cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0,
             comm_mode=cfg.comm_mode,
             group=group,
             device=device,
