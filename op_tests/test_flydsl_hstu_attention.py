@@ -12,10 +12,10 @@ import pytest
 import torch
 
 import aiter
-import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
+import aiter.ops.flydsl.hstu_attention as hstu_kernels
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.hstu_attention_kernels import (
+from aiter.ops.flydsl.hstu_attention import (
     _validate_inputs,
     flydsl_hstu_attention_fwd,
 )
