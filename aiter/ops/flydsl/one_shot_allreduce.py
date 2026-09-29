@@ -70,7 +70,7 @@ class OneShotAllReduce:
     """IPC inbox + launch wrapper for ``one_shot_allreduce``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange,
-    the same constraint ``QuickAllReduceInt4`` has and for the same reason.
+    the same constraint ``FlyQuickAllReduce`` has and for the same reason.
 
     ``atoms``, ``grid_cap``, ``fanout`` and ``block`` are the tuning surface.
     ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it
@@ -84,7 +84,7 @@ class OneShotAllReduce:
     ``link`` selects both the tuning ladder and that default ceiling, and is
     detected from the KFD topology when not given.
 
-    ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
+    ``inbox_memory`` follows ``FlyQuickAllReduce``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
     One exception: at TP2 it picks ``uncached`` on PCIe too, since a single
@@ -401,7 +401,7 @@ class OneShotAllReduce:
                 f"{self.max_bytes} B ceiling: this kernel pushes the whole "
                 "payload to every peer, so its wire volume is (N-1)x the "
                 "message where a mesh schedule moves 2(N-1)/N. Route large messages "
-                "to QuickAllReduceInt4 or cross_device_reduce, or pass max_bytes to "
+                "to FlyQuickAllReduce or cross_device_reduce, or pass max_bytes to "
                 "override."
             )
         self._launch(inp, out, stream, live_bytes=live_bytes)

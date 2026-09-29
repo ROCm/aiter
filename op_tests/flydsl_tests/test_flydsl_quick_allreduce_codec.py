@@ -3,7 +3,7 @@
 
 """Codec-level tests for the quick-allreduce wire formats.
 
-Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce_int4.py``
+Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce.py``
 covers the schedules that carry it.
 
 Two properties are load-bearing:
@@ -580,7 +580,7 @@ def test_illegal_block_widths_raise(block):
 
 
 def _resolve(algorithm, world_size, rs=None, ag=None):
-    from aiter.ops.flydsl import quick_allreduce_int4 as host
+    from aiter.ops.flydsl import quick_allreduce as host
 
     return host._resolve_codecs(host.ALGORITHMS[algorithm], world_size, rs, ag)
 

@@ -170,7 +170,7 @@ def ring_steps(world_size: int) -> int:
     return 2 * (world_size - 1)
 
 
-def make_quick_allreduce_int4_ring_kernel(
+def make_quick_allreduce_ring_kernel(
     *,
     world_size: int,
     rank: int,
@@ -344,7 +344,7 @@ def make_quick_allreduce_int4_ring_kernel(
         return (rank - j) % world_size
 
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def quick_allreduce_int4_ring(
+    def quick_allreduce_ring(
         rank_unused: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -966,7 +966,7 @@ def make_quick_allreduce_int4_ring_kernel(
     # sourced -- it has to stay lexically inside one ``@flyc.kernel``, because
     # only that function's AST is rewritten.
     @flyc.jit
-    def launch_quick_allreduce_int4_ring(
+    def launch_quick_allreduce_ring(
         rank_arg: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -977,7 +977,7 @@ def make_quick_allreduce_int4_ring_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4_ring(
+        quick_allreduce_ring(
             rank_arg,
             nbytes,
             num_tiles,
@@ -998,7 +998,7 @@ def make_quick_allreduce_int4_ring_kernel(
         )
 
     @flyc.jit
-    def launch_quick_allreduce_int4_ring_fused(
+    def launch_quick_allreduce_ring_fused(
         rank_arg: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -1013,7 +1013,7 @@ def make_quick_allreduce_int4_ring_kernel(
         eps: Float32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4_ring(
+        quick_allreduce_ring(
             rank_arg,
             nbytes,
             num_tiles,
@@ -1046,13 +1046,13 @@ def make_quick_allreduce_int4_ring_kernel(
         if padded:
             tag += f"_p{h_pad}"
     launcher = (
-        launch_quick_allreduce_int4_ring_fused
+        launch_quick_allreduce_ring_fused
         if fused
-        else launch_quick_allreduce_int4_ring
+        else launch_quick_allreduce_ring
     )
-    launcher.func.__name__ = f"launch_quick_allreduce_int4_ring_{tag}"
+    launcher.func.__name__ = f"launch_quick_allreduce_ring_{tag}"
     try:
-        quick_allreduce_int4_ring.func.__name__ = f"quick_allreduce_int4_ring_{tag}"
+        quick_allreduce_ring.func.__name__ = f"quick_allreduce_ring_{tag}"
     except AttributeError:
         pass
     return {

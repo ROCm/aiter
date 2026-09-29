@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness and timing for FlyDSL quick all-reduce (``QuickAllReduceInt4``).
+"""Runtime correctness and timing for FlyDSL quick all-reduce (``FlyQuickAllReduce``).
 
 A default run covers what production dispatch can run on this host, and each
 sweep ends in a markdown table:
 
-* ``test_quick_allreduce_int4`` -- the shipping configuration (codecs and
+* ``test_quick_allreduce`` -- the shipping configuration (codecs and
   super-tile left to the per-world defaults and ladders, as production dispatch
   constructs the engine), timed with ``run_perftest``. The payloads come from
   ``allreduce_policy``: for every schedule it routes to at each world size, the
@@ -15,12 +15,12 @@ sweep ends in a markdown table:
   into a CUDA graph and replays it. A schedule the policy never selects on this
   host (the ring on xGMI) gets one row, for a user who moves the boundary with
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
-* ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
+* ``test_quick_allreduce_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
-* ``test_quick_allreduce_int4`` again, as a second table -- the shipping INT4
+* ``test_quick_allreduce`` again, as a second table -- the shipping INT4
   ladder with ``block`` and ``skip_self`` overridden on every rung, at the
   geometry that caught a VMEM store-data hazard.
-* ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the E4M3
+* ``test_quick_allreduce_edge_inputs`` -- payloads that land on the E4M3
   scale's edge cases, and degenerate groups that must stay finite.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
   passthrough, on an exactly representable input: the result must be
@@ -31,7 +31,7 @@ sweep ends in a markdown table:
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes, the full ``block``/``skip_self`` sweep, the fp16 transport over a
 matrix of pinned ``super_tile``/``block``/``skip_self``, and
-``test_quick_allreduce_int4_pinned_codec`` -- the ring with its wire formats
+``test_quick_allreduce_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
 Every mesh row also checks that all ranks wrote bit-identical output: each
@@ -48,7 +48,7 @@ floor.
 
 The kernels see a flat payload, so the derived shapes use one width, 4096,
 whose rows land exactly on every policy and ladder boundary.
-QuickAllReduceInt4 runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs skip,
+FlyQuickAllReduce runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs skip,
 and ``main()`` skips a world size when fewer GPUs are visible than TP.
 """
 
@@ -79,17 +79,17 @@ set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
     clamp_grid_cap,
     mesh_st_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import ring_st_ladder
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import ring_st_ladder
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import (
     ATOMS,
     DEFAULT_GRID_CAP,
     SUPPORTED_WORLDS,
 )
-from aiter.ops.flydsl.quick_allreduce_int4 import (
+from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
 )
@@ -318,7 +318,7 @@ def _expected_cfg(
     block: int | None = None,
     skip_self: bool | None = None,
 ) -> tuple[int, int, bool]:
-    """Mirror of ``QuickAllReduceInt4._pick_cfg``: the ``(super_tile, block,
+    """Mirror of ``FlyQuickAllReduce._pick_cfg``: the ``(super_tile, block,
     skip_self)`` kernel an engine with no super-tile pinned runs *nbytes* on.
     *block* and *skip_self* are the overrides the engine was built with,
     ``None`` for the rung's own.
@@ -536,7 +536,7 @@ def _metrics(
         atol=CLOSE_ATOL,
         tol_err_ratio=CLOSE_ERR_RATIO,
         printLog=False,
-        msg=f"quick_allreduce_int4 rank {rank}",
+        msg=f"quick_allreduce rank {rank}",
     )
     return {
         "sqnr_db": _sqnr_db(got, ref),
@@ -583,7 +583,7 @@ def _run_rank(
     """
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -594,12 +594,12 @@ def _run_rank(
         rank=rank,
         device_id=device,
     )
-    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group; NCCL
+    # FlyQuickAllReduce exchanges IPC metadata over a non-NCCL group; NCCL
     # stays for the fp32 reference all-reduce.
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
@@ -896,14 +896,14 @@ def _transport_key(
 
 
 # ---------------------------------------------------------------------------
-# Fused epilogue: QuickAllReduceInt4RMSNorm (all-reduce + residual add + RMSNorm)
+# Fused epilogue: FlyQuickAllReduceRMSNorm (all-reduce + residual add + RMSNorm)
 # ---------------------------------------------------------------------------
 
 import pytest
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QuickAllReduceInt4RMSNorm unsupported arch (need gfx942 or gfx950)",
+    reason="FlyQuickAllReduceRMSNorm unsupported arch (need gfx942 or gfx950)",
 )
 
 RMS_EPS = 1e-6
@@ -953,7 +953,7 @@ def _run_rank_fused(
     worker above does. That is not only startup cost: each fused engine holds an
     IPC inbox per (hidden, super-tile) rung, hundreds of MiB at the ring's high
     rungs, and a pool per test leaves those in flight while the next pool tries
-    to allocate. ``QuickAllReduceInt4RMSNorm`` builds per-hidden engines on
+    to allocate. ``FlyQuickAllReduceRMSNorm`` builds per-hidden engines on
     demand, so one object covers every width here.
 
     ``solo`` zeroes every rank but 0, which -- paired with the ``fp16``
@@ -965,7 +965,7 @@ def _run_rank_fused(
     """
     import torch.distributed as dist
 
-    from aiter.ops.flydsl.quick_allreduce_int4 import QuickAllReduceInt4RMSNorm
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -979,7 +979,7 @@ def _run_rank_fused(
     gloo = dist.new_group(backend="gloo")
     rs_codec, ag_codec = codecs
 
-    eng = QuickAllReduceInt4RMSNorm(
+    eng = FlyQuickAllReduceRMSNorm(
         group=gloo,
         device=device,
         rank=rank,
@@ -1072,7 +1072,7 @@ def _spawn_fused(
 ) -> list[list[dict]]:
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        pytest.skip(f"QuickAllReduceInt4RMSNorm needs {world_size} GPUs, have {n_gpu}")
+        pytest.skip(f"FlyQuickAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
     pool = Pool(processes=world_size)
@@ -1343,8 +1343,8 @@ def test_mesh_fanout_quad_budget_gates_narrow_blocks():
 
     Host-side and GPU-free.
     """
-    from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
-        make_quick_allreduce_int4_kernel,
+    from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
+        make_quick_allreduce_mesh_kernel,
         mesh_fanout_fits,
     )
 
@@ -1352,7 +1352,7 @@ def test_mesh_fanout_quad_budget_gates_narrow_blocks():
     assert mesh_fanout_fits(256, 8, "int4")
     # The predicate and the factory must agree, or the gate lies again.
     with pytest.raises(ValueError, match="quads"):
-        make_quick_allreduce_int4_kernel(
+        make_quick_allreduce_mesh_kernel(
             world_size=8, grid=64, fusion="rmsnorm", hidden=1024
         )
     for world_size in SUPPORTED_WORLDS:
@@ -1360,7 +1360,7 @@ def test_mesh_fanout_quad_budget_gates_narrow_blocks():
             hidden = block * 8
             fits = mesh_fanout_fits(block, world_size, "int4")
             try:
-                make_quick_allreduce_int4_kernel(
+                make_quick_allreduce_mesh_kernel(
                     world_size=world_size,
                     grid=64,
                     fusion="rmsnorm",
@@ -1433,7 +1433,7 @@ def test_fused_one_shot_block_options():
 
 
 @benchmark()
-def test_quick_allreduce_int4(
+def test_quick_allreduce(
     tokens,
     hidden,
     dtype,
@@ -1474,7 +1474,7 @@ def test_quick_allreduce_int4(
 
 
 @benchmark()
-def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
+def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
     """Edge-case payloads on the shipping engine; correctness only."""
     rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False))
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
@@ -1504,7 +1504,7 @@ def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
 
 
 @benchmark()
-def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
+def test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
     """The ring with both laps' wire formats pinned; correctness only."""
     key = _key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
     rows = _result(key, (tokens, hidden, "normal", False, False))
@@ -1564,7 +1564,7 @@ def test_quick_allreduce_transport(
 
 
 @benchmark()
-def test_quick_allreduce_int4_coverage(tp, algorithm, window):
+def test_quick_allreduce_coverage(tp, algorithm, window):
     """Every kernel production dispatch can select on this host ran in the
     shipping sweep.
 
@@ -1603,7 +1603,7 @@ def _summarize(name: str, rows: list[dict]) -> None:
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("FlyQuickAllReduce unsupported on %s; skipping", ARCH)
         return
     n_gpu = torch.cuda.device_count()
 
@@ -1701,7 +1701,7 @@ def main():
     algos = args.algorithm
     dts = [d for d in args.dtype if d == dtypes.bf16]
     if len(dts) != len(args.dtype):
-        aiter.logger.warning("QuickAllReduceInt4 payload is bf16; skipping others")
+        aiter.logger.warning("FlyQuickAllReduce payload is bf16; skipping others")
 
     if args.mnk is not None:
         for mnk in args.mnk:
@@ -1803,7 +1803,7 @@ def main():
 
     def _int4_rows(cases):
         return [
-            test_quick_allreduce_int4(
+            test_quick_allreduce(
                 tokens,
                 hidden,
                 dtype,
@@ -1823,7 +1823,7 @@ def main():
         _summarize(
             "flydsl quick allreduce INT4 production kernel coverage",
             [
-                test_quick_allreduce_int4_coverage(tp, algorithm, window)
+                test_quick_allreduce_coverage(tp, algorithm, window)
                 for tp, algorithm, window in coverage
             ],
         )
@@ -1844,14 +1844,14 @@ def main():
     _summarize(
         "flydsl quick allreduce INT4 edge inputs",
         [
-            test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
+            test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill)
             for tp, algorithm, tokens, hidden, fill in edge
         ],
     )
     _summarize(
         "flydsl quick allreduce INT4 pinned codec",
         [
-            test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs, ag)
+            test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs, ag)
             for tp, tokens, hidden, rs, ag in pinned
         ],
     )
@@ -1865,7 +1865,7 @@ def main():
 
     if _FAILURES:
         raise SystemExit(
-            f"{len(_FAILURES)} QuickAllReduceInt4 check(s) failed:\n  "
+            f"{len(_FAILURES)} FlyQuickAllReduce check(s) failed:\n  "
             + "\n  ".join(_FAILURES)
         )
 

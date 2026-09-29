@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .quick_allreduce_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 

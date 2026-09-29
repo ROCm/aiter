@@ -45,9 +45,9 @@ try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import fused_qr_row_atoms
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
-    from aiter.ops.flydsl.quick_allreduce_int4 import (
-        QuickAllReduceInt4,
-        QuickAllReduceInt4RMSNorm,
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce as QuickAllReduceInt4,
+        FlyQuickAllReduceRMSNorm as QuickAllReduceInt4RMSNorm,
     )
 
     _FLY_IMPORT_OK = True

@@ -98,7 +98,7 @@ __all__ = [
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
-    "make_quick_allreduce_int4_kernel",
+    "make_quick_allreduce_mesh_kernel",
     "mesh_st_ladder",
 ]
 
@@ -147,7 +147,7 @@ def clamp_grid_cap(
     measurement, and over-estimating residency here is a hang rather than a
     slowdown -- so a fused build must not rely on it alone. The host bounds
     those launches at one workgroup per CU as well; see
-    ``QuickAllReduceInt4RMSNorm``.
+    ``FlyQuickAllReduceRMSNorm``.
     """
     if requested < 1 or cu_count < 1:
         raise ValueError("grid_cap and cu_count must be positive")
@@ -155,7 +155,7 @@ def clamp_grid_cap(
         raise ValueError("block must be positive")
     if arch not in ("gfx942", "gfx950"):
         raise ValueError(
-            f"quick_allreduce_int4 has no residency measurement for {arch!r}"
+            f"quick_allreduce_mesh has no residency measurement for {arch!r}"
         )
     key = (int(world_size), int(super_tile))
     resident = _RESIDENT_WGS_PER_CU.get(key)
@@ -163,7 +163,7 @@ def clamp_grid_cap(
         for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
         if not for_world:
             raise ValueError(
-                "quick_allreduce_int4 has no residency measurement for "
+                "quick_allreduce_mesh has no residency measurement for "
                 f"world_size={world_size}"
             )
         resident = min(for_world)
@@ -226,7 +226,7 @@ def mesh_fanout_fits(block: int, world_size: int, codec: str) -> bool:
     return have >= need
 
 
-def make_quick_allreduce_int4_kernel(
+def make_quick_allreduce_mesh_kernel(
     *,
     world_size: int = WORLD,
     super_tile: int = 1,
@@ -385,7 +385,7 @@ def make_quick_allreduce_int4_kernel(
     # the fused operands, which ``const_expr(fused)`` elides every use of. See
     # the ring kernel for why the split is at the launcher and not here.
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def quick_allreduce_int4(
+    def quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -886,7 +886,7 @@ def make_quick_allreduce_int4_kernel(
 
         # Stride by the *launched* grid, not the compile-time cap. The host
         # launches fewer blocks than `grid` whenever it wants each block to own
-        # several tiles (see QuickAllReduceInt4._grid_x); striding by the cap instead would
+        # several tiles (see FlyQuickAllReduce._grid_x); striding by the cap instead would
         # silently leave every tile above n_blocks unprocessed. `grid` still
         # sizes the wire slots and colour array, so n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
@@ -989,7 +989,7 @@ def make_quick_allreduce_int4_kernel(
     # Two launchers over one kernel: the plain one keeps the eight-argument
     # signature the host builds today and passes zeros for the fused operands.
     @flyc.jit
-    def launch_quick_allreduce_int4(
+    def launch_quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -1000,7 +1000,7 @@ def make_quick_allreduce_int4_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4(
+        quick_allreduce_mesh(
             rank,
             nbytes,
             num_tiles,
@@ -1021,7 +1021,7 @@ def make_quick_allreduce_int4_kernel(
         )
 
     @flyc.jit
-    def launch_quick_allreduce_int4_fused(
+    def launch_quick_allreduce_mesh_fused(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -1036,7 +1036,7 @@ def make_quick_allreduce_int4_kernel(
         eps: Float32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4(
+        quick_allreduce_mesh(
             rank,
             nbytes,
             num_tiles,
@@ -1072,11 +1072,11 @@ def make_quick_allreduce_int4_kernel(
         if padded:
             tag += f"_p{h_pad}"
     launcher = (
-        launch_quick_allreduce_int4_fused if fused else launch_quick_allreduce_int4
+        launch_quick_allreduce_mesh_fused if fused else launch_quick_allreduce_mesh
     )
-    launcher.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
+    launcher.func.__name__ = f"launch_quick_allreduce_mesh_{tag}"
     try:
-        quick_allreduce_int4.func.__name__ = f"quick_allreduce_int4_{tag}"
+        quick_allreduce_mesh.func.__name__ = f"quick_allreduce_mesh_{tag}"
     except AttributeError:
         pass
     return {

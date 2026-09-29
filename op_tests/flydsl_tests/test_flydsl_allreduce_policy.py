@@ -30,11 +30,11 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
     SUPER_TILES,
     mesh_st_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import (
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import (
     RING_SUPER_TILES,
     ring_st_ladder,
 )
