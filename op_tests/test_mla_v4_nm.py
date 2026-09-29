@@ -2615,6 +2615,313 @@ def test_v4_nm_kv_tail_not_tile_multiple():
         )
 
 
+# ---------------------------------------------------------------------------
+# Persistent kernel: mla_decode_fwd_v4_nm_ps (gqa=128, qlen=1, one launch).
+# ---------------------------------------------------------------------------
+_PS_HEADS = 128
+_PS_SENTINEL = -3.0  # rows with K=0 must keep it (the kernel leaves them unwritten)
+
+
+def _ps_inputs(kv_lens, seed=0, pool=None, device="cuda"):
+    """Packed q / KV pool / tables for kv_lens; row j gathers kv_lens[j] random
+    rows of a shared pool (page_size 1)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    n, total = len(kv_lens), int(sum(kv_lens))
+    pool = pool or max(1, min(total, 20000)) + 97
+    qp, qr = _native_to_2buff_for_asm(
+        torch.randn(n, _PS_HEADS, _QUANT_D, generator=g, device=device).to(dtypes.bf16)
+    )
+    kp, kr = _native_to_2buff_for_asm(
+        torch.randn(
+            pool, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D, generator=g, device=device
+        ).to(dtypes.bf16)
+    )
+    kv_indptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    kv_indptr[1:] = torch.tensor(kv_lens, device=device).cumsum(0)
+    kv_page_indices = torch.randint(
+        0, pool, (max(total, 1),), generator=g, device=device, dtype=torch.int32
+    )
+    sink = torch.randn(_PS_HEADS, generator=g, device=device) * 2.0
+    return dict(
+        q_packed=qp,
+        q_rope=qr.contiguous(),
+        kv_packed=kp,
+        kv_rope=kr.contiguous(),
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        sink=sink,
+    )
+
+
+def _ps_call(inp, ws, out=None, lse=None, return_lse=True, kv_indptr=None):
+    n = inp["q_packed"].size(0)
+    if out is None:
+        out = torch.full(
+            (n, _PS_HEADS, V_HEAD_DIM), _PS_SENTINEL, dtype=dtypes.bf16, device="cuda"
+        )
+    if lse is None and return_lse:
+        lse = torch.full((n, _PS_HEADS), _PS_SENTINEL, device="cuda")
+    return aiter.mla.mla_decode_fwd_v4_nm_ps(
+        inp["q_packed"],
+        inp["q_rope"],
+        inp["kv_packed"],
+        inp["kv_rope"],
+        inp["kv_indptr"] if kv_indptr is None else kv_indptr,
+        inp["kv_page_indices"],
+        inp["sink"],
+        ws,
+        out=out,
+        return_lse=return_lse,
+        lse=lse,
+    )
+
+
+def _ps_reference(inp, kv_indptr=None):
+    """(out bf16, lse fp32) of the fp8-dequant reference; lse includes the sink."""
+    n = inp["q_packed"].size(0)
+    kv_indptr = inp["kv_indptr"] if kv_indptr is None else kv_indptr
+    ones = torch.ones(n, dtype=torch.int32, device="cuda")
+    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device="cuda")
+    out, _ = _torch_attn_decode_fp8_dequant_ref(
+        inp["q_packed"],
+        inp["q_rope"],
+        inp["kv_packed"],
+        inp["kv_rope"],
+        qo_indptr,
+        kv_indptr,
+        inp["kv_page_indices"],
+        ones,
+        1.0 / (_QUANT_D**0.5),
+        attn_sink=inp["sink"],
+    )
+    q = _quant_2buff_to_native(inp["q_packed"], inp["q_rope"]).float()
+    kv = (
+        _quant_2buff_to_native(inp["kv_packed"], inp["kv_rope"])
+        .float()
+        .view(-1, _QUANT_D)
+    )
+    lse = torch.empty(n, _PS_HEADS, dtype=torch.float32, device="cuda")
+    ip = kv_indptr.tolist()
+    for j in range(n):
+        k = kv[inp["kv_page_indices"][ip[j] : ip[j + 1]].long()]
+        s = (q[j] @ k.T) / (_QUANT_D**0.5)
+        lse[j] = torch.logsumexp(torch.cat([s, inp["sink"][:, None]], 1), 1)
+    return out, lse
+
+
+def _ps_check(inp, out, lse, ref=None, msg=""):
+    ref_out, ref_lse = ref or _ps_reference(inp)
+    ip = inp["kv_indptr"]
+    live = (ip[1:] - ip[:-1]) > 0
+    assert torch.all(out[~live] == _PS_SENTINEL), "K=0 rows must be left unwritten"
+    if lse is not None:
+        assert torch.all(lse[~live] == _PS_SENTINEL), "K=0 lse must be left unwritten"
+    if not bool(live.any()):
+        return
+    a, b = out[live].float(), ref_out[live].float()
+    assert torch.isfinite(a).all()
+    cos = torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1), dim=1)
+    rel = (a - b).flatten(1).norm(dim=1) / b.flatten(1).norm(dim=1).clamp_min(1e-12)
+    assert float(cos.min()) >= 0.9999, f"{msg} min row cos {float(cos.min())}"
+    assert float(rel.max()) <= 1e-2, f"{msg} max row rel-L2 {float(rel.max())}"
+    err = checkAllclose(
+        b, a, rtol=3e-2, atol=3e-2, tol_err_ratio=0.02, msg=f"v4 nm ps {msg}"
+    )
+    assert float(err or 0) < 0.02
+    if lse is not None:
+        d = float((lse[live] - ref_lse[live]).abs().max())
+        assert d <= 2e-2, f"{msg} lse max abs err {d}"
+
+
+@pytest.fixture(scope="module")
+def ps_workspace():
+    if not torch.cuda.is_available() or not _on_gfx950():
+        pytest.skip("v4 nm shader is shipped only for gfx950")
+    return aiter.mla.get_mla_v4_nm_ps_workspace()
+
+
+def _ps_ragged(n, hi, seed, zero_every=0):
+    g = np.random.default_rng(seed)
+    lens = g.integers(1, hi + 1, size=n).tolist()
+    if zero_every:
+        lens[::zero_every] = [0] * len(lens[::zero_every])
+    return lens
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "kv_lens",
+    [
+        [1],
+        [64] * 7,
+        [129] * 256,  # HCA window + one compressed token
+        [8320] * 4,
+        [0, 1, 33, 8320, 0, 500, 7],
+        _ps_ragged(1000, 2000, 1, zero_every=37),
+        _ps_ragged(3000, 300, 2),
+        [8320] * 3 + [5] * 600,
+    ],
+    ids=lambda v: f"N{len(v)}_Kmax{max(v)}",
+)
+def test_v4_nm_ps_accuracy(ps_workspace, kv_lens):
+    inp = _ps_inputs(kv_lens, seed=len(kv_lens))
+    out, lse = _ps_call(inp, ps_workspace)
+    torch.cuda.synchronize()
+    _ps_check(inp, out, lse, msg=f"N={len(kv_lens)}")
+    assert int(ps_workspace.cnt.abs().sum()) == 0
+
+
+@needs_gfx950
+def test_v4_nm_ps_indptr_offset_and_tail(ps_workspace):
+    """kv_indptr longer than N+1 and not starting at 0 (N comes from q)."""
+    kv_lens = [300, 0, 17, 1024, 64]
+    inp = _ps_inputs(kv_lens, seed=3)
+    base, base_lse = _ps_call(inp, ps_workspace)
+    off = 11
+    idx = inp["kv_page_indices"]
+    pad = torch.zeros(off, dtype=torch.int32, device="cuda")
+    shifted = dict(inp, kv_page_indices=torch.cat([pad, idx, pad]))
+    kv_indptr = torch.cat(
+        [inp["kv_indptr"] + off, (inp["kv_indptr"][-1:] + off + 5).repeat(3)]
+    )
+    out, lse = _ps_call(shifted, ps_workspace, kv_indptr=kv_indptr)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), base.view(torch.int16))
+    assert torch.equal(lse.view(torch.int32), base_lse.view(torch.int32))
+    _ps_check(inp, base, base_lse)
+
+
+@needs_gfx950
+def test_v4_nm_ps_workspace_reuse_across_batches(ps_workspace):
+    """One workspace across batch sizes: counters return to zero and results
+    match a fresh workspace bit for bit."""
+    for n, seed in ((1, 0), (700, 1), (5, 2), (2048, 3), (33, 4)):
+        inp = _ps_inputs(_ps_ragged(n, 1500, seed, zero_every=11), seed=seed)
+        out, lse = _ps_call(inp, ps_workspace)
+        fresh, fresh_lse = _ps_call(inp, aiter.mla.get_mla_v4_nm_ps_workspace())
+        torch.cuda.synchronize()
+        assert int(ps_workspace.cnt.abs().sum()) == 0
+        assert torch.equal(out.view(torch.int16), fresh.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), fresh_lse.view(torch.int32))
+
+
+@needs_gfx950
+def test_v4_nm_ps_partitions(ps_workspace):
+    """Non-default partition counts agree with the default one."""
+    inp = _ps_inputs(_ps_ragged(300, 3000, 5, zero_every=7), seed=5)
+    ref = _ps_reference(inp)
+    for p in (1, 37, 1024):
+        ws = aiter.mla.get_mla_v4_nm_ps_workspace(num_partitions=p)
+        out, lse = _ps_call(inp, ws)
+        torch.cuda.synchronize()
+        _ps_check(inp, out, lse, ref=ref, msg=f"P={p}")
+        assert int(ws.cnt.abs().sum()) == 0
+
+
+@needs_gfx950
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")
+def test_v4_nm_ps_cudagraph_replay(ps_workspace):
+    """Captured once, replayed with changing KV lengths (incl. K=0 rows)."""
+    n, kv_cap = 96, 2048
+    inp = _ps_inputs([kv_cap] * n, seed=6)
+    out = torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
+    lse = torch.empty(n, _PS_HEADS, dtype=torch.float32, device="cuda")
+
+    def run():
+        _ps_call(inp, ps_workspace, out=out, lse=lse)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _ps_call(inp, ps_workspace)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    with pytest.raises(RuntimeError):
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            aiter.mla.get_mla_v4_nm_ps_workspace()
+
+    g = np.random.default_rng(7)
+    for lens in (
+        [kv_cap] * n,
+        g.integers(0, kv_cap + 1, size=n).tolist(),
+        [1] * n,
+        [0] * (n // 2) + [kv_cap] * (n - n // 2),
+    ):
+        # rows read a dense prefix of the capacity-sized index table
+        inp["kv_indptr"][1:].copy_(torch.tensor(lens, device="cuda").cumsum(0))
+        out.fill_(_PS_SENTINEL)
+        lse.fill_(_PS_SENTINEL)
+        graph.replay()
+        torch.cuda.synchronize()
+        _ps_check(inp, out, lse, msg=f"graph lens={lens[:3]}")
+        eager, eager_lse = _ps_call(inp, ps_workspace)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), eager.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), eager_lse.view(torch.int32))
+        assert int(ps_workspace.cnt.abs().sum()) == 0
+
+
+@needs_gfx950
+@pytest.mark.parametrize(
+    "kv_lens", [[1152, 900, 64, 1152], [8320, 200], [100, 60, 128] * 50]
+)
+def test_v4_nm_ps_matches_split_kernel(ps_workspace, kv_lens):
+    """Agrees with mla_decode_fwd_v4_nm (non-persistent kernel + planned split)."""
+    inp = _ps_inputs(kv_lens, seed=8)
+    n = len(kv_lens)
+    out = _ps_call(inp, ps_workspace, return_lse=False)
+    ref = torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
+    plan = aiter.mla.get_mla_v4_nm_split_plan(n, _PS_HEADS, max(kv_lens))
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        inp["q_packed"],
+        inp["q_rope"],
+        inp["kv_packed"],
+        inp["kv_rope"],
+        ref,
+        torch.arange(n + 1, dtype=torch.int32, device="cuda"),
+        inp["kv_indptr"],
+        inp["kv_page_indices"],
+        1,
+        sink=inp["sink"],
+        **plan._asdict(),
+    )
+    if plan.num_kv_splits == 1:
+        ref = logits[:, 0]
+    torch.cuda.synchronize()
+    assert _cos_diff(out, ref) < 1e-5
+    err = checkAllclose(
+        ref.float(),
+        out.float(),
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg="v4 nm ps vs split kernel",
+    )
+    assert float(err or 0) < 0.02
+
+
+@needs_gfx950
+def test_v4_nm_ps_rejects_bad_args(ps_workspace):
+    inp = _ps_inputs([64, 64], seed=9)
+    with pytest.raises(RuntimeError):  # 64 heads
+        aiter.mla.mla_decode_fwd_v4_nm_ps(
+            inp["q_packed"][:, :64].contiguous(),
+            inp["q_rope"][:, :64].contiguous(),
+            inp["kv_packed"],
+            inp["kv_rope"],
+            inp["kv_indptr"],
+            inp["kv_page_indices"],
+            inp["sink"],
+            ps_workspace,
+        )
+    with pytest.raises(RuntimeError):  # kv_indptr shorter than N+1
+        _ps_call(inp, ps_workspace, kv_indptr=inp["kv_indptr"][:2])
+    with pytest.raises(ValueError):
+        aiter.mla.get_mla_v4_nm_ps_workspace(num_partitions=1025)
+
+
 if __name__ == "__main__":
     import argparse
     import itertools

@@ -454,6 +454,55 @@ def get_mla_v4_nm_split_plan(
     return MlaV4NmSplitPlan(num_kv_splits, split_indptr)
 
 
+# Workspace of the persistent v4 nm decode kernel (mla_decode_v4_ps_asm).
+_V4_NM_PS_CNT_INTS = 2 * 65536 + 16 * 512 + 4 * 1024
+_V4_NM_PS_ARANGE = 65537
+_V4_NM_PS_MAX_PARTITIONS = 1024
+
+
+class MlaV4NmPsWorkspace(NamedTuple):
+    """Scratch of `mla_decode_fwd_v4_nm_ps`; build it with
+    `get_mla_v4_nm_ps_workspace`. P = `desc.size(0)` partitions."""
+
+    o_acc: torch.Tensor  # [2P, 128, 512] fp32 split partials
+    lse_acc: torch.Tensor  # [2P, 128] fp32 split partials
+    desc: torch.Tensor  # [P, 8] int32 in-kernel plan
+    span: torch.Tensor  # [P, 2] int32 in-kernel plan
+    cnt: torch.Tensor  # int32 merge counters, zero at rest
+    arange: torch.Tensor  # int32 arange, read-only
+
+
+def get_mla_v4_nm_ps_workspace(device="cuda", num_partitions=128) -> MlaV4NmPsWorkspace:
+    """Allocate a workspace for `mla_decode_fwd_v4_nm_ps`.
+
+    One workspace may serve any number of calls that are ordered on the GPU
+    (same stream, or one CUDA graph replayed at a time); calls that can run
+    concurrently need one workspace each. Nothing carries over between calls,
+    so one workspace can be reused across batch sizes and graphs. Allocate it
+    outside CUDA-graph capture.
+    """
+    if not 1 <= num_partitions <= _V4_NM_PS_MAX_PARTITIONS:
+        raise ValueError(
+            f"num_partitions must be in [1, {_V4_NM_PS_MAX_PARTITIONS}], "
+            f"got {num_partitions}"
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "get_mla_v4_nm_ps_workspace: allocate the workspace before "
+            "CUDA-graph capture"
+        )
+    P = num_partitions
+    i32 = dict(dtype=dtypes.i32, device=device)
+    return MlaV4NmPsWorkspace(
+        o_acc=torch.empty(2 * P, 128, 512, dtype=dtypes.fp32, device=device),
+        lse_acc=torch.empty(2 * P, 128, dtype=dtypes.fp32, device=device),
+        desc=torch.empty(P, 8, **i32),
+        span=torch.zeros(P, 2, **i32),
+        cnt=torch.zeros(_V4_NM_PS_CNT_INTS, **i32),
+        arange=torch.arange(_V4_NM_PS_ARANGE, **i32),
+    )
+
+
 # Persistent MLA-decode kernel gate: the persistent kernel
 # ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
 # ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
@@ -2041,3 +2090,58 @@ def mla_decode_fwd_v4_nm(
         )
 
     return logits, attn_lse
+
+
+def mla_decode_fwd_v4_nm_ps(
+    q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
+    q_rope,  # [N, 128, 64] BF16
+    kv_packed,  # [rows, ..., 512] FP8 packed KV pool, page_size 1
+    kv_rope,  # [rows, ..., 64] BF16
+    kv_indptr,  # [>= N+1] int32
+    kv_page_indices,  # [*] int32
+    sink,  # [128] FP32 attention sink logit
+    workspace: MlaV4NmPsWorkspace,
+    out=None,  # [N, 128, 512] BF16
+    return_lse=False,
+    lse=None,  # [N, 128] FP32, used when return_lse
+):
+    """v4 nm decode (128 heads, one query token per row) with the persistent
+    kernel: one launch that plans the KV split over the workspace's
+    partitions from `kv_indptr`, runs the attention and merges the split
+    partials, so no split plan or stage-2 merge is needed.
+
+    Same math and packed layouts as `mla_decode_fwd_v4_nm` with gqa=128 and
+    max_seqlen_q=1. N = `q_packed.size(0)` (N <= 32768); row j attends to pool
+    rows `kv_page_indices[kv_indptr[j] : kv_indptr[j + 1]]`, so `kv_indptr`
+    may hold more than N+1 entries and need not start at 0. Rows with an
+    empty KV range are left unwritten in `out` (and in the LSE).
+
+    `workspace` comes from `get_mla_v4_nm_ps_workspace`; see its sharing
+    rule. Returns `out`, or `(out, lse)` with the natural-log LSE [N, 128]
+    FP32 (sink included) when `return_lse`; `out` / `lse` are allocated
+    when not given.
+    """
+    require_gfx1250_asm("mla_decode_v4_ps_asm")
+    if out is None:
+        out = torch.empty(
+            (q_packed.size(0), 128, 512), dtype=dtypes.bf16, device=q_packed.device
+        )
+    if not return_lse:
+        lse = None
+    elif lse is None:
+        lse = torch.empty(
+            (q_packed.size(0), 128), dtype=dtypes.fp32, device=q_packed.device
+        )
+    aiter.mla_decode_v4_ps_asm(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        kv_indptr,
+        kv_page_indices,
+        sink,
+        *workspace,
+        out,
+        lse,
+    )
+    return (out, lse) if return_lse else out

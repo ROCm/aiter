@@ -884,6 +884,43 @@ def mla_decode_v4_asm(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME_V4, ffi_type="ctypes")
+def mla_decode_v4_ps_asm(
+    # [N, 128, 512] FP8 packed Q + e8m0 scale region
+    Q: torch.Tensor,
+    # [N, 128, 64] BF16
+    qrope: torch.Tensor,
+    # [rows, ..., 512] FP8 packed KV pool (row-dense, page_size 1)
+    KV: torch.Tensor,
+    # [rows, ..., 64] BF16
+    kvrope: torch.Tensor,
+    # [>= N+1] int32
+    kv_indptr: torch.Tensor,
+    # [*] int32
+    kv_page_indices: torch.Tensor,
+    # [128] FP32 attention sink logit
+    sink: torch.Tensor,
+    # workspace (aiter.mla.get_mla_v4_nm_ps_workspace); P = desc.size(0)
+    # [2P, 128, 512] FP32
+    o_acc: torch.Tensor,
+    # [2P, 128] FP32
+    lse_acc: torch.Tensor,
+    # [P, 8] int32
+    desc: torch.Tensor,
+    # [P, 2] int32
+    span: torch.Tensor,
+    # int32 counters, zero at rest
+    cnt: torch.Tensor,
+    # int32 arange
+    arange: torch.Tensor,
+    # outputs
+    # [N, 128, 512] BF16
+    output: torch.Tensor,
+    # [N, 128] FP32 natural-log LSE (sink included); None = not written
+    lse: torch.Tensor | None = None,
+) -> None: ...
+
+
 @compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_prefill_asm_fwd(
     # [num_seqs, num_heads, head_size]
