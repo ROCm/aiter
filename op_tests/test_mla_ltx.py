@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -600,6 +601,51 @@ def _sweep_rows(
                 )
             )
     return rows
+
+
+@pytest.mark.skipif(get_gfx() != "gfx942", reason="gfx942 bf16 ASM KV addressing")
+@pytest.mark.parametrize("nhead", [16, 128])
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("page_stride", [576, 640])
+def test_gfx942_bf16_kv_span(nhead, persistent, page_stride, monkeypatch):
+    """Reject oversized views, including padded pages, before launching ASM."""
+    monkeypatch.setattr(
+        sys.modules[__name__], "HARNESS", Harness(dtypes.bf16, dtypes.bf16, nhead, 1)
+    )
+    safe_pages = (0xFFFFFFF0 - QK_HEAD_DIM * 2) // (page_stride * 2) + 1
+    kv = torch.empty_strided(
+        (safe_pages + 1, NHEAD_KV, QK_HEAD_DIM),
+        (page_stride, QK_HEAD_DIM, 1),
+        dtype=dtypes.bf16,
+        device="cuda",
+    )
+    kv[:4].fill_(1)
+    kv[-4:].fill_(1)
+    q = torch.zeros((1, nhead, QK_HEAD_DIM), dtype=dtypes.bf16, device="cuda")
+    out = torch.empty((1, nhead, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda")
+    qo_indptr, kv_indptr, kv_indices = _make_indptr(4, 0)
+
+    def decode(cache):
+        return run_asm_mla_decode(
+            q,
+            cache,
+            cache.shape[0],
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            persistent=persistent,
+            return_lse=False,
+            max_split=1,
+        )
+
+    # A view's span is relative to its own data_ptr, not the underlying allocation.
+    for cache in (kv[:safe_pages], kv[-4:]):
+        torch.testing.assert_close(decode(cache), torch.ones_like(out))
+    with pytest.raises(
+        RuntimeError, match="gfx942 bf16 MLA decode uses 32-bit KV offsets"
+    ):
+        decode(kv)
 
 
 def main():

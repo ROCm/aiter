@@ -693,6 +693,20 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const HipDeviceGuard device_guard(Q->device_id);
 
     std::string arch_id = get_gpu_arch();
+    if(arch_id == "gfx942" && Q->dtype() == AITER_DTYPE_bf16 && KV->dtype() == AITER_DTYPE_bf16 &&
+       KV->numel() != 0)
+    {
+        // These kernels use 32-bit KV offsets and a 0xfffffff0-byte buffer descriptor.
+        uint64_t kv_span = 1;
+        for(int dim = 0; dim < KV->dim(); ++dim)
+            kv_span += (KV->size(dim) - 1) * KV->stride(dim);
+        kv_span *= KV->element_size();
+        AITER_CHECK(kv_span <= 0xfffffff0ULL,
+                    __func__,
+                    ": gfx942 bf16 MLA decode uses 32-bit KV offsets, but KV spans ",
+                    kv_span,
+                    " bytes (max 4294967280)");
+    }
     if(arch_id == "gfx1250")
     {
         return mla_decode_gfx1250_dispatch(Q,
