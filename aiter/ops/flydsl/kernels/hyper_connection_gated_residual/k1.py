@@ -45,6 +45,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
     mfma_bf16,
+    norm_weight_f32,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import k1_plan
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
@@ -900,6 +901,16 @@ def _build_up_gate_mix_gemv(
         # MMA-free scalar GEMV (see _build_down_gemv_partial): lane-strided 1-element
         # bf16 dot over lowrank, wave-reduced. Intentional for decode M<=DECODE_MAX_M
         # (launch-bound); no MMA/tiled-copy or wide vector loads here.
+        # lora does not depend on the stream: load it once, not once per stream.
+        lo = [
+            [
+                fx.BFloat16(lora_g.load(m * lstride + lane + i * WAVE, vec_size=1)).to(
+                    fx.Float32
+                )
+                for i in range_constexpr(k_iters)
+            ]
+            for m in range_constexpr(m_rows)
+        ]
         for s in range_constexpr(hc_count):
             n = s * stream_dim + c
             g = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
@@ -907,10 +918,7 @@ def _build_up_gate_mix_gemv(
                 r = lane + i * WAVE
                 wu = fx.BFloat16(wup_g.load(n * lowrank + r, vec_size=1)).to(fx.Float32)
                 for m in range_constexpr(m_rows):
-                    lo = fx.BFloat16(lora_g.load(m * lstride + r, vec_size=1)).to(
-                        fx.Float32
-                    )
-                    g[m] = g[m] + lo * wu
+                    g[m] = g[m] + lo[m][i] * wu
             onepw = (
                 (fx.Float32(1.0) + w_shared)
                 if shared_w
@@ -953,19 +961,18 @@ def _build_up_gate_mix_gemv(
 def _decode_reduce_params(total: int):
     """(block_threads, vec) with ``bt*vec | total`` for the tiny decode reduce.
 
-    ``total = tokens * n_pad`` and ``n_pad`` is 64-padded, so ``total`` is always a
-    multiple of 64 -- the ``bt=16, vec=4`` (=64) candidate therefore always
-    divides it, guaranteeing a vectorized path. This matters for the final mixer
-    (``n_pad=lowrank=320=64*5``): with only ``bt>=64`` candidates the search would
-    fall to ``vec=1``, which the vectorized reduce kernel cannot emit (it can't
-    wrap a scalar load in a Vector). The sub-wavefront blocks are fine here -- the
-    decode reduce is a tiny one-shot elementwise pass.
+    ``total = tokens * n_pad``. Any ``n_pad`` that is a multiple of 4 keeps
+    ``vec=4`` available, which matters because the vectorized reduce kernel cannot
+    emit ``vec=1`` (it can't wrap a scalar load in a Vector). Scanning all block
+    sizes lets a caller pass any padding, e.g. a merged weight padded to 16 rows
+    instead of 64. Odd and sub-wavefront blocks are fine here -- the decode reduce
+    is a tiny one-shot elementwise pass.
     """
     for vec in (4, 2, 1):
-        for bt in (256, 192, 128, 64, 32, 16):
-            if bt * vec <= total and total % (bt * vec) == 0:
+        for bt in range(min(256, total // vec), 0, -1):
+            if total % (bt * vec) == 0:
                 return bt, vec
-    return 16, 1
+    return 1, 1
 
 
 # Decode skinny path holds m_rows accumulators per lane, so the GEMV bodies spill
@@ -1009,11 +1016,12 @@ def flydsl_k1k2_skinny_decode(
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
-    # The combine+RMS prologue reads these as contiguous row-major; a strided
-    # input silently reads the wrong lanes.
+    # The combine+RMS prologue reads residual and block_output as contiguous
+    # row-major; the injection may be a column slice (unit inner stride).
     assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
     assert block_output.dtype == torch.bfloat16 and block_output.is_contiguous()
-    assert injection.dtype == torch.bfloat16 and injection.is_contiguous()
+    assert injection.dtype == torch.bfloat16 and injection.stride(-1) == 1
+    inj_stride = injection.stride(0) if tokens > 1 else hc_count
     # Can't verify "folded" numerically (no unfolded ref here), but pin the
     # checkable half of the contract so a wrong-tensor call fails loudly.
     assert (
@@ -1023,7 +1031,7 @@ def flydsl_k1k2_skinny_decode(
         n_pad,
         hidden,
     ), f"w_down_merged {tuple(w_down_merged.shape)} must be (n_pad, {hidden})"
-    w = norm_weight.reshape(-1).float().contiguous()
+    w = norm_weight_f32(norm_weight)
     if stream is None:
         stream = torch.cuda.current_stream()
     dev = residual.device
@@ -1034,7 +1042,9 @@ def flydsl_k1k2_skinny_decode(
     packed = torch.empty(tokens, n_pad, dtype=torch.bfloat16, device=dev)
     x = torch.empty(tokens, stream_dim, dtype=torch.bfloat16, device=dev)
 
-    pro = _build_combine_rms(hc_count, stream_dim, float(eps))
+    pro = _build_combine_rms(
+        hc_count, stream_dim, float(eps), 0 if inj_stride == hc_count else inj_stride
+    )
     gd = _build_down_gemv_partial(
         hidden, n_pad, hc_count, stream_dim, tokens, split_k_per_stream, waves_per_block
     )
@@ -1058,14 +1068,13 @@ def flydsl_k1k2_skinny_decode(
     _run_compiled(gd, r2, rrms, w_down_merged, partial, fxs)
     _run_compiled(red, partial, packed, fxs)
     _run_compiled(gu, packed, r2, rrms, w, w_up, x, fxs)
-    inj_next = (
-        packed[:, lowrank : lowrank + hc_count].contiguous() if need_inj else None
-    )
+    # A view, not a copy: the next layer's prologue reads it strided.
+    inj_next = packed[:, lowrank : lowrank + hc_count] if need_inj else None
     return r2, x, inj_next
 
 
 @lru_cache(maxsize=16)
-def _build_combine_rms(hc_count: int, stream_dim: int, eps: float):
+def _build_combine_rms(hc_count: int, stream_dim: int, eps: float, inj_stride: int = 0):
     """Prologue for the split-K K1 path: combine + per-stream RMS, emit r2 + rrms.
 
     A trimmed fork of :func:`combine_norm._build` that stops after the reduction:
@@ -1081,9 +1090,13 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float):
     inv_hc = 1.0 / hc_count
     inv_hs = 1.0 / stream_dim
     log2_wave = int(math.log2(WAVE))
+    # Injection row stride in elements; 0 -> hc_count (contiguous). Callers pass
+    # the logits as a column slice of the previous down-GEMM output.
+    istride = inj_stride or hc_count
+    stride_tag = f"_is{istride}" if inj_stride else ""
 
     @flyc.kernel(
-        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}",
+        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}{stride_tag}",
         known_block_size=[WAVE, 1, 1],
     )
     def kernel(
@@ -1102,7 +1115,7 @@ def _build_combine_rms(hc_count: int, stream_dim: int, eps: float):
         r2 = GTensor(r2_out, T.bf16, (1, hidden))
         rrms_g = GTensor(rrms_out, T.f32, (1, hc_count))
 
-        inj_val = fx.BFloat16(inj.load(tok * hc_count + stream, vec_size=1)).to(
+        inj_val = fx.BFloat16(inj.load(tok * istride + stream, vec_size=1)).to(
             fx.Float32
         )
         gate = fx.Float32(2.0) * sigmoid_f32(inj_val * fx.Float32(inv_hc))
@@ -1534,7 +1547,7 @@ def flydsl_k1_combine_norm_down(
     # flow through down/K2 as garbage but every op here is per-token (RMS, GEMM
     # rows, gated mean over streams), so pad rows never contaminate a real row and
     # the caller slices them off. torch.empty (no memset) keeps decode M cheap.
-    w = norm_weight.reshape(-1).float().contiguous()
+    w = norm_weight_f32(norm_weight)
     if r2_out is None:
         r2_out = torch.empty(
             gemm_tokens, hidden, dtype=residual.dtype, device=residual.device

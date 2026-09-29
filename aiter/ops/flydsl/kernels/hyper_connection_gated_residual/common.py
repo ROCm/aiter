@@ -98,6 +98,18 @@ def ab_k_perm(mma_k: int, *, dtype_width: int = 16, copy_bits: int = 128):
     return fx.make_layout((k_group, 4, num_frgv), (1, num_elems, k_group))
 
 
+def norm_weight_f32(norm_weight: torch.Tensor) -> torch.Tensor:
+    """``norm_weight`` as a flat contiguous f32 buffer for the norm kernels.
+
+    The kernels read the affine weight as contiguous f32. A caller already holding
+    it in that form passes through untouched; a bf16 or non-contiguous weight is
+    cast and packed here.
+    """
+    if norm_weight.dtype == torch.float32 and norm_weight.is_contiguous():
+        return norm_weight.reshape(-1)
+    return norm_weight.reshape(-1).float().contiguous()
+
+
 def merge_down_inject(
     w_down: torch.Tensor, w_inject: torch.Tensor, n_pad: int
 ) -> torch.Tensor:

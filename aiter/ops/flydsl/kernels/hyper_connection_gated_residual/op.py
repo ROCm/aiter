@@ -139,7 +139,9 @@ def _k1_then_k2(
     r2, packed = flydsl_k1_combine_norm_down(
         residual,
         block_output,
-        injection,
+        # The skinny path returns inj_next as a strided view; K1 reads it
+        # contiguous.
+        injection.contiguous(),
         norm_weight,
         w_down_merged,
         lowrank,

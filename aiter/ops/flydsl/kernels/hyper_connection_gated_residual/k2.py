@@ -32,6 +32,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
     arch_name,
     mfma_bf16,
+    norm_weight_f32,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
     up_gate_mix_config,
@@ -272,7 +273,7 @@ def flydsl_up_gate_mix_norm(
     stream_dim = hidden // hc_count
     assert w_up.shape == (hidden, lowrank)
     assert rrms.shape == (tokens, hc_count)
-    w = norm_weight.reshape(-1).float().contiguous()
+    w = norm_weight_f32(norm_weight)
     w_len = w.numel()
     assert w_len in (stream_dim, hidden)
 
