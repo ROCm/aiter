@@ -738,6 +738,7 @@ def test_triton_unified_attn(
     ],
 )
 @pytest.mark.parametrize("head_size", [256, 512])
+@pytest.mark.parametrize("seq_lens", [[(1023, 2048)], [(2048, 2048)]])
 @torch.inference_mode()
 def test_triton_unified_attn_gfx942_large_prefill(
     head_size: int,
@@ -746,16 +747,19 @@ def test_triton_unified_attn_gfx942_large_prefill(
     shuffled_kv_cache: bool,
     block_size: int,
     sliding_window: int | None,
+    seq_lens: list[tuple[int, int]],
 ) -> None:
     """Executable coverage for the gfx942 large-prefill attn_2d entries.
 
     The general test never exceeds max_seqlen_q 777 (below the Q_GEQ_1024
     composites) and skips the shuffled 2D Triton path on gfx942, so the
     Q>=1024, head 256/512 and SHUF specializations are otherwise never
-    compiled or numerically checked. This runs one 2048-token prefill per
-    (head, dtype, shuffled, page) combination — enough to select, compile
-    and validate each entry — and asserts the resolved config key. Page 64
-    hits the tuned SHUF.BS_LEQ_64 entries, page 128 the BS-agnostic
+    compiled or numerically checked. This runs one 1023- or 2048-token
+    prefill per (head, dtype, shuffled, page) combination — enough to
+    select, compile and validate each entry — and asserts the resolved
+    config key, pinning the 1023/1024 threshold from both sides (the
+    below-threshold arm runs non-shuffled only; see the skip below). Page
+    64 hits the tuned SHUF.BS_LEQ_64 entries, page 128 the BS-agnostic
     M16/stages-1 fallbacks (the only LDS-safe configs at TILE 128).
     The sliding_window=1024 arm mirrors the Gemma-4 production call shape:
     these entries were tuned for sliding-window prefill, and the general
@@ -766,13 +770,20 @@ def test_triton_unified_attn_gfx942_large_prefill(
     if DEVICE_ARCH != "gfx942":
         pytest.skip(f"gfx942-tuned entries, skip {DEVICE_ARCH}")
 
+    # Below-threshold shuffled prefill is not a launchable combination on
+    # this path: the D-only entries the lookup falls back to predate the
+    # SHUF table and their stage-2 configs do not build at TILE_SIZE=128
+    # (the wrapper pins the tile to the page). The threshold arm therefore
+    # only runs non-shuffled.
+    if seq_lens[0][0] < 1024 and shuffled_kv_cache:
+        pytest.skip("below-threshold shuffled prefill has no table entry")
+
     from aiter.ops.triton.utils.unified_attention_utils import (
         _axis_values,
         _load,
         _lookup,
     )
 
-    seq_lens = [(2048, 2048)]
     num_heads = (32, 4)
     (
         query,
@@ -814,7 +825,14 @@ def test_triton_unified_attn_gfx942_large_prefill(
     # assert the intended table entry serves this call
     table, axes, _ = _load("attn_2d", "triton", "gfx942")
     dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
-    if shuffled_kv_cache and block_size <= 64:
+    if max_query_len < 1024:
+        # below the crossover the D-only entries win; d512 fp8 resolves to
+        # the dtype-specific D_GEQ_512.DT_fp8_fp8 entry
+        if head_size == 512 and dt_tag == "fp8_fp8":
+            expected_key = "D_GEQ_512.DT_fp8_fp8"
+        else:
+            expected_key = f"D_GEQ_{head_size}"
+    elif shuffled_kv_cache and block_size <= 64:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_{dt_tag}"
     elif shuffled_kv_cache:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.DT_{dt_tag}"
