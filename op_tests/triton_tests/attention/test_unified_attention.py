@@ -743,7 +743,7 @@ def test_triton_unified_attn(
     ],
 )
 @pytest.mark.parametrize("head_size", [256, 512])
-@pytest.mark.parametrize("seq_lens", [[(1023, 2048)], [(2048, 2048)]])
+@pytest.mark.parametrize("seq_lens", [[(1, 2048)], [(1023, 2048)], [(2048, 2048)]])
 @torch.inference_mode()
 def test_triton_unified_attn_gfx942_large_prefill(
     head_size: int,
@@ -759,8 +759,9 @@ def test_triton_unified_attn_gfx942_large_prefill(
     The general test never exceeds max_seqlen_q 777 (below the Q_GEQ_1024
     composites) and skips the shuffled 2D Triton path on gfx942, so the
     Q>=1024, head 256/512 and SHUF specializations are otherwise never
-    compiled or numerically checked. This runs one 1023- or 2048-token
-    prefill per (head, dtype, shuffled, page) combination — enough to
+    compiled or numerically checked. This runs one 1-, 1023- or 2048-token
+    prefill/decode per (head, dtype, shuffled, page) combination (the Q=1
+    arm pins shuffled decode to the stage-1 Q_LEQ_1 entries) — enough to
     select, compile and validate each entry — and asserts the resolved
     config key and tuned BLOCK_M, pinning the 1023/1024 threshold from
     both sides: below the threshold, plain calls resolve to the D-only
@@ -824,7 +825,23 @@ def test_triton_unified_attn_gfx942_large_prefill(
     # assert the intended table entry serves this call
     table, axes, _ = _load("attn_2d", "triton", "gfx942")
     dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
-    if max_query_len < 1024 and shuffled_kv_cache:
+    if max_query_len == 1:
+        # decode: d256 shuffled routes to the SHUF stage-1 entry (the
+        # stage-2 D_GEQ_256.Q_LEQ_1 exceeds LDS at TILE 128); d512 decode
+        # is already stage-1 and needs no SHUF variant
+        if head_size == 256:
+            expected_key = (
+                "D_GEQ_256.Q_LEQ_1.SHUF" if shuffled_kv_cache else "D_GEQ_256.Q_LEQ_1"
+            )
+        elif dt_tag == "fp8_fp8":
+            expected_key = "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8"
+        else:
+            expected_key = "D_GEQ_512.Q_LEQ_1"
+        # fp8 decode resolves to the dtype-specific Q_LEQ_1 entries
+        if not shuffled_kv_cache and dt_tag == "fp8_fp8":
+            expected_key = f"D_GEQ_{head_size}.Q_LEQ_1.DT_fp8_fp8"
+        expected_block_m = 16
+    elif max_query_len < 1024 and shuffled_kv_cache:
         # sub-threshold shuffled prefill: the Q-agnostic SHUF entry (M16/s1,
         # the LDS-safe family at every supported page)
         expected_key = f"D_GEQ_{head_size}.SHUF.DT_{dt_tag}"
