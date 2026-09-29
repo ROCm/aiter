@@ -4503,6 +4503,12 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     const int64_t batch_id = blockIdx.x;
     const IdxT row_len = StaticRowLen > 0 ? static_cast<IdxT>(StaticRowLen)
                                              : static_cast<IdxT>(len);
+    // The leading-slice sample below reads up to MaxSampleVecs * BlockSize
+    // elements without a bound; every launch passes a longer row.
+    if(len < static_cast<int64_t>(MaxSampleVecs) * BlockSize)
+    {
+        __builtin_trap();
+    }
 
     auto clear_wide_histogram = [&]() {
         static_assert(num_buckets == BlockSize * 4);
@@ -5245,43 +5251,135 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     IdxT const sample_len = static_cast<IdxT>(nsample) * BlockSize;
     auto const pre_last   = static_cast<decltype(pre_prefix)>(
         pre_prefix | ((1u << pass0_start_bit) - 1u));
+    // Block-uniform: keep the staging bound in an SGPR for the per-element
+    // compares below.
+    PreBits const stage_last =
+        static_cast<PreBits>(__builtin_amdgcn_readfirstlane(static_cast<int>(pre_last)));
+    int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
 
-    auto stage_one = [&](decltype(pre_prefix) bits, IdxT idx, T value) {
-        if(bits <= pre_last)
+    // Stage with one LDS reservation per wave per batch: a returning atomic
+    // per staged element serialized the full-row scan on LDS round trips.
+    // Slots past StageCapacity are reserved but not written, so the final
+    // count alone detects an overflow.
+    auto reserve = [&](unsigned mask) -> IdxT {
+        int const count = __builtin_popcount(mask);
+        int const end   = wave_inclusive_sum_dpp(count);
+        int const total = __builtin_amdgcn_readlane(end, WARP_SIZE - 1);
+        IdxT base       = 0;
+        if(total != 0)
         {
-            IdxT const pos = atomicAdd(&staged_count, static_cast<IdxT>(1));
-            if(pos < StageCapacity)
-            {
-                staged_packed[pos] =
-                    (static_cast<unsigned long long>(__float_as_uint(value)) << 32) |
-                    static_cast<unsigned long long>(static_cast<unsigned>(idx));
-            }
-            else
-            {
-                atomicExch(&staged_overflow, 1);
-            }
+            if(lane == WARP_SIZE - 1)
+                base = atomicAdd(&staged_count, static_cast<IdxT>(total));
+            base = static_cast<IdxT>(__builtin_amdgcn_readlane(base, WARP_SIZE - 1));
+        }
+        return base + end - count;
+    };
+    auto put = [&](IdxT pos, T value, IdxT idx) {
+        if(pos < StageCapacity)
+        {
+            staged_packed[pos] =
+                (static_cast<unsigned long long>(__float_as_uint(value)) << 32) |
+                static_cast<unsigned long long>(static_cast<unsigned>(idx));
         }
     };
 
-    // The rest of the row: histogram and stage in the same read.
-    auto build_and_stage = [&](T value, IdxT i) {
-        auto const bits = histogram_one(value);
-        stage_one(bits, i + sample_len, value);
-    };
-    vectorized_process(
-        threadIdx.x, blockDim.x, in + sample_len, row_len - sample_len, build_and_stage);
-    // The leading slice, from the registers it was read into.
-#pragma unroll
-    for(int j = 0; j < MaxSampleVecs; ++j)
+    // The rest of the row: histogram and stage in the same read, StageVecs
+    // 16-byte vectors per lane per batch.  Only the last batch can be partial.
+    constexpr int StageVecs = 2;
+    union Vec4Values
     {
-        if(j < nsample)
+        WideT w;
+        T a[4];
+    };
+    T const* const rest = in + sample_len;
+    IdxT const rest_len = row_len - sample_len;
+    IdxT skip           = (reinterpret_cast<size_t>(rest) % sizeof(WideT))
+                              ? static_cast<IdxT>((sizeof(WideT) -
+                                                   reinterpret_cast<size_t>(rest) % sizeof(WideT)) /
+                                                  sizeof(T))
+                              : 0;
+    if(skip > rest_len) skip = rest_len;
+    WideT const* const rest4 = reinterpret_cast<WideT const*>(rest + skip);
+    IdxT const len4          = (rest_len - skip) / 4;
+    IdxT const full_len4     = len4 - len4 % (StageVecs * BlockSize);
+    auto stage_vectors = [&](IdxT g, auto full) {
+        constexpr bool Full = decltype(full)::value;
+        IdxT const i0 = g + static_cast<IdxT>(threadIdx.x);
+        Vec4Values w[StageVecs];
+        bool valid[StageVecs];
+#pragma unroll
+        for(int q = 0; q < StageVecs; ++q)
         {
-            stage_one(twiddle_in(sample_values[j], select_min),
-                      static_cast<IdxT>(threadIdx.x) + j * BlockSize,
-                      sample_values[j]);
+            valid[q] = Full || i0 + q * BlockSize < len4;
+            w[q].w   = WideT{};
+            if(valid[q]) w[q].w = rest4[i0 + q * BlockSize];
+        }
+        unsigned mask = 0;
+#pragma unroll
+        for(int q = 0; q < StageVecs; ++q)
+        {
+#pragma unroll
+            for(int e = 0; e < 4; ++e)
+            {
+                if(valid[q])
+                    mask |= static_cast<unsigned>(histogram_one(w[q].a[e]) <= stage_last)
+                            << (4 * q + e);
+            }
+        }
+        IdxT pos = reserve(mask);
+#pragma unroll
+        for(int b = 0; b < 4 * StageVecs; ++b)
+        {
+            if(mask & (1u << b))
+                put(pos++, w[b / 4].a[b % 4],
+                    sample_len + skip + (i0 + (b / 4) * BlockSize) * 4 + (b % 4));
+        }
+    };
+    for(IdxT g = 0; g < full_len4; g += StageVecs * BlockSize)
+        stage_vectors(g, std::true_type{});
+    if(full_len4 < len4) stage_vectors(full_len4, std::false_type{});
+    // The unaligned head and tail of the rest, and the leading slice from the
+    // registers it was read into (already in the histogram): one more batch.
+    {
+        constexpr int Extra = 2 + MaxSampleVecs;
+        IdxT const tid      = static_cast<IdxT>(threadIdx.x);
+        IdxT const tail     = skip + len4 * 4 + tid;
+        T value[Extra];
+        IdxT index[Extra];
+        unsigned mask = 0;
+        value[0] = static_cast<T>(0);
+        index[0] = sample_len + tid;
+        if(tid < skip)
+        {
+            value[0] = rest[tid];
+            mask |= static_cast<unsigned>(histogram_one(value[0]) <= stage_last);
+        }
+        value[1] = static_cast<T>(0);
+        index[1] = sample_len + tail;
+        if(tail < rest_len)
+        {
+            value[1] = rest[tail];
+            mask |= static_cast<unsigned>(histogram_one(value[1]) <= stage_last) << 1;
+        }
+#pragma unroll
+        for(int j = 0; j < MaxSampleVecs; ++j)
+        {
+            value[2 + j] = sample_values[j];
+            index[2 + j] = tid + j * BlockSize;
+            if(j < nsample)
+                mask |= static_cast<unsigned>(twiddle_in(sample_values[j], select_min) <=
+                                              stage_last)
+                        << (2 + j);
+        }
+        IdxT pos = reserve(mask);
+#pragma unroll
+        for(int e = 0; e < Extra; ++e)
+        {
+            if(mask & (1u << e)) put(pos++, value[e], index[e]);
         }
     }
     __syncthreads();
+    if(threadIdx.x == 0 && staged_count > StageCapacity) staged_overflow = 1;
     choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
         &counter, histogram, wave_sums, k, pass0_start_bit);
     }
@@ -5537,7 +5635,10 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     }
     __syncthreads();
 
-    auto const high_prefix = counter.kth_value_bits;
+    // Block-uniform: keep it in an SGPR so the per-element pass-1 compares do
+    // not wait on this LDS load.
+    auto const high_prefix = static_cast<PreBits>(
+        __builtin_amdgcn_readfirstlane(static_cast<int>(counter.kth_value_bits)));
     IdxT* const p_out_cnt  = &counter.out_cnt;
     IdxT* const histogram_ptr              = histogram;
     T* const candidate_values_ptr       = candidate_values;
@@ -5545,12 +5646,13 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     IdxT* const winner_indices_ptr      = winner_indices;
     IdxT* const p_candidate_count       = &candidate_count;
     int* const p_candidate_overflow     = &candidate_overflow;
+    // Every crossing element reserves a candidate slot, stored or not, so the
+    // final count alone detects overflow (see after pass 1).
     auto stage_pass1 = [histogram_ptr,
                         candidate_values_ptr,
                         candidate_indices_ptr,
                         winner_indices_ptr,
                         p_candidate_count,
-                        p_candidate_overflow,
                         p_out_cnt,
                         high_prefix,
                         select_min](T value, IdxT idx) {
@@ -5568,10 +5670,6 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
             {
                 candidate_values_ptr[pos]  = value;
                 candidate_indices_ptr[pos] = idx;
-            }
-            else
-            {
-                atomicExch(p_candidate_overflow, 1);
             }
             int const bucket = __builtin_amdgcn_ubfe(
                 bits, static_cast<unsigned>(pass1_start_bit), static_cast<unsigned>(BitsPerPass));
@@ -5742,7 +5840,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         }
         else
         {
-            IdxT const n = staged_count;
+            IdxT const n =
+                static_cast<IdxT>(__builtin_amdgcn_readfirstlane(static_cast<int>(staged_count)));
             for(IdxT s = static_cast<IdxT>(threadIdx.x); s < n; s += BlockSize)
             {
                 unsigned long long const packed = staged_packed[s];
@@ -5770,6 +5869,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         vectorized_process(threadIdx.x, blockDim.x, in, row_len, stage_pass1);
     }
     __syncthreads();
+    if(threadIdx.x == 0 && candidate_count > CandidateCapacity) candidate_overflow = 1;
 
     IdxT const pass1_k = counter.k;
     choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
