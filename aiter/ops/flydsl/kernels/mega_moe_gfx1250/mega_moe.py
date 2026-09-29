@@ -370,6 +370,16 @@ class MegaMoEConfig:
             raise ValueError("stage1_fused requires dispatch_backend='flydsl'")
         if self.stage1_fused and not self.is_quant_dispatch_wire:
             raise ValueError("stage1_fused requires an fp8 or fp4 dispatch wire")
+        # required_vmm_bytes() sizes every compact row at the bf16 pitch.
+        if (
+            self.stage1_fused
+            and _align_up(self.dispatch_token_nbytes + self.dispatch_scale_nbytes, 128)
+            > 2 * self.hidden_dim
+        ):
+            raise ValueError(
+                "a compact wire row must fit in a bf16 row, got hidden_dim="
+                f"{self.hidden_dim} on the {self.dispatch_wire} wire"
+            )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > _MAX_WORLD_SIZE:
@@ -552,6 +562,120 @@ class Routing:
         return self.reverse_source_view
 
 
+# Tallest compact tile required_vmm_bytes() reserves for. compact_row_capacity
+# grows with the tile, so this bounds every tile the CSV or AITER_TDM_TILE_M
+# can pick at or below it.
+_MAX_COMPACT_TILE_M = 256
+# mori rounds each allocation up to its VMM granularity, then to 2 MiB past
+# 2 GiB; the arena is one allocation.
+_VMM_SLACK_BYTES = 64 << 20
+
+
+def _arena_regions(
+    config: MegaMoEConfig,
+    *,
+    compact: bool,
+    recv_rows: int,
+    wire_row: int,
+    scale_row: int,
+    hist_stride: int,
+) -> list[tuple[str, int]]:
+    from .compact_plan import compact_done_nbytes
+
+    max_recv = config.max_recv
+    regions = [
+        ("tok_off", 4),
+        ("recv_num", config.world_size * 4),
+        ("recv_to_src_token", max_recv * 4),
+        ("out_idx", max_recv * config.topk * 4),
+        ("out_wts", max_recv * config.topk * 4),
+        ("disp_out", recv_rows * wire_row),
+        ("cross_device_barrier", config.world_size * 8),
+    ]
+    if scale_row and not compact:
+        regions.append(("disp_out_scales", recv_rows * scale_row))
+    if compact:
+        regions.extend(
+            [
+                ("ep_rowmap", (recv_rows + 1) * 8),
+                ("compact_hist", 2 * hist_stride * 4),
+                ("compact_done", compact_done_nbytes()),
+            ]
+        )
+    # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+    # holds a step on any of them and a quantized one just packs into the
+    # front of it at its own pitch.
+    regions.append(
+        (
+            "comb_inp",
+            config.max_tokens_per_rank * config.topk * config.combine_slot_stride_bytes,
+        )
+    )
+    return regions
+
+
+def _arena_nbytes(regions: list[tuple[str, int]]) -> int:
+    """Total SymmetricArena allocates for ``regions``."""
+    alignment = SymmetricArena._ALIGNMENT
+    offset = 0
+    for _, size in regions:
+        offset = _align_up(offset, alignment) + size
+    return max(_align_up(offset, alignment), alignment)
+
+
+def _arena_bound_nbytes(
+    *,
+    world_size: int,
+    hidden_dim: int,
+    max_tokens_per_rank: int,
+    experts_per_rank: int,
+    topk: int,
+    stage1_fused: bool,
+) -> int:
+    """Arena bytes for this geometry with every dispatch row at the bf16 pitch.
+
+    A quantized row (payload plus its e8m0 scale) never outgrows a bf16 one,
+    so this covers every dispatch wire; compact rows are counted at
+    _MAX_COMPACT_TILE_M, which covers every smaller tile.
+    """
+    from .compact_plan import compact_hist_stride, compact_row_capacity
+
+    config = MegaMoEConfig(
+        rank=0,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        max_tokens_per_rank=max_tokens_per_rank,
+        experts_per_rank=experts_per_rank,
+        topk=topk,
+        dispatch_wire="bf16",
+    )
+    recv_rows = (
+        compact_row_capacity(
+            max_recv=config.max_recv,
+            topk=topk,
+            experts_per_rank=experts_per_rank,
+            tile_m=_MAX_COMPACT_TILE_M,
+        )
+        if stage1_fused
+        else config.max_recv
+    )
+    hist_stride = compact_hist_stride(
+        npes=world_size,
+        experts_per_rank=experts_per_rank,
+        max_routes=max_tokens_per_rank * topk,
+    )
+    return _arena_nbytes(
+        _arena_regions(
+            config,
+            compact=stage1_fused,
+            recv_rows=recv_rows,
+            wire_row=2 * hidden_dim,
+            scale_row=0,
+            hist_stride=hist_stride,
+        )
+    )
+
+
 class MegaMoEGfx1250:
     """A8W4 EP MoE with GEMM2 P2P scatter fused into combine."""
 
@@ -683,6 +807,38 @@ class MegaMoEGfx1250:
             ),
             communicator,
         )
+
+    @staticmethod
+    def required_vmm_bytes(
+        *,
+        world_size: int,
+        hidden_dim: int,
+        max_tokens_per_rank: int,
+        experts: int,
+        topk: int,
+        stage1_fused: bool,
+    ) -> int:
+        """Per-rank cco VMM to reserve before building an instance of this geometry.
+
+        The communicator has to exist before the constructor sizes its arena, so
+        its caller asks here first. Independent of the dispatch and combine
+        wires: every row is counted at the bf16 pitch. stage1_fused still
+        matters, since compact rows are one per route rather than one per token.
+        Only VA is reserved; the arena itself is allocated at its exact size.
+        """
+        if world_size <= 0 or experts % world_size:
+            raise ValueError(
+                f"experts={experts} must be divisible by world_size={world_size}"
+            )
+        nbytes = _arena_bound_nbytes(
+            world_size=int(world_size),
+            hidden_dim=int(hidden_dim),
+            max_tokens_per_rank=int(max_tokens_per_rank),
+            experts_per_rank=int(experts) // int(world_size),
+            topk=int(topk),
+            stage1_fused=bool(stage1_fused),
+        )
+        return _align_up(nbytes + _VMM_SLACK_BYTES, 2 << 20)
 
     def forward(
         self,
@@ -1194,11 +1350,7 @@ class MegaMoEGfx1250:
             if self._compact_plan
             else config.dispatch_token_nbytes
         )
-        from .compact_plan import (
-            compact_done_nbytes,
-            compact_hist_stride,
-            compact_plan_blocks,
-        )
+        from .compact_plan import compact_hist_stride, compact_plan_blocks
 
         segs = config.world_size * config.experts_per_rank
         max_routes = config.max_tokens_per_rank * config.topk
@@ -1209,39 +1361,41 @@ class MegaMoEGfx1250:
         )
         self._compact_hist_stride = hist_stride
         self._compact_max_routes = max_routes
-        arena_regions = [
-            ("tok_off", 4),
-            ("recv_num", config.world_size * 4),
-            ("recv_to_src_token", max_recv * 4),
-            ("out_idx", max_recv * config.topk * 4),
-            ("out_wts", max_recv * config.topk * 4),
-            ("disp_out", recv_rows * self._compact_wire_row),
-            ("cross_device_barrier", config.world_size * 8),
-        ]
-        if config.dispatch_scale_dst_nbytes and not self._compact_plan:
-            arena_regions.append(
-                ("disp_out_scales", recv_rows * config.dispatch_scale_dst_nbytes)
+        if self._compact_plan and self._compact_tile_m > _MAX_COMPACT_TILE_M:
+            raise ValueError(
+                f"compact tile_m={self._compact_tile_m} exceeds the "
+                f"{_MAX_COMPACT_TILE_M} required_vmm_bytes() reserves for"
             )
-        if self._compact_plan:
-            arena_regions.extend(
-                [
-                    ("ep_rowmap", (recv_rows + 1) * 8),
-                    ("compact_hist", 2 * hist_stride * 4),
-                    ("compact_done", compact_done_nbytes()),
-                ]
-            )
-        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
-        # holds a step on any of them and a quantized one just packs into the
-        # front of it at its own pitch.
-        arena_regions.append(
-            (
-                "comb_inp",
-                config.max_tokens_per_rank
-                * config.topk
-                * config.combine_slot_stride_bytes,
-            )
+        arena_regions = _arena_regions(
+            config,
+            compact=self._compact_plan,
+            recv_rows=recv_rows,
+            wire_row=self._compact_wire_row,
+            scale_row=config.dispatch_scale_dst_nbytes,
+            hist_stride=hist_stride,
         )
-        self._arena = SymmetricArena(communicator, arena_regions)
+        arena_bytes = _arena_nbytes(arena_regions)
+        bound_bytes = _arena_bound_nbytes(
+            world_size=config.world_size,
+            hidden_dim=config.hidden_dim,
+            max_tokens_per_rank=config.max_tokens_per_rank,
+            experts_per_rank=config.experts_per_rank,
+            topk=config.topk,
+            stage1_fused=config.stage1_fused,
+        )
+        if arena_bytes > bound_bytes:
+            raise AssertionError(
+                f"arena needs {arena_bytes} B, more than the {bound_bytes} B "
+                "required_vmm_bytes() reserves for"
+            )
+        try:
+            self._arena = SymmetricArena(communicator, arena_regions)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"MegaMoE arena needs {arena_bytes} B of the communicator's "
+                "per-rank VMM; size per_rank_vmm with "
+                "MegaMoEGfx1250.required_vmm_bytes()"
+            ) from error
         self._compact_scale_row = (
             config.dispatch_scale_nbytes
             if self._compact_plan
