@@ -30,14 +30,15 @@ class CommFusedMoeRuntime:
         self.runners = runners
 
     def bucket_for(self, tokens: int) -> int:
-        """Return the smallest configured bucket that can hold ``tokens``."""
+        """Return the standard padded bucket, extending past its upper bound."""
 
         from aiter.fused_moe import get_padded_M
 
         bucket = int(get_padded_M(tokens))
         if bucket < tokens:
-            configs = getattr(self.runners, "configs", {})
-            larger = [candidate for candidate in configs if candidate >= tokens]
+            larger = [
+                candidate for candidate in self.runners.configs if candidate >= tokens
+            ]
             if larger:
                 bucket = min(larger)
         return bucket
@@ -70,6 +71,7 @@ class CommFusedMoeRuntime:
         before_shared_add: _BeforeSharedAdd | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
         reduce_scatter_sizes: list[int] | tuple[int, ...] | None = None,
+        reuse_is_synchronized: bool = False,
         **moe_args: Any,
     ) -> torch.Tensor:
         """Run ordinary MoE through Stage1 and fuse Stage2 with TP reduction.
@@ -79,6 +81,9 @@ class CommFusedMoeRuntime:
         count; fixed layouts retain their configured output capacity.
         ``before_shared_add`` joins that producer only when the selected runner
         first consumes the shared output; no standalone ready kernel is used.
+        ``reuse_is_synchronized`` lets an enclosing collective prove that all
+        ranks finished the preceding Direct read before its Stage2 destination
+        is overwritten. Other callers retain Direct's explicit deferred wait.
         """
 
         from aiter.fused_moe import _fused_moe_impl
@@ -111,6 +116,8 @@ class CommFusedMoeRuntime:
                 f"({raw_tokens} compact rows)"
             )
         runner = self.runners[bucket]
+        if reuse_is_synchronized and runner.supports_external_reuse_sync:
+            runner_kwargs["reuse_is_synchronized"] = True
         if reduce_scatter_sizes is None:
             output_rows = self.runners.output_rows_for(bucket, raw_tokens)
         else:
@@ -129,10 +136,10 @@ class CommFusedMoeRuntime:
                     f"capacity is {runner.config.output_rows}"
                 )
             output_rows = local_rows
-            runner_kwargs = {
-                "local_rows": local_rows,
-                "rank_offset": rank_offset,
-            }
+            runner_kwargs.update(
+                local_rows=local_rows,
+                rank_offset=rank_offset,
+            )
         stage2_destination = runner.stage2_destination
         final_output = None
         if stage2_destination is not None:
