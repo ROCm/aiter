@@ -419,28 +419,35 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
         init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
             fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(16)
         ]
+        @flyc.jit
+        def prefetch(block):
+            tiles = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(16)]
+            # Guard the page lookup too, including empty splits and the loop tail.
+            if block < end:
+                page = fx.Int32(_load(
+                    btp, (fx.Int64(seq) * fx.Int64(bt_stride)
+                          + fx.Int64(block * 32 // page_size)) * 4, T.i32, 4))
+                tiles = []
+                for i in range_constexpr(8):
+                    off = lane * 16 + i * 1024
+                    token = block * 32 + off // 256
+                    d = off % 256
+                    safe_token = (token < klen).select(token, block * 32)
+                    src = ((fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
+                           * 16 + fx.Int64(head)) * 256 + fx.Int64(d)
+                    tiles.append(fx.Vector(_load(kp, src, fx.Vector.make_type(4, fx.Int32), 16)))
+                    tiles.append(fx.Vector(_load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)))
+            return tiles
+
+        init = init + prefetch(start)
         for block, state in range(start, end, fx.Int32(1), init=init):
             block = fx.Int32(block)
-            # An aligned N32 tile never straddles a cache page.
-            page = fx.Int32(_load(
-                btp, (fx.Int64(seq) * fx.Int64(bt_stride)
-                      + fx.Int64(block * 32 // page_size)) * 4, T.i32, 4))
-            ktiles, vtiles = [], []
-            for i in range_constexpr(8):
-                off = lane * 16 + i * 1024
-                token = block * 32 + off // 256
-                d = off % 256
-                safe_token = (token < klen).select(token, block * 32)
-                src = ((fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
-                       * 16 + fx.Int64(head)) * 256 + fx.Int64(d)
-                ktiles.append(_load(kp, src, fx.Vector.make_type(4, fx.Int32), 16))
-                vtiles.append(_load(vp, src, fx.Vector.make_type(4, fx.Int32), 16))
             rocdl.sched_barrier(0)
             for i in range_constexpr(8):
                 off = lane * 16 + i * 1024
                 d = off % 256
-                vval = fx.Vector(vtiles[i])
-                _store(lds.k.ptr, (off // 256) * 260 + d, ktiles[i], 4)
+                vval = fx.Vector(state[19 + i * 2])
+                _store(lds.k.ptr, (off // 256) * 260 + d, state[18 + i * 2], 4)
                 for j in range_constexpr(4):
                     word = vval[j]
                     peer = word.shuffle_xor(fx.Int32(16), fx.Int32(64))
@@ -456,6 +463,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     _store(lds.v.ptr, (depth // 32) * 1024
                            + ((off // 256) // 4) * 128 + bank * 4, packed, 4)
             gpu.barrier()
+            next_tiles = prefetch(block + 1)
+            rocdl.sched_barrier(0)
             scores = []
             m = fx.Float32(state[0])
             for n in range_constexpr(2):
@@ -502,8 +511,9 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 vfrag = fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0]
                 o = fx.Vector(state[dc + 2]) * fx.Vector.filled(4, correction, fx.Float32)
                 accum.append(_mfma16(vfrag.ir_value(), pfrag.ir_value(), o))
+            # The next iteration may overwrite LDS only after the final PV read.
             gpu.barrier()
-            result = yield [m, denom] + accum
+            result = yield [m, denom] + accum + next_tiles
         if row < 2:
             if const_expr(_num_splits > 1):
                 base = (((fx.Int64(seq) * 16 + fx.Int64(head)) * _num_splits
