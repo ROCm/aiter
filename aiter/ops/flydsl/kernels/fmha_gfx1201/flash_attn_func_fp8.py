@@ -36,8 +36,8 @@ Block:  (BLOCK_M / 16) wave32 waves by default; flat_work_group_size may overrid
 Requires: head_dim % 32 == 0, head_dim >= 64.
 
 Low-level operations remain only where the public API does not expose the same
-packed ABI: FP8 WMMA/conversion intrinsics, packed global pointer accesses, and
-explicit fast-math/signed comparisons. LDS uses one typed SharedAllocator arena
+packed ABI: FP8 WMMA/conversion intrinsics and explicit fast-math/signed
+comparisons. LDS uses one typed SharedAllocator arena
 with an i8 alias for transposed stores. Keep the four K stores scalar to preserve
 their tuned LDS schedule, and compare generated ISA before changing a boundary.
 """
@@ -46,10 +46,6 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import (
-    llvm as _llvm,
-)
 from flydsl.expr import (
     arith,
     const_expr,
@@ -59,40 +55,16 @@ from flydsl.expr import (
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-try:
-    from flydsl.expr import buffer_ops
-except ImportError:
-    from aiter.ops.flydsl.kernels import buffer_ops
-
 from ..kernels_common import LOG2E as _LOG2E
-from ..kernels_common import dtype_to_elem_type
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
 from .flash_attn_func_common import (
     flatten_scores,
     kv_load_schedule,
     mask_scores,
-    pointer_arg,
-    wrap_pointer_args,
 )
 
 NUM_PREFETCH_K = 1
 NUM_PREFETCH_V = 1
-
-
-def _llvm_value(value):
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
-def _pointer_load(result_type, ptr):
-    """Load a packed vector or device scale through the raw LLVM pointer ABI."""
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
-
-
-def _pointer_store(value, ptr):
-    """Store a packed output vector through the raw LLVM pointer ABI."""
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
 def _fmul(a, b):
@@ -279,9 +251,7 @@ def build_flash_attn_func_module(
     class SharedStorage:
         kv: fx.Array[fx.Int32, LDS_TOTAL_BYTES // 4, 16]
 
-    # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and `.to(...)`).
-    # aiter's `dtype_to_elem_type` returns a raw MLIR `ir.Type`; the FlyDSL Vector
-    # API requires a Numeric subclass instead. Both forms are kept available.
+    # Map dtype string to a FlyDSL Numeric class for typed views and `.to(...)`.
     _NUMERIC_MAP = {
         "f32": fx.Float32,
         "f16": fx.Float16,
@@ -291,36 +261,33 @@ def build_flash_attn_func_module(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_func_kernel(
-        Q: fx.Pointer,
-        K: fx.Pointer,
-        V: fx.Pointer,
-        O: fx.Pointer,
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
-        q_scale_ptr: fx.Pointer,
-        k_scale_ptr: fx.Pointer,
-        v_scale_ptr: fx.Pointer,
+        q_scale_ptr: fx.Tensor,
+        k_scale_ptr: fx.Tensor,
+        v_scale_ptr: fx.Tensor,
     ):
-        elem_type = dtype_to_elem_type(dtype_str)
         elem_dtype = elem_numeric_cls
-        q_ptr = fx.to_llvm_ptr(Q)
-        k_ptr = fx.to_llvm_ptr(K)
-        v_ptr = fx.to_llvm_ptr(V)
-        o_ptr = fx.to_llvm_ptr(O)
-        # fp8-input: per-tensor scales arrive as device pointers (the upstream quant
-        # op writes amax to device, no host .item() sync). Load one f32 in the prologue.
-        _f32_ty = fx.Float32.ir_type
-        q_scale = _pointer_load(_f32_ty, fx.to_llvm_ptr(q_scale_ptr))
-        k_scale = _pointer_load(_f32_ty, fx.to_llvm_ptr(k_scale_ptr))
-        v_scale = _pointer_load(_f32_ty, fx.to_llvm_ptr(v_scale_ptr))
+        # Typed V# views preserve the tuned vector widths while keeping global
+        # memory accesses in FlyDSL's buffer-view/copy API. ``unit_stride=1``
+        # permits a wide access at each dword/byte index used by this layout.
+        q_buf = ptr_buf_tensor(Q, fx.Int32, unit_elems=2, unit_stride=1)
+        k_buf = ptr_buf_tensor(K, fx.Int32, unit_elems=4, unit_stride=1)
+        v_buf = ptr_buf_tensor(V, fx.Int32, unit_elems=4, unit_stride=1)
+        o_buf = ptr_buf_tensor(O, elem_dtype, unit_elems=8, unit_stride=1)
+        # Per-tensor descales are one-element device tensors produced upstream.
+        # Load them in the prologue without a host `.item()` synchronization.
+        q_scale = fx.Float32(ptr_buf_tensor(q_scale_ptr, fx.Float32)[0])
+        k_scale = fx.Float32(ptr_buf_tensor(k_scale_ptr, fx.Float32)[0])
+        v_scale = fx.Float32(ptr_buf_tensor(v_scale_ptr, fx.Float32)[0])
         fm_fast = arith.FastMathFlags.fast
 
-        v2i32_type = Vec.make_type(2, fx.Int32)
-        v4i32_type = Vec.make_type(4, fx.Int32)
         v8f32_type = Vec.make_type(8, fx.Float32)
-        v16i8_type = Vec.make_type(16, fx.Int8)
-        _i8_input_ty = fx.Int8.ir_type
 
         def wmma_acc_fp8(k_v2i32_raw, q_pk_pair, c_v8):
             # The high-level WMMA atom does not expose this packed FP8 operand
@@ -382,18 +349,25 @@ def build_flash_attn_func_module(
             token = batch_idx * seq_len_kv_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
-        def _store_global_half(ptr, base_idx, val):
-            gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int64(base_idx), elem_type=elem_type
+        def _store_global_half(base_idx, val):
+            buf_copy_store(
+                o_buf,
+                fx.Int32(base_idx),
+                val,
+                elem=elem_dtype,
+                unit_elems=8,
             )
-            _pointer_store(val, gep)
 
-        def _load_global_fp8(base_ptr, base_idx, vec_type):
-            # fp8-input: base_idx is in element units == byte units (fp8 = 1 byte).
-            gep = buffer_ops.get_element_ptr(
-                base_ptr, fx.Int64(base_idx), elem_type=_i8_input_ty
-            )
-            return _pointer_load(vec_type, gep)
+        def _load_global_fp8(buffer, base_idx, *, elem, unit_elems, dword_index):
+            # FP8 indices are byte indices. Int32-backed Q/K accesses therefore
+            # convert to a dword offset before the wide buffer load.
+            index = base_idx // fx.Index(4) if dword_index else base_idx
+            return buf_copy_load(
+                buffer,
+                fx.Int32(index),
+                elem=elem,
+                unit_elems=unit_elems,
+            ).ir_value()
 
         def coop_load_k(tile_start):
             # Load K global (already fp8), store as i32 words in typed LDS.
@@ -411,7 +385,13 @@ def build_flash_attn_func_module(
                     if chunk_valid:
                         g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_i32_idx = lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
-                        v4 = _load_global_fp8(k_ptr, g_idx, v4i32_type)
+                        v4 = _load_global_fp8(
+                            k_buf,
+                            g_idx,
+                            elem=fx.Int32,
+                            unit_elems=4,
+                            dword_index=True,
+                        )
                         # Four scalar stores preserve the tuned LDS instruction
                         # sequence; keep both branches structurally identical.
                         for wi in range_constexpr(4):
@@ -422,7 +402,13 @@ def build_flash_attn_func_module(
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
                     lds_i32_idx = lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
-                    v4 = _load_global_fp8(k_ptr, g_idx, v4i32_type)
+                    v4 = _load_global_fp8(
+                        k_buf,
+                        g_idx,
+                        elem=fx.Int32,
+                        unit_elems=4,
+                        dword_index=True,
+                    )
                     # Keep this identical to the guarded path above.
                     for wi in range_constexpr(4):
                         fx.ptr_store(
@@ -459,7 +445,15 @@ def build_flash_attn_func_module(
                 else:
                     row_idx = tile_start + lds_row
                 g_idx = kv_global_idx(row_idx, load_col_base)
-                vecs.append(_load_global_fp8(v_ptr, g_idx, v16i8_type))
+                vecs.append(
+                    _load_global_fp8(
+                        v_buf,
+                        g_idx,
+                        elem=fx.Int32,
+                        unit_elems=4,
+                        dword_index=True,
+                    ).bitcast(fx.Int8)
+                )
             return vecs
 
         def coop_store_v_lds(vecs):
@@ -491,7 +485,13 @@ def build_flash_attn_func_module(
             q_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
             # fp8-input: Q already fp8 — load 8 fp8 bytes as v2i32 WMMA-B frag direct.
-            raw = _load_global_fp8(q_ptr, g_idx, v2i32_type)
+            raw = _load_global_fp8(
+                q_buf,
+                g_idx,
+                elem=fx.Int32,
+                unit_elems=2,
+                dword_index=True,
+            )
             raw_safe = q_in_bounds.select(raw, c_zero_v2i32_vec)
             q_b_packs.append([_raw(Vec(raw_safe)[0]), _raw(Vec(raw_safe)[1])])
 
@@ -692,21 +692,21 @@ def build_flash_attn_func_module(
                 o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
                 d_col = fx.Index(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
-                _store_global_half(o_ptr, o_global, o_trunc)
+                _store_global_half(o_global, o_trunc)
 
     @flyc.jit
     def launch_flash_attn_func(
-        Q: fx.Pointer,
-        K: fx.Pointer,
-        V: fx.Pointer,
-        O: fx.Pointer,
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
-        q_scale_ptr: fx.Pointer,
-        k_scale_ptr: fx.Pointer,
-        v_scale_ptr: fx.Pointer,
+        q_scale_ptr: fx.Tensor,
+        k_scale_ptr: fx.Tensor,
+        v_scale_ptr: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         bs_idx = fx.Index(batch_size)
@@ -755,12 +755,6 @@ def build_flash_attn_func_module(
     launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(*args, **kwargs):
-        args, kwargs = wrap_pointer_args(
-            args,
-            kwargs,
-            (0, 1, 2, 3, 8, 9, 10),
-            ("Q", "K", "V", "O", "q_scale_ptr", "k_scale_ptr", "v_scale_ptr"),
-        )
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
@@ -778,20 +772,20 @@ def build_flash_attn_func_module(
         v_scale=None,
         stream=None,
     ):
-        # scales are device f32 pointers (1-element tensors), not host floats.
+        # Scales are one-element device f32 tensors, not host floats.
         return flyc.compile(
             launch_flash_attn_func,
-            pointer_arg(Q),
-            pointer_arg(K),
-            pointer_arg(V),
-            pointer_arg(O),
+            Q,
+            K,
+            V,
+            O,
             batch_size,
             seq_len,
             seq_len_kv_real,
             seq_len_kv,
-            pointer_arg(q_scale),
-            pointer_arg(k_scale),
-            pointer_arg(v_scale),
+            q_scale,
+            k_scale,
+            v_scale,
             fx.Stream(stream),
         )
 
