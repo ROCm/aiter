@@ -56,6 +56,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from ..kernels_common import LOG2E as _LOG2E
+from ..layout_utils import crd2idx, idx2crd
 from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
 from .flash_attn_func_common import (
     flatten_scores,
@@ -369,22 +370,39 @@ def build_flash_attn_func_module(
                 unit_elems=unit_elems,
             ).ir_value()
 
+        # Static layouts let the coordinate helper lower this loader map with
+        # index arithmetic (shifts/masks for power-of-two factors), without
+        # materializing a dynamic coordinate tuple.
+        k_load_layout = fx.make_layout(
+            (BLOCK_N, THREADS_PER_ROW_LOAD),
+            (THREADS_PER_ROW_LOAD, 1),
+        )
+        k_lds_i32_layout = fx.make_layout(
+            (BLOCK_N, HEAD_DIM // 4),
+            (K_STRIDE_I32, 1),
+        )
+
+        def kv_load_coords(batch):
+            linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
+            lds_row, load_lane = idx2crd(linear_chunk, k_load_layout)
+            load_col_base = load_lane * fx.Index(VEC_WIDTH)
+            load_col_i32 = load_lane * fx.Index(VEC_WIDTH // 4)
+            return linear_chunk, lds_row, load_col_base, load_col_i32
+
         def coop_load_k(tile_start):
             # Load K global (already fp8), store as i32 words in typed LDS.
-            # LDS indices are i32 words: row*K_STRIDE_I32 + fp8_column/4.
+            # LDS word offsets use the same static layout as the K tile.
             # Each thread stores its 16-byte global load as four consecutive words.
             for batch in range_constexpr(NUM_BATCHES_KV):
-                linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
-                lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
-                load_lane = linear_chunk % fx.Index(THREADS_PER_ROW_LOAD)
-                load_col_base = load_lane * fx.Index(VEC_WIDTH)
-                load_col_i32 = load_col_base // fx.Index(4)
+                linear_chunk, lds_row, load_col_base, load_col_i32 = kv_load_coords(
+                    batch
+                )
                 row_idx = tile_start + lds_row
                 if const_expr(KV_NEEDS_GUARD):
                     chunk_valid = linear_chunk < fx.Index(NUM_KV_CHUNKS)
                     if chunk_valid:
                         g_idx = kv_global_idx(row_idx, load_col_base)
-                        lds_i32_idx = lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
+                        lds_i32_idx = crd2idx((lds_row, load_col_i32), k_lds_i32_layout)
                         v4 = _load_global_fp8(
                             k_buf,
                             g_idx,
@@ -401,7 +419,7 @@ def build_flash_attn_func_module(
                             )
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
-                    lds_i32_idx = lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
+                    lds_i32_idx = crd2idx((lds_row, load_col_i32), k_lds_i32_layout)
                     v4 = _load_global_fp8(
                         k_buf,
                         g_idx,
@@ -431,10 +449,7 @@ def build_flash_attn_func_module(
         def coop_load_v_global(tile_start):
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
-                linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
-                lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
-                load_lane = linear_chunk % fx.Index(THREADS_PER_ROW_LOAD)
-                load_col_base = load_lane * fx.Index(VEC_WIDTH)
+                _, lds_row, load_col_base, _ = kv_load_coords(batch)
                 if const_expr(KV_NEEDS_GUARD):
                     # Guard OOB global read: with BLOCK_SIZE>256 the extra load
                     # rows, including a partial final load batch, would read
@@ -458,10 +473,7 @@ def build_flash_attn_func_module(
 
         def coop_store_v_lds(vecs):
             for batch in range_constexpr(NUM_BATCHES_KV):
-                linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
-                lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
-                load_lane = linear_chunk % fx.Index(THREADS_PER_ROW_LOAD)
-                load_col_base = load_lane * fx.Index(VEC_WIDTH)
+                linear_chunk, lds_row, load_col_base, _ = kv_load_coords(batch)
                 if const_expr(KV_NEEDS_GUARD):
                     chunk_valid = linear_chunk < fx.Index(NUM_KV_CHUNKS)
                     if chunk_valid:
