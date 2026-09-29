@@ -11,6 +11,7 @@ output is bf16. Dense, packed-varlen and split-K.
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 
@@ -21,7 +22,11 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DUALWAVE_SWP_BLOCK_M,
 )
 
-__all__ = ["dualwave_splitk_workspace_elems", "flydsl_flash_attn_fp8_func"]
+__all__ = [
+    "dualwave_splitk_workspace_elems",
+    "flydsl_flash_attn_fp8_func",
+    "flydsl_flash_attn_fp8_supported",
+]
 
 # Largest flat element count the fp8 C-ABI can address; see the split below.
 _FP8_MAX_FLAT_ELEMS = 2**31
@@ -46,6 +51,11 @@ _FP8_AUTOSPLIT_DENSE_MARGIN = 0.85
 _FP8_AUTOSPLIT_SPLIT2_OCCUPANCY = 50
 _FP8_NARROW_MAX_KV_TILES = 48
 _FP8_BATCH_INTERLEAVE_GROUP = 2
+
+
+def _is_valid_softmax_scale(softmax_scale: float | None) -> bool:
+    """Accept the default scale or a positive, finite custom scale."""
+    return softmax_scale is None or (math.isfinite(softmax_scale) and softmax_scale > 0)
 
 
 def _fp8_rescale_threshold(seqlen_kv: int) -> float:
@@ -77,6 +87,65 @@ def _gpu_arch(device: torch.device) -> str:
 
 def _num_cu(device: torch.device) -> int:
     return _num_cu_cached(device.index)
+
+
+@functools.lru_cache(maxsize=128)
+def _fp8_config_reason(
+    num_heads: int, num_kv_heads: int, head_dim: int, head_dim_v: int
+) -> str | None:
+    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads:
+        return "num_heads must be positive and divisible by positive num_kv_heads"
+    if head_dim < 64:
+        return "head_dim must be >= 64"
+
+    from .fmha_gfx950.pipeline import _make_dualwave_swp_fp8_traits
+
+    # The runtime may choose either tile as sequence lengths change. Reuse the
+    # builder's layout/LDS checks; constructing traits does not compile a kernel.
+    for block_m in (128, 256):
+        try:
+            _make_dualwave_swp_fp8_traits(
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                6.0,
+                head_dim_v=head_dim_v,
+                block_m=block_m,
+            )
+        except RuntimeError as exc:
+            return str(exc)
+    return None
+
+
+def flydsl_flash_attn_fp8_supported(
+    device: torch.device,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    head_dim_v: int,
+    *,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> bool:
+    """Can FP8 FMHA serve this device and fixed attention configuration?
+
+    Takes metadata so a caller can decide BEFORE quantizing Q/K/V or writing
+    FP8 gather outputs over BF16 workspaces. No allocation, compilation, kernel
+    launch, or device-tensor read. Cache the result while device, dtype and head
+    dimensions stay fixed; varying token counts do not invalidate this check.
+
+    ``dtype`` is the intended quantized Q/K/V dtype, not the source activation
+    dtype. Checks the gfx950 architecture, head grouping, QK/V widths and LDS
+    limits for both automatic tile choices. Per-call argument validation
+    (descales, sequence metadata, buffers and explicit split/tile overrides)
+    remains the responsibility of :func:`flydsl_flash_attn_fp8_func`.
+    """
+    device = torch.device(device)
+    return (
+        device.type == "cuda"
+        and dtype == torch.float8_e4m3fn
+        and _gpu_arch(device) == "gfx950"
+        and _fp8_config_reason(num_heads, num_kv_heads, head_dim, head_dim_v) is None
+    )
 
 
 @functools.lru_cache(maxsize=256)
@@ -203,6 +272,7 @@ def flydsl_flash_attn_fp8_func(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    softmax_scale: float | None = None,
     causal: bool = True,
     num_kv_heads: int | None = None,
     cu_seqlens_q: torch.Tensor | None = None,
@@ -231,6 +301,8 @@ def flydsl_flash_attn_fp8_func(
            Dense: ``[B, Sq, H, D]`` (BSHD). Varlen: ``[total_q, H, D]`` (packed).
         k: Key tensor. Dense: ``[B, Skv, Hkv, D]``. Varlen: ``[total_kv, Hkv, D]``.
         v: Value tensor, same shape as k except the last dim may be ``Dv != D``.
+        softmax_scale: Positive, finite scale applied to QK logits, independent
+            of the Q/K descales. Defaults to ``1 / sqrt(q.shape[-1])``.
         causal: Bottom-right aligned causal mask when True.
         num_kv_heads: KV head count for GQA/MQA; defaults to k's head count.
         cu_seqlens_q / cu_seqlens_kv: Int32 ``[B+1]`` cumulative token counts (varlen).
@@ -238,7 +310,9 @@ def flydsl_flash_attn_fp8_func(
         max_seqlen_kv: Maximum per-batch KV seqlen. Required for varlen cross-attn.
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen
             mode; dense mode infers it from ``q.shape[1] != k.shape[1]``.
-        num_kv_splits: Split-K factor (seq_len >= 384). ``None`` autotunes it.
+        num_kv_splits: Split-K factor. Requires seq_len >= 384, or noncausal
+            cross-sequence attention (including short cached-prefix queries).
+            ``None`` autotunes it.
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
         out: Optional pre-allocated bf16 output of shape ``q.shape[:-1] + (Dv,)``.
@@ -291,6 +365,7 @@ def flydsl_flash_attn_fp8_func(
                 "or use bf16."
             )
         kw = {
+            "softmax_scale": softmax_scale,
             "causal": causal,
             "num_kv_heads": num_kv_heads,
             "max_seqlen_q": max_seqlen_q,
@@ -409,6 +484,13 @@ def flydsl_flash_attn_fp8_func(
             f"flydsl_flash_attn_fp8_func: head_dim ({D}) must be >= 64 and a multiple of 32"
         )
 
+    if softmax_scale is None:
+        softmax_scale = D**-0.5
+    if not _is_valid_softmax_scale(softmax_scale):
+        raise ValueError(
+            "flydsl_flash_attn_fp8_func: softmax_scale must be positive and finite"
+        )
+
     Dv = int(v.shape[-1])
     if k.shape[-1] != D:
         raise ValueError(
@@ -426,7 +508,8 @@ def flydsl_flash_attn_fp8_func(
         if fp8_block_m is None
         else int(fp8_block_m)
     )
-    if _auto_splits and Sq >= 384:
+    splitk_supported = Sq >= 384 or (cross and not causal)
+    if _auto_splits and splitk_supported:
         _auto = _fp8_auto_kv_splits(
             B, H, Sq, _skv_eff, causal, _num_cu(q.device), block_m=_block_m
         )
@@ -437,9 +520,11 @@ def flydsl_flash_attn_fp8_func(
 
     splitk = num_kv_splits > 1
     if splitk:
-        if Sq < 384:
+        if not splitk_supported:
             raise ValueError(
-                f"flydsl_flash_attn_fp8_func: split-K requires seq_len>=384, got {Sq}"
+                "flydsl_flash_attn_fp8_func: split-K requires seq_len>=384 "
+                f"or noncausal cross-sequence attention, got seq_len={Sq}, "
+                f"cross_seqlen={cross}, causal={causal}"
             )
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=Dv
@@ -525,6 +610,7 @@ def flydsl_flash_attn_fp8_func(
 
         kwargs = {
             "stream": launch_stream,
+            "softmax_scale": softmax_scale,
             "q_descale": q_descale,
             "k_descale": k_descale,
             "v_descale": v_descale,

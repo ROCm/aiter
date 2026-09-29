@@ -34,6 +34,10 @@ struct opus_gemm_a16w16_traits {
     using D_A   = opus::tuple_element_t<0, DTYPE>;
     using D_B   = opus::tuple_element_t<1, DTYPE>;
     using D_C   = opus::tuple_element_t<2, DTYPE>;
+    // Tuple slot 2 is the final output type for non-split kernels and the
+    // caller-owned workspace type for split-K kernels.  Split-K pipelines use
+    // this explicit alias so workspace width never comes from D_ACC/D_OUT.
+    using D_WS  = opus::tuple_element_t<2, DTYPE>;
     using D_ACC = opus::tuple_element_t<3, DTYPE>;
     static_assert(std::is_same<D_A, D_B>::value);
 
@@ -101,31 +105,31 @@ struct opus_gemm_noscale_kargs {
 
 #ifndef OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
 #define OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
-#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-struct opus_splitk_ws_handle {
-    void*         ptr;
-    unsigned long bytes;
-};
-#endif
 
 #ifdef __HIP_DEVICE_COMPILE__
-template <typename D_WS>
-__device__ __forceinline__ D_WS* opus_splitk_ws_ptr(
-    const opus_splitk_ws_handle* __restrict__ ws_handle) {
+template <typename D_WS, typename Ptr>
+__device__ __forceinline__ auto opus_gfx942_uniform_ws_ptr(Ptr ptr_ws)
+    -> std::conditional_t<
+        std::is_const_v<std::remove_pointer_t<Ptr>>, const D_WS*, D_WS*>
+{
+    static_assert(std::is_pointer_v<Ptr>);
+    static_assert(std::is_same_v<
+                  std::remove_cv_t<std::remove_pointer_t<Ptr>>, void>);
+    using D_WS_PTR = std::conditional_t<
+        std::is_const_v<std::remove_pointer_t<Ptr>>, const D_WS*, D_WS*>;
 #if defined(__gfx942__)
     __UINTPTR_TYPE__ ptr_bits = 0;
     if ((opus::thread_id_x() & (opus::get_warp_size() - 1)) == 0) {
-        ptr_bits = reinterpret_cast<__UINTPTR_TYPE__>(ws_handle->ptr);
+        ptr_bits = reinterpret_cast<__UINTPTR_TYPE__>(ptr_ws);
     }
     const unsigned lo = __builtin_amdgcn_readfirstlane(
         static_cast<unsigned>(ptr_bits));
     const unsigned hi = __builtin_amdgcn_readfirstlane(
         static_cast<unsigned>(ptr_bits >> 32));
     ptr_bits = (static_cast<__UINTPTR_TYPE__>(hi) << 32) | lo;
-    return reinterpret_cast<D_WS*>(ptr_bits);
+    return reinterpret_cast<D_WS_PTR>(ptr_bits);
 #else
-    return reinterpret_cast<D_WS*>(ws_handle->ptr);
+    return reinterpret_cast<D_WS_PTR>(ptr_ws);
 #endif
 }
 #endif
@@ -134,7 +138,7 @@ __device__ __forceinline__ D_WS* opus_splitk_ws_ptr(
 struct opus_gemm_splitk_kargs {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    const opus_splitk_ws_handle* __restrict__ ws_handle; // deref at kernel entry
+    void*       __restrict__ ptr_ws;        // D_WS [split_k, B, padded_M, padded_N]
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] final output (reduce kernel writes)
     const void* __restrict__ ptr_bias;      // unused (reserved)
     int m;

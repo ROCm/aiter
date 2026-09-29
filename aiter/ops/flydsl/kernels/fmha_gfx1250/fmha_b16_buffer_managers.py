@@ -30,19 +30,16 @@ Contents:
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import arith, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import create_llvm_ptr
-
-_scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
-
+from ..tensor_shim import _to_raw as _ir
 
 # ============================================================================
 # Manager-intrinsic tiling constants (private — not the caller's config).
@@ -154,11 +151,6 @@ ENABLE_SCHED_MODE2 = True
 # ===========================================================================
 
 
-def _ir(x):
-    """Unwrap an fx value to its raw MLIR ir.Value (pass-through if already raw)."""
-    return x.ir_value() if hasattr(x, "ir_value") else x
-
-
 def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
     """Issue a BATCH of async 16B (b128) global->LDS loads. Pure issue, no address
     math: the managers' ``global_load_ptrs`` already built the pointers.
@@ -191,13 +183,12 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 
     for gptr, lds_ptr, imm in zip(gptrs, lds_ptrs, imm_offs):
         if cluster:
-            # FlyDSL 0.3.x b128 op takes (gptr, lds_ptr, offset, mask); its
-            # expr.rocdl.cluster_load_async_to_lds wrapper still passes the old
-            # positional order, so call the dialect op directly with a 0 mask.
+            # The generic wrapper in FlyDSL 0.3.2 uses an older argument order.
+            # The public b128 overload preserves (gptr, lds_ptr, offset, mask).
             mask0 = _ir(fx.Int32(0))
-            rocdl_dialect.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
+            rocdl.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
         else:
-            rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
+            rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
 
 
 # ============================================================================
@@ -1467,7 +1458,7 @@ class OManager16bV1:
             fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(_BF16_BYTES)
         )
         o_rsrc = buffer_ops.create_buffer_resource(
-            ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
+            ptr_O, num_records_bytes=_ir(o_num_records_bytes)
         )
         lds_warp = ptr_lds + warp_idx * self._warp_stride
         q_st = lane_idx % _WMMA_M
@@ -1738,8 +1729,8 @@ class OManager16bV3:
     Accumulator (d-tile k, lane l = ``O[q=l%16, d=16k+(l//16)*8+{0..7}]``) -> row-major PADDED LDS
     ``[16, v_hdim]`` (row stride v_hdim+_O_PAD_ELEMS). Then the 16 x (v_hdim/8) b128 chunks are stored
     LDS->global over ``n_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
-    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global). Rows with
-    seq>=q_len are EXEC-masked off (async store has no bounds; ``scf_if_dispatch`` per lane).
+    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global).
+    Rows at seq>=q_len are masked off because async stores have no bounds check.
     """
 
     def __init__(
@@ -1851,11 +1842,13 @@ class OManager16bV3:
             0
         )  # all ds_stores landed (every async row reads a full padded row)
 
-        def _burst(*_a):
-            for gdst, lsrc in addrs:
-                rocdl_dialect.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
+        @flyc.jit
+        def _burst():
+            if valid_rows > fx.Int32(0):
+                for gdst, lsrc in addrs:
+                    rocdl.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
 
-        _scf_if_dispatch(valid_rows > fx.Int32(0), _burst)  # skip a fully-OOB warp
+        _burst()
         # No s_wait_asynccnt: HW drains the async stores' LDS reads at workgroup retire.
         self._pending = []
 

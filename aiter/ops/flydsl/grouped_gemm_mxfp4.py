@@ -15,25 +15,14 @@ from .kernels.tensor_shim import ptr_arg
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
 
-def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
-    """Selects the environment override or the CSV setting."""
-    value = os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH")
+def _select_bool_env(name: str, csv_value: int) -> int:
+    """Select a strict 0/1 environment override or the CSV setting."""
+    value = os.environ.get(name)
     if value is None:
-        return int(bool(csv_next_stage_prefetch))
+        return int(bool(csv_value))
     value = value.strip()
     if value not in ("0", "1"):
-        raise ValueError("AITER_TDM_NEXT_STAGE_PREFETCH must be 0 or 1")
-    return int(value)
-
-
-def _select_as_in_prologue(csv_as_in_prologue: int) -> int:
-    """Selects the environment override or the CSV setting."""
-    value = os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE")
-    if value is None:
-        return int(bool(csv_as_in_prologue))
-    value = value.strip()
-    if value not in ("0", "1"):
-        raise ValueError("AITER_GROUPED_GEMM_AS_PROLOGUE must be 0 or 1")
+        raise ValueError(f"{name} must be 0 or 1")
     return int(value)
 
 
@@ -50,9 +39,10 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
     try:
-        requested_cluster_n = (
-            int(env_cluster_n) if env_cluster_n is not None else int(csv_cluster_n)
-        )
+        if env_cluster_n is not None:
+            requested_cluster_n = int(env_cluster_n)
+        else:
+            requested_cluster_n = int(csv_cluster_n)
     except (TypeError, ValueError) as exc:
         raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_N must be an integer") from exc
     if requested_cluster_n <= 1:
@@ -119,6 +109,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     row_major_ascale=0,
+    a_row_stride_bytes=0,
+    a_scale_row_stride_bytes=0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -143,6 +135,18 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
     enable_ep_scatter = stage2_scatter is not None
+    if enable_ep_scatter and stage2_scatter.combine_quant_bits:
+        # N is the payload plane's length and so the scale plane's base, which
+        # has to land on a cache line; fp4 packs two elements to the byte and
+        # needs twice the element alignment fp8 does. Checked here because N is
+        # traced inside @flyc.jit, same as the cluster_n constraint above.
+        n_align = 128 * (8 // stage2_scatter.combine_quant_bits)
+        if N % n_align:
+            raise ValueError(
+                f"[grouped-moe tdm] combine_quant_bits="
+                f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
+                f"keep the scale plane cache-line aligned, got N={N}"
+            )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
@@ -172,9 +176,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
-        _select_next_stage_prefetch(next_stage_prefetch),
+        _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
-        _select_as_in_prologue(tdm_as_in_prologue),
+        _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
         _select_tdm_b_th(tdm_b_th),
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
@@ -186,9 +190,14 @@ def flydsl_grouped_gemm_a8w4_masked(
         ),
         ep_destination_stride=int(ep_destination_stride),
         ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        ep_quant_bits=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
         row_major_ascale=int(row_major_ascale),
+        a_row_stride_bytes=int(a_row_stride_bytes),
+        a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
     )
     return out

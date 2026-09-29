@@ -56,16 +56,60 @@ def _force_default_pipeline():
     """Pin the reference to the five-kernel path.
 
     ``chunk_delta_attn_fwd`` dispatches to ``flash_kda_fwd`` whenever
-    CHUNK_DELTA_ATTN_USE_FLASH_KDA is set. Without this, running the suite
-    with that variable exported makes every comparison here flash_kda
-    against itself, which passes unconditionally.
+    AITER_FDA_ENABLE is set. Without this, running the suite with that
+    variable exported makes every comparison here flash_kda against itself,
+    which passes unconditionally.
     """
-    saved = _chunk_fwd.CHUNK_DELTA_ATTN_USE_FLASH_KDA
-    _chunk_fwd.CHUNK_DELTA_ATTN_USE_FLASH_KDA = False
+    saved = _chunk_fwd.AITER_FDA_ENABLE
+    _chunk_fwd.AITER_FDA_ENABLE = False
     try:
         yield
     finally:
-        _chunk_fwd.CHUNK_DELTA_ATTN_USE_FLASH_KDA = saved
+        _chunk_fwd.AITER_FDA_ENABLE = saved
+
+
+@contextlib.contextmanager
+def _route(k1: bool | None = None, k2: bool | None = None):
+    """Pin the named kernels to one of their two implementations.
+
+    AITER_FDA_USE_GLUON is read once at import and resolved into these two
+    flags, so a test that wants the other route sets the flags rather than the
+    variable. Both default to on wherever the tile shape and the arch allow it,
+    which leaves the Triton kernels unreached by every test that does not come
+    through here.
+    """
+    saved = _flash_kda.AITER_FDA_USE_GLUON_K1, _flash_kda.AITER_FDA_USE_GLUON_K2
+    if k1 is not None:
+        _flash_kda.AITER_FDA_USE_GLUON_K1 = k1
+    if k2 is not None:
+        _flash_kda.AITER_FDA_USE_GLUON_K2 = k2
+    try:
+        yield
+    finally:
+        (
+            _flash_kda.AITER_FDA_USE_GLUON_K1,
+            _flash_kda.AITER_FDA_USE_GLUON_K2,
+        ) = saved
+
+
+@contextlib.contextmanager
+def _k2_tuner_search_space():
+    """Hand K2's autotuner the candidates a tuning build gives it.
+
+    The launch path pins one config, and Triton consults its autotune cache
+    only when there is more than one to choose between, so a test about the
+    key has to supply the space the key indexes.
+    """
+    if len(_flash_kda._K2_CONFIGS) < 2:
+        pytest.skip("no published K2 candidates on this device to key between")
+    kern = _flash_kda._flash_kda_segment_kernel
+    saved = kern.configs
+    kern.configs = list(_flash_kda._K2_CONFIGS)
+    try:
+        yield kern
+    finally:
+        kern.configs = saved
+        kern.cache.clear()
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
@@ -339,19 +383,196 @@ def test_tuner_keeps_the_two_schedules_apart():
     K2's grid is ``cdiv(W, BW) * num_segs * H``, so the wide BW that suits a
     segmented sweep leaves the unsegmented scan a quarter of the blocks: at
     H=12 that pick costs 2.3x. The two collide unless the segment count reaches
-    the autotune key, and `cache_results` then persists whichever won.
+    the autotune key, and `cache_results` then persists whichever won. Only a
+    tuning build chooses, so the tuner is given its config space here.
     """
-    kern = _flash_kda._flash_kda_segment_kernel
     args = make_inputs(1, 1024, 4)
     # An incoming state is what makes the two output passes otherwise identical:
     # without it the unsegmented one passes h_in=None and the key picks up the
     # difference through the dtypes it appends, hiding the collision.
     kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
-    kern.cache.clear()
-    run_flash(*args, chunks_per_seg=4, **kw)
-    segmented_keys = set(kern.cache)
-    run_flash(*args, chunks_per_seg=0, **kw)
-    assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
+    # This is about the Triton kernel's autotuner, which never runs -- and whose
+    # cache therefore stays empty -- when K2 is routed to Gluon.
+    with _k2_tuner_search_space() as kern, _route(k2=False):
+        kern.cache.clear()
+        run_flash(*args, chunks_per_seg=4, **kw)
+        segmented_keys = set(kern.cache)
+        run_flash(*args, chunks_per_seg=0, **kw)
+        assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
+
+
+def test_published_k2_schedules_can_split_their_tile():
+    """Every published (BW, num_warps) must let the warps divide the state.
+
+    Above BW // 16 the extra warps recompute columns their neighbours already
+    hold -- still correct, which is why nothing downstream catches it, and the
+    pairs are now editable from a config file rather than derived.
+
+    An arch that publishes neither schedule has nothing here to check. Both
+    lookups then return _K2_GLUON_FALLBACK, whose MIN_BLOCKS_PER_CU of 0 makes
+    the occupancy test vacuous, so the wide branch is taken for every shape and
+    exactly one pair is reachable by construction rather than by choice.
+    """
+    if (
+        _flash_kda.chunk_delta_attn_tuned_config(
+            "k2_ab_fused_gluon_wide", _flash_kda._K2_GLUON_FALLBACK, backend="gluon"
+        )
+        is _flash_kda._K2_GLUON_FALLBACK
+    ):
+        pytest.skip("this arch publishes no Gluon K2 schedules")
+    reached = set()
+    for W in (64, 128, 256):
+        for num_segs in (1, 2, 8, 64, 512):
+            for H in (1, 4, 12, 64):
+                reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H))
+    assert len(reached) > 1, f"only one schedule reachable: {reached}"
+    for bw, nw in sorted(reached):
+        assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
+        assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
+
+
+def _varlen(lens):
+    return torch.tensor(
+        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+    )
+
+
+# One configuration per branch the two kernels take, so the route below is
+# covered where it can differ rather than on a single smoke shape. Built on call
+# because two of them carry tensors.
+_CASES = {
+    "batched": lambda: (make_inputs(2, 512, 8), {}),
+    "tail chunk": lambda: (make_inputs(1, 200, 4), {}),
+    "final state": lambda: (make_inputs(2, 256, 4), {"output_final_state": True}),
+    "initial state": lambda: (
+        make_inputs(2, 192, 4),
+        {
+            "initial_state": torch.randn(
+                2, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
+            )
+            * 0.1,
+            "output_final_state": True,
+        },
+    ),
+    "varlen v-first": lambda: (
+        make_inputs(1, 292, 4),
+        {
+            "cu_seqlens": _varlen([128, 100, 64]),
+            "output_final_state": True,
+            "state_v_first": True,
+        },
+    ),
+    "weak gate": lambda: (make_inputs(1, 512, 4), {"lower_bound": -0.01}),
+    # Only a segmented schedule has a pass A, and pass A is the only thing the
+    # Gluon K2 is routed to, so these are the cases where K2's route is visible
+    # at all -- see test_cases_reach_the_gluon_k2.
+    "segmented": lambda: (
+        make_inputs(1, 1024, 4),
+        {"output_final_state": True, "chunks_per_seg": 4},
+    ),
+    "segmented varlen": lambda: (
+        make_inputs(1, 292, 4),
+        {
+            "cu_seqlens": _varlen([128, 100, 64]),
+            "output_final_state": True,
+            "state_v_first": True,
+            "chunks_per_seg": 2,
+        },
+    ),
+    "segmented initial state": lambda: (
+        make_inputs(1, 1024, 4),
+        {
+            "initial_state": torch.randn(
+                1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
+            )
+            * 0.1,
+            "output_final_state": True,
+            "chunks_per_seg": 3,
+        },
+    ),
+    "segmented weak gate": lambda: (
+        make_inputs(1, 512, 4),
+        {"lower_bound": -0.01, "chunks_per_seg": 3},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_CASES))
+def test_triton_route_matches_reference(case):
+    """The Triton kernels against the default pipeline, on the same bound.
+
+    Every other comparison in this file runs whatever AITER_FDA_USE_GLUON
+    resolved to, which is Gluon for both kernels on the arch this suite runs on.
+    Without this the Triton K1 and K2 ship untested.
+    """
+    args, kw = _CASES[case]()
+    o_ref, ht_ref = run_reference(*args, **kw)
+    with _route(k1=False, k2=False):
+        o, ht = run_flash(*args, **kw)
+    assert rel_err(o, o_ref) < 2e-2
+    if kw.get("output_final_state"):
+        assert rel_err(ht, ht_ref) < 2e-2
+
+
+@pytest.mark.parametrize("case", list(_CASES))
+def test_routes_agree(case):
+    """Which implementation ran must not be visible in the answer.
+
+    Both sides write the same ABI and nothing downstream is told which one ran,
+    so a divergence here is a bug in whichever kernel moved rather than a
+    tolerance to widen. Measured across these cases: K2's two implementations
+    agree to the bit, and K1's differ at 3e-4 to 1e-3 on the output and under
+    3e-5 on the state, so the bounds are really about K1.
+    """
+    args, kw = _CASES[case]()
+    with _route(k1=False, k2=False):
+        o_triton, ht_triton = run_flash(*args, **kw)
+    for k1, k2 in ((True, False), (False, True), (True, True)):
+        with _route(k1=k1, k2=k2):
+            o, ht = run_flash(*args, **kw)
+        assert rel_err(o, o_triton) < 2e-3, f"K1={k1} K2={k2}"
+        if kw.get("output_final_state"):
+            assert rel_err(ht, ht_triton) < 1e-4, f"K1={k1} K2={k2}"
+
+
+def test_cases_reach_the_gluon_k2():
+    """The cases above have to exercise the route they are comparing.
+
+    ``use_gluon_k2`` is tested inside ``max_segs > 1``, so an unsegmented shape
+    runs the Triton K2 whichever way the flag is set and test_routes_agree is
+    comparing it against itself. Every non-segmented case here was in exactly
+    that position, and nothing in the assertions would have said so.
+    """
+    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
+        flash_kda_k2 as _g2,
+    )
+
+    reached = set()
+    saved = _g2.k2_ab_fused_fast
+
+    class _Counting:
+        def __getitem__(self, grid):
+            inner = saved[grid]
+
+            def launch(**kw):
+                reached.add(current)
+                return inner(**kw)
+
+            return launch
+
+    _g2.k2_ab_fused_fast = _Counting()
+    try:
+        for current, make in _CASES.items():
+            args, kw = make()
+            with _route(k1=True, k2=True):
+                run_flash(*args, **kw)
+    finally:
+        _g2.k2_ab_fused_fast = saved
+
+    want = {name for name in _CASES if name.startswith("segmented")}
+    assert want <= reached, f"never reached the Gluon K2: {sorted(want - reached)}"
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the
@@ -499,11 +720,11 @@ def test_public_wrapper_routes_to_flash_kda(monkeypatch):
 
     monkeypatch.setattr(_chunk_fwd, "flash_kda_fwd", counting)
 
-    monkeypatch.setattr(_chunk_fwd, "CHUNK_DELTA_ATTN_USE_FLASH_KDA", False)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", False)
     o_ref, ht_ref = chunk_kimi_delta_attn(**kwargs)
     assert not calls, "the flag is off, the default pipeline should have served this"
 
-    monkeypatch.setattr(_chunk_fwd, "CHUNK_DELTA_ATTN_USE_FLASH_KDA", True)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", True)
     o_fkda, ht_fkda = chunk_kimi_delta_attn(**kwargs)
     assert len(calls) == 1, "the wrapper never reached flash_kda_fwd"
 
@@ -546,7 +767,7 @@ def test_unset_chunk_size_follows_the_dispatch(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(_chunk_fwd, "flash_kda_fwd", counting)
-    monkeypatch.setattr(_chunk_fwd, "CHUNK_DELTA_ATTN_USE_FLASH_KDA", True)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", True)
 
     chunk_kimi_delta_attn(chunk_size=None, **kwargs)
     assert len(calls) == 1, "an eligible call should have resolved to FLASH_KDA_CHUNK"
@@ -557,3 +778,235 @@ def test_unset_chunk_size_follows_the_dispatch(monkeypatch):
     o_64, _ = chunk_kimi_delta_attn(chunk_size=64, **{**kwargs, "safe_gate": False})
     assert len(calls) == 1
     assert torch.equal(o_auto, o_64), "an ineligible call should have resolved to 64"
+
+
+def _paged_pool(n, H, initial, pad_floats=0):
+    """V-first paged cache. ``pad_floats`` extra between slots."""
+    V = K = K_DIM
+    inner = H * V * K
+    slot_stride = inner + pad_floats
+    storage = torch.zeros((n + 2) * slot_stride, device=device, dtype=torch.float32)
+    cache = torch.as_strided(
+        storage,
+        size=(n + 2, H, V, K),
+        stride=(slot_stride, V * K, K, 1),
+    )
+    indices = torch.arange(n, 0, -1, device=device, dtype=torch.int32)
+    cache[indices] = initial
+    return cache, indices, storage
+
+
+def _kimi_kwargs(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "scale": scale,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "safe_gate": True,
+        "lower_bound": LOWER_BOUND,
+        "state_v_first": True,
+        **kw,
+    }
+
+
+@pytest.mark.parametrize("T,chunks_per_seg", [(256, 0), (1024, 4)])
+def test_paged_cache_matches_dense(T, chunks_per_seg):
+    """In-kernel paged I/O matches gather into a dense V-first state."""
+    H = 4
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, T, H)
+    h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "scale": scale,
+        "lower_bound": LOWER_BOUND,
+        "state_v_first": True,
+        "chunks_per_seg": chunks_per_seg,
+    }
+    o_dense, ht = flash_kda_fwd(**common, initial_state=h0, output_final_state=True)
+    cache, indices, _storage = _paged_pool(1, H, h0)
+    ptr_before = cache.data_ptr()
+    out = torch.empty_like(v)
+    paged_kw = {
+        **common,
+        "initial_state": None,
+        "output_final_state": False,
+        "out": out,
+        "state_cache": cache,
+        "state_indices": indices,
+        "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+    }
+    # First paged launch autotunes a new PAGED_CACHE specialization; compare
+    # after that, not against a trial config.
+    flash_kda_fwd(**paged_kw)
+    cache[indices] = h0
+    o_paged, ht_paged = flash_kda_fwd(**paged_kw)
+    assert ht_paged is None
+    assert o_paged.data_ptr() == out.data_ptr()
+    assert cache.data_ptr() == ptr_before, "paged cache must not be packed/copied"
+    assert torch.equal(o_paged, o_dense)
+    assert torch.equal(cache[indices], ht)
+    assert torch.count_nonzero(cache[[0, -1]]).item() == 0
+
+
+@pytest.mark.parametrize("seg", ["0", "4"])
+def test_paged_cache_has_initial_state_false(seg, monkeypatch):
+    """A zero-start slot is never read: its NaN contents must not leak.
+
+    ``seg="4"`` cuts the 8-chunk sequence into two segments, so the load under
+    test is the segment kernel's incoming-state load as well as the scan's.
+    """
+    monkeypatch.setenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", seg)
+    H = 4
+    args = make_inputs(1, 256, H)
+    v = args[2]
+    dirty = torch.full(
+        (1, H, K_DIM, K_DIM), float("nan"), device=device, dtype=torch.float32
+    )
+    o_zero, ht_zero = chunk_kimi_delta_attn(
+        **_kimi_kwargs(
+            *args,
+            initial_state=torch.zeros_like(dirty),
+            output_final_state=True,
+        )
+    )
+    cache, indices, _storage = _paged_pool(1, H, dirty)
+    out = torch.empty_like(v)
+    paged_kw = _kimi_kwargs(
+        *args,
+        out=out,
+        state_cache=cache,
+        state_indices=indices,
+        has_initial_state=torch.zeros(1, device=device, dtype=torch.bool),
+    )
+    # Warm the paged specialization's autotune, then re-dirty the slot.
+    chunk_kimi_delta_attn(**paged_kw)
+    cache[indices] = dirty
+    o_paged, _ = chunk_kimi_delta_attn(**paged_kw)
+    assert torch.equal(o_paged, o_zero)
+    assert torch.equal(cache[indices], ht_zero)
+
+
+def test_paged_cache_padded_stride_writes_live_pool():
+    """stride(0) padding must not trigger a packed copy."""
+    H = 4
+    args = make_inputs(1, 256, H)
+    v = args[2]
+    h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    _, ht = chunk_kimi_delta_attn(
+        **_kimi_kwargs(*args, initial_state=h0, output_final_state=True)
+    )
+    cache, indices, storage = _paged_pool(1, H, h0, pad_floats=128)
+    assert not cache.is_contiguous()
+    ptr = storage.data_ptr()
+    out = torch.empty_like(v)
+    chunk_kimi_delta_attn(
+        **_kimi_kwargs(
+            *args,
+            out=out,
+            state_cache=cache,
+            state_indices=indices,
+            has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
+        )
+    )
+    assert storage.data_ptr() == ptr
+    assert torch.equal(cache[indices], ht)
+    # Padding between slots and the unused first/last rows stay zero.
+    inner = H * K_DIM * K_DIM
+    slot_stride = inner + 128
+    for slot in (0, int(indices.item()) + 1):
+        row = storage[slot * slot_stride : (slot + 1) * slot_stride]
+        assert torch.count_nonzero(row).item() == 0
+
+
+@pytest.mark.parametrize("outer", ["expanded", "overlapping"])
+def test_paged_cache_rejects_overlapping_slots(outer):
+    """stride(0) below one [H, V, K] plane would alias neighbouring slots."""
+    H = 4
+    args = make_inputs(1, 128, H)
+    v = args[2]
+    plane = H * K_DIM * K_DIM
+    if outer == "expanded":
+        cache = torch.zeros(1, H, K_DIM, K_DIM, device=device).expand(3, -1, -1, -1)
+    else:
+        storage = torch.zeros(3 * plane, device=device)
+        cache = torch.as_strided(
+            storage,
+            size=(3, H, K_DIM, K_DIM),
+            stride=(plane // 2, K_DIM * K_DIM, K_DIM, 1),
+        )
+    assert cache.stride(0) < plane
+    with pytest.raises(ValueError, match="not dense"):
+        chunk_kimi_delta_attn(
+            **_kimi_kwargs(
+                *args,
+                out=torch.empty_like(v),
+                state_cache=cache,
+                state_indices=torch.tensor([1], device=device, dtype=torch.int32),
+                has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
+            )
+        )
+
+
+def test_out_rejected_on_default_pipeline():
+    """The default pipeline cannot honour `out`, so it must not drop it."""
+    args = make_inputs(1, 128, 4)
+    v = args[2]
+    with (
+        _force_default_pipeline(),
+        pytest.raises(ValueError, match="out is only implemented"),
+    ):
+        chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=torch.empty_like(v)))
+
+
+def test_out_must_be_contiguous():
+    """A strided `out` is rejected, not silently packed into a clone."""
+    args = make_inputs(1, 128, 4)
+    v = args[2]
+    B, T, H, V = v.shape
+    strided = torch.empty(B, T, H, 2 * V, device=device, dtype=v.dtype)[..., :V]
+    assert not strided.is_contiguous()
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=strided))
+
+
+def test_out_is_written_in_place():
+    """A contiguous `out` is the buffer the kernel writes, not a packed copy."""
+    args = make_inputs(1, 128, 4)
+    ref, _ = chunk_kimi_delta_attn(**_kimi_kwargs(*args))
+    out = torch.full_like(args[2], float("nan"))
+    o, _ = chunk_kimi_delta_attn(**_kimi_kwargs(*args, out=out))
+    assert o.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_paged_cache_rejected_on_default_pipeline():
+    args = make_inputs(1, 128, 4)
+    v = args[2]
+    h0 = torch.zeros(1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32)
+    cache, indices, _ = _paged_pool(1, 4, h0)
+    with (
+        _force_default_pipeline(),
+        pytest.raises(ValueError, match="paged state_cache is only implemented"),
+    ):
+        chunk_kimi_delta_attn(
+            **_kimi_kwargs(
+                *args,
+                out=torch.empty_like(v),
+                state_cache=cache,
+                state_indices=indices,
+                has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
+            )
+        )

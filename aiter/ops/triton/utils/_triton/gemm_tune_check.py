@@ -36,7 +36,7 @@ def gemm_tune_check(
     module_pth = module_pth[:3] + ["_triton_kernels"] + module_pth[3:]
     module_pth = ".".join(module_pth)
     module = importlib.import_module(module_pth)
-    _LOGGER.info(f"Function {func} found at {module}")
+    _LOGGER.info("Function %s found at %s", func, module)
 
     if hasattr(module, "_get_config"):
 

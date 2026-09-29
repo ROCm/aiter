@@ -19,7 +19,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 BASE_BLOCK = 64
-NUM_WARPS = 4
+NUM_WARPS = 1
 
 
 @torch.inference_mode()
@@ -73,7 +73,7 @@ def context_attention_fwd(
     """
 
     _LOGGER.info(
-        f"PA_PREFILL: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        "PA_PREFILL: q=%s k=%s v=%s", tuple(q.shape), tuple(k.shape), tuple(v.shape)
     )
     q_dtype_is_f32 = q.dtype is torch.float32
     # need to reduce num. blocks when using fp32
@@ -155,7 +155,7 @@ def context_attention_fwd(
             BLOCK_N=BLOCK,
             SKIP_DECODE=skip_decode,
             num_warps=NUM_WARPS,
-            waves_per_eu=2,
+            waves_per_eu=1,
             num_stages=1,
         )
         return
@@ -207,7 +207,7 @@ def context_attention_fwd(
         SLIDING_WINDOW=sliding_window,
         SKIP_DECODE=skip_decode,
         num_warps=NUM_WARPS,
-        waves_per_eu=2,
+        waves_per_eu=1,
         num_stages=1,
     )
     return
