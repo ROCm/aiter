@@ -1685,7 +1685,6 @@ def launch_gemm_a8w4_tdm(
                 )
 
                 v2i32_ty = T.vec(2, T.i32)
-                QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
@@ -1694,8 +1693,21 @@ def launch_gemm_a8w4_tdm(
                     if wmb + wm * 16 < mn_oob:
                         row_rel = wmb + wm * 16 + lane16
                         row_i32 = fx.Int32(blk_m + row_rel)
-                        scale_tile = row_i32 >> QRPT_LOG2
-                        row_in_tile = row_i32 & (QUANT_ROWS_PER_TILE - 1)
+                        # quant_wmma_rep is tunable, so QUANT_ROWS_PER_TILE is
+                        # not necessarily a power of two (for example, six
+                        # WMMA rows produce a 96-row tile). Derive the common
+                        # equal-warp layout directly; retain exact arithmetic
+                        # for configurations whose GEMM1/GEMM2 row shapes differ.
+                        scale_tile = (
+                            m_tile * m_warp + wave_m
+                            if QUANT_ROWS_PER_TILE == warp_tile_m
+                            else row_i32 // QUANT_ROWS_PER_TILE
+                        )
+                        row_in_tile = (
+                            wm * 16 + lane16
+                            if QUANT_ROWS_PER_TILE == warp_tile_m
+                            else row_i32 - scale_tile * QUANT_ROWS_PER_TILE
+                        )
                         wmma_row = row_in_tile >> 4
                         scale_lane = row_in_tile & 15
                         row_valid = row_rel < mn_oob
