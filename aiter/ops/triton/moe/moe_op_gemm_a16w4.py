@@ -226,6 +226,7 @@ def moe_gemm_a16w4(
     unpadded_K=None,
     backend: str | None = None,
     expert_map=None,
+    gate_valid=None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -333,11 +334,10 @@ def moe_gemm_a16w4(
         config["split_k"],
         x.device,
     )
-    # Expert parallelism: the triton kernel early-returns for experts not on this
-    # rank, leaving their output regions unwritten; zero them so combine is correct.
     if expert_map is not None:
-        assert backend == "triton", "expert_map (EP) is only supported on the triton backend"
-        y.zero_()
+        assert (
+            backend == "triton"
+        ), "expert_map (EP) is only supported on the triton backend"
     stride_bias = None if bias is None else bias.stride(0)
 
     # moe metadata
@@ -467,6 +467,13 @@ def moe_gemm_a16w4(
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
+    # Expert parallelism: skip gates whose expert is not on this rank instead of
+    # zero-filling their (unwritten) output rows, so the combine never reads them.
+    group_valid = (
+        None
+        if (gate_valid is None or scatter_indx is None)
+        else gate_valid.view(-1, routing_data.n_expts_act)
+    )
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -477,6 +484,7 @@ def moe_gemm_a16w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        indx_valid=group_valid,
     )
 
     return y_final
