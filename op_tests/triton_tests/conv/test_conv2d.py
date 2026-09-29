@@ -156,9 +156,9 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
             memory_format=torch.channels_last
         ), f"expected channels-last output, got strides={y.stride()}"
     else:
-        assert y.is_contiguous(), (
-            f"expected contiguous output, got strides={y.stride()}"
-        )
+        assert (
+            y.is_contiguous()
+        ), f"expected contiguous output, got strides={y.stride()}"
 
 
 def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
@@ -243,9 +243,9 @@ def test_exact_nchw_pin_selects_direct(
     _use_arch(monkeypatch, arch)
 
     route = _resolve_nchw_3x3(shape)
-    assert route is conv2d_module.Route.DIRECT_NCHW_3X3, (
-        f"expected direct NCHW route for pinned {arch} shape, got {route}"
-    )
+    assert (
+        route is conv2d_module.Route.DIRECT_NCHW_3X3
+    ), f"expected direct NCHW route for pinned {arch} shape, got {route}"
 
 
 @pytest.mark.parametrize("arch", ["gfx1100", "gfx1151"])
@@ -255,9 +255,9 @@ def test_unpinned_nchw_shape_falls_back_to_cblocked(
     _use_arch(monkeypatch, arch)
 
     route = _resolve_nchw_3x3(_UNPINNED)
-    assert route is conv2d_module.Route.CBLOCKED_NCHW, (
-        f"expected NCHWc fallback for unpinned {arch} shape, got {route}"
-    )
+    assert (
+        route is conv2d_module.Route.CBLOCKED_NCHW
+    ), f"expected NCHWc fallback for unpinned {arch} shape, got {route}"
 
 
 @pytest.mark.parametrize(
@@ -271,9 +271,9 @@ def test_exact_nchw_pin_uses_complete_shape_key(
     _use_arch(monkeypatch, "gfx1100")
 
     route = _resolve_nchw_3x3(_GFX1100_PINNED, **route_override)
-    assert route is conv2d_module.Route.CBLOCKED_NCHW, (
-        f"expected NCHWc after shape-key change {route_override}, got {route}"
-    )
+    assert (
+        route is conv2d_module.Route.CBLOCKED_NCHW
+    ), f"expected NCHWc after shape-key change {route_override}, got {route}"
 
 
 def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config_cache):
@@ -295,9 +295,9 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
 
     assert selected("nhwc") == "layout", "layout-specific config was not preferred"
     assert selected() == "generic", "generic shape config was not selected"
-    assert selected("nhwc", key="missing") == "bucket", (
-        "M bucket was not used after a layout-specific shape miss"
-    )
-    assert selected("nhwc", key="missing", M=65) == "any", (
-        "generic fallback was not used after shape and bucket misses"
-    )
+    assert (
+        selected("nhwc", key="missing") == "bucket"
+    ), "M bucket was not used after a layout-specific shape miss"
+    assert (
+        selected("nhwc", key="missing", M=65) == "any"
+    ), "generic fallback was not used after shape and bucket misses"
