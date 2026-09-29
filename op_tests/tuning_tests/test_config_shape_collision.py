@@ -73,6 +73,7 @@ FAMILIES = [
         "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
     ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
+    ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
@@ -238,12 +239,12 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
         self.assertEqual(
-            rows[("gfx950", 2, 1, 1024, 4096, 128)]["kernelId"],
+            rows[("gfx950", 2, 1, 1024, 4096, "128x128")]["kernelId"],
             8311,
             "legacy local OPUS kid 311 must become public global kid 8311",
         )
         self.assertEqual(
-            rows[("gfx950", 8, 128, 1024, 4096, 128)]["kernelId"],
+            rows[("gfx950", 8, 128, 1024, 4096, "128x128")]["kernelId"],
             8653,
             "legacy local OPUS kid 653 must become public global kid 8653",
         )
@@ -287,6 +288,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
+
+    def test_conv3d_bf16(self):
+        self._check_family("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d")
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
