@@ -268,6 +268,9 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     m = fx.maxnumf(m, scores[r])
                 m = fx.maxnumf(m, m.shuffle_xor(fx.Int32(32), fx.Int32(64)))
                 correction = _exp2(fx.Float32(state[0]) - m)
+                rescale = fx.Int64(rocdl.ballot(
+                    T.i64, (m != fx.Float32(state[0])).ir_value()
+                )) != fx.Int64(0)
                 probs = []
                 psum = fx.Float32(0.0)
                 for r in range_constexpr(16):
@@ -298,18 +301,20 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     ]
                     return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0]
 
-                accum = []
+                accum = [fx.Vector(state[dc + 2]) for dc in range(8)]
+                if rescale:
+                    accum = [o * fx.Vector.filled(16, correction, fx.Float32)
+                             for o in accum]
+                next_accum = []
                 for dc in range_constexpr(8):
-                    o = fx.Vector(state[dc + 2]) * fx.Vector.filled(
-                        16, correction, fx.Float32
-                    )
+                    o = accum[dc]
                     v0 = load_v(dc * 32 + lane % 32, half * 8)
                     o = _mfma(v0.ir_value(), p0.ir_value(), o)
                     v1 = load_v(dc * 32 + lane % 32, 16 + half * 8)
                     o = _mfma(v1.ir_value(), p1.ir_value(), o)
-                    accum.append(o)
+                    next_accum.append(o)
                 gpu.barrier()
-                result = yield [m, denom] + accum
+                result = yield [m, denom] + next_accum
 
             if const_expr(_num_splits > 1):
                 if row < 2:
@@ -468,6 +473,9 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
             for shift in (16, 32):
                 m = fx.maxnumf(m, m.shuffle_xor(fx.Int32(shift), fx.Int32(64)))
             correction = _exp2(fx.Float32(state[0]) - m)
+            rescale = fx.Int64(rocdl.ballot(
+                T.i64, (m != fx.Float32(state[0])).ir_value()
+            )) != fx.Int64(0)
             probs = []
             psum = fx.Float32(0.0)
             for r in range_constexpr(8):
@@ -487,7 +495,11 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 w1 = words[1].shuffle_xor(mask, fx.Int32(64))
                 packed.append((group < 2).select(w0, w1))
             pfrag = fx.Vector.from_elements(packed, fx.Int32).bitcast(fx.Int64)[0]
-            accum = []
+            accum = [fx.Vector(state[dc + 2]) for dc in range(16)]
+            if rescale:
+                accum = [o * fx.Vector.filled(4, correction, fx.Float32)
+                         for o in accum]
+            next_accum = []
             for dc in range_constexpr(16):
                 depth = dc * 16 + row
                 bank = (depth % 32) ^ (depth // 8)
@@ -495,10 +507,9 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 words = [fx.Int32(_load(lds.v.ptr, offset + i * 128, T.i32, 4))
                          for i in range(2)]
                 vfrag = fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0]
-                o = fx.Vector(state[dc + 2]) * fx.Vector.filled(4, correction, fx.Float32)
-                accum.append(_mfma16(vfrag.ir_value(), pfrag.ir_value(), o))
+                next_accum.append(_mfma16(vfrag.ir_value(), pfrag.ir_value(), accum[dc]))
             gpu.barrier()
-            result = yield [m, denom] + accum
+            result = yield [m, denom] + next_accum
         if row < 2:
             if const_expr(_num_splits > 1):
                 base = (((fx.Int64(seq) * 16 + fx.Int64(head)) * _num_splits
