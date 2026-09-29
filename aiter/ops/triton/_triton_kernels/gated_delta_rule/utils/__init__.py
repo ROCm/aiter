@@ -7,6 +7,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.cumsum import (
     chunk_local_cumsum_scalar,
     chunk_local_cumsum_vector,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.fusion import (
+    K5K6Fusion,
+)
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -31,6 +34,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.wy_representation i
 
 __all__ = [
     "GatedDeltaRulePrefillMetadata",
+    "K5K6Fusion",
     "build_gated_delta_rule_prefill_metadata",
     "chunk_local_cumsum",
     "chunk_local_cumsum_scalar",
