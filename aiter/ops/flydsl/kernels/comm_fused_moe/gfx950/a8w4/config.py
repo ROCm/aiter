@@ -295,6 +295,10 @@ class MegakernelConfig:
         return self.m
 
     @property
+    def requires_exact_m(self) -> bool:
+        return False
+
+    @property
     def partial_bytes(self) -> int:
         return _align_up(self.partial_payload_bytes + self.partial_scale_bytes, 16)
 
@@ -594,6 +598,13 @@ class WindowConfig:
         return self.m if self.gather_output else self.shard_rows
 
     @property
+    def requires_exact_m(self) -> bool:
+        # Padding only the global tail changes which rows belong to each rank.
+        # Compact ragged calls bypass this fixed-layout mapping and provide
+        # explicit per-rank sizes instead.
+        return not self.gather_output
+
+    @property
     def phase_count(self) -> int:
         return self.shape.model_dim // self.window
 
@@ -718,15 +729,17 @@ class DirectConfig:
         return _align_up(self.partial_bytes, 256)
 
     @property
-    def done_offset(self) -> int:
-        return self.ready_offset + self.grid * self.shape.tp_size * 8
+    def completion_counter_offset(self) -> int:
+        # The direct readiness protocol owns three i32 words at ready_offset.
+        return self.ready_offset + 12
+
+    @property
+    def done_epoch_offset(self) -> int:
+        return _align_up(self.completion_counter_offset + 4, 8)
 
     @property
     def workspace_bytes(self) -> int:
-        return _align_up(
-            self.done_offset + self.grid * self.shape.tp_size * 8,
-            256,
-        )
+        return _align_up(self.done_epoch_offset + 8, 256)
 
 
 PipelineConfig = MegakernelConfig | WindowConfig | DirectConfig

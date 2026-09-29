@@ -700,7 +700,9 @@ def write_winner(path, row: dict, config: PipelineConfig) -> None:
         fieldnames.append(_COMM_CONFIGS_FIELD)
     base_key = _row_key(row, _BASE_KEY_FIELDS)
     output_row = _find_output_row(rows, base_key)
-    if output_row.get("block_m") not in (None, ""):
+    if output_row.get("block_m") in (None, ""):
+        output_row["block_m"] = row["block_m"]
+    else:
         _check_matching_block_m(output_row, row, base_key)
     mode = row["comm_mode"]
     configs = _comm_configs(output_row)

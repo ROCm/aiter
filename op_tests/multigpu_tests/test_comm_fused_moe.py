@@ -1067,11 +1067,7 @@ def _run_full_runtime_case(
         reduced.add_(fixture.shared_partial)
         return reduced
 
-    def before_stage2(shared_ready: torch.Tensor | None):
-        # Tests use a device fill as a stand-in. Production shared-expert code
-        # must publish this target in its final epilogue, without another kernel.
-        if shared_ready is not None:
-            shared_ready.fill_(1)
+    def before_stage2(_shared_rows: int):
         return fixture.shared_partial
 
     def run_comm_fused(stage2_stream=None):

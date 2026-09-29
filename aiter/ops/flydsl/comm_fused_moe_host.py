@@ -675,11 +675,26 @@ class _RuntimeLayoutRunner:
     def supports_ragged_m(self) -> bool:
         return False
 
+    @property
+    def supports_external_reuse_sync(self) -> bool:
+        return False
+
     def prepare_padded_shared_partial(
         self, shared_partial: torch.Tensor, input_rows: int
     ) -> torch.Tensor:
         """Pad a full-layout shared contribution for this runner's bucket."""
 
+        expected = (input_rows, self.config.shape.model_dim)
+        if (
+            tuple(shared_partial.shape) != expected
+            or shared_partial.dtype != torch.bfloat16
+            or shared_partial.device != self.device
+            or not shared_partial.is_contiguous()
+        ):
+            raise ValueError(
+                f"unpadded shared output must be contiguous BF16 {expected} "
+                f"on {self.device}"
+            )
         if self.output.shape[0] == self.config.m:
             padded = self.output
         else:
@@ -694,6 +709,16 @@ class _RuntimeLayoutRunner:
         return padded
 
     def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
+        expected = (self.config.output_rows, self.config.shape.model_dim)
+        if (
+            tuple(shared_partial.shape) != expected
+            or shared_partial.dtype != torch.bfloat16
+            or shared_partial.device != self.device
+            or not shared_partial.is_contiguous()
+        ):
+            raise ValueError(
+                f"shared output must be contiguous BF16 {expected} on {self.device}"
+            )
         return shared_partial
 
 
@@ -729,8 +754,6 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
         self.comm = None
         self.windows = ()
         self.workspace_flat_base = 0
-        self.shared_partial_window = None
-        self.shared_partial_ptr = None
         self.shared_partial_flat_base = 0
         if not defer_registration:
             self.register_communicator(tp_group)
@@ -765,17 +788,18 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
         self.workspace.narrow(0, self.config.flat_base_offset, 8).view(
             torch.int64
         ).fill_(self.workspace_flat_base)
+        if self.config.shared_bf16_partials:
+            self.shared_partial_flat_base = (
+                self.workspace_flat_base + self.config.output_offset
+            )
 
     def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Stage a normal shared contribution in the registered output window."""
+        """Validate a shared contribution before the fused launch."""
 
+        shared_partial = super().prepare_shared_partial(shared_partial)
         if not self.config.shape.add_shared:
             return self.output
-        if not self.config.shared_bf16_partials:
-            return shared_partial
-        if shared_partial.data_ptr() != self.output.data_ptr():
-            self.output.copy_(shared_partial)
-        return self.output
+        return shared_partial
 
     def __call__(
         self,
@@ -788,42 +812,22 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
     ):
         _bind_inter_layout(self, ordinary_stage2)
         stream = torch.cuda.current_stream(self.device)
+        shared_waited = before_shared_add is None or not self.config.shape.add_shared
+
+        def wait_for_shared():
+            nonlocal shared_waited
+            if not shared_waited:
+                before_shared_add()
+                shared_waited = True
+
         if not self.config.shape.add_shared:
             shared_partial = self.output
-            if self.config.shared_bf16_partials:
-                self.shared_partial_ptr = self.output.data_ptr()
-                self.shared_partial_flat_base = (
-                    self.workspace_flat_base + self.config.output_offset
-                )
-        if self.config.shape.add_shared and self.config.shared_bf16_partials:
-            shared_partial_ptr = shared_partial.data_ptr()
-            if shared_partial_ptr == self.output.data_ptr():
-                if self.shared_partial_ptr not in (None, shared_partial_ptr):
-                    raise RuntimeError(
-                        "GEMM2 TP megakernel shared_partial storage changed after "
-                        "symmetric registration"
-                    )
-                self.shared_partial_ptr = shared_partial_ptr
-                self.shared_partial_flat_base = (
-                    self.workspace_flat_base + self.config.output_offset
-                )
-            elif self.shared_partial_window is None:
-                self.shared_partial_window = self.comm.register_external_window(
-                    shared_partial_ptr,
-                    shared_partial.nbytes,
-                )
-                self.shared_partial_ptr = shared_partial_ptr
-                self.shared_partial_flat_base = (
-                    self.shared_partial_window.local_ptr
-                    - self.rank * FLAT_VA_RANK_STRIDE
-                )
-            elif shared_partial_ptr != self.shared_partial_ptr:
-                raise RuntimeError(
-                    "GEMM2 TP megakernel shared_partial storage changed after "
-                    "symmetric registration"
-                )
-        if before_shared_add is not None:
-            before_shared_add()
+        elif self.config.shared_bf16_partials:
+            wait_for_shared()
+            if shared_partial.data_ptr() != self.output.data_ptr():
+                self.output.copy_(shared_partial)
+            shared_partial = self.output
+        wait_for_shared()
         common = _stage2_args(stage2_args, stage2_kwargs, self.config)
         _run_compiled(
             megakernel.compile_megakernel(self.config, self.rank),
@@ -915,6 +919,35 @@ class _WindowRunner(_RuntimeLayoutRunner):
     @property
     def supports_ragged_m(self) -> bool:
         return not self.config.gather_output
+
+    def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
+        rows = shared_partial.shape[0] if shared_partial.ndim else -1
+        valid_rows = rows == self.config.m or (
+            not self.config.gather_output and 0 <= rows <= self.config.shard_rows
+        )
+        row_contract = (
+            f"exactly M={self.config.m} rows"
+            if self.config.gather_output
+            else (
+                f"M={self.config.m} rows or no more than shard capacity "
+                f"{self.config.shard_rows}"
+            )
+        )
+        if (
+            shared_partial.ndim != 2
+            or not valid_rows
+            or shared_partial.shape[1] != self.config.shape.model_dim
+            or shared_partial.dtype != torch.bfloat16
+            or shared_partial.device != self.device
+            or not shared_partial.is_contiguous()
+        ):
+            raise ValueError(
+                "window shared output must be contiguous BF16 with width "
+                f"{self.config.shape.model_dim} and {row_contract} on {self.device}, "
+                f"got dtype={shared_partial.dtype}, "
+                f"shape={tuple(shared_partial.shape)}, device={shared_partial.device}"
+            )
+        return shared_partial
 
     def _shared_view(self, shared_partial, local_rows: int, rank_offset: int):
         if self.config.gather_output:
@@ -1211,7 +1244,11 @@ class _DirectRunner(_RuntimeLayoutRunner):
         self.comm = None
         self.windows = ()
         self.workspace_base = 0
+        self.wait_for_reuse = direct.compile_wait_for_reuse(config)
         self.reduce_scatter_add = direct.compile_reduce_scatter_add(config)
+        self.reduce_scatter_add_external_sync = direct.compile_reduce_scatter_add(
+            config, protect_reuse=False
+        )
         if not defer_registration:
             self.register_communicator(tp_group)
 
@@ -1245,18 +1282,9 @@ class _DirectRunner(_RuntimeLayoutRunner):
     def stage2_destination(self):
         return self.stage2_output
 
-    def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        expected = (self.config.output_rows, self.config.shape.model_dim)
-        if (
-            tuple(shared_partial.shape) != expected
-            or shared_partial.dtype != torch.bfloat16
-            or shared_partial.device != self.device
-            or not shared_partial.is_contiguous()
-        ):
-            raise ValueError(
-                f"shared output must be contiguous BF16 {expected} on {self.device}"
-            )
-        return shared_partial
+    @property
+    def supports_external_reuse_sync(self) -> bool:
+        return True
 
     def __call__(
         self,
@@ -1266,6 +1294,7 @@ class _DirectRunner(_RuntimeLayoutRunner):
         shared_partial: torch.Tensor | None,
         ordinary_stage2,
         before_shared_add=None,
+        reuse_is_synchronized: bool = False,
     ) -> torch.Tensor:
         from aiter.fused_moe import stage2_uses_route_reduce
 
@@ -1278,6 +1307,14 @@ class _DirectRunner(_RuntimeLayoutRunner):
         if shared_partial is None:
             raise RuntimeError("direct collective requires shared output")
 
+        stream = torch.cuda.current_stream(self.device)
+        if not reuse_is_synchronized:
+            _run_compiled(
+                self.wait_for_reuse,
+                ptr_arg(self.workspace),
+                fx.Int64(self.workspace_base),
+                stream,
+            )
         ordinary_stage2(
             *stage2_args[:6],
             self.partial,
@@ -1287,13 +1324,17 @@ class _DirectRunner(_RuntimeLayoutRunner):
         if before_shared_add is not None:
             before_shared_add()
         _run_compiled(
-            self.reduce_scatter_add,
+            (
+                self.reduce_scatter_add_external_sync
+                if reuse_is_synchronized
+                else self.reduce_scatter_add
+            ),
             ptr_arg(self.workspace),
             fx.Int64(self.workspace_base),
             ptr_arg(self.output),
             ptr_arg(shared_partial),
             self.rank,
-            torch.cuda.current_stream(self.device),
+            stream,
         )
         return self.output
 
@@ -1416,7 +1457,7 @@ class _LazyRunners:
 
     def output_rows_for(self, bucket: int, input_rows: int) -> int:
         config = self.configs[bucket]
-        if getattr(config, "requires_exact_m", False) and input_rows != config.m:
+        if config.requires_exact_m and input_rows != config.m:
             raise ValueError(f"{type(config).__name__} requires exact M={config.m}")
         output_rows, remainder = divmod(input_rows * config.output_rows, config.m)
         if remainder:
