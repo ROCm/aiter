@@ -3156,7 +3156,11 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     static_assert(MainBits > 0 && MainBits <= 31);
     static_assert(TailBits > 0 && TailBits <= 31);
     static_assert(MainBits * 2 + TailBits == sizeof(T) * 8);
-    static_assert(StaticRowLen >= 0);
+    // Production plain kernels must take the row extent from the runtime
+    // `len` argument.  Keep the legacy template parameter temporarily so the
+    // dynamic-path cleanup stays isolated, but reject every exact-N
+    // instantiation at compile time.
+    static_assert(StaticRowLen == 0, "topk_plain requires a runtime row length");
     static_assert(StaticRowLen == 0 || (StaticRowLen + BlockSize - 1) / BlockSize == ElemsPerThread);
     static_assert(!UseWaveWinnerReserve || WARP_SIZE == 64);
     static_assert(!UseWaveWinnerReserve || BlockSize % WARP_SIZE == 0);
@@ -4412,7 +4416,10 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     static_assert(!UseGuardedFixedPredictor || WARP_SIZE == 64);
     static_assert(!UseGuardedFixedPredictor || BlockSize == 1024);
     static_assert(!UseGuardedFixedPredictor || (FixedSampleMin >= 0 && FixedSampleMin <= 360));
-    static_assert(StaticRowLen >= 0);
+    // See the register-resident kernel above: exact input extents are not a
+    // supported production specialization.  Every emitted kernel must use
+    // the runtime `len` argument for bounds and row stride.
+    static_assert(StaticRowLen == 0, "topk_plain requires a runtime row length");
     constexpr bool UseExactHighBucketPredictor = ExactHighBucket != 0;
     constexpr unsigned ExactLowBucket =
         ExactFirstBucket != 0 ? ExactFirstBucket : ExactHighBucket;
@@ -6465,100 +6472,18 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
         bool const specialized = buf != nullptr && topk_oneblock_use_large_bpp() &&
                                  in_idx == nullptr && rowStarts == nullptr &&
                                  rowEnds == nullptr && !select_min && k == 2048;
-        // The M=256 and M=4096 32K cells benefit from
-        // splitting the exact 0x403 predictor staging into known winners and
-        // the crossing bucket.  Stable pass-0 positions then feed pass 1
-        // directly; capacity or predictor misses retain the exact fallback.
-        if(specialized && topk_oneblock_is_gfx950() &&
-           (batch_size == 256 || batch_size == 4096) &&
-           len >= 32768 && len <= 32770)
-        {
-#define AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(ROW_LEN)                                    \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,    \
-                                              false, 270, ROW_LEN, 0x403u, 0x403u,     \
-                                              true, true, true, true>                   \
-            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx,           \
-                                                    select_min);                         \
-        return;
-            switch(static_cast<int>(len))
-            {
-                AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(32768)
-                AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(32769)
-                AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(32770)
-            default: break;
-            }
-#undef AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH
-        }
-        // At 32K the normal-distribution cutoff is almost always inside high
-        // radix bucket 0x403.  Count and stage that exact bucket in one pass;
-        // arbitrary inputs retain the complete histogram fallback.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 512 &&
-           len >= 32768 && len <= 32770)
-        {
-#define AITER_OB_LDSTAIL_EXACT32K_LAUNCH(ROW_LEN)                                      \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,    \
-                                              false, 270, ROW_LEN, 0x403u>              \
-            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx,           \
-                                                    select_min);                         \
-        return;
-            switch(static_cast<int>(len))
-            {
-                AITER_OB_LDSTAIL_EXACT32K_LAUNCH(32768)
-                AITER_OB_LDSTAIL_EXACT32K_LAUNCH(32769)
-                AITER_OB_LDSTAIL_EXACT32K_LAUNCH(32770)
-            default: break;
-            }
-#undef AITER_OB_LDSTAIL_EXACT32K_LAUNCH
-        }
-        // At 16K the k=2048 crossing point straddles the adjacent high radix
-        // buckets 0x406 and 0x407.  Count both exact boundaries while staging
-        // their inclusive prefix; a miss retains the full histogram path.
-        // Batch four adjacent values into each wave reservation for 16384 and
-        // 16385.  The near-green 16386 cell keeps split staging and direct LDS
-        // placement of already-known winners.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 1024 &&
-           len >= 16384 && len <= 16386)
-        {
-#define AITER_OB_LDSTAIL_EXACT16K_LAUNCH(ROW_LEN, USE_SPLIT, DIRECT_KNOWN, WAVE_B128, \
-                                         B128_PREFETCH)                                \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,    \
-                                              false, 270, ROW_LEN, 0x407u, 0x406u,     \
-                                               true, USE_SPLIT, DIRECT_KNOWN, false,     \
-                                               WAVE_B128, B128_PREFETCH>                 \
-            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx,           \
-                                                    select_min);                         \
-        return;
-            switch(static_cast<int>(len))
-            {
-                AITER_OB_LDSTAIL_EXACT16K_LAUNCH(16384, false, false, true, true)
-                AITER_OB_LDSTAIL_EXACT16K_LAUNCH(16385, false, false, true, false)
-                AITER_OB_LDSTAIL_EXACT16K_LAUNCH(16386, true, true, false, false)
-            default: break;
-            }
-#undef AITER_OB_LDSTAIL_EXACT16K_LAUNCH
-        }
+        // Medium rows use only runtime bounds and runtime row strides.  The
+        // predictor choice may still depend on a runtime range, but the input
+        // extent is never compiled into the kernel type.
         if(specialized && len >= 16384 && len <= 32770)
         {
             if((batch_size == 2048 || batch_size == 4096) && len <= 16386 &&
                topk_oneblock_is_gfx950())
             {
-                if(batch_size == 2048 && len == 16385)
-                {
-                    radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize,
-                                                          WRITE_TOPK_VALUES, true, 240, 16385>
-                        <<<batch_size, BlockSize, 0, stream>>>(
-                            in, len, k, out, out_idx, select_min);
-                }
-                else
-                {
-                    radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize,
-                                                          WRITE_TOPK_VALUES, true>
-                        <<<batch_size, BlockSize, 0, stream>>>(
-                            in, len, k, out, out_idx, select_min);
-                }
+                radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize,
+                                                      WRITE_TOPK_VALUES, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
             }
             else
             {
@@ -6574,50 +6499,6 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
            len <= 4098)
         {
             constexpr int RegBlockSize = 512;
-            // At M=1024 the short-tail rows also leave at most a few dozen
-            // entries in the pass-0 crossing bucket.  Reuse the proven Wave64
-            // reservation/direct-write path and finish those candidates with
-            // the ballot radix walk, avoiding the second block-wide reducer.
-            if(batch_size == 1024 && len >= 4096 && len <= 4098)
-            {
-                if(len == 4096)
-                {
-                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
-                                                     WRITE_TOPK_VALUES, 8, 11, 10, 4096,
-                                                     true, true, false, true>
-                        <<<batch_size, RegBlockSize, 0, stream>>>(
-                            in, len, k, out, out_idx, select_min);
-                }
-                else if(len == 4097)
-                {
-                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
-                                                     WRITE_TOPK_VALUES, 9, 11, 10, 4097,
-                                                     true, true, false, true>
-                        <<<batch_size, RegBlockSize, 0, stream>>>(
-                            in, len, k, out, out_idx, select_min);
-                }
-                else
-                {
-                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
-                                                     WRITE_TOPK_VALUES, 9, 11, 10, 4098,
-                                                     true, true, false, true>
-                        <<<batch_size, RegBlockSize, 0, stream>>>(
-                            in, len, k, out, out_idx, select_min);
-                }
-                return;
-            }
-            // The exact M=2048/N=4096 crossing bucket fits in one Wave64.
-            // Resolve it with the same deferred-histogram ballot walk used by
-            // the M=1024 short-tail rows instead of running a second reducer.
-            if(batch_size == 2048 && len == 4096)
-            {
-                radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
-                                                 WRITE_TOPK_VALUES, 8, 11, 10, 4096,
-                                                 true, true, false, true>
-                    <<<batch_size, RegBlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            }
             int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
 #define AITER_OB_REG512_LAUNCH(EPT)                                                       \
     case EPT:                                                                            \
@@ -6632,44 +6513,6 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
             default: break;
             }
 #undef AITER_OB_REG512_LAUNCH
-        }
-        // M=512 is the only 4K row count between the accepted low-M and
-        // high-row-count specializations.  Keep the 16-wave launch, compile
-        // the exact extent, cache radix bits, and reserve definite winners
-        // once per Wave64.  The ordinary seed-0 crossing bucket fits Wave0's
-        // ballot selector; wider/tied buckets retain the exact deferred
-        // histogram and tail fallbacks.  Only 64 candidate slots are reserved
-        // for this exact gate; a wider crossing bucket is detected from the
-        // exact atomic count and takes the existing full-row rescan fallback.
-        // Definite winners retain the faster dense LDS flush.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 512 &&
-           len >= 4096 && len <= 4098)
-        {
-            switch(static_cast<int>(len))
-            {
-            case 4096:
-                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                                 4, 12, 8, 4096, true, true, false, true,
-                                                 false, 0x40du, false, 64, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            case 4097:
-                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                                 5, 11, 10, 4097, true, true, false, true,
-                                                 false, 0x40du, false, 64, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            case 4098:
-                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                                 5, 11, 10, 4098, true, true, false, true,
-                                                 false, 0x40du, false, 64, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            default: break;
-            }
         }
         // The fifth element per lane only appears once a row grows past 4096
         // values. On low-row-count gfx950 launches, shrinking the two main
@@ -6688,139 +6531,15 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                     in, len, k, out, out_idx, select_min);
             return;
         }
-        // The remaining near-green M=256 4K cells still use the 16-wave
-        // register path. Compile their exact row extent and reserve pass-1
-        // winners once per wave instead of once per element.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 256 &&
-           len >= 4096 && len <= 4098)
-        {
-            switch(static_cast<int>(len))
-            {
-            case 4096:
-                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                                 4, 12, 8, 4096, true, true, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            case 4097:
-                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                                 5, 11, 10, 4097, true, true, true, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            case 4098:
-                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                                 5, 11, 10, 4098, true, true, true, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            default: break;
-            }
-        }
-        // Small seeded 8K grids use adjacent high radix buckets 0x40c/0x40d.
-        // Compile the exact row extent and accept either bucket before falling
-        // back to the ordinary exact histogram path.  Keep the dispatch exact
-        // so unrelated launch sizes retain their existing specialization.
-        if(specialized && topk_oneblock_is_gfx950() &&
-           (batch_size == 4 || batch_size == 8) &&
-           len >= 8192 && len <= 8194)
-        {
-            constexpr int RegBlockSize = 1024;
-#define AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(ROW_LEN, EPT)                          \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
-                                         12, 8, ROW_LEN, true, true, true, false, true, \
-                                         0x40cu>                                        \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
-                                                        select_min);                     \
-        return;
-            switch(static_cast<int>(len))
-            {
-                AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(8192, 8)
-                AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(8193, 9)
-                AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(8194, 9)
-            default: break;
-            }
-#undef AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH
-        }
-        // For two 8K rows, try the exact high-bucket predictor before the
-        // ordinary radix pass.  It retains the proven exact/cache/reservation/
-        // direct-write stack and always falls back to the full histogram when
-        // bucket 0x40d does not contain the requested rank.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 2 &&
-           len >= 8192 && len <= 8194)
-        {
-            constexpr int RegBlockSize = 1024;
-#define AITER_OB_REG_PREDICT_STATIC_LAUNCH(ROW_LEN, EPT)                               \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
-                                         12, 8, ROW_LEN, true, true, true, false, true> \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
-                                                        select_min);                     \
-        return;
-            switch(static_cast<int>(len))
-            {
-                AITER_OB_REG_PREDICT_STATIC_LAUNCH(8192, 8)
-                AITER_OB_REG_PREDICT_STATIC_LAUNCH(8193, 9)
-                AITER_OB_REG_PREDICT_STATIC_LAUNCH(8194, 9)
-            default: break;
-            }
-#undef AITER_OB_REG_PREDICT_STATIC_LAUNCH
-        }
-        // A single 8K row is especially sensitive to the LDS atomic tail:
-        // combine an exact row extent with one reservation per Wave64.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 1 &&
-           len >= 8192 && len <= 8194)
-        {
-            constexpr int RegBlockSize = 1024;
-#define AITER_OB_REG_WAVE_STATIC_LAUNCH(ROW_LEN, EPT)                                  \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
-                                         12, 8, ROW_LEN, true, true, true>              \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
-                                                        select_min);                     \
-        return;
-            switch(static_cast<int>(len))
-            {
-                AITER_OB_REG_WAVE_STATIC_LAUNCH(8192, 8)
-                AITER_OB_REG_WAVE_STATIC_LAUNCH(8193, 9)
-                AITER_OB_REG_WAVE_STATIC_LAUNCH(8194, 9)
-            default: break;
-            }
-#undef AITER_OB_REG_WAVE_STATIC_LAUNCH
-        }
         // With a large gfx950 grid, halve the waves per workgroup for 8K rows.
         // The 11+11+10 split keeps every histogram at no more than four
         // buckets per thread and cuts both LDS footprint and block-wide scan
-        // work. Keep the gate exact until both row counts have been validated.
+        // work. EPT is selected from runtime `len`; no exact row extent is
+        // compiled into either launch.
         if(specialized && topk_oneblock_is_gfx950() &&
            (batch_size == 2048 || batch_size == 4096) && len >= 8192 && len <= 8194)
         {
             constexpr int RegBlockSize = 512;
-            if(batch_size == 2048)
-            {
-#define AITER_OB_REG512_8K_STATIC_LAUNCH(ROW_LEN, EPT)                                  \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
-                                         11, 10, ROW_LEN>                                \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
-                                                        select_min);                     \
-        return;
-                switch(static_cast<int>(len))
-                {
-                case 8192:
-                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
-                                                     WRITE_TOPK_VALUES, 16, 11, 10, 8192, true,
-                                                     false, false, false, false, 0x40du, true>
-                        <<<batch_size, RegBlockSize, 0, stream>>>(
-                            in, len, k, out, out_idx, select_min);
-                    return;
-                    AITER_OB_REG512_8K_STATIC_LAUNCH(8193, 17)
-                    AITER_OB_REG512_8K_STATIC_LAUNCH(8194, 17)
-                default: break;
-                }
-#undef AITER_OB_REG512_8K_STATIC_LAUNCH
-            }
             int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
 #define AITER_OB_REG512_8K_LAUNCH(EPT)                                                    \
     case EPT:                                                                            \
