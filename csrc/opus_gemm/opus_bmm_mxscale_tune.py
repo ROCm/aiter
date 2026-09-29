@@ -352,7 +352,7 @@ def gen_bmm_mxscale_data(
     6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
     """
     torch.manual_seed(seed)
-    group = _kid_group(kernel_id)
+    group = _kid_quant_block(kernel_id)
     O_bf16 = _gen_varied((batch, m, k), k, device)
     W_bf16 = _gen_varied((batch, n, k), k, device)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)

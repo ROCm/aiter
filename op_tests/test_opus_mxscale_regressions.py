@@ -141,7 +141,7 @@ def test_public_mxscale_group_matches_reference(
     data = gen_bmm_mxscale_data(2, 96, 128, 2048, 991, dtypes.bf16, kid, split_k)
 
     def lookup(*args, **kwargs):
-        assert kwargs["group_size"] == group_size
+        assert kwargs["w_scale_block"] == f"{group_size}x{group_size}"
         return {"kernelId": kid, "splitK": split_k, "libtype": "opus"}
 
     monkeypatch.setattr(policy, "lookup_mxscale_bmm_config", lookup)
@@ -150,7 +150,7 @@ def test_public_mxscale_group_matches_reference(
         entry = bmm.batched_gemm_a8w8_mxscale
         if compiled:
             entry = torch.compile(entry, backend="aot_eager", fullgraph=True)
-        kwargs = {} if group_size == 128 else {"group_size": 32}
+        kwargs = {} if group_size == 128 else {"w_scale_block": "32x32"}
         result = entry(
             data[0].transpose(0, 1), data[1], data[3].transpose(0, 1), data[4], **kwargs
         )
