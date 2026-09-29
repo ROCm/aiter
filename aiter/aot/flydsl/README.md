@@ -9,9 +9,11 @@ the JIT path hits the cache instead of compiling again.
 | --- | --- | --- |
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
 | `gemm.py` | `GEMM` | GEMM kernels |
+| `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -43,6 +45,9 @@ python -m aiter.aot.flydsl.moe
 # GEMM
 python -m aiter.aot.flydsl.gemm
 
+# conv3d
+python -m aiter.aot.flydsl.conv
+
 # grouped MoE (gfx1250)
 python -m aiter.aot.flydsl.grouped_moe
 
@@ -54,6 +59,20 @@ python -m aiter.aot.flydsl.mega_moe
 
 # Restrict the deployment profiles when building a smaller custom image.
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
+```
+
+The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
+factor per call, so a serving process JIT-compiles each new combination on the
+request path. `fmha_fp8` enumerates every combination the wrapper's heuristics
+can reach for each head shape in its `DEFAULT_SHAPES` table. Add a model by
+adding an entry (`num_heads, num_kv_heads, head_dim, head_dim_v, layout`, heads
+per rank, layout `varlen_cross` for the chunked-prefill serving path).
+
+```bash
+# every configured shape (Kimi-K3 at TP8: 12:12:192:128 -> 92 kernels)
+python -m aiter.aot.flydsl.fmha_fp8
+# ad hoc shape, without editing DEFAULT_SHAPES
+python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
 MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
@@ -79,7 +98,7 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `AITER_GPU_TARGETS` / `ARCH` / `GPU_ARCHS` | Filter **GEMM** AOT jobs by target; other kinds are unfiltered. The first one set wins, in that order. Unset builds every job. | unset |
+| `AITER_GPU_TARGETS` / `ARCH` / `GPU_ARCHS` | Filter **GEMM** AOT jobs by target. The first one set wins, in that order. Unset builds every job. | unset |
 
 > **Compile target.** Each job is compiled for the arch in its `gfx` field, or
 > from the CSV `cu_num` via `cu_num_to_arch(...)` when `gfx` is empty. AOT

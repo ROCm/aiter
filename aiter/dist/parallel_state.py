@@ -1590,6 +1590,7 @@ class GroupCoordinator:
             # process groups that are destroyed by now.
             self.device_communicator = None
         if self.mq_broadcaster is not None:
+            self.mq_broadcaster.close()
             self.mq_broadcaster = None
 
 
