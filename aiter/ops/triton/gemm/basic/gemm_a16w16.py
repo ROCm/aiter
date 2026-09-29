@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
@@ -525,6 +526,7 @@ def gemm_a16w16_(
         ADD_BIAS=(bias is not None),
         SKIP_REDUCE=skip_reduce,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:

@@ -44,6 +44,7 @@ def _gemm_afp4wfp4_kernel(
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
     num_warps: gl.constexpr,
@@ -65,7 +66,7 @@ def _gemm_afp4wfp4_kernel(
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = gl.program_id(axis=0)
     # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT

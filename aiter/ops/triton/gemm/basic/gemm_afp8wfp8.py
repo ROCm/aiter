@@ -18,6 +18,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
@@ -306,6 +307,7 @@ def gemm_afp8wfp8(
             ws_ptr=partials,
             cnt_ptr=counters,
             cache_modifier=launch["cache_modifier"],
+            NUM_XCDS=get_num_xcds(),
             **scales,
             **launch_options,
         )
@@ -577,6 +579,7 @@ def gemm_afp8wfp8_preshuffle(
             w_scales.stride(1),
             A_SCALE_K_GROUP=x_scale_group_size,
             **config,
+            NUM_XCDS=get_num_xcds(),
         )
 
     if config["NUM_KSPLIT"] > 1:
