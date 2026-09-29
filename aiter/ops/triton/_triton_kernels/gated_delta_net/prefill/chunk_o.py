@@ -12,17 +12,17 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
     check_shared_mem,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_rebased_cu_seqlens,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.op import exp
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]

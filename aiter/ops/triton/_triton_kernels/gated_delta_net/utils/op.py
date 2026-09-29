@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
     IS_GATHER_SUPPORTED,
     IS_TMA_SUPPORTED,
 )

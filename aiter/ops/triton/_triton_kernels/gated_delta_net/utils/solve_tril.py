@@ -15,15 +15,15 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
     IS_TMA_SUPPORTED,
     autotune_cache_kwargs,
     input_guard,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.index import (
     prepare_chunk_indices,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.op import (
     make_tensor_descriptor,
 )
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs

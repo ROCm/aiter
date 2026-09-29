@@ -15,17 +15,17 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
     IS_AMD,
     autotune_cache_kwargs,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_rebased_cu_seqlens,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.solve_tril import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.solve_tril import (
     FLA_TRIL_PRECISION,
     solve_tril,
 )
