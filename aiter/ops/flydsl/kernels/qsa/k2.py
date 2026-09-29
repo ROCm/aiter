@@ -702,14 +702,11 @@ def build_qsa_k2_module(
             # chunk held across QK slowed BN32 prefill, so gfx942_v_pf is
             # set only when that one chunk is the whole gather.
             v_frags_pf = []
-            if const_expr(use_k32) and const_expr(not decode_tr_pv):
-                for gr in range_constexpr(v_pf_rounds):
-                    d_chunk = chunk_owner + Int32(gr * col_owners)
-                    v_src = fx.slice(v_row, (None, d_chunk))
-                    v_frag = fx.make_fragment_like(v_src)
-                    fx.copy(g_copy, v_src, v_frag)
-                    v_frags_pf.append(v_frag)
-            elif const_expr(gfx942_v_pf):
+            if (
+                const_expr(use_k32)
+                and const_expr(not decode_tr_pv)
+                or const_expr(gfx942_v_pf)
+            ):
                 for gr in range_constexpr(v_pf_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
@@ -1303,6 +1300,36 @@ def qsa_k2_serves(
     return None
 
 
+def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
+    """Return the caller pair, or raise if it cannot hold this split."""
+    if not isinstance(workspace, tuple) or len(workspace) != 2:
+        raise ValueError("workspace must be (partial_out, partial_lse)")
+    partial_out, partial_lse = workspace
+    out_shape = (n_splits, rows, n_q_heads, head_dim)
+    lse_shape = (n_splits, rows, n_q_heads)
+    if (
+        not isinstance(partial_out, torch.Tensor)
+        or partial_out.dtype != torch.float32
+        or tuple(partial_out.shape) != out_shape
+        or not partial_out.is_contiguous()
+        or partial_out.device != device
+    ):
+        raise ValueError(
+            f"partial_out must be contiguous float32 {out_shape} on {device}"
+        )
+    if (
+        not isinstance(partial_lse, torch.Tensor)
+        or partial_lse.dtype != torch.float32
+        or tuple(partial_lse.shape) != lse_shape
+        or not partial_lse.is_contiguous()
+        or partial_lse.device != device
+    ):
+        raise ValueError(
+            f"partial_lse must be contiguous float32 {lse_shape} on {device}"
+        )
+    return partial_out, partial_lse
+
+
 def qsa_k2(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1312,8 +1339,14 @@ def qsa_k2(
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
     softmax_scale: float | None = None,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Write sparse GQA ``o [M, Hq, D]`` from paged K/V."""
+    """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
+
+    ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
+    ``None`` allocates that pair. A one-split launch writes ``out``
+    directly and does not read ``workspace``.
+    """
     reason = qsa_k2_serves(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
         raise ValueError(f"[FlyDSL qsa_k2] {reason}")
@@ -1359,14 +1392,20 @@ def qsa_k2(
     n_sel = int(indices.shape[1])
     block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
     if n_splits == 1:
+        # The split kernel stores straight into out. A caller workspace
+        # is not a second buffer on this path.
         partial_out = out
         partial_lse = out
-    else:
+    elif workspace is None:
         partial_out = torch.empty(
             (n_splits, rows, n_q_heads, head_dim), dtype=torch.float32, device=q.device
         )
         partial_lse = torch.empty(
             (n_splits, rows, n_q_heads), dtype=torch.float32, device=q.device
+        )
+    else:
+        partial_out, partial_lse = _take_k2_workspace(
+            workspace, n_splits, rows, n_q_heads, head_dim, q.device
         )
 
     _run_compiled(
