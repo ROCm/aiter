@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.fused_add_rmsnorm_pad import (
     _gluon_fused_add_rmsnorm_pad_kernel,
 )
 from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import (
