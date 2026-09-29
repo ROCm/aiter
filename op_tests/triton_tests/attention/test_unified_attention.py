@@ -823,9 +823,23 @@ def test_triton_unified_attn_gfx942_large_prefill(
     )
 
     # assert the intended table entry serves this call
-    table, axes, _ = _load("attn_2d", "triton", "gfx942")
     dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
-    if max_query_len == 1:
+    # decode without a sliding window takes the 3D kernel on gfx942
+    # (use_2d_kernel needs sliding_window > 0 there); assert that table
+    # instead of attn_2d for those cases
+    is_3d = max_query_len == 1 and sliding_window is None
+    table, axes, _ = _load("attn_3d" if is_3d else "attn_2d", "triton", "gfx942")
+    if is_3d:
+        if shuffled_kv_cache:
+            expected_key = (
+                f"D_GEQ_{head_size}.SHUF" if head_size == 256 else f"D_GEQ_{head_size}"
+            )
+            expected_block_m = 16
+        else:
+            # pre-existing entries: d512 stage-1, everything else 'any'
+            expected_key = f"D_GEQ_{head_size}" if head_size == 512 else "any"
+            expected_block_m = 16
+    elif max_query_len == 1:
         # decode: d256 shuffled routes to the SHUF stage-1 entry (the
         # stage-2 D_GEQ_256.Q_LEQ_1 exceeds LDS at TILE 128); d512 decode
         # is already stage-1 and needs no SHUF variant

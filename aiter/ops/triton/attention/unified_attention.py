@@ -255,7 +255,15 @@ def unified_attention(
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
         )
-        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+        if (
+            q_dtype == e4m3_dtype
+            and kv_cache_dtype == e4m3_dtype
+            # the Triton kernels pin the shuffled tile to the page; the Gluon
+            # loaders keep their tuned tile and only need block_size >= k_width
+            and not (
+                DEVICE_ARCH == "gfx950" and _unified_attention_kernel_gfx950 is not None
+            )
+        ):
             assert (
                 block_size >= 32
             ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
