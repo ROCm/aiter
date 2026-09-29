@@ -1162,6 +1162,148 @@ def test_k2_empty_cache_or_table_returns_zeros():
         k2_kernel._run_compiled = original
 
 
+def test_k2_caller_workspace_is_the_only_partial_buffer():
+    """A caller-owned split workspace is the buffer the kernel writes.
+
+    The default launch still allocates that pair itself. A workspace
+    launch writes the caller's tensors and does not allocate another
+    pair. One split still aliases the output and allocates nothing.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    from aiter.ops.flydsl.kernels.qsa.k2 import _launch_config
+
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 1, 64, 16, 32
+    torch.manual_seed(0)
+    q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    k_cache, kv_table = pack_paged_cache(k, page_size)
+    v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
+    _block_n, _threads, n_splits = _launch_config(m, width, gqa.kv_heads, gqa.head_dim)
+    if n_splits <= 1:
+        raise AssertionError(f"workspace shape did not split (n_splits={n_splits})")
+    out_shape = (n_splits, m, gqa.n_heads, gqa.head_dim)
+    lse_shape = (n_splits, m, gqa.n_heads)
+    partial_out = torch.full(out_shape, 7, dtype=torch.float32, device=device)
+    partial_lse = torch.full(lse_shape, 3, dtype=torch.float32, device=device)
+    out_default = torch.empty_like(q)
+    out_ws = torch.empty_like(q)
+    ref = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, out=out_default)
+    try:
+        got = qsa_k2(
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            kv_table,
+            token_to_req,
+            out=out_ws,
+            workspace=(partial_out, partial_lse),
+        )
+    except TypeError as error:
+        raise AssertionError(
+            "qsa_k2 does not accept a caller-owned split workspace"
+        ) from error
+    if not torch.equal(got, ref):
+        raise AssertionError("workspace launch diverged from the default launch")
+    if torch.all(partial_out == 7):
+        raise AssertionError("caller partial_out was not written")
+
+    def _peak_bytes(use_workspace):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+        start = torch.cuda.memory_allocated(device)
+        qsa_k2(
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            kv_table,
+            token_to_req,
+            out=out_default,
+            workspace=(partial_out, partial_lse) if use_workspace else None,
+        )
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated(device) - start
+
+    one = partial_out.nbytes
+    default_bytes = _peak_bytes(False)
+    workspace_bytes = _peak_bytes(True)
+    if default_bytes < one or default_bytes >= 2 * one:
+        raise AssertionError(
+            f"default launch allocated {default_bytes} bytes for a {one}-byte partial"
+        )
+    if workspace_bytes >= one:
+        raise AssertionError(
+            f"workspace launch allocated another {workspace_bytes} bytes"
+        )
+    bad = torch.empty(
+        (n_splits + 1, *out_shape[1:]), dtype=torch.float32, device=device
+    )
+    try:
+        qsa_k2(
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            kv_table,
+            token_to_req,
+            out=out_ws,
+            workspace=(bad, partial_lse),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("wrong workspace shape was accepted")
+
+    m1, width1 = 2, 8
+    q1 = torch.randn(m1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    indices1 = torch.randint(0, seq_len, (m1, width1), dtype=dtypes.i32, device=device)
+    indices1[:, -1] = -1
+    token1 = torch.zeros(m1, dtype=dtypes.i32, device=device)
+    splits1 = _launch_config(m1, width1, gqa.kv_heads, gqa.head_dim)[2]
+    if splits1 != 1:
+        raise AssertionError(f"one-split shape used {splits1} splits")
+    out1 = torch.empty_like(q1)
+    ref1 = qsa_k2(q1, k_cache, v_cache, indices1, kv_table, token1, out=out1)
+    ignored = (
+        torch.empty(
+            4, m1, gqa.n_heads, gqa.head_dim, dtype=torch.float32, device=device
+        ),
+        torch.empty(4, m1, gqa.n_heads, dtype=torch.float32, device=device),
+    )
+    out1b = torch.empty_like(q1)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats(device)
+    start = torch.cuda.memory_allocated(device)
+    got1 = qsa_k2(
+        q1,
+        k_cache,
+        v_cache,
+        indices1,
+        kv_table,
+        token1,
+        out=out1b,
+        workspace=ignored,
+    )
+    torch.cuda.synchronize()
+    one_split_bytes = torch.cuda.max_memory_allocated(device) - start
+    if not torch.equal(got1, ref1):
+        raise AssertionError("one-split workspace launch diverged")
+    if one_split_bytes >= ignored[0].nbytes:
+        raise AssertionError(f"one-split launch allocated {one_split_bytes} bytes")
+
+
 def test_family_a_k1_bench_times_expand():
     """``_flydsl_k1_select`` returns block ids and the vendored expand.
 
@@ -2795,6 +2937,7 @@ def _run_unit_cases():
     test_k2_empty_first_tile_keeps_later_token()
     test_k2_default_out_ignores_query_strides()
     test_k2_empty_cache_or_table_returns_zeros()
+    test_k2_caller_workspace_is_the_only_partial_buffer()
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_aot_collector_lists_family_a_launches()
