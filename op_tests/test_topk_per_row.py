@@ -854,7 +854,8 @@ aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
 assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
 
 
-card = (get_gfx(), topk._decode_cu_count(torch.cuda.current_device()))
+device = torch.cuda.current_device()
+card = (topk._decode_arch(device), topk._decode_cu_count(device))
 if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     # The table picks these shapes and k, not the command line: every band this
     # card ships runs once, at a corner small enough to allocate here.
