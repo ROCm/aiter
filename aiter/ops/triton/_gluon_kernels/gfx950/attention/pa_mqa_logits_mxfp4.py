@@ -174,12 +174,14 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
     )
 
 
-# ends arrives as a row slice, so its alignment moves; it is read once per row
-@triton.jit(do_not_specialize_on_alignment=["ends_ptr"])
+# ends and seq arrive as row slices, so their alignment moves; each is read once
+# per row
+@triton.jit(do_not_specialize_on_alignment=["ends_ptr", "seq_ptr"])
 def _prepare_candidates_kernel(
     ids_ptr,
     ends_ptr,
     bt_ptr,
+    seq_ptr,
     pos_ptr,
     cu_ptr,
     slots_ptr,
@@ -188,6 +190,7 @@ def _prepare_candidates_kernel(
     K: tl.constexpr,
     C: tl.constexpr,
     PAGE: tl.constexpr,
+    HAS_SEQ: tl.constexpr,
 ):
     """Ranked block ids -> the walk's candidate list, one row per program.
 
@@ -214,7 +217,12 @@ def _prepare_candidates_kernel(
     tail = tl.minimum(C, end - max_id * C)
     tl.store(cu_ptr + row, tl.where(n_valid > 0, (n_valid - 1) * C + tail, 0))
 
-    page = tl.load(bt_ptr + row * stride_bt + pos // PAGE)
+    # With seq the table holds a row per sequence rather than per query row
+    if HAS_SEQ:
+        bt_row = tl.load(seq_ptr + row).to(tl.int64)
+    else:
+        bt_row = row
+    page = tl.load(bt_ptr + bt_row * stride_bt + pos // PAGE)
     tl.store(slots_ptr + row * K + cols, page * PAGE + pos % PAGE)
 
 
