@@ -3648,6 +3648,8 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a == dtypes.bf16
         and dtype == dtypes.bf16
+        and not has_stage2_scatter
+        and not has_activation_scales
         and bool(opus_weights_shuffled)
         and get_gfx() == "gfx950"
     ):
