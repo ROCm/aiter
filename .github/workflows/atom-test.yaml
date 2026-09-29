@@ -12,19 +12,28 @@ on:
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:
+    inputs:
+      triage:
+        description: Replay PR 2699 with diagnostics (experimental branch only)
+        type: boolean
+        default: false
+      triage_model:
+        description: Model from the pinned ATOM accuracy matrix
+        type: string
+        default: Kimi-K2.7-Code-MXFP4
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BRANCH: "main"
+  ATOM_BRANCH: ${{ inputs.triage && 'aa0c5c3a131d98124726b41ab62342bb8cafb207' || 'main' }}
   ATOM_REPOSITORY_URL: "ROCm/ATOM"
-  BASE_IMAGE: "rocm/atom-dev:latest"
+  BASE_IMAGE: ${{ inputs.triage && 'rocm/atom-dev@sha256:7ab6365ab92d78eea5a517b5ab4ea8fc579f9d88bb753ca8ccb8b2f7c1c60686' || 'rocm/atom-dev:latest' }}
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
-  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+  GITHUB_REPO_URL: ${{ inputs.triage && 'https://github.com/0xDELUXA/aiter.git' || github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
+  GITHUB_COMMIT_SHA: ${{ inputs.triage && '9bd0ae391992afb7e1c34c1fbd6eef2bc2caae18' || github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
   ci_config:
@@ -49,6 +58,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Wait for Checks workflow
+        if: ${{ !inputs.triage }}
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,6 +86,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          TRIAGE_MODEL: ${{ inputs.triage && inputs.triage_model || '' }}
         run: |
           python3 <<'PY'
           import json
@@ -97,6 +108,8 @@ jobs:
               # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
               {"model_name": "Kimi-K2.7-Code-MXFP4"},
           ]
+          if os.environ.get("TRIAGE_MODEL"):
+              default_models = [{"model_name": os.environ["TRIAGE_MODEL"]}]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
           labels = json.loads(labels_raw)
@@ -212,6 +225,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
@@ -219,6 +233,22 @@ jobs:
         with:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
           ref: ${{ env.ATOM_BRANCH }}
+
+      - name: Checkout diagnostic scripts
+        if: inputs.triage
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/aiter
+          ref: ${{ github.sha }}
+          path: .aiter-ci-tools
+          sparse-checkout: .github/scripts/atom-ci
+          persist-credentials: false
+
+      - name: Guard experimental replay
+        if: inputs.triage
+        env:
+          BRANCH: ${{ github.ref }}
+        run: test "$BRANCH" = refs/heads/leo/atom-ci-triage
 
       - name: Docker login
         env:
@@ -331,6 +361,16 @@ jobs:
         run: |
           docker exec atom_aiter_test bash -lc "pip show amd-aiter atom && pip list"
 
+      - name: Start diagnostic recording
+        if: inputs.triage
+        run: |
+          mkdir -p atom_diagnostics
+          git rev-parse HEAD > atom_diagnostics/atom-sha.txt
+          docker image inspect "$BASE_IMAGE" --format '{{json .RepoDigests}}' > atom_diagnostics/image-digests.json
+          docker exec atom_aiter_test bash -lc 'cd /app/aiter-test && git rev-parse HEAD && git submodule status' > atom_diagnostics/aiter-revisions.txt
+          docker exec atom_aiter_test bash -lc 'pip list --format=json' > atom_diagnostics/packages.json
+          docker exec -d atom_aiter_test bash -lc 'exec python3 /workspace/.aiter-ci-tools/.github/scripts/atom-ci/monitor.py /workspace/atom_diagnostics'
+
       - name: Download Models
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 150
@@ -363,6 +403,8 @@ jobs:
           MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Run ATOM accuracy test
+        id: accuracy
+        continue-on-error: ${{ inputs.triage == true }}
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 90
         env:
@@ -411,6 +453,33 @@ jobs:
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
 
+      - name: Observe build after watchdog failure
+        id: observe
+        if: inputs.triage && steps.accuracy.outcome == 'failure'
+        timeout-minutes: 22
+        run: |
+          cp atom_accuracy_output.txt atom_diagnostics/baseline-accuracy.txt
+          docker cp atom_aiter_test:/tmp/atom_client.log atom_diagnostics/baseline-client.log
+          docker cp atom_aiter_test:/tmp/atom_server.log atom_diagnostics/baseline-server.log
+          grep -q 'HANG detected' atom_accuracy_output.txt
+          docker exec atom_aiter_test bash -lc 'python3 /workspace/.aiter-ci-tools/.github/scripts/atom-ci/observe_build.py /tmp/atom_server.log /workspace/atom_diagnostics'
+
+      - name: Warm-cache accuracy comparison
+        id: warm_accuracy
+        if: inputs.triage && steps.observe.outcome == 'success'
+        timeout-minutes: 35
+        env:
+          MODEL_PATH: ${{ matrix.model_path }}
+          CLIENT_COMMAND: ${{ matrix.client_command || '' }}
+        run: |
+          docker exec -e MODEL_PATH -e CLIENT_COMMAND atom_aiter_test bash -lc '.github/scripts/atom_test.sh accuracy "/models/$MODEL_PATH"' 2>&1 | tee atom_diagnostics/warm-accuracy.txt
+
+      - name: Retain baseline failure
+        if: inputs.triage && steps.accuracy.outcome == 'failure'
+        run: |
+          echo 'The unmodified baseline failed. Diagnostic continuation does not turn it into a pass.'
+          exit 1
+
       - name: Check accuracy test results
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
         run: |
@@ -446,6 +515,18 @@ jobs:
         with:
           name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_accuracy_output.txt
           path: atom_accuracy_output.txt
+          retention-days: 7
+
+      - name: Collect diagnostics before cleanup
+        if: inputs.triage && always()
+        run: bash .aiter-ci-tools/.github/scripts/atom-ci/collect.sh
+
+      - name: Upload diagnostics
+        if: inputs.triage && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-triage-${{ matrix.model_name }}-${{ github.run_attempt }}
+          path: atom_diagnostics/
           retention-days: 7
 
       - name: Clean Up
