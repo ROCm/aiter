@@ -2030,6 +2030,12 @@ def run_case(
         if replayed is not None:
             row["fused_graph_rel_l2"] = rel_l2(replayed, fused(inputs))
             del replayed
+            # the timed replays must compute what the eager launch does
+            if row["fused_graph_rel_l2"] >= args.rtol:
+                raise AssertionError(
+                    f"{shape.tag(tp)} tokens={global_tokens}: fused graph "
+                    f"replay rel_l2={row['fused_graph_rel_l2']:.6f} exceeds {args.rtol}"
+                )
         split_graph = row.get("split_graph_us", float("nan"))
         fused_graph = row.get("fused_graph_us", float("nan"))
         # `fused_graph > 0` is also the NaN guard: a failed capture returns NaN,
@@ -2259,6 +2265,8 @@ def run_case_sp(shape, weights, ctxs, args, global_tokens, max_local_tokens, p2p
         row["fused_graph_us"], rep = _sp_time_graph(devices, lambda r: fused[r](inputs[r]), args)
         if rep is not None:
             row["fused_graph_rel_l2"] = _sp_rel_l2(rep, yf)
+            if not row["fused_graph_rel_l2"] < args.rtol:
+                raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: fused graph replay rel_l2={row['fused_graph_rel_l2']:.6f}")
         f = row["fused_graph_us"]
         row["graph_speedup"] = row["split_graph_us"] / f if f > 0 else float("nan")
     return row
