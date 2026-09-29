@@ -23,12 +23,16 @@ def _load_unshuffle_segment(
     preshuffled weight matrix via coalesced row-major loads, then unshuffle
     in registers.  PaddedHeadDim is HeadDim rounded up to the next power of 2.
     Out-of-range rows are zero-filled so dot-products stay correct.
+
+    Inverse of ``aiter.ops.shuffle.shuffle_weight``
     """
     NumNBlk: tl.constexpr = HeadDim // 16
     PaddedNumNBlk: tl.constexpr = PaddedHeadDim // 16
     SegKBlocks: tl.constexpr = ScaleKGranularity // 32
     NumKBlkTotal: tl.constexpr = KV_CDim // 32
     PaddedTotalRows: tl.constexpr = PaddedNumNBlk * SegKBlocks
+    ElemsPerGroup: tl.constexpr = 128 // base_ptr.type.element_ty.primitive_bitwidth
+    GroupsPerKBlk: tl.constexpr = 32 // ElemsPerGroup
 
     offs_nb = tl.arange(0, PaddedNumNBlk)
     offs_kb = tl.arange(0, SegKBlocks)
@@ -50,7 +54,9 @@ def _load_unshuffle_segment(
 
     w = tl.reshape(
         tl.permute(
-            tl.reshape(raw, (PaddedNumNBlk, SegKBlocks, 2, 16, 16)),
+            tl.reshape(
+                raw, (PaddedNumNBlk, SegKBlocks, GroupsPerKBlk, 16, ElemsPerGroup)
+            ),
             (0, 3, 1, 2, 4),
         ),
         (PaddedHeadDim, ScaleKGranularity),
@@ -430,6 +436,12 @@ def _triton_gather_kv_b_proj_impl(
     # Pipeline Start
     # ===---------------------------------------------------
     k_type = k_buffer.dtype.element_ty
+    w_type = kv_proj_weight.dtype.element_ty
+    # tl.dot needs both operands in one dtype; widen to the larger so an
+    # unquantized bf16 weight is never narrowed to an fp8 kv cache.
+    dot_type = (
+        w_type if w_type.primitive_bitwidth > k_type.primitive_bitwidth else k_type
+    )
     if k_type == tl.bfloat16:
         k_scalar_scale = 1.0
     else:
@@ -466,29 +478,29 @@ def _triton_gather_kv_b_proj_impl(
         # with zero-filled rows beyond HeadDim
         k_nope_weight_0 = _load_unshuffle_segment(
             k_head_base, 0, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_1 = _load_unshuffle_segment(
             k_head_base, 1, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_2 = _load_unshuffle_segment(
             k_head_base, 2, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_3 = _load_unshuffle_segment(
             k_head_base, 3, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
 
         v_nope_weight_0 = _load_unshuffle_segment(
             v_head_base, 0, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_1 = _load_unshuffle_segment(
             v_head_base, 1, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_2 = _load_unshuffle_segment(
             v_head_base, 2, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_3 = _load_unshuffle_segment(
             v_head_base, 3, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
     else:
         k_nope_weight_base_offset = (
             k_head_base + offs_n_k[:, None] * KV_CDim + offs_k[None, :]
@@ -498,22 +510,22 @@ def _triton_gather_kv_b_proj_impl(
             k_nope_weight_base_offset + 0 * ScaleKGranularity,
             mask=k_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_1 = tl.load(
             k_nope_weight_base_offset + 1 * ScaleKGranularity,
             mask=k_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_2 = tl.load(
             k_nope_weight_base_offset + 2 * ScaleKGranularity,
             mask=k_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_3 = tl.load(
             k_nope_weight_base_offset + 3 * ScaleKGranularity,
             mask=k_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
 
         v_nope_weight_base_offset = (
             v_head_base + offs_n_v[:, None] * KV_CDim + offs_k[None, :]
@@ -523,22 +535,22 @@ def _triton_gather_kv_b_proj_impl(
             v_nope_weight_base_offset + 0 * ScaleKGranularity,
             mask=v_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_1 = tl.load(
             v_nope_weight_base_offset + 1 * ScaleKGranularity,
             mask=v_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_2 = tl.load(
             v_nope_weight_base_offset + 2 * ScaleKGranularity,
             mask=v_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_3 = tl.load(
             v_nope_weight_base_offset + 3 * ScaleKGranularity,
             mask=v_mask_2d,
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
 
     if (not NO_SCALE) and (not PER_ROW_SCALE):
         k_nope_scale_0 = tl.load(
@@ -642,22 +654,22 @@ def _triton_gather_kv_b_proj_impl(
             k_buffer + kv_c_data_base_offset + 0 * CHUNK_STRIDE,
             mask=row_mask,
             other=0.0,
-        )
+        ).to(dot_type)
         kv_c_data_1 = tl.load(
             k_buffer + kv_c_data_base_offset + 1 * CHUNK_STRIDE,
             mask=row_mask,
             other=0.0,
-        )
+        ).to(dot_type)
         kv_c_data_2 = tl.load(
             k_buffer + kv_c_data_base_offset + 2 * CHUNK_STRIDE,
             mask=row_mask,
             other=0.0,
-        )
+        ).to(dot_type)
         kv_c_data_3 = tl.load(
             k_buffer + kv_c_data_base_offset + 3 * CHUNK_STRIDE,
             mask=row_mask,
             other=0.0,
-        )
+        ).to(dot_type)
         if SHUFFLED_KV_CACHE:
             kv_pe_data = tl.load(
                 k_buffer
@@ -806,7 +818,11 @@ def _triton_gather_kv_b_proj_flat(
     stride_v_prefix = tl.full([], TpNumHeads * VHeadDim, dtype=tl.int64)
 
     k_type = k_buffer.dtype.element_ty
-    dot_type = tl.bfloat16 if NO_SCALE else k_type
+    w_type = kv_proj_weight.dtype.element_ty
+    # tl.dot needs both operands in one dtype
+    dot_type = (
+        w_type if w_type.primitive_bitwidth > k_type.primitive_bitwidth else k_type
+    )
     k_scalar_scale = 1.0 if k_type == tl.bfloat16 else tl.load(k_scale)
     offs_n_k = tl.arange(0, PaddedK)
     offs_n_v = tl.arange(0, PaddedV)

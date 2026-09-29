@@ -1,87 +1,163 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness for the exact one-shot (1-stage) all-reduce and its fused form.
+"""Correctness and timing for the exact one-shot (1-stage) all-reduce and its
+fused form (``OneShotAllReduceRMSNorm``).
 
 Two kernels, one schedule: ``OneShotAllReduce`` (plain) and
 ``OneShotAllReduceRMSNorm`` (all-reduce + residual add + RMSNorm, the drop-in
 for ``aiter::allreduce_fusion_kernel_1stage<T, T, N, false>``).
 
-Three things are checked per shape, and the second and third matter more than
-the first:
+``python3`` this file runs three sweeps, each ending in a markdown table. A
+default run drives the engine as production does -- no tuning knob pinned, so
+it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
+derived from ``allreduce_policy``: at every world size, both ends of each
+rung's slice of the window the policy routes to the one-shot. Next to it, a
+few spot checks run pinned configurations no shipped rung uses, one world size
+each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self``
+pin a configuration instead.
+
+``test_one_shot_allreduce`` checks three things per shape, and the second
+matters more than the first:
 
 1. The sum is right, against an fp32 reference, at the bf16 rounding floor.
 2. The result is **bit-identical on every rank**. The kernel accumulates in a
    fixed rank order for exactly this reason, and an SQNR check cannot see an
    ordering bug -- both answers would be equally "accurate".
-3. Repeated back-to-back calls stay correct under deliberate rank skew. The
-   inbox is double-buffered by ``colour & 1`` and the safety argument depends
-   on a straggler's read of call k finishing before anyone's push for call
-   k+2; a quiescent test never exercises that. Covered by
-   ``test_one_shot_allreduce_run_ahead`` and its fused counterpart.
+3. It is timed with ``run_perftest``. One row per world size captures the
+   all-reduce into a CUDA graph and replays it, checking 1 and 2 after every
+   replay.
 
-The fused suites add a fourth, which is the strongest check here:
-``residual_out`` must be **bit-exact** against the reference, not merely close.
-Both sides sum in rank order in fp32 and round exactly once, so equality is the
-correct expectation -- and it is the only cheap way to catch a missing bf16
-round-trip before the residual add, an error SQNR on ``out`` is far too loose
-to see and that compounds per layer in a real model.
+``test_one_shot_allreduce_coverage`` checks that those rows ran every rung the
+engine's own ``cfgs_for`` says the production window selects, so a retuned
+ladder or policy the payload derivation does not follow fails rather than
+silently leaving a rung untested.
+
+``test_one_shot_allreduce_run_ahead`` makes repeated back-to-back calls under
+deliberate rank skew. The inbox is double-buffered by ``colour & 1`` and the
+safety argument depends on a straggler's read of call k finishing before
+anyone's push for call k+2; a quiescent test never exercises that.
+
+The fused suites add a fourth check: ``residual_out`` must be **bit-exact**
+against the reference, not merely close. Both sides sum in rank order in fp32
+and round exactly once, so equality is the correct expectation -- and it is the
+only cheap way to catch a missing bf16 round-trip before the residual add, an
+error SQNR on ``out`` is far too loose to see and that compounds per layer in a
+real model.
+
+``--extended`` runs the spot-check configurations at every world size, and the
+spot-check shapes on the production engine too.
+
+Every rank is a ``multiprocessing`` spawn worker (plain tests) or a subprocess
+(fused tests); one spawn per engine configuration and world size runs every
+sweep. OneShotAllReduce runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs
+skip, and ``main()`` skips a world size when fewer GPUs are visible than TP.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+from multiprocessing import Pool, freeze_support, set_start_method
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import pytest
+import pandas as pd
 import torch
 
+import aiter
+from aiter import dtypes
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-pytest.importorskip("flydsl")
+set_start_method("spawn", force=True)
 
+from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
     SUPPORTED_BLOCKS,
+    oneshot_ladder,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import SUPPORTED_WORLDS
-from aiter.ops.flydsl.quick_allreduce_int4 import _SUPPORTED_ARCHS
 
-ARCH = get_gfx_runtime()
-
-pytestmark = pytest.mark.skipif(
-    ARCH not in _SUPPORTED_ARCHS,
-    reason="OneShotAllReduce unsupported arch (need gfx942 or gfx950)",
-)
+try:
+    ARCH = get_gfx_runtime()
+except (KeyError, RuntimeError):
+    ARCH = None
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 HIDDEN = 7168
-# Shapes chosen to straddle the interesting boundaries: a single 4 KiB tile,
-# a partial last tile, an exact multiple, and enough tiles to force several
-# per block at a small grid cap.
-SHAPES = (1, 2, 3, 5, 8, 11, 16)
 
-# The single-block corner, which HIDDEN=7168 cannot reach.
-NARROW_SHAPES = ((1, 2048), (1, 1024), (1, 3072), (2, 2048))
+# Production payloads are derived from the dispatch policy
+# (``_production_payloads``) and laid out in rows of this many bf16. Every
+# ladder floor is a whole number of 2 KiB rows, and a row is under every rung's
+# tile, so the lowest payload is the sub-tile, single-block corner.
+ROW = 1024
+_ROW_BYTES = ROW * 2
 
-_SHAPE_CASES = tuple((m, HIDDEN, f"m={m}") for m in SHAPES) + tuple(
-    (m, hidden, f"{m}x{hidden}") for m, hidden in NARROW_SHAPES
+# Shapes for the spot checks. m x HIDDEN spans 14 KiB to 224 KiB. m = 1, 3, 5
+# end in a partial last tile and m = 8, 16 on an exact multiple at every rung's
+# tile width. The narrow shapes reach the sub-tile, single-block corner HIDDEN
+# cannot.
+SPOT_SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [
+    (1, 1024),
+    (1, 2048),
+    (1, 3072),
+]
+
+# Each replay advances the device-side colour and alternates the inbox parity
+# slot, so only repeated replays show the captured launch advancing that state
+# rather than freezing it.
+GRAPH_REPLAYS = 4
+
+# (tp, knobs): pinned configurations a default run spot-checks next to the
+# shipped ladder, one world size each, for widths no shipped rung uses yet.
+# Block 512 is the widest workgroup; at atoms=4 it is a 32 KiB tile, so every
+# spot shape is a single partial tile. ``--extended`` runs each at every world
+# size.
+SPOT_CONFIGS = (
+    (
+        4,
+        {
+            "atoms": 1,
+            "grid_cap": 64,
+            "fanout": "peer",
+            "block": 512,
+            "skip_self": False,
+        },
+    ),
+    (
+        2,
+        {
+            "atoms": 4,
+            "grid_cap": 64,
+            "fanout": "peer",
+            "block": 512,
+            "skip_self": True,
+        },
+    ),
 )
 
 RUN_AHEAD_M = 5
 RUN_AHEAD_ITERS = 200
 SQNR_FLOOR_DB = 45.0
+
+# Seconds to wait for each rank of a spawn. The kernels spin on flags written
+# by peers, so a protocol bug or a dead rank hangs the rest; this fails the
+# spawn instead of leaving it to CI's per-file timeout. A full default run of
+# either FlyDSL all-reduce test takes a few minutes, JIT included.
+SPAWN_TIMEOUT_S = 600
 
 # Fused (all-reduce + residual add + RMSNorm) coverage. The tile is one token
 # row there, so `hidden` is baked into the kernel and every distinct width is a
@@ -99,8 +175,7 @@ _FUSED_SHAPE_CASES = tuple(
 )
 
 # Widths with no native row geometry, which run on a *padded* workgroup: BLOCK
-# covers h_pad and the lanes past the real row are masked off. See
-# ``op_tests/dump_data/docs/flydsl_fused_allreduce_hidden_coverage.md``.
+# covers h_pad and the lanes past the real row are masked off.
 #
 # 896 -> 1024 and 2304 -> 2560 pad within one atom of the row; 2880 -> 3072 is
 # the gpt-oss width and the one that motivated this.
@@ -131,17 +206,38 @@ _FUSED_PAD_SHAPE_CASES = tuple(
 FUSED_ATOMS_CASES = ((2, 4096), (2, 8192), (4, 4096), (4, 8192))
 
 # The same geometries reached from the other side: pin `block` and let the
-# engine solve for atoms at each width. Worth its own cases because the
-# resolution is per-hidden and hidden-dependent -- block 256 is atoms=4 at 8192
-# and does not exist at 7168 -- so a pinned block is the one knob whose validity
-# the constructor cannot decide on its own.
+# engine solve for atoms at each width.
 FUSED_BLOCK_CASES = ((512, 4096), (256, 8192), (448, 7168))
 
 # Self-skip on the fused kernel: this rank's contribution comes out of registers
-# instead of out of its own inbox. `residual_out` is graded bit-exact, which is
-# what makes this a real check -- reading the register copy must produce the
-# same fp32 accumulation, in the same rank order, as the inbox round trip did.
+# instead of out of its own inbox.
 FUSED_SKIP_SELF_CASES = ((1, 4096), (8, 7168), (32, 8192))
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]]:
+    """Whole-row payloads covering the window the policy routes to the
+    one-shot, and that window, in bytes (inclusive).
+
+    The ladder picks a rung by floor alone, so each rung serves one contiguous
+    slice of the window; both ends of every slice are taken, which reaches
+    every rung and the largest payload each is asked to move.
+    """
+    policy = fly_policy.resolve_oneshot(link, tp)
+    lo, hi = policy.min_bytes, policy.max_bytes
+    ladder = oneshot_ladder(tp, link)
+    ends = [floor - 1 for floor, *_ in ladder[1:]] + [hi]
+    payloads = set()
+    for (floor, *_rung), end in zip(ladder, ends):
+        first = -(-max(lo, floor, 1) // _ROW_BYTES) * _ROW_BYTES
+        last = min(hi, end) // _ROW_BYTES * _ROW_BYTES
+        if first <= last:
+            payloads.update((first, last))
+    return sorted(payloads), (lo, hi)
 
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
@@ -152,6 +248,52 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     if e == 0:
         return float("inf")
     return 10.0 * torch.log10(torch.tensor(p / e)).item()
+
+
+def _parts(m: int, hidden: int, tp: int, seed: int, device) -> list[torch.Tensor]:
+    """Every rank's contribution, generated identically on every rank.
+
+    Same seed everywhere, then a per-rank scale, so each rank can build the
+    reference locally without another collective.
+    """
+    torch.manual_seed(seed)
+    return [
+        torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
+        for r in range(tp)
+    ]
+
+
+def _metrics(out, ref, tp: int) -> dict:
+    """Accuracy against fp32, then bit-identity across ranks."""
+    import torch.distributed as dist
+
+    # Widened to int32 because gloo rejects int16 ("Invalid scalar type"); the
+    # widening is exact, so the comparison is still on bits.
+    bits = out.view(torch.int16).to(torch.int32).cpu()
+    gathered = [torch.empty_like(bits) for _ in range(tp)]
+    dist.all_gather(gathered, bits)
+    lanes_differing = max(int((g != gathered[0]).sum()) for g in gathered)
+    err = checkAllclose(
+        ref, out.float(), printLog=False, msg="one_shot_allreduce vs fp32"
+    )
+    return {
+        "sqnr_db": _sqnr_db(ref, out),
+        "lanes_differing": lanes_differing,
+        "err": float(err),
+    }
+
+
+def _worst(a: dict, b: dict) -> dict:
+    return {
+        "sqnr_db": min(a["sqnr_db"], b["sqnr_db"]),
+        "lanes_differing": max(a["lanes_differing"], b["lanes_differing"]),
+        "err": max(a["err"], b["err"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fused (subprocess) helpers -- used by OneShotAllReduceRMSNorm test suite
+# ---------------------------------------------------------------------------
 
 
 def _fused_reference(parts, residual, weight, eps):
@@ -201,127 +343,130 @@ def _bits_agree(tensor, tp, dist) -> int | None:
     return None
 
 
-def _run_rank(args) -> None:
-    import torch.distributed as dist
+def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
+    """One log per (world size, rank, mode, knobs) so concurrent spawn
+    configurations cannot overwrite each other's failure tails.
 
-    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
+    *tag* has to name every pinned knob, not just ``atoms``: a block-pinned
+    fused spawn leaves atoms unset, so two of them would otherwise share a path.
+    """
+    return f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_{mode}_{tag}_rank{rank}.log"
 
-    rank = args.rank
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="gloo", init_method=args.init_method, world_size=args.tp, rank=rank
+
+def _fused_spawn(
+    world_size: int,
+    pairs: list[tuple[int, int]],
+    *,
+    atoms: int | None = DEFAULT_ATOMS,
+    grid_cap: int | None = DEFAULT_GRID_CAP,
+    fanout: str | None = DEFAULT_FANOUT,
+    skip_self: bool | None = None,
+    block: int | None = None,
+    mode: str = "fused",
+    iters: int = RUN_AHEAD_ITERS,
+) -> list:
+    """Subprocess-based spawn for fused (``OneShotAllReduceRMSNorm``) tests.
+
+    Each rank is relaunched as a subprocess with ``--rank``/``--mode`` flags so
+    it enters ``_run_rank_fused`` directly. Results are collected via a JSON
+    file written by rank 0. Returns a list of bad-lists, one per rank.
+    """
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(f"unsupported world_size={world_size}")
+    n_gpu = torch.cuda.device_count()
+    if n_gpu < world_size:
+        import pytest
+
+        pytest.skip(f"OneShotAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}")
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    out_path = os.path.join(
+        tempfile.mkdtemp(prefix="flydsl_one_shot_fused_"), "rank0.json"
     )
-
-    if args.mode.startswith("fused"):
-        _run_rank_fused(args, rank, device, dist)
-        return
-
-    eng = OneShotAllReduce(
-        group=dist.group.WORLD,
-        device=device,
-        rank=rank,
-        world_size=args.tp,
-        atoms=args.atoms,
-        grid_cap=args.grid_cap,
-        fanout=args.fanout,
-        skip_self=args.skip_self,
-        block=args.block,
-        # MAX_PAYLOAD_BYTES is a speed policy, not a correctness limit -- the
-        # kernel is exact at every size -- so it must not decide what this
-        # test covers. Lifted so the shape list stays free to include sizes
-        # production would route elsewhere.
-        max_bytes=1 << 30,
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
     )
-    warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
-    eng.compile_and_launch(warm, torch.empty_like(warm))
-
-    def _check(m, hidden, tag):
-        """One shape: accuracy against fp32, then bit-identity across ranks."""
-        bad = []
-        torch.manual_seed(1234 + m * 8191 + hidden)
-        # Same seed on every rank, then a per-rank shift, so the reference
-        # can be computed locally without another collective.
-        parts = [
-            torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
-            for r in range(args.tp)
+    env["PYTHONUNBUFFERED"] = "1"
+    if ARCH is not None:
+        env.setdefault("FLYDSL_GPU_ARCH", ARCH)
+    tokens = ",".join(str(t) for t, _ in pairs)
+    hiddens = ",".join(str(h) for _, h in pairs)
+    tag = f"a{atoms}"
+    if block is not None:
+        tag += f"_b{block}"
+    if skip_self is not None:
+        tag += "_ss" if skip_self else "_noss"
+    procs = []
+    logs = []
+    for rank in range(world_size):
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--rank",
+            str(rank),
+            "--init-method",
+            init_method,
+            "--tp",
+            str(world_size),
+            "--mode",
+            mode,
+            "--tokens",
+            tokens,
+            "--hiddens",
+            hiddens,
+            "--iters",
+            str(iters),
         ]
-        inp = parts[rank].contiguous()
-        out = torch.empty_like(inp)
-        out.zero_()
-        eng.allreduce(inp, out)
-        torch.cuda.synchronize()
-
-        ref = torch.zeros(m, hidden, dtype=torch.float32, device=device)
-        for p in parts:
-            ref += p.float()
-
-        db = _sqnr_db(ref, out)
-        if db < SQNR_FLOOR_DB:
-            bad.append(
-                f"{tag}: SQNR {db:.2f} dB below the {SQNR_FLOOR_DB} dB bf16 floor"
-            )
-
-        # Bit-identity across ranks: gather the raw bits, compare exactly.
-        # Widened to int32 because gloo rejects int16 ("Invalid scalar
-        # type"); the widening is exact, so the comparison is still on bits.
-        bits = out.view(torch.int16).to(torch.int32).cpu()
-        gathered = [torch.empty_like(bits) for _ in range(args.tp)]
-        dist.all_gather(gathered, bits)
-        for r, g in enumerate(gathered):
-            if not torch.equal(g, gathered[0]):
-                n = int((g != gathered[0]).sum())
-                bad.append(
-                    f"{tag}: rank {r} differs from rank 0 in {n} bf16 lanes "
-                    "(accumulation order is not rank-stable)"
-                )
-                break
-        return bad
-
-    failures = []
-    if args.mode == "run_ahead":
-        m = args.tokens[0]
-        hidden = args.hiddens[0]
-        torch.manual_seed(99)
-        parts = [
-            torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
-            for r in range(args.tp)
-        ]
-        inp = parts[rank].contiguous()
-        out = torch.empty_like(inp)
-        ref = torch.zeros(m, hidden, dtype=torch.float32, device=device)
-        for p in parts:
-            ref += p.float()
-        drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
-        bad = 0
-        checks = 0
-        for it in range(args.iters):
-            # Rank 0 does unrelated work first, so it enters each call late and
-            # the others get a chance to run ahead into the other parity slot.
-            if rank == 0 and it % 3 == 0:
-                for _ in range(3):
-                    drag = drag @ drag.T * 1e-6
-            eng.allreduce(inp, out)
-            if it % 25 == 0:
-                torch.cuda.synchronize()
-                checks += 1
-                if _sqnr_db(ref, out) < SQNR_FLOOR_DB:
-                    bad += 1
-        torch.cuda.synchronize()
-        if _sqnr_db(ref, out) < SQNR_FLOOR_DB or bad:
-            failures.append(f"run-ahead loop: {bad} bad checks of {checks}")
-    else:
-        for m, hidden in zip(args.tokens, args.hiddens, strict=True):
-            failures.append(_check(m, hidden, f"{m}x{hidden}"))
-
-    gathered = [None] * args.tp
-    dist.all_gather_object(gathered, failures)
-    if rank == 0 and args.out:
-        with open(args.out, "w") as fh:
-            json.dump({"ranks": gathered}, fh)
-    dist.barrier()
-    eng.close()
-    dist.destroy_process_group()
+        if atoms is not None:
+            cmd += ["--atoms", str(atoms)]
+        if grid_cap is not None:
+            cmd += ["--grid-cap", str(grid_cap)]
+        if fanout is not None:
+            cmd += ["--fanout", fanout]
+        if skip_self is not None:
+            cmd += ["--skip-self" if skip_self else "--no-skip-self"]
+        if block is not None:
+            cmd += ["--block", str(block)]
+        if rank == 0:
+            cmd += ["--out", out_path]
+        log = open(  # noqa: SIM115
+            _log_path(world_size, rank, mode, tag),
+            "w",
+        )
+        procs.append(
+            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        )
+        logs.append(log)
+    rc = 0
+    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", str(SPAWN_TIMEOUT_S)))
+    for proc in procs:
+        try:
+            rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc |= 1
+    for log in logs:
+        log.close()
+    if rc != 0:
+        tails = []
+        for rank in range(world_size):
+            path = _log_path(world_size, rank, mode, tag)
+            try:
+                with open(path) as fh:
+                    tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
+            except OSError:
+                pass
+        raise RuntimeError(
+            "OneShotAllReduceRMSNorm ranks failed\n" + "\n".join(tails)
+        )
+    with open(out_path) as fh:
+        payload = json.load(fh)
+    ranks = payload["ranks"]
+    if len(ranks) != world_size:
+        raise RuntimeError(
+            f"OneShotAllReduceRMSNorm gathered {len(ranks)} ranks, expected {world_size}"
+        )
+    return ranks
 
 
 def _run_rank_fused(args, rank, device, dist) -> None:
@@ -438,125 +583,7 @@ def _run_rank_fused(args, rank, device, dist) -> None:
     dist.destroy_process_group()
 
 
-def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
-    """One log per (world size, rank, mode, knobs) so concurrent spawn
-    configurations cannot overwrite each other's failure tails.
-
-    *tag* has to name every pinned knob, not just ``atoms``: a block-pinned
-    fused spawn leaves atoms unset, so two of them would otherwise share a path.
-    """
-    return f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_{mode}_{tag}_rank{rank}.log"
-
-
-def _spawn(
-    world_size: int,
-    pairs: list[tuple[int, int]],
-    *,
-    atoms: int | None = DEFAULT_ATOMS,
-    grid_cap: int | None = DEFAULT_GRID_CAP,
-    fanout: str | None = DEFAULT_FANOUT,
-    skip_self: bool | None = None,
-    block: int | None = None,
-    mode: str = "shapes",
-    iters: int = RUN_AHEAD_ITERS,
-) -> list:
-    if world_size not in SUPPORTED_WORLDS:
-        raise ValueError(f"unsupported world_size={world_size}")
-    n_gpu = torch.cuda.device_count()
-    if n_gpu < world_size:
-        pytest.skip(f"OneShotAllReduce needs {world_size} GPUs, have {n_gpu}")
-    init_method = get_distributed_init_method(get_ip(), get_open_port())
-    out_path = os.path.join(
-        tempfile.mkdtemp(prefix="flydsl_one_shot_allreduce_"), "rank0.json"
-    )
-    env = dict(os.environ)
-    env["PYTHONPATH"] = (
-        f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
-    )
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("FLYDSL_GPU_ARCH", ARCH)
-    tokens = ",".join(str(t) for t, _ in pairs)
-    hiddens = ",".join(str(h) for _, h in pairs)
-    tag = f"a{atoms}"
-    if block is not None:
-        tag += f"_b{block}"
-    if skip_self is not None:
-        tag += "_ss" if skip_self else "_noss"
-    procs = []
-    logs = []
-    for rank in range(world_size):
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--rank",
-            str(rank),
-            "--init-method",
-            init_method,
-            "--tp",
-            str(world_size),
-            "--mode",
-            mode,
-            "--tokens",
-            tokens,
-            "--hiddens",
-            hiddens,
-            "--iters",
-            str(iters),
-        ]
-        # Omitted, not defaulted: OneShotAllReduce distinguishes an unset knob
-        # ("walk ONESHOT_LADDER and pick by payload size") from a pinned one,
-        # and only the unset form exercises _pick_cfg at all.
-        if atoms is not None:
-            cmd += ["--atoms", str(atoms)]
-        if grid_cap is not None:
-            cmd += ["--grid-cap", str(grid_cap)]
-        if fanout is not None:
-            cmd += ["--fanout", fanout]
-        if skip_self is not None:
-            cmd += ["--skip-self" if skip_self else "--no-skip-self"]
-        if block is not None:
-            cmd += ["--block", str(block)]
-        if rank == 0:
-            cmd += ["--out", out_path]
-        log = open(  # noqa: SIM115
-            _log_path(world_size, rank, mode, tag),
-            "w",
-        )
-        procs.append(
-            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-        )
-        logs.append(log)
-    rc = 0
-    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
-    for proc in procs:
-        try:
-            rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            rc |= 1
-    for log in logs:
-        log.close()
-    if rc != 0:
-        tails = []
-        for rank in range(world_size):
-            path = _log_path(world_size, rank, mode, tag)
-            try:
-                with open(path) as fh:
-                    tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
-            except OSError:
-                pass
-        raise RuntimeError("OneShotAllReduce ranks failed\n" + "\n".join(tails))
-    with open(out_path) as fh:
-        payload = json.load(fh)
-    ranks = payload["ranks"]
-    if len(ranks) != world_size:
-        raise RuntimeError(
-            f"OneShotAllReduce gathered {len(ranks)} ranks, expected {world_size}"
-        )
-    return ranks
-
-
-# One `_spawn` call per group of shapes that share every axis baked
+# One `_fused_spawn` call per group of shapes that share every axis baked
 # into the compiled kernel as a Python-level constant.
 _BATCH_CACHE: dict[tuple, dict[tuple[int, int], list]] = {}
 
@@ -564,12 +591,11 @@ _BATCH_CACHE: dict[tuple, dict[tuple[int, int], list]] = {}
 def _index_by_shape(
     ranks: list, pairs: list[tuple[int, int]]
 ) -> dict[tuple[int, int], list]:
-    """Reshape `_spawn`'s per-rank, per-shape bad-lists into a per-shape view.
+    """Reshape `_fused_spawn`'s per-rank, per-shape bad-lists into a per-shape view.
 
-    ``ranks[r]`` holds one bad-list per pair, in ``pairs`` order (``_run_rank``'s
-    "shapes" branch appends in that order). Slicing out one shape's bad-list
-    from every rank reproduces exactly what a single-shape ``_spawn`` call
-    would have returned for that rank.
+    ``ranks[r]`` holds one bad-list per pair, in ``pairs`` order. Slicing out
+    one shape's bad-list from every rank reproduces exactly what a single-shape
+    ``_fused_spawn`` call would have returned for that rank.
     """
     return {
         pair: [rank_shapes[i] for rank_shapes in ranks] for i, pair in enumerate(pairs)
@@ -579,7 +605,7 @@ def _index_by_shape(
 def _batch_cache_lookup(
     key: tuple, pairs: list[tuple[int, int]], **spawn_kwargs
 ) -> dict:
-    """One ``_spawn`` call per `key`, all shapes computed at once.
+    """One ``_fused_spawn`` call per `key`, all shapes computed at once.
 
     ``key`` is ``(world_size, mode)`` or ``(world_size, mode, atoms)``; every
     axis in it is one that forces a separate spawn. Anything passed in
@@ -590,20 +616,330 @@ def _batch_cache_lookup(
     if key not in _BATCH_CACHE:
         world_size, mode = key[0], key[1]
         spawn_kwargs.setdefault("atoms", key[2] if len(key) > 2 else DEFAULT_ATOMS)
-        ranks = _spawn(world_size, pairs, mode=mode, **spawn_kwargs)
+        ranks = _fused_spawn(world_size, pairs, mode=mode, **spawn_kwargs)
         _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
     return _BATCH_CACHE[key]
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("m,hidden,label", _SHAPE_CASES)
-def test_one_shot_allreduce_sqnr_and_bitidentity(m, hidden, label, world_size):
-    """Every shape in `_SHAPE_CASES` rides one spawn per world_size -- see `_batch_cache_lookup`."""
-    group_pairs = [(mm, hh) for mm, hh, _ in _SHAPE_CASES]
-    batch = _batch_cache_lookup((world_size, "shapes"), group_pairs)
-    bad_per_rank = batch[(m, hidden)]
-    for rank, bad in enumerate(bad_per_rank):
-        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+# ---------------------------------------------------------------------------
+# Plain (pool-based) scaffolding -- used by OneShotAllReduce test suite
+# ---------------------------------------------------------------------------
+
+
+def _run_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    engine_kw: dict,
+    cases: list[tuple],
+    window: tuple[int, int] | None = None,
+) -> dict:
+    """One rank of one spawn: every case, then the run-ahead loop.
+
+    A case is ``(tokens, hidden, graph)``. The engine is built once, so every
+    case shares its compiled rungs and IPC inboxes. *window* is the payload
+    range production dispatch routes to this engine, if any; the result then
+    carries the rungs the engine itself says that range selects.
+    """
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+
+    eng = OneShotAllReduce(
+        group=dist.group.WORLD,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        # MAX_PAYLOAD_BYTES is a speed policy, not a correctness limit -- the
+        # kernel is exact at every size -- so it must not decide what this test
+        # covers. Lifted so the shape list stays free to include sizes
+        # production would route elsewhere.
+        max_bytes=1 << 30,
+        **engine_kw,
+    )
+    warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
+    eng.compile_and_launch(warm, torch.empty_like(warm))
+    production_cfgs = None if window is None else eng.cfgs_for(*window)
+
+    rows = []
+    try:
+        for m, hidden, graph in cases:
+            parts = _parts(m, hidden, tp, 1234 + m * 8191 + hidden, device)
+            inp = parts[rank].contiguous()
+            ref = torch.stack(parts).float().sum(0)
+            out = torch.zeros_like(inp)
+            eng.allreduce(inp, out)
+            torch.cuda.synchronize()
+            res = _metrics(out, ref, tp)
+
+            if graph:
+                # Captured on the current stream, which allreduce() launches on
+                # when it is given none.
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    eng.allreduce(inp, out)
+                for _ in range(GRAPH_REPLAYS):
+                    out.zero_()
+                    g.replay()
+                    torch.cuda.synchronize()
+                    res = _worst(res, _metrics(out, ref, tp))
+                fn = g.replay
+            else:
+
+                def fn(e=eng, src=inp, dst=out):
+                    e.allreduce(src, dst)
+                    return dst
+
+            dist.barrier()
+            torch.cuda.synchronize()
+            # cuda.Event timing, not run_perftest's default profiler timer:
+            # `import aiter` creates a GPU context in the parent, and on some
+            # ROCm/torch builds a child spawned after that records no GPU
+            # events in torch.profiler, so the default timer fails reducing an
+            # empty trace.
+            _, us = run_perftest(fn, use_cuda_event=True)
+            nbytes = inp.numel() * inp.element_size()
+            res["us"] = float(us)
+            res["variant"] = eng.variant(nbytes)
+            res["cfg"] = eng._pick_cfg(nbytes)
+            rows.append(res)
+
+        # Run-ahead: many back-to-back calls with rank 0 deliberately late, so
+        # the others get a chance to run ahead into the other parity slot.
+        parts = _parts(RUN_AHEAD_M, HIDDEN, tp, 99, device)
+        inp = parts[rank].contiguous()
+        out = torch.empty_like(inp)
+        ref = torch.stack(parts).float().sum(0)
+        drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
+        bad = 0
+        checks = 0
+        for it in range(RUN_AHEAD_ITERS):
+            if rank == 0 and it % 3 == 0:
+                for _ in range(3):
+                    drag = drag @ drag.T * 1e-6
+            eng.allreduce(inp, out)
+            if it % 25 == 0:
+                torch.cuda.synchronize()
+                checks += 1
+                bad += _sqnr_db(ref, out) < SQNR_FLOOR_DB
+        torch.cuda.synchronize()
+        checks += 1
+        bad += _sqnr_db(ref, out) < SQNR_FLOOR_DB
+        run_ahead = {"checks": checks, "bad_checks": bad}
+    finally:
+        dist.barrier()
+        eng.close()
+        dist.destroy_process_group()
+    return {"rows": rows, "run_ahead": run_ahead, "production_cfgs": production_cfgs}
+
+
+def _spawn_pool(
+    world_size: int,
+    engine_kw: dict,
+    cases: list[tuple],
+    window: tuple[int, int] | None = None,
+) -> list[dict]:
+    """Pool-based spawn for plain ``OneShotAllReduce`` tests.
+
+    Returns a list of dicts (one per rank) each with ``rows``, ``run_ahead``
+    and ``production_cfgs`` keys.
+    """
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(f"unsupported world_size={world_size}")
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    pool = Pool(processes=world_size)
+    try:
+        results = [
+            pool.apply_async(
+                _run_rank,
+                kwds={
+                    "rank": rank,
+                    "tp": world_size,
+                    "init_method": init_method,
+                    "engine_kw": engine_kw,
+                    "cases": cases,
+                    "window": window,
+                },
+            )
+            for rank in range(world_size)
+        ]
+        ranks = [fut.get(timeout=SPAWN_TIMEOUT_S) for fut in results]
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        pool.close()
+    finally:
+        pool.join()
+    return ranks
+
+
+# Rows are registered up front, grouped by engine, so each engine is built by
+# exactly one spawn. A spawn key is ``(tp, sorted engine kwargs)``; a case is
+# ``(tokens, hidden, graph)``.
+_CASES: dict[tuple, list[tuple]] = {}
+# Production dispatch window of an unpinned engine whose rung coverage is
+# checked, per spawn key.
+_WINDOWS: dict[tuple, tuple[int, int]] = {}
+_RESULTS: dict[tuple, list[dict]] = {}
+_FAILURES: list[str] = []
+
+# Tuning knobs the command line can pin. They are test-function arguments, so
+# they select the engine, but not table columns: the ``variant`` column names
+# the binary that actually ran, which is what a pinned knob changes.
+KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self")
+
+
+def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
+    """OneShotAllReduce kwargs for the knobs that are pinned (not None)."""
+    kw = {
+        "atoms": atoms,
+        "grid_cap": grid_cap,
+        "fanout": fanout,
+        "block": block,
+        "skip_self": skip_self,
+    }
+    return {k: v for k, v in kw.items() if v is not None}
+
+
+def _key(tp: int, engine_kw: dict) -> tuple:
+    return (tp, tuple(sorted(engine_kw.items())))
+
+
+def _ranks(key: tuple) -> list[dict]:
+    if key not in _RESULTS:
+        _RESULTS[key] = _spawn_pool(key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key))
+    return _RESULTS[key]
+
+
+def _check(label: str, fails: list[str]) -> None:
+    if fails:
+        msg = f"{label}: " + "; ".join(fails)
+        aiter.logger.error(msg)
+        _FAILURES.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# Plain test functions
+# ---------------------------------------------------------------------------
+
+
+@benchmark()
+def test_one_shot_allreduce(
+    tokens,
+    hidden,
+    dtype,
+    tp,
+    graph=False,
+    atoms=None,
+    grid_cap=None,
+    fanout=None,
+    block=None,
+    skip_self=None,
+):
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    key = _key(tp, engine_kw)
+    i = _CASES[key].index((tokens, hidden, graph))
+    rows = [r["rows"][i] for r in _ranks(key)]
+    fails = []
+    for rank, row in enumerate(rows):
+        if row["sqnr_db"] < SQNR_FLOOR_DB:
+            fails.append(
+                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB below the "
+                f"{SQNR_FLOOR_DB} dB bf16 floor"
+            )
+        if row["lanes_differing"]:
+            fails.append(
+                f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between "
+                "ranks (accumulation order is not rank-stable)"
+            )
+    _check(f"tp={tp} {tokens}x{hidden} graph={graph} {engine_kw}", fails)
+    nbytes = tokens * hidden * 2
+    # (tp - 1) adds per element.
+    flops = tokens * hidden * (tp - 1)
+    us = max(r["us"] for r in rows)
+    return {
+        "gfx": ARCH,
+        "variant": rows[0]["variant"],
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
+        "bit_identical": not any(r["lanes_differing"] for r in rows),
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": max(r["err"] for r in rows),
+    }
+
+
+@benchmark()
+def test_one_shot_allreduce_run_ahead(
+    tokens,
+    hidden,
+    tp,
+    iters,
+    atoms=None,
+    grid_cap=None,
+    fanout=None,
+    block=None,
+    skip_self=None,
+):
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    runs = [r["run_ahead"] for r in _ranks(_key(tp, engine_kw))]
+    _check(
+        f"tp={tp} run-ahead {engine_kw}",
+        [
+            f"rank {rank}: {r['bad_checks']} bad checks of {r['checks']}"
+            for rank, r in enumerate(runs)
+            if r["bad_checks"]
+        ],
+    )
+    return {
+        "gfx": ARCH,
+        "checks": runs[0]["checks"],
+        "bad_checks": sum(r["bad_checks"] for r in runs),
+    }
+
+
+@benchmark()
+def test_one_shot_allreduce_coverage(tp, window):
+    """Every rung production dispatch can select on this host ran on the
+    unpinned engine.
+
+    The engine's own ``cfgs_for`` is the reference, so a retuned ladder or
+    policy that ``_production_payloads`` does not follow fails here.
+    """
+    key = _key(tp, {})
+    ranks = _ranks(key)
+    production = set(ranks[0]["production_cfgs"])
+    ran = {row["cfg"] for row in ranks[0]["rows"]}
+    missing = sorted(production - ran)
+    _check(
+        f"tp={tp} coverage of {window}",
+        [f"production rungs never run: {missing}"] if missing else [],
+    )
+    return {
+        "gfx": ARCH,
+        "production_rungs": sorted(production),
+        "missing": missing,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fused test functions
+# ---------------------------------------------------------------------------
+
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    ARCH not in SUPPORTED_ARCHS,
+    reason="OneShotAllReduce unsupported arch (need gfx942 or gfx950)",
+)
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
@@ -821,200 +1157,258 @@ def test_one_shot_allreduce_rmsnorm_run_ahead(world_size):
     loop, ordered only by the barrier already inside ``_publish``. A quiescent
     single call never puts weight on that argument; this does.
     """
-    ranks = _spawn(
+    ranks = _fused_spawn(
         world_size, [(RUN_AHEAD_M, 4096)], mode="fused_run_ahead", iters=RUN_AHEAD_ITERS
     )
     for rank, bad in enumerate(ranks):
         assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-def test_one_shot_allreduce_run_ahead(world_size):
-    """Many back-to-back calls with one rank deliberately late, to exercise
-    the double-buffered inbox under skew rather than only at rest."""
-    ranks = _spawn(world_size, [(RUN_AHEAD_M, HIDDEN)], mode="run_ahead")
-    for rank, bad in enumerate(ranks):
-        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+# ---------------------------------------------------------------------------
+# Summary helper and main()
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-def test_one_shot_allreduce_ladder(world_size):
-    """The shipped ``ONESHOT_LADDER``, across a payload range that crosses its
-    rung boundaries.
-
-    Every other case here pins ``atoms``/``grid_cap``/``fanout``, which takes
-    ``OneShotAllReduce`` down its single-rung path and leaves ``_pick_cfg``
-    -- and therefore every multi-rung ladder -- uncovered. That was harmless
-    while each world size had one rung; TP2 and TP4 now have two, so switching
-    rungs mid-stream is live behaviour: a different engine, with its own IPC
-    inbox and its own device-side colour counter, selected per payload.
-
-    ``SHAPES`` spans 14 KiB to 224 KiB at HIDDEN=7168, which straddles both
-    shipped boundaries (TP4 at 64 KiB, TP2 at 96 KiB). Run-ahead is included
-    because the colour/parity state is per engine, so alternating across a
-    boundary is what would expose a rung switch desynchronising the ranks.
-    """
-    pairs = [(m, HIDDEN) for m in SHAPES]
-    ranks = _spawn(world_size, pairs, atoms=None, grid_cap=None, fanout=None)
-    for rank, shape_bads in enumerate(ranks):
-        bad = [b for b in shape_bads if b]
-        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
-
-    ahead = _spawn(
-        world_size,
-        [(RUN_AHEAD_M, HIDDEN)],
-        atoms=None,
-        grid_cap=None,
-        fanout=None,
-        mode="run_ahead",
-    )
-    for rank, bad in enumerate(ahead):
-        assert not bad, f"tp={world_size} run_ahead, rank {rank}: {bad}"
+def _summarize(name: str, rows: list[dict]) -> None:
+    if rows:
+        df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
+        aiter.logger.info(
+            "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
+        )
 
 
 def main():
-    if ARCH not in _SUPPORTED_ARCHS:
-        print(f"OneShotAllReduce unsupported on {ARCH}; skipping")
+    if ARCH not in SUPPORTED_ARCHS:
+        aiter.logger.warning("OneShotAllReduce unsupported on %s; skipping", ARCH)
         return
+    n_gpu = torch.cuda.device_count()
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-tp", type=int, default=2, choices=SUPPORTED_WORLDS)
-    # Unset by default: a bare run then covers the shipped ladder, which is
-    # what production walks. Pass any of them to pin a single rung instead.
-    ap.add_argument("--atoms", type=int, default=None)
-    ap.add_argument("--grid-cap", type=int, default=None)
-    ap.add_argument("--fanout", default=None, choices=("peer", "atom"))
-    ap.add_argument(
-        "--skip-self",
-        dest="skip_self",
-        action=argparse.BooleanOptionalAction,
-        default=None,
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
-    ap.add_argument("--block", type=int, default=None, choices=SUPPORTED_BLOCKS)
-    ap.add_argument(
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="Payload dtype (bf16 only).\n    e.g.: -d bf16",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        nargs="*",
+        default=list(SUPPORTED_WORLDS),
+        help="World sizes to sweep (2, 4, 8). Default all; sizes with fewer\n"
+        "visible GPUs are skipped.\n    e.g.: --tp 2",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=None,
+        help="(tokens, hidden) pairs, on every engine. Default: derived from\n"
+        "the dispatch policy for the shipped ladder, SPOT_SHAPES for the spot\n"
+        "checks.\n    e.g.: -s 1,7168 8,7168",
+    )
+    # Unset by default, so the engine walks the shipped ladder, which is what
+    # production runs. Any value pins every rung to it.
+    parser.add_argument("--atoms", type=int, nargs="*", default=[None])
+    parser.add_argument("--grid-cap", type=int, nargs="*", default=[None])
+    parser.add_argument(
+        "--fanout", nargs="*", default=[None], choices=("peer", "atom", None)
+    )
+    parser.add_argument(
+        "--block",
+        type=int,
+        nargs="*",
+        default=[None],
+        choices=(*SUPPORTED_BLOCKS, None),
+    )
+    parser.add_argument(
+        "--skip-self",
+        type=int,
+        nargs="*",
+        default=[None],
+        choices=(0, 1, None),
+        help="Pin skip_self off (0) or on (1).",
+    )
+    parser.add_argument(
+        "--extended",
+        action="store_true",
+        help="Run the spot-check configurations at every world size, and the\n"
+        "spot-check shapes on the shipped ladder too.",
+    )
+    parser.add_argument(
         "--plain-only",
         action="store_true",
         help="skip the fused (all-reduce + residual + RMSNorm) suites",
     )
-    args = ap.parse_args()
+    args = parser.parse_args()
 
-    n = torch.cuda.device_count()
-    if n < args.tp:
-        raise SystemExit(f"need {args.tp} GPUs, saw {n}")
+    tps = []
+    for tp in args.tp:
+        if tp not in SUPPORTED_WORLDS:
+            aiter.logger.warning("unsupported world_size=%s; skipping", tp)
+        elif n_gpu < tp:
+            aiter.logger.warning(
+                "tp=%s needs %s GPUs, have %s; skipping", tp, tp, n_gpu
+            )
+        else:
+            tps.append(tp)
+    dts = [d for d in args.dtype if d == dtypes.bf16]
+    if len(dts) != len(args.dtype):
+        aiter.logger.warning("OneShotAllReduce payload is bf16; skipping others")
 
-    pairs = [(m, HIDDEN) for m in SHAPES] + list(NARROW_SHAPES)
-    ranks = _spawn(
-        args.tp,
-        pairs,
-        atoms=args.atoms,
-        grid_cap=args.grid_cap,
-        fanout=args.fanout,
-        skip_self=args.skip_self,
-        block=args.block,
-    )
-    failures = [
-        f"rank {r}: {bad}"
-        for r, shape_bads in enumerate(ranks)
-        for bad in shape_bads
-        if bad
+    # Pinned knobs per configuration; unset (None) knobs are left to the engine,
+    # which walks ONESHOT_LADDER when none of atoms/grid_cap/fanout/block is set.
+    configs = [
+        {
+            "atoms": atoms,
+            "grid_cap": grid_cap,
+            "fanout": fanout,
+            "block": block,
+            "skip_self": None if skip_self is None else bool(skip_self),
+        }
+        for atoms, grid_cap, fanout, block, skip_self in itertools.product(
+            args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
+        )
     ]
+    ladder = configs == [dict.fromkeys(KNOBS)]
+    given = None if args.mnk is None else [(int(t), int(h)) for t, h in args.mnk]
+    link = fly_policy.detect_link()
 
-    run_ahead_ranks = _spawn(
-        args.tp,
-        [(RUN_AHEAD_M, HIDDEN)],
-        atoms=args.atoms,
-        grid_cap=args.grid_cap,
-        fanout=args.fanout,
-        skip_self=args.skip_self,
-        block=args.block,
-        mode="run_ahead",
+    # Register every row before running any, so each (tp, config) is one spawn.
+    # Each entry of ``spawns`` is ``(tp, knobs, shapes, graph)``.
+    spawns = []
+    coverage = []
+    for tp, knobs in itertools.product(tps, configs):
+        payloads, window = _production_payloads(tp, link)
+        shapes = given or [(nbytes // _ROW_BYTES, ROW) for nbytes in payloads]
+        if given is None and args.extended:
+            shapes += [s for s in SPOT_SHAPES if s not in shapes]
+        spawns.append((tp, knobs, shapes, True))
+        if ladder and given is None:
+            _WINDOWS[_key(tp, {})] = window
+            coverage.append((tp, f"{window[0]}..{window[1]} B"))
+    # Nothing pinned on the command line: the shipped ladder, plus spot checks
+    # of the widths it does not use yet.
+    if ladder:
+        spot = [(tp, knobs) for tp, knobs in SPOT_CONFIGS if tp in tps]
+        if args.extended:
+            spot = [(tp, knobs) for tp in tps for _tp, knobs in SPOT_CONFIGS]
+        spawns += [(tp, dict(knobs), given or SPOT_SHAPES, False) for tp, knobs in spot]
+    rows = []
+    for tp, knobs, shapes, graph in spawns:
+        cases = [(t, h, False) for t, h in shapes]
+        if graph:
+            # Captured at every world size, on the smallest shape.
+            cases.append((*shapes[0], True))
+        _CASES[_key(tp, _engine_kw(**knobs))] = cases
+        rows += [(tp, knobs, case) for case in cases]
+
+    for dtype in dts:
+        _summarize(
+            "flydsl one-shot allreduce",
+            [
+                test_one_shot_allreduce(t, h, dtype, tp, graph=graph, **knobs)
+                for tp, knobs, (t, h, graph) in rows
+            ],
+        )
+    _summarize(
+        "flydsl one-shot allreduce production rung coverage",
+        [test_one_shot_allreduce_coverage(tp, window) for tp, window in coverage],
     )
-    failures += [f"rank {r}: {bad}" for r, bad in enumerate(run_ahead_ranks) if bad]
+    _summarize(
+        "flydsl one-shot allreduce run-ahead",
+        [
+            test_one_shot_allreduce_run_ahead(
+                RUN_AHEAD_M, HIDDEN, tp, RUN_AHEAD_ITERS, **knobs
+            )
+            for tp, knobs, _shapes, _graph in spawns
+        ],
+    )
 
     if not args.plain_only:
-        fused_pairs = [(m, h) for m, h, _ in _FUSED_SHAPE_CASES]
-        fused_ranks = _spawn(
-            args.tp,
-            fused_pairs,
-            atoms=args.atoms,
-            grid_cap=args.grid_cap,
-            fanout=args.fanout,
-            mode="fused",
-        )
-        failures += [
-            f"fused rank {r}: {bad}"
-            for r, shape_bads in enumerate(fused_ranks)
-            for bad in shape_bads
-            if bad
-        ]
-
-        for fused_atoms, fused_hidden in FUSED_ATOMS_CASES:
-            atom_ranks = _spawn(
-                args.tp,
-                [(m, fused_hidden) for m in (1, 8)],
-                atoms=fused_atoms,
-                grid_cap=args.grid_cap,
-                fanout=args.fanout,
+        for tp in tps:
+            fused_pairs = [(m, h) for m, h, _ in _FUSED_SHAPE_CASES]
+            fused_ranks = _fused_spawn(
+                tp,
+                fused_pairs,
+                atoms=DEFAULT_ATOMS,
+                grid_cap=DEFAULT_GRID_CAP,
+                fanout=DEFAULT_FANOUT,
                 mode="fused",
             )
-            failures += [
-                f"fused atoms={fused_atoms} hidden={fused_hidden} rank {r}: {bad}"
-                for r, shape_bads in enumerate(atom_ranks)
+            fused_fails = [
+                f"fused tp={tp} rank {r}: {bad}"
+                for r, shape_bads in enumerate(fused_ranks)
                 for bad in shape_bads
                 if bad
             ]
+            if fused_fails:
+                _FAILURES.extend(fused_fails)
+            aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
 
-        fused_ahead = _spawn(
-            args.tp,
-            [(RUN_AHEAD_M, 4096)],
-            atoms=args.atoms,
-            grid_cap=args.grid_cap,
-            fanout=args.fanout,
-            mode="fused_run_ahead",
+    if _FAILURES:
+        raise SystemExit(
+            f"{len(_FAILURES)} OneShotAllReduce check(s) failed:\n  "
+            + "\n  ".join(_FAILURES)
         )
-        failures += [
-            f"fused run-ahead rank {r}: {bad}"
-            for r, bad in enumerate(fused_ahead)
-            if bad
-        ]
-
-    if failures:
-        print("FAIL\n  " + "\n  ".join(failures))
-        raise SystemExit(1)
-    print("PASS")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--rank", type=int, default=None)
-    parser.add_argument("--init-method", default=None)
-    parser.add_argument("--tp", type=int, default=2)
-    parser.add_argument("--atoms", type=int, default=None)
-    parser.add_argument("--grid-cap", type=int, default=None)
-    parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
-    parser.add_argument(
+    freeze_support()
+    # When relaunched as a subprocess rank worker (fused tests), dispatch
+    # directly to the rank entry point and exit. Otherwise run main().
+    _rank_parser = argparse.ArgumentParser(add_help=False)
+    _rank_parser.add_argument("--rank", type=int, default=None)
+    _rank_parser.add_argument("--init-method", default=None)
+    _rank_parser.add_argument("--tp", type=int, default=2)
+    _rank_parser.add_argument("--atoms", type=int, default=None)
+    _rank_parser.add_argument("--grid-cap", type=int, default=None)
+    _rank_parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
+    _rank_parser.add_argument(
         "--skip-self",
         dest="skip_self",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--block", type=int, default=None)
-    parser.add_argument(
+    _rank_parser.add_argument("--block", type=int, default=None)
+    _rank_parser.add_argument(
         "--mode",
-        default="shapes",
-        choices=("shapes", "run_ahead", "fused", "fused_run_ahead"),
+        default="fused",
+        choices=("fused", "fused_run_ahead"),
     )
-    parser.add_argument("--tokens", default="")
-    parser.add_argument("--hiddens", default="")
-    parser.add_argument("--iters", type=int, default=RUN_AHEAD_ITERS)
-    parser.add_argument("--out", default=None)
-    known, rest = parser.parse_known_args()
+    _rank_parser.add_argument("--tokens", default="")
+    _rank_parser.add_argument("--hiddens", default="")
+    _rank_parser.add_argument("--iters", type=int, default=RUN_AHEAD_ITERS)
+    _rank_parser.add_argument("--out", default=None)
+    known, rest = _rank_parser.parse_known_args()
     if known.rank is not None:
+        import torch.distributed as dist
+
         known.tokens = [int(t) for t in known.tokens.split(",") if t]
         known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
         if len(known.tokens) != len(known.hiddens):
             raise SystemExit("tokens and hiddens lists must match")
-        _run_rank(known)
+        rank = known.rank
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=known.init_method,
+            world_size=known.tp,
+            rank=rank,
+        )
+        _run_rank_fused(known, rank, device, dist)
     else:
+        from time import perf_counter
+
+        start = perf_counter()
         sys.argv = [sys.argv[0]] + rest
         main()
+        end = perf_counter()
+        aiter.logger.info(f"Test execution took {end - start:.2f}s")

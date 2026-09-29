@@ -1,0 +1,13 @@
+gfx,M,N,K,b_intype,a_preshuffle,outdtype,splitK,kernelName,us
+gfx1250,512,2048,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,15.565258064516133
+gfx1250,512,2048,7168,mxfp8,1,torch.bfloat16,8,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x2_psE,12.795064516129091
+gfx1250,512,7168,16384,mxfp8,0,torch.bfloat16,4,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,34.98541836734694
+gfx1250,512,7168,16384,mxfp8,1,torch.bfloat16,4,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x2_psE,29.735540000000046
+gfx1250,512,6144,7168,mxfp8,0,torch.bfloat16,4,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,18.49278021978021
+gfx1250,512,6144,7168,mxfp8,1,torch.bfloat16,4,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x2_psE,16.934277777777734
+gfx1250,512,7168,3072,mxfp8,0,torch.bfloat16,4,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,16.39328089887644
+gfx1250,512,7168,3072,mxfp8,1,torch.bfloat16,4,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x2_psE,15.254590361445807
+gfx1250,512,65536,1536,mxfp8,0,torch.bfloat16,1,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,19.73149438202246
+gfx1250,512,65536,1536,mxfp8,1,torch.bfloat16,1,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x2_psE,17.042505617977536
+gfx1250,512,8192,1536,mxfp8,0,torch.bfloat16,1,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_128x128_4x4_psE,6.810468085106386
+gfx1250,512,8192,1536,mxfp8,1,torch.bfloat16,1,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_128x128_4x4_psE,5.881562499999993

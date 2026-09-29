@@ -1,0 +1,2 @@
+cu_num,num_heads,num_kv_heads,head_dim,head_dim_v,layout,model
+256,12,12,192,128,varlen_cross,kimi_k3_tp8

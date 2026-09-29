@@ -12,7 +12,14 @@ import os
 import torch
 import triton
 
-from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_enabled,
+    get_tuned_kernel_config,
+)
+
+logger = AiterTritonLogger()
 
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters
@@ -22,28 +29,45 @@ autotune_cache_kwargs: dict = (
     {"cache_results": _FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-CHUNK_DELTA_ATTN_TRITON_AUTOTUNE: bool = os.getenv(
-    "CHUNK_DELTA_ATTN_TRITON_AUTOTUNE", "0"
-).lower() in ("1", "true", "yes", "on")
-
-
-def chunk_delta_attn_autotune_configs(
-    configs: list,
-    default_config=None,
-) -> list:
-    """Return configs for @triton.autotune."""
-    if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE:
-        return configs
-    return [default_config if default_config is not None else configs[0]]
+CHUNK_DELTA_ATTN_TRITON_AUTOTUNE: bool = autotune_enabled("CHUNK_DELTA_ATTN")
 
 
 def chunk_delta_attn_tuned_config(
-    kernel_name: str, fallback: triton.Config
+    kernel_name: str, fallback: triton.Config, backend: str = "triton"
 ) -> triton.Config:
-    """This family's tile for the current device, from its published config."""
+    """This family's tile for the current device, from its published config.
+
+    The backends keep separate files: a Gluon kernel's warp count has to agree
+    with the warps its layouts were built for, so the two are not
+    interchangeable and must not fall back to one another.
+    """
     return get_tuned_kernel_config(
-        "attention", "CHUNK_DELTA_ATTN", kernel_name, fallback
+        "attention", "CHUNK_DELTA_ATTN", kernel_name, fallback, backend=backend
     )
+
+
+def chunk_delta_attn_tuned_config_shortlist(
+    kernel_name: str, fallback: list, backend: str = "triton"
+) -> list:
+    cfg_dir = resolve_config_dir("attention", "CHUNK_DELTA_ATTN", backend=backend)
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+    published = (table.get(kernel_name) or {}).get("candidates")
+    if not published:
+        logger.warning(
+            "No tuned Triton schedules for kernel '%s' in '%s/DEFAULT.json'; using fallback %s",
+            kernel_name,
+            cfg_dir,
+            fallback,
+        )
+        return fallback
+    return [
+        triton.Config(
+            {k: v for k, v in entry.items() if k not in ("num_warps", "num_stages")},
+            num_warps=entry.get("num_warps"),
+            num_stages=entry.get("num_stages"),
+        )
+        for entry in published
+    ]
 
 
 RCP_LN2: float = math.log2(math.e)  # 1/ln(2), for log2-space gate arithmetic
@@ -161,16 +185,35 @@ def softplus(x):
     return tl.where(x < 20.0, tl.log(1.0 + tl.exp(x)), x)
 
 
-def input_guard(fn: Callable) -> Callable:
-    """Ensure all tensor arguments are contiguous before kernel launch."""
+def input_guard(fn: Callable | None = None, *, skip: tuple[str, ...] = ()) -> Callable:
+    """Ensure tensor arguments are contiguous before kernel launch.
 
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        args = tuple(a.contiguous() if isinstance(a, torch.Tensor) else a for a in args)
-        kwargs = {
-            k: v.contiguous() if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
-        return fn(*args, **kwargs)
+    ``skip`` names keyword arguments that keep their original storage. The
+    paged ``state_cache`` is one: each slot's ``[H, V, K]`` plane is dense,
+    but ``stride(0)`` may be padded, and packing the pool would copy it and
+    write a clone instead of the live cache. Those tensors must be indexed
+    with their own strides.
+    """
+    skip_keys = frozenset(skip)
 
-    return wrapper
+    def decorator(inner: Callable) -> Callable:
+        @functools.wraps(inner)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            args = tuple(
+                a.contiguous() if isinstance(a, torch.Tensor) else a for a in args
+            )
+            kwargs = {
+                k: (
+                    v
+                    if k in skip_keys or not isinstance(v, torch.Tensor)
+                    else v.contiguous()
+                )
+                for k, v in kwargs.items()
+            }
+            return inner(*args, **kwargs)
+
+        return wrapper
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator

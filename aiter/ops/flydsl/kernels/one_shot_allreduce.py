@@ -24,8 +24,6 @@ handling for free (load->0, store dropped), with no exec-mask split. See
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     Float32,
@@ -33,10 +31,7 @@ from flydsl.expr.typing import (
     Int64,
     Stream,
     T,
-    as_ir_value,
 )
-
-from . import buffer_ops
 
 # The fused epilogue and the row-to-workgroup geometry are shared with the
 # quantized schedules.
@@ -62,86 +57,34 @@ from .quick_allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
     SUPPORTED_WORLDS,
     WAVE,
     _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
     _i32_to_bytes,
+    _load_flag,
+    _load_peers,
+    _payload_io,
+    _release_inbox,
+    _store_flag_peer,
+    _store_v4i32_peer,
     _to_sgpr_i64,
     atom_bf16_to_f32,
     atom_f32_to_bf16,
     make_payload_tensor,
 )
 
-
-def _store_v4i32_peer_multi(pairs, policy):
-    """Emit a whole fanout of 16 B peer stores as ONE inline-asm block.
-
-    Same instruction as ``quick_allreduce_shared._store_v4i32_peer``, but every store in
-    the group lives inside a single ``InlineAsmOp``. It lives here rather than
-    beside it because this kernel is its only consumer; the two must keep
-    agreeing on the ``global_store_dwordx4 ... {policy}`` encoding.
-
-    Why that matters: a VMEM store samples its address and data VGPRs
-    asynchronously *after* issue, so those registers must stay live until
-    ``vmcnt`` retires the store. LLVM guarantees that for real store
-    instructions -- ``SIInsertWaitcnts`` tracks the operands -- but it cannot
-    see inside inline asm. It therefore believes the data is dead the instant
-    the asm "executes" and is free to recycle those VGPRs for the next
-    address computation:
-
-        global_store_dwordx4 v[44:45], v[14:17], off nt   ; reads v[14:17]
-        v_lshl_add_u64       v[14:15], v[46:47], 0, v[8:9] ; clobbers them
-
-    which sends the next peer's *pointer* down the wire in place of the first
-    8 B of payload. Only shows up under register pressure -- one atom per
-    thread has slack, four does not.
-
-    Grouping the stores fixes it because LLVM allocates every operand of one
-    asm block to a distinct register and emits nothing between them, so
-    nothing can clobber a pending store's sources. The caller must still
-    ``s_waitcnt vmcnt(0)`` before reusing the values, which is what
-    ``_publish`` already does on the next line.
-
-    *pairs* is a sequence of ``(addr_i64, data_v4i32)``.
-    """
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    operands, slots = [], []
-    # Reference a repeated payload once: listing the same value N times would
-    # have LLVM allocate N copies of it. Keyed on the *caller's* Python object,
-    # not on ``==`` over the lowered ir.Value -- MLIR compares those
-    # structurally, which silently folds four distinct atoms into one operand
-    # and stores atom 0's data for every atom.
-    data_slot: dict[int, int] = {}
-
-    for addr_i64, data in pairs:
-        ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-        operands.append(ptr)
-        a = len(operands) - 1
-        key = id(data)
-        if key not in data_slot:
-            operands.append(as_ir_value(data))
-            data_slot[key] = len(operands) - 1
-        slots.append((a, data_slot[key]))
-
-    asm = "\n\t".join(
-        f"global_store_dwordx4 ${a}, ${d}, off {policy}" for a, d in slots
-    )
-    llvm.InlineAsmOp(
-        None,
-        operands,
-        asm,
-        ",".join("v" * len(operands)),
-        has_side_effects=True,
-    )
-
-
 DEFAULT_BLOCK = 256
-# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``. 
+# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``.
 # It sets the parallelism floor at a given payload.
 #
 # The trade is flags and per-block fixed cost: the flag count (``blocks * (N-1)``)
 # rises by the same factor the block count does.
-SUPPORTED_BLOCKS = (64, 128, 256)
+SUPPORTED_BLOCKS = (64, 128, 256, 512)
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4
@@ -169,23 +112,20 @@ DEFAULT_GRID_CAP = 64
 #                               to hold the tile narrow.
 #          block 256, atoms=4, cap 128 -- above 96 KiB the trade reverses and
 #                               the wider cap matters, because this window runs
-#                               to 1.5 MiB: at a 16 KiB tile that is 96 tiles,
-#                               so a cap of 64 would leave half the blocks
-#                               running two serialized handshake rounds.
-#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB, 
+#                               to 64 MiB in exact mode: a cap of 64 would leave
+#                               half the blocks running twice the serialized
+#                               handshake rounds.
+#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB,
 #                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
-#     TP8  block 256, atoms=4, cap 64 -- the fattest tile, one rung over the
-#                               whole 80 KiB window: the fanout is to 7 peers
-#                               and cutting the flag count matters more than
-#                               the handful of blocks lost.
+#     TP8  block 512, atoms=1/2 -- the 8 KiB tile to 16 KiB, then the 16 KiB
+#                               tile over the rest of the 80 KiB window. The
+#                               wide workgroup wins at every size.
 #
-#   TODO: xGMI needs to re-measured to see if self-skip is beneficial also here.
-#   xGMI 
-#     TP2  atoms=2, cap 64   -- one rung over the whole 4 MiB window.
-#     TP4  atoms=1, cap 128  -- the narrow tile wins throughout, and the extra
-#                               blocks matter more than tile width because peer
-#                               bandwidth is not the constraint.
-#     TP8  atoms=1, cap 64   -- one rung over the whole 256 KiB window.
+#   xGMI
+#
+#     TP2  atoms=1 cap128 b128 to 768 KiB, then atoms=2 cap64 b256
+#     TP4  atoms=1 cap256 b64  -- one rung over the whole 256 KiB window
+#     TP8  atoms=1 cap128 b128 to 128 KiB, then cap128 b256
 ONESHOT_LADDER = {
     ("pcie", 2): (
         (0, 2, 64, "peer", 128, True),
@@ -196,10 +136,19 @@ ONESHOT_LADDER = {
         (48 << 10, 2, 64, "atom", 256, True),
         (96 << 10, 4, 128, "peer", 256, True),
     ),
-    ("pcie", 8): ((0, 4, 64, "peer", 256, True),),
-    ("xgmi", 2): ((0, 2, 64, "peer", 256, False),),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
-    ("xgmi", 8): ((0, 1, 64, "peer", 256, False),),
+    ("pcie", 8): (
+        (0, 1, 64, "peer", 512, True),
+        (16 << 10, 2, 64, "peer", 512, True),
+    ),
+    ("xgmi", 2): (
+        (0, 1, 128, "peer", 128, False),
+        (768 << 10, 2, 64, "peer", 256, False),
+    ),
+    ("xgmi", 4): ((0, 1, 256, "peer", 64, False),),
+    ("xgmi", 8): (
+        (0, 1, 128, "peer", 128, False),
+        (128 << 10, 1, 128, "peer", 256, False),
+    ),
 }
 
 
@@ -304,7 +253,7 @@ def fused_atoms_for_block(hidden: int, block: int) -> int:
 # straggler has not read.
 PARITIES = 2
 # 64 B handshake sector at the tail of each wire slot, as 16 i32 copies of the
-# colour -- one ``dwordx4`` from each of 4 lanes.
+# colour -- one 8 B store from each of ``FLAG_LANES`` lanes.
 FLAG_I32 = 16
 # Read our own inbox with the caches bypassed (avoids reading stale values).
 _RECV_POLICY = _CM_SC0 | _CM_SC1
@@ -327,23 +276,6 @@ DEFAULT_SPIN_SLEEP = 0
 # costs a store, a load and a flag per tile in memory the rank already holds in
 # registers, which is 1/N of each; dropping it specialises the binary per rank.
 DEFAULT_SKIP_SELF = False
-
-
-def _load_v4i32_at(rsrc, elem_off, policy):
-    """One 16 B atom from a buffer descriptor, at an i32 element offset."""
-    return fx.Vector(
-        buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=4, dtype=T.i32, cache_modifier=policy
-        )
-    )
-
-
-def _load_i32_at(rsrc, elem_off, policy):
-    val = buffer_ops.buffer_load(
-        rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=policy
-    )
-    rocdl.s_waitcnt(vmcnt=0)
-    return fx.Int32(val)
 
 
 def make_one_shot_allreduce_kernel(
@@ -394,7 +326,7 @@ def make_one_shot_allreduce_kernel(
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
-    release_writeback = policy["writeback"]
+    release_scope = policy["release"]
 
     fused = fusion == "rmsnorm"
     if fused:
@@ -482,7 +414,6 @@ def make_one_shot_allreduce_kernel(
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
-        lane_in_quad = tid % fx.Int32(4)
 
         # The tiled copy is used by both modes now. ``hbm_row_layout`` (one
         # atom-wide row) and ``hbm_copy`` are built unconditionally; a padded
@@ -504,16 +435,13 @@ def make_one_shot_allreduce_kernel(
             fx.make_layout((1, block), (1, 1)),
             fx.make_layout((1, ATOM_I32), (1, 1)),
         ).get_slice(tid)
-        color_layout = fx.make_layout((grid,), (1,))
 
-        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
-        peers = [
-            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
-            for i in range(world_size)
-        ]
+        peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
-        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(peer_vec[rank])
+        inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 16)
+
+        _load_payload, _store_payload = _payload_io(
+            inp_ptr, out_ptr, nbytes, num_tiles, atoms, block, tid
         )
 
         hbm_i32_ptr = fx.PointerType.get(
@@ -551,7 +479,7 @@ def make_one_shot_allreduce_kernel(
 
         in_buf = _operand(inp_ptr)
         out_buf = _operand(out_ptr)
-        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+        _load_color, _store_color = _color_io(colors_ptr, bid)
 
         if const_expr(fused):
             # residual in/out are (M, hidden) bf16 exactly like the payload, so
@@ -582,16 +510,6 @@ def make_one_shot_allreduce_kernel(
             return fx.make_view(
                 fx.get_iter(fx.slice(buf, (tile, atom, None))), hbm_row_layout
             )
-
-        def _load_color():
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            return fx.Int32(
-                buffer_ops.buffer_load(color_rsrc, off, vec_width=1, dtype=T.i32)
-            )
-
-        def _store_color(color):
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            buffer_ops.buffer_store(color, color_rsrc, off)
 
         # The row-view function is chosen once at trace time: a padded build
         # addresses each row through a per-row bounded descriptor, an unpadded
@@ -633,41 +551,32 @@ def make_one_shot_allreduce_kernel(
             dropping it removes 1/N of the stores, 1/N of the reduce's loads and
             1/N of the flags, at the cost of one kernel binary per rank.
             """
-            # One asm block for the whole fanout: the stores must not have
-            # their data VGPRs recycled before ``vmcnt`` retires them, and
-            # LLVM cannot see that through inline asm. See
-            # ``_store_v4i32_peer_multi``.
-            _store_v4i32_peer_multi(
-                [
-                    (
-                        peer_vec[peer]
-                        + _i32_to_bytes(
-                            _slot_i32(parity, rank)
-                            + fx.Int32(atom * block * ATOM_I32)
-                            + tid * fx.Int32(ATOM_I32)
-                        ),
-                        my_atoms[atom],
-                    )
-                    for peer, atom in fanout_pairs
-                ],
-                payload_policy,
-            )
+            for peer, atom in fanout_pairs:
+                _store_v4i32_peer(
+                    peer_vec[peer]
+                    + _i32_to_bytes(
+                        _slot_i32(parity, rank)
+                        + fx.Int32(atom * block * ATOM_I32)
+                        + tid * fx.Int32(ATOM_I32)
+                    ),
+                    my_atoms[atom],
+                    payload_policy,
+                )
 
         def _publish(parity, color):
             """Drain the payload stores, then write *color* into every peer.
 
             ``vmcnt(0)`` retires this wave's stores; the barrier joins the other
             waves, whose ``vmcnt`` is separate. On a cacheable inbox retiring is
-            not enough -- the lines can sit in this XCD's L2 -- so write back and
-            wait for that before the flag goes out. Every workgroup issues its
-            own writeback: L2 is per-XCD.
+            not enough -- the lines can sit in this XCD's L2 -- so the release
+            fence writes them back and waits for that before the flag goes out.
+            Every workgroup issues its own writeback: L2 is per-XCD.
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if const_expr(release_writeback is not None):
-                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
-                rocdl.s_waitcnt(vmcnt=0)
-            # 4 lanes, one dwordx4 each -> the 64 B sector, unrolled over the
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
+            # FLAG_LANES lanes, 8 B each -> the 64 B sector, unrolled over the
             # destinations. The peer index must be a trace-time constant: an
             # earlier version keyed it off the lane (``peer = tid // 4``, 4 lanes
             # per destination), which made ``peer_vec[peer]`` a *lane-varying*
@@ -677,20 +586,16 @@ def make_one_shot_allreduce_kernel(
             # per 256 B, in atom 0 of the highest-numbered rank's inbox. See the
             # ``SUPPORTED_ATOMS`` note. ``_fanout`` always unrolled; this is now
             # consistent with it.
-            if tid < fx.Int32(4):
+            if tid < fx.Int32(FLAG_LANES):
                 elem = (
                     _slot_i32(parity, rank)
                     + fx.Int32(tile_i32)
-                    + lane_in_quad * fx.Int32(4)
+                    + tid * fx.Int32(FLAG_I32_PER_LANE)
                 )
-                v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                _store_v4i32_peer_multi(
-                    [
-                        (peer_vec[peer] + _i32_to_bytes(elem), v4)
-                        for peer in push_peers
-                    ],
-                    flag_policy,
-                )
+                for peer in push_peers:
+                    _store_flag_peer(
+                        peer_vec[peer] + _i32_to_bytes(elem), color, flag_policy
+                    )
 
         def _wait(parity, color):
             """Spin until every rank's flag in our own inbox shows *color*.
@@ -708,33 +613,29 @@ def make_one_shot_allreduce_kernel(
             # Computed before the guard rather than nested inside it, so the
             # remap is a flat ``scf.if`` yielding one value.
             spin_src = tid
-            if const_expr(skip_self):
+            if const_expr(skip_self):  # noqa: SIM102
                 if tid >= fx.Int32(self_rank):
                     spin_src = tid + fx.Int32(1)
             if tid < fx.Int32(len(push_peers)):
-                elem = _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
-                flag_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                    peer_vec[rank] + _i32_to_bytes(elem)
+                flag = peer_vec[rank] + _i32_to_bytes(
+                    _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
                 )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
                 # fence is needed in the loop; the acquire below covers the
                 # payload reads, once, after the join.
-                current = _load_i32_at(flag_rsrc, fx.Int32(0), _RECV_POLICY)
+                current = _load_flag(flag)
                 while current != color:
                     if const_expr(spin_sleep):
                         # Back off between polls. Each iteration is a load that
                         # bypasses both caches, and under arrival skew that runs
                         # for the whole skew window against the same line the
                         # peer is trying to write.
-                        llvm.InlineAsmOp(
-                            None, [], f"s_sleep {spin_sleep}", "", has_side_effects=True
-                        )
-                    current = _load_i32_at(flag_rsrc, fx.Int32(0), _RECV_POLICY)
+                        rocdl.s_sleep(spin_sleep)
+                    current = _load_flag(flag)
             gpu.barrier()
             rocdl.s_waitcnt(vmcnt=0)
-            if const_expr(release_writeback is not None):
-                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
-                rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
             _acquire_inbox()
 
         def _reduce_f32(parity, my_atoms):
@@ -762,7 +663,7 @@ def make_one_shot_allreduce_kernel(
                             + tid * fx.Int32(ATOM_I32)
                         )
                         v = atom_bf16_to_f32(
-                            _load_v4i32_at(self_rsrc, elem, _RECV_POLICY)
+                            _buffer_load(inbox, elem, ATOM_I32, fx.Int32, _RECV_POLICY)
                         )
                     acc = v if acc is None else acc + v
                 outs.append(acc)
@@ -860,13 +761,7 @@ def make_one_shot_allreduce_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    # Every compile-time knob that changes the emitted code has to be in the
-    # symbol name, or two variants collide in the JIT cache. At ``atoms == 1``, 
-    # the (peer, atom) product has one atom per peer, so both fanout orders 
-    # unroll to the same store sequence.
-    tag = f"ws{world_size}_a{atoms}_{inbox_memory}"
-    if block != DEFAULT_BLOCK:
-        tag += f"_b{block}"
+    tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
     if fused:

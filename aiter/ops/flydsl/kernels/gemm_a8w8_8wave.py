@@ -7,26 +7,11 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
-
-
-def ceildiv(numer, denom):
-    """Ceiling division; works on Python ints and on DSL scalars alike.
-
-    Kept local rather than shared: the only other cdiv in aiter
-    (``aiter.dist.utils.cdiv``) is int-only and sits in an unrelated layer,
-    while this one is also applied to runtime ``fx.Int32`` values through
-    operator overloading.
-    """
-    return (numer + denom - 1) // denom
-
-
-def _min(a, b):
-    return arith.select(a < b, a, b)
 
 
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
@@ -38,7 +23,7 @@ def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     iter_i8 = fx.get_iter(t_i8)
     f8_buf_ptr_ty = fx.PointerType.get(
         elem_ty=fp8_ir_t,
-        address_space=TargetAddressSpace.BufferDesc,
+        address_space=rocdl.TargetAddressSpace.BufferDesc,
         alignment=fx.PointerType(iter_i8.type).alignment,
     )
     iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
@@ -232,7 +217,7 @@ class StoreC:
                         fx.BFloat16
                     )
                     c_index = (row + i) * self.c_cols + col
-                    self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
+                    self._store_bf16(scaled, col_valid.select(c_index, oob))
 
 
 class Mfma16x16x128:
@@ -312,13 +297,13 @@ def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
     intra_xcd = wgid // NUM_XCDS
     base = num_wg // NUM_XCDS
     extra = num_wg % NUM_XCDS
-    wgid_remap = xcd * base + _min(xcd, extra) + intra_xcd
+    wgid_remap = xcd * base + fx.min(xcd, extra) + intra_xcd
 
     # Group-of-WGM row swizzle for L2 reuse within one XCD.
     num_wgid_in_group = wgm * num_pid_n
     group_id, intra_group = split_row_major_2d(wgid_remap, num_wgid_in_group)
     first_pid_m = group_id * wgm
-    group_size_m = _min(num_pid_m - first_pid_m, wgm)
+    group_size_m = fx.min(num_pid_m - first_pid_m, wgm)
     pid_n, intra_group_m = split_row_major_2d(intra_group, group_size_m)
     return first_pid_m + intra_group_m, pid_n
 

@@ -15,23 +15,33 @@ stays ``ATOMS * rank_tile_bytes``.
 Geometry, cache policy and the wire codec live in
 ``quick_allreduce_shared`` and ``quick_allreduce_codec``, which the ring
 and one-shot schedules share byte for byte.
+
+Two tuning knobs besides the super-tile:
+
+* ``block`` -- threads per workgroup. It sets the tile (``block * ATOMS * 16 B``),
+  hence how many blocks a payload gets and how many flags it costs.
+* ``skip_self`` -- drop this rank's round trip through its own inbox:
+  its reduce-scatter share is added from registers, and its reduced chunk
+  is decoded from the same packet it sends. It needs the rank at trace time,
+  which costs one binary per rank.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
-from . import buffer_ops
 from .quick_allreduce_codec import (
     SUPER_TILES,
+    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
     _codec_quant,
+    _f16x2,
+    _i32,
     _scale_from_word,
     codecs_for_block,
     scale_slot_of,
@@ -53,6 +63,8 @@ from .quick_allreduce_shared import (
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
@@ -60,9 +72,15 @@ from .quick_allreduce_shared import (
     WAVE,
     WORLD,
     _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
     _i32_to_bytes,
-    _load_i32_nt,
-    _load_i32_uncached,
+    _load_flag,
+    _load_peers,
+    _payload_io,
+    _release_inbox,
+    _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
     make_pack_storage,
@@ -75,11 +93,13 @@ __all__ = [
     "MESH_CODECS",
     "MESH_ST_LADDER",
     "SUPER_TILES",
+    "SUPPORTED_BLOCKS",
     "SUPPORTED_WORLDS",
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
     "make_quick_allreduce_int4_kernel",
+    "mesh_st_ladder",
 ]
 
 PHASES = 2
@@ -111,8 +131,7 @@ def clamp_grid_cap(
     """Clamp a requested persistent grid to what actually fits on the device.
 
     A persistent kernel deadlocks if it launches more workgroups than can be
-    co-resident, so the cap has to respect VGPR-limited occupancy rather than
-    the caller's wish.
+    co-resident, so the cap has to respect VGPR-limited occupancy.
 
     An unmeasured *super_tile* -- the ring runs ST=16 and ST=32, which this
     table does not cover -- falls back to the smallest measurement for that
@@ -148,22 +167,43 @@ def clamp_grid_cap(
                 f"world_size={world_size}"
             )
         resident = min(for_world)
-    resident = max(1, (resident * BLOCK) // int(block))
+    if block > BLOCK:
+        resident = max(1, (resident * BLOCK) // int(block))
     return min(int(requested), resident * int(cu_count))
 
 
-# Per-world-size tuning ladder: ``(min_bytes, super_tile, grid_cap)`` rungs.
+# Per-``(link, world_size)`` tuning ladder: ``(min_bytes, super_tile, grid_cap,
+# block, skip_self)`` rungs, ascending.
 #
 #   TP2  ST=1 everywhere.
 #   TP4  ST=8 everywhere.
 #   TP8  ST=1 up to 768 KiB then ST=8.
 #
-# ``grid_cap`` is 128 on every rung, against the ``DEFAULT_GRID_CAP`` of 1216.
-MESH_ST_LADDER = {
-    2: ((0, 1, 128),),
-    4: ((0, 8, 128),),
-    8: ((0, 1, 128), (768 << 10, 8, 128)),
+_MESH_DEFAULT = {
+    2: ((0, 1, 128, BLOCK, False),),
+    4: ((0, 8, 128, BLOCK, False),),
+    8: ((0, 1, 128, BLOCK, False), (768 << 10, 8, 128, BLOCK, False)),
 }
+#  ``(min_bytes, super_tile, grid_cap, block, skip_self)``
+MESH_ST_LADDER = {
+    ("xgmi", 2): ((0, 8, 128, 128, True),),
+    ("xgmi", 4): ((0, 1, 128, 64, True), (1 << 20, 8, 128, 256, True)),
+    ("xgmi", 8): (
+        (0, 8, 128, 256, True),
+        (2 << 20, 8, 128, 256, False),
+        (8 << 20, 8, 128, 512, True),
+    ),
+    ("pcie", 2): ((0, 8, 128, 128, True), (6 << 20, 8, 128, 256, True)),
+    ("pcie", 4): ((0, 1, 128, 256, True), (768 << 10, 8, 128, 512, True)),
+    ("pcie", 8): ((0, 1, 128, 256, True), (96 << 10, 8, 128, 512, True)),
+}
+
+
+def mesh_st_ladder(world_size: int, link: str = "pcie"):
+    """Rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
+    return MESH_ST_LADDER.get((str(link), int(world_size)), ())
+
+
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "fp16")
 
@@ -197,6 +237,8 @@ def make_quick_allreduce_int4_kernel(
     hidden: int | None = None,
     block: int | None = None,
     h_pad: int | None = None,
+    skip_self: bool = False,
+    rank: int | None = None,
 ):
     if fusion not in FUSIONS:
         raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
@@ -216,6 +258,11 @@ def make_quick_allreduce_int4_kernel(
         )
     if codec not in MESH_CODECS:
         raise ValueError(f"codec must be one of {MESH_CODECS}, got {codec!r}")
+    if skip_self and not 0 <= (rank if rank is not None else -1) < world_size:
+        raise ValueError(
+            f"skip_self needs the rank at trace time, got rank={rank!r} for "
+            f"world_size={world_size}"
+        )
 
     fused = fusion == "rmsnorm"
     if fused:
@@ -233,9 +280,12 @@ def make_quick_allreduce_int4_kernel(
             )
         block, atoms_per_row = quick_reduce_row_block_at(h_pad, world_size, block)
     else:
-        if block is not None:
-            raise ValueError("block is only meaningful for a fused build")
-        block, atoms_per_row = BLOCK, 1
+        # The plain kernel takes a caller-chosen block; the fused build derives
+        # its own from the row geometry just above.
+        block = BLOCK if block is None else block
+        if block not in SUPPORTED_BLOCKS:
+            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
+        atoms_per_row = 1
     padded = fused and h_pad != hidden
     rows_per_tile = ATOMS // atoms_per_row
     n_waves = block // WAVE
@@ -251,10 +301,11 @@ def make_quick_allreduce_int4_kernel(
     hbm_tile_bytes = hbm_tile_i32 * 4
 
     c = codecs_for_block(block)[codec]
+    quads_per_block = block // QUAD_LANES
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
-    release_writeback = policy["writeback"]
+    release_scope = policy["release"]
     recv_policy = policy["recv"]
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
@@ -271,30 +322,42 @@ def make_quick_allreduce_int4_kernel(
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
 
-    # A rank-tile's sectors, in stripes of up to 8 (a 256-thread workgroup has
-    # 64 quads, and world_size*8 of them cover one full stripe at TP8). INT4 is
-    # 8+8+2; fp16, with no scale tail, is eight full stripes. One fanout layout
-    # per distinct stripe width.
-    stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
-    _fanout_stride = {
-        w: (w, 1) if policy["fanout"] == "peer" else (1, world_size)
-        for w in {width for _, width in stripes}
-    }
-    # One quad per (peer, sector) of a stripe, in a single pass -- unlike the
-    # ring, which loops rounds. A block narrower than the shipped 256 would run
-    # out of quads and silently drop the sectors past the end, so a fused build
-    # that lands there is rejected rather than built.
-    quads_per_block, need_quads = mesh_fanout_quads(block, world_size, codec)
-    if quads_per_block < need_quads:
-        raise ValueError(
-            f"fused hidden={hidden} gives BLOCK={block} ({quads_per_block} quads), "
-            f"under the {need_quads} the {codec} fanout needs at world_size="
-            f"{world_size}; use a wider hidden or the ring schedule"
-        )
+    # This rank's own index as a trace-time constant, or None when the self
+    # slot is being used. A fused build never skips self.
+    self_rank = int(rank) if skip_self else None
+    # Destinations this rank pushes packets and flags to, in rank order. Every
+    # per-destination structure below -- LDS pack rows, fanout quads, flag
+    # lanes -- is indexed by position in this list, not by rank.
+    push_peers = [p for p in range(world_size) if p != self_rank]
+    n_push = len(push_peers)
 
-    # dest × rank_atoms == ATOMS for every supported world size.
-    pack_i32 = ATOMS * c.rank_tile_i32
-    PackStorage = make_pack_storage(pack_i32)
+    # One quad per (destination, sector) of a stripe, in a single pass -- unlike
+    # the ring, which loops rounds. A block narrower than the shipped 256 would
+    # run out of quads and silently drop the sectors past the end, so a fused
+    # build that lands there is rejected rather than built. (The plain path can
+    # still narrow ``stripe_width`` below; only fused derives its own block.)
+    if const_expr(fused):
+        _, need_quads = mesh_fanout_quads(block, world_size, codec)
+        if quads_per_block < need_quads:
+            raise ValueError(
+                f"fused hidden={hidden} gives BLOCK={block} ({quads_per_block} "
+                f"quads), under the {need_quads} the {codec} fanout needs at "
+                f"world_size={world_size}; use a wider hidden or the ring schedule"
+            )
+
+    # A rank-tile's sectors, in stripes of up to 8, one quad per (destination,
+    # sector) of a stripe, in a single pass.
+    stripe_width = min(8, quads_per_block // n_push)
+    stripes = [
+        (b, min(stripe_width, c.n_sectors - b))
+        for b in range(0, c.n_sectors, stripe_width)
+    ]
+    sector_fastest = policy["fanout"] != "peer"
+
+    # One pack row per (destination, rank-atom).
+    pack_rows = n_push * rank_atoms
+    pack_i32 = pack_rows * c.rank_tile_i32
+    lds_bytes = pack_rows * c.rank_tile_bytes
 
     # Per-wave partials for the fused sum of squares, one slot per row of a
     # tile. Allocated from the same allocator as the pack staging (FlyDSL
@@ -302,8 +365,20 @@ def make_quick_allreduce_int4_kernel(
     # packet the fanout is still reading.
     n_partials = rows_per_tile * n_waves if (fused and n_waves > 1) else 0
     WavePartials = make_wave_partials(n_partials) if n_partials else None
-    lds_bytes = ATOMS * c.rank_tile_bytes + n_partials * 4
+    lds_bytes += n_partials * 4
+    PackStorage = make_pack_storage(pack_i32)
 
+    # flags_i32 is also the i32 offset of the wire area, so the flag prefix has
+    # to be a whole number of 64 B sectors (16 i32s). At a smaller multiple every
+    # rank-tile and release sector straddles two hardware sectors, so the 64 B
+    # fanout stores and the last-sector release stop being one sector wide.
+    grid_multiple = 16 // (PHASES * world_size)
+    if grid % grid_multiple != 0:
+        raise ValueError(
+            f"grid must be a multiple of {grid_multiple} at "
+            f"world_size={world_size} to keep the wire area 64 B aligned, got "
+            f"{grid}"
+        )
     flags_i32 = PHASES * grid * world_size
 
     # One signature for both modes; the plain launcher below passes zeros for
@@ -333,50 +408,42 @@ def make_quick_allreduce_int4_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        pack_layout = fx.make_layout((ATOMS, c.rank_tile_i32), (c.rank_tile_i32, 1))
+        pack_layout = fx.make_layout((pack_rows, c.rank_tile_i32), (c.rank_tile_i32, 1))
         # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
         # start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
-        # Remote NT fanout stays explicit global_store_dwordx4 nt.
-        # The tiled copy is used by both modes. ``hbm_row_layout`` (one atom-wide
-        # row) and ``hbm_copy`` are built unconditionally; a padded build
-        # addresses each row through a per-row bounded descriptor
-        # (``_rowbuf_atom_row``), an unpadded one slices the whole-tensor buffer
-        # tensor (``_hbm_atom_row``). ``hbm_layout`` is the 3-D whole-tensor
-        # layout consumed only by the unpadded ``make_payload_tensor``; a padded
-        # build binds it to None (its ``_payload_tensor`` never reads it).
+        # The fused epilogue reaches its HBM operands (residual, weight, final
+        # output) as raw bf16 atoms through a tiled copy; the plain reduce path
+        # uses the shared ``_payload_io`` helpers below and never builds these.
+        # ``hbm_row_layout`` (one atom-wide row) and ``hbm_copy`` serve both fused
+        # sub-modes; a padded build addresses each row through a per-row bounded
+        # descriptor (``_rowbuf_atom_row``), an unpadded one slices the
+        # whole-tensor buffer tensor (``_hbm_atom_row``). ``hbm_layout`` is the
+        # 3-D whole-tensor layout consumed only by the unpadded
+        # ``make_payload_tensor``; a padded build leaves it None.
+        hbm_i32_ptr = None
         hbm_layout = None
-        if const_expr(not padded):
-            hbm_layout = fx.make_layout(
-                (num_tiles, ATOMS, block * 4),
-                (hbm_tile_i32, block * 4, 1),
+        hbm_row_layout = None
+        hbm_copy_atom = None
+        hbm_copy = None
+        if const_expr(fused):
+            hbm_i32_ptr = fx.PointerType.get(
+                T.i32, address_space=fx.AddressSpace.Global, alignment=16
             )
-        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-        hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-        hbm_copy = fx.make_tiled_copy_tv(
-            hbm_copy_atom,
-            fx.make_layout((1, block), (1, 1)),
-            fx.make_layout((1, 4), (1, 1)),
-        ).get_slice(tid)
+            if const_expr(not padded):
+                hbm_layout = fx.make_layout(
+                    (num_tiles, ATOMS, block * 4),
+                    (hbm_tile_i32, block * 4, 1),
+                )
+            hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
+            hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
+            hbm_copy = fx.make_tiled_copy_tv(
+                hbm_copy_atom,
+                fx.make_layout((1, block), (1, 1)),
+                fx.make_layout((1, 4), (1, 1)),
+            ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
-        # A 256-thread workgroup has 64 quads. A stripe of up to 8 sectors needs
-        # world_size*8 quads (64 at 8 GPUs); leftover quads sit idle (always on
-        # a narrower tail stripe, and on every stripe when world_size < 8).
-        #
-        # Which axis runs fastest across consecutive quads is a fabric
-        # question. "sector": consecutive quads target consecutive peers of
-        # one sector, so a single store instruction hits every GPU -- ideal
-        # on xGMI, whose native packet is exactly the 64 B a quad writes.
-        # "peer": consecutive quads walk the sectors of one peer, giving each
-        # destination a 512 B contiguous run. PCIe wants that -- interleaving
-        # destinations every 64 B costs ~1.5x against >=256 B runs (36.25 vs
-        # 54.03 GB/s measured on MI350P).
-        fanout_layouts = {
-            w: fx.make_layout((world_size, w), stride)
-            for w, stride in _fanout_stride.items()
-        }
-        color_layout = fx.make_layout((grid,), (1,))
         wire_slot_layout = fx.make_layout(
             (PHASES, grid, world_size, super_tile),
             (
@@ -398,65 +465,73 @@ def make_quick_allreduce_int4_kernel(
         if const_expr(n_partials > 0):
             sq_lds = allocator.allocate(WavePartials).peek().wave.ptr
 
-        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
-        peers = [
-            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
-            for i in range(world_size)
-        ]
+        peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
-        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(peer_vec[rank])
-        )
-        # inp/out are a 3-D i32 tensor consumed by TiledCopy (BufferCopy128b).
-        # That API needs a FlyDSL buffer-backed tensor (layout + descriptor),
-        # not a raw descriptor. create_buffer_resource_from_addr is the
-        # scalar-offset buffer_load/store path used for the peer-pointer
-        # table, IPC inbox, and color flags. num_records_bytes is the live
-        # tensor size so a partial last tile is out-of-range safe.
-        hbm_i32_ptr = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=16
-        )
+        inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
 
-        _payload_tensor = make_payload_tensor(
-            padded=padded,
-            nbytes=nbytes,
-            hbm_i32_ptr=hbm_i32_ptr,
-            hbm_layout=hbm_layout,
-        )
-        # A padded build addresses each row through a per-row buffer descriptor
-        # bounded to the true width; ``_rowbuf_atom_row(ptr, tile, atom)`` builds
-        # it from the operand's raw base pointer. Unpadded is None (unused).
-        _rowbuf_atom_row = (
-            make_rowbuf_atom_row(
-                atoms_per_row=atoms_per_row,
-                rows_per_tile=rows_per_tile,
-                row_stride_i32=row_stride_i32,
-                block=block,
-                hidden=hidden,
-                hbm_i32_ptr=hbm_i32_ptr,
-                hbm_row_layout=hbm_row_layout,
-            )
-            if padded
-            else None
-        )
+        def _push_base(j):
+            """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
 
-        # A padded build keeps the HBM operands as raw ``Int64`` base pointers so
-        # ``_rowbuf_atom_row`` can bound a fresh descriptor per row; an unpadded
-        # build wraps them in the whole-tensor buffer tensor via ``_payload_tensor``.
-        def _operand(ptr, records=None):
-            return ptr if const_expr(padded) else _payload_tensor(ptr, records)
+            base = peers[push_peers[0]]
+            for i in range_constexpr(1, n_push):
+                base = (j == fx.Int32(i)).select(peers[push_peers[i]], base)
+            return base
 
-        in_buf = _operand(inp_ptr)
-        out_buf = _operand(out_ptr)
-        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+        # The plain reduce path moves whole tiles through the shared payload
+        # helpers; the fused epilogue below reaches the same rows as raw bf16
+        # atoms through the tiled copy instead.
+        _load_atom, _store_atom = _payload_io(
+            inp_ptr,
+            out_ptr,
+            nbytes,
+            num_tiles,
+            ATOMS,
+            block,
+            tid,
+            decode=_atom_bf16_to_f16,
+            encode=_atom_f16_to_bf16,
+        )
+        _load_color, _store_color = _color_io(colors_ptr, bid)
 
         if const_expr(fused):
-            # residual in/out share the payload's (M, hidden) bf16 shape, so
-            # they ride the same addressing. The gain is one (hidden,) row --
-            # ``atoms_per_row`` atoms at tile 0; a padded build reads it through
-            # the per-row descriptor at row 0, an unpadded one bounds a one-row
-            # buffer tensor at the true width (the whole mask for this operand,
-            # since nothing lies past it).
+            _payload_tensor = make_payload_tensor(
+                padded=padded,
+                nbytes=nbytes,
+                hbm_i32_ptr=hbm_i32_ptr,
+                hbm_layout=hbm_layout,
+            )
+            # A padded build addresses each row through a per-row buffer
+            # descriptor bounded to the true width; ``_rowbuf_atom_row(ptr, tile,
+            # atom)`` builds it from the operand's raw base pointer. Unpadded is
+            # None (unused).
+            _rowbuf_atom_row = (
+                make_rowbuf_atom_row(
+                    atoms_per_row=atoms_per_row,
+                    rows_per_tile=rows_per_tile,
+                    row_stride_i32=row_stride_i32,
+                    block=block,
+                    hidden=hidden,
+                    hbm_i32_ptr=hbm_i32_ptr,
+                    hbm_row_layout=hbm_row_layout,
+                )
+                if padded
+                else None
+            )
+
+            # A padded build keeps the HBM operands as raw ``Int64`` base
+            # pointers so ``_rowbuf_atom_row`` can bound a fresh descriptor per
+            # row; an unpadded build wraps them in the whole-tensor buffer tensor
+            # via ``_payload_tensor``.
+            def _operand(ptr, records=None):
+                return ptr if const_expr(padded) else _payload_tensor(ptr, records)
+
+            # residual in/out share the payload's (M, hidden) bf16 shape, so they
+            # ride the same addressing, as does the final output row. The gain is
+            # one (hidden,) row -- ``atoms_per_row`` atoms at tile 0; a padded
+            # build reads it through the per-row descriptor at row 0, an unpadded
+            # one bounds a one-row buffer tensor at the true width (the whole mask
+            # for this operand, since nothing lies past it).
+            out_buf = _operand(out_ptr)
             res_in_buf = _operand(res_in_ptr)
             res_out_buf = _operand(res_out_ptr)
             w_buf = _operand(w_ptr, records=fx.Int64(hidden * 2))
@@ -470,89 +545,112 @@ def make_quick_allreduce_int4_kernel(
             )
             return fx.Int32(flags_i32) + slot
 
-        def _hbm_atom_row(buf, tile, atom):
-            return fx.make_view(
-                fx.get_iter(fx.slice(buf, (tile, atom, None))),
-                hbm_row_layout,
-            )
+        if const_expr(fused):
 
-        def _load_color():
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            return fx.Int32(
-                buffer_ops.buffer_load(color_rsrc, off, vec_width=1, dtype=T.i32)
-            )
+            def _hbm_atom_row(buf, tile, atom):
+                return fx.make_view(
+                    fx.get_iter(fx.slice(buf, (tile, atom, None))),
+                    hbm_row_layout,
+                )
 
-        def _store_color(color):
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            buffer_ops.buffer_store(color, color_rsrc, off)
-
-        # The row-view function is chosen once at trace time: a padded build
-        # addresses each row through a per-row bounded descriptor, an unpadded
-        # one slices the whole-tensor buffer tensor. Both return a one-atom-wide
-        # row view that ``partition_S/D`` consume, so the copy bodies are uniform.
-        _atom_row = _rowbuf_atom_row if padded else _hbm_atom_row
+            # The row-view function is chosen once at trace time: a padded build
+            # addresses each row through a per-row bounded descriptor, an
+            # unpadded one slices the whole-tensor buffer tensor. Both return a
+            # one-atom-wide row view that ``partition_S/D`` consume, so the copy
+            # bodies are uniform.
+            _atom_row = _rowbuf_atom_row if padded else _hbm_atom_row
 
         def _load_tile_atoms(tile):
-            atoms = []
-            for atom in range_constexpr(ATOMS):
-                atoms.append(_atom_bf16_to_f16(_load_raw_atom(in_buf, tile, atom)))
-            return atoms
+            return [_load_atom(tile, atom) for atom in range_constexpr(ATOMS)]
 
         def _store_tile_atoms(tile, atoms):
+            """Store a gathered tile; ``None`` marks atoms already stored."""
             for atom in range_constexpr(ATOMS):
-                _store_raw_atom(out_buf, tile, atom, _atom_f16_to_bf16(atoms[atom]))
+                if const_expr(atoms[atom] is not None):
+                    _store_atom(tile, atom, atoms[atom])
 
-        def _load_raw_atom(buf, tile, atom):
-            """One 16 B atom, unconverted -- the fused epilogue's bf16 operands
-            are not codec values and never become fp16."""
-            src = hbm_copy.partition_S(_atom_row(buf, tile, atom))
-            frag = fx.make_fragment_like(src)
-            fx.copy(hbm_copy_atom, src, frag)
-            return fx.Vector(frag.load())
+        def _own_atoms(atoms):
+            """This rank's reduce-scatter share, out of a whole tile's atoms."""
+            return atoms[self_rank * rank_atoms : (self_rank + 1) * rank_atoms]
 
-        def _store_raw_atom(buf, tile, atom, value):
-            dst = hbm_copy.partition_D(_atom_row(buf, tile, atom))
-            frag = fx.make_fragment_like(dst)
-            frag.store(value)
-            fx.copy(hbm_copy_atom, frag, dst)
+        def _add_f16(a, b):
+            """Packed fp16 ``a + b`` of two atoms -- the codec's own FP16 add."""
+            return fx.Vector.from_elements(
+                [_i32(_f16x2(a[i]) + _f16x2(b[i])) for i in range_constexpr(4)],
+                fx.Int32,
+            )
 
-        def _atom_f16_to_f32(atom):
-            """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
-            return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32)
+        if const_expr(fused):
 
-        def _epilogue(tile, gathered, w_atoms):
-            """Residual add + RMSNorm over the whole tile.
+            def _load_raw_atom(buf, tile, atom):
+                """One 16 B atom, unconverted -- the fused epilogue's bf16
+                operands are not codec values and never become fp16."""
+                src = hbm_copy.partition_S(_atom_row(buf, tile, atom))
+                frag = fx.make_fragment_like(src)
+                fx.copy(hbm_copy_atom, src, frag)
+                return fx.Vector(frag.load())
 
-            The mesh ends a tile holding every atom of it, and the fused
-            geometry makes ``atoms_per_row`` of them one token row, so the tile
-            is ``rows_per_tile`` independent rows and each reduces inside this
-            block. All of them go through one ``rms_rstd`` call, which is one
-            barrier rather than one per row.
-            """
-            rows = []
-            for r in range_constexpr(rows_per_tile):
-                idx = [r * atoms_per_row + a for a in range_constexpr(atoms_per_row)]
-                xs = residual_add(
-                    [_atom_f16_to_f32(gathered[j]) for j in idx],
-                    [_load_raw_atom(res_in_buf, tile, j) for j in idx],
-                )
-                rows.append(xs)
-                # residual_out is final here, so it is issued ahead of the
-                # reduction rather than behind its barrier.
-                packed = pack_bf16(xs)
-                for a in range_constexpr(atoms_per_row):
-                    _store_raw_atom(res_out_buf, tile, idx[a], packed[a])
+            def _store_raw_atom(buf, tile, atom, value):
+                dst = hbm_copy.partition_D(_atom_row(buf, tile, atom))
+                frag = fx.make_fragment_like(dst)
+                frag.store(value)
+                fx.copy(hbm_copy_atom, frag, dst)
 
-            rstds = rms_rstd(rows, eps, hidden, tid=tid, block=block, lds=sq_lds)
-            for r in range_constexpr(rows_per_tile):
-                outs = scale_by_weight(rows[r], rstds[r], w_atoms)
-                for a in range_constexpr(atoms_per_row):
-                    _store_raw_atom(out_buf, tile, r * atoms_per_row + a, outs[a])
-            if const_expr(n_partials > 0):
-                # The next tile reuses these slots, and the super-tile store
-                # loop runs back-to-back with no barrier of its own between
-                # iterations -- this is what separates its writes from our reads.
-                gpu.barrier()
+            # The reduce-scatter input read must reach ``inp`` through the same
+            # per-row bounded descriptor the epilogue uses, not the plain path's
+            # whole-payload ``_payload_io`` tensor. At h_pad != hidden the wire
+            # tile is wider than the HBM row, so ``_payload_io``'s single bound
+            # lets a pad lane read the next row instead of zero -- which then
+            # rides the wire into residual_out. Re-home ``_load_tile_atoms`` onto
+            # the raw-atom route (bf16 -> f16 for the codec), shadowing the plain
+            # definition above for the fused build only.
+            in_buf = _operand(inp_ptr)
+
+            def _load_tile_atoms(tile):
+                atoms = []
+                for atom in range_constexpr(ATOMS):
+                    atoms.append(_atom_bf16_to_f16(_load_raw_atom(in_buf, tile, atom)))
+                return atoms
+
+            def _atom_f16_to_f32(atom):
+                """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
+                return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32)
+
+            def _epilogue(tile, gathered, w_atoms):
+                """Residual add + RMSNorm over the whole tile.
+
+                The mesh ends a tile holding every atom of it, and the fused
+                geometry makes ``atoms_per_row`` of them one token row, so the
+                tile is ``rows_per_tile`` independent rows and each reduces inside
+                this block. All of them go through one ``rms_rstd`` call, which is
+                one barrier rather than one per row.
+                """
+                rows = []
+                for r in range_constexpr(rows_per_tile):
+                    idx = [
+                        r * atoms_per_row + a for a in range_constexpr(atoms_per_row)
+                    ]
+                    xs = residual_add(
+                        [_atom_f16_to_f32(gathered[j]) for j in idx],
+                        [_load_raw_atom(res_in_buf, tile, j) for j in idx],
+                    )
+                    rows.append(xs)
+                    # residual_out is final here, so it is issued ahead of the
+                    # reduction rather than behind its barrier.
+                    packed = pack_bf16(xs)
+                    for a in range_constexpr(atoms_per_row):
+                        _store_raw_atom(res_out_buf, tile, idx[a], packed[a])
+
+                rstds = rms_rstd(rows, eps, hidden, tid=tid, block=block, lds=sq_lds)
+                for r in range_constexpr(rows_per_tile):
+                    outs = scale_by_weight(rows[r], rstds[r], w_atoms)
+                    for a in range_constexpr(atoms_per_row):
+                        _store_raw_atom(out_buf, tile, r * atoms_per_row + a, outs[a])
+                if const_expr(n_partials > 0):
+                    # The next tile reuses these slots, and the super-tile store
+                    # loop runs back-to-back with no barrier of its own between
+                    # iterations -- this is what separates its writes from reads.
+                    gpu.barrier()
 
         def _finish_tile(tile, gathered, w_atoms):
             if const_expr(fused):
@@ -573,17 +671,19 @@ def make_quick_allreduce_int4_kernel(
         def _pack_reduce_scatter(atoms):
             """Quantize each destination's slice of this tile into LDS.
 
-            A 32 KiB tile is 8 atoms; destination *d* owns
-            ``atoms[d * rank_atoms : (d+1) * rank_atoms]``. Those packets
-            are later NT-stored into *d*'s reduce-scatter inbox.
+            *atoms* is this thread's share of the whole tile, as loaded by
+            ``_load_tile_atoms``: always ``ATOMS`` (8) 16 B atoms. Destination *d*
+            owns ``atoms[d * rank_atoms : (d+1) * rank_atoms]``. Those packets
+            are later NT-stored into *d*'s reduce-scatter inbox. Under
+            skip_self our own slice is never packed: it stays in registers.
             """
-            for dest in range_constexpr(world_size):
+            for j, dest in enumerate(push_peers):
                 for k in range_constexpr(rank_atoms):
                     words, scale, is_leader = _codec_quant(
                         c, atoms[dest * rank_atoms + k], lane, tid
                     )
                     _lds_write_packet(
-                        fx.Int32(dest * rank_atoms + k), words, scale, is_leader
+                        fx.Int32(j * rank_atoms + k), words, scale, is_leader
                     )
 
         def _pack_all_gather(accs):
@@ -593,47 +693,71 @@ def make_quick_allreduce_int4_kernel(
             atoms. Copy the same packets into every destination slot so the
             NT fanout can push them into every peer's all-gather inbox.
             """
+            own = [] if const_expr(self_rank is not None) else None
             for k in range_constexpr(rank_atoms):
                 words, scale, is_leader = _codec_quant(c, accs[k], lane, tid)
-                for dest in range_constexpr(world_size):
+                for j in range_constexpr(n_push):
                     _lds_write_packet(
-                        fx.Int32(dest * rank_atoms + k), words, scale, is_leader
+                        fx.Int32(j * rank_atoms + k), words, scale, is_leader
                     )
+                if const_expr(own is not None):
+                    own.append(
+                        _codec_dequant(
+                            c, words, _scale_from_word(c, scale, pair_in_slot), tid
+                        )
+                    )
+            return own
 
         def _fanout_nt(phase, inbox_src, sub):
-            """NT-store one rank-tile from LDS to every peer's inbox.
+            """NT-store one rank-tile from LDS to every destination's inbox.
 
-            Lockstep stripes of up to 8 sectors cover the rank-tile: INT4 is
-            8+8+2 (16 nibble sectors then the 2-sector E4M3 tail), fp16 is
-            eight full stripes. ``sector_base`` is the first sector of each
-            stripe.
+            Lockstep stripes of up to 8 sectors cover the rank-tile: at the
+            default block INT4 is 8+8+2 (16 nibble sectors then the 2-sector
+            E4M3 tail), fp16 is eight full stripes. ``sector_base`` is the first
+            sector of each stripe.
+
+            One quad per (destination, sector) of a stripe; leftover quads sit
+            idle. Which axis runs fastest across consecutive quads is a fabric
+            question.
+                - "sector": consecutive quads target consecutive peers of
+                  one sector, so a single store instruction hits every GPU
+                  -- ideal on xGMI, whose native packet is exactly the 64 B
+                  a quad writes.
+                - "peer": consecutive quads walk the sectors of one peer,
+                  giving each destination a ``64 * width`` B contiguous run
+                  -- ideal on PCIe.
             """
             for k in range_constexpr(rank_atoms):
                 for sector_base, width in stripes:
-                    fanout = fanout_layouts[width]
-                    n_quads = fx.Int32(world_size * width)
+                    n_quads = fx.Int32(n_push * width)
                     safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
-                    peer, sector_in_stripe = fx.idx2crd(safe, fanout).unpack()
+                    if const_expr(sector_fastest):
+                        # sector fastest
+                        j = safe % fx.Int32(n_push)
+                        sector_in_stripe = safe // fx.Int32(n_push)
+                    else:
+                        # peer fastest
+                        j = safe // fx.Int32(width)
+                        sector_in_stripe = safe % fx.Int32(width)
                     sector = fx.Int32(sector_base) + sector_in_stripe
                     if quad_id < n_quads:
                         vec_idx = fx.get_scalar(
                             fx.crd2idx((sector, lane_in_quad), nt_own_layout)
                         )
-                        pack_peer = peer
+                        pack_row = j
                         wire_idx = vec_idx
                         if const_expr(rank_atoms != 1):
-                            pack_peer = peer * fx.Int32(rank_atoms) + fx.Int32(k)
+                            pack_row = j * fx.Int32(rank_atoms) + fx.Int32(k)
                             wire_idx = vec_idx + fx.Int32(k * c.rank_tile_i32)
                         # 4xi32 NT vector cannot go through the i32 pack view.
                         v4 = fx.ptr_load(
-                            smem_ptr + _pack_off(pack_peer, vec_idx),
+                            smem_ptr + _pack_off(pack_row, vec_idx),
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
-                        dest = peer_vec[peer]
                         byte_off = _i32_to_bytes(
                             _sub_tile_i32(phase, inbox_src, sub) + wire_idx
                         )
-                        _store_v4i32_peer(dest + byte_off, v4, payload_policy)
+                        _store_v4i32_peer(_push_base(j) + byte_off, v4, payload_policy)
 
         def _publish(phase, inbox_src, color):
             """Drain payload NT stores, then write *color* into every peer inbox.
@@ -650,49 +774,54 @@ def make_quick_allreduce_int4_kernel(
             can move after the color store, and neither can be dropped.
 
             On a cacheable inbox retiring the stores is not enough -- they
-            can be sitting in this XCD's L2. ``buffer_wbl2`` after the join
-            writes them back, and its own ``vmcnt(0)`` waits for that to
-            land before the flag goes out. Every workgroup issues its own:
-            L2 is per-XCD, so one workgroup's writeback says nothing about
-            a workgroup on another die.
+            can be sitting in this XCD's L2. The release fence after the join
+            writes them back (``buffer_wbl2``) and waits for that to land
+            before the flag goes out. Every workgroup issues its own: L2 is
+            per-XCD.
+
+            ``FLAG_LANES`` lanes per destination, 8 B each, so at most 64
+            lanes: the whole handshake is one store instruction from wave 0.
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if const_expr(release_writeback is not None):
-                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
-                rocdl.s_waitcnt(vmcnt=0)
-            limit = fx.Int32(world_size)
-            safe = (quad_id < limit).select(quad_id, fx.Int32(0))
-            if quad_id < limit:
-                vec_idx = fx.Int32(release_i32_off) + lane_in_quad * fx.Int32(4)
-                v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                dest = peer_vec[safe]
-                byte_off = _i32_to_bytes(
-                    _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
+            limit = fx.Int32(n_push)
+            dest = tid // fx.Int32(FLAG_LANES)
+            safe = (dest < limit).select(dest, fx.Int32(0))
+            if dest < limit:
+                elem = (
+                    _sub_tile_i32(phase, inbox_src, fx.Int32(0))
+                    + fx.Int32(release_i32_off)
+                    + (tid % fx.Int32(FLAG_LANES)) * fx.Int32(FLAG_I32_PER_LANE)
                 )
-                _store_v4i32_peer(dest + byte_off, v4, flag_policy)
+                _store_flag_peer(
+                    _push_base(safe) + _i32_to_bytes(elem), color, flag_policy
+                )
 
-        def _wait_flag(flag_rsrc, color):
-            # No fence in the loop body: _load_i32_uncached carries `sc0 sc1`,
-            # so a retry cannot be served from a stale line. The acquire the
+        def _wait_flag(flag, color):
+            # No fence in the loop body: _load_flag carries `sc0 sc1`, so a
+            # retry cannot be served from a stale line. The acquire the
             # payload reads need is in _wait_release, once, after the join.
-            current = _load_i32_uncached(flag_rsrc)
+            current = _load_flag(flag)
             while current != color:
-                current = _load_i32_uncached(flag_rsrc)
+                current = _load_flag(flag)
 
         def _wait_release(phase, color):
-            if tid < world_size:
-                elem = _sub_tile_i32(phase, tid, fx.Int32(0)) + fx.Int32(
+            # Lane ``t`` watches one source. Without skip_self that is source
+            # ``t``; with it our own flag is never published, so the N-1 lanes
+            # step over our own index.
+            spin_src = tid
+            if const_expr(self_rank is not None):  # noqa: SIM102
+                if tid >= fx.Int32(self_rank):
+                    spin_src = tid + fx.Int32(1)
+            if tid < n_push:
+                elem = _sub_tile_i32(phase, spin_src, fx.Int32(0)) + fx.Int32(
                     release_i32_off
                 )
-                _wait_flag(
-                    buffer_ops.create_buffer_resource_from_addr(
-                        peer_vec[rank] + _i32_to_bytes(elem)
-                    ),
-                    color,
-                )
+                _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
             gpu.barrier()
-            # Unconditional and after the join. Only `tid < world_size` spun,
+            # Unconditional and after the join. Only `tid < n_push` spun,
             # so scoping the acquire to the spin would leave the other waves
             # of this workgroup reading the payload with nothing invalidated
             # on their behalf -- and would also skip it entirely in the common
@@ -705,34 +834,45 @@ def make_quick_allreduce_int4_kernel(
                 base = base + fx.Int32(k * c.rank_tile_i32)
 
             def _get(off):
-                return _load_i32_nt(self_rsrc, base + off, recv_policy)
+                return _buffer_load(inbox, base + off, 1, fx.Int32, recv_policy)[0]
 
             words, word = _codec_load(c, _get, tid, scale_slot)
             return words, _scale_from_word(c, word, pair_in_slot)
 
-        def _reduce_scattered(sub):
+        def _reduce_scattered(sub, own=None):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    words, scale = _recv_quantized(
-                        PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
-                    )
-                    if accs[k] is None:
-                        accs[k] = _codec_dequant(c, words, scale, tid)
+                    # self_rank is None if self-skip is disabled.
+                    if const_expr(src == self_rank):
+                        if const_expr(accs[k] is None):
+                            accs[k] = own[k]
+                        else:
+                            accs[k] = _add_f16(own[k], accs[k])
                     else:
-                        accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
+                        words, scale = _recv_quantized(
+                            PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
+                        )
+                        if const_expr(accs[k] is None):
+                            accs[k] = _codec_dequant(c, words, scale, tid)
+                        else:
+                            accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
             return accs
 
-        def _recv_all_gather(sub):
+        def _recv_all_gather(sub, own=None):
             """Dequantize every peer's all-gather packet back into full-tile atoms."""
             gathered = []
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    words, scale = _recv_quantized(
-                        PHASE_ALL_GATHER, fx.Int32(src), sub, k
-                    )
-                    gathered.append(_codec_dequant(c, words, scale, tid))
+                    # self_rank is None if self-skip is disabled.
+                    if const_expr(src == self_rank):
+                        gathered.append(None if own is None else own[k])
+                    else:
+                        words, scale = _recv_quantized(
+                            PHASE_ALL_GATHER, fx.Int32(src), sub, k
+                        )
+                        gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
 
         # One row shared by every token, so the gain is read once here rather
@@ -761,15 +901,20 @@ def make_quick_allreduce_int4_kernel(
                 _publish(PHASE_REDUCE_SCATTER, rank, color)
 
                 _wait_release(PHASE_REDUCE_SCATTER, color)
-                acc = _reduce_scattered(fx.Int32(0))
+                # ST=1 keeps the whole tile in registers across the wait, so
+                # under skip_self our share is simply read back out of it.
+                own_rs = None
+                if const_expr(self_rank is not None):
+                    own_rs = _own_atoms(atoms)
+                acc = _reduce_scattered(fx.Int32(0), own_rs)
 
-                _pack_all_gather(acc)
+                own_ag = _pack_all_gather(acc)
                 gpu.barrier()
                 _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
                 _publish(PHASE_ALL_GATHER, rank, color)
 
                 _wait_release(PHASE_ALL_GATHER, color)
-                gathered = _recv_all_gather(fx.Int32(0))
+                gathered = _recv_all_gather(fx.Int32(0), own_ag)
                 _finish_tile(tile, gathered, w_atoms)
 
                 color = color + fx.Int32(1)
@@ -800,8 +945,24 @@ def make_quick_allreduce_int4_kernel(
                 _wait_release(PHASE_REDUCE_SCATTER, color)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    acc = _reduce_scattered(s)
-                    _pack_all_gather(acc)
+                    # Under skip_self nothing is carried from the first loop --
+                    # that would be ST tiles of registers across the wait -- so
+                    # our share is reloaded from the input, a local cached read
+                    # against the uncached inbox read it replaces. Likewise our
+                    # reduced chunk is stored now rather than carried to the
+                    # third loop; the all-gather publish below releases it.
+                    tile = bid + (i + s) * n_blocks
+                    own_rs = None
+                    if const_expr(self_rank is not None):
+                        own_rs = [
+                            _load_atom(tile, self_rank * rank_atoms + k)
+                            for k in range_constexpr(rank_atoms)
+                        ]
+                    acc = _reduce_scattered(s, own_rs)
+                    own_ag = _pack_all_gather(acc)
+                    if const_expr(own_ag is not None):
+                        for k in range_constexpr(rank_atoms):
+                            _store_atom(tile, self_rank * rank_atoms + k, own_ag[k])
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
@@ -898,11 +1059,16 @@ def make_quick_allreduce_int4_kernel(
     # The inbox memory type and wire codec both change the emitted code, so
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
-    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
+    tag = f"ws{world_size}_st{super_tile}_g{grid}_{inbox_memory}_{codec}"
+    tag += f"_b{block}"
+    if skip_self:
+        # ``_r<n>_`` is the rank field the bench's variant comparison already
+        # collapses before checking that the ranks agree.
+        tag += f"_r{self_rank}_ss"
     if fused:
         # h_pad changes both the geometry and which loads carry a mask, so a
         # padded build must not share a JIT key with the plain one.
-        tag += f"_rms_h{hidden}_b{block}"
+        tag += f"_rms_h{hidden}"
         if padded:
             tag += f"_p{h_pad}"
     launcher = (
@@ -933,7 +1099,7 @@ def make_quick_allreduce_int4_kernel(
         "codec": codec,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
-        "release_writeback": release_writeback,
+        "release_scope": release_scope,
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": block,
@@ -943,4 +1109,5 @@ def make_quick_allreduce_int4_kernel(
         "padded": padded,
         "atoms_per_row": atoms_per_row,
         "rows_per_tile": rows_per_tile,
+        "skip_self": skip_self,
     }

@@ -20,6 +20,16 @@ from flydsl.expr.typing import Float32, Int32, Int64, Stream
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .allreduce_policy import FAMILY_POLICY
+from .allreduce_shared import (
+    _SUPPORTED_ARCHS,
+    _cuda_index,
+    _resolve_inbox_flags,
+    _StEngine,
+    _validate_ipc_process_group,
+    has_xgmi_peer_links,
+    kernel_symbol,
+    payload_probes,
+)
 from .kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
@@ -41,15 +51,6 @@ from .kernels.quick_allreduce_fusions import (
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _run_compiled
-from .quick_allreduce_int4 import (
-    _SUPPORTED_ARCHS,
-    _cuda_index,
-    _resolve_inbox_flags,
-    _StEngine,
-    _validate_ipc_process_group,
-    has_xgmi_peer_links,
-    kernel_symbol,
-)
 
 logger = logging.getLogger("aiter")
 
@@ -72,7 +73,7 @@ class OneShotAllReduce:
     the same constraint ``QuickAllReduceInt4`` has and for the same reason.
 
     ``atoms``, ``grid_cap``, ``fanout`` and ``block`` are the tuning surface.
-    ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it 
+    ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it
     from above.
 
     ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
@@ -86,6 +87,8 @@ class OneShotAllReduce:
     ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
+    One exception: at TP2 it picks ``uncached`` on PCIe too, since a single
+    remote destination cannot collapse.
 
     ``skip_self`` drops the round trip this rank does through its own inbox.
     It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_``
@@ -153,10 +156,8 @@ class OneShotAllReduce:
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
 
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
-        # set_device rejects torch.device("cuda") with no index; resolve first.
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device)
-        torch.cuda.set_device(self._device_index)
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self._has_launched = False
@@ -164,9 +165,7 @@ class OneShotAllReduce:
         self.world_size = int(world_size)
         self.inbox_memory = resolved_inbox
         self.max_bytes = (
-            max_payload_bytes(world_size, link)
-            if max_bytes is None
-            else int(max_bytes)
+            max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
         self.spin_sleep = int(spin_sleep)
 
@@ -207,32 +206,32 @@ class OneShotAllReduce:
         # ever be a no-op bought with an extra collective per engine.
         self._by_cfg = {}
         try:
-            for rung in self._ladder:
-                key = self._cfg_of(rung)
-                if key in self._by_cfg:
-                    continue
-                spec = make_one_shot_allreduce_kernel(
-                    world_size=self.world_size,
-                    atoms=key[0],
-                    grid=key[1],
-                    inbox_memory=resolved_inbox,
-                    fanout=key[2],
-                    block=key[3],
-                    spin_sleep=int(spin_sleep),
-                    skip_self=key[4],
-                    rank=self.rank,
-                )
-                self._by_cfg[key] = (
-                    _StEngine(
-                        spec=spec,
-                        group=group,
-                        rank=self.rank,
+            with torch.cuda.device(self._device_index):
+                for rung in self._ladder:
+                    key = self._cfg_of(rung)
+                    if key in self._by_cfg:
+                        continue
+                    spec = make_one_shot_allreduce_kernel(
                         world_size=self.world_size,
-                        inbox_flags=inbox_flags,
-                        device_index=self._device_index,
-                    ),
-                    spec,
-                )
+                        atoms=key[0],
+                        grid=key[1],
+                        inbox_memory=resolved_inbox,
+                        fanout=key[2],
+                        block=key[3],
+                        spin_sleep=int(spin_sleep),
+                        skip_self=key[4],
+                        rank=self.rank,
+                    )
+                    self._by_cfg[key] = (
+                        _StEngine(
+                            spec=spec,
+                            group=group,
+                            rank=self.rank,
+                            world_size=self.world_size,
+                            inbox_flags=inbox_flags,
+                        ),
+                        spec,
+                    )
         except Exception:
             self.close()
             raise
@@ -341,42 +340,55 @@ class OneShotAllReduce:
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
         self._has_launched = True
-        _run_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
 
     def _launch(self, inp, out, stream, *, live_bytes: int) -> None:
         eng, spec = self._by_cfg[self._pick_cfg(live_bytes)]
         self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
 
-    def compile_and_launch(self, inp, out=None, stream=None) -> None:
-        """Eager-JIT every rung's binary and launch each of them once, for
-        real, against *inp*/*out*.
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple]:
+        """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
+        select, in build order."""
+        floors = [rung[0] for rung in self._ladder]
+        picked = {self._pick_cfg(n) for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
 
-        This runs every rung on the GPU -- ``out`` ends up holding whichever
-        rung ran last, and it is a real collective: every rank must call it
-        with the same shape. Used by ``bench_comm_allreduce.py`` and the
-        flydsl op tests to force a real warm launch (and, for the tests, to
-        exercise the launch path directly) before timing or correctness
-        checks begin. Production never calls this: it tolerates the first
-        real call paying a JIT-compile cost instead.
+    def compile_and_launch(
+        self, inp, out=None, stream=None, *, payload_range=None
+    ) -> None:
+        """Eager-JIT rung binaries and launch each of them once, for real,
+        against *inp*/*out*.
+
+        ``payload_range=(lo, hi)`` takes only the rungs ``allreduce`` would run
+        for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every one.
+        The ladder builds engines for the whole size range, while a dispatcher
+        routes only its own window here, so the rest never run.
+
+        ``out`` ends up holding whichever rung ran last, and this is a real
+        collective: every rank must call it with the same shape and range. Used
+        by ``bench_comm_allreduce.py`` and the flydsl op tests to force a real
+        warm launch (and, for the tests, to exercise the launch path directly)
+        before timing or correctness checks begin.
+
+        ``CustomAllreduce`` also calls it once at init, via ``warm_fly_engines``.
+        Not for timing: it keeps each rung's JIT compile and module load off the
+        first real all-reduce, which may be inside a CUDA graph capture.
         """
         if out is None:
             out = torch.empty_like(inp)
         live_bytes = self._check_payload(inp, out)
-        for eng, spec in self._by_cfg.values():
+        keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
+        for key in keys:
+            eng, spec = self._by_cfg[key]
             self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
 
     def variant(self, nbytes: int) -> str:
-        """Identity of the binary an *nbytes* payload would run.
-
-        ``<jit symbol>/g<grid_cap>/x<grid_x>``, matching
-        ``QuickAllReduceInt4.variant``. Resolves the rung through the same ``_pick_cfg`` the launch path uses,
-        so for a ladder-driven engine this is the only way to see which rung a
-        given size takes.
-        """
+        """Identity of the binary an *nbytes* payload would run."""
         cfg = self._pick_cfg(int(nbytes))
         eng, spec = self._by_cfg[cfg]
         grid_x = self._grid_x(self._num_tiles(int(nbytes), spec["tile_bytes"]), cfg[1])
-        return f"{kernel_symbol(eng.launch)}/g{cfg[1]}/x{grid_x}"
+        return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"
 
     def is_beneficial(self, nbytes: int) -> bool:
         return int(nbytes) <= self.max_bytes
@@ -398,12 +410,13 @@ class OneShotAllReduce:
         engines = getattr(self, "_by_cfg", None)
         if not engines:
             return
-        if getattr(self, "_has_launched", False):
-            torch.cuda.synchronize(self._device_index)
-            self._has_launched = False
-        for eng, _ in engines.values():
-            eng.close()
-        engines.clear()
+        with torch.cuda.device(self._device_index):
+            if getattr(self, "_has_launched", False):
+                torch.cuda.synchronize(self._device_index)
+                self._has_launched = False
+            for eng, _ in engines.values():
+                eng.close()
+            engines.clear()
 
     def __del__(self):
         try:
@@ -494,7 +507,7 @@ class OneShotAllReduceRMSNorm:
         if grid_cap is not None and int(grid_cap) < 1:
             raise ValueError(f"grid_cap must be positive, got {grid_cap}")
 
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device)
         torch.cuda.set_device(self._device_index)
         self.group = group
@@ -616,17 +629,17 @@ class OneShotAllReduceRMSNorm:
                 hidden=key[0],
                 h_pad=key[5],
             )
-            self._by_cfg[key] = (
-                _StEngine(
-                    spec=spec,
-                    group=self.group,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    inbox_flags=self._inbox_flags,
-                    device_index=self._device_index,
-                ),
-                spec,
-            )
+            with torch.cuda.device(self._device_index):
+                self._by_cfg[key] = (
+                    _StEngine(
+                        spec=spec,
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        inbox_flags=self._inbox_flags,
+                    ),
+                    spec,
+                )
 
     def _pick_cfg(self, hidden: int, live_bytes: int) -> tuple:
         chosen = self._ladder[0]

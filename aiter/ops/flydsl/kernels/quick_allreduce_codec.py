@@ -19,8 +19,11 @@ alignment that constrains it is the 64 B fabric sector: see
 geometry exactly (INT4 1152 B, INT6 1664 B, FP16 4096 B).
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``quick_allreduce_shared`` for ``BLOCK`` and ``WAVE``, and on
-``I32_BYTES``.
+Depends on ``quick_allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
+
+Note: Editing the shared modules doesn't invalidate the FlyDSL compiler cache.
+Hence, one may end up running stale kernels unless one sets
+export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels at the repo root.
 """
 
 import functools
@@ -29,8 +32,8 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
-from flydsl.expr.typing import as_ir_value
 
+from .kernels_common import ceildiv
 from .quick_allreduce_shared import BLOCK, I32_BYTES, WAVE
 
 SUPER_TILES = (1, 8)
@@ -38,40 +41,47 @@ SUPER_TILES = (1, 8)
 GROUP = 8
 PAIR = 2
 
-# Legal workgroup widths for a codec.
+# The plain schedules' menu of workgroup widths: a caller that does not size a
+# workgroup to a token row picks one of these.
 #
-# The upper bound is the hardware workgroup limit. The alignment is the 64 B
-# fabric sector: a rank-tile is ``4.5*block`` bytes on INT4 and ``6.5*block`` on
-# INT6, and both are a whole number of sectors only when ``block`` is a multiple
-# of 128 (9*block/128 and 13*block/128 respectively). A width that broke it
-# would leave ``n_sectors`` fractional and the fanout would address past the
-# end of a rank-tile.
-MIN_BLOCK = 128
+# Every region of a rank-tile has to be a whole number of 64 B fabric sectors:
+# the fanout moves one sector per quad, so a region ending mid-sector would
+# ship the next region's bytes with it and overwrite them in the peer's inbox.
+# The nibble and 2-bit planes are 4*block and 2*block bytes, whole sectors at
+# every width here. The scale region is block/2 bytes, a whole sector only from
+# block 128 up; at 64 it is padded, see :func:`codecs_for_block`.
+SUPPORTED_BLOCKS = (64, 128, 256, 512)
+# i32 per 64 B fabric sector.
+SECTOR_I32 = 16
+
+# The fused schedules do not pick from ``SUPPORTED_BLOCKS``: they derive
+# ``block = hidden / (8 * atoms_per_row)`` to fit one token row in a workgroup,
+# landing on any 128-thread-aligned width up to the hardware workgroup limit
+# (e.g. hidden 3072 -> 384, hidden 8192 -> 1024). :func:`validate_block` accepts
+# that whole range; these bounds are exported for ``quick_allreduce_fusions`` to
+# size a row with, and gate the codec geometry in :func:`validate_block`.
 MAX_BLOCK = 1024
 BLOCK_ALIGN = 128
 
 
 def validate_block(block: int) -> int:
     block = int(block)
-    if not MIN_BLOCK <= block <= MAX_BLOCK:
-        raise ValueError(
-            f"codec block must be in [{MIN_BLOCK}, {MAX_BLOCK}], got {block}"
-        )
-    if block % BLOCK_ALIGN:
-        raise ValueError(
-            f"codec block must be a multiple of {BLOCK_ALIGN} to keep every "
-            f"rank-tile region on the 64 B fabric sector grid, got {block}"
-        )
-    return block
+    # 64 is the plain menu's floor: below a full fabric sector on the scale
+    # region, so codecs_for_block pads it. Every wider width is a whole number
+    # of 128-thread rank-tile alignments up to the hardware workgroup limit --
+    # the range the fused schedules derive a block in (block = hidden / 8). Both
+    # keep every rank-tile region on the 64 B fabric sector grid.
+    if block == 64 or (BLOCK_ALIGN <= block <= MAX_BLOCK and block % BLOCK_ALIGN == 0):
+        return block
+    raise ValueError(
+        f"codec block must be 64 or a multiple of {BLOCK_ALIGN} in "
+        f"[{BLOCK_ALIGN}, {MAX_BLOCK}], got {block!r}"
+    )
 
 
-# The shipped 256-wide geometry, kept as named constants because the module
-# docstring and the wire format are described in terms of them: 1024 B INT4
-# (256 i32) then 128 B group-16 E4M3 (32 i32), a 1152 B rank-tile.
-SCALE_I32_OFF = BLOCK
-RANK_TILE_I32 = BLOCK + BLOCK // GROUP
-RANK_TILE_BYTES = RANK_TILE_I32 * I32_BYTES
-N_SECTORS = RANK_TILE_BYTES // 64
+def _round_up_to_sector(n_i32: int) -> int:
+    return ceildiv(n_i32, SECTOR_I32) * SECTOR_I32
+
 
 # Dequant bit-trick: code | 0x6400 then + (-(1024+bias)) as f16x2 reconstructs
 # (q - bias). fp16 with exponent field 1024.0 holds the integer in its low
@@ -186,7 +196,8 @@ def codecs_for_block(block: int = BLOCK) -> dict[str, "Codec"]:
     block = validate_block(block)
     nibble = block  # one i32 of nibbles per thread
     hi2 = block // PAIR  # INT6's dense 2-bit plane, one i32 per lane pair
-    scale = block // GROUP  # one i32 per GROUP threads (4 packed E4M3 bytes)
+    # One i32 per GROUP threads (4 packed E4M3 bytes), padded to a sector.
+    scale = _round_up_to_sector(block // GROUP)
     return {
         c.name: c
         for c in (
@@ -245,12 +256,14 @@ def thread_lane(tid, block: int = BLOCK):
     ``lane`` is the codec's own required argument to :func:`_codec_quant` /
     :func:`_codec_dequant` (the pairing and shuffle width both key off it);
     ``wave`` is only a byproduct callers use for their own fanout layouts.
-    Identical across the mesh, ring and codec-test kernels, so extracted here
-    rather than repeated in each.
+    Shared by the mesh, ring and codec-test kernels, so extracted here rather
+    than repeated in each.
 
-    *block* is always a multiple of ``WAVE`` (:func:`validate_block` demands a
-    multiple of 128), so there is no partial wave for the shuffles to fall off.
+    Every supported *block* is a whole number of waves, so there is no partial
+    wave for the shuffles to fall off.
     """
+    if block == WAVE:
+        return fx.Int32(0), tid
     thread_layout = fx.make_layout((block // WAVE, WAVE), (WAVE, 1))
     return fx.idx2crd(tid, thread_layout).unpack()
 
@@ -318,9 +331,9 @@ def _clamp_fp16_overflow():
     FlyDSL has no MODE helper; ``llvm.amdgcn.s.setreg`` is the same
     intrinsic ``rocdl.disable_xdl_arb_stall`` uses for a different bit.
     """
-    # hwreg(HW_REG_MODE, offset=23, size=2): id | (off<<6) | ((size-1)<<11)
-    imm = as_ir_value(fx.Int32(0xDC1))
-    val = as_ir_value(fx.Int32(1))
+    # hwreg(HW_REG_MODE=1, offset=23, size=2): id | (offset << 6) | ((size - 1) << 11)
+    imm = fx.Int32(1 | (23 << 6) | ((2 - 1) << 11)).ir_value()
+    val = fx.Int32(1).ir_value()
     llvm.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
 
@@ -394,20 +407,21 @@ def _e4m3_to_f32(b):
     return is_z.select(fx.Float32(0.0), signed)
 
 
+def _pack_fields(fields, width, mask=None):
+    """``fields[i] << (i * width)`` OR-ed together, each masked first if *mask*."""
+    out = fields[0] if mask is None else fields[0] & mask
+    for i in range_constexpr(1, len(fields)):
+        f = fields[i] if mask is None else fields[i] & mask
+        out = out | (f << fx.Int32(i * width))
+    return out
+
+
 def _pack_e4m3_word(e, lane):
     """Four pair-E4M3 bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
     base = (lane // GROUP) * GROUP
-    e0 = fx.Int32(gpu.shuffle_idx(e, base, WAVE))
-    e1 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(2), WAVE))
-    e2 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(4), WAVE))
-    e3 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(6), WAVE))
-    b = fx.Int32(0xFF)
-    return (
-        (e0 & b)
-        | ((e1 & b) << fx.Int32(8))
-        | ((e2 & b) << fx.Int32(16))
-        | ((e3 & b) << fx.Int32(24))
-    )
+    src = [base] + [base + fx.Int32(k) for k in range_constexpr(PAIR, GROUP, PAIR)]
+    e_pair = [fx.Int32(gpu.shuffle_idx(e, s, WAVE)) for s in src]
+    return _pack_fields(e_pair, 8, mask=fx.Int32(0xFF))
 
 
 def _e4m3_decoding_scale(codec, e):
@@ -429,12 +443,7 @@ def _quant_atom_fp16(codec, atom, enc_pk):
         w = fx.min(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
         q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
     if codec.n_words_per_thread == 1:
-        return (
-            q[0]
-            | (q[1] << fx.Int32(4))
-            | (q[2] << fx.Int32(8))
-            | (q[3] << fx.Int32(12)),
-        )
+        return (_pack_fields(q, 4),)
     # Every code is masked here. In INT4 each field already fills its whole
     # nibble, so the shift-or cannot collide; a 6-bit code would overrun its
     # neighbour's slot if left whole.
@@ -442,19 +451,7 @@ def _quant_atom_fp16(codec, atom, enc_pk):
     m2 = fx.Int32(_K_MASK_0003)
     lo4 = [qi & m4 for qi in q]
     hi2 = [qi.shrui(fx.Int32(4)) & m2 for qi in q]
-    packed_lo = (
-        lo4[0]
-        | (lo4[1] << fx.Int32(4))
-        | (lo4[2] << fx.Int32(8))
-        | (lo4[3] << fx.Int32(12))
-    )
-    packed_hi = (
-        hi2[0]
-        | (hi2[1] << fx.Int32(2))
-        | (hi2[2] << fx.Int32(4))
-        | (hi2[3] << fx.Int32(6))
-    )
-    return (packed_lo, packed_hi)
+    return (_pack_fields(lo4, 4), _pack_fields(hi2, 2))
 
 
 def _compact_hi2(packed_hi, lane):
@@ -471,7 +468,7 @@ def _compact_hi2(packed_hi, lane):
     second convention is introduced.
     """
     c = (packed_hi & fx.Int32(0xFF)) | (packed_hi.shrui(fx.Int32(8)) & fx.Int32(0xFF00))
-    other = fx.Int32(gpu.shuffle_xor(c, 1, WAVE))
+    other = c.shuffle_xor(1, WAVE)
     is_even = (lane & fx.Int32(1)) == fx.Int32(0)
     return is_even.select(c | (other << fx.Int32(16)), other | (c << fx.Int32(16)))
 

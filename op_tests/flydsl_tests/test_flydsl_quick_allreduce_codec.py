@@ -18,6 +18,9 @@ Two properties are load-bearing:
   extremum is within 1/16 of the true one; on top of that a value can miss by
   half a step, and one near the extreme can land a whole code short. That gives
   ``|err| <= |ext| * (1/16 + 1.05/bias)`` with no free parameters.
+
+Both are also checked at every workgroup width the codec supports, since the
+plane and scale offsets scale with it and block 64 pads its scale region.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     CODECS,
     MAX_BLOCK,
-    MIN_BLOCK,
+    SECTOR_I32,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -80,8 +83,9 @@ _GRID_CAP = 256
 # the shipped geometry there exactly. 512 and 896 are what the fused quick-reduce
 # actually builds -- ``hidden/8`` for 4096 and 7168 -- where one 16 B atom is one
 # token row. 896 is also the only non-power-of-two width in play (14 waves), so
-# it is where a wave-count assumption would surface.
-BLOCK_WIDTHS = (BLOCK, 512, 896)
+# it is where a wave-count assumption would surface. 64 and 128 are the plain
+# menu's small widths; 64 is the one that needs the scale region sector-padded.
+BLOCK_WIDTHS = (64, 128, BLOCK, 512, 896)
 
 
 def tile_elems(block: int) -> int:
@@ -350,9 +354,9 @@ def test_group_extremum_keeps_its_sign(codec_name, block):
     x_ext = xg.gather(-1, idx).squeeze(-1)
     y_ext = yg.gather(-1, idx).squeeze(-1)
     live = x_ext.abs() > 1e-6
-    assert bool((torch.sign(x_ext[live]) == torch.sign(y_ext[live])).all()), (
-        "Sign changed"
-    )
+    assert bool(
+        (torch.sign(x_ext[live]) == torch.sign(y_ext[live])).all()
+    ), "Sign changed"
     rel = float(((y_ext[live] - x_ext[live]).abs() / x_ext[live].abs()).max())
     bound = _err_bound(CODECS[codec_name].bias)
     assert rel <= bound, f"extremum moved {rel:.4f} > {bound:.4f}"
@@ -452,9 +456,9 @@ def test_extremum_below_e4m3_floor_survives_instead_of_zeroing(codec_name):
     """
     decoded = codec_roundtrip(_spike_group(1e-3, fill=0.0), codec_name)
     assert torch.isfinite(decoded.float()).all()
-    assert float(decoded[0]) == pytest.approx(1e-3, rel=0.2), (
-        f"expected the sub-floor extremum to survive; got {float(decoded[0])}"
-    )
+    assert float(decoded[0]) == pytest.approx(
+        1e-3, rel=0.2
+    ), f"expected the sub-floor extremum to survive; got {float(decoded[0])}"
     # Exact zero still encodes as exact zero -- the bump must not perturb it.
     zeros = codec_roundtrip(_spike_group(0.0, fill=0.0), codec_name)
     assert float(zeros.float().abs().max()) == 0.0
@@ -469,6 +473,32 @@ def test_fp16_codec_roundtrip_is_identity(block):
     x = _payload(n_tiles=2, seed=53, block=block)
     y = codec_roundtrip(x, "fp16", block=block)
     assert torch.equal(x, y), "fp16 passthrough must not alter a single bit"
+
+
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
+@pytest.mark.parametrize("codec_name", ("int4", "int6", "fp16"))
+def test_rank_tile_regions_are_whole_sectors(codec_name, block):
+    """Every region starts and the rank-tile ends on a 64 B fabric sector.
+
+    The fanout moves one sector per quad, so a region ending mid-sector would
+    ship the next region's bytes with it. Block 64 is the case that needs the
+    scale region padded.
+    """
+    c = codecs_for_block(block)[codec_name]
+    offsets = [c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32]
+    for off in (o for o in offsets if o is not None):
+        assert off % SECTOR_I32 == 0, (codec_name, block, offsets)
+    # No region is short: one nibble i32 per thread, one 2-bit i32 per lane
+    # pair, one scale i32 per group of 8 threads, four fp16x2 i32 per thread.
+    if c.name == "fp16":
+        assert c.rank_tile_i32 == 4 * block
+        return
+    if c.hi2_i32_off is not None:
+        assert c.hi2_i32_off == block
+        assert c.scale_i32_off - c.hi2_i32_off == block // 2
+    else:
+        assert c.scale_i32_off == block
+    assert c.rank_tile_i32 - c.scale_i32_off >= block // 8
 
 
 @pytest.mark.parametrize("block", BLOCK_WIDTHS)
@@ -512,7 +542,7 @@ def test_accuracy_is_block_invariant(codec_name):
 # above is derived from.
 
 
-@pytest.mark.parametrize("block", (MIN_BLOCK, 256, 384, 512, 640, 896, MAX_BLOCK))
+@pytest.mark.parametrize("block", (64, 128, 256, 384, 512, 640, 896, MAX_BLOCK))
 def test_codec_regions_stay_on_the_sector_grid(block):
     """Every rank-tile is a whole number of 64 B fabric sectors at every legal
     width. A fractional one would have the fanout address past its end."""
@@ -541,7 +571,7 @@ def test_default_block_reproduces_the_shipped_geometry():
     assert t is CODECS, "the module table must be the cached default-width one"
 
 
-@pytest.mark.parametrize("block", (0, 64, 192, 320, MAX_BLOCK + 128))
+@pytest.mark.parametrize("block", (0, 96, 192, 320, MAX_BLOCK + 128))
 def test_illegal_block_widths_raise(block):
     """Off-grid or out-of-range widths are rejected at build time rather than
     producing a kernel that addresses past a rank-tile."""
@@ -549,13 +579,9 @@ def test_illegal_block_widths_raise(block):
         codecs_for_block(block)
 
 
-def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):
+def _resolve(algorithm, world_size, rs=None, ag=None):
     from aiter.ops.flydsl import quick_allreduce_int4 as host
 
-    # Patch the parsed value rather than os.environ: the variable is read once
-    # at import, which is the behaviour under test everywhere else.
-    monkeypatch.setattr(host, "AITER_ALL_REDUCE_CODEC", env)
-    monkeypatch.setattr(host, "_warned_codecs", set())
     return host._resolve_codecs(host.ALGORITHMS[algorithm], world_size, rs, ag)
 
 
@@ -563,34 +589,56 @@ def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):
     "world_size,expected",
     ((2, ("int4", "int4")), (4, ("int4", "int4")), (8, ("int6", "int4"))),
 )
-def test_ring_codec_defaults_widen_only_at_tp8(monkeypatch, world_size, expected):
-    """TP8 is the only world size where INT4 misses the floor."""
-    assert _resolve(monkeypatch, "ring", world_size) == expected
+def test_ring_codec_defaults_widen_only_at_tp8(world_size, expected):
+    """TP8 is the only world size where INT4 misses the floor.
+
+    Production dispatch passes ``None`` for both laps precisely to land here --
+    see ``_FLY_REGIMES`` in ``quick_all_reduce.py``.
+    """
+    assert _resolve("ring", world_size) == expected
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_mesh_is_int4_at_every_world_size(monkeypatch, world_size):
-    """The mesh has no separable lap, so the per-N default must not leak into it."""
-    assert _resolve(monkeypatch, "mesh", world_size) == ("int4", "int4")
+def test_mesh_is_int4_at_every_world_size(world_size):
+    """The mesh has no separable lap, so the per-N default must not leak into it.
+
+    It also has no INT6 kernel at all, which is why the TP8 reduce-scatter
+    default narrows back to INT4 here rather than raising.
+    """
+    assert _resolve("mesh", world_size) == ("int4", "int4")
 
 
-@pytest.mark.parametrize("env,expected", (("int4", "int4"), ("int6", "int6")))
-def test_env_override_sets_both_laps(monkeypatch, env, expected):
-    """One variable, both laps -- including the all-gather lap, which has no
-    other way to reach INT6."""
-    assert _resolve(monkeypatch, "ring", 8, env=env) == (expected, expected)
+@pytest.mark.parametrize("codec", ("int4", "int6"))
+def test_explicit_arguments_set_both_laps(codec):
+    """Pinning a wire format is per-lap and explicit.
+
+    This is the path that replaced ``AITER_ALL_REDUCE_CODEC``: the all-gather
+    lap has no other way to reach INT6, and at TP8 an explicit ``"int4"`` is a
+    real downgrade of the reduce-scatter lap rather than a restatement of its
+    default.
+    """
+    assert _resolve("ring", 8, rs=codec, ag=codec) == (codec, codec)
 
 
-def test_explicit_argument_outranks_the_environment(monkeypatch):
-    assert _resolve(monkeypatch, "ring", 8, env="int6", rs="int4") == ("int4", "int6")
+def test_explicit_argument_outranks_the_per_world_default():
+    """TP8's reduce-scatter lap defaults to INT6; asking for INT4 must get it."""
+    assert _resolve("ring", 8) == ("int6", "int4")
+    assert _resolve("ring", 8, rs="int4") == ("int4", "int4")
 
 
-def test_env_that_the_schedule_cannot_build_falls_back(monkeypatch):
-    """A process-wide variable must not break an unrelated call site."""
-    assert _resolve(monkeypatch, "mesh", 8, env="int6") == ("int4", "int4")
+def test_one_lap_can_be_pinned_without_disturbing_the_other():
+    """The laps resolve independently, so pinning the cheap one leaves the
+    reduce-scatter lap on its per-world default."""
+    assert _resolve("ring", 8, ag="int6") == ("int6", "int6")
+    assert _resolve("ring", 8, ag="int4") == ("int6", "int4")
 
 
-def test_explicit_codec_the_schedule_cannot_build_raises(monkeypatch):
-    """Unlike the environment: naming it in code is a programming error."""
+def test_explicit_codec_the_schedule_cannot_build_raises():
+    """Naming a codec the schedule has no kernel for is a programming error.
+
+    Only the per-world *default* narrows silently (see
+    ``test_mesh_is_int4_at_every_world_size``); an explicit argument raises, so
+    a caller never believes it pinned a wire format it did not get.
+    """
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve(monkeypatch, "mesh", 8, rs="int6")
+        _resolve("mesh", 8, rs="int6")

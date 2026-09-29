@@ -45,6 +45,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
         self.use_torch_symm_mem = False
 
+        # A reused communicator borrows the source's ca/qr comms; only the
+        # owner may dispose them in destroy(), or a borrowed handle is freed
+        # twice (double dispose / use-after-free).
+        self._owns_comms = reuse_from is None
+
         if reuse_from is not None:
             # Identical-rank group: share the source's allreduce communicators
             # instead of allocating a second set. Keeps our own unique_name, so
@@ -70,11 +75,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = reuse_from.pynccl_comm
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
-            # Borrowed, not owned: the group this was built for still uses it,
-            # so destroy() here must not close its IPC inboxes.
-            self.fly_comm = reuse_from.fly_comm
-            self.fly_rms_comm = reuse_from.fly_rms_comm
-            self._owns_fly_comm = False
             self.symm_mem_comm = reuse_from.symm_mem_comm
             return
 
@@ -106,9 +106,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
-        self.fly_comm = None
-        self.fly_rms_comm = None
-        self._owns_fly_comm = True
         self.symm_mem_comm = None
         # if use_torch_symm_mem and current_platform.is_cuda():
         #     self.symm_mem_comm = SymmMemCommunicator(
@@ -137,18 +134,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # If it's a rocm, 'use_custom_allreduce==True' means it must
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
-
-            # FlyDSL all-reduce family: exact one-shot / quantized mesh / ring,
-            # selected by payload size. Opt-in behind AITER_FLY_AR.
-            from aiter.dist.device_communicators.flydsl_all_reduce import (
-                FlyDSLAllReduce,
-                FlyDSLAllReduceRMSNorm,
-            )
-
-            self.fly_comm = FlyDSLAllReduce(group=self.cpu_group, device=self.device)
-            self.fly_rms_comm = FlyDSLAllReduceRMSNorm(
-                group=self.cpu_group, device=self.device
-            )
 
     @property
     def all2all_manager(self):
@@ -213,22 +198,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        # FlyDSL first when enabled, then quick reduce, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
-        #
-        # FlyDSL leads because at the sizes it accepts it is the exact one-shot
-        # schedule, which is bit-comparable with cross_device_reduce rather
-        # than quantized. It declines everything else.
-        fly_comm = self.fly_comm
-        if (
-            fly_comm is not None
-            and not fly_comm.disabled
-            and fly_comm.should_fly_all_reduce(input_)
-        ):
-            out = fly_comm.fly_all_reduce(input_)
-            assert out is not None
-            return out
-
+        # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
+        # for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -322,24 +293,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else (total_bytes <= total_bytes_limit)
         )
         
-        # FlyDSL first when enabled. The policy's min_bytes keeps it off 
-        # the decode shapes where cdr_fused:1stage wins.
-        fly_rms_comm = self.fly_rms_comm
+        qr_comm = self.qr_comm
+
+        # FlyDSL fused first when enabled, ahead of the use_1stage gate. Its
+        # engines live in qr_comm; the policy's min_bytes keeps it off the
+        # decode shapes where cdr_fused:1stage wins.
         if (
             not use_general_path
             and x_pad_to_multiple == 0
             and input_n == n
             and not gemma_norm
-            and fly_rms_comm is not None
-            and not fly_rms_comm.disabled
-            and fly_rms_comm.should_fly_fused_ar_rms(input_, res_inp_, weight_)
+            and qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
         ):
-            out, res_out = fly_rms_comm.fly_fused_ar_rms(input_, res_inp_, weight_, eps)
+            out, res_out = qr_comm.quick_all_reduce_rmsnorm(
+                input_, res_inp_, weight_, eps, n
+            )
             assert out is not None
             assert res_out is not None
             return out, res_out
 
-        qr_comm = self.qr_comm
         if (
             not use_1stage
             and not use_general_path
@@ -954,20 +928,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.qr_comm is not None:
+            if self._owns_comms:
+                self.qr_comm.close()
             self.qr_comm = None
-        if self.fly_comm is not None:
-            # Closed rather than merely dropped: it holds IPC inboxes opened
-            # against every peer, and the peers' handles have to be released
-            # before the process group goes away. A borrowed engine belongs to
-            # the group it was built for, which closes it itself.
-            if self._owns_fly_comm:
-                self.fly_comm.close()
-            self.fly_comm = None
-        if self.fly_rms_comm is not None:
-            if self._owns_fly_comm:
-                self.fly_rms_comm.close()
-            self.fly_rms_comm = None
         if self.ca_comm is not None:
+            if self._owns_comms:
+                self.ca_comm.close()
             self.ca_comm = None
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()

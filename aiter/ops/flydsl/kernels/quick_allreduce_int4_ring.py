@@ -19,20 +19,19 @@ once, and the partial's extremum grows with the number of contributions folded
 into it. Hence the two codec knobs. Widening the reduce-scatter lap to INT6 improves
 accuracy with the cost of using slightly more bandwidth. The all-gather lap forwards
 the bytes it received untouched, so it contributes exactly one quantization and stays
-INT4 unless asked otherwise by env variable AITER_ALL_REDUCE_CODEC.
+INT4 unless the caller pins it via the ``ag_codec`` argument.
 
 A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
-from . import buffer_ops
 from .quick_allreduce_codec import (
     GROUP,
+    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -59,15 +58,26 @@ from .quick_allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
+    _RELEASE_SCOPE,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
+    FLAG_I32_PER_LANE,
+    FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
     WAVE,
     _acquire_inbox,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
     _i32_to_bytes,
+    _load_flag,
+    _load_peers,
+    _payload_io,
+    _release_inbox,
+    _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
     make_pack_storage,
@@ -93,18 +103,31 @@ from .quick_allreduce_shared import (
 # Pin ``grid_cap`` alongside ``super_tile``.
 RING_SUPER_TILES = (1, 8, 16, 32)
 
-# Payload-size ladder: ``(min_bytes, super_tile, grid_cap)``, ascending, per
-# world size.
+# Payload-size ladder: ``(min_bytes, super_tile, grid_cap, block, skip_self)``,
+# ascending, per ``(link, world_size)``. ``skip_self`` is always False: the ring never
+# round-trips through its own inbox.
+_RING_DEFAULT = {
+    2: ((0, 8, 128, BLOCK, False), (24 << 20, 16, 128, BLOCK, False)),
+    4: (
+        (0, 8, 128, BLOCK, False),
+        (24 << 20, 16, 128, BLOCK, False),
+        (48 << 20, 32, 128, BLOCK, False),
+    ),
+    8: ((0, 16, 128, BLOCK, False), (48 << 20, 32, 128, BLOCK, False)),
+}
+
+# ``(min_bytes, super_tile, grid_cap, block, skip_self)``
 RING_ST_LADDER = {
-    2: ((0, 8, 128), (24 << 20, 16, 128)),
-    4: ((0, 8, 128), (24 << 20, 16, 128), (48 << 20, 32, 128)),
-    8: ((0, 16, 128), (48 << 20, 32, 128)),
+    **{("xgmi", ws): rungs for ws, rungs in _RING_DEFAULT.items()},
+    ("pcie", 2): ((0, 16, 128, 512, False),),
+    ("pcie", 4): ((0, 32, 128, 512, False),),
+    ("pcie", 8): ((0, 32, 128, 512, False),),
 }
 
 
-def ring_st_ladder(world_size: int):
-    """Rungs for *world_size*, or the TP4 shape for an unlisted one."""
-    return RING_ST_LADDER.get(int(world_size), RING_ST_LADDER[4])
+def ring_st_ladder(world_size: int, link: str = "pcie"):
+    """Rungs for *(link, world_size)*, or the PCIe TP4 shape for an unlisted one."""
+    return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
 
 
 # Wire formats accepted per lap.
@@ -125,18 +148,16 @@ AG_CODECS = ("int4", "int6", "fp16")
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 
-def _load_i32_at(rsrc, elem_off, cache_modifier):
-    """One i32 from *rsrc* at an element offset, drained before it is read.
+def _load_i32_at(ptr, elem_off, cache_modifier):
+    """One i32 from the buffer pointer *ptr* at an element offset, drained
+    before it is read.
 
-    ``quick_allreduce_shared._load_i32_uncached`` does the same but hardcodes offset 0,
-    which would force a fresh per-call descriptor here; the ring always has the
-    inbox descriptor in hand and only the offset varies.
+    The ring always has the inbox pointer in hand and only the offset
+    varies, so its payload reads go through the one shared descriptor.
     """
-    val = buffer_ops.buffer_load(
-        rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=cache_modifier
-    )
+    val = _buffer_load(ptr, elem_off, 1, fx.Int32, cache_modifier)[0]
     rocdl.s_waitcnt(vmcnt=0)
-    return fx.Int32(val)
+    return val
 
 
 def ring_steps(world_size: int) -> int:
@@ -175,6 +196,8 @@ def make_quick_allreduce_int4_ring_kernel(
 
     The kernel *signature* keeps its ``rank`` argument, unused, so the host's
     ``_launch_eng`` is identical for both schedules.
+
+    ``block`` is threads per workgroup.
 
     ``fusion="rmsnorm"`` appends a residual-add + RMSNorm epilogue and requires
     ``hidden``. It changes the geometry rather than just the tail: the block is
@@ -220,7 +243,7 @@ def make_quick_allreduce_int4_ring_kernel(
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
-    release_writeback = policy["writeback"]
+    release_scope = policy["release"]
     # policy["fanout"] is not consulted: it picks which axis of a (peer, sector)
     # fanout runs fastest across quads, and a ring has no peer axis. Sectors run
     # fastest by construction, which is the "peer" (PCIe-favourable) answer.
@@ -248,9 +271,12 @@ def make_quick_allreduce_int4_ring_kernel(
             )
         block, atoms_per_row = quick_reduce_row_block_at(h_pad, world_size, block)
     else:
-        if block is not None:
-            raise ValueError("block is only meaningful for a fused build")
-        block, atoms_per_row = BLOCK, 1
+        # The plain kernel takes a caller-chosen block; the fused build derives
+        # its own from the row geometry just above.
+        block = BLOCK if block is None else block
+        if block not in SUPPORTED_BLOCKS:
+            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
+        atoms_per_row = 1
     padded = fused and h_pad != hidden
     rows_per_chunk = rank_atoms // atoms_per_row
     rows_per_tile = ATOMS // atoms_per_row
@@ -342,28 +368,33 @@ def make_quick_allreduce_int4_ring_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        # The tiled copy is used by both modes. ``hbm_row_layout`` (one atom-wide
-        # row) and ``hbm_copy`` are built unconditionally; a padded build
-        # addresses each row through a per-row bounded descriptor
-        # (``_rowbuf_atom_row``), an unpadded one slices the whole-tensor buffer
-        # tensor (``_hbm_atom_row``). ``hbm_layout`` is the 3-D whole-tensor
-        # layout consumed only by the unpadded ``make_payload_tensor``; a padded
-        # build binds it to None (its ``_payload_tensor`` never reads it).
+        # The fused epilogue reaches its HBM operands (residual, weight, final
+        # output) as raw bf16 atoms through a tiled copy; the plain reduce path
+        # uses the shared ``_payload_io`` helpers and never builds these.
+        # ``hbm_row_layout`` (one atom-wide row) and ``hbm_copy`` serve both fused
+        # sub-modes; a padded build addresses each row through a per-row bounded
+        # descriptor (``_rowbuf_atom_row``), an unpadded one slices the
+        # whole-tensor buffer tensor (``_hbm_atom_row``). ``hbm_layout`` is the
+        # 3-D whole-tensor layout consumed only by the unpadded
+        # ``make_payload_tensor``; a padded build leaves it None.
         hbm_layout = None
-        if const_expr(not padded):
-            hbm_layout = fx.make_layout(
-                (num_tiles, ATOMS, block * 4),
-                (hbm_tile_i32, block * 4, 1),
-            )
-        hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
-        hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
-        hbm_copy = fx.make_tiled_copy_tv(
-            hbm_copy_atom,
-            fx.make_layout((1, block), (1, 1)),
-            fx.make_layout((1, 4), (1, 1)),
-        ).get_slice(tid)
+        hbm_row_layout = None
+        hbm_copy_atom = None
+        hbm_copy = None
+        if const_expr(fused):
+            if const_expr(not padded):
+                hbm_layout = fx.make_layout(
+                    (num_tiles, ATOMS, block * 4),
+                    (hbm_tile_i32, block * 4, 1),
+                )
+            hbm_row_layout = fx.make_layout((1, block * 4), (block * 4, 1))
+            hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
+            hbm_copy = fx.make_tiled_copy_tv(
+                hbm_copy_atom,
+                fx.make_layout((1, block), (1, 1)),
+                fx.make_layout((1, 4), (1, 1)),
+            ).get_slice(tid)
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
-        color_layout = fx.make_layout((grid,), (1,))
 
         # One allocation, one view per codec.
         allocator = fx.SharedAllocator()
@@ -383,69 +414,75 @@ def make_quick_allreduce_int4_ring_kernel(
         if const_expr(n_partials > 0):
             sq_lds = allocator.allocate(WavePartials).peek().wave.ptr
 
-        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
-        peers = [
-            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
-            for i in range(world_size)
-        ]
+        peers = _load_peers(peer_ptrs, world_size)
         # A ring only ever names two of the peers, and ``rank`` is compile-time,
         # so both are plain Python indices into the loaded pointers. The
         # mesh packs these into an fx.Vector because its fanout selects a
         # peer with a *runtime* lane-dependent index; doing that here would put
         # a dynamic extract in front of a constant and get the wrong element.
-        self_base = fx.Int64(peers[rank])
-        next_base = fx.Int64(peers[nxt])
+        self_base = peers[rank]
+        next_base = peers[nxt]
         # Bounded on purpose. Every ring access is in range by construction,
         # so an out-of-range one is a bug -- and with num_records set the
         # hardware returns zero instead of faulting, which turns a
         # process-killing page fault into a wrong SQNR you can bisect.
-        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(self_base), num_records_bytes=inbox_bytes
-        )
+        inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4, inbox_bytes)
 
-        hbm_i32_ptr = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=16
+        _load_atom, _store_atom = _payload_io(
+            inp_ptr,
+            out_ptr,
+            nbytes,
+            num_tiles,
+            ATOMS,
+            block,
+            tid,
+            decode=_atom_bf16_to_f16,
+            encode=_atom_f16_to_bf16,
         )
-
-        _payload_tensor = make_payload_tensor(
-            padded=padded,
-            nbytes=nbytes,
-            hbm_i32_ptr=hbm_i32_ptr,
-            hbm_layout=hbm_layout,
-        )
-        # A padded build addresses each row through a per-row buffer descriptor
-        # bounded to the true width; ``_rowbuf_atom_row(ptr, tile, atom)`` builds
-        # it from the operand's raw base pointer. Unpadded is None (unused).
-        _rowbuf_atom_row = (
-            make_rowbuf_atom_row(
-                atoms_per_row=atoms_per_row,
-                rows_per_tile=rows_per_tile,
-                row_stride_i32=row_stride_i32,
-                block=block,
-                hidden=hidden,
-                hbm_i32_ptr=hbm_i32_ptr,
-                hbm_row_layout=hbm_row_layout,
-            )
-            if padded
-            else None
-        )
-
-        # A padded build keeps the HBM operands as raw ``Int64`` base pointers so
-        # ``_rowbuf_atom_row`` can bound a fresh descriptor per row; an unpadded
-        # build wraps them in the whole-tensor buffer tensor via ``_payload_tensor``.
-        def _operand(ptr, records=None):
-            return ptr if const_expr(padded) else _payload_tensor(ptr, records)
-
-        in_buf = _operand(inp_ptr)
-        out_buf = _operand(out_ptr)
-        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+        _load_color, _store_color = _color_io(colors_ptr, bid)
 
         if const_expr(fused):
+            hbm_i32_ptr = fx.PointerType.get(
+                T.i32, address_space=fx.AddressSpace.Global, alignment=16
+            )
+            _payload_tensor = make_payload_tensor(
+                padded=padded,
+                nbytes=nbytes,
+                hbm_i32_ptr=hbm_i32_ptr,
+                hbm_layout=hbm_layout,
+            )
+            # A padded build addresses each row through a per-row buffer
+            # descriptor bounded to the true width; ``_rowbuf_atom_row(ptr, tile,
+            # atom)`` builds it from the operand's raw base pointer. Unpadded is
+            # None (unused).
+            _rowbuf_atom_row = (
+                make_rowbuf_atom_row(
+                    atoms_per_row=atoms_per_row,
+                    rows_per_tile=rows_per_tile,
+                    row_stride_i32=row_stride_i32,
+                    block=block,
+                    hidden=hidden,
+                    hbm_i32_ptr=hbm_i32_ptr,
+                    hbm_row_layout=hbm_row_layout,
+                )
+                if padded
+                else None
+            )
+
+            # A padded build keeps the HBM operands as raw ``Int64`` base
+            # pointers so ``_rowbuf_atom_row`` can bound a fresh descriptor per
+            # row; an unpadded build wraps them in the whole-tensor buffer tensor
+            # via ``_payload_tensor``.
+            def _operand(ptr, records=None):
+                return ptr if const_expr(padded) else _payload_tensor(ptr, records)
+
             # residual in/out are (M, hidden) bf16 exactly like the payload, so
-            # they ride the same addressing. The gain is a single (hidden,) row
-            # shared by every token -- ``atoms_per_row`` atoms at tile 0; a padded
-            # build reads it through the per-row descriptor at row 0, an unpadded
-            # one bounds a one-row buffer tensor at the true width.
+            # they ride the same addressing, as does the final output row. The
+            # gain is a single (hidden,) row shared by every token --
+            # ``atoms_per_row`` atoms at tile 0; a padded build reads it through
+            # the per-row descriptor at row 0, an unpadded one bounds a one-row
+            # buffer tensor at the true width.
+            out_buf = _operand(out_ptr)
             res_in_buf = _operand(res_in_ptr)
             res_out_buf = _operand(res_out_ptr)
             w_buf = _operand(w_ptr, records=fx.Int64(hidden * 2))
@@ -470,27 +507,34 @@ def make_quick_allreduce_int4_ring_kernel(
                 + sub * fx.Int32(payload_i32[step])
             )
 
-        def _hbm_atom_row(buf, tile, atom):
-            return fx.make_view(
-                fx.get_iter(fx.slice(buf, (tile, atom, None))),
-                hbm_row_layout,
-            )
+        if const_expr(fused):
 
-        def _load_color():
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            return fx.Int32(
-                buffer_ops.buffer_load(color_rsrc, off, vec_width=1, dtype=T.i32)
-            )
+            def _hbm_atom_row(buf, tile, atom):
+                return fx.make_view(
+                    fx.get_iter(fx.slice(buf, (tile, atom, None))),
+                    hbm_row_layout,
+                )
 
-        def _store_color(color):
-            off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
-            buffer_ops.buffer_store(color, color_rsrc, off)
+            # The row-view function is chosen once at trace time: a padded build
+            # addresses each row through a per-row bounded descriptor, an
+            # unpadded one slices the whole-tensor buffer tensor. Both return a
+            # one-atom-wide row view that ``partition_S/D`` consume, so the copy
+            # bodies are uniform.
+            _atom_row = _rowbuf_atom_row if padded else _hbm_atom_row
 
-        # The row-view function is chosen once at trace time: a padded build
-        # addresses each row through a per-row bounded descriptor, an unpadded
-        # one slices the whole-tensor buffer tensor. Both return a one-atom-wide
-        # row view that ``partition_S/D`` consume, so the copy bodies are uniform.
-        _atom_row = _rowbuf_atom_row if padded else _hbm_atom_row
+            def _load_raw_atom(buf, tile, atom):
+                """One 16 B atom, unconverted. For the bf16 operands of the fused
+                epilogue, which are not codec values and never become fp16."""
+                src = hbm_copy.partition_S(_atom_row(buf, tile, atom))
+                frag = fx.make_fragment_like(src)
+                fx.copy(hbm_copy_atom, src, frag)
+                return fx.Vector(frag.load())
+
+            def _store_raw_atom(buf, tile, atom, value):
+                dst = hbm_copy.partition_D(_atom_row(buf, tile, atom))
+                frag = fx.make_fragment_like(dst)
+                frag.store(value)
+                fx.copy(hbm_copy_atom, frag, dst)
 
         def _load_chunk_atoms(tile, chunk):
             """This rank's own bf16 data for *chunk*, as fp16 register atoms.
@@ -501,28 +545,29 @@ def make_quick_allreduce_int4_ring_kernel(
             bulk load, with far fewer values live across the spin-waits.
             """
             return [
-                _atom_bf16_to_f16(_load_raw_atom(in_buf, tile, chunk * rank_atoms + j))
+                _load_atom(tile, chunk * rank_atoms + j)
                 for j in range_constexpr(rank_atoms)
             ]
 
+        if const_expr(fused):
+            # See the mesh kernel: a padded fused build must read ``inp`` through
+            # the per-row bounded descriptor, not ``_payload_io``'s whole-payload
+            # tensor. At h_pad != hidden the wire tile is wider than the HBM row,
+            # so ``_payload_io``'s single bound lets a pad lane read the next row
+            # instead of zero -- which rides the wire into residual_out. Shadow
+            # the plain ``_load_chunk_atoms`` above for the fused build only.
+            in_buf = _operand(inp_ptr)
+
+            def _load_chunk_atoms(tile, chunk):
+                return [
+                    _atom_bf16_to_f16(
+                        _load_raw_atom(in_buf, tile, chunk * rank_atoms + j)
+                    )
+                    for j in range_constexpr(rank_atoms)
+                ]
+
         def _store_chunk_atom(tile, chunk, j, value):
-            _store_raw_atom(
-                out_buf, tile, chunk * rank_atoms + j, _atom_f16_to_bf16(value)
-            )
-
-        def _load_raw_atom(buf, tile, atom):
-            """One 16 B atom, unconverted. For the bf16 operands of the fused
-            epilogue, which are not codec values and never become fp16."""
-            src = hbm_copy.partition_S(_atom_row(buf, tile, atom))
-            frag = fx.make_fragment_like(src)
-            fx.copy(hbm_copy_atom, src, frag)
-            return fx.Vector(frag.load())
-
-        def _store_raw_atom(buf, tile, atom, value):
-            dst = hbm_copy.partition_D(_atom_row(buf, tile, atom))
-            frag = fx.make_fragment_like(dst)
-            frag.store(value)
-            fx.copy(hbm_copy_atom, frag, dst)
+            _store_atom(tile, chunk * rank_atoms + j, value)
 
         def _lds_write_packet(codec, j, words, scale_word, is_leader):
             """Stage one packet of *codec* into the row this hop will send."""
@@ -550,7 +595,7 @@ def make_quick_allreduce_int4_ring_kernel(
             base = _slot_i32(step, sub) + fx.Int32(j * codec.rank_tile_i32)
 
             def _get(off):
-                return _load_i32_at(self_rsrc, base + off, _RECV_POLICY)
+                return _load_i32_at(inbox, base + off, _RECV_POLICY)
 
             return _codec_load(codec, _get, tid, scale_slot)
 
@@ -608,22 +653,23 @@ def make_quick_allreduce_int4_ring_kernel(
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if const_expr(release_writeback is not None):
-                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
-                rocdl.s_waitcnt(vmcnt=0)
-            if quad_id == fx.Int32(0):
-                vec_idx = fx.Int32(release_i32_off[step]) + lane_in_quad * fx.Int32(4)
-                v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                byte_off = _i32_to_bytes(_slot_i32(step, fx.Int32(0)) + vec_idx)
-                _store_v4i32_peer(next_base + byte_off, v4, flag_policy)
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
+            if tid < fx.Int32(FLAG_LANES):
+                elem = (
+                    _slot_i32(step, fx.Int32(0))
+                    + fx.Int32(release_i32_off[step])
+                    + tid * fx.Int32(FLAG_I32_PER_LANE)
+                )
+                _store_flag_peer(next_base + _i32_to_bytes(elem), color, flag_policy)
 
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
             One source, so one thread spins where the mesh needs one per
-            peer. ``buffer_inv sc1`` between attempts is not optional: without
-            it the load can be answered forever from a stale line, which is a
-            hang rather than a slowdown.
+            peer. The poll must bypass the caches (``_load_flag`` is ``sc0
+            sc1``): a load answered from a stale line would spin forever, which
+            is a hang rather than a slowdown.
 
             One colour covers all ``2(N-1)`` slots of a super-tile group. That is
             safe without extra sequencing because the ring's own dependency
@@ -633,23 +679,21 @@ def make_quick_allreduce_int4_ring_kernel(
             transitively requires us to have completed op ``N`` -- i.e. to be
             past the read we are blocked on.
 
-            Spins on the one shared ``self_rsrc`` descriptor at an element
-            offset, rather than building a fresh descriptor from
-            ``self_base + elem*4``. The mesh can afford the latter because
-            its ``elem`` depends on ``tid`` (one spinner per source rank) and the
-            resulting waterfall is genuine. Here there is exactly one source, so
-            a per-call descriptor is a *uniform* value that LLVM cannot prove
-            uniform: it sources all four descriptor dwords from VGPRs and
-            serializes the wave around them, num_records included.
+            Polls through a global address rather than a buffer descriptor:
+            a descriptor built from ``self_base + elem*4`` would be a uniform
+            value LLVM cannot prove uniform, sourcing all four descriptor
+            dwords from VGPRs and serializing the wave around them.
             """
             if tid == fx.Int32(0):
-                elem = _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
+                flag = self_base + _i32_to_bytes(
+                    _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
+                )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
                 # fence is needed in the loop; the acquire below covers the
                 # payload reads, once, after the join.
-                current = _load_i32_at(self_rsrc, elem, _RECV_POLICY)
+                current = _load_flag(flag)
                 while current != color:
-                    current = _load_i32_at(self_rsrc, elem, _RECV_POLICY)
+                    current = _load_flag(flag)
             gpu.barrier()
             # Unconditional, *after* the join, and not just inside the spin.
             # Only `tid == 0` spins, so an acquire inside the loop would cover
@@ -671,8 +715,7 @@ def make_quick_allreduce_int4_ring_kernel(
             # here sits directly on top of dirty output lines, and discarding
             # them silently loses whole chunks.
             rocdl.s_waitcnt(vmcnt=0)
-            llvm.InlineAsmOp(None, [], "buffer_wbl2 sc1", "", has_side_effects=True)
-            rocdl.s_waitcnt(vmcnt=0)
+            _release_inbox(_RELEASE_SCOPE)
             _acquire_inbox()
 
         def _atom_f16_to_f32(atom):
@@ -993,9 +1036,13 @@ def make_quick_allreduce_int4_ring_kernel(
     # rank is baked into the schedule, and the inbox memory type into the store
     # policy, so both have to reach the symbol name -- variants that differ only
     # in a compile-time constant must not collide in the JIT cache.
-    tag = f"ws{world_size}_r{rank}_st{super_tile}_{inbox_memory}_{rs_codec}_{ag_codec}"
+    tag = (
+        f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
+        f"_{rs_codec}_{ag_codec}"
+    )
+    tag += f"_b{block}"
     if fused:
-        tag += f"_rms_h{hidden}_b{block}"
+        tag += f"_rms_h{hidden}"
         if padded:
             tag += f"_p{h_pad}"
     launcher = (
@@ -1030,7 +1077,7 @@ def make_quick_allreduce_int4_ring_kernel(
         "ag_codec": ag_codec,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
-        "release_writeback": release_writeback,
+        "release_scope": release_scope,
         "rank_atoms": rank_atoms,
         "steps": steps,
         "grid": grid,
@@ -1042,4 +1089,5 @@ def make_quick_allreduce_int4_ring_kernel(
         "atoms_per_row": atoms_per_row,
         "rows_per_tile": rows_per_tile,
         "rows_per_chunk": rows_per_chunk,
+        "skip_self": False,
     }
