@@ -75,8 +75,8 @@ def _pack4(values):
 
 _workspaces = {}
 
-# A one-wave WG uses 16 KiB LDS, allowing four resident WGs per CU.
-_DECODE_WGS_PER_CU = 4
+# One wave reuses 8 KiB LDS for K then V, allowing eight resident WGs per CU.
+_DECODE_WGS_PER_CU = 8
 # Fixed b/a, with wave and combine terms fitted to measured page-granular splits.
 _DECODE_SPLIT_A, _DECODE_SPLIT_B, _DECODE_SPLIT_C, _DECODE_SPLIT_D = (
     1.0, 0.89473684, 2.1, -2.5
@@ -390,7 +390,6 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
     @fx.struct
     class DecodeStorage:
         k: fx.Array[fx.Int8, 32 * 256, 16]
-        v: fx.Array[fx.Int8, 256 * 32, 16]
 
     @flyc.kernel(known_block_size=(64, 1, 1))
     def decode(
@@ -432,8 +431,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
             fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(16)
         ]
         @flyc.jit
-        def prefetch(block):
-            tiles = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(16)]
+        def prefetch(block, ptr):
+            tiles = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(8)]
             # Guard the page lookup too, including empty splits and the loop tail.
             if block < end:
                 page = fx.Int32(_load(
@@ -447,38 +446,23 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     safe_token = (token < klen).select(token, block * 32)
                     src = ((fx.Int64(page) * page_size + fx.Int64(safe_token % page_size))
                            * 16 + fx.Int64(head)) * 256 + fx.Int64(d)
-                    tiles.append(fx.Vector(_load(kp, src, fx.Vector.make_type(4, fx.Int32), 16)))
-                    tiles.append(fx.Vector(_load(vp, src, fx.Vector.make_type(4, fx.Int32), 16)))
+                    tiles.append(fx.Vector(_load(ptr, src, fx.Vector.make_type(4, fx.Int32), 16)))
             return tiles
 
-        init = init + prefetch(start)
+        init = init + prefetch(start, kp)
         for block, state in range(start, end, fx.Int32(1), init=init):
             block = fx.Int32(block)
+            current_k = state[18:]
             rocdl.sched_barrier(0)
             for i in range_constexpr(8):
                 off = lane * 16 + i * 1024
                 d = off % 256
-                vval = fx.Vector(state[19 + i * 2])
                 # XOR whole 16-byte chunks to spread banks without row padding.
                 _store(lds.k.ptr, (off // 256) * 256 + (d ^ ((off // 256) % 8 * 16)),
-                       state[18 + i * 2], 16)
-                for j in range_constexpr(4):
-                    word = vval[j]
-                    peer = word.shuffle_xor(fx.Int32(16), fx.Int32(64))
-                    pair = fx.Int32(rocdl.perm_b32(
-                        peer, word, (group % 2 == 0).select(
-                            fx.Int32(0x06020400), fx.Int32(0x03070105))))
-                    peer = pair.shuffle_xor(fx.Int32(32), fx.Int32(64))
-                    packed = rocdl.perm_b32(
-                        peer, pair, (group < 2).select(
-                            fx.Int32(0x05040100), fx.Int32(0x03020706)))
-                    depth = d + j * 4 + group
-                    bank = (depth % 32) ^ (depth // 8)
-                    _store(lds.v.ptr, (depth // 32) * 1024
-                           + ((off // 256) // 4) * 128 + bank * 4, packed, 4)
+                       current_k[i], 16)
             gpu.barrier()
-            next_tiles = prefetch(block + 1)
             rocdl.sched_barrier(0)
+            current_v = prefetch(block, vp)
             scores = []
             m = fx.Float32(state[0])
             for n in range_constexpr(2):
@@ -493,6 +477,27 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     s = valid.select(score[r] * log_scale, fx.Float32(-1.0e30))
                     scores.append(s)
                     m = fx.maxnumf(m, s)
+            # K and V alias; finish every score read before the transpose stores.
+            gpu.barrier()
+            for i in range_constexpr(8):
+                off = lane * 16 + i * 1024
+                d = off % 256
+                vval = fx.Vector(current_v[i])
+                for j in range_constexpr(4):
+                    word = vval[j]
+                    peer = word.shuffle_xor(fx.Int32(16), fx.Int32(64))
+                    pair = fx.Int32(rocdl.perm_b32(
+                        peer, word, (group % 2 == 0).select(
+                            fx.Int32(0x06020400), fx.Int32(0x03070105))))
+                    peer = pair.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                    packed = rocdl.perm_b32(
+                        peer, pair, (group < 2).select(
+                            fx.Int32(0x05040100), fx.Int32(0x03020706)))
+                    depth = d + j * 4 + group
+                    bank = (depth % 32) ^ (depth // 8)
+                    _store(lds.k.ptr, (depth // 32) * 1024
+                           + ((off // 256) // 4) * 128 + bank * 4, packed, 4)
+            gpu.barrier()
             for shift in (16, 32):
                 m = fx.maxnumf(m, m.shuffle_xor(fx.Int32(shift), fx.Int32(64)))
             correction = _exp2(fx.Float32(state[0]) - m)
@@ -506,6 +511,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 probs.append(p * 240.0)
             for shift in (16, 32):
                 psum = psum + psum.shuffle_xor(fx.Int32(shift), fx.Int32(64))
+            next_tiles = prefetch(block + 1, kp)
+            rocdl.sched_barrier(0)
             denom = fx.Float32(state[1]) * correction + psum
             words = [_pack4(probs[g * 4 : g * 4 + 4]) for g in range(2)]
             packed = []
@@ -520,7 +527,7 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 depth = dc * 16 + row
                 bank = (depth % 32) ^ (depth // 8)
                 offset = (depth // 32) * 1024 + bank * 4 + group * 256
-                words = [fx.Int32(_load(lds.v.ptr, offset + i * 128, T.i32, 4))
+                words = [fx.Int32(_load(lds.k.ptr, offset + i * 128, T.i32, 4))
                          for i in range(2)]
                 vfrag = fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int64)[0]
                 o = fx.Vector(state[dc + 2]) * fx.Vector.filled(4, correction, fx.Float32)
