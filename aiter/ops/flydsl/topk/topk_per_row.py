@@ -42,9 +42,10 @@ def _get_cached_adaptive_workspace(
 def _get_adaptive_workspace(
     device: torch.device, stream_id: int, slots: int
 ) -> torch.Tensor:
-    # Do not let graph-pool allocations escape through the process cache.
+    # Do not let graph-pool allocations escape through the process cache. Left
+    # uninitialised: `needs_workspace_zero` alone decides whether replay zeroes it.
     if torch.cuda.is_current_stream_capturing():
-        return torch.zeros(slots, device=device, dtype=torch.int32)
+        return torch.empty(slots, device=device, dtype=torch.int32)
     return _get_cached_adaptive_workspace(device, stream_id, slots)
 
 
