@@ -3,11 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compile the three-phase blocked-scan GDN prefill path.
-
-The blocked path is enabled only for the bf16 K=V=128 specialization. Its
-(H, Hg) coverage follows the serial K5 opt CSV so JIT and AOT remain aligned.
-"""
+"""Precompile blocked GDN prefill kernels from serial K5 configurations."""
 
 from __future__ import annotations
 
@@ -32,16 +28,11 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 CHUNK_GDN_BLOCKED_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_blocked"
 
-# Keep the blocked AOT coverage aligned with serial runtime config resolution.
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE]
 
 
 def parse_csv(csv_path: str) -> list[dict[str, Any]]:
-    """Expand eligible serial K5 rows into blocked-path phase jobs.
-
-    The blocked launch fixes bf16, K=V=128, BV=64, head-major g, and unindexed
-    state. Carry depends only on H, so it is deduplicated across Hg rows.
-    """
+    """Expand eligible K5 rows; deduplicate carry across Hg."""
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
 
@@ -320,7 +311,6 @@ def _format_shape_str(job: dict[str, Any]) -> str:
 
 
 def compile_one_config(*, cu_num: int = 0, phase: str, **kwargs) -> dict[str, Any]:
-    """Compile one blocked-scan phase configuration and save it to cache."""
     del cu_num
     aot_arch = CHUNK_GDN_BLOCKED_AOT_ARCH_DEFAULT
     shape_str = _format_shape_str({"phase": phase, **kwargs})

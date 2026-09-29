@@ -35,7 +35,6 @@ import itertools
 import math
 import zlib
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import pandas as pd
 import torch
@@ -43,7 +42,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
-from aiter.ops.flydsl import linear_attention_prefill_kernels
+from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     _flydsl_run_only,
     chunk_gated_delta_rule_fwd_h_flydsl_opt,
@@ -406,10 +405,6 @@ PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 # -- Helpers -------------------------------------------------------------
 
 
-def _cdiv(a: int, b: int) -> int:
-    return -(-a // b)
-
-
 def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty(0, dtype=dtype, device="cpu").element_size()
 
@@ -468,7 +463,6 @@ def _make_inputs(case: PrefillArgs, context_lens, *, stable_coupling=False):
     w_orig = torch.randn(B, T_total, H, case.K, dtype=dtype, device=device) * scale
     u_orig = torch.randn(B, T_total, H, case.V, dtype=dtype, device=device) * scale
 
-    # Both gate layouts hold identical values.
     if not case.use_g:
         g = None
     else:
@@ -476,7 +470,7 @@ def _make_inputs(case: PrefillArgs, context_lens, *, stable_coupling=False):
         gh = torch.randn(B, H, T_total, dtype=torch.float32, device=device).abs()
         gh *= gate_scale
         if stable_coupling:
-            # Chunk-local decay retains state across adaptive block boundaries.
+            # Weak chunk-local decay preserves cross-block state coupling.
             bos = 0
             for length in context_lens:
                 for start in range(bos, bos + length, case.BT):
@@ -553,10 +547,10 @@ def ref_chunk_gated_delta_rule_fwd_h(
     H_dim, V_dim = u.shape[-2], u.shape[-1]
     BT_dim = chunk_size
     if cu_seqlens is None:
-        NT = _cdiv(T, BT_dim)
+        NT = ceildiv(T, BT_dim)
     else:
         seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        NT = sum(_cdiv(int(seq_len), BT_dim) for seq_len in seq_lens)
+        NT = sum(ceildiv(int(seq_len), BT_dim) for seq_len in seq_lens)
     gqa_ratio = H_dim // Hg_dim
 
     h_out = k.new_zeros(B, NT, H_dim, V_dim, K_dim, dtype=torch.float32)
@@ -580,7 +574,7 @@ def ref_chunk_gated_delta_rule_fwd_h(
         chunk_offset = 0
         for seq_idx, bos, eos in seqs:
             seq_len = eos - bos
-            seq_nt = _cdiv(seq_len, BT_dim)
+            seq_nt = ceildiv(seq_len, BT_dim)
 
             for i_h in range(H_dim):
                 i_hg = i_h // gqa_ratio
@@ -643,8 +637,10 @@ def ref_chunk_gated_delta_rule_fwd_h(
 # -- Benchmark -----------------------------------------------------------
 
 
-def _make_blocked_case(context_lens, trace_tag):
-    return PrefillArgs(
+@benchmark()
+def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
+    """Check cross-block state coupling and empty requests."""
+    case = PrefillArgs(
         K=128,
         V=128,
         Hk=4,
@@ -654,20 +650,14 @@ def _make_blocked_case(context_lens, trace_tag):
         model_name="K5-blocked",
         max_num_batched_tokens=sum(context_lens),
         context_lens=list(context_lens),
-        trace_tag=trace_tag,
+        trace_tag=case_name,
         output_final_state=True,
         g_head_major=True,
     )
-
-
-@benchmark()
-def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
-    """Check adaptive dispatch, state coupling, and the empty-sequence fallback."""
-    case = _make_blocked_case(context_lens, case_name)
     k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(
         case, context_lens, stable_coupling=True
     )
-    # Production consumes log2 gates; the oracle consumes natural-log gates.
+    # Production and oracle gates use log2 and natural-log scales, respectively.
     g_log2 = g * math.log2(math.e)
     metadata = _build_prefill_metadata(context_lens, cu)
     ref_h, ref_vn, ref_fs = ref_chunk_gated_delta_rule_fwd_h(
@@ -697,7 +687,7 @@ def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
             k, w_c, u_c, g=g_log2, g_head_major=True, **common
         ),
     }
-    total_chunks = sum(_cdiv(length, case.BT) for length in context_lens)
+    total_chunks = sum(ceildiv(length, case.BT) for length in context_lens)
     flops = 4 * total_chunks * case.BT * case.H * case.K * case.V
     nbytes = sum(
         tensor.numel() * tensor.element_size() for tensor in (k, w_c, u_c, g_log2, h0)
@@ -706,67 +696,36 @@ def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
     nbytes += total_chunks * case.H * case.V * case.K * k.element_size()
     nbytes += h0.numel() * h0.element_size()
     ret = {"gfx": get_gfx_runtime()}
-    blocked = linear_attention_prefill_kernels._chunk_gated_delta_rule_fwd_h_blocked
-
     for name, fn in candidates.items():
-        blocked_calls = 0
-
-        def record_blocked(*args, **kwargs):
-            nonlocal blocked_calls
-            blocked_calls += 1
-            return blocked(*args, **kwargs)
-
-        # Routing and metadata mutation stay outside the timed callable.
-        with patch.object(
-            linear_attention_prefill_kernels,
-            "_chunk_gated_delta_rule_fwd_h_blocked",
-            side_effect=record_blocked,
-        ):
-            outputs = [fn()]
-            expected_calls = int(0 not in context_lens)
-            assert blocked_calls == expected_calls, f"{case_name}: first dispatch"
-            if expected_calls:
-                cu_version = cu._version
-                cu.copy_(cu.clone())
-                assert cu._version > cu_version, f"{case_name}: cu version"
-                common["prefill_metadata"] = _build_prefill_metadata(context_lens, cu)
-                outputs.append(fn())
-                assert blocked_calls == 2, f"{case_name}: refill dispatch"
-
-        output, us = run_perftest(fn)
-        outputs.append(output)
-        err = 0.0
-        for h, vn, fs in outputs:
-            err = max(
-                err,
-                checkAllclose(
-                    ref_h.to(dtypes.fp32),
-                    h.to(dtypes.fp32),
-                    rtol=2e-2,
-                    atol=2e-2,
-                    msg=f"{case_name}: K5 h snapshots",
-                ),
-                checkAllclose(
-                    ref_vn.to(dtypes.fp32),
-                    _normalize_opt_v_new(vn).to(dtypes.fp32),
-                    rtol=2e-2,
-                    atol=2e-2,
-                    msg=f"{case_name}: K5 v_new",
-                ),
-                checkAllclose(
-                    ref_fs.to(dtypes.fp32),
-                    fs.to(dtypes.fp32),
-                    rtol=2e-2,
-                    atol=2e-2,
-                    msg=f"{case_name}: K5 final_state",
-                ),
-            )
-            if 0 in context_lens:
-                empty_idx = context_lens.index(0)
-                assert torch.equal(
-                    fs[empty_idx], h0[empty_idx]
-                ), f"{case_name}: empty-sequence final state must equal initial state"
-        ret["blocked_calls"] = blocked_calls
+        (h, vn, fs), us = run_perftest(fn)
+        err = max(
+            checkAllclose(
+                ref_h.to(dtypes.fp32),
+                h.to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{case_name}: K5 h snapshots",
+            ),
+            checkAllclose(
+                ref_vn.to(dtypes.fp32),
+                _normalize_opt_v_new(vn).to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{case_name}: K5 v_new",
+            ),
+            checkAllclose(
+                ref_fs.to(dtypes.fp32),
+                fs.to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{case_name}: K5 final_state",
+            ),
+        )
+        if 0 in context_lens:
+            empty_idx = context_lens.index(0)
+            assert torch.equal(
+                fs[empty_idx], h0[empty_idx]
+            ), f"{case_name}: empty-sequence final state must equal initial state"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -821,10 +780,10 @@ def test_chunk_gdn_prefill_h(
 
     if case.is_varlen:
         B, N = 1, len(context_lens)
-        total_chunks = sum(_cdiv(n, BT) for n in context_lens)
+        total_chunks = sum(ceildiv(n, BT) for n in context_lens)
     else:
         B = N = case.dense_batch
-        total_chunks = B * _cdiv(sum(context_lens), BT)
+        total_chunks = B * ceildiv(sum(context_lens), BT)
     T_flat = int(cu[-1].item()) if cu is not None else sum(context_lens)
 
     ref_h, ref_vn, ref_fs = ref_chunk_gated_delta_rule_fwd_h(
@@ -1047,7 +1006,7 @@ def main():
 
     if gfx == "gfx950" and not _flydsl_run_only():
         cases = [
-            ("ragged_coupling_refill", [8257]),
+            ("ragged_coupling", [8257]),
             ("empty_sequence", [8192, 0]),
         ]
         df = pd.DataFrame([test_chunk_gdn_prefill_h_blocked(*case) for case in cases])

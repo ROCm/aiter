@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""
-Gated Delta Net K5 hidden-state recurrence kernel (@flyc.kernel API).
+"""GDN K5 hidden-state recurrence for 64-token chunks.
 
-HIP-aligned fork: same ``mfma_f32_16x16x16bf16_1k`` instruction and warp
-partition (BT split-M, K split across waves, V not split) as the hand-tuned
-HIP/C++ K5 kernel; writes the public [..., V, K] layout through a [V][K]
-transpose buffer + b128 store (fp32 snapshots use two half-BV LDS rounds).
-Serially over the NT chunks: store the h snapshot for K6,
-v_new = u - w @ h, then
-h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g_cumsum)).
+Uses bf16 MFMA and a [V, K] transpose buffer for public state stores.
 """
 
 import flydsl.compiler as flyc
@@ -74,16 +67,9 @@ def compile_chunk_gated_delta_h(
     PHASE: str = PHASE_EMIT,
     BLOCK_ENTRY_SEED: bool = False,
 ):
-    """Compile the GDN K5 kernel into the @flyc.jit launcher below.
+    """Compile GDN K5; BF16-rounded basis states approximate serial carry.
 
-    ``STATE_DTYPE_BF16`` puts ``h0`` / ``ht`` in bf16 (promote on load, demote
-    on store); the f32 accumulator and the LDS layouts are unchanged.
-
-    ``SNAPSHOT_DTYPE_BF16=False`` writes fp32 snapshots in two half-BV LDS rounds.
-    Map construction uses request-aligned blocks and stores fp32 [A^T, C^T].
-    The first K columns propagate basis probes with zero forcing; the rest
-    propagate real forcing from zero. BF16 probe rounding and reassociation
-    approximate the uninterrupted serial recurrence.
+    FP32 snapshots require two half-BV LDS rounds.
     """
     if PHASE not in (PHASE_EMIT, PHASE_BUILD_MAP):
         raise ValueError(f"Unknown GDN phase: {PHASE}")
@@ -95,8 +81,7 @@ def compile_chunk_gated_delta_h(
         assert not USE_INITIAL_STATE and not USE_STATE_INDICES
         assert STORE_FINAL_STATE and not STATE_DTYPE_BF16 and not SAVE_NEW_VALUE
 
-    # BT=64 is baked into the wave mapping / load batching / BT_STEPS, gated_v
-    # alias-reuses h_state panel 1, and the LDS layout is validated at K=V=128.
+    # BT=64 fixes wave mapping and LDS aliasing; K=128 fixes the layout.
     assert BT == 64, f"chunk_gated_delta_h only supports BT=64, got BT={BT}"
     assert K == 128, f"chunk_gated_delta_h only supports K=128, got K={K}"
     assert BV % 16 == 0, f"BV must be a multiple of the MFMA N of 16, got BV={BV}"
@@ -190,8 +175,6 @@ def compile_chunk_gated_delta_h(
         NB_val: fx.Int32,
         T_val: fx.Int32,
         T_flat: fx.Int32,
-        # Only bounds the cu_seqlens / chunk_offsets / state_indices views; the
-        # sequence count itself is carried by the grid.y extent.
         N_val: fx.Int32,
         phase: fx.Constexpr[str],
     ):
@@ -245,11 +228,7 @@ def compile_chunk_gated_delta_h(
             cu_view = _gview(cu_seqlens_tensor, None, (N_val + 1, 1), (1, 1))
             co_view = _gview(chunk_offsets_tensor, None, (N_val, 1), (1, 1))
 
-        # -- LDS -- every MMA operand panel is a view in the shape the tiled MMA
-        # expects (A as (M, K), B as (N, K)), so partition_S computes per-lane
-        # addresses once outside the chunk loop. K nests as (4, k_groups,
-        # panels): the inner 4 = one k_group = one MFMA operand = one b64, kept
-        # contiguous by the base=2 of every swizzle.
+        # Contiguous K4 groups permit hoisting partition_S addresses.
         allocator = fx.SharedAllocator()
         lds = allocator.allocate(SharedStorage).peek()
 
@@ -280,13 +259,8 @@ def compile_chunk_gated_delta_h(
             fx.make_layout((BV, (4, BT // 4)), (4, (1, BV * 4))),
         )
 
-        # GEMM2 A -- k panels as (64, BT), one panel being k^T of a 64-K block:
-        # [64][BT] row-major + S<2,2,8> + S<4,2,4>, the layout form of HIP's
-        # ``k_panel_rotating_pair_addr_bytes``. Two swizzles because the store
-        # (K-row bits 3..5) and the MFMA A read (bits 0..3) must both stay
-        # conflict-free, folding six row bits into the four usable bits 3..6.
-        # Index with fx.slice: partition_S mishandles a NESTED composed layout
-        # and silently produces wrong addresses.
+        # Dual swizzles avoid store/read bank conflicts; partition_S misaddresses
+        # the nested layout, so use fx.slice.
         def _k_panel_view(kb, group):
             """k panel ``kb`` as (64, (group, BT/group)): same addresses either
             way -- group=4 is the MFMA A operand, group=2 the store pair."""
@@ -465,7 +439,7 @@ def compile_chunk_gated_delta_h(
             state_slot_base = (fx.Int64(block_id) * H + i_h64) * (V * K)
         if const_expr(USE_INITIAL_STATE):
             if const_expr(BLOCK_ENTRY_SEED):
-                # Carry stores native [K,V]; each accumulator owns four K rows.
+                # Carry's [K,V] layout transposes the public state.
                 h0_view = _gview(
                     h0_tensor, state_slot_base, (V, K // 4, 4, 1), (1, 4 * V, V, 1)
                 )
@@ -516,7 +490,6 @@ def compile_chunk_gated_delta_h(
         for kb in range_constexpr(NUM_K_BLOCKS):
             frag_h_accs[kb].fill(0.0)
 
-        # FP32 block-entry seeds bypass the persistent-state BF16 conversion.
         def _seed_accumulators(accs, seed_view, seed_copy, seed_num):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
@@ -568,8 +541,6 @@ def compile_chunk_gated_delta_h(
                         fx.Vector.from_elements(elems, dtype=fx.Float32)
                     )
 
-        # Pipelined chunk loop: the prologue stages chunk 0's w/k, then each
-        # iteration prefetches the next chunk's w/k and publishes it at the end.
         GEMM1_PF_SPLIT = 1
         k_vec_group_pf = lane & 7
         k_row_base_pf = k_vec_group_pf * 8
@@ -641,10 +612,7 @@ def compile_chunk_gated_delta_h(
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
 
-        # PROLOGUE: stage chunk 0's w/k under a block-uniform NT>0 guard -- an
-        # empty varlen sequence has bos == T_flat, so its clamped w/k address
-        # would run past the input, and skipping is correct since the loop then
-        # runs 0 times. Closures keep views/atoms out of the scf.if state.
+        # Empty requests would prefetch beyond the input despite clamping.
         has_work = NT > 0
         if has_work:
             _store_w_rows(_load_w_rows())
@@ -755,7 +723,7 @@ def compile_chunk_gated_delta_h(
                 u_prefetch_reg.store(fx.Vector.from_elements(values, fx.BFloat16))
 
             if const_expr(phase == PHASE_BUILD_MAP):
-                # Keep the workgroup-uniform test outside the entire load batch.
+                # A uniform guard avoids per-load branching.
                 if i_v < K // BV:
                     u_prefetch_reg.fill(0.0)
                 else:
@@ -1016,7 +984,6 @@ def compile_chunk_gated_delta_h(
                             state_num,
                         )
 
-    # -- Host launcher ------------------------------------------------------
     @flyc.jit
     def launch_gdn_h(
         k_tensor: fx.Tensor,
@@ -1125,9 +1092,7 @@ def compile_chunk_gated_delta_h(
     )
 
 
-# NOTE: the host wrapper, BV autotune and kernel cache live in
-# ``aiter.ops.flydsl.linear_attention_prefill_kernels`` (no torch/triton here).
-# This file is the device kernel; sibling ``gdn_prepare.py`` is the prepare stage.
+# Host launch, autotuning and caching live in linear_attention_prefill_kernels.py.
 
 
 __all__ = ["compile_chunk_gated_delta_h"]

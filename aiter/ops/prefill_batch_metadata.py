@@ -523,7 +523,7 @@ def build_gated_delta_rule_prefill_metadata(
         grid=grid,
         chunk_offsets=packed[chunk_ids_end:offsets_end],
         kernel_cu_seqlens=packed[source_cu_end:kernel_cu_end],
-        # Zero marks per-sequence sizing: no single scalar describes the blocks.
+        # Zero distinguishes per-sequence sizing from a uniform block size.
         block_chunks=block_chunks if block_chunks_per_seq is None else 0,
         block_seq_id=packed[kernel_cu_end:block_seq_end],
         block_chunk_base=packed[block_seq_end:block_base_end],

@@ -404,7 +404,7 @@ def _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata=None):
 def _resolve_adaptive_k5_metadata(
     cu_seqlens, T, device, target_segments, *, lengths=None
 ):
-    """Resolve adaptive schedules without retaining their owning tensor."""
+    """Resolve adaptive schedules without retaining cu_seqlens."""
     if target_segments <= 0:
         raise ValueError("`target_segments` must be positive.")
     if lengths is None:
@@ -433,7 +433,6 @@ def _resolve_adaptive_k5_metadata(
             for length in lengths
         ],
     )
-    # The schedule owns independent offset tensors, not the source cu_seqlens.
     try:
         object.__setattr__(
             cu_seqlens, _ADAPTIVE_K5_META_ATTR, (cache_key, version, metadata.schedule)
@@ -964,7 +963,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         chunk_counts = tuple(triton.cdiv(length, BT) for length in lengths)
         if all(length > 0 for length in lengths) and max(chunk_counts) > 1:
             target_segments = _gdn_k5_target_segments()
-            # Shared K1--K6 metadata may use scalar blocks; repartition for K5.
+            # K5 requires its own blocks when shared metadata uses scalar sizing.
             adaptive_metadata = _resolve_adaptive_k5_metadata(
                 cu_seqlens, T_flat, k.device, target_segments, lengths=lengths
             )
@@ -1039,10 +1038,9 @@ def _build_chunk_gdn_block_maps(
     prefill_metadata: GatedDeltaRulePrefillMetadata,
     bv: int = 64,
 ) -> torch.Tensor:
-    """Recover packed fp32 [blocks,H,K+V,K] affine maps storing [Aᵀ,Cᵀ].
+    """Build packed fp32 [Aᵀ,Cᵀ] maps with request-aligned blocks.
 
-    BF16-rounded basis probes and reassociation approximate the uninterrupted
-    serial recurrence. Blocks follow the request-aligned metadata schedule.
+    BF16-rounded basis states and reassociation approximate serial recurrence.
     """
     B, T, Hg, K = k.shape
     H, V = u.shape[1], u.shape[-1]
@@ -1059,7 +1057,7 @@ def _build_chunk_gdn_block_maps(
         raise ValueError("Block-map g must be colocated head-major [1,H,T].")
     k, w = _require_contiguous(k, "k"), _require_contiguous(w, "w")
     blocks = schedule.total_blocks
-    # The homogeneous probe is synthesized in-kernel; only real u is stored.
+    # The homogeneous basis state needs no stored u.
     packed_u = u.contiguous()
     packed_v = K + V
     maps = torch.empty((blocks, H, packed_v, K), device=k.device, dtype=torch.float32)
@@ -1129,11 +1127,9 @@ def _carry_chunk_gdn_block_maps(
     *,
     prefill_metadata: GatedDeltaRulePrefillMetadata,
 ) -> torch.Tensor:
-    """Return native fp32 [blocks,H,K,V] entries, scanning requests independently.
+    """Scan request-local maps into fp32 [blocks,H,K,V] entries.
 
-    Maps are packed [blocks,H,K+V,K] storing [Aᵀ,Cᵀ]. Optional fp32
-    initial_state retains the public [N,H,V,K] layout. The last map's exit
-    in each request is not needed for entry states.
+    Initial state retains public [N,H,V,K] layout; final map exits are unused.
     """
     schedule = prefill_metadata.get_chunk_schedule(64)
     requests = schedule.n_prefill
@@ -1196,13 +1192,10 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     target_segments: int | None = None,
     state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Approximate recurrence via BF16-rounded block maps, FP32 carry, and emit.
+    """Approximate serial recurrence with BF16-rounded maps and FP32 carry.
 
-    Probe rounding and reassociation differ from the uninterrupted serial recurrence.
-
-    Inputs retain the public k and head-major w/u layouts, with log2-scaled
-    head-major g. Outputs are bf16 snapshots/new values and fp32 final state.
-    Explicit metadata is authoritative; target_segments sizes newly built metadata.
+    Inputs use public k and head-major w/u, with log2-scaled head-major g.
+    Explicit metadata overrides target_segments; outputs include fp32 final state.
     """
     if k.ndim != 4 or k.shape[0] != 1:
         raise ValueError("Blocked emit requires packed [1,T,Hg,K] input.")

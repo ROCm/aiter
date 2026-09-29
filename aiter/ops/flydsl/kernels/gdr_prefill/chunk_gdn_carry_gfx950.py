@@ -46,44 +46,36 @@ def _affine_step(
     col: fx.Int32,
     group: fx.Int32,
     wave: fx.Int32,
-    N: fx.Constexpr[int],
 ):
-    """Multiply A by an LDS [128,N,1] RHS, add C, and return next A's seed.
-
-    Accumulators and C are ordered by 16-column tile, 64-row panel, then
-    four MFMA values per lane. Maps retain the packed [block,probe,row,1] view.
-    """
+    """Advance affine carry with an LDS RHS and prefetched maps."""
     lds_cp = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32, fx.Float32))
     frag_a = fx.make_rmem_tensor(1, fx.Float32)
     frag_b = fx.make_rmem_tensor(1, fx.Float32)
     frag_c = fx.make_rmem_tensor(4, fx.Float32)
-    acc_count = 2 * (N // 16)
+    acc_count = 2
 
     def multiply(a_values, k_base, accumulators):
         values = list(accumulators)
         for kk in range_constexpr(8):
-            for tile in range_constexpr(N // 16):
-                sv = _load_vec(
-                    lds_cp,
-                    fx.slice(rhs, (k_base + kk * 4 + group, tile * 16 + col, None)),
-                    1,
-                    fx.Float32,
-                )
-                frag_b.store(fx.Vector.from_elements([sv], dtype=fx.Float32))
-                for panel in range_constexpr(2):
-                    slot = tile * 2 + panel
-                    frag_a.store(
-                        fx.Vector.from_elements(
-                            [a_values[kk * 2 + panel]], dtype=fx.Float32
-                        )
+            sv = _load_vec(
+                lds_cp,
+                fx.slice(rhs, (k_base + kk * 4 + group, col, None)),
+                1,
+                fx.Float32,
+            )
+            frag_b.store(fx.Vector.from_elements([sv], dtype=fx.Float32))
+            for panel in range_constexpr(2):
+                frag_a.store(
+                    fx.Vector.from_elements(
+                        [a_values[kk * 2 + panel]], dtype=fx.Float32
                     )
-                    frag_c.store(fx.Vector(values[slot]))
-                    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
-                    values[slot] = frag_c.load()
+                )
+                frag_c.store(fx.Vector(values[panel]))
+                fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+                values[panel] = frag_c.load()
         return values
 
-    # Each buffer covers eight K4 steps, not a full 64 KiB map.
     for chunk, carried in range(
         fx.Int32(0),
         fx.Int32(3),
@@ -98,7 +90,7 @@ def _affine_step(
         )
         result = yield accumulators + [next_a]
 
-    # The caller clamps next_block on the final step, including one-block requests.
+    # The last prefetch must remain in bounds.
     next_a = _prefetch_a(maps, next_block, fx.Int32(0), col, group, wave)
     accumulators = multiply(
         fx.Vector(result[acc_count]), fx.Int32(96), result[:acc_count]
@@ -155,7 +147,7 @@ def compile_chunk_gdn_carry(
             state_num,
         )
         lds_cp = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-        # Keep the packed parent strides; build-map stores probe-major [Aᵀ,Cᵀ].
+        # Packed [Aᵀ,Cᵀ] requires the parent strides.
         maps = _gview(
             maps_tensor,
             head * (K + V) * K,
@@ -172,7 +164,7 @@ def compile_chunk_gdn_carry(
                 row = panel * 64 + wave * 16 + group * 4 + j
                 seed = fx.Float32(0.0)
                 if const_expr(use_initial_state):
-                    # Public h0 is [N,H,V,K]; maps and entries use native [K,V].
+                    # Public h0 [V,K] transposes into carry [K,V].
                     h0 = _gview(h0_tensor, request_head * V * K, (V, K, 1), (K, 1, 1))
                     loaded_seed = _load_vec(
                         cp_state, fx.slice(h0, (v, row, None)), 1, state_num
@@ -189,7 +181,7 @@ def compile_chunk_gdn_carry(
                     )
         gpu.barrier()
 
-        # Empty requests have no map; use an in-bounds seed even for a zero-trip scan.
+        # Empty requests still prefetch one map.
         seed_block = (first < end).select(first, fx.Int32(0))
         first_a = _prefetch_a(maps, seed_block, fx.Int32(0), col, group, wave)
         for block, carried_a in range(first, end - 1, fx.Int32(1), init=[first_a]):
@@ -221,7 +213,6 @@ def compile_chunk_gdn_carry(
                 col,
                 group,
                 wave,
-                BV,
             )
             gpu.barrier()
             for panel in range_constexpr(2):
