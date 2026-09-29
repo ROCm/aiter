@@ -2313,23 +2313,51 @@ def _bench_shape(
             )
             and (flyauto is None or not flyauto.should_fly_all_reduce(x))
         )
+        and not (
+            c.family == "fused_flyauto"
+            and (
+                fused_flyauto is None
+                or not fused_flyauto.should_fly_fused_ar_rms(x, residual, weight)
+            )
+        )
     ]
-    thunks, buffers = _build_thunks(
-        cands,
-        ca_comm=ca_comm,
-        qr_comm=qr_comm,
-        fly=fly,
-        fly1s=fly1s,
-        flyauto=flyauto,
-        group=group,
-        x=x,
-    )
-
-    # fp32 sum of every rank's contribution, accumulated one peer at a time so
-    # peak memory stays at ~2 activations.
-    ref = torch.zeros((tokens, hidden), dtype=dtypes.fp32, device=device)
-    for peer in range(tp_size):
-        ref += _make_input(peer, tokens, hidden, dtype).to(device, dtypes.fp32)
+    if fused:
+        thunks, buffers = _build_fused_thunks(
+            cands,
+            ca_comm=ca_comm,
+            qr_comm=qr_comm,
+            fly=fly,
+            fly1s=fly1s,
+            fly1s_rms=fly1s_rms,
+            flyqr_rms=flyqr_rms,
+            flyauto=flyauto,
+            fused_flyauto=fused_flyauto,
+            group=group,
+            x=x,
+            residual=residual,
+            weight=weight,
+        )
+        ref, res_ref = _fusion_reference(
+            tp_size, tokens, hidden, dtype, device, residual, weight
+        )
+    else:
+        thunks, buffers = _build_thunks(
+            cands,
+            ca_comm=ca_comm,
+            qr_comm=qr_comm,
+            pynccl_comm=pynccl_comm,
+            fly=fly,
+            fly1s=fly1s,
+            flyauto=flyauto,
+            group=group,
+            x=x,
+            cdr_out=bufs.cdr_out(tokens, hidden, dtype),
+        )
+        # fp32 sum of every rank's contribution, accumulated one peer at a time
+        # so peak memory stays at ~2 activations.
+        ref = torch.zeros((tokens, hidden), dtype=dtypes.fp32, device=device)
+        for peer in range(tp_size):
+            ref += _make_input(peer, tokens, hidden, dtype).to(device, dtypes.fp32)
 
     ret = {
         "nbytes": nbytes,
@@ -2454,7 +2482,17 @@ def _bench_shape(
         # Resolved after the run, not before: for a ladder-driven engine the
         # variant is a function of the payload, and asking the engine is the
         # only way to learn which rung this size took.
-        ret[f"{cand.key}_variant"] = _variant_of(cand, fly, fly1s, flyauto, nbytes)
+        ret[f"{cand.key}_variant"] = _variant_of(
+            cand,
+            fly,
+            fly1s,
+            flyauto,
+            nbytes,
+            fly1s_rms=fly1s_rms,
+            flyqr_rms=flyqr_rms,
+            fused_flyauto=fused_flyauto,
+            hidden=hidden,
+        )
 
     if profile:
         dist.barrier(group=group)
@@ -2784,7 +2822,7 @@ def _worker(
             # one-shot ceiling, one token above it, and one token above the
             # mesh ceiling.
             tok = DSV4_HIDDEN * 2
-            reachable = policy.families_reachable(flyauto.policy)
+            reachable = flyauto.reachable
             # Probe sites: just inside each window boundary. Ring probe is only
             # computed when mesh_max is finite (otherwise ring is not reachable
             # and mesh_max=None would make the arithmetic nonsensical).
