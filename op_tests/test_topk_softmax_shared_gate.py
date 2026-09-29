@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Benchmarks for aiter.topk_softmax_fused_shared_gate (Option A: routed softmax
+# Op test for aiter.topk_softmax_fused_shared_gate (Option A: routed softmax
 # top-k + in-kernel shared-expert gate GEMV in a single launch).
 #
-# Two independent unit benchmarks, each emitting its own markdown table:
-#   * bench_unfused : the NOT-fused baseline -- routed topk_softmax (existing op)
-#                     + a separate shared-expert gate GEMV (sigmoid * scale) + append.
-#   * bench_fused   : the fused op topk_softmax_fused_shared_gate (single launch).
-# Both check the result against a torch reference (err == 0). Compare the two
-# tables' `us` columns for the fused-vs-not-fused speedup.
+# Structure follows the aiter op_test standard (see op_tests/test_quant.py):
+#   * ONE @benchmark function times BOTH paths as candidates in one table --
+#       "unfused": routed topk_softmax + a separate bf16 gate GEMV + append
+#       "fused"  : topk_softmax_fused_shared_gate (single launch)
+#     so the fused-vs-unfused comparison is read straight off the `us` columns.
+#   * Correctness IS the `err` column: each candidate is checked against a torch
+#     reference on every swept shape. Because the file runs via `python3 <file>`
+#     (which is how CI invokes op_tests -- NOT pytest), this correctness check
+#     runs in CI. Extra edge configs and the negative/guard behaviors are also
+#     driven from main() for the same reason.
 
 import argparse
 import itertools
 
-import pandas as pd
-import pytest
-import torch
-
 import aiter
+import pandas as pd
+import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.moe_op import topk_softmax, topk_softmax_fused_shared_gate
@@ -27,10 +29,6 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
-
-
-def _gfx_supported():
-    return torch.cuda.is_available() and get_gfx() in SUPPORTED_GFX
 
 
 def sorted_pairs(ids, weights):
@@ -62,18 +60,30 @@ def _make_inputs(tokens, num_experts, hidden, num_shared, dtype):
     return gating, hs, gate_weight
 
 
+def _fused_buffers(tokens, topk, num_shared):
+    total = topk + num_shared
+    return (
+        torch.empty(tokens, total, dtype=dtypes.fp32),
+        torch.empty(tokens, total, dtype=dtypes.i32),
+        torch.empty(tokens, topk, dtype=dtypes.i32),  # token_expert_indices scratch
+    )
+
+
 def _check(wbuf, ibuf, topk, ref, name):
+    # Compare one candidate's output buffers against the torch reference and return
+    # the WORST of the four checks, so a mismatch in ANY of them (ids to the bit,
+    # weights within tol) surfaces as a non-zero err the caller can assert on.
     ref_rw, ref_ri, ref_sw, ref_si = ref
     got_rw, got_ri = wbuf[:, :topk], ibuf[:, :topk]
     got_sw, got_si = wbuf[:, topk:], ibuf[:, topk:]
-    checkAllclose(
+    e_sid = checkAllclose(
         got_si.to(dtypes.fp32),
         ref_si.to(dtypes.fp32),
         rtol=0,
         atol=0,
         msg=f"{name} shared ids",
     )
-    err = checkAllclose(
+    e_sw = checkAllclose(
         got_sw.to(dtypes.fp32),
         ref_sw.to(dtypes.fp32),
         rtol=2e-2,
@@ -82,106 +92,65 @@ def _check(wbuf, ibuf, topk, ref, name):
     )
     ref_ids, ref_w = sorted_pairs(ref_ri, ref_rw)
     got_ids, got_w = sorted_pairs(got_ri.to(dtypes.i32), got_rw)
-    checkAllclose(
+    e_rid = checkAllclose(
         got_ids.to(dtypes.fp32),
         ref_ids.to(dtypes.fp32),
         rtol=0,
         atol=0,
         msg=f"{name} routed ids",
     )
-    checkAllclose(
+    e_rw = checkAllclose(
         got_w.to(dtypes.fp32),
         ref_w.to(dtypes.fp32),
         rtol=2e-2,
         atol=2e-2,
         msg=f"{name} routed weights",
     )
-    return err
-
-
-def _roofline(tokens, num_shared, hidden, gating, hs, gate_weight, wbuf, ibuf):
-    flops = 2 * tokens * num_shared * hidden  # dominant: shared-gate GEMV
-    nbytes = (
-        gating.numel() * gating.element_size()
-        + hs.numel() * hs.element_size()
-        + gate_weight.numel() * gate_weight.element_size()
-        + wbuf.numel() * wbuf.element_size()
-        + ibuf.numel() * ibuf.element_size()
-    )
-    return flops, nbytes
+    return max(e_sid, e_sw, e_rid, e_rw)
 
 
 @benchmark()
-def bench_unfused(tokens, num_experts, hidden, topk, num_shared, scale, renorm, dtype):
-    """NOT-fused baseline, as close to the fused op's work as possible so the speedup
-    is not inflated by torch plumbing:
-      * routed topk_softmax writes the routed columns in place through strided views
-        (w[:, :topk] / ids[:, :topk]) -- no separate buffer + copy.
-      * the shared-gate GEMV runs in the input dtype (bf16 mm accumulates in fp32 on
-        MFMA, matching the fused kernel) -- no .float() upcast temporary, which would
-        also make the baseline more accurate than the op under test.
-      * the shared ids depend only on (base, num_shared), so they are precomputed once
-        OUTSIDE the timed region.
-    Timed region is thus ~2 kernels (routed top-k + gate mm) + sigmoid/scale store."""
+def test_shared_gate(
+    tokens, num_experts, hidden, topk, num_shared, scale, renorm, dtype
+):
+    """Fused vs unfused shared-expert gating in one table. Both candidates are
+    checked against a torch reference (the `err` columns) -- that IS the
+    correctness check, and it runs under `python3 <file>` (CI), not just pytest.
+
+    unfused: routed topk_softmax writing routed columns in place via strided
+             views + a separate bf16 gate GEMV (no fp32 upcast) + sigmoid/scale.
+    fused  : topk_softmax_fused_shared_gate (single launch).
+    """
     base = num_experts
     total = topk + num_shared
     gating, hs, gate_weight = _make_inputs(
         tokens, num_experts, hidden, num_shared, dtype
     )
+    ref = run_torch(gating, hs, gate_weight, topk, num_shared, base, scale, renorm)
 
-    w = torch.empty(tokens, total, dtype=dtypes.fp32)
-    ids = torch.empty(tokens, total, dtype=dtypes.i32)
-    tei = torch.empty(tokens, topk, dtype=dtypes.i32)
-    w_routed, ids_routed = w[:, :topk], ids[:, :topk]  # views, written in place
-    # shared ids depend only on (base, num_shared) -> precompute once, outside timing.
-    ids[:, topk:] = base + torch.arange(num_shared, dtype=dtypes.i32)
-    logit = torch.empty(tokens, num_shared, dtype=dtype)  # reused, not reallocated
+    # --- unfused candidate ---------------------------------------------------
+    w_u = torch.empty(tokens, total, dtype=dtypes.fp32)
+    ids_u = torch.empty(tokens, total, dtype=dtypes.i32)
+    tei_u = torch.empty(tokens, topk, dtype=dtypes.i32)
+    wr_u, ir_u = w_u[:, :topk], ids_u[:, :topk]  # views, written in place
+    # shared ids depend only on (base, num_shared) -> precompute once.
+    ids_u[:, topk:] = base + torch.arange(num_shared, dtype=dtypes.i32)
+    logit = torch.empty(tokens, num_shared, dtype=dtype)  # reused
 
-    def fn():
-        topk_softmax(w_routed, ids_routed, tei, gating, renorm)
+    def run_unfused():
+        topk_softmax(wr_u, ir_u, tei_u, gating, renorm)
         torch.mm(hs, gate_weight.t(), out=logit)  # bf16 GEMV, no upcast
         torch.sigmoid(logit, out=logit)
-        w[:, topk:] = logit * scale
+        w_u[:, topk:] = logit * scale
 
-    _, us = run_perftest(fn)
-    err = _check(
-        w,
-        ids,
-        topk,
-        run_torch(gating, hs, gate_weight, topk, num_shared, base, scale, renorm),
-        "unfused",
-    )
-    flops, nbytes = _roofline(
-        tokens, num_shared, hidden, gating, hs, gate_weight, w, ids
-    )
-    return {
-        "gfx": get_gfx(),
-        "us": us,
-        "TFLOPS": flops / us / 1e6,
-        "TB/s": nbytes / us / 1e6,
-        "err": err,
-    }
+    # --- fused candidate -----------------------------------------------------
+    w_f, ids_f, tei_f = _fused_buffers(tokens, topk, num_shared)
 
-
-@benchmark()
-def bench_fused(tokens, num_experts, hidden, topk, num_shared, scale, renorm, dtype):
-    """Fused op: topk_softmax_fused_shared_gate (single launch)."""
-    base = num_experts
-    total = topk + num_shared
-    gating, hs, gate_weight = _make_inputs(
-        tokens, num_experts, hidden, num_shared, dtype
-    )
-
-    w = torch.empty(tokens, total, dtype=dtypes.fp32)
-    ids = torch.empty(tokens, total, dtype=dtypes.i32)
-    # token_expert_indices is write-only scratch, written with stride topk (routed only).
-    tei = torch.empty(tokens, topk, dtype=dtypes.i32)
-
-    def fn():
+    def run_fused():
         topk_softmax_fused_shared_gate(
-            w,
-            ids,
-            tei,
+            w_f,
+            ids_f,
+            tei_f,
             gating,
             renorm,
             num_shared,
@@ -192,179 +161,61 @@ def bench_fused(tokens, num_experts, hidden, topk, num_shared, scale, renorm, dt
             base,
         )
 
-    _, us = run_perftest(fn)
-    err = _check(
-        w,
-        ids,
-        topk,
-        run_torch(gating, hs, gate_weight, topk, num_shared, base, scale, renorm),
-        "fused",
-    )
-    flops, nbytes = _roofline(
-        tokens, num_shared, hidden, gating, hs, gate_weight, w, ids
-    )
-    return {
-        "gfx": get_gfx(),
-        "us": us,
-        "TFLOPS": flops / us / 1e6,
-        "TB/s": nbytes / us / 1e6,
-        "err": err,
+    candidates = {
+        "unfused": (run_unfused, w_u, ids_u),
+        "fused": (run_fused, w_f, ids_f),
     }
 
+    # Roofline: dominant work is the shared-gate GEMV over [M, hidden].
+    flops = 2 * tokens * num_shared * hidden
+    nbytes = (
+        gating.numel() * gating.element_size()
+        + hs.numel() * hs.element_size()
+        + gate_weight.numel() * gate_weight.element_size()
+        + w_f.numel() * w_f.element_size()
+        + ids_f.numel() * ids_f.element_size()
+    )
 
-# Each case varies ONE axis from the baseline (tokens=64, experts=512, num_shared=1,
-# bf16, hidden=4096, scale=1.0, renorm=True) so a failure points at the branch it
-# exercises. Covered: shared-expert counts (incl. 8), fp32 gating, a larger hidden that
-# exceeds the gate-LDS staging cap (global-read fallback), the need_renorm=False
-# epilogue, a non-unit shared_expert_scale, num_experts=256 (BYTES_PER_LDG=32 GEMV
-# vector width), and token-count edges M=1 and M=65 (tail block, not a multiple of
-# ROWS_PER_CTA=8 at E=512).
-# (tokens, num_experts, num_shared, dtype, hidden, scale, renorm)
-_CORRECTNESS_CASES = [
-    (64, 512, 1, dtypes.bf16, 4096, 1.0, True),  # baseline
-    (64, 512, 2, dtypes.bf16, 4096, 1.0, True),  # num_shared=2
-    (64, 512, 8, dtypes.bf16, 4096, 1.0, True),  # num_shared=8
-    (64, 512, 1, dtypes.fp32, 4096, 1.0, True),  # fp32 gating
-    (64, 512, 1, dtypes.bf16, 8192, 1.0, True),  # H=8192 gate-LDS global fallback
-    (64, 512, 1, dtypes.bf16, 4096, 1.0, False),  # need_renorm=False epilogue
-    (64, 512, 1, dtypes.bf16, 4096, 0.5, True),  # shared_expert_scale != 1.0
-    (64, 256, 1, dtypes.bf16, 4096, 1.0, True),  # E=256 -> BYTES_PER_LDG=32 path
-    (1, 512, 1, dtypes.bf16, 4096, 1.0, True),  # M=1
-    (65, 512, 1, dtypes.bf16, 4096, 1.0, True),  # M=65 tail block (not mult of 8)
+    ret = {"gfx": get_gfx()}
+    for name, (fn, wbuf, ibuf) in candidates.items():
+        _, us = run_perftest(fn)
+        err = _check(wbuf, ibuf, topk, ref, name)
+        # Gate CI on correctness: the runner judges pass/fail by this script's exit
+        # code (checkAllclose only logs), so a wrong result must raise here.
+        assert err == 0, (
+            f"{name} correctness failed: err={err} "
+            f"(tokens={tokens}, num_experts={num_experts}, hidden={hidden}, "
+            f"num_shared={num_shared}, scale={scale}, renorm={renorm}, dtype={dtype})"
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+# Edge configs the Qwen perf sweep (E=512, H=4096, bf16) does not reach, each
+# picked to exercise a distinct code path. Same @benchmark fn -> same err check.
+# (tokens, num_experts, hidden, topk, num_shared, scale, renorm, dtype)
+_CORRECTNESS_EDGES = [
+    (64, 256, 4096, 10, 1, 1.0, True, dtypes.bf16),  # E=256 -> BYTES_PER_LDG=32
+    (64, 512, 8192, 10, 1, 1.0, True, dtypes.bf16),  # H=8192 gate-LDS global fallback
+    (64, 512, 4096, 10, 1, 1.0, True, dtypes.fp32),  # fp32 gating
+    (64, 512, 4096, 10, 8, 1.0, True, dtypes.bf16),  # num_shared=8
+    (65, 512, 4096, 10, 1, 1.0, True, dtypes.bf16),  # M=65 tail block (not mult of 8)
 ]
 
 
-@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
-@pytest.mark.parametrize(
-    "tokens, num_experts, num_shared, dtype, hidden, scale, renorm", _CORRECTNESS_CASES
-)
-def test_correctness(tokens, num_experts, num_shared, dtype, hidden, scale, renorm):
-    """pytest exercises real cases (not just bench_*): the fused op and the unfused
-    baseline must both match the torch reference across shared-expert counts, dtypes,
-    hidden sizes (incl. the larger-H gate-LDS global fallback), the renorm/scale
-    epilogue variants, num_experts=256, and the M=1 / M=65 token-count edges."""
-    topk = 10
-    base = num_experts
-    total = topk + num_shared
-    gating, hs, gate_weight = _make_inputs(
-        tokens, num_experts, hidden, num_shared, dtype
-    )
-    ref = run_torch(gating, hs, gate_weight, topk, num_shared, base, scale, renorm)
-
-    w = torch.empty(tokens, total, dtype=dtypes.fp32)
-    ids = torch.empty(tokens, total, dtype=dtypes.i32)
-    tei = torch.empty(tokens, topk, dtype=dtypes.i32)  # scratch, stride topk
-    topk_softmax_fused_shared_gate(
-        w, ids, tei, gating, renorm, num_shared, "sigmoid", hs, gate_weight, scale, base
-    )
-    _check(w, ids, topk, ref, "fused")
-
-    w_u = torch.empty(tokens, total, dtype=dtypes.fp32)
-    ids_u = torch.empty(tokens, total, dtype=dtypes.i32)
-    r_w = torch.empty(tokens, topk, dtype=dtypes.fp32)
-    r_i = torch.empty(tokens, topk, dtype=dtypes.i32)
-    r_tei = torch.empty(tokens, topk, dtype=dtypes.i32)
-    shared_ids = (
-        (base + torch.arange(num_shared, dtype=dtypes.i32))
-        .unsqueeze(0)
-        .expand(tokens, num_shared)
-    )
-    topk_softmax(r_w, r_i, r_tei, gating, renorm)
-    shared_w = torch.sigmoid(hs.float() @ gate_weight.float().t()) * scale
-    w_u[:, :topk], w_u[:, topk:] = r_w, shared_w
-    ids_u[:, :topk], ids_u[:, topk:] = r_i, shared_ids
-    _check(w_u, ids_u, topk, ref, "unfused")
+def _expect_raises(fn, needle, desc):
+    try:
+        fn()
+    except RuntimeError as e:
+        assert needle in str(e), f"{desc}: unexpected error message: {e}"
+        return
+    raise AssertionError(f"{desc}: expected RuntimeError containing {needle!r}")
 
 
-def _make_fused_buffers(tokens, topk, num_shared):
-    total = topk + num_shared
-    return (
-        torch.empty(tokens, total, dtype=dtypes.fp32),
-        torch.empty(tokens, total, dtype=dtypes.i32),
-        torch.empty(tokens, topk, dtype=dtypes.i32),  # token_expert_indices scratch
-    )
-
-
-@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
-def test_misaligned_hidden_raises():
-    """A hidden dim whose row byte-stride is not 64B-aligned must be rejected: otherwise
-    the gate GEMV's vectorized loads are misaligned on every row after the first (UB).
-    """
-    tokens, num_experts, topk, num_shared = 64, 512, 10, 1
-    hidden = 4008  # 4008 * 2B = 8016 B, not a multiple of 64
-    gating, hs, gate_weight = _make_inputs(
-        tokens, num_experts, hidden, num_shared, dtypes.bf16
-    )
-    w, ids, tei = _make_fused_buffers(tokens, topk, num_shared)
-    with pytest.raises(RuntimeError, match="64B-aligned"):
-        topk_softmax_fused_shared_gate(
-            w,
-            ids,
-            tei,
-            gating,
-            True,
-            num_shared,
-            "sigmoid",
-            hs,
-            gate_weight,
-            1.0,
-            num_experts,
-        )
-
-
-@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
-def test_non_power_of_2_experts_raises():
-    """The fused op supports only power-of-2 num_experts (<= 512); a non-power-of-2
-    routing-expert count must be rejected, not run the removed serial fallback."""
-    tokens, num_experts, topk, num_shared = 64, 384, 10, 1
-    hidden = 4096
-    gating, hs, gate_weight = _make_inputs(
-        tokens, num_experts, hidden, num_shared, dtypes.bf16
-    )
-    w, ids, tei = _make_fused_buffers(tokens, topk, num_shared)
-    with pytest.raises(RuntimeError, match="power-of-2"):
-        topk_softmax_fused_shared_gate(
-            w,
-            ids,
-            tei,
-            gating,
-            True,
-            num_shared,
-            "sigmoid",
-            hs,
-            gate_weight,
-            1.0,
-            num_experts,
-        )
-
-
-@pytest.mark.skipif(not _gfx_supported(), reason="requires an AMD GPU (gfx942/gfx950)")
-def test_zero_tokens_noop():
-    """An empty batch (M=0) must be a guarded no-op: without the host-op guard the
-    launcher computes num_blocks == 0 and the grid launch fails."""
-    tokens, num_experts, topk, num_shared = 0, 512, 10, 1
-    hidden = 4096
-    gating, hs, gate_weight = _make_inputs(
-        tokens, num_experts, hidden, num_shared, dtypes.bf16
-    )
-    w, ids, tei = _make_fused_buffers(tokens, topk, num_shared)
-    topk_softmax_fused_shared_gate(
-        w,
-        ids,
-        tei,
-        gating,
-        True,
-        num_shared,
-        "sigmoid",
-        hs,
-        gate_weight,
-        1.0,
-        num_experts,
-    )
-    assert w.shape[0] == 0 and ids.shape[0] == 0
-
-
-def _sweep(fn, args, dtype):
+def _sweep(args, dtype):
     df = []
     for tokens, experts, hidden, topk, num_shared, scale, renorm in itertools.product(
         args.tokens,
@@ -376,9 +227,51 @@ def _sweep(fn, args, dtype):
         args.renorm,
     ):
         df.append(
-            fn(tokens, experts, hidden, topk, num_shared, scale, bool(renorm), dtype)
+            test_shared_gate(
+                tokens, experts, hidden, topk, num_shared, scale, bool(renorm), dtype
+            )
         )
     return pd.DataFrame(df)
+
+
+def _run_guard_checks():
+    """Negative/guard behaviors. These raise or no-op rather than emit a table
+    row, so they run here as asserts (under `python3 <file>`, i.e. in CI)."""
+    topk, num_shared, num_experts = 10, 1, 512
+
+    # A hidden dim whose row byte-stride is not 64B-aligned must be rejected.
+    gating, hs, gw = _make_inputs(64, num_experts, 4008, num_shared, dtypes.bf16)
+    w, ids, tei = _fused_buffers(64, topk, num_shared)
+    _expect_raises(
+        lambda: topk_softmax_fused_shared_gate(
+            w, ids, tei, gating, True, num_shared, "sigmoid", hs, gw, 1.0, num_experts
+        ),
+        "64B-aligned",
+        "misaligned hidden",
+    )
+
+    # Non-power-of-2 num_experts must be rejected (no serial fallback).
+    gating, hs, gw = _make_inputs(64, 384, 4096, num_shared, dtypes.bf16)
+    w, ids, tei = _fused_buffers(64, topk, num_shared)
+    _expect_raises(
+        lambda: topk_softmax_fused_shared_gate(
+            w, ids, tei, gating, True, num_shared, "sigmoid", hs, gw, 1.0, 384
+        ),
+        "power-of-2",
+        "non-power-of-2 experts",
+    )
+
+    # M=0 must be a guarded no-op (would otherwise launch a 0-block grid).
+    gating, hs, gw = _make_inputs(0, num_experts, 4096, num_shared, dtypes.bf16)
+    w, ids, tei = _fused_buffers(0, topk, num_shared)
+    topk_softmax_fused_shared_gate(
+        w, ids, tei, gating, True, num_shared, "sigmoid", hs, gw, 1.0, num_experts
+    )
+    assert w.shape[0] == 0 and ids.shape[0] == 0, "M=0 should be a no-op"
+
+    aiter.logger.info(
+        "guard checks passed: misaligned-raise, non-power-of-2-raise, M=0 no-op"
+    )
 
 
 def main():
@@ -391,12 +284,6 @@ def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
-    )
-    parser.add_argument(
-        "--bench",
-        choices=["fused", "unfused", "both"],
-        default="both",
-        help="which benchmark to run",
     )
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default="bf16,"
@@ -420,21 +307,21 @@ def main():
     args = parser.parse_args()
 
     for dtype in args.dtype:
-        if args.bench in ("unfused", "both"):
-            df = _sweep(bench_unfused, args, dtype)
-            aiter.logger.info(
-                "UNFUSED baseline (routed topk_softmax + separate gate GEMV + append) "
-                "(%s):\n%s",
-                dtype,
-                df.to_markdown(index=False),
-            )
-        if args.bench in ("fused", "both"):
-            df = _sweep(bench_fused, args, dtype)
-            aiter.logger.info(
-                "FUSED topk_softmax_fused_shared_gate (single launch) (%s):\n%s",
-                dtype,
-                df.to_markdown(index=False),
-            )
+        df = _sweep(args, dtype)
+        aiter.logger.info(
+            "fused vs unfused shared-gate (%s):\n%s",
+            dtype,
+            df.to_markdown(index=False),
+        )
+
+    # Extra correctness-only edge configs the perf sweep does not reach.
+    edge_df = pd.DataFrame([test_shared_gate(*cfg) for cfg in _CORRECTNESS_EDGES])
+    aiter.logger.info(
+        "shared-gate correctness edges:\n%s", edge_df.to_markdown(index=False)
+    )
+
+    # Negative/guard behaviors (raise or no-op) -- asserts, run in CI too.
+    _run_guard_checks()
 
 
 if __name__ == "__main__":
