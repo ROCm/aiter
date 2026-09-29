@@ -9,6 +9,7 @@
 #include <hipcub/util_type.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -1116,6 +1117,71 @@ vectorized_process(size_t thread_rank, size_t num_threads, T const* in, IdxT len
     }
 }
 
+// Exact M=1024, N=16385 rows rotate through four 16-byte alignment phases.
+// For phases 4B and 8B the generic helper leaves only 4095 aligned B128 loads
+// and handles five values with scalar loads.  The allocation is a contiguous
+// 1024-row tensor and the final row has the 12B phase, so those two non-final
+// phases may safely load one complete final B128 vector across the row edge.
+// Only logical indices are published to the callback.  This restores the same
+// 4096-vector body used by the two neighbouring exact row lengths without
+// changing the row stride, radix counts, or fallback semantics.
+template <typename T, typename IdxT, int BlockSize, typename Func>
+__device__ void vectorized_process_exact_16385(T const* in, Func f)
+{
+    static_assert(std::is_same_v<T, float>);
+    static_assert(BlockSize == 1024);
+    static_assert(sizeof(WideT) == 4 * sizeof(T));
+    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+    constexpr IdxT row_len         = 16385;
+    constexpr IdxT wide_len        = 4096;
+
+    union
+    {
+        WideT scalar;
+        T array[items_per_scalar];
+    } wide0, wide1, wide2, wide3;
+
+    int const skip_cnt =
+        (reinterpret_cast<size_t>(in) % sizeof(WideT))
+            ? static_cast<int>((sizeof(WideT) -
+                                reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+                               sizeof(T))
+            : 0;
+    WideT const* in_cast = reinterpret_cast<WideT const*>(in + skip_cnt);
+    IdxT const i          = static_cast<IdxT>(threadIdx.x);
+
+    wide0.scalar = in_cast[i + BlockSize * 0];
+    wide1.scalar = in_cast[i + BlockSize * 1];
+    IdxT real_i  = static_cast<IdxT>(skip_cnt) + (i + BlockSize * 0) * items_per_scalar;
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j) f(wide0.array[j], real_i + j);
+
+    wide2.scalar = in_cast[i + BlockSize * 2];
+    wide3.scalar = in_cast[i + BlockSize * 3];
+    real_i       = static_cast<IdxT>(skip_cnt) + (i + BlockSize * 1) * items_per_scalar;
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j) f(wide1.array[j], real_i + j);
+    real_i = static_cast<IdxT>(skip_cnt) + (i + BlockSize * 2) * items_per_scalar;
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j) f(wide2.array[j], real_i + j);
+    real_i = static_cast<IdxT>(skip_cnt) + (i + BlockSize * 3) * items_per_scalar;
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        IdxT const logical_i = real_i + j;
+        if(logical_i < row_len) f(wide3.array[j], logical_i);
+    }
+
+    if(threadIdx.x < skip_cnt)
+    {
+        f(in[threadIdx.x], static_cast<IdxT>(threadIdx.x));
+    }
+    IdxT const remain_i = static_cast<IdxT>(skip_cnt) +
+                          wide_len * items_per_scalar +
+                          static_cast<IdxT>(threadIdx.x);
+    if(remain_i < row_len) f(in[remain_i], remain_i);
+}
+
 // Per-row shared state for cross-pass communication.
 // Fields are 128B-aligned to avoid L2 cache line false sharing.
 template <typename T, typename IdxT>
@@ -1401,6 +1467,466 @@ __device__ void scan_and_choose_bucket(Counter<T, IdxT>* counter,
     }
 }
 
+using stage_mask_x2 = __attribute__((__ext_vector_type__(2))) unsigned long long;
+
+template <typename T, unsigned ExactLowBucket, int StartBit>
+__device__ __forceinline__ stage_mask_x2
+append_stage_mask(stage_mask_x2 masks, T value, bool select_min, int slot)
+{
+    using PreBits = typename aiter::radix_traits<T>::UnsignedBits;
+    PreBits const bits = twiddle_in(value, select_min);
+    unsigned const bucket = static_cast<unsigned>(bits) >> StartBit;
+    unsigned long long const bit = 1ull << slot;
+    if(bucket < ExactLowBucket)
+    {
+        masks[0] |= bit;
+    }
+    else if(bucket == ExactLowBucket)
+    {
+        masks[1] |= bit;
+    }
+    return masks;
+}
+
+// The M=256/N=32K direct-tail specializations keep the two membership masks
+// in SSA values. Returning a two-lane vector avoids the address-taking lambda
+// captures that otherwise materialize 24 bytes of thread-private scratch.
+template <typename T, typename IdxT, unsigned ExactLowBucket, int StartBit>
+__device__ __forceinline__ stage_mask_x2
+vectorized_process_stage_masks(size_t thread_rank,
+                               size_t num_threads,
+                               T const* in,
+                               IdxT len,
+                               bool select_min)
+{
+    static_assert(sizeof(T) < sizeof(WideT));
+    static_assert(sizeof(WideT) % sizeof(T) == 0);
+    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+
+    stage_mask_x2 masks = {0, 0};
+    int slot = 0;
+    union
+    {
+        WideT scalar;
+        T array[items_per_scalar];
+    } wide0, wide1, wide2, wide3;
+
+    int skip_cnt =
+        (reinterpret_cast<size_t>(in) % sizeof(WideT))
+            ? ((sizeof(WideT) - reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+               sizeof(T))
+            : 0;
+    if(skip_cnt > len) skip_cnt = len;
+    WideT const* in_cast = reinterpret_cast<WideT const*>(in + skip_cnt);
+    IdxT const len_cast  = (len - skip_cnt) / items_per_scalar;
+
+    IdxT i = static_cast<IdxT>(thread_rank);
+    IdxT const strideW = static_cast<IdxT>(num_threads) * 4;
+    for(; i + static_cast<IdxT>(num_threads) * 3 < len_cast; i += strideW)
+    {
+        wide0.scalar = in_cast[i + static_cast<IdxT>(num_threads) * 0];
+        wide1.scalar = in_cast[i + static_cast<IdxT>(num_threads) * 1];
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide0.array[j], select_min, slot++);
+        }
+
+        wide2.scalar = in_cast[i + static_cast<IdxT>(num_threads) * 2];
+        wide3.scalar = in_cast[i + static_cast<IdxT>(num_threads) * 3];
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide1.array[j], select_min, slot++);
+        }
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide2.array[j], select_min, slot++);
+        }
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide3.array[j], select_min, slot++);
+        }
+    }
+    for(; i < len_cast; i += static_cast<IdxT>(num_threads))
+    {
+        wide0.scalar = in_cast[i];
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide0.array[j], select_min, slot++);
+        }
+    }
+
+    if(thread_rank < static_cast<size_t>(skip_cnt))
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[thread_rank], select_min, slot++);
+    }
+    IdxT const remain_i =
+        skip_cnt + len_cast * items_per_scalar + static_cast<IdxT>(thread_rank);
+    if(remain_i < len)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[remain_i], select_min, slot++);
+    }
+    return masks;
+}
+
+// Fixed-ownership scan for the one awkward row length in the M=256 32K
+// family. Seven aligned vectors always belong to every thread; the eighth is
+// absent only for lane 1023 when the row begins at the 8B/12B alignment phase.
+// Spelling those groups directly removes both generic loop backedges without
+// issuing a B128 load past the logical row.
+template <typename T,
+          typename IdxT,
+          int BlockSize,
+          unsigned ExactLowBucket,
+          int StartBit>
+__device__ __forceinline__ stage_mask_x2
+vectorized_process_stage_masks_exact_32769(T const* in, bool select_min)
+{
+    static_assert(std::is_same_v<T, float>);
+    static_assert(BlockSize == 1024);
+    static_assert(sizeof(WideT) == 4 * sizeof(T));
+    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+    constexpr IdxT row_len         = 32769;
+
+    stage_mask_x2 masks = {0, 0};
+    int slot = 0;
+    union
+    {
+        WideT scalar;
+        T array[items_per_scalar];
+    } wide0, wide1, wide2, wide3;
+
+    int const skip_cnt =
+        (reinterpret_cast<size_t>(in) % sizeof(WideT))
+            ? static_cast<int>((sizeof(WideT) -
+                                reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+                               sizeof(T))
+            : 0;
+    WideT const* in_cast = reinterpret_cast<WideT const*>(in + skip_cnt);
+    IdxT const len_cast  = (row_len - skip_cnt) / items_per_scalar;
+    IdxT const i         = static_cast<IdxT>(threadIdx.x);
+
+    wide0.scalar = in_cast[i + BlockSize * 0];
+    wide1.scalar = in_cast[i + BlockSize * 1];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide0.array[j], select_min, slot++);
+    }
+
+    wide2.scalar = in_cast[i + BlockSize * 2];
+    wide3.scalar = in_cast[i + BlockSize * 3];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide1.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide2.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide3.array[j], select_min, slot++);
+    }
+
+    wide0.scalar = in_cast[i + BlockSize * 4];
+    wide1.scalar = in_cast[i + BlockSize * 5];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide0.array[j], select_min, slot++);
+    }
+
+    wide2.scalar = in_cast[i + BlockSize * 6];
+    bool const has_wide7 = i + BlockSize * 7 < len_cast;
+    if(has_wide7) wide3.scalar = in_cast[i + BlockSize * 7];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide1.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide2.array[j], select_min, slot++);
+    }
+    if(has_wide7)
+    {
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide3.array[j], select_min, slot++);
+        }
+    }
+
+    if(threadIdx.x < skip_cnt)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[threadIdx.x], select_min, slot++);
+    }
+    IdxT const remain_i = static_cast<IdxT>(skip_cnt) +
+                          len_cast * items_per_scalar +
+                          static_cast<IdxT>(threadIdx.x);
+    if(remain_i < row_len)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[remain_i], select_min, slot++);
+    }
+    return masks;
+}
+
+// N=32770 has the same seven unconditional vector groups as N=32769. The
+// guarded eighth group plus explicit head/tail ownership removes the generic
+// loop backedges without changing the already-accepted N=32769 specialization.
+template <typename T,
+          typename IdxT,
+          int BlockSize,
+          unsigned ExactLowBucket,
+          int StartBit>
+__device__ __forceinline__ stage_mask_x2
+vectorized_process_stage_masks_exact_32770(T const* in, bool select_min)
+{
+    static_assert(std::is_same_v<T, float>);
+    static_assert(BlockSize == 1024);
+    static_assert(sizeof(WideT) == 4 * sizeof(T));
+    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+    constexpr IdxT row_len         = 32770;
+
+    stage_mask_x2 masks = {0, 0};
+    int slot = 0;
+    union
+    {
+        WideT scalar;
+        T array[items_per_scalar];
+    } wide0, wide1, wide2, wide3;
+
+    int const skip_cnt =
+        (reinterpret_cast<size_t>(in) % sizeof(WideT))
+            ? static_cast<int>((sizeof(WideT) -
+                                reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+                               sizeof(T))
+            : 0;
+    WideT const* in_cast = reinterpret_cast<WideT const*>(in + skip_cnt);
+    IdxT const len_cast  = (row_len - skip_cnt) / items_per_scalar;
+    IdxT const i         = static_cast<IdxT>(threadIdx.x);
+
+    wide0.scalar = in_cast[i + BlockSize * 0];
+    wide1.scalar = in_cast[i + BlockSize * 1];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide0.array[j], select_min, slot++);
+    }
+
+    wide2.scalar = in_cast[i + BlockSize * 2];
+    wide3.scalar = in_cast[i + BlockSize * 3];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide1.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide2.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide3.array[j], select_min, slot++);
+    }
+
+    wide0.scalar = in_cast[i + BlockSize * 4];
+    wide1.scalar = in_cast[i + BlockSize * 5];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide0.array[j], select_min, slot++);
+    }
+
+    wide2.scalar = in_cast[i + BlockSize * 6];
+    bool const has_wide7 = i + BlockSize * 7 < len_cast;
+    if(has_wide7) wide3.scalar = in_cast[i + BlockSize * 7];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide1.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide2.array[j], select_min, slot++);
+    }
+    if(has_wide7)
+    {
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide3.array[j], select_min, slot++);
+        }
+    }
+
+    if(threadIdx.x < skip_cnt)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[threadIdx.x], select_min, slot++);
+    }
+    IdxT const remain_i = static_cast<IdxT>(skip_cnt) +
+                          len_cast * items_per_scalar +
+                          static_cast<IdxT>(threadIdx.x);
+    if(remain_i < row_len)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[remain_i], select_min, slot++);
+    }
+    return masks;
+}
+
+// Complete the adjacent M=256 32K family with a separately instantiated
+// fixed-ownership scanner. Keeping this helper distinct preserves the accepted
+// N=32769 and N=32770 machine code while removing N=32768 loop backedges.
+template <typename T,
+          typename IdxT,
+          int BlockSize,
+          unsigned ExactLowBucket,
+          int StartBit>
+__device__ __forceinline__ stage_mask_x2
+vectorized_process_stage_masks_exact_32768(T const* in, bool select_min)
+{
+    static_assert(std::is_same_v<T, float>);
+    static_assert(BlockSize == 1024);
+    static_assert(sizeof(WideT) == 4 * sizeof(T));
+    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+    constexpr IdxT row_len         = 32768;
+
+    stage_mask_x2 masks = {0, 0};
+    int slot = 0;
+    union
+    {
+        WideT scalar;
+        T array[items_per_scalar];
+    } wide0, wide1, wide2, wide3;
+
+    int const skip_cnt =
+        (reinterpret_cast<size_t>(in) % sizeof(WideT))
+            ? static_cast<int>((sizeof(WideT) -
+                                reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+                               sizeof(T))
+            : 0;
+    WideT const* in_cast = reinterpret_cast<WideT const*>(in + skip_cnt);
+    IdxT const len_cast  = (row_len - skip_cnt) / items_per_scalar;
+    IdxT const i         = static_cast<IdxT>(threadIdx.x);
+
+    wide0.scalar = in_cast[i + BlockSize * 0];
+    wide1.scalar = in_cast[i + BlockSize * 1];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide0.array[j], select_min, slot++);
+    }
+
+    wide2.scalar = in_cast[i + BlockSize * 2];
+    wide3.scalar = in_cast[i + BlockSize * 3];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide1.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide2.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide3.array[j], select_min, slot++);
+    }
+
+    wide0.scalar = in_cast[i + BlockSize * 4];
+    wide1.scalar = in_cast[i + BlockSize * 5];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide0.array[j], select_min, slot++);
+    }
+
+    wide2.scalar = in_cast[i + BlockSize * 6];
+    bool const has_wide7 = i + BlockSize * 7 < len_cast;
+    if(has_wide7) wide3.scalar = in_cast[i + BlockSize * 7];
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide1.array[j], select_min, slot++);
+    }
+#pragma unroll
+    for(int j = 0; j < items_per_scalar; ++j)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, wide2.array[j], select_min, slot++);
+    }
+    if(has_wide7)
+    {
+#pragma unroll
+        for(int j = 0; j < items_per_scalar; ++j)
+        {
+            masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+                masks, wide3.array[j], select_min, slot++);
+        }
+    }
+
+    if(threadIdx.x < skip_cnt)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[threadIdx.x], select_min, slot++);
+    }
+    IdxT const remain_i = static_cast<IdxT>(skip_cnt) +
+                          len_cast * items_per_scalar +
+                          static_cast<IdxT>(threadIdx.x);
+    if(remain_i < row_len)
+    {
+        masks = append_stage_mask<T, ExactLowBucket, StartBit>(
+            masks, in[remain_i], select_min, slot++);
+    }
+    return masks;
+}
+
 /**
  * The crossing bucket, without a block-wide prefix sum.
  *
@@ -1449,6 +1975,29 @@ __device__ __forceinline__ int wave_inclusive_sum_dpp(int x)
     return x;
 }
 
+// Unsigned counterpart used when two independent 16-bit counts are packed
+// into one dword.  The total dword may set bit 31 even though neither field
+// carries, so unsigned addition is required for defined wrap-free C++
+// semantics on rows up to 32770 elements.
+template <int ctrl, int row_mask, int bank_mask>
+__device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
+{
+    uint32_t const moved = static_cast<uint32_t>(
+        __builtin_amdgcn_update_dpp(0, static_cast<int>(x), ctrl, row_mask, bank_mask, false));
+    return x + moved;
+}
+
+__device__ __forceinline__ uint32_t wave_inclusive_sum_dpp_u32(uint32_t x)
+{
+    x = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
+    x = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
+    x = dpp_add_u32<0x114, 0xf, 0xe>(x); // row_shr:4
+    x = dpp_add_u32<0x118, 0xf, 0xc>(x); // row_shr:8
+    x = dpp_add_u32<0x142, 0xa, 0xf>(x); // row_bcast:15
+    x = dpp_add_u32<0x143, 0xc, 0xf>(x); // row_bcast:31
+    return x;
+}
+
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
 __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
                                      IdxT* histogram,
@@ -1460,22 +2009,34 @@ __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
     static_assert(BlockSize % WARP_SIZE == 0);
     constexpr int waves = BlockSize / WARP_SIZE;
     static_assert(waves <= 16);
-    constexpr bool wide = (num_buckets == BlockSize * 4);
-    constexpr int items_per_thread = wide ? 4 : 1;
-    static_assert(wide || num_buckets <= BlockSize,
-                  "choose_bucket_reduce handles 4 buckets per thread or at most one");
+    constexpr bool wide4 = (num_buckets == BlockSize * 4);
+    constexpr bool wide2 = (num_buckets == BlockSize * 2);
+    constexpr int items_per_thread = wide4 ? 4 : (wide2 ? 2 : 1);
+    static_assert(wide4 || wide2 || num_buckets <= BlockSize,
+                  "choose_bucket_reduce handles 4/2 buckets per thread or at most one");
 
     int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
     int const wave = static_cast<int>(threadIdx.x) / WARP_SIZE;
 
     IdxT counts[items_per_thread];
     IdxT sum = 0;
-    if constexpr(wide)
+    if constexpr(wide4)
     {
         using Vec4 = __attribute__((__ext_vector_type__(4))) IdxT;
         Vec4 const v = reinterpret_cast<Vec4 const*>(histogram)[threadIdx.x];
 #pragma unroll
         for(int item = 0; item < 4; ++item)
+        {
+            counts[item] = v[item];
+            sum += v[item];
+        }
+    }
+    else if constexpr(wide2)
+    {
+        using Vec2 = __attribute__((__ext_vector_type__(2))) IdxT;
+        Vec2 const v = reinterpret_cast<Vec2 const*>(histogram)[threadIdx.x];
+#pragma unroll
+        for(int item = 0; item < 2; ++item)
         {
             counts[item] = v[item];
             sum += v[item];
@@ -1527,6 +2088,94 @@ __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
     }
 }
 
+// Exact-N4097 pass-0 reducer.  That specialization derives the remaining rank
+// from k minus its emitted-winner count, and its cold pass-1 reducer overwrites
+// rank/length before their first read.  Keep the generic reducer byte-for-byte
+// unchanged for every neighbouring shape while directly initializing only the
+// selected high prefix here.
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
+__device__ void choose_bucket_reduce_prefix_only(Counter<T, IdxT>* counter,
+                                                  IdxT* histogram,
+                                                  IdxT* wave_sums,
+                                                  const IdxT k,
+                                                  int const start_bit)
+{
+    constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+    static_assert(BlockSize % WARP_SIZE == 0);
+    constexpr int waves = BlockSize / WARP_SIZE;
+    static_assert(waves <= 16);
+    constexpr bool wide4 = (num_buckets == BlockSize * 4);
+    constexpr bool wide2 = (num_buckets == BlockSize * 2);
+    constexpr int items_per_thread = wide4 ? 4 : (wide2 ? 2 : 1);
+    static_assert(wide4 || wide2 || num_buckets <= BlockSize,
+                  "choose_bucket_reduce_prefix_only handles 4/2 buckets per thread or at most one");
+
+    int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
+    int const wave = static_cast<int>(threadIdx.x) / WARP_SIZE;
+
+    IdxT counts[items_per_thread];
+    IdxT sum = 0;
+    if constexpr(wide4)
+    {
+        using Vec4 = __attribute__((__ext_vector_type__(4))) IdxT;
+        Vec4 const v = reinterpret_cast<Vec4 const*>(histogram)[threadIdx.x];
+#pragma unroll
+        for(int item = 0; item < 4; ++item)
+        {
+            counts[item] = v[item];
+            sum += v[item];
+        }
+    }
+    else if constexpr(wide2)
+    {
+        using Vec2 = __attribute__((__ext_vector_type__(2))) IdxT;
+        Vec2 const v = reinterpret_cast<Vec2 const*>(histogram)[threadIdx.x];
+#pragma unroll
+        for(int item = 0; item < 2; ++item)
+        {
+            counts[item] = v[item];
+            sum += v[item];
+        }
+    }
+    else
+    {
+        counts[0] = (static_cast<int>(threadIdx.x) < num_buckets) ? histogram[threadIdx.x]
+                                                                  : static_cast<IdxT>(0);
+        sum       = counts[0];
+    }
+
+    IdxT const x = static_cast<IdxT>(wave_inclusive_sum_dpp(static_cast<int>(sum)));
+    if(lane == WARP_SIZE - 1) wave_sums[wave] = x;
+    __syncthreads();
+    if(wave == 0)
+    {
+        int t = lane < waves ? static_cast<int>(wave_sums[lane]) : 0;
+        t = dpp_add<0x111, 0xf, 0xf>(t);
+        t = dpp_add<0x112, 0xf, 0xf>(t);
+        t = dpp_add<0x114, 0xf, 0xe>(t);
+        t = dpp_add<0x118, 0xf, 0xc>(t);
+        if(lane < waves) wave_sums[lane] = static_cast<IdxT>(t);
+    }
+    __syncthreads();
+
+    IdxT run = (wave ? wave_sums[wave - 1] : static_cast<IdxT>(0)) + x - sum;
+    if(run < k && run + sum >= k)
+    {
+#pragma unroll
+        for(int item = 0; item < items_per_thread; ++item)
+        {
+            IdxT const prev  = run;
+            int const bucket = static_cast<int>(threadIdx.x) * items_per_thread + item;
+            run += counts[item];
+            if(bucket < num_buckets && prev < k && run >= k)
+            {
+                using Bits = typename aiter::radix_traits<T>::UnsignedBits;
+                counter->kth_value_bits = static_cast<Bits>(bucket) << start_bit;
+            }
+        }
+    }
+}
+
 /**
  * Last-pass filter: write final top-k results.
  * bits < kth: definite top-k, written front-to-back.
@@ -1537,7 +2186,8 @@ template <typename T,
           typename IdxT,
           int BitsPerPass,
           bool WRITE_TOPK_VALUES,
-          bool prioritize_smaller_indice = false>
+          bool prioritize_smaller_indice = false,
+          bool INPUT_TWIDDLED_BITS = false>
 __device__ void last_filter(T const* in_buf,
                             IdxT const* in_idx_buf,
                             T* out,
@@ -1549,6 +2199,8 @@ __device__ void last_filter(T const* in_buf,
                             int const pass,
                             bool const use_one_pass = false)
 {
+    static_assert(!INPUT_TWIDDLED_BITS || !WRITE_TOPK_VALUES);
+    using Bits = typename aiter::radix_traits<T>::UnsignedBits;
     auto const kth_value_bits = counter->kth_value_bits;
     int const start_bit       = calc_start_bit<T, BitsPerPass>(pass);
     const IdxT num_of_kth_needed = counter->k;
@@ -1556,9 +2208,13 @@ __device__ void last_filter(T const* in_buf,
     IdxT* p_out_back_cnt         = &counter->out_back_cnt;
 
     auto process_one = [&](T value, IdxT idx) {
-        auto const bits = use_one_pass
-                              ? twiddle_in(value, select_min) & ((1 << BitsPerPass) - 1)
-                              : (twiddle_in(value, select_min) >> start_bit) << start_bit;
+        Bits full_bits;
+        if constexpr(INPUT_TWIDDLED_BITS)
+            full_bits = __builtin_bit_cast(Bits, value);
+        else
+            full_bits = twiddle_in(value, select_min);
+        Bits const bits = use_one_pass ? full_bits & ((1 << BitsPerPass) - 1)
+                                       : (full_bits >> start_bit) << start_bit;
         if(bits < kth_value_bits)
         {
             IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
@@ -2474,11 +3130,19 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
  * 256.6us register-resident against 155.8us for the shipped staged form). So
  * the two specializations split at the width where registers stop paying.
  *
- * Staging overflow -- more than CandidateCapacity elements sharing the top 12
- * bits, which a constant row produces -- discards the partial output and takes
+ * Staging overflow -- more than CandidateCapacity elements sharing the main
+ * radix prefix, which a constant row produces -- discards the partial output
+ * and takes
  * the exact pass-2 path, as the 32K specialization does.
  */
-template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int ElemsPerThread>
+template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int ElemsPerThread,
+          int MainBits = 12, int TailBits = 8, int StaticRowLen = 0,
+          bool UseWaveWinnerReserve = false, bool CacheTwiddledBits = false,
+          bool DirectWaveWinnerWrite = false, bool UseWaveBallotSelect = false,
+           bool UseHighBucketPredictor = false, unsigned PredictorFirstBucket = 0x40du,
+           bool UsePass0Bucket206Predictor = false,
+           int BallotCandidateCapacity = 0,
+           bool FuseLoadPass0Histogram = false>
 __global__ void radix_topk_one_block_reg_kernel(T const* in,
                                                 const int64_t len,
                                                 const IdxT k,
@@ -2489,17 +3153,73 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     static_assert(std::is_same_v<T, float>);
     static_assert(std::is_same_v<IdxT, int>);
     static_assert(!WRITE_TOPK_VALUES);
-    constexpr int BitsPerPass       = 12;
-    constexpr int num_buckets       = calc_num_buckets<BitsPerPass>();
-    constexpr int tail_num_buckets  = 1 << 8;
-    constexpr int CandidateCapacity = 2048;
-    constexpr int WinnerCapacity    = 2048;
-    constexpr int pass0_start_bit   = 20;
-    constexpr int pass1_start_bit   = 8;
-    constexpr int pass2             = 2;
+    static_assert(MainBits > 0 && MainBits <= 31);
+    static_assert(TailBits > 0 && TailBits <= 31);
+    static_assert(MainBits * 2 + TailBits == sizeof(T) * 8);
+    static_assert(StaticRowLen >= 0);
+    static_assert(StaticRowLen == 0 || (StaticRowLen + BlockSize - 1) / BlockSize == ElemsPerThread);
+    static_assert(!UseWaveWinnerReserve || WARP_SIZE == 64);
+    static_assert(!UseWaveWinnerReserve || BlockSize % WARP_SIZE == 0);
+    static_assert(!UseWaveWinnerReserve || ElemsPerThread <= 32);
+    static_assert(!DirectWaveWinnerWrite || UseWaveWinnerReserve);
+    static_assert(!UseWaveBallotSelect || WARP_SIZE == 64);
+    static_assert(!UseWaveBallotSelect || UseWaveWinnerReserve);
+    static_assert(!UseWaveBallotSelect || CacheTwiddledBits);
+    static_assert(!UseWaveBallotSelect || StaticRowLen > 0);
+    static_assert(BallotCandidateCapacity == 0 || UseWaveBallotSelect);
+    static_assert(BallotCandidateCapacity == 0 || BallotCandidateCapacity >= 32);
+    static_assert(!FuseLoadPass0Histogram ||
+                  (BlockSize == 1024 && WARP_SIZE == 64 &&
+                   ((StaticRowLen == 4096 && ElemsPerThread == 4 &&
+                     MainBits == 12 && TailBits == 8) ||
+                    (StaticRowLen >= 4097 && StaticRowLen <= 4098 &&
+                     ElemsPerThread == 5 && MainBits == 11 && TailBits == 10)) &&
+                   UseWaveWinnerReserve && CacheTwiddledBits &&
+                   !DirectWaveWinnerWrite && UseWaveBallotSelect &&
+                   !UseHighBucketPredictor && !UsePass0Bucket206Predictor &&
+                   BallotCandidateCapacity == 64));
+    static_assert(!UseHighBucketPredictor || WARP_SIZE == 64);
+    static_assert(!UseHighBucketPredictor ||
+                  (PredictorFirstBucket == 0x40cu || PredictorFirstBucket == 0x40du));
+    static_assert(!UseHighBucketPredictor ||
+                  (BlockSize == 1024 && MainBits == 12 && TailBits == 8 &&
+                   StaticRowLen >= 8192 && StaticRowLen <= 8194 &&
+                   (ElemsPerThread == 8 || ElemsPerThread == 9) &&
+                   BlockSize * ElemsPerThread < (1 << 15) && UseWaveWinnerReserve &&
+                   CacheTwiddledBits && DirectWaveWinnerWrite && !UseWaveBallotSelect));
+    static_assert(!UsePass0Bucket206Predictor ||
+                  (BlockSize == 512 && MainBits == 11 && TailBits == 10 &&
+                   StaticRowLen == 8192 && ElemsPerThread == 16 &&
+                   UseWaveWinnerReserve && !CacheTwiddledBits &&
+                   !DirectWaveWinnerWrite && !UseWaveBallotSelect &&
+                   !UseHighBucketPredictor));
+    static_assert(!UsePass0Bucket206Predictor || WARP_SIZE == 64);
+    static_assert(!UsePass0Bucket206Predictor || StaticRowLen < (1 << 16));
+    using Bits = typename aiter::radix_traits<T>::UnsignedBits;
+    using CachedValue = std::conditional_t<CacheTwiddledBits, Bits, T>;
+    static_assert(std::is_same_v<Bits, uint32_t>);
+    static_assert(sizeof(CachedValue) == sizeof(T));
+    constexpr int main_num_buckets  = calc_num_buckets<MainBits>();
+    constexpr int tail_num_buckets  = calc_num_buckets<TailBits>();
+    constexpr int histogram_capacity =
+        main_num_buckets > tail_num_buckets ? main_num_buckets : tail_num_buckets;
+    constexpr int CandidateCapacity =
+        BallotCandidateCapacity > 0 ? BallotCandidateCapacity : 2048;
+    constexpr int WinnerCapacity    = DirectWaveWinnerWrite ? 1 : 2048;
+    constexpr int pass0_start_bit   = sizeof(T) * 8 - MainBits;
+    constexpr int pass1_start_bit   = sizeof(T) * 8 - MainBits * 2;
+    constexpr int final_pass        = calc_num_passes<T, MainBits>() - 1;
+    constexpr unsigned tail_mask    = (1u << TailBits) - 1u;
+    // The exact 4097-column ballot arm consumes radix keys, not fp32 values.
+    // Keep its tiny crossing set twiddled in LDS and avoid an inverse/forward
+    // round trip on the hot <=32-candidate path.  Cold radix fallbacks consume
+    // the same twiddled representation directly in their staged last_filter.
+    constexpr bool StoreTwiddledCandidates =
+        StaticRowLen == 4097 && FuseLoadPass0Histogram && UseWaveBallotSelect &&
+        CacheTwiddledBits && BallotCandidateCapacity == 64;
 
     __shared__ Counter<T, IdxT> counter;
-    __shared__ IdxT histogram[num_buckets];
+    __shared__ IdxT histogram[histogram_capacity];
     __shared__ IdxT wave_sums[BlockSize / WARP_SIZE];
     __shared__ T candidate_values[CandidateCapacity];
     __shared__ IdxT candidate_indices[CandidateCapacity];
@@ -2508,18 +3228,56 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     __shared__ int candidate_overflow;
 
     const int64_t batch_id = blockIdx.x;
-    const IdxT row_len     = static_cast<IdxT>(len);
+    const IdxT row_len = StaticRowLen > 0 ? static_cast<IdxT>(StaticRowLen)
+                                          : static_cast<IdxT>(len);
+    constexpr int static_full_iters = StaticRowLen > 0 ? StaticRowLen / BlockSize : 0;
+    constexpr int static_tail       = StaticRowLen > 0 ? StaticRowLen % BlockSize : 0;
 
-    auto clear_wide_histogram = [&]() {
-        if constexpr(num_buckets == BlockSize * 4)
+    auto is_valid_element = [&](int j, IdxT i) {
+        if constexpr(StaticRowLen > 0)
+        {
+            return j < static_full_iters ||
+                   (j == static_full_iters && threadIdx.x < static_tail);
+        }
+        return i < row_len;
+    };
+
+    auto clear_main_histogram = [&]() {
+        if constexpr(main_num_buckets == BlockSize * 4)
         {
             using Vec4 = __attribute__((__ext_vector_type__(4))) IdxT;
             Vec4 const zero = {0, 0, 0, 0};
             reinterpret_cast<Vec4*>(histogram)[threadIdx.x] = zero;
         }
+        else if constexpr(main_num_buckets == BlockSize * 2)
+        {
+            using Vec2 = __attribute__((__ext_vector_type__(2))) IdxT;
+            Vec2 const zero = {0, 0};
+            reinterpret_cast<Vec2*>(histogram)[threadIdx.x] = zero;
+        }
         else
         {
-            for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+            for(int i = threadIdx.x; i < main_num_buckets; i += BlockSize)
+            {
+                histogram[i] = 0;
+            }
+        }
+    };
+
+    auto clear_tail_histogram = [&]() {
+        if constexpr(tail_num_buckets == BlockSize * 2)
+        {
+            using Vec2 = __attribute__((__ext_vector_type__(2))) IdxT;
+            Vec2 const zero = {0, 0};
+            reinterpret_cast<Vec2*>(histogram)[threadIdx.x] = zero;
+        }
+        else if constexpr(tail_num_buckets == BlockSize)
+        {
+            histogram[threadIdx.x] = 0;
+        }
+        else
+        {
+            for(int i = threadIdx.x; i < tail_num_buckets; i += BlockSize)
             {
                 histogram[i] = 0;
             }
@@ -2528,104 +3286,937 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
 
     if(threadIdx.x == 0)
     {
-        counter.k              = k;
-        counter.len            = row_len;
-        counter.previous_len   = row_len;
-        counter.kth_value_bits = 0;
-        counter.filter_cnt     = 0;
-        counter.out_cnt        = 0;
-        counter.out_back_cnt   = 0;
-        candidate_count        = 0;
-        candidate_overflow     = 0;
+        counter.out_cnt = 0;
+        candidate_count = 0;
+        if constexpr(!StoreTwiddledCandidates)
+        {
+            counter.k            = k;
+            counter.len          = row_len;
+            counter.previous_len = row_len;
+            counter.kth_value_bits = 0;
+            counter.filter_cnt   = 0;
+            counter.out_back_cnt = 0;
+            candidate_overflow   = 0;
+        }
     }
-    clear_wide_histogram();
+    if constexpr(!UseHighBucketPredictor && !UsePass0Bucket206Predictor)
+        clear_main_histogram();
 
-    in += batch_id * len;
+    int64_t const row_stride = StaticRowLen > 0 ? static_cast<int64_t>(StaticRowLen) : len;
+    in += batch_id * row_stride;
     out_idx += batch_id * k;
     if constexpr(WRITE_TOPK_VALUES)
     {
         out += batch_id * k;
     }
+    if constexpr(FuseLoadPass0Histogram) __syncthreads();
 
     // The row, read once. Consecutive threads take consecutive elements, so
     // each step is one coalesced wave-wide load, and nothing reads memory
     // again until the overflow path -- which a row of this width almost never
     // takes.
-    T vals[ElemsPerThread];
+    CachedValue vals[ElemsPerThread];
 #pragma unroll
     for(int j = 0; j < ElemsPerThread; ++j)
     {
         IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
-        vals[j]      = (i < row_len) ? in[i] : static_cast<T>(0);
-    }
-    __syncthreads();
-
-    // Pass 0: the high 12-bit histogram, out of registers.
-#pragma unroll
-    for(int j = 0; j < ElemsPerThread; ++j)
-    {
-        IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
-        if(i < row_len)
+        if constexpr(FuseLoadPass0Histogram)
         {
-            auto const bits  = twiddle_in(vals[j], select_min);
-            int const bucket = __builtin_amdgcn_ubfe(
-                bits, static_cast<unsigned>(pass0_start_bit), static_cast<unsigned>(BitsPerPass));
-            atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+            bool const valid = is_valid_element(j, i);
+            T const value = valid ? in[i] : static_cast<T>(0);
+            Bits const bits = twiddle_in(value, select_min);
+            vals[j] = bits;
+            if(valid)
+            {
+                int const bucket = __builtin_amdgcn_ubfe(
+                    bits,
+                    static_cast<unsigned>(pass0_start_bit),
+                    static_cast<unsigned>(MainBits));
+                atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+            }
+        }
+        else
+        {
+            T const value = is_valid_element(j, i) ? in[i] : static_cast<T>(0);
+            if constexpr(CacheTwiddledBits)
+            {
+                vals[j] = twiddle_in(value, select_min);
+            }
+            else
+            {
+                vals[j] = value;
+            }
         }
     }
-    __syncthreads();
-    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
-        &counter, histogram, wave_sums, k, pass0_start_bit);
+    if constexpr(!FuseLoadPass0Histogram) __syncthreads();
 
-    // Pass 1: emit the definite winners, stage the crossing bucket and build
-    // the middle-12 histogram, all from the same registers.
-    // Clear the counts while the crossing thread publishes `counter`; the
-    // retained barrier below serves both operations.
-    clear_wide_histogram();
-    __syncthreads();
+    // The seeded 8K workload's 2048th-largest value normally lands in high
+    // radix bucket 0x40d, with the M=4 rows occasionally using its 0x40c
+    // neighbor.  Count everything before the first predicted bucket and each
+    // candidate bucket with DPP reductions.  A hit skips the full 4096-bin
+    // atomic histogram and its chooser; a miss falls back to the exact pass-0
+    // path below.  Per-wave totals use wave_sums and the not-yet-live candidate
+    // index array, while the other waves overlap the second-level reduction
+    // with the one histogram clear needed by either pass 1 or the fallback.
+    bool pass0_predicted = false;
+    if constexpr(UseHighBucketPredictor)
+    {
+        constexpr unsigned PredictedBucket = 0x40du;
+        IdxT before_bucket   = 0;
+        IdxT in_first_bucket = 0;
+        IdxT in_last_bucket  = 0;
+#pragma unroll
+        for(int j = 0; j < ElemsPerThread; ++j)
+        {
+            IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+            if(is_valid_element(j, i))
+            {
+                unsigned const bucket = static_cast<unsigned>(vals[j]) >> pass0_start_bit;
+                before_bucket += bucket < PredictorFirstBucket;
+                in_first_bucket += bucket == PredictorFirstBucket;
+                if constexpr(PredictorFirstBucket != PredictedBucket)
+                {
+                    in_last_bucket += bucket == PredictedBucket;
+                }
+            }
+        }
+
+        int const packed_local =
+            static_cast<int>(before_bucket | (in_first_bucket << 16));
+        int const packed_wave  = wave_inclusive_sum_dpp(packed_local);
+        int last_wave = 0;
+        if constexpr(PredictorFirstBucket != PredictedBucket)
+        {
+            last_wave = wave_inclusive_sum_dpp(in_last_bucket);
+        }
+        int const lane         = static_cast<int>(threadIdx.x) % WARP_SIZE;
+        int const wave         = static_cast<int>(threadIdx.x) / WARP_SIZE;
+        constexpr int waves    = BlockSize / WARP_SIZE;
+        if(lane == WARP_SIZE - 1)
+        {
+            wave_sums[wave] = static_cast<IdxT>(packed_wave);
+            if constexpr(PredictorFirstBucket != PredictedBucket)
+            {
+                candidate_indices[wave] = static_cast<IdxT>(last_wave);
+            }
+        }
+        __syncthreads();
+
+        if(wave == 0)
+        {
+            int const packed = wave_inclusive_sum_dpp(
+                lane < waves ? static_cast<int>(wave_sums[lane]) : 0);
+            int last = 0;
+            if constexpr(PredictorFirstBucket != PredictedBucket)
+            {
+                last = wave_inclusive_sum_dpp(
+                    lane < waves ? static_cast<int>(candidate_indices[lane]) : 0);
+            }
+            if(lane == waves - 1)
+            {
+                unsigned const total = static_cast<unsigned>(packed);
+                IdxT const previous   = static_cast<IdxT>(total & 0xffffu);
+                IdxT const first_len  = static_cast<IdxT>(total >> 16);
+                IdxT const through_first = previous + first_len;
+                if(previous < k && k <= through_first)
+                {
+                    counter.k              = k - previous;
+                    counter.len            = first_len;
+                    counter.kth_value_bits = PredictorFirstBucket << pass0_start_bit;
+                }
+                else if constexpr(PredictorFirstBucket != PredictedBucket)
+                {
+                    IdxT const last_len = static_cast<IdxT>(last);
+                    if(through_first < k && k <= through_first + last_len)
+                    {
+                        counter.k              = k - through_first;
+                        counter.len            = last_len;
+                        counter.kth_value_bits = PredictedBucket << pass0_start_bit;
+                    }
+                }
+            }
+        }
+        if constexpr(PredictorFirstBucket != PredictedBucket)
+        {
+            // The four-row dual predictor resolves the next five radix bits
+            // directly.  Only its 32 counters need to be zeroed on a hit.
+            if(threadIdx.x < 32) histogram[threadIdx.x] = 0;
+        }
+        else
+        {
+            clear_main_histogram();
+        }
+        __syncthreads();
+        pass0_predicted = counter.kth_value_bits != 0;
+        if constexpr(PredictorFirstBucket != PredictedBucket)
+        {
+            // A predictor miss takes the unchanged exact pass-0 path, which
+            // needs the whole 4096-bin histogram rather than the 32-bin fast
+            // path initialized above.
+            if(!pass0_predicted)
+            {
+                clear_main_histogram();
+                __syncthreads();
+            }
+        }
+    }
+    if constexpr(UsePass0Bucket206Predictor)
+    {
+        // For the exact M=2048, N=8192 arm, the two neighbouring 12-bit
+        // crossing buckets observed at low M collapse to 11-bit bucket 0x206.
+        // Count the strict prefix and that bucket from the register-resident
+        // row.  Packed 16-bit halves are exact because this row has only 8192
+        // elements.  A validated hit skips the 2048-bin pass-0 LDS histogram
+        // and chooser; a miss enters the unchanged path below.
+        constexpr unsigned PredictedBucket = 0x206u;
+        uint32_t packed_local = 0;
+#pragma unroll
+        for(int j = 0; j < ElemsPerThread; ++j)
+        {
+            IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+            if(is_valid_element(j, i))
+            {
+                Bits const bits = twiddle_in(vals[j], select_min);
+                unsigned const bucket = static_cast<unsigned>(bits) >> pass0_start_bit;
+                packed_local += bucket < PredictedBucket
+                                    ? 1u
+                                    : (bucket == PredictedBucket ? (1u << 16) : 0u);
+            }
+        }
+
+        uint32_t const packed_wave = wave_inclusive_sum_dpp_u32(packed_local);
+        int const lane              = static_cast<int>(threadIdx.x) % WARP_SIZE;
+        int const wave              = static_cast<int>(threadIdx.x) / WARP_SIZE;
+        constexpr int waves         = BlockSize / WARP_SIZE;
+        if(lane == WARP_SIZE - 1)
+        {
+            wave_sums[wave] = static_cast<IdxT>(packed_wave);
+        }
+        __syncthreads();
+        if(wave == 0)
+        {
+            uint32_t const packed = wave_inclusive_sum_dpp_u32(
+                lane < waves ? static_cast<uint32_t>(wave_sums[lane]) : 0u);
+            if(lane == waves - 1)
+            {
+                IdxT const before = static_cast<IdxT>(packed & 0xffffu);
+                IdxT const equal  = static_cast<IdxT>(packed >> 16);
+                if(before < k && k <= before + equal)
+                {
+                    counter.k              = k - before;
+                    counter.len            = equal;
+                    counter.kth_value_bits =
+                        static_cast<Bits>(PredictedBucket) << pass0_start_bit;
+                }
+            }
+        }
+        clear_main_histogram();
+        __syncthreads();
+        pass0_predicted = counter.kth_value_bits != 0;
+    }
+
+    if(!pass0_predicted)
+    {
+        // Pass 0: the high MainBits histogram, out of registers.
+        if constexpr(!FuseLoadPass0Histogram)
+        {
+#pragma unroll
+            for(int j = 0; j < ElemsPerThread; ++j)
+            {
+                IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                if(is_valid_element(j, i))
+                {
+                    Bits bits;
+                    if constexpr(CacheTwiddledBits)
+                        bits = vals[j];
+                    else
+                        bits = twiddle_in(vals[j], select_min);
+                    int const bucket = __builtin_amdgcn_ubfe(
+                        bits,
+                        static_cast<unsigned>(pass0_start_bit),
+                        static_cast<unsigned>(MainBits));
+                    atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+                }
+            }
+        }
+        __syncthreads();
+        if constexpr(StoreTwiddledCandidates)
+        {
+            // The exact 4097-column arm does not consume pass-0 rank/length:
+            // its hot rank is k minus the emitted winner count, while the cold
+            // pass-1 reducer overwrites both fields before their first read.
+            choose_bucket_reduce_prefix_only<T, IdxT, MainBits, BlockSize>(
+                &counter, histogram, wave_sums, k, pass0_start_bit);
+        }
+        else
+        {
+            choose_bucket_reduce<T, IdxT, MainBits, BlockSize>(
+                &counter, histogram, wave_sums, k, pass0_start_bit);
+        }
+    }
+
+    // Once the M=4 dual predictor has identified the exact high 12-bit
+    // bucket, resolve its next five bits with fixed LDS staging.  Each of the
+    // 32 sub-buckets owns 64 slots, exactly
+    // covering CandidateCapacity.  A sub-bucket overflow falls back to the
+    // unchanged 12+12+8 path without having issued any provisional global
+    // stores.  On a hit, the register-resident row emits definite winners and
+    // Wave0 finishes the at-most-64 crossing elements with a ballot radix walk
+    // over the remaining 15 bits.
+    if constexpr(UseHighBucketPredictor && PredictorFirstBucket != 0x40du)
+    {
+        if(pass0_predicted)
+        {
+            constexpr int High5Bits        = 5;
+            constexpr int High5Bins        = 1 << High5Bits;
+            constexpr int High5BinCapacity = WARP_SIZE;
+            constexpr int High5StartBit    = pass0_start_bit - High5Bits;
+            static_assert(High5Bins * High5BinCapacity == CandidateCapacity);
+
+            Bits const predicted_high_prefix = counter.kth_value_bits;
+#pragma unroll
+            for(int j = 0; j < ElemsPerThread; ++j)
+            {
+                IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                if(is_valid_element(j, i))
+                {
+                    Bits const bits = vals[j];
+                    Bits const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
+                    if(prefix == predicted_high_prefix)
+                    {
+                        int const bin = static_cast<int>(
+                            (bits >> High5StartBit) & static_cast<Bits>(High5Bins - 1));
+                        IdxT const slot = atomicAdd(histogram + bin, static_cast<IdxT>(1));
+                        if(slot < High5BinCapacity)
+                        {
+                            int const pos = bin * High5BinCapacity + static_cast<int>(slot);
+                            candidate_values[pos] = __builtin_bit_cast(T, bits);
+                            candidate_indices[pos] = i;
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+
+            if(threadIdx.x < WARP_SIZE)
+            {
+                int const lane = static_cast<int>(threadIdx.x);
+                IdxT const count = lane < High5Bins ? histogram[lane] : 0;
+                IdxT const inclusive = static_cast<IdxT>(
+                    wave_inclusive_sum_dpp(static_cast<int>(count)));
+                IdxT const exclusive = inclusive - count;
+                IdxT const needed = counter.k;
+                // All staging atomics are complete at the barrier above, so
+                // Wave0 can reject any over-capacity bin once instead of each
+                // producer issuing a never-taken atomicExch overflow path.
+                // The slot guard still prevents every out-of-bounds store.
+                uint64_t const overflow_mask = static_cast<uint64_t>(
+                    __ballot(count > static_cast<IdxT>(High5BinCapacity)));
+                bool const crossing = lane < High5Bins &&
+                                      exclusive < needed && needed <= inclusive;
+                uint64_t const crossing_mask =
+                    static_cast<uint64_t>(__ballot(crossing));
+
+                if(lane < High5Bins)
+                {
+                    uint32_t const packed = static_cast<uint32_t>(count) |
+                                            (static_cast<uint32_t>(exclusive) << 16);
+                    histogram[lane] = static_cast<IdxT>(packed);
+                }
+                if(lane == 0)
+                {
+                    int selected = -1;
+                    IdxT selected_exclusive = 0;
+                    IdxT const winner_base = k - needed;
+                    if(overflow_mask == 0 && crossing_mask != 0)
+                    {
+                        selected = __builtin_ctzll(crossing_mask);
+                        selected_exclusive = static_cast<IdxT>(
+                            __builtin_amdgcn_readlane(exclusive, selected));
+                        IdxT const selected_count = static_cast<IdxT>(
+                            __builtin_amdgcn_readlane(count, selected));
+                        IdxT const selected_rank = needed - selected_exclusive;
+                        if(winner_base + selected_exclusive + selected_rank == k)
+                        {
+                            counter.k              = selected_rank;
+                            counter.len            = selected_count;
+                            counter.kth_value_bits =
+                                predicted_high_prefix |
+                                (static_cast<Bits>(selected) << High5StartBit);
+                        }
+                        else
+                        {
+                            selected = -1;
+                            selected_exclusive = 0;
+                        }
+                    }
+                    wave_sums[0] = static_cast<IdxT>(selected);
+                    wave_sums[1] = selected_exclusive;
+                    wave_sums[2] = winner_base;
+                }
+            }
+            __syncthreads();
+
+            int const selected_bin = static_cast<int>(wave_sums[0]);
+            if(selected_bin >= 0)
+            {
+                // No global output was touched until the high5 decision was
+                // known to be exact.  Re-scan only register-resident values
+                // now, so the fallback path has no outstanding VM stores to
+                // order against its replay.
+                unsigned high5_winner_j_mask = 0;
+#pragma unroll
+                for(int j = 0; j < ElemsPerThread; ++j)
+                {
+                    IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                    if(is_valid_element(j, i))
+                    {
+                        Bits const bits = vals[j];
+                        Bits const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
+                        if(prefix < predicted_high_prefix) high5_winner_j_mask |= 1u << j;
+                    }
+                }
+                int const high5_lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
+                IdxT const high5_lane_count =
+                    static_cast<IdxT>(__builtin_popcount(high5_winner_j_mask));
+                IdxT const high5_lane_end = static_cast<IdxT>(
+                    wave_inclusive_sum_dpp(static_cast<int>(high5_lane_count)));
+                IdxT high5_leader_base = 0;
+                if(high5_lane == WARP_SIZE - 1)
+                {
+                    high5_leader_base = atomicAdd(&counter.out_cnt, high5_lane_end);
+                }
+                IdxT high5_output_pos = static_cast<IdxT>(
+                    __builtin_amdgcn_readlane(high5_leader_base, WARP_SIZE - 1)) +
+                    high5_lane_end - high5_lane_count;
+#pragma unroll
+                for(int j = 0; j < ElemsPerThread; ++j)
+                {
+                    if(high5_winner_j_mask & (1u << j))
+                    {
+                        IdxT const winner_index =
+                            static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                        __builtin_nontemporal_store(
+                            winner_index, out_idx + high5_output_pos++);
+                    }
+                }
+
+                IdxT const winner_base = wave_sums[2];
+                IdxT const selected_exclusive = wave_sums[1];
+                int const preceding_slots = selected_bin * High5BinCapacity;
+                for(int q = static_cast<int>(threadIdx.x); q < preceding_slots;
+                    q += BlockSize)
+                {
+                    int const bin  = q / High5BinCapacity;
+                    int const slot = q % High5BinCapacity;
+                    uint32_t const packed = static_cast<uint32_t>(histogram[bin]);
+                    IdxT const count = static_cast<IdxT>(packed & 0xffffu);
+                    IdxT const exclusive = static_cast<IdxT>(packed >> 16);
+                    if(slot < count)
+                    {
+                        __builtin_nontemporal_store(
+                            candidate_indices[q], out_idx + winner_base + exclusive + slot);
+                    }
+                }
+
+                if(threadIdx.x < WARP_SIZE)
+                {
+                    int const lane = static_cast<int>(threadIdx.x);
+                    IdxT const staged_len = counter.len;
+                    IdxT const needed = counter.k;
+                    Bits key_bits = 0;
+                    IdxT key_index = 0;
+                    if(lane < staged_len)
+                    {
+                        int const pos = selected_bin * High5BinCapacity + lane;
+                        key_bits  = __builtin_bit_cast(Bits, candidate_values[pos]);
+                        key_index = candidate_indices[pos];
+                    }
+
+                    uint64_t const valid_mask =
+                        static_cast<uint64_t>(__ballot(lane < staged_len));
+                    uint64_t active_mask = valid_mask;
+                    IdxT rank = needed;
+#pragma unroll 1
+                    for(int bit = High5StartBit - 1;
+                        bit >= 0 && (active_mask & (active_mask - uint64_t{1})) != 0;
+                        --bit)
+                    {
+                        Bits const bit_mask = Bits{1} << bit;
+                        uint64_t const zero_mask =
+                            active_mask &
+                            static_cast<uint64_t>(__ballot((key_bits & bit_mask) == 0));
+                        IdxT const zero_count =
+                            static_cast<IdxT>(__builtin_popcountll(zero_mask));
+                        if(rank <= zero_count)
+                        {
+                            active_mask = zero_mask;
+                        }
+                        else
+                        {
+                            active_mask &= ~zero_mask;
+                            rank -= zero_count;
+                        }
+                    }
+
+                    int const kth_lane = __builtin_ctzll(active_mask);
+                    Bits const kth_bits = static_cast<Bits>(
+                        __builtin_amdgcn_readlane(key_bits, kth_lane));
+                    uint64_t const less_mask =
+                        valid_mask & static_cast<uint64_t>(__ballot(key_bits < kth_bits));
+                    uint64_t const equal_mask =
+                        valid_mask & static_cast<uint64_t>(__ballot(key_bits == kth_bits));
+                    IdxT const equal_needed =
+                        needed - static_cast<IdxT>(__builtin_popcountll(less_mask));
+                    uint64_t const lower_lanes =
+                        lane == 0 ? uint64_t{0} : ((uint64_t{1} << lane) - uint64_t{1});
+                    bool const take_equal =
+                        key_bits == kth_bits &&
+                        static_cast<IdxT>(__builtin_popcountll(equal_mask & lower_lanes)) <
+                            equal_needed;
+                    uint64_t const selected_mask =
+                        valid_mask &
+                        static_cast<uint64_t>(__ballot(key_bits < kth_bits || take_equal));
+                    if(selected_mask & (uint64_t{1} << lane))
+                    {
+                        IdxT const pos = static_cast<IdxT>(
+                            __builtin_popcountll(selected_mask & lower_lanes));
+                        __builtin_nontemporal_store(
+                            key_index,
+                            out_idx + winner_base + selected_exclusive + pos);
+                    }
+                }
+                return;
+            }
+
+            // The exact high bucket remains valid, but the fixed high5 staging
+            // did not.  No global output has been written, so reset the LDS
+            // staging state and rebuild the ordinary pass-1 histogram from the
+            // register-resident row.
+            if(threadIdx.x == 0)
+            {
+                counter.out_cnt      = 0;
+                counter.out_back_cnt = 0;
+                candidate_count      = 0;
+                candidate_overflow   = 0;
+            }
+            clear_main_histogram();
+            __syncthreads();
+        }
+    }
+
+    // Pass 1: emit the definite winners and stage the crossing bucket from the
+    // same registers.  The ordinary path also builds the middle-MainBits
+    // histogram here.  A ballot specialization normally resolves <=32 staged
+    // candidates directly, so it defers both the clear and histogram atomics
+    // until the uncommon fallback where that reducer is actually needed.
+    if constexpr(UseHighBucketPredictor || UsePass0Bucket206Predictor)
+    {
+        if(!pass0_predicted)
+        {
+            clear_main_histogram();
+            __syncthreads();
+        }
+    }
+    else
+    {
+        if constexpr(!UseWaveBallotSelect) clear_main_histogram();
+        __syncthreads();
+    }
 
     auto const high_prefix = counter.kth_value_bits;
+    unsigned winner_j_mask = 0;
 #pragma unroll
     for(int j = 0; j < ElemsPerThread; ++j)
     {
         IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
-        if(i < row_len)
+        if(is_valid_element(j, i))
         {
-            T const value     = vals[j];
-            auto const bits   = twiddle_in(value, select_min);
+            Bits bits;
+            if constexpr(CacheTwiddledBits)
+                bits = vals[j];
+            else
+                bits = twiddle_in(vals[j], select_min);
             auto const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
             if(prefix < high_prefix)
             {
-                IdxT const pos      = atomicAdd(&counter.out_cnt, static_cast<IdxT>(1));
-                winner_indices[pos] = i;
+                if constexpr(UseWaveWinnerReserve)
+                {
+                    winner_j_mask |= 1u << j;
+                }
+                else
+                {
+                    IdxT const pos      = atomicAdd(&counter.out_cnt, static_cast<IdxT>(1));
+                    winner_indices[pos] = i;
+                }
             }
             else if(prefix == high_prefix)
             {
                 IdxT const pos = atomicAdd(&candidate_count, static_cast<IdxT>(1));
                 if(pos < CandidateCapacity)
                 {
-                    candidate_values[pos]  = value;
+                    if constexpr(StoreTwiddledCandidates)
+                    {
+                        candidate_values[pos] = __builtin_bit_cast(T, bits);
+                    }
+                    else
+                    {
+                        T value;
+                        if constexpr(CacheTwiddledBits)
+                        {
+                            // twiddle_in is an involution for fp32: sign-bit-clear
+                            // patterns flip the low 31 bits; sign-bit-set patterns do not.
+                            Bits const raw_bits =
+                                bits ^ ((bits >> 31) ? 0u : 0x7fffffffu);
+                            value = __builtin_bit_cast(T, raw_bits);
+                        }
+                        else
+                        {
+                            value = vals[j];
+                        }
+                        candidate_values[pos] = value;
+                    }
                     candidate_indices[pos] = i;
                 }
-                else
+                else if constexpr(BallotCandidateCapacity == 0)
                 {
                     atomicExch(&candidate_overflow, 1);
                 }
-                int const bucket =
-                    __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(pass1_start_bit),
-                                          static_cast<unsigned>(BitsPerPass));
-                atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+                if constexpr(!UseWaveBallotSelect)
+                {
+                    int const bucket =
+                        __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(pass1_start_bit),
+                                              static_cast<unsigned>(MainBits));
+                    atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+                }
+            }
+        }
+    }
+    if constexpr(UseWaveWinnerReserve)
+    {
+        int const lane        = static_cast<int>(threadIdx.x) % WARP_SIZE;
+        IdxT const lane_count = static_cast<IdxT>(__builtin_popcount(winner_j_mask));
+        IdxT const lane_end =
+            static_cast<IdxT>(wave_inclusive_sum_dpp(static_cast<int>(lane_count)));
+        IdxT leader_base = 0;
+        if(lane == WARP_SIZE - 1)
+        {
+            leader_base = atomicAdd(&counter.out_cnt, lane_end);
+        }
+        IdxT pos = static_cast<IdxT>(__builtin_amdgcn_readlane(leader_base, WARP_SIZE - 1)) +
+                   lane_end - lane_count;
+#pragma unroll
+        for(int j = 0; j < ElemsPerThread; ++j)
+        {
+            if(winner_j_mask & (1u << j))
+            {
+                IdxT const winner_index = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                if constexpr(DirectWaveWinnerWrite)
+                {
+                    __builtin_nontemporal_store(winner_index, out_idx + pos++);
+                }
+                else
+                {
+                    winner_indices[pos++] = winner_index;
+                }
             }
         }
     }
     __syncthreads();
 
-    IdxT const pass1_k = counter.k;
-    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
-        &counter, histogram, wave_sums, pass1_k, pass1_start_bit);
+    bool const candidate_did_overflow =
+        BallotCandidateCapacity > 0 ? candidate_count > CandidateCapacity
+                                    : candidate_overflow != 0;
+
+    if constexpr(StoreTwiddledCandidates)
+    {
+        constexpr int SmallCandidateCapacity = 32;
+        static_assert(SmallCandidateCapacity <= WARP_SIZE / 2);
+        IdxT const staged_len        = candidate_count;
+        IdxT const pass0_winner_count = counter.out_cnt;
+        IdxT const needed = StoreTwiddledCandidates ? k - pass0_winner_count : counter.k;
+        bool rank_matches_output = true;
+        if constexpr(!StoreTwiddledCandidates)
+            rank_matches_output = pass0_winner_count + needed == k;
+        if(!candidate_did_overflow && staged_len > 0 && staged_len <= SmallCandidateCapacity &&
+           needed > 0 && needed <= staged_len && rank_matches_output)
+        {
+            // The pass-0 crossing bucket is tiny for the selected 4K shapes.
+            // Resolve its 1-based kth rank directly in Wave0 with a
+            // ballot radix walk instead of sorting lanes or running the second
+            // block-wide histogram reducer.  Every Wave64 lane participates in
+            // each ballot; lanes outside the staged set are removed by the
+            // explicit 64-bit validity mask.
+            if(threadIdx.x < WARP_SIZE)
+            {
+                int const lane = static_cast<int>(threadIdx.x);
+                Bits key_bits  = 0;
+                IdxT key_index = 0;
+                if(lane < staged_len)
+                {
+                    if constexpr(StoreTwiddledCandidates)
+                        key_bits = __builtin_bit_cast(Bits, candidate_values[lane]);
+                    else
+                        key_bits = twiddle_in(candidate_values[lane], select_min);
+                    key_index = candidate_indices[lane];
+                }
+
+                uint64_t const valid_mask = static_cast<uint64_t>(__ballot(lane < staged_len));
+                uint64_t active_mask      = valid_mask;
+                IdxT rank                 = needed;
+
+                // pass 0 already fixed bits 31..21 for MainBits=11.  Walk only
+                // the remaining 21 bits, preferring the zero partition because
+                // smaller twiddled keys are the larger fp32 values selected by
+                // the existing radix implementation.  Random candidate sets
+                // normally isolate the requested rank after only a few bits;
+                // once one lane remains, its complete key determines the
+                // answer and the rest of the radix walk is redundant.
+#pragma unroll 1
+                for(int bit = pass0_start_bit - 1;
+                    bit >= 0 && (active_mask & (active_mask - uint64_t{1})) != 0;
+                    --bit)
+                {
+                    Bits const bit_mask = Bits{1} << bit;
+                    uint64_t const zero_mask =
+                        active_mask & static_cast<uint64_t>(__ballot((key_bits & bit_mask) == 0));
+                    IdxT const zero_count = static_cast<IdxT>(__builtin_popcountll(zero_mask));
+                    if(rank <= zero_count)
+                    {
+                        active_mask = zero_mask;
+                    }
+                    else
+                    {
+                        active_mask &= ~zero_mask;
+                        rank -= zero_count;
+                    }
+                }
+
+                int const kth_lane = __builtin_ctzll(active_mask);
+                Bits const kth_bits = static_cast<Bits>(
+                    __builtin_amdgcn_readlane(key_bits, kth_lane));
+
+                uint64_t const less_mask =
+                    valid_mask & static_cast<uint64_t>(__ballot(key_bits < kth_bits));
+                uint64_t const equal_mask =
+                    valid_mask & static_cast<uint64_t>(__ballot(key_bits == kth_bits));
+                IdxT const equal_needed =
+                    needed - static_cast<IdxT>(__builtin_popcountll(less_mask));
+                uint64_t const lower_lanes =
+                    lane == 0 ? uint64_t{0} : ((uint64_t{1} << lane) - uint64_t{1});
+                bool const take_equal =
+                    key_bits == kth_bits &&
+                    static_cast<IdxT>(__builtin_popcountll(equal_mask & lower_lanes)) < equal_needed;
+                uint64_t const selected_mask =
+                    valid_mask & static_cast<uint64_t>(__ballot(key_bits < kth_bits || take_equal));
+                if(selected_mask & (uint64_t{1} << lane))
+                {
+                    IdxT const pos = static_cast<IdxT>(
+                        __builtin_popcountll(selected_mask & lower_lanes));
+                    __builtin_nontemporal_store(
+                        key_index, out_idx + pass0_winner_count + pos);
+                }
+            }
+            if constexpr(!DirectWaveWinnerWrite)
+            {
+                // High-row-count launches are sensitive to the per-wave
+                // scalar global stores used by DirectWaveWinnerWrite.  Keep
+                // their winners in LDS and flush them densely while Wave0
+                // resolves the small crossing bucket.
+                static_assert(BlockSize > WARP_SIZE);
+                IdxT const winner_count = counter.out_cnt;
+                if(threadIdx.x >= WARP_SIZE)
+                {
+                    constexpr int FlushThreads = BlockSize - WARP_SIZE;
+                    for(IdxT i = static_cast<IdxT>(threadIdx.x - WARP_SIZE);
+                        i < winner_count; i += FlushThreads)
+                    {
+                        __builtin_nontemporal_store(winner_indices[i], out_idx + i);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    if constexpr(UseWaveBallotSelect && !StoreTwiddledCandidates)
+    {
+        constexpr int SmallCandidateCapacity = 32;
+        static_assert(SmallCandidateCapacity <= WARP_SIZE / 2);
+        IdxT const staged_len = candidate_count;
+        IdxT const needed     = counter.k;
+        if(!candidate_did_overflow && staged_len > 0 && staged_len <= SmallCandidateCapacity &&
+           needed > 0 && needed <= staged_len && counter.out_cnt + needed == k)
+        {
+            // The pass-0 crossing bucket is tiny for the selected 4K shapes.
+            // Resolve its 1-based kth rank directly in Wave0 with a
+            // ballot radix walk instead of sorting lanes or running the second
+            // block-wide histogram reducer.  Every Wave64 lane participates in
+            // each ballot; lanes outside the staged set are removed by the
+            // explicit 64-bit validity mask.
+            if(threadIdx.x < WARP_SIZE)
+            {
+                int const lane = static_cast<int>(threadIdx.x);
+                Bits key_bits  = 0;
+                IdxT key_index = 0;
+                if(lane < staged_len)
+                {
+                    if constexpr(StoreTwiddledCandidates)
+                        key_bits = __builtin_bit_cast(Bits, candidate_values[lane]);
+                    else
+                        key_bits = twiddle_in(candidate_values[lane], select_min);
+                    key_index = candidate_indices[lane];
+                }
+
+                uint64_t const valid_mask = static_cast<uint64_t>(__ballot(lane < staged_len));
+                uint64_t active_mask      = valid_mask;
+                IdxT rank                 = needed;
+
+                // pass 0 already fixed bits 31..21 for MainBits=11.  Walk only
+                // the remaining 21 bits, preferring the zero partition because
+                // smaller twiddled keys are the larger fp32 values selected by
+                // the existing radix implementation.  Random candidate sets
+                // normally isolate the requested rank after only a few bits;
+                // once one lane remains, its complete key determines the
+                // answer and the rest of the radix walk is redundant.
+#pragma unroll 1
+                for(int bit = pass0_start_bit - 1;
+                    bit >= 0 && (active_mask & (active_mask - uint64_t{1})) != 0;
+                    --bit)
+                {
+                    Bits const bit_mask = Bits{1} << bit;
+                    uint64_t const zero_mask =
+                        active_mask & static_cast<uint64_t>(__ballot((key_bits & bit_mask) == 0));
+                    IdxT const zero_count = static_cast<IdxT>(__builtin_popcountll(zero_mask));
+                    if(rank <= zero_count)
+                    {
+                        active_mask = zero_mask;
+                    }
+                    else
+                    {
+                        active_mask &= ~zero_mask;
+                        rank -= zero_count;
+                    }
+                }
+
+                int const kth_lane = __builtin_ctzll(active_mask);
+                Bits const kth_bits = static_cast<Bits>(
+                    __builtin_amdgcn_readlane(key_bits, kth_lane));
+
+                uint64_t const less_mask =
+                    valid_mask & static_cast<uint64_t>(__ballot(key_bits < kth_bits));
+                uint64_t const equal_mask =
+                    valid_mask & static_cast<uint64_t>(__ballot(key_bits == kth_bits));
+                IdxT const equal_needed =
+                    needed - static_cast<IdxT>(__builtin_popcountll(less_mask));
+                uint64_t const lower_lanes =
+                    lane == 0 ? uint64_t{0} : ((uint64_t{1} << lane) - uint64_t{1});
+                bool const take_equal =
+                    key_bits == kth_bits &&
+                    static_cast<IdxT>(__builtin_popcountll(equal_mask & lower_lanes)) < equal_needed;
+                uint64_t const selected_mask =
+                    valid_mask & static_cast<uint64_t>(__ballot(key_bits < kth_bits || take_equal));
+                if(selected_mask & (uint64_t{1} << lane))
+                {
+                    IdxT const pos = static_cast<IdxT>(
+                        __builtin_popcountll(selected_mask & lower_lanes));
+                    __builtin_nontemporal_store(
+                        key_index, out_idx + counter.out_cnt + pos);
+                }
+            }
+            if constexpr(!DirectWaveWinnerWrite)
+            {
+                // High-row-count launches are sensitive to the per-wave
+                // scalar global stores used by DirectWaveWinnerWrite.  Keep
+                // their winners in LDS and flush them densely while Wave0
+                // resolves the small crossing bucket.
+                static_assert(BlockSize > WARP_SIZE);
+                IdxT const winner_count = counter.out_cnt;
+                if(threadIdx.x >= WARP_SIZE)
+                {
+                    constexpr int FlushThreads = BlockSize - WARP_SIZE;
+                    for(IdxT i = static_cast<IdxT>(threadIdx.x - WARP_SIZE);
+                        i < winner_count; i += FlushThreads)
+                    {
+                        __builtin_nontemporal_store(winner_indices[i], out_idx + i);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    if constexpr(UseWaveBallotSelect)
+    {
+        // The tiny-candidate fast path was not applicable.  Reconstruct the
+        // exact middle histogram only now: staged candidates suffice unless
+        // their LDS capacity overflowed, in which case the register-resident
+        // row is rescanned.  This leaves all existing reducers and tail
+        // fallbacks unchanged.
+        if constexpr(StoreTwiddledCandidates)
+        {
+            if(threadIdx.x == 0) counter.out_back_cnt = 0;
+        }
+        clear_main_histogram();
+        __syncthreads();
+        if(!candidate_did_overflow)
+        {
+            IdxT const n = candidate_count;
+            for(IdxT i = static_cast<IdxT>(threadIdx.x); i < n; i += BlockSize)
+            {
+                Bits bits;
+                if constexpr(StoreTwiddledCandidates)
+                    bits = __builtin_bit_cast(Bits, candidate_values[i]);
+                else
+                    bits = twiddle_in(candidate_values[i], select_min);
+                int const bucket =
+                    __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(pass1_start_bit),
+                                          static_cast<unsigned>(MainBits));
+                atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+            }
+        }
+        else
+        {
+#pragma unroll
+            for(int j = 0; j < ElemsPerThread; ++j)
+            {
+                IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                if(is_valid_element(j, i))
+                {
+                    Bits bits;
+                    if constexpr(CacheTwiddledBits)
+                        bits = vals[j];
+                    else
+                        bits = twiddle_in(vals[j], select_min);
+                    auto const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
+                    if(prefix == high_prefix)
+                    {
+                        int const bucket =
+                            __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(pass1_start_bit),
+                                                  static_cast<unsigned>(MainBits));
+                        atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if constexpr(StoreTwiddledCandidates)
+    {
+        IdxT const pass1_k = k - counter.out_cnt;
+        choose_bucket_reduce<T, IdxT, MainBits, BlockSize>(
+            &counter, histogram, wave_sums, pass1_k, pass1_start_bit);
+    }
+    else
+    {
+        IdxT const pass1_k = counter.k;
+        choose_bucket_reduce<T, IdxT, MainBits, BlockSize>(
+            &counter, histogram, wave_sums, pass1_k, pass1_start_bit);
+    }
     __syncthreads();
 
-    if(!candidate_overflow)
+    if(!candidate_did_overflow && !DirectWaveWinnerWrite)
     {
         IdxT const winner_count = counter.out_cnt;
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < winner_count; i += BlockSize)
@@ -2638,18 +4229,26 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         }
     }
 
-    if(candidate_overflow)
+    if(candidate_did_overflow)
     {
         // The pass-1 choice is exact even though the staging overflowed.
         // Discard the partial output and take the ordinary pass-2 scan, which
         // can also run out of registers.
+        if constexpr(DirectWaveWinnerWrite)
+        {
+            // Direct winner stores are an optimization only.  Order every
+            // thread's provisional stores before the exact fallback reuses
+            // the same output slots; this branch is cold for ordinary rows.
+            __threadfence_block();
+            __syncthreads();
+        }
         if(threadIdx.x == 0)
         {
             counter.out_cnt      = 0;
             counter.out_back_cnt = 0;
         }
         IdxT const pass2_k = counter.k;
-        clear_wide_histogram();
+        clear_tail_histogram();
         __syncthreads();
 
         auto const pass1_prefix = counter.kth_value_bits;
@@ -2657,77 +4256,104 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         for(int j = 0; j < ElemsPerThread; ++j)
         {
             IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
-            if(i < row_len)
+            if(is_valid_element(j, i))
             {
-                auto const bits   = twiddle_in(vals[j], select_min);
+                Bits bits;
+                if constexpr(CacheTwiddledBits)
+                    bits = vals[j];
+                else
+                    bits = twiddle_in(vals[j], select_min);
                 auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
                 if(prefix == pass1_prefix)
                 {
                     int const bucket =
-                        __builtin_amdgcn_ubfe(bits, 0u, static_cast<unsigned>(BitsPerPass));
+                        __builtin_amdgcn_ubfe(bits, 0u, static_cast<unsigned>(TailBits));
                     atomicAdd(histogram + bucket, static_cast<IdxT>(1));
                 }
             }
         }
         __syncthreads();
-        choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+        choose_bucket_reduce<T, IdxT, TailBits, BlockSize>(
             &counter, histogram, wave_sums, pass2_k, 0);
         __syncthreads();
-        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false>(
             in, static_cast<IdxT const*>(nullptr), out, out_idx, row_len, k, &counter, select_min,
-            pass2);
+            final_pass);
         return;
     }
 
-    // With random fp32 data the selected 24-bit prefix almost always names a
-    // single element, and the remaining low byte is then already known from it.
+    // With random fp32 data the selected two-pass prefix almost always names a
+    // single element, and the remaining tail bits are then already known from it.
     if(counter.len == 1)
     {
         auto const middle_prefix = counter.kth_value_bits;
         IdxT const staged_len    = candidate_count;
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
         {
-            auto const bits   = twiddle_in(candidate_values[i], select_min);
+            Bits bits;
+            if constexpr(StoreTwiddledCandidates)
+                bits = __builtin_bit_cast(Bits, candidate_values[i]);
+            else
+                bits = twiddle_in(candidate_values[i], select_min);
             auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
             if(prefix == middle_prefix)
             {
-                counter.kth_value_bits |= bits & 0xffu;
+                counter.kth_value_bits |= bits & tail_mask;
             }
         }
         __syncthreads();
-        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
-            candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
-            pass2);
+        if constexpr(StoreTwiddledCandidates)
+        {
+            last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false, true>(
+                candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter,
+                select_min, final_pass);
+        }
+        else
+        {
+            last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false>(
+                candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter,
+                select_min, final_pass);
+        }
         return;
     }
 
-    // Resolve the final eight bits from the staged crossing bucket.
-    for(int i = threadIdx.x; i < tail_num_buckets; i += blockDim.x)
-    {
-        histogram[i] = 0;
-    }
+    // Resolve the final radix tail from the staged crossing bucket.
+    clear_tail_histogram();
     __syncthreads();
 
     IdxT const staged_len    = candidate_count;
     auto const middle_prefix = counter.kth_value_bits;
     for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
     {
-        auto const bits   = twiddle_in(candidate_values[i], select_min);
+        Bits bits;
+        if constexpr(StoreTwiddledCandidates)
+            bits = __builtin_bit_cast(Bits, candidate_values[i]);
+        else
+            bits = twiddle_in(candidate_values[i], select_min);
         auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
         if(prefix == middle_prefix)
         {
-            atomicAdd(histogram + (bits & 0xffu), static_cast<IdxT>(1));
+            atomicAdd(histogram + (bits & tail_mask), static_cast<IdxT>(1));
         }
     }
     __syncthreads();
 
     IdxT const pass2_k = counter.k;
-    choose_bucket_reduce<T, IdxT, 8, BlockSize>(&counter, histogram, wave_sums, pass2_k, 0);
+    choose_bucket_reduce<T, IdxT, TailBits, BlockSize>(&counter, histogram, wave_sums, pass2_k, 0);
     __syncthreads();
 
-    last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
-        candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
-        pass2);
+    if constexpr(StoreTwiddledCandidates)
+    {
+        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false, true>(
+            candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
+            final_pass);
+    }
+    else
+    {
+        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false>(
+            candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
+            final_pass);
+    }
 }
 
 /**
@@ -2748,7 +4374,13 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
  * used.  The fallback is slower than baseline only for those unusual rows but
  * preserves identical top-k semantics without an unbounded LDS allocation.
  */
-template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES>
+template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
+          bool UseGuardedFixedPredictor = false, int FixedSampleMin = 270,
+          int StaticRowLen = 0, unsigned ExactHighBucket = 0,
+          unsigned ExactFirstBucket = 0, bool CacheExactStageBits = false,
+          bool UseSplitExactStage = false, bool DirectKnownWinners = false,
+          bool UseHigh5DirectTail = false, bool UseWaveB128ExactStage = false,
+          bool UseWaveB128Prefetch = false>
 __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                                                      const int64_t len,
                                                      const IdxT k,
@@ -2759,6 +4391,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     static_assert(std::is_same_v<T, float>);
     static_assert(std::is_same_v<IdxT, int>);
     static_assert(!WRITE_TOPK_VALUES);
+    using PreBits = typename aiter::radix_traits<T>::UnsignedBits;
     constexpr int BitsPerPass       = 12;
     constexpr int num_buckets       = calc_num_buckets<BitsPerPass>();
     constexpr int tail_num_buckets  = 1 << 8;
@@ -2771,6 +4404,61 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     // threshold, and how many elements the staging may hold.
     constexpr int MaxSampleVecs = 2;
     constexpr int StageCapacity = 4096;
+    constexpr int SplitBucketCapacity = (StageCapacity - WinnerCapacity) / 2;
+    constexpr PreBits FixedPrePrefix = static_cast<PreBits>(0x407u) << pass0_start_bit;
+    constexpr PreBits FixedPreLast =
+        FixedPrePrefix | ((static_cast<PreBits>(1) << pass0_start_bit) - 1);
+    static_assert(BlockSize % WARP_SIZE == 0);
+    static_assert(!UseGuardedFixedPredictor || WARP_SIZE == 64);
+    static_assert(!UseGuardedFixedPredictor || BlockSize == 1024);
+    static_assert(!UseGuardedFixedPredictor || (FixedSampleMin >= 0 && FixedSampleMin <= 360));
+    static_assert(StaticRowLen >= 0);
+    constexpr bool UseExactHighBucketPredictor = ExactHighBucket != 0;
+    constexpr unsigned ExactLowBucket =
+        ExactFirstBucket != 0 ? ExactFirstBucket : ExactHighBucket;
+    static_assert(!UseExactHighBucketPredictor || WARP_SIZE == 64);
+    static_assert(!UseExactHighBucketPredictor || BlockSize == 1024);
+    static_assert(!UseExactHighBucketPredictor || StaticRowLen >= 16384);
+    static_assert(!UseExactHighBucketPredictor || StaticRowLen < (1 << 16));
+    static_assert(!UseExactHighBucketPredictor || ExactHighBucket < num_buckets);
+    static_assert(!UseExactHighBucketPredictor || ExactLowBucket <= ExactHighBucket);
+    static_assert(!UseExactHighBucketPredictor ||
+                  ExactHighBucket - ExactLowBucket <= 1);
+    static_assert(!UseExactHighBucketPredictor || !UseGuardedFixedPredictor);
+    static_assert(!CacheExactStageBits || UseExactHighBucketPredictor);
+    static_assert(!UseSplitExactStage ||
+                  (UseExactHighBucketPredictor && CacheExactStageBits &&
+                   (ExactHighBucket == ExactLowBucket + 1 ||
+                    (DirectKnownWinners && ExactHighBucket == ExactLowBucket))));
+    static_assert(!UseSplitExactStage || BlockSize / WARP_SIZE >= 3);
+    static_assert(!UseSplitExactStage ||
+                  StageCapacity == WinnerCapacity + 2 * SplitBucketCapacity);
+    static_assert(!UseSplitExactStage || SplitBucketCapacity > 0);
+    static_assert(!UseSplitExactStage || SplitBucketCapacity <= CandidateCapacity);
+    static_assert(!DirectKnownWinners || UseSplitExactStage);
+    static_assert(!DirectKnownWinners ||
+                  ((StaticRowLen == 16386 && ExactLowBucket == 0x406u &&
+                    ExactHighBucket == 0x407u) ||
+                   (StaticRowLen >= 32768 && StaticRowLen <= 32770 &&
+                    ExactLowBucket == 0x403u && ExactHighBucket == 0x403u)));
+    static_assert(!DirectKnownWinners || WinnerCapacity >= 2048);
+    static_assert(!UseHigh5DirectTail ||
+                  (DirectKnownWinners && UseSplitExactStage && CacheExactStageBits &&
+                   BlockSize == 1024 && WARP_SIZE == 64 &&
+                   StaticRowLen >= 32768 && StaticRowLen <= 32770 &&
+                   ExactLowBucket == 0x403u && ExactHighBucket == 0x403u &&
+                   CandidateCapacity == 32 * WARP_SIZE));
+    static_assert(!UseWaveB128ExactStage ||
+                   (UseExactHighBucketPredictor && CacheExactStageBits &&
+                    !UseSplitExactStage && !DirectKnownWinners &&
+                   !UseHigh5DirectTail && BlockSize == 1024 &&
+                   (StaticRowLen == 16384 || StaticRowLen == 16385) &&
+                    ExactLowBucket == 0x406u &&
+                    ExactHighBucket == 0x407u));
+    static_assert(!UseWaveB128Prefetch ||
+                  (UseWaveB128ExactStage && StaticRowLen == 16384 &&
+                   BlockSize == 1024 && CacheExactStageBits &&
+                   !UseSplitExactStage && !DirectKnownWinners));
 
     __shared__ Counter<T, IdxT> counter;
     __shared__ Counter<T, IdxT> pre_counter;
@@ -2779,6 +4467,9 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __shared__ unsigned long long staged_packed[StageCapacity];
     __shared__ IdxT staged_count;
     __shared__ int staged_overflow;
+    __shared__ IdxT split_first_count;
+    __shared__ IdxT split_last_count;
+    __shared__ int split_direct_ready;
     __shared__ T candidate_values[CandidateCapacity];
     __shared__ IdxT candidate_indices[CandidateCapacity];
     // Pass-1 winners are sparse across the row.  Staging their indices in LDS
@@ -2789,9 +4480,11 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __shared__ IdxT winner_indices[WinnerCapacity];
     __shared__ IdxT candidate_count;
     __shared__ int candidate_overflow;
+    __shared__ IdxT fixed_sample_count;
 
     const int64_t batch_id = blockIdx.x;
-    const IdxT row_len     = static_cast<IdxT>(len);
+    const IdxT row_len = StaticRowLen > 0 ? static_cast<IdxT>(StaticRowLen)
+                                             : static_cast<IdxT>(len);
 
     auto clear_wide_histogram = [&]() {
         static_assert(num_buckets == BlockSize * 4);
@@ -2814,12 +4507,18 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         pre_counter.k              = 0;
         pre_counter.len            = 0;
         pre_counter.kth_value_bits = 0;
-        staged_count               = 0;
         staged_overflow            = 0;
+        if constexpr(UseSplitExactStage)
+        {
+            split_first_count  = 0;
+            split_last_count   = 0;
+            split_direct_ready = 0;
+        }
+        if constexpr(UseGuardedFixedPredictor) fixed_sample_count = 0;
     }
-    __syncthreads();
+    if(threadIdx.x == 0) staged_count = 0;
 
-    in += batch_id * len;
+    in += batch_id * (StaticRowLen > 0 ? static_cast<int64_t>(StaticRowLen) : len);
     out_idx += batch_id * k;
     if constexpr(WRITE_TOPK_VALUES)
     {
@@ -2830,12 +4529,607 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     // the LDS-tail specialization instead of calling
     // filter_and_histogram_for_one_block(): that helper also declares the
     // compaction staging arrays, even though pass 0 cannot use them.
-    clear_wide_histogram();
+    if constexpr(!UseExactHighBucketPredictor) clear_wide_histogram();
     if(threadIdx.x == 0)
     {
         counter.filter_cnt = 0;
     }
+
     __syncthreads();
+
+    PreBits pre_prefix  = 0;
+    bool pass0_predicted = false;
+    if constexpr(UseExactHighBucketPredictor)
+    {
+        constexpr PreBits PredictedFirstPrefix =
+            static_cast<PreBits>(ExactLowBucket) << pass0_start_bit;
+        constexpr PreBits PredictedLastPrefix =
+            static_cast<PreBits>(ExactHighBucket) << pass0_start_bit;
+        uint32_t packed_local = 0;
+        stage_mask_x2 stage_masks = {0, 0};
+        auto predict_and_stage = [&](T value, IdxT i) {
+            PreBits const bits = twiddle_in(value, select_min);
+            unsigned const bucket = static_cast<unsigned>(bits) >> pass0_start_bit;
+            if constexpr(UseSplitExactStage)
+            {
+                if constexpr(!UseHigh5DirectTail)
+                {
+                    // Other exact-stage specializations retain the generic
+                    // one/two-bucket layout unchanged.
+                    IdxT* count_ptr = nullptr;
+                    IdxT offset = 0;
+                    IdxT capacity = 0;
+                    if(bucket < ExactLowBucket)
+                    {
+                        count_ptr = &staged_count;
+                        capacity  = WinnerCapacity;
+                    }
+                    else if(bucket == ExactLowBucket)
+                    {
+                        count_ptr = &split_first_count;
+                        offset    = WinnerCapacity;
+                        capacity  = SplitBucketCapacity;
+                    }
+                    else if(bucket == ExactHighBucket)
+                    {
+                        count_ptr = &split_last_count;
+                        offset    = WinnerCapacity + SplitBucketCapacity;
+                        capacity  = SplitBucketCapacity;
+                    }
+                    if(count_ptr != nullptr)
+                    {
+                        IdxT const pos = atomicAdd(count_ptr, static_cast<IdxT>(1));
+                        if(pos < capacity)
+                        {
+                            staged_packed[offset + pos] =
+                                (static_cast<unsigned long long>(
+                                     static_cast<uint32_t>(bits)) << 32) |
+                                static_cast<unsigned long long>(
+                                    static_cast<unsigned>(i));
+                        }
+                        else
+                        {
+                            atomicExch(&staged_overflow, 1);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Pack the count strictly before the first candidate bucket
+                // and the count in it.  staged_count supplies the inclusive
+                // second boundary when two adjacent buckets are enabled.
+                packed_local += bucket < ExactLowBucket
+                                    ? 1u
+                                    : (bucket == ExactLowBucket ? (1u << 16) : 0u);
+                if(bucket <= ExactHighBucket)
+                {
+                    IdxT const pos = atomicAdd(&staged_count, static_cast<IdxT>(1));
+                    if(pos < StageCapacity)
+                    {
+                        uint32_t const staged_bits = CacheExactStageBits
+                                                         ? static_cast<uint32_t>(bits)
+                                                         : __float_as_uint(value);
+                        staged_packed[pos] =
+                            (static_cast<unsigned long long>(staged_bits) << 32) |
+                            static_cast<unsigned long long>(static_cast<unsigned>(i));
+                    }
+                    else
+                    {
+                        atomicExch(&staged_overflow, 1);
+                    }
+                }
+            }
+        };
+        if constexpr(UseHigh5DirectTail)
+        {
+            if constexpr(StaticRowLen == 32768)
+            {
+                stage_masks = vectorized_process_stage_masks_exact_32768<
+                    T, IdxT, BlockSize, ExactLowBucket, pass0_start_bit>(
+                    in, select_min);
+            }
+            else if constexpr(StaticRowLen == 32769)
+            {
+                stage_masks = vectorized_process_stage_masks_exact_32769<
+                    T, IdxT, BlockSize, ExactLowBucket, pass0_start_bit>(
+                    in, select_min);
+            }
+            else if constexpr(StaticRowLen == 32770)
+            {
+                stage_masks = vectorized_process_stage_masks_exact_32770<
+                    T, IdxT, BlockSize, ExactLowBucket, pass0_start_bit>(
+                    in, select_min);
+            }
+            else
+            {
+                stage_masks = vectorized_process_stage_masks<
+                    T, IdxT, ExactLowBucket, pass0_start_bit>(
+                    threadIdx.x, blockDim.x, in, row_len, select_min);
+            }
+        }
+        else if constexpr(UseWaveB128ExactStage)
+        {
+            static_assert(sizeof(T) == 4 && sizeof(WideT) == 4 * sizeof(T));
+            if constexpr(StaticRowLen == 16384)
+            {
+                if((reinterpret_cast<size_t>(in) % sizeof(WideT)) == 0)
+                {
+                    constexpr int ItemsPerWide = sizeof(WideT) / sizeof(T);
+                    union WideValues
+                    {
+                        WideT scalar;
+                        T array[ItemsPerWide];
+                    } wide;
+                    WideT const* in_cast = reinterpret_cast<WideT const*>(in);
+                    int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
+                    WideT prefetched;
+                    if constexpr(UseWaveB128Prefetch)
+                    {
+                        prefetched = in_cast[static_cast<IdxT>(threadIdx.x)];
+                    }
+
+                    // One returning LDS reservation covers the four values in a
+                    // B128 load for the whole Wave64.  The ordinary callback does
+                    // one reservation per scalar; batching leaves the exact
+                    // packed predictor counts and staged representation unchanged.
+#pragma unroll 1
+                    for(int group = 0; group < 4; ++group)
+                    {
+                        if constexpr(UseWaveB128Prefetch)
+                        {
+                            wide.scalar = prefetched;
+                            if(group + 1 < 4)
+                            {
+                                prefetched = in_cast[static_cast<IdxT>(threadIdx.x) +
+                                                     (group + 1) * BlockSize];
+                            }
+                        }
+                        else
+                        {
+                            wide.scalar = in_cast[static_cast<IdxT>(threadIdx.x) +
+                                                  group * BlockSize];
+                        }
+                        PreBits bits[ItemsPerWide];
+                        unsigned candidate_mask = 0;
+#pragma unroll
+                        for(int j = 0; j < ItemsPerWide; ++j)
+                        {
+                            bits[j] = twiddle_in(wide.array[j], select_min);
+                            unsigned const bucket =
+                                static_cast<unsigned>(bits[j]) >> pass0_start_bit;
+                            packed_local += bucket < ExactLowBucket
+                                                ? 1u
+                                                : (bucket == ExactLowBucket
+                                                       ? (1u << 16)
+                                                       : 0u);
+                            candidate_mask |= static_cast<unsigned>(
+                                                  bucket <= ExactHighBucket)
+                                              << j;
+                        }
+
+                        IdxT const lane_count = static_cast<IdxT>(
+                            __builtin_popcount(candidate_mask));
+                        uint32_t const wave_end = wave_inclusive_sum_dpp_u32(
+                            static_cast<uint32_t>(lane_count));
+                        IdxT const lane_base =
+                            static_cast<IdxT>(wave_end) - lane_count;
+                        IdxT leader_base = 0;
+                        if(lane == WARP_SIZE - 1 && wave_end != 0)
+                        {
+                            leader_base = atomicAdd(
+                                &staged_count, static_cast<IdxT>(wave_end));
+                        }
+                        IdxT const wave_base = static_cast<IdxT>(
+                            __builtin_amdgcn_readlane(leader_base, WARP_SIZE - 1));
+
+                        int ordinal = 0;
+#pragma unroll
+                        for(int j = 0; j < ItemsPerWide; ++j)
+                        {
+                            if((candidate_mask & (1u << j)) != 0)
+                            {
+                                IdxT const pos = wave_base + lane_base + ordinal;
+                                if(pos < StageCapacity)
+                                {
+                                    IdxT const idx =
+                                        (static_cast<IdxT>(threadIdx.x) +
+                                         group * BlockSize) *
+                                            ItemsPerWide +
+                                        j;
+                                    staged_packed[pos] =
+                                        (static_cast<unsigned long long>(
+                                             static_cast<uint32_t>(bits[j]))
+                                         << 32) |
+                                        static_cast<unsigned long long>(
+                                            static_cast<unsigned>(idx));
+                                }
+                                ++ordinal;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    vectorized_process(
+                        threadIdx.x, blockDim.x, in, row_len, predict_and_stage);
+                }
+            }
+            else
+            {
+                static_assert(StaticRowLen == 16385);
+                constexpr int ItemsPerWide = sizeof(WideT) / sizeof(T);
+                int const skip_cnt =
+                    (reinterpret_cast<size_t>(in) % sizeof(WideT))
+                        ? static_cast<int>((sizeof(WideT) -
+                                            reinterpret_cast<size_t>(in) %
+                                                sizeof(WideT)) /
+                                           sizeof(T))
+                        : 0;
+                bool const can_use_four_full_vectors =
+                    skip_cnt <= 1 || blockIdx.x + 1 < gridDim.x;
+                if(can_use_four_full_vectors)
+                {
+                    union WideValues
+                    {
+                        WideT scalar;
+                        T array[ItemsPerWide];
+                    } wide;
+                    WideT const* in_cast =
+                        reinterpret_cast<WideT const*>(in + skip_cnt);
+                    int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
+
+#pragma unroll 1
+                    for(int group = 0; group < 4; ++group)
+                    {
+                        IdxT const vector_i =
+                            static_cast<IdxT>(threadIdx.x) + group * BlockSize;
+                        IdxT const logical_base =
+                            static_cast<IdxT>(skip_cnt) + vector_i * ItemsPerWide;
+                        wide.scalar = in_cast[vector_i];
+                        PreBits bits[ItemsPerWide];
+                        unsigned candidate_mask = 0;
+#pragma unroll
+                        for(int j = 0; j < ItemsPerWide; ++j)
+                        {
+                            bits[j] = twiddle_in(wide.array[j], select_min);
+                            unsigned const bucket =
+                                static_cast<unsigned>(bits[j]) >> pass0_start_bit;
+                            packed_local += bucket < ExactLowBucket
+                                                ? 1u
+                                                : (bucket == ExactLowBucket
+                                                       ? (1u << 16)
+                                                       : 0u);
+                            candidate_mask |= static_cast<unsigned>(
+                                                  bucket <= ExactHighBucket)
+                                              << j;
+                        }
+
+                        // Only the last vector lane can contain the one or two
+                        // values read from the next row for the 4B/8B phases.
+                        // Count the common full-vector path without per-value
+                        // bounds, then remove those invalid values in that one
+                        // lane before the wave reservation and block reduction.
+                        if(group == 3 && threadIdx.x == BlockSize - 1 &&
+                           skip_cnt > 1)
+                        {
+                            int const valid_count = ItemsPerWide + 1 - skip_cnt;
+                            unsigned const valid_mask =
+                                (1u << static_cast<unsigned>(valid_count)) - 1u;
+#pragma unroll
+                            for(int j = 0; j < ItemsPerWide; ++j)
+                            {
+                                if(j >= valid_count)
+                                {
+                                    unsigned const bucket =
+                                        static_cast<unsigned>(bits[j]) >>
+                                        pass0_start_bit;
+                                    packed_local -= bucket < ExactLowBucket
+                                                        ? 1u
+                                                        : (bucket == ExactLowBucket
+                                                               ? (1u << 16)
+                                                               : 0u);
+                                }
+                            }
+                            candidate_mask &= valid_mask;
+                        }
+
+                        IdxT const lane_count = static_cast<IdxT>(
+                            __builtin_popcount(candidate_mask));
+                        uint32_t const wave_end = wave_inclusive_sum_dpp_u32(
+                            static_cast<uint32_t>(lane_count));
+                        IdxT const lane_base =
+                            static_cast<IdxT>(wave_end) - lane_count;
+                        IdxT leader_base = 0;
+                        if(lane == WARP_SIZE - 1 && wave_end != 0)
+                        {
+                            leader_base = atomicAdd(
+                                &staged_count, static_cast<IdxT>(wave_end));
+                            leader_base =
+                                leader_base + static_cast<IdxT>(wave_end) <=
+                                        StageCapacity
+                                    ? leader_base
+                                    : StageCapacity;
+                        }
+                        IdxT const wave_base = static_cast<IdxT>(
+                            __builtin_amdgcn_readlane(leader_base, WARP_SIZE - 1));
+
+                        if(wave_base < StageCapacity)
+                        {
+                            int ordinal = 0;
+#pragma unroll
+                            for(int j = 0; j < ItemsPerWide; ++j)
+                            {
+                                if((candidate_mask & (1u << j)) != 0)
+                                {
+                                    IdxT const pos =
+                                        wave_base + lane_base + ordinal;
+                                    IdxT const idx = logical_base + j;
+                                    staged_packed[pos] =
+                                        (static_cast<unsigned long long>(
+                                             static_cast<uint32_t>(bits[j]))
+                                         << 32) |
+                                        static_cast<unsigned long long>(
+                                            static_cast<unsigned>(idx));
+                                    ++ordinal;
+                                }
+                            }
+                        }
+                    }
+
+                    if(static_cast<int>(threadIdx.x) < skip_cnt)
+                    {
+                        IdxT const idx = static_cast<IdxT>(threadIdx.x);
+                        predict_and_stage(in[idx], idx);
+                    }
+                    IdxT const remain_i = static_cast<IdxT>(skip_cnt) +
+                                          static_cast<IdxT>(4096 * ItemsPerWide) +
+                                          static_cast<IdxT>(threadIdx.x);
+                    if(remain_i < row_len)
+                    {
+                        predict_and_stage(in[remain_i], remain_i);
+                    }
+                }
+                else
+                {
+                    vectorized_process(
+                        threadIdx.x, blockDim.x, in, row_len, predict_and_stage);
+                }
+            }
+        }
+        else if constexpr(StaticRowLen == 16385 && BlockSize == 1024)
+        {
+            vectorized_process_exact_16385<T, IdxT, BlockSize>(in, predict_and_stage);
+        }
+        else
+        {
+            vectorized_process(
+                threadIdx.x, blockDim.x, in, row_len, predict_and_stage);
+        }
+
+        if constexpr(UseHigh5DirectTail)
+        {
+            static_assert(sizeof(T) == 4 && sizeof(WideT) == 16);
+            static_assert(StaticRowLen <= 32770);
+            uint64_t const strict_mask = static_cast<uint64_t>(stage_masks[0]);
+            uint64_t const exact_mask  = static_cast<uint64_t>(stage_masks[1]);
+
+            IdxT const strict_lane_count =
+                static_cast<IdxT>(__builtin_popcountll(strict_mask));
+            IdxT const exact_lane_count =
+                static_cast<IdxT>(__builtin_popcountll(exact_mask));
+            uint32_t const packed_lane =
+                static_cast<uint32_t>(strict_lane_count) |
+                (static_cast<uint32_t>(exact_lane_count) << 16);
+            uint32_t const packed_end = wave_inclusive_sum_dpp_u32(packed_lane);
+            IdxT const strict_lane_end = static_cast<IdxT>(packed_end & 0xffffu);
+            IdxT const exact_lane_end  = static_cast<IdxT>(packed_end >> 16);
+            IdxT const strict_lane_base = strict_lane_end - strict_lane_count;
+            IdxT const exact_lane_base  = exact_lane_end - exact_lane_count;
+            int const lane = static_cast<int>(threadIdx.x) % WARP_SIZE;
+
+            IdxT strict_leader_base = 0;
+            IdxT exact_leader_base  = 0;
+            if(lane == WARP_SIZE - 1)
+            {
+                if(strict_lane_end > 0)
+                {
+                    strict_leader_base = atomicAdd(&staged_count, strict_lane_end);
+                }
+                if(exact_lane_end > 0)
+                {
+                    exact_leader_base = atomicAdd(&split_first_count, exact_lane_end);
+                }
+                if(strict_leader_base + strict_lane_end > WinnerCapacity ||
+                   exact_leader_base + exact_lane_end > SplitBucketCapacity)
+                {
+                    atomicExch(&staged_overflow, 1);
+                }
+            }
+            IdxT const strict_wave_base = static_cast<IdxT>(
+                __builtin_amdgcn_readlane(strict_leader_base, WARP_SIZE - 1));
+            IdxT const exact_wave_base = static_cast<IdxT>(
+                __builtin_amdgcn_readlane(exact_leader_base, WARP_SIZE - 1));
+
+            constexpr int ItemsPerWide = sizeof(WideT) / sizeof(T);
+            int skip_cnt =
+                (reinterpret_cast<size_t>(in) % sizeof(WideT))
+                    ? static_cast<int>((sizeof(WideT) -
+                                        reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+                                       sizeof(T))
+                    : 0;
+            if(skip_cnt > row_len) skip_cnt = row_len;
+            IdxT const len_cast = (row_len - skip_cnt) / ItemsPerWide;
+            IdxT const body_vecs =
+                static_cast<IdxT>(threadIdx.x) < len_cast
+                    ? 1 + (len_cast - 1 - static_cast<IdxT>(threadIdx.x)) / BlockSize
+                    : 0;
+            int const body_slots = static_cast<int>(body_vecs) * ItemsPerWide;
+            IdxT const tail_begin = skip_cnt + len_cast * ItemsPerWide;
+            auto index_from_slot = [&](int slot) -> IdxT {
+                if(slot < body_slots)
+                {
+                    int const q = slot / ItemsPerWide;
+                    int const j = slot % ItemsPerWide;
+                    return skip_cnt +
+                           (static_cast<IdxT>(threadIdx.x) + q * BlockSize) *
+                               ItemsPerWide +
+                           j;
+                }
+                slot -= body_slots;
+                if(static_cast<int>(threadIdx.x) < skip_cnt)
+                {
+                    if(slot == 0) return static_cast<IdxT>(threadIdx.x);
+                    --slot;
+                }
+                return tail_begin + static_cast<IdxT>(threadIdx.x);
+            };
+
+            int ordinal = 0;
+            for(uint64_t mask = strict_mask; mask != 0;
+                mask &= mask - 1, ++ordinal)
+            {
+                int const slot = __builtin_ctzll(mask);
+                IdxT const pos = strict_wave_base + strict_lane_base + ordinal;
+                if(pos < WinnerCapacity)
+                {
+                    // DirectKnownWinners consumes only the index from this
+                    // region; the key is intentionally not reloaded.
+                    staged_packed[pos] = static_cast<unsigned long long>(
+                        static_cast<unsigned>(index_from_slot(slot)));
+                }
+            }
+
+            ordinal = 0;
+            for(uint64_t mask = exact_mask; mask != 0;
+                mask &= mask - 1, ++ordinal)
+            {
+                int const slot = __builtin_ctzll(mask);
+                IdxT const idx = index_from_slot(slot);
+                IdxT const pos = exact_wave_base + exact_lane_base + ordinal;
+                if(pos < SplitBucketCapacity)
+                {
+                    PreBits const bits = twiddle_in(in[idx], select_min);
+                    staged_packed[WinnerCapacity + pos] =
+                        (static_cast<unsigned long long>(
+                             static_cast<uint32_t>(bits)) << 32) |
+                        static_cast<unsigned long long>(static_cast<unsigned>(idx));
+                }
+            }
+        }
+
+        if constexpr(UseSplitExactStage)
+        {
+            __syncthreads();
+            if(threadIdx.x == 0)
+            {
+                IdxT const before_first = staged_count;
+                IdxT const first_len    = split_first_count;
+                IdxT const last_len     = split_last_count;
+                IdxT const through_first = before_first + first_len;
+                if(before_first < k && k <= through_first)
+                {
+                    counter.k              = k - before_first;
+                    counter.len            = first_len;
+                    counter.kth_value_bits = PredictedFirstPrefix;
+                }
+                else if constexpr(ExactLowBucket != ExactHighBucket)
+                {
+                    IdxT const through_last = through_first + last_len;
+                    if(through_first < k && k <= through_last)
+                    {
+                        counter.k              = k - through_first;
+                        counter.len            = last_len;
+                        counter.kth_value_bits = PredictedLastPrefix;
+                    }
+                }
+                // Preserve all three lengths across the pass-1 counter reset.
+                // choose_bucket_reduce does not reuse wave_sums until every
+                // staged entry has been consumed.
+                wave_sums[0] = before_first;
+                wave_sums[1] = first_len;
+                wave_sums[2] = last_len;
+            }
+        }
+        else
+        {
+            uint32_t const packed_wave = wave_inclusive_sum_dpp_u32(packed_local);
+            int const lane             = static_cast<int>(threadIdx.x) % WARP_SIZE;
+            int const wave             = static_cast<int>(threadIdx.x) / WARP_SIZE;
+            constexpr int waves        = BlockSize / WARP_SIZE;
+            if(lane == WARP_SIZE - 1)
+            {
+                wave_sums[wave] = static_cast<IdxT>(packed_wave);
+            }
+            __syncthreads();
+
+            if(wave == 0)
+            {
+                uint32_t const packed = wave_inclusive_sum_dpp_u32(
+                    lane < waves ? static_cast<uint32_t>(wave_sums[lane]) : 0u);
+                if(lane == waves - 1)
+                {
+                    if constexpr(UseWaveB128ExactStage &&
+                                 (StaticRowLen == 16384 ||
+                                  StaticRowLen == 16385))
+                    {
+                        // Every reservation contributes a non-negative exact
+                        // count.  Each wave reservation is stored only when its
+                        // whole [base, base + count) range fits; an overflowing
+                        // batch is discarded and this deferred flag forces the
+                        // unchanged full-row fallback.
+                        staged_overflow = staged_count > StageCapacity;
+                    }
+                    IdxT const before_first = static_cast<IdxT>(packed & 0xffffu);
+                    IdxT const first_len    = static_cast<IdxT>(packed >> 16);
+                    IdxT const through_first = before_first + first_len;
+                    if(before_first < k && k <= through_first)
+                    {
+                        counter.k              = k - before_first;
+                        counter.len            = first_len;
+                        counter.kth_value_bits = PredictedFirstPrefix;
+                    }
+                    else if constexpr(ExactLowBucket != ExactHighBucket)
+                    {
+                        // The two candidate buckets are adjacent, so the
+                        // staged total minus the first boundary is exact.
+                        IdxT const through_last = staged_count;
+                        if(through_first < k && k <= through_last)
+                        {
+                            counter.k              = k - through_first;
+                            counter.len            = through_last - through_first;
+                            counter.kth_value_bits = PredictedLastPrefix;
+                        }
+                    }
+                }
+            }
+        }
+        // On a hit this is the pass-1 histogram clear.  On a miss it prepares
+        // the unchanged exact pass-0 fallback below.
+        clear_wide_histogram();
+        __syncthreads();
+        pass0_predicted = counter.kth_value_bits != 0;
+        pre_prefix = PredictedLastPrefix;
+    }
+
+    if(!pass0_predicted)
+    {
+        if constexpr(UseExactHighBucketPredictor)
+        {
+            // Discard the speculative staging before rebuilding the ordinary
+            // sample-derived prefix and exact high histogram.
+            if(threadIdx.x == 0)
+            {
+                staged_count    = 0;
+                staged_overflow = 0;
+                if constexpr(UseSplitExactStage)
+                {
+                    split_first_count = 0;
+                    split_last_count  = 0;
+                }
+            }
+            __syncthreads();
+        }
 
     IdxT* const pass0_histogram = histogram;
     auto histogram_one = [pass0_histogram, select_min](T value) {
@@ -2846,9 +5140,10 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         return bits;
     };
 
-    // Predict a staging threshold from the row's leading slice, so that the
-    // one full-row scan that pass 0 already does can also put the elements
-    // pass 1 will want into LDS.
+    // Predict a staging threshold so that the one full-row scan that pass 0
+    // already does can also put the elements pass 1 will want into LDS. The
+    // guarded specialization reuses the ordinary leading-slice values to
+    // validate a fixed threshold and, when accepted, skips the bucket scan.
     //
     // Pass 1 exists only to find the roughly k elements at or above the
     // crossing prefix, and it pays a full traversal of the row to do it --
@@ -2860,9 +5155,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     // full-row one either way, so `high_prefix` stays exact; the staged set is
     // used only when it provably contains every element pass 1 could want
     // (`high_prefix <= pre_prefix`) and did not overflow. Otherwise the
-    // original full-row pass runs, unchanged. A sorted row, whose leading
-    // slice says nothing about the rest, lands there and pays one slice of
-    // histogram work for the attempt.
+    // original full-row pass runs unchanged.
     //
     // The slice is up to an eighth of the row, one element per thread per
     // step, capped at two steps. It is read with scalar loads rather than
@@ -2874,9 +5167,9 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     int nsample = static_cast<int>((row_len / 8 + BlockSize - 1) / BlockSize);
     if(nsample < 1) nsample = 1;
     if(nsample > MaxSampleVecs) nsample = MaxSampleVecs;
-    IdxT const sample_len = static_cast<IdxT>(nsample) * BlockSize;
-
     T sample_values[MaxSampleVecs];
+    bool fixed_pair_hit = false;
+
 #pragma unroll
     for(int j = 0; j < MaxSampleVecs; ++j)
     {
@@ -2884,27 +5177,54 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         if(j < nsample)
         {
             sample_values[j] = in[static_cast<IdxT>(threadIdx.x) + j * BlockSize];
-            histogram_one(sample_values[j]);
+            PreBits const bits = histogram_one(sample_values[j]);
+            if constexpr(UseGuardedFixedPredictor)
+            {
+                fixed_pair_hit = fixed_pair_hit || bits <= FixedPreLast;
+            }
+        }
+    }
+    if constexpr(UseGuardedFixedPredictor)
+    {
+        int const wave_fixed_count = __builtin_popcountll(__ballot(fixed_pair_hit));
+        if(static_cast<int>(threadIdx.x) % WARP_SIZE == WARP_SIZE - 1)
+        {
+            atomicAdd(&fixed_sample_count, static_cast<IdxT>(wave_fixed_count));
         }
     }
     __syncthreads();
-    // Aim the threshold at the midpoint between what the answer needs (k) and
-    // what the staging can hold, so sampling error and the coarseness of a
-    // 4096-bucket boundary have the same room on either side. Undershoot loses
-    // the fast path, overshoot overflows it, and near the cut one bucket is
-    // already several hundred elements wide.
-    IdxT const stage_target = k + k / 4;
-    // This specialization is gated to k=2048 and len<=32770, while sample_len
-    // is capped at 2048.  The largest numerator is therefore 5,242,880, so
-    // signed 32-bit arithmetic is exact.  Keeping it in IdxT avoids lowering
-    // this one quotient to a long software i64 division sequence on gfx950.
-    IdxT sample_k = static_cast<IdxT>((stage_target * sample_len) / row_len);
-    if(sample_k < 1) sample_k = 1;
-    if(sample_k > sample_len) sample_k = sample_len;
-    choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
-        &pre_counter, histogram, wave_sums, sample_k, pass0_start_bit);
-    __syncthreads();
-    auto const pre_prefix = pre_counter.kth_value_bits;
+
+    bool use_fixed_predictor = false;
+    if constexpr(UseGuardedFixedPredictor)
+    {
+        // Each lane contributes whether either of its two baseline samples is
+        // >= 1.0. For randn(0,1), about 299 of the 1024 lane pairs hit. This
+        // window corresponds to an estimated full-row tail of about 2325--
+        // 3192 values: safely above k and below StageCapacity.
+        use_fixed_predictor = fixed_sample_count >= FixedSampleMin && fixed_sample_count <= 360;
+    }
+    if(use_fixed_predictor)
+    {
+        pre_prefix = FixedPrePrefix;
+    }
+    else
+    {
+        // Aim the threshold at the midpoint between what the answer needs (k)
+        // and what the staging can hold. Undershoot loses the fast path;
+        // overshoot overflows it.
+        IdxT const stage_target = k + k / 4;
+        IdxT const sample_len_for_rank = static_cast<IdxT>(nsample) * BlockSize;
+        // k=2048, len<=32770 and sample_len<=2048 keep this quotient in i32.
+        IdxT sample_k =
+            static_cast<IdxT>((stage_target * sample_len_for_rank) / row_len);
+        if(sample_k < 1) sample_k = 1;
+        if(sample_k > sample_len_for_rank) sample_k = sample_len_for_rank;
+        choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
+            &pre_counter, histogram, wave_sums, sample_k, pass0_start_bit);
+        __syncthreads();
+        pre_prefix = pre_counter.kth_value_bits;
+    }
+    IdxT const sample_len = static_cast<IdxT>(nsample) * BlockSize;
     auto const pre_last   = static_cast<decltype(pre_prefix)>(
         pre_prefix | ((1u << pass0_start_bit) - 1u));
 
@@ -2946,15 +5266,256 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     __syncthreads();
     choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
         &counter, histogram, wave_sums, k, pass0_start_bit);
-    __syncthreads();
+    }
+
+    // On the M=256 exact-0x403 hit, resolve five more prefix bits while the
+    // crossing bucket is still in split LDS.  Fixed 64-slot sub-buckets make
+    // every staged position stable; Wave0 resolves the remaining 15 bits.
+    // Any sub-bucket overflow leaves global output untouched and falls through
+    // to the unchanged middle-12 path below.
+    if constexpr(UseHigh5DirectTail)
+    {
+        if(pass0_predicted && !staged_overflow)
+        {
+            constexpr int High5Bits        = 5;
+            constexpr int High5Bins        = 1 << High5Bits;
+            constexpr int High5BinCapacity = WARP_SIZE;
+            constexpr int High5StartBit    = pass0_start_bit - High5Bits;
+            static_assert(High5Bins * High5BinCapacity == CandidateCapacity);
+
+            if(threadIdx.x == 0) candidate_overflow = 0;
+            __syncthreads();
+
+            IdxT const first_len = wave_sums[1];
+            for(IdxT s = static_cast<IdxT>(threadIdx.x); s < first_len; s += BlockSize)
+            {
+                unsigned long long const packed = staged_packed[WinnerCapacity + s];
+                PreBits const bits = static_cast<PreBits>(packed >> 32);
+                int const bin = static_cast<int>(
+                    (bits >> High5StartBit) & static_cast<PreBits>(High5Bins - 1));
+                IdxT const slot = atomicAdd(histogram + bin, static_cast<IdxT>(1));
+                if(slot < High5BinCapacity)
+                {
+                    int const pos = bin * High5BinCapacity + static_cast<int>(slot);
+                    candidate_values[pos] = __builtin_bit_cast(T, bits);
+                    candidate_indices[pos] =
+                        static_cast<IdxT>(static_cast<unsigned>(packed));
+                }
+                else
+                {
+                    atomicExch(&candidate_overflow, 1);
+                }
+            }
+            __syncthreads();
+
+            if(threadIdx.x < WARP_SIZE)
+            {
+                int const lane = static_cast<int>(threadIdx.x);
+                IdxT const count = lane < High5Bins ? histogram[lane] : 0;
+                IdxT const inclusive = static_cast<IdxT>(
+                    wave_inclusive_sum_dpp(static_cast<int>(count)));
+                IdxT const exclusive = inclusive - count;
+                IdxT const needed = counter.k;
+                bool const crossing = !candidate_overflow && lane < High5Bins &&
+                                      exclusive < needed && needed <= inclusive;
+                uint64_t const crossing_mask =
+                    static_cast<uint64_t>(__ballot(crossing));
+
+                if(lane < High5Bins)
+                {
+                    uint32_t const packed = static_cast<uint32_t>(count) |
+                                            (static_cast<uint32_t>(exclusive) << 16);
+                    histogram[lane] = static_cast<IdxT>(packed);
+                }
+                if(lane == 0)
+                {
+                    int selected = -1;
+                    IdxT selected_exclusive = 0;
+                    IdxT const winner_base = k - needed;
+                    bool const one_crossing =
+                        crossing_mask != 0 &&
+                        (crossing_mask & (crossing_mask - uint64_t{1})) == 0;
+                    if(one_crossing && counter.len == first_len && needed > 0 &&
+                       needed <= first_len)
+                    {
+                        selected = __builtin_ctzll(crossing_mask);
+                        selected_exclusive = static_cast<IdxT>(
+                            __builtin_amdgcn_readlane(exclusive, selected));
+                        IdxT const selected_count = static_cast<IdxT>(
+                            __builtin_amdgcn_readlane(count, selected));
+                        IdxT const selected_rank = needed - selected_exclusive;
+                        if(winner_base == wave_sums[0] &&
+                           selected_count > 0 && selected_count <= High5BinCapacity &&
+                           selected_exclusive >= 0 &&
+                           selected_exclusive + selected_count <= first_len &&
+                           selected_rank > 0 && selected_rank <= selected_count)
+                        {
+                            counter.k              = selected_rank;
+                            counter.len            = selected_count;
+                            counter.kth_value_bits =
+                                (static_cast<PreBits>(ExactLowBucket) << pass0_start_bit) |
+                                (static_cast<PreBits>(selected) << High5StartBit);
+                        }
+                        else
+                        {
+                            selected = -1;
+                            selected_exclusive = 0;
+                        }
+                    }
+                    wave_sums[0] = static_cast<IdxT>(selected);
+                    wave_sums[1] = selected_exclusive;
+                    wave_sums[2] = winner_base;
+                }
+            }
+            __syncthreads();
+
+            int const selected_bin = static_cast<int>(wave_sums[0]);
+            if(!candidate_overflow && selected_bin >= 0)
+            {
+                IdxT const winner_base = wave_sums[2];
+                for(IdxT s = static_cast<IdxT>(threadIdx.x); s < winner_base;
+                    s += BlockSize)
+                {
+                    unsigned long long const packed = staged_packed[s];
+                    __builtin_nontemporal_store(
+                        static_cast<IdxT>(static_cast<unsigned>(packed)), out_idx + s);
+                }
+
+                IdxT const selected_exclusive = wave_sums[1];
+                int const preceding_slots = selected_bin * High5BinCapacity;
+                for(int q = static_cast<int>(threadIdx.x); q < preceding_slots;
+                    q += BlockSize)
+                {
+                    int const bin  = q / High5BinCapacity;
+                    int const slot = q % High5BinCapacity;
+                    uint32_t const packed = static_cast<uint32_t>(histogram[bin]);
+                    IdxT const count = static_cast<IdxT>(packed & 0xffffu);
+                    IdxT const exclusive = static_cast<IdxT>(packed >> 16);
+                    if(slot < count)
+                    {
+                        __builtin_nontemporal_store(
+                            candidate_indices[q], out_idx + winner_base + exclusive + slot);
+                    }
+                }
+
+                if(threadIdx.x < WARP_SIZE)
+                {
+                    int const lane = static_cast<int>(threadIdx.x);
+                    IdxT const staged_len = counter.len;
+                    IdxT const needed = counter.k;
+                    PreBits key_bits = 0;
+                    IdxT key_index = 0;
+                    if(lane < staged_len)
+                    {
+                        int const pos = selected_bin * High5BinCapacity + lane;
+                        key_bits = __builtin_bit_cast(PreBits, candidate_values[pos]);
+                        key_index = candidate_indices[pos];
+                    }
+
+                    uint64_t const valid_mask =
+                        static_cast<uint64_t>(__ballot(lane < staged_len));
+                    uint64_t active_mask = valid_mask;
+                    IdxT rank = needed;
+#pragma unroll 1
+                    for(int bit = High5StartBit - 1;
+                        bit >= 0 && (active_mask & (active_mask - uint64_t{1})) != 0;
+                        --bit)
+                    {
+                        PreBits const bit_mask = PreBits{1} << bit;
+                        uint64_t const zero_mask =
+                            active_mask &
+                            static_cast<uint64_t>(__ballot((key_bits & bit_mask) == 0));
+                        IdxT const zero_count =
+                            static_cast<IdxT>(__builtin_popcountll(zero_mask));
+                        if(rank <= zero_count)
+                        {
+                            active_mask = zero_mask;
+                        }
+                        else
+                        {
+                            active_mask &= ~zero_mask;
+                            rank -= zero_count;
+                        }
+                    }
+
+                    int const kth_lane = __builtin_ctzll(active_mask);
+                    PreBits const kth_bits = static_cast<PreBits>(
+                        __builtin_amdgcn_readlane(key_bits, kth_lane));
+                    uint64_t const less_mask =
+                        valid_mask & static_cast<uint64_t>(__ballot(key_bits < kth_bits));
+                    uint64_t const equal_mask =
+                        valid_mask & static_cast<uint64_t>(__ballot(key_bits == kth_bits));
+                    IdxT const equal_needed =
+                        needed - static_cast<IdxT>(__builtin_popcountll(less_mask));
+                    uint64_t const lower_lanes =
+                        lane == 0 ? uint64_t{0} : ((uint64_t{1} << lane) - uint64_t{1});
+                    bool const take_equal =
+                        key_bits == kth_bits &&
+                        static_cast<IdxT>(__builtin_popcountll(equal_mask & lower_lanes)) <
+                            equal_needed;
+                    uint64_t const selected_mask =
+                        valid_mask &
+                        static_cast<uint64_t>(__ballot(key_bits < kth_bits || take_equal));
+                    if(selected_mask & (uint64_t{1} << lane))
+                    {
+                        IdxT const pos = static_cast<IdxT>(
+                            __builtin_popcountll(selected_mask & lower_lanes));
+                        __builtin_nontemporal_store(
+                            key_index,
+                            out_idx + winner_base + selected_exclusive + pos);
+                    }
+                }
+                return;
+            }
+
+            clear_wide_histogram();
+            __syncthreads();
+        }
+    }
 
     // Pass 1: build the middle-12 histogram, immediately emit high-prefix
     // winners, and retain only the crossing high-prefix bucket in LDS.
-    clear_wide_histogram();
+    if(!pass0_predicted) clear_wide_histogram();
     if(threadIdx.x == 0)
     {
         candidate_count    = 0;
         candidate_overflow = 0;
+        if constexpr(UseSplitExactStage) split_direct_ready = 0;
+        if constexpr(DirectKnownWinners)
+        {
+            // A split predictor hit gives every staged element a stable LDS
+            // slot.  Validate the dynamic counts before trusting that layout;
+            // any mismatch leaves split_direct_ready clear and pass 1 falls
+            // back to the unchanged full-row scan below.
+            if(pass0_predicted && !staged_overflow)
+            {
+                IdxT const before_len = wave_sums[0];
+                IdxT const first_len  = wave_sums[1];
+                IdxT const last_len   = wave_sums[2];
+                unsigned const selected_bucket =
+                    static_cast<unsigned>(counter.kth_value_bits >> pass0_start_bit);
+                bool const selected_first = selected_bucket == ExactLowBucket;
+                bool const selected_last  = ExactLowBucket != ExactHighBucket &&
+                                            selected_bucket == ExactHighBucket;
+                IdxT const known_count =
+                    selected_last ? before_len + first_len : before_len;
+                IdxT const selected_count = selected_last ? last_len : first_len;
+                bool const counts_fit =
+                    before_len <= WinnerCapacity && first_len <= SplitBucketCapacity &&
+                    last_len <= SplitBucketCapacity && known_count < k &&
+                    known_count <= WinnerCapacity && selected_count > 0 &&
+                    selected_count <= SplitBucketCapacity &&
+                    selected_count <= CandidateCapacity;
+                bool const rank_matches =
+                    counter.len == selected_count && counter.k == k - known_count;
+                if((selected_first || selected_last) && counts_fit && rank_matches)
+                {
+                    counter.out_cnt    = known_count;
+                    candidate_count    = selected_count;
+                    split_direct_ready = 1;
+                }
+            }
+        }
     }
     __syncthreads();
 
@@ -2999,17 +5560,191 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
             atomicAdd(histogram_ptr + bucket, static_cast<IdxT>(1));
         }
     };
+    auto stage_pass1_bits = [histogram_ptr,
+                             candidate_values_ptr,
+                             candidate_indices_ptr,
+                             winner_indices_ptr,
+                             p_candidate_count,
+                             p_candidate_overflow,
+                             p_out_cnt,
+                             high_prefix](PreBits bits, IdxT idx) {
+        PreBits const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
+        if(prefix < high_prefix)
+        {
+            IdxT const pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+            winner_indices_ptr[pos] = idx;
+        }
+        else if(prefix == high_prefix)
+        {
+            IdxT const pos = atomicAdd(p_candidate_count, static_cast<IdxT>(1));
+            if(pos < CandidateCapacity)
+            {
+                // twiddle_in is an involution for fp32.  Reconstruct a float
+                // only for the crossing bucket; definite winners need no key.
+                PreBits const raw_bits =
+                    bits ^ ((bits >> 31) ? 0u : static_cast<PreBits>(0x7fffffffu));
+                candidate_values_ptr[pos]  = __uint_as_float(raw_bits);
+                candidate_indices_ptr[pos] = idx;
+            }
+            else
+            {
+                atomicExch(p_candidate_overflow, 1);
+            }
+            int const bucket = __builtin_amdgcn_ubfe(
+                bits, static_cast<unsigned>(pass1_start_bit), static_cast<unsigned>(BitsPerPass));
+            atomicAdd(histogram_ptr + bucket, static_cast<IdxT>(1));
+        }
+    };
+    auto stage_split_candidate = [histogram_ptr,
+                                  candidate_values_ptr,
+                                  candidate_indices_ptr](unsigned long long packed,
+                                                         IdxT pos) {
+        PreBits const bits = static_cast<PreBits>(packed >> 32);
+        PreBits const raw_bits =
+            bits ^ ((bits >> 31) ? 0u : static_cast<PreBits>(0x7fffffffu));
+        candidate_values_ptr[pos] = __uint_as_float(raw_bits);
+        candidate_indices_ptr[pos] =
+            static_cast<IdxT>(static_cast<unsigned>(packed));
+        int const bucket = __builtin_amdgcn_ubfe(
+            bits, static_cast<unsigned>(pass1_start_bit), static_cast<unsigned>(BitsPerPass));
+        atomicAdd(histogram_ptr + bucket, static_cast<IdxT>(1));
+    };
     // Prediction held: every element pass 1 wants is in the staged set, so
-    // walk that instead of the row -- about 1.25k entries against a row of
-    // 16K to 32K.
+    // walk that instead of the row -- a few thousand entries against a row
+    // of 16K to 32K.
     if(!staged_overflow && high_prefix <= pre_prefix)
     {
-        IdxT const n = staged_count;
-        for(IdxT s = static_cast<IdxT>(threadIdx.x); s < n; s += BlockSize)
+        if constexpr(UseSplitExactStage)
         {
-            unsigned long long const packed = staged_packed[s];
-            stage_pass1(__uint_as_float(static_cast<unsigned>(packed >> 32)),
-                        static_cast<IdxT>(static_cast<unsigned>(packed)));
+            if(pass0_predicted)
+            {
+                IdxT const before_len = wave_sums[0];
+                IdxT const first_len  = wave_sums[1];
+                IdxT const last_len   = wave_sums[2];
+                bool const selected_last =
+                    ExactLowBucket != ExactHighBucket &&
+                    (high_prefix >> pass0_start_bit) == ExactHighBucket;
+                if constexpr(DirectKnownWinners)
+                {
+                    if(split_direct_ready)
+                    {
+                        // These regions contain only definite winners.  Their
+                        // pass-0 atomic positions are already unique, so place
+                        // them directly in the dense LDS winner array without
+                        // another prefix test or out-count atomic.
+                        for(IdxT s = static_cast<IdxT>(threadIdx.x); s < before_len;
+                            s += BlockSize)
+                        {
+                            unsigned long long const packed = staged_packed[s];
+                            winner_indices_ptr[s] =
+                                static_cast<IdxT>(static_cast<unsigned>(packed));
+                        }
+                        if(selected_last)
+                        {
+                            for(IdxT s = static_cast<IdxT>(threadIdx.x); s < first_len;
+                                s += BlockSize)
+                            {
+                                unsigned long long const packed =
+                                    staged_packed[WinnerCapacity + s];
+                                winner_indices_ptr[before_len + s] =
+                                    static_cast<IdxT>(static_cast<unsigned>(packed));
+                            }
+                        }
+
+                        // candidate_count was set once by thread 0.  The
+                        // selected split region likewise has unique positions,
+                        // so fill candidate LDS by s and retain only the
+                        // unavoidable middle-radix histogram atomic.
+                        IdxT const selected_len = selected_last ? last_len : first_len;
+                        IdxT const selected_offset = selected_last
+                                                         ? WinnerCapacity + SplitBucketCapacity
+                                                         : WinnerCapacity;
+                        for(IdxT s = static_cast<IdxT>(threadIdx.x); s < selected_len;
+                            s += BlockSize)
+                        {
+                            stage_split_candidate(staged_packed[selected_offset + s], s);
+                        }
+                    }
+                    else
+                    {
+                        // Dynamic split invariants did not hold.  The exact
+                        // predictor is still valid, but use the ordinary full
+                        // scan instead of trusting the staged region layout.
+                        vectorized_process(
+                            threadIdx.x, blockDim.x, in, row_len, stage_pass1);
+                    }
+                }
+                else
+                {
+                    // Non-direct split mode retains the original compaction
+                    // behavior and is useful for isolated A/B comparisons.
+                    for(IdxT s = static_cast<IdxT>(threadIdx.x); s < before_len;
+                        s += BlockSize)
+                    {
+                        unsigned long long const packed = staged_packed[s];
+                        stage_pass1_bits(
+                            static_cast<PreBits>(packed >> 32),
+                            static_cast<IdxT>(static_cast<unsigned>(packed)));
+                    }
+                    for(IdxT s = static_cast<IdxT>(threadIdx.x); s < first_len;
+                        s += BlockSize)
+                    {
+                        unsigned long long const packed =
+                            staged_packed[WinnerCapacity + s];
+                        stage_pass1_bits(
+                            static_cast<PreBits>(packed >> 32),
+                            static_cast<IdxT>(static_cast<unsigned>(packed)));
+                    }
+                    if(selected_last)
+                    {
+                        for(IdxT s = static_cast<IdxT>(threadIdx.x); s < last_len;
+                            s += BlockSize)
+                        {
+                            unsigned long long const packed =
+                                staged_packed[WinnerCapacity + SplitBucketCapacity + s];
+                            stage_pass1_bits(
+                                static_cast<PreBits>(packed >> 32),
+                                static_cast<IdxT>(static_cast<unsigned>(packed)));
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // A predictor miss rebuilt the ordinary contiguous staging
+                // region with raw fp32 bits.
+                IdxT const n = staged_count;
+                for(IdxT s = static_cast<IdxT>(threadIdx.x); s < n; s += BlockSize)
+                {
+                    unsigned long long const packed = staged_packed[s];
+                    stage_pass1(__uint_as_float(static_cast<unsigned>(packed >> 32)),
+                                static_cast<IdxT>(static_cast<unsigned>(packed)));
+                }
+            }
+        }
+        else
+        {
+            IdxT const n = staged_count;
+            for(IdxT s = static_cast<IdxT>(threadIdx.x); s < n; s += BlockSize)
+            {
+                unsigned long long const packed = staged_packed[s];
+                IdxT const idx = static_cast<IdxT>(static_cast<unsigned>(packed));
+                if constexpr(CacheExactStageBits)
+                {
+                    if(pass0_predicted)
+                    {
+                        stage_pass1_bits(static_cast<PreBits>(packed >> 32), idx);
+                    }
+                    else
+                    {
+                        stage_pass1(__uint_as_float(static_cast<unsigned>(packed >> 32)), idx);
+                    }
+                }
+                else
+                {
+                    stage_pass1(__uint_as_float(static_cast<unsigned>(packed >> 32)), idx);
+                }
+            }
         }
     }
     else
@@ -3700,6 +6435,19 @@ inline bool topk_oneblock_use_large_bpp()
     return v;
 }
 
+// The eight-wave 4K tuning is specific to CDNA4 scheduling and resources.
+inline bool topk_oneblock_is_gfx950()
+{
+    static const bool v = []() {
+        int dev = 0;
+        (void)hipGetDevice(&dev);
+        hipDeviceProp_t p{};
+        (void)hipGetDeviceProperties(&p, dev);
+        return std::strncmp(p.gcnArchName, "gfx950", 6) == 0;
+    }();
+    return v;
+}
+
 // Thin wrapper dispatching to the correct BPP at runtime.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           Phase phase = Phase::Prefill, bool STABLE = false>
@@ -3717,11 +6465,410 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
         bool const specialized = buf != nullptr && topk_oneblock_use_large_bpp() &&
                                  in_idx == nullptr && rowStarts == nullptr &&
                                  rowEnds == nullptr && !select_min && k == 2048;
+        // The M=256 and M=4096 32K cells benefit from
+        // splitting the exact 0x403 predictor staging into known winners and
+        // the crossing bucket.  Stable pass-0 positions then feed pass 1
+        // directly; capacity or predictor misses retain the exact fallback.
+        if(specialized && topk_oneblock_is_gfx950() &&
+           (batch_size == 256 || batch_size == 4096) &&
+           len >= 32768 && len <= 32770)
+        {
+#define AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(ROW_LEN)                                    \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,    \
+                                              false, 270, ROW_LEN, 0x403u, 0x403u,     \
+                                              true, true, true, true>                   \
+            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx,           \
+                                                    select_min);                         \
+        return;
+            switch(static_cast<int>(len))
+            {
+                AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(32768)
+                AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(32769)
+                AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH(32770)
+            default: break;
+            }
+#undef AITER_OB_LDSTAIL_DIRECT403_32K_LAUNCH
+        }
+        // At 32K the normal-distribution cutoff is almost always inside high
+        // radix bucket 0x403.  Count and stage that exact bucket in one pass;
+        // arbitrary inputs retain the complete histogram fallback.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 512 &&
+           len >= 32768 && len <= 32770)
+        {
+#define AITER_OB_LDSTAIL_EXACT32K_LAUNCH(ROW_LEN)                                      \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,    \
+                                              false, 270, ROW_LEN, 0x403u>              \
+            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx,           \
+                                                    select_min);                         \
+        return;
+            switch(static_cast<int>(len))
+            {
+                AITER_OB_LDSTAIL_EXACT32K_LAUNCH(32768)
+                AITER_OB_LDSTAIL_EXACT32K_LAUNCH(32769)
+                AITER_OB_LDSTAIL_EXACT32K_LAUNCH(32770)
+            default: break;
+            }
+#undef AITER_OB_LDSTAIL_EXACT32K_LAUNCH
+        }
+        // At 16K the k=2048 crossing point straddles the adjacent high radix
+        // buckets 0x406 and 0x407.  Count both exact boundaries while staging
+        // their inclusive prefix; a miss retains the full histogram path.
+        // Batch four adjacent values into each wave reservation for 16384 and
+        // 16385.  The near-green 16386 cell keeps split staging and direct LDS
+        // placement of already-known winners.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 1024 &&
+           len >= 16384 && len <= 16386)
+        {
+#define AITER_OB_LDSTAIL_EXACT16K_LAUNCH(ROW_LEN, USE_SPLIT, DIRECT_KNOWN, WAVE_B128, \
+                                         B128_PREFETCH)                                \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,    \
+                                              false, 270, ROW_LEN, 0x407u, 0x406u,     \
+                                               true, USE_SPLIT, DIRECT_KNOWN, false,     \
+                                               WAVE_B128, B128_PREFETCH>                 \
+            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx,           \
+                                                    select_min);                         \
+        return;
+            switch(static_cast<int>(len))
+            {
+                AITER_OB_LDSTAIL_EXACT16K_LAUNCH(16384, false, false, true, true)
+                AITER_OB_LDSTAIL_EXACT16K_LAUNCH(16385, false, false, true, false)
+                AITER_OB_LDSTAIL_EXACT16K_LAUNCH(16386, true, true, false, false)
+            default: break;
+            }
+#undef AITER_OB_LDSTAIL_EXACT16K_LAUNCH
+        }
         if(specialized && len >= 16384 && len <= 32770)
         {
-            radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
-                <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
+            if((batch_size == 2048 || batch_size == 4096) && len <= 16386 &&
+               topk_oneblock_is_gfx950())
+            {
+                if(batch_size == 2048 && len == 16385)
+                {
+                    radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize,
+                                                          WRITE_TOPK_VALUES, true, 240, 16385>
+                        <<<batch_size, BlockSize, 0, stream>>>(
+                            in, len, k, out, out_idx, select_min);
+                }
+                else
+                {
+                    radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize,
+                                                          WRITE_TOPK_VALUES, true>
+                        <<<batch_size, BlockSize, 0, stream>>>(
+                            in, len, k, out, out_idx, select_min);
+                }
+            }
+            else
+            {
+                radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+            }
             return;
+        }
+        // High-row-count 4K shapes benefit from eight waves and 11+11+10
+        // radix passes. Keep lower row counts on the 16-wave 12+12+8 path.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size >= 1024 && len >= 4096 &&
+           len <= 4098)
+        {
+            constexpr int RegBlockSize = 512;
+            // At M=1024 the short-tail rows also leave at most a few dozen
+            // entries in the pass-0 crossing bucket.  Reuse the proven Wave64
+            // reservation/direct-write path and finish those candidates with
+            // the ballot radix walk, avoiding the second block-wide reducer.
+            if(batch_size == 1024 && len >= 4096 && len <= 4098)
+            {
+                if(len == 4096)
+                {
+                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
+                                                     WRITE_TOPK_VALUES, 8, 11, 10, 4096,
+                                                     true, true, false, true>
+                        <<<batch_size, RegBlockSize, 0, stream>>>(
+                            in, len, k, out, out_idx, select_min);
+                }
+                else if(len == 4097)
+                {
+                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
+                                                     WRITE_TOPK_VALUES, 9, 11, 10, 4097,
+                                                     true, true, false, true>
+                        <<<batch_size, RegBlockSize, 0, stream>>>(
+                            in, len, k, out, out_idx, select_min);
+                }
+                else
+                {
+                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
+                                                     WRITE_TOPK_VALUES, 9, 11, 10, 4098,
+                                                     true, true, false, true>
+                        <<<batch_size, RegBlockSize, 0, stream>>>(
+                            in, len, k, out, out_idx, select_min);
+                }
+                return;
+            }
+            // The exact M=2048/N=4096 crossing bucket fits in one Wave64.
+            // Resolve it with the same deferred-histogram ballot walk used by
+            // the M=1024 short-tail rows instead of running a second reducer.
+            if(batch_size == 2048 && len == 4096)
+            {
+                radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
+                                                 WRITE_TOPK_VALUES, 8, 11, 10, 4096,
+                                                 true, true, false, true>
+                    <<<batch_size, RegBlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            }
+            // Compile the exact row extent into the eight-wave 4K kernel for
+            // the two near-green row counts.  This removes the dynamic row
+            // stride and all per-element tail predicates while leaving the
+            // generic M=4096 launch and neighbouring shapes untouched.
+            if(batch_size == 1024 || batch_size == 2048)
+            {
+#define AITER_OB_REG512_4K_STATIC_LAUNCH(ROW_LEN, EPT)                                  \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
+                                         11, 10, ROW_LEN>                                \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
+                                                        select_min);                     \
+        return;
+                switch(static_cast<int>(len))
+                {
+                    AITER_OB_REG512_4K_STATIC_LAUNCH(4096, 8)
+                    AITER_OB_REG512_4K_STATIC_LAUNCH(4097, 9)
+                    AITER_OB_REG512_4K_STATIC_LAUNCH(4098, 9)
+                default: break;
+                }
+#undef AITER_OB_REG512_4K_STATIC_LAUNCH
+            }
+            int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
+#define AITER_OB_REG512_LAUNCH(EPT)                                                       \
+    case EPT:                                                                            \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT, 11,     \
+                                         10>                                                   \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min); \
+        return;
+            switch(ept)
+            {
+                AITER_OB_REG512_LAUNCH(8)
+                AITER_OB_REG512_LAUNCH(9)
+            default: break;
+            }
+#undef AITER_OB_REG512_LAUNCH
+        }
+        // M=512 is the only 4K row count between the accepted low-M and
+        // high-row-count specializations.  Keep the 16-wave launch, compile
+        // the exact extent, cache radix bits, and reserve definite winners
+        // once per Wave64.  The ordinary seed-0 crossing bucket fits Wave0's
+        // ballot selector; wider/tied buckets retain the exact deferred
+        // histogram and tail fallbacks.  Only 64 candidate slots are reserved
+        // for this exact gate; a wider crossing bucket is detected from the
+        // exact atomic count and takes the existing full-row rescan fallback.
+        // Definite winners retain the faster dense LDS flush.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 512 &&
+           len >= 4096 && len <= 4098)
+        {
+            switch(static_cast<int>(len))
+            {
+            case 4096:
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                                 4, 12, 8, 4096, true, true, false, true,
+                                                 false, 0x40du, false, 64, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            case 4097:
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                                 5, 11, 10, 4097, true, true, false, true,
+                                                 false, 0x40du, false, 64, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            case 4098:
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                                 5, 11, 10, 4098, true, true, false, true,
+                                                 false, 0x40du, false, 64, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            default: break;
+            }
+        }
+        // The exact 4K extent has four valid values in every lane.  Compile
+        // that fact into the low-row-count kernel so the hot full-row scans do
+        // not carry a dynamic row-stride calculation or per-element tail
+        // predicates.  Keep all radix and output paths otherwise unchanged.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 128 && len == 4096)
+        {
+            radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                             4, 12, 8, 4096>
+                <<<batch_size, BlockSize, 0, stream>>>(
+                    in, len, k, out, out_idx, select_min);
+            return;
+        }
+        // The fifth element per lane only appears once a row grows past 4096
+        // values. On low-row-count gfx950 launches, shrinking the two main
+        // radix histograms from 12 to 11 bits reduces their fixed scan cost;
+        // the larger 10-bit tail is still cheap because only the crossing
+        // prefix reaches that pass. Restrict this to one or two tail values;
+        // longer EPT=5 rows spend enough time in the larger tail pass to lose.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size <= 128 && len > 4096 &&
+           len <= 4098)
+        {
+            constexpr int RegBlockSize = 1024;
+            constexpr int EPT          = 5;
+            radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT, 11,
+                                             10>
+                <<<batch_size, RegBlockSize, 0, stream>>>(
+                    in, len, k, out, out_idx, select_min);
+            return;
+        }
+        // The remaining near-green M=256 4K cells still use the 16-wave
+        // register path. Compile their exact row extent and reserve pass-1
+        // winners once per wave instead of once per element.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 256 &&
+           len >= 4096 && len <= 4098)
+        {
+            switch(static_cast<int>(len))
+            {
+            case 4096:
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                                 4, 12, 8, 4096, true, true, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            case 4097:
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                                 5, 11, 10, 4097, true, true, true, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            case 4098:
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
+                                                 5, 11, 10, 4098, true, true, true, true>
+                    <<<batch_size, BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            default: break;
+            }
+        }
+        // Small seeded 8K grids use adjacent high radix buckets 0x40c/0x40d.
+        // Compile the exact row extent and accept either bucket before falling
+        // back to the ordinary exact histogram path.  Keep the dispatch exact
+        // so unrelated launch sizes retain their existing specialization.
+        if(specialized && topk_oneblock_is_gfx950() &&
+           (batch_size == 4 || batch_size == 8) &&
+           len >= 8192 && len <= 8194)
+        {
+            constexpr int RegBlockSize = 1024;
+#define AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(ROW_LEN, EPT)                          \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
+                                         12, 8, ROW_LEN, true, true, true, false, true, \
+                                         0x40cu>                                        \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
+                                                        select_min);                     \
+        return;
+            switch(static_cast<int>(len))
+            {
+                AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(8192, 8)
+                AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(8193, 9)
+                AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH(8194, 9)
+            default: break;
+            }
+#undef AITER_OB_REG_DUAL_PREDICT_STATIC_LAUNCH
+        }
+        // For two 8K rows, try the exact high-bucket predictor before the
+        // ordinary radix pass.  It retains the proven exact/cache/reservation/
+        // direct-write stack and always falls back to the full histogram when
+        // bucket 0x40d does not contain the requested rank.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 2 &&
+           len >= 8192 && len <= 8194)
+        {
+            constexpr int RegBlockSize = 1024;
+#define AITER_OB_REG_PREDICT_STATIC_LAUNCH(ROW_LEN, EPT)                               \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
+                                         12, 8, ROW_LEN, true, true, true, false, true> \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
+                                                        select_min);                     \
+        return;
+            switch(static_cast<int>(len))
+            {
+                AITER_OB_REG_PREDICT_STATIC_LAUNCH(8192, 8)
+                AITER_OB_REG_PREDICT_STATIC_LAUNCH(8193, 9)
+                AITER_OB_REG_PREDICT_STATIC_LAUNCH(8194, 9)
+            default: break;
+            }
+#undef AITER_OB_REG_PREDICT_STATIC_LAUNCH
+        }
+        // A single 8K row is especially sensitive to the LDS atomic tail:
+        // combine an exact row extent with one reservation per Wave64.
+        if(specialized && topk_oneblock_is_gfx950() && batch_size == 1 &&
+           len >= 8192 && len <= 8194)
+        {
+            constexpr int RegBlockSize = 1024;
+#define AITER_OB_REG_WAVE_STATIC_LAUNCH(ROW_LEN, EPT)                                  \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
+                                         12, 8, ROW_LEN, true, true, true>              \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
+                                                        select_min);                     \
+        return;
+            switch(static_cast<int>(len))
+            {
+                AITER_OB_REG_WAVE_STATIC_LAUNCH(8192, 8)
+                AITER_OB_REG_WAVE_STATIC_LAUNCH(8193, 9)
+                AITER_OB_REG_WAVE_STATIC_LAUNCH(8194, 9)
+            default: break;
+            }
+#undef AITER_OB_REG_WAVE_STATIC_LAUNCH
+        }
+        // With a large gfx950 grid, halve the waves per workgroup for 8K rows.
+        // The 11+11+10 split keeps every histogram at no more than four
+        // buckets per thread and cuts both LDS footprint and block-wide scan
+        // work. Keep the gate exact until both row counts have been validated.
+        if(specialized && topk_oneblock_is_gfx950() &&
+           (batch_size == 2048 || batch_size == 4096) && len >= 8192 && len <= 8194)
+        {
+            constexpr int RegBlockSize = 512;
+            if(batch_size == 2048)
+            {
+#define AITER_OB_REG512_8K_STATIC_LAUNCH(ROW_LEN, EPT)                                  \
+    case ROW_LEN:                                                                       \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
+                                         11, 10, ROW_LEN>                                \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
+                                                        select_min);                     \
+        return;
+                switch(static_cast<int>(len))
+                {
+                case 8192:
+                    radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize,
+                                                     WRITE_TOPK_VALUES, 16, 11, 10, 8192, true,
+                                                     false, false, false, false, 0x40du, true>
+                        <<<batch_size, RegBlockSize, 0, stream>>>(
+                            in, len, k, out, out_idx, select_min);
+                    return;
+                    AITER_OB_REG512_8K_STATIC_LAUNCH(8193, 17)
+                    AITER_OB_REG512_8K_STATIC_LAUNCH(8194, 17)
+                default: break;
+                }
+#undef AITER_OB_REG512_8K_STATIC_LAUNCH
+            }
+            int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
+#define AITER_OB_REG512_8K_LAUNCH(EPT)                                                    \
+    case EPT:                                                                            \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT, 11, \
+                                         10>                                               \
+            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min); \
+        return;
+            switch(ept)
+            {
+                AITER_OB_REG512_8K_LAUNCH(16)
+                AITER_OB_REG512_8K_LAUNCH(17)
+            default: break;
+            }
+#undef AITER_OB_REG512_8K_LAUNCH
         }
         // Rows short enough to hold in registers. The upper bound is where the
         // register copy stops paying for itself, not where it stops fitting.
