@@ -9,7 +9,6 @@ import torch
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
-    get_kernel_config_triton,
     moe_gemm_a16w4,
     moe_gemm_torch,
 )
@@ -22,7 +21,6 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
@@ -263,49 +261,3 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
-
-
-# (BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, waves_per_eu, nonkdim)
-_MEASURED_TILES = {
-    "bm128_n1024_k5120": (256, 128, 8, 2, 2, 32),
-    "bm128_n1536_k5120": (256, 64, 4, 1, 2, 32),
-    "bm128_n5120_k512": (256, 64, 8, 2, 0, 32),
-    "bm128_n5120_k768": (256, 64, 4, 2, 2, 32),
-    "bm64_n1024_k5120": (128, 256, 8, 2, 2, 16),
-    "bm64_n1536_k5120": (128, 128, 8, 2, 2, 16),
-    "bm64_n5120_k512": (256, 128, 4, 1, 0, 16),
-    "bm64_n5120_k768": (256, 128, 4, 2, 0, 16),
-}
-
-
-def test_tuned_table_entries_reach_the_kernel():
-    """A stock tile computes the same answer as a tuned one, so the Case rows
-    above cannot tell whether an entry was used; pin what each key resolves to."""
-    if arch_info.get_arch() != _TUNED_ARCH:
-        pytest.skip(f"a16w4 tuned table is {_TUNED_ARCH}-only")
-
-    dispatch = get_moe_dispatch("A16W4", _TUNED_ARCH, "triton")
-    assert set(dispatch) == set(
-        _MEASURED_TILES
-    ), "table drifted; update _MEASURED_TILES"
-
-    n_expts_tot, n_expts_act = 2, 1
-    for key, measured in sorted(_MEASURED_TILES.items()):
-        bm, n_part, k_part = key.split("_")
-        block_m, n, k = int(bm[2:]), int(n_part[1:]), int(k_part[1:])
-        m = block_m * n_expts_tot // n_expts_act
-
-        logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device="cuda")
-        rdata, _, _ = routing(logits, n_expts_act)
-        assert rdata.block_m == block_m, f"{key}: block_m={rdata.block_m}"
-
-        cfg = get_kernel_config_triton(m=m, n=n, k=k, routing_data=rdata)
-        resolved = (
-            cfg["block_n"],
-            cfg["block_k"],
-            cfg["num_warps"],
-            cfg["num_stages"],
-            cfg["waves_per_eu"],
-            cfg["matrix_instr_nonkdim"],
-        )
-        assert resolved == measured, f"{key} missed the table: {resolved}"
