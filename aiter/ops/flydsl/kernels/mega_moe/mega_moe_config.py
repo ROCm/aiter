@@ -332,7 +332,9 @@ def _select_bounded_stage2(
         block_n=block_n,
         persist=persist,
         persist_cu=persist_cu,
-        use_nt=bucket <= 128,
+        # Non-temporal W2 loads also for fixed-slot 256: DP-padded decode graphs
+        # (224 rows, ~84 real) -14 us/layer; fully real 224 rows -2 us.
+        use_nt=bucket <= 128 or (fixed_slot and bucket <= 256),
         persist_strided=512 <= bucket <= 2048,
     )
 
