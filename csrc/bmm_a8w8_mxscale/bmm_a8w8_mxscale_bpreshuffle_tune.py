@@ -33,16 +33,17 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "opus_gemm"))
 
-import opus_bmm_mxscale_tune as opus_tune  # noqa: E402
-from aiter import dtypes, logger  # noqa: E402
-from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8  # noqa: E402
-from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (  # noqa: E402
+import opus_bmm_mxscale_tune as opus_tune
+
+from aiter import dtypes, logger
+from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
+from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     bmm_kernel_name,
     check_bmm_config,
     parse_bmm_kernel_name,
     pick_bmm_kernel_name,
 )
-from aiter.utility.mp_tuner import mp_tuner  # noqa: E402
+from aiter.utility.mp_tuner import mp_tuner
 
 FLYDSL_KERNEL_ID = -1
 _SPLITS = (1, 2, 4, 8, 16)
@@ -54,15 +55,20 @@ _DATA_KID = {128: 8179, 32: 9179}
 
 # --- mp_tuner hooks (module level so the spawned workers import them) -------
 def gen_flydsl_bmm_data(b, m, n, k, seed, out_dtype, group, device="cuda"):
-    """(x, w, x_scale, w_scale, y, ref): the opus tuner's operands, laid out as
-    the flydsl entry takes them -- token-major and contiguous."""
+    """(x, w, x_scale, w_scale, y, ref): the opus tuner's operands, which the
+    generator already hands out token-major and contiguous -- the layout the
+    flydsl entry requires and the one opus is now timed on too.
+
+    This used to re-lay A out here, because the generator emitted it batch-first
+    and opus reached the launcher through a transpose view. flydsl cannot run on
+    that view (its entry rejects non-contiguous XQ), so the copy was mandatory --
+    and it made the two backends' numbers, which this tuner exists to compare,
+    measurements of different physical layouts."""
     data = opus_tune.gen_bmm_mxscale_data(
         b, m, n, k, seed, out_dtype, _DATA_KID[group], 1, device=device
     )
-    O_mx, _W_mx, Y, xs_mx, ws_mx, _ws, ref, W_sh, _xs_sh, _ws_sh = data
-    x = O_mx.transpose(0, 1).contiguous()
-    x_scale = xs_mx.transpose(0, 1).contiguous()
-    return x, W_sh, x_scale, ws_mx, Y, ref
+    A_mx, _W_mx, Y, A_scale, ws_mx, _ws, ref, W_sh, _xs_sh, _ws_sh = data
+    return A_mx, W_sh, A_scale, ws_mx, Y, ref
 
 
 def run_flydsl_bmm_bench(x, w, x_scale, w_scale, y, kernel_name):
@@ -200,7 +206,9 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
                         )
                         n_cand += 1
             if "flydsl" in self.libs:
-                for name in self._flydsl_names(b, m, n, k, block, args.flydsl_candidates):
+                for name in self._flydsl_names(
+                    b, m, n, k, block, args.flydsl_candidates
+                ):
                     splits = parse_bmm_kernel_name(name)["splits"]
                     task.append(
                         (

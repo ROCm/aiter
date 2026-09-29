@@ -50,6 +50,11 @@ SUPPORTED_GFX = ["gfx950"]
 # kernel's answer. A hardcoded list that outlived two of its kids reported those
 # two at 1.41 relative error, which looks like a kernel bug and is not one.
 KIDS_BPRESHUFFLE = tuple(sorted(_preshuffled_kids()))
+# --kids narrows KIDS_BPRESHUFFLE to whatever the caller wants timed, but the
+# dispatch self-check is about the catalogue, not about that subset: picking its
+# probe kid out of a one-element list raised StopIteration and failed the run
+# before any kernel ran.
+ALL_KIDS_BPRESHUFFLE = KIDS_BPRESHUFFLE
 KID_PLAIN = 8320  # same tile, row-major B, broadcast scale pack
 
 
@@ -255,7 +260,7 @@ def _check_dispatch():
     pre = {kid: entry[1] for kid, entry in table.items()}
     kid_pre = next(
         kid
-        for kid in KIDS_BPRESHUFFLE
+        for kid in ALL_KIDS_BPRESHUFFLE
         if pre.get(kid)
         and policy.mxscale_bmm_kid_takes_plain_scales(kid)
         and policy.mxscale_bmm_kid_group(kid) == 128

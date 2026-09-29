@@ -1501,6 +1501,13 @@ def _a8w8_mxscale_bmm_bpreshuffle_allwave(bm, bn, bk, wg_per_cu, quant_block=128
 # pipeline needs, so neither is here.
 _BMM_MXSCALE_BPRESHUFFLE_ALLWAVE_TILES = {
     #    (B_M, B_N, B_K, WG_PER_CU)
+    420: (64, 64, 256, 1),
+    422: (64, 64, 128, 2),
+    423: (64, 128, 256, 1),
+    424: (64, 128, 128, 2),
+    425: (128, 64, 256, 1),
+    426: (128, 128, 128, 1),
+    427: (128, 64, 128, 2),
 }
 _bmm_bpre_allwave_local = {
     kid: _a8w8_mxscale_bmm_bpreshuffle_allwave(bm, bn, bk, wg)

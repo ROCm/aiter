@@ -163,8 +163,16 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
             constexpr int ng = decltype(ng_c)::value;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
+                // Byte 0, not a broadcast into all four. op_sel_b below is 0 on
+                // this path for every (im, ik), so the upper three bytes are
+                // never selected -- and pack_e8m0x4's own comment says it is for
+                // callers that read byte 0 and nothing else. Building them cost
+                // a v_and plus a v_mul_lo_u32 per B scale, landing immediately
+                // above the MFMA that reads the result, which is the VALU-write
+                // -> MFMA-scale-read hazard: ATT on kid8408 counts 495 s_nops
+                // against flydsl's 8.
                 packed_sfb[ng * T::COM_REP_K + ik] =
-                    sf_scale_word<T>(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]);
+                    static_cast<int>(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]) & 0xFF;
             });
         });
     }

@@ -95,9 +95,9 @@ for _p in (_HERE, _OPTESTS):
 # table here does not pull in the build.
 from opus_gemm_common import (
     _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF,
-    _opus_sf_shuf_sub,
     BMM_MXSCALE_KID_OFFSET,
     MX32_KID_STRIDE,
+    _opus_sf_shuf_sub,
     a8w8_mxscale_bmm_kernel_lists,
     bmm_mxscale_global_kid,
 )
@@ -106,7 +106,9 @@ from opus_gemm_common import (
 # kid needs 32-block scales and its tuned row is meaningless for a 128 one. So
 # it is read off the instance here rather than taken from the module constant.
 _KID_INSTANCE = {
-    kid: inst for family in a8w8_mxscale_bmm_kernel_lists for kid, inst in family.items()
+    kid: inst
+    for family in a8w8_mxscale_bmm_kernel_lists
+    for kid, inst in family.items()
 }
 # Local ids resolve too, for the reason spelled out where _CODEGEN_BMM does the
 # same. This one is load-bearing beyond convenience: the MX twin sweep tests
@@ -129,6 +131,8 @@ def _kid_group(kid):
         f"({inst.GROUP_N}/{inst.GROUP_K}); the tuned schema carries one w_scale_block"
     )
     return inst.GROUP_K
+
+
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -518,11 +522,14 @@ _SHUF_POLICY = {kid: _TUNE_POLICY[plain] for kid, plain in _SHUF_TWIN_OF.items()
 #
 # w_scale_block is part of the tuned key, so a twin competes only against other 32
 # kids for its shape and gets its own winning row.
-_TUNE_POLICY.update({
-    twin: factors
-    for mirror, factors in list(_TUNE_POLICY.items())
-    if (twin := mirror + MX32_KID_STRIDE) in _KID_INSTANCE
-})
+_TUNE_POLICY.update(
+    {
+        twin: factors
+        for mirror, factors in list(_TUNE_POLICY.items())
+        if (twin := mirror + MX32_KID_STRIDE) in _KID_INSTANCE
+    }
+)
+
 
 # Globalised here, once, and this is the boundary the whole file depends on.
 #
@@ -889,15 +896,17 @@ def _workspace_numel(kernel_id, split_k, batch, m, n):
     counter_offset = (partial_numel * 4 + 255) & ~255
     counter_bytes = batch * tiles_m * tiles_n * 4
     return (counter_offset + counter_bytes + 3) // 4
+
+
 def gen_bmm_mxscale_data(
     batch, m, n, k, seed, out_dtype, kernel_id, split_k, device="cuda"
 ):
     """Return the 10-tuple mp_tuner indexes into:
 
-    0 O_mx   [g,m,k]     fp8 batch-first contiguous input
+    0 A_mx   [m,g,k]     fp8 token-major contiguous input (production layout)
     1 W_mx   [g,n,k]     fp8 (batch-major)
     2 Y       [m,g,n]     contiguous production-layout output buffer
-    3 xs_mx  [g,m,k/128] uint8 e8m0 batch-first contiguous scale
+    3 A_scale [m,g,k/128] uint8 e8m0 token-major contiguous scale
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
     5 workspace optional caller-owned FP32 split-K buffer, None when unused
     6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
@@ -934,7 +943,11 @@ def gen_bmm_mxscale_data(
         if workspace_numel
         else None
     )
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group).transpose(0, 1).to(out_dtype)
+    ref = (
+        run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group)
+        .transpose(0, 1)
+        .to(out_dtype)
+    )
     # The preshuffled-B kids read B through the (16,16) MFMA-fragment layout that
     # a serving stack bakes into the weight offline. It is a permutation, so the
     # reference above covers both forms. Building it here rather than in the bench
@@ -964,11 +977,26 @@ def gen_bmm_mxscale_data(
         ws_sh = shuffle_scale_b(ws_mx, n, k).view(batch, n // 128, -1)
     else:
         xs_sh, ws_sh = xs_mx, ws_mx
-    return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref, W_sh, xs_sh, ws_sh)
+    # A and its scale go out in the layout a serving stack actually holds them:
+    # [m, batch, ...] *contiguous*. Everything above wants batch-first -- run_torch
+    # for the reference, shuffle_scale_a for the shuffled slab -- so the flip is
+    # last, and materialised here rather than at the bench so the copy stays out
+    # of what is timed.
+    #
+    # It used to go out batch-first and reach the launcher through a transpose
+    # view, whose M stride is K where production's is batch*K. flydsl cannot take
+    # that view at all (its entry rejects non-contiguous XQ), so the joint tuner
+    # made its own contiguous copy and the two backends were timed on different
+    # physical layouts -- the one comparison the table is built from. The view
+    # measured kid8408 at 14.09us against 13.90us contiguous, so the bias ran
+    # against opus, but a backend comparison cannot rest on that.
+    A_mx = O_mx.transpose(0, 1).contiguous()
+    A_scale = xs_mx.transpose(0, 1).contiguous()
+    return (A_mx, W_mx, Y, A_scale, ws_mx, workspace, ref, W_sh, xs_sh, ws_sh)
 
 
 def run_bmm_mxscale_bench(
-    O_mx, W_mx, Y, xs_mx, ws_mx, workspace, W_sh, xs_sh, ws_sh, kernelId, splitK
+    A_mx, W_mx, Y, A_scale, ws_mx, workspace, W_sh, xs_sh, ws_sh, kernelId, splitK
 ):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose.
 
@@ -990,19 +1018,23 @@ def run_bmm_mxscale_bench(
     """
     inst = _CODEGEN_BMM[kernelId]
     Wb = W_sh if inst.needs_preshuffled_b else W_mx
+    # A, its plain scale and Y all arrive [M, batch, ...] contiguous, which is
+    # both what the launcher takes and what a serving stack holds. The shuffled
+    # scale is the exception: shuffle_scale_a builds its slab batch-first, so
+    # that one is still flipped into place here.
     if inst.needs_shuffle_scale:
-        sfa, sfb = xs_sh, ws_sh
+        sfa, sfb = xs_sh.transpose(0, 1), ws_sh
     else:
-        sfa, sfb = xs_mx, ws_mx
-    # A and its scale are generated batch-major -- (batch, M, K) -- because that
-    # is the order run_torch wants for the reference, but the launcher takes A as
-    # [M, batch, K] and Y is already built that way. Without the transpose the
-    # launcher reads M where batch belongs, and the shape it then rejects is B's:
-    # "wo_a must have shape [batch,N,K]", 159 times in one batch, with every
-    # candidate scoring errRatio 1.0 because nothing was written.
+        sfa, sfb = A_scale, ws_mx
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
-        O_mx.transpose(0, 1), Wb, Y, sfa.transpose(0, 1), sfb,
-        workspace=workspace, kid=kernelId, split_k=splitK,
+        A_mx,
+        Wb,
+        Y,
+        sfa,
+        sfb,
+        workspace=workspace,
+        kid=kernelId,
+        split_k=splitK,
     )
     return Y
 
@@ -1230,12 +1262,20 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         # the kid's real group, so the base tuner matched no result to any
         # input and wrote an empty table however many candidates passed.
         groups = sorted(
-            set(args.groupSize) if args.groupSize
+            set(args.groupSize)
+            if args.groupSize
             else {_kid_group(kid) for kid in _CANDIDATE_KIDS}
         )
         self.untunedf = pd.DataFrame(
             [
-                {"gfx": gfx, "b": g, "m": m, "n": n, "k": k, "w_scale_block": f"{grp}x{grp}"}
+                {
+                    "gfx": gfx,
+                    "b": g,
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "w_scale_block": f"{grp}x{grp}",
+                }
                 for (g, m, n, k) in shapes
                 for grp in groups
             ],
@@ -1363,23 +1403,23 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                 # 10-tuple now: upstream's workspace at 5, our shuffled B/scale
                 # forms at 7/8/9. This site only needs the plain operands and the
                 # reference, so the tail is dropped rather than named.
-                (
-                    O_mx, W_mx, _Y, xs_mx, ws_mx, _workspace, ref, *_shuf
-                ) = gen_bmm_mxscale_data(
-                    b,
-                    m,
-                    n,
-                    k,
-                    seed,
-                    dtypes.bf16,
-                    8000,
-                    1,
+                O_mx, W_mx, _Y, xs_mx, ws_mx, _workspace, ref, *_shuf = (
+                    gen_bmm_mxscale_data(
+                        b,
+                        m,
+                        n,
+                        k,
+                        seed,
+                        dtypes.bf16,
+                        8000,
+                        1,
+                    )
                 )
                 out, us = run_perftest(
                     batched_gemm_a8w8_mxscale,
-                    O_mx.transpose(0, 1),
+                    O_mx,
                     W_mx,
-                    xs_mx.transpose(0, 1),
+                    xs_mx,
                     ws_mx,
                     dtype=dtypes.bf16,
                     num_warmup=args.warmup,
