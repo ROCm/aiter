@@ -227,6 +227,46 @@ def _warn_untuned_flydsl_fallback(gfx: str, op: str, n: int, k: int) -> None:
     )
 
 
+def gemm_a8w8_blockscale_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+    isBpreshuffled: bool = False,
+) -> Tensor:
+    # Configs are not keyed by output dtype. Keep the original CK path for
+    # FP16, unsupported shapes/archs, or installations without FlyDSL.
+    if (
+        get_gfx() == "gfx950"
+        and Out.dtype == dtypes.bf16
+        and x_scale.dtype == dtypes.fp32
+        and w_scale.dtype == dtypes.fp32
+    ):
+        try:
+            from .flydsl.gemm_a8w8_blockscale import (
+                is_supported,
+                run_gemm_a8w8_blockscale,
+            )
+        except ImportError as exc:
+            logger.warning("FlyDSL blockscale unavailable; using CK: %s", exc)
+        else:
+            if is_supported(XQ, WQ, Out, isBpreshuffled):
+                return run_gemm_a8w8_blockscale(
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Out,
+                    str(config.get("kernelName", "")),
+                    isBpreshuffled,
+                )
+    if isBpreshuffled:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Out)
+
+
 def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -1098,6 +1138,8 @@ def gemm_a8w8_blockscale(
                 splitK=splitK,
                 kernelName=kernelName,
             )
+        elif libtype == "flydsl":
+            return gemm_a8w8_blockscale_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
         else:
             assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
 
@@ -1430,6 +1472,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 w_scale=w_scale,
             )
         elif libtype == "flydsl":
+            if kernelName.startswith("flydsl_blockscale_8w_"):
+                return gemm_a8w8_blockscale_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
+                )
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )

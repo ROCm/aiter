@@ -26,6 +26,48 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 
 ## More Options
 
+### FlyDSL FP8 blockscale (gfx950)
+
+The existing tuner also accepts `--libtype flydsl`. Use `--libtype all` to race
+FlyDSL against the existing supported CK, CKTile, ASM and Opus candidates;
+`--libtype both` retains its original CK/CKTile-only meaning. Add `--preshuffle`
+for the B-preshuffled operator and select its output CSV with `-o`.
+
+- The public `gemm_a8w8_blockscale` and `gemm_a8w8_blockscale_bpreshuffle` APIs
+  keep their signatures and default backends. A winning row with
+  `libtype=flydsl` and a `flydsl_blockscale_8w_...` name selects the new backend.
+  No FlyDSL default or tuned rows are installed by this integration.
+- The candidate table fixes the original 256x256x128 tile and sweeps
+  `split_m` (full/half-M) and raw/tiled DMA, four candidates per B layout.
+  The name records the B layout and both pipeline flags; `splitK` remains zero.
+- Supported calls use gfx950, FP8 E4M3FN operands, FP32 block scales and BF16
+  output, with positive M/N, K >= 256, K divisible by 256, and N divisible by
+  8 (plain B) or 16 (preshuffled B). LDS and signed-i32 address limits are checked
+  before launch. M/N tile tails are supported. Unsupported output types/shapes
+  and missing FlyDSL retain the existing CK fallback; actual compile/runtime
+  errors are not hidden by a fallback.
+- Plain B uses row-major `x_scale[M,K/128]`; its transpose cost is included in
+  tuning. Preshuffled B consumes the existing `(16,16)` weight shuffle and
+  column-major scale storage, either packed back into shape `[M,K/128]` or a
+  strided column-major view. Both use `w_scale[ceil(N/128),K/128]`. The
+  preshuffle API continues to honor a caller-supplied `out`.
+- Kernel implementation and scheduling were copied without changes; only the
+  standalone pyhip test driver/imports were removed. Aiter does not acquire a
+  pyhip runtime dependency. The tensor adapter and tune table are separate from
+  the copied kernel. The existing gfx1250 MXFP8_128 path is unaffected.
+
+Use `-o2` to retain every candidate result, and `--run_config` with the resulting
+CSV (plus `--preshuffle` for that layout) to validate the production dispatch.
+Prefer scratch output CSVs for experiments rather than overwriting existing
+model configurations. Before promoting winners, check for duplicate shape keys
+across the canonical and model-specific config files.
+
+The dedicated correctness/performance sweep is
+[op_tests/test_gemm_a8w8_blockscale_flydsl.py](../../op_tests/test_gemm_a8w8_blockscale_flydsl.py);
+it covers both public APIs, signed/random data, M/N tails, and packed/strided
+scales. CPU routing/tuner regressions are in
+[op_tests/tuning_tests/test_flydsl_blockscale.py](../../op_tests/tuning_tests/test_flydsl_blockscale.py).
+
 ### Output Configuration
 
 #### `-o2, --profile_file`
