@@ -86,7 +86,7 @@ def _store(tensor, offset, value, dtype):
     fx.copy(atom, frag, view)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _up_shared(rpad):
     """LDS storage for the staged [16, rpad] BF16 T tile, declared as i32 words."""
 
