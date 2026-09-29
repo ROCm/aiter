@@ -38,7 +38,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.l2norm import l2norm_fwd
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
 
@@ -218,7 +218,7 @@ def chunk_delta_attn_fwd(
             lower_bound=lower_bound,
         )
     else:
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
             chunk_local_cumsum,
         )
 

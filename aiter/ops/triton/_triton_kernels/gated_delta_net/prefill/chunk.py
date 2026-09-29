@@ -14,23 +14,23 @@ from collections.abc import Sequence
 
 import torch
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h_opt,
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_o import (
     chunk_fwd_o,
     chunk_fwd_o_opt,
     chunk_fwd_o_opt_vk,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_cumsum_kkt import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.fused_cumsum_kkt import (
     fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_solve_tril_recompute import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.fused_solve_tril_recompute import (
     fused_solve_tril_recompute_w_u,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
     chunk_local_cumsum,

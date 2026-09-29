@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
     tensor_cache,
 )
 
