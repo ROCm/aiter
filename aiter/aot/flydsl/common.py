@@ -436,6 +436,7 @@ AOT_MODULES = (
     "aiter.aot.flydsl.chunk_gdn_h",
     "aiter.aot.flydsl.fmha_fp8",
     "aiter.aot.flydsl.pa_decode_plan",
+    "aiter.aot.flydsl.qsa",
 )
 
 
