@@ -310,9 +310,14 @@ def _select_bounded_stage2(
     )
     if model_dim < 4096:
         block_n = 128
-    persist = bucket >= 128
+    # Fixed-slot buckets below 128 also run persistent: the non-persistent grid
+    # is sized for the MTPR capacity, and its idle CTAs delay the real tiles
+    # (T=7/14/28: -10..-11 us/layer with 128 persistent CTAs).
+    persist = bucket >= 128 or fixed_slot
     if not persist:
         persist_cu = 0
+    elif bucket < 128:
+        persist_cu = 128
     elif bucket == 256:
         persist_cu = 128
     elif bucket == 1024:
