@@ -3503,7 +3503,7 @@ def get_2stage_cfgs(
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if is_opus1 or is_flydsl1 or is_flydsl2:
         enable_bias = (
-            activation == ActivationType.Swiglu
+            activation != ActivationType.Relu2
             and _needs_swiglu_bias_support(dtype, q_type)
             and q_dtype_w == dtypes.fp4x2
         )
@@ -3845,7 +3845,7 @@ def get_2stage_cfgs(
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
         enable_bias = (
-            activation == ActivationType.Swiglu
+            activation != ActivationType.Relu2
             and _needs_swiglu_bias_support(dtype, q_type)
         )
         return MOEMetadata(
