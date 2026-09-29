@@ -220,9 +220,11 @@ def compile_gemm_fp8_8wave(
         ldsA_b_wr = [fx.make_view(lds.a_b0.ptr, _wr), fx.make_view(lds.a_b1.ptr, _wr)]
         ldsA_t_rd = [fx.make_view(lds.a_t0.ptr, _rd), fx.make_view(lds.a_t1.ptr, _rd)]
         ldsA_b_rd = [fx.make_view(lds.a_b0.ptr, _rd), fx.make_view(lds.a_b1.ptr, _rd)]
-        ### LDS B would have different read layout when preshuffled. LDSB write layout is same with LDS A
+        ### LDS B would have different read layout when preshuffled.
+        ### LDS B write layout is not useless when preshuffled.
         if const_expr(preshuffle_b):
-            # Logical B[n,k] -> [n//16, k//16, n%16, k%16] in packed LDS.
+            # [N, K] weight is preshuffled to [N//16, K//128, 4k2, 2k1, 16n0, 16k0] layout
+            # in LDS[128n, 128k] is preshuffled to [8n1, 4k2, 2k1, 16n0, 16k0] layout
             # k_perm still assigns each MFMA lane the same contiguous 32 K values.
             _b_rd = fx.make_layout(
                 ((16, BLOCK_N // 16), (16, BLOCK_K // 16)),
@@ -537,6 +539,9 @@ def compile_gemm_fp8_8wave(
         # Per-thread (row, k) source mapping, matching pyhip a_lane_row = tid//8.
         a_lane_row = tid // 8
         a_lane_k = tid % 8 * elements_per_128b
+        # Each group of 8 lanes copies one row per load (16 FP8 elements per lane).
+        # 8 lane-rows per wave would divide BM/BN into 8 groups. each group is 16m/16n(16 contineous rows/columns).
+        # 2 contineous lane-rows would have load A/B with stride of 16m/16n.
         a_local_row = a_lane_row % 8 * (BLOCK_M // 8) + a_lane_row // 8
         lane_src_offset = fx.Int32((a_local_row * K + a_lane_k) * _elem_bytes)
         aT_src_wave_base = fx.Int32(0)
@@ -564,6 +569,8 @@ def compile_gemm_fp8_8wave(
         if const_expr(preshuffle_b):
             # Each wave copies a contiguous 16x64-byte block; two instructions
             # per quadrant retain the existing pipeline's vmcnt accounting.
+            # [N//16, K//128, 4k2, 2k1, 16n0, 16k0] view as [N//16, K//128, 2k3, 2k2, 2k1, 16n0, 16k0]
+            # [2k2, 2k1, 16n0, 16k0] is tile for one  DWORDx4 copy per wave.
             # Global offset(n,k) = (n//16)*16*K + (k//16)*256
             #                       + (n%16)*16 + k%16.
             src_voffset = fx.Int32(
@@ -827,6 +834,8 @@ def compile_gemm_fp8_8wave(
         # ---- epilogue store ----
         N_tail = N % TILE_N != 0
         if const_expr((permlane_epilogue or N_tail) and TILE_N % 256 == 0):
+            # In physical C, lane_id % 16 selects a row within the MFMA tile;
+            # lane_group selects four consecutive columns in that row.
             pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
             lane_id = tid % 64
             wave_m = wave_id // 4
@@ -840,10 +849,18 @@ def compile_gemm_fp8_8wave(
                     for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
                         acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
                         acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                        # These 4-column slices share a row but are 64 columns apart.
+                        # Pack each pair into a dword: first BF16 low, second high.
                         d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
                         d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
                         d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
                         d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        # Swap a's odd 16-lane groups with b's even groups
+                        # (partner lane = lane_id ^ 16); keep the other values.
+                        # At fixed lane_id % 16, groups 0, 1, 2, 3 become:
+                        #   a: a0 a1 a2 a3 -> a0 b0 a2 b2 (result[0])
+                        #   b: b0 b1 b2 b3 -> a1 b1 a3 b3 (result[1])
+                        # Apply this to both dword pairs; no LDS transpose.
                         swap0 = rocdl.permlane16_swap(
                             pair_type,
                             arith._to_raw(d0_a),
@@ -858,6 +875,8 @@ def compile_gemm_fp8_8wave(
                             False,
                             False,
                         )
+                        # Word order: BF16 columns [0:2], [2:4], [4:6], [6:8]
+                        # relative to col below: 4 dwords = 8 BF16 = 16 bytes.
                         packed = Vec.from_elements(
                             [
                                 fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
@@ -873,6 +892,8 @@ def compile_gemm_fp8_8wave(
                             + wave_m * 16
                             + lane_id % 16
                         )
+                        # Groups 0/1/2/3 now start at columns 0/64/8/72,
+                        # relative to the quadrant/repeat/wave N base.
                         col = (
                             quadrant_n * (TILE_N // 2)
                             + col_repeat * 64
@@ -882,9 +903,12 @@ def compile_gemm_fp8_8wave(
                         )
                         byte_offset = fx.Int32((row * N + col) * 2)
                         if const_expr(N_tail):
+                            # N % 8 == 0: each 8-BF16 store is fully in or out.
                             byte_offset = (col < b_rows_left).select(
                                 byte_offset, fx.Int32(0x7FFFFFFF)
                             )
+                        # vector<4xi32> -> buffer_store_dwordx4:
+                        # one 16-byte store per lane to C[row, col:col+8].
                         rocdl.raw_ptr_buffer_store(
                             packed.ir_value(),
                             c_store_rsrc,

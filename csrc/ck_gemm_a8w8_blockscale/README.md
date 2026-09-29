@@ -55,7 +55,11 @@ for the B-preshuffled operator and select its output CSV with `-o`.
   as the cause. No CK fallback is taken for a selected FlyDSL row; the original
   no-config default path is unchanged. Other compile/runtime errors propagate.
 - Plain B uses row-major `x_scale[M,K/128]`; its transpose cost is included in
-  tuning. Preshuffled B consumes the existing `(16,16)` weight shuffle and
+  tuning. For FlyDSL, a prepared scale tensor with the same shape may set
+  `is_transposed=True` to skip that transpose; the flag is trusted without
+  layout inference. Set it on the final tensor (views/clones do not inherit
+  Python attributes). Other backends' scale contracts are unchanged.
+  Preshuffled B consumes the existing `(16,16)` weight shuffle and
   column-major scale storage, either packed back into shape `[M,K/128]` or a
   strided column-major view. Both use `w_scale[ceil(N/128),K/128]`. The
   preshuffle API continues to honor a caller-supplied `out`.
@@ -86,6 +90,12 @@ See [MI355X backend comparison and FlyDSL regression calibration (2026-09-28)](p
 for same-GPU CK/CKTile/ASM/Triton/FlyDSL results, graph and event timing scopes,
 historical screenshot calibration, source fingerprints, and validation limits.
 These measurements do not install or change tuned dispatch configurations.
+
+The [model Q/KV projection comparison (2026-09-28)](perf_model_qkv_gfx950_20260928.md)
+covers Qwen3.8, Qwen3.5, Kimi-K3 and DeepSeek V4 at 8192–65536 local tokens and
+TP 1/2/4/8: 80 unique shapes, both B layouts, 688 validated backend results,
+per-model summaries and large-output availability limits. Model quantization
+caveats and the correct gate/KV-replication/low-rank TP rules are included.
 
 ### Output Configuration
 
