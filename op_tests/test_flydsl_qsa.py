@@ -1145,6 +1145,41 @@ def test_family_a_k1_bench_times_expand():
         raise AssertionError("timed select did not expand with the vendored kernel")
 
 
+def test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch():
+    """Requested M stays in the decode or prefill list, and a mismatch raises.
+
+    Decode is ``M<=8``. Every larger requested M, including 64, 2048, and
+    8192, is prefill. A nonzero K1 set mismatch and a K2 err above the
+    unit tolerance (``checkAllclose`` rtol=1e-2 atol=1e-2, so ``err!=0``)
+    raise. ``M > L`` is skipped.
+    """
+    if _skip_m_past_seq(8, 512, "family A K1 decode"):
+        raise AssertionError("M <= L was skipped")
+    if not _skip_m_past_seq(8192, 512, "family A K1 prefill"):
+        raise AssertionError("M > L was not skipped")
+    decode, prefill = _k1_k2_sweep_batches([1, 8, 64, 512, 2048, 8192])
+    if decode != [1, 8] or prefill != [64, 512, 2048, 8192]:
+        raise AssertionError(
+            f"requested M was dropped: decode={decode} prefill={prefill}"
+        )
+    _raise_if_k1_mismatch(0, 1, 32768)
+    _raise_if_k2_above_tolerance(0, 512, 8192)
+    try:
+        _raise_if_k1_mismatch(1, 64, 8192)
+    except AssertionError as exc:
+        if "set mismatch" not in str(exc):
+            raise
+    else:
+        raise AssertionError("nonzero K1 set mismatch did not fail the sweep")
+    try:
+        _raise_if_k2_above_tolerance(2, 2048, 8192)
+    except AssertionError as exc:
+        if "unit tolerance" not in str(exc):
+            raise
+    else:
+        raise AssertionError("K2 err above the unit tolerance did not fail the sweep")
+
+
 def _flydsl_k1_select(
     q,
     k_cache,
@@ -2601,6 +2636,7 @@ def _run_unit_cases():
     test_k1_decode_rejects_invalid_page_ids()
     test_k1_gfx942_h8_skips_prefill_tile()
     test_family_a_k1_bench_times_expand()
+    test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch()
     test_qsa_arch_allowlist()
     test_k1_page_past_4gib()
     test_k1_family_b_set_equality_short_decode()
@@ -2621,6 +2657,38 @@ def _run_unit_cases():
     test_qsa_layer_family_b_matches_oracle()
     test_qsa_layer_decode_graph_replays()
     aiter.logger.info("QSA oracle + K1 + K2 + layer unit cases passed")
+
+
+def _k1_k2_sweep_batches(batches):
+    """Split requested M into the family A K1/K2 decode and prefill tables.
+
+    Decode is ``M<=8``. Every larger M is prefill, so 64, 2048, and 8192
+    are run instead of dropped. Family B is not split this way: its tables
+    are emit versus long-L, and every requested M runs in one of them.
+    """
+    decode = [m for m in batches if m <= 8]
+    prefill = [m for m in batches if m > 8]
+    return decode, prefill
+
+
+def _skip_m_past_seq(m, seq_len, where):
+    if m <= seq_len:
+        return False
+    aiter.logger.warning("skip %s M=%s L=%s (M must fit in L)", where, m, seq_len)
+    return True
+
+
+def _raise_if_k1_mismatch(err, m, seq_len):
+    if err != 0:
+        raise AssertionError(f"FlyDSL K1 set mismatch at M={m} L={seq_len} (err={err})")
+
+
+def _raise_if_k2_above_tolerance(err, m, seq_len):
+    if err != 0:
+        raise AssertionError(
+            f"FlyDSL K2 err={err} at M={m} L={seq_len} is above the unit "
+            "tolerance rtol=1e-2 atol=1e-2"
+        )
 
 
 def main():
@@ -2644,7 +2712,8 @@ def main():
         type=int,
         nargs="*",
         default=[1, 8, 512],
-        help="flattened query tokens M (decode 1..8, prefill 512)",
+        help="flattened query tokens M. Family A K1/K2 report M<=8 as\n"
+        "decode and every larger M as prefill.",
     )
     parser.add_argument(
         "-s",
@@ -2752,16 +2821,17 @@ def main():
             df.to_markdown(index=False),
         )
 
+        decode_m, prefill_m = _k1_k2_sweep_batches(args.batch)
+
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
-            [b for b in args.batch if b <= 8],
-            args.seq,
-            args.page_size,
-            args.rotate,
+            decode_m, args.seq, args.page_size, args.rotate
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family A K1 decode"):
                 continue
-            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate))
+            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate)
+            _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -2771,14 +2841,13 @@ def main():
 
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
-            [b for b in args.batch if b <= 8],
-            args.seq,
-            args.page_size,
-            args.rotate,
+            decode_m, args.seq, args.page_size, args.rotate
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family A K2 decode"):
                 continue
-            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate))
+            row = bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate)
+            _raise_if_k2_above_tolerance(row["flydsl_k2 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -2788,14 +2857,13 @@ def main():
 
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
-            [b for b in args.batch if b == 512],
-            args.seq,
-            args.page_size,
-            args.rotate,
+            prefill_m, args.seq, args.page_size, args.rotate
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family A K1 prefill"):
                 continue
-            rows.append(bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate))
+            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate)
+            _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -2805,14 +2873,13 @@ def main():
 
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
-            [b for b in args.batch if b == 512],
-            args.seq,
-            args.page_size,
-            args.rotate,
+            prefill_m, args.seq, args.page_size, args.rotate
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family A K2 prefill"):
                 continue
-            rows.append(bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate))
+            row = bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate)
+            _raise_if_k2_above_tolerance(row["flydsl_k2 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -2822,14 +2889,16 @@ def main():
 
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
-            [b for b in args.batch if b <= 8],
+            args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio <= 512],
             args.page_size,
             args.rotate,
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family B K1 H=4"):
                 continue
-            rows.append(bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 4, rotate))
+            row = bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 4, rotate)
+            _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -2839,14 +2908,16 @@ def main():
 
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
-            [b for b in args.batch if b <= 8],
+            args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER_H8.compress_ratio <= 512],
             args.page_size,
             args.rotate,
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family B K1 H=8"):
                 continue
-            rows.append(bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 8, rotate))
+            row = bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 8, rotate)
+            _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -2855,10 +2926,11 @@ def main():
             )
 
         # #4882 published indexer point: M=32, H=4, page_size=8, n_blocks=512.
-        rows = [
-            bench_qsa_family_b_k1(32, 2048, 8, dtype, 4, rotate)
-            for rotate in args.rotate
-        ]
+        rows = []
+        for rotate in args.rotate:
+            row = bench_qsa_family_b_k1(32, 2048, 8, dtype, 4, rotate)
+            _raise_if_k1_mismatch(row["flydsl_k1 err"], 32, 2048)
+            rows.append(row)
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "QSA family B FlyDSL K1 published indexer point (markdown):\n%s",
@@ -2867,17 +2939,19 @@ def main():
 
         rows = []
         for m, seq_len, page_size, index_heads, rotate in itertools.product(
-            [b for b in args.batch if b <= 8],
+            args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio > 512],
             args.page_size,
             (4, 8),
             args.rotate,
         ):
-            if m > seq_len:
+            if _skip_m_past_seq(m, seq_len, "family B K1 long-L"):
                 continue
-            rows.append(
-                bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate)
+            row = bench_qsa_family_b_k1(
+                m, seq_len, page_size, dtype, index_heads, rotate
             )
+            _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
