@@ -225,7 +225,7 @@ def compile_mega_moe_stage1(
     OWNER_LIGHT = os.environ.get("AITER_MEGA_S1_OWNER_LIGHT", "0") == "1"
     # Compact producers read two route ids back to back and keep both rows' loads
     # in flight before storing (instead of ~4 dependent load round trips per row).
-    DISPATCH_FAST_COPY = os.environ.get("AITER_MEGA_DISPATCH_FAST_COPY", "0") == "1"
+    DISPATCH_FAST_COPY = os.environ.get("AITER_MEGA_DISPATCH_FAST_COPY", "1") == "1"
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
