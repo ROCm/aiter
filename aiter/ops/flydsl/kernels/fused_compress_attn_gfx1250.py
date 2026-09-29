@@ -32,10 +32,12 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import CmpFPredicate
+from flydsl.expr.arith import ArithValue, CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.utility.mx_types import MxDtypeInt as _MxDtypeInt
+from aiter.utility.mx_types import MxScaleRoundModeInt as _MxRoundInt
 
 from .fused_compress_attn_common import (
     _NEG_INF,
@@ -48,10 +50,13 @@ from .fused_compress_attn_common import (
     state_slot_byte_offset,
 )
 from .kernels_common import LOG2E as _LOG2E
+from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250); D must be a multiple
+_FP4_GROUP_SIZE = 32
+_FP4_K_TILE = 128
 
 
 # ============================================================================
@@ -208,6 +213,7 @@ def _build_kernel(
     # For Indexer (D=128, VEC=4) -> 16 .. 31 are rope threads, 2 pairs each (=64=2RD/2).
     # The RD%(2*VEC) == 0 invariant means rope threads cleanly own whole pairs.
 
+    quant_fp4 = quant_mode == "fp4"
     # FP8 1xG e8m0 group-quant geometry (quant_mode=="group_fp8" only): wave32 ->
     # VEC=16, RTS = G/VEC = 4, N_GROUPS = NOPE/G = 7. Byte-identical to wave64.
     nm_asm = quant_mode == "group_fp8"
@@ -234,6 +240,11 @@ def _build_kernel(
         # quant=True with no scatter is meaningless (the scale write is what
         # the FP8 cache reader consumes). Reject early.
         raise ValueError("quant=True requires has_block_table=True")
+    if quant_fp4:
+        assert D % _FP4_K_TILE == 0, f"FP4 requires D%128==0, got D={D}"
+        assert D % _FP4_GROUP_SIZE == 0, f"FP4 requires D%32==0, got D={D}"
+        assert _FP4_GROUP_SIZE % VEC == 0
+        assert not preshuffle, "gfx1250 FP4 cache uses the natural layout"
 
     # --- kernel name ----
     _name_parts = [
@@ -248,7 +259,9 @@ def _build_kernel(
         _name_parts.append(f"KB{k_per_block}")
         if quant:
             _name_parts.append("Q")
-            if nm_asm:
+            if quant_fp4:
+                _name_parts.append("fp4nat_v4")
+            elif nm_asm:
                 _name_parts.append(f"nmasm{GROUP_SIZE_Q}")
             else:
                 if use_ue8m0:
@@ -666,10 +679,11 @@ def _build_kernel(
             # Production atom passes bf16 (the param is cast at model load);
             # tests may pass fp32. Constexpr branch picks the right load.
             rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
-            if const_expr(rms_weight_is_bf16):
-                rmsw_lane = _load_bf16_vec_then_f32(rmsw_rsrc, tid_x_vec, VEC)
-            else:
-                rmsw_lane = _load_f32_vec(rmsw_rsrc, tid_x_vec, VEC)
+            rmsw_lane = (
+                _load_bf16_vec_then_f32(rmsw_rsrc, tid_x_vec, VEC)
+                if rms_weight_is_bf16
+                else _load_f32_vec(rmsw_rsrc, tid_x_vec, VEC)
+            )
 
             normed_lane = [
                 arith.MulFOp(
@@ -878,7 +892,7 @@ def _build_kernel(
                         ROPE_THREAD_LO=ROPE_THREAD_LO,
                         wave_width=BLOCK_THREADS,
                     )
-                else:
+                elif const_expr(not quant_fp4):
                     # -- QUANT=1: FP8 per-row scaled write + fp32 scale --
                     # Steps:
                     #   (a) per-lane amax over VEC values, wave-reduce-max
@@ -1094,6 +1108,90 @@ def _build_kernel(
                             ),
                         )
                         buffer_ops.buffer_store(scale_v, cs_rsrc, slot_in_block)
+                else:
+                    # -- FP4 natural scatter (gfx1250 OPUS layout) --
+                    # D=128 / wave32 gives VEC=4. Eight lanes cooperate on each
+                    # 32-element MX group. Adjacent lanes combine their two
+                    # packed bytes into one aligned dword store, producing one
+                    # contiguous 64-byte E2M1 row. Lane 0 gathers the four group
+                    # scales and writes the row's contiguous 4-byte E8M0 record.
+                    NTG = _FP4_GROUP_SIZE // VEC
+                    LOG2_NTG = int(math.log2(NTG))
+                    PACKED_BYTES = VEC // 2
+                    c_eps_amax = arith.constant(
+                        6.0 * float.fromhex("0x1p-126"), type=f32
+                    )
+
+                    am_grp = arith.constant(0.0, type=f32)
+                    for i in range_constexpr(VEC):
+                        am_grp = arith.maximumf(am_grp, fmath.absf(out_lane[i]))
+                    for sh_exp in range_constexpr(LOG2_NTG):
+                        off = NTG // (2 << sh_exp)
+                        peer = _to_raw(
+                            fx.Float32(am_grp).shuffle_xor(off, BLOCK_THREADS)
+                        )
+                        am_grp = arith.maximumf(am_grp, peer)
+                    am_safe = arith.maximumf(am_grp, c_eps_amax)
+
+                    e8m0 = emit_mx_e8m0_scale(
+                        am_safe,
+                        mode=_MxRoundInt.RoundUp,
+                        dtype=_MxDtypeInt.FP4_E2M1,
+                    )
+                    e8m0_v = ArithValue(e8m0)
+                    quant_exp = ArithValue(arith.constant(254, type=i32)) - e8m0_v
+                    quant_scale = (
+                        quant_exp << ArithValue(arith.constant(23, type=i32))
+                    ).bitcast(f32)
+                    nibs = [
+                        emit_f32_to_e2m1(ArithValue(out_lane[i]) * quant_scale)
+                        for i in range_constexpr(VEC)
+                    ]
+                    assert PACKED_BYTES == 2, "gfx1250 natural FP4 expects D=128"
+                    packed16 = (
+                        ArithValue(nibs[0])
+                        | (ArithValue(nibs[1]) << 4)
+                        | (ArithValue(nibs[2]) << 8)
+                        | (ArithValue(nibs[3]) << 12)
+                    )
+                    peer16 = packed16.shuffle_xor(1, BLOCK_THREADS)
+                    packed32 = packed16 | (peer16 << fx.Int32(16))
+
+                    data_rsrc = buffer_ops.create_buffer_resource(
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, k_per_block * (D // 2), 1
+                        ),
+                    )
+                    fp4_byte_off = fx.Int32(slot_in_block) * (D // 2) + (
+                        (fx.Uint32(tid) * VEC) >> 1
+                    )
+                    if (fx.Int32(tid) & 1) == 0:
+                        buffer_ops.buffer_store(
+                            packed32,
+                            data_rsrc,
+                            fp4_byte_off,
+                            offset_is_bytes=True,
+                        )
+
+                    if (fx.Int32(tid) % NTG) == 0:
+                        scale_rsrc = buffer_ops.create_buffer_resource(
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block,
+                                k_per_block * (D // _FP4_GROUP_SIZE),
+                                1,
+                            ),
+                        )
+                        buffer_ops.buffer_store(
+                            arith.trunci(T.i8, e8m0_v),
+                            scale_rsrc,
+                            fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
+                            + fx.Int32(tid) // NTG,
+                            offset_is_bytes=True,
+                        )
             # else: warmup -- no scatter, just consume compute.
 
     @flyc.jit
@@ -1202,6 +1300,7 @@ def _build_kernel_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
+    quant_mode: str = "per_row_fp8",
 ):
     """K-split single-kernel (wave32 / gfx1250): NW-wave LDS-reduced compress +
     norm + rope + scatter (BF16 or FP8).
@@ -1223,6 +1322,7 @@ def _build_kernel_ksplit(
     NW = k_split_num_waves
     BLOCK_TH = BLOCK_THREADS * NW
     K_PER_WAVE = K // NW
+    quant_fp4 = quant_mode == "fp4"
 
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
@@ -1236,6 +1336,9 @@ def _build_kernel_ksplit(
     if quant and preshuffle:
         assert D % _PRESHUFFLE_TILE == 0
         assert k_per_block % _PRESHUFFLE_TILE == 0
+    if quant_fp4:
+        assert D == 128 and k_per_block == 64
+        assert not preshuffle
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D
@@ -1258,7 +1361,9 @@ def _build_kernel_ksplit(
     ]
     if quant:
         _name_parts.append("Q")
-        if use_ue8m0:
+        if quant_fp4:
+            _name_parts.append("fp4nat_v3")
+        elif use_ue8m0:
             _name_parts.append("ue8m0")
         if preshuffle:
             _name_parts.append("psh")
@@ -1532,10 +1637,11 @@ def _build_kernel_ksplit(
                 )
 
                 rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
-                if const_expr(rms_weight_is_bf16):
-                    rmsw_lane = _load_bf16_vec_then_f32(rmsw_rsrc, lid_x_vec, VEC)
-                else:
-                    rmsw_lane = _load_f32_vec(rmsw_rsrc, lid_x_vec, VEC)
+                rmsw_lane = (
+                    _load_bf16_vec_then_f32(rmsw_rsrc, lid_x_vec, VEC)
+                    if rms_weight_is_bf16
+                    else _load_f32_vec(rmsw_rsrc, lid_x_vec, VEC)
+                )
 
                 normed_lane = [
                     arith.MulFOp(
@@ -1675,7 +1781,7 @@ def _build_kernel_ksplit(
                         )
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(hi, out_rsrc, cache_off_dw + 4)
-                else:
+                elif const_expr(not quant_fp4):
                     # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
                     # store via shuffle_xor(1) within the wave.
@@ -1843,6 +1949,77 @@ def _build_kernel_ksplit(
                             ),
                         )
                         buffer_ops.buffer_store(scale_v, cs_rsrc, slot_in_block)
+                else:
+                    # Natural gfx1250 MXFP4 rows. The K reduction above is
+                    # shared; wave 0 quantizes four f32 values per lane.
+                    NTG = _FP4_GROUP_SIZE // VEC
+                    LOG2_NTG = int(math.log2(NTG))
+                    c_eps_amax = arith.constant(
+                        6.0 * float.fromhex("0x1p-126"), type=f32
+                    )
+                    am_grp = arith.constant(0.0, type=f32)
+                    for i in range_constexpr(VEC):
+                        am_grp = arith.maximumf(am_grp, fmath.absf(out_lane[i]))
+                    for sh_exp in range_constexpr(LOG2_NTG):
+                        off = NTG // (2 << sh_exp)
+                        peer = _to_raw(
+                            fx.Float32(am_grp).shuffle_xor(off, BLOCK_THREADS)
+                        )
+                        am_grp = arith.maximumf(am_grp, peer)
+                    e8m0 = emit_mx_e8m0_scale(
+                        arith.maximumf(am_grp, c_eps_amax),
+                        mode=_MxRoundInt.RoundUp,
+                        dtype=_MxDtypeInt.FP4_E2M1,
+                    )
+                    e8m0_v = ArithValue(e8m0)
+                    quant_scale = (
+                        (ArithValue(arith.constant(254, type=i32)) - e8m0_v)
+                        << ArithValue(arith.constant(23, type=i32))
+                    ).bitcast(f32)
+                    nibs = [
+                        ArithValue(
+                            emit_f32_to_e2m1(ArithValue(out_lane[i]) * quant_scale)
+                        )
+                        for i in range_constexpr(VEC)
+                    ]
+                    packed16 = (
+                        nibs[0] | (nibs[1] << 4) | (nibs[2] << 8) | (nibs[3] << 12)
+                    )
+                    packed32 = packed16 | (packed16.shuffle_xor(1, BLOCK_THREADS) << 16)
+                    data_rsrc = buffer_ops.create_buffer_resource(
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, k_per_block * (D // 2), 1
+                        ),
+                    )
+                    fp4_byte_off = fx.Int32(slot_in_block) * (D // 2) + (
+                        (fx.Uint32(lid) * VEC) >> 1
+                    )
+                    if (fx.Int32(lid) & 1) == 0:
+                        buffer_ops.buffer_store(
+                            _to_raw(packed32),
+                            data_rsrc,
+                            fp4_byte_off,
+                            offset_is_bytes=True,
+                        )
+                    if (fx.Int32(lid) % NTG) == 0:
+                        scale_rsrc = buffer_ops.create_buffer_resource(
+                            cache_scale,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block,
+                                k_per_block * (D // _FP4_GROUP_SIZE),
+                                1,
+                            ),
+                        )
+                        buffer_ops.buffer_store(
+                            arith.trunci(T.i8, e8m0_v),
+                            scale_rsrc,
+                            fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
+                            + fx.Int32(lid) // NTG,
+                            offset_is_bytes=True,
+                        )
 
     @flyc.jit
     def launch_fused_compress_attn_ksplit(
@@ -2052,6 +2229,7 @@ def compile_flydsl_fused_compress_attn_ksplit_gfx1250(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
+    quant_mode: str = "per_row_fp8",
 ):
     launcher = _build_kernel_ksplit(
         head_dim=head_dim,
@@ -2066,6 +2244,7 @@ def compile_flydsl_fused_compress_attn_ksplit_gfx1250(
         preshuffle=preshuffle,
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
+        quant_mode=quant_mode,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -2096,7 +2275,7 @@ def flydsl_fused_compress_attn_gfx1250(
     use_ue8m0: bool = True,
     preshuffle: bool = True,
     k_split_num_waves: int | None = None,
-    quant_mode: str = "per_row_fp8",  # "per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main, nm-asm)
+    quant_mode: str = "per_row_fp8",  # per_row_fp8 | group_fp8 | fp4
     k_rope_cache: (
         torch.Tensor | None
     ) = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
@@ -2112,6 +2291,7 @@ def flydsl_fused_compress_attn_gfx1250(
     preshuffle = False  # MFMA preshuffle is gfx9-only; force linear layout
     enable_prefetch_input = False  # noqa: F841  # VEC=16 VGPR pressure
     nm_asm = quant_mode == "group_fp8"  # V4 nm-asm group-quant (separate rope buf)
+    quant_fp4 = quant_mode == "fp4"
     # ---- input validation ----
     plan_capacity = plan_gpu.shape[0]
     if plan_capacity == 0:
@@ -2186,15 +2366,47 @@ def flydsl_fused_compress_attn_gfx1250(
     if quant:
         if not has_bt:
             raise ValueError("quant=True requires block_tables")
-        if kv_cache.dtype == torch.bfloat16:
-            raise TypeError("quant=True needs fp8 kv_cache")
-        if not nm_asm and (
-            cache_scale is None
-            or cache_scale.dtype != torch.float32
-            or cache_scale.dim() != 2
-            or cache_scale.shape[0] != kv_cache.shape[0]
-        ):
-            raise ValueError("quant=True requires fp32 [NB, k_per_block] cache_scale")
+        if quant_fp4:
+            if head_dim != 128 or k_per_block != 64:
+                raise ValueError(
+                    "gfx1250 FP4 compressor requires head_dim=128 and k_per_block=64"
+                )
+            if (
+                kv_cache.dtype != torch.uint8
+                or tuple(kv_cache.shape[1:]) != (k_per_block, head_dim // 2)
+                or kv_cache.stride(-1) != 1
+                or kv_cache.stride(0) != k_per_block * (head_dim // 2)
+            ):
+                raise ValueError(
+                    "gfx1250 FP4 kv_cache must be contiguous uint8 "
+                    f"[NB, {k_per_block}, {head_dim // 2}], got "
+                    f"shape={tuple(kv_cache.shape)} stride={kv_cache.stride()} "
+                    f"dtype={kv_cache.dtype}"
+                )
+            if (
+                cache_scale is None
+                or cache_scale.dtype != torch.uint8
+                or tuple(cache_scale.shape[1:])
+                != (k_per_block, head_dim // _FP4_GROUP_SIZE)
+                or cache_scale.stride(-1) != 1
+                or cache_scale.stride(0) != k_per_block * (head_dim // _FP4_GROUP_SIZE)
+            ):
+                raise ValueError(
+                    "gfx1250 FP4 cache_scale must be contiguous uint8 "
+                    f"[NB, {k_per_block}, {head_dim // _FP4_GROUP_SIZE}]"
+                )
+        else:
+            if kv_cache.dtype == torch.bfloat16:
+                raise TypeError("quant=True needs fp8/uint8 kv_cache")
+            if not nm_asm and (
+                cache_scale is None
+                or cache_scale.dtype != torch.float32
+                or cache_scale.dim() != 2
+                or cache_scale.shape[0] != kv_cache.shape[0]
+            ):
+                raise ValueError(
+                    "per-row FP8 requires fp32 [NB, k_per_block] cache_scale"
+                )
         if preshuffle:
             if head_dim % _PRESHUFFLE_TILE != 0:
                 raise ValueError(f"preshuffle requires head_dim%16==0, got {head_dim}")
@@ -2260,10 +2472,16 @@ def flydsl_fused_compress_attn_gfx1250(
         head_dim == 512 and rope_head_dim == 64 and ratio == 4 and overlap and not quant
     )
     _is_csa_indexer = (
-        head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap and quant
+        head_dim == 128
+        and rope_head_dim == 64
+        and ratio == 4
+        and overlap
+        and quant_mode in ("per_row_fp8", "fp4")
     )
     if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
         nw_eff = csa_ksplit_num_waves_gfx1250(plan_capacity)
+        if quant_fp4:
+            nw_eff = max(nw_eff, 2)
     else:
         nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
     use_ksplit = (
@@ -2288,6 +2506,7 @@ def flydsl_fused_compress_attn_gfx1250(
             preshuffle=preshuffle,
             rms_weight_is_bf16=_rms_weight_is_bf16,
             rms_eps=float(rms_eps),
+            quant_mode=quant_mode,
         )
         if stream is None:
             stream = torch.cuda.current_stream()
