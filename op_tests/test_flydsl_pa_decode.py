@@ -90,12 +90,13 @@ def _make_inputs(
     elif pattern == "probability_tail":
         # Individually tiny probabilities carry substantial mass together.
         # Keep the maximum first and use one partition to retain all 1023 tails.
+        # These Q/K values give the same scores in E4M3FN and E4M3FNUZ,
+        # with tail probabilities near 2**-12. Scaling P preserves the tails
+        # in both formats; converting unscaled P to FP8 rounds them to zero.
         query.zero_()
-        query[..., 0] = 8
-        query[..., 1] = 1
+        query[..., 0] = 13.4375
         key.zero_()
-        key[..., 0] = -10
-        key[..., 1] = -0.15625
+        key[..., 0] = -7
         key[..., 2] = -14
         value.fill_(3.5)
         first_page = table[0, 0].item()
