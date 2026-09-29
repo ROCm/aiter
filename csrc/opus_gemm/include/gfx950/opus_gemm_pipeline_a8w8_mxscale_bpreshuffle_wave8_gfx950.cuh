@@ -265,6 +265,74 @@ inline __device__ auto make_layout_gmem_b_direct_nrep_mxsk(int lane_id, int stri
     return u_gb;
 }
 
+// A's LDS swizzle. A load group's slot holds 8 rows of 128 bytes, a group's
+// rows alternate between slots, and slots sit 1056 bytes apart, so the rows a
+// ds_read_b128 fragment read puts in one LDS pass land on the same banks: PMC
+// puts 78% of kid8408's bank conflicts (and 65% of kid8205's) on the A read,
+// flydsl's same tile has almost none. The DMA writes lane l at l*16 and cannot
+// permute its destination, so the swizzle is on the source: position (slot s,
+// row r, 16-byte chunk c) holds global chunk c ^ f(s, r), and the reader
+// fetches chunk c from position c ^ f(s, r). Bit 2 of f flips the fragment
+// half, which no y stride expresses, so the read issues each half on its own.
+//
+// f was picked against every LDS pass model that reproduces the measurements
+// (the unswizzled layout conflicts, a swizzle on row bits 1-2 alone changes
+// nothing, flydsl's row % 16 XOR is clean): it is within 2 cycles of ideal on
+// all of them at both T_M=1 and T_M=2.
+#ifdef __HIP_DEVICE_COMPILE__
+OPUS_D int a_lds_swz_mxsk(int s, int r) {
+    return ((s & 1) ? 1 : 0) ^ ((r & 1) ? 5 : 0) ^ ((r & 2) ? 5 : 0) ^ ((r & 4) ? 4 : 0);
+}
+
+// make_layout_ra_mxsk's default arm with the fragment-half dim turned from a y
+// dim into a p dim at `half`, and the lane's K quarter given as `kq`: the
+// swizzle moves both per lane. The dim keeps its extent so every other stride
+// is unchanged.
+template<typename T>
+inline __device__ auto make_layout_ra_half_mxsk(int lane_id, int wave_id_m, int half, int kq) {
+    constexpr int threads_k = opus::get_warp_size() / T::W_M;
+    constexpr int threads_m_per_wave = opus::get_warp_size() / threads_k;
+    constexpr int interlanegroup_m = threads_m_per_wave / T::LOAD_GROUP_M_LANE;
+    constexpr int per_block_load = T::slots * (T::smem_linear_wave_per_async_load + T::smem_padding);
+    constexpr int m_block_stride = ra_m_block_stride_mxsk<T>;
+
+    constexpr auto ra_block_shape = opus::make_tuple(
+        opus::number<T::COM_REP_M>{},
+        opus::number<T::slots>{},
+        opus::number<T::NUM_LOAD_GROUPS_PER_BK>{},
+        opus::number<T::T_M>{},
+        opus::number<interlanegroup_m / T::slots>{},
+        opus::number<T::LOAD_GROUP_M_LANE>{},
+        opus::number<2>{},
+        opus::number<threads_k>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto ra_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{},
+                         opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    auto lane_id_m = lane_id % T::W_M;
+
+    return opus::make_layout<0>(
+        ra_block_shape,
+        opus::unfold_x_stride(ra_block_dim, ra_block_shape,
+            opus::tuple{opus::number<m_block_stride>{},
+                        opus::number<T::smem_linear_wave_per_async_load + T::smem_padding>{},
+                        opus::number<per_block_load>{},
+                        1_I}),
+        opus::unfold_p_coord(ra_block_dim,
+            opus::tuple{lane_id_m % T::slots,
+                        wave_id_m,
+                        lane_id_m / T::slots,
+                        lane_id_m % T::LOAD_GROUP_M_LANE,
+                        half,
+                        kq}));
+}
+#endif // __HIP_DEVICE_COMPILE__
+
 // DIRECT_ONLY / PREFETCH_SCALE / PRELOAD_SF_LDS are kept in the signature so the
 // codegen'd launcher can instantiate this exactly like the shared kernel; only
 // the one combination this file implements is accepted.
@@ -516,16 +584,33 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // global and gives the array back entirely.
     constexpr bool SF_LDS_A = !SFA_MPACK_GLOBAL && !SHUFFLE_SCALE;
     constexpr bool SF_LDS_B = !SHUFFLE_SCALE;
-    constexpr bool SF_PLAIN_DEFER_BARRIER =
-        (SF_LDS_A || SF_LDS_B) && T::B_M == 128 && T::B_K == 256;
-    // Pad per M-packed lane row of the GROUP_K=32 A panel. A row there is
-    // COM_REP_M*K/32 bytes, 128 dwords at K=4096, so a wave's 16 lanes all hit
-    // one bank: PMC puts 4.2x the 128 kid's LDS bank conflicts on kid9348. The
-    // pad moves consecutive rows four banks apart. 128 keeps its layout.
-    constexpr int SF_A_PAD = (SF_LDS_A && T::SF_PER_MFMA_K > 1) ? T::SF_PANEL_PAD : 0;
+    // The B panel is row-major, one row per scale group, each row this split's
+    // scales rounded up to whole dwords, so the async DMA fills it straight from
+    // global with no register round trip (see fill_panels).
+    //
+    // The A panel takes one of two layouts. SF_A_DMA: the same row-major form,
+    // one row per A row, its dwords rotated by the row's lane index so the 16
+    // rows a scale read spans land on different banks; a K tile then reads a
+    // byte per (M subtile, K rep). Otherwise M-packed, [lane row][k][subtile],
+    // so a K tile's scales for all of a lane's subtiles are one read -- but only
+    // a register fill can build it. The DMA layout pays COM_REP_M reads a tile
+    // to drop the fill's register round trip, which is a win at COM_REP_M = 4
+    // (kid8408 0.96x) and a loss at 8 (kid8406 1.10x, kid8205 1.04x).
+    constexpr bool SF_A_DMA = SF_LDS_A && T::COM_REP_M <= 4;
+    constexpr bool SF_A_MPACK = SF_LDS_A && !SF_A_DMA;
+    // Pad per M-packed lane row. GROUP_K=32: a row is COM_REP_M*K/32 bytes, 128
+    // dwords at K=4096, so a wave's 16 lanes all hit one bank (PMC: 4.2x the 128
+    // kid's conflicts on kid9348); the pad moves rows four banks apart. 128: a
+    // row is read one K tile's COM_REP_M*SCALES_PER_BK bytes at a time and is
+    // 128 bytes unpadded at K=4096, so those 16 rows stack on the same banks
+    // (31% of kid8205's conflicts); one read's width of pad separates them.
+    constexpr int SF_A_PAD = !SF_A_MPACK ? 0
+                           : (T::SF_PER_MFMA_K > 1 ? T::SF_PANEL_PAD : T::SF_PANEL_PAD_128);
+    constexpr int SF_ROW_MAX = (SF_SCALES_MAX + 3) / 4 * 4;
     constexpr int SF_LDS_ELEMS =
-        ((SF_LDS_A ? SFA_ROWS : 0) + (SF_LDS_B ? T::N_SCALE_GROUPS : 0)) * SF_SCALES_MAX
-        + SFA_MB * SF_A_PAD;
+        (SF_A_DMA ? SFA_ROWS * SF_ROW_MAX : 0)
+        + (SF_A_MPACK ? SFA_ROWS * SF_SCALES_MAX + SFA_MB * SF_A_PAD : 0)
+        + (SF_LDS_B ? T::N_SCALE_GROUPS * SF_ROW_MAX : 0);
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS > 0 ? SF_LDS_ELEMS : 1];
 
     // Shuffled-word panel, in dwords, holding what read_scales_shuf would
@@ -562,67 +647,55 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     };
 
     const int sf_k_scales = loops * T::SCALES_PER_BK;
+    // Panel row, in dwords and in bytes.
+    const int sf_row_dw = (sf_k_scales + 3) / 4;
+    const int sf_pitch = sf_row_dw * 4;
     // Bytes per M-packed lane row of the A panel.
     const int sfa_pitch = sf_k_scales * T::COM_REP_M + SF_A_PAD;
     D_SF* s_sfa_ptr = smem_sf;
-    D_SF* s_sfb_ptr = smem_sf + (SF_LDS_A ? SFA_MB * sfa_pitch : 0);
+    D_SF* s_sfb_ptr = smem_sf + (SF_A_DMA ? SFA_ROWS * sf_pitch
+                                          : (SF_A_MPACK ? SFA_MB * sfa_pitch : 0));
+    // A panel dword d of row r sits at (d + rot(r)) % sf_row_dw, rot(r) being
+    // the row's index within its SFA_MB block (the lane that reads it) masked
+    // to the row length. Only a power-of-two row rotates; another keeps its
+    // order and takes the bank conflicts.
+    const int sf_rot_mask = (sf_row_dw & (sf_row_dw - 1)) == 0 ? sf_row_dw - 1 : 0;
+    auto sf_rot = [&](int r) { return (r & (SFA_MB - 1)) & sf_rot_mask; };
+    static_assert((SFA_MB & (SFA_MB - 1)) == 0);
 
-    // One-shot cooperative fill of both panels by all BLOCK_SIZE threads,
-    // published by the barrier at the end. OOB rows of a partial M tile read 0
-    // through g_sfa's bound and are never consumed. Nothing to do, and no K limit
-    // to respect, when both panels are read from global.
+    // Overrunning the panels would corrupt LDS, so the bail-out stays, but
+    // returning leaves Y untouched and a zeroed output reads like a correct
+    // answer. The launcher checks the same bound with AITER_CHECK; reaching
+    // this return means a caller went around it.
     if constexpr (SF_LDS_A || SF_LDS_B) {
-        // Overrunning the panels would corrupt LDS, so the bail-out stays, but
-        // returning leaves Y untouched and a zeroed output reads like a correct
-        // answer. The launcher checks the same bound with AITER_CHECK; reaching
-        // this return means a caller went around it.
         if (loops > SFA_K_TILES_MAX) return;
+    }
+    // One-shot cooperative fill of both panels, issued ahead of the A ring and
+    // B prefill. It goes by async DMA, a dword per lane straight into LDS, so
+    // there is no register round trip, no wait and no rendezvous of its own:
+    // the copies are older than A(0), tile 0's barrier wait retires them with
+    // it and tile 0's barrier publishes them. ATT on kid8408 had ~1.7k cycles of
+    // vmcnt and ~2k of barrier per wave on the register fill this replaces,
+    // which flydsl's same tile, filling by DMA, does not pay. OOB rows of a
+    // partial M tile read 0 through g_sfa's bound and are never consumed.
+    //
+    // The DMA needs every row to start on a dword; strides that do not fall
+    // back to a byte fill into the same layout.
+    // M-packed A panel fill: row r of the logical panel is subtile r/SFA_MB of
+    // the lane at row r%SFA_MB, stored as [r%SFA_MB][k][r/SFA_MB], so the
+    // COM_REP_M bytes one lane needs for a K group sit in adjacent slots. A
+    // thread takes SFA_PACK such rows at once so the panel lands in dword stores
+    // rather than one ds_write_b8 per byte; lanes still walk K within a row, so
+    // the global reads stay wide and coalesced. It runs ahead of the B panel's
+    // DMA, whose copies its register waits would otherwise also drain.
+    auto fill_sfa_mpack = [&]() {
         const int tid = opus::thread_id_x();
         auto sm_sfa = make_smem(s_sfa_ptr);
-        auto sm_sfb = make_smem(s_sfb_ptr);
-        const int sfa_total = SFA_ROWS * sf_k_scales;
-        const int sfb_total = T::N_SCALE_GROUPS * sf_k_scales;
-        auto fill_sfb = [&](auto vec_c) {
-            constexpr int VEC = decltype(vec_c)::value;
-            for (int idx = tid * VEC; idx < sfb_total; idx += T::BLOCK_SIZE * VEC) {
-                const int r  = idx / sf_k_scales;
-                const int kt = idx - r * sf_k_scales;
-                sm_sfb.template store<VEC>(
-                    load<VEC>(g_sfb, r * kargs.stride_sfb + kt), idx);
-            }
-        };
-        // SFA goes in M-packed: row r of the logical panel is subtile r/SFA_MB of
-        // the lane at row r%SFA_MB, so storing it as [r%SFA_MB][k][r/SFA_MB] puts
-        // the COM_REP_M bytes one lane needs for a K group in COM_REP_M adjacent
-        // slots, naturally aligned for a single dword read.
-        //
-        // The subtile index being the fastest destination axis is what makes the
-        // fill awkward: adjacent destination bytes come from rows SFA_MB apart. A
-        // thread therefore takes SFA_PACK such rows rather than one, which puts
-        // SFA_PACK adjacent panel bytes in its registers and lets the panel land
-        // in dword stores instead of one ds_write_b8 per byte. Lanes still walk K
-        // within a row, so the global reads stay as wide and as coalesced as they
-        // were, and the instruction count moves on the LDS side only.
-        //
-        // Worth 2-3% at large K on every kid that runs this fill, and nothing at
-        // K=1024 (g16/m8192/n1024, dword against byte stores: 0.98 / 0.97 / 0.99 /
-        // 0.97 / 1.00 / 0.99 / 0.98 for kid168/175/192/194/202/203/205 at K=4096,
-        // and 0.99 / 0.97 / 0.99 / 0.98 / 0.97 / 0.98 / 0.98 at K=8192, against
-        // 1.00 +-0.006 across all seven at K=1024).
-        //
-        // That K profile is the panel's own: sf_k_scales is loops*SCALES_PER_BK,
-        // so the panel and its fill grow with K and this is a reduction in cost
-        // per unit K, not in the fixed part. Worth keeping straight because the
-        // panel's *fixed* cost is a separate quantity and kid208 is what measures
-        // it -- removing the panel outright buys ~18 us of it and pays 6.9% per
-        // unit K back, i.e. exactly the term this store width is what sets.
         constexpr int SFA_PACK = (T::COM_REP_M % 4 == 0) ? 4
                                : ((T::COM_REP_M % 2 == 0) ? 2 : 1);
         constexpr int SFA_PACK_GROUPS = T::COM_REP_M / SFA_PACK;
-        auto fill_sfa = [&](auto vec_c) {
+        auto fill = [&](auto vec_c) {
             constexpr int VEC = decltype(vec_c)::value;
-            // dispatch_width picks VEC to divide sf_k_scales and stride_sfa, so
-            // the chunk count is exact and every global read stays aligned.
             const int k_chunks = sf_k_scales / VEC;
             const int items = SFA_MB * SFA_PACK_GROUPS * k_chunks;
             for (int it = tid; it < items; it += T::BLOCK_SIZE) {
@@ -635,15 +708,13 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 opus::static_for<SFA_PACK>([&](auto j_c) {
                     constexpr int j = decltype(j_c)::value;
                     const int r = (pk * SFA_PACK + j) * SFA_MB + mb;
-                    auto row = load<VEC>(g_sfa, r * kargs.stride_sfa + kt);
+                    auto rw = load<VEC>(g_sfa, r * kargs.stride_sfa + kt);
                     opus::static_for<VEC>([&](auto i_c) {
                         constexpr int i = decltype(i_c)::value;
-                        v[j * VEC + i] = row[i];
+                        v[j * VEC + i] = rw[i];
                     });
                 });
-                const int dst = SF_A_PAD
-                    ? mb * sfa_pitch + kt * T::COM_REP_M + pk * SFA_PACK
-                    : (mb * sf_k_scales + kt) * T::COM_REP_M + pk * SFA_PACK;
+                const int dst = mb * sfa_pitch + kt * T::COM_REP_M + pk * SFA_PACK;
                 opus::static_for<VEC>([&](auto i_c) {
                     constexpr int i = decltype(i_c)::value;
                     opus::vector_t<D_SF, SFA_PACK> w;
@@ -655,21 +726,78 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 });
             }
         };
-        auto dispatch_width = [&](int stride, auto&& fill) {
-            const int widths = sf_k_scales | stride;
-            if      ((widths & 15) == 0) fill(number<16>{});
-            else if ((widths & 3) == 0)  fill(number<4>{});
-            else                         fill(number<1>{});
-        };
-        if constexpr (SF_LDS_A) dispatch_width(kargs.stride_sfa, fill_sfa);
-        if constexpr (SF_LDS_B) dispatch_width(kargs.stride_sfb, fill_sfb);
-        s_waitcnt_vmcnt(0_I);
-        s_waitcnt_lgkmcnt(0_I);
-        // The writes are complete. Selected plain-scale tiles publish the panel
-        // at tile 0's existing barrier after issuing the A ring and B(0), rather
-        // than paying a panel-only rendezvous.
-        if constexpr (!SF_PLAIN_DEFER_BARRIER) __builtin_amdgcn_s_barrier();
+        // VEC must divide both sf_k_scales and stride_sfa so every read is aligned.
+        const int widths = sf_k_scales | kargs.stride_sfa;
+        if      ((widths & 15) == 0) fill(number<16>{});
+        else if ((widths & 3) == 0)  fill(number<4>{});
+        else                         fill(number<1>{});
+    };
+    auto fill_panels = [&]() {
+    if constexpr (SF_A_MPACK) fill_sfa_mpack();
+    if constexpr (SF_LDS_A || SF_LDS_B) {
+        const bool dma_ok = ((kargs.stride_sfa | kargs.stride_sfb | sf_start
+                              | kargs.stride_sfa_batch | kargs.stride_sfb_batch) & 3) == 0;
+        const int sfa_rows_total = SFA_ROWS * sf_row_dw;
+        const int sfb_rows_total = T::N_SCALE_GROUPS * sf_row_dw;
+        if (dma_ok) {
+            auto g_sfa_dw = make_gmem(
+                reinterpret_cast<const int*>(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
+                    + (size_t)batch_id * kargs.stride_sfa_batch
+                    + (size_t)row * kargs.stride_sfa + sf_start),
+                sfa_bytes);
+            auto g_sfb_dw = make_gmem(
+                reinterpret_cast<const int*>(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
+                    + (size_t)batch_id * kargs.stride_sfb_batch
+                    + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start));
+            int* s_sfa_dw = reinterpret_cast<int*>(s_sfa_ptr);
+            int* s_sfb_dw = reinterpret_cast<int*>(s_sfb_ptr);
+            if constexpr (SF_A_DMA) {
+                for (int off = wave_id * 64; off < sfa_rows_total; off += T::WAVES * 64) {
+                    const int l = off + lane_id;
+                    if (l < sfa_rows_total) {
+                        const int r = l / sf_row_dw;
+                        int d = l - r * sf_row_dw - sf_rot(r);
+                        if (d < 0) d += sf_row_dw;
+                        g_sfa_dw.template async_load<1>(s_sfa_dw + l,
+                                                        r * (kargs.stride_sfa / 4) + d);
+                    }
+                }
+            }
+            if constexpr (SF_LDS_B) {
+                for (int off = wave_id * 64; off < sfb_rows_total; off += T::WAVES * 64) {
+                    const int l = off + lane_id;
+                    if (l < sfb_rows_total) {
+                        const int r = l / sf_row_dw;
+                        g_sfb_dw.template async_load<1>(
+                            s_sfb_dw + l, r * (kargs.stride_sfb / 4) + (l - r * sf_row_dw));
+                    }
+                }
+            }
+        } else {
+            const int tid = opus::thread_id_x();
+            if constexpr (SF_A_DMA) {
+                for (int i = tid; i < SFA_ROWS * sf_k_scales; i += T::BLOCK_SIZE) {
+                    const int r = i / sf_k_scales;
+                    const int b = i - r * sf_k_scales;
+                    int d = (b >> 2) + sf_rot(r);
+                    if (d >= sf_row_dw) d -= sf_row_dw;
+                    s_sfa_ptr[r * sf_pitch + d * 4 + (b & 3)] =
+                        load<1>(g_sfa, r * kargs.stride_sfa + b)[0];
+                }
+            }
+            if constexpr (SF_LDS_B) {
+                for (int i = tid; i < T::N_SCALE_GROUPS * sf_k_scales; i += T::BLOCK_SIZE) {
+                    const int r = i / sf_k_scales;
+                    const int b = i - r * sf_k_scales;
+                    s_sfb_ptr[r * sf_pitch + b] = load<1>(g_sfb, r * kargs.stride_sfb + b)[0];
+                }
+            }
+            s_waitcnt_lgkmcnt(0_I);
+        }
+        if constexpr (SF_A_MPACK) s_waitcnt_lgkmcnt(0_I);
     }
+    };
+    fill_panels();
 
     // Staging: there are no producer waves, every wave issues its own share of
     // each A tile. A wave takes slot group wave_id%LOAD_WAVES of the A load
@@ -681,7 +809,27 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         lane_id, wave_id_load, kargs.stride_a);
     auto u_sa = make_layout_smem_group_load_mxsk<T, T::LOAD_WAVES>(lane_id, wave_id_load);
 
+    // The wave-pair remap renumbers the rows a lane reads; the swizzle is only
+    // derived for the default map.
+    constexpr bool A_SWZ = !SF_WPAIR;
+    constexpr int A_ROW_CHUNKS = T::LOAD_GROUP_K / T::VEC_A;
+    static_assert(!A_SWZ || (A_ROW_CHUNKS == 8 && T::slots == T::LOAD_WAVES
+                             && T::LOAD_GROUP_M_LANE == 1 && T::W_M % T::slots == 0),
+                  "the A swizzle assumes one wave per slot and 8-row, 8-chunk slots");
+    if constexpr (A_SWZ) {
+        // This wave stages slot wave_id_load; lane l lands on row l/8, chunk l%8.
+        const int c = lane_id % A_ROW_CHUNKS;
+        u_ga += ((c ^ a_lds_swz_mxsk(wave_id_load, lane_id / A_ROW_CHUNKS)) - c) * T::VEC_A;
+    }
+
     auto u_ra = make_layout_ra_mxsk<T, T::COM_REP_M, SF_WPAIR>(lane_id, wave_id_m);
+    // The slot and row this lane reads, as make_layout_ra_mxsk derives them.
+    const int ra_swz = a_lds_swz_mxsk(
+        (lane_id % T::W_M) % T::slots,
+        wave_id_m * (T::W_M / T::slots) + (lane_id % T::W_M) / T::slots);
+    const int ra_kq = (lane_id / T::W_M) ^ (ra_swz & 3);
+    auto u_ra_h0 = make_layout_ra_half_mxsk<T>(lane_id, wave_id_m, ra_swz >> 2, ra_kq);
+    auto u_ra_h1 = make_layout_ra_half_mxsk<T>(lane_id, wave_id_m, 1 ^ (ra_swz >> 2), ra_kq);
     // Each N-wave owns COM_REP_N contiguous 16-column blocks of the tile.
     auto u_gb_direct = make_layout_gmem_b_direct_mxsk<T>(
         lane_id, kargs.stride_b, wave_id_n * T::COM_REP_N);
@@ -944,9 +1092,28 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // 0.94-1.00 on every shape and the 128x128 2x4 ones (8348/8349) at 0.94-1.05,
     // mostly under 1. The 256-wide 2x4 tiles (8194/8346, 8168/8175) and the 1x8
     // grid were a wash either way, so they keep the end-of-tile issue.
+    //
+    // B_BUFS > 1 replaces that with a register ring: tile k consumes buffer
+    // k % B_BUFS and issues B(k + B_BUFS - 1) into the buffer tile k-1 freed,
+    // right after its A batch, so a B load has B_BUFS - 1 whole tiles to land
+    // rather than the barrier and A read between its issue and its use. ATT on
+    // kid8408 (64x64x256) put ~4.5k cycles per wave on the single buffer's
+    // staged wait, against none on flydsl's same tile. Every tile, and each
+    // prefill step, issues one A batch then one B batch, which is what the
+    // vmcnt thresholds below are counted against.
+    constexpr int B_BUFS = (B_STAGED_WAIT && !SHUFFLE_SCALE) ? T::B_DIRECT_BUFS : 1;
+    static_assert(B_BUFS == 1 || B_BUFS >= PF,
+                  "the prefill issues B(p + B_BUFS - PF) beside A(p); a shallower "
+                  "ring would need B tiles before 0");
     constexpr bool B_EARLY_TILE =
         (T::T_M == 1 && T::WAVES == 4) || (T::B_M == 128 && T::B_N == 128);
-    constexpr bool B_EARLY = B_EARLY_TILE && B_STAGED_WAIT && !SHUFFLE_SCALE;
+    constexpr bool B_EARLY = B_EARLY_TILE && B_STAGED_WAIT && !SHUFFLE_SCALE && B_BUFS == 1;
+    typename decltype(mma)::vtype_b v_bs[B_BUFS];
+    auto issue_b_buf = [&](int loop_k, auto buf_c) {
+        const int kk = loop_k < loops ? loop_k : loops - 1;
+        v_bs[decltype(buf_c)::value] =
+            load<T::VEC_B>(g_b, u_gb_direct, b_direct_iter_offset_mxsk<T>(kk));
+    };
     constexpr int B_NREP_ELEMS = T::COM_REP_K * decltype(mma)::mma_b_len;
     auto issue_b_nrep = [&](int loop_k, auto j_c) {
         constexpr int j = decltype(j_c)::value;
@@ -957,44 +1124,76 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                         opus::number<(j + 1) * B_NREP_ELEMS>{});
     };
 
+    // This lane's A panel row within an SFA_MB block, its rotation, and the
+    // byte offset of its row in block 0; subtile im adds im*SFA_MB rows.
+    const int sfa_lane_row = wave_id_m * T::W_M + lane_id % T::W_M;
+    const int sfa_lane_rot = sf_rot(sfa_lane_row);
+    const int sfa_lane_off = sfa_lane_row * sf_pitch;
     auto read_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
         const int scale_base = loop_k * T::SCALES_PER_BK;
-        // One load for the whole K tile's A scales: this lane's COM_REP_M bytes
-        // per K group are adjacent in either panel. Read straight from the host's
-        // panel when there is one -- the caller must pass
-        // shuffle_scale_mxsk_mpack(x_scale, B_M, T_M*W_M).
-        if constexpr (T::SF_PER_MFMA_K > 1) {
-            // GROUP_K=32: the lane's block of MFMA ik is K scale
-            // ik*SF_PER_MFMA_K + sf_lane_k, and the panel's [row][k][subtile]
-            // order keeps its COM_REP_M subtile bytes adjacent at every k, so
-            // each MFMA is still one aligned COM_REP_M-byte read.
-            auto sm_a = make_smem(s_sfa_ptr
-                                  + (wave_id_m * T::W_M + lane_id % T::W_M) * sfa_pitch
-                                  + (scale_base + sf_lane_k) * T::COM_REP_M);
-            opus::static_for<T::COM_REP_K>([&](auto ik_c) {
-                constexpr int ik = decltype(ik_c)::value;
-                auto w = load<T::COM_REP_M>(sm_a, ik * T::SF_PER_MFMA_K * T::COM_REP_M);
+        if constexpr (SFA_MPACK_GLOBAL) {
+            // The host's M-packed panel: one load for the whole K tile, this
+            // lane's COM_REP_M bytes per K group adjacent (the caller passes
+            // shuffle_scale_mxsk_mpack(x_scale, B_M, T_M*W_M)).
+            v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(
+                g_sfa, (sfa_mpack_row + scale_base) * T::COM_REP_M);
+        } else if constexpr (SF_A_MPACK) {
+            // This lane's COM_REP_M subtile bytes per K scale are adjacent: at 128
+            // one read covers the tile, at 32 one per MFMA K rep.
+            auto sm_a = make_smem(s_sfa_ptr + sfa_lane_row * sfa_pitch);
+            if constexpr (T::SF_PER_MFMA_K > 1) {
+                opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                    constexpr int ik = decltype(ik_c)::value;
+                    auto w = load<T::COM_REP_M>(
+                        sm_a, (scale_base + ik * T::SF_PER_MFMA_K + sf_lane_k) * T::COM_REP_M);
+                    opus::static_for<T::COM_REP_M>([&](auto im_c) {
+                        constexpr int im = decltype(im_c)::value;
+                        v_sfa[ik * T::COM_REP_M + im] = w[im];
+                    });
+                });
+            } else {
+                v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(sm_a, scale_base * T::COM_REP_M);
+            }
+        } else {
+            // A byte per (MFMA K rep, M subtile): MFMA ik's scale is K scale
+            // ik*SF_PER_MFMA_K + sf_lane_k of the tile (sf_lane_k is 0 at 128).
+            auto sm_a = make_smem(s_sfa_ptr + sfa_lane_off);
+            if constexpr (T::SF_PER_MFMA_K == 1 && T::COM_REP_K == 2) {
+                // The tile's two scales are adjacent and, scale_base being even,
+                // inside one dword: one u16 per subtile.
+                int d = (scale_base >> 2) + sfa_lane_rot;
+                if (d >= sf_row_dw) d -= sf_row_dw;
+                const int byte = d * 4 + (scale_base & 3);
                 opus::static_for<T::COM_REP_M>([&](auto im_c) {
                     constexpr int im = decltype(im_c)::value;
-                    v_sfa[ik * T::COM_REP_M + im] = w[im];
+                    auto w = load<2>(sm_a, byte + im * SFA_MB * sf_pitch);
+                    v_sfa[im] = w[0];
+                    v_sfa[T::COM_REP_M + im] = w[1];
+                });
+            } else
+            opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                constexpr int ik = decltype(ik_c)::value;
+                const int sc = scale_base + ik * T::SF_PER_MFMA_K + sf_lane_k;
+                int d = (sc >> 2) + sfa_lane_rot;
+                if (d >= sf_row_dw) d -= sf_row_dw;
+                const int byte = d * 4 + (sc & 3);
+                opus::static_for<T::COM_REP_M>([&](auto im_c) {
+                    constexpr int im = decltype(im_c)::value;
+                    v_sfa[ik * T::COM_REP_M + im] =
+                        load<1>(sm_a, byte + im * SFA_MB * sf_pitch)[0];
                 });
             });
+        }
+        if constexpr (T::SF_PER_MFMA_K > 1) {
             opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_k_scales + scale_base);
+                auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_pitch + scale_base);
                 load_sfb_lane<T, ng>(sm_b, 0, sf_lane_k, v_sfb);
             });
         } else {
-            if constexpr (SFA_MPACK_GLOBAL) {
-                v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(
-                    g_sfa, (sfa_mpack_row + scale_base) * T::COM_REP_M);
-            } else {
-                auto sm_a = make_smem(s_sfa_ptr + (sfa_mpack_row + scale_base) * T::COM_REP_M);
-                v_sfa = load<T::COM_REP_M * T::SCALES_PER_BK>(sm_a, 0);
-            }
             opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_k_scales + scale_base);
+                auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_pitch + scale_base);
                 auto sfb = load<T::SCALES_PER_BK>(sm_b, 0);
                 opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
                     constexpr int kg = decltype(kg_c)::value;
@@ -1015,8 +1214,13 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     //                                  A batch just issued plus any prefetch,
     //                                  which retires B(k))
     //   issue B(k+1)                  (vmcnt; earliest point, v_b is now dead)
-    auto k_tile = [&](int k, auto kp_c) {
+    auto k_tile = [&](int k, auto kp_c, auto bi_c) {
         constexpr int KP = decltype(kp_c)::value;
+        constexpr int BI = decltype(bi_c)::value;
+        auto& v_bk = [&]() -> auto& {
+            if constexpr (B_BUFS > 1) return v_bs[BI];
+            else return v_b;
+        }();
         // The shuffle_scale layout only loads scales on the first tile of a pair, so the
         // second one issues nothing the staged B wait cannot account for and
         // keeps it. The words it reads landed a pair ago, and the load it does
@@ -1027,14 +1231,42 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         // and it has to leave them: at the plain A_MB + B_MB it would collect them
         // itself, cutting the cover to the half pair it already had.
         constexpr int SF_HELD = KP == 1 ? SF_PF : 0;
-        s_waitcnt_vmcnt(number<A_MB + B_MB + SF_HELD>{});
+        // Under the B ring the count issued after A(k) is B_MB + (PF-2)*(A_MB +
+        // B_MB), and waiting down to exactly that is not enough: the B_K=128
+        // ring kids (8406/8407/8411, 8349) returned errRatio up to 0.2 with it,
+        // with the ISA's issue order and counts exactly as derived. Waiting one
+        // more batch, as the single-buffer schedule always has, makes them exact
+        // at no measurable cost -- read it as an async copy's LDS write trailing
+        // its vmcnt retirement by more than a short tile covers.
+        constexpr int BAR_WAIT = A_MB + B_MB + SF_HELD;
+        s_waitcnt_vmcnt(number<BAR_WAIT>{});
         __builtin_amdgcn_s_barrier();
 
         vtype_sfa v_sfa;
         vtype_sfb v_sfb;
 
         auto sa = make_smem(smem_a_at(k % PF, 0, 0));
-        v_a = load<T::VEC_A>(sa, u_ra);
+        if constexpr (A_SWZ) {
+            // v_a is [M rep][K group][half][VEC_A]; each load is one half.
+            auto a0 = load<T::VEC_A>(sa, u_ra_h0);
+            auto a1 = load<T::VEC_A>(sa, u_ra_h1);
+            constexpr int A_PIECES = T::COM_REP_M * T::NUM_LOAD_GROUPS_PER_BK;
+            opus::static_for<A_PIECES>([&](auto p_c) {
+                constexpr int p = decltype(p_c)::value;
+                opus::set_slice(v_a,
+                    opus::slice(a0, opus::number<p * T::VEC_A>{},
+                                opus::number<(p + 1) * T::VEC_A>{}),
+                    opus::number<(2 * p) * T::VEC_A>{},
+                    opus::number<(2 * p + 1) * T::VEC_A>{});
+                opus::set_slice(v_a,
+                    opus::slice(a1, opus::number<p * T::VEC_A>{},
+                                opus::number<(p + 1) * T::VEC_A>{}),
+                    opus::number<(2 * p + 1) * T::VEC_A>{},
+                    opus::number<(2 * p + 2) * T::VEC_A>{});
+            });
+        } else {
+            v_a = load<T::VEC_A>(sa, u_ra);
+        }
         // read_scales' slot, which is sized for the LDS latency of a panel read.
         // A global load put here is waited on ~A_MB instructions later and so is
         // fully exposed, which is why SF_PREFETCH issues the *next* pair's words
@@ -1051,6 +1283,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         }
 
         issue_a_tile(k + PF - 1);
+        if constexpr (B_BUFS > 1)
+            issue_b_buf(k + B_BUFS - 1, number<(BI + B_BUFS - 1) % B_BUFS>{});
 
         s_waitcnt_lgkmcnt(0_I);
         // Down to the A batch, plus the prefetch that has to outlive this tile.
@@ -1062,8 +1296,11 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             mma_mxscale_wave8_accum<T, decltype(mma), A_MB, STAGED, true, KP>(
                 v_a, v_b, v_sfa_shuf, v_sfb_shuf, v_c);
         } else {
-            mma_mxscale_wave8_accum<T, decltype(mma), A_MB, STAGED, false, 0, B_EARLY>(
-                v_a, v_b, v_sfa, v_sfb, v_c,
+            // What was issued after B(k): A(k+PF-1) alone on a single buffer; on
+            // the ring, the B_BUFS-1 whole steps since B(k)'s own.
+            constexpr int B_TRAIL = B_BUFS > 1 ? (B_BUFS - 1) * (A_MB + B_MB) : A_MB;
+            mma_mxscale_wave8_accum<T, decltype(mma), B_TRAIL, STAGED, false, 0, B_EARLY>(
+                v_a, v_bk, v_sfa, v_sfb, v_c,
                 [&](auto j_c) { issue_b_nrep(k + 1, j_c); });
         }
         __builtin_amdgcn_s_setprio(0);
@@ -1079,7 +1316,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             });
         }
 
-        if constexpr (!B_EARLY) issue_b_direct(k + 1);
+        if constexpr (!B_EARLY && B_BUFS == 1) issue_b_direct(k + 1);
     };
 
     // Prefill: PF-1 A tiles, then B(0).
@@ -1096,25 +1333,45 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // for. Only this one pair pays the latency the steady state now hides.
     if constexpr (SF_PREFETCH) read_scales_shuf(0, v_sfa_shuf, v_sfb_shuf);
 
-    opus::static_for<PF - 1>([&](auto p_c) {
-        issue_a_tile(decltype(p_c)::value);
-    });
-    issue_b_direct(0);
+    if constexpr (B_BUFS > 1) {
+        opus::static_for<PF - 1>([&](auto p_c) {
+            constexpr int p = decltype(p_c)::value;
+            issue_a_tile(p);
+            issue_b_buf(p + B_BUFS - PF, number<(p + B_BUFS - PF) % B_BUFS>{});
+        });
+    } else {
+        opus::static_for<PF - 1>([&](auto p_c) {
+            issue_a_tile(decltype(p_c)::value);
+        });
+        issue_b_direct(0);
+    }
 
-    if constexpr (SHUFFLE_SCALE && T::COM_REP_K == 1) {
+    if constexpr (B_BUFS > 1) {
+        // Unrolled by the ring depth so each tile's buffer is a compile-time index.
+        int k = 0;
+        for (; k + B_BUFS - 1 < loops; k += B_BUFS) {
+            opus::static_for<B_BUFS>([&](auto i_c) {
+                k_tile(k + decltype(i_c)::value, number<0>{}, i_c);
+            });
+        }
+        opus::static_for<B_BUFS - 1>([&](auto i_c) {
+            if (k + decltype(i_c)::value < loops)
+                k_tile(k + decltype(i_c)::value, number<0>{}, i_c);
+        });
+    } else if constexpr (SHUFFLE_SCALE && T::COM_REP_K == 1) {
         // A tile covers one of the scale word's two K blocks, so K walks in pairs
         // to make the word's K bit a compile-time op_sel, and the loop body
         // exists at both parities. An odd tail runs on the KP=0 body, which is
         // the parity a last unpaired tile has, so it costs no third copy.
         int k = 0;
         for (; k + 1 < loops; k += 2) {
-            k_tile(k, number<0>{});
-            k_tile(k + 1, number<1>{});
+            k_tile(k, number<0>{}, number<0>{});
+            k_tile(k + 1, number<1>{}, number<0>{});
         }
-        if (k < loops) k_tile(k, number<0>{});
+        if (k < loops) k_tile(k, number<0>{}, number<0>{});
     } else {
         for (int k = 0; k < loops; ++k) {
-            k_tile(k, number<0>{});
+            k_tile(k, number<0>{}, number<0>{});
         }
     }
 

@@ -258,6 +258,7 @@ def _kargs_template_vars(kernel_tag, kargs_name):
         "a8w8_mxscale_bmm_bpreshuffle_bdirect",
         "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
         "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_allwave",
     ):
         return (
             "",
@@ -270,7 +271,6 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     if kernel_tag in (
         "a8w8_mxscale_bmm_bpreshuffle",
         "a8w8_mxscale_bmm_bpreshuffle_bcast",
-        "a8w8_mxscale_bmm_bpreshuffle_allwave",
         "a8w8_mxscale_bmm_bpreshuffle_sfmpack",
     ):
         return (

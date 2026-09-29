@@ -259,6 +259,15 @@ _TUNE_POLICY = {
     401: [1],
     402: [1],
     404: [1],
+    # kid205's 1x4 grid on the mid-M tiles (see
+    # _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_TILES).
+    405: [1],
+    406: [1],
+    407: [1],
+    408: [1],
+    409: [1],
+    410: [1],
+    411: [1],
     # bdirect, B straight to registers with no LDS hop: the 16x32 and 64x32
     # last-mile tiles, and the 128x128 tile that owns the mid band.
     171: [1],

@@ -1213,10 +1213,14 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
                                                  : max_lds_size_per_wg;
     static constexpr int SF_PANEL_LDS_BUDGET =
         SF_PANEL_LDS_CEILING - SF_PANEL_STAGING_LDS - SF_PANEL_LDS_RESERVE;
-    // The pipeline pads each M-packed A lane row by this at GROUP_K=32 (see
-    // SF_A_PAD there); T_M*W_M rows of it come off the budget first.
+    // The pipeline pads each M-packed A lane row by SF_PANEL_PAD at GROUP_K=32
+    // and by SF_PANEL_PAD_128 at 128 (see SF_A_PAD there); T_M*W_M rows of it
+    // come off the budget first.
     static constexpr int SF_PANEL_PAD = 16;
-    static constexpr int SF_PANEL_PAD_LDS = GROUP_K == 128 ? 0 : T_M * W_M * SF_PANEL_PAD;
+    // The 128 pad is one K tile's read of a lane row, COM_REP_M bytes per scale.
+    static constexpr int SF_PANEL_PAD_128 = COM_REP_M * SCALES_PER_BK;
+    static constexpr int SF_PANEL_PAD_LDS =
+        T_M * W_M * (GROUP_K == 128 ? SF_PANEL_PAD_128 : SF_PANEL_PAD);
     static constexpr int SF_PRELOAD_K_FIT =
         ((SF_PANEL_LDS_BUDGET - SF_PANEL_PAD_LDS) / SF_PANEL_ROWS) * GROUP_K;
     static constexpr int SF_PRELOAD_K_CAP = 32768;
@@ -1311,6 +1315,11 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int est_b_vgpr = b_direct_load_insts * 4;
     static_assert(est_acc_vgpr + est_a_vgpr + est_b_vgpr <= 224,
                   "no room left for addressing inside the 256-register wave");
+    // Direct-B register buffers. One is what the 256-wide tiles can afford; a
+    // tile with room for three issues each K tile's B two tiles ahead, so its
+    // global latency is covered by two tiles of work instead of one barrier.
+    static constexpr int B_DIRECT_BUFS =
+        est_acc_vgpr + est_a_vgpr + 3 * est_b_vgpr <= 224 ? 3 : 1;
 };
 
 // The same 8-wave direct-B schedule on a 2x4 wave grid instead of 4x2.
@@ -1360,9 +1369,10 @@ template<int BLOCK_SIZE_,
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_traits_gfx950
     : opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950<
           BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 1> {
-    static_assert(opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 128,
-                  "one wave owns all B_M rows here, and A only stays resident at "
-                  "B_M=128; a 256-row tile needs a wider grid (wave8n4)");
+    static_assert(opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 128
+                      || opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 64,
+                  "one wave owns all B_M rows here, and A only stays resident up "
+                  "to B_M=128; a 256-row tile needs a wider grid (wave8n4)");
 };
 
 // B-preshuffle sibling with no producer waves: all four waves stage the tile
