@@ -164,7 +164,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
     SCALING_MODE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     scaleN: tl.constexpr,
-    scaleM_pad: tl.constexpr,
+    scaleM_pad,
     scaleN_pad: tl.constexpr,
     SHUFFLE: tl.constexpr,
 ):
