@@ -585,6 +585,11 @@ def topk_select(
     rows, width = input.shape
     if not 1 <= topk <= width:
         raise ValueError(f"topk must be in [1, {width}], got {topk}")
+    if end is None and max_row_len is not None and max_row_len < width:
+        raise ValueError(
+            f"max_row_len={max_row_len} is below width={width}, which every row "
+            "has when end is omitted"
+        )
 
     row_lens = _full_rows(rows, width, input.device) if end is None else end
     if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
