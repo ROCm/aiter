@@ -1931,6 +1931,7 @@ def launch_gemm_a8w4_tdm_optimized(
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
     cluster_n: Constexpr[int] = 1,
+    cluster_m: Constexpr[int] = -1,
     next_stage_prefetch: Constexpr[int] = 0,
     num_waves_per_tensor_tdm: Constexpr[int] = 2,
 ):
@@ -1981,7 +1982,7 @@ def launch_gemm_a8w4_tdm_optimized(
     common_schedule = all(
         (
             a_is_fp4,
-            tile_m == 256,
+            tile_m in (192, 256),
             tile_n == 256,
             tile_k == 256,
             m_warp == 2,
@@ -2009,10 +2010,20 @@ def launch_gemm_a8w4_tdm_optimized(
     relax_cluster_wrap_dscnt = fp4_prefill_schedule
     disable_xdl_arb_stall = 0 if fp4_prefill_schedule else -1
     wmma_reuse = fp4_prefill_schedule
-    output_store_split_wm = 4 if fp4_prefill_schedule else 3
+    schedule_wmma_m_rep = tile_m // m_warp // WMMA_M
+    schedule_mma_n_rep = (tile_n // n_warp // WMMA_N) // 2
+    schedule_mma_count = schedule_wmma_m_rep * schedule_mma_n_rep
+    # Leave one four-MMA group before the closing group.  This gives t256 its
+    # established 28 and gives t192 a valid 20 instead of the old literal 28.
+    fence_cover_mma = schedule_mma_count - 4
+    # Split the output rows evenly.  t256 naturally remains 4+4, while t192
+    # becomes 3+3 instead of 4+2 so the first TDM store has more epilogue work
+    # available to cover it.
+    output_store_split_wm = schedule_wmma_m_rep // 2 if fp4_prefill_schedule else 3
     output_store_wave_split = gemm2_schedule
     assert (tile_n // n_warp // WMMA_N) % epilogue_batch_wn == 0
-    cluster_m = 4 if fp4_prefill_schedule else 1
+    cluster_m = (4 if cluster_m < 0 else cluster_m) if fp4_prefill_schedule else 1
+    assert cluster_m in (1, 4)
     cache_tag = (
         K,
         tile_m,
@@ -2037,6 +2048,7 @@ def launch_gemm_a8w4_tdm_optimized(
         relax_cluster_wrap_dscnt,
         disable_xdl_arb_stall,
         wmma_reuse,
+        fence_cover_mma,
         output_store_split_wm,
         output_store_wave_split,
     )
@@ -2097,12 +2109,13 @@ def launch_gemm_a8w4_tdm_optimized(
     _wmma_reuse = "_reuse" if wmma_reuse else ""
     _overlap_store = f"_ostore2p_s{output_store_split_wm}"
     _output_wave_split = "_ow2" if output_store_wave_split else ""
+    _cluster_m = f"_cm{cluster_m}" if fp4_prefill_schedule and cluster_m != 4 else ""
     _kname = (
         "a8w4_tdm_fp4"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}_cn4_prefetch{_epilogue_batch}_apre_sh"
-        f"{_relax_cluster_wrap}_mg4_fc28{_xdl_arb}"
+        f"{_grouped}{_act}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh"
+        f"{_relax_cluster_wrap}_mg4_fc{fence_cover_mma}{_xdl_arb}"
         f"{_wmma_reuse}{_overlap_store}{_output_wave_split}"
     )
 
@@ -2648,7 +2661,7 @@ def launch_gemm_a8w4_tdm_optimized(
         MMA_GROUP = 4
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
         # REUSE fence; the prefetch reads interleave evenly over the rest.
-        FENCE_COVER_MMA = 28
+        FENCE_COVER_MMA = fence_cover_mma
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
@@ -3014,9 +3027,16 @@ def launch_gemm_a8w4_tdm_optimized(
                             outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                         )
                     # Carry target only -- see buf_ptr_opaque; ``buf`` itself
-                    # must stay foldable or the tile reads wrong LDS.
+                    # must stay foldable or the tile reads wrong LDS.  t192 has
+                    # fewer live accumulators and can afford the ordinary target
+                    # address; its opaque form misaddresses the drain on random
+                    # inputs even though all-zero tests hide the error.
                     next_stage_buf = (
-                        buf_ptr_opaque((kt + 1) % num_buffers)
+                        (
+                            ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                            if tile_m == 192
+                            else buf_ptr_opaque((kt + 1) % num_buffers)
+                        )
                         if const_expr(has_next)
                         else None
                     )

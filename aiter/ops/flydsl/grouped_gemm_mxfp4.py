@@ -104,8 +104,8 @@ def supports_gfx1250_a_preshuffle(
             out_is_f16 == 0,
             has_bias == 0,
             n_experts > 0,
-            (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-            == (256, 256, 256, 2, 2, 4),
+            tile_m in (192, 256),
+            (tile_n, tile_k, m_warp, n_warp, num_buffers) == (256, 256, 2, 2, 4),
             cluster_n == 4,
             next_stage_prefetch == 1,
         )
@@ -145,6 +145,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_scale=None,
     quant_wmma_rep=1,
     cluster_n=-1,
+    cluster_m=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
@@ -266,6 +267,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             quant_wmma_rep,
             quant_scale_tensor,
             cluster_n,
+            cluster_m,
             next_stage_prefetch,
             waves_per_tensor_tdm,
         )

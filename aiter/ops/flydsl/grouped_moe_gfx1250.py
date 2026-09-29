@@ -576,6 +576,7 @@ def _grouped_a8w4_tdm_moe(
     n_warp2=None,
     num_buffers2=None,
     cluster_n=-1,
+    cluster_m=-1,
     cluster_n2=None,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
@@ -1123,6 +1124,7 @@ def _grouped_a8w4_tdm_moe(
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             cluster_n=cluster_n,
+            cluster_m=cluster_m,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
@@ -1159,6 +1161,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             cluster_n=cluster_n,
+            cluster_m=cluster_m,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
@@ -1317,6 +1320,7 @@ def _grouped_a8w4_tdm_moe(
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         cluster_n=cluster_n,
+                        cluster_m=cluster_m,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
@@ -1354,6 +1358,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         cluster_n=cluster_n,
+                        cluster_m=cluster_m,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
@@ -1651,6 +1656,7 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
             _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["cluster_m"] = _as_int(cfg_row.get("cluster_m"), -1)
             _tdm_kw["cluster_n2"] = _as_int(
                 cfg_row.get("cluster_n2"), _tdm_kw["cluster_n"]
             )
