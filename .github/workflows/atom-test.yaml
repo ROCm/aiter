@@ -29,6 +29,10 @@ on:
         description: Stream compiler output with AITER_LOG_MORE=1 (no prebuild)
         type: boolean
         default: false
+      triage_jit_verbose:
+        description: Test the compiler-only logging patch (no prebuild or global verbosity)
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.triage && format('-{0}', inputs.triage_model) || '' }}
@@ -266,7 +270,15 @@ jobs:
         if: inputs.triage
         env:
           BRANCH: ${{ github.ref }}
-        run: test "$BRANCH" = refs/heads/leo/atom-ci-triage
+          JIT_VERBOSE: ${{ inputs.triage_jit_verbose }}
+          LOG_MORE: ${{ inputs.triage_log_more }}
+          PREBUILD: ${{ inputs.triage_prebuild }}
+        run: |
+          test "$BRANCH" = refs/heads/leo/atom-ci-triage
+          if [ "$JIT_VERBOSE" = true ]; then
+            test "$LOG_MORE" = false
+            test "$PREBUILD" = false
+          fi
 
       - name: Docker login
         env:
@@ -292,6 +304,8 @@ jobs:
 
       - name: Generate Dockerfile
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        env:
+          TRIAGE_JIT_VERBOSE: ${{ inputs.triage && inputs.triage_jit_verbose }}
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.BASE_IMAGE }}
@@ -310,6 +324,12 @@ jobs:
           RUN echo "=== triton version ===" && pip show triton || true
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
+          if [ "$TRIAGE_JIT_VERBOSE" = true ]; then
+            cat <<'EOF' >> Dockerfile.mod
+          COPY .aiter-ci-tools/.github/scripts/atom-ci/jit-verbose.patch /tmp/jit-verbose.patch
+          RUN cd /app/aiter-test && git apply --check /tmp/jit-verbose.patch && git apply /tmp/jit-verbose.patch
+          EOF
+          fi
 
       - name: Build the ATOM test image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
@@ -360,6 +380,7 @@ jobs:
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
           -e AITER_LOG_MORE="${{ inputs.triage && inputs.triage_log_more && '1' || '0' }}" \
+          -e AITER_JIT_VERBOSE="${{ inputs.triage && inputs.triage_jit_verbose && '1' || '0' }}" \
           -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -387,6 +408,7 @@ jobs:
           git rev-parse HEAD > atom_diagnostics/atom-sha.txt
           docker image inspect "$BASE_IMAGE" --format '{{json .RepoDigests}}' > atom_diagnostics/image-digests.json
           docker exec atom_aiter_test bash -lc 'cd /app/aiter-test && git rev-parse HEAD && git submodule status' > atom_diagnostics/aiter-revisions.txt
+          docker exec atom_aiter_test bash -lc 'cd /app/aiter-test && git diff -- aiter/jit/utils/cpp_extension.py' > atom_diagnostics/aiter-overlay.patch
           docker exec atom_aiter_test bash -lc 'pip list --format=json' > atom_diagnostics/packages.json
           docker exec -d atom_aiter_test bash -lc 'exec python3 /workspace/.aiter-ci-tools/.github/scripts/atom-ci/monitor.py /workspace/atom_diagnostics'
 
@@ -422,18 +444,21 @@ jobs:
           MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Verify cold JIT cache for compiler logging test
-        if: inputs.triage && inputs.triage_log_more
+        if: inputs.triage && (inputs.triage_log_more || inputs.triage_jit_verbose)
         env:
           PREBUILD_MODULE: ${{ matrix.aiter_prebuild_module }}
           PREBUILD_ENABLED: ${{ inputs.triage_prebuild }}
+          EXPECTED_LOG_MORE: ${{ inputs.triage_log_more && '1' || '0' }}
+          EXPECTED_JIT_VERBOSE: ${{ inputs.triage_jit_verbose && '1' || '0' }}
         run: |
           set -euo pipefail
           test "$PREBUILD_ENABLED" = false
           test -n "$PREBUILD_MODULE"
-          docker exec -e PREBUILD_MODULE atom_aiter_test bash -lc '
-            test "$AITER_LOG_MORE" = 1 &&
+          docker exec -e PREBUILD_MODULE -e EXPECTED_LOG_MORE -e EXPECTED_JIT_VERBOSE atom_aiter_test bash -lc '
+            test "$AITER_LOG_MORE" = "$EXPECTED_LOG_MORE" &&
+            test "$AITER_JIT_VERBOSE" = "$EXPECTED_JIT_VERBOSE" &&
             test ! -e "/app/aiter-test/aiter/jit/$PREBUILD_MODULE.so" &&
-            printf "AITER_LOG_MORE=%s; cold module: %s\n" "$AITER_LOG_MORE" "$PREBUILD_MODULE"
+            printf "AITER_LOG_MORE=%s; AITER_JIT_VERBOSE=%s; cold module: %s\n" "$AITER_LOG_MORE" "$AITER_JIT_VERBOSE" "$PREBUILD_MODULE"
           ' | tee atom_diagnostics/cold-jit-check.txt
 
       - name: Prebuild slow ATOM dependency
