@@ -338,6 +338,13 @@ def moe_gemm_a16w4(
         assert (
             backend == "triton"
         ), "expert_map (EP) is only supported on the triton backend"
+        # The kernel indexes ExpertMap as a flat pointer, so enforce the same
+        # contiguous int32 contract the fused routing path uses.
+        assert (
+            expert_map.is_contiguous()
+            and expert_map.dtype == torch.int32
+            and expert_map.device == x.device
+        ), "expert_map must be a contiguous int32 tensor on x.device"
     stride_bias = None if bias is None else bias.stride(0)
 
     # moe metadata
