@@ -46,6 +46,12 @@ from .tensor_shim import (
     AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
 )
 
+
+def is_fx_set_register_available():
+    """Return whether this FlyDSL build supports explicit register placement."""
+    return callable(getattr(fx, "set_register", None))
+
+
 TDM_DESCRIPTOR_VERSION = 1
 MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
@@ -75,6 +81,10 @@ if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
+
+SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
+    EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
+)
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
 # payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
@@ -227,7 +237,7 @@ def launch_gemm_a8w4_tdm(
         MMA_GROUP,
         MMA_FIRST_GROUP,
         DS_FIRST_N,
-        EXPLICIT_VGPR_PARTITION,
+        SUPPORT_EXPLICIT_VGPR_PARTITION,
         PLANAR_LDS,
         INTERLEAVED_LDS_LOAD,
         row_major_ascale,
@@ -405,7 +415,9 @@ def launch_gemm_a8w4_tdm(
         else f"_mg{MMA_FIRST_GROUP}x{MMA_GROUP}"
     )
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
-    _explicit_vgpr_partition = "_regpart" if EXPLICIT_VGPR_PARTITION else ""
+    _explicit_vgpr_partition = (
+        "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
+    )
     _planar_lds = "_planarlds" if PLANAR_LDS else ""
     _interleaved_lds_load = "_interleavelds" if INTERLEAVED_LDS_LOAD else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
@@ -1061,7 +1073,7 @@ def launch_gemm_a8w4_tdm(
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
             for _ in range_constexpr(n_acc)
         ]
-        if const_expr(EXPLICIT_VGPR_PARTITION):
+        if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
                 fx.set_register(
@@ -1142,7 +1154,7 @@ def launch_gemm_a8w4_tdm(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
-            if const_expr(EXPLICIT_VGPR_PARTITION):
+            if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
                 slot_width = (
                     wmma_m_rep * ACT_NDW
                     + wmma_n_rep * WMMA_VECTOR_DWORDS
@@ -2252,6 +2264,6 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
-if EXPLICIT_VGPR_PARTITION:
+if SUPPORT_EXPLICIT_VGPR_PARTITION:
     launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
     launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
