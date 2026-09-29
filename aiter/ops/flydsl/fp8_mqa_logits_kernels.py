@@ -9,8 +9,9 @@ Wraps the gfx942/gfx950 kernel builders in
     (``_auto_variant`` / ``KERNEL_VARIANTS`` / ``DEFAULT_VARIANT``).
   - A build cache keyed by shape/variant/dtype-conversion flags
     (``compile_fp8_mqa_logits``).
-  - Host-side seq_len padding, output-column alignment, and the KV-column
-    split (``grid.y``) heuristic that fills the device for small-M shapes.
+  - Host-side seq_len padding, output-column alignment, and the occupancy-aware
+    KV-column split (``grid.y``) heuristic that fills the device for small-M
+    shapes (``_auto_num_splits``, ``aiter.ops.flydsl.kernel_occupancy``).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
+from .kernel_occupancy import kernel_occupancy
 from .kernels.mqa_logits.fp8_mqa_logits import (
     _MFMA16,
     _MFMA16_K128,
@@ -82,24 +84,48 @@ class _SplitPolicy:
         stops being amortized. Note this is denominated in *tiles*, so its
         column-equivalent scales with the variant's ``block_kv``.
     cu_oversub : int
-        Target total blocks as a multiple of the device CU count.
+        Target total blocks as a multiple of the device CU count. Used only by
+        the fixed-oversubscription path (``occupancy_aware=False``).
     fallback_cu : int
         Nominal CU count to assume when the device query fails.
+    occupancy_aware : bool
+        Minimize the wave-quantized cost model over ``cu_count * occupancy``
+        instead of targeting a fixed ``cu_oversub``. See ``_auto_num_splits``.
+    block_overhead_tiles : int
+        Per-block fixed cost in BKV tiles (Q/weight preload, tail effects).
+        Splitting multiplies it by ``num_splits``, so it is what bounds the
+        split count. Fitted on MI325X over 86 shapes from three window
+        regimes weighted equally; dominates when windows are narrow.
     """
 
     min_seq_len_kv: int
     min_tiles_per_split: int
     cu_oversub: int
     fallback_cu: int
+    occupancy_aware: bool = False
+    block_overhead_tiles: int = 0
 
 
 _SPLIT_POLICIES = {
     # Tuned on MI300X (304 CU) against the direct-load builder at BKV=128,
     # where min_tiles_per_split=8 is 1024 KV columns.
     "gfx942": _SplitPolicy(
-        min_seq_len_kv=4096, min_tiles_per_split=8, cu_oversub=4, fallback_cu=304
+        min_seq_len_kv=4096,
+        min_tiles_per_split=8,
+        cu_oversub=4,
+        fallback_cu=304,
+        occupancy_aware=True,
+        block_overhead_tiles=8,
     ),
     # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
+    #
+    # Left on the fixed-oversubscription path deliberately. Occupancy is
+    # verified here (308/308 vs HIP), but gfx950 cannot show the effect:
+    # its auto-selected variants span two occupancy values against gfx942's
+    # six, and 32 of 35 measured shapes have four or more split choices
+    # within 3% of optimal. Its optima also sit 8-24x past one effective
+    # wave (4-7x on gfx942), which is window load imbalance -- a term this
+    # model lacks, and a separate change.
     "gfx950": _SplitPolicy(
         min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=256
     ),
@@ -122,30 +148,103 @@ def _device_cu_count(device_index: int) -> int:
         return _split_policy().fallback_cu
 
 
+# ``max_splits`` grows with seq_len_kv (1024 at 1M KV) and the scan runs per
+# launch, so it is capped to keep host cost flat. No measured shape's optimum
+# reached this bound.
+_MAX_SPLIT_SEARCH = 64
+
+
+def _splits_by_wave_cost(
+    grid_x: int, effective_cus: int, window_tiles: int, max_splits: int, overhead: int
+) -> int:
+    """``num_splits`` minimizing a wave-quantized model of the launch's cost.
+
+    The device runs the grid in ``ceil(total_blocks / effective_cus)``
+    waves and a wave costs what its longest block costs, so::
+
+        cost(s) = ceil(grid_x * s / effective_cus) * (ceil(W / s) + overhead)
+
+    with ``W`` the KV window in BKV tiles. Raising ``s`` shortens each
+    block's tile loop but eventually buys a whole extra wave and re-pays
+    ``overhead`` per split; minimizing the product is what replaces guessing
+    an oversubscription factor. Ties go to the smaller ``s`` -- same
+    predicted cost, less duplicated KV traffic at split boundaries.
+
+    Not monotone in ``effective_cus``, by design: higher occupancy can
+    lower the split count when a smaller grid now fits one wave instead of
+    spilling into a second. Those boundaries move with occupancy, which is
+    exactly what a fixed factor cannot see.
+
+    Bounded by ``_MAX_SPLIT_SEARCH``. Known limit: when ``grid_x`` is a small
+    fraction of ``effective_cus`` the extra wave this charges is nearly free,
+    since those CUs were idle anyway, and such shapes measure fastest up to
+    ~7% below what this picks. Pricing partial waves fractionally fixes them
+    and is far worse elsewhere (mean 1.19 vs 1.01 of per-shape optimum over
+    86 shapes), so the quantization stays.
+    """
+    return min(
+        range(1, min(max_splits, _MAX_SPLIT_SEARCH) + 1),
+        key=lambda s: (
+            -(-(grid_x * s) // effective_cus) * (-(-window_tiles // s) + overhead),
+            s,
+        ),
+    )
+
+
 def _auto_num_splits(
     seq_len_padded: int,
     seq_len_kv: int,
     rows_per_block: int,
     block_kv: int,
     device_index: int,
+    launcher=None,
+    variant: str | None = None,
+    num_heads: int = 0,
+    head_size: int = 0,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
     For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
-    Returns 1 once the row grid alone oversubscribes the device. The three
-    tuning constants are per-arch -- see ``_SPLIT_POLICIES``.
+
+    How full the device is depends on the kernel instance, not just the
+    shape: gfx942's ``mfma_r2_w4`` holds 8 blocks/CU at num_heads=16 and 2
+    at 128, so one ``cu_oversub`` constant cannot suit both. The
+    occupancy-aware path forms ``cu_count * kernel_occupancy`` effective CUs
+    and minimizes ``_splits_by_wave_cost`` over them; other arches keep the
+    original behaviour exactly.
     """
     pol = _split_policy()
     grid_x = seq_len_padded // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
-    target_blocks = pol.cu_oversub * _device_cu_count(device_index)
-    if grid_x >= target_blocks:
-        return 1
+    cu_count = _device_cu_count(device_index)
     max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
-    return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
+
+    if not pol.occupancy_aware:
+        target_blocks = pol.cu_oversub * cu_count
+        if grid_x >= target_blocks:
+            return 1
+        return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
+
+    occupancy = kernel_occupancy(
+        launcher,
+        arch=_ARCH,
+        variant=variant,
+        num_heads=num_heads,
+        head_size=head_size,
+        device_index=device_index,
+    )
+    effective_cus = cu_count * occupancy
+    # cu_starts/cu_ends live on the device, so the true window is unknown
+    # without a sync. The full KV extent bounds it, and only the ratio
+    # between candidates matters to the argmin -- exact causal windows were
+    # measured to give the same choice.
+    window_tiles = max(1, seq_len_kv // block_kv)
+    return _splits_by_wave_cost(
+        grid_x, effective_cus, window_tiles, max_splits, pol.block_overhead_tiles
+    )
 
 
 # Kernel-variant registry (arch-dependent).
@@ -588,7 +687,15 @@ def flydsl_fp8_mqa_logits(
     )[:, :seq_len_kv]
 
     num_splits = _auto_num_splits(
-        seq_len_padded, seq_len_kv, _ROWS_PER_BLOCK, _BKV, Q.device.index
+        seq_len_padded,
+        seq_len_kv,
+        _ROWS_PER_BLOCK,
+        _BKV,
+        Q.device.index,
+        launcher=launcher,
+        variant=variant,
+        num_heads=num_heads,
+        head_size=head_size,
     )
 
     if stream is None:
