@@ -56,11 +56,11 @@ def _routing_compute_indx(
     if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx + pid_m * BLOCK_M * N_EXPTS_ACT,
-            shape=(1, LOAD_SIZE),
-            strides=(LOAD_SIZE, 1),
-            block_shape=(1, LOAD_SIZE),
+            shape=(LOAD_SIZE,),
+            strides=(1,),
+            block_shape=(LOAD_SIZE,),
         )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
+        expert = expt_desc.load([0])
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
@@ -134,11 +134,11 @@ def _routing_compute_indx_fused(
     if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx,
-            shape=(1, LOAD_SIZE),
-            strides=(LOAD_SIZE, 1),
-            block_shape=(1, LOAD_SIZE),
+            shape=(LOAD_SIZE,),
+            strides=(1,),
+            block_shape=(LOAD_SIZE,),
         )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
+        expert = expt_desc.load([0])
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
