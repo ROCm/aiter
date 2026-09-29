@@ -3846,9 +3846,8 @@ def get_2stage_cfgs(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
-        enable_bias = (
-            activation != ActivationType.Relu2
-            and _needs_swiglu_bias_support(dtype, q_type)
+        enable_bias = activation != ActivationType.Relu2 and _needs_swiglu_bias_support(
+            dtype, q_type
         )
         return MOEMetadata(
             functools.partial(
