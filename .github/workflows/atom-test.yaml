@@ -142,6 +142,16 @@ jobs:
               "MiniMax-M2.7-MXFP4": "-tp 2 --enforce-eager --level 0",
           }
 
+          # Compile these dependencies before the inference watchdog starts.
+          # Cold builds exceed its three-minute inactivity limit.
+          model_prebuild_modules = {
+              "Kimi-K2.7-Code-MXFP4": "module_gemm_a8w8_bpreshuffle",
+              "DeepSeek-R1-0528-FP4": "module_gemm_a8w8_bpreshuffle",
+              "DeepSeek-R1-0528-FP4 MTP": "module_gemm_a8w8_bpreshuffle",
+              "GLM-5.2-MXFP4 MTP": "module_gemm_a8w8_bpreshuffle",
+              "DeepSeek-V4-Pro": "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
@@ -159,6 +169,7 @@ jobs:
               model["label"] = model.get("runner", "")
               model["display_name"] = model.get("display_name", model["model_name"])
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
+              model["aiter_prebuild_module"] = model_prebuild_modules.get(model["model_name"], "")
               model["run_on_pr"] = True
               return model
 
@@ -225,6 +236,22 @@ jobs:
           DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
           DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin || true
+
+      - name: Checkout AITER CI scripts
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .aiter-ci-tools
+          sparse-checkout: .github/scripts/atom-ci
+          persist-credentials: false
+
+      - name: Record ATOM revision
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        run: |
+          mkdir -p atom_diagnostics
+          git rev-parse HEAD > atom_diagnostics/atom-sha.txt
 
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
@@ -362,6 +389,14 @@ jobs:
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
 
+      - name: Prebuild slow ATOM dependency
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.aiter_prebuild_module != ''
+        timeout-minutes: 30
+        env:
+          PREBUILD_MODULE: ${{ matrix.aiter_prebuild_module }}
+        run: |
+          docker exec -e PREBUILD_MODULE -e GPU_ARCHS=gfx950 atom_aiter_test bash -lc 'python3 /workspace/.aiter-ci-tools/.github/scripts/atom-ci/prebuild.py /app/aiter-test "$PREBUILD_MODULE"' 2>&1 | tee atom_diagnostics/prebuild.log
+
       - name: Run ATOM accuracy test
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 90
@@ -446,6 +481,19 @@ jobs:
         with:
           name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_accuracy_output.txt
           path: atom_accuracy_output.txt
+          retention-days: 7
+
+      - name: Collect diagnostics before cleanup
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        timeout-minutes: 5
+        run: bash .aiter-ci-tools/.github/scripts/atom-ci/collect.sh
+
+      - name: Upload diagnostics
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model_name }}_${{ matrix.runner }}_atom_diagnostics
+          path: atom_diagnostics/
           retention-days: 7
 
       - name: Clean Up
