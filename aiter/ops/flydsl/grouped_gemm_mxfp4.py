@@ -53,9 +53,7 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
 
 
-def _select_cluster_m(
-    csv_cluster_m: int, cluster_n: int, stage1_act: int
-) -> int:
+def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> int:
     """Selects the M cluster degree, preserving the legacy automatic policy."""
     env_cluster_m = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_M")
     try:

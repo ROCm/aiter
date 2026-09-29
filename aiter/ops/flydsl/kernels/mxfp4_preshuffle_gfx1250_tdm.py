@@ -60,13 +60,9 @@ EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
-INTERLEAVED_LDS_LOAD = int(
-    os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0")
-)
+INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
-DISABLE_CLUSTER_SYNC = int(
-    os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0")
-)
+DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
@@ -322,9 +318,6 @@ def launch_gemm_a8w4_tdm(
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
     STAGE_SB = ceildiv(SB_SUPERS * SC_INNER * 4, 16) * 16
-    B_OFF = STAGE_A
-    SA_OFF = STAGE_A + STAGE_B
-    SB_OFF = STAGE_A + STAGE_B + STAGE_SA
     # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
     PITCH = ceildiv(STAGE_A + STAGE_B + STAGE_SA + STAGE_SB, 512) * 512
 
@@ -334,16 +327,12 @@ def launch_gemm_a8w4_tdm(
     PLANAR_SA_OFF = 0
     PLANAR_A_OFF = PLANAR_SA_OFF + num_buffers * STAGE_SA
     PLANAR_SB_OFF = PLANAR_A_OFF + num_buffers * STAGE_A
-    PLANAR_B_OFF = (
-        (PLANAR_SB_OFF + num_buffers * STAGE_SB + 65535) // 65536
-    ) * 65536
+    PLANAR_B_OFF = ((PLANAR_SB_OFF + num_buffers * STAGE_SB + 65535) // 65536) * 65536
     PLANAR_END = PLANAR_B_OFF + num_buffers * STAGE_B
     A_LDS_OFF = PLANAR_A_OFF if PLANAR_LDS else 0
     B_LDS_OFF = PLANAR_B_OFF if PLANAR_LDS else STAGE_A
     SA_LDS_OFF = PLANAR_SA_OFF if PLANAR_LDS else STAGE_A + STAGE_B
-    SB_LDS_OFF = (
-        PLANAR_SB_OFF if PLANAR_LDS else STAGE_A + STAGE_B + STAGE_SA
-    )
+    SB_LDS_OFF = PLANAR_SB_OFF if PLANAR_LDS else STAGE_A + STAGE_B + STAGE_SA
     A_LDS_STAGE = STAGE_A if PLANAR_LDS else PITCH
     B_LDS_STAGE = STAGE_B if PLANAR_LDS else PITCH
     SA_LDS_STAGE = STAGE_SA if PLANAR_LDS else PITCH
@@ -395,11 +384,7 @@ def launch_gemm_a8w4_tdm(
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
-    _cl = (
-        f"_cluster{cluster_m}x{cluster_n}"
-        if cluster_m > 1 or cluster_n > 1
-        else ""
-    )
+    _cl = f"_cluster{cluster_m}x{cluster_n}" if cluster_m > 1 or cluster_n > 1 else ""
     _cluster_sync = "_nosync" if (cluster_m > 1 and DISABLE_CLUSTER_SYNC) else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
@@ -415,9 +400,7 @@ def launch_gemm_a8w4_tdm(
         else f"_mg{MMA_FIRST_GROUP}x{MMA_GROUP}"
     )
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
-    _explicit_vgpr_partition = (
-        "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
-    )
+    _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if PLANAR_LDS else ""
     _interleaved_lds_load = "_interleavelds" if INTERLEAVED_LDS_LOAD else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
@@ -481,9 +464,7 @@ def launch_gemm_a8w4_tdm(
         in_group = swz_id - group * blocks_per_group
         rem_tiles = m_units - group_first_tile
         group_tiles = (rem_tiles < group_m_units).select(rem_tiles, group_m_units)
-        m_unit = group_first_tile + (
-            in_group - (in_group // group_tiles) * group_tiles
-        )
+        m_unit = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
         m_tile = m_unit * cluster_m + local_m
         blk_m = m_tile * tile_m
         n_unit = in_group // group_tiles
@@ -495,9 +476,7 @@ def launch_gemm_a8w4_tdm(
         # A always follows the existing 1x4 direction: one M row broadcasts
         # across the four N columns, even when the physical cluster is 4x4.
         a_mcast_mask = (
-            ((1 << cluster_n) - 1) << (local_m * cluster_n)
-            if cluster_n > 1
-            else None
+            ((1 << cluster_n) - 1) << (local_m * cluster_n) if cluster_n > 1 else None
         )
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
@@ -555,9 +534,7 @@ def launch_gemm_a8w4_tdm(
             valid_m_tiles = (tile_map[n_experts - 1] + tile_m - 1) // tile_m
             full_cluster = cluster_first_m + cluster_m <= valid_m_tiles
             prev_expert = (expert > 0).select(expert - 1, 0)
-            prev_expert = (prev_expert < n_experts).select(
-                prev_expert, n_experts - 1
-            )
+            prev_expert = (prev_expert < n_experts).select(prev_expert, n_experts - 1)
             first_m = (expert > 0).select(
                 (tile_map[prev_expert] + tile_m - 1) // tile_m, 0
             )
@@ -568,9 +545,7 @@ def launch_gemm_a8w4_tdm(
             for mi in range_constexpr(cluster_m):
                 peer_m = cluster_first_m + mi
                 same_expert = (peer_m >= first_m) & (peer_m < end_m)
-                column_mask = column_mask | same_expert.select(
-                    1 << (mi * cluster_n), 0
-                )
+                column_mask = column_mask | same_expert.select(1 << (mi * cluster_n), 0)
                 group_size = group_size + same_expert.select(1, 0)
             # A partial M-tail retains four independent copies of the current
             # 1x4 A protocol.  Disable B multicast there so sentinel rows can
@@ -581,9 +556,9 @@ def launch_gemm_a8w4_tdm(
             b_mcast_mask = use_b_mcast.select(column_mask << local_n, 0)
 
         def cluster_sync():
-            if const_expr(
+            if const_expr(  # noqa: SIM102 - preserve DSL staging
                 cluster_m > 1 and not DISABLE_CLUSTER_SYNC
-            ):  # noqa: SIM102 - preserve DSL staging
+            ):
                 if full_cluster:
                     workgroup_barrier()
                     if wave == 0:
@@ -1155,21 +1130,14 @@ def launch_gemm_a8w4_tdm(
                 for _ in range_constexpr(wmma_n_rep)
             ]
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
-                slot_width = (
-                    wmma_m_rep * ACT_NDW
-                    + wmma_n_rep * WMMA_VECTOR_DWORDS
-                )
+                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
                 reg = 256 + slot_idx * 128
                 for wm in range_constexpr(wmma_m_rep):
-                    fx.set_register(
-                        a[wm], register_class=fx.rocdl.VGPR, start=reg
-                    )
+                    fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
-                    fx.set_register(
-                        b[wn], register_class=fx.rocdl.VGPR, start=reg
-                    )
+                    fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
             return RmemSlot(
@@ -1188,19 +1156,14 @@ def launch_gemm_a8w4_tdm(
             if const_expr(not interleaved_lds_load):
                 # Preserve the legacy instruction order for a clean A/B test.
                 sb_v = [
-                    load_sb(lds_addr.sb, sn, ksl)
-                    for sn in range_constexpr(sb_pairs)
+                    load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
                 ]
                 sa_v = [
                     load_sa(lds_addr.sa, sm, ksl, kt)
                     for sm in range_constexpr(sa_pairs)
                 ]
-                slot.sb.store(
-                    Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs])
-                )
-                slot.sa.store(
-                    Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs])
-                )
+                slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
+                slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
                 for wm in range_constexpr(wmma_m_rep):
                     slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
                 for wn in range_constexpr(wmma_n_rep):
@@ -1218,12 +1181,8 @@ def launch_gemm_a8w4_tdm(
                         sa_v.append(load_sa(lds_addr.sa, i, ksl, kt))
                     if const_expr(i < sb_pairs):
                         sb_v.append(load_sb(lds_addr.sb, i, ksl))
-                slot.sa.store(
-                    Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs])
-                )
-                slot.sb.store(
-                    Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs])
-                )
+                slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+                slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
                 for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
                     if const_expr(i < wmma_m_rep):
                         slot.a[i].store(load_a(lds_addr.a, i, ksl))
@@ -1351,9 +1310,7 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_mfma(tail_mfma)
 
             if const_expr(not rmem_preloaded):
-                load_lds_data(
-                    rmem_slots[0], lds_addr, 0, kt, interleaved_lds_load
-                )
+                load_lds_data(rmem_slots[0], lds_addr, 0, kt, interleaved_lds_load)
             for ksl in range_constexpr(KWS):
                 is_last = ksl + 1 == KWS
                 carries = is_last and next_stage_lds_addr is not None
@@ -1383,9 +1340,7 @@ def launch_gemm_a8w4_tdm(
                         if const_expr(prefetch_kt is not None and is_last)
                         else None
                     ),
-                    fence_fn=(
-                        next_stage_fence_fn if const_expr(carries) else None
-                    ),
+                    fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
                 )
                 # One region per k128: sched_group_barrier only partitions
                 # within a region, and only sched_barrier delimits one.
@@ -1513,7 +1468,9 @@ def launch_gemm_a8w4_tdm(
                             )
                             workgroup_barrier()
                             issue(s, kt + num_buffers, my_jobs)
-                            if const_expr(cluster_m > 1):
+                            if const_expr(  # noqa: SIM102 - preserve DSL staging
+                                cluster_m > 1
+                            ):
                                 if (kt + 1) % num_buffers == 0:
                                     cluster_sync()
 
@@ -1527,9 +1484,7 @@ def launch_gemm_a8w4_tdm(
                             * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                         )
                         next_stage_buf = (
-                            (kt + 1) % num_buffers
-                            if const_expr(has_next)
-                            else None
+                            (kt + 1) % num_buffers if const_expr(has_next) else None
                         )
                         compute_ktile(
                             buf,
@@ -1568,9 +1523,7 @@ def launch_gemm_a8w4_tdm(
                             )
                             rocdl.sched_barrier(0)
                         next_stage_buf = (
-                            (s + 1) % num_buffers
-                            if const_expr(next_stage_on)
-                            else None
+                            (s + 1) % num_buffers if const_expr(next_stage_on) else None
                         )
                         compute_ktile(
                             buf,
@@ -1601,9 +1554,7 @@ def launch_gemm_a8w4_tdm(
                                 steady_mid_iteration(my_jobs, kt, phase)
                         else:
                             for kt in range(n_steady):
-                                steady_mid_iteration(
-                                    my_jobs, kt, kt % num_buffers
-                                )
+                                steady_mid_iteration(my_jobs, kt, kt % num_buffers)
 
                     dispatch_wave_job(steady_mid)
 
@@ -1616,9 +1567,7 @@ def launch_gemm_a8w4_tdm(
                                 outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                             )
                         next_stage_buf = (
-                            (kt + 1) % num_buffers
-                            if const_expr(has_next)
-                            else None
+                            (kt + 1) % num_buffers if const_expr(has_next) else None
                         )
                         compute_ktile(
                             buf,

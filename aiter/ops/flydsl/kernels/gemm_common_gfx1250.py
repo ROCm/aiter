@@ -172,9 +172,7 @@ def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
     half_gate = g * _half
     if swiglu:
-        th = fx.Float32(
-            rocdl.tanh(T.f32, as_ir_value(half_gate * fx.Float32(1.702)))
-        )
+        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate * fx.Float32(1.702))))
         return _fma_f32(half_gate, th, half_gate) * (u + _one)
     th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate)))
     return _fma_f32(half_gate, th, half_gate) * u
