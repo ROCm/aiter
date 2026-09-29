@@ -593,6 +593,55 @@ def test_k1_family_a_set_equality_prefill():
         raise AssertionError("K1 prefill block-id set diverged from the oracle")
 
 
+def test_k1_prefill_padded_page_table():
+    """Page-table entries past the context must not be loaded.
+
+    One request, M=32, context 4096. Sixty-four pages of 16 cover the
+    1024 visible blocks; four more entries are padding. Pad 0 matches
+    the oracle. Pad -1 and a huge page id must not fault or change
+    the selected set.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, context, page_size, n_real_pages, n_pad = 32, 4096, 16, 64, 4
+    n_blocks = context // idx.compress_ratio
+    if n_real_pages * page_size != n_blocks:
+        raise AssertionError("the real pages must cover the context exactly")
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    if index_table.shape[1] != n_real_pages:
+        raise AssertionError(f"expected {n_real_pages} pages, got {index_table.shape}")
+    ref_scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    for name, pad_value in (("zero", 0), ("negative", -1), ("huge", 100000)):
+        pad = torch.full((1, n_pad), pad_value, dtype=dtypes.i32, device=device)
+        table = torch.cat((index_table, pad), dim=1)
+        got = qsa_k1_block_ids(
+            q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        if _set_mismatch_ratio(ref_ids, got) != 0.0:
+            raise AssertionError(f"K1 prefill pad {name} changed the selected set")
+
+
 def test_k2_family_a_decode_matches_oracle():
     """Family A FlyDSL K2 decode matches qsa_sparse_gqa on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -2271,6 +2320,7 @@ def _run_unit_cases():
     test_k1_family_a_set_equality_two_tiles()
     test_k1_family_a_set_equality_wide_stream()
     test_k1_family_a_set_equality_prefill()
+    test_k1_prefill_padded_page_table()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
     test_k1_family_b_set_equality_two_tiles()
