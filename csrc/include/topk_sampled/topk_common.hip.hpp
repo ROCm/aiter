@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: clang-format version 23.1.1
+// Formatted by: AMD clang-format version 22.0.0git
 
 #pragma once
 
@@ -234,7 +234,44 @@ __device__ __forceinline__ void emit_identity_row(int* __restrict__ out,
 }
 
 // LDS capacity for the Phase C candidate set (keys + indices).
-constexpr int PHASE_C_CAP = 4096; // 4096 * (4+4) B = 32 KB LDS
+constexpr int PHASE_C_CAP = 4096;
+
+// Borrowed from the per-row backend (aiter 3d40280db / f0818e31d): the final
+// top-k write is the kernel's answer and is never read back, so it should not
+// allocate against a cache the row data still wants. Behind a define so the two
+// halves can be priced apart.
+#ifndef OPT_NT_OUT
+#define OPT_NT_OUT 0
+#endif
+template <typename T>
+__device__ __forceinline__ void out_store(T* p, T v)
+{
+#if OPT_NT_OUT
+    __builtin_nontemporal_store(v, p);
+#else
+    *p = v;
+#endif
+}
+
+// Borrowed from aiter 2f2314596 / 68ae4c238: one 16-byte LDS store per thread
+// covers four bins, against four strided dword stores. HIST_SLOTS is 1024 and
+// divisible by 4, and every s_hist is declared __align__(16) for this.
+#ifndef OPT_VEC_CLEAR
+#define OPT_VEC_CLEAR 0
+#endif
+__device__ __forceinline__ void clear_hist(uint32_t* __restrict__ s_hist)
+{
+#if OPT_VEC_CLEAR
+    using u32x4   = __attribute__((__ext_vector_type__(4))) uint32_t;
+    const u32x4 z = {0u, 0u, 0u, 0u};
+    for(int i = threadIdx.x; i < HIST_SLOTS / 4; i += blockDim.x)
+        reinterpret_cast<u32x4*>(s_hist)[i] = z;
+#else
+    for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
+        s_hist[i] = 0u;
+#endif
+}
+// 4096 * (4+4) B = 32 KB LDS
 
 struct GPUInfo
 {
@@ -509,9 +546,9 @@ __device__ __forceinline__ void block_gather_topk(int c,
             unsigned p = baseg + (unsigned)__popcll(bg & lt);
             if(p < (unsigned)ngt)
             {
-                out[p] = idx_at(i);
+                out_store(out + p, idx_at(i));
                 if(WRITE_VALUES)
-                    out_val[p] = sortable_to_fp32(k);
+                    out_store(out_val + p, sortable_to_fp32(k));
             }
         }
         if(eq)
@@ -519,9 +556,129 @@ __device__ __forceinline__ void block_gather_topk(int c,
             unsigned p = basee + (unsigned)__popcll(be & lt);
             if(p < (unsigned)eq_needed)
             {
-                out[ngt + p] = idx_at(i);
+                out_store(out + ngt + p, idx_at(i));
                 if(WRITE_VALUES)
-                    out_val[ngt + p] = sortable_to_fp32(k);
+                    out_store(out_val + ngt + p, sortable_to_fp32(k));
+            }
+        }
+    }
+}
+
+// Pointer form (no lambdas): prefer this under PHASE_C_OCCUPANCY. Named
+// distinctly so it does not collide with the KeyFn/IdxFn template above when
+// pointers are passed.
+template <bool WRITE_VALUES>
+__device__ __forceinline__ void block_gather_topk_ptrs(int c,
+                                                       uint32_t pivot,
+                                                       int ngt,
+                                                       int eq_needed,
+                                                       int* __restrict__ out,
+                                                       float* __restrict__ out_val,
+                                                       unsigned* __restrict__ s_wgt,
+                                                       unsigned* __restrict__ s_weq,
+                                                       const uint32_t* __restrict__ keys,
+                                                       const int* __restrict__ idxs)
+{
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const uint64_t lt = (1ull << lane) - 1ull;
+    for(int i0 = 0; i0 < c; i0 += blockDim.x)
+    {
+        const int i       = i0 + threadIdx.x;
+        const bool has    = (i < c);
+        const uint32_t k  = has ? keys[i] : 0u;
+        const bool gt     = has && (k > pivot);
+        const bool eq     = has && (k == pivot);
+        const uint64_t bg = __ballot(gt);
+        const uint64_t be = __ballot(eq);
+        const int tg      = __popcll(bg);
+        const int te      = __popcll(be);
+        unsigned baseg = 0, basee = 0;
+        if(lane == 0)
+        {
+            if(tg)
+                baseg = atomicAdd(s_wgt, (unsigned)tg);
+            if(te)
+                basee = atomicAdd(s_weq, (unsigned)te);
+        }
+        baseg = __shfl(baseg, 0);
+        basee = __shfl(basee, 0);
+        if(gt)
+        {
+            unsigned p = baseg + (unsigned)__popcll(bg & lt);
+            if(p < (unsigned)ngt)
+            {
+                out_store(out + p, idxs[i]);
+                if(WRITE_VALUES)
+                    out_store(out_val + p, sortable_to_fp32(k));
+            }
+        }
+        if(eq)
+        {
+            unsigned p = basee + (unsigned)__popcll(be & lt);
+            if(p < (unsigned)eq_needed)
+            {
+                out_store(out + ngt + p, idxs[i]);
+                if(WRITE_VALUES)
+                    out_store(out_val + ngt + p, sortable_to_fp32(k));
+            }
+        }
+    }
+}
+
+template <bool WRITE_VALUES>
+__device__ __forceinline__ void block_gather_topk_ragged(int c,
+                                                         uint32_t pivot,
+                                                         int ngt,
+                                                         int eq_needed,
+                                                         int* __restrict__ out,
+                                                         float* __restrict__ out_val,
+                                                         unsigned* __restrict__ s_wgt,
+                                                         unsigned* __restrict__ s_weq,
+                                                         const uint32_t* __restrict__ keys,
+                                                         const int* __restrict__ idxs,
+                                                         int row_start)
+{
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const uint64_t lt = (1ull << lane) - 1ull;
+    for(int i0 = 0; i0 < c; i0 += blockDim.x)
+    {
+        const int i       = i0 + threadIdx.x;
+        const bool has    = (i < c);
+        const uint32_t k  = has ? keys[i] : 0u;
+        const bool gt     = has && (k > pivot);
+        const bool eq     = has && (k == pivot);
+        const uint64_t bg = __ballot(gt);
+        const uint64_t be = __ballot(eq);
+        const int tg      = __popcll(bg);
+        const int te      = __popcll(be);
+        unsigned baseg = 0, basee = 0;
+        if(lane == 0)
+        {
+            if(tg)
+                baseg = atomicAdd(s_wgt, (unsigned)tg);
+            if(te)
+                basee = atomicAdd(s_weq, (unsigned)te);
+        }
+        baseg = __shfl(baseg, 0);
+        basee = __shfl(basee, 0);
+        if(gt)
+        {
+            unsigned p = baseg + (unsigned)__popcll(bg & lt);
+            if(p < (unsigned)ngt)
+            {
+                out_store(out + p, row_start + idxs[i]);
+                if(WRITE_VALUES)
+                    out_store(out_val + p, sortable_to_fp32(k));
+            }
+        }
+        if(eq)
+        {
+            unsigned p = basee + (unsigned)__popcll(be & lt);
+            if(p < (unsigned)eq_needed)
+            {
+                out_store(out + ngt + p, row_start + idxs[i]);
+                if(WRITE_VALUES)
+                    out_store(out_val + ngt + p, sortable_to_fp32(k));
             }
         }
     }
@@ -632,6 +789,9 @@ __device__ __forceinline__ void hist_add_aggregated(
 // which takes phase_a from 4 to 3 blocks/CU at S=8192 (163840/42008 vs
 // 163840/37912) for a barrier that g_14 measured at -0.35% on the anchor.
 template <bool CLEAR = false>
+#ifndef ABLATE_SCAN
+#define ABLATE_SCAN 0
+#endif
 __device__ __forceinline__ void
 block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)
 {
@@ -695,6 +855,106 @@ block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restric
     __syncthreads();
 }
 
+// 12-bit radix digit for the filtered passes, so an exact 32-bit select is
+// 8 + 12 + 12 bits in three passes instead of four, and phase_a's threshold is
+// 8 + 12 bits in two instead of 8 + 8 + 8 in three. A pass costs its barriers
+// and its scan latency, not its data (knowledge/known_bad.md, "What actually
+// sets phase A and phase C cost"), so the lever is the pass count.
+//
+// A flat 4096-bucket scan would give that back: one wave reading 4096 slots, or
+// a block-wide scan with a third barrier. Instead every counted key bumps two
+// histograms, 64 coarse buckets (the digit's top 6 bits) and 4096 fine ones,
+// and wave 0 scans the coarse one (one slot per lane) and then only the 64 fine
+// buckets under the coarse bucket it picked. Two slot reads per lane and the
+// same 2 barriers per pass as block_find_pivot_bucket_wave0.
+//
+// The filtered passes count only keys whose higher digits match the pivot, so
+// the second atomic per counted key is cheap. The fine buckets outside the
+// picked coarse one are never read, so they are not cleared on read: every wide
+// pass gets its own WIDE_WORDS buffer, zeroed once by the kernel before its
+// first barrier (clear_wide).
+//
+// The coarse buckets carry HIST_REP replicas like s_hist does: Phase C's
+// candidates sit just above one threshold, so most of them share one or two
+// coarse buckets and a single counter per bucket serialises the whole wave.
+constexpr int WIDE_BITS         = 12;
+constexpr int WIDE_COARSE       = 64;
+constexpr int WIDE_FINE         = 1 << WIDE_BITS;
+constexpr int WIDE_COARSE_SLOTS = WIDE_COARSE * HIST_REP;
+constexpr int WIDE_WORDS        = WIDE_COARSE_SLOTS + WIDE_FINE;
+static_assert(WIDE_COARSE == WAVE_SIZE && WIDE_FINE == WIDE_COARSE * WAVE_SIZE,
+              "the two-level scan puts one bucket per lane at each level");
+
+// One counted key: its coarse bucket (replica `rep`) and its fine bucket.
+__device__ __forceinline__ void wide_count(uint32_t* __restrict__ s_w, uint32_t d, int rep)
+{
+    atomicAdd(&s_w[(d >> 6) * HIST_REP + rep], 1u);
+    atomicAdd(&s_w[WIDE_COARSE_SLOTS + d], 1u);
+}
+static_assert(WIDE_WORDS % 4 == 0, "clear_wide stores 16 bytes per thread");
+
+__device__ __forceinline__ void clear_wide(uint32_t* __restrict__ s_wide, int nbuf)
+{
+    using u32x4   = __attribute__((__ext_vector_type__(4))) uint32_t;
+    const u32x4 z = {0u, 0u, 0u, 0u};
+    for(int i = threadIdx.x; i < nbuf * WIDE_WORDS / 4; i += blockDim.x)
+        reinterpret_cast<u32x4*>(s_wide)[i] = z;
+}
+
+// Coarse buckets (HIST_REP replicas each) and fine buckets in separate arrays;
+// the one-buffer form below keeps them back to back.
+__device__ __forceinline__ void block_find_pivot_wide_wave0(const uint32_t* __restrict__ s_coarse,
+                                                            const uint32_t* __restrict__ s_fine,
+                                                            uint32_t* __restrict__ s_scan,
+                                                            int ek)
+{
+    if(threadIdx.x < WAVE_SIZE)
+    {
+        const int lane = (int)threadIdx.x;
+        uint32_t cv    = 0;
+#pragma unroll
+        for(int r = 0; r < HIST_REP; r++)
+            cv += s_coarse[lane * HIST_REP + r];
+        uint32_t cinc = cv;
+#pragma unroll
+        for(int off = 1; off < WAVE_SIZE; off <<= 1)
+        {
+            const uint32_t up = (uint32_t)__shfl_down((int)cinc, off);
+            if(lane + off < WAVE_SIZE)
+                cinc += up;
+        }
+        const uint32_t cnxt    = cinc - cv;
+        const uint64_t cbal    = __ballot(ek > 0 && cinc >= (uint32_t)ek && cnxt < (uint32_t)ek);
+        const int cb           = cbal != 0ull ? __builtin_ctzll(cbal) : 0;
+        const uint32_t above_c = (uint32_t)__shfl((int)cnxt, cb);
+
+        const uint32_t fv = s_fine[cb * WAVE_SIZE + lane];
+        uint32_t finc     = fv;
+#pragma unroll
+        for(int off = 1; off < WAVE_SIZE; off <<= 1)
+        {
+            const uint32_t up = (uint32_t)__shfl_down((int)finc, off);
+            if(lane + off < WAVE_SIZE)
+                finc += up;
+        }
+        const uint32_t fs      = above_c + finc;
+        const uint32_t fnxt    = fs - fv;
+        const uint64_t fbal    = __ballot(ek > 0 && fs >= (uint32_t)ek && fnxt < (uint32_t)ek);
+        const int fb           = fbal != 0ull ? __builtin_ctzll(fbal) : 0;
+        const uint32_t above_f = (uint32_t)__shfl((int)fnxt, fb);
+        if(cbal != 0ull && fbal != 0ull && lane == 0)
+        {
+            s_scan[0] = (uint32_t)(cb * WAVE_SIZE + fb);
+            s_scan[1] = above_f;
+        }
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ void
+block_find_pivot_wide_wave0(const uint32_t* __restrict__ s_w, uint32_t* __restrict__ s_scan, int ek)
+{ block_find_pivot_wide_wave0(s_w, s_w + WIDE_COARSE_SLOTS, s_scan, ek); }
+
 // Replica-reducing form of the scan below: folds the HIST_REP replicas of each
 // bucket in as it reads them, instead of having the caller run a separate
 // block-wide reduction loop into s_red first.
@@ -736,6 +996,7 @@ block_find_pivot_bucket_rep(uint32_t* __restrict__ s_hist, uint32_t* __restrict_
             for(int r = 0; r < HIST_REP; r++)
                 s_hist[t * HIST_REP + r] = 0u;
         }
+#if ABLATE_SCAN == 0
 #pragma unroll
         for(int off = 1; off < WAVE_SIZE; off <<= 1)
         {
@@ -743,6 +1004,7 @@ block_find_pivot_bucket_rep(uint32_t* __restrict__ s_hist, uint32_t* __restrict_
             if(lane + off < WAVE_SIZE)
                 x += up;
         }
+#endif
         if(lane == 0)
             s_wavetot[wv] = x;
     }
@@ -777,6 +1039,7 @@ block_find_pivot_bucket(const uint32_t* __restrict__ s_hist, uint32_t* __restric
     uint32_t x     = (t < 256) ? s_hist[t] : 0u;
     if(t < 256)
     {
+#if ABLATE_SCAN == 0
 #pragma unroll
         for(int off = 1; off < WAVE_SIZE; off <<= 1)
         {
@@ -784,6 +1047,7 @@ block_find_pivot_bucket(const uint32_t* __restrict__ s_hist, uint32_t* __restric
             if(lane + off < WAVE_SIZE)
                 x += up;
         }
+#endif
         if(lane == 0)
             s_wavetot[wv] = x;
     }

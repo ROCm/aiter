@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: clang-format version 23.1.1
+// Formatted by: AMD clang-format version 22.0.0git
 
 #pragma once
 
@@ -43,7 +43,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
         return;
     }
     extern __shared__ uint32_t s_keys[];
-    __shared__ uint32_t s_hist[HIST_SLOTS];
+    __shared__ __align__(16) uint32_t s_hist[HIST_SLOTS];
     __shared__ uint32_t s_red[256];
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
@@ -76,6 +76,8 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     __syncthreads();
     if constexpr(RAGGED)
     {
+        // Identity column = row_start + i; build a tiny idx view via s_red reused? Keep
+        // functor form here: small_n is not under PHASE_C_OCCUPANCY.
         block_gather_topk<WRITE_VALUES>(
             len,
             pivot,
@@ -109,6 +111,12 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     }
 }
 
+#ifndef BLOCK_TSTAMP
+#define BLOCK_TSTAMP 0
+#endif
+#if BLOCK_TSTAMP
+__device__ unsigned long long* d_bt;
+#endif
 template <bool RAGGED, bool NT>
 __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     int pitch,
@@ -120,7 +128,10 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     unsigned int* __restrict__ cand_bad,
                                     int cap)
 {
-    const int row   = blockIdx.y;
+    const int row = blockIdx.y;
+#if BLOCK_TSTAMP
+    const unsigned long long t_begin = __builtin_amdgcn_s_memrealtime();
+#endif
     const int len   = row_len_of<RAGGED>(row, pitch, extents);
     const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
 #if ABLATE_TH == 1
@@ -589,23 +600,35 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         }
     }
 #endif
+#if BLOCK_TSTAMP
+    __syncthreads();
+    if(threadIdx.x == 0)
+    {
+        const unsigned long long t_end = __builtin_amdgcn_s_memrealtime();
+        const size_t slot              = (size_t)(blockIdx.y * gridDim.x + blockIdx.x) * 2;
+        d_bt[slot]                     = t_begin;
+        d_bt[slot + 1]                 = t_end;
+    }
+#endif
 }
 
 template <bool RAGGED, bool WRITE_VALUES>
-__global__ void phase_c_select_contig(const float* __restrict__ input,
-                                      int pitch,
-                                      RowExtents<RAGGED> extents,
-                                      const uint64_t* __restrict__ cand_pack,
-                                      const unsigned int* __restrict__ cand_reserved,
-                                      const unsigned int* __restrict__ cand_bad,
-                                      unsigned int* __restrict__ cand_count,
-                                      int cap,
-                                      int K,
-                                      TopkOut<WRITE_VALUES> dst,
-                                      int* __restrict__ fb_rows,
-                                      int* __restrict__ fb_count,
-                                      int npasses,
-                                      bool keys_only)
+__global__ PHASE_C_OCCUPANCY void
+phase_c_select_contig(const float* __restrict__ input,
+                      int pitch,
+                      RowExtents<RAGGED> extents,
+                      const uint64_t* __restrict__ cand_pack,
+                      const unsigned int* __restrict__ cand_reserved,
+                      const unsigned int* __restrict__ cand_bad,
+                      unsigned int* __restrict__ cand_count,
+                      int cap,
+                      int K,
+                      TopkOut<WRITE_VALUES> dst,
+                      int* __restrict__ fb_rows,
+                      int* __restrict__ fb_count,
+                      int npasses,
+                      bool keys_only,
+                      int nwide)
 {
     const int row            = blockIdx.x;
     const int row_start      = RAGGED ? extents.row_start(row, pitch) : 0;
@@ -617,7 +640,9 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     extern __shared__ uint32_t s_dyn[];
     uint32_t* s_keys_ext = s_dyn;
     int* s_idx           = reinterpret_cast<int*>(s_dyn + cap);
-    __shared__ uint32_t s_hist[HIST_SLOTS];
+    // nwide * WIDE_WORDS words after the keys (and the indices unless keys_only).
+    uint32_t* s_wide = s_dyn + (keys_only ? cap : 2 * cap);
+    __shared__ __align__(16) uint32_t s_hist[HIST_SLOTS];
     __shared__ uint32_t s_red[256];
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
@@ -633,7 +658,7 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
         exact_row_select<RAGGED, WRITE_VALUES>(
-            input, pitch, extents, K, row, out, val, s_hist, s_red, s_scan, &s_wgt, &s_weq);
+            input, pitch, extents, K, row, out, val, s_hist, s_red, s_scan, &s_wgt, &s_weq, s_dyn);
         return;
     }
     const int c          = (int)c_raw;
@@ -645,6 +670,8 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
 #define ABLATE_CREAD 0
 #endif
 #if ABLATE_CREAD
+    if(nwide > 0)
+        clear_wide(s_wide, nwide);
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
         s_keys_ext[i] = (uint32_t)i;
@@ -668,10 +695,15 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
 #endif
 #if PC_FOLD
     const int fold_rep = threadIdx.x & (HIST_REP - 1);
-    for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
-        s_hist[i] = 0u;
+    clear_hist(s_hist);
     __syncthreads();
 #endif
+    // Published by the barrier after the read. Folding the first wide pass's
+    // digits into this read as well, the way pass 0's are, was measured and is
+    // SLOWER: phase_c +0.2 to +1.0us over the unfolded wide select at m=64..512
+    // (scripts/wide_ab.py, arms acF against acN), against -0.3 to -0.4us unfolded.
+    if(nwide > 0)
+        clear_wide(s_wide, nwide);
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
 #if NT_CAND
@@ -711,18 +743,32 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     eq_needed = 0;
     (void)npasses;
 #else
-    block_select_lds(s_keys_ext,
-                     c,
-                     k_out,
-                     s_hist,
-                     s_red,
-                     s_scan,
-                     s_mm,
-                     pivot,
-                     eq_needed,
-                     npasses,
-                     true,
-                     PC_FOLD != 0);
+    if(nwide > 0)
+        block_select_lds_wide(s_keys_ext,
+                              c,
+                              k_out,
+                              s_hist,
+                              s_wide,
+                              s_scan,
+                              s_mm,
+                              pivot,
+                              eq_needed,
+                              nwide,
+                              PC_WIDE_SKIP != 0,
+                              PC_FOLD != 0);
+    else
+        block_select_lds(s_keys_ext,
+                         c,
+                         k_out,
+                         s_hist,
+                         s_red,
+                         s_scan,
+                         s_mm,
+                         pivot,
+                         eq_needed,
+                         npasses,
+                         true,
+                         PC_FOLD != 0);
 #endif
 
     if(threadIdx.x == 0)
@@ -748,17 +794,17 @@ __global__ void phase_c_select_contig(const float* __restrict__ input,
     }
     else
     {
-        block_gather_topk<WRITE_VALUES>(
-            c,
-            pivot,
-            k_out - eq_needed,
-            eq_needed,
-            out,
-            val,
-            &s_wgt,
-            &s_weq,
-            [&](int i) { return s_keys_ext[i]; },
-            [&](int i) { return row_start + s_idx[i]; });
+        block_gather_topk_ragged<WRITE_VALUES>(c,
+                                               pivot,
+                                               k_out - eq_needed,
+                                               eq_needed,
+                                               out,
+                                               val,
+                                               &s_wgt,
+                                               &s_weq,
+                                               s_keys_ext,
+                                               s_idx,
+                                               row_start);
     }
     if(RAGGED && k_out < K)
     {
@@ -790,7 +836,7 @@ __global__ __launch_bounds__(1024) void phase_ab_fused(const float* __restrict__
         *fb_count = 0;
 
     extern __shared__ uint32_t s_keys[];
-    __shared__ uint32_t s_hist[HIST_SLOTS];
+    __shared__ __align__(16) uint32_t s_hist[HIST_SLOTS];
     __shared__ uint32_t s_red[256];
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];

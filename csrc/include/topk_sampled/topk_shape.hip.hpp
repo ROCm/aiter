@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: clang-format version 23.1.1
+// Formatted by: AMD clang-format version 22.0.0git
 
 #pragma once
 
@@ -82,6 +82,20 @@ constexpr int PHASE_A_STATIC_LDS = 5144;
 constexpr int PHASE_C_STATIC_LDS = 5408;
 
 static inline int grid_blocks_per_cu(int M) { return std::max(1, (M + CU_COUNT - 1) / CU_COUNT); }
+
+// Whether a select kernel can take block_select_lds_wide's buffers (a 12-bit
+// digit on the filtered passes, one pass fewer) without losing residency: the
+// blocks this grid actually stacks on a CU must still fit with them. Standalone
+// A/B, k=2048 gaussian seed 0, with the buffers in STATIC LDS so that every
+// launch paid for them, three-kernel device total:
+//   m=128  n=131072  -2.98us   m=256 n=262144  -1.64   m=64 n=1048577 -1.24
+//   m=1024 n=262144 +11.56us   m=4096 n=131072 +30.56  m=4096 n=1048576 +30.38
+// The losses are residency, and this is the condition that avoids them.
+static inline bool wide_select_fits(int M, int lds_bytes, int wide_bytes)
+{
+    const int resident = std::min(grid_blocks_per_cu(M), std::max(1, LDS_BYTES_PER_CU / lds_bytes));
+    return resident * (lds_bytes + wide_bytes) <= LDS_BYTES_PER_CU;
+}
 
 static inline int ilog2_floor(int v)
 {
