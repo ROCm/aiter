@@ -509,8 +509,8 @@ def _decode_with_backend(
 ) -> None:
     """Run the decode on `backend`, which must be the gate's answer or None to ask it.
 
-    An `upstream` answer still runs the chunked pair here, because this host
-    owns no other kernel to fall back to.
+    A `default` answer still runs the chunked pair here, because this entry
+    point has no one-block dispatch below it.
     """
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values

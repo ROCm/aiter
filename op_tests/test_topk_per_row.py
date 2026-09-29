@@ -513,8 +513,8 @@ def test_decode_bound_gate():
                 cell = (arch, cu, *call)
                 bounded = topk._decode_backend(arch, cu, *call, _BOUNDED_CONTEXT)
                 assert bounded == topk.BACKEND_ADAPTIVE, cell
-                # An unmeasured CU count keeps what ran before the adaptive
-                # bands, and `None` declines those bands and nothing else.
+                # A CU count the table does not carry never routes to the
+                # adaptive kernel, and `None` declines its bands and nothing else.
                 plain = topk._decode_backend(arch, unmeasured, *call, _BOUNDED_CONTEXT)
                 assert plain != topk.BACKEND_ADAPTIVE, cell
                 assert topk._decode_backend(arch, cu, *call, None) == plain, cell

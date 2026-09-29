@@ -515,23 +515,22 @@ _FLYDSL_TOPK_DECODE_GATES = {
 }
 _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 
-# What the gate answers. `upstream` is "not ours", not a named kernel: the
-# dispatch below it picks the FlyDSL one-block port where that is enabled and
-# the C++ one-block kernel everywhere else, and which of the two runs differs
-# per arch.
-BACKEND_UPSTREAM = "upstream"
+# What the gate answers. `default` names no kernel: the call keeps its entry
+# point's own dispatch, which runs the FlyDSL one-block kernel where that is
+# enabled and the C++ one-block kernel elsewhere.
+BACKEND_DEFAULT = "default"
 BACKEND_CHUNKED = "chunked"
 BACKEND_ADAPTIVE = "adaptive"
 
 # Which shapes the adaptive kernel is fastest for, as (minimum width, maximum
 # width, minimum rows, maximum rows) per k and per emit, bounds inclusive and a
 # maximum width of None meaning no upper bound. The row minimum is not
-# decoration: one row of a narrow buffer goes to the one-block HIP kernel, which
-# has no grid to fill while this one pays for having one.
+# decoration: one row of a narrow buffer goes to a one-block kernel, which has
+# no grid to fill while the adaptive kernel pays for having one.
 #
 # Keyed by CU count as well as arch: one arch name spans several, and the grid
 # these were measured against is built from that count. A pair the table does
-# not name keeps the chunked gate below, so an unmeasured shape is unchanged.
+# not name is routed by the chunked gate below alone.
 #
 # A cell is admitted only when this kernel is the fastest of the four and at
 # least 1.05x faster than the kernel the gate would pick without it, on a full
@@ -745,7 +744,7 @@ def _decode_backend(
     bands read `adaptive_width`, the caller's bound, because that kernel is
     configured from it; `None` means no bound was stated and declines them. The
     chunked bands read the physical `width` they were fitted on, so a bound
-    never moves a call between the two kernels upstream already ships.
+    never moves a call between the chunked kernel and the one-block path.
 
     Both entry points ask this one function rather than deciding again further
     down, which is what keeps them from disagreeing.
@@ -767,7 +766,7 @@ def _decode_backend(
         )
     ):
         return BACKEND_CHUNKED
-    return BACKEND_UPSTREAM
+    return BACKEND_DEFAULT
 
 
 @functools.lru_cache(maxsize=8)
@@ -842,7 +841,7 @@ def decode_backend_for_call(
         or not isinstance(logits, torch.Tensor)
         or logits.ndim != 2
     ):
-        return BACKEND_UPSTREAM
+        return BACKEND_DEFAULT
 
     device_index = logits.device.index
     width = logits.shape[1]
@@ -858,8 +857,8 @@ def decode_backend_for_call(
         # the chunked bands still see the physical width.
         None if max_row_len is None else decode_adaptive_width(width, max_row_len),
     )
-    if backend == BACKEND_UPSTREAM:
-        return BACKEND_UPSTREAM
+    if backend == BACKEND_DEFAULT:
+        return BACKEND_DEFAULT
 
     from .flydsl.topk.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
@@ -874,7 +873,7 @@ def decode_backend_for_call(
         k,
         values,
     )
-    return backend if supported else BACKEND_UPSTREAM
+    return backend if supported else BACKEND_DEFAULT
 
 
 def _hip_top_k_per_row_decode(
@@ -960,7 +959,7 @@ def top_k_per_row_decode(
         values,
         max_row_len=max_row_len,
     )
-    if backend != BACKEND_UPSTREAM:
+    if backend != BACKEND_DEFAULT:
         from .flydsl.topk.topk_per_row import _decode_with_backend
 
         return _decode_with_backend(

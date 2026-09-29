@@ -299,8 +299,9 @@ def _next_pow2(n: int) -> int:
 def decode_adaptive_short_max(rows: int) -> int:
     """The length below which a row runs on the single-workgroup short tier.
 
-    Not the dispatcher's rule, which was fitted on another kernel; do not reconcile
-    the two without re-measuring. k does not enter: the crossover barely moves.
+    Not `_ONE_WORKGROUP_MAX_ROW_WIDTH`, which was fitted on the chunked kernel; do
+    not reconcile the two without re-measuring. k does not enter: the crossover
+    barely moves.
     """
     return min(SHORT_MAX_CAP, SHORT_MAX_BASE + _next_pow2(rows) * SHORT_MAX_SLOPE)
 
@@ -442,8 +443,8 @@ def create_topk_per_row_decode_adaptive_kernel(
     - `bits_per_pass` is 10 or 11, and the short tier needs 11 (2048-bin histogram).
     - `scan_stages` is one of 1/2/4/8; `spin_sleep` is 0..15.
     - `mask_non_finite` off is the default *because* it matches torch.topk and the
-      HIP kernel, which rank inf/NaN by raw twiddled bits. Asking for it is asking
-      to diverge from both.
+      C++ one-block kernel, which rank inf/NaN by raw twiddled bits. Asking for it
+      is asking to diverge from both.
     - `compact_cap_mult` trades workspace for how often the buffer path is taken,
       never correctness: a row that overflows rescans instead.
     - `early_stop` is silently dropped under `ordered` or `compact`, which are the
@@ -815,9 +816,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             # Map larger fp32 values to smaller unsigned keys so ascending bucket
             # scans select descending values -- the bitwise complement of the
             # ascending twiddle, which is why the mask is a nor rather than an or.
-            # Signed zero is left alone: torch.topk and the HIP kernel both rank
-            # -0.0 strictly below +0.0, so collapsing the two here would change
-            # which tied index we emit.
+            # Signed zero is left alone: torch.topk and the C++ one-block kernel
+            # both rank -0.0 strictly below +0.0, so collapsing the two here would
+            # change which tied index is emitted.
             bits = mask_nonfinite(val).bitcast(fx.Int32)
             return bits ^ ~(shrsi(bits, 31) | c_sign_bit)
 
@@ -1836,9 +1837,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             return next_k, next_len, next_bits
 
         def one_workgroup_short_tier():
-            # Faithful copy of the standalone one-workgroup unordered radix-select,
-            # running entirely in part 0: LDS-only histograms, a hierarchical block
-            # scan, and an atomic-append write. Unlike the multi-block path it uses the
+            # The standalone one-workgroup unordered radix-select algorithm
+            # (radix_topk_one_block.py), run entirely in part 0: LDS-only
+            # histograms, a hierarchical block scan, and an atomic-append write.
+            # Unlike the multi-block path it uses the
             # standalone ascending key and total-k threshold convention, and its three
             # 11/11/10-bit passes require a 2048-bin histogram (bits_per_pass == 11).
             # Reuses the persistent kernel's LDS with no extra shared memory.
