@@ -521,17 +521,33 @@ def _check_shuffled_page_triton(params: _UAParams):
         assert (
             params.block_size >= 32
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-    # Tuned only up to block_size 128: the pinned tile exceeds the LDS limit
-    # on gfx942 beyond that.
-    assert not (DEVICE_ARCH == "gfx942" and params.block_size > 128), (
-        "Unified Attention Triton path with pre-shuffled KV cache supports "
-        f"pages up to 128 on gfx942; got block_size={params.block_size}"
+
+
+def _check_shuffled_tile_lds(params: _UAParams, config: dict):
+    """A shuffled Triton kernel reads TILE_SIZE (pinned to the page) rows of
+    K and V per iteration. With num_stages > 1 the pipeliner stages two
+    iterations of each tile, and combinations whose staged tiles exceed the
+    64 KiB LDS do not compile (observed on gfx942: stages-2, page 128,
+    head 256, bf16 -> 131072 B required). Stage-1 configs launch at any page
+    (verified up to page 256 on gfx942), so only the multi-stage oversized
+    combinations are rejected."""
+    if not params.shuffled_kv_cache or config.get("num_stages", 1) <= 1:
+        return
+    tile = params.block_size
+    itemsize = max(params.q_dtype.itemsize, params.kv_cache_dtype.itemsize)
+    staged = config["num_stages"] * tile * params.head_size * itemsize
+    assert staged <= 65536, (
+        f"Unified Attention Triton path with pre-shuffled KV cache: page "
+        f"{tile} x head {params.head_size} with num_stages "
+        f"{config['num_stages']} stages {staged} B per tile, exceeding the "
+        f"64 KiB LDS; use a smaller page or a stage-1 config"
     )
 
 
 def _unified_attention_2d_triton(params: _UAParams):
     _check_shuffled_page_triton(params)
     config = get_unified_attention_config("attn_2d", params, backend="triton")
+    _check_shuffled_tile_lds(params, config)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -608,6 +624,7 @@ def _unified_attention_3d_triton(
 ):
     _check_shuffled_page_triton(params)
     config = get_unified_attention_config("attn_3d", params, backend="triton")
+    _check_shuffled_tile_lds(params, config)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
