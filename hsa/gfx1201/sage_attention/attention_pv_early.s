@@ -623,6 +623,22 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_dual_mov_b32 v5, v204 :: v_dual_mov_b32 v4, v204
 	v_dual_mov_b32 v7, v204 :: v_dual_mov_b32 v6, v204
 	v_mov_b32_e32 v8, v204
+	s_mul_u64 s[38:39], s[10:11], s[12:13]
+	s_mul_u64 s[36:37], s[14:15], s[26:27]
+	s_lshl_b32 s44, s26, 7
+	s_wait_alu depctr_sa_sdst(0)
+	s_add_nc_u64 s[38:39], s[38:39], s[8:9]
+	s_add_nc_u64 s[36:37], s[36:37], s[28:29]
+	s_wait_alu depctr_sa_sdst(0)
+	s_lshl_b64 s[36:37], s[36:37], 7
+	s_wait_alu depctr_sa_sdst(0)
+	s_add_nc_u64 s[36:37], s[36:37], s[6:7]
+	v_lshlrev_b32_e32 v206, 4, v0
+	v_mul_lo_u32 v205, v201, s44
+	v_mul_lo_u32 v208, v197, s12
+	v_and_b32_e32 v206, 0x70, v206
+	v_add_nc_u32_e32 v208, v208, v202
+	v_add_nc_u32_e32 v205, v205, v206
 	s_mov_b32 s6, 0
 	s_mov_b32 s7, 0
 	v_dual_mov_b32 v244, 0x4b400000 :: v_dual_mov_b32 v245, 0x4b400000
@@ -744,32 +760,24 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_cmp_lt_i32 s1, s12
 	s_cselect_b32 s1, s1, 0
 	s_wait_alu depctr_sa_sdst(0)
-	v_or_b32_e32 v129, s1, v201
-	s_delay_alu instid0(VALU_DEP_1)
-	v_add_co_u32 v129, s11, s14, v129
-	s_wait_alu depctr_va_sdst(0)
-	v_add_co_ci_u32_e64 v130, null, s15, 0, s11
 	s_mul_i32 s11, s10, 0x1400
-	v_mul_lo_u32 v131, v129, s27
+	s_mul_i32 s45, s10, 0x1100
+	s_add_co_u32 s40, s38, s1
+	s_add_co_ci_u32 s41, s39, 0
+	s_mul_i32 s42, s1, s44
+	s_mul_hi_u32 s43, s1, s44
 	s_wait_alu depctr_sa_sdst(0)
+	s_add_co_u32 s42, s36, s42
+	s_add_co_ci_u32 s43, s37, s43
+	s_wait_alu depctr_sa_sdst(0)
+	v_add_nc_u32_e32 v131, s45, v189
 	v_add3_u32 v134, v203, s11, 0x3300
-	v_mul_lo_u32 v132, v130, s26
-	v_mad_co_u64_u32 v[129:130], null, v129, s26, s[28:29]
-	s_delay_alu instid0(VALU_DEP_1)
-	v_add3_u32 v130, v132, v130, v131
-	v_mad_co_u64_u32 v[131:132], null, 0x1100, s10, v[189:190]
-	v_or_b32_e32 v132, s1, v202
 	ds_store_2addr_b64 v131, v[145:146], v[147:148] offset1:1
 	ds_store_2addr_b64 v134, v[149:150], v[151:152] offset1:1
-	v_lshlrev_b64_e32 v[129:130], 7, v[129:130]
-	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
-	v_add_co_u32 v129, s1, v205, v129
+	v_add_co_u32 v132, s45, s40, v208
 	s_wait_alu depctr_va_sdst(0)
-	v_add_co_ci_u32_e64 v130, null, v206, v130, s1
-	v_add_co_u32 v132, s1, v190, v132
-	s_wait_alu depctr_va_sdst(0)
-	v_add_co_ci_u32_e64 v133, null, 0, v191, s1
-	global_load_b128 v[145:148], v[129:130], off
+	v_add_co_ci_u32_e64 v133, null, s41, 0, s45
+	global_load_b128 v[145:148], v205, s[42:43]
 	global_load_b128 v[149:152], v[132:133], off
 .LBB0_39:                               ;   in Loop: Header=BB0_37 Depth=1
 	s_wait_alu depctr_sa_sdst(0)
@@ -2968,7 +2976,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 256
-		.amdhsa_next_free_sgpr 36
+		.amdhsa_next_free_sgpr 48
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
 		.amdhsa_float_round_mode_16_64 0
@@ -3105,7 +3113,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 512
     .name:           sage_hip_attn_bm128_bn32
     .private_segment_fixed_size: 0
-    .sgpr_count:     38
+    .sgpr_count:     50
     .sgpr_spill_count: 0
     .symbol:         sage_hip_attn_bm128_bn32.kd
     .uniform_work_group_size: 1

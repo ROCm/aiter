@@ -7,8 +7,6 @@ import triton
 from .tp_reduce import FusedReducer
 from .gated_residual import _gated_residual
 
-from .out_projection import project_out
-
 
 class BufferedProjection:
     def __init__(self, rows, token_rows, device, group=None):
@@ -47,7 +45,8 @@ class BufferedProjection:
             for first in range(0, self.rows, self.width):
                 last = min(self.rows, first + self.width)
                 target = self.reducer.input[first:last]
-                project_out(inputs[first:last], down_weights, target)
+                # hipBLASLt beats the Triton out GEMM (out_projection.project_out) at TP2 chunk shapes.
+                torch.mm(inputs[first:last], down_weights, out=target)
                 if self.group is not None:
                     if overlap:
                         ready = torch.cuda.Event()

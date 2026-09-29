@@ -23,7 +23,8 @@ void gfx1201_norm_rope_prepare_hip(const aiter_tensor_t& query,
                                    int64_t rows,
                                    int64_t padded_rows,
                                    double sm_scale,
-                                   int64_t parts)
+                                   int64_t parts,
+                                   int64_t heads)
 {
     launch_gfx1201_norm_rope_prepare(reinterpret_cast<int64_t>(query.ptr),
                                      reinterpret_cast<int64_t>(key.ptr),
@@ -43,7 +44,8 @@ void gfx1201_norm_rope_prepare_hip(const aiter_tensor_t& query,
                                      padded_rows,
                                      sm_scale,
                                      reinterpret_cast<int64_t>(aiter::getCurrentHIPStream()),
-                                     parts);
+                                     parts,
+                                     heads);
 }
 
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)

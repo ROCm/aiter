@@ -117,9 +117,11 @@ direct_register_custom_op(
 
 def _validate_norm_rope(query, key, value, query_weight, key_weight, cosine, sine):
     _validate(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0))
-    if query.shape[1:] != (28, 128):
+    from .norm_rope_prepare import HEADS
+
+    if query.dim() != 3 or query.shape[1] not in HEADS or query.shape[2] != 128:
         raise ValueError(
-            "Fused QK norm/RoPE attention requires local TP2 layout [S,28,128]"
+            f"Fused QK norm/RoPE attention requires a local head shard [S,H,128] with H in {HEADS}"
         )
     for tensor in (query_weight, key_weight):
         if (
@@ -152,8 +154,8 @@ def gfx1201_norm_rope_attention(
 ) -> torch.Tensor:
     """attention(rope(qk_norm(Q)), rope(qk_norm(K)), V) with norm eps 1e-5.
 
-    Pre-norm BF16 ``[S, 28, 128]`` in, ``[S, 28, 128]`` out. Bitwise equal to the
-    separate qk_norm, rope, and attention chain.
+    Pre-norm BF16 ``[S, H, 128]`` in (H = 28 for the TP2 shard, 28/14/7 for Ulysses SP2/4/8),
+    ``[S, H, 128]`` out. Bitwise equal to the separate qk_norm, rope, and attention chain.
     """
     _validate_norm_rope(query, key, value, query_weight, key_weight, cosine, sine)
     _check_device(query)

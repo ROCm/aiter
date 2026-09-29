@@ -8,7 +8,6 @@ from .tp_reduce import FusedReducer
 from .gated_residual import _gated_residual
 
 from .ffn_up import fused_up_out
-from .ffn_down import down_out
 
 
 class BufferedFFN:
@@ -51,7 +50,8 @@ class BufferedFFN:
                 activation = self.activation[:last - first]
                 target = self.reducer.input[first:last]
                 fused_up_out(inputs[first:last], up_weights, activation)
-                down_out(activation, down_weights, target)
+                # hipBLASLt beats the Triton down GEMM (ffn_down.down_out) by ~5 ms/layer at TP2 chunk shapes.
+                torch.mm(activation, down_weights, out=target)
                 if self.group is not None:
                     if overlap:
                         ready = torch.cuda.Event()

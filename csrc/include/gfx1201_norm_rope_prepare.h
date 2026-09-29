@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-// Fused QK RMSNorm + RoPE + Sage INT8 Q/K and FP8 V preparation for gfx1201.
+// Fused QK RMSNorm + RoPE + Sage INT8 Q/K and FP8 V preparation for gfx1201, heads in {7, 14, 28, 56}.
 // Pointers are device addresses. `stream` is a hipStream_t passed as an integer.
 void launch_gfx1201_norm_rope_prepare(int64_t query,
                                       int64_t key,
@@ -24,4 +24,5 @@ void launch_gfx1201_norm_rope_prepare(int64_t query,
                                       int64_t padded_rows,
                                       double sm_scale,
                                       int64_t stream,
-                                      int64_t parts);
+                                      int64_t parts,
+                                      int64_t heads);

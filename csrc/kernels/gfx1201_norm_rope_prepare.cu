@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-
+// QK RMSNorm + RoPE + Sage INT8 Q/K + FP8 V prepare; the head count is a template parameter
+// (7/14/28/56: TP2 shards and Ulysses SP2/4/8 head shards of MiniMax-H3).
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <stdint.h>
+#include <stdexcept>
 
-static constexpr int HEADS = 28;
+#include "gfx1201_norm_rope_prepare.h"
+
 static constexpr int DIM = 128;
 static constexpr int BLOCK_ROWS = 32;
 static constexpr int ROPE_DIM = 96;
 static constexpr int THREADS = 256;
-static constexpr int COLUMNS = HEADS * DIM;
 static constexpr float NORM_EPS = 1e-5f;
 
 __device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
@@ -47,79 +49,70 @@ __device__ __forceinline__ float block_max(float value, float* shared) {
   return value;
 }
 
-extern "C" __global__ __launch_bounds__(THREADS)
+template <int HEADS>
+__global__ __launch_bounds__(HEADS * DIM / 8)  // one uint4 (8 bf16) per thread
 void v_absmax_kernel(const uint16_t* __restrict__ value, uint32_t* __restrict__ maximum, int rows, int rows_per_block) {
-  const int column = blockIdx.x * THREADS + threadIdx.x;
-  const int begin = blockIdx.y * rows_per_block;
+  constexpr int COLUMNS = HEADS * DIM;
+  const int column = threadIdx.x * 8;
+  const int begin = blockIdx.x * rows_per_block;
   const int end = min(rows, begin + rows_per_block);
-  float best = 0.f;
-  for (int row = begin; row < end; ++row)
-    best = fmaxf(best, fabsf(bf16_bits_to_float(value[(size_t)row * COLUMNS + column])));
-  atomicMax(maximum + column, __float_as_uint(best));
+  // |bf16| bits are monotone; NaN keys map to 0 because fmaxf ignores NaN operands.
+  auto key = [](uint32_t h) { h &= 0x7fffu; return h > 0x7f80u ? 0u : h; };
+  uint32_t best[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int row = begin;
+  for (; row + 4 <= end; row += 4) {
+    uint4 v[4];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) v[u] = *reinterpret_cast<const uint4*>(value + (size_t)(row + u) * COLUMNS + column);
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const uint32_t w[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        best[2 * i] = max(best[2 * i], key(w[i]));
+        best[2 * i + 1] = max(best[2 * i + 1], key(w[i] >> 16));
+      }
+    }
+  }
+  for (; row < end; ++row) {
+    const uint4 v = *reinterpret_cast<const uint4*>(value + (size_t)row * COLUMNS + column);
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      best[2 * i] = max(best[2 * i], key(w[i]));
+      best[2 * i + 1] = max(best[2 * i + 1], key(w[i] >> 16));
+    }
+  }
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) atomicMax(maximum + column + i, best[i] << 16);
 }
 
-extern "C" __global__ __launch_bounds__(THREADS)
+template <int HEADS>
+__global__ __launch_bounds__(THREADS)
 void rope_sage_prepare_kernel(
-    const uint16_t* __restrict__ query, const uint16_t* __restrict__ key, const uint16_t* __restrict__ value,
-    const float* __restrict__ cosine, const float* __restrict__ sine, const uint32_t* __restrict__ v_maximum,
+    const uint16_t* __restrict__ query, const uint16_t* __restrict__ key,
+    const float* __restrict__ cosine, const float* __restrict__ sine,
     const uint16_t* __restrict__ query_weight, const uint16_t* __restrict__ key_weight,
-    int8_t* __restrict__ query_out, int8_t* __restrict__ key_out, uint8_t* __restrict__ value_out,
-    float* __restrict__ query_scale, float* __restrict__ key_scale, float* __restrict__ value_scale,
+    int8_t* __restrict__ query_out, int8_t* __restrict__ key_out,
+    float* __restrict__ query_scale, float* __restrict__ key_scale,
     int rows, int padded_rows, float sm_scale) {
   __shared__ float shared[THREADS / 32];
   const int head = blockIdx.x % HEADS;
   const int block = blockIdx.x / HEADS;
   const int blocks = padded_rows / BLOCK_ROWS;
   const int tid = threadIdx.x;
-  if (blockIdx.y == 2) {
-    __shared__ uint16_t tile[BLOCK_ROWS][DIM + 2];
-    const int load_row = block * BLOCK_ROWS + tid / 8;
-    const int load_col = (tid % 8) * 16;
-    uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
-    if (load_row < rows) {
-      const uint16_t* source = value + ((size_t)load_row * HEADS + head) * DIM + load_col;
-      a = *reinterpret_cast<const uint4*>(source);
-      b = *reinterpret_cast<const uint4*>(source + 8);
-    }
-    const uint32_t words[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      tile[tid / 8][load_col + 2 * i] = (uint16_t)(words[i] & 0xffff);
-      tile[tid / 8][load_col + 2 * i + 1] = (uint16_t)(words[i] >> 16);
-    }
-    __syncthreads();
-    const int dim = tid / 2;
-    const int first = (tid % 2) * 16;
-    const float scale = __fmul_rn(__uint_as_float(v_maximum[head * DIM + dim]), 1.0f / 448.0f);
-    if (block == 0 && tid % 2 == 0) value_scale[head * DIM + dim] = scale;
-    uint32_t packed[4];
-    #pragma unroll
-    for (int word = 0; word < 4; ++word) {
-      float x[4];
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int local = first + word * 4 + i;
-        x[i] = block * BLOCK_ROWS + local < rows ? __fdiv_rn(bf16_bits_to_float(tile[local][dim]), scale) : 0.f;
-      }
-      int bits = 0;
-      bits = __builtin_amdgcn_cvt_pk_fp8_f32(x[0], x[1], bits, false);
-      bits = __builtin_amdgcn_cvt_pk_fp8_f32(x[2], x[3], bits, true);
-      packed[word] = (uint32_t)bits;
-    }
-    *reinterpret_cast<uint4*>(value_out + ((size_t)head * DIM + dim) * padded_rows + block * BLOCK_ROWS + first) =
-        make_uint4(packed[0], packed[1], packed[2], packed[3]);
-    return;
-  }
   const bool is_query = blockIdx.y == 0;
   const uint16_t* source = is_query ? query : key;
   const int group = tid % 8;
   const int row = block * BLOCK_ROWS + tid / 8;
   const bool valid = row < rows;
   const size_t base = ((size_t)row * HEADS + head) * DIM;
+  const int src_row = row;
+  const size_t src_base = ((size_t)src_row * HEADS + head) * DIM;
   float x[16], partner[16];
   const int partner_group = group < 3 ? group + 3 : group - 3;
-  load16(source + base + group * 16, valid, x);
-  load16(source + base + partner_group * 16, valid && group < 6, partner);
+  load16(source + src_base + group * 16, valid, x);
+  load16(source + src_base + partner_group * 16, valid && group < 6, partner);
   // Reproduces ATen vectorized RMSNorm: per-4 fma chains, then shfl_down tree 16/8/4/2/1.
   float sums[4];
   #pragma unroll
@@ -144,8 +137,8 @@ void rope_sage_prepare_kernel(
   if (group < 6) {
     #pragma unroll
     for (int i = 0; i < 16; ++i) {
-      const float c = valid ? cosine[(size_t)row * ROPE_DIM + group * 16 + i] : 0.f;
-      const float s = valid ? sine[(size_t)row * ROPE_DIM + group * 16 + i] : 0.f;
+      const float c = valid ? cosine[(size_t)src_row * ROPE_DIM + group * 16 + i] : 0.f;
+      const float s = valid ? sine[(size_t)src_row * ROPE_DIM + group * 16 + i] : 0.f;
       const float rotated = group < 3 ? -partner[i] : partner[i];
       x[i] = __fadd_rn(__fmul_rn(x[i], c), __fmul_rn(rotated, s));
     }
@@ -176,20 +169,101 @@ void rope_sage_prepare_kernel(
       make_uint4(packed[0], packed[1], packed[2], packed[3]);
 }
 
+// V pass: 128-row tiles so each (head, dim) output row gets one contiguous 128-byte FP8 segment
+// (the 32-row tile in rope_sage_prepare_kernel emitted scattered 32-byte writes). Same per-element math.
+static constexpr int V_ROWS = 128;
+
+template <int HEADS>
+__global__ __launch_bounds__(THREADS)
+void v_quant_kernel(const uint16_t* __restrict__ value, const uint32_t* __restrict__ v_maximum,
+                    uint8_t* __restrict__ value_out, float* __restrict__ value_scale, int rows, int padded_rows) {
+  __shared__ uint16_t tile[V_ROWS][DIM + 2];
+  const int head = blockIdx.x % HEADS;
+  const int block = blockIdx.x / HEADS;
+  const int tid = threadIdx.x;
+  const int load_col = (tid % 8) * 16;
+  #pragma unroll
+  for (int pass = 0; pass < V_ROWS / 32; ++pass) {
+    const int local_row = pass * 32 + tid / 8;
+    const int load_row = block * V_ROWS + local_row;
+    uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
+    if (load_row < rows) {
+      const uint16_t* source = value + ((size_t)load_row * HEADS + head) * DIM + load_col;
+      a = *reinterpret_cast<const uint4*>(source);
+      b = *reinterpret_cast<const uint4*>(source + 8);
+    }
+    const uint32_t words[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      tile[local_row][load_col + 2 * i] = (uint16_t)(words[i] & 0xffff);
+      tile[local_row][load_col + 2 * i + 1] = (uint16_t)(words[i] >> 16);
+    }
+  }
+  __syncthreads();
+  const int first = (tid % 8) * 16;
+  #pragma unroll
+  for (int pass = 0; pass < DIM / 32; ++pass) {
+    const int dim = pass * 32 + tid / 8;
+    const float scale = __fmul_rn(__uint_as_float(v_maximum[head * DIM + dim]), 1.0f / 448.0f);
+    if (block == 0 && tid % 8 == 0) value_scale[head * DIM + dim] = scale;
+    if (block * V_ROWS + first >= padded_rows) continue;
+    uint32_t packed[4];
+    #pragma unroll
+    for (int word = 0; word < 4; ++word) {
+      float x[4];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int local = first + word * 4 + i;
+        x[i] = block * V_ROWS + local < rows ? __fdiv_rn(bf16_bits_to_float(tile[local][dim]), scale) : 0.f;
+      }
+      int bits = 0;
+      bits = __builtin_amdgcn_cvt_pk_fp8_f32(x[0], x[1], bits, false);
+      bits = __builtin_amdgcn_cvt_pk_fp8_f32(x[2], x[3], bits, true);
+      packed[word] = (uint32_t)bits;
+    }
+    *reinterpret_cast<uint4*>(value_out + ((size_t)head * DIM + dim) * padded_rows + block * V_ROWS + first) =
+        make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  }
+}
+
+template <int HEADS>
+static void launch(hipStream_t s, const uint16_t* query, const uint16_t* key, const uint16_t* value,
+                   const float* cosine, const float* sine, uint32_t* maximum,
+                   const uint16_t* query_weight, const uint16_t* key_weight, int8_t* query_out, int8_t* key_out,
+                   uint8_t* value_out, float* query_scale, float* key_scale, float* value_scale,
+                   int rows, int padded_rows, float sm_scale, int parts) {
+  if (parts > 2) {
+    hipMemsetAsync(maximum, 0, HEADS * DIM * sizeof(uint32_t), s);
+    const int chunks = 512;
+    const int rows_per_block = (rows + chunks - 1) / chunks;
+    hipLaunchKernelGGL(v_absmax_kernel<HEADS>, dim3((unsigned)((rows + rows_per_block - 1) / rows_per_block)),
+                       dim3(HEADS * DIM / 8), 0, s, value, maximum, rows, rows_per_block);
+    hipLaunchKernelGGL(v_quant_kernel<HEADS>, dim3((unsigned)((padded_rows + V_ROWS - 1) / V_ROWS * HEADS)), dim3(THREADS), 0, s,
+                       value, (const uint32_t*)maximum, value_out, value_scale, rows, padded_rows);
+  }
+  hipLaunchKernelGGL(rope_sage_prepare_kernel<HEADS>, dim3((unsigned)(padded_rows / BLOCK_ROWS * HEADS), (unsigned)(parts > 2 ? 2 : parts)),
+                     dim3(THREADS), 0, s, query, key, cosine, sine, query_weight, key_weight, query_out, key_out,
+                     query_scale, key_scale, rows, padded_rows, sm_scale);
+}
+
 void launch_gfx1201_norm_rope_prepare(int64_t query, int64_t key, int64_t value, int64_t cosine, int64_t sine, int64_t maximum,
                     int64_t query_weight, int64_t key_weight, int64_t query_out, int64_t key_out, int64_t value_out,
                     int64_t query_scale, int64_t key_scale, int64_t value_scale,
-                    int64_t rows, int64_t padded_rows, double sm_scale, int64_t stream, int64_t parts) {
-  hipStream_t s = (hipStream_t)stream;
-  hipMemsetAsync((void*)maximum, 0, COLUMNS * sizeof(uint32_t), s);
-  const int chunks = 64;
-  const int rows_per_block = (int)((rows + chunks - 1) / chunks);
-  hipLaunchKernelGGL(v_absmax_kernel, dim3(COLUMNS / THREADS, chunks), dim3(THREADS), 0, s,
-                     (const uint16_t*)value, (uint32_t*)maximum, (int)rows, rows_per_block);
-  hipLaunchKernelGGL(rope_sage_prepare_kernel, dim3((unsigned)(padded_rows / BLOCK_ROWS * HEADS), (unsigned)parts), dim3(THREADS), 0, s,
-                     (const uint16_t*)query, (const uint16_t*)key, (const uint16_t*)value,
-                     (const float*)cosine, (const float*)sine, (const uint32_t*)maximum,
-                     (const uint16_t*)query_weight, (const uint16_t*)key_weight, (int8_t*)query_out, (int8_t*)key_out, (uint8_t*)value_out,
-                     (float*)query_scale, (float*)key_scale, (float*)value_scale,
-                     (int)rows, (int)padded_rows, (float)sm_scale);
+                    int64_t rows, int64_t padded_rows, double sm_scale, int64_t stream, int64_t parts, int64_t heads) {
+#define GFX1201_PREPARE_CASE(H)                                                                                   \
+  case H:                                                                                                        \
+    launch<H>((hipStream_t)stream, (const uint16_t*)query, (const uint16_t*)key, (const uint16_t*)value,         \
+              (const float*)cosine, (const float*)sine, (uint32_t*)maximum, (const uint16_t*)query_weight,       \
+              (const uint16_t*)key_weight, (int8_t*)query_out, (int8_t*)key_out, (uint8_t*)value_out,            \
+              (float*)query_scale, (float*)key_scale, (float*)value_scale, (int)rows, (int)padded_rows,          \
+              (float)sm_scale, (int)parts);                                                                      \
+    return;
+  switch (heads) {
+    GFX1201_PREPARE_CASE(7)
+    GFX1201_PREPARE_CASE(14)
+    GFX1201_PREPARE_CASE(28)
+    GFX1201_PREPARE_CASE(56)
+  }
+#undef GFX1201_PREPARE_CASE
+  throw std::invalid_argument("gfx1201_norm_rope_prepare supports 7/14/28/56 heads");
 }

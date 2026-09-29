@@ -2039,6 +2039,27 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_gfx1201_h3_ops": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_h3_rms_modulate.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_h3_swiglu.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_h3_gated_residual.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_h3_vae_block.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_h3_ops_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-std=c++17'",
+            "'-ffp-contract=off'",
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_decode_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
