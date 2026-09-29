@@ -640,7 +640,6 @@ gfx942,304,3,7168,3072,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,66
 gfx942,304,3,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,693,0,12.9304,flydsl_decode_agfx942_m3_n3584_k7168_pblock_ww16_cw1_aslds_bl8_ku2_pf1_pn0_g1_we0_cp2_orrne,0.0,11.92,3978.59
 gfx942,304,3,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,671,0,12.9656,flydsl_decode_agfx942_m3_n7168_k3584_pblock_ww12_cw1_aslds_bl8_ku2_pf1_pn0_g1_we2_cp2_orrne,0.0,11.89,3967.79
 gfx942,304,3,7168,4224,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,665,0,15.4340,flydsl_decode_agfx942_m3_n7168_k4224_pblock_ww12_cw1_aslds_bl8_ku1_pf1_pn0_g1_we0_cp2_orrne,0.0,11.77,3927.93
-gfx942,304,3,6288,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,532,0,21.5563,flydsl_decode_agfx942_m3_n6288_k7168_pwave_mp3_np2_kv8_pf1_we2_cp2_rddpp_ctscalar_orrne,0.0,12.55,4185.57
 gfx942,304,3,7168,8448,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,717,0,27.8587,flydsl_decode_agfx942_m3_n7168_k8448_pblock_ww16_cw2_aslds_bl8_ku2_pf1_pn0_g1_we0_cp2_orrne,0.0,13.04,4350.68
 gfx942,304,3,8448,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,587,0,25.5159,flydsl_decode_agfx942_m3_n8448_k7168_pblock_ww4_cw1_asglobal_bl8_ku2_pf1_pn0_g1_we2_cp2_orrne,0.0,14.24,4750.14
 gfx942,304,3,12448,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,691,0,39.3211,flydsl_decode_agfx942_m3_n12448_k7168_pblock_ww16_cw1_aslds_bl8_ku1_pf1_pn0_g1_we2_cp2_orrne,0.0,13.62,4541.38
