@@ -1018,6 +1018,86 @@ def test_candidates_implicit(num_heads):
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
+def _ragged_rows(lens, ctx):
+    """Each row's sequence and causal key bound: lens[s] rows ending at ctx[s]."""
+    seq = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device="cuda"),
+        torch.tensor(lens, device="cuda"),
+    )
+    ends = torch.cat(
+        [torch.arange(c - n + 1, c + 1, dtype=torch.int32) for n, c in zip(lens, ctx)]
+    )
+    return seq, ends.cuda()
+
+
+def _ranked_ids(ends, k, block):
+    """k distinct block ids per row, legal for every row, in rank order."""
+    nb = int(ends.min()) // block
+    ids = torch.rand(ends.shape[0], nb, device="cuda").argsort(1)[:, :k]
+    return ids.to(torch.int32)
+
+
+@pytest.mark.parametrize("block", [8, 32])
+def test_candidate_gather_row_seq(block):
+    """row_seq resolves through a table row per sequence exactly as a table row
+    per query row does."""
+    torch.manual_seed(0)
+    lens, ctx = [5, 3, 4], [1024, 777, 640]
+    st = _make_case(3, 4, 32, 128, ctx, 64)
+    seq, ends = _ragged_rows(lens, ctx)
+    ids = _ranked_ids(ends, 16, block)
+    args = (st["cache"], 32, 128, block)
+    a, cu_a = build_candidate_gather(ids, ends, st["block_table"][seq.long()], *args)
+    b, cu_b = build_candidate_gather(ids, ends, st["block_table"], *args, row_seq=seq)
+    assert torch.equal(a["slots"], b["slots"]) and torch.equal(cu_a, cu_b)
+    assert torch.equal(a["positions"], b["positions"])
+
+
+@pytest.mark.parametrize("preshuffle", [1, 0])
+def test_gather_launch_spans_sequences(preshuffle):
+    """Rows of several sequences, resolved with row_seq, score as one [1, ROWS]
+    launch bit for bit as one launch per sequence: the walk reads a row's slots
+    and row_ends, so block_table and context_lens there only have to be valid."""
+    torch.manual_seed(0)
+    lens, ctx, block, k = [5, 3, 4], [1024, 777, 640], 8, 16
+    st = _make_case(3, 4, 32, 128, ctx, 64, preshuffle=preshuffle)
+    seq, ends = _ragged_rows(lens, ctx)
+    meta, cu = build_candidate_gather(
+        _ranked_ids(ends, k, block),
+        ends,
+        st["block_table"],
+        st["cache"],
+        32,
+        128,
+        block,
+        row_seq=seq,
+    )
+    rows = sum(lens)
+    q, qs = st["q4"].reshape(1, rows, 32, 64), st["q4s"].reshape(1, rows, 32, 4)
+
+    def launch(s, lo, hi):
+        part = {**meta, "slots": meta["slots"][lo:hi]}
+        return paged_mxfp4_mqa_logits(
+            q[:, lo:hi],
+            qs[:, lo:hi],
+            st["cache"],
+            st["weights"][lo:hi],
+            st["cl"][s : s + 1],
+            st["block_table"][s : s + 1],
+            k * block,
+            preshuffle=preshuffle,
+            use_gather=True,
+            candidates=part,
+            row_ends=cu[lo:hi],
+        )
+
+    starts = [sum(lens[:s]) for s in range(len(lens) + 1)]
+    ref = torch.cat([launch(s, starts[s], starts[s + 1]) for s in range(len(lens))])
+    got = launch(0, 0, rows)
+    torch.cuda.synchronize()
+    assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
+
+
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("pad", [256, 9472])

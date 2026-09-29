@@ -272,12 +272,17 @@ def build_candidate_gather(
     head_size,
     block=CANDIDATE_BLOCK,
     kv_scale_cache=None,
+    row_seq=None,
 ):
     """Ranked block ids -> (gather, row_ends), in one launch.
 
     candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
     ends:        [B * NEXT_N] int32 exclusive per-row key bound
-    block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row
+    block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row, or
+                 [S, MAX_BLOCKS], one row per sequence, with row_seq
+    row_seq:     [B * NEXT_N] int32, optional. The block_table row each query
+                 row reads, so rows of several sequences resolve together
+                 without a table row per query row
 
     Returns the sorted block starts (positions) and the slot of each one
     (page * page_size + offset), which is all the walk reads, so a layer group
@@ -292,7 +297,12 @@ def build_candidate_gather(
         if rows >= 4 * get_num_sms()
         else (8 if k >= 2048 else 4)
     )
-    assert block_table.shape[0] == rows and block_table.stride(1) == 1
+    assert block_table.stride(1) == 1
+    if row_seq is None:
+        assert block_table.shape[0] == rows
+    else:
+        assert row_seq.dtype == torch.int32 and row_seq.shape == (rows,)
+        assert row_seq.stride(0) == 1, "row_seq must be contiguous"
     page_size = cache_strides(kv_cache, head_size, kv_scale_cache)[0]
     assert page_size % block == 0 and block <= mfma_nonk_dim(num_heads, head_size)
     assert (
@@ -306,6 +316,7 @@ def build_candidate_gather(
         candidates,
         ends,
         block_table,
+        row_seq,
         pos,
         cu,
         slots,
@@ -314,6 +325,7 @@ def build_candidate_gather(
         k,
         block,
         page_size,
+        HAS_SEQ=row_seq is not None,
         num_warps=num_warps,
     )
     return {"slots": slots, "block": block, "positions": pos}, cu
@@ -499,7 +511,10 @@ def paged_mxfp4_mqa_logits(
                     or context parallelism. build_schedule needs the same tensor.
                     Under gather it counts the row's valid candidate slots
     use_gather:     bool. Walk a candidate list rather than the context, so
-                    output column j holds candidate slot j
+                    output column j holds candidate slot j. Rows are then
+                    independent: the walk reads a row's slots and row_ends, not
+                    block_table, and context_lens only has to be positive, so
+                    one [1, ROWS] launch can hold rows of several sequences
     candidates:     [B * NEXT_N, K] int32 ranked block ids, resolved here, or
                     what build_candidate_gather returned, used as is. row_ends
                     is the per-row key bound for the first and the slot count
