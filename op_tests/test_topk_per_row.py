@@ -233,6 +233,7 @@ def run_top_k_per_row_decode(
             k,
             stable,
             values,
+            max_row_len=max_row_len,
         )
     elif fast:
         assert k == 2048, "top_k_per_row_decode_fast only supports k=2048"
