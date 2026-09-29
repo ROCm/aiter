@@ -32,7 +32,41 @@ def compile_moe_gemm2(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    down_path="default",
+    down_output_padding_bytes=0,
 ):
+    if down_path != "default":
+        from .gemm2_1x4 import _build_moe_gemm2_1x4
+        from .gemm2_8x1 import _build_moe_gemm2_8x1
+        from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
+
+        builders = {
+            "1x4_64x256": _build_moe_gemm2_1x4,
+            "8x1": _build_moe_gemm2_8x1,
+            "8x1_compact": _build_moe_gemm2_8x1_compact,
+        }
+        if down_path not in builders:
+            raise ValueError(f"Unsupported Down path: {down_path}")
+        return builders[down_path](
+            N=N,
+            K=K,
+            weight_dtype=weight_dtype,
+            weight_quant_type=weight_quant_type,
+            TOPK=TOPK,
+            BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
+            BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+            alg=alg,
+            E=E,
+            USE_ATOMIC_WRITE=USE_ATOMIC_WRITE,
+            act_quant_type=act_quant_type,
+            tile_k=tile_k,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            down_path=down_path,
+            down_output_padding_bytes=down_output_padding_bytes,
+        )
+    if down_output_padding_bytes != 0:
+        raise ValueError("The default Down path does not support output padding")
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
         weight_dtype,
