@@ -58,7 +58,7 @@ from .quick_allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
-    _RELEASE_SCOPE,
+    _SYSTEM_SYNC_SCOPE,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
@@ -140,11 +140,11 @@ def ring_st_ladder(world_size: int, link: str = "pcie"):
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
-# Cache policy for reading a rank-tile out of our own inbox.
-#
-# The mesh reads its inbox `nt`, which is only a non-temporal hint -- it
-# does not bypass. For the ring algorithm, a hint is not enough:
-# `sc0 sc1` makes the load actually go to memory.
+# Cache policy for reading a rank-tile out of our own inbox, on every inbox
+# type. The mesh takes the policy's ``recv`` instead, which is `nt` on a
+# fine-grained inbox -- only a non-temporal hint, not a bypass. For the ring
+# algorithm a hint is never enough: `sc0 sc1` makes the load actually go to
+# memory.
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 
@@ -244,6 +244,7 @@ def make_quick_allreduce_ring_kernel(
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
     release_scope = policy["release"]
+    acquire_scope = policy["acquire"]
     # policy["fanout"] is not consulted: it picks which axis of a (peer, sector)
     # fanout runs fastest across quads, and a ring has no peer axis. Sectors run
     # fastest by construction, which is the "peer" (PCIe-favourable) answer.
@@ -689,8 +690,8 @@ def make_quick_allreduce_ring_kernel(
                     _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
                 )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
-                # fence is needed in the loop; the acquire below covers the
-                # payload reads, once, after the join.
+                # fence is needed in the loop; the acquire below orders the
+                # payload reads after it, once, after the join.
                 current = _load_flag(flag)
                 while current != color:
                     current = _load_flag(flag)
@@ -698,25 +699,28 @@ def make_quick_allreduce_ring_kernel(
             # Unconditional, *after* the join, and not just inside the spin.
             # Only `tid == 0` spins, so an acquire inside the loop would cover
             # one lane of one wave and leave the rest of the workgroup reading
-            # the payload with nothing invalidated on its behalf -- and would be
-            # skipped entirely in the common case where the flag is already set
-            # on the first read.
+            # the payload unordered after it -- and would be skipped entirely
+            # in the common case where the flag is already set on the first
+            # read.
             #
-            # This is now defensive rather than load-bearing: `_RECV_POLICY` is
-            # `sc0 sc1`, so the payload loads below already bypass both caches
-            # and cannot be served a stale line on their own. It is kept because
-            # it costs one fence per step and the failure it guards against is a
-            # silent wrong result. (An earlier version of this comment said the
-            # payload was read `nt`; that describes the mesh kernel, not
-            # this one -- see the note on _RECV_POLICY above.)
+            # The scope is the inbox policy's. `_RECV_POLICY` is `sc0 sc1`, so
+            # the payload loads below bypass both caches on every inbox and
+            # cannot be served a stale line on their own. On an uncached inbox
+            # the policy therefore gives a workgroup-scope acquire: no
+            # invalidate, only a compiler barrier that keeps those loads below
+            # the spin. Every other inbox keeps the system-scope acquire, an
+            # L1+L2 invalidate, as a defence against a silent wrong result.
             #
-            # Write back *before* invalidating. The ring stores
-            # one chunk per all-gather op and then waits again -- so an acquire
-            # here sits directly on top of dirty output lines, and discarding
-            # them silently loses whole chunks.
-            rocdl.s_waitcnt(vmcnt=0)
-            _release_inbox(_RELEASE_SCOPE)
-            _acquire_inbox()
+            # A system-scope acquire must be preceded by a writeback. The ring
+            # stores one chunk per all-gather op and then waits again -- so an
+            # invalidate here sits directly on top of dirty output lines, and
+            # discarding them silently loses whole chunks. A workgroup-scope
+            # acquire invalidates nothing, so it needs neither the writeback
+            # nor the drain before it.
+            if const_expr(acquire_scope == _SYSTEM_SYNC_SCOPE):
+                rocdl.s_waitcnt(vmcnt=0)
+                _release_inbox(_SYSTEM_SYNC_SCOPE)
+            _acquire_inbox(acquire_scope)
 
         def _atom_f16_to_f32(atom):
             """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""

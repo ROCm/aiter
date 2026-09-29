@@ -106,15 +106,10 @@ DEFAULT_GRID_CAP = 64
 #
 #   PCIe
 #
-#     TP2  block 128, atoms=2, cap 64 -- a 4 KiB tile reached with a half-size
-#                               workgroup. Below 96 KiB the schedule is
-#                               flag-bound, and 128 threads is the cheapest way
-#                               to hold the tile narrow.
-#          block 256, atoms=4, cap 128 -- above 96 KiB the trade reverses and
-#                               the wider cap matters, because this window runs
-#                               to 64 MiB in exact mode: a cap of 64 would leave
-#                               half the blocks running twice the serialized
-#                               handshake rounds.
+#     TP2  block 512, atoms=1/4 -- the 8 KiB tile to 384 KiB (the whole fast-mode
+#                               window, where the mesh takes over), then the
+#                               32 KiB tile with cap 128 over the rest of the
+#                               exact-mode window, which runs to 64 MiB.
 #     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB,
 #                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
 #     TP8  block 512, atoms=1/2 -- the 8 KiB tile to 16 KiB, then the 16 KiB
@@ -123,13 +118,13 @@ DEFAULT_GRID_CAP = 64
 #
 #   xGMI
 #
-#     TP2  atoms=1 cap128 b128 to 768 KiB, then atoms=2 cap64 b256
-#     TP4  atoms=1 cap256 b64  -- one rung over the whole 256 KiB window
-#     TP8  atoms=1 cap128 b128 to 128 KiB, then cap128 b256
+#     TP2  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP4  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP8  atoms=1 cap128 b256 -- one rung over the whole window
 ONESHOT_LADDER = {
     ("pcie", 2): (
-        (0, 2, 64, "peer", 128, True),
-        (96 << 10, 4, 128, "peer", 256, True),
+        (0, 1, 64, "peer", 512, True),
+        (384 << 10, 4, 128, "peer", 512, True),
     ),
     ("pcie", 4): (
         (0, 1, 64, "peer", 256, True),
@@ -140,15 +135,9 @@ ONESHOT_LADDER = {
         (0, 1, 64, "peer", 512, True),
         (16 << 10, 2, 64, "peer", 512, True),
     ),
-    ("xgmi", 2): (
-        (0, 1, 128, "peer", 128, False),
-        (768 << 10, 2, 64, "peer", 256, False),
-    ),
-    ("xgmi", 4): ((0, 1, 256, "peer", 64, False),),
-    ("xgmi", 8): (
-        (0, 1, 128, "peer", 128, False),
-        (128 << 10, 1, 128, "peer", 256, False),
-    ),
+    ("xgmi", 2): ((0, 1, 128, "peer", 256, False),),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
+    ("xgmi", 8): ((0, 1, 128, "peer", 256, False),),
 }
 
 
@@ -327,6 +316,7 @@ def make_one_shot_allreduce_kernel(
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
     release_scope = policy["release"]
+    acquire_scope = policy["acquire"]
 
     fused = fusion == "rmsnorm"
     if fused:
@@ -600,12 +590,19 @@ def make_one_shot_allreduce_kernel(
         def _wait(parity, color):
             """Spin until every rank's flag in our own inbox shows *color*.
 
-            One spinner per source. The writeback-then-invalidate after the join
-            is unconditional on purpose: if the flag is already present the loop
-            body never runs, and an invalidate placed only inside it would leave
-            the common case reading stale payload. Write back *before*
-            invalidating or the output lines this block already wrote are
-            discarded.
+            One spinner per source. The fences after the join are placed there,
+            not inside the spin, on purpose: if the flag is already present the
+            loop body never runs, and a fence placed only inside it would be
+            skipped in the common case.
+
+            The fences depend on the inbox type (``_INBOX_POLICY``). A cacheable
+            inbox gets a writeback then a system-scope acquire, i.e., an L1+L2
+            invalidate, so the payload loads cannot hit a stale line. Write back
+            *before* invalidating, or the output lines this block already wrote
+            are discarded. The uncached inbox has no stale line to invalidate:
+            the memory is never cached and the loads bypass L1 and L2
+            (``_RECV_POLICY``). It gets a workgroup-scope acquire, which only
+            keeps the payload loads below the spin.
             """
             # Lane ``t`` watches one source. Without ``skip_self`` that is
             # source ``t``; with it our own flag is never published, so the
@@ -621,8 +618,8 @@ def make_one_shot_allreduce_kernel(
                     _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
                 )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
-                # fence is needed in the loop; the acquire below covers the
-                # payload reads, once, after the join.
+                # fence is needed in the loop; the fences below order the
+                # payload reads after it, once, after the join.
                 current = _load_flag(flag)
                 while current != color:
                     if const_expr(spin_sleep):
@@ -636,7 +633,7 @@ def make_one_shot_allreduce_kernel(
             rocdl.s_waitcnt(vmcnt=0)
             if const_expr(release_scope is not None):
                 _release_inbox(release_scope)
-            _acquire_inbox()
+            _acquire_inbox(acquire_scope)
 
         def _reduce_f32(parity, my_atoms):
             """Sum this thread's atom across all N contributions, in rank order.
@@ -721,8 +718,13 @@ def make_one_shot_allreduce_kernel(
             else:
                 _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)
-            if color == fx.Int32(0):  # 0 is the unset sentinel
-                color = fx.Int32(1)
+            # 0 is the unset sentinel. The
+            # inbox slot is `color & 1`, and the colour before the wrap is -1,
+            # which is odd: resuming at 1 would put two consecutive tiles in
+            # the same slot, and a rank one tile ahead would overwrite data a
+            # peer is still reading.
+            if color == fx.Int32(0):
+                color = fx.Int32(2)
         if tid == 0:
             _store_color(color)
         gpu.barrier()

@@ -19,7 +19,7 @@ all-reduce is fastest at this shape, and what does it cost in accuracy".
 | ``fly_int4``  | FlyDSL mesh INT4 (ROCm/aiter#4970)      | int4     | no  |
 | ``fly_int4_ring`` | FlyDSL ring, same two-shot volume   | int4/int6| no  |
 | ``fly_1stage``| FlyDSL exact one-shot                   | bf16     | yes |
-| ``rccl``      | ``dist.all_reduce``                     | bf16/fp16| yes |
+| ``rccl``      | PyNccl ``all_reduce`` (out-of-place)    | bf16/fp16| yes |
 
 The three ``fly_*`` families are the ones with a dispatch question open: which
 of them wins is a function of payload size, and so is which variant wins inside
@@ -119,16 +119,26 @@ not "how efficiently is the wire used".
 **``us`` is HIP-graph replay time by default** (``--timing graph``): capture the
 collective, replay it, divide. That is the metric a captured deployment sees --
 decode is captured -- and it is the only fair kernel-to-kernel comparison here.
+The captured collectives replay back-to-back, with no work between them. That
+was checked for bias towards FlyDSL, whose double-buffered inbox could in
+principle let one call overlap the next across ranks, and found not to matter;
+see ``_bench_graph`` for the measurement.
+
+Every thunk calls what ``CudaCommunicator.all_reduce`` would call for its family,
+with the arguments production passes. In particular the ``cdr`` rows use the
+input in place and IPC-register it under capture, as
+``CustomAllreduce.custom_all_reduce`` does, rather than staging it through the
+pre-registered pool on every call; and ``rccl`` is PyNccl's out-of-place call,
+production's fallback, not c10d plus a copy.
 
 ``--timing eager`` switches to hipEvent wall time around the Python call. Read
 that number knowing what it contains: ``run_perftest`` brackets a loop of
 back-to-back calls, so once host cost per call exceeds device time the GPU
-starves and the measurement *is* the host cost -- at TP2/M=1 a 5.7 us kernel
-reads as ~20 us. That cost also differs per candidate family (a ``separate_*``
-row makes two Python op calls, ``cdr``/``qr`` go through pybind, the FlyDSL
-rows through ``_run_compiled``, ``rccl`` through an aten op plus a ``copy_``),
-so eager partly ranks candidates by how much Python sits in their bench thunk
--- a property of this harness, not of the kernel. Every boundary in
+starves and the measurement *is* the host cost. That cost also differs per
+candidate family (``cdr``/``qr`` go through pybind, the FlyDSL rows through
+``_run_compiled``, ``rccl`` through PyNccl's ctypes binding), so eager
+partly ranks candidates by how much Python sits in their bench thunk -- a
+property of this harness, not of the kernel. Every boundary in
 ``allreduce_policy`` is a crossover *between* families, so that bias lands
 straight on the shipped thresholds. Either way the peer-wait that dominates the
 1-stage kernel is included, and the torch profiler is not usable here -- see
@@ -2046,9 +2056,14 @@ def _bench_graph(thunk, *, num_iters, num_warmup, inner, group, label="candidate
     stream rather than on ``torch.cuda.graph``'s own class-level one. Capturing
     without either records a different code path than the one that replays.
 
-    ``inner`` calls per graph, so the replay is back-to-back collectives with no
-    host in between -- the run-ahead case the double-buffered inbox is built
-    for, and a closer model of production than eager is.
+    ``inner`` calls per graph, replayed back-to-back: no host and no other
+    device work between consecutive collectives. That is deliberate, and was
+    checked for bias. The FlyDSL schedules double-buffer their inbox and close
+    each call on a single handshake, so a rank that finishes call *i* early
+    can start pushing call *i+1* while its peers are still reducing call *i*.
+    The ``cross_device_reduce_*`` kernels close every call with an end barrier
+    and cannot run ahead. A normal deployment puts model compute between two 
+    all-reduces and the concern was that this timing methodology flatters FlyDSL.
 
     What comes back is whatever the thunk returns -- a tensor in plain mode, the
     ``(out, residual_out)`` pair in fused mode -- and it is what a **replay**
@@ -2108,27 +2123,76 @@ def _bench_graph(thunk, *, num_iters, num_warmup, inner, group, label="candidate
     return out, us
 
 
-def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, flyauto, group, x):
+class _PersistentBuffers:
+    """Input and custom-AR output storage that lives for the whole sweep.
+
+    Under graph capture the ``cdr`` rows run the way production does: the
+    input and output are used in place and their addresses IPC-registered when
+    the capture exits (see ``_build_thunks``). The C++ side caches a registered
+    output by its raw pointer and never forgets it, which is harmless in
+    production -- a captured graph's buffers are never freed. In a
+    sweep that frees every buffer between shapes to this extra time. A later shape whose output
+    lands on a recycled address would silently reuse the stale peer mapping.
+    """
+
+    def __init__(self, shapes, dtype, device):
+        elem = torch.empty((), dtype=dtype).element_size()
+        nbytes = max(m * k for m, k in shapes) * elem
+        self._inp = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        self._cdr_out = torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+    @staticmethod
+    def _view(buf, tokens, hidden, dtype):
+        n = tokens * hidden * torch.empty((), dtype=dtype).element_size()
+        return buf[:n].view(dtype).view(tokens, hidden)
+
+    def inp(self, tokens, hidden, dtype):
+        return self._view(self._inp, tokens, hidden, dtype)
+
+    def cdr_out(self, tokens, hidden, dtype):
+        return self._view(self._cdr_out, tokens, hidden, dtype)
+
+
+def _build_thunks(
+    cands, *, ca_comm, qr_comm, pynccl_comm, fly, fly1s, flyauto, group, x, cdr_out
+):
     """Zero-arg thunks, one per candidate, each returning the all-reduced tensor.
 
-    Every candidate owns its output buffer so none of them alias, and the QR
-    quantization level is set inside the thunk rather than around the timed
-    loop, so candidates sharing one QuickAllReduce cannot leak state into each
-    other.
+    Every candidate owns its output buffer so none of them alias -- except the
+    ``cdr`` family, which shares *cdr_out* (see ``_PersistentBuffers``) and is
+    timed and graded one candidate at a time. The QR quantization level is set
+    inside the thunk rather than around the timed loop, so candidates sharing
+    one QuickAllReduce cannot leak state into each other.
+
+    Each thunk calls what ``CudaCommunicator.all_reduce`` would call for its
+    family, with the arguments production would pass.
     """
     from aiter.dist.device_communicators.quick_all_reduce import QuickReduceRegime
 
     thunks = {}
     buffers = []
     for cand in cands:
-        out = torch.empty_like(x)
+        out = cdr_out if cand.family == "cdr" else torch.empty_like(x)
         buffers.append(out)
         if cand.family == "cdr":
             # Direct kernel entry: bypasses should_custom_ar()'s size window, so
             # the kernel is measured even above the 64 MiB RCCL-fallback cutoff.
+            #
+            # `registered_input` mirrors CustomAllreduce.custom_all_reduce:
+            # while a graph is being captured the input is used in place and
+            # its address -- and the output's -- is IPC-registered when the
+            # capture exits.
             def _cdr(o=out, c=cand):
+                reg = (
+                    ca_comm.enable_register_for_capturing
+                    and torch.cuda.is_current_stream_capturing()
+                )
                 return ca_comm.all_reduce(
-                    x, out=o, use_new=c.use_new, open_fp8_quant=c.fp8
+                    x,
+                    out=o,
+                    use_new=c.use_new,
+                    open_fp8_quant=c.fp8,
+                    registered_input=reg,
                 )
 
             thunks[cand.key] = _cdr
@@ -2160,14 +2224,23 @@ def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, flyauto, group, x):
                 return o
 
             thunks[cand.key] = _flyauto
-        else:
-
+        elif pynccl_comm is not None:
+            # What CudaCommunicator.all_reduce falls back to: an out-of-place
+            # ncclAllReduce on the current stream, with no copy.
             def _rccl(o=out):
+                pynccl_comm.all_reduce(x, o)
+                return o
+
+            thunks[cand.key] = _rccl
+        else:
+            # Production's last resort when PyNccl is unavailable. The copy is
+            # part of that path (it clones before the in-place c10d call).
+            def _rccl_c10d(o=out):
                 o.copy_(x)
                 dist.all_reduce(o, group=group)
                 return o
 
-            thunks[cand.key] = _rccl
+            thunks[cand.key] = _rccl_c10d
     return thunks, buffers
 
 
@@ -2191,6 +2264,8 @@ def _bench_shape(
     prod_regime,
     timing,
     graph_inner,
+    pynccl_comm,
+    bufs,
     fusion="none",
     fly1s_rms=None,
     flyqr_rms=None,
@@ -2198,7 +2273,8 @@ def _bench_shape(
 ):
     """Time and grade every applicable candidate at one shape. Scalars only."""
     device = torch.device(f"cuda:{rank}")
-    x = _make_input(rank, tokens, hidden, dtype).to(device)
+    x = bufs.inp(tokens, hidden, dtype)
+    x.copy_(_make_input(rank, tokens, hidden, dtype))
     nbytes = x.numel() * x.element_size()
     fused = fusion != "none"
     residual = weight = res_ref = None
@@ -2237,49 +2313,23 @@ def _bench_shape(
             )
             and (flyauto is None or not flyauto.should_fly_all_reduce(x))
         )
-        and not (
-            c.family == "fused_flyauto"
-            and (
-                fused_flyauto is None
-                or not fused_flyauto.should_fly_fused_ar_rms(x, residual, weight)
-            )
-        )
     ]
-    if fused:
-        thunks, buffers = _build_fused_thunks(
-            cands,
-            ca_comm=ca_comm,
-            qr_comm=qr_comm,
-            fly=fly,
-            fly1s=fly1s,
-            fly1s_rms=fly1s_rms,
-            flyqr_rms=flyqr_rms,
-            flyauto=flyauto,
-            fused_flyauto=fused_flyauto,
-            group=group,
-            x=x,
-            residual=residual,
-            weight=weight,
-        )
-        ref, res_ref = _fusion_reference(
-            tp_size, tokens, hidden, dtype, device, residual, weight
-        )
-    else:
-        thunks, buffers = _build_thunks(
-            cands,
-            ca_comm=ca_comm,
-            qr_comm=qr_comm,
-            fly=fly,
-            fly1s=fly1s,
-            flyauto=flyauto,
-            group=group,
-            x=x,
-        )
-        # fp32 sum of every rank's contribution, accumulated one peer at a time
-        # so peak memory stays at ~2 activations.
-        ref = torch.zeros((tokens, hidden), dtype=dtypes.fp32, device=device)
-        for peer in range(tp_size):
-            ref += _make_input(peer, tokens, hidden, dtype).to(device, dtypes.fp32)
+    thunks, buffers = _build_thunks(
+        cands,
+        ca_comm=ca_comm,
+        qr_comm=qr_comm,
+        fly=fly,
+        fly1s=fly1s,
+        flyauto=flyauto,
+        group=group,
+        x=x,
+    )
+
+    # fp32 sum of every rank's contribution, accumulated one peer at a time so
+    # peak memory stays at ~2 activations.
+    ref = torch.zeros((tokens, hidden), dtype=dtypes.fp32, device=device)
+    for peer in range(tp_size):
+        ref += _make_input(peer, tokens, hidden, dtype).to(device, dtypes.fp32)
 
     ret = {
         "nbytes": nbytes,
@@ -2404,17 +2454,7 @@ def _bench_shape(
         # Resolved after the run, not before: for a ladder-driven engine the
         # variant is a function of the payload, and asking the engine is the
         # only way to learn which rung this size took.
-        ret[f"{cand.key}_variant"] = _variant_of(
-            cand,
-            fly,
-            fly1s,
-            flyauto,
-            nbytes,
-            fly1s_rms=fly1s_rms,
-            flyqr_rms=flyqr_rms,
-            fused_flyauto=fused_flyauto,
-            hidden=hidden,
-        )
+        ret[f"{cand.key}_variant"] = _variant_of(cand, fly, fly1s, flyauto, nbytes)
 
     if profile:
         dist.barrier(group=group)
@@ -2488,10 +2528,26 @@ def _worker(
             os.environ.get(_QR_ENV),
         )
         qr_comm = None
+    # The `rccl` row times what production falls back to, PyNccl's
+    # out-of-place call. c10d is only the fallback when PyNccl is unavailable,
+    # as it is in CudaCommunicator.all_reduce.
+    pynccl_comm = tp_group.device_communicator.pynccl_comm
+    if pynccl_comm is None or pynccl_comm.disabled:
+        logger.warning(
+            "rank %d: PyNccl is unavailable; the rccl row falls back to c10d "
+            "all_reduce plus a copy",
+            rank,
+        )
+        pynccl_comm = None
 
-    # Warm the RCCL communicator and align ranks before any timing.
+    # Warm the RCCL communicators and align ranks before any timing.
     dist.all_reduce(torch.zeros(1, device=device), group=group)
+    if pynccl_comm is not None:
+        warm = torch.zeros(1, device=device)
+        pynccl_comm.all_reduce(warm, torch.empty_like(warm))
     torch.cuda.synchronize()
+
+    bufs = _PersistentBuffers(shapes, dtype, device)
 
     fly = {}  # FlyQuickAllReduce config tuple -> engine
     # One engine per distinct (schedule, super_tile, grid_cap, rs_codec,
@@ -2832,6 +2888,8 @@ def _worker(
                 prod_regime=prod_regime,
                 timing=timing,
                 graph_inner=graph_inner,
+                pynccl_comm=pynccl_comm,
+                bufs=bufs,
                 fusion=fusion,
                 fly1s_rms=fly1s_rms,
                 flyqr_rms=flyqr_rms,
@@ -3733,7 +3791,8 @@ def _write_report(
         (
             f"- timing: **{args.timing}** -- `us` is "
             + (
-                f"HIP-graph replay ({args.graph_inner} collectives per capture)"
+                f"HIP-graph replay ({args.graph_inner} collectives per capture, "
+                "back-to-back)"
                 if args.timing == "graph"
                 else "eager hipEvent wall time, host path included"
             )
@@ -3994,24 +4053,23 @@ def main():
         "fair kernel-to-kernel comparison, because eager timing here is\n"
         "host-bound: run_perftest brackets back-to-back Python calls, so once\n"
         "host cost per call exceeds device time the GPU starves and the number\n"
-        "*is* the host cost. That cost also differs per candidate family (a\n"
-        "separate_* row makes two Python op calls, cdr and qr go through\n"
-        "pybind, the FlyDSL rows through _run_compiled, rccl through an aten op\n"
-        "plus a copy_), so eager partly ranks candidates by how much Python\n"
-        "sits in their bench thunk -- a property of this harness, not of the\n"
-        "kernel. Since every family boundary in allreduce_policy is a\n"
-        "*crossover between families*, that bias lands directly on the shipped\n"
-        "thresholds.\n"
+        "*is* the host cost. That cost also differs per candidate family (cdr\n"
+        "and qr go through pybind, the FlyDSL rows through _run_compiled, rccl\n"
+        "through an aten op plus a copy_), so eager partly ranks candidates by\n"
+        "how much Python sits in their bench thunk -- a property of this\n"
+        "harness, not of the kernel. Since every family boundary in\n"
+        "allreduce_policy is a *crossover between families*, that bias lands\n"
+        "directly on the shipped thresholds.\n"
         "'eager' is kept for when the host path is what you want to see.",
     )
     parser.add_argument(
         "--graph-inner",
         type=int,
         default=_GRAPH_INNER_DEFAULT,
-        help="collectives captured per HIP graph (--timing graph). Replay is\n"
-        "back-to-back with no host in between, which is the run-ahead case the\n"
-        "double-buffered inbox is designed for. Pass 1 to price a capture that\n"
-        "cannot run ahead.",
+        help="collectives captured per HIP graph (--timing graph), replayed\n"
+        "back-to-back with no host and no other device work in between. That\n"
+        "was measured not to favour the FlyDSL schedules' run-ahead; see\n"
+        "_bench_graph.",
     )
     parser.add_argument(
         "-b",

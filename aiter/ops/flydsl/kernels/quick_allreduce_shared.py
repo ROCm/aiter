@@ -69,6 +69,17 @@ _CM_SC1 = 16
 # None for none. System scope: the peers are other GPUs, and
 # only a system-scope release orders the payload before the flag for them.
 #
+# ``acquire`` is the sync scope of the acquire fence between the flag spin and
+# the payload loads. At system scope it lowers to ``buffer_inv sc0 sc1``, a full
+# L1+L2 invalidate, which only a cached inbox needs. Every kernel takes it from
+# here; the ring additionally writes back before a system-scope acquire.
+#
+# ``acquire`` and ``recv`` are one decision and must change together. A
+# workgroup-scope acquire invalidates nothing, so it is only safe when ``recv``
+# makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
+# hint, not a bypass, and could be answered from a line cached by an earlier
+# call into the same slot. A system-scope acquire is what makes ``nt`` safe.
+#
 # ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
 # consecutive quads; see the layouts in the kernel body.
 #
@@ -79,20 +90,26 @@ _CM_SC1 = 16
 _ST_PLAIN = ()
 _ST_NT = (("nontemporal", True),)
 _ST_SYSTEM = (("memory_order", fx.AtomicOrdering.Monotonic),)
-_RELEASE_SCOPE = rocdl.SyncScope.OneAs
+_SYSTEM_SYNC_SCOPE = rocdl.SyncScope.OneAs
+# The acquire for an un-cached inbox no cache: a compiler barrier, so
+# the payload loads cannot be hoisted above the flag spin. Do not replace it
+# with no fence at all, which drops that barrier.
+_WORKGROUP_SYNC_SCOPE = rocdl.SyncScope.WorkgroupOneAs
 
 _INBOX_POLICY = {
     "uncached": {
         "payload": _ST_NT,
         "flag": _ST_NT,
         "release": None,
+        "acquire": _WORKGROUP_SYNC_SCOPE,
         "fanout": "sector",
-        "recv": _CM_NT,
+        "recv": _CM_SC0 | _CM_SC1,
     },
     "finegrained": {
         "payload": _ST_NT,
         "flag": _ST_SYSTEM,
-        "release": _RELEASE_SCOPE,
+        "release": _SYSTEM_SYNC_SCOPE,
+        "acquire": _SYSTEM_SYNC_SCOPE,
         "fanout": "peer",
         "recv": _CM_NT,
     },
@@ -109,7 +126,8 @@ _INBOX_POLICY = {
     "default": {
         "payload": _ST_PLAIN,
         "flag": _ST_SYSTEM,
-        "release": _RELEASE_SCOPE,
+        "release": _SYSTEM_SYNC_SCOPE,
+        "acquire": _SYSTEM_SYNC_SCOPE,
         "fanout": "peer",
         "recv": _CM_SC0 | _CM_SC1,
     },
@@ -203,10 +221,10 @@ def _buffer_load(ptr, elem_off, n, dtype, cache_modifier=0):
     """*n* consecutive elements of a buffer pointer, at an element offset.
 
     *cache_modifier* is ``_CM_*`` bits. An inbox read passes the policy's
-    ``recv`` entry: ``nt`` is enough where the inbox memory cannot hold a
-    stale line in the first place, but a cacheable (coarse-grained) inbox
-    needs ``_CM_SC0 | _CM_SC1``, because ``nt`` is a reuse *hint* and does
-    not stop the load being answered from the reader's own L1/L2.
+    ``recv`` entry. ``nt`` is a reuse *hint* and does not stop the load being
+    answered from the reader's own L1/L2, so it is only used where the
+    policy's ``acquire`` invalidates both first (fine-grained). The uncached
+    and coarse-grained inboxes read ``_CM_SC0 | _CM_SC1``, which does bypass.
     """
     atom = fx.make_copy_atom(rocdl.BufferCopy(n * dtype.width, cache_modifier), dtype)
     reg = fx.make_rmem_tensor(n, dtype)
@@ -288,9 +306,9 @@ def _payload_io(
     return load, store
 
 
-def _acquire_inbox():
-    """Acquire fence over global memory, system scope."""
-    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=rocdl.SyncScope.OneAs)
+def _acquire_inbox(scope=_SYSTEM_SYNC_SCOPE):
+    """Acquire fence over global memory at *scope*, system scope by default."""
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=scope)
 
 
 def atom_bf16_to_f32(atom_i32):

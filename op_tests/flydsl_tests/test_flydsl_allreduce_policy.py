@@ -64,9 +64,15 @@ def test_dispatch_is_monotone(ws):
 
     Composed across both slots, in the order ``CudaCommunicator.all_reduce``
     consults them, so this is the ordering a payload actually experiences.
+    Below ``min_bytes`` the payload falls back by design (the Aiter kernel is
+    faster there); above it the order must hold.
     """
     order = {"oneshot": 0, "mesh": 1, "ring": 2, "fallback": 3}
-    seen = [order[_slot_of("pcie", ws, n)] for n in (1 << k for k in range(4, 31))]
+    floor = P.resolve_oneshot("pcie", ws).min_bytes
+    sizes = [1 << k for k in range(4, 31)]
+    below = [_slot_of("pcie", ws, n) for n in sizes if n < floor]
+    assert set(below) <= {"fallback"}
+    seen = [order[_slot_of("pcie", ws, n)] for n in sizes if n >= floor]
     assert seen == sorted(seen)
 
 
@@ -214,6 +220,29 @@ def test_byte_overrides():
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
         assert P.resolve_oneshot("pcie", 8).max_bytes == table_one
         assert P.resolve_quant("pcie", 8).floor == table_floor
+
+
+def test_oneshot_min_override():
+    """``AITER_FLY_AR_ONESHOT_MIN_BYTES`` moves only the one-shot's small-payload
+    floor; the ceiling and the quant floor are untouched."""
+    table_min = P.FAMILY_POLICY[("xgmi", 8)].min_bytes
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="65536"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == 65536
+        # ceiling and quant slot are independent of the min override
+        assert (
+            P.resolve_oneshot("xgmi", 8).max_bytes
+            == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max_exact
+        )
+        assert P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+    # 0 is a valid override: accept every size down to the custom-AR floor.
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == 0
+    # -1 is the house sentinel for "unset, use the table".
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="-1"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
+    # Garbage warns and is ignored.
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="lots"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
 
 
 def test_override_cannot_invert_the_partition():
