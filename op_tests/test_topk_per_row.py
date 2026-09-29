@@ -485,6 +485,64 @@ def test_top_k_per_row_decode_bounded(
     }
 
 
+@benchmark()
+def test_top_k_per_row_decode_bounded_graph(
+    batch_size: int,
+    context_len: int,
+    top_k: int,
+    stable: bool = False,
+    replays: int = 3,
+) -> dict:
+    """The bounded decode captured once in a CUDAGraph, then replayed on logits and
+    `seq_lens` rewritten in place, as a serving stack replays its decode step."""
+    width = 4 * context_len
+    seq_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device="cuda")
+    logits = create_planted_logits(seq_lens, width, top_k)
+    indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+
+    def decode():
+        aiter.top_k_per_row_decode(
+            *args, k=top_k, stable=stable, max_row_len=context_len
+        )
+
+    # Compile outside the capture, which cannot record a JIT build.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        decode()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode()
+
+    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    all_close = True
+    for _ in range(replays):
+        fresh = torch.randint(
+            top_k, context_len + 1, (batch_size,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens.copy_(fresh)
+        logits.copy_(create_planted_logits(fresh, width, top_k))
+        indices.fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        masked = torch.where(live, logits, float("-inf"))
+        torch_indices = masked.topk(top_k, dim=-1)[1]
+        all_close &= compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k, stable=stable
+        )
+
+    return {
+        "backend": topk.decode_backend_for_call(
+            *args, top_k, stable, max_row_len=context_len
+        ),
+        "replays": replays,
+        "all_close": all_close,
+    }
+
+
 def adaptive_band_cells(card):
     """One bounded cell per band `card` ships, at the band's smallest corner, with
     each k group's members taken in turn across its bands."""
@@ -723,17 +781,20 @@ assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
 
 card = (get_gfx(), topk._decode_cu_count(torch.cuda.current_device()))
 if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
-    torch.manual_seed(0)
     # The table picks these shapes and k, not the command line: every band this
     # card ships runs once, at a corner small enough to allocate here.
-    df = [test_top_k_per_row_decode_bounded(*c) for c in adaptive_band_cells(card)]
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("topk_per_row_decode bounded summary (markdown):\n%s", df_md)
-    assert df["all_close"].all(), f"topk_per_row_decode bounded mismatch:\n{df_md}"
-    assert (
-        df["backend"] == topk.BACKEND_ADAPTIVE
-    ).all(), f"bounded decode left the adaptive kernel:\n{df_md}"
+    for name, run in (
+        ("bounded", test_top_k_per_row_decode_bounded),
+        ("bounded graph", test_top_k_per_row_decode_bounded_graph),
+    ):
+        torch.manual_seed(0)
+        df = pd.DataFrame([run(*c) for c in adaptive_band_cells(card)])
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("topk_per_row_decode %s summary (markdown):\n%s", name, df_md)
+        assert df["all_close"].all(), f"topk_per_row_decode {name} mismatch:\n{df_md}"
+        assert (
+            df["backend"] == topk.BACKEND_ADAPTIVE
+        ).all(), f"{name} decode left the adaptive kernel:\n{df_md}"
 else:
     aiter.logger.warning(
         "%s at %d CU carries no adaptive decode bands; bounded decode skipped", *card
