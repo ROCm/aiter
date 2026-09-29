@@ -15,11 +15,11 @@
   python3 -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
     --scenario kernel \
     --data-format a4w4 \
-    --experts 96 \
-    --tokens 16384 \
-    --topk 6 \
+    --experts 64 \
+    --tokens 6144 \
+    --topk 8 \
     --model-dim 7168 \
-    --inter-dim 3072 \
+    --inter-dim 2048 \
     --act silu \
     --no-bias \
     --iters 32 \
