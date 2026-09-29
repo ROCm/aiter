@@ -8,9 +8,10 @@ kernel writes its id without scoring. Longer rows use independent
 16/32-column BF16 MFMA scorer workgroups, an fp32 ``[M, n_columns]`` score
 buffer, and a per-row selector. Rows narrower than 32768 columns use the
 stable decode radix; wider rows use streaming radix with ``tie='low'``.
-Single-request prefill batches 16 rows per scorer workgroup; decode and
-multi-request inputs keep the one-row scorer. BLOCK_N=32 is the measured
-default for both.
+Single-request prefill batches 16 rows per scorer workgroup, except
+gfx942 with 8 heads: that tile is 73792 bytes and gfx942 has 65536, so
+it stays on the one-row scorer. Decode and multi-request inputs keep the
+one-row scorer. BLOCK_N=32 is the measured default for both.
 
 Every shape this serves shares one indexer contract, so the only thing that
 varies is the accepted head count. Callers pin it through ``heads``: pass
@@ -722,6 +723,39 @@ def _prefill_scores_plan(
     return build_qsa_k1_prefill_scores_module(page_size, use_k32, n_heads, wide_cache)
 
 
+def _k1_prefill_lds_bytes(n_heads: int) -> int:
+    """Bytes in the 16-row scorer's LDS tile.
+
+    Q is ``16.H.128`` bf16, K is ``32.128`` bf16, the visibility vector is
+    16 int32s, and C is ``H.2.2.64.4`` fp32. Each field is already a
+    multiple of its 16-byte alignment, so nothing is inserted between them.
+    """
+    block_m = 16
+    block_n = 32
+    num_waves = 2
+    n_subtiles = block_n // 16
+    q_bytes = block_m * n_heads * _D * 2
+    k_bytes = block_n * _D * 2
+    visible_bytes = block_m * 4
+    c_bytes = n_heads * n_subtiles * num_waves * 64 * 4 * 4
+    return q_bytes + k_bytes + visible_bytes + c_bytes
+
+
+def _k1_uses_prefill_scorer(
+    n_requests: int, rows: int, n_heads: int, arch: str
+) -> bool:
+    """Whether this launch uses the 16-row scorer.
+
+    gfx942 H=8 stays on the one-row scorer. That tile is 73792 bytes and
+    gfx942 has 65536. gfx950 H=8 keeps the 16-row tile.
+    """
+    if n_requests != 1 or rows < 16:
+        return False
+    if arch.startswith("gfx942") and n_heads == 8:
+        return False
+    return True
+
+
 def qsa_k1_score_and_select(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -736,9 +770,11 @@ def qsa_k1_score_and_select(
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
-    ``n_heads`` is 4 or 8, each a separate compile. Selection is the
-    stable decode radix below 32768 columns and streaming radix
-    (``tie='low'``) at or above that width.
+    ``n_heads`` is 4 or 8, each a separate compile. One request with
+    ``M >= 16`` uses the 16-row scorer, except gfx942 H=8, which stays
+    on the one-row scorer. Selection is the stable decode radix below
+    32768 columns and streaming radix (``tie='low'``) at or above that
+    width.
     """
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
@@ -749,12 +785,11 @@ def qsa_k1_score_and_select(
     score_block_n = 32
     scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
-    use_k32 = torch.cuda.get_device_properties(q.device).gcnArchName.startswith(
-        "gfx950"
-    )
+    arch = torch.cuda.get_device_properties(q.device).gcnArchName
+    use_k32 = arch.startswith("gfx950")
     score_tiles = (n_columns + score_block_n - 1) // score_block_n
     wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
-    if context_lens.shape[0] == 1 and m >= 16:
+    if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
         _run_compiled(
             _prefill_scores_plan(page_size, use_k32, n_heads, wide_cache),
             q,
@@ -858,10 +893,11 @@ def qsa_k1_block_ids(
     """Write indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Rows no wider than 512 use the fused emit path. Longer rows materialize
-    scores with a BLOCK_N=32 MFMA writer; single-request prefill batches 16
-    query rows while other inputs use one row per workgroup. Selection is the
-    stable decode radix below 32768 columns and streaming radix
-    (``tie='low'``) at or above that width. Expand+tail is still separate.
+    scores with a BLOCK_N=32 MFMA writer. Single-request prefill batches
+    16 query rows, except gfx942 H=8; other inputs use one row per
+    workgroup. Selection is the stable decode radix below 32768 columns
+    and streaming radix (``tie='low'``) at or above that width.
+    Expand+tail is still separate.
 
     ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
     narrow; the ``(4, 8)`` default also admits the 8-head indexer.
