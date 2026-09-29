@@ -113,6 +113,10 @@ def validate_gemm_options(
         "ptpc",
         "per_tensor",
     ], "act_quant_type must be either 'no', 'ptpc' or 'per_tensor'"
+    if weight_dtype == "bf16" and (weight_quant_type != "no" or act_quant_type != "no"):
+        raise ValueError(
+            "BF16 kernels require weight_quant_type='no' and act_quant_type='no'"
+        )
     assert activation in [
         "silu",
         "swiglu",
