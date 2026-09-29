@@ -419,6 +419,70 @@ def _set_mismatch_ratio(ref: torch.Tensor, got: torch.Tensor) -> float:
     return miss / rows if rows else 0.0
 
 
+def _k1_row_is_packed(row: torch.Tensor) -> str | None:
+    """Valid ids, each once, then only ``-1``. ``None`` when the row is packed."""
+    seen = set()
+    padding = False
+    for value in row.tolist():
+        if value == -1:
+            padding = True
+            continue
+        if padding:
+            return "valid id after -1"
+        if value in seen:
+            return "duplicate id"
+        seen.add(value)
+    return None
+
+
+def _assert_k1_block_ids(ref: torch.Tensor, got: torch.Tensor, what: str) -> None:
+    """Set equality, plus no duplicates and a compact valid prefix on ``got``."""
+    for i in range(got.shape[0]):
+        reason = _k1_row_is_packed(got[i])
+        if reason is not None:
+            raise AssertionError(f"{what}: row {i} {reason}")
+    if _set_mismatch_ratio(ref, got) != 0.0:
+        raise AssertionError(f"{what}: set mismatch")
+
+
+def test_k1_block_ids_require_packed_prefix():
+    """A K1 id row is unique valid ids, then only ``-1``.
+
+    Order may differ from the oracle. A duplicate, a valid id after
+    ``-1``, or a different id set fails.
+    """
+    ref = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+    _assert_k1_block_ids(ref, torch.tensor([[1, 0, -1]], dtype=torch.int32), "order")
+    _assert_k1_block_ids(ref, torch.tensor([[0, 1, -1, -1]], dtype=torch.int32), "pad")
+    _assert_k1_block_ids(
+        torch.full((1, 4), -1, dtype=torch.int32),
+        torch.full((1, 4), -1, dtype=torch.int32),
+        "empty",
+    )
+    same = torch.tensor([[0, -1]], dtype=torch.int32)
+    try:
+        _assert_k1_block_ids(same, torch.tensor([[0, 0]], dtype=torch.int32), "dup")
+    except AssertionError as exc:
+        if "duplicate" not in str(exc):
+            raise
+    else:
+        raise AssertionError("duplicate ids passed the K1 check")
+    try:
+        _assert_k1_block_ids(ref, torch.tensor([[0, -1, 1]], dtype=torch.int32), "hole")
+    except AssertionError as exc:
+        if "after -1" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a valid id after -1 passed the K1 check")
+    try:
+        _assert_k1_block_ids(ref, torch.tensor([[2, 3, -1]], dtype=torch.int32), "sets")
+    except AssertionError as exc:
+        if "set mismatch" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a set mismatch passed the K1 check")
+
+
 def test_k1_family_a_set_equality_short_decode():
     """FlyDSL K1 block-id sets match the oracle on short family A decode."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -458,8 +522,7 @@ def test_k1_family_a_set_equality_short_decode():
         slen,
         heads=(4,),
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("K1 block-id set diverged from the oracle")
+    _assert_k1_block_ids(ref_ids, got, "K1 block-id set diverged from the oracle")
 
 
 def test_k1_family_a_set_equality_two_tiles():
@@ -502,8 +565,9 @@ def test_k1_family_a_set_equality_two_tiles():
         slen,
         heads=(4,),
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("K1 two-tile block-id set diverged from the oracle")
+    _assert_k1_block_ids(
+        ref_ids, got, "K1 two-tile block-id set diverged from the oracle"
+    )
 
 
 def test_k1_family_a_set_equality_wide_stream():
@@ -546,8 +610,9 @@ def test_k1_family_a_set_equality_wide_stream():
         slen,
         heads=(4,),
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("K1 wide-row block-id set diverged from the oracle")
+    _assert_k1_block_ids(
+        ref_ids, got, "K1 wide-row block-id set diverged from the oracle"
+    )
 
 
 def test_k1_family_a_set_equality_prefill():
@@ -590,8 +655,9 @@ def test_k1_family_a_set_equality_prefill():
         slen,
         heads=(4,),
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("K1 prefill block-id set diverged from the oracle")
+    _assert_k1_block_ids(
+        ref_ids, got, "K1 prefill block-id set diverged from the oracle"
+    )
 
 
 def test_k1_prefill_padded_page_table():
@@ -639,8 +705,9 @@ def test_k1_prefill_padded_page_table():
         got = qsa_k1_block_ids(
             q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
         )
-        if _set_mismatch_ratio(ref_ids, got) != 0.0:
-            raise AssertionError(f"K1 prefill pad {name} changed the selected set")
+        _assert_k1_block_ids(
+            ref_ids, got, f"K1 prefill pad {name} changed the selected set"
+        )
 
 
 def test_k1_decode_rejects_invalid_page_ids():
@@ -669,8 +736,11 @@ def test_k1_decode_rejects_invalid_page_ids():
     slen = torch.zeros(1, dtype=dtypes.i32, device=device)
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
     got = qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
-    if int((got != -1).sum()) != 0:
-        raise AssertionError("K1 decode with no live pages selected a block")
+    _assert_k1_block_ids(
+        torch.full_like(got, -1),
+        got,
+        "K1 decode with no live pages selected a block",
+    )
 
     # -1 inside the visible range. The other pages stay real.
     context = 4096
@@ -705,8 +775,7 @@ def test_k1_decode_rejects_invalid_page_ids():
     got = qsa_k1_block_ids(
         q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("K1 decode kept a block whose page id is -1")
+    _assert_k1_block_ids(ref_ids, got, "K1 decode kept a block whose page id is -1")
 
 
 def test_k1_gfx942_h8_skips_prefill_tile():
@@ -820,8 +889,9 @@ def test_k1_page_past_4gib():
         )
         ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
         got = qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
-        if _set_mismatch_ratio(ref_ids, got) != 0.0:
-            raise AssertionError(f"K1 page past 4 GiB aliased page 0 at M={m}")
+        _assert_k1_block_ids(
+            ref_ids, got, f"K1 page past 4 GiB aliased page 0 at M={m}"
+        )
 
 
 def test_k2_family_a_decode_matches_oracle():
@@ -1490,8 +1560,9 @@ def test_k1_family_b_set_equality_short_decode():
         qpos,
         slen,
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("family B K1 block-id set diverged from the oracle")
+    _assert_k1_block_ids(
+        ref_ids, got, "family B K1 block-id set diverged from the oracle"
+    )
 
 
 def test_k1_family_b_set_equality_short_decode_h8():
@@ -1532,8 +1603,9 @@ def test_k1_family_b_set_equality_short_decode_h8():
         qpos,
         slen,
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError("family B K1 H=8 block-id set diverged from the oracle")
+    _assert_k1_block_ids(
+        ref_ids, got, "family B K1 H=8 block-id set diverged from the oracle"
+    )
 
 
 def test_k1_family_b_set_equality_two_tiles():
@@ -1575,10 +1647,9 @@ def test_k1_family_b_set_equality_two_tiles():
         qpos,
         slen,
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError(
-            "family B K1 two-tile block-id set diverged from the oracle"
-        )
+    _assert_k1_block_ids(
+        ref_ids, got, "family B K1 two-tile block-id set diverged from the oracle"
+    )
 
 
 def test_k1_family_b_set_equality_two_tiles_h8():
@@ -1620,10 +1691,9 @@ def test_k1_family_b_set_equality_two_tiles_h8():
         qpos,
         slen,
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError(
-            "family B K1 H=8 two-tile block-id set diverged from the oracle"
-        )
+    _assert_k1_block_ids(
+        ref_ids, got, "family B K1 H=8 two-tile block-id set diverged from the oracle"
+    )
 
 
 def test_k1_family_b_set_equality_published_indexer_point():
@@ -1669,10 +1739,11 @@ def test_k1_family_b_set_equality_published_indexer_point():
         qpos,
         slen,
     )
-    if _set_mismatch_ratio(ref_ids, got) != 0.0:
-        raise AssertionError(
-            "family B K1 published-indexer block-id set diverged from the oracle"
-        )
+    _assert_k1_block_ids(
+        ref_ids,
+        got,
+        "family B K1 published-indexer block-id set diverged from the oracle",
+    )
 
 
 @benchmark()
@@ -2629,6 +2700,7 @@ def _run_unit_cases():
     test_family_b_shape_constants()
     test_paged_roundtrip_tiny()
     test_k1_family_a_set_equality_short_decode()
+    test_k1_block_ids_require_packed_prefix()
     test_k1_family_a_set_equality_two_tiles()
     test_k1_family_a_set_equality_wide_stream()
     test_k1_family_a_set_equality_prefill()
