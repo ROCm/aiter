@@ -75,6 +75,13 @@ def _pack4(values):
 
 _workspaces = {}
 
+# A one-wave WG uses 16.5 KiB LDS, allowing three resident WGs per CU.
+_DECODE_WGS_PER_CU = 3
+# Fixed b/a, with wave and combine terms fitted to measured page-granular splits.
+_DECODE_SPLIT_A, _DECODE_SPLIT_B, _DECODE_SPLIT_C, _DECODE_SPLIT_D = (
+    1.0, 0.89473684, 2.1, -2.5
+)
+
 
 def _decode_splits(batch, max_q, max_k, page_size, cu_count, forced=None):
     if max_q != 1:
@@ -86,14 +93,19 @@ def _decode_splits(batch, max_q, max_k, page_size, cu_count, forced=None):
     length = min(max_k, 1024) if max_k is not None else 0
     if length < 512:
         return 1
-    # Small batches fill the CUs; large batches shorten the serial KV loop.
-    target = max(1, (cu_count + batch * 16 - 1) // (batch * 16))
-    if batch <= 4:
-        target = 1 << (target - 1).bit_length()
-    elif batch >= 32:
-        target = 4
-    return max(1, min(16, target, length // 64,
-                      (length + page_size - 1) // page_size))
+    # The host cannot see per-sequence alignment; model the aligned page count.
+    pages = (length + page_size - 1) // page_size
+    slots = cu_count * _DECODE_WGS_PER_CU
+    max_s = min(16, length // 64, pages)
+
+    def cost(s):
+        full, rem = divmod(batch * 16 * s, slots)
+        tile_count = ((pages + s - 1) // s) * (page_size // 32)
+        return ((full + (rem > 0)) * (tile_count * _DECODE_SPLIT_A + _DECODE_SPLIT_C)
+                + tile_count * _DECODE_SPLIT_B * (full + rem / slots)
+                + _DECODE_SPLIT_D * (s > 1))
+
+    return min(range(1, max_s + 1), key=cost)
 
 
 @lru_cache(maxsize=32)
