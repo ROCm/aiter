@@ -101,16 +101,23 @@ def get_tuned_kernel_config(
         config_path, entry = _get_tuned_kernel_entry(
             op, config_name, kernel_name, backend
         )
-    except BaseException as error:  # noqa: BLE001 -- no accelerator/unreadable file
-        logger.warning(
-            f"Unable to load tuned Triton config '{config_name}' for "
-            f"kernel '{kernel_name}'; using fallback {fallback}: {error}"
+    except BaseException:  # noqa: BLE001 -- no accelerator/unreadable file
+        # AiterTritonLogger forwards only *args, so exc_info goes to the
+        # underlying stdlib logger; it renders the traceback for us.
+        logger.get_logger().warning(
+            "Unable to load tuned Triton config '%s' for kernel '%s'; using fallback %s",
+            config_name,
+            kernel_name,
+            fallback,
+            exc_info=True,
         )
         return fallback
     if not entry:
         logger.warning(
-            f"No tuned Triton config for kernel '{kernel_name}' in "
-            f"'{config_path}'; using fallback {fallback}"
+            "No tuned Triton config for kernel '%s' in '%s'; using fallback %s",
+            kernel_name,
+            config_path,
+            fallback,
         )
         return fallback
     entry = dict(entry)
