@@ -152,6 +152,30 @@ def generate_batched_gemm_a16w8_inputs(
     return x, weight, w_scale, bias, y
 
 
+def generate_native_value_mode_inputs(mode):
+    """Shared signed/zero/extreme-group fixture for the twelve K512 modes."""
+    assert mode.get("K", 512) == 512
+    x, weight, scale, bias, output = generate_batched_gemm_a16w8_inputs(
+        mode.get("B", 8),
+        mode.get("M", 48),
+        mode.get("N", 256),
+        mode.get("K", 512),
+        mode.get("dtype", torch.bfloat16),
+        mode.get("has_bias", False),
+        mode.get("output", True),
+        layout=mode.get("layout", "TN"),
+        transpose_bm=mode.get("transpose_bm", False),
+    )
+    x = (x - 0.05).contiguous()
+    x[:, 0, :128] = 0
+    x[..., 128:256] *= 16
+    x[..., 256:384] *= 0.0625
+    weight = (weight.float() - 0.05).to(weight.dtype)
+    scale.fill_(0.125)
+    inputs = x.transpose(0, 1).contiguous() if mode.get("transpose_bm_in", False) else x
+    return inputs, weight, scale, bias, output
+
+
 def run_torch(x, weight, w_scale, bias=None, dtype=torch.bfloat16, transpose_bm=True):
     B = x.size(0)
     M = x.size(1)
@@ -380,23 +404,7 @@ def test_native_value_modes_replay(mode):
         "transpose_bm_in": False,
     }
     options.update({key: value for key, value in mode.items() if key != "name"})
-    x, weight, scale, bias, output = generate_batched_gemm_a16w8_inputs(
-        8,
-        48,
-        256,
-        512,
-        options["dtype"],
-        options["has_bias"],
-        options["output"],
-        transpose_bm=options["transpose_bm"],
-    )
-    x = (x - 0.05).contiguous()
-    x[:, 0, :128] = 0
-    x[..., 128:256] *= 16
-    x[..., 256:384] *= 0.0625
-    weight = (weight.float() - 0.05).to(weight.dtype)
-    scale.fill_(0.125)
-    inputs = x.transpose(0, 1).contiguous() if options["transpose_bm_in"] else x
+    inputs, weight, scale, bias, output = generate_native_value_mode_inputs(options)
     operands = (inputs, weight, scale) + ((bias,) if bias is not None else ())
     pristine = [tensor.clone() for tensor in operands]
 
