@@ -265,8 +265,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     scores = fx.Vector.from_elements(masked, fx.Float32)
                 m = fx.Float32(state[0])
                 for r in range_constexpr(16):
-                    m = m.maximumf(scores[r])
-                m = m.maximumf(m.shuffle_xor(fx.Int32(32), fx.Int32(64)))
+                    m = fx.maxnumf(m, scores[r])
+                m = fx.maxnumf(m, m.shuffle_xor(fx.Int32(32), fx.Int32(64)))
                 correction = _exp2(fx.Float32(state[0]) - m)
                 probs = []
                 psum = fx.Float32(0.0)
@@ -464,9 +464,9 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                     valid = (col < klen) & (col >= lower)
                     s = valid.select(score[r] * log_scale, fx.Float32(-1.0e30))
                     scores.append(s)
-                    m = m.maximumf(s)
+                    m = fx.maxnumf(m, s)
             for shift in (16, 32):
-                m = m.maximumf(m.shuffle_xor(fx.Int32(shift), fx.Int32(64)))
+                m = fx.maxnumf(m, m.shuffle_xor(fx.Int32(shift), fx.Int32(64)))
             correction = _exp2(fx.Float32(state[0]) - m)
             probs = []
             psum = fx.Float32(0.0)
