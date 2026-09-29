@@ -151,16 +151,18 @@ def test_gemm(dtype, M, N, K, output, shuffle):
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
 
 
+@pytest.mark.parametrize("shuffle", [False, True])
 @pytest.mark.parametrize("K", [640, 896])
-def test_gemm_splitk_tail(K):
+def test_gemm_splitk_tail(K, shuffle):
     # an 8-way split leaves the last partition running past K
     M, N = 16, 6144
-    x, weight, _, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
-        M, N, K, *block_shape
+    x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
+        M, N, K, *block_shape, shuffle=shuffle
     )
-    config = dict(_get_config(M, N, K)[0], NUM_KSPLIT=8)
+    config = dict(_get_config(M, N, K, shuffle)[0], NUM_KSPLIT=8)
+    impl = gemm_a16w8_blockscale_preshuffle if shuffle else gemm_a16w8_blockscale
 
     a = run_torch(x, weight, w_scale)
-    b = gemm_a16w8_blockscale(x, weight, w_scale, torch.bfloat16, y, config=config)
+    b = impl(x, weight_triton, w_scale, torch.bfloat16, y, config=config)
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)

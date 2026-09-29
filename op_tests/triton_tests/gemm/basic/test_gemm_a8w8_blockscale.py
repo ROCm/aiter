@@ -76,6 +76,8 @@ def get_x_vals():
     x_vals += [(v, 7168, 3072) for v in (1, 32, 64, 128, 256, 1024)]
     # split-K whose last partition runs past K
     x_vals += [(v, 6144, K) for v in (1, 16, 64) for K in (640, 896)]
+    # gfx942's tuned preshuffle config splits K=11008 four ways, 2752 each
+    x_vals += [(16, 4096, 11008)]
     return x_vals
 
 
@@ -205,18 +207,29 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 
 
+@pytest.mark.parametrize("shuffle", [False, True])
 @pytest.mark.parametrize("K", [640, 896])
-def test_gemm_splitk_tail(K):
+def test_gemm_splitk_tail(K, shuffle):
     # an 8-way split leaves the last partition running past K
     M, N = 16, 6144
-    x, weight, _, x_scale, _, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, *block_shape, output=True
+    x, weight, weight_triton, x_scale, x_scale_triton, w_scale, y = (
+        generate_gemm_a8w8_blockscale_inputs(
+            M, N, K, *block_shape, output=True, shuffle=shuffle
+        )
     )
-    config = dict(_get_config(M, N, K, backend="triton")[0], NUM_KSPLIT=8)
+    config = dict(_get_config(M, N, K, shuffle, backend="triton")[0], NUM_KSPLIT=8)
+    impl = gemm_a8w8_blockscale_preshuffle if shuffle else gemm_a8w8_blockscale
 
     a = run_torch(x, weight, x_scale, w_scale)
-    b = gemm_a8w8_blockscale(
-        x, weight, x_scale, w_scale, torch.bfloat16, y, config=config, backend="triton"
+    b = impl(
+        x,
+        weight_triton,
+        x_scale_triton,
+        w_scale,
+        torch.bfloat16,
+        y,
+        config=config,
+        backend="triton",
     )
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
