@@ -307,12 +307,16 @@ def run_benchmark(custom, args):
             fn()
             ref_output = ref_paged_attn(
                 query=inputs["q_fp8"] if args.fp8 else inputs["query"],
-                key_cache=inputs["k_fp8"]
-                if (args.fp8 or args.fp8_kv)
-                else inputs["key_cache"],
-                value_cache=inputs["v_fp8"]
-                if (args.fp8 or args.fp8_kv)
-                else inputs["value_cache"],
+                key_cache=(
+                    inputs["k_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["key_cache"]
+                ),
+                value_cache=(
+                    inputs["v_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["value_cache"]
+                ),
                 query_lens=inputs["query_lens"],
                 kv_lens=inputs["kv_lens"],
                 block_tables=inputs["block_tables"],
