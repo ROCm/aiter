@@ -46,7 +46,7 @@ Fixed test arguments:
   --scenario bench --data-format a4w4 --act silu
   --no-bias --no-check-aot-cache
 
-  For a custom shape, other test options such as --iters use the
+  Custom shapes additionally use --iters 20. Other test options use the
   defaults from my_code/test_flydsl_grouped_gemm_gfx1250.py.
 
 Revisions:
@@ -438,6 +438,7 @@ if ((CUSTOM_SHAPE)); then
     --topk "$CUSTOM_TOPK"
     --model-dim "$CUSTOM_MODEL_DIM"
     --inter-dim "$CUSTOM_INTER_DIM"
+    --iters 20
   )
   CUSTOM_SHAPE_LABEL="E${CUSTOM_EXPERTS}/T${CUSTOM_TOKENS}/topk${CUSTOM_TOPK}/M${CUSTOM_MODEL_DIM}/I${CUSTOM_INTER_DIM}"
 fi
