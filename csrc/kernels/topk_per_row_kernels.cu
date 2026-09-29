@@ -6618,24 +6618,23 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                         in, len, k, out, out_idx, select_min);
                 return;
             }
-            // Compile the exact row extent into the eight-wave 4K kernel for
-            // the two near-green row counts.  This removes the dynamic row
-            // stride and all per-element tail predicates while leaving the
-            // generic M=4096 launch and neighbouring shapes untouched.
-            if(batch_size == 1024 || batch_size == 2048)
+            // Keep exact row extents only for the two M=2048 short-tail
+            // shapes where the runtime extent has a material measured cost.
+            // M=1024 and M=2048/N=4096 take the feature-bearing ballot paths
+            // above; all other rows use the general runtime-extent launch.
+            if(batch_size == 2048)
             {
-#define AITER_OB_REG512_4K_STATIC_LAUNCH(ROW_LEN, EPT)                                  \
+#define AITER_OB_REG512_4K_STATIC_LAUNCH(ROW_LEN)                                      \
     case ROW_LEN:                                                                       \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,  \
+        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, 9,    \
                                          11, 10, ROW_LEN>                                \
             <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
                                                         select_min);                     \
         return;
                 switch(static_cast<int>(len))
                 {
-                    AITER_OB_REG512_4K_STATIC_LAUNCH(4096, 8)
-                    AITER_OB_REG512_4K_STATIC_LAUNCH(4097, 9)
-                    AITER_OB_REG512_4K_STATIC_LAUNCH(4098, 9)
+                    AITER_OB_REG512_4K_STATIC_LAUNCH(4097)
+                    AITER_OB_REG512_4K_STATIC_LAUNCH(4098)
                 default: break;
                 }
 #undef AITER_OB_REG512_4K_STATIC_LAUNCH
@@ -6692,18 +6691,6 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                 return;
             default: break;
             }
-        }
-        // The exact 4K extent has four valid values in every lane.  Compile
-        // that fact into the low-row-count kernel so the hot full-row scans do
-        // not carry a dynamic row-stride calculation or per-element tail
-        // predicates.  Keep all radix and output paths otherwise unchanged.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size == 128 && len == 4096)
-        {
-            radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES,
-                                             4, 12, 8, 4096>
-                <<<batch_size, BlockSize, 0, stream>>>(
-                    in, len, k, out, out_idx, select_min);
-            return;
         }
         // The fifth element per lane only appears once a row grows past 4096
         // values. On low-row-count gfx950 launches, shrinking the two main
