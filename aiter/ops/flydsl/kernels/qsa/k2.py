@@ -344,7 +344,6 @@ def build_qsa_k2_module(
             fx.make_layout((1, vec), (vec, 1)),
         )
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
-        fx.make_tiled_copy(lds_copy64, kv_tv, kv_tile).get_slice(tid)
         # A V# voffset is 32 bits. A cache that fits in 4 GiB keeps one
         # uniform descriptor. A larger cache is a separate compile: each
         # gathered row rebases its page in 64-bit, then a descriptor covers
@@ -408,12 +407,10 @@ def build_qsa_k2_module(
         # rejects. K32 (gfx950) is 8xbf16 and keeps the 16-byte atom.
         q_copy = g_copy if qk_k == 32 else buf_copy_atom(8, BFloat16)
         qk_q_copy = fx.make_tiled_copy_B(q_copy, qk_wave_mma).get_slice(lane)
-        pv_wave_mma = fx.make_tiled_mma(pv_mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
         pv_b_atom = fx.make_copy_atom(
             (fx.rocdl.cdna4.LDSReadTrans16_64b() if use_k32 else fx.UniversalCopy64b()),
             BFloat16,
         )
-        fx.make_tiled_copy_B(pv_b_atom, pv_wave_mma).get_slice(lane)
 
         def qk_mfma(a_vec, b_vec, c_vec):
             qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
