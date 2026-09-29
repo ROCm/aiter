@@ -10,6 +10,7 @@ This is a direct-launch prototype, not a dispatch target.
 """
 
 from functools import lru_cache
+from math import ceil
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -77,9 +78,9 @@ _workspaces = {}
 
 # One wave reuses 8 KiB LDS for K then V, allowing eight resident WGs per CU.
 _DECODE_WGS_PER_CU = 8
-# Fixed b/a, with wave and combine terms fitted to measured page-granular splits.
+# Wave and combine terms fitted to measured page-granular splits.
 _DECODE_SPLIT_A, _DECODE_SPLIT_B, _DECODE_SPLIT_C, _DECODE_SPLIT_D = (
-    1.0, 0.89473684, 2.1, -2.5
+    1.0, 0.6, 4.0, -4.0
 )
 
 
@@ -101,7 +102,10 @@ def _decode_splits(batch, max_q, max_k, page_size, cu_count, forced=None):
     def cost(s):
         full, rem = divmod(batch * 16 * s, slots)
         tile_count = ((pages + s - 1) // s) * (page_size // 32)
-        return ((full + (rem > 0)) * (tile_count * _DECODE_SPLIT_A + _DECODE_SPLIT_C)
+        # Fit effective wave rounds separately from the physical residency ceiling.
+        wave_capacity = min(_DECODE_WGS_PER_CU, max(3.0, tile_count / 2))
+        rounds = ceil(batch * 16 * s / (cu_count * wave_capacity))
+        return (rounds * (tile_count * _DECODE_SPLIT_A + _DECODE_SPLIT_C)
                 + tile_count * _DECODE_SPLIT_B * (full + rem / slots)
                 + _DECODE_SPLIT_D * (s > 1))
 
