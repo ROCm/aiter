@@ -8,6 +8,7 @@ from functools import lru_cache
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.topk import BACKEND_ADAPTIVE
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -29,10 +30,6 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
-
-# The gate's answer for this call. The arch, the k and the shape are all the
-# gate's decision; nothing here re-derives them.
-_BACKEND_ADAPTIVE = "adaptive"
 
 
 @lru_cache(maxsize=16)
@@ -538,7 +535,7 @@ def _decode_with_backend(
             max_row_len=max_row_len,
         )
 
-    if backend == _BACKEND_ADAPTIVE:
+    if backend == BACKEND_ADAPTIVE:
         # Only the adaptive path takes a host-side config, and it is reached only
         # when the gate admitted the call, which needs `max_row_len`. So the
         # width is computed here, not before the gate: `decode_adaptive_width`
