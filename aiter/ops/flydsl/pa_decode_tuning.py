@@ -43,12 +43,12 @@ STATIC_SHAPE_FIELDS = (
     "per_token_kv",
     "trans_v",
     "sliding_window",
-    "softmax_scale",
 )
 BENCHMARK_FIELDS = (
     "length_mode",
     "seed",
     "lengths",
+    "softmax_scale",
 )
 
 
