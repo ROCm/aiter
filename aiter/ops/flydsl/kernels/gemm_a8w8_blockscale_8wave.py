@@ -194,7 +194,7 @@ def compile_gemm_fp8_8wave(
         buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
 
-        ### 分配LDS
+        ### Allocate LDS.
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
         # ScaleB still needs a global descriptor for the two scalar K-tile loads.
@@ -206,7 +206,7 @@ def compile_gemm_fp8_8wave(
         )
 
         ### read LDS layout and write LDS layout. AC copy tile
-        # Write groups (8,2,8) become read groups (2,8,8) without moving data.
+        ### LDS using dual padding to avoid swizzle. each 8 rows padded 16 elements and each 16 rows padded another 32 elements.
         _wr = fx.make_layout(
             ((8, 2, BLOCK_M // 16), BLOCK_K),
             ((BLOCK_K, 8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32), 1),
@@ -215,10 +215,12 @@ def compile_gemm_fp8_8wave(
             ((2, BLOCK_M // 16, 8), (32, BLOCK_K // 32)),
             ((8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32, BLOCK_K), (1, 32)),
         )
+        ### LDS A write layout and read layout.
         ldsA_t_wr = [fx.make_view(lds.a_t0.ptr, _wr), fx.make_view(lds.a_t1.ptr, _wr)]
         ldsA_b_wr = [fx.make_view(lds.a_b0.ptr, _wr), fx.make_view(lds.a_b1.ptr, _wr)]
         ldsA_t_rd = [fx.make_view(lds.a_t0.ptr, _rd), fx.make_view(lds.a_t1.ptr, _rd)]
         ldsA_b_rd = [fx.make_view(lds.a_b0.ptr, _rd), fx.make_view(lds.a_b1.ptr, _rd)]
+        ### LDS B would have different read layout when preshuffled. LDSB write layout is same with LDS A
         if const_expr(preshuffle_b):
             # Logical B[n,k] -> [n//16, k//16, n%16, k%16] in packed LDS.
             # k_perm still assigns each MFMA lane the same contiguous 32 K values.
@@ -246,10 +248,13 @@ def compile_gemm_fp8_8wave(
         )
         mma_atom = fx.atom_set_value(mma_atom, "scale_a", fx.Int32(0))
         mma_atom = fx.atom_set_value(mma_atom, "scale_b", fx.Int32(0))
-        ### MFMA instruction spec with scale:k_perm is fx.make_layout(((16, 2), 4), ((1, 64), 16)), spec里面每条lane 处理32个K，32个K 分两段连续。每段16个K连续。
-        ### 这里每条lane处理连续得32个K，没有follow spec,但是结果是一样， A， B做同样的permute.
-        ### 每个MFMA按照spec可以理解把A分解为：   A [16m, 128k] -> [16m, [2k2, 4k1, 16k0]]
-        ### 目前的permute相当于分解后做了一次permute：A.view(16, 2, 4, 16).permute(0, 2, 1, 3).contineous().view(16,128)
+        ### Scaled-MFMA specification: k_perm = fx.make_layout(((16, 2), 4), ((1, 64), 16)).
+        ### Each lane processes 32 K elements in two contiguous 16-element segments.
+        ### Here each lane instead processes 32 consecutive K elements. Applying the
+        ### same permutation to A and B preserves the result despite the different mapping.
+        ### The specification decomposes A as: A [16m, 128k] -> [16m, [2k2, 4k1, 16k0]].
+        ### The current mapping is equivalent to decomposing and then permuting A:
+        ### A.view(16, 2, 4, 16).permute(0, 2, 1, 3).contineous().view(16,128)
         ### A*B = A.view(16, 2, 4, 16).permute(0, 2, 1, 3).contineous().view(16,128) * B.view(16, 2, 4, 16).permute(0, 2, 1, 3).contineous().view(16,128)
         k_perm = fx.make_layout((32, 4), (1, 32))
         # 8waves: 4 waves on MMA 'logical M' dimension(operand A) and 2 waves  on MMA 'logical N' dimension(operand B)
@@ -299,15 +304,11 @@ def compile_gemm_fp8_8wave(
         ]
         frag_P = thr_mma.make_fragment_C(c_slice)  # One 16-f32 FIFO.
 
-        # ==== A/B block-scale 设置：A per-token group-128，B per-128 rows/group-128 ====
-        # C[m,n] = sum_kb scaleA[m,kb] * scaleB[n//128,kb] * partial[kb]。
-        # scaleA [KB, M] 以 f32 写入 ping-pong LDS，计算 phase 按当前 MFMA 行读回。
-        # C fragment 布局 [val=N, n0(N_REP), m0(M_REP)]；M 行 = quadrant_m*128 + m0*32
-        #   + wave_m*16 + lane%16（wave_m=wave_id//4）=> scaleA 随 m0/lane 变化，广播 val/n0。
         N_REP = BLOCK_N // 64
         ### Ascale layout: groups = K //128, [groups, M//256, 256m]
-        ### 是一次kiter 256 rows 只需要256个scale(atop+abottom)就够了。
-        ### 每个lane读一个dword, 512个lane读取512个元素， 512个元素前后得256指向相同得A scale, 所以只有256个A scale.
+        ### Each K iteration needs 256 scales for its 256 rows (A top + A bottom).
+        ### Each lane loads one dword. The 512 lanes load two copies of the same
+        ### 256 A scales, so there are only 256 distinct scale values.
         scaleA_rsrc = _buffer_resource(
             argScaleA,
             num_records_bytes=arith._to_raw(fx.Int32(M * scaleA_stride * 4)),
@@ -330,7 +331,7 @@ def compile_gemm_fp8_8wave(
         scale_lane_src_offset = fx.Int32(scale_row * 4)
         scale_src_tile_base = fx.Int32(bid_x * TILE_M * 4)
 
-        def _ac_scale_a(buf, kb):
+        def async_copy_scale_a(buf, kb):
             scale_dst = _scale_dst_ptr(scale_a_lds[buf], scale_wave_dst_offset)
             rocdl.raw_ptr_buffer_load_lds(
                 scaleA_rsrc,
@@ -416,7 +417,7 @@ def compile_gemm_fp8_8wave(
             #       frag_C[1, nn, m_slice_offset + mm] += dq_scale * frag_P[1, nn, mm]
             #       frag_C[2, nn, m_slice_offset + mm] += dq_scale * frag_P[2, nn, mm]
             #       frag_C[3, nn, m_slice_offset + mm] += dq_scale * frag_P[3, nn, mm]
-            #       frag_P[0：3, nn, mm] = mfma_16x16x128(frag_A[:, mm], frag_B[:, nn], 0)
+            #       frag_P[0:3, nn, mm] = mfma_16x16x128(frag_A[:, mm], frag_B[:, nn], 0)
 
             #
             # Compiler-only sched_barrier fences preserve 4 scalar FMAs ->
@@ -460,12 +461,10 @@ def compile_gemm_fp8_8wave(
         def begin_compute_phase():
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
-            rocdl.sched_barrier(0)
             rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
             rocdl.sched_barrier(0)
 
         def end_compute_phase():
-            rocdl.sched_barrier(0)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -491,7 +490,7 @@ def compile_gemm_fp8_8wave(
         # VGPRs. A and unshuffled B share the grouped-row / dual-padding map.
         _elem_bytes = element_type.width // 8  # fp8 = 1
 
-        def _dma_dst_ptr(root_view, byte_offset):
+        def dma_dst_ptr(root_view, byte_offset):
             # Keep a typed byte pointer until the final raw-DMA boundary,
             # so subsequent static chunk offsets stay byte-addressed.
             return fx.add_offset(
@@ -499,7 +498,7 @@ def compile_gemm_fp8_8wave(
                 fx.make_int_tuple(byte_offset),
             )
 
-        # pyhip 的 g2s tv（512 线程 = 64 行 × 8 k-组，每线程 1×16 fp8）
+        # pyhip g2s TV layout: 512 threads = 64 rows x 8 K groups; 1x16 FP8 per thread.
         _g2s_tile, _g2s_tv = fx.make_layout_tv(
             fx.make_layout((8 * 8, 8), (8, 1)),
             fx.make_layout((1, elements_per_128b), (1, 1)),
@@ -509,55 +508,55 @@ def compile_gemm_fp8_8wave(
         )
         _dst_stride = _copy_g2s.partition_D(ldsA_t_wr[0]).stride[1].to_py_value()
 
-        # 每 wave 的 LDS 基址（dual-padding group），readfirstlane 一次
+        # Per-wave LDS base in the dual-padding layout; readfirstlane is called once.
         _a_wave_off_elems = wave_id % 2 * (8 * BLOCK_K + 16) + wave_id // 2 * (
             2 * (8 * BLOCK_K + 16) + 32
         )
         _a_wave_off_bytes = rocdl.readfirstlane(
             T.i32, arith._to_raw(fx.Int32(_a_wave_off_elems * _elem_bytes))
         )
-        _b_wave_off_bytes = _a_wave_off_bytes  # 非 preshuffle B 与 A 同布局
+        _b_wave_off_bytes = _a_wave_off_bytes  # Unshuffled B uses the same layout as A.
 
         dma_aT_dst = [
-            _dma_dst_ptr(ldsA_t_wr[0], _a_wave_off_bytes),
-            _dma_dst_ptr(ldsA_t_wr[1], _a_wave_off_bytes),
+            dma_dst_ptr(ldsA_t_wr[0], _a_wave_off_bytes),
+            dma_dst_ptr(ldsA_t_wr[1], _a_wave_off_bytes),
         ]
         dma_aB_dst = [
-            _dma_dst_ptr(ldsA_b_wr[0], _a_wave_off_bytes),
-            _dma_dst_ptr(ldsA_b_wr[1], _a_wave_off_bytes),
+            dma_dst_ptr(ldsA_b_wr[0], _a_wave_off_bytes),
+            dma_dst_ptr(ldsA_b_wr[1], _a_wave_off_bytes),
         ]
         dma_bL_dst = [
-            _dma_dst_ptr(ldsB_l_wr[0], _b_wave_off_bytes),
-            _dma_dst_ptr(ldsB_l_wr[1], _b_wave_off_bytes),
+            dma_dst_ptr(ldsB_l_wr[0], _b_wave_off_bytes),
+            dma_dst_ptr(ldsB_l_wr[1], _b_wave_off_bytes),
         ]
         dma_bR_dst = [
-            _dma_dst_ptr(ldsB_r_wr[0], _b_wave_off_bytes),
-            _dma_dst_ptr(ldsB_r_wr[1], _b_wave_off_bytes),
+            dma_dst_ptr(ldsB_r_wr[0], _b_wave_off_bytes),
+            dma_dst_ptr(ldsB_r_wr[1], _b_wave_off_bytes),
         ]
 
-        # 每 thread 的 (row, k) 源映射（对标 pyhip a_lane_row = tid//8）
-        _a_lane_row = tid // 8
-        _a_lane_k = tid % 8 * elements_per_128b
-        _a_local_row = _a_lane_row % 8 * (BLOCK_M // 8) + _a_lane_row // 8
-        _lane_src_offset = fx.Int32((_a_local_row * K + _a_lane_k) * _elem_bytes)
-        _aT_src_wave_base = fx.Int32(0)
-        _bL_src_wave_base = fx.Int32(0)
+        # Per-thread (row, k) source mapping, matching pyhip a_lane_row = tid//8.
+        a_lane_row = tid // 8
+        a_lane_k = tid % 8 * elements_per_128b
+        a_local_row = a_lane_row % 8 * (BLOCK_M // 8) + a_lane_row // 8
+        lane_src_offset = fx.Int32((a_local_row * K + a_lane_k) * _elem_bytes)
+        aT_src_wave_base = fx.Int32(0)
+        bL_src_wave_base = fx.Int32(0)
 
-        def _raw_g2s(rsrc, dst_base, src_wave_base, ki):
+        def raw_g2s(rsrc, dst_base, src_wave_base, ki):
             for chunk in range_constexpr(BLOCK_M // 64):
-                _dp = _lds_byte_ptr(
+                dest_lds_m0 = _lds_byte_ptr(
                     dst_base,
                     chunk * _dst_stride * _elem_bytes,
                 )
-                _so = src_wave_base + fx.Int32(
+                src_soffset = src_wave_base + fx.Int32(
                     ki * BLOCK_K * _elem_bytes + chunk * 8 * K * _elem_bytes
                 )
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc,
-                    _dp,
+                    dest_lds_m0,
                     fx.Int32(16),
-                    _lane_src_offset,
-                    _so,
+                    lane_src_offset,
+                    src_soffset,
                     fx.Int32(0),
                     fx.Int32(0),
                 )
@@ -567,69 +566,71 @@ def compile_gemm_fp8_8wave(
             # per quadrant retain the existing pipeline's vmcnt accounting.
             # Global offset(n,k) = (n//16)*16*K + (k//16)*256
             #                       + (n%16)*16 + k%16.
-            _b_ps_lane_offset = fx.Int32(
+            src_voffset = fx.Int32(
                 (wave_id // 2) * 16 * K + (wave_id % 2) * 1024 + (tid % 64) * 16
             )
-            _b_ps_wave_offset = rocdl.readfirstlane(
+            lds_wave_offset = rocdl.readfirstlane(
                 T.i32, arith._to_raw(fx.Int32(wave_id * 1024))
             )
 
-            def _preshuffle_g2s(root_view, quadrant, ki):
+            def preshuffle_g2s(root_view, quadrant, ki):
                 for chunk in range_constexpr(2):
-                    dst = _lds_byte_ptr(
-                        fx.get_iter(root_view), _b_ps_wave_offset + chunk * 8192
+                    dest_lds_m0 = _lds_byte_ptr(
+                        fx.get_iter(root_view), lds_wave_offset + chunk * 8192
                     )
-                    src_base = fx.Int32(
-                        (quadrant * BLOCK_N + chunk * 64) * K + ki * BLOCK_K * 16
-                    )
+                    vmem_scalar_offset = (
+                        quadrant * BLOCK_N + chunk * 64
+                    ) * K + ki * BLOCK_K * 16
+
+                    src_soffset = fx.Int32(vmem_scalar_offset)
                     rocdl.raw_ptr_buffer_load_lds(
                         b_dma_rsrc,
-                        dst,
+                        dest_lds_m0,
                         fx.Int32(16),
-                        _b_ps_lane_offset,
-                        src_base,
+                        src_voffset,
+                        src_soffset,
                         fx.Int32(0),
                         fx.Int32(0),
                     )
 
-        def _ac_At(lds_idx, ki):
-            _raw_g2s(a_dma_rsrc, dma_aT_dst[lds_idx], _aT_src_wave_base, ki)
+        def async_copy_At(lds_idx, ki):
+            raw_g2s(a_dma_rsrc, dma_aT_dst[lds_idx], aT_src_wave_base, ki)
 
-        def _ac_Ab(lds_idx, ki):
-            _raw_g2s(
+        def async_copy_Ab(lds_idx, ki):
+            raw_g2s(
                 a_dma_rsrc,
                 dma_aB_dst[lds_idx],
-                _aT_src_wave_base + BLOCK_M * K * _elem_bytes,
+                aT_src_wave_base + BLOCK_M * K * _elem_bytes,
                 ki,
             )
 
-        def _ac_Bl(lds_idx, ki):
+        def async_copy_Bl(lds_idx, ki):
             if const_expr(preshuffle_b):
-                _preshuffle_g2s(ldsB_l_rd[lds_idx], 0, ki)
+                preshuffle_g2s(ldsB_l_rd[lds_idx], 0, ki)
             else:
-                _raw_g2s(b_dma_rsrc, dma_bL_dst[lds_idx], _bL_src_wave_base, ki)
+                raw_g2s(b_dma_rsrc, dma_bL_dst[lds_idx], bL_src_wave_base, ki)
 
-        def _ac_Br(lds_idx, ki):
+        def async_copy_Br(lds_idx, ki):
             if const_expr(preshuffle_b):
-                _preshuffle_g2s(ldsB_r_rd[lds_idx], 1, ki)
+                preshuffle_g2s(ldsB_r_rd[lds_idx], 1, ki)
             else:
-                _raw_g2s(
+                raw_g2s(
                     b_dma_rsrc,
                     dma_bR_dst[lds_idx],
-                    _bL_src_wave_base + BLOCK_N * K * _elem_bytes,
+                    bL_src_wave_base + BLOCK_N * K * _elem_bytes,
                     ki,
                 )
 
         rocdl.sched_barrier(0)
-        _ac_scale_a(0, fx.Int32(0))
+        async_copy_scale_a(0, fx.Int32(0))
         rocdl.sched_barrier(0)
-        _ac_Bl(0, 0)
+        async_copy_Bl(0, 0)
         rocdl.sched_barrier(0)
-        _ac_At(0, 0)
+        async_copy_At(0, 0)
         rocdl.sched_barrier(0)
-        _ac_Br(0, 0)
+        async_copy_Br(0, 0)
         rocdl.sched_barrier(0)
-        _ac_Ab(0, 0)
+        async_copy_Ab(0, 0)
         rocdl.sched_barrier(0)
         # Offset the two groups of four waves by one stage. The lower group
         # closes this unmatched barrier after the final FIFO drain.
@@ -644,21 +645,18 @@ def compile_gemm_fp8_8wave(
         vm_load_cnt_b = 2
         vm_load_cnt_scale_a = 1
 
-        rocdl.sched_barrier(0)
-        ### todo: this part useless??? barrier needed?
         vmcnt = vm_load_cnt_a + vm_load_cnt_b
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
         rocdl.s_barrier()
-        rocdl.sched_barrier(0)
 
         rocdl.sched_barrier(0)
-        _ac_scale_a(1, fx.Int32(1))
+        async_copy_scale_a(1, fx.Int32(1))
         rocdl.sched_barrier(0)
-        _ac_At(1, 1)
+        async_copy_At(1, 1)
         rocdl.sched_barrier(0)
-        _ac_Bl(1, 1)
+        async_copy_Bl(1, 1)
         rocdl.sched_barrier(0)
-        _ac_Br(1, 1)
+        async_copy_Br(1, 1)
         rocdl.sched_barrier(0)
 
         vmcnt = vm_load_cnt_a + vm_load_cnt_b * 2 + vm_load_cnt_scale_a
@@ -707,7 +705,7 @@ def compile_gemm_fp8_8wave(
                     mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)
                     if const_expr(m_slice == 0):
                         mfma_scaleB = load_scale_b(ki)
-                        _ac_Ab(tock, ki + 1)
+                        async_copy_Ab(tock, ki + 1)
                     rocdl.sched_barrier(0)
 
                     fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
@@ -727,7 +725,7 @@ def compile_gemm_fp8_8wave(
                     else:
                         # A_t must survive slice0; only slice1's read closes
                         # its lifetime in both staggered wave groups.
-                        _ac_At(tick, ki + 2)
+                        async_copy_At(tick, ki + 2)
 
                     fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
                     begin_compute_phase()
@@ -746,7 +744,7 @@ def compile_gemm_fp8_8wave(
                     if const_expr(m_slice == 0):
                         # B survives in registers through slice1; its LDS
                         # slot is already free after slice0's reads.
-                        _ac_Bl(tick, ki + 2)
+                        async_copy_Bl(tick, ki + 2)
 
                     fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
                     begin_compute_phase()
@@ -761,10 +759,10 @@ def compile_gemm_fp8_8wave(
                     end_compute_phase()
 
                     if const_expr(m_slice == 0):
-                        _ac_Br(tick, ki + 2)
+                        async_copy_Br(tick, ki + 2)
                     else:
                         # BL[s1]'s end barrier closes all current ScaleA reads.
-                        _ac_scale_a(tick, ki + 2)
+                        async_copy_scale_a(tick, ki + 2)
                         rocdl.s_waitcnt(
                             encode_waitcnt_950(
                                 vmcnt=vm_load_cnt_a
