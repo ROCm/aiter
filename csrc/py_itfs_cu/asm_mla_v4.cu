@@ -587,7 +587,7 @@ struct __attribute__((packed)) MlaV4PsKernelArgs
     p2 _p_nq;                // 0xa8: pad
     unsigned int s_plan;     // 0xb0: repurposed: planner config F | (MT << 8)
     unsigned int _p_pl;      // 0xb4: pad
-    void* ptr_span;          // 0xb8: workspace span [P, 2] int32 (rw)
+    void* ptr_unused;        // 0xb8: not read by this kernel, nullptr
     unsigned int s_zero;
     p3 _p_z; // 0xc0: 0
     void* ptr_QTP;
@@ -610,12 +610,14 @@ struct __attribute__((packed)) MlaV4PsKernelArgs
 static_assert(sizeof(MlaV4PsKernelArgs) == 21 * 16, "persistent v4 nm kernarg is 0x150 bytes");
 static_assert(offsetof(MlaV4PsKernelArgs, ptr_cnt) == 0x98 &&
                   offsetof(MlaV4PsKernelArgs, s_num_q) == 0xa4 &&
-                  offsetof(MlaV4PsKernelArgs, ptr_span) == 0xb8 &&
+                  offsetof(MlaV4PsKernelArgs, ptr_unused) == 0xb8 &&
                   offsetof(MlaV4PsKernelArgs, ptr_sink) == 0x120,
               "persistent v4 nm kernarg offsets");
 
 // Workspace sizes the kernel indexes into (aiter/mla.py
 // get_mla_v4_nm_ps_workspace).
+// cnt holds [0, 2*65536) row counters, [2*65536, +16*512) reserved (unused)
+// and [.., +4*1024) group counters.
 static constexpr int kV4PsHeads            = 128;
 static constexpr int kV4PsDim              = kV4DimNope + kV4DimRope;
 static constexpr int kV4PsMaxParts         = 1024;
@@ -636,7 +638,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* o_acc,           // workspace [2P, 128, 512] FP32
      aiter_tensor_t* lse_acc,         // workspace [2P, 128] FP32
      aiter_tensor_t* desc,            // workspace [P, 8] int32
-     aiter_tensor_t* span,            // workspace [P, 2] int32
      aiter_tensor_t* cnt,             // workspace [kV4PsCntInts] int32, zero at rest
      aiter_tensor_t* arange,          // workspace arange(kV4PsArange) int32
      aiter_tensor_t* output,          // [N, 128, 512] BF16
@@ -652,7 +653,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      o_acc,
      lse_acc,
      desc,
-     span,
      cnt,
      arange,
      output,
@@ -692,7 +692,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     check_buf(o_acc, AITER_DTYPE_fp32, "o_acc");
     check_buf(lse_acc, AITER_DTYPE_fp32, "lse_acc");
     check_buf(desc, AITER_DTYPE_i32, "desc");
-    check_buf(span, AITER_DTYPE_i32, "span");
     check_buf(cnt, AITER_DTYPE_i32, "cnt");
     check_buf(arange, AITER_DTYPE_i32, "arange");
     check_buf(output, AITER_DTYPE_bf16, "output");
@@ -740,7 +739,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(lse_acc->numel() == static_cast<size_t>(2 * num_p * kV4PsHeads),
                 __func__,
                 ": lse_acc must be [2P, 128]");
-    AITER_CHECK(span->numel() == static_cast<size_t>(2 * num_p), __func__, ": span must be [P, 2]");
     AITER_CHECK(cnt->numel() >= static_cast<size_t>(kV4PsCntInts),
                 __func__,
                 ": cnt needs ",
@@ -774,7 +772,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.s_num_p           = static_cast<unsigned int>(num_p);
     args.s_num_q           = static_cast<unsigned int>(num_q);
     args.s_plan            = kV4PsPlanCfg;
-    args.ptr_span          = span->data_ptr();
+    args.ptr_unused        = nullptr;
     args.ptr_QTP           = arange->data_ptr();
     args.ptr_STP           = arange->data_ptr();
     args.out_16_nosplit    = 1;

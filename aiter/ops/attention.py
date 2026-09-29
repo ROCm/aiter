@@ -907,8 +907,6 @@ def mla_decode_v4_ps_asm(
     lse_acc: torch.Tensor,
     # [P, 8] int32
     desc: torch.Tensor,
-    # [P, 2] int32
-    span: torch.Tensor,
     # int32 counters, zero at rest
     cnt: torch.Tensor,
     # int32 arange

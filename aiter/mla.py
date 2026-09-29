@@ -455,6 +455,8 @@ def get_mla_v4_nm_split_plan(
 
 
 # Workspace of the persistent v4 nm decode kernel (mla_decode_v4_ps_asm).
+# cnt: [0, 2*65536) row counters, [2*65536, +16*512) reserved,
+# [.., +4*1024) group counters.
 _V4_NM_PS_CNT_INTS = 2 * 65536 + 16 * 512 + 4 * 1024
 _V4_NM_PS_ARANGE = 65537
 _V4_NM_PS_MAX_PARTITIONS = 1024
@@ -467,7 +469,6 @@ class MlaV4NmPsWorkspace(NamedTuple):
     o_acc: torch.Tensor  # [2P, 128, 512] fp32 split partials
     lse_acc: torch.Tensor  # [2P, 128] fp32 split partials
     desc: torch.Tensor  # [P, 8] int32 in-kernel plan
-    span: torch.Tensor  # [P, 2] int32 in-kernel plan
     cnt: torch.Tensor  # int32 merge counters, zero at rest
     arange: torch.Tensor  # int32 arange, read-only
 
@@ -497,7 +498,6 @@ def get_mla_v4_nm_ps_workspace(device="cuda", num_partitions=128) -> MlaV4NmPsWo
         o_acc=torch.empty(2 * P, 128, 512, dtype=dtypes.fp32, device=device),
         lse_acc=torch.empty(2 * P, 128, dtype=dtypes.fp32, device=device),
         desc=torch.empty(P, 8, **i32),
-        span=torch.zeros(P, 2, **i32),
         cnt=torch.zeros(_V4_NM_PS_CNT_INTS, **i32),
         arange=torch.arange(_V4_NM_PS_ARANGE, **i32),
     )
