@@ -454,7 +454,6 @@ def test_top_k_per_row_decode_bounded(
 ) -> dict:
     """Decode rows of ragged length in a buffer 4x the bound, the longest row on
     the bound, called with `max_row_len` as a serving stack would."""
-    torch.set_default_device("cuda:0")
     seq_lens = torch.randint(
         top_k, context_len + 1, (batch_size,), dtype=torch.int32, device="cuda"
     )
