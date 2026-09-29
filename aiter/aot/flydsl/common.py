@@ -37,6 +37,7 @@ class OpKind(enum.Enum):
     CHUNK_GDN_H = "chunk_gdn_h"
     MEGA_MOE = "mega_moe"
     FMHA_FP8 = "fmha_fp8"
+    QSA = "qsa"
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .fmha_fp8 import default_jobs
 
         return default_jobs()
+    if kind is OpKind.QSA:
+        from .qsa import default_jobs
+
+        return default_jobs()
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:
@@ -167,6 +172,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
     if kind is OpKind.MEGA_MOE:
         from .mega_moe import compile_one_config
+    elif kind is OpKind.QSA:
+        from .qsa import compile_one_config
     elif kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import compile_one_config
     elif kind is OpKind.MOE:

@@ -2267,6 +2267,61 @@ def test_qsa_auto_admits_only_measured_pairs():
     assert qsa_auto_uses_flydsl(*untuned) is False
 
 
+def test_qsa_aot_collector_lists_family_a_launches():
+    """The AOT collector lists the family A compiles and nothing else.
+
+    K1 is the page-16 emit, the M=1 long-row scorer, and the M=512
+    prefill scorer. M=8 decode uses that same scorer, so it is not a
+    second K1 job. K2 is the three bar launches. The JIT wrappers do
+    not import this collector.
+    """
+    import sys
+
+    if "aiter.aot.flydsl.qsa" in sys.modules:
+        raise AssertionError("QSA JIT import loaded the AOT collector")
+    from aiter.aot.flydsl.common import (
+        OpKind,
+        _collect_aot_jobs_for,
+        _compile_one_config_for,
+    )
+
+    try:
+        kind = OpKind.QSA
+    except AttributeError:
+        raise AssertionError("QSA is not an AOT kind") from None
+    jobs = _collect_aot_jobs_for(kind)
+    if any(job is None for job in jobs):
+        raise AssertionError("QSA AOT job list contains None")
+    by_name = {job["kernel_name"]: job for job in jobs}
+    if len(by_name) != len(jobs):
+        raise AssertionError("QSA AOT jobs repeat a kernel_name")
+    expect = {
+        "qsa_k1_emit_family_a": ("k1", 1, 512),
+        "qsa_k1_long_row_family_a_decode": ("k1", 1, 32768),
+        "qsa_k1_long_row_family_a_prefill": ("k1", 512, 8192),
+        "qsa_k2_family_a_m1_l32768": ("k2", 1, 32768),
+        "qsa_k2_family_a_m8_l32768": ("k2", 8, 32768),
+        "qsa_k2_family_a_m512_l8192": ("k2", 512, 8192),
+    }
+    if set(by_name) != set(expect):
+        raise AssertionError(f"QSA AOT jobs {sorted(by_name)} != {sorted(expect)}")
+    for name, (op, rows, seq_len) in expect.items():
+        job = by_name[name]
+        if (job["op"], job["m"], job["seq_len"]) != (op, rows, seq_len):
+            raise AssertionError(f"{name} collected as {job}")
+        if job["page_size"] != 16:
+            raise AssertionError(f"{name} page_size is {job['page_size']}")
+    decode = by_name["qsa_k1_long_row_family_a_decode"]
+    if decode["heads"] != 4 or decode["compress_ratio"] != 4:
+        raise AssertionError(f"K1 decode job is not family A: {decode}")
+    prefill_k2 = by_name["qsa_k2_family_a_m512_l8192"]
+    if (prefill_k2["hq"], prefill_k2["hkv"], prefill_k2["width"]) != (24, 2, 2051):
+        raise AssertionError(f"K2 prefill job is not a bar launch: {prefill_k2}")
+    compile_one = _compile_one_config_for(kind)
+    if not callable(compile_one):
+        raise TypeError("QSA AOT has no compile_one_config")
+
+
 def test_qsa_symbols_export_lazily():
     """K1, K2, and the layer are on ``aiter.ops.flydsl`` without a side import."""
     from aiter.ops import flydsl
@@ -2724,6 +2779,7 @@ def _run_unit_cases():
     test_k2_empty_cache_or_table_returns_zeros()
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
+    test_qsa_aot_collector_lists_family_a_launches()
     test_qsa_symbols_export_lazily()
     test_qsa_layer_family_a_matches_oracle()
     test_qsa_layer_family_b_matches_oracle()
