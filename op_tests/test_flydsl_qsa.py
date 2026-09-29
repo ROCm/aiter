@@ -2322,6 +2322,24 @@ def test_qsa_aot_collector_lists_family_a_launches():
         raise TypeError("QSA AOT has no compile_one_config")
 
 
+def test_qsa_aot_empty_launch_list_has_no_jobs():
+    """An empty QSA launch list collects no jobs.
+
+    The result is ``[]``. ``[None]`` is not the stand-in for no configs.
+    One real launch still collects one job.
+    """
+    from aiter.aot.flydsl.qsa import default_jobs
+
+    jobs = default_jobs(())
+    if jobs != []:
+        raise AssertionError(f"empty QSA launches collected as {jobs!r}")
+    one = default_jobs((("qsa_k1_emit_family_a", "k1", 1, 512),))
+    if len(one) != 1 or one[0] is None:
+        raise AssertionError(f"one QSA launch collected as {one!r}")
+    if one[0]["op"] != "k1" or one[0]["m"] != 1 or one[0]["seq_len"] != 512:
+        raise AssertionError(f"one QSA launch collected as {one[0]!r}")
+
+
 def test_qsa_symbols_export_lazily():
     """K1, K2, and the layer are on ``aiter.ops.flydsl`` without a side import."""
     from aiter.ops import flydsl
@@ -2780,6 +2798,7 @@ def _run_unit_cases():
     test_qsa_backend_default_is_live_amd()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_aot_collector_lists_family_a_launches()
+    test_qsa_aot_empty_launch_list_has_no_jobs()
     test_qsa_symbols_export_lazily()
     test_qsa_layer_family_a_matches_oracle()
     test_qsa_layer_family_b_matches_oracle()
