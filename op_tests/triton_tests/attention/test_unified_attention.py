@@ -762,10 +762,12 @@ def test_triton_unified_attn_gfx942_large_prefill(
     compiled or numerically checked. This runs one 1023- or 2048-token
     prefill per (head, dtype, shuffled, page) combination — enough to
     select, compile and validate each entry — and asserts the resolved
-    config key, pinning the 1023/1024 threshold from both sides (the
-    below-threshold arm runs non-shuffled only; see the skip below). Page
-    64 hits the tuned SHUF.BS_LEQ_64 entries, page 128 the BS-agnostic
-    M16/stages-1 fallbacks (the only LDS-safe configs at TILE 128).
+    config key and tuned BLOCK_M, pinning the 1023/1024 threshold from
+    both sides: below the threshold, plain calls resolve to the D-only
+    entries and shuffled calls to the Q-agnostic D_GEQ_*.SHUF.* entries.
+    Page 64 hits the tuned SHUF.BS_LEQ_64 entries, page 128 the
+    BS-agnostic M16/stages-1 fallbacks (the only LDS-safe configs at
+    TILE 128).
     The sliding_window=1024 arm mirrors the Gemma-4 production call shape:
     these entries were tuned for sliding-window prefill, and the general
     test's windowed cases all stay below Q_GEQ_1024, so this is the only
