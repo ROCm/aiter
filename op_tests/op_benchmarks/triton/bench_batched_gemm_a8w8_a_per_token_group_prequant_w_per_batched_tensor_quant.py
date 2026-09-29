@@ -22,6 +22,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     generate_batched_gemm_a16w8_inputs as generate_batched_gemm_a8w8_per_token_group_inputs,
 )
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    prepare_batched_gemm_input,
+)
 
 
 def bench_gemm_fn(
@@ -36,6 +39,8 @@ def bench_gemm_fn(
     transpose_bm: bool,
     transpose_bm_in: bool = False,
     profile_path: str | None = None,
+    supplied_output: bool = True,
+    input_pad: int = 0,
 ):
     c_dtype = torch.bfloat16
     x, weight, w_scale, bias, y = generate_batched_gemm_a8w8_per_token_group_inputs(
@@ -45,12 +50,11 @@ def bench_gemm_fn(
         K,
         c_dtype,
         has_bias=has_bias,
-        output=True,
+        output=supplied_output,
         layout=layout,
         transpose_bm=transpose_bm,
     )
-    if transpose_bm_in:
-        x = x.transpose(0, 1).contiguous()
+    x = prepare_batched_gemm_input(x, transpose_bm_in, input_pad)
     # flops
     flops = 2.0 * batch * M * N * K
     # memory transfer
@@ -60,7 +64,7 @@ def bench_gemm_fn(
         + w_scale.numel() * w_scale.element_size()
         + (bias.numel() * bias.element_size() if bias is not None else 0)
     )
-    mem_write = y.numel() * y.element_size()
+    mem_write = batch * M * N * (torch.finfo(c_dtype).bits // 8)
     mem = mem_read + mem_write
 
     def fn():
@@ -146,6 +150,8 @@ def run_model_benchmark(args):
             args.transpose_bm,
             args.transpose_bm_in,
             args.profile,
+            not args.allocate_output,
+            args.input_pad,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -174,6 +180,8 @@ def run_shape_benchmark(args):
             args.transpose_bm,
             args.transpose_bm_in,
             args.profile,
+            not args.allocate_output,
+            args.input_pad,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -206,6 +214,17 @@ def parse_args(args: list[str] | None = None):
         "--profile",
         default=None,
         help="Export one separate eager Chrome trace; no clean timing is reported.",
+    )
+    parser.add_argument(
+        "--allocate-output",
+        action="store_true",
+        help="Allocate output inside each native operator call instead of supplying it.",
+    )
+    parser.add_argument(
+        "--input-pad",
+        type=int,
+        default=0,
+        help="Extra elements in input row storage; pass a last-dimension slice view.",
     )
     parser.add_argument(
         "--group-size",

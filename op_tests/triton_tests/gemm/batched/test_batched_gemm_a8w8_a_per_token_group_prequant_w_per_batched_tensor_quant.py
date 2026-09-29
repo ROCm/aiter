@@ -14,11 +14,16 @@ from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
-# Twelve representative modes for the N256/K512 config bucket. Other API modes
+# Twelve representative modes for the N256/K512 and N512/K192 config buckets. Other API modes
 # retain their native contract; this is bounded coverage rather than a cartesian
-# sweep. Every case uses B8/M48 and resident E4M3 weights.
+# sweep. Cases use B8, resident E4M3 weights and the separately selected M shape.
 NATIVE_VALUE_MODES = [
-    {"name": "batch_first", "transpose_bm_in": False, "transpose_bm": False},
+    {
+        "name": "batch_first",
+        "transpose_bm_in": False,
+        "transpose_bm": False,
+        "output": True,
+    },
     {"name": "token_first", "transpose_bm_in": True, "transpose_bm": True},
     {"name": "transposed_output", "transpose_bm_in": False, "transpose_bm": True},
     {"name": "transposed_input", "transpose_bm_in": True, "transpose_bm": False},
@@ -47,18 +52,20 @@ NATIVE_VALUE_MODES = [
 def run_group_quantized_fp32(
     x, weight, w_scale, group_size=128, bias=None, transpose_bm=True
 ):
-    """Independent FP8/group-quantized oracle for the K512 native value op.
+    """Independent FP8/group-quantized oracle for K192/K512 native GEMMs.
 
     Reproduce the native bias epilogue's intermediate rounding, while retaining
     FP32 group accumulation, scaling and the pre-output-rounding reference.
     """
-    assert x.shape[-1] == weight.shape[-1] == 512
+    assert x.shape[-1] == weight.shape[-1] and x.shape[-1] in (192, 512)
     out = torch.zeros(
         (x.shape[0], x.shape[1], weight.shape[1]), device=x.device, dtype=torch.float32
     )
     dtype_max = torch.finfo(weight.dtype).max
     for first in range(0, x.shape[-1], group_size):
-        last = first + group_size
+        # The kernel masks the final group with zeroes. Reducing and multiplying
+        # only valid values is equivalent, without including storage beyond K.
+        last = min(first + group_size, x.shape[-1])
         a = x[..., first:last].float()
         scale = a.abs().amax(-1, keepdim=True).clamp_min(1e-10) * (1.0 / dtype_max)
         quantized = (
@@ -152,9 +159,22 @@ def generate_batched_gemm_a16w8_inputs(
     return x, weight, w_scale, bias, y
 
 
+def prepare_batched_gemm_input(x, transpose_bm_in=False, input_pad=0, pad_value=0):
+    """Prepare the actual input layout, optionally retaining padded row strides."""
+    assert input_pad >= 0
+    if transpose_bm_in:
+        x = x.transpose(0, 1).contiguous()
+    if input_pad:
+        k = x.shape[-1]
+        storage = x.new_full((*x.shape[:-1], k + input_pad), pad_value)
+        storage[..., :k].copy_(x)
+        x = storage[..., :k]
+    return x
+
+
 def generate_native_value_mode_inputs(mode):
-    """Shared signed/zero/extreme-group fixture for the twelve K512 modes."""
-    assert mode.get("K", 512) == 512
+    """Shared signed/zero/extreme-group fixture for K192/K512 native modes."""
+    assert mode.get("K", 512) in (192, 512)
     x, weight, scale, bias, output = generate_batched_gemm_a16w8_inputs(
         mode.get("B", 8),
         mode.get("M", 48),
@@ -172,7 +192,14 @@ def generate_native_value_mode_inputs(mode):
     x[..., 256:384] *= 0.0625
     weight = (weight.float() - 0.05).to(weight.dtype)
     scale.fill_(0.125)
-    inputs = x.transpose(0, 1).contiguous() if mode.get("transpose_bm_in", False) else x
+    inputs = prepare_batched_gemm_input(
+        x,
+        mode.get("transpose_bm_in", False),
+        mode.get("input_pad", 0),
+        # Mode correctness fixtures poison the unused tail to expose unmasked
+        # loads during activation scale computation. Timed fixtures retain zero.
+        pad_value=1024,
+    )
     return inputs, weight, scale, bias, output
 
 
@@ -352,6 +379,83 @@ def test_native_value_oracle_cpu(group_size):
     )
 
 
+@pytest.mark.parametrize("group_size", [64, 128, 256])
+def test_native_query_oracle_masked_tail_cpu(group_size):
+    # Poison storage beyond valid K: the reference must ignore the masked tail.
+    storage = torch.full((1, 16, 256), 1024.0, dtype=torch.bfloat16)
+    x = storage[..., :192]
+    x[..., :128] = 1
+    x[..., 128:] = 2
+    weight = torch.ones((1, 32, 192)).to(torch.float8_e4m3fn)
+    scale = torch.tensor(0.25)
+    expected = torch.full((1, 16, 32), 64.0)
+    torch.testing.assert_close(
+        run_group_quantized_fp32(x, weight, scale, group_size, transpose_bm=False),
+        expected,
+        atol=1e-4,
+        rtol=1e-6,
+    )
+    x.zero_()
+    assert (
+        torch.count_nonzero(run_group_quantized_fp32(x, weight, scale, group_size)) == 0
+    )
+    assert torch.all(storage[..., 192:] == 1024)
+
+
+def test_native_query_benchmark_layout_cpu(monkeypatch):
+    benchmark = importlib.import_module(
+        "op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant"
+    )
+    x = torch.ones((8, 64, 192), dtype=torch.bfloat16)
+    weight = torch.ones((8, 512, 192)).to(torch.float8_e4m3fn)
+
+    def generate(*args, **kwargs):
+        assert kwargs["output"] is False
+        return x, weight, torch.ones(()), None, None
+
+    def operation(inputs, *args, **kwargs):
+        assert inputs.shape == (64, 8, 192)
+        assert inputs.stride() == (8 * 256, 256, 1)
+        assert not inputs.is_contiguous()
+        assert kwargs["YQ"] is None
+        assert kwargs["transpose_bm_in"] and not kwargs["transpose_bm"]
+        assert "backend" not in kwargs and "config" not in kwargs
+        torch.testing.assert_close(inputs.transpose(0, 1), x)
+        return torch.empty((8, 64, 512), dtype=torch.bfloat16)
+
+    def timer(fn, **kwargs):
+        assert kwargs == {"warmup": 25, "rep": 100, "return_mode": "median"}
+        fn()
+        return 0.0123
+
+    monkeypatch.setattr(
+        benchmark, "generate_batched_gemm_a8w8_per_token_group_inputs", generate
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
+        operation,
+    )
+    monkeypatch.setattr(triton.testing, "do_bench", timer)
+    assert (
+        benchmark.bench_gemm_fn(
+            8,
+            64,
+            512,
+            192,
+            "time",
+            "TN",
+            128,
+            False,
+            False,
+            True,
+            supplied_output=False,
+            input_pad=64,
+        )
+        == 0.0123
+    )
+
+
 def test_native_value_benchmark_median(monkeypatch):
     """Exercise native layout preparation and timer options without a GPU timer."""
     benchmark = importlib.import_module(
@@ -393,15 +497,30 @@ def test_native_value_benchmark_median(monkeypatch):
     assert observed == [1]
 
 
+@pytest.mark.parametrize(
+    "m, n, k",
+    [
+        (48, 256, 512),
+        (64, 512, 192),
+        (128, 512, 192),
+        (256, 512, 192),
+        (128, 256, 512),
+        (256, 256, 512),
+    ],
+)
 @pytest.mark.parametrize("mode", NATIVE_VALUE_MODES, ids=lambda mode: mode["name"])
-def test_native_value_modes_replay(mode):
+def test_native_batched_modes_replay(mode, m, n, k):
     options = {
+        "M": m,
+        "N": n,
+        "K": k,
         "dtype": torch.bfloat16,
-        "output": True,
+        "output": k == 512,
         "has_bias": False,
         "group_size": 128,
-        "transpose_bm": False,
-        "transpose_bm_in": False,
+        "transpose_bm": k == 512,
+        "transpose_bm_in": True,
+        "input_pad": 64 if k == 192 else 0,
     }
     options.update({key: value for key, value in mode.items() if key != "name"})
     inputs, weight, scale, bias, output = generate_native_value_mode_inputs(options)
@@ -502,6 +621,8 @@ def get_x_vals():
     x_vals += [(v**2, 128, 512) for v in range(7)]
     x_vals += [(v**2, 512, 128) for v in range(7)]
     x_vals += [(m, 256, 512) for m in (32, 33, 48, 63, 64, 65)]
+    x_vals += [(m, 512, 192) for m in (32, 33, 64, 65, 128, 129, 256, 257)]
+    x_vals += [(m, 256, 512) for m in (128, 129, 256, 257)]
     x_vals += [(1, 128, 1)]  # minimal case
     return x_vals
 
