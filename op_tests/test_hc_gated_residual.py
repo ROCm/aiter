@@ -2,19 +2,21 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Correctness test for the two-stage Hyper-Connection Gated-Residual op
-(SILOTIGER-1042), ``aiter.ops.flydsl.kernels.hyper_connection_gated_residual``.
+(``aiter.ops.flydsl.kernels.hyper_connection_gated_residual``).
 
-Exercises the three ticket entry points (``combine_and_mix`` / ``mix`` /
-``combine``), the final mixer (no inject), and the decode tail -- all against the
-shared float32 oracle in the package's ``reference`` module. Both weight modes
-are covered: ``fold_w=False`` (K1 applies the RMSNorm affine) and ``fold_w=True``
-((1+w) pre-folded into the down weight). The tile-aligned sweep spans both K1
-reduction branches: split-K (M<3072) and the decoupled async-LDS pipe (M>=3072).
+Exercises the three entry points (``combine_and_mix`` / ``mix`` / ``combine``),
+the final mixer (no inject), the decode tail, and the full-width norm weight --
+all against the shared float32 oracle in the package's ``reference`` module. Both
+weight modes are covered: ``fold_w=False`` (K1 applies the RMSNorm affine) and
+``fold_w=True`` ((1+w) pre-folded into the down weight). The tile-aligned sweep
+spans both K1 reduction branches: split-K (M<3072) and the decoupled pipe (M>=3072).
 
-Aiter script convention (not pytest): run directly; exits non-zero on failure.
+Aiter script convention (run directly, not pytest): the run loop is under
+``if __name__ == "__main__"`` so importing the file has no side effects and CI's
+``python3 <file>`` runs the checks. Exits non-zero on failure.
 
-    python op_tests/flydsl_tests/test_hc_gated_residual.py
-    python op_tests/flydsl_tests/test_hc_gated_residual.py --tokens 512 4096
+    python op_tests/test_hc_gated_residual.py
+    python op_tests/test_hc_gated_residual.py --tokens 512 4096
 """
 
 import argparse
@@ -119,7 +121,7 @@ def _merged(inp, fold_w):
     return fold_norm_weight(merged, inp["norm_weight"], HC)
 
 
-def test_combine_and_mix(tokens, fold_w):
+def _run_combine_and_mix(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
@@ -147,7 +149,7 @@ def test_combine_and_mix(tokens, fold_w):
     )
 
 
-def test_mix(tokens, fold_w):
+def _run_mix(tokens, fold_w):
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, seed=1)
     r2, x, inj = flydsl_gr_two_stage_mix(
@@ -179,7 +181,7 @@ def test_mix(tokens, fold_w):
     )
 
 
-def test_combine(tokens):
+def _run_combine(tokens):
     inp = _make_inputs(tokens, seed=2)
     r2 = flydsl_gr_two_stage_combine(
         inp["residual"],
@@ -194,7 +196,7 @@ def test_combine(tokens):
     _check(r2_ref.to(r2.dtype), r2, f"combine[M={tokens}] r2", atol=0.05, rtol=0.02)
 
 
-def test_final_mixer_no_inject(tokens, fold_w):
+def _run_final_mixer_no_inject(tokens, fold_w):
     """Final mixer: ``w_inject=None`` -> no inject columns, ``inj_next=None``."""
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, with_inject=False, seed=3)
@@ -226,11 +228,11 @@ def test_final_mixer_no_inject(tokens, fold_w):
     _check(x_ref.to(x.dtype), x, f"final_mixer[{tag}][M={tokens}] x")
 
 
-def test_decode(tokens, fold_w):
+def _run_decode(tokens, fold_w):
     """Decode M vs the oracle, both weight modes. ``fold_w=True`` takes the skinny
-    GEMV two-stage on gfx942 (padded fused on gfx950); ``fold_w=False`` is *not*
-    skinny (the skinny down assumes the folded weight) -- it exercises the padded
-    low-M tail of the split-K/decouple path instead."""
+    GEMV two-stage; ``fold_w=False`` is *not* skinny (the skinny down assumes the
+    folded weight) -- it exercises the padded low-M tail of the split-K/decouple
+    path instead."""
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, seed=7)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
@@ -260,7 +262,7 @@ def test_decode(tokens, fold_w):
     )
 
 
-def test_full_norm_weight(tokens, fold_w):
+def _run_full_norm_weight(tokens, fold_w):
     """Full-width norm_weight ([hidden]) instead of the shared [stream_dim] -- covers
     the ``w_len==hidden`` branch in the down norm_A, K2, and the skinny up-GEMV
     (``shared_w=False``), which the [stream_dim] inputs never reach."""
@@ -293,52 +295,58 @@ def test_full_norm_weight(tokens, fold_w):
     )
 
 
-parser = argparse.ArgumentParser(
-    description="Correctness test for the two-stage HC Gated-Residual op (SILOTIGER-1042)."
-)
-parser.add_argument(
-    "--tokens",
-    type=int,
-    nargs="+",
-    default=[512, 2048, 4096],
-    help="tile-aligned token counts (spans split-K <3072 and decouple >=3072).",
-)
-parser.add_argument(
-    "--decode-tokens",
-    type=int,
-    nargs="+",
-    default=[1, 3, 4, 5, 8, 32],
-    help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
-)
-args = parser.parse_args()
-
-_arch = get_gfx()
-if _arch not in ("gfx950", "gfx942"):
-    print(
-        f"[skip] two-stage HC gated-residual requires gfx950/gfx942 FlyDSL, got {_arch}"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Correctness test for the two-stage HC Gated-Residual op."
     )
-    sys.exit(0)
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[512, 2048, 4096],
+        help="tile-aligned token counts (spans split-K <3072 and decouple >=3072).",
+    )
+    parser.add_argument(
+        "--decode-tokens",
+        type=int,
+        nargs="+",
+        default=[1, 3, 4, 5, 8, 32],
+        help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
+    )
+    args = parser.parse_args()
 
-for m in args.tokens:
-    for fold_w in (False, True):
-        test_combine_and_mix(m, fold_w)
-        test_mix(m, fold_w)
-        test_final_mixer_no_inject(m, fold_w)
-    test_combine(m)
-test_combine(64)  # extra tile-aligned combine size
-for m in args.decode_tokens:
-    for fold_w in (False, True):  # C1: cover the non-skinny nofold tail at decode M
-        test_decode(m, fold_w)
-    # C2: final mixer (w_inject=None -> n_pad=lowrank) at decode/small M -- covers
-    # the skinny/tail need_inj=False path and the n_pad divisor fallbacks at tiny M.
-    test_final_mixer_no_inject(m, True)
-# Full-width norm_weight ([hidden]): decode/skinny (M=3, fold) + split-K/K2 (M=512,
-# both modes) -- the w_len==hidden branch the shared [stream_dim] inputs never hit.
-for m in (3, 512):
-    for fold_w in (False, True):
-        test_full_norm_weight(m, fold_w)
+    arch = get_gfx()
+    if arch not in ("gfx950", "gfx942"):
+        print(
+            f"[skip] two-stage HC gated-residual requires gfx950/gfx942 FlyDSL, got {arch}"
+        )
+        return 0
 
-if _FAILURES:
-    print(f"\n{len(_FAILURES)} check(s) FAILED: {_FAILURES}")
-    sys.exit(1)
-print("\nall checks passed")
+    for m in args.tokens:
+        for fold_w in (False, True):
+            _run_combine_and_mix(m, fold_w)
+            _run_mix(m, fold_w)
+            _run_final_mixer_no_inject(m, fold_w)
+        _run_combine(m)
+    _run_combine(64)  # extra tile-aligned combine size
+    for m in args.decode_tokens:
+        for fold_w in (False, True):  # cover the non-skinny nofold tail at decode M
+            _run_decode(m, fold_w)
+        # final mixer (w_inject=None -> n_pad=lowrank) at decode/small M: covers the
+        # skinny/tail need_inj=False path and the n_pad divisor fallbacks at tiny M.
+        _run_final_mixer_no_inject(m, True)
+    # Full-width norm_weight ([hidden]) -- the w_len==hidden branch the shared
+    # [stream_dim] inputs never hit.
+    for m in (3, 512):
+        for fold_w in (False, True):
+            _run_full_norm_weight(m, fold_w)
+
+    if _FAILURES:
+        print(f"\n{len(_FAILURES)} check(s) FAILED: {_FAILURES}")
+        return 1
+    print("\nall checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
