@@ -6,8 +6,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+git_repo() {
+  git -c safe.directory="$REPO_ROOT" "$@"
+}
+
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ROUNDS="${ROUNDS:-2}"
+BASELINE_COMMIT="527047231cb41a3265549cb4e3f6c0b1d2725935"
 MODE=e2e-const0
 mode_seen=0
 
@@ -19,6 +24,10 @@ Modes:
   e2e-const0   Run both shapes with --const-init 0 (default)
   e2e-random   Run both shapes with random initialization
   e2e-both     Run random followed by const0
+
+Revisions:
+  baseline     527047231cb41a3265549cb4e3f6c0b1d2725935
+  optimized    HEAD at script startup
 
 Environment:
   ROUNDS=N     Number of rounds for every data/shape/mode case (default: 2)
@@ -50,18 +59,36 @@ for arg in "$@"; do
   esac
 done
 
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/moe_prefill_switch_ab_runs/$RUN_ID}"
-mkdir -p "$LOG_DIR"
-
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
   printf 'ROUNDS must be a positive integer, got %q\n' "$ROUNDS" >&2
   exit 2
 fi
 
+if [[ ! -f /.dockerenv ]]; then
+  printf 'This script must be run inside the ROCm container.\n' >&2
+  exit 2
+fi
+
+if ! git_repo diff --quiet || ! git_repo diff --cached --quiet; then
+  printf 'Tracked changes must be committed or stashed before revision switching.\n' >&2
+  exit 2
+fi
+
+if ! git_repo cat-file -e "${BASELINE_COMMIT}^{commit}" 2>/dev/null; then
+  printf 'Baseline commit is unavailable: %s\n' "$BASELINE_COMMIT" >&2
+  exit 2
+fi
+
+OPTIMIZED_COMMIT="$(git_repo rev-parse HEAD)"
+ORIGINAL_BRANCH="$(git_repo symbolic-ref --quiet --short HEAD || true)"
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/moe_prefill_switch_ab_runs/$RUN_ID}"
+mkdir -p "$LOG_DIR"
+
 RESULTS_TSV="$LOG_DIR/results.tsv"
 SUMMARY_MD="$LOG_DIR/summary.md"
-printf 'data\tround\torder\tcase\tshape\tmode\treturn_code\tgemm1_us\tgemm1_tflops\tgemm1_rw_tbps\tgemm1_ref_output_hash128\tgemm1_output_hash128\tgemm2_us\tgemm2_tflops\tgemm2_rw_tbps\tgemm2_ref_output_hash128\tgemm2_output_hash128\tmoe_e2e_us\tlogits_diff\trel_l2\tpass\tgemm1_symbol\tgemm2_symbol\tlog_file\n' \
+printf 'data\tround\torder\tcase\tshape\tmode\tgit_commit\treturn_code\tgemm1_us\tgemm1_tflops\tgemm1_rw_tbps\tgemm1_ref_output_hash128\tgemm1_output_hash128\tgemm2_us\tgemm2_tflops\tgemm2_rw_tbps\tgemm2_ref_output_hash128\tgemm2_output_hash128\tmoe_e2e_us\tlogits_diff\trel_l2\tpass\tgemm1_symbol\tgemm2_symbol\tlog_file\n' \
   >"$RESULTS_TSV"
 
 # Common environment for all four cases.
@@ -72,63 +99,49 @@ export AITER_USE_GROUPED_GEMM=1
 export AITER_GROUPED_DEBUG=0
 export AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 
-OPT_ENV_VARS=(
-  AITER_FLYDSL_MXFP4_CLUSTER_N
-  AITER_TDM_NEXT_STAGE_PREFETCH
-  AITER_FLYDSL_GEMM1_A_PRESHUFFLE
-  AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM
-  AITER_FLYDSL_GEMM1_MMA_GROUP
-  AITER_FLYDSL_GEMM1_FENCE_COVER_MMA
-  AITER_FLYDSL_GEMM1_DISABLE_XDL_ARB_STALL
-  AITER_FLYDSL_GEMM1_WMMA_REUSE
-  AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE
-  AITER_FLYDSL_GEMM2_A_PRESHUFFLE
-  AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER
-  AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW
-  AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH
-  AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM
-  AITER_FLYDSL_GEMM2_SCHEDULE_HINTS
-  AITER_FLYDSL_GEMM2_MMA_GROUP
-  AITER_FLYDSL_GEMM2_FENCE_COVER_MMA
-  AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE
-  AITER_FLYDSL_GEMM2_OUTPUT_SPLIT_WM
-  AITER_FLYDSL_GEMM2_OUTPUT_WAVE_SPLIT
-)
-
-disable_optimizations() {
+clear_legacy_optimization_env() {
   local var
-  for var in "${OPT_ENV_VARS[@]}"; do
-    unset "$var"
-  done
+  while IFS='=' read -r var _; do
+    case "$var" in
+      AITER_FLYDSL_GEMM1_*|AITER_FLYDSL_GEMM2_*|AITER_FLYDSL_MXFP4_CLUSTER_*|AITER_TDM_NEXT_STAGE_*)
+        unset "$var"
+        ;;
+    esac
+  done < <(env)
 }
 
-enable_optimizations() {
-  export AITER_FLYDSL_MXFP4_CLUSTER_N=4
-  export AITER_TDM_NEXT_STAGE_PREFETCH=1
-  export AITER_FLYDSL_GEMM1_A_PRESHUFFLE=1
-  export AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM=2
-  export AITER_FLYDSL_GEMM1_MMA_GROUP=4
-  export AITER_FLYDSL_GEMM1_FENCE_COVER_MMA=28
-  export AITER_FLYDSL_GEMM1_DISABLE_XDL_ARB_STALL=0
-  export AITER_FLYDSL_GEMM1_WMMA_REUSE=1
-  export AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE=1
-  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE=1
-  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER=rowgroup
-  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW=2
-  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH=2
-  export AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM=2
-  export AITER_FLYDSL_GEMM2_SCHEDULE_HINTS=1
-  export AITER_FLYDSL_GEMM2_MMA_GROUP=4
-  export AITER_FLYDSL_GEMM2_FENCE_COVER_MMA=28
-  export AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE=1
-  export AITER_FLYDSL_GEMM2_OUTPUT_SPLIT_WM=3
-  export AITER_FLYDSL_GEMM2_OUTPUT_WAVE_SPLIT=1
+checkout_revision() {
+  local revision="$1"
+  if [[ "$(git_repo rev-parse HEAD)" != "$revision" ]]; then
+    git_repo -c advice.detachedHead=false checkout --quiet --detach "$revision"
+  fi
+}
+
+restore_original_checkout() {
+  if [[ -n "$ORIGINAL_BRANCH" ]]; then
+    git_repo checkout --quiet "$ORIGINAL_BRANCH"
+  else
+    checkout_revision "$OPTIMIZED_COMMIT"
+  fi
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  clear_legacy_optimization_env
+  if ! restore_original_checkout; then
+    printf 'Failed to restore the original checkout.\n' >&2
+    rc=1
+  fi
+  exit "$rc"
 }
 
 print_case_environment() {
   local mode="$1"
+  local tested_commit="$2"
 
   printf 'mode=%s\n' "$mode"
+  printf 'git_commit=%s\n' "$tested_commit"
   printf 'ENABLE_CK=%s\n' "$ENABLE_CK"
   printf 'AITER_MOE_EXPERT_BALANCE=%s\n' "$AITER_MOE_EXPERT_BALANCE"
   printf 'AITER_LOG_MORE=%s\n' "$AITER_LOG_MORE"
@@ -136,15 +149,7 @@ print_case_environment() {
   printf 'AITER_GROUPED_DEBUG=%s\n' "$AITER_GROUPED_DEBUG"
   printf 'AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=%s\n' \
     "$AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE"
-
-  local var
-  for var in "${OPT_ENV_VARS[@]}"; do
-    if [[ -v "$var" ]]; then
-      printf '%s=%s\n' "$var" "${!var}"
-    else
-      printf '%s=<unset>\n' "$var"
-    fi
-  done
+  printf 'legacy_gemm_optimization_env=cleared\n'
 }
 
 extract_precision_metrics() {
@@ -210,13 +215,22 @@ run_case() {
   local order="$6"
   shift 6
 
-  disable_optimizations
-  if [[ "$mode" == "optimized" ]]; then
-    enable_optimizations
-  elif [[ "$mode" != "baseline" ]]; then
-    printf 'Unknown mode: %s\n' "$mode" >&2
-    return 2
-  fi
+  local tested_commit
+  clear_legacy_optimization_env
+  case "$mode" in
+    baseline)
+      tested_commit="$BASELINE_COMMIT"
+      ;;
+    optimized)
+      tested_commit="$OPTIMIZED_COMMIT"
+      ;;
+    *)
+      printf 'Unknown mode: %s\n' "$mode" >&2
+      return 2
+      ;;
+  esac
+  checkout_revision "$tested_commit"
+  tested_commit="$(git_repo rev-parse HEAD)"
 
   local log_file="$LOG_DIR/${data}_r${round}_o${order}_${case_name}.log"
   local rc gemm1_us gemm2_us moe_e2e_us logits_diff rel_l2 pass
@@ -234,10 +248,11 @@ run_case() {
     printf 'order: %s\n' "$order"
     printf 'started_utc: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'repository: %s\n' "$REPO_ROOT"
+    printf 'git_commit: %s\n' "$tested_commit"
     printf 'command:'
     printf ' %q' "$PYTHON_BIN" "$@"
     printf '\n'
-    print_case_environment "$mode"
+    print_case_environment "$mode" "$tested_commit"
     printf '============================================================\n\n'
 
     "$PYTHON_BIN" "$@"
@@ -262,8 +277,9 @@ run_case() {
     gemm1_tflops gemm1_rw_tbps gemm2_tflops gemm2_rw_tbps \
     < <(extract_precision_metrics "$log_file")
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$data" "$round" "$order" "$case_name" "$shape" "$mode" "$rc" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$data" "$round" "$order" "$case_name" "$shape" "$mode" \
+    "$tested_commit" "$rc" \
     "${gemm1_us:-NA}" "${gemm1_tflops:-NA}" "${gemm1_rw_tbps:-NA}" \
     "${gemm1_ref_hash:-NA}" "${gemm1_out_hash:-NA}" \
     "${gemm2_us:-NA}" "${gemm2_tflops:-NA}" "${gemm2_rw_tbps:-NA}" \
@@ -415,7 +431,8 @@ def hashes(case_rows, key):
 
 
 print(
-    "| data | shape | mode | GEMM1 samples (us) | GEMM1 median us | GEMM1 vs baseline | "
+    "| data | shape | mode | commit | GEMM1 samples (us) | GEMM1 median us | "
+    "GEMM1 vs baseline | "
     "GEMM1 TFLOP/s | GEMM1 effective R+W (TB/s) | "
     "GEMM1 ref out hash128 | GEMM1 out hash128 | "
     "GEMM2 samples (us) | GEMM2 median us | GEMM2 vs baseline | "
@@ -425,7 +442,7 @@ print(
     "pass | logits_diff | rel_l2 |"
 )
 print(
-    "|---|---|---|---|---:|---:|---:|---:|---|---|"
+    "|---|---|---|---|---|---:|---:|---:|---:|---|---|"
     "---|---:|---:|---:|---:|---|---|"
     "---|---:|---:|:---:|---:|---:|"
 )
@@ -458,7 +475,8 @@ for data in data_order:
             last = case_rows[-1]
 
             print(
-                f"| {data} | {shape} | {mode} | {samples(g1, 3)} | "
+                f"| {data} | {shape} | {mode} | {last['git_commit'][:12]} | "
+                f"{samples(g1, 3)} | "
                 f"{g1_med:.3f} | {gain(baseline_g1, g1_med):+.2f}% | "
                 f"{g1_tflops:.1f} | {g1_rw_tbps:.3f} | "
                 f"{hashes(case_rows, 'gemm1_ref_output_hash128')} | "
@@ -494,10 +512,12 @@ case "$MODE" in
     ;;
 esac
 
-trap disable_optimizations EXIT
+trap cleanup EXIT
 
 printf 'MODE=%s\n' "$MODE"
 printf 'ROUNDS=%s\n' "$ROUNDS"
+printf 'Baseline commit: %s\n' "$BASELINE_COMMIT"
+printf 'Optimized commit: %s\n' "$OPTIMIZED_COMMIT"
 printf 'Logs: %s\n' "$LOG_DIR"
 printf 'Raw results: %s\n' "$RESULTS_TSV"
 
@@ -517,7 +537,7 @@ for data in "${DATA_MODES[@]}"; do
   done
 done
 
-disable_optimizations
+clear_legacy_optimization_env
 
 write_summary
 
