@@ -13,9 +13,12 @@ name: AITER-triton Kernels board
 #   3. it carries the Triton/Gluon label.
 #
 # Issues stay label-driven through the board's own auto-add rule. Here they are
-# added when assigned to a team member or labeled (rules 1 and 3), removed
-# again on unassign/unlabel when neither applies any more, and their Status is
-# left to the board's "Item added" automation.
+# added when assigned to a team member or labeled (rules 1 and 3), and their
+# Status is left to the board's "Item added" automation.
+#
+# An item leaves the board only when it loses what qualified it — the
+# Triton/Gluon label, or a team member as assignee — and no rule still applies.
+# Nothing else removes anything, so items people add by hand stay put.
 #
 
 on:
@@ -41,7 +44,6 @@ concurrency:
 
 jobs:
   board:
-    if: ${{ vars.AITER_TRITON_BOARD_ADD == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Mint an AITER CI App token
@@ -97,15 +99,18 @@ jobs:
             const reasons = [];
 
             // Rule 1: authored by (PRs) or assigned to a team member.
+            // `team` stays null when the lookup fails; the rule is then
+            // skipped for adding, and nothing is removed (see below).
             const people = (item.assignees ?? []).map(a => a.login);
             if (pr) people.unshift(pr.user.login);
+            let team = null;
             try {
               const members = await github.paginate(github.rest.teams.listMembersInOrg, {
                 org: ORG,
                 team_slug: TEAM_SLUG,
                 per_page: 100,
               });
-              const team = new Set(members.map(m => m.login.toLowerCase()));
+              team = new Set(members.map(m => m.login.toLowerCase()));
               const ours = people.filter(login => team.has(login.toLowerCase()));
               if (ours.length) {
                 reasons.push(`team: ${[...new Set(ours)].join(', ')}`);
@@ -138,14 +143,27 @@ jobs:
               reasons.push(`labeled ${LABEL}`);
             }
 
-            // Losing the label or an assignee is the only thing that takes an
-            // item off the board; other events never remove anything, so items
-            // people added by hand are left alone.
-            const lostQualifier = action === 'unassigned'
-              || (action === 'unlabeled' && context.payload.label?.name === LABEL);
+            // Only losing a qualifier takes an item off the board: the
+            // Triton/Gluon label, or a team member as assignee. Removing an
+            // unrelated assignee says nothing about the item, and other events
+            // never remove anything, so items people added by hand are left
+            // alone.
+            let lostQualifier = false;
+            if (action === 'unlabeled') {
+              lostQualifier = context.payload.label?.name === LABEL;
+            } else if (action === 'unassigned' && team) {
+              const removed = context.payload.assignee?.login;
+              lostQualifier = Boolean(removed) && team.has(removed.toLowerCase());
+            }
 
             try {
               if (!reasons.length) {
+                if (!team && (lostQualifier || action === 'unassigned')) {
+                  // Without the team we cannot tell whether the item still
+                  // qualifies through an assignee, so leave the board alone.
+                  core.warning(`${what} may have lost a qualifier, but the team lookup failed — leaving the board alone.`);
+                  return;
+                }
                 if (!lostQualifier) {
                   core.info(`${what} does not belong on the board.`);
                   return;
