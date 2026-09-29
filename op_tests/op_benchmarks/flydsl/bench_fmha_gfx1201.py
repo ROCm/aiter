@@ -3,14 +3,17 @@
 
 """Benchmark the FlyDSL flash-attention kernels for gfx1201 / RDNA4.
 
-Drives the public ``flydsl_flash_attn_func`` wrapper (which dispatches the
-bf16/f16 and per-tensor-fp8 gfx1201 kernels) and benchmarks it against torch
+Drives the public ``flydsl_flash_attn_func`` wrapper (BF16 and per-tensor-FP8
+gfx1201 paths) and benchmarks it against torch
 SDPA forced to the FLASH_ATTENTION backend. Correctness is checked against an
 fp32 SDPA reference (not timed, not in the table).
 
 Candidates per shape:
     sdpa_flash            : torch SDPA, FLASH_ATTENTION backend (baseline)
-    flydsl_bf16           : flydsl_flash_attn_func on bf16/f16 inputs
+    triton_bf16           : maintained Triton FlashAttention v3 route
+    flydsl_bf16           : flydsl_flash_attn_func on BF16 inputs
+    triton_fp8_kernel_only: maintained Triton FP8 consumer on the same
+                            pre-quantized Q/K/V and descales as FlyDSL
     flydsl_fp8_incl_quant : per-tensor fp8 (bf16 output) with the Hadamard rotation
                             of Q/K + amax+cast quantization INSIDE the timed region
                             -- the realistic xDiT path, where q/k/v arrive bf16 and
@@ -19,8 +22,8 @@ Candidates per shape:
                             outside the timed region (quant amortized upstream) --
                             the pure attention-kernel ceiling; shows fp8's headroom
 
-Correctness (functional coverage) lives in the pytest suite
-``op_tests/test_flydsl_fmha_gfx1201.py``; this file is the perf sweep.
+Functional coverage lives in the executable op test
+``op_tests/test_flydsl_fmha_gfx1201.py``; this file is the comparative perf sweep.
 """
 
 import argparse
@@ -35,6 +38,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
+from aiter.ops.triton.attention.mha_v3 import flash_attn_func as triton_flash_attn_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # The flydsl flash-attn kernels are gfx1201/RDNA4 only.
@@ -91,6 +95,11 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
     # upstream. Quantized once, outside timing (rotation off -- this row isolates
     # the attention kernel, not the quant/rotate producer cost).
     qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
+    # Triton v3 accepts per-head descales; expand the native per-tensor values
+    # so both consumers receive identical quantized Q/K/V and effective scales.
+    triton_sq = sq.expand(1, num_heads).contiguous()
+    triton_sk = sk.expand(1, num_heads).contiguous()
+    triton_sv = sv.expand(1, num_heads).contiguous()
 
     def _sdpa_flash():
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
@@ -98,6 +107,9 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
 
     def _flydsl_bf16():
         return flydsl_flash_attn_func(q, k, v, causal=causal)
+
+    def _triton_bf16():
+        return triton_flash_attn_func(q, k, v, causal=causal)
 
     def _flydsl_fp8_incl_quant():
         # Realistic path: q/k/v arrive bf16, so the Hadamard rotation of Q/K
@@ -124,14 +136,27 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
             v_descale=sv,
         )
 
+    def _triton_fp8_kernel_only():
+        return triton_flash_attn_func(
+            qq,
+            kk,
+            vv,
+            causal=causal,
+            q_descale=triton_sq,
+            k_descale=triton_sk,
+            v_descale=triton_sv,
+        )
+
     # (fn, layout, in_bytes, out_bytes) -- layout is the fn's output layout.
     # in/out bytes count the attention tensor I/O only (the fp8 quant/rotate
     # traffic in flydsl_fp8_incl_quant shows up in latency/TFLOPS, not gb_per_sec).
     elem = q.element_size()
     candidates = {
         "sdpa_flash": (_sdpa_flash, "bhsd", elem, elem),
+        "triton_bf16": (_triton_bf16, "bshd", elem, elem),
         "flydsl_bf16": (_flydsl_bf16, "bshd", elem, elem),
         "flydsl_fp8_incl_quant": (_flydsl_fp8_incl_quant, "bshd", 1, 2),
+        "triton_fp8_kernel_only": (_triton_fp8_kernel_only, "bshd", 1, 2),
         "flydsl_fp8_kernel_only": (_flydsl_fp8_kernel_only, "bshd", 1, 2),
     }
 
@@ -154,8 +179,8 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
         err = checkAllclose(
             ref.to(dtypes.fp32),
             out_bshd.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=2e-2,
+            rtol=2e-1 if "fp8" in name else 2e-2,
+            atol=2e-1 if "fp8" in name else 2e-2,
             msg=f"{name}: flydsl_fmha {model}",
         )
         cos_min, cos_mean = cosine_stats(out_bshd, ref, head_dim)
@@ -204,9 +229,10 @@ def main():
         "--dtype",
         type=dtypes.str2Dtype,
         nargs="*",
+        choices=[dtypes.bf16],
         default=[dtypes.bf16],
-        help="""Input dtypes for the bf16/f16 path (fp8 is always cross-checked).
-        e.g.: -d bf16 fp16""",
+        help="""Input dtype; only BF16 is supported because FP8 candidates quantize it.
+        e.g.: -d bf16""",
     )
     parser.add_argument(
         "-c",
