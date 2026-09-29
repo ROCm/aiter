@@ -182,7 +182,8 @@ _PLAIN_K2048_SHORT_MAX_ROWS = 128
 # columns with a register or LDS-tail variant picked from continuous ranges,
 # so the bands above apply only off gfx950.  There plain beat the backend
 # otherwise in place at every measured off-grid cell (seed-0 randn, MI355X):
-# stream from 2053 to 8191 columns through 2048 rows (0.35x--0.94x), decode
+# stream from 2053 to 8191 columns at every row count measured, 1..100000
+# (0.31x--0.94x; 4096 rows of 4096 columns 26.2 against 43.7us), decode
 # from 8195 to 81920 columns through 128 rows (0.38x--0.94x), and stream at
 # 129..255 rows from 8192 to 65536 columns (0.37x--0.85x) and at 129..4000
 # rows from 65537 to 131071 columns (0.42x--0.89x).  Past 80 * 1024 columns
@@ -190,7 +191,6 @@ _PLAIN_K2048_SHORT_MAX_ROWS = 128
 # rows from 100000 columns, so the few-row band stops there.  Widths the
 # stream small-reject path serves stay with it.
 _PLAIN_K2048_NARROW_WIDTH = 8192
-_PLAIN_K2048_NARROW_MAX_ROWS = 2048
 _PLAIN_K2048_FEW_ROWS = 128
 _PLAIN_K2048_FEW_ROWS_MAX_WIDTH = 80 * 1024
 _PLAIN_K2048_MAX_WIDTH = 131071
@@ -554,11 +554,7 @@ def _plain_takes(rows: int, width: int, k: int) -> bool:
     """Enough rows for the row-scaling selector, on a width it is tuned for."""
     if k == 2048 and get_gfx_runtime() == "gfx950":
         if width < _PLAIN_K2048_NARROW_WIDTH:
-            return (
-                rows <= _PLAIN_K2048_NARROW_MAX_ROWS
-                and width > k
-                and not _stream_small_reject(rows, width - k)
-            )
+            return width > k and not _stream_small_reject(rows, width - k)
         if rows <= _PLAIN_K2048_FEW_ROWS:
             return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         return width <= _PLAIN_K2048_MAX_WIDTH
