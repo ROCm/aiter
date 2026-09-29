@@ -18,7 +18,6 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
     sage_quant_v_mxfp4_colmajor_kernel,
 )
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
 def _bshd_order(layout):
@@ -100,6 +99,11 @@ def sage_quant_mxfp4(
         num_stages=3,
         num_warps=8,
     )
+
+    # Deferred: importing aiter.ops.triton.moe runs its __init__, which eagerly builds the
+    # moe_wgrad autotune decorator. Only this function needs it, so keep it off the import path
+    # of every sage/MHA caller.
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
     downcast_func = downcast_to_mxfp
 
