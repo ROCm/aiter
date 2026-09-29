@@ -3,8 +3,11 @@
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from aiter import logger
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_nvfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -555,3 +558,48 @@ def test_dynamic_mxfp4_quant_sr_rounds_midpoints_without_bias():
     assert torch.all(scales == 127)
     assert torch.all((midpoint_values == 1.0) | (midpoint_values == 1.5))
     assert abs(round_up_fraction.item() - 0.5) < 0.02
+
+
+@triton.jit
+def _mxfp4_quant_op_kernel(
+    x_ptr,
+    fp4_ptr,
+    scale_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    SCALING_MODE: tl.constexpr,
+    USE_ASM: tl.constexpr,
+):
+    rows = tl.program_id(0) * M + tl.arange(0, M)
+    x = tl.load(x_ptr + rows[:, None] * N + tl.arange(0, N)[None, :])
+    x_fp4, scales = _mxfp4_quant_op(x, N, M, 32, SCALING_MODE, USE_ASM)
+    fp4_cols = tl.arange(0, N // 2)
+    tl.store(fp4_ptr + rows[:, None] * (N // 2) + fp4_cols[None, :], x_fp4)
+    scale_cols = tl.arange(0, N // 32)
+    tl.store(scale_ptr + rows[:, None] * (N // 32) + scale_cols[None, :], scales)
+
+
+@pytest.mark.parametrize("scaling_mode", [0, 1])
+def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
+    torch.manual_seed(scaling_mode)
+    m, n = 1024, 128
+    x = torch.randn(m, n, device="cuda") * torch.exp2(
+        torch.randint(-140, 120, (m, 1), device="cuda").float()
+    )
+    # Rounding ties, -0.0 and an all-zero block.
+    x[0, :8] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.0])
+    x[1, :32] = 0.0
+    outs = []
+    for use_asm in (True, False):
+        x_fp4 = torch.empty(m, n // 2, dtype=torch.uint8, device="cuda")
+        scales = torch.empty(m, n // 32, dtype=torch.uint8, device="cuda")
+        _mxfp4_quant_op_kernel[(m // 16,)](
+            x, x_fp4, scales, M=16, N=n, SCALING_MODE=scaling_mode, USE_ASM=use_asm
+        )
+        outs.append((x_fp4, scales))
+    torch.testing.assert_close(outs[0][0], outs[1][0], atol=0, rtol=0)
+    torch.testing.assert_close(outs[0][1], outs[1][1], atol=0, rtol=0)
+    if scaling_mode == 1:
+        amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=6 * 2**-126)
+        ref = torch.ceil(torch.log2(amax / 6)).to(torch.int32) + 127
+        torch.testing.assert_close(outs[0][1].int(), ref, atol=0, rtol=0)
