@@ -63,6 +63,7 @@ from aiter.ops.triton.attention.qsa_4882 import (
 )
 from aiter.ops.triton.attention.qsa_vllm_amd import (
     VLLM_AMD_QSA_PIN,
+    expand_qsa_block_indices_cuda,
     qsa_select_paged_tokens,
     qsa_sparse_paged_attention,
 )
@@ -1091,6 +1092,96 @@ def test_k2_empty_cache_or_table_returns_zeros():
         k2_kernel._run_compiled = original
 
 
+def test_family_a_k1_bench_times_expand():
+    """``_flydsl_k1_select`` returns block ids and the vendored expand.
+
+    Block ids match ``qsa_k1_block_ids``. Indices match
+    ``expand_qsa_block_indices_cuda`` on those ids.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 1, 512, 16
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_cache, index_table = pack_paged_cache(k_bar.unsqueeze(1), page_size)
+    indices, block_ids = _flydsl_k1_select(
+        q,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        (4,),
+    )
+    direct = qsa_k1_block_ids(
+        q,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(4,),
+    )
+    if not torch.equal(block_ids, direct):
+        raise AssertionError("timed select block ids differ from qsa_k1_block_ids")
+    expanded = expand_qsa_block_indices_cuda(
+        direct,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        idx.token_budget,
+    )
+    if indices.shape != expanded.shape or not torch.equal(indices, expanded):
+        raise AssertionError("timed select did not expand with the vendored kernel")
+
+
+def _flydsl_k1_select(
+    q,
+    k_cache,
+    page_table,
+    token_to_req,
+    query_positions,
+    sequence_lengths,
+    token_topk,
+    compress_ratio,
+    heads,
+):
+    """Block ids plus the vendored Triton expand live AMD select includes.
+
+    The vLLM and #4882 columns time ``qsa_select_paged_tokens``, which
+    expands inside the call. This is that same span for FlyDSL. Set
+    equality uses the block ids.
+    """
+    block_ids = qsa_k1_block_ids(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        heads=heads,
+    )
+    indices = expand_qsa_block_indices_cuda(
+        block_ids,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+    )
+    return indices, block_ids
+
+
 @benchmark()
 def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
@@ -1098,9 +1189,12 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
     and streaming radix at or above that width. Single-request prefill scores
-    16 query rows per workgroup. Expand is not fused. Same ``rotate`` on every
-    select column. Family A GQA is group 12 / D=256, so #4882 Gluon does not
-    dispatch and is not a column here.
+    16 query rows per workgroup. The FlyDSL column times block ids and then
+    the vendored Triton expand, the same expand live AMD select includes.
+    The #4882 column times its own select, which also expands. Set equality
+    stays on block ids. Same ``rotate`` on every select column. Family A GQA
+    is group 12 / D=256, so #4882 Gluon does not dispatch and is not a column
+    here. The layer bench is a separate matched chain and is not changed here.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -1131,14 +1225,16 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
-    block_ids, k1_us = _time(
-        qsa_k1_block_ids,
+    (_indices, block_ids), k1_us = _time(
+        _flydsl_k1_select,
         q_indexer,
         index_cache,
         index_table,
         token_to_req,
         qpos,
         slen,
+        idx.token_budget,
+        idx.compress_ratio,
         rotate=rotate,
         heads=(4,),
     )
@@ -2504,6 +2600,7 @@ def _run_unit_cases():
     test_k1_prefill_padded_page_table()
     test_k1_decode_rejects_invalid_page_ids()
     test_k1_gfx942_h8_skips_prefill_tile()
+    test_family_a_k1_bench_times_expand()
     test_qsa_arch_allowlist()
     test_k1_page_past_4gib()
     test_k1_family_b_set_equality_short_decode()
