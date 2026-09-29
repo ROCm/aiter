@@ -23,10 +23,22 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import BFloat16, Float32, Int32, gpu, range_constexpr
+from flydsl.expr import (
+    BFloat16,
+    Float32,
+    Int32,
+    Int64,
+    const_expr,
+    gpu,
+    range_constexpr,
+)
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_atom
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    buf_base_i64,
+    buf_copy_atom,
+)
 from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.topk_select import topk_select
 
@@ -134,6 +146,7 @@ def build_qsa_k1_scores_module(
     use_k32: bool,
     block_n: int,
     n_heads: int = _H,
+    wide_cache: bool = False,
 ):
     """Build a long-context paged MFMA scorer."""
     if page_size < 1:
@@ -171,6 +184,7 @@ def build_qsa_k1_scores_module(
             d=_D,
             blk=block_threads,
             qkk=qk_k,
+            wide=int(wide_cache),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -201,7 +215,41 @@ def build_qsa_k1_scores_module(
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
         q_buf = fx.rocdl.make_buffer_tensor(q)
-        k_buf = fx.rocdl.make_buffer_tensor(k_cache)
+        # A V# voffset is 32 bits. A cache that fits in 4 GiB keeps one
+        # uniform descriptor. A larger cache is a separate compile: each
+        # gathered row rebases its page in 64-bit, then a descriptor covers
+        # only that row. The two bodies are not both traced.
+        if const_expr(wide_cache):
+            k_base = buf_base_i64(k_cache)
+            row_ptr_ty = fx.PointerType.get(
+                BFloat16.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=16,
+            )
+            page_elems64 = Int64(page_size * _KV_HEADS * _D)
+            token_elems64 = Int64(_KV_HEADS * _D)
+            head_elems64 = Int64(_D)
+            row_bytes = _D * 2
+
+            def k_page_row(phys, page_off):
+                addr = k_base + (
+                    Int64(phys) * page_elems64
+                    + Int64(page_off) * token_elems64
+                    + Int64(zero) * head_elems64
+                ) * Int64(2)
+                view = fx.make_view(
+                    fx.inttoptr(row_ptr_ty, addr),
+                    fx.make_layout((_D,), (1,)),
+                )
+                return fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(
+                        view, max_size=False, num_records_bytes=row_bytes
+                    ),
+                    vec_layout,
+                )
+
+        else:
+            k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         q_lds = storage.q.view(fx.make_layout((head_pad, _D), (_D, 1)))
@@ -265,9 +313,12 @@ def build_qsa_k1_scores_module(
         phys_live = (phys >= zero) & (phys < n_cache_blocks)
         safe_phys = phys_live.select(phys, zero)
         col_live = col_live & phys_live
-        k_row = fx.logical_divide(
-            fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
-        )
+        if const_expr(wide_cache):
+            k_row = k_page_row(safe_phys, off)
+        else:
+            k_row = fx.logical_divide(
+                fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
+            )
         for part in range_constexpr(chunks_per_thread):
             d_chunk = chunk + Int32(part * (block_threads // block_n))
             k_src = fx.slice(k_row, (None, d_chunk))
@@ -360,6 +411,7 @@ def build_qsa_k1_prefill_scores_module(
     page_size: int,
     use_k32: bool,
     n_heads: int = _H,
+    wide_cache: bool = False,
 ):
     """Build the single-request, 16-row by 32-column MFMA scorer."""
     if page_size < 1:
@@ -401,6 +453,7 @@ def build_qsa_k1_prefill_scores_module(
             d=_D,
             blk=block_threads,
             qkk=qk_k,
+            wide=int(wide_cache),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -431,7 +484,39 @@ def build_qsa_k1_prefill_scores_module(
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
         q_buf = fx.rocdl.make_buffer_tensor(q)
-        k_buf = fx.rocdl.make_buffer_tensor(k_cache)
+        # Same 4 GiB split as the one-row scorer: one whole-cache descriptor,
+        # or a separate compile that rebases each gathered row.
+        if const_expr(wide_cache):
+            k_base = buf_base_i64(k_cache)
+            row_ptr_ty = fx.PointerType.get(
+                BFloat16.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=16,
+            )
+            page_elems64 = Int64(page_size * _KV_HEADS * _D)
+            token_elems64 = Int64(_KV_HEADS * _D)
+            head_elems64 = Int64(_D)
+            row_bytes = _D * 2
+
+            def k_page_row(phys, page_off):
+                addr = k_base + (
+                    Int64(phys) * page_elems64
+                    + Int64(page_off) * token_elems64
+                    + Int64(zero) * head_elems64
+                ) * Int64(2)
+                view = fx.make_view(
+                    fx.inttoptr(row_ptr_ty, addr),
+                    fx.make_layout((_D,), (1,)),
+                )
+                return fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(
+                        view, max_size=False, num_records_bytes=row_bytes
+                    ),
+                    vec_layout,
+                )
+
+        else:
+            k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         q_lds = storage.q.view(
@@ -515,9 +600,12 @@ def build_qsa_k1_prefill_scores_module(
             phys_live = (phys >= zero) & (phys < n_cache_blocks)
             safe_phys = phys_live.select(phys, zero)
             col_live = col_live & phys_live
-            k_row = fx.logical_divide(
-                fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
-            )
+            if const_expr(wide_cache):
+                k_row = k_page_row(safe_phys, off)
+            else:
+                k_row = fx.logical_divide(
+                    fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
+                )
             k_src = fx.slice(k_row, (None, d_chunk))
             k_frag = fx.make_fragment_like(k_src)
             fx.copy(g_copy, k_src, k_frag)
@@ -614,13 +702,24 @@ def _emit_plan(page_size: int):
 
 
 @lru_cache(maxsize=16)
-def _scores_plan(page_size: int, use_k32: bool, block_n: int, n_heads: int = _H):
-    return build_qsa_k1_scores_module(page_size, use_k32, block_n, n_heads)
+def _scores_plan(
+    page_size: int,
+    use_k32: bool,
+    block_n: int,
+    n_heads: int = _H,
+    wide_cache: bool = False,
+):
+    return build_qsa_k1_scores_module(page_size, use_k32, block_n, n_heads, wide_cache)
 
 
 @lru_cache(maxsize=8)
-def _prefill_scores_plan(page_size: int, use_k32: bool, n_heads: int = _H):
-    return build_qsa_k1_prefill_scores_module(page_size, use_k32, n_heads)
+def _prefill_scores_plan(
+    page_size: int,
+    use_k32: bool,
+    n_heads: int = _H,
+    wide_cache: bool = False,
+):
+    return build_qsa_k1_prefill_scores_module(page_size, use_k32, n_heads, wide_cache)
 
 
 def qsa_k1_score_and_select(
@@ -654,9 +753,10 @@ def qsa_k1_score_and_select(
         "gfx950"
     )
     score_tiles = (n_columns + score_block_n - 1) // score_block_n
+    wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
     if context_lens.shape[0] == 1 and m >= 16:
         _run_compiled(
-            _prefill_scores_plan(page_size, use_k32, n_heads),
+            _prefill_scores_plan(page_size, use_k32, n_heads, wide_cache),
             q,
             k_cache,
             page_table,
@@ -675,7 +775,7 @@ def qsa_k1_score_and_select(
         )
     else:
         _run_compiled(
-            _scores_plan(page_size, use_k32, score_block_n, n_heads),
+            _scores_plan(page_size, use_k32, score_block_n, n_heads, wide_cache),
             q,
             k_cache,
             page_table,

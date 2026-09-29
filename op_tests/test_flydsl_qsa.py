@@ -708,6 +708,66 @@ def test_k1_decode_rejects_invalid_page_ids():
         raise AssertionError("K1 decode kept a block whose page id is -1")
 
 
+def test_k1_page_past_4gib():
+    """A physical indexer page at byte offset 2^32 must not alias page 0.
+
+    A page is 4096 bytes (page 16, one KV head, D=128, bf16), so physical
+    page 1048576 starts at 4 GiB. The table is 33 pages wide so the
+    scorers run, not emit. Logical page 32 is that far page and holds
+    ones; every other logical page is physical page 0 and holds zeros.
+    Q is ones, so only blocks 512..527 score above zero. M=4 uses the
+    one-row scorer and M=32 the prefill scorer.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    page_bytes = page_size * 1 * idx.head_dim * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32:
+        raise AssertionError(f"page of {page_bytes} bytes does not divide 4 GiB")
+    n_pages = alias + 1
+    n_logical = 33
+    far_logical = n_logical - 1
+    n_columns = n_logical * page_size
+    need = n_pages * page_bytes
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip K1 4GiB page test: need %s bytes, %s free", need, free
+        )
+        return
+    k_cache = torch.empty(
+        n_pages, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_cache[0].zero_()
+    k_cache[alias].fill_(1)
+    table = torch.zeros(1, n_logical, dtype=dtypes.i32, device=device)
+    table[0, far_logical] = alias
+    context = n_columns * idx.compress_ratio
+    k_bar = torch.zeros(n_columns, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar[far_logical * page_size : n_columns] = 1
+    for m in (4, 32):
+        q = torch.ones(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = torch.full((m,), context - 1, dtype=dtypes.i32, device=device)
+        slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        ref_scores = qsa_indexer_scores(
+            q,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FAMILY_A_SCORE_SCALE,
+        )
+        ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+        got = qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
+        if _set_mismatch_ratio(ref_ids, got) != 0.0:
+            raise AssertionError(f"K1 page past 4 GiB aliased page 0 at M={m}")
+
+
 def test_k2_family_a_decode_matches_oracle():
     """Family A FlyDSL K2 decode matches qsa_sparse_gqa on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -2388,6 +2448,7 @@ def _run_unit_cases():
     test_k1_family_a_set_equality_prefill()
     test_k1_prefill_padded_page_table()
     test_k1_decode_rejects_invalid_page_ids()
+    test_k1_page_past_4gib()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
     test_k1_family_b_set_equality_two_tiles()
