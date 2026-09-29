@@ -6,7 +6,6 @@
 Run this file with --help for the shape sweep options. --help and --dry-run
 need only Python. GPU runs search on a cache miss; FLYDSL_AUTOTUNE=1 forces
 a fresh search. FLYDSL_AUTOTUNE_CACHE_DIR controls FlyDSL's cache directory.
-An optional CSV is a measurement report, not a runtime configuration file.
 
 Each candidate uses a fixed plan and a graph containing decode plus reduction.
 FlyDSL validates candidates, measures them, and caches the smallest budget
@@ -16,7 +15,6 @@ within 97% of the fastest measured performance. Runtime lookup never benchmarks.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import importlib
 import itertools
@@ -51,16 +49,6 @@ BENCHMARK_FIELDS = (
     "length_mode",
     "seed",
     "lengths",
-)
-CSV_FIELDS = (
-    "architecture",
-    "num_cu",
-    *STATIC_SHAPE_FIELDS,
-    "workgroup_budget",
-    "median_us",
-    "min_us",
-    "max_us",
-    "unique_kv_tb_s",
 )
 
 
@@ -901,19 +889,6 @@ def tune_shape(
     return record
 
 
-def _csv_row(key, candidate):
-    return {
-        "architecture": key["architecture"],
-        "num_cu": key["num_cu"],
-        **key["shape"],
-        "workgroup_budget": candidate["workgroup_budget"],
-        "median_us": candidate.get("median_us", ""),
-        "min_us": candidate.get("min_us", ""),
-        "max_us": candidate.get("max_us", ""),
-        "unique_kv_tb_s": candidate.get("unique_kv_tb_s", ""),
-    }
-
-
 def _list_arg(text, converter=int, *, unique=True):
     try:
         result = [converter(item.strip()) for item in text.split(",")]
@@ -997,17 +972,8 @@ def main(argv=None):
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--architecture", choices=("gfx942", "gfx950"))
     parser.add_argument("--num-cu", type=int)
-    result_output = parser.add_mutually_exclusive_group()
-    result_output.add_argument(
-        "--output",
-        type=Path,
-        help="Optional measurement report; runtime configurations use FlyDSL cache",
-    )
-    result_output.add_argument(
-        "--csv", dest="output", type=Path, help="Alias for --output"
-    )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Print a CSV preview with blank timings"
+        "--dry-run", action="store_true", help="Preview shapes and candidate budgets"
     )
     args = parser.parse_args(argv)
     try:
@@ -1062,15 +1028,6 @@ def main(argv=None):
                 )
             info = {"architecture": args.architecture, "num_cu": args.num_cu}
         else:
-            if args.output is not None:
-                if args.output.suffix.lower() != ".csv":
-                    raise ValueError("Measurement reports require a .csv output path")
-                if args.output.exists() or args.output.is_symlink():
-                    raise FileExistsError("Output CSV must be a new path")
-                if not args.output.parent.is_dir():
-                    raise FileNotFoundError(
-                        "Output CSV parent directory must already exist"
-                    )
             torch, pa, info = _load_gpu(args)
         candidates = args.budgets or list(DEFAULT_BUDGETS)
         if args.budget_cu is not None:
@@ -1083,74 +1040,62 @@ def main(argv=None):
         preview = []
         for shape in shapes:
             key = make_key(shape, info["architecture"], info["num_cu"])
-            preview.extend(
-                _csv_row(key, candidate)
-                for candidate in candidate_groups(
-                    candidates,
-                    shape["batch_size"],
-                    shape["num_kv_heads"],
-                    info["num_cu"],
+            preview.append(
+                (
+                    key,
+                    candidate_groups(
+                        candidates,
+                        shape["batch_size"],
+                        shape["num_kv_heads"],
+                        info["num_cu"],
+                    ),
                 )
             )
     except (OSError, ValueError, TypeError, RuntimeError, ImportError) as exc:
         parser.error(str(exc))
     if args.dry_run:
-        writer = csv.DictWriter(sys.stdout, fieldnames=CSV_FIELDS, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(preview)
+        for index, (key, groups) in enumerate(preview, 1):
+            print(
+                f"SHAPE {index}/{len(preview)} architecture={key['architecture']} num_cu={key['num_cu']}"
+            )
+            print("  " + " ".join(f"{k}={v}" for k, v in key["shape"].items()))
+            for candidate in groups:
+                print(
+                    f"  budget={candidate['workgroup_budget']} capacity={candidate['capacity']} "
+                    f"aliases={candidate['budget_aliases']} baseline={candidate['is_baseline']}"
+                )
         return 0
 
-    report = (
-        args.output.open("x", newline="", encoding="utf-8") if args.output else None
-    )
-    writer = (
-        csv.DictWriter(report, fieldnames=CSV_FIELDS, lineterminator="\n")
-        if report
-        else None
-    )
-    if writer:
-        writer.writeheader()
     all_passed = True
-    try:
-        for index, shape in enumerate(shapes, 1):
-            print(
-                f"TUNE {index}/{len(shapes)} B={shape['batch_size']} L={shape['context_length']} QL={shape['query_length']}",
-                flush=True,
-            )
-            result = tune_shape(
-                torch,
-                pa,
-                shape,
-                info,
-                candidates,
-                rounds=args.rounds,
-                iterations=args.iterations,
-                warmup=args.warmup,
-            )
-            all_passed &= result["status"] == "PASS"
-            if writer and result["status"] == "PASS":
-                writer.writerows(
-                    _csv_row(result["key"], candidate)
-                    for candidate in result["candidates"]
-                    if candidate["status"] == "PASS"
+    for index, shape in enumerate(shapes, 1):
+        print(
+            f"TUNE {index}/{len(shapes)} B={shape['batch_size']} L={shape['context_length']} QL={shape['query_length']}",
+            flush=True,
+        )
+        result = tune_shape(
+            torch,
+            pa,
+            shape,
+            info,
+            candidates,
+            rounds=args.rounds,
+            iterations=args.iterations,
+            warmup=args.warmup,
+        )
+        all_passed &= result["status"] == "PASS"
+        print(
+            f"RESULT {result['status']} cache_hit={result.get('cache_hit', False)} {result['selection']}",
+            flush=True,
+        )
+        for candidate in result["candidates"]:
+            for error in candidate["errors"]:
+                print(
+                    f"ERROR budget={candidate['workgroup_budget']}: {error}",
+                    file=sys.stderr,
                 )
-                report.flush()
-            print(
-                f"RESULT {result['status']} cache_hit={result.get('cache_hit', False)} {result['selection']}",
-                flush=True,
-            )
-            for candidate in result["candidates"]:
-                for error in candidate["errors"]:
-                    print(
-                        f"ERROR budget={candidate['workgroup_budget']}: {error}",
-                        file=sys.stderr,
-                    )
-            for error in result["errors"]:
-                print(f"ERROR {error}", file=sys.stderr)
-            torch.cuda.empty_cache()
-    finally:
-        if report:
-            report.close()
+        for error in result["errors"]:
+            print(f"ERROR {error}", file=sys.stderr)
+        torch.cuda.empty_cache()
     return 0 if all_passed else 1
 
 
