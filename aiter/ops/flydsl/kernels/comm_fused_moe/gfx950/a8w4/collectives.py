@@ -480,6 +480,8 @@ def emit_tp_reduce_scatter(
     payload,
     scales,
     rank,
+    local_rows,
+    rank_offset,
     worker,
     *,
     tokens,
@@ -506,13 +508,13 @@ def emit_tp_reduce_scatter(
     start = worker * fx.Int32(block) + fx.Int32(gpu.thread_id("x"))
     for pack in range(
         start,
-        fx.Int32(shard_rows * groups_per_row),
+        local_rows * fx.Int32(groups_per_row),
         fx.Int32(reduce_scatter_grid * block),
     ):
         local_token = pack // fx.Int32(groups_per_row)
         group = pack - local_token * fx.Int32(groups_per_row)
         column = group * fx.Int32(32)
-        global_token = rank * fx.Int32(shard_rows) + local_token
+        global_token = rank_offset + local_token
         acc = _reduce_tp_partial_group(
             flat_base,
             rank,

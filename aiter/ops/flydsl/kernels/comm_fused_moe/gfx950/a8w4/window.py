@@ -402,6 +402,8 @@ def _compose_cycle(
             gather_scale_base: fx.Int64,
             gathered_output: fx.Pointer,
             rank: fx.Int32,
+            local_rows: fx.Int32,
+            rank_offset: fx.Int32,
         ):
             linear = fx.Int32(gpu.block_id("x"))
             tid = fx.Int32(gpu.thread_id("x"))
@@ -450,6 +452,8 @@ def _compose_cycle(
                         reduced_payload,
                         reduced_scale,
                         rank,
+                        local_rows,
+                        rank_offset,
                         worker,
                         tokens=m,
                         output_width=shape.model_dim,
@@ -571,6 +575,8 @@ def _compose_cycle(
             gather_scale_base,
             gathered_output,
             rank,
+            local_rows,
+            rank_offset,
             stream,
         ):
             compute_workers = fx.Int32(size_expert_ids) * fx.Int32(tiles_per_window)
@@ -601,6 +607,8 @@ def _compose_cycle(
                 gather_scale_base,
                 gathered_output,
                 rank,
+                local_rows,
+                rank_offset,
             ).launch(grid=(grid, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
         launch.__name__ = f"launch_{kernel_name}"
@@ -677,6 +685,8 @@ def compile_drain(
         gather_scale_base: fx.Int64,
         gathered_output: fx.Pointer,
         rank: fx.Int32,
+        local_rows: fx.Int32,
+        rank_offset: fx.Int32,
     ):
         worker = fx.Int32(gpu.block_id("x"))
 
@@ -689,6 +699,8 @@ def compile_drain(
                     reduced_payload,
                     reduced_scale,
                     rank,
+                    local_rows,
+                    rank_offset,
                     worker,
                     tokens=m,
                     output_width=shape.model_dim,
@@ -774,6 +786,8 @@ def compile_drain(
         gather_scale_base,
         gathered_output,
         rank,
+        local_rows,
+        rank_offset,
         stream,
     ):
         kernel(
@@ -788,6 +802,8 @@ def compile_drain(
             gather_scale_base,
             gathered_output,
             rank,
+            local_rows,
+            rank_offset,
         ).launch(
             grid=(service_grid + (local_workers if has_local else 0), 1, 1),
             block=(BLOCK, 1, 1),
