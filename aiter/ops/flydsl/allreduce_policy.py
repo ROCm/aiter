@@ -73,6 +73,8 @@ class FamilyPolicy:
                 f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
                 f"({self.oneshot_max}); the families partition by size"
             )
+        if self.min_bytes < 0:
+            raise ValueError(f"min_bytes ({self.min_bytes}) must be non-negative")
 
 
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
@@ -89,18 +91,21 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- xGMI: Policy from measurements (on gfx942) --------------------
     ("xgmi", 2): FamilyPolicy(
         oneshot_max=384 << 10,
-        oneshot_max_exact=24 << 20,
+        oneshot_max_exact=1536 << 10,
         mesh_max=128 << 20,
+        min_bytes=56 << 10,
     ),
     ("xgmi", 4): FamilyPolicy(
-        oneshot_max=256 << 10,
-        oneshot_max_exact=256 << 10,
+        oneshot_max=384 << 10,
+        oneshot_max_exact=384 << 10,
         mesh_max=128 << 20,
+        min_bytes=48 << 10,
     ),
     ("xgmi", 8): FamilyPolicy(
-        oneshot_max=192 << 10,
-        oneshot_max_exact=512 << 10,
+        oneshot_max=256 << 10,
+        oneshot_max_exact=168 << 10,
         mesh_max=128 << 20,
+        min_bytes=112 << 10,
     ),
 }
 
@@ -108,6 +113,7 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
 
 ENABLE_VAR = "AITER_FLY_AR"
 ONESHOT_MAX_VAR = "AITER_FLY_AR_ONESHOT_MAX_BYTES"
+ONESHOT_MIN_VAR = "AITER_FLY_AR_ONESHOT_MIN_BYTES"
 MESH_MAX_VAR = "AITER_FLY_AR_MESH_MAX_BYTES"
 
 
@@ -186,13 +192,20 @@ class QuantPolicy:
 
 
 def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
-    """The one-shot's window for a rank, environment overrides applied."""
+    """The one-shot's window for a rank, environment overrides applied.
+
+    ``ONESHOT_MIN_VAR`` overrides the small-payload floor below which the
+    one-shot declines (the custom-AR slot then falls through to ``cdr``);
+    ``ONESHOT_MAX_VAR`` overrides the ceiling. ``-1`` on either means "use the
+    table".
+    """
 
     base = _base(link, world_size)
-    override = _env_int(ONESHOT_MAX_VAR)
+    max_override = _env_int(ONESHOT_MAX_VAR)
+    min_override = _env_int(ONESHOT_MIN_VAR)
     return OneShotPolicy(
-        max_bytes=base.oneshot_max_exact if override is None else override,
-        min_bytes=base.min_bytes,
+        max_bytes=base.oneshot_max_exact if max_override is None else max_override,
+        min_bytes=base.min_bytes if min_override is None else min_override,
     )
 
 

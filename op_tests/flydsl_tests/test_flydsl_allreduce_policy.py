@@ -216,6 +216,29 @@ def test_byte_overrides():
         assert P.resolve_quant("pcie", 8).floor == table_floor
 
 
+def test_oneshot_min_override():
+    """``AITER_FLY_AR_ONESHOT_MIN_BYTES`` moves only the one-shot's small-payload
+    floor; the ceiling and the quant floor are untouched."""
+    table_min = P.FAMILY_POLICY[("xgmi", 8)].min_bytes
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="65536"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == 65536
+        # ceiling and quant slot are independent of the min override
+        assert (
+            P.resolve_oneshot("xgmi", 8).max_bytes
+            == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max_exact
+        )
+        assert P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+    # 0 is a valid override: accept every size down to the custom-AR floor.
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == 0
+    # -1 is the house sentinel for "unset, use the table".
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="-1"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
+    # Garbage warns and is ignored.
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="lots"):
+        assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
+
+
 def test_override_cannot_invert_the_partition():
     """Pushing the one-shot ceiling past the mesh window means "give me the
     one-shot up to here", not "crash" -- the mesh window closes instead.
