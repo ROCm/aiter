@@ -6618,27 +6618,6 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                         in, len, k, out, out_idx, select_min);
                 return;
             }
-            // Keep exact row extents only for the two M=2048 short-tail
-            // shapes where the runtime extent has a material measured cost.
-            // M=1024 and M=2048/N=4096 take the feature-bearing ballot paths
-            // above; all other rows use the general runtime-extent launch.
-            if(batch_size == 2048)
-            {
-#define AITER_OB_REG512_4K_STATIC_LAUNCH(ROW_LEN)                                      \
-    case ROW_LEN:                                                                       \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, 9,    \
-                                         11, 10, ROW_LEN>                                \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx,         \
-                                                        select_min);                     \
-        return;
-                switch(static_cast<int>(len))
-                {
-                    AITER_OB_REG512_4K_STATIC_LAUNCH(4097)
-                    AITER_OB_REG512_4K_STATIC_LAUNCH(4098)
-                default: break;
-                }
-#undef AITER_OB_REG512_4K_STATIC_LAUNCH
-            }
             int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
 #define AITER_OB_REG512_LAUNCH(EPT)                                                       \
     case EPT:                                                                            \
