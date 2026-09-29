@@ -1357,6 +1357,65 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         )
 
 
+class TestNinjaBuildLogging(unittest.TestCase):
+    def setUp(self):
+        self.process = types.SimpleNamespace(
+            run=mock.Mock(),
+            PIPE=subprocess.PIPE,
+            STDOUT=subprocess.STDOUT,
+            CalledProcessError=subprocess.CalledProcessError,
+        )
+        self.build = _load_functions(
+            JIT_CACHE_PATH.with_name("cpp_extension.py"),
+            ["_run_ninja_build"],
+            {
+                "os": os,
+                "sys": sys,
+                "subprocess": self.process,
+                "_get_num_workers": lambda verbose: 2,
+                "SUBPROCESS_DECODE_ARGS": (),
+            },
+        )["_run_ninja_build"]
+
+    def test_streaming_is_opt_in_and_preserves_explicit_verbose(self):
+        for setting, verbose, stdout in (
+            (None, False, subprocess.PIPE),
+            ("0", False, subprocess.PIPE),
+            ("1", False, 1),
+            (None, True, 1),
+            ("0", True, 1),
+        ):
+            with self.subTest(setting=setting, verbose=verbose), mock.patch.dict(
+                os.environ, {"AITER_LOG_MORE": "0"}
+            ):
+                os.environ.pop("AITER_JIT_VERBOSE", None)
+                if setting is not None:
+                    os.environ["AITER_JIT_VERBOSE"] = setting
+                self.build("/build", verbose, "build failed")
+                self.process.run.assert_called_with(
+                    ["ninja", "-v", "-j", "2"],
+                    stdout=stdout,
+                    stderr=subprocess.STDOUT,
+                    cwd="/build",
+                    check=True,
+                    env=os.environ.copy(),
+                )
+                self.assertEqual(os.environ["AITER_LOG_MORE"], "0")
+
+    def test_build_errors_propagate_in_both_modes(self):
+        for setting, output in (("0", b"compiler error"), ("1", None)):
+            with self.subTest(setting=setting):
+                error = subprocess.CalledProcessError(1, ["ninja"], output=output)
+                self.process.run.side_effect = error
+                with mock.patch.dict(
+                    os.environ, {"AITER_JIT_VERBOSE": setting}
+                ), self.assertRaisesRegex(RuntimeError, "build failed") as raised:
+                    self.build("/build", False, "build failed")
+                self.assertIs(raised.exception.__cause__, error)
+                if output:
+                    self.assertIn(output.decode(), str(raised.exception))
+
+
 class TestCppExtensionControl(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
