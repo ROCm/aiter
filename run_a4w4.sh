@@ -19,7 +19,7 @@
     --scenario kernel \
     --data-format a4w4 \
     --experts 64 \
-    --tokens 6144 \
+    --tokens 1536 \
     --topk 8 \
     --model-dim 7168 \
     --inter-dim 2048 \

@@ -57,6 +57,10 @@ PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
 INTERLEAVED_LDS_LOAD = int(
     os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0")
 )
+FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
+DISABLE_CLUSTER_SYNC = int(
+    os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0")
+)
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
@@ -67,6 +71,10 @@ if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
 if INTERLEAVED_LDS_LOAD not in (0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
+if FORCE_1X4_CLUSTER not in (0, 1):
+    raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
+if DISABLE_CLUSTER_SYNC not in (0, 1):
+    raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
 # payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
@@ -130,6 +138,7 @@ def launch_gemm_a8w4_tdm(
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
     cluster_n: Constexpr[int] = 1,
+    cluster_m: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
     num_waves_per_tensor_tdm: Constexpr[int] = 2,
     tdm_as_in_prologue: Constexpr[int] = 0,
@@ -150,18 +159,16 @@ def launch_gemm_a8w4_tdm(
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
-    ``cluster_n`` > 1 launches (cluster_n, 1, 1) workgroup clusters whose peers
-    all share one m_tile (and therefore one expert) and differ only in n_tile, so
-    one A / A-scale load can serve the whole cluster.
+    ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
+    cluster. Peers along N share A, while expert-compatible peers along M can
+    share B. A 1xN cluster needs no software cluster barrier; an MxN cluster
+    uses ``cluster_sync`` to protect its cross-M multicast and LDS reuse.
 
-    No cluster barrier is emitted, and none is needed: a non-zero workgroup_mask
-    turns the load into CLUSTER_LOAD_ASYNC, which rendezvouses with the peers the
-    mask names, and each workgroup's own s_wait_tensorcnt still covers its own
-    LDS. That is the same protocol as opus (see csrc/opus_gemm/include/gfx1250/
-    opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_ws_gfx1250.cuh), which
-    emits s_barrier -3 only for a 2D cluster whose mask is a strided group; for a
-    1-D cluster like this one the mask is contiguous, the barrier is unnecessary,
-    and on a thin 1-D cluster it can hang on co-residency.
+    For a 1xN cluster, a non-zero workgroup mask turns the load into
+    CLUSTER_LOAD_ASYNC, which rendezvouses with the named peers, and each
+    workgroup's own s_wait_tensorcnt covers its LDS. For an MxN cluster, the
+    strided cross-M multicast additionally needs cluster_sync to keep producer
+    and consumer workgroups from reusing an LDS stage at different times.
 
     The rendezvous replaces drift bounding with two hard preconditions, and
     breaking either hangs rather than corrupts:
@@ -185,10 +192,9 @@ def launch_gemm_a8w4_tdm(
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
-    # GEMM1 always uses a physical 4x4 cluster when the existing N multicast
-    # path selects four columns.  The four M rows are partitioned into
-    # expert-homogeneous multicast subgroups below.
-    cluster_m = 4 if (stage1_act and cluster_n == 4) else 1
+    # Keep the experiment switch as an override while normal dispatch obtains
+    # both cluster dimensions from the tuned configuration.
+    cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
     cache_tag = (
         K,
         tile_m,
@@ -207,6 +213,7 @@ def launch_gemm_a8w4_tdm(
         quant_wmma_rep,
         cluster_n,
         cluster_m,
+        DISABLE_CLUSTER_SYNC,
         next_stage_on,
         num_waves_per_tensor_tdm,
         tdm_as_in_prologue,
@@ -378,7 +385,12 @@ def launch_gemm_a8w4_tdm(
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
-    _cl = f"_cm{cluster_m}_cn{cluster_n}" if cluster_n > 1 else ""
+    _cl = (
+        f"_cluster{cluster_m}x{cluster_n}"
+        if cluster_m > 1 or cluster_n > 1
+        else ""
+    )
+    _cluster_sync = "_nosync" if (cluster_m > 1 and DISABLE_CLUSTER_SYNC) else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
     _as_prologue = "_asprol" if tdm_as_in_prologue else ""
@@ -401,7 +413,8 @@ def launch_gemm_a8w4_tdm(
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_as_prologue}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
+        f"{_next_stage}{_as_prologue}"
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
@@ -445,7 +458,7 @@ def launch_gemm_a8w4_tdm(
         total_n_tiles = ceildiv(i32_n, tile_n)
         total_m_tiles = ceildiv(i32_m, tile_m)
         swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
-        local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
+        local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else 0
         n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
         local_m = fx.block_idx.y if cluster_m > 1 else 0
         m_units = (total_m_tiles + cluster_m - 1) // cluster_m
@@ -523,9 +536,9 @@ def launch_gemm_a8w4_tdm(
         b_mcast_mask = None
         full_cluster = None
         if const_expr(cluster_m > 1):
-            # Intersect this expert's contiguous M-tile interval with the four
-            # physical M rows.  This produces Hx4 logical subclusters: A still
-            # multicasts across each row, while B multicasts down each column.
+            # Intersect this expert's contiguous M-tile interval with the
+            # physical M rows. This produces H x cluster_n logical subclusters:
+            # A multicasts across each row, while B multicasts down each column.
             cluster_first_m = m_unit * cluster_m
             valid_m_tiles = (tile_map[n_experts - 1] + tile_m - 1) // tile_m
             full_cluster = cluster_first_m + cluster_m <= valid_m_tiles
@@ -556,7 +569,9 @@ def launch_gemm_a8w4_tdm(
             b_mcast_mask = use_b_mcast.select(column_mask << local_n, 0)
 
         def cluster_sync():
-            if const_expr(cluster_m > 1):  # noqa: SIM102 - preserve DSL staging
+            if const_expr(
+                cluster_m > 1 and not DISABLE_CLUSTER_SYNC
+            ):  # noqa: SIM102 - preserve DSL staging
                 if full_cluster:
                     workgroup_barrier()
                     if wave == 0:
@@ -2204,7 +2219,7 @@ def launch_gemm_a8w4_tdm(
         f32_situ_linear_beta,
     )
     grid = (((m_tiles + cluster_m - 1) // cluster_m) * n_tiles, cluster_m, 1)
-    if cluster_n > 1:
+    if cluster_m > 1 or cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.
         kernel(
