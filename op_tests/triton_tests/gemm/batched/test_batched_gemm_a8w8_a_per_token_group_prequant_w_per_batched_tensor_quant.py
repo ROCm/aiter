@@ -240,7 +240,7 @@ def test_native_value_config_bucket(m, gfx950_value_lookup):
         config["num_warps"],
         config["num_stages"],
         config["waves_per_eu"],
-    ) == (16, 32, 4, 2, 1)
+    ) == (16, 64, 4, 2, 2)
 
 
 @pytest.mark.parametrize(
