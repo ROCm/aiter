@@ -821,7 +821,8 @@ def _build_up_gate_mix_gemv(
     w_len: int,
     m_rows: int,
     waves_per_block: int,
-):
+    lora_stride: int = 0,  # lora row stride; 0 -> lowrank (contiguous). Pass n_pad
+):  # to read lora straight from the wider `packed` buffer.
     """MMA-free skinny (GEMV) K2 (up-GEMM + gated mean) for the decode regime.
 
     One wave owns one output channel ``c in [0, stream_dim)``. For each of the
@@ -834,6 +835,7 @@ def _build_up_gate_mix_gemv(
     """
     assert stream_dim % waves_per_block == 0
     assert lowrank % WAVE == 0, f"lowrank={lowrank} must be a multiple of WAVE={WAVE}"
+    lstride = lora_stride or lowrank
     k_iters = lowrank // WAVE
     inv_hc = 1.0 / hc_count
     block_threads = waves_per_block * WAVE
@@ -842,11 +844,11 @@ def _build_up_gate_mix_gemv(
 
     @flyc.kernel(
         name=f"gr_up_gemv_hc{hc_count}_hs{stream_dim}_r{lowrank}_m{m_rows}"
-        f"_w{waves_per_block}",
+        f"_w{waves_per_block}_ls{lstride}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
-        lora: fx.Tensor,  # [m_rows, lowrank] bf16
+        lora: fx.Tensor,  # [m_rows, lstride] bf16 (lora is cols [0, lowrank))
         r2: fx.Tensor,  # [m_rows, hidden] bf16
         rrms: fx.Tensor,  # [m_rows, hc] f32
         w: fx.Tensor,  # [w_len] f32
@@ -858,7 +860,7 @@ def _build_up_gate_mix_gemv(
         lane = tid % WAVE
         c = fx.block_idx.x * waves_per_block + wid
 
-        lora_g = GTensor(lora, T.bf16, (1, m_rows * lowrank))
+        lora_g = GTensor(lora, T.bf16, (1, m_rows * lstride))
         r2_g = GTensor(r2, T.bf16, (1, m_rows * hidden))
         rrms_g = GTensor(rrms, T.f32, (1, m_rows * hc_count))
         w_g = GTensor(w, T.f32, (1, w_len))
@@ -877,7 +879,7 @@ def _build_up_gate_mix_gemv(
                 r = lane + i * WAVE
                 wu = fx.BFloat16(wup_g.load(n * lowrank + r, vec_size=1)).to(fx.Float32)
                 for m in range_constexpr(m_rows):
-                    lo = fx.BFloat16(lora_g.load(m * lowrank + r, vec_size=1)).to(
+                    lo = fx.BFloat16(lora_g.load(m * lstride + r, vec_size=1)).to(
                         fx.Float32
                     )
                     g[m] = g[m] + lo * wu
@@ -956,13 +958,15 @@ def flydsl_k1k2_skinny_decode(
     hc_count: int,
     eps: float,
     need_inj: bool,
-    split_k_per_stream: int = 1,
+    # split each stream's down-GEMV K-slice across this many waves; 2 adds a little
+    # decode occupancy over 1.
+    split_k_per_stream: int = 2,
     waves_per_block: int = 4,
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """MMA-free skinny GEMV two-stage for decode M (combine+RMS -> down GEMV ->
-    reduce/silu -> up GEMV + gated mean). No 64-row tile padding; ``xn`` never
-    materialized. Returns the op contract ``(r2, block_input, inj_next)``.
+    reduce/SiLU -> up GEMV + gated mean). No 64-row tile padding; ``xn`` never
+    materialized. Returns ``(r2, block_input, inj_next)``.
 
     CONTRACT: ``w_down_merged`` MUST be the ``(1+w)``-folded merged weight (see
     :func:`op.fold_norm_weight`). The down GEMV bakes that in -- it forms
@@ -1004,15 +1008,23 @@ def flydsl_k1k2_skinny_decode(
     total = tokens * n_pad
     bt, vec = _decode_reduce_params(total)
     red = _build_reduce_silu(total, nb, lowrank, n_pad, hc_count, bt, vec)
+    # Up GEMV reads lora straight from ``packed`` (cols [0, lowrank), row stride
+    # n_pad) -- no ``.contiguous()`` copy of the lora slice.
     gu = _build_up_gate_mix_gemv(
-        hidden, stream_dim, hc_count, lowrank, w.numel(), tokens, waves_per_block
+        hidden,
+        stream_dim,
+        hc_count,
+        lowrank,
+        w.numel(),
+        tokens,
+        waves_per_block,
+        lora_stride=n_pad,
     )
     fxs = fx.Stream(stream)
     _run_compiled(pro, residual, block_output, injection, r2, rrms, fxs)
     _run_compiled(gd, r2, rrms, w_down_merged, partial, fxs)
     _run_compiled(red, partial, packed, fxs)
-    lora = packed[:, :lowrank].contiguous()
-    _run_compiled(gu, lora, r2, rrms, w, w_up, x, fxs)
+    _run_compiled(gu, packed, r2, rrms, w, w_up, x, fxs)
     inj_next = (
         packed[:, lowrank : lowrank + hc_count].contiguous() if need_inj else None
     )

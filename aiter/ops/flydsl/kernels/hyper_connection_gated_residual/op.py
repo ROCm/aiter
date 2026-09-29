@@ -16,7 +16,7 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .common import arch_name, merge_down_inject, split_down_inject
+from .common import merge_down_inject, split_down_inject
 from .k1 import (
     DECODE_MAX_M,
     _build_combine_rms,
@@ -110,26 +110,24 @@ def _k1_then_k2(
     norm-rebuild launch ever exists.
     """
     tokens = residual.shape[0]
-    # Decode M (non-gfx950): a fully-skinny MMA-free GEMV two-stage beats the
-    # padding-MMA path at small M (no 64-row pad; xn still never materialized).
-    # Gated to fold_w (the GEMV down assumes the folded weight), non-gfx950
-    # (gfx950 has the async-LDS pipe + native tail), and M<=DECODE_MAX_M.
+    # Decode M: the fully-skinny MMA-free GEMV two-stage does true-M work (no
+    # 64-row pad, xn never materialized) and beats the padding-MMA tail at small M.
+    # Gated to fold_w (the GEMV down assumes the folded weight) and M<=DECODE_MAX_M
+    # (the GEMV holds M accumulators per lane, so it spills above that).
     if fold_w and 1 <= tokens <= DECODE_MAX_M:
-        arch = arch_name(residual.device)
-        if arch != "gfx950":
-            return flydsl_k1k2_skinny_decode(
-                residual,
-                block_output,
-                injection,
-                norm_weight,
-                w_up,
-                w_down_merged,
-                lowrank,
-                hc_count,
-                eps,
-                need_inj,
-                stream=stream,
-            )
+        return flydsl_k1k2_skinny_decode(
+            residual,
+            block_output,
+            injection,
+            norm_weight,
+            w_up,
+            w_down_merged,
+            lowrank,
+            hc_count,
+            eps,
+            need_inj,
+            stream=stream,
+        )
     # Low-M tail path: when tokens is not a tile multiple, run the GEMM stages
     # over a padded row count P while the combine prologue reads only the true
     # tokens rows. All K1->K2 bridge buffers (r2, rrms, packed) live at P; the
