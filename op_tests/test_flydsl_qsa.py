@@ -642,6 +642,72 @@ def test_k1_prefill_padded_page_table():
             raise AssertionError(f"K1 prefill pad {name} changed the selected set")
 
 
+def test_k1_decode_rejects_invalid_page_ids():
+    """The one-row scorer must not load a page id that is not in the cache.
+
+    Both cases use M=4 so the one-row scorer runs, and a table wider
+    than 512 columns so the emit kernel does not. A request with no
+    live blocks still reads entry 0; that entry is ``-1``. A second
+    request has ``-1`` on a page inside the visible range.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, page_size = 4, 16
+
+    # No live blocks. Entry 0 is -1, and the table is wide enough that
+    # dead columns still index it.
+    n_pages = 33
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_cache = torch.zeros(
+        1, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    table = torch.full((1, n_pages), -1, dtype=dtypes.i32, device=device)
+    qpos = torch.zeros(m, dtype=dtypes.i32, device=device)
+    slen = torch.zeros(1, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    got = qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
+    if int((got != -1).sum()) != 0:
+        raise AssertionError("K1 decode with no live pages selected a block")
+
+    # -1 inside the visible range. The other pages stay real.
+    context = 4096
+    n_blocks = context // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    bad_page = 3
+    index_table = index_table.clone()
+    index_table[0, bad_page] = -1
+    ref_scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FAMILY_A_SCORE_SCALE,
+    )
+    block0 = bad_page * page_size
+    ref_scores = ref_scores.clone()
+    ref_scores[:, block0 : block0 + page_size] = float("-inf")
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_k1_block_ids(
+        q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
+    )
+    if _set_mismatch_ratio(ref_ids, got) != 0.0:
+        raise AssertionError("K1 decode kept a block whose page id is -1")
+
+
 def test_k2_family_a_decode_matches_oracle():
     """Family A FlyDSL K2 decode matches qsa_sparse_gqa on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -2321,6 +2387,7 @@ def _run_unit_cases():
     test_k1_family_a_set_equality_wide_stream()
     test_k1_family_a_set_equality_prefill()
     test_k1_prefill_padded_page_table()
+    test_k1_decode_rejects_invalid_page_ids()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
     test_k1_family_b_set_equality_two_tiles()
