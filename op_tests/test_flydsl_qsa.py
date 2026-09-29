@@ -708,6 +708,35 @@ def test_k1_decode_rejects_invalid_page_ids():
         raise AssertionError("K1 decode kept a block whose page id is -1")
 
 
+def test_k1_gfx942_h8_skips_prefill_tile():
+    """gfx942 H=8 prefill must not launch the 16-row tile.
+
+    That tile is 73792 bytes at H=8, past gfx942's 65536-byte budget.
+    H=4 still fits, and gfx950 H=8 keeps the 16-by-32 tile. This is a
+    dispatch decision: GPU 6 is gfx950 and does not execute the gfx942 path.
+    """
+    h8 = k1_kernel._k1_prefill_lds_bytes(8)
+    h4 = k1_kernel._k1_prefill_lds_bytes(4)
+    if h8 != 73792 or h8 <= 65536:
+        raise AssertionError(f"H=8 prefill LDS should be 73792, got {h8}")
+    if h4 > 65536:
+        raise AssertionError(f"H=4 prefill LDS should fit gfx942, got {h4}")
+    if k1_kernel._k1_uses_prefill_scorer(1, 16, 8, "gfx942"):
+        raise AssertionError("gfx942 H=8 still dispatches the 16-row tile")
+    if k1_kernel._k1_uses_prefill_scorer(1, 16, 8, "gfx942:sramecc+:xnack-"):
+        raise AssertionError(
+            "gfx942 H=8 with an arch suffix still dispatches the 16-row tile"
+        )
+    if not k1_kernel._k1_uses_prefill_scorer(1, 16, 8, "gfx950"):
+        raise AssertionError("gfx950 H=8 left the 16-row tile")
+    if not k1_kernel._k1_uses_prefill_scorer(1, 32, 4, "gfx942"):
+        raise AssertionError("gfx942 H=4 left the 16-row tile")
+    if k1_kernel._k1_uses_prefill_scorer(2, 32, 8, "gfx950"):
+        raise AssertionError("multi-request prefill entered the 16-row tile")
+    if k1_kernel._k1_uses_prefill_scorer(1, 8, 8, "gfx950"):
+        raise AssertionError("short M entered the 16-row tile")
+
+
 def test_k1_page_past_4gib():
     """A physical indexer page at byte offset 2^32 must not alias page 0.
 
@@ -2448,6 +2477,7 @@ def _run_unit_cases():
     test_k1_family_a_set_equality_prefill()
     test_k1_prefill_padded_page_table()
     test_k1_decode_rejects_invalid_page_ids()
+    test_k1_gfx942_h8_skips_prefill_tile()
     test_k1_page_past_4gib()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
