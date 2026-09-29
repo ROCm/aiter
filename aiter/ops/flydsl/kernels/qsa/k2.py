@@ -401,7 +401,11 @@ def build_qsa_k2_module(
             BFloat16,
         )
         qk_a_copy = fx.make_tiled_copy_A(qk_b_atom, qk_wave_mma).get_slice(lane)
-        qk_q_copy = fx.make_tiled_copy_B(g_copy, qk_wave_mma).get_slice(lane)
+        # K16 (gfx942) holds 4xbf16 per lane. The 16-byte gather atom lowers
+        # that copy to `load i128` bitcast onto vector<4xbf16>, which LLVM
+        # rejects. K32 (gfx950) is 8xbf16 and keeps the 16-byte atom.
+        q_copy = g_copy if qk_k == 32 else buf_copy_atom(8, BFloat16)
+        qk_q_copy = fx.make_tiled_copy_B(q_copy, qk_wave_mma).get_slice(lane)
         pv_wave_mma = fx.make_tiled_mma(pv_mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
         pv_b_atom = fx.make_copy_atom(
             (fx.rocdl.cdna4.LDSReadTrans16_64b() if use_k32 else fx.UniversalCopy64b()),
@@ -578,7 +582,7 @@ def build_qsa_k2_module(
             )
             q_src = qk_q_copy.partition_S(q_tile)
             q_frag = fx.make_fragment_like(q_src)
-            fx.copy(g_copy, q_src, q_frag)
+            fx.copy(q_copy, q_src, q_frag)
             q_frags.append(q_frag)
 
         # Pin the masking below the loads. Left alone the scheduler sinks the
