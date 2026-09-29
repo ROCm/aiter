@@ -6465,6 +6465,97 @@ inline bool topk_oneblock_is_gfx950()
     return v;
 }
 
+inline int topk_oneblock_num_cu()
+{
+    static const int v = []() {
+        int dev = 0;
+        (void)hipGetDevice(&dev);
+        hipDeviceProp_t p{};
+        (void)hipGetDeviceProperties(&p, dev);
+        return p.multiProcessorCount;
+    }();
+    return v;
+}
+
+// Launches the register copy whose compile-time lane capacity equals the
+// runtime `ept`; returns false when `ept` is outside [MinEPT, MaxEPT].
+template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int MainBits,
+          int TailBits, int MinEPT, int MaxEPT>
+inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream, T const* in,
+                                     int64_t len, IdxT k, T* out, IdxT* out_idx, bool select_min)
+{
+    if constexpr(MinEPT > MaxEPT)
+    {
+        return false;
+    }
+    else
+    {
+        if(ept != MinEPT)
+            return topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MainBits,
+                                            TailBits, MinEPT + 1, MaxEPT>(
+                ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+        radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
+                                        TailBits>
+            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        return true;
+    }
+}
+
+// gfx950 plain variants for uniform k == 2048 rows.  Each bound is a kernel
+// capacity or a measured crossover (MI355X, randn rows, 1..4096 rows of
+// 2051..131071 columns), never a benchmark grid point:
+//  - Register copies hold ceil(len / threads) elements per lane, at most 16
+//    with 1024 threads or 32 with 512 (at most 64 VGPRs), so len <= 16 * 1024.
+//    The LDS tail is faster from 16 * 1024 columns on; below that the register
+//    copy was faster at every measured point but one (16383 columns at 512
+//    and 1024 rows, by 4-5%).
+//  - Eight-wave workgroups are faster, or at most 2% slower, once a
+//    sixteen-wave grid no longer runs as one wave of workgroups (more than
+//    two rows per CU) up to 12 * 1024 columns, and past that once more than
+//    four rows per CU queue up.
+//  - The 11+11+10 split only pays while the fifth element per lane is at most
+//    three-quarters used and at most half of the CUs have a row.
+//  - The fixed-threshold predictor stages about 16% of a randn row, which
+//    fits its 4096-entry stage, and wins, up to 22 * 1024 columns.
+//  - Past 80 * 1024 columns the sampled threshold expects fewer than 64 ranks
+//    (2560 * 2048 / len), and with fewer rows than CUs the generic kernel is
+//    as fast.  With at least one row per CU the LDS tail stays at least as
+//    fast (up to 40% faster) through the widest row measured, 128 * 1024 - 1.
+template <typename T, typename IdxT, bool WRITE_TOPK_VALUES>
+inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
+                                       IdxT* out_idx, bool select_min, hipStream_t stream)
+{
+    if(len < 16 * 1024)
+    {
+        int const num_cu = topk_oneblock_num_cu();
+        if((batch_size > 2 * num_cu && len <= 12 * 1024) || batch_size > 4 * num_cu)
+        {
+            int const ept = static_cast<int>((len + 511) / 512);
+            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, 5, 32>(
+                ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+        }
+        int const ept = static_cast<int>((len + 1023) / 1024);
+        if(2 * batch_size <= num_cu && len > 4 * 1024 && len <= 4 * 1024 + 768)
+            return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5>(
+                ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16>(
+            ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+    }
+    if(len <= 22 * 1024)
+    {
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true>
+            <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        return true;
+    }
+    if(len <= 80 * 1024 || (batch_size >= topk_oneblock_num_cu() && len < 128 * 1024))
+    {
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES>
+            <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        return true;
+    }
+    return false;
+}
+
 // Thin wrapper dispatching to the correct BPP at runtime.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           Phase phase = Phase::Prefill, bool STABLE = false>
@@ -6482,113 +6573,30 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
         bool const specialized = buf != nullptr && topk_oneblock_use_large_bpp() &&
                                  in_idx == nullptr && rowStarts == nullptr &&
                                  rowEnds == nullptr && !select_min && k == 2048;
-        // Medium rows use only runtime bounds and runtime row strides.  The
-        // predictor choice may still depend on a runtime range, but the input
-        // extent is never compiled into the kernel type.
-        if(specialized && len >= 16384 && len <= 32770)
+        if(specialized && topk_oneblock_is_gfx950())
         {
-            if((batch_size == 2048 || batch_size == 4096) && len <= 16386 &&
-               topk_oneblock_is_gfx950())
-            {
-                radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize,
-                                                      WRITE_TOPK_VALUES, true>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-            }
-            else
+            if(dispatch_topk_plain_gfx950<T, IdxT, WRITE_TOPK_VALUES>(
+                   in, batch_size, len, k, out, out_idx, select_min, stream))
+                return;
+        }
+        else if(specialized)
+        {
+            // Other large-BPP parts keep the windows they were tuned with; the
+            // gfx950 ranges above have not been measured on them.
+            if(len >= 16384 && len <= 32770)
             {
                 radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
                     <<<batch_size, BlockSize, 0, stream>>>(
                         in, len, k, out, out_idx, select_min);
-            }
-            return;
-        }
-        // High-row-count 4K shapes benefit from eight waves and 11+11+10
-        // radix passes. Keep lower row counts on the 16-wave 12+12+8 path.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size >= 1024 && len >= 4096 &&
-           len <= 4098)
-        {
-            constexpr int RegBlockSize = 512;
-            int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
-#define AITER_OB_REG512_LAUNCH(EPT)                                                       \
-    case EPT:                                                                            \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT, 11,     \
-                                         10>                                                   \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min); \
-        return;
-            switch(ept)
-            {
-                AITER_OB_REG512_LAUNCH(8)
-                AITER_OB_REG512_LAUNCH(9)
-            default: break;
-            }
-#undef AITER_OB_REG512_LAUNCH
-        }
-        // The fifth element per lane only appears once a row grows past 4096
-        // values. On low-row-count gfx950 launches, shrinking the two main
-        // radix histograms from 12 to 11 bits reduces their fixed scan cost;
-        // the larger 10-bit tail is still cheap because only the crossing
-        // prefix reaches that pass. Restrict this to one or two tail values;
-        // longer EPT=5 rows spend enough time in the larger tail pass to lose.
-        if(specialized && topk_oneblock_is_gfx950() && batch_size <= 128 && len > 4096 &&
-           len <= 4098)
-        {
-            constexpr int RegBlockSize = 1024;
-            constexpr int EPT          = 5;
-            if((len + RegBlockSize - 1) / RegBlockSize == EPT)
-            {
-                radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,
-                                                 11, 10>
-                    <<<batch_size, RegBlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
                 return;
             }
-        }
-        // With a large gfx950 grid, halve the waves per workgroup for 8K rows.
-        // The 11+11+10 split keeps every histogram at no more than four
-        // buckets per thread and cuts both LDS footprint and block-wide scan
-        // work. EPT is selected from runtime `len`; no exact row extent is
-        // compiled into either launch.
-        if(specialized && topk_oneblock_is_gfx950() &&
-           (batch_size == 2048 || batch_size == 4096) && len >= 8192 && len <= 8194)
-        {
-            constexpr int RegBlockSize = 512;
-            int const ept = static_cast<int>((len + RegBlockSize - 1) / RegBlockSize);
-#define AITER_OB_REG512_8K_LAUNCH(EPT)                                                    \
-    case EPT:                                                                            \
-        radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT, 11, \
-                                         10>                                               \
-            <<<batch_size, RegBlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min); \
-        return;
-            switch(ept)
+            if(len >= 4096 && len <= 8194)
             {
-                AITER_OB_REG512_8K_LAUNCH(16)
-                AITER_OB_REG512_8K_LAUNCH(17)
-            default: break;
+                int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
+                if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9>(
+                       ept, batch_size, stream, in, len, k, out, out_idx, select_min))
+                    return;
             }
-#undef AITER_OB_REG512_8K_LAUNCH
-        }
-        // Rows short enough to hold in registers. The upper bound is where the
-        // register copy stops paying for itself, not where it stops fitting.
-        if(specialized && len >= 4096 && len <= 8194)
-        {
-            int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
-#define AITER_OB_REG_LAUNCH(EPT)                                                              \
-    case EPT:                                                                                 \
-        radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, EPT>            \
-            <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);      \
-        return;
-            switch(ept)
-            {
-                AITER_OB_REG_LAUNCH(4)
-                AITER_OB_REG_LAUNCH(5)
-                AITER_OB_REG_LAUNCH(6)
-                AITER_OB_REG_LAUNCH(7)
-                AITER_OB_REG_LAUNCH(8)
-                AITER_OB_REG_LAUNCH(9)
-            default: break;
-            }
-#undef AITER_OB_REG_LAUNCH
         }
     }
 
