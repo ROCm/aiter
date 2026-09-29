@@ -513,7 +513,6 @@ class MegaMoETileA4W4:
         # 与 candidate 基线的可比性越强(计时/捕获/对比口径完全不变)。
         import os as _os
         self._two_kernel_stage2 = _os.environ.get("MEGAMOE_TWO_KERNEL") == "1"
-        self._two_kernel_bn = int(_os.environ.get("MEGAMOE_TK_BN", "128"))
         # 两段各自可覆盖:只开 push 就能单独量出 inbox 减半的收益,
         # 精度掉了也分得清是哪一段吃掉的。
         # push 段跟 MegaMoEv2 的门限走(mega_moe_config.py:102/330/345):
@@ -557,6 +556,11 @@ class MegaMoETileA4W4:
             # 查表永远不该让一次跑挂掉:查不到/读不了就回落到内置默认。
             _s2_tuned = None
         _s2_tuned = _s2_tuned or {}
+        # GEMM2 的 N tile 同样按 shape 查表(可选列,旧表没有也能加载)。
+        from .stage2_tune import resolve_gemm2_bn as _resolve_gemm2_bn
+
+        self._two_kernel_bn, self._two_kernel_bn_source = _resolve_gemm2_bn(
+            _s2_tuned or None)
         self._two_kernel_qp = int(
             _os.environ.get("MEGAMOE_TK_QP", _s2_tuned.get("num_qp", 8)))
         # 查不到表时按机制推:rail 有 num_qp 条队列,每条分到一个 chunk 时

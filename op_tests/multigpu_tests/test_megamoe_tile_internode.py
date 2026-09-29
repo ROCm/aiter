@@ -74,7 +74,6 @@ FUSED_BEST_ENV = {
     "MEGAMOE_TK_S1_META_OPT": "1",
     "MEGAMOE_TK_S1_RAIL_POST_CTAS": "1",
     "MEGAMOE_TK_S1_CREDIT_ASYNC": "1",
-    "MEGAMOE_TK_S1_TILE_GROUP": "4",
     "MEGAMOE_TK_S1_KERNEL_SPLIT": "0",
     "MEGAMOE_TK_S1_GATE_SLEEP": "127",
     "MEGAMOE_TK_S1_EARLY_LOCAL_GMM": "1",
@@ -95,9 +94,47 @@ FUSED_BEST_ENV = {
 FUSED_BEST_STAGE1_FRAGMENTS = (
     "_widewait", "_widefan", "_cf8", "_f1d", "_t0nf", "_cra", "_soa4", "_pcta",
     "_gb", "_asg", "_pofft0", "_sck2", "_gp2", "_mo1", "_slg", "_h1p",
-    "_gs127", "_elg", "_f2s16", "_tg4", "_expertmajor", "_fos32", "_defrecv",
+    "_gs127", "_elg", "_f2s16", "_expertmajor", "_fos32", "_defrecv",
     "_hoistwait", "_lsc_nfb", "_esw", "_nxc2", "_pnf", "_lp", "_prx", "_crx", "_xc", "_srx",
 )
+
+# GMM1 tiling (tile_group / gmm1_bn) is not in FUSED_BEST_ENV: it is per shape,
+# resolved by stage1_tune (env > megamoe_tile_stage1_tuned.csv > rule).  An env
+# pin here would override the table for every TPR -- TILE_GROUP=4 used to, and
+# that is not the TPR128 optimum.  The guard derives the expected _tg/_gbn
+# fragments from the same resolver.
+TILE_ENV_KEYS = ("MEGAMOE_TK_S1_TILE_GROUP", "MEGAMOE_TK_S1_GMM1_BN", "MEGAMOE_TK_BN")
+
+
+def stage1_tile(net, tpr):
+    from aiter.ops.flydsl.kernels.megamoe_tile.stage1_tune import resolve_stage1_tile
+
+    return resolve_stage1_tile(token=tpr * net["topk"], model_dim=net["model_dim"],
+                               inter_dim=net["inter_dim"], expert=net["experts"] // 16,
+                               topk=net["topk"])
+
+
+def stage2_tile(net, tpr):
+    """GEMM2 (kernel1) N tile, resolved exactly as the operator does."""
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+    from aiter.ops.flydsl.kernels.megamoe_tile.stage2_tune import (
+        lookup_stage2_tune, resolve_gemm2_bn)
+
+    tuned = lookup_stage2_tune(gfx=get_gfx_runtime(), cu_num=get_cu_num(),
+                               token=tpr * net["topk"], model_dim=net["model_dim"],
+                               inter_dim=net["inter_dim"], expert=net["experts"] // 16,
+                               topk=net["topk"])
+    bn, source = resolve_gemm2_bn(tuned)
+    return {"gemm2_bn": bn, "source": source}
+
+
+def tile_fragments(tile):
+    """(must contain, must not contain) kernel-name fragments for a tile config."""
+    g, bn = tile["tile_group"], tile["gmm1_bn"]
+    has = ([f"_tg{g}"] if g != 1 else []) + (["_gbn128"] if bn == 128 else [])
+    lacks = ([] if g != 1 else ["_tg"]) + ([] if bn == 128 else ["_gbn"])
+    return has, lacks
+
 
 SMALLOP_ENV = {
     "a4w4": {"AITER_SITUV2_A4W4": "1", "AITER_SITUV2_A8W4": "0"},
@@ -192,6 +229,10 @@ def apply_env(args, net):
     """Must run before any aiter/operator import: some flags are read at import."""
     if args.config == "best":
         os.environ.update(FUSED_BEST_ENV)
+        # A caller-shell pin would silently override the tune table; tiling
+        # sweeps go through --set (which also disables the guard).
+        for key in TILE_ENV_KEYS:
+            os.environ.pop(key, None)
         if args.rail_fp8:
             os.environ["MEGAMOE_TK_COMM_QUANT_RAIL"] = "fp8"
         else:
@@ -381,23 +422,36 @@ def kernel_names(trace_dir, rank):
     return {k: sorted(v) for k, v in names.items()}
 
 
-def check_fused_config(names, args):
+def check_fused_config(names, args, tile, s2tile):
     """Kernel-name guard for --config best (rank 0 only)."""
     problems = []
-    if args.config != "best" or args.env_set:
+    # Tiling overrides keep the guard: the resolver sees the same env, so the
+    # expected _tg/_gbn follow the sweep point and everything else stays checked.
+    if args.config != "best" or any(
+            item.partition("=")[0] not in TILE_ENV_KEYS for item in args.env_set):
         return problems
     stage1 = names.get("fused_stage1", [])
     if len(stage1) != 1:
         problems.append(f"expected one fused_stage1 kernel, got {stage1}")
     else:
-        missing = [f for f in FUSED_BEST_STAGE1_FRAGMENTS if f not in stage1[0]]
+        has, lacks = tile_fragments(tile)
+        missing = [f for f in FUSED_BEST_STAGE1_FRAGMENTS + tuple(has) if f not in stage1[0]]
         if missing:
             problems.append(f"fused_stage1 missing {missing}")
+        extra = [f for f in lacks if f in stage1[0]]
+        if extra:
+            problems.append(f"fused_stage1 has {extra}, tile config {tile}")
     k2 = [n for n in names.get("fused_stage2", []) if n.startswith("megamoe_k2")]
     if len(k2) != 1:
         problems.append(f"expected one megamoe_k2 kernel, got {k2}")
     elif ("_qr8" in k2[0]) != args.rail_fp8:
         problems.append(f"k2 rail fp8 mismatch: {k2[0]}")
+    k1 = [n for n in names.get("fused_stage2", []) if n.startswith("megamoe_stage2_compact")]
+    want = f"_t32x{s2tile['gemm2_bn']}x256_"
+    if len(k1) != 1:
+        problems.append(f"expected one megamoe_stage2_compact kernel, got {k1}")
+    elif want not in k1[0]:
+        problems.append(f"kernel1 missing {want!r} (stage2 tile {s2tile}): {k1[0][:60]}")
     return problems
 
 
@@ -507,7 +561,11 @@ class Runner:
             record["correctness"] = summary.get("correctness", [])
             names = kernel_names(trace_dir, 0)
             record["kernel_names"] = names
-            record["config_problems"] = check_fused_config(names, self.args)
+            tile = stage1_tile(self.net, tpr)
+            s2tile = stage2_tile(self.net, tpr)
+            record["stage1_tile"] = tile
+            record["stage2_tile"] = s2tile
+            record["config_problems"] = check_fused_config(names, self.args, tile, s2tile)
             record["split"] = split
         del shared
         gc.collect()
@@ -566,6 +624,11 @@ def fmt(value):
     return "-" if value is None else f"{value:.1f}"
 
 
+def tile_str(tile):
+    return (f"G={tile['tile_group']} (BM={32 * tile['tile_group']}) "
+            f"BN={tile['gmm1_bn']} [{tile['source']}]")
+
+
 def print_perf(runner, tpr, fused, small):
     if runner.rank != 0:
         return
@@ -585,6 +648,11 @@ def print_perf(runner, tpr, fused, small):
     print(f"  stage2 k2/combine {fmt(sp.get('k2')):>8} | {fmt(get(st, 'combine_us')):>8}", flush=True)
     print(f"  stage2 total      {fmt(get(ft, 'fused_stage2_us')):>8} | {fmt(get(st, 'stage2_span_us')):>8}", flush=True)
     print(f"  pipeline          {fmt(pipe_f):>8} | {fmt(pipe_s):>8}  speedup {speed}", flush=True)
+    if "stage1_tile" in fused:
+        print(f"  stage1 tile       {tile_str(fused['stage1_tile'])}", flush=True)
+    if "stage2_tile" in fused:
+        t = fused["stage2_tile"]
+        print(f"  stage2 tile       BM=32 BN={t['gemm2_bn']} [{t['source']}]", flush=True)
     for rec in (fused, small):
         if rec.get("error"):
             print(f"  ERROR {rec['path']}: {rec['error']}", flush=True)
@@ -632,7 +700,11 @@ def main(argv=None):
                     runner.results.append(rec)
                     if runner.rank == 0:
                         state = "FAIL" if rec.get("error") else "PASS"
-                        print(f"[FUNC] {state} TPR={tpr} fixture={fixture}", flush=True)
+                        tile = rec.get("stage1_tile")
+                        print(f"[FUNC] {state} TPR={tpr} fixture={fixture}"
+                              + (f" tile {tile_str(tile)}" if tile else ""), flush=True)
+                        for problem in rec.get("config_problems", []):
+                            print(f"    CONFIG-GUARD FAIL: {problem}", flush=True)
                         for check in rec.get("correctness", []):
                             print(f"    {check['label']}: {check['rank_max_rel_l2']:.6g}"
                                   f" (threshold {check['threshold']})", flush=True)
