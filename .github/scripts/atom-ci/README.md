@@ -87,6 +87,35 @@ No kernel/model code, cluster configuration, production branch, PR, or accuracy
 threshold was changed. The clean fix branch removes experimental replay pins
 and retries and adds prebuilding plus retained failure diagnostics only.
 
+## Compiler logging alternative
+
+The `AITER_LOG_MORE=1` alternative was tested without prebuilding. Both runs
+used the same pinned revisions, image digests, model arguments, watchdog, and
+accuracy thresholds as above. Before launch, each verified that the implicated
+module's `.so` did not exist and that `AITER_LOG_MORE` was `1`.
+
+| Test | Run | Accuracy | Threshold | Cold module build | Result |
+| --- | --- | --- | --- | --- | --- |
+| Kimi-K2.7-Code-MXFP4 | https://github.com/ROCm/aiter/actions/runs/36618677804 | 0.956785 | 0.92 | 275.7 s | PASS |
+| DeepSeek-V4-Pro | https://github.com/ROCm/aiter/actions/runs/36618683679 | 0.944655 | 0.94 | 390.8 s | PASS |
+
+Both evaluated all 1319 GSM8K samples. Replay with `-f triage_log_more=true`
+and `-f triage_prebuild=false`; the workflow rejects combining the two modes.
+
+**Do not ship this flag alone.** A separate accelerated-time test used the
+unchanged pinned ATOM watchdog and the actual pinned AITER `getLogger()`
+formatter, with a stalled client/server and only the shared-memory idle warning
+every 60 seconds. Normal logging triggered the 18-poll hang detector; verbose
+logging instead reached the full 30-minute timeout. The verbose formatter puts
+metadata on a separate line, which survives the watchdog's idle-warning filter
+and falsely counts as progress. With no warnings, hang detection still worked;
+GPU fault detection also still returned exit 2. This is a simulated regression
+test, not a deliberately hung GPU run.
+
+The next minimal alternative should enable compiler output without changing
+the global logger format. Neither the prebuild branch nor `main` was changed
+by this experiment.
+
 ## Local checks
 
 ```sh
