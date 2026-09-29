@@ -51,16 +51,9 @@ def task_capacities(
     )
 
 
-def allocate_task_buffers(
-    sorted_expert_ids, experts, *, cu_count=None, min_tail_utilization=0.6
-):
-    """Allocate from host-visible tensor sizes without reading device counts."""
-    full, tail = task_capacities(
-        sorted_expert_ids.numel(),
-        experts,
-        cu_count=cu_count,
-        min_tail_utilization=min_tail_utilization,
-    )
+def allocate_task_buffers(sorted_expert_ids, experts):
+    """Allocate from tensor sizes using the compact launcher's default policy."""
+    full, tail = task_capacities(sorted_expert_ids.numel(), experts)
     return (
         torch.empty((full, 2), dtype=torch.int32, device=sorted_expert_ids.device),
         torch.empty((tail, 2), dtype=torch.int32, device=sorted_expert_ids.device),

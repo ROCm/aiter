@@ -47,8 +47,8 @@ def flydsl_absmax():
         div_tensor = fx.logical_divide(A, fx.make_layout(num_values, 1))
         num_atoms = fx.Int32(fxh.div_up(neles, num_values))
         i0 = fx.thread_idx.x
-        for i in range(0, num_atoms, num_threads):
-            src = div_tensor[None, i0 + i]
+        for atom_idx in range(i0, num_atoms, num_threads):
+            src = div_tensor[None, atom_idx]
             frag = fx.make_fragment_like(src)
             fx.copy(copy_atom, src, frag)
             vec = frag.load().to(fx.Float32)
@@ -141,13 +141,11 @@ def flydsl_quant_per_tensor(torch_dtype):
         num_values = copy_bits // A.dtype.width
         div_tensorA = fx.logical_divide(A, fx.make_layout(num_values, 1))
         div_tensorB = fx.logical_divide(B, fx.make_layout(num_values, 1))
-        fx.Int32(fxh.div_up(neles, num_values))
         num_atoms_full = fx.Int32(neles // num_values)
         i0 = fx.thread_idx.x
         clamp_lo = fx.Float32(-fmax)
         clamp_hi = fx.Float32(fmax)
-        for i in range(0, num_atoms_full, num_threads):
-            atom_idx = i0 + i
+        for atom_idx in range(i0, num_atoms_full, num_threads):
             src = div_tensorA[None, atom_idx]
             dst = div_tensorB[None, atom_idx]
             frag = fx.make_fragment_like(src)
