@@ -470,6 +470,18 @@ class MegaMoETileA4W4:
         self._w2 = _as_u8_contiguous(w2, "w2")
         self._w2_scale = _as_u8_contiguous(w2_scale, "w2_scale")
 
+        # GMM1 的 tile 切块(tile_group G -> BM=32*G、gmm1_bn)按 shape 查表,
+        # 优先级 env > 表 > 解析式默认(见 stage1_tune.py)。G 同时是 arena
+        # 布局参数,所以必须在建 layout 之前定下来。
+        from .stage1_tune import resolve_stage1_tile as _resolve_s1_tile
+
+        self._s1_tile = _resolve_s1_tile(
+            token=self.mtpr * self.topk,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            expert=self.epr,
+            topk=self.topk,
+        )
         self.stage1_layout = Stage1ArenaLayout.create(
             hidden=self.model_dim,
             inter=self.inter_dim,
@@ -480,7 +492,7 @@ class MegaMoETileA4W4:
             max_tokens=self.mtpr,
             max_routes_per_token_per_rank=self.max_routes_per_token_per_rank,
             block_m=int(os.environ.get("MEGAMOE_TK_S1_BLOCK_M", "32")),
-            tile_group=int(os.environ.get("MEGAMOE_TK_S1_TILE_GROUP", "1")),
+            tile_group=self._s1_tile["tile_group"],
             dispatch_plan=os.environ.get("MEGAMOE_TK_S1_PLAN", "0") != "0",
         )
         stage2_node_accumulation_mode = getattr(
@@ -1109,7 +1121,7 @@ class MegaMoETileA4W4:
             split_local=os.environ.get("MEGAMOE_TK_S1_SPLIT_LOCAL", "0") == "1",
             h1_phys=os.environ.get("MEGAMOE_TK_H1_PHYS", "0") == "1",
             k2_sorted_jobs=os.environ.get("MEGAMOE_TK_S1_K2_SORTED_JOBS", "0") == "1",
-            gmm1_bn=int(os.environ.get("MEGAMOE_TK_S1_GMM1_BN", "0")),
+            gmm1_bn=self._s1_tile["gmm1_bn"],
             gate_sleep=int(os.environ.get("MEGAMOE_TK_S1_GATE_SLEEP", "0")),
             finisher_off_t0=os.environ.get("MEGAMOE_TK_S1_FINISHER_OFF_T0", "0") == "1",
             early_local_gmm=os.environ.get("MEGAMOE_TK_S1_EARLY_LOCAL_GMM", "0") == "1",

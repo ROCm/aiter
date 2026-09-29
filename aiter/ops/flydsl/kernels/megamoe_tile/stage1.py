@@ -4604,11 +4604,21 @@ def compile_megamoe_tile_ep16_stage1(
                 tile_map = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("expert_tile_map")
                 )
-                group_perm_res = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_group_perm")
+                # 按组的两张表只在 G>1 的 layout 里有 region;G=1 时连 resource
+                # 都不能建(trace 期就 KeyError),用处也都在 const_expr(G > 1) 里。
+                group_perm_res = (
+                    buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("tile_group_perm")
+                    )
+                    if G > 1
+                    else None
                 )
-                group_e_res = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_expert_group")
+                group_e_res = (
+                    buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("tile_expert_group")
+                    )
+                    if G > 1
+                    else None
                 )
                 run_base = my_base
                 for si in range_constexpr(len(segs)):
@@ -4688,8 +4698,12 @@ def compile_megamoe_tile_ep16_stage1(
                 gl_list = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("gmm1_group_list")
                 )
-                gl_egrp = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_expert_group")
+                gl_egrp = (
+                    buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("tile_expert_group")
+                    )
+                    if G > 1
+                    else None
                 )
                 gl_map0 = (ge + fx.Int32(EO)) * fx.Int32(max_tiles_per_expert)
                 gl_groups = _alloc_tiles_for(
