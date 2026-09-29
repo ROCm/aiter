@@ -2730,6 +2730,18 @@ namespace py = pybind11;
           py::arg("out"),                              \
           py::arg("scale"));
 
+#define SPLITK_REDUCE_QK_RMSNORM_PYBIND                \
+    m.def("splitk_reduce_qk_rmsnorm",                  \
+          &aiter::splitk_reduce_qk_rmsnorm,            \
+          py::arg("partial"),                          \
+          py::arg("out"),                              \
+          py::arg("q_out"),                            \
+          py::arg("k_out"),                            \
+          py::arg("q_weight"),                         \
+          py::arg("k_weight"),                         \
+          py::arg("q_eps"),                            \
+          py::arg("k_eps"));
+
 #define MXFP4_MOE_AUX_PYBIND                  \
     m.def("mxfp4_moe_sort_quant",             \
           &mxfp4_moe_sort_quant_kernel,       \

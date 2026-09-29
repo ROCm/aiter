@@ -1985,6 +1985,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_splitk_reduce_qk_rmsnorm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/splitk_reduce_qk_rmsnorm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/splitk_reduce_qk_rmsnorm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_split_gdr_update": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
