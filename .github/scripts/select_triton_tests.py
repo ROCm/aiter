@@ -1,9 +1,16 @@
 #!/usr/bin/env python
-"""Select Triton unit tests to run for a PR, from its git diff."""
+"""Select Triton unit tests to run for a PR, from its git diff.
+
+.github/workflows/triton-test.yaml runs this as a dry run (--dry-run) while its
+DRY_RUN switch is 'true': the selection is printed, and CI runs what it ran
+before test selection existed. The ci:triton-355 PR label runs the full suite
+(--all). Any error falls back to the full suite.
+"""
 
 import argparse
 import ast
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -49,6 +56,57 @@ CONFIG_CATEGORIES = {
     "attention": {"attention", "chunk_delta_attn"},
     "mhc": {"fusions"},
 }
+
+# triton-test.yaml's `paths:` filter before test selection. A dry run runs the
+# full suite exactly when this matches: when the workflow used to run at all.
+LEGACY_PATHS = (
+    "aiter/ops/triton/**",
+    "op_tests/triton_tests/**",
+    "op_tests/op_benchmarks/triton/**",
+    ".github/scripts/build_aiter_triton.sh",
+    ".github/scripts/download_triton_wheel.sh",
+    ".github/scripts/install_triton.sh",
+    ".github/scripts/select_triton_tests.py",
+    ".github/scripts/split_tests.sh",
+    ".github/scripts/verify_triton_pin.py",
+    ".github/requirements/triton-test.txt",
+    "!**/*.md",
+    "!docs/**",
+    "!LICENSE",
+    "!.gitignore",
+    "!.github/workflows/**",
+    "!.github/scripts/sglang_downstream.py",
+    ".github/workflows/triton-test.yaml",
+    ".github/workflows/prepare-triton-wheel.yaml",
+    ".github/workflows/ci-config.yaml",
+)
+
+
+def legacy_trigger(diff):
+    """Whether LEGACY_PATHS matches a changed file, with GitHub's rules: `**`
+    crosses directories, `*` does not, and the last matching pattern wins."""
+    glob = {"**/": "(?:.*/)?", "**": ".*", "*": "[^/]*", "?": "[^/]"}
+    rules = [
+        (
+            not pattern.startswith("!"),
+            re.compile(
+                "".join(
+                    glob.get(token, re.escape(token))
+                    for token in re.split(r"(\*\*/|\*\*|\*|\?)", pattern.lstrip("!"))
+                )
+            ),
+        )
+        for pattern in LEGACY_PATHS
+    ]
+
+    def included(path):
+        keep = False
+        for include, regex in rules:
+            if regex.fullmatch(path):
+                keep = include
+        return keep
+
+    return any(included(path) for path in diff)
 
 
 def list_files(base, pattern):
@@ -311,35 +369,52 @@ def select(diff):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--merge-ref", help="PR merge ref; diff is taken against its first parent"
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    mode.add_argument("--all", action="store_true", help="select the full suite")
+    ap.add_argument(
+        "--merge-ref",
+        help="PR merge ref; diff is taken against its first parent. Without it "
+        "the full suite runs",
+    )
+    ap.add_argument("--all", action="store_true", help="select the full suite")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the selection, but run what CI ran before test selection",
+    )
     ap.add_argument("--output", default="selected_triton_tests.list")
     args = ap.parse_args()
+    everything = list_files(TESTS, "test_*.py")
     needs_mi300x = True
+    diff = None
+    tests, reasons = everything, ["full suite requested"]
     try:
-        if args.all:
-            tests, reasons = list_files(TESTS, "test_*.py"), ["full suite requested"]
-        else:
+        if args.merge_ref:
             diff = changed_files(args.merge_ref)
             needs_mi300x = any(
                 path.startswith((CONFIGS + "gfx942/", GLUON_KERNELS + "gfx942/"))
                 for path in diff
             )
-            tests, reasons = select(diff)
+            if not args.all:
+                tests, reasons = select(diff)
     except Exception as why:  # noqa: BLE001 -- any failure falls open to a full run
-        tests, reasons = list_files(TESTS, "test_*.py"), [f"FULL SUITE: {why}"]
+        tests, reasons = everything, [f"FULL SUITE: {why}"]
+    report = f"Triton tests: {len(tests)} files\n"
+    report += "".join(f"- {reason}\n" for reason in reasons)
+    if args.dry_run and not args.all:
+        # Print the selection, but keep the tests CI ran before selection.
+        report = "DRY RUN, selection not applied.\n" + report
+        if len(tests) < len(everything):
+            report += "".join(f"  {test}\n" for test in tests)
+        tests = everything if diff is None or legacy_trigger(diff) else []
+        report += f"Running {len(tests)} files, as CI did before test selection.\n"
     Path(args.output).write_text("".join(t + "\n" for t in tests), encoding="utf-8")
     if output := os.environ.get("GITHUB_OUTPUT"):
         with open(output, "a", encoding="utf-8") as fh:
             fh.write(
                 f"selected_count={len(tests)}\nneeds_mi300x={str(needs_mi300x).lower()}\n"
             )
-    report = f"Triton tests: {len(tests)} files\n"
-    report += "".join(f"- {reason}\n" for reason in reasons)
     print(report, file=sys.stderr)
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a", encoding="utf-8") as fh:

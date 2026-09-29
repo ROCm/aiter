@@ -1,5 +1,14 @@
 name: Triton Test
 
+# Test selection: .github/scripts/select_triton_tests.py picks the unit tests a
+# PR affects.
+#   - It runs as a dry run (DRY_RUN in the "Select Triton tests from PR diff"
+#     step): the selection is printed, and CI runs what it ran before test
+#     selection existed. DRY_RUN: 'false' applies the selection; setting it
+#     back to 'true' is the revert for every PR.
+#   - PR label ci:triton-355: that PR runs the full suite.
+# Pushes to main always run the full suite, on MI35X and MI300X.
+
 on:
   push:
     branches: [main]
@@ -40,7 +49,8 @@ jobs:
     outputs:
       shard_count: 8
       selected_count: ${{ steps.select.outputs.selected_count }}
-      needs_mi300x: ${{ steps.select.outputs.needs_mi300x == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:triton-300x') }}
+      # main always; a PR for gfx942-specific changes or the ci:triton-300x label.
+      needs_mi300x: ${{ github.ref == 'refs/heads/main' || steps.select.outputs.needs_mi300x == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:triton-300x') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -51,16 +61,19 @@ jobs:
       - name: Select Triton tests from PR diff
         id: select
         env:
-          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-full') }}
+          # 'true': print the selection, but run what CI ran before test
+          # selection existed. 'false': run only the selected tests.
+          DRY_RUN: "true"
+          FULL_SUITE: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
         run: |
-          set -ex
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FULL_LABEL" != "true" ]; then
-            python3 .github/scripts/select_triton_tests.py \
-              --merge-ref HEAD --output selected_triton_tests.list
-          else
-            python3 .github/scripts/select_triton_tests.py \
-              --all --output selected_triton_tests.list
+          set -euo pipefail
+          args=(--merge-ref HEAD --output selected_triton_tests.list)
+          if [ "$FULL_SUITE" = true ]; then
+            args+=(--all)
+          elif [ "$DRY_RUN" = true ]; then
+            args+=(--dry-run)
           fi
+          python3 .github/scripts/select_triton_tests.py "${args[@]}"
 
       - name: Split Triton Tests (8 shards)
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton --select-file selected_triton_tests.list
