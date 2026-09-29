@@ -740,6 +740,9 @@ def test_triton_unified_attn(
         (e4m3_dtype, e4m3_dtype, True, 64),
         (torch.bfloat16, torch.bfloat16, True, 128),
         (e4m3_dtype, e4m3_dtype, True, 128),
+        # mixed dtype: bf16 queries over an fp8 KV cache; the LDS tile is
+        # sized by kv_cache_dtype, so this must not be rejected
+        (torch.bfloat16, e4m3_dtype, True, 64),
     ],
 )
 @pytest.mark.parametrize("head_size", [256, 512])
@@ -824,6 +827,9 @@ def test_triton_unified_attn_gfx942_large_prefill(
 
     # assert the intended table entry serves this call
     dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
+    mixed_dtype = (
+        q_dtype != kv_dtype
+    )  # no dtype-specific entry; generic configs serve it
     # decode without a sliding window takes the 3D kernel on gfx942
     # (use_2d_kernel needs sliding_window > 0 there); assert that table
     # instead of attn_2d for those cases
@@ -897,8 +903,9 @@ def test_triton_unified_attn_gfx942_large_prefill(
             kv_dtype,
         ),
     )
-    assert key == expected_key, f"expected {expected_key}, matched {key}"
-    assert config["BLOCK_M"] == expected_block_m, (
+    if not mixed_dtype:
+        assert key == expected_key, f"expected {expected_key}, matched {key}"
+    assert mixed_dtype or config["BLOCK_M"] == expected_block_m, (
         f"expected BLOCK_M={expected_block_m} via {expected_key},"
         f" got {config['BLOCK_M']}"
     )

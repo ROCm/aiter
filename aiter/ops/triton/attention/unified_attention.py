@@ -534,8 +534,11 @@ def _check_shuffled_tile_lds(params: _UAParams, config: dict):
     if not params.shuffled_kv_cache or config.get("num_stages", 1) <= 1:
         return
     tile = params.block_size
-    itemsize = max(params.q_dtype.itemsize, params.kv_cache_dtype.itemsize)
-    staged = config["num_stages"] * tile * params.head_size * itemsize
+    # the LDS tile is the K/V load (kv_cache_dtype); Q is staged separately
+    # in the query load/accumulator. Use the padded head dimension, like the
+    # kernel's HEAD_SIZE_PADDED.
+    head = triton.next_power_of_2(params.head_size)
+    staged = config["num_stages"] * tile * head * params.kv_cache_dtype.itemsize
     lds_cap = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
     if lds_cap is None:
         return
