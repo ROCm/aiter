@@ -304,6 +304,7 @@ C_XC, C_XC_N = 64, 32  # [C_XC_N] compute waves done with a column slice's chunk
 C_PLAN, C_NACT = 42, 43  # dynamic schedule: units planned; active experts
 C_ARDY = 44  # loader: K-chunks of the current row tile known to have arrived
 C_DYNP = 45  # dynamic schedule: pieces per active expert
+C_CDONE = 46  # dyn + LL: this CTA's compute waves are done
 C_CLAIM = 56  # [NW] the column slice this CTA claimed last, per compute wave
 C_COLJ = 47  # the running column slice's expert slot (its chunk counts' shard)
 C_UL, UL_MAX = 96, 8  # dynamic schedule: this CTA's units (4 ints each)
@@ -334,6 +335,7 @@ def compile_fused_tp(
     nsk: int = NSK,
     nab: int = NAB,
     ll_rs: bool = False,
+    ll_route: bool = False,
 ):
     """Build the launcher for one (shape, MT) instance.
 
@@ -397,7 +399,21 @@ def compile_fused_tp(
         TB = 1  # one token per push unit: its K * P route rows in one round trip
     # dyn piece counts: divisors of the inter slices (equal pieces)
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
-    ROW_B = H + H // 32 if FP8R else 2 * H
+    # LL, dyn or one route-row region per route (static without pieces): the
+    # route rows are LL packets as well ([E4M3 x4, tag, E4M3 x4, tag] per 8
+    # columns, tag = epoch << 8 | E8M0): the push polls them per (token,
+    # chunk) -- no chunk readiness counts, flags or claims
+    DLL = LL and bool(ll_route) and (DYN or NPC == 1)
+    assert not DLL or FP8R
+    # dyn + LL, AllGather layer: the routing all-gather is LL too -- a route
+    # is one 16 B packet [id, epoch, weight, epoch] in the ids region; the
+    # compute waves poll the packets and read the routing from them
+    MLL = DLL and not ar
+    # dyn + LL, AllReduce layer: the output ReduceScatter + AllGather become
+    # one LL all-reduce -- every (token, chunk) sum goes to every rank, and
+    # every rank sums the TP partials of all rows into its own yall
+    ARLL = DLL and bool(ar)
+    ROW_B = 2 * H if DLL else (H + H // 32 if FP8R else 2 * H)
     name = (
         f"mega_moe_tp_fused_h{H}_i{I}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
         + (f"_p{NPC}" if NPC > 1 else "")
@@ -411,6 +427,7 @@ def compile_fused_tp(
         + (f"_nsk{NSK}" if NSK != 4 else "")
         + (f"_nab{NAB}" if NAB != 4 else "")
         + ("_ll" if LL else "")
+        + ("_llr" if DLL else "")
     )
     # Column-split leftover experts (xsplit = GEMM1 inter slices per expert):
     # the engine's units then include UNIT_G1X / UNIT_G2COL, see unit_tile_x.
@@ -820,6 +837,36 @@ def compile_fused_tp(
     @traced
     def gather_routes(L, tid, ids_addr, tw_addr, ttot, expert):
         """Collect every route to `expert` into LDS (rix, wt); return the count."""
+        if const_expr(MLL):
+            return gather_routes_ll(L, tid, ids_addr, ttot, expert)
+        return _gather_routes(L, tid, ids_addr, tw_addr, ttot, expert)
+
+    @traced
+    def gather_routes_ll(L, tid, ids_addr, ttot, expert):
+        """(LL routing: a route's id and weight are words 0 and 2 of its packet)"""
+        if tid == i32(0):
+            lds_st(L, L_CTL + C_CNT * 4, i32(0))
+        cbar(L, tid)
+        rid = rsrc(ids_addr)
+        for i_ in range(tid, ttot * i32(TOPK), i32(NT)):
+            i = i32(i_)
+            pk = fx.Vector(bld(rid, i * i32(16), 0, V4I, 0))
+            _gather_one(L, i, fx.Int32(pk[0]), fx.Int32(pk[2]), expert)
+        cbar(L, tid)
+        cnt = lds_ld_i32(L, L_CTL + C_CNT * 4)
+        cbar(L, tid)
+        return fx.min(cnt, i32(TMAX))
+
+    @traced
+    def _gather_one(L, idx, e, wv, expert):
+        if e == expert:
+            slot = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
+            if slot < i32(TMAX):
+                lds_st(L, L_RIX + slot * i32(4), idx)
+                lds_st(L, L_WT + slot * i32(4), wv)
+
+    @traced
+    def _gather_routes(L, tid, ids_addr, tw_addr, ttot, expert):
         if tid == i32(0):
             lds_st(L, L_CTL + C_CNT * 4, i32(0))
         cbar(L, tid)
@@ -1192,8 +1239,17 @@ def compile_fused_tp(
             x, y = swap32(packs[0][dw], packs[1][dw])
             lo.append(x)
             hi.append(y)
-        ov = fx.Vector.from_elements(lo + hi, fx.Int32)
         col = n0 + (q4 >> i32(1)) * i32(32) + (q4 & i32(1)) * i32(16)
+        if const_expr(DLL):
+            e8 = ((q4 >> i32(1)) == i32(0)).select(e8s[0], e8s[1])
+            tag = ((a["epoch"] & i32(0xFFFFFF)) << i32(8)) | e8
+            off = (rix * i32(H) + col) * i32(2)
+            for h in range_constexpr(2):
+                d = lo if h == 0 else hi
+                pkt = fx.Vector.from_elements([d[0], tag, d[1], tag], fx.Int32)
+                bst(pkt, rs, ok.select(off + i32(16 * h), oob), 0, AUX_SC1)
+            return
+        ov = fx.Vector.from_elements(lo + hi, fx.Int32)
         bst(ov, rs, ok.select(rix * i32(H) + col, oob), 0, AUX_SC1)
         # the row's two scale bytes, from its q4 == 0 lane
         sc = fx.Int16(e8s[0] | (e8s[1] << i32(8)))
@@ -1373,12 +1429,14 @@ def compile_fused_tp(
                             )
                     if const_expr(FP8R):
                         store_route_fp8(r_routes, halves, rix, n0, q4, lane, ok, oob, a)
-                maybe_report(L, lane, w, gi, signal, LAG * RLAG, LAG)
-                if const_expr(colsig is not None):
+                if const_expr(not DLL):
+                    maybe_report(L, lane, w, gi, signal, LAG * RLAG, LAG)
+                if const_expr(colsig is not None and not DLL):
                     col_report(L, a, lane, gi, g_lo, colsig, RLAG)
         wait_vm(0)
-        _final_report(L, lane, w, signal)
-        if const_expr(colsig is not None):
+        if const_expr(not DLL):
+            _final_report(L, lane, w, signal)
+        if const_expr(colsig is not None and not DLL):
             if colsig:
                 col_done(L, a, lane, (g_hi - i32(1)) // i32(GPC))
 
@@ -1460,7 +1518,9 @@ def compile_fused_tp(
     @traced
     def compute_units(L, tid, a):
         lane = tid % i32(64)
-        if const_expr(not AR):
+        if const_expr(MLL):
+            meta_ll_wait(L, tid, a)
+        elif const_expr(not AR):
             ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
         cbar(L, tid)
@@ -1513,6 +1573,13 @@ def compile_fused_tp(
             for it_ in range(i32(0), cap, i32(1)):
                 _col_unit(L, tid, a, ub, ue)
         mark(a, tid == i32(0), 6)
+        if const_expr(DLL):
+            _cdone(L, tid)
+
+    @traced
+    def _cdone(L, tid):
+        if tid == i32(0):
+            lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
 
     @traced
     def _col_unit(L, tid, a, ub, ue):
@@ -1564,7 +1631,7 @@ def compile_fused_tp(
         rid = rsrc(a["ids"])
         for idx_ in range(tid, n, i32(NT)):
             idx = i32(idx_)
-            e = fx.Int32(bld(rid, idx * i32(4), 0, T.i32, 0))
+            e = fx.Int32(bld(rid, idx * i32(16 if MLL else 4), 0, T.i32, 0))
             lds_atomic_or(L, L_DYN + (e >> i32(5)) * i32(4), i32(1) << (e & i32(31)))
         cbar(L, tid)
         _dyn_prefix(L, tid)
@@ -1629,8 +1696,12 @@ def compile_fused_tp(
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, u_hi - u_lo)
             lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
 
-    @traced
     def _xcol_empty(a, tid, kind, gi, R):
+        if not DLL:  # (DLL: no chunk counts)
+            _xcol_empty_count(a, tid, kind, gi, R)
+
+    @traced
+    def _xcol_empty_count(a, tid, kind, gi, R):
         """A column slice without rows counts every wave into its chunks here."""
         if ((kind & i32(0xFF)) == i32(UNIT_G2COL)) & (R == i32(0)) & (tid == i32(0)):
             c0 = gi // i32(GPC)
@@ -2627,7 +2698,7 @@ def compile_fused_tp(
         # let the (small) routing metadata out first: the payload would queue
         # it behind a megabyte per peer (not with split rows: a few hundred
         # bytes per CTA, sent alongside)
-        if const_expr(not AR and par == 0):
+        if const_expr(not AR and par == 0 and not MLL):
             mp = (ag_split(a) > i32(1)).select(
                 i32(0), _meta_pending(a, lane, a["epoch"], own=True)
             )
@@ -2745,6 +2816,9 @@ def compile_fused_tp(
         weights) to every peer -- one load and one store round, no serial chain
         -- then raise their own flag per peer."""
         bid = i32(gpu.block_id("x"))
+        if const_expr(MLL):
+            _ag_send_meta_ll(lane, a, bid)
+            return
         if bid < _ag_nmeta(a):
             m = a["m"]
             rank = a["rank"]
@@ -2790,6 +2864,39 @@ def compile_fused_tp(
                     0,
                     AUX_SYS,
                 )
+
+    @traced
+    def _ag_send_meta_ll(lane, a, bid):
+        """LL routing all-gather: this rank's routes as packets to every peer
+        (no completion wait, no flags). CTA b sends routes 64 b + lane, ..."""
+        m = a["m"]
+        n = m * i32(TOPK)
+        rid = rsrc(a["ids_in"])
+        rtw = rsrc(a["tw_in"])
+        big = i32(1 << 30)
+        for i_ in range(bid * i32(64) + lane, n, i32(gpu.grid_dim.x) * i32(64)):
+            i = i32(i_)
+            e = fx.Int32(bld(rid, i * i32(4), 0, T.i32, 0))
+            wv = fx.Int32(bld(rtw, i * i32(4), 0, T.i32, 0))
+            pkt = fx.Vector.from_elements([e, a["epoch"], wv, a["epoch"]], fx.Int32)
+            off = (a["rank"] * n + i) * i32(16)
+            for p in range_constexpr(TPC):
+                ri = rsrc(fx.Int64(a["peer"][p]) + fx.Int64(a["off_ids"]), big)
+                bst(pkt, ri, off, 0, AUX_SYS)
+
+    @traced
+    def meta_ll_wait(L, tid, a):
+        """Compute waves: every route packet of this launch landed."""
+        n = a["ttot"] * i32(TOPK)
+        rid = rsrc(a["ids"])
+        for i_ in range(tid, n, i32(NT)):
+            i = i32(i_)
+            t = fx.Int32(fx.Vector(bld(rid, i * i32(16), 0, V4I, AUX_SYS))[1])
+            t0 = _now()
+            while (t != a["epoch"]) & _alive(t0):
+                rocdl.s_sleep(1)
+                t = fx.Int32(fx.Vector(bld(rid, i * i32(16), 0, V4I, AUX_SYS))[1])
+            _report_if(a, t != a["epoch"], ERR_META)
 
     def _wave_any(v, lane):
         for k in (1, 2, 4, 8, 16, 32):
@@ -2972,12 +3079,146 @@ def compile_fused_tp(
             # output rows no final
             stage = (tid == i32(C_LRED)) | (tid == i32(C_PULL))
             v = (stage & comm_idle(a)).select(i32(NCK), v)
+            if const_expr(DLL):
+                # pushes poll their route packets (push_dll): nothing to
+                # signal or claim
+                v = ((tid == i32(C_LRED)) | (tid == i32(C_NSIG))).select(i32(NCK), v)
             # the final stage claims only its own chunks: the others count as
             # claimed and done
             own = fin_owned(a)
             v = (tid == i32(C_PULL)).select(i32(NCK) - _ctpop(own), v)
             v = (tid == i32(C_FBITS)).select(i32((1 << NCK) - 1) & (own ^ i32(-1)), v)
+            if const_expr(ARLL):
+                v = (tid == i32(C_PULL)).select(i32(NCK), v)  # final_all_ll
             lds_st(L, L_CTL + tid * i32(4), v)
+
+    def _dll_rows(a, t, c0, vc, P):
+        """The K x NPC route packets of token t's columns [c0 + 8 vc, +8)
+        (pieces p >= P read past the end: zeros, and count as live)."""
+        ttot = a["ttot"]
+        rb = route_region_bytes(ttot)
+        r_routes = rsrc(a["routes"], rb)
+        r_pr = rsrc(a["proutes"], i32(NPC - 1) * rb)
+        out = []
+        for k in range_constexpr(TOPK):
+            ridx = t * i32(TOPK) + i32(k)
+            off = (ridx * i32(H) + c0 + vc * i32(8)) * i32(2)
+            out.append(fx.Vector(bld(r_routes, off, 0, V4I, AUX_SC1)))
+            for p in range_constexpr(1, NPC):
+                o2 = (i32(p) < P).select(i32(p - 1) * rb + off, i32(NPC) * rb)
+                out.append(fx.Vector(bld(r_pr, o2, 0, V4I, AUX_SC1)))
+        return out
+
+    def _dll_pending(a, lane, pk, v, P):
+        want = a["epoch"] & i32(0xFFFFFF)
+        bad = i32(0)
+        live_v = v < i32(CW // 8)
+        for k in range_constexpr(TOPK):
+            for p in range_constexpr(NPC):
+                q = pk[k * NPC + p]
+                ok = (fx.Int32(q[1]).shrui(i32(8)) == want) & (fx.Int32(q[3]).shrui(i32(8)) == want)
+                live = live_v & (i32(p) < P)
+                bad = fx.max(bad, (live & (ok == fx.Boolean(False))).select(i32(1), i32(0)))
+        return _wave_any(bad, lane)
+
+    DLL_NWS = 4  # waves per CTA running push / final items (dyn + LL)
+
+    @traced
+    def push_dll(L, tid, a, ws=0):
+        """dyn + LL: this CTA's (token, chunk) push items: poll the token's
+        K x P route packets of the chunk until they carry this launch's tag,
+        sum them, LL-push the sum to the token's owner."""
+        lane = tid % i32(64)
+        # the chunk's rows complete when every CTA's GEMM2 passed it -- about
+        # when this CTA's does: no polling (memory traffic) before that
+        if lane == i32(0):
+            spin_lds_ge(L, L_CTL + C_CDONE * 4, i32(1))
+        rocdl.sched_barrier(0)
+        P = uni(lds_ld_acq(L, L_CTL + C_DYNP * 4)) if DYN else i32(1)
+        ttot = a["ttot"]
+        nblk = i32(gpu.grid_dim.x)
+        for it_ in range(i32(gpu.block_id("x")) + i32(ws) * nblk, ttot * i32(NCK), nblk * i32(DLL_NWS)):
+            it = i32(it_)
+            c = it // ttot
+            t = it - c * ttot
+            c0 = c * i32(CW)
+            owner = t // a["m"]
+            orow = t - owner * a["m"]
+            r_dst = rsrc(peer_sel(a, owner) + fx.Int64(a["off_part"]))
+            pd = (a["rank"] * a["mmax"] + orow, c0)
+            if const_expr(ARLL):
+                pd = (a["rank"] * a["mmax"] * a["tp"] + t, c0)
+            for j in range_constexpr(VPL):
+                v = lane + i32(j * 64)
+                vc = fx.min(v, i32(CW // 8 - 1))
+                pk = _dll_rows(a, t, c0, vc, P)
+                pend = _dll_pending(a, lane, pk, v, P)
+                t0 = _now()
+                while (pend != i32(0)) & _alive(t0):
+                    rocdl.s_sleep(8)
+                    pk = _dll_rows(a, t, c0, vc, P)
+                    pend = _dll_pending(a, lane, pk, v, P)
+                _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+                acc = [fx.Float32(0.0)] * 8
+                for k in range_constexpr(TOPK):
+                    for p in range_constexpr(NPC):
+                        q = pk[k * NPC + p]
+                        sc = ((fx.Int32(q[1]) & i32(0xFF)) << i32(23)).bitcast(fx.Float32)
+                        vals = fp8x4_unpack(fx.Int32(q[0]), sc) + fp8x4_unpack(fx.Int32(q[2]), sc)
+                        live = i32(p) < P
+                        acc = [x + live.select(y, fx.Float32(0.0)) for x, y in zip(acc, vals)]
+                if const_expr(ARLL):
+                    for pr in range_constexpr(TPC):
+                        rd = rsrc(fx.Int64(a["peer"][pr]) + fx.Int64(a["off_part"]))
+                        _push_store(a, rd, pd, v, acc, v < i32(CW // 8))
+                else:
+                    _push_store(a, r_dst, pd, v, acc, v < i32(CW // 8))
+        if const_expr(ARLL):
+            final_all_ll(L, tid, a, ws)
+
+    @traced
+    def final_all_ll(L, tid, a, ws=0):
+        """AR + LL: this CTA's (token, chunk) output items: poll every rank's
+        packets of the token's chunk, sum them in rank order, write the local
+        yall row."""
+        lane = tid % i32(64)
+        ttot = a["ttot"]
+        trows = a["mmax"] * a["tp"]
+        nblk = i32(gpu.grid_dim.x)
+        r_recv = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_part"]))
+        ry = rsrc(peer_sel(a, a["rank"]) + fx.Int64(a["off_yall"]))
+        for it_ in range(i32(gpu.block_id("x")) + i32(ws) * nblk, ttot * i32(NCK), nblk * i32(DLL_NWS)):
+            it = i32(it_)
+            c = it // ttot
+            t = it - c * ttot
+            c0 = c * i32(CW)
+            for j in range_constexpr(VPL):
+                v = lane + i32(j * 64)
+                vc = fx.min(v, i32(CW // 8 - 1))
+                pk = _ll_pkts_rows(a, r_recv, t, trows, c0, vc)
+                pend = _ll_pending(a, lane, pk, v)
+                t0 = _now()
+                while (pend != i32(0)) & _alive(t0):
+                    rocdl.s_sleep(1)
+                    pk = _ll_pkts_rows(a, r_recv, t, trows, c0, vc)
+                    pend = _ll_pending(a, lane, pk, v)
+                _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+                acc = [fx.Float32(0.0)] * 8
+                for p in range_constexpr(MAX_TP):
+                    sc = ((fx.Int32(pk[p][1]) & i32(0xFF)) << i32(23)).bitcast(fx.Float32)
+                    vals = fp8x4_unpack(fx.Int32(pk[p][0]), sc) + fp8x4_unpack(fx.Int32(pk[p][2]), sc)
+                    live = i32(p) < a["tp"]
+                    acc = [x + live.select(y, fx.Float32(0.0)) for x, y in zip(acc, vals)]
+                if v < i32(CW // 8):
+                    bst(pack_bf16x8(acc), ry, (t * i32(H) + c0 + v * i32(8)) * i32(2), 0, 0)
+
+    def _ll_pkts_rows(a, r_recv, row, rstride, c0, vc):
+        out = []
+        for p in range_constexpr(MAX_TP):
+            pc = fx.min(i32(p), a["tp"] - i32(1))
+            off = ((pc * rstride + row) * i32(H) + c0 + vc * i32(8)) * i32(2)
+            out.append(fx.Vector(bld(r_recv, off, 0, V4I, AUX_SYS)))
+        return out
 
     @traced
     def roles(L, tid, a, epoch):
@@ -2988,10 +3229,14 @@ def compile_fused_tp(
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
                 mark(a, tid == i32(NT), 7)
+                if const_expr(DLL):
+                    push_dll(L, tid, a)
                 comm_wave(L, tid, a, epoch)
                 mark(a, tid == i32(NT), 12)
             elif tid < i32(NT + 128):
                 a_loader(L, tid, a)
+                if const_expr(DLL):
+                    push_dll(L, tid, a, 1)
                 signal_loop(L, tid, a, epoch)
                 comm_help(L, tid, a, epoch)
             else:
@@ -3000,6 +3245,11 @@ def compile_fused_tp(
                         pre_send(L, tid % i32(64), a)
                     else:
                         ag_send(L, tid % i32(64), a, 1)
+                if const_expr(DLL):
+                    if tid < i32(NT + 192):
+                        push_dll(L, tid, a, 2)
+                    else:
+                        push_dll(L, tid, a, 3)
                 comm_help(L, tid, a, epoch)
 
     # Explicit annotation: the module's postponed annotations cannot see LDS_BYTES.
@@ -3102,8 +3352,10 @@ def compile_fused_tp(
         # once, by its first workgroup -- 256 L2 invalidations back to back
         # stall every XCD's memory traffic for ~20 us.
         _drop_stale(tid, a)
-        if const_expr(XSPLIT):
-            claim_reset(tid, a)
+        # every variant zeroes the next launch's claim bank: an engine may
+        # alternate variants (per batch size), and a column-split launch after
+        # others must not find a stale count
+        claim_reset(tid, a)
         # the gathered operand of this rank lives in its own arena
         mine = peers[0]
         for j in range_constexpr(1, MAX_TP):
@@ -3125,7 +3377,7 @@ def compile_fused_tp(
         a["axs"] = fx.Int64(mine) + off_xs
         roles(L, tid, a, epoch)
         gpu.barrier()
-        if const_expr(AR):
+        if const_expr(AR and not ARLL):
             yag_wait(tid, a, epoch)
         mark(a, tid == i32(0), 11)
         finish(tid, a, epoch)

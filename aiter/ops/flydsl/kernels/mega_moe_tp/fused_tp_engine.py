@@ -52,7 +52,7 @@ LDS_LIMIT = 160 * 1024
 TUNED_CSV = "mega_moe_tp_a4w4_tuned.csv"
 # the key columns of a tuned row, and its config columns
 CSV_KEY = ("gfx", "cu_num", "tp", "comm_mode", "model_dim", "inter_dim", "expert", "topk", "act")
-CSV_CFG = ("block_m", "nsk", "dyn", "route_fp8", "xsplit", "ll")
+CSV_CFG = ("block_m", "nsk", "dyn", "route_fp8", "xsplit", "ll", "llr")
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,10 @@ class LaunchCfg:
     """One launch's variant: row tile block_m = 16 * mt, weight ring depth
     nsk (k-steps), dynamic schedule, E4M3 (else bf16) route rows, column
     split of the static schedule's leftover experts, LL ReduceScatter
-    packets (data + tag: no completion flags; twice the wire bytes)."""
+    packets (data + tag: no completion flags; twice the wire bytes), and
+    (llr, with ll) LL route rows pushed as soon as they land -- no chunk
+    counting -- with an LL routing all-gather (AG/RS layer) or an LL output
+    all-reduce (AR/AR layer)."""
 
     mt: int
     nsk: int
@@ -68,6 +71,7 @@ class LaunchCfg:
     route_fp8: bool
     xsplit: bool
     ll: bool = False
+    llr: bool = False
 
     @property
     def block_m(self) -> int:
@@ -99,6 +103,7 @@ def _tuned_rows(path: str) -> dict:
                 route_fp8=int(r["route_fp8"]) == 1,
                 xsplit=int(r["xsplit"]) == 1,
                 ll=int(r.get("ll") or 0) == 1,
+                llr=int(r.get("llr") or 0) == 1,
             )
             rows.setdefault(key, []).append((int(r["token"]), cfg))
     for v in rows.values():
@@ -168,11 +173,15 @@ class FusedTpMegaMoe:
         arena = SymmetricArena(group=group, device=self.device)
         self._x = arena.reserve("x", (tot, H // 2), torch.uint8)
         self._xs = arena.reserve("xs", (tot, H // 32), torch.uint8)
-        self._ids = arena.reserve("ids", (tot, K), torch.int32)
+        # (16 B per route: LL routing packets, see compile_fused_tp)
+        self._ids = arena.reserve("ids", (tot, 4 * K), torch.int32)
         self._w = arena.reserve("w", (tot, K), torch.float32)
         # ReduceScatter receive slots [source rank][row][H]. A peer only writes
         # launch n + 1's rows after this rank joined n + 1's AllGather.
-        self._recv = arena.reserve("recv", (self.tp, self.mmax, H), torch.bfloat16)
+        # (AR: every rank's partial of every row -- the LL output all-reduce)
+        self._recv = arena.reserve(
+            "recv", (self.tp, tot if self.ar else self.mmax, H), torch.bfloat16
+        )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         # AR/AR: the peers' partials of this rank's input shard, and the
         # all-gathered output (returned as a view: valid until the next call)
@@ -445,16 +454,10 @@ class FusedTpMegaMoe:
         rpe = (tot * self.K + self.E - 1) // self.E
         mt = self._fit_mt((rpe + 15) // 16, dyn, 4)
         nsk = 4
-        if dyn:
-            # short pieces store route rows every few k-steps: deepest ring
-            for n in (8, 6):
-                if (self.H // 128) % n == 0 and self._lds(mt, dyn, n) <= LDS_LIMIT:
-                    nsk = n
-                    break
         # bf16 route rows at small batches (the route traffic is small there);
         # LL ReduceScatter packets while the RS is latency, not bandwidth, bound
         return LaunchCfg(mt=mt, nsk=nsk, dyn=dyn, route_fp8=not dyn, xsplit=True,
-                         ll=tot <= 256)
+                         ll=tot <= 256, llr=tot <= 128)
 
     def config(self, m: int) -> LaunchCfg:
         """The launch config for m local tokens: the tuned CSV row of the
@@ -475,7 +478,8 @@ class FusedTpMegaMoe:
             over["mt"] = int(env("AITER_MEGAMOE_BLOCK_M")) // 16
         if env("AITER_MEGAMOE_NSK"):
             over["nsk"] = int(env("AITER_MEGAMOE_NSK"))
-        for name, field in (("DYN", "dyn"), ("ROUTE_FP8", "route_fp8"), ("XSPLIT", "xsplit"), ("LL", "ll")):
+        for name, field in (("DYN", "dyn"), ("ROUTE_FP8", "route_fp8"), ("XSPLIT", "xsplit"),
+                            ("LL", "ll"), ("LLR", "llr")):
             v = env(f"AITER_MEGAMOE_{name}", "")
             if v in ("0", "1"):
                 over[field] = v == "1"
@@ -493,8 +497,10 @@ class FusedTpMegaMoe:
         if self._lds(mt, dyn, nsk) > LDS_LIMIT:
             nsk = 4
             mt = self._fit_mt(cfg.mt, dyn, nsk)
-        cfg = LaunchCfg(mt=mt, nsk=nsk, dyn=dyn, route_fp8=cfg.route_fp8, xsplit=cfg.xsplit,
-                        ll=cfg.ll and self.rs_fp8)
+        ll = cfg.ll and self.rs_fp8
+        # dyn + LL: the route rows are E4M3 LL packets too
+        cfg = LaunchCfg(mt=mt, nsk=nsk, dyn=dyn, route_fp8=cfg.route_fp8,
+                        xsplit=cfg.xsplit, ll=ll, llr=cfg.llr and ll)
         self._cfgs[m] = cfg
         return cfg
 
@@ -513,7 +519,9 @@ class FusedTpMegaMoe:
             act=self.activation,
             situ_beta=self.situ[0],
             situ_linear_beta=self.situ[1],
-            route_fp8=cfg.route_fp8,
+            # (LL route rows -- dyn, or static without pieces -- are E4M3
+            # LL packets)
+            route_fp8=cfg.route_fp8 or (cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)),
             rs_fp8=self.rs_fp8,
             agr=self.agr,
             tp=self.tp,
@@ -523,6 +531,7 @@ class FusedTpMegaMoe:
             nsk=cfg.nsk,
             nab=self._nab(cfg.mt, cfg.dyn, cfg.nsk),
             ll_rs=cfg.ll,
+            ll_route=cfg.ll and cfg.llr,
             **static,
         )
 

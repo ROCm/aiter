@@ -102,10 +102,11 @@ def schedules(eng, m: int) -> list[LaunchCfg]:
         mt = eng._fit_mt((rpe + 15) // 16, dyn, 4)
         xss = [True] if dyn or eng._scheds[True].xsplit == eng._scheds[False].xsplit else [True, False]
         for xs in xss:
-            cfg = LaunchCfg(mt=mt, nsk=base.nsk if dyn == base.dyn else 4, dyn=dyn,
-                            route_fp8=not dyn, xsplit=xs, ll=base.ll)
-            if _valid(eng, cfg):
-                out.append(cfg)
+            for llr in ([True, False] if base.ll else [False]):
+                cfg = LaunchCfg(mt=mt, nsk=base.nsk if dyn == base.dyn else 4, dyn=dyn,
+                                route_fp8=not dyn, xsplit=xs, ll=base.ll, llr=llr)
+                if _valid(eng, cfg):
+                    out.append(cfg)
     return out
 
 
@@ -116,7 +117,7 @@ def refinements(eng, best: LaunchCfg) -> list[LaunchCfg]:
     for mt in (best.mt - 1, best.mt + 1):
         out.append(LaunchCfg(**{**best.__dict__, "mt": mt}))
     out.append(LaunchCfg(**{**best.__dict__, "route_fp8": not best.route_fp8}))
-    out.append(LaunchCfg(**{**best.__dict__, "ll": not best.ll}))
+    out.append(LaunchCfg(**{**best.__dict__, "ll": not best.ll, "llr": False}))
     if best.dyn:
         for nsk in (4, 6, 8):
             if nsk != best.nsk:
@@ -232,7 +233,7 @@ def main() -> int:
                     print(f"[tune] {name} {mode} M={tok} {cfg}: failed {exc}", flush=True)
                     return True
                 print(f"[tune] {name} {mode} M={tok} block_m={cfg.block_m} nsk={cfg.nsk} dyn={int(cfg.dyn)} "
-                      f"rf8={int(cfg.route_fp8)} xs={int(cfg.xsplit)} ll={int(cfg.ll)}: {us:.1f} us (rel_l2 {err:.4f})", flush=True)
+                      f"rf8={int(cfg.route_fp8)} xs={int(cfg.xsplit)} ll={int(cfg.ll)} llr={int(cfg.llr)}: {us:.1f} us (rel_l2 {err:.4f})", flush=True)
                 # earlier candidates win ties within 1%
                 if best is None or us < best[0] * 0.99:
                     best = (us, cfg)
@@ -253,6 +254,7 @@ def main() -> int:
                 model_dim=e.H, inter_dim=e.I, expert=e.E, topk=e.K, act=e.activation,
                 block_m=cfg.block_m, nsk=cfg.nsk, dyn=int(cfg.dyn),
                 route_fp8=int(cfg.route_fp8), xsplit=int(cfg.xsplit), ll=int(cfg.ll),
+                llr=int(cfg.llr),
                 us=f"{us:.2f}", split_us=f"{split_us:.2f}",
                 speedup=f"{split_us / us:.3f}" if split_us == split_us else "",
                 model=name,
