@@ -15,12 +15,7 @@ class UncachedIpcHeap:
 
     _HIP_IPC_HANDLE_BYTES = 64
     _HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
-    # hipExtMallocWithFlags modes. Uncached is right on xGMI, where the peer
-    # aperture has no penalty and skipping the caches keeps the handshake
-    # simple. It is catastrophic on PCIe: peer writes into uncached memory
-    # serialize per destination, so bandwidth collapses as the number of peers
-    # written grows (measured on MI350P: 55 GB/s to 1 peer, 4.45 to 2, 1.44 to
-    # 3, against 33.5 GB/s fine-grained).
+    # hipExtMallocWithFlags modes.
     _HIP_DEVICE_MALLOC_DEFAULT = 0x0
     _HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
     _HIP_DEVICE_MALLOC_UNCACHED = 0x3

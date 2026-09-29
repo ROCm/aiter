@@ -47,7 +47,7 @@ from .quick_allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
-    _RELEASE_SCOPE,
+    _SYSTEM_SYNC_SCOPE,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
@@ -513,7 +513,7 @@ def make_quick_allreduce_int4_ring_kernel(
             # here sits directly on top of dirty output lines, and discarding
             # them silently loses whole chunks.
             rocdl.s_waitcnt(vmcnt=0)
-            _release_inbox(_RELEASE_SCOPE)
+            _release_inbox(_SYSTEM_SYNC_SCOPE)
             _acquire_inbox()
 
         def _op_substep(k, tile, sub):

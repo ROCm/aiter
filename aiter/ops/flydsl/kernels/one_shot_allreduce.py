@@ -219,6 +219,7 @@ def make_one_shot_allreduce_kernel(
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
     release_scope = policy["release"]
+    acquire_scope = policy["acquire"]
 
     tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
@@ -349,12 +350,19 @@ def make_one_shot_allreduce_kernel(
         def _wait(parity, color):
             """Spin until every rank's flag in our own inbox shows *color*.
 
-            One spinner per source. The writeback-then-invalidate after the join
-            is unconditional on purpose: if the flag is already present the loop
-            body never runs, and an invalidate placed only inside it would leave
-            the common case reading stale payload. Write back *before*
-            invalidating or the output lines this block already wrote are
-            discarded.
+            One spinner per source. The fences after the join are placed there,
+            not inside the spin, on purpose: if the flag is already present the
+            loop body never runs, and a fence placed only inside it would be
+            skipped in the common case.
+
+            The fences depend on the inbox type (``_INBOX_POLICY``). A cacheable
+            inbox gets a writeback then a system-scope acquire, i.e., an L1+L2
+            invalidate, so the payload loads cannot hit a stale line. Write back
+            *before* invalidating, or the output lines this block already wrote
+            are discarded. The uncached inbox has no stale line to invalidate:
+            the memory is never cached and the loads bypass L1 and L2
+            (``_RECV_POLICY``). It gets a workgroup-scope acquire, which only
+            keeps the payload loads below the spin.
             """
             # Lane ``t`` watches one source. Without ``skip_self`` that is
             # source ``t``; with it our own flag is never published, so the
@@ -370,8 +378,8 @@ def make_one_shot_allreduce_kernel(
                     _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
                 )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
-                # fence is needed in the loop; the acquire below covers the
-                # payload reads, once, after the join.
+                # fence is needed in the loop; the fences below order the
+                # payload reads after it, once, after the join.
                 current = _load_flag(flag)
                 while current != color:
                     current = _load_flag(flag)
@@ -379,7 +387,7 @@ def make_one_shot_allreduce_kernel(
             rocdl.s_waitcnt(vmcnt=0)
             if const_expr(release_scope is not None):
                 _release_inbox(release_scope)
-            _acquire_inbox()
+            _acquire_inbox(acquire_scope)
 
         def _reduce(parity, my_atoms):
             """Sum this thread's atom across all N contributions, in rank order.
