@@ -725,3 +725,43 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.parametrize("num_heads", [(32, 4), (8, 1)])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_short_query_head512(
+    num_heads: tuple[int, int],
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    use_q_descale: bool,
+    use_kv_descale: bool,
+) -> None:
+    """head_size 512 steps with 2-3 query tokens per sequence (speculative
+    verify), which take the split-KV 3D path rather than the 2D kernel."""
+    test_triton_unified_attn(
+        seq_lens=[(3, 1033), (3, 517), (2, 2049), (1, 777)],
+        num_heads=num_heads,
+        head_size=512,
+        sliding_window=None,
+        block_size=block_size,
+        soft_cap=None,
+        num_blocks=2048,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=out_dtype,
+        use_q_descale=use_q_descale,
+        use_kv_descale=use_kv_descale,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+        backend="triton",
+    )
