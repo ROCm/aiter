@@ -226,6 +226,13 @@ def compile_mega_moe_stage1(
     # Compact producers read two route ids back to back and keep both rows' loads
     # in flight before storing (instead of ~4 dependent load round trips per row).
     DISPATCH_FAST_COPY = os.environ.get("AITER_MEGA_DISPATCH_FAST_COPY", "1") == "1"
+    # Fixed-slot GEMM1 with LDS-DMA A copies runs its K loop two steps per
+    # iteration so the B prefetch stays in flight (compact prefill is slower
+    # with it: its 8-wave tiles already hide the latency).
+    K_UNROLL = 2 if (
+        fixed_slot_dispatch and async_a_copy
+        and os.environ.get("AITER_MEGA_S1_FIXED_KPAIR", "1") == "1"
+    ) else 0
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
@@ -246,6 +253,8 @@ def compile_mega_moe_stage1(
         f"{'_ol' if OWNER_LIGHT else ''}"
         f"_ev{os.environ.get('AITER_MEGA_S1_EPI_EVEC', '8')}"
         f"{'_fc' if DISPATCH_FAST_COPY and not fixed_slot_dispatch else ''}"
+        f"{'_uk' + os.environ['AITER_MEGA_S1_UNROLL_K'] if os.environ.get('AITER_MEGA_S1_UNROLL_K', '0') != '0' else ''}"
+        f"{'_kp2' if K_UNROLL == 2 else ''}"
         f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
     TRACE_BASE = _trace.trace_base("stage1")
@@ -524,6 +533,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+            k_unroll=K_UNROLL,
             indirect_input=compact_dispatch and not indexed_payload,
             indexed_input=indexed_payload,
             row_map_rsrc=srcmap_rsrc,

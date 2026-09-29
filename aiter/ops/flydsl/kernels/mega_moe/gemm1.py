@@ -31,12 +31,20 @@ class _LdsF32View:
         self.ptr = ptr
 
 
+# K loop shape: 0 rolled; 1 fully unrolled; 2 rolled by two steps (ping-pong B
+# registers: the prefetched tile is not copied into loop-carried registers,
+# which forced a vmcnt drain of the prefetch every step). Callers pass
+# ``k_unroll``; AITER_MEGA_S1_UNROLL_K overrides it for experiments.
+UNROLL_K_MODE = int(os.environ.get("AITER_MEGA_S1_UNROLL_K", "0"))
+
+
 # fmt: off
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, k_unroll=0):
 # fmt: on
+    k_mode = k_unroll if k_unroll else UNROLL_K_MODE
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
     NUM_A_SCALE = M_REPEAT // _PACK
@@ -78,7 +86,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_scale_lds,
                 fx.Int32(0),
             )
-        for sp_i, state in range(0, K_ITERS - 1, 1, init=init):
+        def _kstep(sp_i, state):
             sp = fx.Int32(sp_i)
             acc = [Vec(a) for a in state[:N_ACC]]
             b_prev = [
@@ -163,7 +171,28 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             if const_expr(async_a_copy):
                 yv += sb_next
                 yv += sa_next
-            state = yield yv
+            return yv
+
+        if const_expr(k_mode == 1):
+            # Fully unrolled K: the prefetched B tile is consumed in place instead of
+            # being copied into loop-carried registers (which forced a vmcnt drain
+            # of the prefetch at the end of every K step).
+            state = init
+            for sp_i in range_constexpr(K_ITERS - 1):
+                state = _kstep(sp_i, state)
+        elif const_expr(k_mode == 2):
+            pairs = (K_ITERS - 1) // 2
+            for pr_i, state in range(0, pairs, 1, init=init):
+                pr = fx.Int32(pr_i)
+                mid = _kstep(pr * fx.Int32(2), state)
+                yv = _kstep(pr * fx.Int32(2) + fx.Int32(1), mid)
+                state = yield yv
+            if const_expr((K_ITERS - 1) % 2):
+                state = _kstep(fx.Int32(K_ITERS - 2), state)
+        else:
+            for sp_i, state in range(0, K_ITERS - 1, 1, init=init):
+                yv = _kstep(sp_i, state)
+                state = yield yv
         acc = [Vec(r) for r in state[:N_ACC]]
         b_prev = [
             [Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)]
@@ -274,7 +303,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
-    source_rows=0, swiglu_limit=0.0):
+    source_rows=0, swiglu_limit=0.0, k_unroll=0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -335,7 +364,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input)
+            trb_rsrc, tib_rsrc, indirect_input, k_unroll)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile

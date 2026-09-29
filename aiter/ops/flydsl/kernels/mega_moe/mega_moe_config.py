@@ -207,7 +207,10 @@ def _select_fixed_stage1(bucket: int) -> Stage1Config:
         grid_mult=grid_mult,
         num_dispatch_cu=_fixed_dispatch_cu(bucket),
         mfma_amajor=False,
-        async_a_copy=False,
+        # LDS-DMA A copies + the paired K loop keep the B prefetch in flight;
+        # it matters when few tiles are resident (T=3 -12, T=7 -1.6 us/layer;
+        # neutral from 14 up).
+        async_a_copy=bucket <= 8,
         use_tile_resource=bucket <= 16,
         b_nt=0 if bucket == 1 else 3,
         waves_per_eu_hint=1 if bucket == 16 else 2,
