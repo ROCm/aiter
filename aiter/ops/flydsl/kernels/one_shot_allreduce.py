@@ -431,8 +431,13 @@ def make_one_shot_allreduce_kernel(
             _wait(parity, color)
             _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)
-            if color == fx.Int32(0):  # 0 is the unset sentinel
-                color = fx.Int32(1)
+            # 0 is the unset sentinel. The
+            # inbox slot is `color & 1`, and the colour before the wrap is -1,
+            # which is odd: resuming at 1 would put two consecutive tiles in
+            # the same slot, and a rank one tile ahead would overwrite data a
+            # peer is still reading.
+            if color == fx.Int32(0):
+                color = fx.Int32(2)
         if tid == 0:
             _store_color(color)
         gpu.barrier()
