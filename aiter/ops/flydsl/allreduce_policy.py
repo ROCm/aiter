@@ -78,7 +78,10 @@ class FamilyPolicy:
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
     ("pcie", 2): FamilyPolicy(
-        oneshot_max=256 << 10, oneshot_max_exact=64 << 20, mesh_max=NO_MAX
+        oneshot_max=384 << 10,
+        oneshot_max_exact=64 << 20,
+        mesh_max=NO_MAX,
+        min_bytes=24 << 10,
     ),
     ("pcie", 4): FamilyPolicy(
         oneshot_max=64 << 10, oneshot_max_exact=(160 << 10) - 1, mesh_max=16 << 20
