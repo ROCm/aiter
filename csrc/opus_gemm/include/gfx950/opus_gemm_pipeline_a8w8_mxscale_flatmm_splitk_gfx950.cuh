@@ -925,6 +925,23 @@ OPUS_D void mma_mxscale_flatmm_accum_on_demand(Mma& mma, const VA& v_a, const VB
     mma_mxscale_tiled<T, mxscale_pack::on_demand>(mma, v_a, v_b, v_sfa, v_sfb, v_c);
 }
 
+// Ask the scheduler to lay the current scheduling region out as N_MFMA groups
+// of one MFMA followed by its share of N_DS LDS reads and N_VMEM global loads
+// (the async LDS copies count as VMEM reads). Whatever the counts leave over is
+// scheduled freely. The instructions must already be in the region, i.e. there
+// is no s_barrier, s_waitcnt or s_setprio between them and this call.
+template<int N_MFMA, int N_DS, int N_VMEM>
+OPUS_D void sched_mfma_interleave() {
+    opus::static_for<N_MFMA>([&](auto i_c) {
+        constexpr int i = decltype(i_c)::value;
+        constexpr int ds = (i + 1) * N_DS / N_MFMA - i * N_DS / N_MFMA;
+        constexpr int vm = (i + 1) * N_VMEM / N_MFMA - i * N_VMEM / N_MFMA;
+        __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);          // MFMA
+        if constexpr (ds > 0) __builtin_amdgcn_sched_group_barrier(0x100, ds, 0);  // DS read
+        if constexpr (vm > 0) __builtin_amdgcn_sched_group_barrier(0x020, vm, 0);  // VMEM read
+    });
+}
+
 #endif // __HIP_DEVICE_COMPILE__
 
 // ============================================================================
@@ -2174,6 +2191,66 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 }
             };
 
+        if constexpr (T::ALL_WAVE) {
+        // All-wave K loop. Step k reads tile k into one register set while tile
+        // k-1's MFMAs run from the other, and refills the slot tile k-1 left:
+        //
+        //   lgkmcnt(0)     -- this wave's reads of tile k-1 are in its registers,
+        //                     so they can be consumed and their slot reused
+        //   vmcnt, barrier -- tile k has landed for every wave, and every wave is
+        //                     done reading tile k-1
+        //   copy tile k+PF-1 into tile k-1's slot, read tile k (A, B, scales),
+        //   MFMA tile k-1 -- one region, interleaved by sched_mfma_interleave
+        //
+        // The schedule it replaces issued each tile's copies ahead of the barrier
+        // (into a slot other waves could still be reading), then every read in a
+        // burst behind it, then the MFMAs behind an lgkmcnt: kid8420 (64x64x256)
+        // ran 1.45x flydsl's kernel of the same tile and wave grid. No s_setprio
+        // here: it would split the region the interleave works on.
+        //
+        // After tile k come the PF-2 copies issued since, at every step and at
+        // the first one, so that is what the barrier waits down to.
+        constexpr int PFK = T::prefetch_k_iter;
+        vtype_sfa v_sfa0, v_sfa1;
+        vtype_sfb v_sfb0, v_sfb1;
+        auto aw_read_tile = [&](int kt, auto& va, auto& vb, vtype_sfa& sfa, vtype_sfb& sfb) {
+            const int slot = kt % PFK;
+            auto sa = make_smem(smem_a_at(slot, 0, 0));
+            va = load<T::VEC_A>(sa, u_ra);
+            read_b_lds(vb, slot);
+            load_scale_regs(kt, sfa, sfb);
+        };
+        auto aw_rendezvous = [&]() {
+            s_waitcnt_lgkmcnt(0_I);
+            s_waitcnt_vmcnt(number<(PFK - 2) * aw_mb>{});
+            __builtin_amdgcn_s_barrier();
+        };
+        auto aw_step = [&](int kt, auto& va_c, auto& vb_c, vtype_sfa& sfa_c, vtype_sfb& sfb_c,
+                           auto& va_n, auto& vb_n, vtype_sfa& sfa_n, vtype_sfb& sfb_n) {
+            aw_rendezvous();
+            issue_tile_aw(kt + PFK - 1);
+            aw_read_tile(kt, va_n, vb_n, sfa_n, sfb_n);
+            mma_mxscale_flatmm_accum<T>(mma, va_c, vb_c, sfa_c, sfb_c, v_c);
+            sched_mfma_interleave<T::mma_insts, ds_read_insts, aw_mb>();
+        };
+        aw_rendezvous();
+        issue_tile_aw(PFK - 1);
+        aw_read_tile(0, v_a0, v_b0, v_sfa0, v_sfb0);
+        // Tile t lands in set t % 2.
+        int k = 1;
+        for (; k + 1 < loops; k += 2) {
+            aw_step(k, v_a0, v_b0, v_sfa0, v_sfb0, v_a1, v_b1, v_sfa1, v_sfb1);
+            aw_step(k + 1, v_a1, v_b1, v_sfa1, v_sfb1, v_a0, v_b0, v_sfa0, v_sfb0);
+        }
+        if (k < loops) {
+            aw_step(k, v_a0, v_b0, v_sfa0, v_sfb0, v_a1, v_b1, v_sfa1, v_sfb1);
+            s_waitcnt_lgkmcnt(0_I);
+            mma_mxscale_flatmm_accum<T>(mma, v_a1, v_b1, v_sfa1, v_sfb1, v_c);
+        } else {
+            s_waitcnt_lgkmcnt(0_I);
+            mma_mxscale_flatmm_accum<T>(mma, v_a0, v_b0, v_sfa0, v_sfb0, v_c);
+        }
+        } else {
         // Direct B goes global -> registers and owes the stage-0 barrier
         // nothing, so its first tile is issued before it: the consumer would
         // otherwise idle there behind the producers' prologue and then wait a
@@ -2282,6 +2359,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             read_b_lds(v_b1, last_slot);
             wait_lgkm_then_scaled_mma(v_a0, v_b0, v_b1, loops - 2, number<ds_read_insts>{});
             wait_lgkm_then_scaled_mma(v_a1, v_b1, v_b0, loops - 1, 0_I);
+        }
         }
 
         auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
