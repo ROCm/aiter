@@ -527,20 +527,24 @@ def _check_shuffled_tile_lds(params: _UAParams, config: dict):
     """A shuffled Triton kernel reads TILE_SIZE (pinned to the page) rows of
     K and V per iteration. With num_stages > 1 the pipeliner stages two
     iterations of each tile, and combinations whose staged tiles exceed the
-    64 KiB LDS do not compile (observed on gfx942: stages-2, page 128,
-    head 256, bf16 -> 131072 B required). Stage-1 configs launch at any page
-    (verified up to page 256 on gfx942), so only the multi-stage oversized
-    combinations are rejected."""
+    architecture's LDS cap do not compile (observed on gfx942: stages-2,
+    page 128, head 256, bf16 -> 131072 B vs a 64 KiB cap). Stage-1 configs
+    launch at any page (verified up to page 256 on gfx942), so only the
+    multi-stage oversized combinations are rejected."""
     if not params.shuffled_kv_cache or config.get("num_stages", 1) <= 1:
         return
     tile = params.block_size
     itemsize = max(params.q_dtype.itemsize, params.kv_cache_dtype.itemsize)
     staged = config["num_stages"] * tile * params.head_size * itemsize
-    assert staged <= 65536, (
+    lds_cap = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+    if lds_cap is None:
+        return
+    assert staged <= lds_cap, (
         f"Unified Attention Triton path with pre-shuffled KV cache: page "
         f"{tile} x head {params.head_size} with num_stages "
         f"{config['num_stages']} stages {staged} B per tile, exceeding the "
-        f"64 KiB LDS; use a smaller page or a stage-1 config"
+        f"{DEVICE_ARCH} LDS cap of {lds_cap} B; use a smaller page or a "
+        f"stage-1 config"
     )
 
 
