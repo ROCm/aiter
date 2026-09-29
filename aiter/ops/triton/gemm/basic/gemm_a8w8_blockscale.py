@@ -329,6 +329,8 @@ def gemm_a8w8_blockscale_preshuffle(
     else:
         y_pp = None
 
+    compute_splitk_params(config, K)
+
     # If block size is greater than split k size, shrink the block size
     if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
