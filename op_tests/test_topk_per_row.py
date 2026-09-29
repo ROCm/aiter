@@ -455,17 +455,30 @@ def create_planted_logits(seq_lens: torch.Tensor, width: int, top_k: int):
 
 @benchmark()
 def test_top_k_per_row_decode_bounded(
-    batch_size: int, context_len: int, top_k: int, stable: bool = False
+    batch_size: int,
+    context_len: int,
+    top_k: int,
+    stable: bool = False,
+    next_n: int = 1,
 ) -> dict:
     """Decode rows of ragged length in a buffer 4x the bound, the longest row on
-    the bound, called with `max_row_len` as a serving stack would."""
+    the bound, called with `max_row_len` as a serving stack would. With
+    `next_n > 1` each sequence owns `next_n` rows, slot `s` ending at
+    `seq_len - next_n + s + 1`."""
     seq_lens = torch.randint(
-        top_k, context_len + 1, (batch_size,), dtype=torch.int32, device="cuda"
+        top_k + next_n - 1,
+        context_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device="cuda",
     )
     seq_lens[0] = context_len
-    logits = create_planted_logits(seq_lens, 4 * context_len, top_k)
-    indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
-    args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+    rows = batch_size * next_n
+    slot = torch.arange(rows, dtype=torch.int32, device="cuda") % next_n
+    row_ends = seq_lens.repeat_interleave(next_n) - next_n + slot + 1
+    logits = create_planted_logits(row_ends, 4 * context_len, top_k)
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, next_n, seq_lens, indices, rows, *logits.stride())
 
     _, us = run_top_k_per_row_decode(
         *args, False, k=top_k, stable=stable, max_row_len=context_len
@@ -473,8 +486,8 @@ def test_top_k_per_row_decode_bounded(
     torch.cuda.synchronize()
 
     # The reference sees each row's live part only.
-    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-    live = torch.arange(logits.shape[1], device="cuda")[None, :] < seq_lens[:, None]
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    live = torch.arange(logits.shape[1], device="cuda")[None, :] < row_ends[:, None]
     masked = torch.where(live, logits, float("-inf"))
     torch_indices = masked.topk(top_k, dim=-1)[1]
 
@@ -483,7 +496,7 @@ def test_top_k_per_row_decode_bounded(
             *args, top_k, stable, max_row_len=context_len
         ),
         "all_close": compare_topk_results(
-            masked, indices, torch_indices, row_starts, seq_lens, top_k, stable=stable
+            masked, indices, torch_indices, row_starts, row_ends, top_k, stable=stable
         ),
         "us": us,
     }
@@ -862,6 +875,12 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     for name, run in (
         ("bounded", test_top_k_per_row_decode_bounded),
         ("bounded graph", test_top_k_per_row_decode_bounded_graph),
+        (
+            "bounded next_n=2",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
+                max(1, m // 2), n, k, s, next_n=2
+            ),
+        ),
     ):
         torch.manual_seed(0)
         df = pd.DataFrame([run(*c) for c in adaptive_band_cells(card)])
