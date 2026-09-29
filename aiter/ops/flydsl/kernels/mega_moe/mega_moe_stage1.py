@@ -211,6 +211,13 @@ def compile_mega_moe_stage1(
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
+        # Block-wide broadcast slots. They must not alias ``pool``: the A tile's
+        # LDS DMA and the GEMM1 C tile reuse pool while slower waves may still
+        # be reading a broadcast value (a lagging wave then read A bytes as its
+        # tile index and loaded weights from a garbage expert).
+        bc_ticket: fx.Array[fx.Int8, 16, 16]
+        bc_work: fx.Array[fx.Int8, 16, 16]
+        bc_sched: fx.Array[fx.Int8, 16, 16]
 
     # The fixed-slot LAUNCH_READY round trip only orders this invocation's remote
     # payload writes after every peer finished reading the previous one.  When
@@ -245,13 +252,13 @@ def compile_mega_moe_stage1(
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
         f"_pc{payload_chunk_rows}"
         f"_tss{tile_state_stride}"
-        f"_rc31_wb{WORK_BATCH}_adaptive"
+        f"_rc31_wb{WORK_BATCH}_adaptive_bc"
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
         f"{'' if LAUNCH_HANDSHAKE else '_nohs'}"
         f"{'' if PRODUCER_FENCE else '_nopf'}"
         f"{'_ol' if OWNER_LIGHT else ''}"
-        f"_ev{os.environ.get('AITER_MEGA_S1_EPI_EVEC', '8')}"
+        f"_ev{os.environ.get('AITER_MEGA_S1_EPI_EVEC', '8')}b"
         f"{'_fc' if DISPATCH_FAST_COPY and not fixed_slot_dispatch else ''}"
         f"{'_uk' + os.environ['AITER_MEGA_S1_UNROLL_K'] if os.environ.get('AITER_MEGA_S1_UNROLL_K', '0') != '0' else ''}"
         f"{'_kp2' if K_UNROLL == 2 else ''}"
@@ -306,7 +313,7 @@ def compile_mega_moe_stage1(
             ticket = fx.block_idx.x
             generation = fx.Int64(0)
         else:
-            ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
+            ticket_scratch = fx.recast_iter(fx.Int64, lds.bc_ticket.ptr)
             ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
             if tid == fx.Int32(0):
                 ticket64 = fx.Int64(
@@ -509,12 +516,16 @@ def compile_mega_moe_stage1(
         nv_rsrc = ptr_buf_tensor(fx.get_iter(num_valid_ids), fx.Int32)
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
         os_nbytes = tokens * fx.Int32(scale_cols) + fx.Int32(8192)
+        out_vec_rsrc = None
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
             out_nbytes = tokens * fx.Int32(inter_dim)
             out_rsrc = ptr_buf_tensor(
                 fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes
+            )
+            out_vec_rsrc = ptr_buf_tensor(
+                fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
             )
         os_rsrc = ptr_buf_tensor(
             fx.get_iter(out_scale), fx.Int8, num_records_bytes=os_nbytes
@@ -533,7 +544,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
-            k_unroll=K_UNROLL,
+            k_unroll=K_UNROLL, out_vec_rsrc=out_vec_rsrc,
             indirect_input=compact_dispatch and not indexed_payload,
             indexed_input=indexed_payload,
             row_map_rsrc=srcmap_rsrc,
@@ -589,8 +600,12 @@ def compile_mega_moe_stage1(
         consumer_active = (consumer_ticket >= consumer_base) & (
             consumer_id < total_work
         )
-        work_scratch = fx.recast_iter(fx.Int32, a_buf.ptr)
+        work_scratch = fx.recast_iter(fx.Int32, lds.bc_work.ptr)
         work_scratch_view = fx.make_view(work_scratch, fx.make_layout(1, 1))
+        # scheduled_first gets its own slot: tid 0 writes it while other waves
+        # may not have read first_work yet.
+        sched_scratch = fx.recast_iter(fx.Int32, lds.bc_sched.ptr)
+        sched_scratch_view = fx.make_view(sched_scratch, fx.make_layout(1, 1))
         work_shard = consumer_id & fx.Int32(WORK_SHARDS - 1)
         work_batch = WORK_BATCH
         assert N_TILES % work_batch == 0
@@ -650,6 +665,9 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(
                     Vec.from_elements([first_work], fx.Int32), work_scratch
                 )
+                fx.ptr_store(
+                    Vec.from_elements([first_work], fx.Int32), sched_scratch
+                )
             fx.barrier()
             first_work = Vec(work_scratch_view.load())[0]
             if (  # noqa: SIM102 - preserve DSL staging
@@ -674,10 +692,10 @@ def compile_mega_moe_stage1(
                         )
                         fx.ptr_store(
                             Vec.from_elements([scheduled_first], fx.Int32),
-                            work_scratch,
+                            sched_scratch,
                         )
                     fx.barrier()
-            scheduled_first = Vec(work_scratch_view.load())[0]
+            scheduled_first = Vec(sched_scratch_view.load())[0]
             if const_expr(compact_dispatch):  # noqa: SIM102 - preserve DSL staging
                 if use_ready_order:
                     comm_ops.fence_system_acquire()

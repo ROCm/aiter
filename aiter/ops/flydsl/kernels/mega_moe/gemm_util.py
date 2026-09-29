@@ -619,7 +619,7 @@ class SiluQuantEpilogue:
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
         sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None,
-        out_full_tensor=None, evec=2):
+        out_vec_rsrc=None, evec=2):
     # fmt: on
         self._out_rsrc = out_rsrc
         self._out_scale_rsrc = out_scale_rsrc
@@ -635,7 +635,11 @@ class SiluQuantEpilogue:
         self._swiglu_limit = float(swiglu_limit)
         self._always_valid = always_valid
         self._out_tensor = out_tensor
-        self._out_full_tensor = out_full_tensor
+        # Bounded 8-byte view of the full output (non-tile-resource case): rows past
+        # the valid count must hit the buffer bound like the 2-column path's stores.
+        self._out_vec_rsrc = out_vec_rsrc
+        if out_tensor is None and out_vec_rsrc is None:
+            evec = 2
         # Columns quantized per lane in the store pass. 2: one 16-bit store and a
         # 16-lane max per pair; 8: one 8-byte store and a 4-lane max per 8 values.
         assert evec in (2, 8)
@@ -806,7 +810,7 @@ class SiluQuantEpilogue:
                 num_records_bytes=self._sort_block_m * self._inter_dim,
             )
         else:
-            out_vec = ptr_buf_tensor(fx.get_iter(self._out_full_tensor), fx.Int32, unit_elems=2)
+            out_vec = self._out_vec_rsrc
         col0 = nlane * fx.Int32(EVEC)
         gcol = out_tile_base + col0
         is_writer = (nlane & fx.Int32(3)) == fx.Int32(0)
