@@ -369,6 +369,10 @@ class mxfp4_moe_aux_codegen:
     def gen_instances(self, instances):
         inst_dir = self.working_path / "instances"
         inst_dir.mkdir(exist_ok=True)
+        expected_sources = {f"{inst.name}.cu" for inst in instances}
+        for old_source in inst_dir.glob("*.cu"):
+            if old_source.name not in expected_sources:
+                old_source.unlink()
         for inst in instances:
             text = AUX_INSTANCE_HEADER.format(
                 kernel_include=inst.include,
