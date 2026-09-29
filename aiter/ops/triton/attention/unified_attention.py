@@ -255,6 +255,17 @@ def unified_attention(
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
         )
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            assert (
+                block_size >= 32
+            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        # Tuned only up to block_size 128: TILE_SIZE is pinned to the page
+        # size on gfx942, and larger pages exceed the LDS limit. Applies to
+        # the 2D and 3D Triton paths alike, so it runs before dispatch.
+        assert not (DEVICE_ARCH == "gfx942" and block_size > 128), (
+            "Unified Attention with pre-shuffled KV cache supports pages up "
+            f"to 128 on gfx942; got block_size={block_size}"
+        )
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
@@ -512,21 +523,6 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 
 
 def _unified_attention_2d_triton(params: _UAParams):
-    if params.shuffled_kv_cache and (
-        params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
-    ):
-        assert (
-            params.block_size >= 32
-        ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-    if params.shuffled_kv_cache:
-        # Tuned only up to block_size 128: TILE_SIZE is pinned to the page
-        # size here, and larger pages exceed the LDS limit.
-        assert not (DEVICE_ARCH == "gfx942" and params.block_size > 128), (
-            "Unified Attention 2D Triton path with pre-shuffled KV cache "
-            f"supports pages up to 128 on gfx942; got block_size="
-            f"{params.block_size}"
-        )
-
     config = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)

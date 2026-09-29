@@ -8,7 +8,8 @@
       "DT"
     ],
     "attn_3d": [
-      "D"
+      "D",
+      "SHUF"
     ],
     "reduce": [
       "D"
@@ -273,7 +274,7 @@
       "num_stages": 2,
       "waves_per_eu": 2
     },
-    "D_GEQ_256": {
+    "D_GEQ_256.SHUF": {
       "BLOCK_M": 16,
       "num_warps": 4,
       "num_stages": 1,
