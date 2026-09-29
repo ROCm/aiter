@@ -15,19 +15,45 @@ ROUNDS="${ROUNDS:-2}"
 BASELINE_COMMIT="527047231cb41a3265549cb4e3f6c0b1d2725935"
 MODE=e2e-const0
 mode_seen=0
+CUSTOM_EXPERTS=""
+CUSTOM_TOKENS=""
+CUSTOM_TOPK=""
+CUSTOM_MODEL_DIM=""
+CUSTOM_INTER_DIM=""
+CUSTOM_SHAPE_REQUESTED=0
 
 usage() {
   cat <<'EOF'
-usage: bash my_code/run_moe_prefill_switch_ab.sh [MODE]
+usage: bash my_code/run_moe_prefill_switch_ab.sh [MODE] [SHAPE OPTIONS]
 
 Modes:
-  e2e-const0   Run both shapes with --const-init 0 (default)
-  e2e-random   Run both shapes with random initialization
+  e2e-const0   Run selected shapes with --const-init 0 (default)
+  e2e-random   Run selected shapes with random initialization
   e2e-both     Run random followed by const0
+
+Shape options:
+  --experts N
+  --tokens N
+  --topk N
+  --model-dim N
+  --inter-dim N
+
+  Specify all five options to run only that shape on HEAD at script startup.
+  Custom-shape mode does not run the baseline/optimized revision comparison.
+  Without shape options, the script compares both built-in shapes below.
+
+Fixed test arguments:
+  --scenario bench --data-format a4w4 --act silu
+  --no-bias --no-check-aot-cache
+
+  For a custom shape, other test options such as --iters use the
+  defaults from my_code/test_flydsl_grouped_gemm_gfx1250.py.
 
 Revisions:
   baseline     527047231cb41a3265549cb4e3f6c0b1d2725935
   optimized    HEAD at script startup
+
+  Revision comparison applies only when no custom shape is specified.
 
 Environment:
   ROUNDS=N     Number of rounds for every data/shape/mode case (default: 2)
@@ -36,8 +62,8 @@ Environment:
 EOF
 }
 
-for arg in "$@"; do
-  case "$arg" in
+while (($#)); do
+  case "$1" in
     -h|--help|help)
       usage
       exit 0
@@ -48,16 +74,79 @@ for arg in "$@"; do
         usage >&2
         exit 2
       fi
-      MODE="$arg"
+      MODE="$1"
       mode_seen=1
+      shift
+      ;;
+    --experts|--tokens|--topk|--model-dim|--inter-dim)
+      CUSTOM_SHAPE_REQUESTED=1
+      if (($# < 2)); then
+        printf 'Missing value for %s.\n' "$1" >&2
+        exit 2
+      fi
+      case "$1" in
+        --experts) CUSTOM_EXPERTS="$2" ;;
+        --tokens) CUSTOM_TOKENS="$2" ;;
+        --topk) CUSTOM_TOPK="$2" ;;
+        --model-dim) CUSTOM_MODEL_DIM="$2" ;;
+        --inter-dim) CUSTOM_INTER_DIM="$2" ;;
+      esac
+      shift 2
+      ;;
+    --experts=*|--tokens=*|--topk=*|--model-dim=*|--inter-dim=*)
+      CUSTOM_SHAPE_REQUESTED=1
+      value="${1#*=}"
+      case "$1" in
+        --experts=*) CUSTOM_EXPERTS="$value" ;;
+        --tokens=*) CUSTOM_TOKENS="$value" ;;
+        --topk=*) CUSTOM_TOPK="$value" ;;
+        --model-dim=*) CUSTOM_MODEL_DIM="$value" ;;
+        --inter-dim=*) CUSTOM_INTER_DIM="$value" ;;
+      esac
+      shift
       ;;
     *)
-      printf 'Unknown argument: %s\n' "$arg" >&2
+      printf 'Unknown argument: %s\n' "$1" >&2
       usage >&2
       exit 2
       ;;
   esac
 done
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s must be a positive integer, got %q.\n' "$name" "$value" >&2
+    exit 2
+  fi
+}
+
+custom_count=0
+for value in \
+  "$CUSTOM_EXPERTS" "$CUSTOM_TOKENS" "$CUSTOM_TOPK" \
+  "$CUSTOM_MODEL_DIM" "$CUSTOM_INTER_DIM"; do
+  [[ -n "$value" ]] && custom_count=$((custom_count + 1))
+done
+if ((CUSTOM_SHAPE_REQUESTED && custom_count != 5)); then
+  printf '%s\n' \
+    'Custom shape requires --experts, --tokens, --topk, --model-dim, and --inter-dim.' >&2
+  exit 2
+fi
+
+CUSTOM_SHAPE=0
+if ((custom_count == 5)); then
+  require_positive_integer --experts "$CUSTOM_EXPERTS"
+  require_positive_integer --tokens "$CUSTOM_TOKENS"
+  require_positive_integer --topk "$CUSTOM_TOPK"
+  require_positive_integer --model-dim "$CUSTOM_MODEL_DIM"
+  require_positive_integer --inter-dim "$CUSTOM_INTER_DIM"
+  if ((10#$CUSTOM_TOPK > 10#$CUSTOM_EXPERTS)); then
+    printf '%s\n' '--topk must not exceed --experts.' >&2
+    exit 2
+  fi
+  CUSTOM_SHAPE=1
+fi
 
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
   printf 'ROUNDS must be a positive integer, got %q\n' "$ROUNDS" >&2
@@ -74,13 +163,13 @@ if ! git_repo diff --quiet || ! git_repo diff --cached --quiet; then
   exit 2
 fi
 
-if ! git_repo cat-file -e "${BASELINE_COMMIT}^{commit}" 2>/dev/null; then
+OPTIMIZED_COMMIT="$(git_repo rev-parse HEAD)"
+ORIGINAL_BRANCH="$(git_repo symbolic-ref --quiet --short HEAD || true)"
+if ((!CUSTOM_SHAPE)) && \
+  ! git_repo cat-file -e "${BASELINE_COMMIT}^{commit}" 2>/dev/null; then
   printf 'Baseline commit is unavailable: %s\n' "$BASELINE_COMMIT" >&2
   exit 2
 fi
-
-OPTIMIZED_COMMIT="$(git_repo rev-parse HEAD)"
-ORIGINAL_BRANCH="$(git_repo symbolic-ref --quiet --short HEAD || true)"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/moe_prefill_switch_ab_runs/$RUN_ID}"
@@ -91,7 +180,7 @@ SUMMARY_MD="$LOG_DIR/summary.md"
 printf 'data\tround\torder\tcase\tshape\tmode\tgit_commit\treturn_code\tgemm1_us\tgemm1_tflops\tgemm1_rw_tbps\tgemm1_ref_output_hash128\tgemm1_output_hash128\tgemm2_us\tgemm2_tflops\tgemm2_rw_tbps\tgemm2_ref_output_hash128\tgemm2_output_hash128\tmoe_e2e_us\tlogits_diff\trel_l2\tpass\tgemm1_symbol\tgemm2_symbol\tlog_file\n' \
   >"$RESULTS_TSV"
 
-# Common environment for all four cases.
+# Common environment for every baseline/optimized case.
 export ENABLE_CK=0
 export AITER_MOE_EXPERT_BALANCE=true
 export AITER_LOG_MORE=1
@@ -221,7 +310,7 @@ run_case() {
     baseline)
       tested_commit="$BASELINE_COMMIT"
       ;;
-    optimized)
+    optimized|current)
       tested_commit="$OPTIMIZED_COMMIT"
       ;;
     *)
@@ -311,37 +400,47 @@ run_case() {
   fi
 }
 
-E96_COMMAND=(
+COMMON_TEST_COMMAND=(
   -u
   my_code/test_flydsl_grouped_gemm_gfx1250.py
   --scenario bench
   --data-format a4w4
+  --act silu
+  --no-bias
+  --no-check-aot-cache
+)
+
+E96_COMMAND=(
+  "${COMMON_TEST_COMMAND[@]}"
   --experts 96
   --tokens 16384
   --topk 6
   --iters 20
   --model-dim 7168
   --inter-dim 3072
-  --act silu
-  --no-bias
-  --no-check-aot-cache
 )
 
 E256_COMMAND=(
-  -u
-  my_code/test_flydsl_grouped_gemm_gfx1250.py
-  --scenario bench
-  --data-format a4w4
+  "${COMMON_TEST_COMMAND[@]}"
   --experts 256
   --tokens 16384
   --topk 8
   --iters 100
   --model-dim 7168
   --inter-dim 2048
-  --act silu
-  --no-bias
-  --no-check-aot-cache
 )
+
+if ((CUSTOM_SHAPE)); then
+  CUSTOM_COMMAND=(
+    "${COMMON_TEST_COMMAND[@]}"
+    --experts "$CUSTOM_EXPERTS"
+    --tokens "$CUSTOM_TOKENS"
+    --topk "$CUSTOM_TOPK"
+    --model-dim "$CUSTOM_MODEL_DIM"
+    --inter-dim "$CUSTOM_INTER_DIM"
+  )
+  CUSTOM_SHAPE_LABEL="E${CUSTOM_EXPERTS}/T${CUSTOM_TOKENS}/topk${CUSTOM_TOPK}/M${CUSTOM_MODEL_DIM}/I${CUSTOM_INTER_DIM}"
+fi
 
 run_named_case() {
   local case_name="$1"
@@ -378,6 +477,10 @@ run_named_case() {
     e256_optimized)
       run_case "$case_name" "E256/T16384/topk8/I2048" "$data" optimized \
         "$round" "$order" "${E256_COMMAND[@]}" "${data_args[@]}"
+      ;;
+    custom_current)
+      run_case "$case_name" "$CUSTOM_SHAPE_LABEL" "$data" current \
+        "$round" "$order" "${CUSTOM_COMMAND[@]}" "${data_args[@]}"
       ;;
     *)
       printf 'Unknown case: %s\n' "$case_name" >&2
@@ -426,6 +529,10 @@ def gain(baseline, value):
     return (baseline - value) / baseline * 100.0
 
 
+def gain_text(baseline, value):
+    return "N/A" if baseline is None else f"{gain(baseline, value):+.2f}%"
+
+
 def hashes(case_rows, key):
     return "<br>".join(dict.fromkeys(row[key] for row in case_rows))
 
@@ -450,14 +557,18 @@ print(
 for data in data_order:
     for shape in shape_order:
         baseline_rows = grouped.get((data, shape, "baseline"), [])
-        if not baseline_rows:
-            continue
+        if baseline_rows:
+            baseline_g1 = statistics.median(values(baseline_rows, "gemm1_us"))
+            baseline_g2 = statistics.median(values(baseline_rows, "gemm2_us"))
+            baseline_e2e = statistics.median(
+                values(baseline_rows, "moe_e2e_us")
+            )
+            modes = ("baseline", "optimized")
+        else:
+            baseline_g1 = baseline_g2 = baseline_e2e = None
+            modes = ("current",)
 
-        baseline_g1 = statistics.median(values(baseline_rows, "gemm1_us"))
-        baseline_g2 = statistics.median(values(baseline_rows, "gemm2_us"))
-        baseline_e2e = statistics.median(values(baseline_rows, "moe_e2e_us"))
-
-        for mode in ("baseline", "optimized"):
+        for mode in modes:
             case_rows = grouped.get((data, shape, mode), [])
             if not case_rows:
                 continue
@@ -477,17 +588,17 @@ for data in data_order:
             print(
                 f"| {data} | {shape} | {mode} | {last['git_commit'][:12]} | "
                 f"{samples(g1, 3)} | "
-                f"{g1_med:.3f} | {gain(baseline_g1, g1_med):+.2f}% | "
+                f"{g1_med:.3f} | {gain_text(baseline_g1, g1_med)} | "
                 f"{g1_tflops:.1f} | {g1_rw_tbps:.3f} | "
                 f"{hashes(case_rows, 'gemm1_ref_output_hash128')} | "
                 f"{hashes(case_rows, 'gemm1_output_hash128')} | "
                 f"{samples(g2, 3)} | {g2_med:.3f} | "
-                f"{gain(baseline_g2, g2_med):+.2f}% | "
+                f"{gain_text(baseline_g2, g2_med)} | "
                 f"{g2_tflops:.1f} | {g2_rw_tbps:.3f} | "
                 f"{hashes(case_rows, 'gemm2_ref_output_hash128')} | "
                 f"{hashes(case_rows, 'gemm2_output_hash128')} | "
                 f"{samples(e2e, 2)} | {e2e_med:.2f} | "
-                f"{gain(baseline_e2e, e2e_med):+.2f}% | "
+                f"{gain_text(baseline_e2e, e2e_med)} | "
                 f"{last['pass']} | {last['logits_diff']} | {last['rel_l2']} |"
             )
 PY
@@ -497,8 +608,13 @@ PY
   printf '=================================================\n'
 }
 
-ODD_CASES=(e96_baseline e96_optimized e256_baseline e256_optimized)
-EVEN_CASES=(e256_optimized e256_baseline e96_optimized e96_baseline)
+if ((CUSTOM_SHAPE)); then
+  ODD_CASES=(custom_current)
+  EVEN_CASES=(custom_current)
+else
+  ODD_CASES=(e96_baseline e96_optimized e256_baseline e256_optimized)
+  EVEN_CASES=(e256_optimized e256_baseline e96_optimized e96_baseline)
+fi
 
 case "$MODE" in
   e2e-random)
@@ -516,8 +632,14 @@ trap cleanup EXIT
 
 printf 'MODE=%s\n' "$MODE"
 printf 'ROUNDS=%s\n' "$ROUNDS"
-printf 'Baseline commit: %s\n' "$BASELINE_COMMIT"
-printf 'Optimized commit: %s\n' "$OPTIMIZED_COMMIT"
+if ((CUSTOM_SHAPE)); then
+  printf 'Current commit: %s\n' "$OPTIMIZED_COMMIT"
+  printf 'Custom shape: %s\n' "$CUSTOM_SHAPE_LABEL"
+else
+  printf 'Baseline commit: %s\n' "$BASELINE_COMMIT"
+  printf 'Optimized commit: %s\n' "$OPTIMIZED_COMMIT"
+  printf 'Shapes: E96/T16384/topk6/I3072, E256/T16384/topk8/I2048\n'
+fi
 printf 'Logs: %s\n' "$LOG_DIR"
 printf 'Raw results: %s\n' "$RESULTS_TSV"
 
