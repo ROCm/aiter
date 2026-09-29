@@ -71,7 +71,14 @@ _CM_SC1 = 16
 #
 # ``acquire`` is the sync scope of the acquire fence between the flag spin and
 # the payload loads. At system scope it lowers to ``buffer_inv sc0 sc1``, a full
-# L1+L2 invalidate, which only a cached inbox needs.
+# L1+L2 invalidate, which only a cached inbox needs. Every kernel takes it from
+# here; the ring additionally writes back before a system-scope acquire.
+#
+# ``acquire`` and ``recv`` are one decision and must change together. A
+# workgroup-scope acquire invalidates nothing, so it is only safe when ``recv``
+# makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
+# hint, not a bypass, and could be answered from a line cached by an earlier
+# call into the same slot. A system-scope acquire is what makes ``nt`` safe.
 #
 # ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
 # consecutive quads; see the layouts in the kernel body.
@@ -96,7 +103,7 @@ _INBOX_POLICY = {
         "release": None,
         "acquire": _WORKGROUP_SYNC_SCOPE,
         "fanout": "sector",
-        "recv": _CM_NT,
+        "recv": _CM_SC0 | _CM_SC1,
     },
     "finegrained": {
         "payload": _ST_NT,
@@ -214,10 +221,10 @@ def _buffer_load(ptr, elem_off, n, dtype, cache_modifier=0):
     """*n* consecutive elements of a buffer pointer, at an element offset.
 
     *cache_modifier* is ``_CM_*`` bits. An inbox read passes the policy's
-    ``recv`` entry: ``nt`` is enough where the inbox memory cannot hold a
-    stale line in the first place, but a cacheable (coarse-grained) inbox
-    needs ``_CM_SC0 | _CM_SC1``, because ``nt`` is a reuse *hint* and does
-    not stop the load being answered from the reader's own L1/L2.
+    ``recv`` entry. ``nt`` is a reuse *hint* and does not stop the load being
+    answered from the reader's own L1/L2, so it is only used where the
+    policy's ``acquire`` invalidates both first (fine-grained). The uncached
+    and coarse-grained inboxes read ``_CM_SC0 | _CM_SC1``, which does bypass.
     """
     atom = fx.make_copy_atom(rocdl.BufferCopy(n * dtype.width, cache_modifier), dtype)
     reg = fx.make_rmem_tensor(n, dtype)

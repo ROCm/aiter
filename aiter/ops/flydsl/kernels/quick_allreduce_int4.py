@@ -217,6 +217,7 @@ def make_quick_allreduce_int4_kernel(
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
     release_scope = policy["release"]
+    acquire_scope = policy["acquire"]
     recv_policy = policy["recv"]
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
@@ -507,8 +508,9 @@ def make_quick_allreduce_int4_kernel(
 
         def _wait_flag(flag, color):
             # No fence in the loop body: _load_flag carries `sc0 sc1`, so a
-            # retry cannot be served from a stale line. The acquire the
-            # payload reads need is in _wait_release, once, after the join.
+            # retry cannot be served from a stale line. The acquire that
+            # orders the payload reads is in _wait_release, once, after the
+            # join.
             current = _load_flag(flag)
             while current != color:
                 current = _load_flag(flag)
@@ -529,10 +531,17 @@ def make_quick_allreduce_int4_kernel(
             gpu.barrier()
             # Unconditional and after the join. Only `tid < n_push` spun,
             # so scoping the acquire to the spin would leave the other waves
-            # of this workgroup reading the payload with nothing invalidated
-            # on their behalf -- and would also skip it entirely in the common
-            # case where the flag is already set on the first read.
-            _acquire_inbox()
+            # of this workgroup reading the payload unordered after it -- and
+            # would also skip it entirely in the common case where the flag is
+            # already set on the first read.
+            #
+            # The scope is the inbox policy's. On a fine-grained inbox it is
+            # system scope, an L1+L2 invalidate, which the `nt` payload loads
+            # rely on. On an uncached inbox it is workgroup scope, which
+            # invalidates nothing and is only a compiler barrier; that is safe
+            # because the policy pairs it with `sc0 sc1` payload loads
+            # (`recv_policy`), which bypass both caches.
+            _acquire_inbox(acquire_scope)
 
         def _recv_quantized(phase, src, sub, k=0):
             base = _sub_tile_i32(phase, src, sub)
