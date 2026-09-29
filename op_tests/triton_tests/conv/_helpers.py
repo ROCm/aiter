@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from aiter import logger
 from aiter.ops.triton.conv._utils import (
     _is_1x1_conv,
     _is_3x3_conv,
@@ -271,7 +272,14 @@ class TestSuite:
         self.results.append(res)
         if self.verbose:
             mark = "✓" if passed else "✗"
-            print(f"  {mark} {name:<40} | max_abs={max_abs:.3e} rel={rel:.3e}")
+            log_result = logger.info if passed else logger.warning
+            log_result(
+                "  %s %-40s | max_abs=%.3e rel=%.3e",
+                mark,
+                name,
+                max_abs,
+                rel,
+            )
         return res
 
     def all_passed(self) -> bool:
@@ -329,8 +337,13 @@ def run_all_methods(
             kernel_type = "[3x3]"
         else:
             kernel_type = "[general]"
-        print(
-            f"    {name} {kernel_type}: X{tuple(x.shape)} W{tuple(w.shape)} -> Y{tuple(y_ref.shape)}"
+        logger.info(
+            "    %s %s: X%s W%s -> Y%s",
+            name,
+            kernel_type,
+            tuple(x.shape),
+            tuple(w.shape),
+            tuple(y_ref.shape),
         )
 
     if suite.layout_mode in ("nchw", "both"):
