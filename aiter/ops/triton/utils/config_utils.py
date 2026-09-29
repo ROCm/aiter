@@ -198,16 +198,10 @@ def _bucket_index(keys: tuple, axes: tuple) -> tuple:
 
 
 def lookup_config(table: dict, axes: tuple, **values) -> dict:
-    """Resolve a launch config from a flat table keyed by composite bucket
-    keys, e.g. ``{"M_LEQ_32": {...}, "M_GEQ_33.N_LEQ_1024": {...}, "any": {...}}``.
-    Each key lists only the axes that matter for that bucket, joined by '.';
-    a bucket's value is a complete config, not a patch on a default -- exactly
-    one bucket wins, so there is no rule-stacking to replay.
-
-    Axes are matched in the order given by ``axes`` (the leftmost wins when
-    more than one key could apply): for each axis, candidates are tried LEQ
-    bounds ascending, then GEQ bounds descending, then the shared ``"any"``
-    fallback -- every table needs one. Returns a fresh, mutable dict.
+    """Resolve one config from a flat table keyed by composite bucket keys,
+    e.g. ``{"M_LEQ_32": {...}, "M_GEQ_33.N_LEQ_1024": {...}, "any": {...}}``.
+    Per axis (in ``axes`` order, leftmost wins ties): LEQ bounds ascending,
+    then GEQ bounds descending, then ``"any"`` (required). Fresh dict copy.
     """
     index, parts = _bucket_index(tuple(table), axes)
     per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]

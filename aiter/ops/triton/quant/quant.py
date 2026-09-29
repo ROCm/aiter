@@ -50,15 +50,8 @@ _LOGGER = AiterTritonLogger()
 
 
 def _mxfp4_gfx1250_config(M: int, N: int) -> dict:
-    """
-    Tuned launch config for dynamic_mxfp4_quant, resolved from
-    configs/gfx1250/gluon/quant/mxfp4/DEFAULT.json's bucket-key table
-    (see config_utils.lookup_config), tuned by a benchmark sweep on gfx1250.
-    Also used, unchanged, as the plain-Triton fallback kernel's launch config
-    on every other arch -- always resolved against the gfx1250 config tree
-    regardless of the arch actually running. BLOCK_SIZE_M/BLOCK_SIZE_N are
-    shape-derived, not tunable via JSON, at the M <= 32 and N <= 1024 edges
-    (BLOCK_SIZE_N must stay a multiple of 32).
+    """Tuned config from mxfp4/DEFAULT.json (also used as the non-gfx1250
+    fallback config); M<=32/N<=1024 override BLOCK_SIZE_M/N by shape instead.
     """
     cfg_dir = resolve_config_dir("quant", "MXFP4", backend="gluon", arch="gfx1250")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
@@ -73,11 +66,8 @@ def _mxfp4_gfx1250_config(M: int, N: int) -> dict:
 
 
 # BLOCK_SIZE_N for M <= 32, keyed by (BLOCK_SIZE_M upper bound, K upper
-# bound); first matching row wins. Must stay >= 128 (NUM_QUANT_BLOCKS >= 4,
-# required by scaled_downcast, see _mxfp8_quant_op), capped at 512 (else the
-# TDM descriptor's pad-interval field overflows, see repo notes), and
-# narrowed to 128 for K > 1024 (more, narrower CTAs beat one wide tile there
-# -- benchmark-verified with repeated trials, ~11-13% win at M=8).
+# bound), first match wins; range is [128, 512] (TDM pad-interval overflow
+# above 512, scaled_downcast needs >=128), narrowed for K > 1024 (benchmarked).
 _MXFP8_SMALL_M_BLOCK_SIZE_N = [
     (8, 1024, 512),
     (16, 1024, 256),
@@ -94,15 +84,8 @@ def _mxfp8_small_m_block_size_n(block_size_m: int, K: int) -> int:
 
 
 def _mxfp8_gfx1250_config(M: int, K: int) -> dict:
-    """
-    Tuned launch config for dynamic_mxfp8_quant's gfx1250 gluon path. For
-    M > 32, resolved from configs/gfx1250/gluon/quant/mxfp8/DEFAULT.json's
-    bucket-key table (see config_utils.lookup_config), tuned by a benchmark
-    sweep. NUM_BUFFERS defaults to 2 (double-buffered/prefetching
-    loads+stores); some buckets pin it to 1 (no prefetch, fully synchronous
-    per-tile) -- empirically found to be both faster and required for
-    correctness there. For M <= 32, BLOCK_SIZE_M/BLOCK_SIZE_N are shape-derived
-    instead of JSON-tuned (see _MXFP8_SMALL_M_BLOCK_SIZE_N above).
+    """Tuned config from mxfp8/DEFAULT.json for M>32 (some buckets pin
+    NUM_BUFFERS=1, faster/required there); M<=32 uses shape-derived blocks.
     """
     cfg_dir = resolve_config_dir("quant", "MXFP8", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
