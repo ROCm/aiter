@@ -138,17 +138,23 @@ def _exercise_wrapper_contracts() -> None:
         return
 
     # The FP8 consumer must select the input device, not the current device.
-    device1 = torch.device("cuda", 1)
-    with torch.cuda.device(device1):
-        q, k, v = _make_qkv(1, 128, 128, 2, 128, device=device1)
-        q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(q, k, v)
-        ref = run_torch(q, k, v, causal=False)
-    torch.cuda.set_device(0)
-    assert torch.cuda.current_device() == 0
-    out = flydsl_flash_attn_func(q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv)
-    torch.cuda.synchronize(device1)
-    assert out.device == device1
-    _check_quality(out, ref, head_dim=128, minimum=0.97, mean=0.994)
+    previous_device = torch.cuda.current_device()
+    try:
+        device1 = torch.device("cuda", 1)
+        with torch.cuda.device(device1):
+            q, k, v = _make_qkv(1, 128, 128, 2, 128, device=device1)
+            q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(q, k, v)
+            ref = run_torch(q, k, v, causal=False)
+        torch.cuda.set_device(0)
+        assert torch.cuda.current_device() == 0
+        out = flydsl_flash_attn_func(
+            q8, k8, v8, q_descale=sq, k_descale=sk, v_descale=sv
+        )
+        torch.cuda.synchronize(device1)
+        assert out.device == device1
+        _check_quality(out, ref, head_dim=128, minimum=0.97, mean=0.994)
+    finally:
+        torch.cuda.set_device(previous_device)
 
 
 @benchmark()

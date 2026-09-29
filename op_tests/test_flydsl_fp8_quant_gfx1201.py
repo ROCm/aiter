@@ -88,13 +88,15 @@ def _check_quantized(
         assert torch.equal(scale, reference_scale), f"{name}: scale is not exact"
     else:
         assert torch.allclose(scale, reference_scale, rtol=2e-5, atol=1e-7), name
-    return checkAllclose(
+    err = checkAllclose(
         reference.to(dtypes.fp32),
         (actual.float() * scale).to(dtypes.fp32),
         rtol=1.3e-1,
         atol=scale.item() * 0.125,
         msg=f"{name}: fp8 dequant",
     )
+    assert err == 0, f"{name}: fp8 dequant mismatch ratio={err}"
+    return err
 
 
 def _exercise_public_contracts() -> None:
@@ -129,13 +131,17 @@ def _exercise_public_contracts() -> None:
         )
         return
 
-    device1 = torch.device("cuda", 1)
-    with torch.cuda.device(device1):
-        q, k, v = _make_qkv(1, 64, 64, 2, 64, device=device1)
-    torch.cuda.set_device(0)
-    outputs = flydsl_fp8_quant(q, k, v, rotation=False)
-    torch.cuda.synchronize(device1)
-    assert all(x.device == device1 for x in outputs)
+    previous_device = torch.cuda.current_device()
+    try:
+        device1 = torch.device("cuda", 1)
+        with torch.cuda.device(device1):
+            q, k, v = _make_qkv(1, 64, 64, 2, 64, device=device1)
+        torch.cuda.set_device(0)
+        outputs = flydsl_fp8_quant(q, k, v, rotation=False)
+        torch.cuda.synchronize(device1)
+        assert all(x.device == device1 for x in outputs)
+    finally:
+        torch.cuda.set_device(previous_device)
 
 
 @benchmark()

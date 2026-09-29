@@ -278,8 +278,14 @@ def flydsl_flash_attn_func(
             "q/k must share batch, num_heads, and head dimension, got "
             f"{tuple(q.shape)}/{tuple(k.shape)}"
         )
-    if stream is not None and stream.device != q.device:
-        raise ValueError(f"stream must belong to {q.device}, got {stream.device}")
+    if stream is not None:
+        if not isinstance(stream, torch.cuda.Stream):
+            raise TypeError(
+                "stream must be a torch.cuda.Stream or None, got "
+                f"{type(stream).__name__}"
+            )
+        if stream.device != q.device:
+            raise ValueError(f"stream must belong to {q.device}, got {stream.device}")
 
     batch, seq_len_real, num_heads, head_dim = q.shape
     seq_len_kv_real = k.shape[1]
@@ -404,6 +410,8 @@ def flydsl_flash_attn_func(
             # protocol: callers establish producer ordering themselves.
             for tensor in (q, k, v):
                 tensor.record_stream(launch_stream)
+            if out is not None:
+                out.record_stream(launch_stream)
             if is_fp8:
                 for tensor in (q_descale, k_descale, v_descale):
                     tensor.record_stream(launch_stream)
