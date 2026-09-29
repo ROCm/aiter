@@ -394,8 +394,7 @@ All weight/scale pre-shuffle helpers are unified in
     folder, and a new test folder that does not match a folder under
     `aiter/ops/triton/` (every op test folder also carries an `__init__.py`).
   - A PR that moves a wrapper into another folder without moving its kernels
-    and its test, or that moves a test without updating its `FILE_TIMES` key in
-    `.github/scripts/split_tests.sh` and every importer of the old module
+    and its test, or that moves a test without updating every importer of the old module
     path (`grep -rn "triton_tests.<old>"`).
 - No kernel tuning configs in test files: flag test code that hardcodes
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
