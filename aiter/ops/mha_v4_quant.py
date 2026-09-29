@@ -315,7 +315,11 @@ def query_block_scale(
 def _plain_block_scale(input: Tensor) -> Tensor:
     """One E8M0 scale per 32-element block, without the gather padding.
 
-    Used where the consumer addresses scales within the logical sequence, and by the fakes, which
+    Safe for K because the consumer gathers K scales through a buffer descriptor whose
+    num_records is the logical extent (``kv_seq_len * kscale_stride``), so the K pipeline's
+    deliberate one-tile overshoot past the sequence end is clamped in hardware and returns zero
+    without touching memory. Q scales cannot use this -- they are fetched with unguarded
+    ``global_load``, which is what ``block_scale_storage`` pads for. Also used by the fakes, which
     only have to agree on shape and dtype.
     """
     batch, sequence, heads, head_dim = input.shape

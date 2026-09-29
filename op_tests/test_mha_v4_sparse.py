@@ -1021,6 +1021,96 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
         )
 
 
+# The three guards below are what let the sparse ASM skip apply_mask entirely: with the key length
+# padded to a whole number of KV tiles and no per-batch length, the last selected block is always
+# full, so there is no ragged tail to mask. Relax either and the unmasked tail columns read zeroed
+# K, score 0, and contribute weight 1.0 each to L -- O is not obviously wrong, just silently scaled.
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_rejects_ragged_key_length():
+    kv_tile = mha_v4_kv_tile()
+    sequence_k = kv_tile * 4 - 1
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    kv_tiles = (sequence_k + kv_tile - 1) // kv_tile
+    mask = torch.ones((1, 2, 1, kv_tiles), device="cuda", dtype=torch.bool)
+    with pytest.raises(ValueError, match="padded to a multiple"):
+        mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            block_mask=mask,
+        )
+
+
+def test_mha_v4_sparse_rejects_per_batch_key_lengths():
+    """BF16 Q/V so the varlen capability gate cannot fire; only the sparse guard can raise."""
+    q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
+    mask = torch.ones((1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.bool)
+    seqlens_k = torch.full((1,), 128, dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="sorted-sparse"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            block_mask=mask,
+            seqlens_k=seqlens_k,
+        )
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
+    """mha_v4 guards this too, but the MX recipes return through launchers it never reaches.
+
+    Matching "sorted-sparse" rather than the shared "per-batch key lengths" phrase is what keeps
+    this pinned to the sparse guard: FP8 is not varlen-capable, so _check_varlen_capable would
+    otherwise raise NotImplementedError here too and the test would pass with the guard removed.
+    """
+    heads = 2
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * mha_v4_kv_tile(), heads=heads
+    )
+    device = q.quantized.device
+    fp8_format = native_fp8_format()
+    rows = heads
+    with pytest.raises(NotImplementedError, match="sorted-sparse"):
+        mha_v4_packed(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            q.descale,
+            k.descale,
+            v.descale,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            kv_block_indices=torch.zeros(rows, dtype=torch.int32, device=device),
+            lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
+            lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+            seqlens_k=torch.full((1,), 128, dtype=torch.int32, device=device),
+        )
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse")
 def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
     max_tiles = 8192
