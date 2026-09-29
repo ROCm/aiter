@@ -35,6 +35,7 @@ from flydsl.expr import (
 )
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
+from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_base_i64,
@@ -780,13 +781,13 @@ def qsa_k1_score_and_select(
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
     if q.shape[1] != n_heads:
         raise ValueError(f"q must have {n_heads} heads, got {tuple(q.shape)}")
+    arch = qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
+    use_k32 = arch == "gfx950"
     m = q.shape[0]
     page_size = k_cache.shape[1]
     score_block_n = 32
     scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
-    arch = torch.cuda.get_device_properties(q.device).gcnArchName
-    use_k32 = arch.startswith("gfx950")
     score_tiles = (n_columns + score_block_n - 1) // score_block_n
     wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
     if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
@@ -923,6 +924,7 @@ def qsa_k1_block_ids(
         raise ValueError("every tensor must be on the GPU")
     if any(t.device != q.device for t in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
+    qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
     q = q.contiguous()
     k_cache = k_cache.contiguous()
     page_table = page_table.contiguous()
