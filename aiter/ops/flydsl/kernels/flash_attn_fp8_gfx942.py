@@ -75,8 +75,8 @@ def _pack4(values):
 
 _workspaces = {}
 
-# A one-wave WG uses 16.5 KiB LDS, allowing three resident WGs per CU.
-_DECODE_WGS_PER_CU = 3
+# A one-wave WG uses 16 KiB LDS, allowing four resident WGs per CU.
+_DECODE_WGS_PER_CU = 4
 # Fixed b/a, with wave and combine terms fitted to measured page-granular splits.
 _DECODE_SPLIT_A, _DECODE_SPLIT_B, _DECODE_SPLIT_C, _DECODE_SPLIT_D = (
     1.0, 0.89473684, 2.1, -2.5
@@ -389,7 +389,7 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
 
     @fx.struct
     class DecodeStorage:
-        k: fx.Array[fx.Int8, 32 * 260, 16]
+        k: fx.Array[fx.Int8, 32 * 256, 16]
         v: fx.Array[fx.Int8, 256 * 32, 16]
 
     @flyc.kernel(known_block_size=(64, 1, 1))
@@ -459,7 +459,9 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
                 off = lane * 16 + i * 1024
                 d = off % 256
                 vval = fx.Vector(state[19 + i * 2])
-                _store(lds.k.ptr, (off // 256) * 260 + d, state[18 + i * 2], 4)
+                # XOR whole 16-byte chunks to spread banks without row padding.
+                _store(lds.k.ptr, (off // 256) * 256 + (d ^ ((off // 256) % 8 * 16)),
+                       state[18 + i * 2], 16)
                 for j in range_constexpr(4):
                     word = vval[j]
                     peer = word.shuffle_xor(fx.Int32(16), fx.Int32(64))
@@ -482,8 +484,8 @@ def build_flash_attn_fp8_gfx942(page_size=32, _num_splits=1):
             for n in range_constexpr(2):
                 score = fx.Vector.filled(4, 0.0, fx.Float32)
                 for depth in range_constexpr(8):
-                    a = _load(lds.k.ptr, (n * 16 + row) * 260
-                              + depth * 32 + group * 8, T.i64, 4)
+                    a = _load(lds.k.ptr, (n * 16 + row) * 256
+                              + ((depth * 32 + group * 8) ^ (row % 8 * 16)), T.i64, 8)
                     score = _mfma16(a, q_frag[depth], score)
                 for r in range_constexpr(4):
                     col = block * 32 + n * 16 + group * 4 + r
