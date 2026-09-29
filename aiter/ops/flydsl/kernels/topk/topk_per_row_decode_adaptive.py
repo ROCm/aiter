@@ -55,13 +55,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import (
     arith,
-    as_ir_value,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
 )
-from flydsl.expr.typing import T
+from flydsl.expr.typing import ReductionOp, T
+from flydsl.extension.coop.warp import warp_inclusive_scan
 
 # buffer_ops comes from aiter's own shim; flydsl.expr's stable interface lacks it.
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -851,17 +851,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             gpu.barrier()
 
         def wave_inclusive_scan_i32(value):
-            cur = value
-            for sh in range_constexpr(int.bit_length(WARP_SIZE) - 1):
-                d = fx.Int32(1 << sh)
-                src_lane = lane - d
-                byte_addr = src_lane * c_four
-                peer = rocdl.ds_bpermute(
-                    T.i32, as_ir_value(byte_addr), as_ir_value(cur)
-                )
-                take = lane >= d
-                cur = take.select(cur + peer, cur)
-            return cur
+            return warp_inclusive_scan(fx.Int32(value), ReductionOp.ADD)
 
         def choose_bucket_prefix(target_k):
             # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
