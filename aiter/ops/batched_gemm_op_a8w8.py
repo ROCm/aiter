@@ -19,7 +19,6 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .gemm_op_common import (
-    find_padded_m_row,
     get_padded_m,
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
