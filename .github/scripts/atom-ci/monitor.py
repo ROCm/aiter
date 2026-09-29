@@ -50,7 +50,7 @@ def snapshot():
         except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
             continue
     builds = {}
-    for path in Path("/app/aiter-test/aiter/jit/build").glob("*/.ninja_log"):
+    for path in Path("/app/aiter-test/aiter/jit/build").glob("*/build/.ninja_log"):
         try:
             stat = path.stat()
             builds[str(path)] = {"bytes": stat.st_size, "mtime": stat.st_mtime}

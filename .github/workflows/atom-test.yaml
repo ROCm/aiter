@@ -21,9 +21,13 @@ on:
         description: Model from the pinned ATOM accuracy matrix
         type: string
         default: Kimi-K2.7-Code-MXFP4
+      triage_prebuild:
+        description: Prebuild the module implicated by the original timeout
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.triage && format('-{0}', inputs.triage_model) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -155,6 +159,15 @@ jobs:
               "MiniMax-M2.7-MXFP4": "-tp 2 --enforce-eager --level 0",
           }
 
+          # Cold builds of these modules exceeded the inference inactivity limit.
+          model_prebuild_modules = {
+              "Kimi-K2.7-Code-MXFP4": "module_gemm_a8w8_bpreshuffle",
+              "DeepSeek-R1-0528-FP4": "module_gemm_a8w8_bpreshuffle",
+              "DeepSeek-R1-0528-FP4 MTP": "module_gemm_a8w8_bpreshuffle",
+              "GLM-5.2-MXFP4 MTP": "module_gemm_a8w8_bpreshuffle",
+              "DeepSeek-V4-Pro": "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
@@ -172,6 +185,7 @@ jobs:
               model["label"] = model.get("runner", "")
               model["display_name"] = model.get("display_name", model["model_name"])
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
+              model["aiter_prebuild_module"] = model_prebuild_modules.get(model["model_name"], "")
               model["run_on_pr"] = True
               return model
 
@@ -225,7 +239,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
+    timeout-minutes: ${{ inputs.triage && 150 || 360 }}
     steps:
       - name: Checkout code
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
@@ -401,6 +415,15 @@ jobs:
           MODEL_LOCK_WAIT_SECONDS: "7200"
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Prebuild slow ATOM dependency
+        if: inputs.triage && inputs.triage_prebuild
+        timeout-minutes: 30
+        env:
+          PREBUILD_MODULE: ${{ matrix.aiter_prebuild_module }}
+        run: |
+          test -n "$PREBUILD_MODULE"
+          docker exec -e PREBUILD_MODULE -e GPU_ARCHS=gfx950 atom_aiter_test bash -lc 'python3 /workspace/.aiter-ci-tools/.github/scripts/atom-ci/prebuild.py /app/aiter-test "$PREBUILD_MODULE"' 2>&1 | tee atom_diagnostics/prebuild.log
 
       - name: Run ATOM accuracy test
         id: accuracy
