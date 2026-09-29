@@ -271,7 +271,8 @@ class TestConfigShapeCollision(unittest.TestCase):
                 "gfx,b,m,n,k,kernelId,splitK,us\ngfx950,2,128,1024,4096,653,1,20\n"
             )
             new.write_text(
-                "gfx,b,m,n,k,groupSize,kernelId,splitK,us\ngfx950,2,128,1024,4096,32,9653,1,22\n"
+                "gfx,b,m,n,k,w_scale_block,kernelId,splitK,us\n"
+                "gfx950,2,128,1024,4096,32x32,9653,1,22\n"
             )
             before = [p.read_bytes() for p in (old, new)]
             try:
@@ -279,7 +280,7 @@ class TestConfigShapeCollision(unittest.TestCase):
                 merged = core.AITER_CONFIGS.update_config_files(f"{old}:{new}", name)
                 with open(merged, newline="") as f:
                     rows = list(csv.DictReader(f))
-                self.assertEqual({int(r["groupSize"]) for r in rows}, {32, 128})
+                self.assertEqual({r["w_scale_block"] for r in rows}, {"32x32", "128x128"})
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(before, [p.read_bytes() for p in (old, new)])
             finally:

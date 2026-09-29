@@ -279,12 +279,8 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
             8640,
             1,
         )
-        assert len(warnings) == 2
-        assert any("w_scale_block" in warning[0] for warning in warnings)
-        assert any(
-            warning[0].startswith("Skipping %d invalid OPUS row")
-            for warning in warnings
-        )
+        assert len(warnings) == 1
+        assert warnings[0][0].startswith("Skipping %d invalid OPUS row")
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
