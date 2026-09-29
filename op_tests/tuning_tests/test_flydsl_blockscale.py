@@ -187,8 +187,14 @@ def test_kernel_names_and_shape_gates(catalog):
         assert not catalog.kernel_fits_shape(ki, 33, 384, 384, "gfx950")
         assert not catalog.kernel_fits_shape(ki, 0, 384, 512, "gfx950")
         assert not catalog.kernel_fits_shape(ki, 33, 383, 512, "gfx950")
-        assert not catalog.kernel_fits_shape(ki, 33, 384, 524288, "gfx950")
+        assert catalog.kernel_fits_shape(ki, 33, 384, 524288, "gfx950")
+        assert not catalog.kernel_fits_shape(ki, 33, 384, 2**23, "gfx950")
         assert not catalog.kernel_fits_shape(ki, 2**27, 384, 512, "gfx950")
+
+
+@pytest.mark.parametrize("k", [256, 6144, 16384, 131072, 393216, 524288])
+def test_lds_bytes_excludes_scalar_b_scales(catalog, k):
+    assert catalog.lds_bytes(k) == 136 * 1024
 
 
 def test_i32_bounds_are_local_but_scales_remain_global(catalog):
