@@ -8,8 +8,12 @@ import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import topk
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.flydsl.topk import topk_per_row as flydsl_decode_host
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
+from aiter.ops.topk_select import _choose as topk_select_backend_for
+from aiter.ops.topk_select import topk_select
 from aiter.test_common import benchmark, perftest
 
 
@@ -579,6 +583,77 @@ def test_decode_bound_gate():
     print(f"[decode_bound_gate] PASS: {len(table)} cards")
 
 
+def test_decode_bound_entry_points(card):
+    """`topk_select` and the public FlyDSL wrapper each carry `max_row_len` to the
+    adaptive kernel. A dropped bound still returns correct indices, so the launch
+    itself is checked, not only the result."""
+    wave = wave_size_of(torch.cuda.current_device())
+    rows, context_len, top_k, _ = next(
+        (m, n, k, s)
+        for m, n, k, s in adaptive_band_cells(card)
+        if s
+        and topk_select_backend_for(m, 4 * n, k, wave, True, "low", False, True)
+        == "decode"
+    )
+    width = 4 * context_len
+    seq_lens = torch.randint(
+        top_k, context_len + 1, (rows,), dtype=torch.int32, device="cuda"
+    )
+    seq_lens[0] = context_len
+    logits = create_planted_logits(seq_lens, width, top_k)
+    live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+    masked = torch.where(live, logits, float("-inf"))
+    torch_indices = masked.topk(top_k, dim=-1)[1]
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    def flydsl_wrapper():
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        aiter.flydsl_top_k_per_row_decode(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            True,
+            max_row_len=context_len,
+        )
+        return indices
+
+    entry_points = {
+        "topk_select": lambda: topk_select(
+            logits, top_k, end=seq_lens, tie="low", max_row_len=context_len
+        )[1],
+        "flydsl_top_k_per_row_decode": flydsl_wrapper,
+    }
+    run_adaptive = flydsl_decode_host._run_adaptive
+    launches = []
+
+    def record(*args, cfg_width, **kwargs):
+        launches.append(cfg_width)
+        return run_adaptive(*args, cfg_width=cfg_width, **kwargs)
+
+    for name, call in entry_points.items():
+        launches.clear()
+        flydsl_decode_host._run_adaptive = record
+        try:
+            indices = call()
+        finally:
+            flydsl_decode_host._run_adaptive = run_adaptive
+        torch.cuda.synchronize()
+        assert launches == [
+            context_len
+        ], f"{name} launched the adaptive kernel as {launches}, not [{context_len}]"
+        assert compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k, stable=True
+        ), f"{name} mismatch at rows={rows} width={width} bound={context_len}"
+    print(
+        f"[decode_bound_entry_points] PASS: {', '.join(entry_points)} at "
+        f"rows={rows} width={width} bound={context_len} k={top_k}"
+    )
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -795,6 +870,7 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         assert (
             df["backend"] == topk.BACKEND_ADAPTIVE
         ).all(), f"{name} decode left the adaptive kernel:\n{df_md}"
+    test_decode_bound_entry_points(card)
 else:
     aiter.logger.warning(
         "%s at %d CU carries no adaptive decode bands; bounded decode skipped", *card
