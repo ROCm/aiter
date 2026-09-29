@@ -1009,15 +1009,24 @@ def get_ps_metadata_info_v1(
     num_head_k: int,
     max_qlen: int,
     qlen_granularity: int = 256,
+    total_qlen: int | None = None,
 ):
     """
+    Args:
+        total_qlen: Upper bound on the sum of query lengths over the batch of a
+            single call, e.g. the serving engine's token budget. None means
+            unknown, in which case every batch is assumed to carry max_qlen query
+            tokens.
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
         3. Shape of work_info followed by its scalar type.
         4. Shape of reduce_indptr followed by its scalar type.
         5. Shape of reduce_final_map followed by its scalar type.
-        6. Shape of reduce_partial_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type. Its entries
+           index a partial pool of reduce_partial_map_size * qlen_granularity
+           rows, so allocate the partial logits as (rows, num_head_q,
+           v_head_dim) and the partial lse as (rows, num_head_q).
     """
 
     device = torch.cuda.current_device()
@@ -1030,6 +1039,12 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
+    if total_qlen is not None:
+        assert total_qlen > 0, "total_qlen must be positive, use None if unknown"
+        # sum_i ceil(qlen_i / g) <= ceil(sum_i qlen_i / g) + (batch_size - 1),
+        # since only the last tile of each batch is a partially filled one.
+        budget_qo_tile_cnt = math.ceil(total_qlen / qlen_granularity) + batch_size - 1
+        qo_tile_cnt = min(qo_tile_cnt, max(budget_qo_tile_cnt, max_qo_split_per_batch))
     # a work item is created either
     #   1. for every qo tile (no split)
     #   2. every split qo tile, which can be done at most #TG times in total
@@ -1159,7 +1174,7 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 8 == 0
+    assert num_head_qo % 4 == 0
     max_splits = get_mla_decode_fwd_max_splits(
         num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
@@ -1234,17 +1249,28 @@ def get_mla_metadata_info_v1(
     ):
         max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
-        get_gfx() == "gfx950"
-        and (packed_qo_len >= 128 or num_head_qo > 64)
-        and kv_dtype == dtypes.bf16
-        and q_dtype == dtypes.bf16
-        and num_head_qo != 48
-    ) or (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo == 96
-        and effective_seqlen_qo <= 6
+        (
+            get_gfx() == "gfx950"
+            and (packed_qo_len >= 128 or num_head_qo > 64)
+            and kv_dtype == dtypes.bf16
+            and q_dtype == dtypes.bf16
+            and num_head_qo != 48
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+            and effective_seqlen_qo <= 6
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 12
+            and packed_qo_len <= 128
+            and fast_mode
+        )
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1669,6 +1695,13 @@ def decode_update_mla_metadata_v1(
             and kv_is_fp8
             and num_heads_per_head_k in (32, 64, 128)
             and max_seqlen_qo == 1
+        )
+        or (
+            arch_id == "gfx950"
+            and q_is_fp8
+            and kv_is_fp8
+            and num_heads_per_head_k == 12
+            and num_heads_per_head_k * max_seqlen_qo <= 128
         )
     )
     cu_num = work_indptr.shape[0] - 1
