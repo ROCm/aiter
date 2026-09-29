@@ -10,6 +10,7 @@ written for callers that consume it.
 Run:
   CUDA_VISIBLE_DEVICES=0 python3 op_tests/test_fused_qk_norm_rope_cache_q_fp8.py
 """
+
 import torch
 
 import aiter
@@ -44,9 +45,34 @@ def _run(head_size, q_scale_val, with_qfp8):
         q_scale = torch.full((1,), q_scale_val, dtype=torch.float32, device=DEV)
 
     aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
-        qkv.clone(), qw, kw, cos_sin, positions, nt, hq, hk, hv, head_size,
-        True, EPS, q_out, k_cache, v_cache, slot_mapping, k_scale, v_scale,
-        None, None, False, False, block_size, x, 0, False, q_out_fp8, q_scale,
+        qkv.clone(),
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        nt,
+        hq,
+        hk,
+        hv,
+        head_size,
+        True,
+        EPS,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        None,
+        None,
+        False,
+        False,
+        block_size,
+        x,
+        0,
+        False,
+        q_out_fp8,
+        q_scale,
     )
     return q_out, q_out_fp8, cache_dtype
 
