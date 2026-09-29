@@ -45,8 +45,8 @@ DeepSeek-V4 HCA decode kernel (fp8 KV "nm" layout, 128 query heads, qseqlen 1) f
 | `asm/patch.py` | rt.s -> persistent kernel (library, called by gen.py) |
 | `asm/align.py` | alignment pads (assembles trial passes, reads label offsets with llvm-readelf) |
 | `splice/splice.py` | `hipcc -S` + extraction of one kernel body as a splice block |
-| `splice/pre.hip` | in-kernel split planner (`t8pre`) |
-| `splice/fin.hip` | fused last-arriver combine (`t8fin`) |
+| `splice/pre.hip` | in-kernel split planner (`ps_plan`) |
+| `splice/fin.hip` | fused last-arriver combine (`ps_merge`) |
 | `splice/hca_common.hip` | shared definitions: cost line, `Desc`, wave-cooperative search, WG map |
 
 ## Build and verify
@@ -95,12 +95,14 @@ AMD LLD 22.0.0 (... f58b06dce1f9c15707c5f808fd002e18c2accf7e) (compatible with G
 ```
 
 Expected sha256 of the output:
-`b1a1944b57d006aba1fa91fff4d1ddc87029bef94d8bea066e59a4f7c5ab342c`.
+`889d8c653c3278f7c0df138476b1ca0d491b7fced25617f816d6818a68392af8`.
 
 ## Launch and kernarg ABI
 
 * Grid `(2P, 1, 1)` and block `256`, with no dynamic LDS. `P` is the number of partitions (`P <= 1024`, and
-  `P % 8 == 0` selects the XCD-aware WG map). Rows: `N <= 65536`.
+  `P % 8 == 0` selects the XCD-aware WG map). Rows: `N <= 32768`; the byte offsets
+  of `out` / `q` wrap above that (inherited from the #5195 ASM). The `cnt` / `arange` sizes below come from a
+  65536-row counter layout and are larger than that limit needs.
 * The kernarg block is 336 B: 21 slots of 16 B. Offsets are in bytes. Slots the kernel does not read are passed as
   the values shown.
 
@@ -119,11 +121,11 @@ Expected sha256 of the output:
 | 0x70 | f32 | softmax scale `1/sqrt(512)` |
 | 0x80 | u32 | 128 (gqa ratio) |
 | 0x90 | u32 | 1 (num_kv_splits) |
-| 0x98 | ptr | `cnt` uint32 `[2*65536 + 16*512 + 4*1024]`, zero at rest (row / group counters of the fused combine) |
+| 0x98 | ptr | `cnt` int32 `[2*65536 + 16*512 + 4*1024]`, zero at rest: `[0, 2*65536)` row counters, `[2*65536, +16*512)` reserved (unused, but allocated), then `4*1024` group counters of the fused combine |
 | 0xa0 | u32 | `P` |
 | 0xa4 | u32 | `N` (rows) |
 | 0xb0 | u32 | planner config `F | MT << 8` (default `6 | 1 << 8`) |
-| 0xb8 | ptr | `span` int32 `[P][2]` (passed by the host wrapper; not read by this build) |
+| 0xb8 | ptr | 0 (unused) |
 | 0xc0 | u32 | 0 |
 | 0xd0 | ptr | `qo_indptr` = int32 `arange(>= N+1)` |
 | 0xe0 | ptr | `split_indptr` = int32 `arange(>= N+1)` (same buffer) |

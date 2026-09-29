@@ -53,7 +53,7 @@ template <class T> __device__ __forceinline__ T* uni(T* p) {   // make a pointer
 #define CPOL_SC1 16
 #define OCP " sc1"
 
-extern "C" __global__ void __launch_bounds__(256) t8fin(KA ka) {
+extern "C" __global__ void __launch_bounds__(256) ps_merge(KA ka) {
   __shared__ unsigned s_dec[2];
   __shared__ int s_slot[4][FIN_MAXJ];
   __shared__ float s_wt[4][FIN_MAXJ + 1][16];

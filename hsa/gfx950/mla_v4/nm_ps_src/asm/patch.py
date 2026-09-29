@@ -67,8 +67,8 @@ def patch(src_text, clang, readelf, hipcc, workdir):
     _pre, _kd = SP.body(
         hipcc,
         os.path.join(SP.HERE, "pre.hip"),
-        "t8pre",
-        "T8PRE",
+        "ps_plan",
+        "PS_PLAN",
         workdir,
         vmax=240,
         smax=100,
@@ -78,8 +78,8 @@ def patch(src_text, clang, readelf, hipcc, workdir):
     _fin, _kf = SP.body(
         hipcc,
         os.path.join(SP.HERE, "fin.hip"),
-        "t8fin",
-        "T8FIN",
+        "ps_merge",
+        "PS_MERGE",
         workdir,
         vmax=240,
         smax=100,
@@ -93,7 +93,7 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\tv_accvgpr_write_b32 a241, s1",
         "\tv_accvgpr_write_b32 a242, s2",
         _pre,
-        "T8PRE_RET:",
+        "PS_PLAN_RET:",
         "\ts_waitcnt vmcnt(0) lgkmcnt(0)",
         "\ts_nop 4",
         "\tv_accvgpr_read_b32 v250, a240",
@@ -111,7 +111,7 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\ts_waitcnt lgkmcnt(0)",
         "\ts_and_b32 s43, s42, 7",
         "\ts_cmp_eq_u32 s43, 0",
-        "\ts_cbranch_scc0 T8_MAP_PLAIN",
+        "\ts_cbranch_scc0 PS_MAP_PLAIN",
         "\ts_and_b32 s84, s2, 7",
         "\ts_lshr_b32 s85, s2, 3",
         "\ts_lshr_b32 s43, s42, 3",
@@ -119,17 +119,17 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\ts_lshr_b32 s43, s85, 1",
         "\ts_add_u32 s101, s84, s43",
         "\ts_and_b32 s2, s85, 1",
-        "\ts_branch T8_MAPPED",
-        "T8_MAP_PLAIN:",
+        "\ts_branch PS_MAPPED",
+        "PS_MAP_PLAIN:",
         "\ts_lshr_b32 s101, s2, 1",
         "\ts_and_b32 s2, s2, 1",
-        "T8_MAPPED:",
+        "PS_MAPPED:",
         "\tv_accvgpr_read_b32 v250, a243",
         "\ts_nop 4",
         "\tv_readfirstlane_b32 s30, v250",  # r = begin_row
     ]
     PIECE = [
-        "T8_PIECE_START:",
+        "PS_PIECE_START:",
         "\ts_and_b32 s1, s1, 0xffff",
         "\ts_load_dwordx2 s[42:43], s[0:1], 0x60",
         "\ts_load_dwordx2 s[76:77], s[0:1], 0x40",
@@ -154,13 +154,13 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\ts_waitcnt lgkmcnt(0)",
         # s64 begin_row s65 end_row s66 begin_tile s67 end_tile s68 flags
         "\ts_cmp_gt_i32 s30, s65",
-        "\ts_cbranch_scc1 T8_DONE",
+        "\ts_cbranch_scc1 PS_DONE",
         # K = 0 row inside the walk (e.g. bucket padding): skip without entering the ASM (no LDS use, no barrier)
         "\ts_cmp_eq_u32 s78, s79",
-        "\ts_cbranch_scc0 T8_KNZ",
+        "\ts_cbranch_scc0 PS_KNZ",
         "\ts_add_u32 s30, s30, 1",
-        "\ts_branch T8_PIECE_START",
-        "T8_KNZ:",
+        "\ts_branch PS_PIECE_START",
+        "PS_KNZ:",
         "\tv_accvgpr_write_b32 a236, s78",
         "\tv_accvgpr_write_b32 a237, s79",
         "\ts_and_b32 s69, s68, 1",
@@ -184,9 +184,9 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\ts_mov_b32 s88, 0",
         "\ts_mov_b32 s70, 0",
         "\tv_mov_b32_e32 v0, v248",
-        "\ts_branch T8_PADA_END",
+        "\ts_branch PS_PADA_END",
         "@@PADA@@",
-        "T8_PADA_END:",  # alignment pad (skipped), see align.py
+        "PS_PADA_END:",  # alignment pad (skipped), see align.py
     ]
     EPI_PART = [  # label_8068: o_acc / lse_acc slot bases
         "\ts_mul_i32 s75, s31, 0x40000",
@@ -204,7 +204,7 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\ts_and_b32 s9, s9, 0xffff",
         "\ts_or_b32 s9, s9, 0x40000",
         "\ts_cmp_eq_u64 s[42:43], 0",
-        "\ts_cbranch_scc1 T8_NOLSE",
+        "\ts_cbranch_scc1 PS_NOLSE",
         "\ts_lshl_b32 s84, s89, 9",
         "\ts_lshl_b32 s85, s2, 8",
         "\ts_add_u32 s84, s84, s85",
@@ -215,13 +215,13 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\tv_and_b32_e32 v249, 15, v0",
         "\tv_lshlrev_b32_e32 v249, 2, v249",
         "\tglobal_store_dword v249, v33, s[42:43]",
-        "T8_NOLSE:",
+        "PS_NOLSE:",
     ]
     END = [
         "\ts_mov_b64 exec, -1",
         # fused combine (split pieces only)
         "\ts_cmp_eq_u32 s31, -1",
-        "\ts_cbranch_scc1 T8FIN_SKIP",
+        "\ts_cbranch_scc1 PS_MERGE_SKIP",
         "\tv_accvgpr_write_b32 a230, s30",
         "\tv_accvgpr_write_b32 a231, s31",
         "\tv_accvgpr_write_b32 a232, s101",
@@ -231,7 +231,7 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\tv_mov_b32_e32 v0, v248",
         "\ts_nop 4",
         _fin,
-        "T8FIN_RET:",
+        "PS_MERGE_RET:",
         "\ts_waitcnt vmcnt(0) lgkmcnt(0)",
         "\ts_mov_b64 exec, -1",
         "\ts_nop 4",
@@ -246,12 +246,12 @@ def patch(src_text, clang, readelf, hipcc, workdir):
         "\tv_readfirstlane_b32 s2, v252",
         "\tv_readfirstlane_b32 s30, v253",
         "\tv_readfirstlane_b32 s101, v254",
-        "T8FIN_SKIP:",
+        "PS_MERGE_SKIP:",
         "\ts_barrier",
         "\ts_add_u32 s30, s30, 1",
-        "\ts_branch T8_PIECE_START",
+        "\ts_branch PS_PIECE_START",
         "@@PADB@@",
-        "T8_DONE:",
+        "PS_DONE:",
         "\ts_endpgm",
     ]
 
@@ -327,9 +327,9 @@ def patch(src_text, clang, readelf, hipcc, workdir):
             out += [
                 ln,
                 "\ts_cmp_eq_u32 s82, 1",
-                "\ts_cbranch_scc1 T8_LSE_NAT",
+                "\ts_cbranch_scc1 PS_LSE_NAT",
                 "\tv_fma_f32 v33, v45, s5, v27",
-                "T8_LSE_NAT:",
+                "PS_LSE_NAT:",
             ]
             mark("P4")
             continue

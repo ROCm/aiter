@@ -85,7 +85,7 @@ __device__ __forceinline__ void plan_both(const int* __restrict__ ind, int N, in
 // kernarg reads through the constant-address-space kernarg pointer -> s_load (the by-value struct compiled to vector loads)
 #define KARG(T, off) (*(T const __attribute__((address_space(4)))*)((const __attribute__((address_space(4))) char*)__builtin_amdgcn_kernarg_segment_ptr() + (off)))
 
-extern "C" __global__ void __launch_bounds__(256) t8pre(KA ka) {
+extern "C" __global__ void __launch_bounds__(256) ps_plan(KA ka) {
   const int* ind = KARG(const int*, 0x40);
   Desc* desc = KARG(Desc*, 0x60);
   const int P = KARG(int, 0xa0), N = KARG(int, 0xa4), F = KARG(int, 0xb0);
