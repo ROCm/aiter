@@ -38,6 +38,7 @@ from flydsl.expr import math as fxmath
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
+from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_base_i64,
@@ -1305,6 +1306,7 @@ def qsa_k2(
         raise ValueError("every tensor must be on the GPU")
     if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
+    arch = qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
     if not rows or not indices.shape[1]:
@@ -1323,9 +1325,7 @@ def qsa_k2(
     # offset is 2^32 - 1. Python ints do not wrap.
     wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
     page_size = k_cache.shape[1]
-    use_k32 = torch.cuda.get_device_properties(q.device).gcnArchName.startswith(
-        "gfx950"
-    )
+    use_k32 = arch == "gfx950"
     n_sel = int(indices.shape[1])
     block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
     if n_splits == 1:
