@@ -72,15 +72,10 @@ DEFAULT_GRID_CAP = 64
 #
 #   PCIe
 #
-#     TP2  block 128, atoms=2, cap 64 -- a 4 KiB tile reached with a half-size
-#                               workgroup. Below 96 KiB the schedule is
-#                               flag-bound, and 128 threads is the cheapest way
-#                               to hold the tile narrow.
-#          block 256, atoms=4, cap 128 -- above 96 KiB the trade reverses and
-#                               the wider cap matters, because this window runs
-#                               to 64 MiB in exact mode: a cap of 64 would leave
-#                               half the blocks running twice the serialized
-#                               handshake rounds.
+#     TP2  block 512, atoms=1/4 -- the 8 KiB tile to 384 KiB (the whole fast-mode
+#                               window, where the mesh takes over), then the
+#                               32 KiB tile with cap 128 over the rest of the
+#                               exact-mode window, which runs to 64 MiB.
 #     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB,
 #                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
 #     TP8  block 512, atoms=1/2 -- the 8 KiB tile to 16 KiB, then the 16 KiB
@@ -94,8 +89,8 @@ DEFAULT_GRID_CAP = 64
 #     TP8  atoms=1 cap128 b256 -- one rung over the whole window
 ONESHOT_LADDER = {
     ("pcie", 2): (
-        (0, 2, 64, "peer", 128, True),
-        (96 << 10, 4, 128, "peer", 256, True),
+        (0, 1, 64, "peer", 512, True),
+        (384 << 10, 4, 128, "peer", 512, True),
     ),
     ("pcie", 4): (
         (0, 1, 64, "peer", 256, True),

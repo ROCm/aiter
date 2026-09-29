@@ -64,9 +64,15 @@ def test_dispatch_is_monotone(ws):
 
     Composed across both slots, in the order ``CudaCommunicator.all_reduce``
     consults them, so this is the ordering a payload actually experiences.
+    Below ``min_bytes`` the payload falls back by design (the Aiter kernel is
+    faster there); above it the order must hold.
     """
     order = {"oneshot": 0, "mesh": 1, "ring": 2, "fallback": 3}
-    seen = [order[_slot_of("pcie", ws, n)] for n in (1 << k for k in range(4, 31))]
+    floor = P.resolve_oneshot("pcie", ws).min_bytes
+    sizes = [1 << k for k in range(4, 31)]
+    below = [_slot_of("pcie", ws, n) for n in sizes if n < floor]
+    assert set(below) <= {"fallback"}
+    seen = [order[_slot_of("pcie", ws, n)] for n in sizes if n >= floor]
     assert seen == sorted(seen)
 
 
