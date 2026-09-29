@@ -29,7 +29,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..gemm_op_common import get_padded_m
+from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
@@ -638,8 +638,8 @@ def index_tuned_by_cu_num(
 
 @cache
 def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
-    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k"]
-    shape_keys_fallback = ["gfx", "b", "m", "n", "k"]
+    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
+    shape_keys_fallback = ["gfx", "b", "m", "n", "k", "w_scale_block"]
 
     path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
     try:
@@ -647,6 +647,8 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
     except FileNotFoundError:
         logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
+
+    df = with_mxscale_w_scale_block(df, path)
 
     required = set(shape_keys_fallback) | {"kernelId", "splitK"}
     missing = required.difference(df.columns)
@@ -732,28 +734,31 @@ def lookup_mxscale_bmm_config(
     n: int,
     k: int,
     *,
+    w_scale_block: str = "128x128",
     libtype: str | None = None,
 ):
-    """Return the exact or existing padded-M tuned row for one shape."""
+    """Return the exact or existing padded-M tuned row for one shape and
+    weight-scale block (OPUS kernels read 128x128)."""
     gfx = get_gfx()
     cu_num = get_cu_num()
     tuned = _load_mxscale_bmm_tuned(libtype)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, cu_num, b, padded_m, n, k))
+        row = tuned.get((gfx, cu_num, b, padded_m, n, k, w_scale_block))
         if row is None:
-            row = tuned.get((gfx, b, padded_m, n, k))
+            row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
         if row is not None:
             break
 
     if row is None:
         logger.info(
-            "shape B:%s M:%s N:%s K:%s has no MXFP8 BMM tuned row",
+            "shape B:%s M:%s N:%s K:%s w_scale %s has no MXFP8 BMM tuned row",
             b,
             m,
             n,
             k,
+            w_scale_block,
         )
         return None
     if AITER_LOG_TUNED_CONFIG:

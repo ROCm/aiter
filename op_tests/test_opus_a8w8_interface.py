@@ -251,9 +251,9 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
 
     config_path = tmp_path / "mxscale.csv"
     config_path.write_text(
-        "gfx,b,m,n,k,libtype,kernelId,splitK\n"
-        "gfx950,2,1,1024,4096,opus,8001,1\n"
-        "gfx950,3,1,1024,4096,other,42,1\n"
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,2,1,1024,4096,128x128,opus,8001,1\n"
+        "gfx950,3,1,1024,4096,128x128,other,42,1\n"
     )
     warnings = []
     monkeypatch.setattr(
@@ -274,7 +274,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     policy.lookup_mxscale_bmm_config.cache_clear()
     try:
         rows = policy._load_mxscale_bmm_tuned(None)
-        assert rows[("gfx950", 3, 1, 1024, 4096)]["kernelId"] == 42
+        assert rows[("gfx950", 3, 1, 1024, 4096, "128x128")]["kernelId"] == 42
         assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
             8640,
             1,
@@ -295,9 +295,9 @@ def test_mxscale_tuned_lookup_distinguishes_cu_count(monkeypatch, tmp_path):
 
     config_path = tmp_path / "mxscale.csv"
     config_path.write_text(
-        "gfx,cu_num,b,m,n,k,libtype,kernelId,splitK\n"
-        "gfx950,128,2,1,1024,4096,opus,8311,1\n"
-        "gfx950,256,2,1,1024,4096,opus,8312,1\n"
+        "gfx,cu_num,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,128,2,1,1024,4096,128x128,opus,8311,1\n"
+        "gfx950,256,2,1,1024,4096,128x128,opus,8312,1\n"
     )
     monkeypatch.setattr(
         policy,
@@ -319,8 +319,8 @@ def test_mxscale_tuned_lookup_distinguishes_cu_count(monkeypatch, tmp_path):
 
     try:
         rows = policy._load_mxscale_bmm_tuned("opus")
-        assert rows[("gfx950", 128, 2, 1, 1024, 4096)]["kernelId"] == 8311
-        assert rows[("gfx950", 256, 2, 1, 1024, 4096)]["kernelId"] == 8312
+        assert rows[("gfx950", 128, 2, 1, 1024, 4096, "128x128")]["kernelId"] == 8311
+        assert rows[("gfx950", 256, 2, 1, 1024, 4096, "128x128")]["kernelId"] == 8312
 
         current["cu_num"] = 128
         policy.lookup_mxscale_bmm_config.cache_clear()
@@ -369,7 +369,7 @@ def test_mxscale_tuned_lookup_with_no_cu_count_warns_and_resolves(
     try:
         assert policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"] == 8311
         assert policy.lookup_mxscale_bmm_config(2, 1, 1024, 4096)["kernelId"] == 8311
-        assert len(warnings) == 1
+        assert len([w for w in warnings if "cu_num" in w[0]]) == 1
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
@@ -380,9 +380,9 @@ def test_mxscale_tuned_loader_rejects_duplicate_cu_shape(monkeypatch, tmp_path):
 
     config_path = tmp_path / "mxscale.csv"
     config_path.write_text(
-        "gfx,cu_num,b,m,n,k,libtype,kernelId,splitK\n"
-        "gfx950,128,2,1,1024,4096,opus,8311,1\n"
-        "gfx950,128,2,1,1024,4096,opus,8312,1\n"
+        "gfx,cu_num,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,128,2,1,1024,4096,128x128,opus,8311,1\n"
+        "gfx950,128,2,1,1024,4096,128x128,opus,8312,1\n"
     )
     monkeypatch.setattr(
         policy,
@@ -413,10 +413,18 @@ def test_mxscale_tuner_emits_cu_count_key():
 
     tuner = OpusBmmMxscaleTuner()
     frame = tuner.result_to_df(
-        [((("gfx950", 128, 2, 1, 1024, 4096), 8311, 1, "kid"), 10.0, 0.0)]
+        [((("gfx950", 128, 2, 1, 1024, 4096, "128x128"), 8311, 1, "kid"), 10.0, 0.0)]
     )
 
-    assert list(frame.columns[:6]) == ["gfx", "cu_num", "b", "m", "n", "k"]
+    assert list(frame.columns[:7]) == [
+        "gfx",
+        "cu_num",
+        "b",
+        "m",
+        "n",
+        "k",
+        "w_scale_block",
+    ]
     assert frame.loc[0, "cu_num"] == 128
     assert frame.loc[0, "b"] == 2
 
