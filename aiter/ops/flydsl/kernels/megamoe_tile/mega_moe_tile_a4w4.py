@@ -558,8 +558,12 @@ class MegaMoETileA4W4:
         _s2_tuned = _s2_tuned or {}
         # GEMM2 的 N tile 同样按 shape 查表(可选列,旧表没有也能加载)。
         from .stage2_tune import resolve_gemm2_bn as _resolve_gemm2_bn
+        from .stage2_tune import resolve_gemm2_cu as _resolve_gemm2_cu
 
         self._two_kernel_bn, self._two_kernel_bn_source = _resolve_gemm2_bn(
+            _s2_tuned or None)
+        # kernel1 的持久 grid 同样按 shape 查表(0 = 沿用 worker_blocks)。
+        self._two_kernel_k1_cu, self._two_kernel_k1_cu_source = _resolve_gemm2_cu(
             _s2_tuned or None)
         self._two_kernel_qp = int(
             _os.environ.get("MEGAMOE_TK_QP", _s2_tuned.get("num_qp", 8)))
@@ -583,8 +587,7 @@ class MegaMoETileA4W4:
         self._two_kernel_rail = _os.environ.get("MEGAMOE_TK_RAIL", "1") != "0"
         self._two_kernel_wait_remote = (
             _os.environ.get("MEGAMOE_TK_WAIT_REMOTE", "1") != "0")
-        # 0 = 沿用 worker_blocks(现状)。g2_spart 要和实际 CU 数配套。
-        self._two_kernel_k1_cu = int(_os.environ.get("MEGAMOE_TK_K1_CU", "0"))
+        # kernel1 的 grid(MEGAMOE_TK_K1_CU)已在上面按 shape 查表。g2_spart 要和实际 CU 数配套。
         self._two_kernel_k1_spart = int(_os.environ.get("MEGAMOE_TK_K1_SPART", "402"))
         # 0 = 跟随 cu_num。单节点 179us 那次是 cu_num=256 / persist_cu=240。
         self._two_kernel_k1_pcu = int(_os.environ.get("MEGAMOE_TK_K1_PCU", "0"))
@@ -1083,9 +1086,7 @@ class MegaMoETileA4W4:
             wide_fanout_wait=(
                 os.environ.get("MEGAMOE_TK_S1_WIDE_FANOUT_WAIT", "0") != "0"
             ),
-            compute_first=int(
-                os.environ.get("MEGAMOE_TK_S1_COMPUTE_FIRST", "-1")
-            ),
+            compute_first=self._s1_tile["compute_first"],
             lean_waitcnt=(
                 os.environ.get("MEGAMOE_TK_S1_LEAN_WAITCNT", "0") != "0"
             ),

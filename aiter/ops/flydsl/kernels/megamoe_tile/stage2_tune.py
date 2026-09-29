@@ -12,9 +12,10 @@ tuned tables (``fused_moe.py:2192``), with ``token`` meaning the GEMM row count
 the per-rank token count.  A miss returns ``None``; the caller keeps its built-in
 default, so an absent or partial table never breaks a run.
 
-``gemm2_bn`` (kernel1's GEMM2 N tile, 128 or 256) is an *optional* column: a
-table without it, or a row with the cell left empty, falls back to the built-in
-default, so older tables keep loading.  BM stays 32: kernel1 requires
+``gemm2_bn`` (kernel1's GEMM2 N tile, 128 or 256) and ``gemm2_cu`` (kernel1's
+persistent grid; 0 = the operator's worker_blocks) are *optional* columns: a
+table without them, or a row with the cell left empty, falls back to the
+built-in default, so older tables keep loading.  BM stays 32: kernel1 requires
 ``SBM % BM == 0`` and the arena tile (SBM) is 32 rows.
 """
 from __future__ import annotations
@@ -29,11 +30,14 @@ _DEFAULT_NAME = "megamoe_tile_stage2_tuned.csv"
 _KEY_FIELDS = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
 _INT_KEYS = ("cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
 _VALUE_FIELDS = ("num_qp", "return_chunk_tokens")
-_OPTIONAL_FIELDS = ("gemm2_bn",)
+_OPTIONAL_FIELDS = ("gemm2_bn", "gemm2_cu")
 
 ENV_GEMM2_BN = "MEGAMOE_TK_BN"
 GEMM2_BNS = (128, 256)
 DEFAULT_GEMM2_BN = 128
+ENV_GEMM2_CU = "MEGAMOE_TK_K1_CU"
+DEFAULT_GEMM2_CU = 0
+GEMM2_CU_MAX = 2048
 
 _lock = threading.Lock()
 _cache: dict | None = None
@@ -68,6 +72,11 @@ def _validate(row: dict, path: str, lineno: int) -> None:
     if bn is not None and bn not in GEMM2_BNS:
         raise ValueError(
             f"{path}:{lineno}: gemm2_bn must be one of {GEMM2_BNS} (got {bn})"
+        )
+    cu = row.get("gemm2_cu")
+    if cu is not None and not 0 <= cu <= GEMM2_CU_MAX:
+        raise ValueError(
+            f"{path}:{lineno}: gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu})"
         )
 
 
@@ -125,7 +134,7 @@ def lookup_stage2_tune(
     expert: int,
     topk: int,
 ) -> dict | None:
-    """Return ``{"num_qp", "return_chunk_tokens"[, "gemm2_bn"]}`` or ``None`` on a miss.
+    """Return ``{"num_qp", "return_chunk_tokens"[, "gemm2_bn", "gemm2_cu"]}`` or ``None``.
 
     ``expert`` is the per-rank routed-expert count and ``inter_dim`` the global
     one, matching ``kimik3_a4w4_tuned_fmoe.csv``.
@@ -158,3 +167,20 @@ def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     if bn not in GEMM2_BNS:
         raise ValueError(f"gemm2_bn must be one of {GEMM2_BNS} (got {bn}, from {source})")
     return bn, source
+
+
+def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
+    """GEMM2 (kernel1) persistent grid and its source: env > table > 0.
+
+    0 keeps the operator's behaviour of launching ``worker_blocks`` CTAs.
+    """
+    raw = os.environ.get(ENV_GEMM2_CU, "")
+    if raw:
+        cu, source = int(raw), "env"
+    elif tuned and tuned.get("gemm2_cu") is not None:
+        cu, source = int(tuned["gemm2_cu"]), "table"
+    else:
+        cu, source = DEFAULT_GEMM2_CU, "default"
+    if not 0 <= cu <= GEMM2_CU_MAX:
+        raise ValueError(f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})")
+    return cu, source

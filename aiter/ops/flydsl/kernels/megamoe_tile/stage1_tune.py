@@ -11,6 +11,10 @@ Two knobs decide how GMM1 tiles its work:
     before ``Stage1ArenaLayout.create``.
 ``gmm1_bn``
     GMM1's own N block (128 or 256), decoupled from the arena ``block_n``.
+``compute_first`` (optional column)
+    First worker ticket that runs GMM1 (clamped to the essential CTAs by the
+    kernel; -1 = the essential-CTA count).  A table without the column, or an
+    empty cell, falls back to -1, the operator's long-standing default.
 
 The table follows ``stage2_tune.py`` (and ``aiter/fused_moe.py``): same key, with
 ``token`` = GEMM rows = ``max_tok_per_rank * topk`` and ``expert`` the per-rank
@@ -43,9 +47,12 @@ _DEFAULT_NAME = "megamoe_tile_stage1_tuned.csv"
 # Per-field overrides; env > table > rule.
 ENV_TILE_GROUP = "MEGAMOE_TK_S1_TILE_GROUP"
 ENV_GMM1_BN = "MEGAMOE_TK_S1_GMM1_BN"
+ENV_COMPUTE_FIRST = "MEGAMOE_TK_S1_COMPUTE_FIRST"
 
 _KEY_FIELDS = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
 _VALUE_FIELDS = ("tile_group", "gmm1_bn")
+_OPTIONAL_FIELDS = ("compute_first",)
+DEFAULT_COMPUTE_FIRST = -1
 
 TILE_GROUPS = (1, 2, 4)
 GMM1_BNS = (128, 256)
@@ -80,6 +87,9 @@ def _validate(row: dict, where: str) -> None:
         raise ValueError(
             f"{where}: gmm1_bn must be one of {GMM1_BNS} (got {row['gmm1_bn']})"
         )
+    cf = row.get("compute_first")
+    if cf is not None and cf < -1:
+        raise ValueError(f"{where}: compute_first must be >= -1 (got {cf})")
 
 
 def _load(path: str) -> dict:
@@ -99,6 +109,10 @@ def _load(path: str) -> dict:
                 for f in _KEY_FIELDS
             )
             row = {f: int(raw[f]) for f in _VALUE_FIELDS}
+            for f in _OPTIONAL_FIELDS:
+                cell = (raw.get(f) or "").strip()
+                if cell:
+                    row[f] = int(cell)
             _validate(row, f"{path}:{lineno}")
             table[key] = row
     return table
@@ -132,7 +146,7 @@ def lookup_stage1_tune(
     expert: int,
     topk: int,
 ) -> dict | None:
-    """Return ``{"tile_group": int, "gmm1_bn": int}`` or ``None`` on a miss."""
+    """Return ``{"tile_group", "gmm1_bn"[, "compute_first"]}`` or ``None`` on a miss."""
     key = (
         str(gfx),
         int(cu_num),
@@ -165,7 +179,7 @@ def resolve_stage1_tile(
     gfx: str | None = None,
     cu_num: int | None = None,
 ) -> dict:
-    """Return ``{"tile_group", "gmm1_bn", "source"}`` for this shape.
+    """Return ``{"tile_group", "gmm1_bn", "compute_first", "source"}`` for this shape.
 
     ``source`` is ``env`` / ``table`` / ``default`` for the whole tuple, or a
     ``field=source`` list when the fields came from different places.  The
@@ -193,23 +207,26 @@ def resolve_stage1_tile(
     except Exception:
         # Anything else (no device, no aiter root) falls back to the rule.
         tuned = None
-    rule = {"tile_group": default_tile_group(token, expert), "gmm1_bn": _DEFAULT_BN}
+    rule = {"tile_group": default_tile_group(token, expert), "gmm1_bn": _DEFAULT_BN,
+            "compute_first": DEFAULT_COMPUTE_FIRST}
+    fields = (("tile_group", ENV_TILE_GROUP), ("gmm1_bn", ENV_GMM1_BN),
+              ("compute_first", ENV_COMPUTE_FIRST))
     out, sources = {}, {}
-    for field, env in (("tile_group", ENV_TILE_GROUP), ("gmm1_bn", ENV_GMM1_BN)):
+    for field, env in fields:
         raw = os.environ.get(env, "")
         # MEGAMOE_TK_S1_GMM1_BN=0 historically meant "use the default"; keep it
         # a non-override so old scripts do not pin the value.
         if raw and not (field == "gmm1_bn" and int(raw) == 0):
             out[field], sources[field] = int(raw), "env"
-        elif tuned is not None:
+        elif tuned is not None and tuned.get(field) is not None:
             out[field], sources[field] = int(tuned[field]), "table"
         else:
             out[field], sources[field] = rule[field], "default"
     _validate(out, "stage1 tile config (" + ", ".join(
-        f"{f}={sources[f]}" for f in _VALUE_FIELDS) + ")")
+        f"{f}={sources[f]}" for f, _ in fields) + ")")
     kinds = set(sources.values())
     out["source"] = (
         kinds.pop() if len(kinds) == 1
-        else ",".join(f"{f}={sources[f]}" for f in _VALUE_FIELDS)
+        else ",".join(f"{f}={sources[f]}" for f, _ in fields)
     )
     return out
