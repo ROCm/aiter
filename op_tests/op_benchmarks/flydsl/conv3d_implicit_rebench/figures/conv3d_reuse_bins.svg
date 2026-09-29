@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300" font-family="Helvetica,Arial,sans-serif">
+<rect width="640" height="300" fill="#ffffff"/>
+<line x1="56" y1="238.0" x2="620" y2="238.0" stroke="#e6e6e6"/>
+<text x="48" y="242.0" text-anchor="end" font-size="11" fill="#777777">0%</text>
+<line x1="56" y1="185.0" x2="620" y2="185.0" stroke="#e6e6e6"/>
+<text x="48" y="189.0" text-anchor="end" font-size="11" fill="#777777">10%</text>
+<line x1="56" y1="132.0" x2="620" y2="132.0" stroke="#e6e6e6"/>
+<text x="48" y="136.0" text-anchor="end" font-size="11" fill="#777777">20%</text>
+<line x1="56" y1="79.0" x2="620" y2="79.0" stroke="#e6e6e6"/>
+<text x="48" y="83.0" text-anchor="end" font-size="11" fill="#777777">30%</text>
+<line x1="56" y1="26.0" x2="620" y2="26.0" stroke="#e6e6e6"/>
+<text x="48" y="30.0" text-anchor="end" font-size="11" fill="#777777">40%</text>
+<rect x="88.0" y="198.9" width="36.7" height="39.1" fill="#2f6f9f" fill-opacity="0.55" stroke="#2f6f9f" stroke-width="1"/>
+<text x="106.3" y="193.9" text-anchor="middle" font-size="10.5" fill="#333333">7.4</text>
+<rect x="128.3" y="181.0" width="36.7" height="57.0" fill="#b5651d" fill-opacity="0.55" stroke="#b5651d" stroke-width="1"/>
+<text x="146.7" y="176.0" text-anchor="middle" font-size="10.5" fill="#333333">10.7</text>
+<text x="126.5" y="255.0" text-anchor="middle" font-size="11" fill="#333333">(0, 0.9]</text>
+<text x="126.5" y="269.0" text-anchor="middle" font-size="10" fill="#777777">n=3</text>
+<rect x="229.0" y="111.8" width="36.7" height="126.2" fill="#2f6f9f" fill-opacity="0.55" stroke="#2f6f9f" stroke-width="1"/>
+<text x="247.3" y="106.8" text-anchor="middle" font-size="10.5" fill="#333333">23.8</text>
+<rect x="269.3" y="52.1" width="36.7" height="185.9" fill="#b5651d" fill-opacity="0.55" stroke="#b5651d" stroke-width="1"/>
+<text x="287.7" y="47.1" text-anchor="middle" font-size="10.5" fill="#333333">35.1</text>
+<text x="267.5" y="255.0" text-anchor="middle" font-size="11" fill="#333333">(0.9, 1.4]</text>
+<text x="267.5" y="269.0" text-anchor="middle" font-size="10" fill="#777777">n=15</text>
+<rect x="370.0" y="79.7" width="36.7" height="158.3" fill="#2f6f9f" fill-opacity="0.55" stroke="#2f6f9f" stroke-width="1"/>
+<text x="388.3" y="74.7" text-anchor="middle" font-size="10.5" fill="#333333">29.9</text>
+<rect x="410.3" y="61.7" width="36.7" height="176.3" fill="#b5651d" fill-opacity="0.55" stroke="#b5651d" stroke-width="1"/>
+<text x="428.7" y="56.7" text-anchor="middle" font-size="10.5" fill="#333333">33.3</text>
+<text x="408.5" y="255.0" text-anchor="middle" font-size="11" fill="#333333">(1.4, 1.8]</text>
+<text x="408.5" y="269.0" text-anchor="middle" font-size="10" fill="#777777">n=6</text>
+<rect x="511.0" y="79.0" width="36.7" height="159.0" fill="#2f6f9f" fill-opacity="0.55" stroke="#2f6f9f" stroke-width="1"/>
+<text x="529.3" y="74.0" text-anchor="middle" font-size="10.5" fill="#333333">30.0</text>
+<rect x="551.3" y="-1.8" width="36.7" height="239.8" fill="#b5651d" fill-opacity="0.55" stroke="#b5651d" stroke-width="1"/>
+<text x="569.7" y="-6.8" text-anchor="middle" font-size="10.5" fill="#333333">45.2</text>
+<text x="549.5" y="255.0" text-anchor="middle" font-size="11" fill="#333333">(1.8, 2.5]</text>
+<text x="549.5" y="269.0" text-anchor="middle" font-size="10" fill="#777777">n=31</text>
+<text x="338.0" y="292" text-anchor="middle" font-size="12" fill="#333333">MFMA operand reuse (mi_m&#183;mi_n)/(mi_m+mi_n), 56 compute-bound rows</text>
+<text x="14" y="132.0" text-anchor="middle" font-size="12" fill="#333333" transform="rotate(-90 14 132.0)">MFMA util., masked cols removed</text>
+<rect x="64" y="26" width="9" height="9" fill="#2f6f9f" fill-opacity="0.55" stroke="#2f6f9f"/>
+<text x="78" y="34" font-size="11" fill="#333333">bin mean</text>
+<rect x="64" y="42" width="9" height="9" fill="#b5651d" fill-opacity="0.55" stroke="#b5651d"/>
+<text x="78" y="50" font-size="11" fill="#333333">best row in bin</text>
+</svg>
