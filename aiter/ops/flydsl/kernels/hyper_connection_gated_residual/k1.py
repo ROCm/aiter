@@ -128,9 +128,15 @@ def _build_down_norm_pipe(
     assert (
         block_m * block_k >= block_threads * 8
     ), "async-LDS pipe needs block_m*block_k >= block_threads*async_vec"
-    assert w_len % block_threads == 0
     k_tiles = hidden // block_k
-    w_stage_iters = w_len // block_threads
+    # Stage (1+w) in LDS only when it is the small shared [stream_dim] weight and
+    # unfolded: the full [hidden] weight is 40 KB and would overflow LDS with the
+    # A/B panels at large M; fold_w never reads (1+w) here (it is baked into w_dn),
+    # so it stages nothing. Otherwise the transform loads (1+w) from global.
+    stage_w = (not fold_w) and w_len != hidden
+    assert not stage_w or w_len % block_threads == 0
+    w_stage_iters = (w_len // block_threads) if stage_w else 0
+    w1_len = w_len if stage_w else 1
     # Stage this M-tile's rrms ([block_m, hc]) in LDS once: the A-transform
     # otherwise re-loads rrms from global for every fragment element on every
     # k-tile. Only when the tile divides the workgroup evenly (it does for the
@@ -187,17 +193,17 @@ def _build_down_norm_pipe(
         class Smem:
             a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
             b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
-            w1: fx.Array[fx.Float32, w_len, 16]
+            w1: fx.Array[fx.Float32, w1_len, 16]
             rr: fx.Array[fx.Float32, block_m * hc_count, 16]
 
         smem = fx.SharedAllocator().allocate(Smem)
         smem_a = smem.a.peek().ptr
         smem_b = smem.b.peek().ptr
-        sW1 = fx.make_view(smem.w1.peek().ptr, fx.make_layout((w_len,), (1,)))
+        sW1 = fx.make_view(smem.w1.peek().ptr, fx.make_layout((w1_len,), (1,)))
         sRrms = fx.make_view(
             smem.rr.peek().ptr, fx.make_layout((block_m, hc_count), (hc_count, 1))
         )
-        if const_expr(not fold_w):
+        if const_expr(stage_w):
             for wi in range_constexpr(w_stage_iters):
                 widx = wi * block_threads + tid
                 sW1[widx] = fx.Float32(1.0) + fx.Float32(w_g.load(widx, vec_size=1))
@@ -304,7 +310,15 @@ def _build_down_norm_pipe(
                 else:
                     g_m = bid_m * block_m + m_i
                     rr = fx.Float32(rrms_g.load(g_m * hc_count + stream, vec_size=1))
-                scales.append(rr if const_expr(fold_w) else rr * sW1[col % w_len])
+                if const_expr(fold_w):
+                    scales.append(rr)
+                elif const_expr(stage_w):
+                    scales.append(rr * sW1[col % w_len])
+                else:  # full [hidden] weight, unfolded: load (1+w) from global
+                    onepw = fx.Float32(1.0) + fx.Float32(
+                        w_g.load(col % w_len, vec_size=1)
+                    )
+                    scales.append(rr * onepw)
             scale_frag.store(fx.Vector.from_elements(scales, dtype=fx.Float32))
             frag_A.store((va * scale_frag.load()).to(fx.BFloat16))
 
@@ -455,12 +469,18 @@ def _build_down_norm_partial_pipe(
     assert block_k % mma_k == 0 and hidden % block_k == 0
     assert stream_dim % block_k == 0
     assert stages >= 2 and block_m * block_k >= block_threads * 8
-    assert w_len % block_threads == 0
     k_tiles = hidden // block_k
     assert k_tiles % split_k == 0
     k_tiles_local = k_tiles // split_k
     assert k_tiles_local >= stages - 1, "split-K slice too short for the pipeline"
-    w_stage_iters = w_len // block_threads
+    # Stage (1+w) in LDS only when it is the small shared [stream_dim] weight and
+    # unfolded: the full [hidden] weight is 40 KB and would overflow LDS with the
+    # A/B panels at large M; fold_w never reads (1+w) here (it is baked into w_dn),
+    # so it stages nothing. Otherwise the transform loads (1+w) from global.
+    stage_w = (not fold_w) and w_len != hidden
+    assert not stage_w or w_len % block_threads == 0
+    w_stage_iters = (w_len // block_threads) if stage_w else 0
+    w1_len = w_len if stage_w else 1
     stage_rrms = (block_m * hc_count) % block_threads == 0
     rr_stage_iters = (block_m * hc_count) // block_threads if stage_rrms else 0
 
@@ -516,17 +536,17 @@ def _build_down_norm_partial_pipe(
         class Smem:
             a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
             b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
-            w1: fx.Array[fx.Float32, w_len, 16]
+            w1: fx.Array[fx.Float32, w1_len, 16]
             rr: fx.Array[fx.Float32, block_m * hc_count, 16]
 
         smem = fx.SharedAllocator().allocate(Smem)
         smem_a = smem.a.peek().ptr
         smem_b = smem.b.peek().ptr
-        sW1 = fx.make_view(smem.w1.peek().ptr, fx.make_layout((w_len,), (1,)))
+        sW1 = fx.make_view(smem.w1.peek().ptr, fx.make_layout((w1_len,), (1,)))
         sRrms = fx.make_view(
             smem.rr.peek().ptr, fx.make_layout((block_m, hc_count), (hc_count, 1))
         )
-        if const_expr(not fold_w):
+        if const_expr(stage_w):
             for wi in range_constexpr(w_stage_iters):
                 widx = wi * block_threads + tid
                 sW1[widx] = fx.Float32(1.0) + fx.Float32(w_g.load(widx, vec_size=1))
@@ -632,7 +652,15 @@ def _build_down_norm_partial_pipe(
                 else:
                     g_m = bid_m * block_m + m_i
                     rr = fx.Float32(rrms_g.load(g_m * hc_count + stream, vec_size=1))
-                scales.append(rr if const_expr(fold_w) else rr * sW1[col % w_len])
+                if const_expr(fold_w):
+                    scales.append(rr)
+                elif const_expr(stage_w):
+                    scales.append(rr * sW1[col % w_len])
+                else:  # full [hidden] weight, unfolded: load (1+w) from global
+                    onepw = fx.Float32(1.0) + fx.Float32(
+                        w_g.load(col % w_len, vec_size=1)
+                    )
+                    scales.append(rr * onepw)
             scale_frag.store(fx.Vector.from_elements(scales, dtype=fx.Float32))
             frag_A.store((va * scale_frag.load()).to(fx.BFloat16))
 
