@@ -11,7 +11,6 @@ An optional CSV is a measurement report, not a runtime configuration file.
 Each candidate uses a fixed plan and a graph containing decode plus reduction.
 FlyDSL validates candidates, measures them, and caches the smallest budget
 within 97% of the fastest measured performance. Runtime lookup never benchmarks.
-See docs/flydsl_pa_decode_tuning.md for cache and explicit-plan usage.
 """
 
 from __future__ import annotations
