@@ -3229,7 +3229,6 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     __shared__ IdxT candidate_indices[CandidateCapacity];
     __shared__ IdxT winner_indices[WinnerCapacity];
     __shared__ IdxT candidate_count;
-    __shared__ int candidate_overflow;
 
     const int64_t batch_id = blockIdx.x;
     const IdxT row_len = StaticRowLen > 0 ? static_cast<IdxT>(StaticRowLen)
@@ -3237,13 +3236,22 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     constexpr int static_full_iters = StaticRowLen > 0 ? StaticRowLen / BlockSize : 0;
     constexpr int static_tail       = StaticRowLen > 0 ? StaticRowLen % BlockSize : 0;
 
+    // Every launch derives ElemsPerThread = ceil(len / BlockSize), so all but a
+    // thread's last element are in range and only that one needs the runtime
+    // bound.  Any other row length cannot be held by this register copy.
+    if(static_cast<int64_t>(ElemsPerThread - 1) * BlockSize >= len ||
+       len > static_cast<int64_t>(ElemsPerThread) * BlockSize)
+    {
+        __builtin_trap();
+    }
+
     auto is_valid_element = [&](int j, IdxT i) {
         if constexpr(StaticRowLen > 0)
         {
             return j < static_full_iters ||
                    (j == static_full_iters && threadIdx.x < static_tail);
         }
-        return i < row_len;
+        return j < ElemsPerThread - 1 || i < row_len;
     };
 
     auto clear_main_histogram = [&]() {
@@ -3300,7 +3308,6 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             counter.kth_value_bits = 0;
             counter.filter_cnt   = 0;
             counter.out_back_cnt = 0;
-            candidate_overflow   = 0;
         }
     }
     if constexpr(!UseHighBucketPredictor && !UsePass0Bucket206Predictor)
@@ -3802,7 +3809,6 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                 counter.out_cnt      = 0;
                 counter.out_back_cnt = 0;
                 candidate_count      = 0;
-                candidate_overflow   = 0;
             }
             clear_main_histogram();
             __syncthreads();
@@ -3828,7 +3834,10 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         __syncthreads();
     }
 
-    auto const high_prefix = counter.kth_value_bits;
+    // Block-uniform: keep it in an SGPR so no per-element branch below waits on
+    // this LDS load.
+    auto const high_prefix = static_cast<Bits>(
+        __builtin_amdgcn_readfirstlane(static_cast<int>(counter.kth_value_bits)));
     unsigned winner_j_mask = 0;
 #pragma unroll
     for(int j = 0; j < ElemsPerThread; ++j)
@@ -3882,10 +3891,6 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                     }
                     candidate_indices[pos] = i;
                 }
-                else if constexpr(BallotCandidateCapacity == 0)
-                {
-                    atomicExch(&candidate_overflow, 1);
-                }
                 if constexpr(!UseWaveBallotSelect)
                 {
                     int const bucket =
@@ -3928,9 +3933,9 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     }
     __syncthreads();
 
-    bool const candidate_did_overflow =
-        BallotCandidateCapacity > 0 ? candidate_count > CandidateCapacity
-                                    : candidate_overflow != 0;
+    // Every crossing-bucket element reserved a slot, stored or not, so the final
+    // count alone detects overflow; the hot loop issues no returning flag write.
+    bool const candidate_did_overflow = candidate_count > CandidateCapacity;
 
     if constexpr(StoreTwiddledCandidates)
     {
@@ -4255,7 +4260,8 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         clear_tail_histogram();
         __syncthreads();
 
-        auto const pass1_prefix = counter.kth_value_bits;
+        auto const pass1_prefix = static_cast<Bits>(
+            __builtin_amdgcn_readfirstlane(static_cast<int>(counter.kth_value_bits)));
 #pragma unroll
         for(int j = 0; j < ElemsPerThread; ++j)
         {
@@ -4290,8 +4296,10 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     // single element, and the remaining tail bits are then already known from it.
     if(counter.len == 1)
     {
-        auto const middle_prefix = counter.kth_value_bits;
-        IdxT const staged_len    = candidate_count;
+        auto const middle_prefix = static_cast<Bits>(
+            __builtin_amdgcn_readfirstlane(static_cast<int>(counter.kth_value_bits)));
+        IdxT const staged_len =
+            static_cast<IdxT>(__builtin_amdgcn_readfirstlane(static_cast<int>(candidate_count)));
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
         {
             Bits bits;
@@ -4325,8 +4333,10 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     clear_tail_histogram();
     __syncthreads();
 
-    IdxT const staged_len    = candidate_count;
-    auto const middle_prefix = counter.kth_value_bits;
+    IdxT const staged_len =
+        static_cast<IdxT>(__builtin_amdgcn_readfirstlane(static_cast<int>(candidate_count)));
+    auto const middle_prefix = static_cast<Bits>(
+        __builtin_amdgcn_readfirstlane(static_cast<int>(counter.kth_value_bits)));
     for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
     {
         Bits bits;
@@ -6525,11 +6535,14 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
         {
             constexpr int RegBlockSize = 1024;
             constexpr int EPT          = 5;
-            radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT, 11,
-                                             10>
-                <<<batch_size, RegBlockSize, 0, stream>>>(
-                    in, len, k, out, out_idx, select_min);
-            return;
+            if((len + RegBlockSize - 1) / RegBlockSize == EPT)
+            {
+                radix_topk_one_block_reg_kernel<T, IdxT, RegBlockSize, WRITE_TOPK_VALUES, EPT,
+                                                 11, 10>
+                    <<<batch_size, RegBlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min);
+                return;
+            }
         }
         // With a large gfx950 grid, halve the waves per workgroup for 8K rows.
         // The 11+11+10 split keeps every histogram at no more than four
