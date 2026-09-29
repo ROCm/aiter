@@ -97,6 +97,18 @@ static inline bool wide_select_fits(int M, int lds_bytes, int wide_bytes)
     return resident * (lds_bytes + wide_bytes) <= LDS_BYTES_PER_CU;
 }
 
+constexpr int LDS_ALLOC_GRANULE = 1280;
+static inline int lds_allocated_bytes(int bytes)
+{ return ((bytes + LDS_ALLOC_GRANULE - 1) / LDS_ALLOC_GRANULE) * LDS_ALLOC_GRANULE; }
+static inline bool wide_select_fits_allocated(int M, int lds_bytes, int wide_bytes)
+{
+    const int base_alloc = lds_allocated_bytes(lds_bytes);
+    const int wide_alloc = lds_allocated_bytes(lds_bytes + wide_bytes);
+    const int resident =
+        std::min(grid_blocks_per_cu(M), std::max(1, LDS_BYTES_PER_CU / base_alloc));
+    return resident * wide_alloc <= LDS_BYTES_PER_CU;
+}
+
 static inline int ilog2_floor(int v)
 {
     int r = 0;

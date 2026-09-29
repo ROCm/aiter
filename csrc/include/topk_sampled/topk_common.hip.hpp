@@ -885,6 +885,12 @@ constexpr int WIDE_WORDS        = WIDE_COARSE_SLOTS + WIDE_FINE;
 static_assert(WIDE_COARSE == WAVE_SIZE && WIDE_FINE == WIDE_COARSE * WAVE_SIZE,
               "the two-level scan puts one bucket per lane at each level");
 
+#ifndef PC_WIDE_REUSE
+#define PC_WIDE_REUSE 1
+#endif
+__host__ __device__ static inline constexpr int wide_buffer_count(int nwide, bool reuse)
+{ return reuse && nwide > 0 ? 1 : nwide; }
+
 // One counted key: its coarse bucket (replica `rep`) and its fine bucket.
 __device__ __forceinline__ void wide_count(uint32_t* __restrict__ s_w, uint32_t d, int rep)
 {

@@ -1747,6 +1747,11 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
+        "flags_extra_hip_per_source": {
+            "*topk_per_row_sampled_kernels.cu": [
+                "-foffload-uniform-block"
+            ]
+        },
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

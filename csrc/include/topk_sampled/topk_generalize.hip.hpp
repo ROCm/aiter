@@ -612,7 +612,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 #endif
 }
 
-template <bool RAGGED, bool WRITE_VALUES>
+template <bool RAGGED, bool WRITE_VALUES, bool REUSE_WIDE = false>
 __global__ PHASE_C_OCCUPANCY void
 phase_c_select_contig(const float* __restrict__ input,
                       int pitch,
@@ -671,7 +671,7 @@ phase_c_select_contig(const float* __restrict__ input,
 #endif
 #if ABLATE_CREAD
     if(nwide > 0)
-        clear_wide(s_wide, nwide);
+        clear_wide(s_wide, wide_buffer_count(nwide, REUSE_WIDE));
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
         s_keys_ext[i] = (uint32_t)i;
@@ -703,7 +703,7 @@ phase_c_select_contig(const float* __restrict__ input,
     // SLOWER: phase_c +0.2 to +1.0us over the unfolded wide select at m=64..512
     // (scripts/wide_ab.py, arms acF against acN), against -0.3 to -0.4us unfolded.
     if(nwide > 0)
-        clear_wide(s_wide, nwide);
+        clear_wide(s_wide, wide_buffer_count(nwide, REUSE_WIDE));
     for(int i = threadIdx.x; i < c; i += blockDim.x)
     {
 #if NT_CAND
@@ -744,18 +744,18 @@ phase_c_select_contig(const float* __restrict__ input,
     (void)npasses;
 #else
     if(nwide > 0)
-        block_select_lds_wide(s_keys_ext,
-                              c,
-                              k_out,
-                              s_hist,
-                              s_wide,
-                              s_scan,
-                              s_mm,
-                              pivot,
-                              eq_needed,
-                              nwide,
-                              PC_WIDE_SKIP != 0,
-                              PC_FOLD != 0);
+        block_select_lds_wide<REUSE_WIDE>(s_keys_ext,
+                                          c,
+                                          k_out,
+                                          s_hist,
+                                          s_wide,
+                                          s_scan,
+                                          s_mm,
+                                          pivot,
+                                          eq_needed,
+                                          nwide,
+                                          PC_WIDE_SKIP != 0,
+                                          PC_FOLD != 0);
     else
         block_select_lds(s_keys_ext,
                          c,

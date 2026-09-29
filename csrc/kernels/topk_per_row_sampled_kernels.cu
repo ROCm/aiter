@@ -361,6 +361,7 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
 #if !(SELECT_CLEAR_ON_READ && SELECT_WAVE0_SCAN)
 #error "block_select_lds_wide is written against the clear-on-read wave-0 scan of pass 0"
 #endif
+template <bool REUSE_WIDE = false>
 __device__ __forceinline__ void block_select_lds_wide(const uint32_t* __restrict__ s_keys,
                                                       int c,
                                                       int K,
@@ -412,11 +413,20 @@ __device__ __forceinline__ void block_select_lds_wide(const uint32_t* __restrict
         pivot |= (s_scan[0] << 24);
         ek -= (int)s_scan[1];
     }
-    for(int w = (start == 0) ? 0 : start - 1; w < nwide; w++)
+    const int first_w = (start == 0) ? 0 : start - 1;
+    for(int w = first_w; w < nwide; w++)
     {
         const int sh     = 12 - WIDE_BITS * w;
         const int hshift = sh + WIDE_BITS;
-        uint32_t* sw     = s_wide + w * WIDE_WORDS;
+        if constexpr(REUSE_WIDE)
+        {
+            if(w != first_w)
+            {
+                clear_wide(s_wide, 1);
+                __syncthreads();
+            }
+        }
+        uint32_t* sw = s_wide + (REUSE_WIDE ? 0 : w * WIDE_WORDS);
         for(int i = threadIdx.x; i < c; i += blockDim.x)
         {
             const uint32_t k = s_keys[i];
@@ -1480,7 +1490,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     __syncthreads();
 #endif
     if(nwide > 0)
-        clear_wide(s_wide, nwide);
+        clear_wide(s_wide, wide_buffer_count(nwide, false));
 
 #ifndef PA_UNROLL
 #define PA_UNROLL 4
@@ -1566,18 +1576,18 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     }
     else if(nwide > 0)
     {
-        block_select_lds_wide(s_keys,
-                              S,
-                              rank_row,
-                              s_hist,
-                              s_wide,
-                              s_scan,
-                              s_mm,
-                              pivot,
-                              eq_needed,
-                              nwide,
-                              false,
-                              PA_FOLD != 0);
+        block_select_lds_wide<false>(s_keys,
+                                     S,
+                                     rank_row,
+                                     s_hist,
+                                     s_wide,
+                                     s_scan,
+                                     s_mm,
+                                     pivot,
+                                     eq_needed,
+                                     nwide,
+                                     false,
+                                     PA_FOLD != 0);
     }
     else
     {
@@ -1960,7 +1970,7 @@ phase_c_select_waveseg(const float* __restrict__ input,
 
     // Published by the barrier after the candidate copy.
     if(nwide > 0)
-        clear_wide(s_wide, nwide);
+        clear_wide(s_wide, wide_buffer_count(nwide, false));
     const uint64_t* base = cand_pack + (size_t)row * CAND_SLOTS_PER_ROW;
     for(int w = 0; w < nwaves_b; w++)
     {
@@ -1978,18 +1988,18 @@ phase_c_select_waveseg(const float* __restrict__ input,
     uint32_t pivot;
     int eq_needed;
     if(nwide > 0)
-        block_select_lds_wide(s_keys,
-                              c,
-                              k_out,
-                              s_hist,
-                              s_wide,
-                              s_scan,
-                              s_mm,
-                              pivot,
-                              eq_needed,
-                              nwide,
-                              /*prefix_skip=*/PC_WIDE_SKIP != 0,
-                              false);
+        block_select_lds_wide<false>(s_keys,
+                                     c,
+                                     k_out,
+                                     s_hist,
+                                     s_wide,
+                                     s_scan,
+                                     s_mm,
+                                     pivot,
+                                     eq_needed,
+                                     nwide,
+                                     /*prefix_skip=*/PC_WIDE_SKIP != 0,
+                                     false);
     else
         block_select_lds(s_keys,
                          c,
@@ -2274,18 +2284,28 @@ static void topk_fused_impl(const float* d_in,
     const int nwaves_b           = std::max(1, g_cf_block / WAVE_SIZE);
     const int seg_stride         = CAND_SLOTS_PER_ROW / nwaves_b;
 
-    const int wide_buf = WIDE_WORDS * (int)sizeof(uint32_t);
+#ifndef FORCE_PC_KEYS_ONLY
+#define FORCE_PC_KEYS_ONLY 1
+#endif
+    const int wide_buf         = WIDE_WORDS * (int)sizeof(uint32_t);
+    const bool baseline_wide_c = wide_select_fits(M, PHASE_C_STATIC_LDS + cap * 8, 2 * wide_buf);
+    const bool compact_wide_c =
+        cap == PHASE_C_CAP && wide_select_fits_allocated(M, PHASE_C_STATIC_LDS + cap * 4, wide_buf);
+    const bool resource_compact_c = FORCE_PC_KEYS_ONLY && PC_WIDE_REUSE && sp.coop_g > 1 &&
+                                    !sp.keys_only_c && !baseline_wide_c && compact_wide_c;
+    const bool keys_only_c  = sp.keys_only_c || resource_compact_c;
+    const bool reuse_wide_c = resource_compact_c;
+    const int phase_c_candidate_lds =
+        cap * (keys_only_c ? (int)sizeof(uint32_t) : (int)(sizeof(uint32_t) + sizeof(int)));
     // Provisional wide/occupancy with keys in LDS (the historical default). The
     // register path below may drop S*4 from LDS and re-evaluate wide_select_fits.
     bool wide_a =
         g_wide_a < 0 ? wide_select_fits(M, PHASE_A_STATIC_LDS + S * 4, wide_buf) : (g_wide_a != 0);
-    const bool wide_c         = g_wide_c < 0
-                                    ? wide_select_fits(M, PHASE_C_STATIC_LDS + cap * 8, 2 * wide_buf)
-                                    : (g_wide_c != 0);
-    int nwide_a               = wide_a ? 1 : 0;
-    const int nwide_c         = wide_c ? (ABLATE_PC_SECOND_WIDE ? 1 : 2) : 0;
-    size_t wide_a_bytes       = (size_t)nwide_a * wide_buf;
-    const size_t wide_c_bytes = (size_t)nwide_c * wide_buf;
+    const bool wide_c   = g_wide_c < 0 ? (resource_compact_c || baseline_wide_c) : (g_wide_c != 0);
+    int nwide_a         = wide_a ? 1 : 0;
+    const int nwide_c   = wide_c ? (ABLATE_PC_SECOND_WIDE ? 1 : 2) : 0;
+    size_t wide_a_bytes = (size_t)wide_buffer_count(nwide_a, false) * wide_buf;
+    const size_t wide_c_bytes = (size_t)wide_buffer_count(nwide_c, reuse_wide_c) * wide_buf;
     int a_block =
         g_phase_a_block > 0
             ? g_phase_a_block
@@ -2293,7 +2313,8 @@ static void topk_fused_impl(const float* d_in,
     const int c_block =
         g_phase_c_block > 0
             ? g_phase_c_block
-            : occupancy_block_threads(M, PHASE_C_STATIC_LDS + cap * 8 + (int)wide_c_bytes, 0);
+            : occupancy_block_threads(
+                  M, PHASE_C_STATIC_LDS + phase_c_candidate_lds + (int)wide_c_bytes, 0);
 
     // Register-resident sample keys. Auto picks KPT in {4,8} only: KPT=16 is
     // correct and matches the LDS path on the standalone hipcc binary, but the
@@ -2302,16 +2323,19 @@ static void topk_fused_impl(const float* d_in,
     // attributed, auto never selects 16; --pa-keys=reg still accepts it when the
     // block divides that way. When the provisional KPT would be 16, double
     // a_block (capped at 1024) to land on KPT=8 instead of falling back to LDS.
+#ifndef PA_ALLOW_KPT16
+#define PA_ALLOW_KPT16 1
+#endif
     int pa_kpt = 0;
     if(!g_phase_a_compact && a_block > 0 && (S % a_block) == 0)
     {
         int kpt = S / a_block;
-        if(kpt == 16 && a_block * 2 <= 1024 && (S % (a_block * 2)) == 0)
+        if(!PA_ALLOW_KPT16 && kpt == 16 && a_block * 2 <= 1024 && (S % (a_block * 2)) == 0)
         {
             a_block *= 2;
             kpt = 8;
         }
-        if(kpt == 4 || kpt == 8 || (g_pa_keys == 1 && kpt == 16))
+        if(kpt == 4 || kpt == 8 || (PA_ALLOW_KPT16 && kpt == 16))
             pa_kpt = kpt;
     }
     if(g_pa_keys == 0)
@@ -2331,7 +2355,7 @@ static void topk_fused_impl(const float* d_in,
         {
             wide_a       = wide_select_fits(M, PHASE_A_STATIC_LDS, wide_buf);
             nwide_a      = wide_a ? 1 : 0;
-            wide_a_bytes = (size_t)nwide_a * wide_buf;
+            wide_a_bytes = (size_t)wide_buffer_count(nwide_a, false) * wide_buf;
         }
     }
     const size_t pa_dyn_bytes =
@@ -2485,24 +2509,30 @@ static void topk_fused_impl(const float* d_in,
 
     if(coop)
     {
-        const size_t lds_c =
-            (size_t)cap * (sp.keys_only_c ? sizeof(uint32_t) : sizeof(uint32_t) + sizeof(int));
-        phase_c_select_contig<RAGGED, WRITE_VALUES>
-            <<<M, c_block, lds_c + wide_c_bytes, s>>>(d_in,
-                                                      pitch,
-                                                      ext,
-                                                      b.cand_pack,
-                                                      b.cand_reserved,
-                                                      b.cand_bad,
-                                                      b.cand_count,
-                                                      cap,
-                                                      K,
-                                                      dst,
-                                                      b.fb_rows,
-                                                      b.fb_count,
-                                                      g_phase_c_passes,
-                                                      sp.keys_only_c,
-                                                      nwide_c);
+        const size_t lds_c  = (size_t)phase_c_candidate_lds;
+        auto launch_phase_c = [&](auto reuse_tag) {
+            constexpr bool REUSE = decltype(reuse_tag)::value;
+            phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE>
+                <<<M, c_block, lds_c + wide_c_bytes, s>>>(d_in,
+                                                          pitch,
+                                                          ext,
+                                                          b.cand_pack,
+                                                          b.cand_reserved,
+                                                          b.cand_bad,
+                                                          b.cand_count,
+                                                          cap,
+                                                          K,
+                                                          dst,
+                                                          b.fb_rows,
+                                                          b.fb_count,
+                                                          g_phase_c_passes,
+                                                          keys_only_c,
+                                                          nwide_c);
+        };
+        if(reuse_wide_c)
+            launch_phase_c(std::true_type{});
+        else
+            launch_phase_c(std::false_type{});
     }
     else if(cap <= PHASE_C_CAP)
     {
