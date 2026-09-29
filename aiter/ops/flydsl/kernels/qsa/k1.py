@@ -408,6 +408,7 @@ def build_qsa_k1_prefill_scores_module(
         n_columns: Int32,
         rows: Int32,
         score_scale: Float32,
+        n_cache_blocks: Int32,
     ):
         tile = Int32(gpu.block_id("x"))
         row_tile = Int32(gpu.block_id("y"))
@@ -492,18 +493,22 @@ def build_qsa_k1_prefill_scores_module(
                 qv = req_live.select(q_vec[i].to(Float32), Float32(0.0))
                 q_lds[row_local, head, d0 + Int32(i)] = qv.to(BFloat16)
 
+        context_cols = _idiv(context_lens[zero], Int32(_R))
         for part in range_constexpr(k_vectors_per_thread):
             linear = tid + Int32(part * block_threads)
             col = _idiv(linear, Int32(vec_chunks))
             d_chunk = linear - col * Int32(vec_chunks)
             score_col = tile * Int32(block_n) + col
-            col_live = score_col < n_columns
+            col_live = (score_col < n_columns) & (score_col < context_cols)
             safe_col = col_live.select(score_col, zero)
             logical_page = _idiv(safe_col, page)
             off = safe_col - logical_page * page
             phys = page_table[zero, logical_page]
+            phys_live = (phys >= zero) & (phys < n_cache_blocks)
+            safe_phys = phys_live.select(phys, zero)
+            col_live = col_live & phys_live
             k_row = fx.logical_divide(
-                fx.slice(k_buf, (phys, off, zero, None)), vec_layout
+                fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
             )
             k_src = fx.slice(k_row, (None, d_chunk))
             k_frag = fx.make_fragment_like(k_src)
@@ -568,6 +573,7 @@ def build_qsa_k1_prefill_scores_module(
         n_columns: Int32,
         rows: Int32,
         score_scale: Float32,
+        n_cache_blocks: Int32,
         row_tiles: Int32,
         tiles: Int32,
         stream: fx.Stream,
@@ -584,6 +590,7 @@ def build_qsa_k1_prefill_scores_module(
             n_columns,
             rows,
             score_scale,
+            n_cache_blocks,
         ).launch(
             grid=(tiles, row_tiles, 1),
             block=(block_threads, 1, 1),
@@ -653,6 +660,7 @@ def qsa_k1_score_and_select(
             int(n_columns),
             m,
             float(score_scale),
+            int(k_cache.shape[0]),
             (m + 15) // 16,
             score_tiles,
             torch.cuda.current_stream(q.device),
