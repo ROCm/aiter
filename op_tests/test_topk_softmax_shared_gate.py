@@ -18,9 +18,10 @@
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.moe_op import topk_softmax, topk_softmax_fused_shared_gate
