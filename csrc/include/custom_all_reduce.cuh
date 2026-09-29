@@ -480,7 +480,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool has_tail = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
                                                                      RankData* _output_dp,
                                                                      RankSignals sg,
@@ -516,8 +516,14 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
-    // stage 1: reduce scatter
-    for(int idx = start + tid; idx < end; idx += stride)
+    // stage 1: reduce scatter. The optimized dispatch has equal rank partitions.
+    int loop_end = end;
+    if constexpr(has_tail)
+    {
+        loop_end -= (end - start) % tnum_gpu;
+    }
+    int idx = start + tid;
+    for(; idx < loop_end; idx += stride)
     {
         *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
         __syncthreads();
@@ -550,6 +556,15 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             tmp_out[idx - start] = write_reg;
         }
         __syncthreads();
+    }
+    if constexpr(has_tail)
+    {
+        // Preserve the full-tile loop and its barriers. The remaining packs are
+        // reduced by their original owner threads without shared memory.
+        if(warp_id == 0 && idx < end)
+        {
+            tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+        }
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -619,12 +634,16 @@ __global__ void __launch_bounds__(512, 1)
 
     // stage 2: reduce scatter & write result to remote rank
     end = rank != ngpus - 1 ? part : size - part * (ngpus - 1);
-    for(int idx = tid; idx < end; idx += stride)
+    // Uniform trip count, see cross_device_reduce_2stage.
+    int loop_end = (end + stride - 1) / stride * stride;
+    for(int idx = tid; idx < loop_end; idx += stride)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
+        bool active = idx < end;
+        if(active)
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
         __syncthreads();
         // cal add in first 64 threads
-        if(warp_id == 0)
+        if(warp_id == 0 && active)
         {
             A add_reg;
 #pragma unroll
@@ -652,6 +671,8 @@ __global__ void __launch_bounds__(512, 1)
             *(reinterpret_cast<P*>(&res_smem[0]) + lane_id) = write_reg;
         }
         __syncthreads();
+        if(!active)
+            continue;
         // send data to remote rank
         if(is_broadcast_reg_outptr)
         {
@@ -1285,18 +1306,25 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     start_sync<ngpus>(sg, self_sg, rank);
 
     int part = m * valid_pack_count / ngpus;
-    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    // Uniform trip count, see cross_device_reduce_2stage.
+    int stride   = gridDim.x * tnum_gpu;
+    int loop_end = (part + stride - 1) / stride * stride;
+    for(int idx = tid; idx < loop_end; idx += stride)
     {
-        int flat_idx = rank * part + idx;
-        int row      = flat_idx / valid_pack_count;
-        int col      = flat_idx % valid_pack_count;
-        int input_idx = row * input_pack_count + col;
-        // cross device read by all warp
-        P input_reg                                         = ptrs[warp_id][input_idx];
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+        bool active = idx < part;
+        if(active)
+        {
+            int flat_idx  = rank * part + idx;
+            int row       = flat_idx / valid_pack_count;
+            int col       = flat_idx % valid_pack_count;
+            int input_idx = row * input_pack_count + col;
+            // cross device read by all warp
+            P input_reg                                         = ptrs[warp_id][input_idx];
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+        }
         __syncthreads();
         // calculate and save in first warp
-        if(warp_id == 0)
+        if(warp_id == 0 && active)
         {
             A add_reg;
 #pragma unroll
@@ -1323,6 +1351,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
             *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
         }
         __syncthreads();
+        if(!active)
+            continue;
 
         // cross device store
         P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
@@ -4600,19 +4630,19 @@ class CustomAllreduce
             }
         }
 
-#define KL(ngpus, name)                                                       \
-    do                                                                        \
-    {                                                                         \
-        if(is_broadcast_reg_outptr)                                           \
-        {                                                                     \
-            name<T, ngpus, true><<<blocks, threads, 0, stream>>>(             \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size); \
-        }                                                                     \
-        else                                                                  \
-        {                                                                     \
-            name<T, ngpus, false><<<blocks, threads, 0, stream>>>(            \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size); \
-        }                                                                     \
+#define KL(ngpus, name, ...)                                                                  \
+    do                                                                                        \
+    {                                                                                         \
+        if(is_broadcast_reg_outptr)                                                           \
+        {                                                                                     \
+            name<T, ngpus, true __VA_OPT__(, ) __VA_ARGS__><<<blocks, threads, 0, stream>>>(  \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);                 \
+        }                                                                                     \
+        else                                                                                  \
+        {                                                                                     \
+            name<T, ngpus, false __VA_OPT__(, ) __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);                 \
+        }                                                                                     \
     } while(0)
 
 #define DISPATCH_REDUCE(ngpus, name)                      \
@@ -4623,6 +4653,10 @@ class CustomAllreduce
             if(use_write_mode)                            \
             {                                             \
                 KL(ngpus, name##_write_mode);             \
+            }                                             \
+            else if(size % THREAD_NUM != 0)               \
+            {                                             \
+                KL(ngpus, name, true);                    \
             }                                             \
             else                                          \
             {                                             \

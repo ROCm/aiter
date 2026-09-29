@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.fused_add_rmsnorm_pad import (
     _gluon_fused_add_rmsnorm_pad_kernel,
 )
 from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import (
@@ -29,7 +29,7 @@ def fused_add_rmsnorm_pad(
     x: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
-    res: torch.Tensor = None,
+    res: torch.Tensor | None = None,
     x_pad_to_multiple: int = 0,
     backend: str | None = None,
 ):

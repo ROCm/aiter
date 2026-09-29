@@ -55,6 +55,16 @@ inline bool topk_gating_prefer_optn_e128()
     return v;
 }
 
+// E=512 prefill_n is measured on gfx942 and gfx950. Other archs (gfx1201,
+// gfx1250, ...) stay on the smem fallback until benchmarked.
+// Cached: get_gpu_arch() re-queries the driver on every call.
+inline bool topk_gating_prefer_prefill_n_e512()
+{
+    static const bool v =
+        (get_gpu_arch() == "gfx942" || get_gpu_arch() == "gfx950");
+    return v;
+}
+
 // Largest power-of-2 rows/tokens per warp whose sub-group -- warp_size/N lanes
 // wide -- can still hold one topk slot per lane, i.e. topk <= warp_size/N.
 //
@@ -1433,6 +1443,12 @@ void topk_gating_launch(const topk_gating_params& p)
                 _DISPATCH_PREFILL_N_KERNEL(128, 1)
                 _DISPATCH_PREFILL_N_KERNEL(256, 1)
                 _DISPATCH_PREFILL_N_KERNEL(384, 1)
+                // E=512: prefill_n wins at T<=1024 on gfx942/gfx950; above that
+                // smem is faster. Other archs keep smem until measured.
+                if(num_tokens <= 1024 && topk_gating_prefer_prefill_n_e512())
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(512, 1)
+                }
                 // E=640: prefill_n wins at T<=2048; above that smem is faster.
                 if(num_tokens <= 2048)
                 {

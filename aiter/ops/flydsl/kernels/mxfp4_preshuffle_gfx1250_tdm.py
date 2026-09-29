@@ -4,13 +4,12 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
-import os
 from collections import namedtuple
-from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -31,9 +30,11 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
+from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
+    emit_cvt_scalef32_pk8_fp4_f32,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 from .tensor_shim import (
@@ -44,12 +45,37 @@ from .tensor_shim import (
 
 TDM_DESCRIPTOR_VERSION = 1
 
-# Read A by row indices instead of a contiguous run, so the quant kernel can
-# emit one compact row per token rather than one per route. The pipeline's
-# fence/wait counts assume every wave issues the same number of TDMs per
-# k-tile, so the gather has to fit in a single descriptor per wave: at most 16
-# rows (16-bit indices). That holds when tile_m // waves_per_tensor_tdm <= 16.
-_A_GATHER = os.environ.get("AITER_A_GATHER", "0") == "1"
+# MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
+# payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
+# fixed rather than tied to tile_n so the wire does not drift with the GEMM
+# tuning table.
+#
+# Both plane bases stay cache-line aligned -- N is a multiple of 128 and the slot
+# stride is a power of two -- and that must not slip: an earlier 272-byte chunk
+# pitch started every row mid-line and cost 123us/layer at 16k tokens/rank
+# despite moving 41% fewer bytes.
+EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
+# GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
+# 16 values, and the two kgrp halves merge into the full 32-element MX block.
+WN_PER_MX_BLOCK_EP = 2
+
+
+def _pack_bytes_i32(byte_vals):
+    """Pack up to four i8 IR values into one i32, first value in the low byte."""
+    assert 1 <= len(byte_vals) <= 4, len(byte_vals)
+    packed = None
+    for n, b in enumerate(byte_vals):
+        w = fx.Int32(arith.extui(T.i32, _raw(b)))
+        if n:
+            w = w << fx.Int32(8 * n)
+        packed = w if packed is None else packed | w
+    return packed
+
+
+# The staging loop emits one e8m0 per WN_PER_MX_BLOCK_EP subtiles of 16 columns
+# and the wire reads one per EP_SCALE_BLOCK columns; drift and the scale plane
+# silently describes the wrong columns.
+assert WN_PER_MX_BLOCK_EP * 16 == EP_SCALE_BLOCK
 
 
 @flyc.jit
@@ -91,13 +117,13 @@ def launch_gemm_a8w4_tdm(
     ep_slot_stride_bytes: Constexpr[int] = 0,
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
+    ep_quant_bits: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
-    a_gather_indexed: Constexpr[int] = 0,
-    a_gather_rows: Constexpr[int] = 0,
-    arg_row_to_token: fx.Pointer = None,
+    a_row_stride_bytes: Constexpr[int] = 0,
+    a_scale_row_stride_bytes: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -164,20 +190,34 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride,
         ep_world_size,
         row_major_ascale,
-        a_gather_indexed,
-        a_gather_rows,
+        a_row_stride_bytes,
+        a_scale_row_stride_bytes,
+        ep_quant_bits,
     )
     _ = cache_tag
-    # The gather descriptor carries 16-bit row indices.
-    if a_gather_indexed and not 0 < a_gather_rows < 65536:
-        raise ValueError(
-            f"a_gather_indexed needs 0 < a_gather_rows < 65536, got {a_gather_rows}"
-        )
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
+    if ep_quant_bits not in (0, 8, 4):
+        raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
+    if ep_quant_bits:
+        if not enable_ep_scatter:
+            raise ValueError("ep_quant_bits requires enable_ep_scatter")
+        # A tile row must hold whole scale blocks, else its slice of the scale
+        # plane is not a whole number of bytes. 256 rather than EP_SCALE_BLOCK so
+        # each plane's slice also starts on a cache line: on the fp4 wire the
+        # payload row is tile_n/2 bytes, so only a multiple of 256 keeps that a
+        # multiple of 128. The tuning table only emits tile_n2 in {256, 512}, but
+        # env overrides (*_N2) bypass it.
+        if tile_n % 256 != 0:
+            raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
+        if (tile_n // n_warp // 16) % WN_PER_MX_BLOCK_EP != 0:
+            raise ValueError(
+                "ep_quant_bits requires wmma_n_rep % "
+                f"{WN_PER_MX_BLOCK_EP} == 0, got {tile_n // n_warp // 16}"
+            )
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -186,6 +226,15 @@ def launch_gemm_a8w4_tdm(
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
+    SCATTER_GROUP_ROWS = 8
+    SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
+    scatter_groups = (tile_m + SCATTER_GROUP_ROWS - 1) // SCATTER_GROUP_ROWS
+    scatter_passes = (scatter_groups + num_waves - 1) // num_waves
+    scatter_dst_vectors = (
+        scatter_passes + SCATTER_PASSES_PER_VECTOR - 1
+    ) // SCATTER_PASSES_PER_VECTOR
+    if (4 * num_waves_per_tensor_tdm) % num_waves:
+        raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
 
     A_PACK = 2 if a_is_fp4 else 1
     A_ROW_B = tile_k // A_PACK
@@ -204,6 +253,7 @@ def launch_gemm_a8w4_tdm(
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
+    AS_FULL_KDW = K // 128
     AS_FULL_INNER = (K // 128) * wmma_m_rep * 16
     # A-scale LDS: one outer row is one wave's M tile, and its inner
     # (k128, wm, lane16) layout gives each WMMA scale operand a contiguous
@@ -221,24 +271,38 @@ def launch_gemm_a8w4_tdm(
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
     STAGE_SB = ceildiv(SB_SUPERS * SC_INNER * 4, 16) * 16
+    B_OFF = STAGE_A
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
     # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
     PITCH = ceildiv(STAGE_A + STAGE_B + STAGE_SA + STAGE_SB, 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
-    # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
-    # to break the ds_store bank conflict; reserve it so the padded tile fits.
-    # The scatter epilogue instead pads to the smallest 16B-aligned row that is
-    # not a multiple of 32B, the least padding the gather-store descriptor can
-    # take while still spreading the b128 writes off one bank.
+
+    # The bf16 passthrough epilogue stages C with a padded row pitch to break the
+    # ds_store bank conflict; reserve it so the padded tile fits.  On gfx1250's
+    # 64-bank LDS, scatter uses the smallest 16B-aligned row that is not a
+    # multiple of 32B.  Consecutive rows then rotate by four banks and spread a
+    # wave32 b128 write uniformly to its intrinsic two-bank-cycle floor.
     # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
-    C_ROW_BYTES = tile_n * 2
-    _lds_row_bytes = ceildiv(C_ROW_BYTES, 16) * 16
-    _lds_row_bytes = _lds_row_bytes + (16 if _lds_row_bytes % 32 == 0 else 0)
+    # Quantized rows are payload bytes, not bf16 elements, and their scale plane
+    # is staged in a second region sitting right behind the payload one.
+    def _lds_pitch(nbytes):
+        p = ((nbytes + 15) // 16) * 16
+        return p + (16 if p % 32 == 0 else 0)
+
+    C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
+    EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
+    _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
+    _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
+    _ep_scale_lds_off = tile_m * _lds_row_bytes
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
-    C_STORE_B = ceildiv(tile_m * (tile_n + store_pad) * 2, 128) * 128
+    C_STORE_B = (
+        ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
+        if ep_quant_bits
+        else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+    )
     AS_FULL_OFF = num_buffers * PITCH
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
@@ -267,28 +331,26 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
-    # Marked: a gathering build reads a different A layout than a contiguous one.
-    _agi = "_agi" if a_gather_indexed else ""
+    _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_as_prologue}"
-        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_agi}"
+        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
-        arg_c: fx.Tensor,
+        arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
         arg_m_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
-        arg_quant_scale: fx.Tensor,
-        arg_ep_row_map: fx.Tensor,
-        arg_row_to_token: fx.Pointer,
+        arg_quant_scale: fx.Pointer,
+        arg_ep_row_map: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -338,23 +400,41 @@ def launch_gemm_a8w4_tdm(
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
 
-        # In-kernel bisect: find expert owning this M-tile via psum
+        # The host launches a CUDAGraph-safe worst-case M grid.  The final psum
+        # entry is the end of the last expert's valid rows, so reject the padded
+        # tail before paying for the dependent expert bisect.  blk_m is shared
+        # by every workgroup in a cluster, making this predicate cluster-uniform.
         i32_ptr = fx.PointerType.get(
             elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
         )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
-        lo, hi = blk_m * 0, blk_m * 0 + n_experts
-        for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
-            mid = (lo + hi) >> 1
-            mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-            go_right = tile_map[mid_clamped] <= blk_m
-            lo = go_right.select(mid + 1, lo)
-            hi = go_right.select(hi, mid)
-        expert = lo
+        has_work = blk_m < tile_map[n_experts - 1]
+
+        # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
+        # result with the padding sentinel so it remains defined outside the
+        # dynamic branch and the existing main-body guard stays valid.
+        expert = blk_m * 0 + n_experts
+        if has_work:
+            lo, hi = blk_m * 0, blk_m * 0 + n_experts
+            for _ in range_constexpr(
+                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+            ):
+                mid = (lo + hi) >> 1
+                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                go_right = tile_map[mid_clamped] <= blk_m
+                lo = go_right.select(mid + 1, lo)
+                hi = go_right.select(hi, mid)
+            expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
-        SA_GROW = K // 128  # row-major: scale dwords per M row
+        # Compact dest rows arrive on the dispatch wire's padded pitch, so the A
+        # row stride is not K bytes and the scale row stride is not K/128 dwords.
+        A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
+        # row-major: scale dwords per M row
+        SA_GROW = (
+            a_scale_row_stride_bytes // 4 if a_scale_row_stride_bytes else K // 128
+        )
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -362,25 +442,14 @@ def launch_gemm_a8w4_tdm(
         # Per-expert A-data OOB: bound to the owning expert's valid-row
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
-        # static=False (one dyn-shared base) only where a second region is
-        # needed, so the non-scatter path keeps its per-leaf static allocation.
-        _smem = (
-            fx.SharedAllocator(static=False)
-            if const_expr(enable_ep_scatter)
-            else fx.SharedAllocator()
-        )
+        # Keep the complete workgroup allocation visible in kernel metadata.
+        _smem = fx.SharedAllocator(static=True)
         base_ptr = _smem.allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
             return fx.Index(fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
-        if const_expr(enable_ep_scatter):
-            # Persistent (survives the mainloop) LDS slot for the prefetched
-            # rowmap: tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Bumped
-            # off the SAME allocator so it is disjoint from the A/B/C arena.
-            _rowmap_lds_ptr = _smem.allocate(tile_m * 8)._ptr
-            rowmap_lds_idx = ptr_to_idx(_rowmap_lds_ptr)
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
@@ -399,10 +468,37 @@ def launch_gemm_a8w4_tdm(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
-        gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
+        gSA_base = fx.recast_iter(fx.Int32, arg_scale_a)
+        gSB_base = fx.recast_iter(fx.Int32, arg_scale_b)
+        if const_expr(enable_ep_scatter):
+            # Resolve every remote-scatter base before entering the GEMM
+            # pipeline.  cco_lsa_ptr reads winBase/stride4G from window metadata;
+            # keeping those reads out of the drain prevents their loadcnt waits
+            # from extending the final compute-to-scatter critical path.
+            import mori.cco.device.flydsl as _cco
+
+            ep_win = _cco.Window(fx.Int64(ep_arena_handle))
+            _rm_i32 = fx.recast_iter(fx.Int32, arg_ep_row_map)
+            _rm_addr = fx.Int64(fx.ptrtoint(_rm_i32))
+            # get_iter is otherwise pure, so LLVM sinks its kernarg pointer load
+            # to the drain where the rowmap descriptor first consumes it.  This
+            # empty side-effect asm is an ordering anchor only (zero ISA bytes).
+            # It lets the pointer load join the existing prologue kernarg loads,
+            # so they issue in one clause and share the already-required wait.
+            from flydsl._mlir.dialects import llvm as llvm_dialect
+
+            llvm_dialect.InlineAsmOp(
+                res=None,
+                operands_=[_rm_addr.ir_value()],
+                asm_string="",
+                constraints="s",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+            _ep_lsa0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), 0))
+            _ep_lsa1 = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0))
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
-        a_off0 = blk_m64 * A_KROW
-        a_gather_oob = fx.Int32(blk_m64) + fx.Int32(mn_oob)
+        a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
         assert num_waves_per_tensor_tdm in (
@@ -413,17 +509,6 @@ def launch_gemm_a8w4_tdm(
         assert (
             num_waves_per_tensor_tdm <= num_waves
         ), "waves per tensor cannot exceed workgroup waves"
-        # A gather descriptor carries at most 16 row indices, so a wave owning
-        # more than that issues several. Every wave owns the same row count, so
-        # the per-wave TDM total stays uniform and the fence arithmetic below
-        # still holds -- it only has to count the extra descriptors.
-        A_DESCS = 1
-        if const_expr(_A_GATHER or a_gather_indexed):
-            _rows_per_wave_a = tile_m // num_waves_per_tensor_tdm
-            A_DESCS = (_rows_per_wave_a + 15) // 16
-        assert (
-            (3 + A_DESCS) * num_waves_per_tensor_tdm
-        ) % num_waves == 0, "A/B/SA/SB ownership must cover every workgroup wave"
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
             elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
@@ -433,9 +518,6 @@ def launch_gemm_a8w4_tdm(
         )
         if const_expr(tdm_as_in_prologue):
             assert num_waves == 4, "As-prologue requires a four-wave workgroup"
-            assert (
-                A_DESCS == 1
-            ), "As-prologue TDM schedule has no extra A gather descriptors"
             # Match the WST rotating-stage assignment. The one-shot A-scale load
             # is split across all four waves along its K-scale dimension.
             waves = [(2,), (0, 1), (0, 1, 2, 3), (3,)]
@@ -446,18 +528,15 @@ def launch_gemm_a8w4_tdm(
                 for i in range(0, num_waves, num_waves_per_tensor_tdm)
             ]
             waves = [wave_groups[i % len(wave_groups)] for i in range(4)]
-            # TDMs one wave issues per k-tile: its share of the A/B/SA/SB jobs.
-            # Both the tensorcnt arithmetic and the WMMA interleave count in these.
-            TDM_PER = (3 + A_DESCS) * num_waves_per_tensor_tdm // num_waves
+            # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
+            TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
         nw = 1
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
         # Waves in one ``wv`` differ only in runtime atom state, so the whole list
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
-            "Job",
-            "atom gt on_i32 lds_off lds_row inner outer k_adv waves gather",
-            defaults=(None,),
+            "Job", "atom gt on_i32 lds_off lds_row inner outer k_adv waves"
         )
         jobs = []
         as_prologue_jobs = []
@@ -532,72 +611,21 @@ def launch_gemm_a8w4_tdm(
                 )
             )
 
-        if const_expr(_A_GATHER or a_gather_indexed):
-            _wv_a = waves[0]
-            _seg_a = tile_m // len(_wv_a)
-            _rows_per_desc = (_seg_a + A_DESCS - 1) // A_DESCS
-            _wave_off_a = (wave - _wv_a[0]) * _seg_a
-            for _d in range_constexpr(A_DESCS):
-                _woff_a = _wave_off_a + _d * _rows_per_desc
-                _n_a = min(_rows_per_desc, _seg_a - _d * _rows_per_desc)
-                # Read the row indices once, here, outside the k loop: they do
-                # not depend on k, and the descriptor the main loop rebuilds
-                # each k-tile only reuses the values.
-                if const_expr(a_gather_indexed):
-                    # Compact A holds one row per token, so the row index is a
-                    # token id from the inverse route map. Padding rows carry
-                    # an index at the token bound, which the TDM drops.
-                    _row_map = fx.recast_iter(i32_ptr, arg_row_to_token)
-                    _rows_a = [
-                        _row_map[blk_m64 + _woff_a + fx.Int32(i)].ir_value()
-                        for i in range_constexpr(_n_a)
-                    ]
-                    _bound_a = fx.Int32(a_gather_rows)
-                else:
-                    # Identity indices: same rows the contiguous path would
-                    # load, kept for isolating the gather's cost from its
-                    # indexing. Narrowed to i32 because the descriptor packs
-                    # indices with i32 arithmetic, while blk_m64 is i64 to keep
-                    # the byte offsets it feeds in range.
-                    _rows_a = [
-                        fx.Int32(blk_m64 + _woff_a + fx.Int32(i)).ir_value()
-                        for i in range_constexpr(_n_a)
-                    ]
-                    # Rows past this expert's extent get an index >= the bound,
-                    # which the TDM drops -- the contiguous path clamps its
-                    # extent instead.
-                    _bound_a = a_gather_oob
-                gA_view = tensor_view(gA_base, (_bound_a, A_KROW), (A_KROW, 1))
-                jobs.append(
-                    Job(
-                        None,
-                        gA_view,
-                        False,
-                        _woff_a * A_LDS_ROW,
-                        A_LDS_ROW,
-                        A_ROW_B,
-                        _n_a,
-                        A_ROW_B,
-                        _wv_a,
-                        SimpleNamespace(rows=_rows_a, bound=_bound_a),
-                    )
-                )
-        else:
-            add_tdm_loads(
-                gA_base,
-                a_off0,
-                A_KROW,
-                mn_oob,
-                A_ROW_B,
-                tile_m,
-                on_i32=False,
-                lds_off=0,
-                lds_row=A_LDS_ROW,
-                k_adv=A_ROW_B,
-                wv=waves[0],
-                pad=(A_ROW_B, LDS_PAD_A),
-                wg_mask=a_mcast_mask,
-            )
+        add_tdm_loads(
+            gA_base,
+            a_off0,
+            A_GROW,
+            mn_oob,
+            A_ROW_B,
+            tile_m,
+            on_i32=False,
+            lds_off=0,
+            lds_row=A_LDS_ROW,
+            k_adv=A_ROW_B,
+            wv=waves[0],
+            pad=(A_ROW_B, LDS_PAD_A),
+            wg_mask=a_mcast_mask,
+        )
         add_tdm_loads(
             gB_base,
             b_off0,
@@ -606,13 +634,47 @@ def launch_gemm_a8w4_tdm(
             PACK_TK * 16,
             tile_n // 16,
             on_i32=False,
-            lds_off=STAGE_A,
+            lds_off=B_OFF,
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
             cache_modifier=tdm_b_th,
         )
-        if const_expr(tdm_as_in_prologue):
+        if const_expr(row_major_ascale and tdm_as_in_prologue):
+            # The compact wire is row-major with a padded global row pitch.
+            # Keep that layout in the resident LDS region too: each owner wave
+            # brings in a slice of M rows across the complete K-scale range.
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                AS_FULL_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=AS_FULL_OFF // 4,
+                lds_row=AS_FULL_KDW,
+                k_adv=0,
+                wv=waves[2],
+                target_jobs=as_prologue_jobs,
+            )
+        elif const_expr(row_major_ascale):
+            # Compact dispatch lands e8m0 row-major at the wire pitch. The
+            # rotating path keeps one tile_k slice in each pipeline buffer.
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                SA_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=SA_OFF // 4,
+                lds_row=SA_KDW,
+                k_adv=SA_KDW * 4,
+                wv=waves[2],
+            )
+        elif const_expr(tdm_as_in_prologue):
             add_tdm_loads(
                 gSA_base,
                 (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
@@ -627,20 +689,6 @@ def launch_gemm_a8w4_tdm(
                 wv=waves[2],
                 split_inner=AS_SUPERS < len(waves[2]),
                 target_jobs=as_prologue_jobs,
-            )
-        elif const_expr(row_major_ascale):
-            add_tdm_loads(
-                gSA_base,
-                blk_m64 * SA_GROW,
-                SA_GROW,
-                None,
-                SA_KDW,
-                tile_m,
-                on_i32=True,
-                lds_off=SA_OFF // 4,
-                lds_row=SA_KDW,
-                k_adv=SA_KDW * 4,
-                wv=waves[2],
             )
         else:
             add_tdm_loads(
@@ -684,35 +732,9 @@ def launch_gemm_a8w4_tdm(
 
         def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
-            so4 = s * (PITCH // 4)
+            so4 = (s * PITCH) // 4
 
             def emit(j):
-                if const_expr(j.gather is not None):
-                    # Shape is the written extent, stride the padded pitch --
-                    # same split as the contiguous path's destination view.
-                    lds_c = tensor_view(
-                        pa + j.lds_off, (j.outer, j.inner), (j.lds_row, 1)
-                    )
-                    desc = make_tensor_gather_descriptor(
-                        j.gt,
-                        lds_c,
-                        j.gather.rows,
-                        row_width=j.inner,
-                        tensor_dim0=A_KROW,
-                        tensor_dim1=j.gather.bound.ir_value(),
-                        stride=A_KROW,
-                        elem_bytes=1,
-                        index_size=16,
-                        # The descriptor only takes the LDS base address, so the
-                        # row pitch has to come from the pad fields, exactly as
-                        # add_tdm_loads passes it for the contiguous path.
-                        pad_interval=A_ROW_B,
-                        pad_amount=LDS_PAD_A,
-                        lds_byte_offset=0,
-                        global_byte_offset=kt * j.k_adv,
-                    )
-                    tdm_ops.tensor_load_gather(desc)
-                    return
                 base = base_i32 if j.on_i32 else pa
                 dst = tensor_view(
                     base + j.lds_off + (so4 if j.on_i32 else 0),
@@ -732,10 +754,8 @@ def launch_gemm_a8w4_tdm(
                                 emit(j)
 
         def dispatch_wave_job(fn):
-            """Run ``fn`` with the current wave's jobs."""
-            for g in range_constexpr(len(job_waves)):
-                if owns(job_waves[g]):
-                    fn([j for j in jobs if j.waves == job_waves[g]])
+            """Run ``fn`` once. ``issue`` still filters jobs by wave owner."""
+            fn(None)
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
@@ -754,7 +774,7 @@ def launch_gemm_a8w4_tdm(
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
         lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
-        lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+        lds_b_lane_off = B_OFF + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
         SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
@@ -821,12 +841,18 @@ def launch_gemm_a8w4_tdm(
 
         def load_sa(buf, sm, ksl, kt):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            if const_expr(row_major_ascale and tdm_as_in_prologue):
+                as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
+                row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
+                off = (row * AS_FULL_KDW + kt * SA_KDW + ksl) * 4
+                return lds_load_b32(as_base, fx.Int32(off))[0]
+            if const_expr(row_major_ascale):
+                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
+                return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
             if const_expr(tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
                 off = off + wave_m * AS_FULL_INNER * 4 + sa_lane * 4 + kt * AS_INNER * 4
                 return lds_load_b32(as_base, fx.Int32(off))[0]
-            if const_expr(row_major_ascale):
-                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
         def load_sb(buf, sn, ksl):
@@ -871,8 +897,10 @@ def launch_gemm_a8w4_tdm(
         # activations: 4 is safe for both, 16 costs 2.5%; 2..8 is within noise.
         MMA_GROUP = 4
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
-        # REUSE fence; the prefetch reads interleave evenly over the rest.
-        FENCE_COVER_MMA = 8
+        # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
+        # tiles can have n_acc as low as the tail itself, so clamp it to keep at
+        # least one group for the interleaved part.
+        FENCE_COVER_MMA = min(8, max(0, n_acc - MMA_GROUP))
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
@@ -993,9 +1021,9 @@ def launch_gemm_a8w4_tdm(
             ``next_stage_buf``, emitted at that last k128 instead of by the caller
             at the tile top; pass None only when an earlier fence already covers it.
 
-            ``my_jobs`` is the owner list already selected by
-            ``dispatch_wave_job``; it only reaches ``issue`` and is unused when
-            ``prefetch_kt`` is None.
+            ``my_jobs`` only reaches ``issue``, which falls back to filtering
+            ``jobs`` by wave owner itself; it is unused when ``prefetch_kt`` is
+            None.
             """
 
             def do_issue():
@@ -1086,31 +1114,69 @@ def launch_gemm_a8w4_tdm(
                 )
                 rocdl.sched_barrier(0)
 
-        # Skip padding tiles (expert id == n_experts); uniform across workgroup
-        if expert < n_experts:
+        # Skip padding tiles; uniform across every workgroup and cluster.
+        if has_work:
+            if const_expr(enable_ep_scatter):
+                # Each lane carries one destination row in each vector. A wave32
+                # vector covers four 8-row scatter passes; larger M tiles use
+                # multiple vectors. Issue all loads before the GEMM pipeline so
+                # their latency overlaps the mainloop. Invalid lanes safely read
+                # row zero and are replaced with the TDM OOB index below.
+                _rm_dst_lanes = []
+                _scatter_lane_valids = []
+                for scatter_vector in range_constexpr(scatter_dst_vectors):
+                    _scatter_pass_lane = lane // fx.Int32(
+                        SCATTER_GROUP_ROWS
+                    ) + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
+                    _scatter_group_lane = wave + _scatter_pass_lane * fx.Int32(
+                        num_waves
+                    )
+                    _scatter_row_lane = _scatter_group_lane * fx.Int32(
+                        SCATTER_GROUP_ROWS
+                    ) + lane % fx.Int32(SCATTER_GROUP_ROWS)
+                    _scatter_lane_valid = (
+                        _scatter_pass_lane < fx.Int32(scatter_passes)
+                    ) & (_scatter_group_lane < fx.Int32(scatter_groups))
+                    _scatter_lane_valid = _scatter_lane_valid & (
+                        _scatter_row_lane < mn_oob
+                    )
+                    _scatter_safe_row = _scatter_lane_valid.select(
+                        _scatter_row_lane, fx.Int32(0)
+                    )
+                    _rm_dst_lanes.append(
+                        fx.Int32(
+                            fx.ptr_load(
+                                _rm_i32
+                                + blk_m64 * fx.Int64(2)
+                                + fx.Int64(_scatter_safe_row) * fx.Int64(2)
+                            )
+                        )
+                    )
+                    _scatter_lane_valids.append(_scatter_lane_valid)
+                # Every GEMM wave needs the route weight for all of its M rows.
+                # Coalesced global loads replace the shared row-map TDM,
+                # LDS allocation, barrier, and four epilogue LDS reads. Their
+                # latency is likewise covered by the mainloop.
+                _rm_weight_rows = []
+                for wm in range_constexpr(wmma_m_rep):
+                    _weight_row = wmb + wm * 16 + lane16
+                    _weight_valid = _weight_row < mn_oob
+                    _weight_safe_row = _weight_valid.select(_weight_row, fx.Int32(0))
+                    _weight_bits = fx.Int32(
+                        fx.ptr_load(
+                            _rm_i32
+                            + blk_m64 * fx.Int64(2)
+                            + fx.Int64(_weight_safe_row) * fx.Int64(2)
+                            + fx.Int64(1)
+                        )
+                    )
+                    _weight = _weight_bits.bitcast(fx.Float32)
+                    _rm_weight_rows.append(
+                        _weight_valid.select(_weight, fx.Float32(0.0))
+                    )
             if const_expr(tdm_as_in_prologue):
                 issue_as_prologue()
                 # The first normal pipeline fence covers this oldest TDM load.
-            if const_expr(enable_ep_scatter):
-                # Rowmap (dst_i32, weight_f32) TDM descriptor: a (tile_m, 2) i32
-                # slice at global row blk_m into the persistent rowmap LDS region.
-                # It is issued at the drain tail below rather than here so it does
-                # not perturb the mainloop's exact tensor_wait counts. ext=mn_oob
-                # clamps to this expert's valid rows; padding rows stay unloaded
-                # and are masked in the epilogue.
-                _rm_i32 = fx.get_iter(arg_ep_row_map)
-                _rm_gt = tensor_view(
-                    _rm_i32 + blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
-                )
-                _rm_atom = fx.rocdl.make_tdm_atom(
-                    _rm_gt,
-                    [mn_oob, None],
-                    strides=[fx.Int64(2), None],
-                    num_warps=num_waves,
-                )
-                _rm_dst = tensor_view(
-                    fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
-                )
             # Post-compute wins for decode and for shallow pipelines: at
             # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
             if const_expr(tile_m <= 32 or num_buffers <= 2):
@@ -1160,11 +1226,6 @@ def launch_gemm_a8w4_tdm(
                         outstanding=TDM_PER
                         * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                     )
-                    if const_expr(enable_ep_scatter and j == num_buffers - 1):
-                        # Last drain tile: issue the rowmap TDM here so it overlaps
-                        # this final WMMA on the otherwise idle HBM. Nothing waits
-                        # on it before the epilogue's outstanding==0 fence.
-                        fx.copy(_rm_atom, _rm_gt, _rm_dst)
                     next_stage_buf = (
                         ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
@@ -1227,12 +1288,6 @@ def launch_gemm_a8w4_tdm(
                         pipeline_fence(
                             outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                         )
-                    if const_expr(enable_ep_scatter and j == PRE - 1):
-                        # Last drain tile (PRE-1, which next_stage_prefetch grows
-                        # past num_buffers-2): issuing earlier would land the
-                        # rowmap inside a carry's tensor_wait window, so the wait
-                        # would block on it instead of overlapping it.
-                        fx.copy(_rm_atom, _rm_gt, _rm_dst)
                     next_stage_buf = (
                         ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
@@ -1289,14 +1344,6 @@ def launch_gemm_a8w4_tdm(
             )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
-            if const_expr(enable_ep_scatter):
-                # Symmetric-heap window for the TDM gather-store, built in epilogue
-                # scope so it never crosses the dynamic `if expert < n_experts` /
-                # mainloop scf.if boundaries.
-                import mori.cco.device.flydsl as _cco
-
-                ep_win = _cco.Window(fx.Int64(ep_arena_handle))
-
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
                 # Fused activation + MX quant; payload to LDS, scale to global.
@@ -1305,7 +1352,7 @@ def launch_gemm_a8w4_tdm(
                     address_space=fx.AddressSpace.Global,
                     alignment=1,
                 )
-                scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
+                scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                 # i32_n is the pre-activation gate+up width; the quantized
                 # output has half as many columns and one scale dword per K128.
@@ -1437,73 +1484,182 @@ def launch_gemm_a8w4_tdm(
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
                 if const_expr(enable_ep_scatter):
-                    # Route weight per output row (byte 4 of the prefetched 8-byte
-                    # [dst|weight] slot), hoisted out of the wn loop -- alias
-                    # analysis would otherwise re-read it for every wn subtile.
-                    _wf_rows = [
-                        lds_load_b32(rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4)[
-                            0
-                        ].bitcast(fx.Float32)
-                        for wm in range_constexpr(wmma_m_rep)
-                    ]
-                for wm in range_constexpr(wmma_m_rep):
-                    row_rel = wmb + wm * 16 + lane16
-                    for wn in range_constexpr(output_n_rep):
-                        col_rel = wnb + wn * 16 + kgrp * 8
-                        acc = Vec(accs[wm * output_n_rep + wn])
-                        if const_expr(has_bias):
-                            acc = acc + Vec(
-                                fx.ptr_load(
-                                    bias_map + expert * i32_n + col_rel,
-                                    result_type=T.vec(8, out_elem),
-                                )
-                            ).to(fx.Float32)
-                        if const_expr(stage1_act):
-                            if const_expr(is_situv2):
-                                act_vals = [
-                                    fused_situv2_elem(
-                                        acc[2 * p],
-                                        acc[2 * p + 1],
-                                        consts=situ_c,
-                                    )
-                                    for p in range_constexpr(4)
-                                ]
-                            else:
-                                act_vals = [
-                                    fused_silu_swiglu_elem(
-                                        acc[2 * p],
-                                        acc[2 * p + 1],
-                                        swiglu=is_swiglu,
-                                        limit_f32=f32_swiglu_limit,
-                                        neg_limit_f32=neg_limit,
-                                    )
-                                    for p in range_constexpr(4)
-                                ]
-                            hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
-                            lds_store_b64(
-                                stC_idx,
-                                (row_rel * STORE_N + col_rel // 2) * 2,
-                                hv.bitcast(fx.Int32).ir_value(),
+                    _wf_rows = _rm_weight_rows
+
+                def _biased_acc(wm, wn, col_rel):
+                    acc = Vec(accs[wm * output_n_rep + wn])
+                    if const_expr(has_bias):
+                        acc = acc + Vec(
+                            fx.ptr_load(
+                                bias_map + expert * i32_n + col_rel,
+                                result_type=T.vec(8, out_elem),
                             )
-                        else:
-                            if const_expr(enable_ep_scatter):
-                                # Weight the row BEFORE truncating to bf16; the
-                                # combine kernel does an unweighted sum.
-                                _wf = _wf_rows[wm]
-                                hv = Vec.from_elements(
-                                    [acc[i] * _wf for i in range_constexpr(8)],
+                        ).to(fx.Float32)
+                    return acc
+
+                if const_expr(ep_quant_bits):
+                    # MX staging. The per-32 block amax is reduced across the kgrp
+                    # lane pair by the shuffle_xor(16) inside
+                    # emit_amax_e8m0_native_scale, so quantization has to happen HERE,
+                    # in registers: once the values reach LDS they are scattered by
+                    # column and can no longer be reduced.
+                    _v2i32_ty = T.vec(2, T.i32)
+                    _mx_dt = (
+                        MxDtype.FP8_E4M3 if ep_quant_bits == 8 else MxDtype.FP4_E2M1
+                    )
+                    _n_mx_blks = output_n_rep // WN_PER_MX_BLOCK_EP
+                    # Whole dwords only: a warp owning a byte count that is not a
+                    # multiple of four starts mid-dword, and a wider store would
+                    # reach into the next warp's scales.
+                    _e8m0_pack_dwords = _n_mx_blks // 4 if _n_mx_blks % 4 == 0 else 0
+                    _is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                    _p8_scale = fx.PointerType.get(
+                        elem_ty=fx.Int8.ir_type,
+                        address_space=fx.AddressSpace.Shared,
+                        alignment=1,
+                    )
+                    _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
+                    for wm in range_constexpr(wmma_m_rep):
+                        row_rel = wmb + wm * 16 + lane16
+                        _wf = _wf_rows[wm]
+                        _row_byte = row_rel * _lds_row_bytes
+                        _e8m0_blks = []
+                        for mx_blk in range_constexpr(_n_mx_blks):
+                            _vals = []
+                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
+                                wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
+                                col_rel = wnb + wn * 16 + kgrp * 8
+                                acc = _biased_acc(wm, wn, col_rel)
+                                # Weight before quantizing: combine sums
+                                # unweighted. It cannot ride the cvt scale
+                                # operand instead -- v_cvt_scalef32 takes only
+                                # the exponent of that f32, so a weight that is
+                                # not a power of two would be rounded to one.
+                                # Measured: folding it there costs 0.180 -> 0.292
+                                # logits_diff over 8 layers at 16k tokens/rank.
+                                for i in range_constexpr(8):
+                                    _vals.append(acc[i] * _wf)
+                            _scale_f32, _e8m0 = emit_amax_e8m0_native_scale(
+                                _vals, wave_size=WAVE, dtype=_mx_dt
+                            )
+                            _e8m0_blks.append(_e8m0)
+                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
+                                wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
+                                col_rel = wnb + wn * 16 + kgrp * 8
+                                _src8 = Vec.from_elements(
+                                    _vals[sub_wn * 8 : sub_wn * 8 + 8],
                                     fx.Float32,
-                                ).to(oc)
+                                ).ir_value()
+                                # col_rel is a multiple of 8, so the byte column
+                                # lands 8-aligned on the fp8 wire and 4-aligned
+                                # on the fp4 one.
+                                if const_expr(ep_quant_bits == 8):
+                                    lds_store_b64(
+                                        stC_idx,
+                                        _row_byte + col_rel,
+                                        emit_cvt_scalef32_pk8_fp8_f32(
+                                            _src8,
+                                            _scale_f32,
+                                            v2i32_ty=_v2i32_ty,
+                                            rocdl=rocdl,
+                                        ),
+                                    )
+                                else:
+                                    lds_store_b32(
+                                        stC_idx,
+                                        _row_byte + col_rel // 2,
+                                        Vec.from_elements(
+                                            [
+                                                emit_cvt_scalef32_pk8_fp4_f32(
+                                                    _src8,
+                                                    _scale_f32,
+                                                    i32_ty=T.i32,
+                                                    rocdl=rocdl,
+                                                )
+                                            ],
+                                            fx.Int32,
+                                        ),
+                                    )
+                        # Both kgrp lanes hold the same block scales; one stores.
+                        # This row's e8m0 bytes are contiguous -- block b sits at
+                        # wnb/32 + b -- so they go out as whole dwords instead of
+                        # one masked byte store per block. Each warp owns
+                        # warp_tile_n/32 bytes starting at a multiple of that, so
+                        # a dword store stays inside this warp's own run.
+                        _sc_byte = (
+                            row_rel * _lds_scale_row_bytes
+                            + wnb // EP_SCALE_BLOCK
+                            + _ep_scale_lds_off
+                        )
+                        if _is_kgrp0:
+                            if const_expr(_e8m0_pack_dwords):
+                                for dw in range_constexpr(_e8m0_pack_dwords):
+                                    _packed = _pack_bytes_i32(
+                                        _e8m0_blks[dw * 4 : dw * 4 + 4]
+                                    )
+                                    lds_store_b32(
+                                        stC_idx,
+                                        _sc_byte + dw * 4,
+                                        Vec.from_elements([_packed], fx.Int32),
+                                    )
                             else:
-                                hv = Vec.from_elements(
-                                    [acc[i] for i in range_constexpr(8)], fx.Float32
-                                ).to(oc)
-                            hv_i32 = hv.bitcast(fx.Int32).ir_value()
-                            lds_store_b128(
-                                stC_idx,
-                                (row_rel * STORE_PITCH + col_rel) * 2,
-                                hv_i32,
-                            )
+                                for mx_blk in range_constexpr(_n_mx_blks):
+                                    fx.ptr_store(
+                                        _e8m0_blks[mx_blk],
+                                        _scale_lds + (_sc_byte + mx_blk),
+                                    )
+                else:
+                    for wm in range_constexpr(wmma_m_rep):
+                        row_rel = wmb + wm * 16 + lane16
+                        for wn in range_constexpr(output_n_rep):
+                            col_rel = wnb + wn * 16 + kgrp * 8
+                            acc = _biased_acc(wm, wn, col_rel)
+                            if const_expr(stage1_act):
+                                if const_expr(is_situv2):
+                                    act_vals = [
+                                        fused_situv2_elem(
+                                            acc[2 * p],
+                                            acc[2 * p + 1],
+                                            consts=situ_c,
+                                        )
+                                        for p in range_constexpr(4)
+                                    ]
+                                else:
+                                    act_vals = [
+                                        fused_silu_swiglu_elem(
+                                            acc[2 * p],
+                                            acc[2 * p + 1],
+                                            swiglu=is_swiglu,
+                                            limit_f32=f32_swiglu_limit,
+                                            neg_limit_f32=neg_limit,
+                                        )
+                                        for p in range_constexpr(4)
+                                    ]
+                                hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
+                                lds_store_b64(
+                                    stC_idx,
+                                    (row_rel * STORE_N + col_rel // 2) * 2,
+                                    hv.bitcast(fx.Int32).ir_value(),
+                                )
+                            else:
+                                if const_expr(enable_ep_scatter):
+                                    # Weight the row BEFORE truncating to bf16; the
+                                    # combine kernel does an unweighted sum.
+                                    _wf = _wf_rows[wm]
+                                    hv = Vec.from_elements(
+                                        [acc[i] * _wf for i in range_constexpr(8)],
+                                        fx.Float32,
+                                    ).to(oc)
+                                else:
+                                    hv = Vec.from_elements(
+                                        [acc[i] for i in range_constexpr(8)], fx.Float32
+                                    ).to(oc)
+                                hv_i32 = hv.bitcast(fx.Int32).ir_value()
+                                lds_store_b128(
+                                    stC_idx,
+                                    (row_rel * STORE_PITCH + col_rel) * 2,
+                                    hv_i32,
+                                )
 
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
@@ -1522,68 +1678,130 @@ def launch_gemm_a8w4_tdm(
                 # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
                 # measured in-kernel from the lsa_ptr stride. Each wave issues the
                 # gather-stores for its row groups, 8 rows per instruction.
-                elem_bytes = 2
+                # Quantized rows are addressed in bytes, so a 4-bit element just
+                # halves the row length; the scale plane rides a second store.
+                elem_bytes = 1 if ep_quant_bits else 2
+                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
                 _stride_elems = ep_slot_stride_bytes // elem_bytes
-                _GRP = 8
-                _ngrp = (tile_m + _GRP - 1) // _GRP
-                _pr = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0)) - fx.Int64(
-                    ep_win.lsa_ptr(fx.Int32(0), 0)
-                )
+                _GRP = SCATTER_GROUP_ROWS
+                _ngrp = scatter_groups
+                _pr = _ep_lsa1 - _ep_lsa0
                 _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
                 # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
                 # slot<K); dropped/padding rows use this index so the HW drops them.
                 _oob = _K * fx.Int32(ep_world_size)
                 _comb_ptr_ty = fx.PointerType.get(
-                    T.i16, address_space=fx.AddressSpace.Global, alignment=16
+                    T.i8 if ep_quant_bits else T.i16,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=16,
                 )
                 _comb_iter = fx.inttoptr(
                     _comb_ptr_ty,
-                    fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)),
+                    _ep_lsa0 + fx.Int64(ep_combine_input_offset),
                 )
                 _comb_view = tensor_view(
-                    _comb_iter, (_oob, STORE_N), (_stride_elems, 1)
+                    _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
                 )
                 _lds_c = tensor_view(
-                    fx.recast_iter(oc, base_ptr),
-                    (tile_m, STORE_PITCH),
-                    (STORE_PITCH, 1),
+                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, base_ptr),
+                    (tile_m, _lds_row_elems),
+                    (_lds_row_elems, 1),
                 )
-                _gboff = blk_n * elem_bytes
-                for g in range_constexpr(_ngrp):
-                    base_row = g * _GRP
-                    if wave == g % num_waves:
-                        row_indices = []
-                        for i in range_constexpr(_GRP):
-                            r = base_row + i
-                            if const_expr(r < tile_m):
-                                dstp = fx.Int32(
-                                    lds_load_b32(rowmap_lds_idx, arith.index(r * 8))[0]
+                if const_expr(ep_quant_bits):
+                    # Byte column of this tile in the payload plane: one byte per
+                    # element on the fp8 wire, half that on fp4.
+                    _elem_div = 8 // ep_quant_bits
+                    _gboff = blk_n64 // _elem_div
+                    # The scale plane starts one payload plane into the slot; blk_n
+                    # is a multiple of tile_n, itself a multiple of the scale block,
+                    # so the tile's scale run starts whole.
+                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                else:
+                    _gboff = blk_n * elem_bytes
+                _passes = scatter_passes
+                # Compute all of this wave's destination indices lane-wise.
+                # The old LDS path scalarized each row first and consequently
+                # expanded signed / and % once per descriptor row.
+                _scatter_idx_lanes = []
+                for scatter_vector in range_constexpr(scatter_dst_vectors):
+                    _rm_dst_lane = _rm_dst_lanes[scatter_vector]
+                    _dst_pe_lane = _rm_dst_lane // fx.Int32(ep_destination_stride)
+                    _dst_slot_lane = _rm_dst_lane % fx.Int32(ep_destination_stride)
+                    _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane
+                    _scatter_keep_lane = _scatter_lane_valids[scatter_vector] & (
+                        _rm_dst_lane >= fx.Int32(0)
+                    )
+                    _scatter_idx_lanes.append(
+                        _scatter_keep_lane.select(_scatter_idx_lane, _oob)
+                    )
+
+                def issue_scatter_group(group, scatter_vector, vector_pass):
+                    base_row = group * fx.Int32(_GRP)
+                    row_indices = []
+                    for i in range_constexpr(_GRP):
+                        src_lane = fx.Int32(vector_pass * _GRP + i)
+                        row_indices.append(
+                            fx.Int32(
+                                rocdl.readlane(
+                                    T.i32,
+                                    _raw(_scatter_idx_lanes[scatter_vector]),
+                                    _raw(src_lane),
                                 )
-                                pe = dstp // fx.Int32(ep_destination_stride)
-                                slot = dstp % fx.Int32(ep_destination_stride)
-                                idxv = pe * _K + slot
-                                keep = (fx.Int32(r) < mn_oob) & (dstp >= fx.Int32(0))
-                                row_indices.append(keep.select(idxv, _oob))
-                            else:
-                                row_indices.append(_oob)
-                        # Geometry is passed explicitly rather than derived from
-                        # the views: under kernel tracing the layout leaves are
-                        # dynamic IR, not the Python ints the descriptor packs into
-                        # bitfields (row_width << 16, etc.).
-                        desc = make_tensor_gather_descriptor(
+                            )
+                        )
+                    # Geometry is explicit because traced layout leaves are not
+                    # Python integers suitable for the descriptor bitfields.
+                    desc = make_tensor_gather_descriptor(
+                        _comb_view,
+                        _lds_c,
+                        row_indices,
+                        row_width=_lds_row_elems,
+                        tensor_dim0=_row_elems,
+                        tensor_dim1=_oob.ir_value(),
+                        stride=_stride_elems,
+                        elem_bytes=elem_bytes,
+                        index_size=32,
+                        lds_byte_offset=fx.index_cast(
+                            T.index,
+                            base_row * fx.Int32(_lds_row_elems * elem_bytes),
+                        ),
+                        global_byte_offset=_gboff,
+                    )
+                    tensor_store_gather(desc)
+                    if const_expr(ep_quant_bits):
+                        # Same rows and slot stride as the payload store; only the
+                        # plane base and the row width differ.
+                        desc_s = make_tensor_gather_descriptor(
                             _comb_view,
                             _lds_c,
                             row_indices,
-                            row_width=STORE_PITCH,
-                            tensor_dim0=STORE_N,
+                            row_width=_lds_scale_row_bytes,
+                            tensor_dim0=EP_SCALE_ROW_BYTES,
                             tensor_dim1=_oob.ir_value(),
                             stride=_stride_elems,
-                            elem_bytes=elem_bytes,
+                            elem_bytes=1,
                             index_size=32,
-                            lds_byte_offset=base_row * STORE_PITCH * elem_bytes,
-                            global_byte_offset=_gboff,
+                            lds_byte_offset=fx.index_cast(
+                                T.index,
+                                fx.Int32(_ep_scale_lds_off)
+                                + base_row * fx.Int32(_lds_scale_row_bytes),
+                            ),
+                            global_byte_offset=_gboff_s,
                         )
-                        tensor_store_gather(desc)
+                        tensor_store_gather(desc_s)
+
+                # Let every wave issue its own groups directly. This avoids
+                # cloning every descriptor behind a wave-selection branch.
+                for scatter_pass in range_constexpr(_passes):
+                    group = wave + fx.Int32(scatter_pass * num_waves)
+                    scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
+                    vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
+                    if const_expr(_ngrp % num_waves):
+                        if group < fx.Int32(_ngrp):
+                            issue_scatter_group(group, scatter_vector, vector_pass)
+                    else:
+                        issue_scatter_group(group, scatter_vector, vector_pass)
                 tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):
@@ -1595,10 +1813,10 @@ def launch_gemm_a8w4_tdm(
                     out_col_off = c_inner_off
                 if const_expr(stage1_quant_out and stage1_act):
                     oc_store = fx.Int8
-                    c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
+                    c_iter = fx.recast_iter(fx.Int8, arg_c)
                 else:
                     oc_store = oc
-                    c_iter = fx.get_iter(arg_c)
+                    c_iter = fx.recast_iter(oc, arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                 if const_expr(STORE_PAD == 0):
                     gtC = tensor_view(
@@ -1636,17 +1854,18 @@ def launch_gemm_a8w4_tdm(
     n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c
+    if arg_quant_scale is None:
+        arg_quant_scale = arg_c
     kargs = (
-        arg_c,
+        fx.get_iter(arg_c),
         arg_a,
         arg_b,
-        arg_scale_a,
-        arg_scale_b,
+        fx.get_iter(arg_scale_a),
+        fx.get_iter(arg_scale_b),
         arg_m_tile_map,
         arg_bias,
-        arg_quant_scale,
-        arg_ep_row_map,
-        arg_row_to_token,
+        fx.get_iter(arg_quant_scale),
+        fx.get_iter(arg_ep_row_map),
         i32_m,
         N,
         f32_swiglu_limit,
