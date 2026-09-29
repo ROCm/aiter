@@ -3506,24 +3506,13 @@ def flydsl_moe_fused_quant_preshuffle(
             token_scale = torch.empty(
                 (token_rows, Ws), dtype=torch.uint8, device=device
             )
-            default_tdm_chunks = (
+            tdm_hidden_chunks = (
                 7
                 if feat_dim == 7168
                 and token_rows >= 1024
                 and token_rows % warps_per_block == 0
                 else 0
             )
-            try:
-                tdm_hidden_chunks = int(
-                    os.environ.get(
-                        "AITER_FLYDSL_GEMM1_APRE_TDM_HIDDEN_CHUNKS",
-                        str(default_tdm_chunks),
-                    )
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "AITER_FLYDSL_GEMM1_APRE_TDM_HIDDEN_CHUNKS must be an integer"
-                ) from exc
             if token_rows % warps_per_block:
                 tdm_hidden_chunks = 0
             token_grid = (token_rows + warps_per_block - 1) // warps_per_block
@@ -3546,26 +3535,9 @@ def flydsl_moe_fused_quant_preshuffle(
                 stream=torch.cuda.current_stream(),
             )
             scatter_grid = (n_rows + 31) // 32
-            default_scatter_tiles_per_epoch = 7 if feat_dim == 7168 else 1
-            try:
-                scatter_tiles_per_epoch = int(
-                    os.environ.get(
-                        "AITER_FLYDSL_GEMM1_APRE_SCATTER_TILES_PER_EPOCH",
-                        str(default_scatter_tiles_per_epoch),
-                    )
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "AITER_FLYDSL_GEMM1_APRE_SCATTER_TILES_PER_EPOCH must be an integer"
-                ) from exc
-            scatter_scale_lds = os.environ.get(
-                "AITER_FLYDSL_GEMM1_APRE_SCATTER_SCALE_LDS",
-                "1" if feat_dim == 7168 else "0",
-            ) in ("1", "true", "True")
-            scatter_skip_empty = os.environ.get(
-                "AITER_FLYDSL_GEMM1_APRE_SCATTER_SKIP_EMPTY",
-                "1" if feat_dim == 7168 else "0",
-            ) in ("1", "true", "True")
+            scatter_tiles_per_epoch = 7 if feat_dim == 7168 else 1
+            scatter_scale_lds = feat_dim == 7168
+            scatter_skip_empty = feat_dim == 7168
             _get_compiled_scatter_preshuffled_a_lds(
                 feat_dim,
                 scatter_tiles_per_epoch,
@@ -3597,91 +3569,46 @@ def flydsl_moe_fused_quant_preshuffle(
             and n_rows * Pb < 0x80000000
             and n_rows * Ws < 0x80000000
         ):
-            producer_mode = (
-                os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER", "rowgroup")
-                .strip()
-                .lower()
+            rows_per_wave = 2
+            prefetch_depth = 2
+            use_tdm = feat_dim in (2048, 3072)
+            rowgroup_tdm_chunks = feat_dim // 512 if use_tdm else 0
+            rows_per_block = warps_per_block * rows_per_wave
+            k_blocks_per_wave = 8 // rows_per_wave
+            loop_iters = (feat_dim // 32) // k_blocks_per_wave
+            rowgroup_supported = (
+                m_tile_map is not None
+                and n_experts > 0
+                and expert_tile_m > 0
+                and feat_dim % 256 == 0
+                and (feat_dim // 32) % k_blocks_per_wave == 0
+                and loop_iters % prefetch_depth == 0
+                and expert_tile_m % rows_per_block == 0
+                and n_rows * feat_dim * 2 < 0x80000000
             )
-            if producer_mode not in ("rowgroup", "three_kernel"):
-                raise ValueError(
-                    "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER must be "
-                    f"'rowgroup' or 'three_kernel', got {producer_mode!r}"
+            if rowgroup_supported:
+                launch_rowgroup = _get_compiled_quant_preshuffled_a_rowgroup(
+                    feat_dim=feat_dim,
+                    n_experts=int(n_experts),
+                    expert_tile_m=int(expert_tile_m),
+                    rows_per_wave=rows_per_wave,
+                    prefetch_depth=prefetch_depth,
+                    tdm_hidden_chunks=rowgroup_tdm_chunks,
+                    tdm_payload_store=use_tdm,
                 )
-            if producer_mode == "rowgroup":
-                rows_per_wave = int(
-                    os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW", "2")
+                rowgroup_grid = (n_rows + rows_per_block - 1) // rows_per_block
+                launch_rowgroup(
+                    ptr_arg(grouped_in.contiguous().view(-1)),
+                    ptr_arg(out_payload.view(-1)),
+                    ptr_arg(out_scale.view(-1)),
+                    ptr_arg(
+                        m_tile_map.to(device=device, dtype=torch.int32).reshape(-1)
+                    ),
+                    n_rows,
+                    rowgroup_grid,
+                    stream=torch.cuda.current_stream(),
                 )
-                prefetch_depth = int(
-                    os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH", "2")
-                )
-                use_target_tdm_defaults = (
-                    feat_dim in (2048, 3072)
-                    and rows_per_wave == 2
-                    and prefetch_depth == 2
-                )
-                try:
-                    rowgroup_tdm_chunks = int(
-                        os.environ.get(
-                            "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_CHUNKS",
-                            str(feat_dim // 512) if use_target_tdm_defaults else "0",
-                        )
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_CHUNKS must be an integer"
-                    ) from exc
-                rowgroup_tdm_payload_store = os.environ.get(
-                    "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_STORE",
-                    "1" if use_target_tdm_defaults else "0",
-                ) in ("1", "true", "True")
-                if not rowgroup_tdm_chunks:
-                    rowgroup_tdm_payload_store = False
-                rows_per_block = warps_per_block * rows_per_wave
-                if rows_per_wave not in (1, 2, 4, 8):
-                    raise ValueError(
-                        "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW must be one of "
-                        f"1, 2, 4, 8; got {rows_per_wave}"
-                    )
-                if prefetch_depth not in (1, 2, 4, 8):
-                    raise ValueError(
-                        "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH must be one of "
-                        f"1, 2, 4, 8; got {prefetch_depth}"
-                    )
-                k_blocks_per_wave = 8 // rows_per_wave
-                loop_iters = (feat_dim // 32) // k_blocks_per_wave
-                rowgroup_supported = (
-                    m_tile_map is not None
-                    and n_experts > 0
-                    and expert_tile_m > 0
-                    and feat_dim % 256 == 0
-                    and (feat_dim // 32) % k_blocks_per_wave == 0
-                    and loop_iters % prefetch_depth == 0
-                    and expert_tile_m % rows_per_block == 0
-                    and n_rows * feat_dim * 2 < 0x80000000
-                )
-                if rowgroup_supported:
-                    launch_rowgroup = _get_compiled_quant_preshuffled_a_rowgroup(
-                        feat_dim=feat_dim,
-                        n_experts=int(n_experts),
-                        expert_tile_m=int(expert_tile_m),
-                        rows_per_wave=rows_per_wave,
-                        prefetch_depth=prefetch_depth,
-                        tdm_hidden_chunks=rowgroup_tdm_chunks,
-                        tdm_payload_store=rowgroup_tdm_payload_store,
-                    )
-                    rowgroup_grid = (n_rows + rows_per_block - 1) // rows_per_block
-                    launch_rowgroup(
-                        ptr_arg(grouped_in.contiguous().view(-1)),
-                        ptr_arg(out_payload.view(-1)),
-                        ptr_arg(out_scale.view(-1)),
-                        ptr_arg(
-                            m_tile_map.to(device=device, dtype=torch.int32).reshape(-1)
-                        ),
-                        n_rows,
-                        rowgroup_grid,
-                        stream=torch.cuda.current_stream(),
-                    )
-                    return out_payload, out_scale
+                return out_payload, out_scale
 
             use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
             route_payload = torch.empty((numel, Pb), dtype=torch.uint8, device=device)

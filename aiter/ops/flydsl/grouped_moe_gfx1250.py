@@ -63,12 +63,6 @@ def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _as_bool(value, default: bool) -> bool:
-    if value is None or str(value).strip() == "":
-        return default
-    return str(value).strip() in _TRUTHY_ENV
-
-
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
@@ -893,14 +887,10 @@ def _grouped_a8w4_tdm_moe(
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
-    _gemm1_a_preshuffle = _is_fp4 and _as_bool(
-        os.environ.get("AITER_FLYDSL_GEMM1_A_PRESHUFFLE"), False
-    )
+    _gemm1_a_preshuffle = _is_fp4
     # GEMM2 consumes expert-local grouped rows, so its producer switches layout
     # independently from the token-once GEMM1 producer.
-    _gemm2_a_preshuffle = _is_fp4 and _as_bool(
-        os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE"), False
-    )
+    _gemm2_a_preshuffle = _is_fp4
 
     # Bound once, because the quant pass below rebinds a1_scale to the
     # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
@@ -915,10 +905,6 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
-    if _prequantized and _gemm1_a_preshuffle:
-        raise NotImplementedError(
-            "GEMM1 A-preshuffle does not accept a prequantized wire payload"
-        )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -945,11 +931,12 @@ def _grouped_a8w4_tdm_moe(
             bool(tdm_as_in_prologue),
             bool(tdm_b_th),
             bool(_row_major_ascale),
+            _prequantized,
         )
     )
-    # Serving captures decode and prefill shapes in the same process. Keep the
-    # opt-in enabled only for shapes accepted by the retained optimized kernel;
-    # all other shapes continue through the ordinary row-major producer/GEMM.
+    # Serving captures decode and prefill shapes in the same process. Enable the
+    # optimized layout only for shapes accepted by the retained kernel; all
+    # other shapes continue through the ordinary row-major producer/GEMM.
     _gemm1_a_preshuffle = (
         _gemm1_a_preshuffle
         and _a_preshuffle_common
@@ -970,7 +957,6 @@ def _grouped_a8w4_tdm_moe(
                 has_bias=int(_b1 is not None),
                 cluster_n=cluster_n,
                 next_stage_prefetch=next_stage_prefetch,
-                waves_per_tensor_tdm=waves_per_tensor_tdm,
                 n_experts=E,
             )
         )
@@ -995,7 +981,6 @@ def _grouped_a8w4_tdm_moe(
                 has_bias=int(_b2 is not None),
                 cluster_n=cluster_n,
                 next_stage_prefetch=next_stage_prefetch,
-                waves_per_tensor_tdm=waves_per_tensor_tdm,
                 n_experts=E,
             )
         )
@@ -1184,21 +1169,6 @@ def _grouped_a8w4_tdm_moe(
             a_preshuffle=_gemm1_a_preshuffle,
             **_situ_kw,
         )
-        if os.environ.get("AITER_FLYDSL_GEMM1_DEBUG_OUTPUT", "0") == "1":
-            torch.cuda.synchronize()
-            _y = y.float()
-            _bad = ~torch.isfinite(_y)
-            _bad_2d = _bad.reshape(-1, _bad.shape[-1])
-            _bad_rows = torch.nonzero(_bad_2d.any(dim=1), as_tuple=False).flatten()
-            _bad_cols = torch.nonzero(_bad_2d.any(dim=0), as_tuple=False).flatten()
-            print(
-                "[grouped-moe gemm1 debug] "
-                f"shape={tuple(y.shape)} nan={int(torch.isnan(_y).sum())} "
-                f"inf={int(torch.isinf(_y).sum())} finite={int(torch.isfinite(_y).sum())} "
-                f"bad_rows={_bad_rows[:16].cpu().tolist()} "
-                f"bad_cols={_bad_cols[:16].cpu().tolist()}",
-                flush=True,
-            )
         # Quantize only routed rows. Per-expert padding and the sentinel tail
         # remain unwritten and are excluded by GEMM2's mn_oob bound.
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
