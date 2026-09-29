@@ -33,7 +33,7 @@ concurrency:
 env:
   ATOM_BRANCH: ${{ inputs.triage && 'aa0c5c3a131d98124726b41ab62342bb8cafb207' || 'main' }}
   ATOM_REPOSITORY_URL: "ROCm/ATOM"
-  BASE_IMAGE: ${{ inputs.triage && 'rocm/atom-dev@sha256:7ab6365ab92d78eea5a517b5ab4ea8fc579f9d88bb753ca8ccb8b2f7c1c60686' || 'rocm/atom-dev:latest' }}
+  BASE_IMAGE: ${{ inputs.triage && (inputs.triage_model == 'DeepSeek-V4-Pro' && 'rocm/atom-dev@sha256:a88cc66af5c4f255a90de38a0c560cefdb9d67abee331158182d45966540766b' || 'rocm/atom-dev@sha256:7ab6365ab92d78eea5a517b5ab4ea8fc579f9d88bb753ca8ccb8b2f7c1c60686') || 'rocm/atom-dev:latest' }}
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   GITHUB_REPO_URL: ${{ inputs.triage && 'https://github.com/0xDELUXA/aiter.git' || github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
