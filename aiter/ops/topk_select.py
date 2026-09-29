@@ -178,6 +178,22 @@ _PLAIN_K2048_TINY_BAND = (8192, 32770)
 _PLAIN_K2048_TINY_MAX_ROWS = 8
 _PLAIN_K2048_SHORT_BANDS = ((8192, 8194), (16384, 16386), (20000, 32770))
 _PLAIN_K2048_SHORT_MAX_ROWS = 128
+# On gfx950 the plain dispatch serves every k=2048 row length up to 80 * 1024
+# columns with a register or LDS-tail variant picked from continuous ranges,
+# so the bands above apply only off gfx950.  There plain beat the backend
+# otherwise in place at every measured off-grid cell (seed-0 randn, MI355X):
+# stream from 2053 to 8191 columns through 2048 rows (0.35x--0.94x), decode
+# from 8195 to 81920 columns through 128 rows (0.38x--0.94x), and stream at
+# 129..255 rows from 8192 to 65536 columns (0.37x--0.85x) and at 129..4000
+# rows from 65537 to 131071 columns (0.42x--0.89x).  Past 80 * 1024 columns
+# plain falls back to its generic kernel and decode is faster again at 8..32
+# rows from 100000 columns, so the few-row band stops there.  Widths the
+# stream small-reject path serves stay with it.
+_PLAIN_K2048_NARROW_WIDTH = 8192
+_PLAIN_K2048_NARROW_MAX_ROWS = 2048
+_PLAIN_K2048_FEW_ROWS = 128
+_PLAIN_K2048_FEW_ROWS_MAX_WIDTH = 80 * 1024
+_PLAIN_K2048_MAX_WIDTH = 131071
 
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
@@ -525,8 +541,27 @@ def _sampled_takes(rows: int, width: int, k: int) -> bool:
     return bool(topk_sampled_supports(rows, width, k))
 
 
+def _stream_small_reject(rows: int, rejects: int) -> bool:
+    """Whether stream serves a gfx950 k=2048 row as a reject-r problem."""
+    return rejects > 0 and (
+        rejects <= 4
+        or (rows >= 1024 and rejects <= 7)
+        or (rows >= 4096 and rejects <= 8)
+    )
+
+
 def _plain_takes(rows: int, width: int, k: int) -> bool:
     """Enough rows for the row-scaling selector, on a width it is tuned for."""
+    if k == 2048 and get_gfx_runtime() == "gfx950":
+        if width < _PLAIN_K2048_NARROW_WIDTH:
+            return (
+                rows <= _PLAIN_K2048_NARROW_MAX_ROWS
+                and width > k
+                and not _stream_small_reject(rows, width - k)
+            )
+        if rows <= _PLAIN_K2048_FEW_ROWS:
+            return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
+        return width <= _PLAIN_K2048_MAX_WIDTH
     if k == 2048:
         four_k_lo, four_k_hi = _PLAIN_K2048_4K_BAND
         if rows <= _PLAIN_K2048_4K_MAX_ROWS and four_k_lo <= width <= four_k_hi:
@@ -1003,11 +1038,7 @@ def _dispatch(
     elif backend == "stream":
         wave = wave_size_of(input.device.index)
         rejects = input.shape[1] - topk
-        small_reject = rejects > 0 and (
-            rejects <= 4
-            or (rows >= 1024 and rejects <= 7)
-            or (rows >= 4096 and rejects <= 8)
-        )
+        small_reject = _stream_small_reject(rows, rejects)
         if (
             not ragged
             and get_gfx_runtime() == "gfx950"
