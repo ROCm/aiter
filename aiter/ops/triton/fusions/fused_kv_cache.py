@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -33,6 +35,8 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 _LOGGER = AiterTritonLogger()
 
 DEVICE_ARCH = arch_info.get_arch()
+
+_BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -135,8 +139,16 @@ def fused_qk_rope_cat_and_cache_mla(
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
     """
     _LOGGER.info(
-        f"FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope={tuple(q_nope.shape)} q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
-        + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+        "FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope=%s q_pe=%s k_nope=%s k_pe=%s pos=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s",
+        tuple(q_nope.shape),
+        tuple(q_pe.shape),
+        tuple(k_nope.shape),
+        tuple(k_pe.shape),
+        tuple(pos.shape),
+        tuple(cos.shape),
+        tuple(sin.shape),
+        tuple(kv_cache.shape),
+        tuple(slot_mapping.shape),
     )
 
     b, qh, d_nope = q_nope.shape
@@ -260,13 +272,8 @@ def fused_qk_rope_cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
-        # The gfx1250 gluon kernel keeps an extra (unused) MAX_EMBD_POS positional
-        # arg for a uniform launch interface with the BLOCK kernel. Pass the
-        # cos/sin cache length to satisfy its signature.
-        _extra_uniform_args = (cos.shape[0],)
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
-        _extra_uniform_args = ()
 
     _kernel[grid](
         q_nope,
@@ -285,7 +292,6 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
-        *_extra_uniform_args,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -370,8 +376,15 @@ def fused_qk_rope_reshape_and_cache(
     - zeros_out: same shape as input q.
     """
     _LOGGER.info(
-        f"FUSED_QK_ROPE_RESHAPE_AND_CACHE: q={tuple(q.shape)} k={tuple(k.shape)} "
-        + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+        "FUSED_QK_ROPE_RESHAPE_AND_CACHE: q=%s k=%s pos=%s cos=%s sin=%s key_cache=%s value_cache=%s slot_mapping=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(pos.shape),
+        tuple(cos.shape),
+        tuple(sin.shape),
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
+        tuple(slot_mapping.shape),
     )
 
     t, qh, d = q.shape
@@ -546,9 +559,20 @@ def fused_qk_rope_reshape_and_cache(
         _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
         _extra_args = {"BLOCK_T": BLOCK_T}
     else:
-        n_pid = t * qh + (t_slot - t) * kh
+        # 1 q-head per program is 2B/lane; tile heads once the grid is big enough.
+        BLOCK_H = 1
+        if t >= _BLOCK_H_MIN_TOKENS:
+            qh_per_kh = qh // kh
+            for cand in (16, 8, 4, 2):
+                if qh % cand == 0 and (cand % qh_per_kh == 0 or qh_per_kh % cand == 0):
+                    BLOCK_H = cand
+                    break
+        n_pid = t * (qh // BLOCK_H) + (t_slot - t) * kh
         _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
-        _extra_args = {}
+        _extra_args = {
+            "BLOCK_H": BLOCK_H,
+            "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
+        }
     grid = (n_pid, 1, 1)
     _kernel[grid](
         q,
@@ -658,8 +682,15 @@ def fused_qk_rope_cosine_cache_llama(
     - value_cache: same shape as input value_cache (inplace).
     """
     _LOGGER.info(
-        f"FUSED_QK_ROPE_COSINE_CACHE_LLAMA: q={tuple(q.shape)} k={tuple(k.shape)} "
-        + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+        "FUSED_QK_ROPE_COSINE_CACHE_LLAMA: q=%s k=%s pos=%s cos=%s sin=%s key_cache=%s value_cache=%s slot_mapping=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(pos.shape),
+        tuple(cos.shape),
+        tuple(sin.shape),
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
+        tuple(slot_mapping.shape),
     )
 
     t, qh, d = q.shape

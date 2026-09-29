@@ -173,6 +173,11 @@ T = TypeVar("T")
 U = TypeVar("U")
 
 
+def env_flag(name: str) -> bool:
+    """Parse a boolean AITER_* env var: ``1/true/yes/on``, case-insensitive."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class _Sentinel: ...
 
 

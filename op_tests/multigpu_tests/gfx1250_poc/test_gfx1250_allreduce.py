@@ -224,8 +224,9 @@ parser.add_argument(
     "-s",
     "--shape",
     type=dtypes.str2tuple,
+    action="append",
     default=None,
-    help="shape, e.g. -s 128,8192",
+    help="shape (repeatable), e.g. -s 16,7168 -s 32,7168",
 )
 parser.add_argument(
     "-t",
@@ -269,7 +270,7 @@ if __name__ == "__main__":
     else:
         test_dtypes = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
-        test_shapes = [args.shape]
+        test_shapes = args.shape
     else:
         test_shapes = l_shape
     if args.tp_size is not None:

@@ -104,6 +104,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
 ):
     if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    torch.manual_seed(0)
     dtype = torch.bfloat16
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -756,7 +757,6 @@ def test_fused_qk_rope_cosine_cache_llama(
         )
     else:
         pytest.skip()
-    torch.manual_seed(0)
 
     if cache_dtype == torch.uint8:
         k_scale = torch.randn(

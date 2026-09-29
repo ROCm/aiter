@@ -10,8 +10,9 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_from_hash,
     routing_torch,
 )
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.triton_tests.moe.moe_test_utils import assert_close
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
@@ -33,79 +34,55 @@ def assert_equal(ref, tri):
         assert ref == tri
 
 
-def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=True):
-    if tri.dtype.itemsize == 1:
-        ref_as_type = ref.to(tri.dtype)
-        if ref.dtype == tri.dtype:
-            assert torch.all(ref_as_type == tri)
-            return
-        ref = ref_as_type
-
-    if maxtol is None:
-        maxtol = 2e-2
-    if rmstol is None:
-        rmstol = 4e-3
-    """
-    Compare reference values against obtained values.
-    """
-
-    # cast to float32:
-    ref = ref.to(torch.float32).detach()
-    tri = tri.to(torch.float32).detach()
-    assert (
-        ref.shape == tri.shape
-    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
-
-    # deal with infinite elements:
-    inf_mask_ref = torch.isinf(ref)
-    inf_mask_tri = torch.isinf(tri)
-    assert torch.equal(
-        inf_mask_ref, inf_mask_tri
-    ), "Tensor must have same infinite elements"
-    refn = torch.where(inf_mask_ref, 0, ref)
-    trin = torch.where(inf_mask_tri, 0, tri)
-
-    # normalise so that RMS calculation doesn't overflow:
-    eps = 1.0e-30
-    multiplier = 1.0 / (torch.max(torch.abs(refn)) + eps)
-    refn *= multiplier
-    trin *= multiplier
-
-    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
-
-    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
-    max_err = torch.max(rel_err).item()
-    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
-
-    if verbose:
-        print(
-            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
-        )
-        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
-
-    if max_err > maxtol:
-        bad_idxs = torch.nonzero(rel_err > maxtol)
-        num_nonzero = bad_idxs.size(0)
-        bad_idxs = bad_idxs[:1000]
-        print(
-            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
-            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
-        )
-
-        bad_idxs = bad_idxs.unbind(-1)
-        print("ref values: ", ref[tuple(bad_idxs)].cpu())
-        print("tri values: ", tri[tuple(bad_idxs)].cpu())
-
-    assert max_err <= maxtol
-    assert rms_err <= rmstol
-
-
 def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
     logits = torch.randn((n_tokens, n_expts_tot), dtype=dtype, device=device)
     return logits
 
 
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
+
+
+@pytest.mark.parametrize("n_tokens", [8, 16, 24, 32])
+@pytest.mark.parametrize("n_expts_tot", [32, 64, 128])
+def test_topk_in_range(n_tokens: int, n_expts_tot: int):
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_act = 4
+    hist_block_m = 32
+    sm_first = False
+
+    # A CUDA graph replay pads the batch to the captured size, so rows
+    # [n_tokens_unpadded, n_tokens) hold whatever the router produced for
+    # uninitialised hidden states.
+    n_tokens_unpadded = n_tokens - 1
+    torch.manual_seed(0)
+    logits = torch.randn(
+        (n_tokens, n_expts_tot), dtype=torch.bfloat16, device="cuda"
+    ).detach()
+
+    # streaming_topk masks columns [n_expts_tot, N_EXPTS_PAD) with -inf, which
+    # is not strictly below every real logit: a real -inf ties with it and a
+    # negative NaN sorts under it, and ties break towards the larger column
+    # index. Once fewer than n_expts_act real columns outrank the placeholder,
+    # top-k elects padded columns and returns expert ids >= n_expts_tot.
+    logits[n_tokens_unpadded:, :] = -float("inf")
+    logits[n_tokens_unpadded:, 0] = float("inf")
+    logits[n_tokens_unpadded:, 1] = float("nan")
+    logits[n_tokens_unpadded:, 2] = -float("nan")
+
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=not sm_first,
+        HIST_BLOCK_M=hist_block_m,
+    )
+    assert expt_scal.shape == (n_tokens, n_expts_act)
+    assert expt_indx.shape == (n_tokens, n_expts_act)
+    assert bitmatrix.shape[0] == n_tokens
+
+    assert torch.all(expt_indx >= 0)
+    assert torch.all(expt_indx < n_expts_tot)
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
@@ -166,6 +143,9 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 def _score_transform_torch(logits, score_mode):
     if score_mode == "sqrtsoftplus":
         return torch.sqrt(F.softplus(logits.to(torch.float32))).to(logits.dtype)
+    if score_mode == "sigmoid":
+        # kept in fp32: the kernel selects in fp32 for this mode
+        return torch.sigmoid(logits.to(torch.float32))
     # "softmax" mode in the kernel means "no pre-transform" (identity)
     return logits
 
@@ -367,7 +347,7 @@ def _check_routing_data_bucket(
 @pytest.mark.parametrize(
     "n_tokens, n_expts_tot, n_expts_act",
     [
-        (8, 128, 4),  # tiny: hits sort_tokens_fused path (n_tokens <= 16)
+        (8, 128, 4),  # tiny: hits sort_tokens_fused
         (16, 128, 4),  # boundary
         (64, 128, 4),
         (1024, 128, 4),
@@ -375,12 +355,16 @@ def _check_routing_data_bucket(
     ],
 )
 @pytest.mark.parametrize(
-    "score_mode, has_bias, renorm, routed_scaling_factor",
+    "score_mode, has_bias, renorm, routed_scaling_factor, dtype",
     [
-        ("sqrtsoftplus", True, True, 2.5),  # full V4 noaux_tc path
-        ("sqrtsoftplus", True, False, 1.0),  # bias, no renorm
-        ("sqrtsoftplus", False, True, 1.0),  # no bias
-        ("softmax", False, False, 1.0),  # identity transform, no renorm
+        ("sqrtsoftplus", True, True, 2.5, torch.float32),  # full V4 noaux_tc path
+        ("sqrtsoftplus", True, False, 1.0, torch.float32),  # bias, no renorm
+        ("sqrtsoftplus", False, True, 1.0, torch.float32),  # no bias
+        ("sigmoid", True, True, 2.5, torch.float32),  # full GLM-5.2 / DSv3 path
+        ("sigmoid", True, False, 1.0, torch.float32),  # bias, no renorm
+        ("sigmoid", False, True, 1.0, torch.float32),  # no bias
+        ("sigmoid", True, True, 2.5, torch.bfloat16),  # selection must stay fp32
+        ("softmax", False, False, 1.0, torch.float32),  # identity, no renorm
     ],
 )
 def test_routing_score_mode(
@@ -391,13 +375,14 @@ def test_routing_score_mode(
     has_bias,
     renorm,
     routed_scaling_factor,
+    dtype,
 ):
     if get_arch() not in ["gfx950", "gfx1250"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
     torch.manual_seed(2)
-    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
+    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=dtype)
     bias = (
         torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
         if has_bias

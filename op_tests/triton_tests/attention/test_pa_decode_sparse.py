@@ -9,6 +9,7 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import checkAllclose
 
 
@@ -248,7 +249,7 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 64, 256, 2048])
+@pytest.mark.parametrize("T", [1, 64, 256, 2437])
 @pytest.mark.parametrize("H", [16, 32, 64, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [136, 388, 1024])
@@ -311,18 +312,14 @@ def test_pa_decode_sparse_vs_reference(
     )
 
 
-# ---------------------------------------------------------------------------
-# FP8 KV cache quantization helpers
-# ---------------------------------------------------------------------------
-
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+_FP8_DTYPE = get_fp8_e4m3_dtype()
 
 
 def _quantize_kv_fp8(unified_kv, group_size=_FP8_GROUP_SIZE):
     """Quantize bf16/fp16 unified_kv to (fp8, scales) with 1xGROUP_SIZE block scaling.
 
-    Returns (kv_fp8, kv_scales) where kv_fp8 is float8_e4m3fnuz and
+    Returns (kv_fp8, kv_scales) where kv_fp8 is _FP8_DTYPE and
     kv_scales is [total_pages, D // group_size] fp32.
     """
     total_pages, D = unified_kv.shape
@@ -434,6 +431,29 @@ def make_packed_cache(num_tokens, D, dtype):
     return cache, kv_deq.reshape(nb * block, D)
 
 
+def widen_to_int32_overflow(cache, kv_deq):
+    """Re-lay ``cache`` as a strided view whose span exceeds a 32-bit offset.
+
+    Same nelement() and same contents, but the dim-0 pitch is stretched so the
+    last block sits past 2**31 bytes. Only the blocks themselves are written;
+    the padding between them is left uninitialised, so the pool costs its
+    address space but not the time to fill it.
+    """
+    nb, block, row = cache.shape
+    itemsize = cache.element_size()
+    pitch = triton.cdiv(2**31, max(1, nb - 1) * itemsize)
+    pitch = max(pitch, block * row)
+    # the packed fp8 cache is viewed as bfloat16, which needs an even stride
+    pitch += pitch % 2
+    pool = torch.empty(
+        pitch * (nb - 1) + block * row, dtype=cache.dtype, device=cache.device
+    )
+    view = pool.as_strided((nb, block, row), (pitch, row, 1))
+    view.copy_(cache)
+    assert view.stride(0) * itemsize * (nb - 1) >= 2**31
+    return view, kv_deq
+
+
 def two_loop_reference(
     q,
     main_deq,
@@ -454,6 +474,7 @@ def two_loop_reference(
     T = main_indptr.numel() - 1
     mi, mp = main_idx.long(), main_indptr.long()
     ei, ep = extra_idx.long(), extra_indptr.long()
+    ei = torch.where(ei < 0, -1 - main_pages, ei)  # -1 again after the shift below
     rows, lens = [], []
     for tok in range(T):
         row = torch.cat(
@@ -469,13 +490,14 @@ def two_loop_reference(
     )
 
 
-@pytest.mark.parametrize("T", [1, 32, 128])
+@pytest.mark.parametrize("T", [1, 32, 128, 2437])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("main_len", [128])
 @pytest.mark.parametrize("extra_len", [8, 256])
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
-def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
+@pytest.mark.parametrize("strided_cache", [False, True])
+def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_cache):
     """gfx950 vLLM DSv4 decode path: SWA (main) + top-k (extra) two-loop over
     packed caches. fp8 (fp8_ds_mla) is the vLLM production format; bf16 is also
     exercised. Skipped off gfx950 (extra_* is a packed-only gluon path)."""
@@ -483,6 +505,14 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
         pytest.skip("CUDA required")
     if arch_info.get_arch() != "gfx950":
         pytest.skip("two-loop (extra_*) is a gfx950 packed-cache-only path")
+    if strided_cache:
+        # The pool has to span >2 GiB for the offsets to overflow, so pin the
+        # regression to one shape -- the fp8 production format at the largest T
+        # -- rather than paying it on all 24 combinations.
+        if dtype != "fp8" or T != 128:
+            pytest.skip("strided-cache case is pinned to the fp8 T=128 shape")
+        if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
+            pytest.skip("needs ~3 GiB free for the >2 GiB strided pool")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -502,9 +532,12 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
     # extra = scattered top-k over a pool
     extra_pool = T * extra_len
     extra_cache, extra_deq = make_packed_cache(extra_pool, D, dtype)
+    if strided_cache:
+        extra_cache, extra_deq = widen_to_int32_overflow(extra_cache, extra_deq)
     extra_idx = torch.randint(
         0, extra_pool, (T, extra_len), device=device, dtype=torch.int32
     ).reshape(-1)
+    extra_idx[::5] = -1  # -1 sentinels, skipped by the kernel
     extra_indptr = torch.arange(
         0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
     )
@@ -534,3 +567,42 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("has_invalid", [False, True])
+@pytest.mark.parametrize("T", [13, 2437])
+def test_pa_decode_sparse_global_gather(T, has_invalid):
+    """A pool past 2 GiB takes the 64-bit gathers, where the launcher unpeels
+    the tile loop without has_invalid. T=2437 takes the prefill config."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
+    if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
+        pytest.skip("needs ~3 GiB free for the >2 GiB strided pool")
+
+    device = "cuda"
+    H, D = 16, 512
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    softmax_scale = float(D) ** -0.5
+
+    lens = torch.randint(1, 300, (T,), device=device)
+    cache, deq = make_packed_cache(int(lens.sum()), D, "fp8")
+    cache, deq = widen_to_int32_overflow(cache, deq)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    indptr[1:] = lens.cumsum(0)
+    idx = torch.randperm(int(lens.sum()), device=device).to(torch.int32)
+    if has_invalid:
+        drop = torch.rand(idx.shape, device=device) < 0.2
+        drop[indptr[:-1].long()] = False  # every row keeps a key
+        idx[drop] = -1
+
+    ref = pa_decode_sparse_reference(
+        q, deq.to(q.dtype), idx, indptr, attn_sink, softmax_scale
+    )
+    out = pa_decode_sparse(
+        q, cache, idx, indptr, attn_sink, softmax_scale, has_invalid=has_invalid
+    )
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

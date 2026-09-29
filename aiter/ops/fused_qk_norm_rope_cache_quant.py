@@ -251,6 +251,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     block_size: int,
     x: int,
     rotary_dim: int = 0,
+    v_norm: bool = False,
 ) -> None: ...
 
 
@@ -340,11 +341,16 @@ def _fused_qk_norm_rope_group_quant_kernel(
     q_rope_buff: Tensor | None = None,
     # --- Optional fused SWA write (decode-only) ---
     # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, pe_dim],
-    # addressed by swa_block_tables[bid, positions[t] // swa_block_size].
+    # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
+    # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
+    # window whose layout this kernel need not know). Pass exactly one.
+    # Both modes still skip a token whose positions[t] is negative: the caller
+    # owns the row, not the staleness test.
     # batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
     swa_nope_scale_buff: Tensor | None = None,
     swa_rope_buff: Tensor | None = None,
     swa_block_tables: Tensor | None = None,
+    swa_dest_row: Tensor | None = None,
     swa_block_size: int = 0,
     batch_id_per_token: Tensor | None = None,
 ) -> None: ...
@@ -379,11 +385,16 @@ def fused_qk_norm_rope_group_quant(
     scale_dtype: str = "e8m0",
     # --- Optional fused SWA write (decode-only) ---
     # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, rot_dim],
-    # addressed by swa_block_tables[bid, positions[t] // swa_block_size].
+    # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
+    # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
+    # window whose layout this kernel need not know). Pass exactly one.
+    # Both modes still skip a token whose positions[t] is negative: the caller
+    # owns the row, not the staleness test.
     # batch_id_per_token maps token->seq (-1 = skip).
     swa_nope_scale_buff: Tensor | None = None,
     swa_rope_buff: Tensor | None = None,
     swa_block_tables: Tensor | None = None,
+    swa_dest_row: Tensor | None = None,
     swa_block_size: int | None = None,
     batch_id_per_token: Tensor | None = None,
 ):
@@ -488,6 +499,7 @@ def fused_qk_norm_rope_group_quant(
         swa_nope_scale_buff=swa_nope_scale_buff,
         swa_rope_buff=swa_rope_buff,
         swa_block_tables=swa_block_tables,
+        swa_dest_row=swa_dest_row,
         swa_block_size=0 if swa_block_size is None else swa_block_size,
         batch_id_per_token=batch_id_per_token,
     )
@@ -524,6 +536,8 @@ def _fused_qk_norm_rope_2way_fp8_perhead_quant_kernel(
     k_descale: Tensor,
     q_unquantized: Tensor,
     k_unquantized: Tensor,
+    q_partial_amax: Tensor,
+    k_partial_amax: Tensor,
 ) -> None: ...
 
 
@@ -595,6 +609,17 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
         )
     )
 
+    # Per-warp amax scratch (written once per warp, no atomics) allocated here on
+    # the Python side (torch caching allocator) and passed into the kernel, so the
+    # C++ side never allocates device memory itself.
+    total_warps = total_tokens * (num_heads_q + num_heads_k)
+    q_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q0.device
+    )
+    k_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q0.device
+    )
+
     _fused_qk_norm_rope_2way_fp8_perhead_quant_kernel(
         q0,
         k0,
@@ -620,6 +645,8 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
         k_descale,
         q_unquantized,
         k_unquantized,
+        q_partial_amax,
+        k_partial_amax,
     )
 
     if not want_bf16:
@@ -653,6 +680,8 @@ def _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
     k_descale: Tensor,
     q_unquantized: Tensor,
     k_unquantized: Tensor,
+    q_partial_amax: Tensor,
+    k_partial_amax: Tensor,
 ) -> None: ...
 
 
@@ -711,6 +740,17 @@ def fused_qk_norm_rope_1way_fp8_perhead_quant(
         )
     )
 
+    # Per-warp amax scratch (written once per warp, no atomics) allocated here on
+    # the Python side (torch caching allocator) and passed into the kernel, so the
+    # C++ side never allocates device memory itself.
+    total_warps = num_tokens * (num_heads_q + num_heads_k)
+    q_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q.device
+    )
+    k_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q.device
+    )
+
     _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
         q,
         k,
@@ -730,6 +770,8 @@ def fused_qk_norm_rope_1way_fp8_perhead_quant(
         k_descale,
         q_unquantized,
         k_unquantized,
+        q_partial_amax,
+        k_partial_amax,
     )
 
     if not want_bf16:
@@ -865,6 +907,7 @@ def _v_2way_per_head_fp8_quant_kernel(
     v1: Tensor,
     v_fp8: Tensor,
     v_descale: Tensor,
+    v_amax: Tensor,
 ) -> None: ...
 
 
@@ -883,7 +926,10 @@ def v_2way_per_head_fp8_quant(v0: Tensor, v1: Tensor) -> tuple[Tensor, Tensor]:
     v_descale = torch.empty(
         (batch_size, num_heads), dtype=torch.float32, device=v0.device
     )
-    _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale)
+    # v_amax is accumulated with atomic max in the kernel, so it must be
+    # zero-initialized. Allocated here (torch caching allocator) and passed in.
+    v_amax = torch.zeros((batch_size, num_heads), dtype=torch.float32, device=v0.device)
+    _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale, v_amax)
     return v_fp8, v_descale
 
 
@@ -896,6 +942,7 @@ def _v_1way_per_head_fp8_quant_kernel(
     v: Tensor,
     v_fp8: Tensor,
     v_descale: Tensor,
+    v_amax: Tensor,
 ) -> None: ...
 
 
@@ -914,5 +961,8 @@ def v_1way_per_head_fp8_quant(v: Tensor) -> tuple[Tensor, Tensor]:
     v_descale = torch.empty(
         (batch_size, num_heads), dtype=torch.float32, device=v.device
     )
-    _v_1way_per_head_fp8_quant_kernel(v, v_fp8, v_descale)
+    # v_amax is accumulated with atomic max in the kernel, so it must be
+    # zero-initialized. Allocated here (torch caching allocator) and passed in.
+    v_amax = torch.zeros((batch_size, num_heads), dtype=torch.float32, device=v.device)
+    _v_1way_per_head_fp8_quant_kernel(v, v_fp8, v_descale, v_amax)
     return v_fp8, v_descale

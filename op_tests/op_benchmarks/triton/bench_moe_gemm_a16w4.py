@@ -12,12 +12,12 @@ import torch
 import triton.profiler as proton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
-    moe_gemm_a16w4,
-)
+from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import (
+    get_arch,
+)
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 
@@ -99,6 +99,9 @@ def compute_roofline(
             f"{intensity_proxy_name}: {val:5d} | "
             f"Total latency (us): {total_latency_us:.2f} | "
             f"Kernel latency (us): {kernel_latency_us:.2f} | "
+            f"FLOPS: {perf['flops']:.2f} | "
+            f"Bytes: {perf['bytes']:.2f} | "
+            f"AI: {perf['flops'] / perf['bytes']:.2f} | "
             f"TFLOPS: {tflops:#.4g} | "
             f"TBPS: {tbps:.2f}"
         )
@@ -138,10 +141,13 @@ def compute_roofline(
 
 def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = shuffle_scale_moe(
-            scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        return shuffle_scale_moe(
+            scale,
+            arch=get_arch(),
+            preshuffle_factor=32,
+            scale_kwidth=8,
+            return_layout=True,
         )
-        return scale, "CDNA4_SCALE"
     else:
         return scale, None
 
@@ -170,7 +176,7 @@ def quantize(x, dtype):
 
 
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex, backend
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -182,6 +188,7 @@ def bench_mlp_single_weight_init(
     wg = torch.randn((dim1, n_expts_tot), device=dev)
     w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
     w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+
     # biases
     bg = torch.randn((n_expts_tot,), device=dev)
     b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
@@ -222,6 +229,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             out_dtype=x_dtype_torch,
             apply_swiglu=True,
+            backend=backend,
         )
         x = moe_gemm_a16w4(
             x,
@@ -235,7 +243,8 @@ def bench_mlp_single_weight_init(
             gather_indx=gather_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             out_dtype=x_dtype_torch,
-            apply_swiglu=True,
+            apply_swiglu=False,
+            backend=backend,
         )
 
     proton.finalize()
@@ -255,11 +264,21 @@ def bench_mlp(
     TP,
     op_regex,
     num_weight_inits=1,
+    backend=None,
 ):
     all_results = []
     for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
+            backend,
         )
         all_results.append(result)
 
@@ -287,6 +306,7 @@ def roofline_mlp(
     op_regex,
     name="",
     num_weight_inits=1,
+    backend=None,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -294,6 +314,7 @@ def roofline_mlp(
 
     out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
 
+    print(f"batch_sizes={batch_sizes}")
     compute_roofline(
         dim1,
         dim2,
@@ -304,6 +325,7 @@ def roofline_mlp(
         TP,
         op_regex,  # fixed args
         num_weight_inits,
+        backend=backend,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -349,6 +371,18 @@ def parse_args(args: list[str] | None = None):
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="gluon",
+        help="gluon or triton backend",
+    )
+    parser.add_argument(
+        "--TP",
+        type=int,
+        default=1,
+        help="Tensor Parallelism(TP)",
+    )
     return parser.parse_args(args=args)
 
 
@@ -381,10 +415,11 @@ def main(args: list[str] | None = None) -> None:
         active_experts,
         quantized_dtypes[0],
         quantized_dtypes[1],
-        TP=1,
+        TP=parsed_args.TP,
         op_regex=parsed_args.op_regex,
-        name="gpt-oss-x2",
+        name="default-model",
         num_weight_inits=parsed_args.num_weight_inits,
+        backend=parsed_args.backend,
     )
 
 

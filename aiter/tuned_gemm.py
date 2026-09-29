@@ -21,124 +21,28 @@ import os
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
-import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-from torch import Tensor
-
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import is_splitk_kid as _opus_is_splitk_kid
-    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
-    from aiter.ops.opus.gemm_op_a16w16 import (
-        opus_gemm_workspace_init as _opus_workspace_init,
-    )
+    from aiter.ops.opus import opus_gemm as _opus_launch
 except Exception:  # noqa: BLE001  blanket catch is intentional here
-    _opus_tune = None
-    _opus_workspace_init = None
-    _opus_is_splitk_kid = None
-
-# Every opus split-K arch (gfx950 / gfx942 / gfx1250) owns a per-stream fp32
-# workspace (process-global `opus_splitk_ws_get` registry, backed by raw
-# hipMalloc) that must be registered AND grown to the shape's size *eagerly*
-# before HIP graph capture -- hipMalloc/hipFree are stream-capture-illegal, so a
-# grow inside capture aborts the capture, leaving an empty graph whose replay
-# silently writes zeros (garbage logits). torch.cuda.graph captures on a
-# process-global stream (`torch.cuda.graphs.graph.default_capture_stream`) when
-# no explicit stream is passed (the vLLM/ATOM CUDAGraphWrapper case); we warm
-# that stream here during the eager pass so a later capture of the same shape
-# finds a ready workspace. (The opus launcher reads a stable device-resident
-# handle, so the captured graph stays valid across replays / post-capture grows
-# -- which is exactly why opus keeps a persistent workspace instead of a
-# per-call hipMallocAsync that would not survive capture; the only cost is this
-# one-time warm.)
-_OPUS_WS_ARCHS = {"gfx950", "gfx942", "gfx1250"}
-_opus_ws_warmed_sigs = set()
+    _opus_launch = None
 
 
 @functools.lru_cache(maxsize=1)
-def _opus_needs_ws_prewarm() -> bool:
-    if _opus_tune is None or _opus_workspace_init is None:
-        return False
-    try:
-        return get_gfx() in _OPUS_WS_ARCHS
-    except Exception:  # noqa: BLE001
-        return False
+def _get_flydsl_gemm_kernels():
+    from aiter.ops.flydsl import gemm_kernels
 
-
-def _opus_graph_capture_stream():
-    """The stream torch.cuda.graph captures on when called without `stream=`.
-
-    Mirrors torch's own lazy-init so we register the opus workspace on the exact
-    stream a later `with torch.cuda.graph(g):` will use.
-    """
-    g = torch.cuda.graphs.graph
-    if getattr(g, "default_capture_stream", None) is None:
-        g.default_capture_stream = torch.cuda.Stream()
-    return g.default_capture_stream
-
-
-def _opus_prewarm_capture_workspace(inp, weights, solidx, splitK, bias, otype):
-    """Eagerly size the opus split-K workspace on the graph capture stream.
-
-    No-op when already capturing (too late to allocate), on non-registry archs,
-    for a non-split-K kid (never touches the workspace), or when this
-    (shape, kid, splitK, bias) was already warmed.
-    """
-    if not _opus_needs_ws_prewarm():
-        return
-    # Only split-K kids allocate/read the fp32 workspace; every other kid family
-    # (flatmm / persistent / mono_tile / nosplit) launches straight to its kernel
-    # and never touches the registry, so warming it for them is pure waste.
-    if _opus_is_splitk_kid is not None and not _opus_is_splitk_kid(solidx):
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    m, k = inp.shape
-    n = weights.shape[0]
-    sig = (int(solidx), m, n, k, int(splitK), bias is not None, str(otype))
-    if sig in _opus_ws_warmed_sigs:
-        return
-    try:
-        s = _opus_graph_capture_stream()
-        with torch.cuda.stream(s):
-            _opus_workspace_init()
-            Yw = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-            _opus_tune(
-                inp.unsqueeze(0),
-                weights.unsqueeze(0),
-                Yw.unsqueeze(0),
-                bias=bias,
-                kernelId=int(solidx),
-                splitK=int(splitK),
-            )
-        s.synchronize()
-        _opus_ws_warmed_sigs.add(sig)
-    # Don't break eager callers; capture would re-surface it.
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"opus split-K workspace prewarm on the graph capture stream failed "
-            f"({type(e).__name__}: {e}); HIP graph capture of this opus shape may "
-            f"produce zeros. Call aiter.opus_gemm_workspace_init() on the capture "
-            f"stream manually if you capture with a custom stream."
-        )
+    return gemm_kernels
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-
 
 extensions_created = False
 untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
@@ -220,6 +124,7 @@ def get_GEMM_A16W16_config(
     padded_M = M
     config = None
     gfx = get_gfx()
+    warned_invalid_opus = set()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
@@ -239,20 +144,67 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                flydsl_config = (
+                    _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
                         config["kernelName"]
                     )
-                    if flydsl_config is None:
-                        logger.warning(
-                            f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognized by the current catalog; falling back to next candidate."
-                        )
-                        config = None
-                else:
+                )
+                # None means the tuned CSV names a kernel absent from this
+                # catalog version; it is unrelated to FlyDSL import availability.
+                if flydsl_config is None:
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
+                        "recognized by the current catalog; falling back to next candidate."
+                    )
                     config = None
             if config is None:
                 continue
+            if config["libtype"] == "opus":
+                if _opus_launch is None:
+                    resolved = None
+                else:
+                    from aiter.ops.opus.policy import (
+                        resolve_a16w16_tuned_candidate,
+                    )
+
+                    resolved = resolve_a16w16_tuned_candidate(
+                        arch=gfx,
+                        M=M,
+                        N=N,
+                        K=K,
+                        batch=1,
+                        cu_num=cu_num,
+                        has_bias=bias,
+                        input_dtype=eval(dtype),
+                        output_dtype=eval(otype),
+                        requested_kid=config.get("solidx"),
+                        requested_split_k=config.get("splitK"),
+                    )
+                if resolved is None:
+                    # Discard the whole stale (kid, split-K) pair before
+                    # trying another padded row or the default fallback.
+                    invalid_row = (
+                        padded_M,
+                        config.get("solidx"),
+                        config.get("splitK"),
+                    )
+                    if invalid_row not in warned_invalid_opus:
+                        logger.warning(
+                            "Ignoring invalid OPUS tuned row for gfx=%s, "
+                            "shape=(%d,%d,%d), kid=%r, splitK=%r; trying "
+                            "the next padded row or default backend",
+                            gfx,
+                            padded_M,
+                            N,
+                            K,
+                            config.get("solidx"),
+                            config.get("splitK"),
+                        )
+                        warned_invalid_opus.add(invalid_row)
+                    config = None
+                    continue
+                config = dict(config)
+                config["solidx"] = int(resolved.resolved_kid)
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = (
                     config["kernelName"] if config["libtype"] != "hipblaslt" else ""
@@ -284,14 +236,36 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif is_skinny_default_shape(M, N, K, dtype, cu_num):
+        # `otype == dtype` because the skinny kernels allocate their output at
+        # the input dtype and write it there; picking one when the caller asked
+        # for a wider output means the widening happens after the values have
+        # already been rounded, which is not what asking for it meant. Those
+        # shapes go to torch instead, which writes the accumulator.
+        elif (
+            gfx in ("gfx90a", "gfx942", "gfx950")
+            and otype == dtype
+            and is_skinny_default_shape(M, N, K, dtype, cu_num)
+        ):
             # soltype, solution_idx = 3, 2
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
         if not default_config:
-            default_config["libtype"] = "torch"
-            default_config["solidx"] = 0
+            # gfx1250 has no tuned ASM/skinny/hipblaslt bf16 kernels, so the
+            # torch fallback lands on hipBLASLt, which is markedly slower than
+            # the Triton (gluon) a16w16 kernel for these shapes. Prefer Triton
+            # for unscaled bf16/fp16 GEMMs; explicit tuned CSV entries still win
+            # since they are matched before this fallback is reached.
+            if (
+                gfx == "gfx1250"
+                and not scaleAB
+                and eval(dtype) in (dtypes.bf16, dtypes.fp16)
+            ):
+                default_config["libtype"] = "triton"
+                default_config["solidx"] = 0
+            else:
+                default_config["libtype"] = "torch"
+                default_config["solidx"] = 0
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
@@ -450,6 +424,8 @@ def skinny_gemm(
         ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], get_cu_num())
     if bias is not None:
         out += bias
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
     return out
 
 
@@ -511,7 +487,18 @@ def torch_gemm(
             )
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
+    if otype == dtypes.fp32 and inp.dtype in (dtypes.bf16, dtypes.fp16):
+        # `F.linear` returns the *input* dtype, so widening its result
+        # afterwards preserves nothing: the values are already on the BF16
+        # grid and a caller that asked for FP32 silently gets BF16 precision.
+        # `out_dtype` writes the accumulator instead, which is what the tuned
+        # ASM (`bf16gemm_fp32bf16_*`) and OPUS kernels do -- an untuned shape
+        # must not disagree with them about what `otype` means.
+        out = torch.mm(inp, weights.t(), out_dtype=otype)
+        return out if bias is None else out + bias
     out = F.linear(inp, weights, bias)
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
     return out
 
 
@@ -550,10 +537,10 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]
     )
-    stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -561,27 +548,21 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+    out = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
         bias=fused_bias,
-        kernel_family=flydsl_config.get("kernel_family"),
-        tile_m=flydsl_config["tile_m"],
-        tile_n=flydsl_config["tile_n"],
-        tile_k=flydsl_config["tile_k"],
+        block_m=flydsl_config["block_m"],
+        block_n=flydsl_config["block_n"],
+        block_k=flydsl_config["block_k"],
         split_k=flydsl_config["split_k"],
-        block_m_warps=flydsl_config["block_m_warps"],
-        block_n_warps=flydsl_config["block_n_warps"],
-        block_k_warps=flydsl_config.get("block_k_warps", 1),
-        n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
-        persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
-        waves_per_eu=flydsl_config.get("waves_per_eu", 0),
-        b_to_lds_unroll=flydsl_config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=flydsl_config.get("async_copy", False),
-        b_to_lds=flydsl_config["b_to_lds"],
-        b_preshuffle=flydsl_config.get("b_preshuffle", False),
-        c_to_lds=flydsl_config.get("c_to_lds", False),
+        m_waves=flydsl_config["m_waves"],
+        n_waves=flydsl_config["n_waves"],
+        k_waves=flydsl_config["k_waves"],
+        stages=flydsl_config["stages"],
+        group_m=flydsl_config["group_m"],
+        policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
+        out_dtype=otype,
     )
 
     if bias is not None and fused_bias is None:
@@ -603,7 +584,8 @@ def opus_gemm(
     bpreshuffle: bool | None = False,
     config: dict | None = None,
 ):
-    if _opus_tune is None:
+    """Run one tuned OPUS A16W16 row through the exact-kid interface."""
+    if _opus_launch is None:
         logger.warning(
             "opus tuned config found but opus is not available; falling back to torch"
         )
@@ -626,25 +608,16 @@ def opus_gemm(
     splitK = int(config.get("splitK", 0)) if config is not None else 0
     m, _k = inp.shape
     n = weights.shape[0]
-    # Eagerly size the per-stream split-K workspace on torch's graph capture
-    # stream so a later HIP graph capture of this shape doesn't abort (which
-    # would leave the captured graph empty -> replay writes zeros). No-op when
-    # already capturing, on gfx950, or for an already-warmed shape.
-    _opus_prewarm_capture_workspace(inp, weights, solidx, splitK, bias, otype)
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-    _opus_tune(
-        inp.unsqueeze(0),
-        weights.unsqueeze(0),
-        Y.unsqueeze(0),
+    _opus_launch(
+        inp,
+        weights,
+        Y,
+        kid=int(solidx),
         bias=bias,
-        kernelId=int(solidx),
-        splitK=splitK,
+        split_k=splitK,
     )
-    # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
-    # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
-    # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
-    # 2*bias), causing ~54% miscompare (maxabs ~= bias range) for every bias!=None
-    # opus shape under tgemm (e.g. ATOM's bf16 linear).
+    # The OPUS launcher already applies bias, including split-K reduction.
     return Y
 
 

@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _per_token_quant(
@@ -25,7 +27,15 @@ def _per_token_quant(
     return qx, scale_out
 
 
-@triton.jit
+_layernorm_kernel_repr = make_kernel_repr(
+    "_layernorm_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_kernel_repr)
 def _layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -129,7 +139,15 @@ def _layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
 
 
-@triton.jit
+_fused_add_layernorm_kernel_repr = make_kernel_repr(
+    "_fused_add_layernorm_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_add_layernorm_kernel_repr)
 def _fused_add_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -252,7 +270,17 @@ def _fused_add_layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
 
 
-@triton.jit
+_quant_layernorm_kernel_repr = make_kernel_repr(
+    "_quant_layernorm_kernel",
+    [
+        "DTYPE_MAX",
+        "IS_SMOOTH",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_quant_layernorm_kernel_repr)
 def _quant_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -406,7 +434,17 @@ def _quant_layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_quant_fused_add_layernorm_kernel_repr = make_kernel_repr(
+    "_quant_fused_add_layernorm_kernel",
+    [
+        "DTYPE_MAX",
+        "IS_SMOOTH",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_quant_fused_add_layernorm_kernel_repr)
 def _quant_fused_add_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
@@ -578,7 +616,18 @@ def _quant_fused_add_layernorm_kernel(
     tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
 
 
-@triton.jit
+_layernorm_bwd_dx_fused_triton_repr = make_kernel_repr(
+    "_layernorm_bwd_dx_fused_triton",
+    [
+        "NUM_ROWS",
+        "BLOCK_SIZE_N",
+        "USE_BLOCKED",
+        "IGNORE_DW_DB",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_bwd_dx_fused_triton_repr)
 def _layernorm_bwd_dx_fused_triton(
     DX,  # pointer to the input gradient
     DY,  # pointer to the output gradient
@@ -751,7 +800,16 @@ def _layernorm_bwd_dx_fused_triton(
             tl.store(DB + pid * N + cols, db_row.to(DB.type.element_ty), mask=mask)
 
 
-@triton.jit
+_layernorm_bwd_dwdb_triton_repr = make_kernel_repr(
+    "_layernorm_bwd_dwdb_triton",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_bwd_dwdb_triton_repr)
 def _layernorm_bwd_dwdb_triton(
     DW,  # pointer to the partial sum of weights gradient
     DB,  # pointer to the partial sum of biases gradient
@@ -781,7 +839,16 @@ def _layernorm_bwd_dwdb_triton(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.type.element_ty), mask=cols < N)
 
 
-@triton.jit
+_layernorm_bwd_dwdb_triton_v2_repr = make_kernel_repr(
+    "_layernorm_bwd_dwdb_triton_v2",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+    ],
+)
+
+
+@triton.jit(repr=_layernorm_bwd_dwdb_triton_v2_repr)
 def _layernorm_bwd_dwdb_triton_v2(
     X,  # pointer to the input
     DY,  # pointer to the output gradient

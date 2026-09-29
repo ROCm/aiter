@@ -12,7 +12,6 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 namespace aiter {
 
@@ -232,7 +231,7 @@ __global__ void add_rmsnorm_quant_kernel(
                 float quant_scale;
                 if(group_size ==  0)
                 {
-                    float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
+                    float max = block_reduce<float, aiter::Max, BlockSize, true>(thread_max, aiter::Max());
                     quant_scale = max * inverted_DTYPE_MAX;
                     if(threadIdx.x == 0)
                     {
@@ -242,7 +241,7 @@ __global__ void add_rmsnorm_quant_kernel(
                 else
                 {
                     int reduce_thread_size = group_size / thread_data_size;
-                    float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
+                    float max= multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
                     if(use_e8m0)
                     {
                         constexpr aiter::MxDtype kMxDtype = is_fp4_out
@@ -362,6 +361,13 @@ __global__ void add_rmsnorm_quant_kernel(
         ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, true); \
     }
 
+// A grouped quant needs `group_size % thread_data_size == 0`: the group is
+// reduced across whole threads. So a width whose widest shape is 24 elements
+// per thread has no grouped kernel at all -- neither 32 nor 128 divides 24 --
+// and the `4096 < n <= 6144` bucket used to fail the check rather than pick
+// another shape. It now falls back to the same pair the 8192 bucket already
+// uses for grouped quant, whose 16 and 8 divide every group this op supports.
+// Both instantiations already exist, so this adds no compile time.
 #define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
@@ -372,7 +378,13 @@ __global__ void add_rmsnorm_quant_kernel(
     } else if (n <= 4096){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 6144){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        if (group_size == 0 || group_size % 24 == 0) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        } else if (cu_num < 160) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16, ADD_RESIDUAL, FUSE_QUANT); \
+        } else { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        } \
     } else if (n <= 8192){ \
         if (group_size == 0) { \
             ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 32, ADD_RESIDUAL, FUSE_QUANT); \
@@ -454,6 +466,8 @@ __global__ void add_rmsnorm_quant_kernel(
         }
     }
 
+// Same grouped-quant fallback as the residual dispatch above, and for the same
+// reason: 24 elements per thread cannot carry a 32- or 128-wide group.
 #define RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
     if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
@@ -464,7 +478,13 @@ __global__ void add_rmsnorm_quant_kernel(
     } else if (n <= 4096){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 6144){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        if (group_size == 0 || group_size % 24 == 0) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        } else if (cu_num < 160) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16, ADD_RESIDUAL, FUSE_QUANT); \
+        } else { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        } \
     } else if (n <= 8192){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 32, ADD_RESIDUAL, FUSE_QUANT); \
     } else { \

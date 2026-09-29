@@ -4,12 +4,13 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from aiter.ops.triton.causal_conv1d import (
+from einops import rearrange
+
+from aiter.ops.triton.conv.causal_conv1d import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from einops import rearrange
 
 
 def seed_everything(seed: int = 0) -> None:

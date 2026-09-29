@@ -17,22 +17,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-# Attempt to import the FLA reference; skip if unavailable.
-# Install flash-linear-attention (`pip install -e /path/to/fla`) to enable
-# the consistency tests against the upstream reference.
-try:
-    from fla.ops.kda.chunk import chunk_kda
-
-    HAS_FLA = True
-except (ImportError, ModuleNotFoundError):
-    HAS_FLA = False
-
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import beta_sigmoid_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils import l2norm_fwd
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.cumsum import (
     chunk_gate_cumsum,
 )
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.l2norm import l2norm_fwd
+from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
 device = "cuda"
 dtype = torch.bfloat16
@@ -437,8 +428,8 @@ class TestStateVFirst:
             )
 
 
-@pytest.mark.skipif(not HAS_FLA, reason="flash-linear-attention not available")
-class TestChunkDeltaAttnFwdVsFLA:
+class TestChunkDeltaAttnFwdVsReference:
+    """Compare against the token-at-a-time fp32 recurrence the kernels blockify."""
 
     @pytest.mark.parametrize(
         "B,T,H,K,V",
@@ -448,11 +439,11 @@ class TestChunkDeltaAttnFwdVsFLA:
             (1, 64, 64, 128, 128),
         ],
     )
-    def test_output_matches_fla(self, B, T, H, K, V):
+    def test_output_matches_reference(self, B, T, H, K, V):
         HV = H
         q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
 
-        o_ref, _ = chunk_kda(
+        o_ref, _ = chunk_kda_ref(
             q=q,
             k=k,
             v=v,

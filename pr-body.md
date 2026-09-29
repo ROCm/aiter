@@ -8,25 +8,25 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `107`
-- with samples: `107`
-- added: `4`
-- updated: `97`
-- unchanged: `6`
-- defaulted (no history): `0`
-- removed stale entries: `0`
-- defaulted files list: `none`
+- discovered files: `144`
+- with samples: `143`
+- added: `14`
+- updated: `72`
+- unchanged: `58`
+- defaulted (no history): `1`
+- removed stale entries: `1`
+- defaulted files list: `op_tests/test_moe_mxfp4_inter_dim_dispatch.py`
 
 ### Triton
 - runs used: `10`
-- discovered files: `102`
-- with samples: `102`
-- added: `0`
-- updated: `76`
-- unchanged: `26`
-- defaulted (no history): `0`
+- discovered files: `121`
+- with samples: `120`
+- added: `14`
+- updated: `89`
+- unchanged: `18`
+- defaulted (no history): `1`
 - removed stale entries: `0`
-- defaulted files list: `none`
+- defaulted files list: `op_tests/triton_tests/chunk_delta_attn/test_chunk_delta_attn_fwd.py`
 
 ## Test plan
 - [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run

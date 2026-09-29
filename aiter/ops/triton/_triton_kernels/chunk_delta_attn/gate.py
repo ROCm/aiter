@@ -15,7 +15,13 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import autotune_cache_kwargs, exp, input_guard, softplus
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
+    autotune_cache_kwargs,
+    exp,
+    input_guard,
+    softplus,
+)
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 _BETA_SIGMOID_BLOCK_SIZE = 2048
 _BETA_SIGMOID_NUM_WARPS = 8
@@ -62,12 +68,15 @@ def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BT": BT}, num_warps=nw, num_stages=ns)
-        for BT in BT_LIST
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [2, 3]
-    ],
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
+        [
+            triton.Config({"BT": BT}, num_warps=nw, num_stages=ns)
+            for BT in BT_LIST
+            for nw in NUM_WARPS_AUTOTUNE
+            for ns in [2, 3]
+        ],
+    ),
     key=["H", "D"],
     **autotune_cache_kwargs,
 )

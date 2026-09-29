@@ -31,7 +31,7 @@ from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
@@ -40,6 +40,7 @@ enable_aot_gluon_pa_mqa_logits = os.environ.get(
 )
 enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
 triton_version = Version(Version(triton.__version__).base_version)
+_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250")
 if triton_version >= Version("3.5.0"):
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
 
@@ -57,7 +58,7 @@ if triton_version >= Version("3.5.0"):
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
 
-    enable_gluon_pa_mqa_logits = True
+    enable_gluon_pa_mqa_logits = get_gfx() in _GLUON_PA_MQA_LOGITS_ARCHS
     enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits
 else:
     from triton.compiler import ASTSource
@@ -73,7 +74,9 @@ else:
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
 
-    enable_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits
+    enable_gluon_pa_mqa_logits = (
+        enable_aot_gluon_pa_mqa_logits and get_gfx() in _GLUON_PA_MQA_LOGITS_ARCHS
+    )
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
@@ -265,7 +268,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
-    assert gfx_version in ("gfx942", "gfx950", "gfx1250")
+    assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
     is_gfx1250 = gfx_version == "gfx1250"
     if is_gfx1250:
         if Preshuffle:
@@ -297,9 +300,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "stride_q_next_n": "i32",
         "stride_q_heads": "i32",
         "KV_buffer": gfx_fp8_pointer,
-        "stride_k_seq": "i32",
+        # The plain kernel forms per-token KV addresses from the page table, so
+        # a cache past 2 GiB overflows a 32-bit stride product.
+        "stride_k_seq": "i32" if Preshuffle else "i64",
         "scale_buffer": "*fp32",
-        "stride_scale_seq": "i32",
+        "stride_scale_seq": "i32" if Preshuffle else "i64",
         "context_len_ptr": "*i32",
         "kv_indices": "*i32",
         "weights": "*fp32",
@@ -496,9 +501,19 @@ def deepgemm_fp8_paged_mqa_logits(
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
     if Preshuffle:
-        assert (
-            KVBlockSize % 16 == 0
-        ), f"Preshuffle mode only supports KVBlockSize aligned to 16. Got KVBlockSize={KVBlockSize}"
+        # The shuffled layout feeds the 16-token MFMA B tile directly, so a page
+        # normally holds whole tiles. Page 8 is shuffled in groups of its own
+        # length -- `shuffle_weight(kv, layout=(8, 16))` -- and the kernel
+        # assembles one tile from two pages. The addressing generalises to any
+        # page that divides 16, but 8 is the only such page a caller asks for
+        # and the only one swept, so it is the only one admitted.
+        assert KVBlockSize % 16 == 0 or KVBlockSize == 8, (
+            "Preshuffle needs the KV page to be a multiple of the 16-token MFMA "
+            f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
+        )
+        assert not (
+            KVBlockSize < 16 and get_gfx() == "gfx1250"
+        ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     num_block = kv_cache.shape[0]
@@ -605,8 +620,9 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
     else:
-        assert KVBlockSize == 1
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
+        kv_cache_values = kv_cache_fp8.view(num_block, KVBlockSize, hidden_dim)
+        kv_cache_scales = kv_cache_scale.view(num_block, KVBlockSize)
         kernel = _deepgemm_fp8_paged_mqa_logits[grid](
             batch_size,
             next_n,
@@ -615,10 +631,12 @@ def deepgemm_fp8_paged_mqa_logits(
             q_fp8.stride(0),
             q_fp8.stride(1),
             q_fp8.stride(2),
-            kv_cache_fp8,
-            kv_cache_fp8.stride(0),
-            kv_cache_scale,
-            kv_cache_scale.stride(0),
+            kv_cache_values,
+            kv_cache_values.stride(0),
+            kv_cache_values.stride(1),
+            kv_cache_scales,
+            kv_cache_scales.stride(0),
+            kv_cache_scales.stride(1),
             context_lens,
             kv_indices,
             weights,
@@ -632,5 +650,6 @@ def deepgemm_fp8_paged_mqa_logits(
             ChunkK=ChunkK,
             SplitKV=SplitKV,
             HiddenDim=hidden_dim,
+            KVBlockSize=KVBlockSize,
         )
     return triton.runtime.cache.get_cache_manager(kernel.hash).key

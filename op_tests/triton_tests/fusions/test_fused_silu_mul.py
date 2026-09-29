@@ -43,6 +43,7 @@ def torch_silu_mul_last_dim_ref(x: torch.Tensor) -> torch.Tensor:
 def test_fused_silu_mul(shape, dtype, use_explicit_out):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    torch.manual_seed(0)
     x = torch.randn(shape, dtype=dtype, device="cuda")
     ref = torch_silu_mul_last_dim_ref(x)
     if use_explicit_out:
@@ -81,6 +82,7 @@ def test_fused_silu_mul_tp4_moe_shapes(n_rows, last_dim, dtype):
     """MoE fused silu×mul tensor as (tokens * top_k, 2 * local_d) under TP4."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    torch.manual_seed(0)
     shape = (n_rows, last_dim)
     x = torch.randn(shape, dtype=dtype, device="cuda")
     ref = torch_silu_mul_last_dim_ref(x)
@@ -116,6 +118,7 @@ def test_fused_silu_mul_tp4_moe_shapes(n_rows, last_dim, dtype):
 def test_fused_silu_mul_tp4_prefill_bf16(n_rows, last_dim):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    torch.manual_seed(0)
     dtype = torch.bfloat16
     shape = (n_rows, last_dim)
     x = torch.randn(shape, dtype=dtype, device="cuda")

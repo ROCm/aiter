@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def get_topmask_and_fullmask(x):
@@ -36,11 +38,15 @@ def _apply_score_mode(x, SCORE_MODE: tl.constexpr):
       - "sqrtsoftplus": x → sqrt(softplus(x)) using numerically stable
         softplus(x) = max(x, 0) + log(1 + exp(-|x|)). Matches
         torch.nn.functional.softplus for the DeepSeek-V4 sqrtsoftplus router.
+      - "sigmoid": x → 1 / (1 + exp(-x)). GLM-5.2 / DeepSeek-V3 sigmoid
+        router (config scoring_func="sigmoid").
     """
     if SCORE_MODE == "sqrtsoftplus":
         x_f = x.to(tl.float32)
         softplus_x = tl.maximum(x_f, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x_f)))
         return tl.sqrt(softplus_x).to(x.dtype)
+    if SCORE_MODE == "sigmoid":
+        return (1.0 / (1.0 + tl.exp(-x.to(tl.float32)))).to(x.dtype)
     # "softmax" (and default): identity
     return x
 
@@ -60,14 +66,17 @@ def streaming_topk(
     SCORE_MODE: tl.constexpr = "softmax",
     HAS_BIAS: tl.constexpr = False,
 ):
-    x_nbits: tl.constexpr = X.dtype.element_ty.primitive_bitwidth
+    if SCORE_MODE == "sigmoid":
+        x_dtype: tl.constexpr = tl.float32
+    else:
+        x_dtype: tl.constexpr = X.dtype.element_ty
+    x_nbits: tl.constexpr = x_dtype.primitive_bitwidth
     x_utype: tl.constexpr = tl.dtype(f"uint{x_nbits}")
     if x_nbits < 16:
         y_nbits: tl.constexpr = 32
     else:
         y_nbits: tl.constexpr = x_nbits * 2
     x_ultype: tl.constexpr = tl.dtype(f"uint{y_nbits}")
-    x_dtype: tl.constexpr = X.dtype.element_ty
 
     loop_iterations: tl.constexpr = N_EXPTS_PAD // BLOCK_N - 1
     offs_x_n = loop_iterations * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -84,6 +93,8 @@ def streaming_topk(
         x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=float("-inf"))
     else:
         x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=0.0)
+        if SCORE_MODE == "sigmoid":
+            x = x.to(tl.float32)
         x = _apply_score_mode(x, SCORE_MODE)
         if HAS_BIAS:
             bias_col_mask = offs_x_n < n_expts_tot
@@ -92,6 +103,14 @@ def streaming_topk(
         x = tl.where(mask_m & mask_n, x, float("-inf"))
     x = fpval_to_key(x.to(x_utype, bitcast=True))
     x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+
+    # The `other=-inf` placeholder above is NOT strictly below every real logit:
+    # -inf ties with a real -inf and sorts above a negative NaN, and ties are
+    # broken by the packed column index, which is largest for the padded
+    # columns. Such a row then selects `offs_x_n >= n_expts_tot`, i.e. an expert
+    # id that does not exist. Zero the whole packed key instead, which is the
+    # true minimum.
+    x = tl.where(mask_n, x, 0)
     acc = tl.topk(x, N_EXPTS_ACT_PAD, dim=1)
 
     # subsequent iterations: full blocks within n_expts_tot, no col mask
@@ -103,6 +122,8 @@ def streaming_topk(
             x = tl.load(X_ptrs, mask=mask_m, other=float("-inf"))
         else:
             x = tl.load(X_ptrs, mask=mask_m, other=0.0)
+            if SCORE_MODE == "sigmoid":
+                x = x.to(tl.float32)
             x = _apply_score_mode(x, SCORE_MODE)
             if HAS_BIAS:
                 b = tl.load(Bias + offs_x_n)
@@ -142,7 +163,26 @@ def streaming_topk(
     return y_values, y_indices
 
 
-@triton.jit
+_topk_repr = make_kernel_repr(
+    "_topk",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_S",
+        "BLOCK_SP",
+        "N_EXPTS_PAD",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "SCORE_MODE",
+        "APPLY_SOFTMAX",
+        "HAS_BIAS",
+        "APPLY_RENORM",
+        "WRITE_POP",
+    ],
+)
+
+
+@triton.jit(repr=_topk_repr)
 def _topk(
     X,
     stride_xm,  # inputs
@@ -234,7 +274,7 @@ def _topk(
     # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for
     # selection. We want the unbiased sqrt(softplus(x)) values as the gathered
     # weights (the "noaux_tc" pattern from V4). Subtract bias[y_indices].
-    if SCORE_MODE == "sqrtsoftplus" and HAS_BIAS:
+    if (SCORE_MODE == "sqrtsoftplus" or SCORE_MODE == "sigmoid") and HAS_BIAS:
         safe_idx = tl.where(real_mask, y_indices, 0).to(tl.int32)
         b_at_idx = tl.load(Bias + safe_idx)
         y_unbiased = y_values.to(tl.float32) - b_at_idx
@@ -284,7 +324,23 @@ def _topk(
         tl.store(BitsPtrs, r, mask=mask_m)
 
 
-@triton.jit
+_hash_routing_repr = make_kernel_repr(
+    "_hash_routing",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_S",
+        "BLOCK_SP",
+        "N_EXPTS_PAD",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "SCORE_MODE",
+        "APPLY_RENORM",
+    ],
+)
+
+
+@triton.jit(repr=_hash_routing_repr)
 def _hash_routing(
     InputIds,  # int32 [n_rows] — token-id per row
     Tid2Eid,  # int32 [vocab_size, K] — per-token-id top-K expert table
@@ -437,7 +493,26 @@ def _hash_routing(
         tl.store(BitsPtrs, r, mask=mask_m[:, None])
 
 
-@triton.jit
+_grouped_topk_repr = make_kernel_repr(
+    "_grouped_topk",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_S",
+        "BLOCK_SP",
+        "N_EXPTS_PAD",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "NUM_EXPERT_GROUP",
+        "TOPK_GROUP",
+        "SCORE_MODE",
+        "HAS_BIAS",
+        "APPLY_RENORM",
+    ],
+)
+
+
+@triton.jit(repr=_grouped_topk_repr)
 def _grouped_topk(
     X,  # router logits [n_rows, n_expts_tot] (bf16/fp32)
     stride_xm,
