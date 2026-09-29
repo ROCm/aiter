@@ -167,11 +167,21 @@ def compile_gemm2_a4w4_port(
     if use_scatter and _composition is not None:
         raise ValueError("epilog='scatter' does not support a composition")
     out_dtype = str(out_dtype).strip().lower()
-    if out_dtype not in ("bf16", "fp8"):
-        raise AssertionError(f"out_dtype must be 'bf16' or 'fp8', got {out_dtype!r}")
+    if out_dtype not in ("bf16", "fp8", "fp4"):
+        raise AssertionError(
+            f"out_dtype must be 'bf16', 'fp8' or 'fp4', got {out_dtype!r}"
+        )
     route_out_fp8 = out_dtype == "fp8"
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
+    scatter_out_fp4 = out_dtype == "fp4"
+    if scatter_out_fp4 and not use_scatter:
+        raise AssertionError("out_dtype='fp4' is supported only with epilog='scatter'")
+    if scatter_out_fp4 and BN not in (128, 256):
+        # fp32 C staging is BM*BN*4 bytes of LDS; BN=512 would need 256KB.
+        raise AssertionError(
+            f"out_dtype='fp4' supports only BN in (128, 256), got {BN}"
+        )
     compact_route = _output_n_range is not None
     if compact_route:
         if not route_out_fp8:
@@ -215,7 +225,8 @@ def compile_gemm2_a4w4_port(
     slot_bytes = BM * KH_TILE_A
     if use_scatter:
         aStages = 3
-        c_lds_bytes = 0
+        # fp4 out stages fp32 C in LDS (aliasing the A slots) for the block-32 quant.
+        c_lds_bytes = BM * BN * 4 if scatter_out_fp4 else 0
     else:
         c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
         # aStages must exceed kStages: the K-loop ds_reads slot kt%aStages then
@@ -294,7 +305,7 @@ def compile_gemm2_a4w4_port(
         f"_pa{g2_out_pitch_align}" if (route_out_fp8 and g2_out_pitch_align) else ""
     )
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
-    out_tag = "_fp8out" if route_out_fp8 else ""
+    out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if scatter_out_fp4 else "")
     compact_tag = "_weighted_compact_s8" if compact_route else ""
     route_guard_tag = "_routeguard" if use_reduce else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
@@ -337,6 +348,7 @@ def compile_gemm2_a4w4_port(
         arg_sweights,
         arg_bias,
         arg_out,
+        arg_out_scale,
         bx_i32,
         lane,
         wave,
@@ -422,6 +434,8 @@ def compile_gemm2_a4w4_port(
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
                 nonatomic=use_scatter,
+                scatter_out_fp4=scatter_out_fp4,
+                arg_out_scale=arg_out_scale,
                 g2_prefetch_ids=g2_prefetch_ids,
                 mn_idx=mn_idx,
                 reduce_store_cache_modifier=_reduce_store_cache_modifier,
@@ -541,6 +555,7 @@ def compile_gemm2_a4w4_port(
             arg_sweights,
             arg_bias,
             arg_out,
+            arg_out,
             fx.Int32(0),
             lane,
             wave,
@@ -580,7 +595,7 @@ def compile_gemm2_a4w4_port(
         i32_inter: fx.Int32,
         i32_hidden: fx.Int32,
         arg_out: fx.Int64,
-        arg_out_scale: fx.Int64,  # unused (atomic epilog); kept for signature parity
+        arg_out_scale: fx.Int64,  # e8m0 scales for out_dtype='fp4' scatter; unused otherwise
         i32_grid_blocks: fx.Int32,
     ):
         tx = gpu.thread_id("x")
@@ -601,6 +616,7 @@ def compile_gemm2_a4w4_port(
             arg_sweights,
             arg_bias,
             arg_out,
+            arg_out_scale,
             bx_i32,
             lane,
             wave,
@@ -788,8 +804,13 @@ def mxfp4_moe_gemm2(
     stream=None,
     bias=None,
     is_ep=False,
+    out_scale=None,
 ):
-    """Stage-2 down-proj gemm for unpadded dimensions."""
+    """Stage-2 down-proj gemm for unpadded dimensions.
+
+    out_dtype='fp4' (epilog='scatter' only): ``out`` is uint8 [max_sorted, D_HIDDEN//2]
+    packed fp4 and ``out_scale`` is uint8 [max_sorted, D_HIDDEN//32] e8m0, both unweighted.
+    """
     import torch
 
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
@@ -814,7 +835,25 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
         )
-    if (
+    if str(out_dtype).strip().lower() == "fp4":
+        if epilog != "scatter":
+            raise AssertionError(
+                "out_dtype='fp4' is supported only with epilog='scatter'"
+            )
+        if bias is not None:
+            raise NotImplementedError("out_dtype='fp4' scatter does not support bias")
+        if out_scale is None:
+            raise ValueError("out_dtype='fp4' requires out_scale")
+        for t, cols, what in (
+            (out, D_HIDDEN // 2, "out"),
+            (out_scale, D_HIDDEN // 32, "out_scale"),
+        ):
+            if t.dtype != torch.uint8 or tuple(t.shape) != (max_sorted, cols):
+                raise TypeError(
+                    f"out_dtype='fp4' needs {what} uint8 [{max_sorted}, {cols}], "
+                    f"got {t.dtype} {tuple(t.shape)}"
+                )
+    elif (
         str(out_dtype).strip().lower() == "bf16"
         and getattr(out, "dtype", None) != torch.bfloat16
     ):
@@ -874,7 +913,8 @@ def mxfp4_moe_gemm2(
             max_m_blocks,
             _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM),
         )
-    out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
+    if out_scale is None:
+        out_scale = out  # unused unless out_dtype='fp4'; any valid device ptr is fine
     run_compiled(
         launch,
         inter_sorted_quant.data_ptr(),

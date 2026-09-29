@@ -2290,8 +2290,7 @@ def _mxfp4_a4w4_stage2(
             BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
         )
 
-        # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
-        if _mx_shape_ok and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1":
+        if _mx_shape_ok and _mxfp4_intermediate_enabled():
             flat_out_q = torch.empty(
                 (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
             )
@@ -2630,6 +2629,11 @@ def _flydsl_stage2_fp8_enabled():
     return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
+def _mxfp4_intermediate_enabled():
+    # Lossy before-sum 4-bit quant of the scatter intermediate (ok for gsm8k, degrades other evals).
+    return os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
+
+
 def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
 
@@ -2689,6 +2693,13 @@ def _flydsl_v2_stage2_wrapper(
     _defer_w = _s2_fp8_inter
     _fp8_scale_blk = None
     _fp8_pitch_align = None
+    _s2_fp4_scatter = (
+        epilog == "scatter"
+        and bn in (128, 256)
+        and bias2 is None
+        and _mxfp4_intermediate_enabled()
+    )
+    target_scale = None
     if epilog == "scatter":
         if reverse_sorted is None or sorted_weights is None:
             raise ValueError(
@@ -2698,9 +2709,21 @@ def _flydsl_v2_stage2_wrapper(
             raise NotImplementedError(
                 "epilog='scatter' FlyDSL GEMM2 does not support expert-parallel"
             )
-        target = torch.empty(
-            (max_sorted, model_dim_runtime), dtype=out.dtype, device=out.device
-        )
+        if _s2_fp4_scatter:
+            target = torch.empty(
+                (max_sorted, model_dim_runtime // 2),
+                dtype=torch.uint8,
+                device=out.device,
+            )
+            target_scale = torch.empty(
+                (max_sorted, model_dim_runtime // 32),
+                dtype=torch.uint8,
+                device=out.device,
+            )
+        else:
+            target = torch.empty(
+                (max_sorted, model_dim_runtime), dtype=out.dtype, device=out.device
+            )
     elif epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
@@ -2768,10 +2791,24 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
-        out_dtype="fp8" if _s2_fp8_inter else "bf16",
+        out_dtype="fp8" if _s2_fp8_inter else ("fp4" if _s2_fp4_scatter else "bf16"),
         bias=bias2,
         is_ep=expert_mask is not None,
+        out_scale=target_scale,
     )
+    if _s2_fp4_scatter:
+        aiter.mxfp4_moe_scatter_reduce_q(
+            flat_out_q=target,
+            flat_out_scale=target_scale,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            out=out,
+            NE=num_experts,
+            TOPK=topk,
+            D_HIDDEN=model_dim_runtime,
+            MB=bm,
+        )
+        return out
     if epilog == "scatter":
         aiter.mxfp4_moe_scatter_reduce(
             flat_out=target,

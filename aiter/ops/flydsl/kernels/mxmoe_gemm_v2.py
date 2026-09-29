@@ -21,6 +21,7 @@ from flydsl.expr.typing import as_ir_value as _raw
 
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import (
+    _e8m0_from_amax,
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
     _udiv,
@@ -254,6 +255,8 @@ def gemm2_body_v2(
     g2_apre=False,
     enable_bias=False,
     nonatomic=False,
+    scatter_out_fp4=False,
+    arg_out_scale=None,
     g2_prefetch_ids=False,
     reduce_store_cache_modifier=None,
     resolved_input_rows=(),
@@ -818,7 +821,21 @@ def gemm2_body_v2(
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
-    if const_expr(nonatomic):
+    if const_expr(nonatomic and scatter_out_fp4):
+        nonatomic_mxfp4_epilog(
+            lds_acc_base,
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            arg_out,
+            arg_out_scale,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT_rt,
+            BN,
+            kMChunks,
+        )
+    elif const_expr(nonatomic):
         nonatomic_bf16_epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
             arg_out,
@@ -1301,3 +1318,103 @@ def nonatomic_bf16_epilog(
             for v in range_constexpr(4):
                 bf = Vec.from_elements([vec[v]], Float32).to(BFloat16)
                 out_ptr[(row_base + i * 16 + v) * N_OUT + gn_base + J * 16] = bf[0]
+
+
+def nonatomic_mxfp4_epilog(
+    lds_acc_base,
+    accm,
+    arg_out_q,
+    arg_out_scale,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    N_OUT,
+    BN,
+    kMChunks,
+):
+    """Scatter epilog with MXFP4 output: q [max_sorted, N/2] + e8m0 [max_sorted, N/32], unweighted.
+
+    fp32 C is staged through LDS (aliases the A slots) so each lane reads 8 contiguous
+    columns; a lane quad owns one 32-column scale block.
+    """
+    assert BN % 128 == 0, f"mxfp4 scatter epilog needs BN % 128 == 0, got {BN}"
+    numAccN = (BN // 4) // 16
+    wave_n = BN // 4
+    lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
+    # C aliases the A slots: every wave must be done ds_reading A before C lands.
+    gpu.barrier()
+    for i in range_constexpr(kMChunks):
+        row_base = fx.Int32(i * 16) + (lane // 16) * 4
+        for J in range_constexpr(numAccN):
+            col = wave * wave_n + J * 16 + lane % 16
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                lds_base_fptr[(row_base + v) * BN + col] = fx.Float32(vec[v])
+    gpu.barrier()
+
+    NBLK = BN // 32
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // 16
+    n_lane = tx_i32 % 16
+    wave_grp = n_lane // 4
+    kk = n_lane % 4
+    out_q = flat_buffer_view(arg_out_q, None, T.i32, align=4, elem_bytes=4, fold=False)
+    store_q_nt = fx.make_copy_atom(fx.rocdl.BufferCopy32b(2), Int32)
+    out_scale_ptr = global_typed_ptr(arg_out_scale, T.i8, align=1)
+    q_row0 = fx.Int64(m_row + m_lane) * fx.Int64(_udiv(N_OUT, fx.Int32(8)))
+    s_row0 = fx.Int64(m_row + m_lane) * fx.Int64(_udiv(N_OUT, fx.Int32(32)))
+    blocks = [(mr, half) for mr in range(kMChunks) for half in range(NBLK // 4)]
+
+    def issue_load(mr, half):
+        group = wave_grp + half * 4
+        col0 = group * 32 + kk * 8
+        idx = (fx.Int32(mr * 16) + m_lane) * BN + col0
+        v0 = Vec(lds_vec_load(lds_acc_base, idx * 4, T.vec(4, T.f32), T.f32, align=16))
+        v1 = Vec(
+            lds_vec_load(lds_acc_base, (idx + 4) * 4, T.vec(4, T.f32), T.f32, align=16)
+        )
+        return (
+            [fx.Float32(v0[e]) for e in range(4)]
+            + [fx.Float32(v1[e]) for e in range(4)],
+            group,
+            col0,
+        )
+
+    r_next = issue_load(*blocks[0])
+    for bi in range_constexpr(len(blocks)):
+        mr, _half = blocks[bi]
+        r, group, col0 = r_next
+        if const_expr(bi + 1 < len(blocks)):
+            r_next = issue_load(*blocks[bi + 1])
+        local_max = fabs_f32(r[0])
+        for e in range_constexpr(1, 8):
+            local_max = local_max.maximumf(fabs_f32(r[e]))
+        amax_bits = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
+        e8m0, qscale = _e8m0_from_amax(amax_bits.bitcast(Float32))
+        packed = _raw(fx.Int32(0))
+        for h in range_constexpr(4):
+            packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                T.i32, packed, _raw(r[2 * h]), _raw(r[2 * h + 1]), _raw(qscale), h
+            )
+        global_col = n_block_idx * BN + col0
+        q_idx = (
+            q_row0
+            + fx.Int64(mr * 16) * fx.Int64(_udiv(N_OUT, fx.Int32(8)))
+            + fx.Int64(global_col // 8)
+        )
+        q_frag = fx.make_rmem_tensor(1, Int32)
+        q_frag.store(Vec.from_elements([fx.Int32(packed)], Int32))
+        fx.copy(store_q_nt, q_frag, out_q[None, q_idx])
+        s_off = (
+            s_row0
+            + fx.Int64(mr * 16) * fx.Int64(_udiv(N_OUT, fx.Int32(32)))
+            + fx.Int64(n_block_idx * NBLK + group)
+        )
+
+        @flyc.jit
+        def store_scale_if_leader(kk, e8m0, s_off):
+            if kk == fx.Int32(0):
+                fx.ptr_store(e8m0.to(Int8), out_scale_ptr + s_off)
+
+        store_scale_if_leader(kk, e8m0, s_off)
