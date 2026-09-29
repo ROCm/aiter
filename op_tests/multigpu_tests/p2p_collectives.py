@@ -19,10 +19,9 @@ from __future__ import annotations
 import functools
 import threading
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
@@ -54,8 +53,6 @@ def _attr(v):
 
 @functools.cache
 def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
-    """``kind``: 0 AllGather (any bytes), 1 ReduceScatter / 2 AllReduce (bf16).
-    ``device`` keys the cache: one launcher per GPU."""
     UB = 16 if row_bytes % 16 == 0 else (8 if row_bytes % 8 == 0 else 4)
     UPR = row_bytes // UB
     TP = int(tp)
@@ -86,26 +83,37 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         return buffer_ops.create_buffer_resource_from_addr(_u(uni64(addr)))
 
     def bld(rs, off, ty, aux=0):
-        return rocdl.raw_ptr_buffer_load(ty, rs, _u(i32(off)), _u(i32(0)), aux=_attr(aux))
+        return rocdl.raw_ptr_buffer_load(
+            ty, rs, _u(i32(off)), _u(i32(0)), aux=_attr(aux)
+        )
 
     def bst(v, rs, off, aux=0):
         rocdl.raw_ptr_buffer_store(_u(v), rs, _u(i32(off)), _u(i32(0)), aux=_attr(aux))
 
     def gptr(addr):
-        return _llvm.IntToPtrOp(_llvm.PointerType.get(address_space=1), _u(i64(addr))).result
+        return _llvm.IntToPtrOp(
+            _llvm.PointerType.get(address_space=1), _u(i64(addr))
+        ).result
 
     def ld_sys(addr):
         return i32(
             _llvm.LoadOp(
-                T.i32, gptr(addr), alignment=4, volatile_=True,
-                ordering=_llvm.AtomicOrdering.monotonic, syncscope="one-as",
+                T.i32,
+                gptr(addr),
+                alignment=4,
+                volatile_=True,
+                ordering=_llvm.AtomicOrdering.monotonic,
+                syncscope="one-as",
             ).res
         )
 
     def st_sys(addr, v):
         _llvm.StoreOp(
-            _u(i32(v)), gptr(addr), alignment=4,
-            ordering=_llvm.AtomicOrdering.monotonic, syncscope="one-as",
+            _u(i32(v)),
+            gptr(addr),
+            alignment=4,
+            ordering=_llvm.AtomicOrdering.monotonic,
+            syncscope="one-as",
         )
 
     def wait_vm0():
@@ -119,17 +127,23 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         out = []
         for q in range_constexpr(4):
             w = i32(dv[q])
-            out += [(w << i32(16)).bitcast(fx.Float32), (w & i32(-65536)).bitcast(fx.Float32)]
+            out += [
+                (w << i32(16)).bitcast(fx.Float32),
+                (w & i32(-65536)).bitcast(fx.Float32),
+            ]
         return out
 
     def bits(x):
         return i32(
-            fx.Vector.from_elements([fx.Float32(x).to(fx.BFloat16)], fx.BFloat16).bitcast(fx.Int16)[0]
+            fx.Vector.from_elements(
+                [fx.Float32(x).to(fx.BFloat16)], fx.BFloat16
+            ).bitcast(fx.Int16)[0]
         ) & i32(0xFFFF)
 
     def pack8(f):
         return fx.Vector.from_elements(
-            [bits(f[2 * q]) | (bits(f[2 * q + 1]) << i32(16)) for q in range(4)], fx.Int32
+            [bits(f[2 * q]) | (bits(f[2 * q + 1]) << i32(16)) for q in range(4)],
+            fx.Int32,
         )
 
     BIG = 0x7FFFFFF0
@@ -161,7 +175,9 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         gpu.barrier()
 
     def stage_row0(a, p, bank, src_rank):
-        return tab(a["stage"], p) + i64(bank * a["stage_sz"] + src_rank * a["mmax"] * i32(row_bytes))
+        return tab(a["stage"], p) + i64(
+            bank * a["stage_sz"] + src_rank * a["mmax"] * i32(row_bytes)
+        )
 
     def offs(tid, it, r0, nu):
         out = []
@@ -187,7 +203,9 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
                         if rank != i32(p):
                             bst(vs[k], dsts[p], o[k], push_aux)
         else:
-            rs_ins = [rsrc_n(i64(a["src"]) + i64(i32(p) * nbytes), nbytes) for p in range(TP)]
+            rs_ins = [
+                rsrc_n(i64(a["src"]) + i64(i32(p) * nbytes), nbytes) for p in range(TP)
+            ]
             for it_ in range(tid, nu, i32(NT_K * UNR)):
                 o = offs(tid, i32(it_), r0, nu)
                 for p in range_constexpr(TP):
@@ -213,14 +231,24 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         nbytes = m * i32(row_bytes)
         own0 = i64(a["src"]) + i64(rank * nbytes)
         srcs = [
-            rsrc_n((rank == i32(p)).select(own0, stage_row0(a, rank, bank, i32(p))), nbytes)
+            rsrc_n(
+                (rank == i32(p)).select(own0, stage_row0(a, rank, bank, i32(p))), nbytes
+            )
             for p in range(TP)
         ]
-        rs_out = rsrc_n(i64(a["out"]) + i64((rank * nbytes) if kind == KIND_AR else i32(0)), nbytes)
-        dsts = [rsrc_n(stage_row0(a, i32(p), bank + i32(2), rank), nbytes) for p in range(TP)]
+        rs_out = rsrc_n(
+            i64(a["out"]) + i64((rank * nbytes) if kind == KIND_AR else i32(0)), nbytes
+        )
+        dsts = [
+            rsrc_n(stage_row0(a, i32(p), bank + i32(2), rank), nbytes)
+            for p in range(TP)
+        ]
         for it_ in range(tid, nu, i32(NT_K * UNR)):
             o = offs(tid, i32(it_), r0, nu)
-            vs = [[bld(srcs[p], o[k], vty(), AUX_SYS) for p in range(TP)] for k in range(UNR)]
+            vs = [
+                [bld(srcs[p], o[k], vty(), AUX_SYS) for p in range(TP)]
+                for k in range(UNR)
+            ]
             for k in range_constexpr(UNR):
                 acc = bf16x8(vs[k][0])
                 for p in range_constexpr(1, TP):
@@ -248,7 +276,14 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         if const_expr(kind == KIND_AG):
             for p in range_constexpr(TP):
                 if rank != i32(p):
-                    pull(a, tid, stage_row0(a, rank, bank, i32(p)), i64(a["out"]) + i64(i32(p) * nbytes), r0, nu)
+                    pull(
+                        a,
+                        tid,
+                        stage_row0(a, rank, bank, i32(p)),
+                        i64(a["out"]) + i64(i32(p) * nbytes),
+                        r0,
+                        nu,
+                    )
         else:
             reduce(a, tid, r0, nu, bank)
             if const_expr(kind == KIND_AR):
@@ -256,7 +291,14 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
                 wait_flags(a, tid, 1, c, ep)
                 for p in range_constexpr(TP):
                     if rank != i32(p):
-                        pull(a, tid, stage_row0(a, rank, bank + i32(2), i32(p)), i64(a["out"]) + i64(i32(p) * nbytes), r0, nu)
+                        pull(
+                            a,
+                            tid,
+                            stage_row0(a, rank, bank + i32(2), i32(p)),
+                            i64(a["out"]) + i64(i32(p) * nbytes),
+                            r0,
+                            nu,
+                        )
 
     @traced
     def epoch_store(a, tid, c, ep):
@@ -265,11 +307,26 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
 
     @flyc.kernel(name=name, known_block_size=[NT_K, 1, 1])
     def p2p_kernel(
-        src: fx.Int64, out: fx.Int64, stage: fx.Int64, flags: fx.Int64, eflag: fx.Int64,
-        rank: fx.Int32, m: fx.Int32, mmax: fx.Int32,
+        src: fx.Int64,
+        out: fx.Int64,
+        stage: fx.Int64,
+        flags: fx.Int64,
+        eflag: fx.Int64,
+        rank: fx.Int32,
+        m: fx.Int32,
+        mmax: fx.Int32,
     ):
-        a = {"src": src, "out": out, "stage": stage, "flags": flags, "eflag": eflag,
-             "rank": rank, "m": m, "mmax": mmax, "stage_sz": mmax * i32(MAX_TP * row_bytes)}
+        a = {
+            "src": src,
+            "out": out,
+            "stage": stage,
+            "flags": flags,
+            "eflag": eflag,
+            "rank": rank,
+            "m": m,
+            "mmax": mmax,
+            "stage_sz": mmax * i32(MAX_TP * row_bytes),
+        }
         tid = i32(gpu.thread_id("x"))
         c = i32(gpu.block_id("x"))
         ep = ld_sys(i64(eflag) + i64(c * i32(4))) + i32(1)
@@ -279,8 +336,16 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
 
     @flyc.jit
     def launch(
-        src: fx.Int64, out: fx.Int64, stage: fx.Int64, flags: fx.Int64, eflag: fx.Int64,
-        rank: fx.Int32, m: fx.Int32, mmax: fx.Int32, grid: fx.Int32, stream: fx.Stream,
+        src: fx.Int64,
+        out: fx.Int64,
+        stage: fx.Int64,
+        flags: fx.Int64,
+        eflag: fx.Int64,
+        rank: fx.Int32,
+        m: fx.Int32,
+        mmax: fx.Int32,
+        grid: fx.Int32,
+        stream: fx.Stream,
     ):
         p2p_kernel(src, out, stage, flags, eflag, rank, m, mmax).launch(
             grid=(fx.Int64(grid), 1, 1), block=(NT_K, 1, 1), stream=stream
@@ -290,24 +355,25 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
 
 
 MAX_SITES = 16
-SITE_FLAG_INTS = 2 * MAX_TP * NCTA_MAX + NCTA_MAX  # flags (2 phases) + epochs
+SITE_FLAG_INTS = 2 * MAX_TP * NCTA_MAX + NCTA_MAX
 
 
 class _Site:
-    """Staging + flags of one call site, on every rank. Flags and epochs come
-    from the group's pool (zeroed once, up front); staging needs no
-    initialization -- its bytes are always written before their flag -- so
-    a site can be created lazily without launching anything on a peer that
-    may be mid-collective."""
 
     def __init__(self, group, idx, kind, row_bytes):
         devices, tp, mmax = group.devices, group.tp, group.mmax
         nstage = 4 if kind == KIND_AR else 2
         self.kind, self.row_bytes, self.mmax = kind, row_bytes, mmax
-        self.stage = [torch.empty(nstage * MAX_TP * mmax * row_bytes, dtype=torch.uint8, device=d) for d in devices]
+        self.stage = [
+            torch.empty(nstage * MAX_TP * mmax * row_bytes, dtype=torch.uint8, device=d)
+            for d in devices
+        ]
         base = idx * SITE_FLAG_INTS
         self.flags = [pool[base : base + 2 * MAX_TP * NCTA_MAX] for pool in group.pool]
-        self.eflag = [pool[base + 2 * MAX_TP * NCTA_MAX : base + SITE_FLAG_INTS] for pool in group.pool]
+        self.eflag = [
+            pool[base + 2 * MAX_TP * NCTA_MAX : base + SITE_FLAG_INTS]
+            for pool in group.pool
+        ]
         sp = [t.data_ptr() for t in self.stage] + [0] * (MAX_TP - tp)
         fp = [t.data_ptr() for t in self.flags] + [0] * (MAX_TP - tp)
         # pinned + non_blocking: a pageable copy would wait for the peer's
@@ -319,7 +385,6 @@ class _Site:
 
 
 class P2PGroup:
-    """Every rank's view; ``comm(rank)`` has TpCollectives' interface."""
 
     def __init__(self, devices, max_local_tokens: int):
         self.devices = [torch.device(d) for d in devices]
@@ -327,7 +392,10 @@ class P2PGroup:
         self.mmax = int(max_local_tokens)
         self._sites: dict = {}
         self._lock = threading.Lock()
-        self.pool = [torch.zeros(MAX_SITES * SITE_FLAG_INTS, dtype=torch.int32, device=d) for d in self.devices]
+        self.pool = [
+            torch.zeros(MAX_SITES * SITE_FLAG_INTS, dtype=torch.int32, device=d)
+            for d in self.devices
+        ]
         for d in self.devices:
             torch.cuda.synchronize(d)
 
@@ -341,7 +409,7 @@ class P2PGroup:
                 self._sites[key] = s
             return s
 
-    def comm(self, rank: int) -> "P2PComm":
+    def comm(self, rank: int) -> P2PComm:
         return P2PComm(self, rank)
 
 
@@ -362,8 +430,14 @@ class P2PComm:
         exe = compile_p2p(kind, row_bytes, self.tp_size, self.device.index)
         _run_compiled(
             exe,
-            x.data_ptr(), out.data_ptr(), s.stage_tab[r].data_ptr(), s.flag_tab[r].data_ptr(),
-            s.eflag[r].data_ptr(), r, rows_per_rank, self.group.mmax,
+            x.data_ptr(),
+            out.data_ptr(),
+            s.stage_tab[r].data_ptr(),
+            s.flag_tab[r].data_ptr(),
+            s.eflag[r].data_ptr(),
+            r,
+            rows_per_rank,
+            self.group.mmax,
             max(1, min(NCTA, rows_per_rank)),
             torch.cuda.current_stream(self.device),
         )
@@ -373,7 +447,9 @@ class P2PComm:
         x = x.contiguous()
         m = x.shape[0]
         if out is None:
-            out = torch.empty((m * self.tp_size,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
+            out = torch.empty(
+                (m * self.tp_size,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device
+            )
         return self._launch(KIND_AG, x, out, m)
 
     def reduce_scatter(self, x: torch.Tensor, out: torch.Tensor | None = None):

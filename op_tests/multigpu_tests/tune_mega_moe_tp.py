@@ -20,16 +20,17 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import test_mega_moe_TP as T  # noqa: E402  (sets the tuned-a4w4 env first)
-import torch  # noqa: E402
+import test_mega_moe_TP as T
+import torch
 
-from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp import (  # noqa: E402
+from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp import (
     CSV_CFG,
     CSV_KEY,
     LDS_LIMIT,
@@ -37,24 +38,39 @@ from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp import (  # noqa: E402
     tuned_config_path,
 )
 
-CSV_COLS = [*CSV_KEY[:4], "token", *CSV_KEY[4:], *CSV_CFG, "us", "split_us", "speedup", "model"]
+CSV_COLS = [
+    *CSV_KEY[:4],
+    "token",
+    *CSV_KEY[4:],
+    *CSV_CFG,
+    "us",
+    "model",
+]
 
 
 def idle_gpus(n: int, wait_s: int = 1800) -> str:
-    """n GPUs with < 5% use and < 2% VRAM over 5 samples (prefers 4-7)."""
     t0 = time.time()
     while True:
         busy, cards = set(), []
         for _ in range(5):
-            smi = subprocess.run(["rocm-smi", "--showuse", "--showmemuse", "--json"],
-                                 capture_output=True, text=True).stdout
+            smi = subprocess.run(
+                ["rocm-smi", "--showuse", "--showmemuse", "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
             d = {k: v for k, v in json.loads(smi).items() if k.startswith("card")}
             cards = sorted(int(k[4:]) for k in d)
-            busy |= {int(k[4:]) for k, v in d.items()
-                     if float(v.get("GPU use (%)", 0)) >= 5
-                     or float(v.get("GPU Memory Allocated (VRAM%)", 0)) >= 2}
+            busy |= {
+                int(k[4:])
+                for k, v in d.items()
+                if float(v.get("GPU use (%)", 0)) >= 5
+                or float(v.get("GPU Memory Allocated (VRAM%)", 0)) >= 2
+            }
             time.sleep(0.4)
-        free = sorted((g for g in cards if g not in busy), key=lambda g: not 4 <= g <= 7)
+        free = sorted(
+            (g for g in cards if g not in busy), key=lambda g: not 4 <= g <= 7
+        )
         if len(free) >= n:
             return ",".join(map(str, sorted(free[:n])))
         if time.time() - t0 > wait_s:
@@ -68,23 +84,24 @@ def _valid(eng, cfg: LaunchCfg) -> bool:
 
 
 def schedules(eng, m: int) -> list[LaunchCfg]:
-    """Stage 1: static and (when the routes can leave experts idle) dynamic
-    schedule at the heuristic tile, with and without LL route rows."""
     tot = m * eng.tp
     base = eng.default_config(m)
     rpe = (tot * eng.K + eng.E - 1) // eng.E
     out = []
     for dyn in (False, True):
-        if dyn and not (tot <= eng.dyn_max and eng.I // 128 >= 2 and tot * eng.K <= 4 * eng.E):
+        if dyn and not (
+            tot <= eng.dyn_max and eng.I // 128 >= 2 and tot * eng.K <= 4 * eng.E
+        ):
             continue
         mt = eng._fit_mt((rpe + 15) // 16, dyn)
         for llr in [True, False] if base.ll else [False]:
-            out.append(LaunchCfg(mt=mt, dyn=dyn, route_fp8=not dyn, ll=base.ll, llr=llr))
+            out.append(
+                LaunchCfg(mt=mt, dyn=dyn, route_fp8=not dyn, ll=base.ll, llr=llr)
+            )
     return [c for c in out if _valid(eng, c)]
 
 
 def refinements(best: LaunchCfg) -> list[LaunchCfg]:
-    """Stage 2: neighbouring row tiles, the other route format, LL flipped."""
     d = best.__dict__
     return [
         LaunchCfg(**{**d, "mt": best.mt - 1}),
@@ -99,7 +116,7 @@ def merge_csv(path: str, rows: list[dict]) -> None:
     if os.path.exists(path):
         with open(path) as f:
             old = list(csv.DictReader(f))
-    key = lambda r: tuple(str(r[k]) for k in (*CSV_KEY, "token"))  # noqa: E731
+    key = lambda r: tuple(str(r[k]) for k in (*CSV_KEY, "token"))
     new = {key(r) for r in rows}
     allr = [r for r in old if key(r) not in new] + rows
     allr.sort(key=lambda r: (r["model"], r["comm_mode"], int(r["tp"]), int(r["token"])))
@@ -148,7 +165,6 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
     tag = f"[tune] {name} {mode} M={tok}"
 
     def run(cfg) -> bool:
-        """Time one variant; False once a watchdog fired (the arena is out of step)."""
         nonlocal best
         if cfg in tried or not _valid(engs[0], cfg):
             return True
@@ -171,7 +187,7 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
             print(f"{tag} {cfg}: failed {exc}", flush=True)
             return True
         print(f"{tag} {cfg}: {us:.1f} us (rel_l2 {err:.4f})", flush=True)
-        if best is None or us < best[0] * 0.99:  # earlier candidates win ties within 1%
+        if best is None or us < best[0] * 0.99:
             best = (us, cfg)
         return True
 
@@ -184,29 +200,52 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
         return None
     us, cfg = best
     e = engs[0]
-    return dict(
-        gfx=e.gfx, cu_num=e.n_cta, tp=tp, comm_mode=mode, token=tok,
-        model_dim=e.H, inter_dim=e.I, expert=e.E, topk=e.K, act=e.activation,
-        block_m=cfg.block_m, dyn=int(cfg.dyn), route_fp8=int(cfg.route_fp8),
-        ll=int(cfg.ll), llr=int(cfg.llr),
-        us=f"{us:.2f}", split_us=f"{split_us:.2f}",
-        speedup=f"{split_us / us:.3f}" if split_us == split_us else "",
-        model=name,
-    )
+    return {
+        "gfx": e.gfx,
+        "cu_num": e.n_cta,
+        "tp": tp,
+        "comm_mode": mode,
+        "token": tok,
+        "model_dim": e.H,
+        "inter_dim": e.I,
+        "expert": e.E,
+        "topk": e.K,
+        "act": e.activation,
+        "block_m": cfg.block_m,
+        "dyn": int(cfg.dyn),
+        "route_fp8": int(cfg.route_fp8),
+        "ll": int(cfg.ll),
+        "llr": int(cfg.llr),
+        "us": f"{us:.2f}",
+        "split_us": f"{split_us:.2f}",
+        "speedup": f"{split_us / us:.3f}" if not math.isnan(split_us) else "",
+        "model": name,
+    }
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--models", nargs="+", default=["glm5", "m3"])
-    p.add_argument("--tokens", type=int, nargs="+", default=[8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048])
+    p.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048],
+    )
     p.add_argument("--comm-modes", nargs="+", default=["ag_rs", "ar_ar"])
     p.add_argument("--tp", type=int, default=4)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=5)
-    p.add_argument("--rtol", type=float, default=0.06, help="fused vs split rel L2 gate")
+    p.add_argument(
+        "--rtol", type=float, default=0.06, help="fused vs split rel L2 gate"
+    )
     p.add_argument("--out", default=tuned_config_path())
     p.add_argument("--no-split", action="store_true", help="skip timing the split path")
-    p.add_argument("--cell", nargs=3, metavar=("MODEL", "MODE", "TOKENS"), help=argparse.SUPPRESS)
+    p.add_argument(
+        "--cell", nargs=3, metavar=("MODEL", "MODE", "TOKENS"), help=argparse.SUPPRESS
+    )
     a = p.parse_args()
     if a.cell is not None:
         row = tune_cell(a, a.cell[0], a.cell[1], int(a.cell[2]))
@@ -214,23 +253,44 @@ def main() -> int:
             print(f"[tune] BEST {row}", flush=True)
             print("TUNE_ROW " + json.dumps(row), flush=True)
         return 0
-    # every cell in its own process: a variant that faults the GPU takes only its cell down
     os.environ.setdefault("HIP_VISIBLE_DEVICES", idle_gpus(a.tp))
     print(f"[tune] GPUs {os.environ['HIP_VISIBLE_DEVICES']} -> {a.out}", flush=True)
-    for name, mode, tok in itertools.product(a.models, a.comm_modes, sorted(set(a.tokens))):
-        cmd = [sys.executable, os.path.abspath(__file__), "--cell", name, mode, str(tok),
-               "--tp", str(a.tp), "--iters", str(a.iters), "--rounds", str(a.rounds),
-               "--rtol", str(a.rtol), "--out", a.out] + (["--no-split"] if a.no_split else [])
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    for name, mode, tok in itertools.product(
+        a.models, a.comm_modes, sorted(set(a.tokens))
+    ):
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--cell",
+            name,
+            mode,
+            str(tok),
+            "--tp",
+            str(a.tp),
+            "--iters",
+            str(a.iters),
+            "--rounds",
+            str(a.rounds),
+            "--rtol",
+            str(a.rtol),
+            "--out",
+            a.out,
+        ] + (["--no-split"] if a.no_split else [])
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=3600, check=False
+        )
         rows = []
         for line in r.stdout.splitlines():
             if line.startswith("[tune]"):
                 print(line, flush=True)
             elif line.startswith("TUNE_ROW "):
-                rows.append(json.loads(line[len("TUNE_ROW "):]))
+                rows.append(json.loads(line[len("TUNE_ROW ") :]))
         if r.returncode != 0:
             tail = "\n".join((r.stderr or "").splitlines()[-5:])
-            print(f"[tune] {name} {mode} M={tok}: cell exited {r.returncode}\n{tail}", flush=True)
+            print(
+                f"[tune] {name} {mode} M={tok}: cell exited {r.returncode}\n{tail}",
+                flush=True,
+            )
         if rows:
             merge_csv(a.out, rows)
     print(f"[tune] done -> {a.out}", flush=True)

@@ -23,7 +23,6 @@ class _IpcHandle(ctypes.Structure):
 
 @functools.cache
 def _hip():
-    """The already-loaded HIP runtime (resolved lazily: importing must not touch HIP)."""
     path = "libamdhip64.so"
     with open("/proc/self/maps") as maps:
         for line in maps:
@@ -34,10 +33,14 @@ def _hip():
     lib.hipGetErrorString.restype = ctypes.c_char_p
     lib.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_IpcHandle), ctypes.c_void_p]
     lib.hipIpcOpenMemHandle.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p), _IpcHandle, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p),
+        _IpcHandle,
+        ctypes.c_uint,
     ]
     lib.hipMemGetAddressRange.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
     ]
     return lib
 
@@ -51,7 +54,9 @@ def _check(status: int, what: str) -> None:
 def _allocation_base(ptr: int) -> int:
     base, size = ctypes.c_void_p(), ctypes.c_size_t()
     _check(
-        _hip().hipMemGetAddressRange(ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(ptr)),
+        _hip().hipMemGetAddressRange(
+            ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(ptr)
+        ),
         "hipMemGetAddressRange",
     )
     return int(base.value or 0)
@@ -59,17 +64,22 @@ def _allocation_base(ptr: int) -> int:
 
 def _ipc_handle(ptr: int) -> bytes:
     h = _IpcHandle()
-    _check(_hip().hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr)), "hipIpcGetMemHandle")
+    _check(
+        _hip().hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr)),
+        "hipIpcGetMemHandle",
+    )
     return bytes(bytearray(h.reserved))
 
 
 @functools.cache
 def _ipc_open(handle: bytes) -> int:
-    """Map a peer's exported allocation once per process (lazy peer access)."""
     h = _IpcHandle()
     ctypes.memmove(ctypes.byref(h), handle, _IPC_HANDLE_BYTES)
     peer = ctypes.c_void_p()
-    _check(_hip().hipIpcOpenMemHandle(ctypes.byref(peer), h, ctypes.c_uint(1)), "hipIpcOpenMemHandle")
+    _check(
+        _hip().hipIpcOpenMemHandle(ctypes.byref(peer), h, ctypes.c_uint(1)),
+        "hipIpcOpenMemHandle",
+    )
     return int(peer.value or 0)
 
 
@@ -89,7 +99,9 @@ class PeerArenaGroup:
                 if peer != d:
                     err = hip.hipDeviceEnablePeerAccess(peer.index, 0)
                     if err not in (0, 704):  # 704: already enabled
-                        raise RuntimeError(f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}")
+                        raise RuntimeError(
+                            f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}"
+                        )
                     if err:
                         hip.hipGetLastError()
         torch.cuda.set_device(prev)
@@ -102,13 +114,14 @@ class PeerArenaGroup:
 
     def base_ptrs(self) -> tuple[int, ...]:
         if len(self._base) != self.world_size:
-            raise RuntimeError(f"{len(self._base)} of {self.world_size} ranks committed")
+            raise RuntimeError(
+                f"{len(self._base)} of {self.world_size} ranks committed"
+            )
         return tuple(self._base[r] for r in range(self.world_size))
 
 
 @dataclass
 class SymmetricSlice:
-    """A named region of the arena (same offset on every rank)."""
 
     offset: int
     nbytes: int
@@ -145,17 +158,24 @@ class SymmetricArena:
         return self._slices[name]
 
     def commit(self) -> SymmetricArena:
-        """Allocate and zero the arena, exchange and map every rank's."""
         total = (self._cursor + _ALIGN - 1) // _ALIGN * _ALIGN
         self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
         base_ptr = int(self._storage.data_ptr())
         for s in self._slices.values():
-            s.local = self._storage[s.offset : s.offset + s.nbytes].view(s.dtype).view(s.shape)
+            s.local = (
+                self._storage[s.offset : s.offset + s.nbytes]
+                .view(s.dtype)
+                .view(s.shape)
+            )
         if isinstance(self.group, PeerArenaGroup):
             self.group.register(self.rank, base_ptr)
             return self
         with torch.cuda.device(self.device):
-            payload = (_ipc_handle(base_ptr), base_ptr - _allocation_base(base_ptr), total)
+            payload = (
+                _ipc_handle(base_ptr),
+                base_ptr - _allocation_base(base_ptr),
+                total,
+            )
         torch.cuda.synchronize(self.device)
         gathered: list = [None] * self.world_size
         dist.all_gather_object(gathered, payload, group=self.group)
@@ -163,7 +183,9 @@ class SymmetricArena:
         with torch.cuda.device(self.device):
             for r, (handle, off, size) in enumerate(gathered):
                 if size != total:
-                    raise RuntimeError(f"arena size disagrees: rank {self.rank} {total} B, rank {r} {size} B")
+                    raise RuntimeError(
+                        f"arena size disagrees: rank {self.rank} {total} B, rank {r} {size} B"
+                    )
                 ptrs.append(base_ptr if r == self.rank else _ipc_open(handle) + off)
         self._base_ptrs = tuple(ptrs)
         dist.barrier(group=self.group)

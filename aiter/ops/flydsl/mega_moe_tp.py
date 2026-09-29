@@ -55,18 +55,17 @@ class MegaMoeTPConfig:
     rank: int
     world_size: int
     model_dim: int
-    inter_dim: int  # this rank's shard
+    inter_dim: int
     experts: int
     topk: int
     max_local_tokens: int
     activation: ActivationType = ActivationType.Silu
-    beta: float | None = None  # Situv2 only
-    linear_beta: float | None = None  # Situv2 only
-    comm_mode: str = "ag_rs"  # "ag_rs" | "ar_ar"
+    beta: float | None = None
+    linear_beta: float | None = None
+    comm_mode: str = "ag_rs"
 
 
 class MegaMoeTP:
-    """AllGather + GEMM1 + act + GEMM2 + ReduceScatter for one TP rank."""
 
     def __init__(
         self,
@@ -98,7 +97,9 @@ class MegaMoeTP:
             w2_scale=w2_scale,
             activation=act,
             situ_beta=cfg.beta if situ and cfg.beta is not None else 1.0,
-            situ_linear_beta=cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0,
+            situ_linear_beta=(
+                cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0
+            ),
             comm_mode=cfg.comm_mode,
             group=group,
             device=device,
