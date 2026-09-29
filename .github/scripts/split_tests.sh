@@ -50,7 +50,15 @@ TEST_DIR="${TEST_DIR%/}"
 # scan test files in TEST_DIR
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
-    mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    mapfile -t ALL_FILES < <(
+        {
+            find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f
+            printf '%s\n' \
+                "$TEST_DIR/tuning_tests/test_csv_validation.py" \
+                "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
+                "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py"
+        } | LC_ALL=C sort -u
+    )
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
@@ -85,6 +93,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gated_delta_rule.py]=198
     FILE_TIMES[op_tests/test_mha_native_splitkv.py]=186
     FILE_TIMES[op_tests/test_pa_mtp.py]=164
+    FILE_TIMES[op_tests/test_flydsl_moe_a16wfp4.py]=75
     FILE_TIMES[op_tests/test_moe_dp_share_expert.py]=131
     FILE_TIMES[op_tests/test_batched_gemm_bf16.py]=124
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=108
@@ -119,6 +128,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_aiter_addInp.py]=31
     FILE_TIMES[op_tests/test_sampling.py]=31
     FILE_TIMES[op_tests/test_gemm_a4w4.py]=30
+    FILE_TIMES[op_tests/test_gemm_a4w6.py]=12
+    FILE_TIMES[op_tests/test_gemm_a6w4.py]=12
     FILE_TIMES[op_tests/test_flydsl_linear_attention.py]=29
     FILE_TIMES[op_tests/test_gated_rmsnorm_fp8_quant.py]=29
     FILE_TIMES[op_tests/test_aiter_add.py]=28
@@ -169,6 +180,9 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_opus_a8w8_bmm.py]=6
     FILE_TIMES[op_tests/test_pa_mqa_logits_offset.py]=6
     FILE_TIMES[op_tests/test_quant_mxfp6_gemm.py]=6
+    FILE_TIMES[op_tests/tuning_tests/test_config_shape_collision.py]=4
+    FILE_TIMES[op_tests/tuning_tests/test_csv_validation.py]=4
+    FILE_TIMES[op_tests/tuning_tests/test_mixed_mxfp_tuning.py]=4
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=5
     FILE_TIMES[op_tests/test_groupnorm.py]=5
     FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=5
