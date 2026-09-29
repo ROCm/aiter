@@ -25,6 +25,10 @@ on:
         description: Prebuild the module implicated by the original timeout
         type: boolean
         default: false
+      triage_log_more:
+        description: Stream compiler output with AITER_LOG_MORE=1 (no prebuild)
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.triage && format('-{0}', inputs.triage_model) || '' }}
@@ -355,6 +359,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e AITER_LOG_MORE="${{ inputs.triage && inputs.triage_log_more && '1' || '0' }}" \
           -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -415,6 +420,21 @@ jobs:
           MODEL_LOCK_WAIT_SECONDS: "7200"
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Verify cold JIT cache for compiler logging test
+        if: inputs.triage && inputs.triage_log_more
+        env:
+          PREBUILD_MODULE: ${{ matrix.aiter_prebuild_module }}
+          PREBUILD_ENABLED: ${{ inputs.triage_prebuild }}
+        run: |
+          set -euo pipefail
+          test "$PREBUILD_ENABLED" = false
+          test -n "$PREBUILD_MODULE"
+          docker exec -e PREBUILD_MODULE atom_aiter_test bash -lc '
+            test "$AITER_LOG_MORE" = 1 &&
+            test ! -e "/app/aiter-test/aiter/jit/$PREBUILD_MODULE.so" &&
+            printf "AITER_LOG_MORE=%s; cold module: %s\n" "$AITER_LOG_MORE" "$PREBUILD_MODULE"
+          ' | tee atom_diagnostics/cold-jit-check.txt
 
       - name: Prebuild slow ATOM dependency
         if: inputs.triage && inputs.triage_prebuild
