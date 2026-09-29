@@ -186,6 +186,7 @@ def build_qsa_k1_scores_module(
         n_columns: Int32,
         n_req: Int32,
         score_scale: Float32,
+        n_cache_blocks: Int32,
     ):
         tile = Int32(gpu.block_id("x"))
         row = Int32(gpu.block_id("y"))
@@ -261,7 +262,12 @@ def build_qsa_k1_scores_module(
         logical_page = _idiv(safe_col, page)
         off = safe_col - logical_page * page
         phys = page_table[safe_req, logical_page]
-        k_row = fx.logical_divide(fx.slice(k_buf, (phys, off, zero, None)), vec_layout)
+        phys_live = (phys >= zero) & (phys < n_cache_blocks)
+        safe_phys = phys_live.select(phys, zero)
+        col_live = col_live & phys_live
+        k_row = fx.logical_divide(
+            fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
+        )
         for part in range_constexpr(chunks_per_thread):
             d_chunk = chunk + Int32(part * (block_threads // block_n))
             k_src = fx.slice(k_row, (None, d_chunk))
@@ -323,6 +329,7 @@ def build_qsa_k1_scores_module(
         n_columns: Int32,
         n_req: Int32,
         score_scale: Float32,
+        n_cache_blocks: Int32,
         rows: Int32,
         tiles: Int32,
         stream: fx.Stream,
@@ -339,6 +346,7 @@ def build_qsa_k1_scores_module(
             n_columns,
             n_req,
             score_scale,
+            n_cache_blocks,
         ).launch(
             grid=(tiles, rows, 1),
             block=(block_threads, 1, 1),
@@ -679,6 +687,7 @@ def qsa_k1_score_and_select(
             int(n_columns),
             int(context_lens.shape[0]),
             float(score_scale),
+            int(k_cache.shape[0]),
             m,
             score_tiles,
             torch.cuda.current_stream(q.device),
