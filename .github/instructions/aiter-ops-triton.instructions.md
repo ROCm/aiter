@@ -70,6 +70,19 @@ and tuned JSON in `configs/`. Flag:
   Gluon bodies under `_gluon_kernels/<arch>/`, mirroring the wrapper's
   category path. JIT-decorated device helpers that are called only from
   another kernel may remain with the entry kernel they support.
+- A kernel module or directory whose path under `_triton_kernels/`
+  (`_gluon_kernels/<arch>/`) differs from the folder of the wrapper that
+  launches it. A kernel directory is named after the wrapper folder, never
+  after the kernel family or a topic: `_triton_kernels/gated_delta_net/`,
+  not `gated_delta_rule/`; `kimi_delta_attn/`, not `chunk_delta_attn/`;
+  `normalization/`, not `norm/`; the vendored flash-attention package that
+  `attention/mha.py` launches sits under `_triton_kernels/attention/`. A
+  kernel that wrappers in several folders reuse lives with the wrapper that
+  owns it, or in `_triton_kernels/common/` when none does
+  (`common/splitk_reduce.py`); importing it across folders is fine. A PR
+  that moves a wrapper into another folder moves its kernels too and
+  updates every importer of the old module path
+  (`grep -rn "_triton_kernels.<old>"`).
 - Generic helpers (config loading, shuffling, arch detection, logging)
   re-implemented inside a kernel file instead of imported from `utils/`.
 - New code importing via the legacy flat paths
@@ -354,6 +367,32 @@ All weight/scale pre-shuffle helpers are unified in
   inside the category folder, shared helpers in the existing
   `*_test_utils.py` / `utils/` modules. Flag tests added flat at the
   `op_tests/triton_tests/` root or as one-off scripts.
+- A test's folder is the folder of the wrapper it imports. The path under
+  `op_tests/triton_tests/` mirrors the wrapper's path under
+  `aiter/ops/triton/`: a test of `aiter/ops/triton/attention/mla.py` is
+  `op_tests/triton_tests/attention/test_mla.py`, a test of
+  `gemm/basic/gemm_a8w8.py` is `gemm/basic/test_gemm_a8w8.py`, a test of
+  `gated_delta_net/fused_kda_decode.py` is
+  `gated_delta_net/test_fused_kda_decode.py`. The wrapper's folder decides
+  for kernels and tests alike: `kimi_delta_attn/chunk_delta_attn.py` keeps
+  its kernels in `_triton_kernels/kimi_delta_attn/` and its tests in
+  `triton_tests/kimi_delta_attn/`; a sub-package counts as a folder
+  (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`). The few
+  wrappers that still sit flat at `aiter/ops/triton/<op>.py`
+  (`activation.py`, `topk.py`, ...) keep their tests flat at the
+  `triton_tests/` root; `utils/` helpers are tested under
+  `triton_tests/utils/`; `torch_compile/` and `triton_metadata_redirect/`
+  are infrastructure suites, not op folders. Flag:
+  - A test whose folder differs from the folder of the wrapper it imports
+    (`from aiter.ops.triton.gated_delta_net...` in a test under
+    `triton_tests/attention/` or at the root).
+  - A test placed by kernel directory or by topic instead of by wrapper
+    folder, and a new test folder that does not match a folder under
+    `aiter/ops/triton/` (every op test folder also carries an `__init__.py`).
+  - A PR that moves a wrapper into another folder without moving its kernels
+    and its test, or that moves a test without updating its `FILE_TIMES` key in
+    `.github/scripts/split_tests.sh` and every importer of the old module
+    path (`grep -rn "triton_tests.<old>"`).
 - No kernel tuning configs in test files: flag test code that hardcodes
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
   literal `config=` overrides to a wrapper. Tests exercise the wrapper's own
