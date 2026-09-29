@@ -7,7 +7,9 @@ import pytest
 import torch
 from einops import rearrange, repeat
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd.utils import (
+    FP8_ARCHS,
+)
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_func,

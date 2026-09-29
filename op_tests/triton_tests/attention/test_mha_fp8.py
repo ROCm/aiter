@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from aiter import logger
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd.utils import (
+    FP8_ARCHS,
+)
 from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
 )

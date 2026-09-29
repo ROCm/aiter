@@ -51,7 +51,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd import (
+    flash_attn_3,
+)
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
