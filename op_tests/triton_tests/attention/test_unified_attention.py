@@ -775,14 +775,6 @@ def test_triton_unified_attn_gfx942_large_prefill(
     if DEVICE_ARCH != "gfx942":
         pytest.skip(f"gfx942-tuned entries, skip {DEVICE_ARCH}")
 
-    # Below-threshold shuffled prefill is not a launchable combination on
-    # this path: the D-only entries the lookup falls back to predate the
-    # SHUF table and their stage-2 configs do not build at TILE_SIZE=128
-    # (the wrapper pins the tile to the page). The threshold arm therefore
-    # only runs non-shuffled.
-    if seq_lens[0][0] < 1024 and shuffled_kv_cache:
-        pytest.skip("below-threshold shuffled prefill has no table entry")
-
     from aiter.ops.triton.utils.unified_attention_utils import (
         _axis_values,
         _load,
@@ -830,20 +822,35 @@ def test_triton_unified_attn_gfx942_large_prefill(
     # assert the intended table entry serves this call
     table, axes, _ = _load("attn_2d", "triton", "gfx942")
     dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
-    if max_query_len < 1024:
+    if max_query_len < 1024 and shuffled_kv_cache:
+        # sub-threshold shuffled prefill: the Q-agnostic SHUF entry (M16/s1,
+        # the LDS-safe family at every supported page)
+        expected_key = f"D_GEQ_{head_size}.SHUF.DT_{dt_tag}"
+        expected_block_m = 16
+    elif max_query_len < 1024:
         # below the crossover the D-only entries win; d512 fp8 resolves to
         # the dtype-specific D_GEQ_512.DT_fp8_fp8 entry
         if head_size == 512 and dt_tag == "fp8_fp8":
             expected_key = "D_GEQ_512.DT_fp8_fp8"
         else:
             expected_key = f"D_GEQ_{head_size}"
+        expected_block_m = 16
     elif shuffled_kv_cache and block_size <= 64:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_{dt_tag}"
+        # tuned per dtype: bf16 M16, fp8 M128 (d256) / M32 (d512)
+        expected_block_m = {"bf16_bf16": 16}.get(dt_tag) or (
+            128 if head_size == 256 else 32
+        )
     elif shuffled_kv_cache:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.DT_{dt_tag}"
+        expected_block_m = 16
     else:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
-    key, _config = _lookup(
+        # d512 fp8 tuned to M128; the other composites to M64
+        expected_block_m = 128 if head_size == 512 else 64
+        if head_size == 512 and dt_tag == "bf16_bf16":
+            expected_block_m = 64
+    key, config = _lookup(
         table,
         axes,
         _axis_values(
@@ -858,6 +865,10 @@ def test_triton_unified_attn_gfx942_large_prefill(
         ),
     )
     assert key == expected_key, f"expected {expected_key}, matched {key}"
+    assert config["BLOCK_M"] == expected_block_m, (
+        f"expected BLOCK_M={expected_block_m} via {expected_key},"
+        f" got {config['BLOCK_M']}"
+    )
 
     unified_attention(
         q=query,
