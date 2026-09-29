@@ -136,6 +136,7 @@ def compile_mixed_moe_gemm1_common(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
@@ -266,6 +267,8 @@ def compile_mixed_moe_gemm1_common(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    if xcd_swizzle > 0 and num_xcds != 8:
+        xcd_tag += f"_nxcd{num_xcds}"
     v2out_tag = "_v2out" if v2_output_layout else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
@@ -514,7 +517,6 @@ def compile_mixed_moe_gemm1_common(
             bx_persist = gpu.block_id("y")
 
             if const_expr(xcd_swizzle > 0):
-                num_xcds = 8
                 one = arith.constant(1, index=True)
                 tile_n_idx = arith.constant(tile_n, index=True)
                 inter_pad_idx = arith.constant(2 * inter_dim_pad, index=True)
@@ -3153,6 +3155,7 @@ def compile_mixed_moe_gemm2_common(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     shared_expert_id: int | None = None,
     use_global_a: bool = True,
 ):
@@ -3330,6 +3333,8 @@ def compile_mixed_moe_gemm2_common(
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    if xcd_swizzle > 0 and num_xcds != 8:
+        xcd_tag += f"_nxcd{num_xcds}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b:
@@ -3428,7 +3433,6 @@ def compile_mixed_moe_gemm2_common(
             bx_persist = gpu.block_id("y")
 
             if const_expr(xcd_swizzle > 0):
-                num_xcds = 8
                 one = arith.constant(1, index=True)
                 tile_n_idx = arith.constant(tile_n, index=True)
                 model_pad_idx = arith.constant(model_dim_pad, index=True)
