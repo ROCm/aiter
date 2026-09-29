@@ -210,24 +210,14 @@ def _bucket_candidates(axis: str, value, parts: set) -> list:
 
 
 def lookup_tuned_config(tuned: dict, **variables) -> dict:
-    """Resolve a launch config from a flat, range-keyed bucket table instead
-    of a rule-tree or a hardcoded if/else chain.
+    """Resolve one config from a flat bucket table.
 
-    ``tuned`` is ``{"schema": [<axis>, ...], "<bucket key>": {...}, ...,
-    "any": {...}}``. A bucket key lists only the axes it constrains, joined
-    by ``'.'``, e.g. ``"M_GEQ_33.N_LEQ_16384"``; each config is a complete,
-    standalone dict -- exactly one bucket wins per call, there is no rule
-    stacking. ``"any"`` is the required catch-all.
+    ``tuned`` is ``{"schema": [<axis>, ...], "<bucket key>": {...}, "any": {...}}``;
+    a key names only the axes it constrains, joined by ``'.'`` (e.g.
+    ``"M_GEQ_33.N_LEQ_16384"``). Each config is complete; ``"any"`` is required.
 
-    Lookup walks the axes in the order ``"schema"`` lists them and takes the
-    first key that exists: LEQ bounds ascending, then GEQ bounds descending,
-    then ``"any"``. So the leftmost axis wins on a tie -- listing ``"M"``
-    before ``"N"`` is what makes an M-bucket outrank an N-bucket. This is the
-    same lookup ``unified_attention_utils`` uses for its (bool/enum-capable)
-    axes, generalized here to the plain numeric LEQ/GEQ case so other ops
-    (e.g. quant) can share it.
-
-    Returns a fresh, mutable dict.
+    Per axis, in ``"schema"`` order (leftmost wins ties): LEQ bounds ascending,
+    then GEQ bounds descending, then ``"any"``. Returns a fresh dict.
     """
     axes = tuple(tuned["schema"])
     table = {k: v for k, v in tuned.items() if k != "schema"}

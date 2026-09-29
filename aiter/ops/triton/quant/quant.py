@@ -288,10 +288,8 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
-    # The gfx950 Gluon kernel dropped its sw (manual bit-manipulation)
-    # fallback and always uses the hw-cvt instruction, which only supports
-    # bf16 -- non-bf16 input, and any use_sr=True call (unsupported by the
-    # Gluon kernel), falls through to the plain Triton path below.
+    # The gfx950 Gluon kernel only supports bf16 (hw-cvt) and no use_sr;
+    # everything else uses the Triton path below.
     if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16 and not use_sr:
         from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx950,

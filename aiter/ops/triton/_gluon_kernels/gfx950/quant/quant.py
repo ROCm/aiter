@@ -80,15 +80,11 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
     stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    # Each warp's nominal per-axis tile (given size_per_thread=[1,8],
-    # threads_per_warp=[8,8]) is 8 rows along M or 64 cols along N. Putting all
-    # `num_warps` along an axis whose BLOCK_SIZE can't fit them (nominal tile >
-    # BLOCK_SIZE) leaves most warps idle -- e.g. BLOCK_SIZE_M=8 narrow-N configs.
-    # Prefer the M axis (matches the large-BLOCK_SIZE_N configs this was tuned
-    # for) and only fall back to the N axis when M can't fit all the warps.
+    # Nominal warp tile is 8 rows (M) or 64 cols (N); put all warps on M only
+    # if BLOCK_SIZE_M fits them, else on N (avoids idle warps at small M).
     WARPS_M: gl.constexpr = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
     WARPS_N: gl.constexpr = num_warps // WARPS_M
-    # N (dim 1) is memory-contiguous; vectorize 8 elements/thread there for dwordx4 loads.
+    # N is contiguous; 8 elems/thread gives dwordx4 loads.
     layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[8, 8],
@@ -98,22 +94,17 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
 
     end_n = min(start_n + NUM_ITER, N)
 
-    # Per-lane intra-block offsets don't depend on pid_n -- compute once so the
-    # buffer_load vaddr operand is loop-invariant (compiler hoists it), like
-    # the non-prefetch kernel already does.
+    # Independent of pid_n: computed once so the load offset is loop-invariant.
     local_m = gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout))
     local_n = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, layout))
     x_offs = local_m[:, None] * stride_x_m_in + local_n[None, :] * stride_x_n_in
-    # Loop-invariant per-block-column stride: an affine accumulator added to
-    # the scalar base pointer each iteration, so the compiler can strength-
-    # reduce it to one cheap add/iteration instead of re-deriving from an index.
+    # Per-iteration pointer step along N.
     x_block_stride = BLOCK_SIZE_N * stride_x_n
     if not EVEN_M_N:
         x_offs_m = pid_m * BLOCK_SIZE_M + local_m
 
-    # NUM_STAGES==1 (skinny shapes): plain loop, no cross-iteration overlap.
-    # NUM_STAGES==2 (larger shapes): double-buffered, warp_pipeline_stage-staged
-    # loop below. Gluon has no closures, so the body is duplicated per branch.
+    # NUM_STAGES==1: plain loop. ==2: double-buffered, warp-pipelined loop.
+    # Gluon has no closures, so the body is duplicated per branch.
     if NUM_STAGES == 1:
         for pid_n in range(start_n, end_n):
             x_block_ptr = (
@@ -181,8 +172,7 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
                     mask=bs_mask,
                 )
     else:
-        # Prologue: load the first iteration unconditionally (start_n < end_n
-        # is guaranteed by the launch grid).
+        # Prologue: first iteration is always valid (grid guarantees start_n < end_n).
         pid_n = start_n
         x_block_ptr = (
             x_ptr
@@ -197,11 +187,9 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
             x = gl.amd.cdna4.buffer_load(x_block_ptr, x_offs, mask=x_mask, cache=".cg")
 
         for pid_n in range(start_n, end_n):
-            # Warp-pipeline staging: marks the load as a separate cluster from
-            # compute+store, letting the backend overlap them across warps.
+            # Separate load cluster so the backend can overlap it with compute+store.
             with gl.amd.warp_pipeline_stage("load", priority=1):
-                # Uniform (warp-synchronous) scalar check -- not a per-lane mask --
-                # so this is a plain branch, no divergence.
+                # Scalar (warp-uniform) check, so no divergence.
                 has_next = pid_n + 1 < end_n
                 x_block_ptr_next = x_block_ptr + x_block_stride
                 if EVEN_M_N:
@@ -356,8 +344,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx950(
     stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
-    # Same warp-axis heuristic as the MXFP4 kernel (size_per_thread=[1,8],
-    # threads_per_warp=[8,8] -> 8 rows/warp along M or 64 cols/warp along N).
+    # Same warp-axis heuristic as the MXFP4 kernel.
     WARPS_M: gl.constexpr = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
     WARPS_N: gl.constexpr = num_warps // WARPS_M
     layout: gl.constexpr = gl.BlockedLayout(
@@ -392,8 +379,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx950(
             x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE
         )
 
-        # Output is elementwise fp8 (1 byte/elem, not packed), so unlike MXFP4
-        # the output N-extent equals BLOCK_SIZE_N (not BLOCK_SIZE_N // 2).
+        # fp8 output is unpacked: N-extent is BLOCK_SIZE_N (MXFP4: // 2).
         out_m_local = gl.arange(0, BLOCK_SIZE_M)
         out_n_local = gl.arange(0, BLOCK_SIZE_N)
         out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
