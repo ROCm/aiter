@@ -12,6 +12,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -556,14 +557,7 @@ def launch_gemm_a8w4_tdm(
             b_mcast_mask = use_b_mcast.select(column_mask << local_n, 0)
 
         def cluster_sync():
-            if const_expr(  # noqa: SIM102 - preserve DSL staging
-                cluster_m > 1 and not DISABLE_CLUSTER_SYNC
-            ):
-                if full_cluster:
-                    workgroup_barrier()
-                    if wave == 0:
-                        rocdl.s_barrier_signal(-3)
-                    rocdl.s_barrier_wait(-3)
+            cluster.cluster_barrier()
 
         # static=False (one dyn-shared base) only where a second region is
         # needed, so the non-scatter path keeps its per-leaf static allocation.
@@ -1421,7 +1415,11 @@ def launch_gemm_a8w4_tdm(
             if const_expr(tdm_as_in_prologue):
                 issue_as_prologue()
                 # The first normal pipeline fence covers this oldest TDM load.
-            cluster_sync()
+            if const_expr(  # noqa: SIM102 - preserve DSL staging
+                cluster_m > 1 and not DISABLE_CLUSTER_SYNC
+            ):
+                if full_cluster:
+                    cluster_sync()
 
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
@@ -1469,10 +1467,13 @@ def launch_gemm_a8w4_tdm(
                             workgroup_barrier()
                             issue(s, kt + num_buffers, my_jobs)
                             if const_expr(  # noqa: SIM102 - preserve DSL staging
-                                cluster_m > 1
+                                cluster_m > 1 and not DISABLE_CLUSTER_SYNC
                             ):
-                                if (kt + 1) % num_buffers == 0:
-                                    cluster_sync()
+                                if (  # noqa: SIM102 - preserve DSL staging
+                                    kt + 1
+                                ) % num_buffers == 0:
+                                    if full_cluster:
+                                        cluster_sync()
 
                     dispatch_wave_job(steady_post)
                     for j in range_constexpr(num_buffers):
@@ -1548,7 +1549,11 @@ def launch_gemm_a8w4_tdm(
                                 for phase in range_constexpr(num_buffers):
                                     kt = ring * num_buffers + phase
                                     steady_mid_iteration(my_jobs, kt, phase)
-                                cluster_sync()
+                                if const_expr(  # noqa: SIM102 - preserve DSL staging
+                                    not DISABLE_CLUSTER_SYNC
+                                ):
+                                    if full_cluster:
+                                        cluster_sync()
                             for phase in range_constexpr(n_steady % num_buffers):
                                 kt = (n_steady // num_buffers) * num_buffers + phase
                                 steady_mid_iteration(my_jobs, kt, phase)
