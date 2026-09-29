@@ -3,6 +3,7 @@
 
 import functools
 import importlib
+import importlib.util
 import json
 import logging
 import multiprocessing
@@ -36,6 +37,7 @@ from jit_cache import (
 from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+AITER_USE_ASAN = int(os.environ.get("AITER_USE_ASAN", "0")) != 0
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 AITER_DISABLE_KERNARG_PRELOAD = (
     int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
@@ -647,8 +649,12 @@ def get_asm_dir():
 
 @functools.lru_cache(maxsize=1)
 def get_user_jit_dir() -> str:
+    if AITER_USE_ASAN and not os.environ.get("AITER_JIT_DIR"):
+        raise ValueError("AITER_USE_ASAN requires an explicit AITER_JIT_DIR")
     if "AITER_JIT_DIR" in os.environ:
         path = os.getenv("AITER_JIT_DIR", "")
+        if AITER_USE_ASAN:
+            path = os.path.join(path, "asan")
         os.makedirs(path, exist_ok=True)
         sys.path.insert(0, path)
         return path
@@ -700,6 +706,18 @@ def validate_and_update_archs():
         arch in allowed_archs for arch in archs
     ), f"One of GPU archs of {archs} is invalid or not supported"
     return archs
+
+
+def _asan_build_flags(archs):
+    if not archs or any(arch not in ("gfx942", "gfx950") for arch in archs):
+        raise ValueError("GPU ASan currently requires GPU_ARCHS=gfx942 or gfx950")
+    common = ["-fsanitize=address", "-shared-libsan", "-g", "-fno-omit-frame-pointer"]
+    hip = (
+        common
+        + ["-Werror=option-ignored"]
+        + [f"--offload-arch={arch}:xnack+" for arch in archs]
+    )
+    return common, hip, ["-fsanitize=address", "-shared-libsan"]
 
 
 @functools.lru_cache
@@ -837,6 +855,18 @@ __mds = {}
 @torch_compile_guard()
 def get_module_custom_op(md_name: str) -> None:
     if md_name not in __mds:
+        if AITER_USE_ASAN:
+            expected = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+            # Do not fall through sys.path to an ordinary prebuilt extension.
+            if not os.path.isfile(expected):
+                raise ModuleNotFoundError(md_name)
+            spec = importlib.util.find_spec(md_name)
+            if spec is None or os.path.realpath(spec.origin or "") != os.path.realpath(
+                expected
+            ):
+                raise RuntimeError(
+                    f"ASan refused extension outside its isolated cache: {md_name}"
+                )
         if "AITER_JIT_DIR" in os.environ:
             __mds[md_name] = importlib.import_module(md_name)
         else:
@@ -1243,9 +1273,17 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
-        flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        if not AITER_USE_ASAN:
+            flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
+        asan_ldflags = []
+        if AITER_USE_ASAN:
+            # Required sanitizer flags must never pass through the optional
+            # flag filter, which can silently discard unsupported options.
+            asan_cc, asan_hip, asan_ldflags = _asan_build_flags(archs)
+            flags_cc += asan_cc
+            flags_hip += asan_hip
         check_and_set_ninja_worker()
 
         blob_dir = f"{op_dir}/blob"
@@ -1340,7 +1378,11 @@ def build_module(
                 sorted(set(sources)),
                 extra_cflags=flags_cc,
                 extra_cuda_cflags=flags_hip,
-                extra_ldflags=extra_ldflags,
+                extra_ldflags=(
+                    (extra_ldflags or []) + asan_ldflags
+                    if AITER_USE_ASAN
+                    else extra_ldflags
+                ),
                 extra_include_paths=extra_include_paths,
                 build_directory=opbd_dir,
                 verbose=verbose or AITER_LOG_MORE > 0,
