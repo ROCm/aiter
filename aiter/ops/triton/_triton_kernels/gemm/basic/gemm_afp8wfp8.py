@@ -79,6 +79,7 @@ def _gemm_afp8wfp8_kernel(
     FUSED_SPLITS: tl.constexpr = 1,
     ws_ptr=None,
     cnt_ptr=None,
+    DENSE_LAYOUT: tl.constexpr = False,
 ):
     """
     Kernel for computing the matmul C = A x B.
@@ -97,6 +98,20 @@ def _gemm_afp8wfp8_kernel(
     written to c_ptr + pid_k * stride_ck; a downstream reduce kernel sums them.
     With FUSED_SPLITS > 1, the last CTA combines FP32 partials in this launch.
     """
+
+    # Fold dense address arithmetic without specializing on exact stride values.
+    # The M-dependent split-K stride stays runtime.
+    if DENSE_LAYOUT:
+        stride_am = K
+        stride_ak = 1
+        stride_bn = K
+        stride_bk = 1
+        stride_asm = K // A_SCALE_K_GROUP
+        stride_ask = 1
+        stride_bsn = K // B_SCALE_K_GROUP
+        stride_bsk = 1
+        stride_cm = N
+        stride_cn = 1
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -381,6 +396,7 @@ def _gemm_afp8wfp8_packed_kernel(
     B_SCALE_N_GROUP: tl.constexpr = 32,
     B_SCALE_K_GROUP: tl.constexpr = 32,
     NUM_KSPLIT: tl.constexpr = 1,
+    DENSE_LAYOUT: tl.constexpr = False,
 ):
     """Small-M E4M3 GEMM with K panels packed into MFMA rows/columns.
 
@@ -391,6 +407,20 @@ def _gemm_afp8wfp8_packed_kernel(
     independent of runtime M. B_CACHE_MODIFIER applies to the weight and
     weight-scale loads.
     """
+    # Fold dense address arithmetic without specializing on exact stride values.
+    # The M-dependent split-K stride stays runtime.
+    if DENSE_LAYOUT:
+        stride_am = K
+        stride_ak = 1
+        stride_bn = K
+        stride_bk = 1
+        stride_asm = K // A_SCALE_K_GROUP
+        stride_ask = 1
+        stride_bsn = K // B_SCALE_K_GROUP
+        stride_bsk = 1
+        stride_cm = N
+        stride_cn = 1
+
     tl.static_assert(K_PACK == 1 or K_PACK == 2 or K_PACK == 4)
     tl.static_assert(BLOCK_SIZE_M * K_PACK >= 16)
     tl.static_assert(BLOCK_SIZE_K >= 128 and BLOCK_SIZE_K % 32 == 0)

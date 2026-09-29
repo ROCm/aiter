@@ -232,7 +232,16 @@ def gemm_afp8wfp8(
         k: launch[k]
         for k in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim")
     }
+    # One layout flag enables constant-folded dense strides; other layouts keep
+    # their runtime strides, including transposed activation scales.
     scales = {
+        "DENSE_LAYOUT": (
+            x.stride() == (K, 1)
+            and w.stride() == (K, 1)
+            and (stride_asm, stride_ask) == (K // x_scale_group_size, 1)
+            and w_scales.stride() == (K // group_k, 1)
+            and (stride_cm, stride_cn) == (N, 1)
+        ),
         "A_SCALE_K_GROUP": x_scale_group_size,
         "B_SCALE_N_GROUP": group_n,
         "B_SCALE_K_GROUP": group_k,

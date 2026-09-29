@@ -267,7 +267,7 @@
         "num_stages": 3,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 32,
-        "cache_modifier": ".cg",
+        "cache_modifier": null,
         "NUM_KSPLIT": 1,
         "N_FIRST": false,
         "REDUCE_BLOCK_SIZE_M": 32,
