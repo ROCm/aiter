@@ -776,6 +776,9 @@ def _decode_cu_count(device_index: int) -> int:
     `CU_NUM` may lower it but never raise it past the device, because a row's
     parts must be co-resident on the card that actually runs them.
     """
+    # Callers pass a CUDA tensor's `device.index`, which torch always sets. Do not
+    # map `None` to the current device here: the cache would pin that device's
+    # count under the `None` key for every later device.
     physical = torch.cuda.get_device_properties(device_index).multi_processor_count
     override = int(os.getenv("CU_NUM", "0"))
     return min(override, physical) if override > 0 else physical
