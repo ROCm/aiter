@@ -42,6 +42,27 @@ def _get_flydsl_gemm_kernels():
     return gemm_kernels
 
 
+@functools.lru_cache(maxsize=1)
+def _get_gluon_gemm_kernels():
+    """kernelName -> (supported, accepts, gemm) for each Gluon GEMM a row can name.
+
+    A row with libtype "gluon" selects the kernel registered under its kernelName.
+    The interface computes an unscaled, bias-free GEMM on an unshuffled weight.
+    ``supported(M, N, K, bias, dtype, otype)`` says whether the kernel computes that
+    actual (not padded) shape and dtype on this device and Triton.
+    ``accepts(x, w)`` says whether the kernel can read these operands (layout,
+    alignment); a call it rejects runs torch. Both predicates must be non-raising
+    host checks, safe after eager warm-up before graph capture.
+    ``gemm(x, w)`` returns ``x @ w.T`` at the registered output dtype.
+    """
+    return {}
+
+
+# A synchronous exception disables that registered name process-wide. This does
+# not recover asynchronous device faults surfaced after the call returns.
+_failed_gluon_gemm_kernels: set[str] = set()
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 extensions_created = False
@@ -156,6 +177,28 @@ def get_GEMM_A16W16_config(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
                         "recognized by the current catalog; falling back to next candidate."
                     )
+                    config = None
+            elif config["libtype"] == "gluon":
+                kernel_name = config["kernelName"]
+                if bias or scaleAB or bpreshuffle:
+                    # The registered two-operand interface cannot implement these
+                    # requests, even if a stale row's predicate accepts them.
+                    config = None
+                    continue
+                gluon_kernel = _get_gluon_gemm_kernels().get(kernel_name)
+                if gluon_kernel is None:
+                    logger.warning(
+                        "Gluon kernel '%s' from tuned config is not registered; "
+                        "falling back to next candidate.",
+                        kernel_name,
+                    )
+                    config = None
+                elif kernel_name in _failed_gluon_gemm_kernels or not gluon_kernel[0](
+                    M, N, K, bias, eval(dtype), eval(otype)
+                ):
+                    # A row reached through padded M, one the kernel cannot run here,
+                    # or one whose kernel already failed: resolve this call as if the
+                    # row were absent.
                     config = None
             if config is None:
                 continue
@@ -642,6 +685,57 @@ def triton_gemm(
     return gemm_a16w16(inp, weights, bias=bias, dtype=otype)
 
 
+def gluon_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = False,
+    config: dict | None = None,
+):
+    assert scale_a is None and scale_b is None, "Gluon gemm does not support scaling"
+    assert not bpreshuffle, "Gluon gemm does not support bpreshuffle"
+    if scale_c is not None:
+        # scale_c is not part of the existing lookup key. Keep the incumbent
+        # torch route for this call instead of passing it to a two-operand op.
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+        )
+    name = config["kernelName"]
+    _, accepts, gemm = _get_gluon_gemm_kernels()[name]
+    if not accepts(inp, weights):
+        # Operands this kernel cannot read: torch for this call only.
+        return torch_gemm(inp, weights, solidx, bias, otype, config=config)
+    try:
+        return gemm(inp, weights)
+    except Exception as exc:  # noqa: BLE001  synchronous failure falls back to torch
+        # A kernel compiles on its first call, which in serving is an eager
+        # warm-up before graph capture.
+        if name not in _failed_gluon_gemm_kernels:
+            _failed_gluon_gemm_kernels.add(name)
+            get_GEMM_A16W16_config.cache_clear()
+            logger.warning(
+                "Gluon kernel '%s' failed (%r); its tuned rows are ignored from now "
+                "on and this call runs torch.",
+                name,
+                exc,
+            )
+    return torch_gemm(inp, weights, solidx, bias, otype, config=config)
+
+
 solMap = {
     "torch": torch_gemm,
     "hipblaslt": hipb_gemm,
@@ -650,6 +744,7 @@ solMap = {
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
     "opus": opus_gemm,
+    "gluon": gluon_gemm,
 }
 
 

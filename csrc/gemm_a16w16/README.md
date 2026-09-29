@@ -48,6 +48,15 @@ Results are written to `aiter/configs/bf16_tuned_gemm.csv`:
     |-------|----------|-----|-----|-----|--------|---------|------------|-----------|---------------|-----------|----------|----------|------|--------------|-------------|----------|------|
     |gfx942 |304       |1    |7168 |2048 |False   |torch.bfloat16|torch.bfloat16|False|False       |asm        |1         |1         |12.5  |bf16gemm_...  |0.001        |2.35      |34.1  |
 
+The tuner does not write `gluon` rows; they are added by hand. A `gluon` row's
+kernelName names a kernel registered in `_get_gluon_gemm_kernels`
+(`aiter/tuned_gemm.py`). Its host predicates check the actual shape/dtypes and
+operand layout; bias, scaleAB and preshuffled rows are skipped. Rejected operands
+use the existing torch route for that call only. A synchronous kernel exception
+(for example, a compilation failure) also uses torch and disables that registered
+name process-wide. This does not recover asynchronous device faults. Warm up
+eagerly before graph capture. The initial registry is empty and no Gluon rows ship.
+
 4. Build tuned kernels and test:
 ```bash
 python3 op_tests/test_gemm.py
