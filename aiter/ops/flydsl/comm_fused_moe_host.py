@@ -410,31 +410,68 @@ def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
         raise KeyError(f"unsupported comm_fused shape {shape}") from None
 
 
-def _symmetric(device, size: int) -> torch.Tensor:
-    requested_bytes = int(size)
-    alignment = _PEER_VMM_ALLOCATION_ALIGNMENT
-    allocated_bytes = max(
-        alignment,
-        (requested_bytes + alignment - 1) // alignment * alignment,
+def _align_bytes(size: int, alignment: int) -> int:
+    return (int(size) + alignment - 1) // alignment * alignment
+
+
+def _symmetric_allocation_bytes(size: int) -> int:
+    return max(
+        _PEER_VMM_ALLOCATION_ALIGNMENT,
+        _align_bytes(size, _PEER_VMM_ALLOCATION_ALIGNMENT),
     )
+
+
+def _symmetric(device, size: int) -> torch.Tensor:
+    allocated_bytes = _symmetric_allocation_bytes(size)
     return symm_mem.empty((allocated_bytes,), dtype=torch.uint8, device=device)
 
 
-def _packed_symmetric(
-    device, sizes: tuple[int, ...]
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[int, ...]]:
-    """Carve aligned views from one peer-VMM allocation and CCO window."""
+def _packed_offsets(sizes: tuple[int, ...]) -> tuple[tuple[int, ...], int]:
     offsets = []
     total_bytes = 0
     for size in sizes:
-        total_bytes = (total_bytes + 255) // 256 * 256
+        total_bytes = _align_bytes(total_bytes, 256)
         offsets.append(total_bytes)
         total_bytes += int(size)
-    workspace = _symmetric(device, total_bytes)
+    return tuple(offsets), total_bytes
+
+
+def _packed_symmetric(
+    device,
+    sizes: tuple[int, ...],
+    *,
+    storage: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[int, ...]]:
+    """Carve aligned views from one peer-VMM allocation and CCO window."""
+    offsets, total_bytes = _packed_offsets(sizes)
+    workspace = _symmetric(device, total_bytes) if storage is None else storage
+    if workspace.dtype != torch.uint8 or workspace.ndim != 1:
+        raise ValueError("packed symmetric storage must be a flat uint8 tensor")
+    if workspace.nbytes < total_bytes:
+        raise ValueError(
+            f"packed symmetric storage has {workspace.nbytes} bytes, "
+            f"requires {total_bytes}"
+        )
     tensors = tuple(
         workspace.narrow(0, offset, int(size)) for offset, size in zip(offsets, sizes)
     )
-    return workspace, tensors, tuple(offsets)
+    return workspace, tensors, offsets
+
+
+def _window_workspace_sizes(config: WindowConfig) -> tuple[int, ...]:
+    sizes = (config.partial_buffer_bytes,) * config.phase_count
+    if config.gather_output:
+        sizes += (config.reduced_buffer_bytes,) * config.phase_count
+        sizes += (config.reduced_scale_bytes,) * config.phase_count
+    return sizes
+
+
+def _runner_workspace_bytes(config: PipelineConfig) -> int:
+    if isinstance(config, WindowConfig):
+        _, requested_bytes = _packed_offsets(_window_workspace_sizes(config))
+    else:
+        requested_bytes = config.workspace_bytes
+    return _symmetric_allocation_bytes(requested_bytes)
 
 
 @dataclass(slots=True)
@@ -456,16 +493,23 @@ class _WindowWorkspaceLayout:
     reduced_scale_bases: tuple[int, ...] = ()
 
     @classmethod
-    def allocate(cls, device, config: WindowConfig):
+    def allocate(
+        cls,
+        device,
+        config: WindowConfig,
+        *,
+        storage: torch.Tensor | None = None,
+    ):
         phase_count = config.phase_count
         partial_ready = config.partial_epoch_offset
         reduced_ready = config.reduced_epoch_offset
-        sizes = (config.partial_buffer_bytes,) * phase_count
-        if config.gather_output:
-            sizes += (config.reduced_buffer_bytes,) * phase_count
-            sizes += (config.reduced_scale_bytes,) * phase_count
+        sizes = _window_workspace_sizes(config)
 
-        storage, tensors, offsets = _packed_symmetric(device, sizes)
+        storage, tensors, offsets = _packed_symmetric(
+            device,
+            sizes,
+            storage=storage,
+        )
         partial_end = phase_count
         reduced_end = 2 * phase_count if config.gather_output else partial_end
         return cls(
@@ -535,12 +579,15 @@ class _WindowPhaseView:
         )
 
 
-def _register(tp_group, rank: int, tp: int, tensors):
+def _create_communicator(tp_group, rank: int, tp: int):
     Communicator = _mori_communicator()
     uid = Communicator.get_unique_id() if rank == 0 else None
-    comm = Communicator.init(
+    return Communicator.init(
         tp, rank, tp_group.broadcast_object(uid), per_rank_vmm=FLAT_VA_RANK_STRIDE
     )
+
+
+def _register(comm, rank: int, tensors):
     windows = tuple(
         comm.register_external_window(tensor.data_ptr(), tensor.nbytes)
         for tensor in tensors
@@ -624,6 +671,10 @@ class _RuntimeLayoutRunner:
     def stage2_destination(self):
         return None
 
+    @property
+    def supports_ragged_m(self) -> bool:
+        return False
+
     def prepare_padded_shared_partial(
         self, shared_partial: torch.Tensor, input_rows: int
     ) -> torch.Tensor:
@@ -653,12 +704,21 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
         self,
         tp_group,
         config: MegakernelConfig,
+        *,
+        defer_registration: bool = False,
+        workspace: torch.Tensor | None = None,
     ) -> None:
         shape = config.shape
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
-        self.workspace = _symmetric(self.device, config.workspace_bytes)
+        self.workspace = (
+            _symmetric(self.device, config.workspace_bytes)
+            if workspace is None
+            else workspace
+        )
+        if self.workspace.nbytes < config.workspace_bytes:
+            raise ValueError("megakernel workspace is smaller than its config")
         self.workspace.zero_()
         self.output = (
             self.workspace.narrow(0, config.output_offset, config.payload_bytes)
@@ -666,21 +726,45 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
             .view(config.output_rows, shape.model_dim)
         )
         self._runtime_shared_stage = None
-        self.comm, self.windows, bases = _register(
-            tp_group,
-            self.rank,
-            shape.tp_size,
-            (self.workspace,),
-        )
-        # Register all peer windows before launching a peer-dereferencing kernel.
-        tp_group.barrier()
+        self.comm = None
+        self.windows = ()
+        self.workspace_flat_base = 0
         self.shared_partial_window = None
         self.shared_partial_ptr = None
         self.shared_partial_flat_base = 0
-        (self.workspace_flat_base,) = bases
-        self.workspace.narrow(0, config.flat_base_offset, 8).view(torch.int64).fill_(
-            self.workspace_flat_base
-        )
+        if not defer_registration:
+            self.register_communicator(tp_group)
+
+    def register_communicator(
+        self,
+        tp_group,
+        communicator=None,
+        *,
+        workspace_base: int | None = None,
+        windows=(),
+    ) -> None:
+        if self.comm is not None:
+            raise RuntimeError("megakernel runner communicator already registered")
+        self.comm = communicator
+        if self.comm is None:
+            self.comm = _create_communicator(
+                tp_group,
+                self.rank,
+                self.config.shape.tp_size,
+            )
+        if workspace_base is None:
+            self.comm, self.windows, (workspace_base,) = _register(
+                self.comm, self.rank, (self.workspace,)
+            )
+            # Register all peer windows before launching a peer-dereferencing
+            # kernel.
+            tp_group.barrier()
+        else:
+            self.windows = windows
+        self.workspace_flat_base = workspace_base
+        self.workspace.narrow(0, self.config.flat_base_offset, 8).view(
+            torch.int64
+        ).fill_(self.workspace_flat_base)
 
     def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
         """Stage a normal shared contribution in the registered output window."""
@@ -758,6 +842,9 @@ class _WindowRunner(_RuntimeLayoutRunner):
         self,
         tp_group,
         config: WindowConfig,
+        *,
+        defer_registration: bool = False,
+        workspace: torch.Tensor | None = None,
     ) -> None:
         shape = config.shape
         self.config = config
@@ -775,7 +862,11 @@ class _WindowRunner(_RuntimeLayoutRunner):
             )
             for _ in range(SLOTS)
         )
-        self.workspace = _WindowWorkspaceLayout.allocate(self.device, config)
+        self.workspace = _WindowWorkspaceLayout.allocate(
+            self.device,
+            config,
+            storage=workspace,
+        )
         self.workspace.clear_epochs()
         # The symmetric workspace comes from torch.empty(), so peer-visible epoch
         # words may contain stale values.  The host TP barrier below does not wait
@@ -788,28 +879,57 @@ class _WindowRunner(_RuntimeLayoutRunner):
             device=self.device,
         )
         self._runtime_shared_stage = None
-        self.comm, self.windows, (workspace_base,) = _register(
-            tp_group, self.rank, shape.tp_size, (self.workspace.storage,)
-        )
-        tp_group.barrier()
-        self.workspace.bind_flat_base(workspace_base)
+        self.comm = None
+        self.windows = ()
         shard_begin = self.rank * config.shard_rows if config.gather_output else 0
         self.reduced_output = self.output[shard_begin : shard_begin + config.shard_rows]
+        if not defer_registration:
+            self.register_communicator(tp_group)
 
-    def _shared_view(self, shared_partial):
+    def register_communicator(
+        self,
+        tp_group,
+        communicator=None,
+        *,
+        workspace_base: int | None = None,
+        windows=(),
+    ) -> None:
+        if self.comm is not None:
+            raise RuntimeError("window runner communicator already registered")
+        self.comm = communicator
+        if self.comm is None:
+            self.comm = _create_communicator(
+                tp_group,
+                self.rank,
+                self.config.shape.tp_size,
+            )
+        if workspace_base is None:
+            self.comm, self.windows, (workspace_base,) = _register(
+                self.comm, self.rank, (self.workspace.storage,)
+            )
+            tp_group.barrier()
+        else:
+            self.windows = windows
+        self.workspace.bind_flat_base(workspace_base)
+
+    @property
+    def supports_ragged_m(self) -> bool:
+        return not self.config.gather_output
+
+    def _shared_view(self, shared_partial, local_rows: int, rank_offset: int):
         if self.config.gather_output:
             return shared_partial
         elif shared_partial is None:
             return None
         elif shared_partial.shape[0] == self.config.m:
-            shard_begin = self.rank * self.config.shard_rows
-            return shared_partial[shard_begin : shard_begin + self.config.shard_rows]
-        elif shared_partial.shape[0] == self.config.shard_rows:
+            return shared_partial[rank_offset : rank_offset + local_rows]
+        elif shared_partial.shape[0] == local_rows:
             return shared_partial
         else:
             raise ValueError(
                 "window shared partial must use either the full or local-shard "
-                f"row layout, got {tuple(shared_partial.shape)}"
+                f"row layout (local_rows={local_rows}), got "
+                f"{tuple(shared_partial.shape)}"
             )
 
     def _phase_view(
@@ -819,13 +939,15 @@ class _WindowRunner(_RuntimeLayoutRunner):
         reduce_scatter: int | None,
         all_gather: int | None,
         shared_partial,
+        local_rows: int,
+        rank_offset: int,
     ) -> _WindowPhaseView:
         workspace = self.workspace
         gather_output = self.config.gather_output
         return _WindowPhaseView(
             local_route=None if local is None else self.routes[local % SLOTS],
             local_partial=None if local is None else workspace.partials[local],
-            shared=self._shared_view(shared_partial),
+            shared=self._shared_view(shared_partial, local_rows, rank_offset),
             reduce_partial_base=(
                 None
                 if reduce_scatter is None
@@ -857,12 +979,23 @@ class _WindowRunner(_RuntimeLayoutRunner):
             ),
         )
 
-    def _drain(self, local, reduce_scatter, all_gather, shared_partial, stream):
+    def _drain(
+        self,
+        local,
+        reduce_scatter,
+        all_gather,
+        shared_partial,
+        local_rows,
+        rank_offset,
+        stream,
+    ):
         phase = self._phase_view(
             local=local,
             reduce_scatter=reduce_scatter,
             all_gather=all_gather,
             shared_partial=shared_partial,
+            local_rows=local_rows,
+            rank_offset=rank_offset,
         )
         _run_compiled(
             window.compile_drain(
@@ -873,6 +1006,8 @@ class _WindowRunner(_RuntimeLayoutRunner):
             ),
             *phase.launch_args(),
             self.rank,
+            local_rows,
+            rank_offset,
             stream,
         )
 
@@ -884,10 +1019,26 @@ class _WindowRunner(_RuntimeLayoutRunner):
         shared_partial,
         ordinary_stage2,
         before_shared_add=None,
+        local_rows: int | None = None,
+        rank_offset: int | None = None,
     ):
         k = window
         _bind_inter_layout(self, ordinary_stage2)
         config = self.config
+        if local_rows is None:
+            local_rows = config.shard_rows
+        if rank_offset is None:
+            rank_offset = self.rank * config.shard_rows
+        if not 0 <= local_rows <= config.shard_rows:
+            raise ValueError(
+                f"window local_rows={local_rows} exceeds shard capacity "
+                f"{config.shard_rows}"
+            )
+        if not 0 <= rank_offset <= config.m - local_rows:
+            raise ValueError(
+                f"window rank_offset={rank_offset} cannot address "
+                f"local_rows={local_rows} inside M={config.m}"
+            )
         workspace = self.workspace
         phase_count = workspace.phase_count
         stream = torch.cuda.current_stream(self.device)
@@ -923,6 +1074,8 @@ class _WindowRunner(_RuntimeLayoutRunner):
                     all_gather if all_gather is not None and all_gather >= 0 else None
                 ),
                 shared_partial=shared_partial,
+                local_rows=local_rows,
+                rank_offset=rank_offset,
             )
             _run_compiled(
                 k.compile_cycle(
@@ -933,6 +1086,8 @@ class _WindowRunner(_RuntimeLayoutRunner):
                 *common,
                 *phase.launch_args(),
                 self.rank,
+                local_rows,
+                rank_offset,
                 stream,
             )
             if config.gather_output and reduce_scatter >= 0:
@@ -962,6 +1117,8 @@ class _WindowRunner(_RuntimeLayoutRunner):
             last - 1,
             last - 2 if config.gather_output else None,
             shared_partial,
+            local_rows,
+            rank_offset,
             stream,
         )
         if config.gather_output:
@@ -988,6 +1145,8 @@ class _WindowRunner(_RuntimeLayoutRunner):
             last,
             last - 1 if config.gather_output else None,
             shared_partial,
+            local_rows,
+            rank_offset,
             stream,
         )
         if config.gather_output:
@@ -998,7 +1157,15 @@ class _WindowRunner(_RuntimeLayoutRunner):
                 config.shape.tp_size,
                 stream,
             )
-            self._drain(None, None, last, shared_partial, stream)
+            self._drain(
+                None,
+                None,
+                last,
+                shared_partial,
+                local_rows,
+                rank_offset,
+                stream,
+            )
         # The workspace is private to this cached runner. Before either the
         # final AR payload or the final RS partial can be overwritten, the next
         # call reaches an earlier all-rank partial barrier. Stream ordering
@@ -1014,11 +1181,20 @@ class _DirectRunner(_RuntimeLayoutRunner):
         self,
         tp_group,
         config: DirectConfig,
+        *,
+        defer_registration: bool = False,
+        workspace: torch.Tensor | None = None,
     ) -> None:
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
-        self.workspace = _symmetric(self.device, config.workspace_bytes)
+        self.workspace = (
+            _symmetric(self.device, config.workspace_bytes)
+            if workspace is None
+            else workspace
+        )
+        if self.workspace.nbytes < config.workspace_bytes:
+            raise ValueError("direct workspace is smaller than its config")
         self.workspace.zero_()
         self.partial = (
             self.workspace.narrow(0, 0, config.partial_bytes)
@@ -1032,14 +1208,38 @@ class _DirectRunner(_RuntimeLayoutRunner):
             device=self.device,
         )
         self._runtime_shared_stage = None
-        self.comm, self.windows, (self.workspace_base,) = _register(
-            tp_group,
-            self.rank,
-            config.shape.tp_size,
-            (self.workspace,),
-        )
-        tp_group.barrier()
+        self.comm = None
+        self.windows = ()
+        self.workspace_base = 0
         self.reduce_scatter_add = direct.compile_reduce_scatter_add(config)
+        if not defer_registration:
+            self.register_communicator(tp_group)
+
+    def register_communicator(
+        self,
+        tp_group,
+        communicator=None,
+        *,
+        workspace_base: int | None = None,
+        windows=(),
+    ) -> None:
+        if self.comm is not None:
+            raise RuntimeError("direct runner communicator already registered")
+        self.comm = communicator
+        if self.comm is None:
+            self.comm = _create_communicator(
+                tp_group,
+                self.rank,
+                self.config.shape.tp_size,
+            )
+        if workspace_base is None:
+            self.comm, self.windows, (workspace_base,) = _register(
+                self.comm, self.rank, (self.workspace,)
+            )
+            tp_group.barrier()
+        else:
+            self.windows = windows
+        self.workspace_base = workspace_base
 
     @property
     def stage2_destination(self):
@@ -1105,9 +1305,20 @@ _RUNNER_TYPES = {
 }
 
 
-def create_runner(tp_group, config: PipelineConfig):
+def create_runner(
+    tp_group,
+    config: PipelineConfig,
+    *,
+    defer_registration: bool = False,
+    workspace: torch.Tensor | None = None,
+):
     runner_type = _RUNNER_TYPES[type(config)]
-    return runner_type(tp_group, config)
+    return runner_type(
+        tp_group,
+        config,
+        defer_registration=defer_registration,
+        workspace=workspace,
+    )
 
 
 class _LazyRunners:
@@ -1123,16 +1334,54 @@ class _LazyRunners:
         self.instances = {}
         self.activated = set()
 
-        # A Window runner creates a peer-VMM communicator and registers its
-        # symmetric workspace.  Doing that lazily from the first DPA request is
-        # unsafe: ranks may reach the first MoE layer at different times and
-        # enter a different collective while one rank is still broadcasting
-        # the communicator id.  Materialize only Window runners here, while
-        # model initialization is ordered identically on every rank.  Kernel
-        # compilation remains lazy.
-        for tokens, config in sorted(configs.items()):
-            if isinstance(config, WindowConfig):
-                self.instances[tokens] = create_runner(self.tp_group, config)
+        # Every runner family owns a peer-visible workspace.  Allocate one
+        # packed symmetric arena before creating CCO: MORI's flat-VA setup does
+        # not permit later symmetric allocations, and registering several
+        # independent allocations in one communicator is not portable across
+        # providers.  One communicator and one external window then cover all
+        # buckets.  None of this collective host work may happen from the first
+        # forward, which may already be inside CUDA graph capture.
+        ordered_configs = sorted(configs.items())
+        workspace_sizes = tuple(
+            _runner_workspace_bytes(config) for _, config in ordered_configs
+        )
+        _, arena_bytes = _packed_offsets(workspace_sizes)
+        arena_bytes = _symmetric_allocation_bytes(arena_bytes)
+        if arena_bytes > FLAT_VA_RANK_STRIDE:
+            raise ValueError(
+                f"comm-fused workspace arena requires {arena_bytes} bytes per rank, "
+                f"exceeding flat-VA stride {FLAT_VA_RANK_STRIDE}"
+            )
+        self.workspace_arena, workspaces, workspace_offsets = _packed_symmetric(
+            torch.device(tp_group.device), workspace_sizes
+        )
+        for (tokens, config), workspace in zip(ordered_configs, workspaces):
+            self.instances[tokens] = create_runner(
+                self.tp_group,
+                config,
+                defer_registration=True,
+                workspace=workspace,
+            )
+        torch.cuda.synchronize(torch.device(tp_group.device))
+        rank = int(tp_group.rank_in_group)
+        self.communicator = _create_communicator(
+            tp_group,
+            rank,
+            int(tp_group.world_size),
+        )
+        self.communicator, self.windows, (arena_base,) = _register(
+            self.communicator,
+            rank,
+            (self.workspace_arena,),
+        )
+        tp_group.barrier()
+        for (tokens, _), offset in zip(ordered_configs, workspace_offsets):
+            self.instances[tokens].register_communicator(
+                tp_group,
+                self.communicator,
+                workspace_base=arena_base + offset,
+                windows=self.windows,
+            )
 
     def __contains__(self, tokens: int) -> bool:
         return tokens in self.configs
@@ -1163,8 +1412,6 @@ class _LazyRunners:
                     lookup_key,
                 )
             self.activated.add(tokens)
-        if tokens not in self.instances:
-            self.instances[tokens] = create_runner(self.tp_group, config)
         return self.instances[tokens]
 
     def output_rows_for(self, bucket: int, input_rows: int) -> int:

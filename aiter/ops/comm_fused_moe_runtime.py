@@ -29,10 +29,23 @@ class CommFusedMoeRuntime:
     def __init__(self, *, runners) -> None:
         self.runners = runners
 
-    def supports(self, tokens: int) -> bool:
+    def bucket_for(self, tokens: int) -> int:
+        """Return the smallest configured bucket that can hold ``tokens``."""
+
         from aiter.fused_moe import get_padded_M
 
         bucket = int(get_padded_M(tokens))
+        if bucket < tokens:
+            configs = getattr(self.runners, "configs", {})
+            larger = [candidate for candidate in configs if candidate >= tokens]
+            if larger:
+                bucket = min(larger)
+        return bucket
+
+    def supports(self, tokens: int) -> bool:
+        bucket = self.bucket_for(tokens)
+        if bucket < tokens:
+            return False
         if bucket not in self.runners:
             return False
         try:
@@ -41,10 +54,13 @@ class CommFusedMoeRuntime:
             return False
         return True
 
-    def supports_ragged_m(self, _tokens: int) -> bool:
-        """Current runners require rank-major DPA padding before all-gather."""
+    def supports_ragged_m(self, tokens: int) -> bool:
+        """Return whether the selected runner accepts compact ragged RS rows."""
 
-        return False
+        bucket = self.bucket_for(tokens)
+        if bucket < tokens or bucket not in self.runners:
+            return False
+        return self.runners[bucket].supports_ragged_m
 
     def run(
         self,
@@ -53,25 +69,70 @@ class CommFusedMoeRuntime:
         before_stage2: _BeforeStage2 | None = None,
         before_shared_add: _BeforeSharedAdd | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
+        reduce_scatter_sizes: list[int] | tuple[int, ...] | None = None,
         **moe_args: Any,
     ) -> torch.Tensor:
         """Run ordinary MoE through Stage1 and fuse Stage2 with TP reduction.
 
-        ``before_stage2`` receives the runner's required shared-output row count
-        so an asynchronous producer can perform any padding on its own stream.
+        ``before_stage2`` receives the runner's required shared-output row count.
+        For compact ragged reduce-scatter this is the calling rank's real row
+        count; fixed layouts retain their configured output capacity.
         ``before_shared_add`` joins that producer only when the selected runner
         first consumes the shared output; no standalone ready kernel is used.
         """
 
-        from aiter.fused_moe import _fused_moe_impl, get_padded_M
+        from aiter.fused_moe import _fused_moe_impl
 
         hidden_states = moe_args["hidden_states"]
         raw_tokens = int(hidden_states.shape[0])
-        bucket = int(get_padded_M(raw_tokens))
-        if bucket < raw_tokens:
-            raise KeyError(f"no comm_fused bucket for {raw_tokens} tokens")
+        runner_kwargs = {}
+        if reduce_scatter_sizes is None:
+            bucket_input_rows = raw_tokens
+        else:
+            sizes = tuple(int(size) for size in reduce_scatter_sizes)
+            if not sizes or any(size < 0 for size in sizes):
+                raise ValueError(
+                    "reduce_scatter_sizes must contain non-negative rank sizes"
+                )
+            if sum(sizes) != raw_tokens:
+                raise ValueError(
+                    "compact ragged input rows must equal sum(reduce_scatter_sizes): "
+                    f"input={raw_tokens}, sizes={sizes}"
+                )
+            # Keep the compiled runner's fixed per-rank output capacity large
+            # enough for the most-loaded rank. Input rows themselves remain
+            # compact and any remaining bucket slack is appended only once at
+            # the global tail below.
+            bucket_input_rows = max(sizes) * len(sizes)
+        bucket = self.bucket_for(bucket_input_rows)
+        if bucket < bucket_input_rows:
+            raise KeyError(
+                f"no comm_fused bucket for required M={bucket_input_rows} "
+                f"({raw_tokens} compact rows)"
+            )
         runner = self.runners[bucket]
-        output_rows = self.runners.output_rows_for(bucket, raw_tokens)
+        if reduce_scatter_sizes is None:
+            output_rows = self.runners.output_rows_for(bucket, raw_tokens)
+        else:
+            if len(sizes) != runner.config.shape.tp_size:
+                raise ValueError(
+                    "reduce_scatter_sizes length must equal TP size: "
+                    f"sizes={len(sizes)}, TP={runner.config.shape.tp_size}"
+                )
+            if not runner.supports_ragged_m:
+                raise ValueError(f"{type(runner).__name__} does not support ragged M")
+            local_rows = sizes[runner.rank]
+            rank_offset = sum(sizes[: runner.rank])
+            if local_rows > runner.config.output_rows:
+                raise ValueError(
+                    f"rank {runner.rank} has {local_rows} rows but runner "
+                    f"capacity is {runner.config.output_rows}"
+                )
+            output_rows = local_rows
+            runner_kwargs = {
+                "local_rows": local_rows,
+                "rank_offset": rank_offset,
+            }
         stage2_destination = runner.stage2_destination
         final_output = None
         if stage2_destination is not None:
@@ -98,12 +159,18 @@ class CommFusedMoeRuntime:
                 nonlocal final_output
                 current_shared = shared_partial
                 if before_stage2 is not None:
-                    current_shared = before_stage2(runner.config.output_rows)
+                    shared_rows = (
+                        output_rows
+                        if reduce_scatter_sizes is not None
+                        else runner.config.output_rows
+                    )
+                    current_shared = before_stage2(shared_rows)
                 add_shared = runner.config.shape.add_shared
                 if add_shared and current_shared is None:
                     raise RuntimeError("comm-fused Stage2 requires shared_partial")
                 if (
                     add_shared
+                    and reduce_scatter_sizes is None
                     and bucket != raw_tokens
                     and current_shared.shape[0] != runner.config.output_rows
                 ):
@@ -115,6 +182,7 @@ class CommFusedMoeRuntime:
                 final_output = runner(
                     shared_partial=current_shared,
                     before_shared_add=before_shared_add,
+                    **runner_kwargs,
                     **kwargs,
                 )
                 return (
