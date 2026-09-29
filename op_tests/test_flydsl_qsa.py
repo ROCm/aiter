@@ -737,6 +737,32 @@ def test_k1_gfx942_h8_skips_prefill_tile():
         raise AssertionError("short M entered the 16-row tile")
 
 
+def test_qsa_arch_allowlist():
+    """qsa_device_arch accepts gfx942 and gfx950, including an ISA suffix.
+
+    A name that does not start with gfx950 used to take the gfx942 tile.
+    Anything else raises.
+    """
+    from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
+
+    accepted = {
+        "gfx942": "gfx942",
+        "gfx950": "gfx950",
+        "gfx942:sramecc+:xnack-": "gfx942",
+        "gfx950:sramecc+:xnack-": "gfx950",
+    }
+    for raw, want in accepted.items():
+        got = qsa_device_arch(raw)
+        if got != want:
+            raise AssertionError(f"{raw!r} resolved to {got!r}, want {want!r}")
+    for bad in ("gfx1100", "gfx1250", "gfx90a", "gfx9420", "GFX950", ""):
+        try:
+            qsa_device_arch(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} was accepted")
+
+
 def test_k1_page_past_4gib():
     """A physical indexer page at byte offset 2^32 must not alias page 0.
 
@@ -2478,6 +2504,7 @@ def _run_unit_cases():
     test_k1_prefill_padded_page_table()
     test_k1_decode_rejects_invalid_page_ids()
     test_k1_gfx942_h8_skips_prefill_tile()
+    test_qsa_arch_allowlist()
     test_k1_page_past_4gib()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
