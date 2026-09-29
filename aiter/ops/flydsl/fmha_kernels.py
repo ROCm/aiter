@@ -36,7 +36,6 @@ from .kernels.fmha_gfx1201.flash_attn_func_fp8 import (
     build_flash_attn_func_module as build_flash_attn_fp8_func_module,
 )
 from .kernels.fmha_gfx1201.flash_attn_func_fp8 import get_flash_attn_fp8_lds_bytes
-from .kernels.fmha_gfx1201.stream_readiness import register_ready, wait_ready
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8,
     flash_attn_varlen_m32x8,
@@ -232,8 +231,8 @@ def flydsl_flash_attn_func(
             not supported.
         waves_per_eu: kernel occupancy hint passed to the FlyDSL builder.
         daz: enable denormals-are-zero on the kernel.
-        stream: optional CUDA/HIP stream to launch on. Defaults to the current
-            stream for ``q.device``.
+        stream: optional launch stream. The caller owns normal PyTorch stream
+            dependencies between producers and consumers.
         softmax_scale: optional positive finite QK scale. Defaults to
             ``1 / sqrt(head_dim)``.
         q_descale, k_descale, v_descale: one-element float32 device tensors
@@ -279,6 +278,8 @@ def flydsl_flash_attn_func(
             "q/k must share batch, num_heads, and head dimension, got "
             f"{tuple(q.shape)}/{tuple(k.shape)}"
         )
+    if stream is not None and stream.device != q.device:
+        raise ValueError(f"stream must belong to {q.device}, got {stream.device}")
 
     batch, seq_len_real, num_heads, head_dim = q.shape
     seq_len_kv_real = k.shape[1]
@@ -394,28 +395,18 @@ def flydsl_flash_attn_func(
     # whose current device differs from q.device get the kernel compiled
     # and launched on the right device/stream.
     with torch.cuda.device(q.device.index):
-        if stream is not None and not isinstance(stream, torch.cuda.Stream):
-            raise TypeError(
-                "stream must be a torch.cuda.Stream or None, got "
-                f"{type(stream).__name__}"
-            )
         launch_stream = (
-            torch.cuda.current_stream(q.device) if stream is None else stream
+            stream if stream is not None else torch.cuda.current_stream(q.device)
         )
-        if launch_stream.device != q.device:
-            raise ValueError(
-                f"`stream` must be on {q.device}, got {launch_stream.device}"
-            )
-        producer_stream = torch.cuda.current_stream(q.device)
-        if launch_stream != producer_stream:
-            launch_stream.wait_stream(producer_stream)
-        wait_ready(launch_stream, (q, k, v))
-        if is_fp8:
-            wait_ready(launch_stream, (q_descale, k_descale, v_descale))
-        if out is not None:
-            wait_ready(launch_stream, (out,))
 
         with torch.cuda.stream(launch_stream):
+            # This is normal allocator lifetime tracking, not a readiness
+            # protocol: callers establish producer ordering themselves.
+            for tensor in (q, k, v):
+                tensor.record_stream(launch_stream)
+            if is_fp8:
+                for tensor in (q_descale, k_descale, v_descale):
+                    tensor.record_stream(launch_stream)
             q_p = _pad_seq(q, seq_len_pad - seq_len_real)
             k_p = _pad_seq(k, seq_len_kv_pad - seq_len_kv_real)
             v_p = _pad_seq(v, seq_len_kv_pad - seq_len_kv_real)
@@ -491,14 +482,6 @@ def flydsl_flash_attn_func(
                 result = out
             elif out is None:
                 result = result.contiguous()
-
-        for tensor in (q, k, v, q_p, k_p, v_p, o_p, result):
-            tensor.record_stream(launch_stream)
-        if is_fp8:
-            q_descale.record_stream(launch_stream)
-            k_descale.record_stream(launch_stream)
-            v_descale.record_stream(launch_stream)
-        (result,) = register_ready((result,), stream=launch_stream)
 
     return result
 

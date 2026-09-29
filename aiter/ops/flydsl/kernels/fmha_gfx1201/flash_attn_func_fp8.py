@@ -330,6 +330,10 @@ def build_flash_attn_func_module(
                 res=v8f32_type, a=k_v2i32_raw, b=q_vec, c=c_v8
             ).result
 
+        # Keep global/LDS address arithmetic index-typed. On pinned FlyDSL 0.3.4.1,
+        # replacing these with i64 values changed the generated address code and
+        # regressed the FP8 consumer by 5–8% on the production gfx1201 shapes.
+        # Revisit only with an ISA diff and the five-shape performance benchmark.
         seq_len_v = fx.Index(seq_len)
         seq_len_kv_real_v = fx.Index(seq_len_kv_real)
         if const_expr(CROSS_ATTN):
