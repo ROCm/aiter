@@ -574,7 +574,7 @@ struct __attribute__((packed)) MlaV4PsKernelArgs
     void* ptr_LTD;
     p2 _p_ltd;      // 0x50: kv_page_indices
     void* ptr_desc; // 0x60: repurposed: workspace desc [P, 8] int32 (rw)
-    void* ptr_dbg;  // 0x68: debug probe, nullptr
+    void* ptr_dbg;  // 0x68: unused, nullptr
     float scalar_f;
     p3 _p_sc; // 0x70: 1.0f/sqrtf(kV4DimNope+kV4DimRope)
     unsigned int s_gqa_ratio;
