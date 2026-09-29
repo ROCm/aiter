@@ -70,7 +70,12 @@ def _neg_inf():
 
 
 def build_qsa_k1_emit_module(page_size: int):
-    """Build the short-context emit kernel. It never reads Q or K."""
+    """Build the short-context emit kernel.
+
+    The kernel writes block ids from the query position and the context
+    length. It does not take Q, the cache, the page table, or the score
+    scale; those stay on the host wrapper for the long-row scorer.
+    """
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
     if _K % _BLOCK_THREADS:
@@ -81,16 +86,12 @@ def build_qsa_k1_emit_module(page_size: int):
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def qsa_k1_emit_kernel(
-        q: fx.Tensor,
-        k_cache: fx.Tensor,
-        page_table: fx.Tensor,
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
         block_ids: fx.Tensor,
         n_columns: Int32,
         n_req: Int32,
-        score_scale: Float32,
     ):
         row = Int32(gpu.block_id("x"))
         tid = Int32(gpu.thread_id("x"))
@@ -110,30 +111,22 @@ def build_qsa_k1_emit_module(page_size: int):
 
     @flyc.jit
     def launch_qsa_k1_emit(
-        q: fx.Tensor,
-        k_cache: fx.Tensor,
-        page_table: fx.Tensor,
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
         block_ids: fx.Tensor,
         n_columns: Int32,
         n_req: Int32,
-        score_scale: Float32,
         rows: Int32,
         stream: fx.Stream,
     ):
         qsa_k1_emit_kernel(
-            q,
-            k_cache,
-            page_table,
             token_to_req,
             query_positions,
             context_lens,
             block_ids,
             n_columns,
             n_req,
-            score_scale,
         ).launch(
             grid=(rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -752,9 +745,7 @@ def _k1_uses_prefill_scorer(
     """
     if n_requests != 1 or rows < 16:
         return False
-    if arch.startswith("gfx942") and n_heads == 8:
-        return False
-    return True
+    return not (arch.startswith("gfx942") and n_heads == 8)
 
 
 def qsa_k1_score_and_select(
@@ -936,16 +927,12 @@ def qsa_k1_block_ids(
     if n_columns <= _K:
         _run_compiled(
             _emit_plan(page_size),
-            q,
-            k_cache,
-            page_table,
             token_to_req,
             query_positions,
             context_lens,
             out,
             int(n_columns),
             int(context_lens.shape[0]),
-            float(score_scale),
             m,
             torch.cuda.current_stream(q.device),
         )
