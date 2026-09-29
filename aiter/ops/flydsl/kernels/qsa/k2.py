@@ -10,7 +10,8 @@ with split-K; prefill runs BLOCK_N=32 over two waves and, once the grid
 alone fills the machine, writes its output directly.
 
 gfx942 aliases K and V in one LDS tile so the tile stays under 64 KiB.
-gfx950 stores K and V separately and gathers this tile's V after K is
+gfx950 decode still overlays one tile. Only gfx950 prefill stores K and V
+separately (``split_kv_lds``) and gathers this tile's V after K is
 visible so QK can run while V is in flight.  Softmax stays in registers
 (full-D QK on every wave, in-wave P transpose); LDS is MMA scratch only.
 Expand, partial RoPE, and the sigmoid output gate remain outside K2.
