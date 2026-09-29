@@ -981,6 +981,11 @@ def flydsl_k1k2_skinny_decode(
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
     n_pad = w_down_merged.shape[0]
+    # The combine+RMS prologue reads these as contiguous row-major; a strided
+    # input silently reads the wrong lanes.
+    assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
+    assert block_output.dtype == torch.bfloat16 and block_output.is_contiguous()
+    assert injection.dtype == torch.bfloat16 and injection.is_contiguous()
     # Can't verify "folded" numerically (no unfolded ref here), but pin the
     # checkable half of the contract so a wrong-tensor call fails loudly.
     assert (
