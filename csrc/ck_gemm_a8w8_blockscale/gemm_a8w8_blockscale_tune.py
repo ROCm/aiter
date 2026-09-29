@@ -277,6 +277,7 @@ def generate_data(m, n, k, seed, device="cuda"):
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    x_scale_t.is_transposed = True
     zero_bias = torch.zeros((1, n), dtype=torch.float32, device=device)
     return {
         "x": x,

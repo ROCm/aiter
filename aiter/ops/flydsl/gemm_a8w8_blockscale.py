@@ -68,8 +68,12 @@ def _prepare_scales(
     else:
         if tuple(x_scale.shape) != (M, KB):
             raise ValueError("x_scale must have shape (M, K / 128)")
-        # Kept inside the timed call: plain-layout tuning must include this cost.
-        sa = x_scale.transpose(0, 1).contiguous().view(-1)
+        if getattr(x_scale, "is_transposed", False):
+            # The producer's flag guarantees the layout expected by this kernel.
+            sa = x_scale.view(-1)
+        else:
+            # Unprepared plain-layout scales still pay this cost in the timed call.
+            sa = x_scale.transpose(0, 1).contiguous().view(-1)
     return sa, w_scale.contiguous().view(-1)
 
 
@@ -102,7 +106,7 @@ def run_gemm_a8w8_blockscale(
 ) -> Tensor:
     """Run the named candidate into ``Out``; never silently benchmark a fallback.
 
-    Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128].
+    Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128] unless is_transposed=True.
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
     Both use w_scale[ceil(N/128),K/128] and BF16 output on gfx950.
     """

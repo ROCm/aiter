@@ -54,11 +54,14 @@ def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
     w_scale = torch.rand(((n + 127) // 128, k // 128), device="cuda") + 0.1
     ref = run_torch(x, weight, x_scale, w_scale, dtype)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle_b else weight
-    if preshuffle_b:
+    if preshuffle_b or scale_layout == "tagged":
         transposed = x_scale.T.contiguous()
         gemm_scale = (
             transposed.T if scale_layout == "strided" else transposed.view_as(x_scale)
         )
+        if scale_layout == "tagged":
+            # Mark the final prepared tensor, not the row-major reference scales.
+            gemm_scale.is_transposed = True
     else:
         gemm_scale = x_scale
 
@@ -154,8 +157,8 @@ def main():
     parser.add_argument(
         "--scale-layout",
         nargs="+",
-        choices=["packed", "strided"],
-        default=["packed", "strided"],
+        choices=["packed", "strided", "tagged"],
+        default=["packed", "strided", "tagged"],
     )
     parser.add_argument(
         "--data-init",
@@ -168,7 +171,7 @@ def main():
     for dtype, (m, n, k), layout, scale_layout, data_init in itertools.product(
         args.dtype, args.mnk, args.layout, args.scale_layout, args.data_init
     ):
-        if layout == "plain" and scale_layout != "packed":
+        if layout == "plain" and scale_layout == "strided":
             continue
         rows.append(test_gemm(m, n, k, dtype, layout, scale_layout, data_init))
     aiter.logger.info(

@@ -164,6 +164,62 @@ def test_scale_layouts(backend, m):
         assert actual.data_ptr() == layout.data_ptr()
 
 
+@pytest.mark.parametrize("m", [1, 4, 33])
+@pytest.mark.parametrize("is_transposed", [None, False, True])
+def test_plain_scale_transpose_flag(backend, m, is_transposed):
+    n, k = 384, 512
+    original = torch.arange(m * 4, dtype=torch.float32).reshape(m, 4)
+    expected = original.T.contiguous().flatten()
+    sb = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    sa = original.T.contiguous().view_as(original) if is_transposed else original
+    if is_transposed is not None:
+        sa.is_transposed = is_transposed
+
+    if is_transposed:
+        with patch.object(
+            torch.Tensor, "transpose", side_effect=AssertionError("double transpose")
+        ):
+            actual, _ = backend._prepare_scales(sa, sb, m, n, k, False)
+        assert actual.data_ptr() == sa.data_ptr()
+        assert not getattr(original, "is_transposed", False)
+    else:
+        actual, _ = backend._prepare_scales(sa, sb, m, n, k, False)
+        assert getattr(sa, "is_transposed", None) is is_transposed
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_tuner_marks_only_prepared_scales(tuner_module, backend):
+    data = tuner_module.generate_data(33, 384, 512, seed=0, device="cpu")
+    assert data["x_scale_t"].is_transposed is True
+    assert not getattr(data["x_scale"], "is_transposed", False)
+    expected = data["x_scale"].T.contiguous().flatten()
+    actual, _ = backend._prepare_scales(
+        data["x_scale_t"], data["w_scale"], 33, 384, 512, False
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.data_ptr() == data["x_scale_t"].data_ptr()
+
+
+@pytest.mark.parametrize("transpose_scale", [False, True])
+@pytest.mark.parametrize("scale_type", [torch.float32, ops.dtypes.fp8_e8m0])
+def test_group_quant_marks_transposed_scales(transpose_scale, scale_type):
+    from aiter.ops import quant
+
+    x = torch.empty((33, 512), dtype=torch.bfloat16)
+    target = (
+        "dynamic_per_group_scaled_quant"
+        if scale_type == ops.dtypes.fp8_e8m0
+        else "dynamic_per_token_scaled_quant"
+    )
+    with patch.object(quant, target) as quantize:
+        _, scale = quant.per_group_quant_hip(
+            x, transpose_scale=transpose_scale, scale_type=scale_type
+        )
+    assert scale.is_transposed is transpose_scale
+    assert scale.shape == (33, 4)
+    assert quantize.call_args.kwargs["shuffle_scale"] is transpose_scale
+
+
 def test_invalid_scales_are_rejected(backend):
     _, _, sa, sb, _ = _inputs()
     with pytest.raises(ValueError, match="FP32"):
