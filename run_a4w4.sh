@@ -1,3 +1,6 @@
+# Input initialization defaults to zero for stable performance measurements.
+# Run a nonzero randomized correctness check with:
+#   AITER_DATA_INIT=uniform AITER_SCALE_INIT=auto bash run_a4w4.sh
   AITER_USE_GROUPED_GEMM=1 \
   AITER_GROUPED_DEBUG=0 \
   ENABLE_CK=0 \
