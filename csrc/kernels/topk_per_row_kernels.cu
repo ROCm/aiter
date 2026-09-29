@@ -3169,7 +3169,6 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     static_assert(!UseWaveBallotSelect || WARP_SIZE == 64);
     static_assert(!UseWaveBallotSelect || UseWaveWinnerReserve);
     static_assert(!UseWaveBallotSelect || CacheTwiddledBits);
-    static_assert(!UseWaveBallotSelect || StaticRowLen > 0);
     static_assert(BallotCandidateCapacity == 0 || UseWaveBallotSelect);
     static_assert(BallotCandidateCapacity == 0 || BallotCandidateCapacity >= 32);
     static_assert(!FuseLoadPass0Histogram ||
@@ -3221,6 +3220,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     constexpr bool StoreTwiddledCandidates =
         StaticRowLen == 4097 && FuseLoadPass0Histogram && UseWaveBallotSelect &&
         CacheTwiddledBits && BallotCandidateCapacity == 64;
+    constexpr bool DeferMiddleHistogram = UseWaveBallotSelect && StoreTwiddledCandidates;
 
     __shared__ Counter<T, IdxT> counter;
     __shared__ IdxT histogram[histogram_capacity];
@@ -3816,10 +3816,11 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     }
 
     // Pass 1: emit the definite winners and stage the crossing bucket from the
-    // same registers.  The ordinary path also builds the middle-MainBits
-    // histogram here.  A ballot specialization normally resolves <=32 staged
-    // candidates directly, so it defers both the clear and histogram atomics
-    // until the uncommon fallback where that reducer is actually needed.
+    // same registers, building the middle-MainBits histogram as they go.  Only
+    // the static 4097-column ballot arm, whose <=32-candidate path almost always
+    // applies, defers the clear and the histogram atomics to its fallback.  A
+    // runtime-length row often stages more keys than the ballot takes, and a
+    // deferred rebuild would add two barrier phases to every such row.
     if constexpr(UseHighBucketPredictor || UsePass0Bucket206Predictor)
     {
         if(!pass0_predicted)
@@ -3830,7 +3831,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     }
     else
     {
-        if constexpr(!UseWaveBallotSelect) clear_main_histogram();
+        if constexpr(!DeferMiddleHistogram) clear_main_histogram();
         __syncthreads();
     }
 
@@ -3891,7 +3892,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                     }
                     candidate_indices[pos] = i;
                 }
-                if constexpr(!UseWaveBallotSelect)
+                if constexpr(!DeferMiddleHistogram)
                 {
                     int const bucket =
                         __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(pass1_start_bit),
@@ -4155,7 +4156,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         }
     }
 
-    if constexpr(UseWaveBallotSelect)
+    if constexpr(DeferMiddleHistogram)
     {
         // The tiny-candidate fast path was not applicable.  Reconstruct the
         // exact middle histogram only now: staged candidates suffice unless
@@ -6477,10 +6478,20 @@ inline int topk_oneblock_num_cu()
     return v;
 }
 
+// Per-wave winner reservation, the twiddled register cache and the Wave0
+// ballot selector keep the row live across the selector.  Take them only for
+// copies that still compile to at most 64 VGPRs without scratch on gfx950 (two
+// 1024-thread or four 512-thread workgroups per CU): up to 21 elements per
+// lane for either thread count.  Larger copies keep the plain form.
+constexpr bool topk_oneblock_reg_wave_select_fits(int elems_per_thread)
+{
+    return elems_per_thread <= 21;
+}
+
 // Launches the register copy whose compile-time lane capacity equals the
 // runtime `ept`; returns false when `ept` is outside [MinEPT, MaxEPT].
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int MainBits,
-          int TailBits, int MinEPT, int MaxEPT>
+          int TailBits, int MinEPT, int MaxEPT, bool WaveSelect>
 inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream, T const* in,
                                      int64_t len, IdxT k, T* out, IdxT* out_idx, bool select_min)
 {
@@ -6492,10 +6503,11 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
     {
         if(ept != MinEPT)
             return topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MainBits,
-                                            TailBits, MinEPT + 1, MaxEPT>(
+                                            TailBits, MinEPT + 1, MaxEPT, WaveSelect>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
+        constexpr bool Wave = WaveSelect && topk_oneblock_reg_wave_select_fits(MinEPT);
         radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
-                                        TailBits>
+                                        TailBits, 0, Wave, Wave, false, Wave>
             <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
         return true;
     }
@@ -6531,14 +6543,14 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         if((batch_size > 2 * num_cu && len <= 12 * 1024) || batch_size > 4 * num_cu)
         {
             int const ept = static_cast<int>((len + 511) / 512);
-            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, 5, 32>(
+            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, 5, 32, true>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         }
         int const ept = static_cast<int>((len + 1023) / 1024);
         if(2 * batch_size <= num_cu && len > 4 * 1024 && len <= 4 * 1024 + 768)
-            return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5>(
+            return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
-        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16>(
+        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true>(
             ept, batch_size, stream, in, len, k, out, out_idx, select_min);
     }
     if(len <= 22 * 1024)
@@ -6593,7 +6605,7 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
             if(len >= 4096 && len <= 8194)
             {
                 int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
-                if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9>(
+                if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9, false>(
                        ept, batch_size, stream, in, len, k, out, out_idx, select_min))
                     return;
             }
