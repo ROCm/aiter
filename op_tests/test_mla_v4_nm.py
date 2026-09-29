@@ -2619,6 +2619,7 @@ def test_v4_nm_kv_tail_not_tile_multiple():
 # Persistent kernel: mla_decode_fwd_v4_nm_ps (gqa=128, qlen=1, one launch).
 # ---------------------------------------------------------------------------
 _PS_HEADS = 128
+_PS_MAX_ROWS = 32768  # mla_decode_fwd_v4_nm_ps row limit
 _PS_SENTINEL = -3.0  # rows with K=0 must keep it (the kernel leaves them unwritten)
 
 
@@ -2922,6 +2923,62 @@ def test_v4_nm_ps_rejects_bad_args(ps_workspace):
         aiter.mla.get_mla_v4_nm_ps_workspace(num_partitions=1025)
 
 
+def _ps_oob_worker_main():
+    """Subprocess body of test_v4_nm_ps_oob_guardpage. Every buffer the
+    persistent kernel reads or writes (q, qrope, KV pools, kv_indptr with
+    exactly N+1 entries, kv_page_indices, sink, out, lse) is placed at the
+    very end of its own allocation, rounded to 2 MiB, under the non-caching
+    allocator, so an access even one element past any of them crosses into an
+    unmapped page and faults the GPU. (A one-entry over-read of
+    kv_page_indices faults with this layout; a plain clone of the same tensor
+    leaves up to 2 MiB of slack and does not.)"""
+    granule = 2 << 20
+
+    def tail(t):
+        nbytes = t.numel() * t.element_size()
+        total = -(-nbytes // granule) * granule
+        buf = torch.empty(total, dtype=torch.uint8, device=t.device)
+        v = buf[total - nbytes :].view(t.dtype).view(t.shape)
+        v.copy_(t)
+        return v
+
+    for n, hi, zero_every, return_lse in (
+        (8192, 700, 13, True),
+        (_PS_MAX_ROWS, 64, 0, True),  # largest N: out ends at the 4 GiB offset limit
+        (3000, 4000, 0, False),
+    ):
+        inp = _ps_inputs(_ps_ragged(n, hi, n, zero_every=zero_every), seed=n)
+        inp = {k: tail(v) for k, v in inp.items()}
+        out = tail(
+            torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
+        )
+        lse = tail(torch.empty(n, _PS_HEADS, device="cuda")) if return_lse else None
+        ws = aiter.mla.get_mla_v4_nm_ps_workspace()
+        _ps_call(inp, ws, out=out, lse=lse, return_lse=return_lse)
+        torch.cuda.synchronize()
+        assert int(ws.cnt.abs().sum()) == 0
+        del inp, out, lse, ws
+
+
+@needs_gfx950
+def test_v4_nm_ps_oob_guardpage():
+    """Guard-page out-of-bounds check for mla_decode_fwd_v4_nm_ps.
+
+    The persistent kernel runs the head 64..127 path of the ASM (the one the
+    gqa=128 Q_rope over-read regression lived on) and adds its own reads:
+    the kv_indptr scans of the in-kernel planner, the split partials and the
+    merge. An over-read there can be numerically silent, so this runs large
+    batches in a subprocess with every input and output in a tight
+    allocation and asserts a clean exit, like
+    test_v4_nm_gqa128_qrope_oob_guardpage.
+    """
+    _run_oob_guardpage_worker(
+        ["ps"],
+        "v4 nm ps OOB detected: the persistent kernel accessed memory past "
+        "one of its input / output buffers.",
+    )
+
+
 if __name__ == "__main__":
     import argparse
     import itertools
@@ -2940,6 +2997,10 @@ if __name__ == "__main__":
     # non-caching allocator so any tg_idx=1 Q_rope over-read crosses into an
     # unmapped page and faults the GPU (killing THIS process). A clean exit 0
     # means no OOB. See the test's docstring for the full rationale.
+    if sys.argv[1:3] == ["--oob-worker", "ps"]:
+        _ps_oob_worker_main()
+        print("[v4 nm][oob-worker] COMPLETED no fault")
+        sys.exit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--oob-worker":
         _gqa = int(sys.argv[2]) if len(sys.argv) >= 3 else 128
         _msq = int(sys.argv[3]) if len(sys.argv) >= 4 else 1
