@@ -242,6 +242,9 @@ def build_qsa_k2_module(
     v_elem_off = block_n * head_dim if split_kv_lds else 0
     v_pf_rounds = gather_rounds if split_kv_lds else gather_chunk
     v_pf_chunks = v_pf_rounds // gather_chunk
+    # gfx942 overlays K and V. Prefetch only when one chunk is the whole
+    # gather (BN16 decode). Holding a partial chunk across QK slowed BN32.
+    gfx942_v_pf = (not use_k32) and n_gather_chunks == 1
     # PV splits the output dimension across waves, so every wave needs the
     # whole score tile and by default every wave recomputes all of QK. When
     # the token subtiles divide across waves each wave can instead compute
@@ -695,9 +698,18 @@ def build_qsa_k2_module(
             # overlays K the prefetch is one chunk deep; with a separate V
             # region there is no aliasing barrier to sit behind and the whole
             # gather can ride across QK, which is where the memory-level
-            # parallelism comes from.
+            # parallelism comes from. gfx942 overlays too, but a partial
+            # chunk held across QK slowed BN32 prefill, so gfx942_v_pf is
+            # set only when that one chunk is the whole gather.
             v_frags_pf = []
             if const_expr(use_k32) and const_expr(not decode_tr_pv):
+                for gr in range_constexpr(v_pf_rounds):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_frag = fx.make_fragment_like(v_src)
+                    fx.copy(g_copy, v_src, v_frag)
+                    v_frags_pf.append(v_frag)
+            elif const_expr(gfx942_v_pf):
                 for gr in range_constexpr(v_pf_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
@@ -835,6 +847,26 @@ def build_qsa_k2_module(
                             offset0=gr * v_round_st64,
                             offset1=gr * v_round_st64 + v_half_st64,
                         )
+                gpu.barrier()
+            elif const_expr(gfx942_v_pf):
+                for gc in range_constexpr(n_gather_chunks):
+                    base = gc * gather_chunk
+                    v_chunk = v_frags_pf[base : base + gather_chunk]
+                    for j in range_constexpr(gather_chunk):
+                        gr = gc * gather_chunk + j
+                        v_vec = live.select(
+                            fx.Vector(fx.memref_load_vec(v_chunk[j])),
+                            fx.Vector.filled(vec, 0.0, BFloat16),
+                        )
+                        fx.memref_store_vec(v_vec, v_chunk[j])
+                        v_tile = fx.make_view(
+                            fx.get_iter(v_lds) + Int32(gr * gather_span),
+                            fx.make_layout((block_n, gather_span), (k_stride, 1)),
+                        )
+                        v_dst = kv_store.partition_D(v_tile)
+                        v_store_frag = fx.make_fragment_like(v_dst)
+                        fx.memref_store_vec(v_vec, v_store_frag)
+                        fx.copy(lds_copy, v_store_frag, v_dst)
                 gpu.barrier()
             elif const_expr(not use_k32):
                 for gr in range_constexpr(gather_rounds):
