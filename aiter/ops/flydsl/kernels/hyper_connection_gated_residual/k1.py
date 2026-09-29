@@ -1631,8 +1631,13 @@ def flydsl_k1_combine_norm_down(
             # tuned/explicit block_n (from the with-inject n_pad=384) may not divide
             # the final-mixer n_pad (w_inject=None -> n_pad=lowrank); use a divisor.
             _dn_bn = 64 if n_pad % 64 == 0 else n_pad
-        if _dn_bm is None:
+        # A tuned dn_block_m (e.g. 128) may not divide gemm_tokens, which is only
+        # 64-padded -- the last block would then store 64 rows past ``out``. Fall
+        # back to a divisor (the down store isn't bounds-checked, so an overrun
+        # silently corrupts neighbouring memory).
+        if _dn_bm is None or gemm_tokens % _dn_bm:
             _dn_bm = 64 if gemm_tokens % 64 == 0 else block_m
+        assert gemm_tokens % _dn_bm == 0
         # Wave layout: the joint sweep found m_waves=2,n_waves=2 (same 256
         # threads, more balanced MMA tiling than the default 1x4) is ~10% faster
         # for the decouple down at large M -- a cross-dimension interaction the
