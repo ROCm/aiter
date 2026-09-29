@@ -88,7 +88,8 @@ def compile_pa_decode_ps_reduce(
 ):
     """Build PA decode's partitioned-softmax reducer.
 
-    D128/NP>64 shares weights in LDS; other shapes stay register-only.
+    Static D128 and D256 with NP>64 share weights in LDS; other shapes stay
+    register-only. Work plans stay register-only at D256.
     Sinks are per-head zero-value logits: include them in the shared maximum
     for stability and add their denominator mass once after summing KV.
     ``query_group_size`` is None for runtime GQA, or a matching positive value.
@@ -138,10 +139,16 @@ def compile_pa_decode_ps_reduce(
     ]
 
     # D128 splits partition ranges across wave pairs, one wave per 64 outputs.
-    use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
+    # D256 has four head waves; four partition groups stay within 1024 threads.
+    use_parallel_lds = max_context_partition_num > warp_size and (
+        head_size == 128 or (head_size == 256 and not use_work_plan)
+    )
     parallel_groups = 1
     if use_parallel_lds:
-        parallel_groups = 2 if max_context_partition_num <= 96 else 8
+        if head_size == 256:
+            parallel_groups = 4
+        else:
+            parallel_groups = 2 if max_context_partition_num <= 96 else 8
     head_waves = head_size // warp_size
     worker_waves = head_waves * parallel_groups
     block_shape = (

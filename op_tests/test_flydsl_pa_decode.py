@@ -32,12 +32,13 @@ try:
     from aiter.ops.flydsl.pa_decode import (
         MAX_CONTEXT_PARTITIONS,
         get_recommended_splits,
+        longctx_m1_shape,
         pa_decode,
         plan_pa_decode,
     )
 except (ImportError, AttributeError, RuntimeError, OSError):
     MAX_CONTEXT_PARTITIONS = 256
-    get_recommended_splits = pa_decode = plan_pa_decode = None
+    get_recommended_splits = longctx_m1_shape = pa_decode = plan_pa_decode = None
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 KV_COMPUTE_BLOCK = 256
@@ -279,12 +280,26 @@ def _make_inputs(case, planned=False):
         sinks = torch.where(sinks.abs() < 10, sinks + offset, sinks)
     parts = case.num_partitions
     if parts is None and not planned:
+        ctas_per_cu = (
+            1
+            if get_gfx_runtime() == "gfx950"
+            and longctx_m1_shape(
+                case.head_dim,
+                page,
+                case.trans_v,
+                case.per_token,
+                case.query_length,
+                case.query_group_size,
+            )
+            else 2
+        )
         parts = get_recommended_splits(
             batch,
             kv_heads,
             KV_COMPUTE_BLOCK // page,
             case.max_partitions,
             max_context_length=max(case.lengths),
+            ctas_per_cu=ctas_per_cu,
         )
     plan = (
         plan_pa_decode(
@@ -805,6 +820,14 @@ CASES = [
         dtype=FP16,
         lengths=(0, 1, 257, 65537),
     ),
+    # 8192 tokens and 8 splits is four tiles per CTA, so page-id staging runs.
+    _case(
+        "longctx-d256-page64",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(0, 1, 255, 256, 257, 8192),
+    ),
     _case(
         "exact-parts-override",
         (1, 1, 16, 128),
@@ -868,6 +891,27 @@ CASES = [
     ),
     _case("empty", window=1, sink=FP16, lengths=(0,) * 4),
 ]
+
+
+def test_longctx_split_target():
+    """Length-aware splits follow ctas_per_cu; the default stays at two."""
+    _require_gpu()
+    assert get_recommended_splits(
+        1, 1, 4, max_context_length=8192, ctas_per_cu=1
+    ) == get_recommended_splits(1, 1, 4, max_context_length=8192)
+    cus = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    def splits(seqs, ctas):
+        return max(8, min(MAX_CONTEXT_PARTITIONS, (ctas * cus + seqs - 1) // seqs))
+
+    length = 1_048_576
+    for seqs in (2, 4):
+        assert get_recommended_splits(seqs, 1, 4, max_context_length=length) == splits(
+            seqs, 2
+        )
+        assert get_recommended_splits(
+            seqs, 1, 4, max_context_length=length, ctas_per_cu=1
+        ) == splits(seqs, 1)
 
 
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])

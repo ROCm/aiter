@@ -51,6 +51,26 @@ KV_COMPUTE_BLOCK = 256
 _PA_DECODE_TILE_CACHE = {}
 
 
+def longctx_m1_shape(
+    head_dim: int,
+    block_size: int,
+    trans_v: bool,
+    per_token_kv: bool,
+    query_length: int,
+    query_group_size: int,
+) -> bool:
+    """Head 256, page 64/128, plain V, per-tensor scales, one query M-tile."""
+    rows = query_length * query_group_size
+    return (
+        head_dim == 256
+        and block_size in (64, 128)
+        and not trans_v
+        and not per_token_kv
+        and query_length == 1
+        and (rows + MFMA_MNK - 1) // MFMA_MNK == 1
+    )
+
+
 def compile_pa_decode_tile(
     *,
     head_dim: int,
@@ -72,6 +92,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     use_sinks: bool = False,
     sink_dtype_str: str = "f32",
+    stage_page_capacity: int = 0,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -164,11 +185,33 @@ def compile_pa_decode_tile(
             or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
         )
     )
-    prefetch_v = PER_TOKEN_M1 or (
-        TUNED_SCALAR
-        and block_size == 128
-        and TOTAL_ROWS <= MFMA_MNK
-        and num_compute_units < dense_workgroups <= 2 * num_compute_units
+    # K is consumed once per tile: a nontemporal load keeps those lines from
+    # evicting V, which is still being merged in L2. V prefetch only stays
+    # live if the page-id load is not on the same in-order vmcnt chain, so
+    # the host-sized page list is staged in LDS before the tile loop.
+    LONGCTX_PIPE = (
+        is_gfx950
+        and not use_work_plan
+        and longctx_m1_shape(
+            head_dim,
+            block_size,
+            trans_v,
+            per_token_kv,
+            query_length,
+            query_group_size,
+        )
+    )
+    if not LONGCTX_PIPE:
+        stage_page_capacity = 0
+    prefetch_v = (
+        LONGCTX_PIPE
+        or PER_TOKEN_M1
+        or (
+            TUNED_SCALAR
+            and block_size == 128
+            and TOTAL_ROWS <= MFMA_MNK
+            and num_compute_units < dense_workgroups <= 2 * num_compute_units
+        )
     )
     # Require an exact one-tile task budget and the small planned reducer.
     batch_first_plan_grid = (
@@ -203,6 +246,7 @@ def compile_pa_decode_tile(
         sliding_window,
         use_sinks,
         sink_dtype_str,
+        stage_page_capacity,
     )
     cached = _PA_DECODE_TILE_CACHE.get(cache_key)
     if cached is not None:
@@ -374,6 +418,11 @@ def compile_pa_decode_tile(
         NWARP_PAD * f32 if per_token_kv else 0
     )  # m-independent: one cross-warp slot
     total_bytes = sVScaleMax_off + sVScaleMax_bytes
+    # Partition page ids, one i32 each. The host passes the full count or
+    # zero; a nonzero capacity is staged entirely before the tile loop.
+    sPages_off = total_bytes
+    if stage_page_capacity:
+        total_bytes += stage_page_capacity * 4
 
     # All typed LDS regions are 4-byte-aligned within this i32 blob.
     @fx.struct
@@ -479,7 +528,27 @@ def compile_pa_decode_tile(
 
             return _load
 
-        _k_load_fp8x16 = _make_raw_flat_loader(key_cache_ptr, FP8, 16, KV_EXTENT)
+        def _make_nt_k_loader(tensor_ptr):
+            # Flat global_load_dwordx4 with !nontemporal. Buffer-nt loads and
+            # nontemporal V both measured slower; V stays on the cached copy.
+            base = buf_base_i64(tensor_ptr)
+            ptr_ty = fx.PointerType.get(
+                fx.Int32.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=16,
+            )
+
+            def _load(elem_idx):
+                # FP8 elements are one byte, so the element index is the byte offset.
+                ptr = fx.Pointer(fx.inttoptr(ptr_ty, base + fx.Int64(elem_idx)))
+                return fx.generic_load(ptr, dtype=fx.Int32, count=4, nontemporal=True)
+
+            return _load
+
+        if const_expr(LONGCTX_PIPE):
+            _k_load_fp8x16 = _make_nt_k_loader(key_cache_ptr)
+        else:
+            _k_load_fp8x16 = _make_raw_flat_loader(key_cache_ptr, FP8, 16, KV_EXTENT)
         _v_load_fp8x16 = _make_raw_flat_loader(value_cache_ptr, FP8, 16, KV_EXTENT)
 
         def _kv_addr(phys, page_elems, rest):
@@ -636,6 +705,10 @@ def compile_pa_decode_tile(
         def _load_phys_scalar(page, vec_width=1):
             # Padding may contain stale page IDs. Force out-of-context pages
             # to block 0 even when the table read itself is in bounds.
+            # Staged ids were masked the same way when they were stored.
+            if const_expr(stage_page_capacity and vec_width == 1):
+                rel = page - part_start * (TILE_TOK // block_size)
+                return fx.Int32(_lds_load(sPages_off + rel * 4, fx.Int32, 1)[0])
             element_offset = seq * max_blocks_per_seq + page
             if const_expr(vec_width == 1):
                 result = bt_buf[element_offset]
@@ -815,6 +888,23 @@ def compile_pa_decode_tile(
         # Empty partitions must not read K/V or block_tables.
         k_pf0 = fx.Vector.filled(NCHUNK * N_SUBCHUNKS, 0, fx.Int64)
         if part_start < part_end:
+            if const_expr(stage_page_capacity):
+                ppt = TILE_TOK // block_size
+                first_page = part_start * ppt
+                n_part_pages = (part_end - part_start) * ppt
+                rounds = (stage_page_capacity + BLOCK_THREADS - 1) // BLOCK_THREADS
+                for r in range_constexpr(rounds):
+                    idx = tid + r * BLOCK_THREADS
+                    if (idx < fx.Int32(stage_page_capacity)) & (idx < n_part_pages):
+                        pg = first_page + idx
+                        raw = fx.Int32(bt_buf[seq * max_blocks_per_seq + pg])
+                        val = (pg < num_pages).select(raw, fx.Int32(0))
+                        _lds_store(
+                            sPages_off + idx * 4,
+                            fx.Int32,
+                            fx.Vector.from_elements([val], dtype=fx.Int32),
+                        )
+                gpu.barrier()
             k_pf0, phys_vec0 = _k_ops_flat(part_start)
             if const_expr(REUSE_KV_PAGES):
                 # Reuse K page IDs for V's LDS broadcast.

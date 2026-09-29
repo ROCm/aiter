@@ -14,7 +14,11 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_kernel import (
+    KV_COMPUTE_BLOCK,
+    compile_pa_decode_tile,
+    longctx_m1_shape,
+)
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
@@ -31,14 +35,17 @@ def get_recommended_splits(
     max_partitions: int | None = None,
     *,
     max_context_length: int | None = None,
+    ctas_per_cu: int = 2,
 ) -> int:
     """Recommend a uniform split count for scratch allocation and ``pa_decode``.
 
     Without ``max_context_length``, the default cap is eight. A host length
-    hint targets two CTAs per CU, bounded by 256-token tiles and the reducer
-    limit; short contexts and large grids retain the legacy recommendation.
-    ``max_partitions`` caps either mode. Allocate scratch and call ``pa_decode``
-    with the returned count for every sequence; no GPU lengths are read back.
+    hint targets ``ctas_per_cu`` CTAs per CU, bounded by 256-token tiles and
+    the reducer limit. The default is two. Pass one for the gfx950 head-256
+    streamed-K schedule (``longctx_m1_shape``). Short contexts and large
+    grids retain the legacy recommendation. ``max_partitions`` caps either
+    mode. Allocate scratch and call ``pa_decode`` with the returned count
+    for every sequence; no GPU lengths are read back.
     """
     if max_context_length is not None and max_context_length < 0:
         raise ValueError("max_context_length must be non-negative")
@@ -59,7 +66,8 @@ def get_recommended_splits(
         context_tiles = (max_context_length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
         work_limit = max(8, context_tiles)
         sequence_heads = max(1, num_sequences * num_kv_heads)
-        occupancy_limit = (num_sm + sequence_heads - 1) // sequence_heads
+        occupancy_target = ctas_per_cu * props.multi_processor_count
+        occupancy_limit = (occupancy_target + sequence_heads - 1) // sequence_heads
         n = max(legacy, min(work_limit, occupancy_limit))
     return max(4, min(n, max_partitions))
 
@@ -559,6 +567,29 @@ def pa_decode(
     # Widen before either cache's i32 element offsets can wrap.
     wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
+    # Bound page-id LDS by the block table, not the live lengths, so capture
+    # and replay keep the same specialization. Past 16 KiB, leave the table
+    # load in the tile loop.
+    stage_page_capacity = 0
+    if (
+        work_plan is None
+        and arch == "gfx950"
+        and longctx_m1_shape(
+            head_dim,
+            block_size,
+            trans_v,
+            per_token_kv,
+            query_length,
+            query_group_size,
+        )
+    ):
+        max_blocks = block_tables.shape[1]
+        max_tiles = (max_blocks * block_size + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+        tiles_per_part = (max_tiles + num_partitions - 1) // num_partitions
+        pages = tiles_per_part * (KV_COMPUTE_BLOCK // block_size)
+        if 0 < pages <= 4096:
+            stage_page_capacity = pages
+
     # Add sinks once: here for static NP=1, otherwise in reduction.
     use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None
     with torch.cuda.device(dev):
@@ -583,6 +614,7 @@ def pa_decode(
             sliding_window=sliding_window,
             use_sinks=use_direct_sinks,
             sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",
+            stage_page_capacity=stage_page_capacity,
         )
 
     if num_partitions == 1 and work_plan is None:
