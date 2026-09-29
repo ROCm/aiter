@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import math
 import multiprocessing as mp
+import os
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
 
@@ -11,6 +12,7 @@ from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
 
 _TASK_START_TIMES = None
+_TASK_PIDS = None
 
 
 def _is_mapping_error(exc: BaseException) -> bool:
@@ -21,16 +23,35 @@ def _is_accelerator_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError"
 
 
-def _init_task_start_times(task_start_times):
-    global _TASK_START_TIMES
+def _init_task_start_times(task_start_times, task_pids=None):
+    global _TASK_START_TIMES, _TASK_PIDS
     _TASK_START_TIMES = task_start_times
+    _TASK_PIDS = task_pids
 
 
 def _run_with_start_tracking(task_index, func, args):
     if _TASK_START_TIMES is None:
         raise RuntimeError("Task start-time storage is not initialized")
+    if _TASK_PIDS is not None:
+        _TASK_PIDS[task_index] = os.getpid()
     _TASK_START_TIMES[task_index] = time.monotonic()
     return func(*args)
+
+
+def _task_worker_exited(task_pids, task_index):
+    """True once the worker that started this task is gone. A worker killed by a
+    GPU memory fault never returns a result, so waiting on it only ends at the
+    task timeout (or never, without one)."""
+    pid = task_pids[task_index]
+    if pid == 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 def _elapsed_since_task_start(task_start_times, task_index, now=None):
@@ -41,11 +62,13 @@ def _elapsed_since_task_start(task_start_times, task_index, now=None):
     return current_time - started_at
 
 
-def _reset_task_start_times(task_start_times, task_indices):
+def _reset_task_start_times(task_start_times, task_indices, task_pids=None):
     """Mark tasks as queued again, so a resubmit is not judged against the
-    timestamp its previous attempt left behind."""
+    timestamp (or worker) its previous attempt left behind."""
     for k in task_indices:
         task_start_times[k] = 0
+        if task_pids is not None:
+            task_pids[k] = 0
 
 
 def _merge_error_ratio(current, observed):
@@ -440,7 +463,7 @@ def mp_tuner(
     def submit_tasks(pool, gpu_map, task_indices):
         """Submit tasks to the pool and return async results as a dict"""
         task_indices = list(task_indices)
-        _reset_task_start_times(task_start_times, task_indices)
+        _reset_task_start_times(task_start_times, task_indices, task_pids)
         return {
             k: pool.apply_async(
                 _run_with_start_tracking,
@@ -462,10 +485,11 @@ def mp_tuner(
 
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
+    task_pids = mp.RawArray("i", len(task_group))
     pool = mp.Pool(
         processes=parallel_num,
         initializer=_init_task_start_times,
-        initargs=(task_start_times,),
+        initargs=(task_start_times, task_pids),
     )
     pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
@@ -542,6 +566,20 @@ def mp_tuner(
                     )
 
             except MPTimeoutError:
+                if _task_worker_exited(task_pids, k):
+                    print(
+                        f"[!] Task {k} lost its worker (pid {task_pids[k]} exited) - likely a GPU fault",
+                        flush=True,
+                    )
+                    failed_tasks.append((k, "worker exited"))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
+                    completed_this_round.append((k, async_result))
+                    pool_restart_needed = True
+                    break
                 # Check if this specific task has exceeded its timeout (only if timeout is set)
                 if timeout is not None:
                     elapsed = _elapsed_since_task_start(task_start_times, k)
@@ -643,7 +681,7 @@ def mp_tuner(
             pool = mp.Pool(
                 processes=parallel_num,
                 initializer=_init_task_start_times,
-                initargs=(task_start_times,),
+                initargs=(task_start_times, task_pids),
             )
 
             # Recreate gpu_map for new processes (new PIDs)
