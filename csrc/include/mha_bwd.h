@@ -159,6 +159,13 @@ struct mha_bwd_args
     // Required for the group-mode async pipeline; mha_bwd returns an error if
     // left empty in group mode. Unused in batch mode (may be left empty).
     std::function<std::shared_ptr<void>(size_t bytes)> pinned_host_alloc{};
+
+    // Zeroes the caller's dq. mha_bwd calls it only when the dq/dk/dv kernel will
+    // accumulate straight into dq, i.e. when there is no dq_acc post-processing pass.
+    // With post-processing, the kernel accumulates into a zero-initialised dq_acc
+    // workspace and the post kernel writes every element of dq, so zeroing dq first
+    // would be a wasted full pass over it. Leave empty if dq is already zero.
+    std::function<void()> zero_dq{};
 };
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args

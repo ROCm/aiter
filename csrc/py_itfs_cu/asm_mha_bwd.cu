@@ -323,6 +323,9 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 workspace_alloc};
         }();
 
+        // dq arrives uninitialised; mha_bwd zeroes it only on the path that needs it.
+        args.zero_dq = [&dq]() { dq.zero_(); };
+
         float t = aiter::mha_bwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_bwd");
     } else {

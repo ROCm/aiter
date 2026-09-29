@@ -628,6 +628,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dq_acc_ptr = a.workspace_alloc(dq_acc_bytes, /*zero_init=*/true);
     }
 
+    // Without post-processing the kernel accumulates atomically into dq itself, so dq
+    // must start at zero. With it, dq is written in full by the post kernel and needs
+    // no initialisation (see mha_bwd_args::zero_dq).
+    if(!need_post_processing && a.zero_dq)
+    {
+        a.zero_dq();
+    }
+
     fmha_bwd_dqdkdv_args dqdkdv_args;
     dqdkdv_args.ptr_dq     = need_post_processing ? dq_acc_ptr : a.dq_ptr;
     dqdkdv_args.ptr_dk     = a.dk_ptr;

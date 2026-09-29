@@ -2532,8 +2532,9 @@ def _flash_attn_backward(
     if (
         can_impl_fmha_v3_bwd_ and seqlen_q > 16
     ):  # ck fmha bwd has optimization for seqlen_q <= 16
-        if dq is not None:
-            dq.zero_()
+        # dq is not zeroed here: fmha_v3_bwd zeroes it itself when its kernel accumulates
+        # into dq directly, and otherwise writes every element through dq_acc
+        # post-processing, where a zero here would be a wasted pass over dq.
         (
             dq,
             dk,
