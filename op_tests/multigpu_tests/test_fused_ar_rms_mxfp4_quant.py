@@ -126,6 +126,7 @@ def _run_rank(
     distributed_init_method: str,
     emit_bf16: bool,
     stage_override: str | None = None,
+    gemma_norm: bool = False,
 ):
     if stage_override is not None:
         os.environ["AITER_AR_1STAGE"] = stage_override
@@ -156,7 +157,13 @@ def _run_rank(
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-        x, residual, weight, eps, quant_type="mxfp4", emit_bf16=emit_bf16
+        x,
+        residual,
+        weight,
+        eps,
+        quant_type="mxfp4",
+        emit_bf16=emit_bf16,
+        gemma_norm=gemma_norm,
     )
     end.record()
     torch.cuda.synchronize()
@@ -232,6 +239,7 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     emit_bf16: bool,
     distributed_init_method: str | None = None,
     stage_override: str | None = None,
+    gemma_norm: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49383"
@@ -243,7 +251,13 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     residual = torch.randn(shape, dtype=dtype)
     weight = torch.randn((shape[-1],), dtype=dtype)
     ref_residual = x * tp_size + residual
-    ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
+    if gemma_norm:
+        # Gemma RMSNorm scales by (1 + w); the kernel adds the 1 after widening w.
+        ref = F.rms_norm(
+            ref_residual.float(), (shape[-1],), weight=weight.float() + 1.0, eps=eps
+        ).to(dtype)
+    else:
+        ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
     ref_fp4, ref_scale = dynamic_mxfp4_quant(ref.cuda())
@@ -263,6 +277,7 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
                     distributed_init_method,
                     emit_bf16,
                     stage_override,
+                    gemma_norm,
                 ),
             )
             for rank in range(tp_size)
@@ -270,12 +285,23 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
         results = [future.get() for future in futures]
 
     max_dequant_err = 0.0
+    max_dequant_rel_l1 = 0.0
     max_bf16_err = 0.0
     max_residual_err = 0.0
     for rank, (out_fp4, scale, res_out, bf16_out, us) in enumerate(results):
         assert out_fp4.shape == ref_fp4.shape
         assert scale.shape == ref_scale.shape
         out_dequant = _dequant_mxfp4(out_fp4.cuda(), scale.cuda()).cpu()
+        # The elementwise tolerance above has to absorb FP4 rounding flips, so
+        # it cannot tell a wrong norm weight apart; the mean error can.
+        rel_l1 = (
+            (out_dequant - ref_dequant).abs().mean() / ref_dequant.abs().mean()
+        ).item()
+        assert rel_l1 < 0.05, (
+            f"mxfp4 dequant rel L1 {rel_l1:.4f} {shape=} {gemma_norm=} "
+            f"{emit_bf16=} {stage_override=} rank={rank}"
+        )
+        max_dequant_rel_l1 = max(max_dequant_rel_l1, rel_l1)
         max_dequant_err = max(
             max_dequant_err,
             checkAllclose(
@@ -320,11 +346,13 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
         "tp_size": tp_size,
         "dtype": str(dtype).replace("torch.", ""),
         "emit_bf16": emit_bf16,
+        "gemma_norm": gemma_norm,
         "stage_override": stage_override or "auto",
         "expected_path": expected_path,
         "min_us": min(us for *_, us in results),
         "max_us": max(us for *_, us in results),
         "mxfp4_dequant_err": max_dequant_err,
+        "mxfp4_dequant_rel_l1": max_dequant_rel_l1,
         "residual_err": max_residual_err,
         "bf16_err": max_bf16_err,
     }
@@ -346,6 +374,7 @@ FULL_SHAPES = [
     (32, 7168),  # 2-stage at TP=8 (32*7168*2 = 448 KiB <= 512 KiB)
     (56, 7168),  # fallback at TP=8 (56*7168*2 = 784 KiB > 512 KiB)
     (16, 4096),  # 2-stage (block_size=512, 16*4096*2 = 128 KiB)
+    (8, 8192),  # 1-stage (K == 8192 -> M <= 8)
     (32, 8192),  # 2-stage at TP=8 (block_size=1024, 32*8192*2 = 512 KiB)
     (64, 7168),  # fallback (64*7168*2 = 896 KiB > 512 KiB)
     (128, 7168),  # fallback
@@ -404,6 +433,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--gemma-norm",
+        action="store_true",
+        help=("Also exercise the Gemma (1 + w) weight path; --full implies it."),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help=(
@@ -429,6 +463,7 @@ def main():
         shapes = args.shape if args.shape is not None else FULL_SHAPES
         emit_bf16_values = [False, True]
         stage_overrides = [None, "1", "0"]
+        gemma_norm_values = [False, True]
     else:
         shapes = args.shape if args.shape is not None else DEFAULT_SHAPES
         emit_bf16_values = [False, True] if args.emit_bf16 else [False]
@@ -437,12 +472,13 @@ def main():
             stage_overrides = [None, "1", "0"]
         else:
             stage_overrides = [stage_to_env[args.stage]]
+        gemma_norm_values = [False, True] if args.gemma_norm else [False]
 
     tp_sizes = [args.tp_size] if args.tp_size is not None else [2, 4, 8]
 
     rows = []
-    for tp_size, shape, emit_bf16, stage_override in itertools.product(
-        tp_sizes, shapes, emit_bf16_values, stage_overrides
+    for tp_size, shape, emit_bf16, stage_override, gemma_norm in itertools.product(
+        tp_sizes, shapes, emit_bf16_values, stage_overrides, gemma_norm_values
     ):
         element_size = torch.tensor([], dtype=dtype).element_size()
         expected = _expected_path(
@@ -463,6 +499,7 @@ def main():
                     get_ip(), get_open_port()
                 ),
                 stage_override=stage_override,
+                gemma_norm=gemma_norm,
             )
         )
 

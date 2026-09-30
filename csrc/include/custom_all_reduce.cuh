@@ -1757,7 +1757,7 @@ __device__ __forceinline__ float ar_mxfp4_quant_scale(uint8_t scale_e8m0)
     return v.f;
 }
 
-template <typename P, typename A, typename T, int PACK_SIZE>
+template <typename P, typename A, typename T, int PACK_SIZE, bool GEMMA_NORM = false>
 __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     A& in,
     P& weight,
@@ -1775,7 +1775,7 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     constexpr int MXFP4_GROUP_SIZE = 32;
     A out;
 
-    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
+    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, 32, GEMMA_NORM>(
         out, in, weight, eps, hidden_dim, block_size);
 
     if(bf16_output != nullptr && active)
@@ -2206,7 +2206,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
         launch(std::false_type{});
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_1stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2276,14 +2276,14 @@ __global__ void __launch_bounds__(1024, 1)
             weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
         }
         int padded_block_size = (int)blockDim.x;
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2296,7 +2296,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     int m           = size / hidden_dim;
     dim3 block(padded_size);
     dim3 grid(std::min(m, kMaxBlocks));
-    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS>
+    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS, GEMMA_NORM>
         <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
@@ -2315,7 +2315,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
 //   * keeps the stage-1 numerics identical to the per-group 2-stage kernel
 //     (sum in fp32, downcast to T before storing in tmp), which matches the
 //     unfused (allreduce -> RMSNorm -> dynamic_mxfp4_quant) reference.
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2412,13 +2412,13 @@ __global__ void __launch_bounds__(1024, 1)
             for(int v = 0; v < pack_size; ++v)
                 acc[v] = upcast_s(vec[v]);
         }
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2438,7 +2438,7 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS>
+    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
             _dp, sg, self_sg, rank,
             residual_inp, residual_out, output, weight, scale_out,
@@ -5480,7 +5480,8 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
                                              int m,
                                              int n,
                                              bool use_1stage,
-                                             T* bf16_output = nullptr)
+                                             T* bf16_output = nullptr,
+                                             bool gemma_norm = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -5516,20 +5517,30 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             "size*sizeof(T) <= 512 KiB)");
     }
 
-#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA)                                  \
     if(can_1stage)                                                                           \
     {                                                                                        \
-        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                             \
+        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS, GEMMA>(                      \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS>(                             \
+        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS, GEMMA>(                      \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
+    }
+
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+    if(gemma_norm)                                                                           \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, true)                                    \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, false)                                   \
     }
 
     switch(world_size_)
@@ -5543,6 +5554,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             std::to_string(world_size_));
     }
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL
+#undef DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL
 }
 
 template <typename T, bool FUSE_ROPE>

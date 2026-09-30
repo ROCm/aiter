@@ -742,7 +742,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          double eps,
                                          int64_t reg_ptr, int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr)
+                                         int64_t bf16_out_ptr,
+                                         bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -779,7 +780,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            reinterpret_cast<opus::bf16_t*>(bf16_out), gemma_norm);
         break;
     }
 #endif
@@ -793,7 +794,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            reinterpret_cast<opus::fp16_t*>(bf16_out), gemma_norm);
         break;
     }
     default:
