@@ -492,6 +492,26 @@ __device__ __host__ __forceinline__ int common_prefix_passes(uint32_t mn, uint32
     return start;
 }
 
+#ifndef BCAST_RL
+#define BCAST_RL 1
+#endif
+#ifndef BCAST_RL_MUTANT
+#define BCAST_RL_MUTANT 0
+#endif
+// v from lane `src`, which must be the same on every lane (a constant or a
+// ballot index): v_readlane instead of a ds_bpermute round trip.
+__device__ __forceinline__ uint32_t wave_bcast(uint32_t v, int src)
+{
+#if BCAST_RL_MUTANT // gate self-test only: reads the neighbouring lane
+    src = (src + 1) & (WAVE_SIZE - 1);
+#endif
+#if BCAST_RL
+    return (uint32_t)__builtin_amdgcn_readlane((int)v, src);
+#else
+    return (uint32_t)__shfl((int)v, src);
+#endif
+}
+
 // Tie-correct gather shared by Phase C and the fallback: emits the indices of
 // every key strictly above the pivot, then exactly eq_needed of the keys equal
 // to it. Uses one LDS atomic per wave via ballot/popcount rather than one per
@@ -539,8 +559,8 @@ __device__ __forceinline__ void block_gather_topk(int c,
             if(te)
                 basee = atomicAdd(s_weq, (unsigned)te);
         }
-        baseg = __shfl(baseg, 0);
-        basee = __shfl(basee, 0);
+        baseg = wave_bcast(baseg, 0);
+        basee = wave_bcast(basee, 0);
         if(gt)
         {
             unsigned p = baseg + (unsigned)__popcll(bg & lt);
@@ -600,8 +620,8 @@ __device__ __forceinline__ void block_gather_topk_ptrs(int c,
             if(te)
                 basee = atomicAdd(s_weq, (unsigned)te);
         }
-        baseg = __shfl(baseg, 0);
-        basee = __shfl(basee, 0);
+        baseg = wave_bcast(baseg, 0);
+        basee = wave_bcast(basee, 0);
         if(gt)
         {
             unsigned p = baseg + (unsigned)__popcll(bg & lt);
@@ -659,8 +679,8 @@ __device__ __forceinline__ void block_gather_topk_ragged(int c,
             if(te)
                 basee = atomicAdd(s_weq, (unsigned)te);
         }
-        baseg = __shfl(baseg, 0);
-        basee = __shfl(basee, 0);
+        baseg = wave_bcast(baseg, 0);
+        basee = wave_bcast(basee, 0);
         if(gt)
         {
             unsigned p = baseg + (unsigned)__popcll(bg & lt);
@@ -753,7 +773,7 @@ __device__ __forceinline__ void hist_add_aggregated(
     for(int r = 0; r < rounds && todo != 0ull; r++)
     {
         const int leader    = __builtin_ctzll(todo);
-        const uint32_t cand = (uint32_t)__shfl((int)bucket, leader);
+        const uint32_t cand = wave_bcast(bucket, leader);
         const uint64_t grp  = todo & __ballot(active && bucket == cand);
         if(lane == leader)
             atomicAdd(&s_hist[cand * HIST_REP + rep], (uint32_t)__popcll(grp));
@@ -761,6 +781,44 @@ __device__ __forceinline__ void hist_add_aggregated(
     }
     if(todo & (1ull << lane))
         atomicAdd(&s_hist[bucket * HIST_REP + rep], 1u);
+}
+
+#ifndef SCAN_DPP
+#define SCAN_DPP 1
+#endif
+template <int ctrl, int row_mask, int bank_mask>
+__device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
+{ return x + (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, ctrl, row_mask, bank_mask, false); }
+// Inclusive suffix sum over one fully active wave64 (lane i: lanes i..63).
+// The prefix is the GCN row_shr/row_bcast DPP sequence aiter's plain top-k
+// ships (topk_per_row_kernels.cu, wave_inclusive_sum_dpp_u32), pure VALU;
+// the __shfl_down tree it replaces is six ds_bpermute + lgkmcnt(0) round trips.
+__device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
+{
+#if SCAN_DPP
+    uint32_t x = v;
+    x          = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
+    x          = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
+    x          = dpp_add_u32<0x114, 0xf, 0xe>(x); // row_shr:4
+    x          = dpp_add_u32<0x118, 0xf, 0xc>(x); // row_shr:8
+    x          = dpp_add_u32<0x142, 0xa, 0xf>(x); // row_bcast:15
+#if !SCAN_DPP_MUTANT // gate self-test only: without this step lanes 32..63 miss lanes 0..31
+    x = dpp_add_u32<0x143, 0xc, 0xf>(x); // row_bcast:31
+#endif
+    const uint32_t tot = (uint32_t)__builtin_amdgcn_readlane((int)x, WAVE_SIZE - 1);
+    return tot - x + v;
+#else
+    const int lane = (int)(threadIdx.x & (WAVE_SIZE - 1));
+    uint32_t x     = v;
+#pragma unroll
+    for(int off = 1; off < WAVE_SIZE; off <<= 1)
+    {
+        const uint32_t up = (uint32_t)__shfl_down((int)x, off);
+        if(lane + off < WAVE_SIZE)
+            x += up;
+    }
+    return x;
+#endif
 }
 
 // Single-wave form of the scan: wave 0 alone reduces the replicas, scans all 256
@@ -818,14 +876,7 @@ block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restric
         }
         // Inclusive suffix sum of the per-lane totals, so above_lane is everything
         // in buckets above this lane's group.
-        uint32_t inc = tot;
-#pragma unroll
-        for(int off = 1; off < WAVE_SIZE; off <<= 1)
-        {
-            const uint32_t up = (uint32_t)__shfl_down((int)inc, off);
-            if(lane + off < WAVE_SIZE)
-                inc += up;
-        }
+        const uint32_t inc = wave_suffix_sum(tot);
         uint32_t acc       = inc - tot;
         int hit_j          = -1;
         uint32_t hit_above = 0;
@@ -844,8 +895,8 @@ block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restric
         // did not elect themselves would not participate.
         const uint64_t bal       = __ballot(hit_j >= 0);
         const int src            = bal != 0ull ? __builtin_ctzll(bal) : 0;
-        const int j_sel          = __shfl(hit_j, src);
-        const uint32_t above_sel = (uint32_t)__shfl((int)hit_above, src);
+        const int j_sel          = (int)wave_bcast((uint32_t)hit_j, src);
+        const uint32_t above_sel = wave_bcast(hit_above, src);
         if(bal != 0ull && lane == 0)
         {
             s_scan[0] = (uint32_t)(src * PER_LANE + j_sel);
@@ -921,33 +972,19 @@ __device__ __forceinline__ void block_find_pivot_wide_wave0(const uint32_t* __re
 #pragma unroll
         for(int r = 0; r < HIST_REP; r++)
             cv += s_coarse[lane * HIST_REP + r];
-        uint32_t cinc = cv;
-#pragma unroll
-        for(int off = 1; off < WAVE_SIZE; off <<= 1)
-        {
-            const uint32_t up = (uint32_t)__shfl_down((int)cinc, off);
-            if(lane + off < WAVE_SIZE)
-                cinc += up;
-        }
+        const uint32_t cinc    = wave_suffix_sum(cv);
         const uint32_t cnxt    = cinc - cv;
         const uint64_t cbal    = __ballot(ek > 0 && cinc >= (uint32_t)ek && cnxt < (uint32_t)ek);
         const int cb           = cbal != 0ull ? __builtin_ctzll(cbal) : 0;
-        const uint32_t above_c = (uint32_t)__shfl((int)cnxt, cb);
+        const uint32_t above_c = wave_bcast(cnxt, cb);
 
-        const uint32_t fv = s_fine[cb * WAVE_SIZE + lane];
-        uint32_t finc     = fv;
-#pragma unroll
-        for(int off = 1; off < WAVE_SIZE; off <<= 1)
-        {
-            const uint32_t up = (uint32_t)__shfl_down((int)finc, off);
-            if(lane + off < WAVE_SIZE)
-                finc += up;
-        }
+        const uint32_t fv      = s_fine[cb * WAVE_SIZE + lane];
+        const uint32_t finc    = wave_suffix_sum(fv);
         const uint32_t fs      = above_c + finc;
         const uint32_t fnxt    = fs - fv;
         const uint64_t fbal    = __ballot(ek > 0 && fs >= (uint32_t)ek && fnxt < (uint32_t)ek);
         const int fb           = fbal != 0ull ? __builtin_ctzll(fbal) : 0;
-        const uint32_t above_f = (uint32_t)__shfl((int)fnxt, fb);
+        const uint32_t above_f = wave_bcast(fnxt, fb);
         if(cbal != 0ull && fbal != 0ull && lane == 0)
         {
             s_scan[0] = (uint32_t)(cb * WAVE_SIZE + fb);
@@ -1003,13 +1040,7 @@ block_find_pivot_bucket_rep(uint32_t* __restrict__ s_hist, uint32_t* __restrict_
                 s_hist[t * HIST_REP + r] = 0u;
         }
 #if ABLATE_SCAN == 0
-#pragma unroll
-        for(int off = 1; off < WAVE_SIZE; off <<= 1)
-        {
-            uint32_t up = __shfl_down(x, off);
-            if(lane + off < WAVE_SIZE)
-                x += up;
-        }
+        x = wave_suffix_sum(x);
 #endif
         if(lane == 0)
             s_wavetot[wv] = x;
@@ -1046,13 +1077,7 @@ block_find_pivot_bucket(const uint32_t* __restrict__ s_hist, uint32_t* __restric
     if(t < 256)
     {
 #if ABLATE_SCAN == 0
-#pragma unroll
-        for(int off = 1; off < WAVE_SIZE; off <<= 1)
-        {
-            uint32_t up = __shfl_down(x, off);
-            if(lane + off < WAVE_SIZE)
-                x += up;
-        }
+        x = wave_suffix_sum(x);
 #endif
         if(lane == 0)
             s_wavetot[wv] = x;

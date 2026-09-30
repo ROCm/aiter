@@ -55,6 +55,25 @@ constexpr double CAP_SAFE_FILL = 0.85;
 #endif
 constexpr int WSTAGE_WAVES = WSTAGE_WAVES_OVERRIDE;
 constexpr int WSTAGE_CAP   = 320;
+// Per-row reservation counters (cand_reserved, cand_bad) sit one 128-byte line
+// apart, in uints. Packed, 32 rows share a line and phase_b's atomicAdds from
+// different rows serialize on it: ATT at M=4 N=131072 puts that atomic at 26.8%
+// of a phase_b block (log/v7/att_smallm/report.md).
+#ifndef CTR_STRIDE_OVERRIDE
+#define CTR_STRIDE_OVERRIDE 32
+#endif
+constexpr int CTR_STRIDE = CTR_STRIDE_OVERRIDE;
+// phase_b_filter_coop's per-wave staging entries (dynamic LDS, so only that
+// kernel pays). A wave drains to global once more than CAP - 256 are staged,
+// and each drain waits on a global atomicAdd in the middle of the stream:
+// ABLATE_TH=1 prices candidate handling at 7.5 us of phase_b at M=512
+// N=131072 (coop_g=2, ~181 candidates per wave), of which the epilogue copy is
+// 0.7 us (log/v7/price_ablth.json, price_ablepi.json). 576 x 8 B x 8 waves =
+// 36.9 KB keeps 4 512-thread blocks per CU inside 160 KB.
+#ifndef WSTAGE_CAP_COOP_OVERRIDE
+#define WSTAGE_CAP_COOP_OVERRIDE 576
+#endif
+constexpr int WSTAGE_CAP_COOP = WSTAGE_CAP_COOP_OVERRIDE;
 
 // The K the GEOMETRY has to serve on a ragged launch, which is not the caller's
 // K. A ragged row ranks min(K, row_len) <= min(K, N) elements and pads the rest
@@ -644,11 +663,15 @@ static inline ShapeParams derive_shape_params(int M,
     const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
     const int cap           = derive_cap(K, margin, S, N);
 
-    p.S           = S;
-    p.margin      = margin;
-    p.rank        = rank;
-    p.cap         = cap;
-    p.keys_only_c = cap > PHASE_C_CAP;
+    p.S      = S;
+    p.margin = margin;
+    p.rank   = rank;
+    p.cap    = cap;
+    // Indices stay in LDS whenever phase_c runs one block per CU: keys-only
+    // re-reads every index from global inside the gather, which ATT puts at
+    // 22-25% of a small-M phase_c block (log/v7/att_smallm/report.md, PC-3).
+    // cap 8192 with indices is 64 KB + static + two wide buffers ~ 106 KB.
+    p.keys_only_c = cap > PHASE_C_CAP && grid_blocks_per_cu(M) > 1;
     p.geom_ok     = sampling_geometry_ok(N, S) && K <= cap;
 
     const int n4 = N / FP32_EPT;

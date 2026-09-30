@@ -117,7 +117,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
 #if BLOCK_TSTAMP
 __device__ unsigned long long* d_bt;
 #endif
-template <bool RAGGED, bool NT>
+template <bool RAGGED, bool NT, bool NT_STORE = NT, int PB_B = 0>
 __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     int pitch,
                                     RowExtents<RAGGED> extents,
@@ -148,14 +148,14 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     const int nwaves  = blockDim.x / WAVE_SIZE;
     const uint64_t lt = (1ull << lane) - 1ull;
 
-    // Dynamic, not static: the staging buffer needs WSTAGE_CAP entries per wave,
+    // Dynamic, not static: the staging buffer needs WSTAGE_CAP_COOP entries per wave,
     // so a 1024-thread block wants sixteen waves' worth and a 512-thread block
     // eight. As a compile-time constant that has to be the larger of the two, and
     // then every 512-thread block reserves 40 KB it cannot use -- measured at 7 to
     // 14% (m=4096 n=131072 goes 540.1 to 615.2us with WSTAGE_WAVES forced to 16).
     // Sized at launch instead, each block reserves exactly what its width needs.
     extern __shared__ uint64_t wbuf[];
-    uint64_t* buf      = wbuf + (size_t)wid * WSTAGE_CAP;
+    uint64_t* buf      = wbuf + (size_t)wid * WSTAGE_CAP_COOP;
     uint64_t* row_base = cand_pack + (size_t)row * cap;
     (void)nwaves;
 
@@ -212,7 +212,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 #if ABLATE_DRAIN == 3
 #define COOP_RESERVE(row, n) ((unsigned)0)
 #else
-#define COOP_RESERVE(row, n) atomicAdd(&cand_reserved[row], (unsigned)(n))
+#define COOP_RESERVE(row, n) atomicAdd(&cand_reserved[(size_t)(row) * CTR_STRIDE], (unsigned)(n))
 #endif
 #if ABLATE_DRAIN == 1
 #define COOP_DRAIN_BODY(off)                       \
@@ -229,99 +229,165 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     row_base[(off) + _j] = buf[_j]
 #endif
 
-#define COOP_DRAIN_WAVE()                         \
-    do                                            \
-    {                                             \
-        unsigned _off = 0;                        \
-        if(lane == 0)                             \
-            _off = COOP_RESERVE(row, bcnt);       \
-        _off = (unsigned)__shfl((int)_off, 0);    \
-        if(_off + (unsigned)bcnt > (unsigned)cap) \
-        {                                         \
-            if(lane == 0)                         \
-                atomicExch(&cand_bad[row], 1u);   \
-            bcnt = -1;                            \
-            break;                                \
-        }                                         \
-        COOP_DRAIN_BODY(_off);                    \
-        bcnt = 0;                                 \
+#define COOP_DRAIN_WAVE()                                            \
+    do                                                               \
+    {                                                                \
+        unsigned _off = 0;                                           \
+        if(lane == 0)                                                \
+            _off = COOP_RESERVE(row, bcnt);                          \
+        _off = (unsigned)__shfl((int)_off, 0);                       \
+        if(_off + (unsigned)bcnt > (unsigned)cap)                    \
+        {                                                            \
+            if(lane == 0)                                            \
+                atomicExch(&cand_bad[(size_t)row * CTR_STRIDE], 1u); \
+            bcnt = -1;                                               \
+            break;                                                   \
+        }                                                            \
+        COOP_DRAIN_BODY(_off);                                       \
+        bcnt = 0;                                                    \
     } while(0)
 
-    for(int it = 0; it < iters; it++)
+    if constexpr(PB_B > 0)
     {
-        const int i     = i0 + it * stride + threadIdx.x;
-        vfloat4 v       = {0.f, 0.f, 0.f, 0.f};
-        const bool live = (i < i1);
-        if(live)
-            v = load_row_f4<RAGGED, NT>(ri, i, len);
-        const int base_idx = i * FP32_EPT;
-        const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
-        const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
-        const uint64_t b2  = __ballot(live && !(v[2] < th) && (!RAGGED || base_idx + 2 < len));
-        const uint64_t b3  = __ballot(live && !(v[3] < th) && (!RAGGED || base_idx + 3 < len));
-        const int t0       = __popcll(b0);
-        const int t1       = t0 + __popcll(b1);
-        const int t2       = t1 + __popcll(b2);
-        const int wtotal   = t2 + __popcll(b3);
+        // With at most two blocks per CU little else hides a filter load, so each
+        // thread issues PB_B before filtering any, in the loop's filter order; a
+        // slot past i1 loads a live address and is masked by `live`. Default
+        // compaction only: the ABLATE_COMPACT hooks price the one-load loop.
+#ifndef COOP_DRAIN_AT
+#define COOP_DRAIN_AT (WSTAGE_CAP_COOP - 4 * WAVE_SIZE)
+#endif
+        auto filter_v4 = [&](const vfloat4& v, int i, bool live) {
+            const int base_idx = i * FP32_EPT;
+            const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
+            const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
+            const uint64_t b2  = __ballot(live && !(v[2] < th) && (!RAGGED || base_idx + 2 < len));
+            const uint64_t b3  = __ballot(live && !(v[3] < th) && (!RAGGED || base_idx + 3 < len));
+            const int t0       = __popcll(b0);
+            const int t1       = t0 + __popcll(b1);
+            const int t2       = t1 + __popcll(b2);
+            const int wtotal   = t2 + __popcll(b3);
+            if(wtotal > 0)
+            {
+                if(b0 & (1ull << lane))
+                    buf[bcnt + __popcll(b0 & lt)] =
+                        ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
+                if(b1 & (1ull << lane))
+                    buf[bcnt + t0 + __popcll(b1 & lt)] =
+                        ((uint64_t)__float_as_uint(v[1]) << 32) | (uint32_t)(base_idx + 1);
+                if(b2 & (1ull << lane))
+                    buf[bcnt + t1 + __popcll(b2 & lt)] =
+                        ((uint64_t)__float_as_uint(v[2]) << 32) | (uint32_t)(base_idx + 2);
+                if(b3 & (1ull << lane))
+                    buf[bcnt + t2 + __popcll(b3 & lt)] =
+                        ((uint64_t)__float_as_uint(v[3]) << 32) | (uint32_t)(base_idx + 3);
+                bcnt += wtotal;
+            }
+            if(bcnt > COOP_DRAIN_AT)
+            {
+                __builtin_amdgcn_wave_barrier();
+                COOP_DRAIN_WAVE();
+            }
+        };
+        for(int it0 = 0; it0 < iters; it0 += PB_B)
+        {
+            vfloat4 vv[PB_B];
+#pragma unroll
+            for(int t = 0; t < PB_B; t++)
+                vv[t] = load_row_f4<RAGGED, NT>(
+                    ri, min(i0 + (it0 + t) * stride + (int)threadIdx.x, i1 - 1), len);
+#pragma unroll
+            for(int t = 0; t < PB_B; t++)
+            {
+                const int i = i0 + (it0 + t) * stride + threadIdx.x;
+#if PB_BATCH_MUTANT // gate self-test only: never filters a batch's last slot
+                filter_v4(vv[t], i, i < i1 && t != PB_B - 1);
+#else
+                filter_v4(vv[t], i, i < i1);
+#endif
+            }
+        }
+    }
+    else
+    {
+        for(int it = 0; it < iters; it++)
+        {
+            const int i     = i0 + it * stride + threadIdx.x;
+            vfloat4 v       = {0.f, 0.f, 0.f, 0.f};
+            const bool live = (i < i1);
+            if(live)
+                v = load_row_f4<RAGGED, NT>(ri, i, len);
+            const int base_idx = i * FP32_EPT;
+            const uint64_t b0  = __ballot(live && !(v[0] < th) && (!RAGGED || base_idx + 0 < len));
+            const uint64_t b1  = __ballot(live && !(v[1] < th) && (!RAGGED || base_idx + 1 < len));
+            const uint64_t b2  = __ballot(live && !(v[2] < th) && (!RAGGED || base_idx + 2 < len));
+            const uint64_t b3  = __ballot(live && !(v[3] < th) && (!RAGGED || base_idx + 3 < len));
+            const int t0       = __popcll(b0);
+            const int t1       = t0 + __popcll(b1);
+            const int t2       = t1 + __popcll(b2);
+            const int wtotal   = t2 + __popcll(b3);
 #if ABLATE_COMPACT == 3
-        // Everything the branch guards, gone -- with the REAL threshold and the real
-        // shape parameters. The 363.52us reading it is compared against came from
-        // --margin 0.02, which changes the threshold to get the same branch outcome;
-        // this reproduces the outcome without touching any parameter, so whatever
-        // separates 363 from 463 has nowhere else to hide.
-        (void)wtotal;
+            // Everything the branch guards, gone -- with the REAL threshold and the real
+            // shape parameters. The 363.52us reading it is compared against came from
+            // --margin 0.02, which changes the threshold to get the same branch outcome;
+            // this reproduces the outcome without touching any parameter, so whatever
+            // separates 363 from 463 has nowhere else to hide.
+            (void)wtotal;
 #else
-        if(wtotal > 0)
-        {
+            if(wtotal > 0)
+            {
 #if ABLATE_COMPACT == 1
-            if(b0 & (1ull << lane))
-                buf[lane] = ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
-            if(b1 & (1ull << lane))
-                buf[lane] = ((uint64_t)__float_as_uint(v[1]) << 32) | (uint32_t)(base_idx + 1);
-            if(b2 & (1ull << lane))
-                buf[lane] = ((uint64_t)__float_as_uint(v[2]) << 32) | (uint32_t)(base_idx + 2);
-            if(b3 & (1ull << lane))
-                buf[lane] = ((uint64_t)__float_as_uint(v[3]) << 32) | (uint32_t)(base_idx + 3);
+                if(b0 & (1ull << lane))
+                    buf[lane] = ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
+                if(b1 & (1ull << lane))
+                    buf[lane] = ((uint64_t)__float_as_uint(v[1]) << 32) | (uint32_t)(base_idx + 1);
+                if(b2 & (1ull << lane))
+                    buf[lane] = ((uint64_t)__float_as_uint(v[2]) << 32) | (uint32_t)(base_idx + 2);
+                if(b3 & (1ull << lane))
+                    buf[lane] = ((uint64_t)__float_as_uint(v[3]) << 32) | (uint32_t)(base_idx + 3);
 #elif ABLATE_COMPACT == 2
-            if(b0 & (1ull << lane))
-                (void)(bcnt + __popcll(b0 & lt));
-            if(b1 & (1ull << lane))
-                (void)(bcnt + t0 + __popcll(b1 & lt));
-            if(b2 & (1ull << lane))
-                (void)(bcnt + t1 + __popcll(b2 & lt));
-            if(b3 & (1ull << lane))
-                (void)(bcnt + t2 + __popcll(b3 & lt));
+                if(b0 & (1ull << lane))
+                    (void)(bcnt + __popcll(b0 & lt));
+                if(b1 & (1ull << lane))
+                    (void)(bcnt + t0 + __popcll(b1 & lt));
+                if(b2 & (1ull << lane))
+                    (void)(bcnt + t1 + __popcll(b2 & lt));
+                if(b3 & (1ull << lane))
+                    (void)(bcnt + t2 + __popcll(b3 & lt));
 #else
-            if(b0 & (1ull << lane))
-                buf[bcnt + __popcll(b0 & lt)] =
-                    ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
-            if(b1 & (1ull << lane))
-                buf[bcnt + t0 + __popcll(b1 & lt)] =
-                    ((uint64_t)__float_as_uint(v[1]) << 32) | (uint32_t)(base_idx + 1);
-            if(b2 & (1ull << lane))
-                buf[bcnt + t1 + __popcll(b2 & lt)] =
-                    ((uint64_t)__float_as_uint(v[2]) << 32) | (uint32_t)(base_idx + 2);
-            if(b3 & (1ull << lane))
-                buf[bcnt + t2 + __popcll(b3 & lt)] =
-                    ((uint64_t)__float_as_uint(v[3]) << 32) | (uint32_t)(base_idx + 3);
+                if(b0 & (1ull << lane))
+                    buf[bcnt + __popcll(b0 & lt)] =
+                        ((uint64_t)__float_as_uint(v[0]) << 32) | (uint32_t)(base_idx + 0);
+                if(b1 & (1ull << lane))
+                    buf[bcnt + t0 + __popcll(b1 & lt)] =
+                        ((uint64_t)__float_as_uint(v[1]) << 32) | (uint32_t)(base_idx + 1);
+                if(b2 & (1ull << lane))
+                    buf[bcnt + t1 + __popcll(b2 & lt)] =
+                        ((uint64_t)__float_as_uint(v[2]) << 32) | (uint32_t)(base_idx + 2);
+                if(b3 & (1ull << lane))
+                    buf[bcnt + t2 + __popcll(b3 & lt)] =
+                        ((uint64_t)__float_as_uint(v[3]) << 32) | (uint32_t)(base_idx + 3);
 #endif
-            bcnt += wtotal;
-        }
+                bcnt += wtotal;
+            }
 #if ABLATE_DRAIN == 4
-        // The drain CHECK itself, gone: no wave_barrier, no drain. The 2x2 leaves
-        // 76us unaccounted after both the staging write and the drain copy are
-        // removed, and __builtin_amdgcn_wave_barrier() fires every ~11 iterations
-        // (bcnt passes 64 at ~5.6 passers per wave-iteration). It is a scheduling
-        // barrier, so it stops the compiler hoisting the next loads past it.
-        (void)0;
+            // The drain CHECK itself, gone: no wave_barrier, no drain. The 2x2 leaves
+            // 76us unaccounted after both the staging write and the drain copy are
+            // removed, and __builtin_amdgcn_wave_barrier() fires every ~11 iterations
+            // (bcnt passes 64 at ~5.6 passers per wave-iteration). It is a scheduling
+            // barrier, so it stops the compiler hoisting the next loads past it.
+            (void)0;
 #else
-        if(bcnt > WSTAGE_CAP - 4 * WAVE_SIZE)
-        {
-            __builtin_amdgcn_wave_barrier();
-            COOP_DRAIN_WAVE();
+#ifndef COOP_DRAIN_AT
+#define COOP_DRAIN_AT (WSTAGE_CAP_COOP - 4 * WAVE_SIZE)
+#endif
+            if(bcnt > COOP_DRAIN_AT)
+            {
+                __builtin_amdgcn_wave_barrier();
+                COOP_DRAIN_WAVE();
+            }
+#endif
+#endif
         }
-#endif
-#endif
     }
     // The vector loop stops at n4 = pitch / FP32_EPT, which TRUNCATES when the row
     // width is not a multiple of four, so the last one to three columns would
@@ -332,7 +398,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     //
     // The block that owns the last chunk picks the tail up instead: at most three
     // columns, one lane each, staged exactly like any other candidate so the
-    // epilogue needs no special case. bcnt is at most WSTAGE_CAP - 4 * WAVE_SIZE
+    // epilogue needs no special case. bcnt is at most WSTAGE_CAP_COOP - 4 * WAVE_SIZE
     // here because the drain check runs at the end of every iteration, so the
     // three extra entries cannot overflow the staging buffer.
     //
@@ -405,7 +471,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         if(bad || total > cap)
         {
             if(bad || total > cap)
-                atomicExch(&cand_bad[row], 1u);
+                atomicExch(&cand_bad[(size_t)row * CTR_STRIDE], 1u);
             s_base = 0xFFFFFFFFu;
         }
         else if(total == 0)
@@ -415,10 +481,10 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         else
         {
             s_tot  = total;
-            s_base = atomicAdd(&cand_reserved[row], (unsigned)total);
+            s_base = atomicAdd(&cand_reserved[(size_t)row * CTR_STRIDE], (unsigned)total);
             if(s_base + (unsigned)total > (unsigned)cap)
             {
-                atomicExch(&cand_bad[row], 1u);
+                atomicExch(&cand_bad[(size_t)row * CTR_STRIDE], 1u);
                 s_base = 0xFFFFFFFFu;
             }
         }
@@ -437,7 +503,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         if(cnt <= 0)
             continue;
         uint64_t* dst       = row_base;
-        const uint64_t* src = wbuf + (size_t)w * WSTAGE_CAP;
+        const uint64_t* src = wbuf + (size_t)w * WSTAGE_CAP_COOP;
         for(int j = threadIdx.x; j < cnt; j += blockDim.x)
             dst[j] = src[j];
     }
@@ -479,7 +545,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         int w = 0;
         while(w + 1 < nwaves && j >= s_off[w + 1])
             w++;
-        __builtin_nontemporal_store(wbuf[(size_t)w * WSTAGE_CAP + (j - s_off[w])],
+        __builtin_nontemporal_store(wbuf[(size_t)w * WSTAGE_CAP_COOP + (j - s_off[w])],
                                     &row_base[s_base + j]);
     }
 #elif ABLATE_EPI == 7
@@ -494,7 +560,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             int w = 0;
             while(w + 1 < nwaves && j >= s_off[w + 1])
                 w++;
-            row32[s_base + j] = (uint32_t)wbuf[(size_t)w * WSTAGE_CAP + (j - s_off[w])];
+            row32[s_base + j] = (uint32_t)wbuf[(size_t)w * WSTAGE_CAP_COOP + (j - s_off[w])];
         }
     }
 #elif ABLATE_EPI == 6
@@ -509,7 +575,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         int w = 0;
         while(w + 1 < nwaves && j >= s_off[w + 1])
             w++;
-        row_base[(s_base & ~15u) + j] = wbuf[(size_t)w * WSTAGE_CAP + (j - s_off[w])];
+        row_base[(s_base & ~15u) + j] = wbuf[(size_t)w * WSTAGE_CAP_COOP + (j - s_off[w])];
     }
 #elif ABLATE_EPI == 5
     // CORRECT, not an ablation. s_off is a prefix sum, so row_base + s_base +
@@ -526,7 +592,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         int w = 0;
         while(w + 1 < nwaves && j >= s_off[w + 1])
             w++;
-        row_base[s_base + j] = wbuf[(size_t)w * WSTAGE_CAP + (j - s_off[w])];
+        row_base[s_base + j] = wbuf[(size_t)w * WSTAGE_CAP_COOP + (j - s_off[w])];
     }
 #elif ABLATE_EPI == 91
     // The block walking the eight staged runs one after another, which is what
@@ -537,7 +603,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         if(cnt <= 0)
             continue;
         uint64_t* dst       = row_base + s_base + s_off[w];
-        const uint64_t* src = wbuf + (size_t)w * WSTAGE_CAP;
+        const uint64_t* src = wbuf + (size_t)w * WSTAGE_CAP_COOP;
         for(int j = threadIdx.x; j < cnt; j += blockDim.x)
             dst[j] = src[j];
     }
@@ -587,7 +653,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             // It crosses at the same 2^27 the loads do. Writing each wave's own run
             // rather than having the block walk all eight is a win at every size, so
             // only the non-temporal part is gated.
-            if constexpr(NT)
+            if constexpr(NT_STORE)
             {
                 for(int j = lane; j < cnt; j += WAVE_SIZE)
                     __builtin_nontemporal_store(buf[j], &dst[j]);
@@ -595,7 +661,15 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             else
             {
                 for(int j = lane; j < cnt; j += WAVE_SIZE)
+                {
+#if NT_LOAD_ONLY_MUTANT
+                    // Gate self-test only: drops each wave's first candidate in the
+                    // NT-load / cached-store instantiation. Must turn the gate red.
+                    if(NT && j == 0)
+                        continue;
+#endif
                     dst[j] = buf[j];
+                }
             }
         }
     }
@@ -630,10 +704,14 @@ phase_c_select_contig(const float* __restrict__ input,
                       bool keys_only,
                       int nwide)
 {
-    const int row            = blockIdx.x;
-    const int row_start      = RAGGED ? extents.row_start(row, pitch) : 0;
-    const int len            = row_len_of<RAGGED>(row, pitch, extents);
-    const unsigned int c_raw = cand_bad[row] ? 0xFFFFFFFFu : cand_reserved[row];
+    const int row       = blockIdx.x;
+    const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
+    const int len       = row_len_of<RAGGED>(row, pitch, extents);
+    // Both counters unconditionally: the ternary compiled to load, wait, branch,
+    // load, a second serial round trip in front of every phase_c block.
+    const unsigned int bad_raw = cand_bad[(size_t)row * CTR_STRIDE];
+    const unsigned int res_raw = cand_reserved[(size_t)row * CTR_STRIDE];
+    const unsigned int c_raw   = bad_raw ? 0xFFFFFFFFu : res_raw;
     if(threadIdx.x == 0)
         cand_count[row] = c_raw;
 
@@ -704,16 +782,7 @@ phase_c_select_contig(const float* __restrict__ input,
     // (scripts/wide_ab.py, arms acF against acN), against -0.3 to -0.4us unfolded.
     if(nwide > 0)
         clear_wide(s_wide, wide_buffer_count(nwide, REUSE_WIDE));
-    for(int i = threadIdx.x; i < c; i += blockDim.x)
-    {
-#if NT_CAND
-        // The candidate array is read once here and never again, and phase_b now
-        // writes it non-temporally so it is not in cache to begin with. Pricing
-        // knob: NT_CAND=0 puts the ordinary load back.
-        uint64_t p = __builtin_nontemporal_load(&base[i]);
-#else
-        uint64_t p = base[i];
-#endif
+    auto take_cand = [&](uint64_t p, int i) {
         const uint32_t kk = fp32_to_sortable_bits((uint32_t)(p >> 32));
         s_keys_ext[i]     = kk;
         if(!keys_only)
@@ -722,6 +791,38 @@ phase_c_select_contig(const float* __restrict__ input,
         // radix_shift(0) is 24, so pass 0's digit is the top byte.
         atomicAdd(&s_hist[(kk >> 24) * HIST_REP + fold_rep], 1u);
 #endif
+    };
+    // PC_B candidate loads per thread go out before the first is used; with one
+    // block per CU nothing else hides their round trips.
+    constexpr int PC_B = 4;
+    for(int i0 = threadIdx.x; i0 < c; i0 += PC_B * (int)blockDim.x)
+    {
+        uint64_t pv[PC_B];
+#pragma unroll
+        for(int u = 0; u < PC_B; u++)
+        {
+            const int i = i0 + u * (int)blockDim.x;
+#if NT_CAND
+            // The candidate array is read once here and never again, and phase_b now
+            // writes it non-temporally so it is not in cache to begin with. Pricing
+            // knob: NT_CAND=0 puts the ordinary load back.
+            pv[u] = i < c ? __builtin_nontemporal_load(&base[i]) : 0ull;
+#else
+            pv[u] = i < c ? base[i] : 0ull;
+#endif
+        }
+#pragma unroll
+        for(int u = 0; u < PC_B; u++)
+        {
+            const int i = i0 + u * (int)blockDim.x;
+#if PC_BATCH_MUTANT // gate self-test only: never stores a batch's last candidate
+            if(i < c && u != PC_B - 1)
+                take_cand(pv[u], i);
+#else
+            if(i < c)
+                take_cand(pv[u], i);
+#endif
+        }
     }
 #endif
     __syncthreads();

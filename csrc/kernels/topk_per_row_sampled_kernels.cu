@@ -58,7 +58,15 @@ static float g_margin    = 0.0f; // 0 => derive from the estimator's own noise
 // Distinct from g_use_nt_load above: that one flips a __constant__ read inside
 // load_f4, so it applies to every phase and costs a branch in the innermost
 // load. This one is a template parameter on phase_b only.
-static int g_nt_load     = -1;  // -1 = the size gate below, 0 = never, 1 = always
+static int g_nt_load = -1; // -1 = the size gate below, 0 = never, 1 = always
+// log2(M * pitch) at which phase_b's row loads, and separately its candidate
+// stores, go non-temporal. Stores only ever go NT when loads do.
+#ifndef NT_LOAD_LOG2
+#define NT_LOAD_LOG2 25
+#endif
+#ifndef NT_STORE_LOG2
+#define NT_STORE_LOG2 27
+#endif
 static int g_cf_block    = 512; // Phase B block size
 static int g_cf_gx       = 16;  // Phase B blocks per row (grid.x)
 static int g_use_nt_load = 0;   // non-temporal streaming loads in Phase B
@@ -1437,10 +1445,18 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
 
     if(threadIdx.x == 0)
     {
+#if CTR_STRIDE_MUTANT
+        // Gate self-test only: clears at the unpadded index. Must turn the gate red.
         if(cand_reserved)
             cand_reserved[row] = 0u;
         if(cand_bad)
             cand_bad[row] = 0u;
+#else
+        if(cand_reserved)
+            cand_reserved[(size_t)row * CTR_STRIDE] = 0u;
+        if(cand_bad)
+            cand_bad[(size_t)row * CTR_STRIDE] = 0u;
+#endif
         if(row == 0)
             *fb_count = 0;
     }
@@ -1492,9 +1508,6 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     if(nwide > 0)
         clear_wide(s_wide, wide_buffer_count(nwide, false));
 
-#ifndef PA_UNROLL
-#define PA_UNROLL 4
-#endif
     // Register-resident keys for KPT>0. Filled in the same strided v4 order the
     // LDS path uses, so each thread's keys[t] is exactly what s_keys[tid+...] held.
     uint32_t keys[KPT > 0 ? KPT : 1];
@@ -1504,27 +1517,23 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
         for(int t = 0; t < KPT; t++)
             keys[t] = 0u;
     }
-    int kfill = 0;
-#pragma unroll PA_UNROLL
-    for(int u = threadIdx.x; u < total_v4; u += blockDim.x)
-    {
-        const int chunk = u / v4_per_chunk;
-        const int off4  = u % v4_per_chunk;
-        vfloat4 v = *(reinterpret_cast<const vfloat4*>(ri + (size_t)chunk * chunk_stride) + off4);
+    // Convert one v4 of samples: keys into registers (slot t) or LDS (index u),
+    // and pass 0's digits folded into s_hist.
+    auto take_v4 = [&](const vfloat4& v, int u, int t) {
         const uint32_t k0 = fp32_to_sortable(v[0]);
         const uint32_t k1 = fp32_to_sortable(v[1]);
         const uint32_t k2 = fp32_to_sortable(v[2]);
         const uint32_t k3 = fp32_to_sortable(v[3]);
         if constexpr(KPT > 0)
         {
-            keys[kfill + 0] = k0;
-            keys[kfill + 1] = k1;
-            keys[kfill + 2] = k2;
-            keys[kfill + 3] = k3;
-            kfill += FP32_EPT;
+            keys[t * FP32_EPT + 0] = k0;
+            keys[t * FP32_EPT + 1] = k1;
+            keys[t * FP32_EPT + 2] = k2;
+            keys[t * FP32_EPT + 3] = k3;
         }
         else
         {
+            (void)t;
             const int base   = u * FP32_EPT;
             s_keys[base + 0] = k0;
             s_keys[base + 1] = k1;
@@ -1535,13 +1544,50 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
         // radix_shift(0) is 24, so pass 0's digit is the top byte.
         // PA_REG_MUTANT drops keys[0] in the select; drop the matching fold count
         // here so the prefilled hist stays consistent with the mutant select.
-        const bool drop0 = (PA_REG_MUTANT && KPT > 0 && (kfill == FP32_EPT));
+        const bool drop0 = (PA_REG_MUTANT && KPT > 0 && t == 0);
         if(!drop0)
             atomicAdd(&s_hist[(k0 >> 24) * HIST_REP + fold_rep], 1u);
         atomicAdd(&s_hist[(k1 >> 24) * HIST_REP + fold_rep], 1u);
         atomicAdd(&s_hist[(k2 >> 24) * HIST_REP + fold_rep], 1u);
         atomicAdd(&s_hist[(k3 >> 24) * HIST_REP + fold_rep], 1u);
 #endif
+    };
+    auto load_v4 = [&](int u) {
+        const int chunk = u / v4_per_chunk;
+        const int off4  = u % v4_per_chunk;
+        return *(reinterpret_cast<const vfloat4*>(ri + (size_t)chunk * chunk_stride) + off4);
+    };
+    // Every sample load a thread owns issues before the first is converted. The
+    // plain loop kept each load beside its use: 4-5 serial global round trips
+    // per thread (ISA: load, s_waitcnt vmcnt(0), convert, next load).
+    if constexpr(KPT > 0)
+    {
+        // S == KPT * blockDim.x here, so each thread owns exactly KPT/4 v4s.
+        constexpr int NV = KPT / FP32_EPT;
+        vfloat4 vv[NV];
+#pragma unroll
+        for(int t = 0; t < NV; t++)
+            vv[t] = load_v4((int)threadIdx.x + t * (int)blockDim.x);
+#pragma unroll
+        for(int t = 0; t < NV; t++)
+            take_v4(vv[t], (int)threadIdx.x + t * (int)blockDim.x, t);
+    }
+    else
+    {
+        constexpr int NB = 4;
+        const int bd     = (int)blockDim.x;
+        for(int u0 = (int)threadIdx.x; u0 < total_v4; u0 += NB * bd)
+        {
+            vfloat4 vv[NB];
+#pragma unroll
+            for(int t = 0; t < NB; t++)
+                if(u0 + t * bd < total_v4)
+                    vv[t] = load_v4(u0 + t * bd);
+#pragma unroll
+            for(int t = 0; t < NB; t++)
+                if(u0 + t * bd < total_v4)
+                    take_v4(vv[t], u0 + t * bd, t);
+        }
     }
     __syncthreads();
 
@@ -2165,8 +2211,8 @@ static void alloc_bufs(Bufs& b, int M, int K, int cap)
     HIP_CHECK(hipMalloc(&b.cand_pack, (size_t)M * row_slots * sizeof(uint64_t)));
     HIP_CHECK(hipMalloc(&b.cand_seg, (size_t)M * MAX_WAVES_PER_BLOCK * sizeof(int)));
     HIP_CHECK(hipMalloc(&b.cand_count, (size_t)M * sizeof(unsigned int)));
-    HIP_CHECK(hipMalloc(&b.cand_reserved, (size_t)M * sizeof(unsigned int)));
-    HIP_CHECK(hipMalloc(&b.cand_bad, (size_t)M * sizeof(unsigned int)));
+    HIP_CHECK(hipMalloc(&b.cand_reserved, (size_t)M * CTR_STRIDE * sizeof(unsigned int)));
+    HIP_CHECK(hipMalloc(&b.cand_bad, (size_t)M * CTR_STRIDE * sizeof(unsigned int)));
     HIP_CHECK(hipMalloc(&b.fb_rows, (size_t)M * sizeof(int)));
     HIP_CHECK(hipMalloc(&b.fb_count, sizeof(int)));
     (void)K;
@@ -2295,8 +2341,14 @@ static void topk_fused_impl(const float* d_in,
                                     !sp.keys_only_c && !baseline_wide_c && compact_wide_c;
     const bool keys_only_c  = sp.keys_only_c || resource_compact_c;
     const bool reuse_wide_c = resource_compact_c;
+#if PCIDX_MUTANT
+    // Gate self-test only: sizes phase_c's LDS for keys alone even when the
+    // kernel also stages indices. Must turn the gate red.
+    const int phase_c_candidate_lds = cap * (int)sizeof(uint32_t);
+#else
     const int phase_c_candidate_lds =
         cap * (keys_only_c ? (int)sizeof(uint32_t) : (int)(sizeof(uint32_t) + sizeof(int)));
+#endif
     // Provisional wide/occupancy with keys in LDS (the historical default). The
     // register path below may drop S*4 from LDS and re-evaluate wide_select_fits.
     bool wide_a =
@@ -2368,7 +2420,8 @@ static void topk_fused_impl(const float* d_in,
     // for a bandwidth reason. known_bad.md records that as unmeasured.
     static unsigned long long* bt_dev = nullptr;
     static size_t bt_slots            = 0;
-    const size_t bt_need              = (size_t)(coop ? sp.coop_g : 1) * (size_t)M * 2;
+    const size_t bt_need =
+        (size_t)(coop ? 2 * sp.coop_g : 1) * (size_t)M * 2; // launch may double G
     if(bt_need > bt_slots)
     {
         if(bt_dev)
@@ -2449,51 +2502,126 @@ static void topk_fused_impl(const float* d_in,
 
         if(coop)
         {
-            // Stream the row data past the caches when the input is too big to have
-            // stayed resident anyway. Every element is read by exactly one block and
-            // never looked at again, so the only thing a cache line does for it is
-            // evict what the other blocks are still reading -- but below the MALL's
-            // 256MB the input CAN stay resident across calls, and then the eviction
-            // is the whole benefit. Measured, three-kernel device total, k=2048
-            // --dist gaussian --seed 0, non-temporal against cached:
+            // Stream the row data past the caches: every element is read by exactly
+            // one block and never again. Priced on rotated inputs, one fresh buffer
+            // per call, same-process dual-module A/B against cached loads
+            // (log/v7/nt_price_load20.json, nt_region_load20.json, nt_interior_v7c1.json):
             //
-            //   M*N >= 2^27          M*N <= 2^26
-            //   4096 x 1048576 0.903  64 x 262144 1.050
-            //   1024 x 1048576 0.906  128 x 131072 1.042
-            //    128 x 1048576 0.890   16 x 1048576 1.031
-            //    256 x  524288 0.892   64 x 131073  1.029
-            //   1024 x  131072 0.969    1 x 1048576 1.020
+            //   M*N in [2^26, 2^27)  1.032 .. 1.114   M*N = 2^24  0.987 .. 1.021
+            //   M*N in [2^25, 2^26)  1.009 .. 1.068   M*N <= 2^23 0.985 .. 1.002
             //
-            // The two groups do not overlap and 2^27 elements is 512MB, which is the
-            // first size that cannot fit. g_nt_load forces it either way for pricing.
-            const bool nt =
-                g_nt_load < 0 ? ((size_t)M * (size_t)pitch >= ((size_t)1 << 27)) : (g_nt_load != 0);
+            // The whole gain is phase_b's (phase_b 1.03-1.15, phase_c 0.97-1.02). The
+            // old 2^27 gate was fitted on one reused input buffer, where anything under
+            // the 256 MB MALL stayed resident between calls, and it priced loads and
+            // stores together. Stores stay cached below 2^27: NT loads+stores over NT
+            // loads alone is 0.970-0.988 at 2^25 and 0.981-1.011 at 2^26
+            // (log/v7/nt_price_both20.json). This assumes the input is not already in
+            // the MALL when the op starts. g_nt_load forces loads and stores for pricing.
+            const size_t mn = (size_t)M * (size_t)pitch;
+            const bool nt = g_nt_load < 0 ? (mn >= ((size_t)1 << NT_LOAD_LOG2)) : (g_nt_load != 0);
+            const bool nt_st = nt && (g_nt_load >= 0 || mn >= ((size_t)1 << NT_STORE_LOG2));
             // One WSTAGE_CAP-entry staging slot per wave, and no more: see the
             // declaration in phase_b_filter_coop for why this is not a constant.
+#if WSTAGE_HOST_MUTANT
+            // Gate self-test only: the host sizes the old 320-entry staging while
+            // the kernel indexes WSTAGE_CAP_COOP. Must turn the gate red.
             const size_t wstage_bytes =
                 (size_t)(g_cf_block / WAVE_SIZE) * WSTAGE_CAP * sizeof(uint64_t);
-            if(nt)
+#else
+            const size_t wstage_bytes =
+                (size_t)(g_cf_block / WAVE_SIZE) * WSTAGE_CAP_COOP * sizeof(uint64_t);
+#endif
+            // Batched filter loads only where at most two blocks share a CU: a
+            // prefetch ring cost the bandwidth-bound grids 1-16% (log/v7/price_pbpf*.json).
+            // Not ragged: load_row_f4's partial-vector branch waits after each load.
+            // The batch never exceeds a thread's loads: dead slots cost 4-7% at 1-2.
+#ifndef PB_BATCH_MAX_BLOCKS
+#define PB_BATCH_MAX_BLOCKS (2 * CU_COUNT)
+#endif
+            auto batches = [&](int g) {
+                const int it = ((n4 + g - 1) / g + g_cf_block - 1) / g_cf_block;
+                return !RAGGED && !nt_st && it >= 2 &&
+                       (size_t)M * (size_t)g <= (size_t)PB_BATCH_MAX_BLOCKS;
+            };
+            // kCoopLog2G predates the batched loads. Below M=32 at N >= 131072 one more
+            // doubling of G wins where the doubled grid still batches: 1.005-1.059 at
+            // pow2 N, 1.007-1.115 at 35 widths inside the buckets (log/v7/price_cgup*.json,
+            // price_v7c7b_*.json). A doubling that turned batching off lost (M=1 N=262144
+            // 0.98, 1024-block grids 0.86-0.99), so it is taken only where the new grid batches.
+            int g = sp.coop_g;
+            if(g_coop_g <= 0 && M < 32 && pitch >= 131072 &&
+               2 * g <= std::max(1, n4 / g_cf_block) && batches(2 * g))
+                g *= 2;
+            const int pb_iters  = ((n4 + g - 1) / g + g_cf_block - 1) / g_cf_block;
+            const bool pb_batch = batches(g);
+            auto launch_pb      = [&](auto ntc, auto pb) {
+                phase_b_filter_coop<RAGGED,
+                                         decltype(ntc)::value,
+                                         false,
+                                    RAGGED ? 0 : decltype(pb)::value>
+                    <<<dim3(g, M), g_cf_block, wstage_bytes, s>>>(d_in,
+                                                                  pitch,
+                                                                  ext,
+                                                                  n4,
+                                                                  b.threshold_f,
+                                                                  b.cand_pack,
+                                                                  b.cand_reserved,
+                                                                  b.cand_bad,
+                                                                  cap);
+            };
+            // NT needs M*N >= 2^25, so at <= 512 blocks a thread has >= 32 loads.
+            auto launch_batched = [&](auto ntc) {
+                if constexpr(decltype(ntc)::value)
+                {
+                    launch_pb(ntc, std::integral_constant<int, 8>{});
+                }
+                else
+                {
+                    if(pb_iters >= 8)
+                        launch_pb(ntc, std::integral_constant<int, 8>{});
+                    else if(pb_iters >= 4)
+                        launch_pb(ntc, std::integral_constant<int, 4>{});
+                    else
+                        launch_pb(ntc, std::integral_constant<int, 2>{});
+                }
+            };
+            if(nt_st)
                 phase_b_filter_coop<RAGGED, true>
-                    <<<dim3(sp.coop_g, M), g_cf_block, wstage_bytes, s>>>(d_in,
-                                                                          pitch,
-                                                                          ext,
-                                                                          n4,
-                                                                          b.threshold_f,
-                                                                          b.cand_pack,
-                                                                          b.cand_reserved,
-                                                                          b.cand_bad,
-                                                                          cap);
+                    <<<dim3(g, M), g_cf_block, wstage_bytes, s>>>(d_in,
+                                                                  pitch,
+                                                                  ext,
+                                                                  n4,
+                                                                  b.threshold_f,
+                                                                  b.cand_pack,
+                                                                  b.cand_reserved,
+                                                                  b.cand_bad,
+                                                                  cap);
+            else if(pb_batch && nt)
+                launch_batched(std::true_type{});
+            else if(pb_batch)
+                launch_batched(std::false_type{});
+            else if(nt)
+                phase_b_filter_coop<RAGGED, true, false>
+                    <<<dim3(g, M), g_cf_block, wstage_bytes, s>>>(d_in,
+                                                                  pitch,
+                                                                  ext,
+                                                                  n4,
+                                                                  b.threshold_f,
+                                                                  b.cand_pack,
+                                                                  b.cand_reserved,
+                                                                  b.cand_bad,
+                                                                  cap);
             else
                 phase_b_filter_coop<RAGGED, false>
-                    <<<dim3(sp.coop_g, M), g_cf_block, wstage_bytes, s>>>(d_in,
-                                                                          pitch,
-                                                                          ext,
-                                                                          n4,
-                                                                          b.threshold_f,
-                                                                          b.cand_pack,
-                                                                          b.cand_reserved,
-                                                                          b.cand_bad,
-                                                                          cap);
+                    <<<dim3(g, M), g_cf_block, wstage_bytes, s>>>(d_in,
+                                                                  pitch,
+                                                                  ext,
+                                                                  n4,
+                                                                  b.threshold_f,
+                                                                  b.cand_pack,
+                                                                  b.cand_reserved,
+                                                                  b.cand_bad,
+                                                                  cap);
         }
         else if(g_phase_b == 4)
         {
@@ -2770,16 +2898,23 @@ static inline WsLayout ws_layout(int M, int cap)
         return here;
     };
     WsLayout L{};
-    L.threshold     = take((size_t)M * sizeof(uint32_t));
-    L.threshold_f   = take((size_t)M * sizeof(float));
-    L.cand_pack     = take((size_t)M * row_slots * sizeof(uint64_t));
-    L.cand_seg      = take((size_t)M * MAX_WAVES_PER_BLOCK * sizeof(int));
-    L.cand_count    = take((size_t)M * sizeof(unsigned int));
+    L.threshold   = take((size_t)M * sizeof(uint32_t));
+    L.threshold_f = take((size_t)M * sizeof(float));
+    L.cand_pack   = take((size_t)M * row_slots * sizeof(uint64_t));
+    L.cand_seg    = take((size_t)M * MAX_WAVES_PER_BLOCK * sizeof(int));
+    L.cand_count  = take((size_t)M * sizeof(unsigned int));
+#if CTR_ALLOC_MUTANT
+    // Gate self-test only: allocates the counters unpadded while the kernels
+    // index them padded. Must turn the gate red.
     L.cand_reserved = take((size_t)M * sizeof(unsigned int));
     L.cand_bad      = take((size_t)M * sizeof(unsigned int));
-    L.fb_rows       = take((size_t)M * sizeof(int));
-    L.fb_count      = take(sizeof(int));
-    L.total         = o;
+#else
+    L.cand_reserved = take((size_t)M * CTR_STRIDE * sizeof(unsigned int));
+    L.cand_bad      = take((size_t)M * CTR_STRIDE * sizeof(unsigned int));
+#endif
+    L.fb_rows  = take((size_t)M * sizeof(int));
+    L.fb_count = take(sizeof(int));
+    L.total    = o;
     return L;
 }
 
