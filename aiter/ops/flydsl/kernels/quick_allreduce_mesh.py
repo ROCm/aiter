@@ -324,7 +324,7 @@ def make_quick_allreduce_mesh_kernel(
     wire_tile_bytes = wire_tile_i32 * 4
 
     # This rank's own index as a trace-time constant, or None when the self
-    # slot is being used. A fused build never skips self.
+    # slot is being used.
     self_rank = int(rank) if skip_self else None
     # Destinations this rank pushes packets and flags to, in rank order. Every
     # per-destination structure below -- LDS pack rows, fanout quads, flag
@@ -884,6 +884,43 @@ def make_quick_allreduce_mesh_kernel(
                         gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
 
+        # Self-skip at ST>1 carries nothing in registers between the three
+        # super-tile loops; these move our own share and reduced chunk instead.
+        def _load_own_share(tile, k):
+            """Our reduce-scatter share of *tile*, reloaded from the input. A
+            fused build reads it through the same per-row route as
+            ``_load_tile_atoms``, so a padded row's pad lanes come back zero."""
+            atom = self_rank * rank_atoms + k
+            if const_expr(fused):
+                return _atom_bf16_to_f16(_load_raw_atom(in_buf, tile, atom))
+            return _load_atom(tile, atom)
+
+        def _stash_own(tile, k, value):
+            """Park our reduced chunk in ``out`` until the tile is finished.
+
+            A plain build's store here is already its final one. A fused build
+            parks the raw fp16 bits in the same slot for ``_unstash_own`` --
+            exact, where a bf16 store would round -- and the epilogue then
+            overwrites them. The all-gather publish between the two drains
+            ``vmcnt``, so the reload sees the store.
+            """
+            atom = self_rank * rank_atoms + k
+            if const_expr(fused):
+                _store_raw_atom(out_buf, tile, atom, value)
+            else:
+                _store_atom(tile, atom, value)
+
+        def _unstash_own(tile):
+            """The own slot for ``_recv_all_gather`` in the third loop: what
+            ``_stash_own`` parked on a fused self-skip build, else ``None`` (no
+            self-skip, or a plain build whose store was final)."""
+            if const_expr(fused and self_rank is not None):
+                return [
+                    _load_raw_atom(out_buf, tile, self_rank * rank_atoms + k)
+                    for k in range_constexpr(rank_atoms)
+                ]
+            return None
+
         # One row shared by every token, so the gain is read once here rather
         # than once per tile.
         w_atoms = None
@@ -964,14 +1001,14 @@ def make_quick_allreduce_mesh_kernel(
                     own_rs = None
                     if const_expr(self_rank is not None):
                         own_rs = [
-                            _load_atom(tile, self_rank * rank_atoms + k)
+                            _load_own_share(tile, k)
                             for k in range_constexpr(rank_atoms)
                         ]
                     acc = _reduce_scattered(s, own_rs)
                     own_ag = _pack_all_gather(acc)
                     if const_expr(own_ag is not None):
                         for k in range_constexpr(rank_atoms):
-                            _store_atom(tile, self_rank * rank_atoms + k, own_ag[k])
+                            _stash_own(tile, k, own_ag[k])
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
@@ -982,8 +1019,8 @@ def make_quick_allreduce_mesh_kernel(
                 _wait_release(PHASE_ALL_GATHER, color)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    gathered = _recv_all_gather(s)
                     tile = bid + (i + s) * n_blocks
+                    gathered = _recv_all_gather(s, _unstash_own(tile))
                     _finish_tile(tile, gathered, w_atoms)
 
                 color = color + fx.Int32(1)

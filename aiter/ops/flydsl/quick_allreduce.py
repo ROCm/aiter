@@ -793,24 +793,13 @@ class FlyQuickAllReduceRMSNorm:
         out = bf16(acc * rsqrt(sum(acc^2)/hidden + eps) * weight)
 
     Defaults to ``algorithm="ring"``, the schedule whose structure the
-    row-sized block was chosen for -- but **measure before choosing it**. On
-    MI350P at TP8, fusing pays on the mesh and costs on the ring:
+    row-sized block was chosen for.
 
-        1024x7168   fused mesh 323 us   separate mesh 383 us   (1.18x)
-                    fused ring 509 us   separate ring 383 us   (0.75x)
-        4096x8192   fused mesh 1398 us  separate mesh 1693 us  (1.21x)
-                    fused ring 1281 us  separate ring 1110 us  (0.87x)
-
-    The asymmetry is structural. The mesh runs its epilogue once per tile, as a
+    The mesh runs its epilogue once per tile, as a
     tail after the all-gather, on values already in registers -- so it collects
     the two saved HBM passes and nothing else changes. The ring runs it inside
     the ``2(N-1)``-op pipeline, once per chunk, putting barriers and norm
-    arithmetic between one receive and the next; that pipeline is what the
-    ring's throughput is, and disturbing it costs more than the passes save.
-
-    Note the mesh is also ~2.4 dB noisier in that comparison, for an unrelated
-    reason: its codec defaults to INT4 on both laps where the ring widens its
-    reduce-scatter lap to INT6 at TP8.
+    arithmetic between one receive and the next.
 
     Unlike ``FlyQuickAllReduce`` the *geometry* depends on ``hidden``, not just
     the epilogue -- the block is sized so one 16 B atom is one token row (see
@@ -821,7 +810,7 @@ class FlyQuickAllReduceRMSNorm:
     build them up front instead.
 
     Supported widths are multiples of 1024 up to 8192 -- 7168 and 5120
-    included, which the tile-aligned formulation this replaces could not do.
+    included.
     """
 
     #: Fused launches are capped at one workgroup per CU. That is not a
@@ -854,6 +843,7 @@ class FlyQuickAllReduceRMSNorm:
         atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
         pad: bool = True,
+        skip_self: bool = False,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -869,6 +859,11 @@ class FlyQuickAllReduceRMSNorm:
             raise ValueError(
                 f"super_tile must be one of {algo.super_tiles} for "
                 f"algorithm={algorithm!r}, got {super_tile!r}"
+            )
+        if skip_self and not algo.supports_skip_self:
+            raise ValueError(
+                f"skip_self does not apply to algorithm={algorithm!r}: it never "
+                "writes its own inbox, so there is no round trip to skip"
             )
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         group_world = dist.get_world_size(group=group)
@@ -926,6 +921,7 @@ class FlyQuickAllReduceRMSNorm:
         self.min_bytes = algo.floor_bytes(self.world_size)
         self.max_bytes = max_bytes
         self.pad = bool(pad)
+        self.skip_self = bool(skip_self)
 
         # Rungs to build, as ``(super_tile, grid_cap)``. Same ladder the plain
         # class walks; pinning ``super_tile`` collapses it to one rung.
@@ -1072,7 +1068,7 @@ class FlyQuickAllReduceRMSNorm:
                 inbox_memory=self.inbox_memory,
                 rs_codec=self.rs_codec,
                 ag_codec=self.ag_codec,
-                skip_self=False,
+                skip_self=self.skip_self,
                 fusion="rmsnorm",
                 hidden=hidden,
                 block=block,

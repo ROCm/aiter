@@ -935,6 +935,7 @@ def _run_rank_fused(
     algorithm: str,
     codecs: tuple[str | None, str | None],
     solo: bool,
+    engine_kw: dict | None = None,
 ) -> list[dict]:
     """One rank of a fused run, over every case in one spawn.
 
@@ -976,6 +977,7 @@ def _run_rank_fused(
         algorithm=algorithm,
         rs_codec=rs_codec,
         ag_codec=ag_codec,
+        **(engine_kw or {}),
     )
     # The cases here are deliberately small; the floor is a speed policy, not a
     # correctness limit, so it must not decide what this test covers.
@@ -1054,6 +1056,7 @@ def _spawn_fused(
     algorithm: str = "ring",
     codecs: tuple[str | None, str | None] = (None, None),
     solo: bool = False,
+    engine_kw: dict | None = None,
 ) -> list[list[dict]]:
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
@@ -1073,6 +1076,7 @@ def _spawn_fused(
                     "algorithm": algorithm,
                     "codecs": codecs,
                     "solo": solo,
+                    "engine_kw": engine_kw,
                 },
             )
             for rank in range(world_size)
@@ -1140,8 +1144,14 @@ def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
     """
     cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
     batch = _fused_batch((tp, "sqnr", algorithm), cases, algorithm=algorithm)
+    fails = _fused_sqnr_fails(batch[(tokens, hidden)])
+    assert not fails, f"{label}/{algorithm}: " + "; ".join(fails)
+
+
+def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
+    """The SQNR gates of ``test_quick_allreduce_rmsnorm_sqnr``, per rank."""
     fails = []
-    for row in batch[(tokens, hidden)]:
+    for row in rows:
         if not row["finite"]:
             fails.append(f"rank {row['rank']}: non-finite output")
         if row["out_sqnr_db"] < FUSED_SQNR_MIN_DB:
@@ -1160,7 +1170,7 @@ def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
                 f"{row['self_sqnr_db']:.2f} dB < {FUSED_SELF_SQNR_MIN_DB} -- the "
                 "epilogue disagrees with its own residual"
             )
-    assert not fails, f"{label}/{algorithm}: " + "; ".join(fails)
+    return fails
 
 
 #: Widths with no native row geometry, which run on a *padded* workgroup.
@@ -1255,6 +1265,102 @@ def test_quick_allreduce_rmsnorm_mesh_ranks_agree():
         if (r["out_bits"], r["res_bits"]) != (first["out_bits"], first["res_bits"])
     ]
     assert not bad, f"mesh ranks {bad} disagree with rank 0"
+
+
+#: Self-skip is tested at both super-tile paths the mesh has: ST=1 carries the
+#: own share and chunk in registers across the waits, ST>1 reloads the share
+#: from the input and parks the chunk in ``out`` between its three loops.
+_FUSED_SKIP_SELF_STS = (1, 8)
+
+
+def _skip_self_kw(super_tile: int) -> dict:
+    return {"super_tile": super_tile, "skip_self": True}
+
+
+@pytest.mark.parametrize("super_tile", _FUSED_SKIP_SELF_STS)
+@pytest.mark.parametrize("tp,tokens,hidden,label", _FUSED_CASES)
+def test_quick_allreduce_rmsnorm_mesh_skip_self(tp, tokens, hidden, label, super_tile):
+    """The fused mesh with self-skip: the SQNR gates, and every rank agreeing.
+
+    Under self-skip a rank's own share never goes through its codec on the
+    reduce-scatter lap, and its own reduced chunk never goes through its inbox
+    on the all-gather lap. That chunk is the dequant of the very packet its
+    peers receive, so the ranks must still agree bit for bit; a rank that used
+    its unquantized accumulator instead would not.
+
+    A pinned ST=8 still falls back to ST=1 on payloads with too few tiles, so
+    only the variant says which path a case took.
+    """
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    batch = _fused_batch(
+        (tp, "ss", "mesh", super_tile),
+        cases,
+        algorithm="mesh",
+        engine_kw=_skip_self_kw(super_tile),
+    )
+    rows = batch[(tokens, hidden)]
+    fails = _fused_sqnr_fails(rows)
+    first = rows[0]
+    fails += [
+        f"rank {r['rank']} disagrees with rank 0"
+        for r in rows
+        if (r["out_bits"], r["res_bits"]) != (first["out_bits"], first["res_bits"])
+    ]
+    fails += [
+        f"rank {r['rank']} ran {r['variant']}, not a self-skip build"
+        for r in rows
+        if "_ss" not in r["variant"]
+    ]
+    assert not fails, f"{label}/mesh/skip_self/st{super_tile}: " + "; ".join(fails)
+
+
+@pytest.mark.parametrize("tp", sorted({w for w, *_ in _FUSED_CASES}))
+def test_quick_allreduce_rmsnorm_mesh_skip_self_st8_is_exercised(tp):
+    """At least one case per world size really takes the ST>1 self-skip path,
+    so the pinned-ST=8 rows above are not all silently ST=1."""
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    batch = _fused_batch(
+        (tp, "ss", "mesh", 8), cases, algorithm="mesh", engine_kw=_skip_self_kw(8)
+    )
+    variants = {r["variant"] for rows in batch.values() for r in rows}
+    assert any("_st8_" in v for v in variants), variants
+
+
+#: ``tokens`` is large enough that a pinned ST=8 really runs ST=8 at every
+#: world size and inbox type here; the test asserts it.
+@pytest.mark.parametrize("super_tile", _FUSED_SKIP_SELF_STS)
+@pytest.mark.parametrize(
+    "tp,tokens,hidden", ((2, 4096, 4096), (4, 4096, 4096), (2, 4096, 1536))
+)
+def test_quick_allreduce_rmsnorm_mesh_skip_self_is_bit_exact(
+    tp, tokens, hidden, super_tile
+):
+    """Self-skip on a lossless wire with one live rank: ``residual_out`` exact.
+
+    The own slot sits at ``self_rank * rank_atoms`` in the tile; an off-by-one
+    there moves a whole atom, which only an equality sees. TP4 puts some rank's
+    slot in the middle of the tile, and 1536 runs on a padded workgroup -- the
+    case where ST>1's reload of the own share must take the per-row route.
+    """
+    batch = _fused_batch(
+        (tp, "ss-exact", "mesh", hidden, super_tile),
+        [(tokens, hidden)],
+        algorithm="mesh",
+        codecs=("fp16", "fp16"),
+        solo=True,
+        engine_kw=_skip_self_kw(super_tile),
+    )
+    rows = batch[(tokens, hidden)]
+    for row in rows:
+        assert f"_st{super_tile}_" in row["variant"], row["variant"]
+    bad = [r["rank"] for r in rows if not r["res_exact"]]
+    assert not bad, (
+        f"tp{tp} {tokens}x{hidden} st{super_tile}: residual_out is not bit-exact "
+        f"on ranks {bad} with a lossless wire under skip_self -- the own slot is "
+        "misplaced"
+    )
+    for row in rows:
+        assert row["out_sqnr_db"] > 60.0, row
 
 
 @pytest.mark.parametrize("hidden", (2560, 640, 12288))

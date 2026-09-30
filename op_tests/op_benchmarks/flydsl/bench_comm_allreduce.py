@@ -729,6 +729,7 @@ class Candidate:
         would build one engine per (config, shape) in a sweep and exhaust the
         IPC heap. ``block`` is safe to key on because it is a *policy* (pin this
         width, or take the widest), resolved per hidden inside the engine.
+        ``skip_self`` is last, and ``None`` means the engine default (off).
         """
         return (
             self.algorithm,
@@ -737,6 +738,7 @@ class Candidate:
             self.rs_codec,
             self.ag_codec,
             self.block,
+            self.skip_self,
         )
 
     @property
@@ -1126,6 +1128,32 @@ CANDIDATES = (
     ),
     # ... plus their pinned-block rows, see `_fused_flyqr_grid_rows`.
     *_fused_flyqr_grid_rows(),
+    # Self-skip for the fused mesh: on the ladder (`fused_fly_mesh_ss`, against
+    # `fused_fly_mesh`), and pinned per super-tile, each pair differing in
+    # nothing else.
+    Candidate(
+        "fused_fly_mesh_ss",
+        "fused_flyqr",
+        15.0,
+        False,
+        fusion=True,
+        algorithm="mesh",
+        skip_self=True,
+    ),
+    *(
+        Candidate(
+            f"fused_fly_mesh_st{st}" + ("_ss" if ss else ""),
+            "fused_flyqr",
+            15.0,
+            False,
+            fusion=True,
+            algorithm="mesh",
+            super_tile=st,
+            skip_self=ss,
+        )
+        for st in (1, 8)
+        for ss in (False, True)
+    ),
     Candidate("separate_cdr", "separate", 40.0, True, fusion=True, sep_ar="cdr"),
     Candidate("separate_rccl", "separate", 40.0, True, fusion=True, sep_ar="rccl"),
     # The incumbent quick-reduce's own two-launch baseline, so "does fusing
@@ -2762,7 +2790,14 @@ def _worker(
                 pad=_bench_fly_pad_enabled(),
                 **_fly_kwargs(
                     cfg[1:],
-                    ("super_tile", "grid_cap", "rs_codec", "ag_codec", "block"),
+                    (
+                        "super_tile",
+                        "grid_cap",
+                        "rs_codec",
+                        "ag_codec",
+                        "block",
+                        "skip_self",
+                    ),
                 ),
             )
             # Measure every size the sweep asks for, as the plain fly rows do.
