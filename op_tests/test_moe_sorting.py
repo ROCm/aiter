@@ -20,6 +20,30 @@ BLOCK_SIZE_M = 32
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
+def test_moe_sorting_opus_host_dispatch_boundaries():
+    if get_gfx() != "gfx950":
+        aiter.logger.warning("gfx950 dispatch test skipped on %s", get_gfx())
+        return
+
+    tokens = (1, 7, 8, 12, 16, 24, 25, 31)
+    multi_tokens = {
+        255: (25, 31),
+        256: (8, 12, 16, 24, 25, 31),
+        257: (8, 12, 16, 24, 25, 31),
+        385: tokens,
+    }
+    for E, token in itertools.product(multi_tokens, tokens):
+        auto_workspace = aiter.moe_sorting_opus_get_workspace_size(token, E, 8, 0)
+        oneshot_workspace = aiter.moe_sorting_opus_get_workspace_size(token, E, 8, 1)
+        multi_workspace = aiter.moe_sorting_opus_get_workspace_size(token, E, 8, 2)
+        expect_auto_multi = token in multi_tokens[E]
+        assert (auto_workspace > 0) == expect_auto_multi, (
+            f"unexpected auto dispatch for E={E}, M={token}"
+        )
+        assert oneshot_workspace == 0, f"forced oneshot failed for E={E}, M={token}"
+        assert multi_workspace > 0, f"forced multi failed for E={E}, M={token}"
+
+
 def set_moe_sorting_backend(backend: str) -> None:
     """Force which moe_sorting backend `moe_sorting()` dispatches to."""
     if backend == "flydsl":
@@ -792,6 +816,7 @@ def main():
     model_configs = list(zip(args.expert, args.topk))
     routing_cases = args.routing_case if args.routing_case is not None else ["valid"]
 
+    test_moe_sorting_opus_host_dispatch_boundaries()
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_capacity(dtype, args.model_dim)
         df = []

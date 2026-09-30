@@ -36,6 +36,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -1387,6 +1388,24 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
     return is_sub_token_onshot;
 }
 
+OPUS_H bool moe_sorting_auto_is_oneshot(int tokens_, int num_experts_)
+{
+    bool is_oneshot = moe_sorting_is_oneshot(tokens_, num_experts_);
+    if(!is_oneshot)
+        return false;
+
+    static const bool is_gfx950 = [] {
+        hipDeviceProp_t dev_prop;
+        hipDevice_t dev;
+        OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
+        OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, dev));
+        return std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+    }();
+    // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
+    return !(is_gfx950 && prefer_mp);
+}
+
 // return size in byte
 OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_experts_, int topk_)
 {
@@ -1410,7 +1429,7 @@ moe_sorting_get_workspace_size(int tokens_, int num_experts_, int topk_, int dis
     // return 0;
     if(dispatch_policy_ == 0)
     {
-        if(moe_sorting_is_oneshot(tokens_, num_experts_))
+        if(moe_sorting_auto_is_oneshot(tokens_, num_experts_))
         {
             return 0;
         }
