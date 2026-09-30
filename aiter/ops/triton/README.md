@@ -18,7 +18,7 @@ both that file and this README in the same PR, so the two stay current.
 ```text
 aiter/ops/triton/
 ├── __init__.py            # public API + _BACKWARD_COMPAT_MAP (legacy flat imports)
-├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/
+├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/, grouped/
 ├── attention/             # MHA, MLA, lean attention, unified attention, ...
 ├── moe/                   # Mixture-of-experts ops
 ├── normalization/         # RMSNorm / LayerNorm and fused add+norm variants
