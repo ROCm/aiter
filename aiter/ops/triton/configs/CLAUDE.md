@@ -399,7 +399,8 @@ MOE dispatch, the `fallback` tile for `get_tuned_kernel_config()`. Where that
 is not acceptable, seed the directory with a **byte-identical copy** from the
 closest measured arch and say so in the commit message.
 
-The one seeding rule currently in force: **gfx950 → gfx1250, triton only.**
+The seeding rules currently in force: **gfx950 → gfx1250, triton only**, and
+**gfx1151 → gfx1150, triton only**.
 Never seed a gluon directory from another arch (gluon configs carry
 arch-specific tile and buffer counts), and never seed backwards into gfx950.
 A seed is a placeholder that unblocks the caller-declared backend policy — it
