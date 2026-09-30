@@ -2170,7 +2170,14 @@ def test_qsa_auto_admits_only_measured_pairs():
     """
     page = 16
     n_columns = 128
-    for hq, d_gqa, heads in ((24, 256, 4), (24, 256, 8), (10, 128, 4), (10, 128, 8)):
+    for hq, d_gqa, heads in (
+        (24, 256, 4),
+        (24, 256, 8),
+        (12, 256, 4),
+        (12, 256, 8),
+        (10, 128, 4),
+        (10, 128, 8),
+    ):
         swept = _policy_args(1, hq, d_gqa, n_columns, page, heads, 128)
         assert qsa_auto_uses_flydsl(*swept) is True
     # An untuned GQA query stays on Triton however it is indexed.

@@ -50,7 +50,8 @@ from .kernels.qsa.k2 import qsa_k2, qsa_k2_serves
 # it. K2 serves any structurally valid shape, so this table is the only
 # thing keeping auto off an untuned one. The measured thing is the pair.
 _MEASURED_QUERIES = {
-    (24, 256): (4, 8),  # Flash-Next / qwen4_exp
+    (24, 256): (4, 8),  # Flash-Next / qwen4_exp, TP1
+    (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
     (10, 128): (4, 8),
 }
 _BACKENDS = ("auto", "flydsl", "triton")
@@ -64,8 +65,13 @@ _BACKENDS = ("auto", "flydsl", "triton")
 # every launch config the K2 policy can pick, and M past 512 reuses M=512's
 # BN32 single-split config with a larger grid, so neither M nor the
 # selection width filters this gate. The ``_launch_config`` decode bands are
-# now fitted at both head widths, so a new GQA query shape needs its own
-# sweep only if its head_dim is one neither ladder was fitted on.
+# now fitted at both head widths. A per-rank shard with a different KV-head
+# count is still its own grid, because the K2 launch is
+# ``(rows, kv_heads, splits)``. GPU 7 / gfx942, cold ``rotate=0``, page size
+# 16, the same M x L grid: q ``[M, 12, 256]`` over 1 KV head and the
+# replicated 4-head indexer. All 52 rows beat live AMD with err=0, by 1.73x
+# to 6.06x. The same grid with an 8-head indexer also won all 52 rows,
+# FlyDSL err=0, by 1.46x to 4.86x.
 
 __all__ = [
     "QsaGqaSpec",
