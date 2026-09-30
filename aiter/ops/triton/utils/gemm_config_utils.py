@@ -12,6 +12,7 @@ import itertools
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
@@ -73,8 +74,13 @@ def _get_gemm_config_cached(
     if specialized_filename is not None:
         specialized_suffixes = [specialized_filename]
     elif N is not None and K is not None:
+        # Parts of one arch can differ in CU count; a "-CU=<n>" file tuned for
+        # this CU count wins over the arch-wide one.
+        cu = get_num_sms()
         if B is not None:
+            specialized_suffixes.append(f"B={B}-N={N}-K={K}-CU={cu}")
             specialized_suffixes.append(f"B={B}-N={N}-K={K}")
+        specialized_suffixes.append(f"N={N}-K={K}-CU={cu}")
         specialized_suffixes.append(f"N={N}-K={K}")
 
     is_tuned = False
@@ -128,6 +134,7 @@ def get_gemm_config(
     1. Load default config file: <d_type>/DEFAULT.json
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
+       In 2 and 3, a {...}-CU={cu}.json file for the device's CU count is tried first.
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
     4. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
