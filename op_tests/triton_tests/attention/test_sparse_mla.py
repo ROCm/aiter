@@ -10,15 +10,14 @@ rope-free (GLM-5.3-Flash), where the query is the latent alone.
 import pytest
 import torch
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-
 import aiter.ops.triton.attention.sparse_mla as smd
 from aiter.ops.triton.attention.sparse_mla import (
     FP8_ARCHS,
     SUPPORTED_ARCHS,
     sparse_mla_fwd,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 # The arch-native fp8, as a producer on this machine writes it. That is OCP e4m3,
 # what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else.

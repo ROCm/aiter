@@ -19,8 +19,11 @@ import triton
 from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
-from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
-from aiter.ops.triton.attention.sparse_mla import FP8_ARCHS, SUPPORTED_ARCHS
+from aiter.ops.triton.attention.sparse_mla import (
+    FP8_ARCHS,
+    SUPPORTED_ARCHS,
+    sparse_mla_fwd,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
