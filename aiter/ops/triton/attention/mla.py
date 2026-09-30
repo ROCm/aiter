@@ -372,7 +372,30 @@ def mla_decode_fwd(
         BLOCK_M,
     )
 
-    NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    use_specialized_decode = (
+        DEVICE_ARCH == "gfx1250"
+        and ALL_DECODE
+        and not skip_reduce
+        and shuffled_kv_cache
+        and QUERY_DTYPE == "fp8"
+        and KV_CACHE_DTYPE == "fp8"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and block_size == 64
+        and num_queries_per_kv == 128
+        and NUM_HEAD_BLOCKS == 1
+        and (selected_num_segments == 1 or max_seqlen_kv <= 3 * block_size)
+        and q_scales is None
+        and q.stride(2) == 1
+        and kv_buffer.stride(3) == 1
+        and out.stride(2) == 1
+        and block_tables.stride(1) == 1
+        and q.numel() < 2**31
+        and out.numel() < 2**31
+        and block_tables.numel() < 2**31
+    )
+    NUM_SEGMENTS = 1 if use_specialized_decode else selected_num_segments
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
             total_num_tokens,
@@ -401,7 +424,43 @@ def mla_decode_fwd(
         segm_max = out  # dummy ptr
         segm_expsum = out  # dummy ptr
 
-    if IS_DEVICE_ARCH_GFX12:
+    if use_specialized_decode:
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla_decode import (
+            _mla_decode_fwd_kernel_specialized,
+        )
+
+        _mla_decode_fwd_kernel_specialized[(num_seqs, num_kv_heads)](
+            output_ptr=out,
+            query_ptr=q,
+            kv_buffer_ptr=kv_buffer,
+            block_tables_ptr=block_tables,
+            seq_lens_ptr=seqused_k,
+            query_start_len_ptr=cu_seqlens_q,
+            SCALE=softmax_scale,
+            q_scale_ptr=q_descale,
+            kv_scale_ptr=kv_descale,
+            out_scale_ptr=out_scale,
+            num_kv_heads=num_kv_heads,
+            block_tables_stride=block_tables.stride(0),
+            query_stride_0=q.stride(0),
+            query_stride_1=q.stride(1),
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            stride_kv_buffer_1=kv_buffer.stride(1),
+            num_blocks=num_blocks,
+            # TDM requires aligned BF16 rows; retain direct stores for other
+            # output types and views, including the FP8 clamp/scale path.
+            TDM_STORE=(
+                out.dtype == torch.bfloat16
+                and out.data_ptr() % 16 == 0
+                and out.stride(0) % 8 == 0
+                and out.stride(1) % 8 == 0
+            ),
+            num_warps=4,
+            num_stages=4,
+            waves_per_eu=1,
+        )
+    elif IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel
         else:

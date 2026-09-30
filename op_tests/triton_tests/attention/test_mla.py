@@ -433,6 +433,214 @@ def test_mla_decode_fwd(
     )
 
 
+@torch.inference_mode()
+def test_mla_decode_fwd_specialized_short_contexts():
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("specialized decode kernel requires gfx1250")
+
+    torch.manual_seed(0)
+    seq_lens = torch.tensor(
+        [1, 64, 65, 128, 129, 191, 192, 2], dtype=torch.int32, device="cuda"
+    )
+    batch_size = seq_lens.numel()
+    block_size = 64
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    num_query_heads = 128
+    num_kv_heads = 1
+    num_blocks = 64
+
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (batch_size, 3),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, num_kv_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(e4m3_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(e4m3_dtype)
+    q_descale = uniform_random(
+        1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+    )
+    kv_descale = uniform_random(
+        1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    shuffled_kv = shuffle_kv_buffer(kv_buffer, kv_lora_rank)
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=shuffled_kv,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens,
+        max_seqlen_kv=int(seq_lens.max()),
+        block_tables=block_tables,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        shuffled_kv_cache=True,
+    )
+    reference = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        o_dtype=torch.bfloat16,
+    )
+    assert (
+        checkAllclose(
+            output,
+            reference,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=0.01,
+            msg="specialized MLA decode short contexts",
+        )
+        <= 0.01
+    )
+
+
+@pytest.mark.parametrize(
+    "output_kind,num_kv_heads",
+    [("padded", 2), ("strided", 1), ("offset", 1), ("fp8", 1)],
+)
+def test_mla_decode_fwd_specialized_ring_wraparound(
+    monkeypatch, output_kind, num_kv_heads
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("specialized decode kernel requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    # Exercise the single-segment specialization with a small batch that also
+    # contains long sequences. The normal occupancy heuristic may split it.
+    select_config = mla_module.select_3d_config
+
+    def single_segment(*args, **kwargs):
+        attn, reduce = select_config(*args, **kwargs)
+        attn["NUM_SEGMENTS_PER_SEQ"] = 1
+        return attn, reduce
+
+    monkeypatch.setattr(mla_module, "select_3d_config", single_segment)
+    torch.manual_seed(0)
+    lengths = [
+        1,
+        31,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        191,
+        192,
+        193,
+        255,
+        256,
+        257,
+        319,
+        320,
+        321,
+        1023,
+        4097,
+    ]
+    batch, heads = len(lengths), 128 * num_kv_heads
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    indptr = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    table = torch.randint(0, 128, (batch, 65), dtype=torch.int32, device="cuda")
+    kv = torch.randn(
+        (128, 64, num_kv_heads, 576), device="cuda", dtype=torch.bfloat16
+    ).to(e4m3_dtype)
+    q = torch.randn((batch, heads, 576), device="cuda", dtype=torch.bfloat16).to(
+        e4m3_dtype
+    )
+    shuffled = shuffle_kv_buffer(kv, 512)
+    qs = None if output_kind == "strided" else torch.tensor([0.3], device="cuda")
+    ks = None if output_kind == "strided" else torch.tensor([0.4], device="cuda")
+    os = torch.tensor([1e-4 if output_kind == "fp8" else 0.7], device="cuda")
+    dtype = e4m3_dtype if output_kind == "fp8" else torch.bfloat16
+    width = 513 if output_kind == "strided" else 520
+    storage = torch.full((batch, heads, width), 16.0, device="cuda", dtype=dtype)
+    offset = 1 if output_kind == "offset" else 0
+    output = storage[..., offset : offset + 512]
+
+    def run():
+        return mla_decode_fwd(
+            q,
+            shuffled,
+            output,
+            indptr,
+            lens,
+            max(lengths),
+            table,
+            576**-0.5,
+            512,
+            64,
+            True,
+            qs,
+            ks,
+            out_scale=os,
+            shuffled_kv_cache=True,
+        )
+
+    run()
+    actual = output.float().clone()
+    reference = torch_mla_extend(
+        q,
+        kv,
+        indptr,
+        lens,
+        table,
+        512,
+        576**-0.5,
+        q_descale=qs,
+        kv_descale=ks,
+        out_scale=os,
+        o_dtype=torch.float32,
+    )
+    if output_kind == "fp8":
+        reference = reference.clamp(
+            torch.finfo(e4m3_dtype).min, torch.finfo(e4m3_dtype).max
+        )
+    reference = reference.to(dtype).float()
+    assert torch.isfinite(actual).all()
+    relative_rmse = (
+        (actual - reference).square().sum() / reference.square().sum()
+    ).sqrt()
+    assert relative_rmse < 0.08
+    for _ in range(3):
+        run()
+        torch.testing.assert_close(output.float(), actual, rtol=0, atol=0)
+    # TDM and direct stores must respect the output view, including its padding.
+    assert (storage[..., offset + 512 :].float() == 16).all()
+    if offset:
+        assert (storage[..., :offset].float() == 16).all()
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])

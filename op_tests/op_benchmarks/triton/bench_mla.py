@@ -271,6 +271,7 @@ def benchmark(args):
                     kv_descale=kv_descale,
                     out_scale=out_scale,
                     shuffled_kv_cache=shuffled_kv_cache,
+                    skip_reduce=skip_reduce,
                 )
             else:
                 out = mla_prefill_fwd(
@@ -292,13 +293,21 @@ def benchmark(args):
                 )
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-        if "ms" in provider:
+        if provider == "time":
             return ms
         else:  # BW TB/s
             return mem / ms * 1e3
 
     bench_mla.run(save_path="." if args.o else None, print_data=True, show_plots=False)
     # return x_vals_list, x_names, line_vals
+
+
+def str2bool(value):
+    if value.lower() in ("true", "1", "yes"):
+        return True
+    if value.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
 
 
 def parse_args():
@@ -314,15 +323,19 @@ def parse_args():
     parser.add_argument("--kv_lora_rank", type=int, default=512)
     parser.add_argument("--qk_rope_head_dim", type=int, default=64)
     parser.add_argument("--block_size", type=int, default=64)
-    parser.add_argument("--shuffled_kv_cache", type=bool, default=True)
+    parser.add_argument(
+        "--shuffled_kv_cache", type=str2bool, nargs="?", const=True, default=True
+    )
     parser.add_argument("--num_query_heads", type=int, default=16)
     parser.add_argument("--num_kv_heads", type=int, default=1)
-    parser.add_argument("--varlen", type=bool, default=True)
+    parser.add_argument("--varlen", type=str2bool, nargs="?", const=True, default=True)
     parser.add_argument("--q_dtype", type=str, default="bf16")
     parser.add_argument("--kv_dtype", type=str, default="bf16")
     parser.add_argument("--out_dtype", type=str, default="bf16")
     parser.add_argument("--backend", type=str, default="triton")
-    parser.add_argument("--skip_reduce", type=bool, default=True)
+    parser.add_argument(
+        "--skip_reduce", type=str2bool, nargs="?", const=True, default=False
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "-metric",
