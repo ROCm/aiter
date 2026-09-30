@@ -138,7 +138,6 @@ def _auto_num_splits(
     tuning constants are per-arch -- see ``_SPLIT_POLICIES``.
     """
     pol = _split_policy()
-    # Match the kernel grid. A short last tile is one block, not a host pad.
     grid_x = (seq_len + rows_per_block - 1) // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
@@ -563,10 +562,7 @@ def flydsl_fp8_mqa_logits(
         clean_logits=bool(clean_logits),
     )
 
-    # The last query tile may be short. The kernel masks those rows, so Q,
-    # weights, and the window are not padded and the output is exactly seq_len
-    # rows. No torch.full: when clean_logits is set the kernel writes -inf
-    # itself, at the out-of-window positions it would otherwise skip.
+    # No torch.full even when clean_logits: the kernel writes -inf itself.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     logits = torch.empty(
