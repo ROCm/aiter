@@ -2610,19 +2610,25 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // num_records, which returns zero without touching the cache -- no branch,
     // and no extra requests either (clamping to a live row instead cost the
     // one-head path eight times its pe loads).
-    auto rope_pe_issue = [&](const scalar_t* pe_ptr, int chunk, bool active) -> PeOperands {
+    //
+    // pe_ptr is the wave's first head row and row_off (elements) the lane's
+    // own row within the `extent` elements after it. The buffer descriptor has
+    // to stay wave-uniform: built from a lane-derived head, it landed in VGPRs
+    // and the compiler wrapped every access in a readfirstlane waterfall loop.
+    auto rope_pe_issue = [&](const scalar_t* pe_ptr, int row_off, int extent, int chunk,
+                             bool active) -> PeOperands {
         PeOperands o{};
-        const int d0 = active ? chunk * VEC : PE_DIM;
-        auto pe_buf  = opus::make_gmem<scalar_t>(pe_ptr, PE_DIM * sizeof(scalar_t));
+        const int d0 = chunk * VEC;
+        auto pe_buf  = opus::make_gmem<scalar_t>(pe_ptr, extent * sizeof(scalar_t));
         auto cos_buf = opus::make_gmem<scalar_t>(cos_ptr, HALF * sizeof(scalar_t));
         auto sin_buf = opus::make_gmem<scalar_t>(sin_ptr, HALF * sizeof(scalar_t));
-        o.x = pe_buf.template load<VEC>(d0);
+        o.x = pe_buf.template load<VEC>(active ? row_off + d0 : extent);
         if constexpr(IS_NEOX)
         {
             const bool low   = d0 < HALF;
             const int  cbase = !active ? HALF : (low ? d0 : d0 - HALF);
             if constexpr(!PE_EXCHANGE)
-                o.y = pe_buf.template load<VEC>(low ? d0 + HALF : d0 - HALF);
+                o.y = pe_buf.template load<VEC>(active ? row_off + (d0 ^ HALF) : extent);
             o.c = cos_buf.template load<VEC>(cbase);
             o.s = sin_buf.template load<VEC>(cbase);
         }
@@ -2633,16 +2639,17 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         }
         return o;
     };
+    // Same row_off / extent convention as rope_pe_issue.
 
     // `active` masks the store without touching EXEC: an inactive lane writes
     // at PE_DIM, past the buffer's num_records, which the hardware drops. A
     // divergent `if` here put s_and_saveexec right behind the nope store, and
     // EXEC being an operand of that in-flight store it had to drain the whole
     // address queue first -- s_wait_xcnt, 18% of the wave at H=32 T=192 in ATT.
-    auto rope_pe_emit = [&](const PeOperands& o, cache_t* out_ptr, float inv_scale,
-                            int chunk, bool active) {
+    auto rope_pe_emit = [&](const PeOperands& o, cache_t* out_ptr, int row_off, int extent,
+                            float inv_scale, int chunk, bool active) {
         const int d0 = chunk * VEC;
-        auto out_buf = opus::make_gmem<cache_t>(out_ptr, PE_DIM * sizeof(cache_t));
+        auto out_buf = opus::make_gmem<cache_t>(out_ptr, extent * sizeof(cache_t));
         out_vec_t vout;
         if constexpr(IS_NEOX)
         {
@@ -2692,13 +2699,13 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 vout[2 * k + 1] = opus::cast<cache_t>((b * cv + a * sv) * inv_scale);
             }
         }
-        out_buf.template store<VEC, out_vec_t>(vout, active ? d0 : PE_DIM);
+        out_buf.template store<VEC, out_vec_t>(vout, active ? row_off + d0 : extent);
     };
 
     auto rope_pe_seg = [&](const scalar_t* pe_ptr, cache_t* out_ptr, float inv_scale) {
         if(threadIdx.x < PE_CHUNKS)
-            rope_pe_emit(rope_pe_issue(pe_ptr, threadIdx.x, true), out_ptr, inv_scale,
-                         threadIdx.x, true);
+            rope_pe_emit(rope_pe_issue(pe_ptr, 0, PE_DIM, threadIdx.x, true), out_ptr, 0,
+                         PE_DIM, inv_scale, threadIdx.x, true);
     };
 
     // ================= Q (HPT heads per block) =================
@@ -2792,15 +2799,21 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 lds + static_cast<__UINTPTR_TYPE__>(wave_off + elem) * sizeof(scalar_t));
         };
         const int col = (threadIdx.x % W) * VEC;
+        // Every head is converted before any is stored. Converted and stored
+        // one at a time, each head's store data landed in the registers the
+        // next head's was about to use, and the wave sat in s_wait_xcnt behind
+        // every store until the memory pipe had read it out.
+        out_vec_t nope_out[HPT];
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
+            nope_out[k] = aiter::scaled_cast<cache_t>(lds_vec(k * COLS + col), inv_qscale);
+        cache_t* q_out_tok = q_out + token_idx * q_out_stride_0;
 #pragma unroll
         for(int k = 0; k < HPT; ++k)
         {
-            cache_t* q_out_row =
-                q_out + token_idx * q_out_stride_0 + (head_base + k) * q_out_stride_1;
-            auto out_buf = opus::make_gmem<cache_t>(q_out_row, KV_LORA * sizeof(cache_t));
-            out_buf.template store<VEC, out_vec_t>(
-                aiter::scaled_cast<cache_t>(lds_vec(k * COLS + col), inv_qscale),
-                wave * COLS + col);
+            auto out_buf = opus::make_gmem<cache_t>(q_out_tok + (head_base + k) * q_out_stride_1,
+                                                    KV_LORA * sizeof(cache_t));
+            out_buf.template store<VEC, out_vec_t>(nope_out[k], wave * COLS + col);
         }
         {
             const bool pe_active = wave * PE_ROWS + pe_row < HPT;
@@ -2811,8 +2824,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             if constexpr(IS_NEOX && !PE_EXCHANGE)
                 pe_op.y = lds_vec(HPT * COLS + pe_r * PE_DIM + (d0 ^ HALF));
             rope_pe_emit(pe_op,
-                         q_out + token_idx * q_out_stride_0 +
-                             (head_base + wave * PE_ROWS + pe_r) * q_out_stride_1 + KV_LORA,
+                         q_out_tok + (head_base + wave * PE_ROWS) * q_out_stride_1 + KV_LORA,
+                         static_cast<int>(pe_r * q_out_stride_1),
+                         static_cast<int>((PE_ROWS - 1) * q_out_stride_1) + PE_DIM,
                          inv_qscale, pe_chunk, pe_active);
         }
     }
@@ -2850,9 +2864,10 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
 #endif
         PeOperands pe_op{};
         if(wave_pe)
-            pe_op = rope_pe_issue(
-                q_pe + token_idx * q_pe_stride_0 + (head_base + pe_h) * q_pe_stride_1,
-                pe_chunk, pe_lane);
+            pe_op = rope_pe_issue(q_pe + token_idx * q_pe_stride_0 + head_base * q_pe_stride_1,
+                                  static_cast<int>(pe_h * q_pe_stride_1),
+                                  static_cast<int>((HPT - 1) * q_pe_stride_1) + PE_DIM,
+                                  pe_chunk, pe_lane);
 
         in_vec_t nope_in[HPT];
 #pragma unroll
@@ -2880,8 +2895,10 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         }
         if(wave_pe)
             rope_pe_emit(pe_op,
-                         q_out + token_idx * q_out_stride_0 +
-                             (head_base + pe_h) * q_out_stride_1 + KV_LORA,
+                         q_out + token_idx * q_out_stride_0 + head_base * q_out_stride_1 +
+                             KV_LORA,
+                         static_cast<int>(pe_h * q_out_stride_1),
+                         static_cast<int>((HPT - 1) * q_out_stride_1) + PE_DIM,
                          inv_qscale, pe_chunk, pe_lane && q_live);
     }
 
