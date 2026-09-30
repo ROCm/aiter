@@ -73,19 +73,16 @@ and tuned JSON in `configs/`. Flag:
 - A kernel module or directory whose path under `_triton_kernels/`
   (`_gluon_kernels/<arch>/`) differs from the folder of the wrapper that
   launches it. A kernel directory is named after the wrapper folder, never
-  after the kernel family or a topic: `normalization/`, not `norm/`. Three
-  existing directories predate this rule and are grandfathered until a
-  dedicated follow-up moves them and all their importers:
-  `_triton_kernels/gated_delta_rule/` (wrappers in `gated_delta_net/`),
-  `_triton_kernels/chunk_delta_attn/` (wrappers in `kimi_delta_attn/`), and
-  the vendored `_triton_kernels/flash_attn_triton_amd/` (launched by
-  `attention/mha.py`). Do not flag code in these three; flag any new
-  mismatched directory. A kernel that wrappers in several folders reuse
-  lives with the wrapper that owns it, or in `_triton_kernels/common/` when
-  none does (`common/splitk_reduce.py`); importing it across folders is
-  fine. A PR that moves a wrapper into another folder moves its kernels too
-  and updates every importer of the old module path
-  (`grep -rn "_triton_kernels.<old>"`).
+  after the kernel family or a topic: `normalization/`, not `norm/`. One
+  existing directory predates this rule and is grandfathered until a
+  dedicated follow-up moves it and all its importers: the vendored
+  `_triton_kernels/flash_attn_triton_amd/` (launched by `attention/mha.py`).
+  Do not flag code in it; flag any new mismatched directory. A kernel that
+  wrappers in several folders reuse lives with the wrapper that owns it, or in
+  `_triton_kernels/common/` when none does (`common/splitk_reduce.py`);
+  importing it across folders is fine. A PR that moves a wrapper into another
+  folder moves its kernels too and updates every importer of the old module
+  path (`grep -rn "_triton_kernels.<old>"`).
 - Generic helpers (config loading, shuffling, arch detection, logging)
   re-implemented inside a kernel file instead of imported from `utils/`.
 - New code importing via the legacy flat paths
@@ -377,12 +374,11 @@ All weight/scale pre-shuffle helpers are unified in
   `gemm/basic/gemm_a8w8.py` is `gemm/basic/test_gemm_a8w8.py`, a test of
   `gated_delta_net/fused_kda_decode.py` is
   `gated_delta_net/test_fused_kda_decode.py`. The wrapper's folder decides
-  the test folder, not the kernel directory:
-  `kimi_delta_attn/chunk_delta_attn.py` keeps its tests in
-  `triton_tests/kimi_delta_attn/` even though its kernels sit in the
-  grandfathered `_triton_kernels/chunk_delta_attn/`; a sub-package counts as a folder
-  (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`). The few
-  wrappers that still sit flat at `aiter/ops/triton/<op>.py`
+  the test folder, not the kernel directory: `attention/mha.py` keeps its
+  tests in `triton_tests/attention/` even though its kernels sit in the
+  vendored `_triton_kernels/flash_attn_triton_amd/`; a sub-package counts as
+  a folder (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`).
+  The few wrappers that still sit flat at `aiter/ops/triton/<op>.py`
   (`activation.py`, `topk.py`, ...) keep their tests flat at the
   `triton_tests/` root; `utils/` helpers are tested under
   `triton_tests/utils/`; `torch_compile/` and `triton_metadata_redirect/`
