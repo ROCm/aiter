@@ -685,15 +685,16 @@ def compile_gemm_fp8_8wave(
             fifo_scale_b_0 = fx.Float32(0)
             kiter = fx.Int32(kidx)
 
-            # Each K tile: TL[s0]/TR[s0]/BL[s0]/BR[s0], then TL[s1]/TR[s1]/BL[s1]/BR[s1].
-            # A and P are half-sized and reused, B_l/B_r survive both M slices.
-            # P always holds the immediately preceding compute phase:
-            # TL[s0] consumes BR[s1](k-1); TL[s1] consumes BR[s0](k). Other phases
-            # consume the preceding quadrant of their current M slice.
-            for tile in range_constexpr(2):
-                tick = tile
-                tock = 1 - tile
-                ki = kiter + tile
+            # Each K128 tile: TL[s0] -> TR[s0] -> BL[s0] -> BR[s0],
+            #                TL[s1] -> TR[s1] -> BL[s1] -> BR[s1].
+            # Each phase retires old fragP with its saved scales and produces new fragP
+            # Based on 8 wave gemm implmentation, M is divided into 2 slices per tile futher.
+            # Also the async reading and lds loading has some changes compare with the original 8 wave gemm implementation.
+
+            for unroll_idx in range_constexpr(2):
+                tick = unroll_idx
+                tock = 1 - unroll_idx
+                ki = kiter + unroll_idx
                 for m_slice in range_constexpr(2):
                     lds_rd_At(tick, m_slice)
                     mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)

@@ -88,8 +88,13 @@ scales. CPU routing/tuner regressions are in
 
 #### Pipeline and synchronization
 
-The [8-wave pipeline comparison](pipeline_8wave.md) documents the current
-FlyDSL half-M mainloop against pyhip `moe_gemm_8wave_g1u1`: DMA counts,
+The current source-level DOT / LR / AC schedule is available as a
+[PNG diagram](figures/pipeline_8wave_current.png) and a
+[scalable SVG](figures/pipeline_8wave_current.svg), with two K tiles, both
+M-slices, FIFO retirement, waits and staggered wave groups.
+The [8-wave pipeline comparison](pipeline_8wave.md) includes the diagram and
+the source-bound 2026-09-29 FlyDSL comparison against pyhip
+`moe_gemm_8wave_g1u1`: DMA counts,
 rolling `vmcnt`, LDS/register lifetimes, FIFO retirement, staggered barrier
 epochs, and source-bound ISA observations. It separates verified instruction
 accounting from cross-wave synchronization proof gaps; it is not a new GPU
