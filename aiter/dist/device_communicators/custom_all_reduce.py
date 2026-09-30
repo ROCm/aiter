@@ -32,7 +32,7 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
-from .flydsl_utils import all_ranks_agree, warm_fly_engines
+from .flydsl_utils import all_ranks_agree, preload_fly_engines
 from .rocm_version import get_rocm_version
 
 # Importing this pulls in flydsl, an optional dependency whose version is
@@ -1031,7 +1031,7 @@ class CustomAllreduce:
 
         ok = True
         try:
-            warm_fly_engines(((engine, payload_range),), self.device)
+            preload_fly_engines(((engine, payload_range),))
         except Exception:  # noqa: BLE001
             logger.warning("FlyDSL one-shot disabled: warmup failed.", exc_info=True)
             ok = False

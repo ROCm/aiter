@@ -13,7 +13,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
-from .flydsl_utils import all_ranks_agree, warm_fly_engines
+from .flydsl_utils import all_ranks_agree, preload_fly_engines
 
 logger = logging.getLogger(__name__)
 
@@ -257,12 +257,9 @@ class QuickAllReduce:
 
         ok = True
         try:
-            warm_fly_engines(
-                (
-                    (engine, fly_policy.quant_family_range(family, policy))
-                    for family, engine in self._fly_engines.items()
-                ),
-                self.device,
+            preload_fly_engines(
+                (engine, fly_policy.quant_family_range(family, policy))
+                for family, engine in self._fly_engines.items()
             )
         except Exception:
             logger.warning(
@@ -428,7 +425,7 @@ class QuickAllReduce:
         # quick allreduce doesn't require a separate graph mode,
         # as QR uses static IPC buffer. The same holds for the FlyDSL
         # schedules, whose IPC inbox is likewise allocated once at init
-        # and whose served binaries are compiled at init (warm_fly_engines).
+        # and whose served binaries are compiled at init (preload_fly_engines).
         if out is None:
             out = torch.empty_like(inp)
         if self._should_fly(inp):

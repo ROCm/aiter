@@ -1719,14 +1719,11 @@ def _worker(
                     ),
                 ),
             )
-        # compile() JIT-compiles every super-tile engine without launching any
-        # of them (quick_allreduce_int4.compile_only), so one call at any shape keeps every
-        # timed region below free of a first-call JIT stall.
-        warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
+        # preload() JIT-compiles and loads every super-tile engine without
+        # launching any of them, so every timed region below is free of a
+        # first-call JIT stall.
         for cfg in wanted_cfgs:
-            dist.barrier(group=group)
-            fly[cfg].compile_and_launch(warm, torch.empty_like(warm))
-        del warm
+            fly[cfg].preload()
 
     fly1s = {}  # fly1s_cfg tuple -> OneShotAllReduce engine
     # Same rules as the QuickAllReduceInt4 engines above: one per distinct config, each with
@@ -1753,11 +1750,8 @@ def _worker(
                 max_bytes=_fly1s_ceiling(tp_size),
                 **kw,
             )
-        warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
         for cfg in wanted_1s:
-            dist.barrier(group=group)
-            fly1s[cfg].compile_and_launch(warm, torch.empty_like(warm))
-        del warm
+            fly1s[cfg].preload()
 
     # Production dispatch, built last so its internal engines exchange handles
     # after every pinned one -- the exchange is a collective and the order has

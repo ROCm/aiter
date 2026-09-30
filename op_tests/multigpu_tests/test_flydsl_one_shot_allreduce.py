@@ -250,8 +250,7 @@ def _run_rank(
         max_bytes=1 << 30,
         **engine_kw,
     )
-    warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
-    eng.compile_and_launch(warm, torch.empty_like(warm))
+    eng.preload()
     production_cfgs = None if window is None else eng.cfgs_for(*window)
 
     rows = []

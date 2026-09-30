@@ -41,7 +41,7 @@ from .kernels.one_shot_allreduce import (
     oneshot_ladder,
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
 
@@ -300,23 +300,33 @@ class OneShotAllReduce:
             raise ValueError("OneShotAllReduce requires non-overlapping input/output")
         return live_bytes
 
-    def _launch_eng(self, eng, spec, inp, out, stream, *, live_bytes: int) -> None:
+    def _launch_args(self, eng, spec, inp_ptr, out_ptr, stream, *, live_bytes):
         num_tiles = self._num_tiles(live_bytes, spec["tile_bytes"])
         grid_x = self._grid_x(num_tiles, spec["grid"])
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
         elif not isinstance(stream, Stream):
             stream = Stream(stream)
-        args = (
+        return (
             Int32(self.rank),
             Int64(live_bytes),
             Int32(num_tiles),
-            Int64(int(inp.data_ptr())),
-            Int64(int(out.data_ptr())),
+            Int64(inp_ptr),
+            Int64(out_ptr),
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             Int32(grid_x),
             stream,
+        )
+
+    def _launch_eng(self, eng, spec, inp, out, stream, *, live_bytes: int) -> None:
+        args = self._launch_args(
+            eng,
+            spec,
+            int(inp.data_ptr()),
+            int(out.data_ptr()),
+            stream,
+            live_bytes=live_bytes,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -335,34 +345,23 @@ class OneShotAllReduce:
         picked = {self._pick_cfg(n) for n in payload_probes(floors, lo, hi)}
         return [key for key in self._by_cfg if key in picked]
 
-    def compile_and_launch(
-        self, inp, out=None, stream=None, *, payload_range=None
-    ) -> None:
-        """Eager-JIT rung binaries and launch each of them once, for real,
-        against *inp*/*out*.
+    def preload(self, *, payload_range=None) -> None:
+        """JIT-compile rung binaries without launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the rungs ``allreduce`` would run
         for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every one.
         The ladder builds engines for the whole size range, while a dispatcher
         routes only its own window here, so the rest never run.
 
-        ``out`` ends up holding whichever rung ran last, and this is a real
-        collective: every rank must call it with the same shape and range. Used
-        by ``bench_comm_allreduce.py`` and the flydsl op tests to force a real
-        warm launch (and, for the tests, to exercise the launch path directly)
-        before timing or correctness checks begin.
-
-        ``CustomAllreduce`` also calls it once at init, via ``warm_fly_engines``.
-        Not for timing: it keeps each rung's JIT compile and module load off the
-        first real all-reduce, which may be inside a CUDA graph capture.
+        Local to this rank, not a collective. ``CustomAllreduce`` calls it once
+        at init, via ``preload_fly_engines``, to keep each rung's JIT compile off
+        the first real all-reduce, which may be inside a CUDA graph capture.
         """
-        if out is None:
-            out = torch.empty_like(inp)
-        live_bytes = self._check_payload(inp, out)
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
         for key in keys:
             eng, spec = self._by_cfg[key]
-            self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
+            args = self._launch_args(eng, spec, 0, 0, None, live_bytes=0)
+            _preload_compiled(eng.launch, *args)
 
     def variant(self, nbytes: int) -> str:
         """Identity of the binary an *nbytes* payload would run."""

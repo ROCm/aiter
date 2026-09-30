@@ -63,7 +63,7 @@ from .kernels.quick_allreduce_shared import (
     WORLD,
     has_release_fence,
 )
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
 
@@ -312,8 +312,7 @@ class QuickAllReduceInt4:
       before the flag goes out write-through (``sc0 sc1``).
 
     ``min_bytes`` is the payload below which ``allreduce`` refuses to run,
-    defaulting to ``MIN_PAYLOAD_BYTES``. ``compile_and_launch`` is deliberately
-    not gated: its warmup tensor is allowed to be small.
+    defaulting to ``MIN_PAYLOAD_BYTES``.
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
     when not given. ``block`` and ``skip_self`` override those knobs on every
@@ -646,7 +645,9 @@ class QuickAllReduceInt4:
             raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
         return live_bytes
 
-    def _launch_args(self, eng: _StEngine, inp, out, stream, *, live_bytes, num_tiles):
+    def _launch_args(
+        self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles
+    ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
         elif not isinstance(stream, Stream):
@@ -655,8 +656,8 @@ class QuickAllReduceInt4:
             Int32(self.rank),
             Int64(live_bytes),
             Int32(num_tiles),
-            Int64(int(inp.data_ptr())),
-            Int64(int(out.data_ptr())),
+            Int64(inp_ptr),
+            Int64(out_ptr),
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
@@ -666,7 +667,12 @@ class QuickAllReduceInt4:
     def _launch_eng(self, eng: _StEngine, inp, out, stream, *, live_bytes: int) -> None:
         num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
-            eng, inp, out, stream, live_bytes=live_bytes, num_tiles=num_tiles
+            eng,
+            int(inp.data_ptr()),
+            int(out.data_ptr()),
+            stream,
+            live_bytes=live_bytes,
+            num_tiles=num_tiles,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -681,28 +687,25 @@ class QuickAllReduceInt4:
         picked = {self._pick_cfg(n)[0] for n in payload_probes(floors, lo, hi)}
         return [key for key in self._by_cfg if key in picked]
 
-    def compile_and_launch(
-        self, inp, out=None, stream=None, *, payload_range=None
-    ) -> None:
-        """Eager-JIT engine binaries and launch each of them once, for real,
-        against *inp*/*out*.
+    def preload(self, *, payload_range=None) -> None:
+        """JIT-compile engine binaries without launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the binaries ``allreduce`` would
         run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every
         one. The ladder builds engines for the whole size range, while a
         dispatcher routes only its own window here, so the rest never run.
 
-        ``out`` ends up holding whichever engine ran last, and this is a real
-        collective: every rank must call it with the same shape and range. Used
-        by ``bench_comm_allreduce.py`` and the op tests to force a real warm
-        launch before timing or correctness checks begin.
+        Local to this rank, not a collective. ``QuickAllReduce`` calls it once
+        at init, via ``preload_fly_engines``, to keep JIT compiles out of CUDA
+        graph capture; ``bench_comm_allreduce.py`` and the op tests call it
+        before timing or correctness checks begin. The HIP module load still happens 
+        on each binary's first launch.
         """
-        if out is None:
-            out = torch.empty_like(inp)
-        live_bytes = self._check_payload(inp, out)
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
         for key in keys:
-            self._launch_eng(self._by_cfg[key], inp, out, stream, live_bytes=live_bytes)
+            eng = self._by_cfg[key]
+            args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+            _preload_compiled(eng.launch, *args)
 
     def close(self):
         engines = getattr(self, "_by_cfg", None)
