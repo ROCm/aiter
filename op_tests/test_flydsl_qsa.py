@@ -2037,9 +2037,9 @@ def _policy_args(m, hq, d_gqa, n_columns, page_size, n_heads, d_idx):
     )
 
 
-def test_qsa_backend_default_is_live_amd():
-    """The opt-in defaults to Triton, and unknown names are rejected."""
-    assert normalize_qsa_backend(None) == "triton"
+def test_qsa_backend_default_is_auto():
+    """The opt-in defaults to auto, and unknown names are rejected."""
+    assert normalize_qsa_backend(None) == "auto"
     assert normalize_qsa_backend("TRITON") == "triton"
     assert normalize_qsa_backend("FlyDSL") == "flydsl"
     assert normalize_qsa_backend("auto") == "auto"
@@ -2235,7 +2235,10 @@ def _layer_kwargs(idx, backend, **extra):
 
 
 def test_qsa_layer_family_a_matches_oracle():
-    """FlyDSL and the default Triton opt-in both match the oracle on one layer."""
+    """FlyDSL, the default auto path, and named Triton all match the oracle.
+
+    This family A shape is a measured pair, so auto selects FlyDSL.
+    """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
@@ -2515,7 +2518,7 @@ def _run_unit_cases():
     test_k2_default_out_ignores_query_strides()
     test_k2_empty_cache_or_table_returns_zeros()
     test_k2_caller_workspace_is_the_only_partial_buffer()
-    test_qsa_backend_default_is_live_amd()
+    test_qsa_backend_default_is_auto()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_aot_collector_lists_family_a_launches()
     test_qsa_aot_empty_launch_list_has_no_jobs()

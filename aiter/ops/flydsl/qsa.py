@@ -20,12 +20,11 @@ partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 validated against are test fixtures in ``op_tests/qsa_shapes.py``.
 
 ``qsa_layer`` is the ``qwen4_exp`` opt-in. ``backend`` is ``auto``,
-``flydsl``, or ``triton``. The default is ``triton``: live AMD paged MQA,
-HIP top-k, expand+tail, and sparse GQA. Calling the wrapper without a
-backend leaves that path as it is. ``flydsl`` runs K1, the same vendored
-expand+tail, and K2. ``auto`` launches FlyDSL only for the query shapes
-whose end-to-end layer was measured to beat live AMD; every other shape
-stays on Triton. Sigmoid and partial RoPE stay outside the layer.
+``flydsl``, or ``triton``. The default is ``auto``: FlyDSL for the query
+shapes whose end-to-end layer was measured to beat live AMD, and Triton
+for every other shape. ``triton`` is live AMD paged MQA, HIP top-k,
+expand+tail, and sparse GQA. ``flydsl`` runs K1, the same vendored
+expand+tail, and K2. Sigmoid and partial RoPE stay outside the layer.
 """
 
 import torch
@@ -92,10 +91,10 @@ __all__ = [
 def normalize_qsa_backend(backend: str | None) -> str:
     """Map a ``qsa_layer`` backend to ``auto``, ``flydsl``, or ``triton``.
 
-    ``None`` is ``triton``, matching the live AMD path.
+    ``None`` is ``auto``.
     """
     if backend is None:
-        return "triton"
+        return "auto"
     normalized = str(backend).lower()
     if normalized not in _BACKENDS:
         raise ValueError(
@@ -286,9 +285,10 @@ def qsa_layer(
 ) -> torch.Tensor:
     """Run one QSA layer: indexer select, expand+tail, sparse GQA.
 
-    ``backend="triton"`` (the default) is the live AMD path.
+    ``backend="auto"`` (the default) uses FlyDSL only when
+    ``qsa_auto_uses_flydsl`` is set, and Triton otherwise.
     ``backend="flydsl"`` is K1 + vendored expand + K2.
-    ``backend="auto"`` uses FlyDSL only when ``qsa_auto_uses_flydsl`` is set.
+    ``backend="triton"`` is the live AMD path.
     """
     selected = normalize_qsa_backend(backend)
     if selected == "auto":
