@@ -9,7 +9,8 @@
 #include "aiter_tensor.h"
 #include <optional>
 
-int moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy);
+int moe_sorting_opus_get_workspace_size(
+    int tokens, int num_experts, int topk, int dispatch_policy, int device_id = -1);
 
 void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           aiter_tensor_t& topk_weights,
@@ -1388,19 +1389,20 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
     return is_sub_token_onshot;
 }
 
-OPUS_H bool moe_sorting_auto_is_oneshot(int tokens_, int num_experts_)
+OPUS_H bool
+moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
 {
     bool is_oneshot = moe_sorting_is_oneshot(tokens_, num_experts_);
     if(!is_oneshot)
         return false;
 
-    static const bool is_gfx950 = [] {
-        hipDeviceProp_t dev_prop;
-        hipDevice_t dev;
+    hipDevice_t dev = device_id_;
+    if(dev < 0)
         OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
-        OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, dev));
-        return std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
-    }();
+    hipDeviceProp_t dev_prop;
+    OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, dev));
+    bool is_gfx950 = std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+
     // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
     bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
     return !(is_gfx950 && prefer_mp);
@@ -1423,13 +1425,14 @@ OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_expe
 // dispatch_policy: 0-automatically pick up kerel. 1-always use single kernel, 2-always use mp
 // kernel
 OPUS_H opus::index_t
-moe_sorting_get_workspace_size(int tokens_, int num_experts_, int topk_, int dispatch_policy_)
+moe_sorting_get_workspace_size(
+    int tokens_, int num_experts_, int topk_, int dispatch_policy_, int device_id_ = -1)
 {
 #if 1
     // return 0;
     if(dispatch_policy_ == 0)
     {
-        if(moe_sorting_auto_is_oneshot(tokens_, num_experts_))
+        if(moe_sorting_auto_is_oneshot(tokens_, num_experts_, device_id_))
         {
             return 0;
         }
@@ -3314,9 +3317,11 @@ struct moe_sorting_opus_args : public aiter::MoeSortingHostArgs
 };
 
 int
-moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy)
+moe_sorting_opus_get_workspace_size(
+    int tokens, int num_experts, int topk, int dispatch_policy, int device_id)
 {
-    return aiter::moe_sorting_get_workspace_size(tokens, num_experts, topk, dispatch_policy);
+    return aiter::moe_sorting_get_workspace_size(
+        tokens, num_experts, topk, dispatch_policy, device_id);
 }
 
 // Forward declaration

@@ -1476,7 +1476,8 @@ namespace py = pybind11;
           py::arg("tokens"),                           \
           py::arg("num_experts"),                      \
           py::arg("topk"),                             \
-          py::arg("dispatch_policy") = 0);             \
+          py::arg("dispatch_policy") = 0,              \
+          py::arg("device_id")       = -1);            \
     m.def("moe_sorting_opus_fwd",                      \
           &moe_sorting_opus_fwd,                       \
           py::arg("topk_ids"),                         \
