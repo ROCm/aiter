@@ -34,6 +34,10 @@ def compile_moe_gemm1(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    fused_down_clear=False,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    mxfp4_gate_up_interleaved=True,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -45,6 +49,17 @@ def compile_moe_gemm1(
         activation,
         swiglu_limit,
     )
+    if weight_dtype == "fp4":
+        assert K % 512 == 0, "MXFP4 Gate/Up requires K divisible by 512"
+        assert BLOCK_TILE_SIZE_M == 16
+    if alg == "batch1":
+        assert K % 256 == 0, "batch1 Gate/Up requires K divisible by 256"
+    if fused_down_clear:
+        assert alg == "batch1" and K % 8 == 0
+    if activation == "situv2" and (
+        not 0 < situ_beta < float("inf") or not 0 < situ_linear_beta < float("inf")
+    ):
+        raise ValueError("SiTUv2 beta and linear_beta must be positive and finite")
 
     if alg == "splitk":
         assert (
@@ -128,10 +143,18 @@ def compile_moe_gemm1(
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
     elif weight_dtype == "fp8":
-        weight_dtype = fx.Float8E4M3FNUZ
+        weight_dtype = fxh.get_fp8_dtype()
+    elif weight_dtype == "fp4":
+        weight_dtype = fx.Float4E2M1FN
 
     TensorWithIndex, _read_sorted_index, gemm_splitk = make_gemm_helpers(
-        K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK
+        K,
+        weight_dtype,
+        BLOCK_TILE_SIZE_M,
+        TOPK,
+        N,
+        BLOCK_TILE_SIZE_N,
+        mxfp4_gate_up_interleaved,
     )
 
     def _clamp_gateup(gate, up):
@@ -145,6 +168,19 @@ def compile_moe_gemm1(
         neg_alpha_log2e = -1.702 * 1.4426950408889634
         tmp = rocdl.exp2(T.f32, _raw(gate * neg_alpha_log2e))
         return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * (up + 1.0)
+
+    def _tanh(value):
+        abs_value = value.maximumf(-value)
+        exp_value = rocdl.exp2(T.f32, _raw(abs_value * -2.8853900817779268))
+        tanh_abs = (1.0 - exp_value) * rocdl.rcp(T.f32, 1.0 + exp_value)
+        return (value > fx.Float32(0.0)).select(tanh_abs, -tanh_abs)
+
+    def _situv2(gate, up):
+        exponential = rocdl.exp2(T.f32, _raw(gate * -1.4426950408889634))
+        sigmoid = rocdl.rcp(T.f32, 1.0 + exponential)
+        gate_value = situ_beta * _tanh(gate * (1.0 / situ_beta)) * sigmoid
+        up_value = situ_linear_beta * _tanh(up * (1.0 / situ_linear_beta))
+        return gate_value * up_value
 
     def _apply_scale_gateup_bf16(
         c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
@@ -213,6 +249,9 @@ def compile_moe_gemm1(
             if const_expr(activation == "swiglu"):
                 for j in range_constexpr(gate.numel):
                     acc.append(_swiglu_oai(gate[j], up[j]))
+            elif const_expr(activation == "situv2"):
+                for value_idx in range_constexpr(gate.numel):
+                    acc.append(_situv2(gate[value_idx], up[value_idx]))
             else:
                 log2_exp1 = -1.4426950408889634
                 gate_log2 = gate * log2_exp1
@@ -260,17 +299,34 @@ def compile_moe_gemm1(
         return out_bf16
 
     def _make_gateup_weight_view(p_weight, expert_id, contiguous_n):
+        storage_k = K // 2 if const_expr(weight_dtype == fx.Float4E2M1FN) else K
         group_layout_silu = fx.make_layout(
-            ((contiguous_n, 2, N // (contiguous_n * 2)), K),
+            ((contiguous_n, 2, N // (contiguous_n * 2)), storage_k),
             ((1, N // 2, contiguous_n), N),
         )
+        if const_expr(weight_dtype == fx.Float4E2M1FN and mxfp4_gate_up_interleaved):
+            return fx.make_view(
+                p_weight + fx.Int64(expert_id) * N * storage_k,
+                fx.composition(
+                    fx.make_layout(
+                        (((16, N // 32), 2), (16, 4, storage_k // 64)),
+                        (((16, 32 * storage_k), 16 * storage_k), (1, 256, 1024)),
+                    ),
+                    group_layout_silu,
+                ),
+            )
         element_num = 16 // (p_weight.dtype.width // 8)
+        expert_offset = (
+            fx.Int64(expert_id) * N * storage_k
+            if const_expr(weight_dtype == fx.Float4E2M1FN)
+            else fx.Int64(expert_id * N * K)
+        )
         return fx.make_view(
-            p_weight + fx.Int64(expert_id * N * K),
+            p_weight + expert_offset,
             fx.composition(
                 fx.make_layout(
-                    ((16, N // 16), (element_num, K // element_num)),
-                    ((element_num, 16 * K), (1, 16 * element_num)),
+                    ((16, N // 16), (element_num, storage_k // element_num)),
+                    ((element_num, 16 * storage_k), (1, 16 * element_num)),
                 ),
                 group_layout_silu,
             ),
@@ -716,6 +772,9 @@ def compile_moe_gemm1(
                 arg_p_weight,
                 lds,
                 splitk_waves=4,
+                p_w_scale=p_w_scale,
+                expert_id=expert_id,
+                gateup_contiguous_n=contiguous_n,
             )
 
             c_frag_bf16 = _apply_scale_gateup_bf16(
@@ -732,17 +791,23 @@ def compile_moe_gemm1(
         p_weight: fx.Pointer,
         p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
+        p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
-        arg_p_input = fx.make_view(fxh._as_ptr(p_input), fx.make_layout((1, K), (K, 1)))
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(batch_idx) * K,
+            fx.make_layout((1, K), (K, 1)),
+        )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
-        expert_id = arg_p_expert_ids[e_idx]
+        expert_id = arg_p_expert_ids[route_idx]
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         contiguous_n = min(64, BLOCK_TILE_SIZE_N // 2)
 
@@ -758,6 +823,9 @@ def compile_moe_gemm1(
             lds,
             splitk_waves=4,
             a_with_index=False,
+            p_w_scale=p_w_scale,
+            expert_id=expert_id,
+            gateup_contiguous_n=contiguous_n,
         )
 
         c_frag_bf16 = _apply_scale_gateup_bf16(
@@ -765,7 +833,7 @@ def compile_moe_gemm1(
         )
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output),
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * TOPK * (N // 2),
             fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
         )
         out_tensor = fx.rocdl.make_buffer_tensor(
@@ -801,6 +869,27 @@ def compile_moe_gemm1(
         c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
 
         fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
+
+        if const_expr(fused_down_clear):
+            clear_blocks = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
+            clear_threads = clear_blocks * 256
+            clear_rounds = (K // 8 + clear_threads - 1) // clear_threads
+            for clear_round in range_constexpr(clear_rounds):
+                clear_idx = blk_n * 256 + tid + clear_round * clear_threads
+                if e_idx == 0 and clear_idx < K // 8:
+                    clear_output = fx.make_view(
+                        fxh._as_ptr(p_clear_output)
+                        + fx.Int64(batch_idx) * K
+                        + fx.Int64(clear_idx) * 8,
+                        fx.make_layout(8, 1),
+                    )
+                    clear_frag = fx.make_fragment_like(clear_output)
+                    clear_frag.fill(0)
+                    fx.copy(
+                        fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+                        clear_frag,
+                        clear_output,
+                    )
 
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(
@@ -1017,10 +1106,11 @@ def compile_moe_gemm1(
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        batch_size = task_num // TOPK
         moe_2stage_gateup_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_w_scale
+            p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
         ).launch(
-            grid=(num_n_blocks, task_num, 1),
+            grid=(num_n_blocks, TOPK, batch_size),
             block=(256, 1, 1),
             stream=stream,
         )

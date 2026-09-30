@@ -3256,9 +3256,18 @@ def get_2stage_cfgs(
             unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
-        elif gate_mode is not GateMode.SEPARATED:
+        elif gate_mode is not GateMode.SEPARATED and not (
+            kernel_name1.startswith("impl__flydsl_gfx950__")
+            and q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and gate_mode is GateMode.INTERLEAVE
+        ):
             unsupported = f"gate mode {gate_mode.value!r}"
-        elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
+        elif activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
             unsupported = f"activation {activation}"
         if unsupported is not None:
             cfg = None

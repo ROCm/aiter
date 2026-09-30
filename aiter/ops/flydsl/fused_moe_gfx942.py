@@ -8,8 +8,9 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import GateMode, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
@@ -28,6 +29,7 @@ class Config:
     use_prefill: bool
     down_path: str = "default"
     down_output_padding_bytes: int = 0
+    use_batch1_algorithm: bool = False
 
     def __post_init__(self):
         if self.down_path not in ("default", "1x4_64x256", "8x1_compact"):
@@ -38,19 +40,29 @@ class Config:
             raise ValueError("The default Down path does not support output padding")
         if self.down_path != "default" and not self.use_prefill:
             raise ValueError("Specialized Down paths require prefill")
+        if self.use_batch1_algorithm and (
+            self.use_prefill or self.down_path != "default"
+        ):
+            raise ValueError(
+                "Direct decoding cannot use prefill or specialized Down paths"
+            )
 
     def to_string(self):
         return (
-            f"{self.BLOCK_M}_{self.BLOCK_N}_{self.BLOCK_K}_{self.use_prefill}:"
+            f"{self.BLOCK_M}_{self.BLOCK_N}_{self.BLOCK_K}_"
+            f"{self.use_prefill}_{self.use_batch1_algorithm}:"
             f"{self.down_path}:{self.down_output_padding_bytes}"
         )
 
     @classmethod
     def from_string(cls, data: str):
         tile, down_path, padding = data.split(":")
-        block_m, block_n, block_k, use_prefill = tile.split("_")
-        if use_prefill not in ("True", "False"):
-            raise ValueError(f"Invalid prefill flag: {use_prefill}")
+        block_m, block_n, block_k, use_prefill, use_batch1_algorithm = tile.split("_")
+        if use_prefill not in ("True", "False") or use_batch1_algorithm not in (
+            "True",
+            "False",
+        ):
+            raise ValueError(f"Invalid algorithm flags: {tile}")
         return cls(
             int(block_m),
             int(block_n),
@@ -58,9 +70,37 @@ class Config:
             use_prefill == "True",
             down_path,
             int(padding),
+            use_batch1_algorithm=use_batch1_algorithm == "True",
         )
 
     def unsupported_reason(self, problem: "_Problem") -> str | None:
+        if not self.use_prefill:
+            if self.use_batch1_algorithm:
+                if not 2 <= problem.batch <= 8:
+                    return "direct decoding requires 2 to 8 tokens"
+                if (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K) != (16, 16, 16):
+                    return "direct decoding uses the fixed 16_16_16 config"
+            else:
+                if not 1 <= problem.batch <= 256:
+                    return "decoding requires 1 to 256 tokens"
+                if self.BLOCK_M != 16 or self.BLOCK_N not in (16, 64, 128):
+                    return "decoding requires BM16 and BN64 or BN128"
+                if self.BLOCK_K not in (16, 64):
+                    return "decoding requires BK64"
+                if problem.batch == 1 and (self.BLOCK_N, self.BLOCK_K) != (16, 16):
+                    return "batch1 uses the fixed 16_16_16 config"
+            if problem.quant_type == "mxfp4":
+                if not self.use_batch1_algorithm and self.BLOCK_N not in (16, 64):
+                    return "MXFP4 sorted decoding requires BLOCK_N=64"
+                if problem.hidden_dim % 512 or problem.inter_dim % 128:
+                    return "MXFP4 requires hidden_dim divisible by 512 and inter_dim by 128"
+            elif problem.hidden_dim % 256 or problem.inter_dim % 64:
+                return (
+                    "decoding requires hidden_dim divisible by 256 and inter_dim by 64"
+                )
+            return None
+        if problem.quant_type == "mxfp4":
+            return "MXFP4 is supported by decoding kernels only"
         if self.down_path != "default":
             if self.BLOCK_M != 64:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
@@ -130,6 +170,11 @@ class _Problem:
     ):
         experts, gateup_dim, hidden_dim = w1.shape
         model_dim, inter_dim = w2.shape[1], w2.shape[2]
+        if w1.dtype == torch.float4_e2m1fn_x2:
+            hidden_dim *= 2
+            inter_dim *= 2
+            if hidden_states.shape[1] != hidden_dim or model_dim != hidden_dim:
+                raise ValueError("MXFP4 input, weight and output dimensions must match")
         assert gateup_dim == 2 * inter_dim
         return cls(
             batch=int(hidden_states.shape[0]),
@@ -143,13 +188,20 @@ class _Problem:
                 QuantType.No: "no",
                 QuantType.per_Token: "ptpc",
                 QuantType.per_Tensor: "per_tensor",
+                QuantType.per_1x32: "mxfp4",
             }[quant_type],
         )
 
 
 def get_tune_space():
     prefill = [(256, 128), (128, 256), (128, 128)]
-    configs = [Config(16, 16, 16, False)]
+    configs = [
+        Config(16, 16, 16, False),
+        Config(16, 16, 16, False, use_batch1_algorithm=True),
+        Config(16, 128, 64, False),
+    ]
+    if get_gfx() == "gfx950":
+        return [config.to_string() for config in configs]
     configs.extend(Config(64, block_n, block_k, True) for block_n, block_k in prefill)
     configs.extend(
         Config(
@@ -179,6 +231,10 @@ def _get_compiled_kernel(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    fused_down_clear=False,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    mxfp4_gate_up_interleaved=True,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_gemm
 
@@ -200,6 +256,10 @@ def _get_compiled_kernel(
         swiglu_limit=swiglu_limit,
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
+        fused_down_clear=fused_down_clear,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
     )
 
 
@@ -228,6 +288,21 @@ def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=N
 
 def _empty_scale(device):
     return torch.empty(0, device=device)
+
+
+def _validate_mxfp4_inputs(w1, w2, w1_scale, w2_scale, problem):
+    if w1.shape[0] != w2.shape[0]:
+        raise ValueError("MXFP4 weights must have the same expert count")
+    for name, scale, channels, reduction in (
+        ("w1_scale", w1_scale, problem.gateup_dim, problem.hidden_dim),
+        ("w2_scale", w2_scale, problem.model_dim, problem.inter_dim),
+    ):
+        if scale is None or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise ValueError(f"{name} must use an E8M0/uint8 dtype")
+        groups = ((reduction // 32 + 7) // 8) * 8
+        required = problem.experts * channels * groups
+        if scale.numel() < required:
+            raise ValueError(f"{name} needs at least {required} E8M0 scale entries")
 
 
 def _gateup_output(hidden_states: torch.Tensor, problem: _Problem):
@@ -416,17 +491,26 @@ def _run_batch1(
     problem: _Problem,
     activation_str: str,
     swiglu_limit: float | None,
+    situ_beta: float,
+    situ_linear_beta: float,
+    mxfp4_gate_up_interleaved: bool,
 ):
+    is_mxfp4 = w1.dtype == torch.float4_e2m1fn_x2
     topk_weight = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
     gemm1_out = _gateup_output(hidden_states, problem)
-    cur_out = torch.zeros(
-        [1, problem.model_dim],
+    fused_down_clear = problem.model_dim == problem.hidden_dim
+    allocate_output = torch.empty if fused_down_clear else torch.zeros
+    cur_out = allocate_output(
+        [problem.batch, problem.model_dim],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
+    route_count = problem.batch * problem.topk
+    weight_dtype_str = (
+        "bf16" if w1.dtype == torch.bfloat16 else "fp4" if is_mxfp4 else "fp8"
+    )
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
@@ -434,12 +518,16 @@ def _run_batch1(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=16,
-        BLOCK_TILE_SIZE_N=32,
+        BLOCK_TILE_SIZE_N=64 if is_mxfp4 and problem.batch >= 4 else 32,
         stage="gateup",
         alg="batch1",
         E=None,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        fused_down_clear=fused_down_clear,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
     )
     _launch(
         gateup_kernel,
@@ -447,9 +535,9 @@ def _run_batch1(
         w1,
         gemm1_out,
         topk_ids,
-        topk_weight,
+        cur_out,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
-        problem.topk,
+        route_count,
     )
 
     down_kernel = _get_compiled_kernel(
@@ -459,7 +547,7 @@ def _run_batch1(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=16,
-        BLOCK_TILE_SIZE_N=64,
+        BLOCK_TILE_SIZE_N=32 if is_mxfp4 and problem.batch > 1 else 64,
         stage="down",
         alg="batch1",
         E=None,
@@ -472,7 +560,7 @@ def _run_batch1(
         topk_ids,
         topk_weight,
         w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
-        problem.topk,
+        route_count,
     )
     return cur_out
 
@@ -492,6 +580,9 @@ def _run_decode(
     problem: _Problem,
     activation_str: str,
     swiglu_limit: float | None,
+    situ_beta: float,
+    situ_linear_beta: float,
+    mxfp4_gate_up_interleaved: bool,
 ):
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
         topk_ids,
@@ -509,7 +600,12 @@ def _run_decode(
         grid = problem.batch * problem.topk
 
     gemm1_out = _gateup_output(hidden_states, problem)
-    weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
+    weight_dtype_str = (
+        "bf16"
+        if w1.dtype == torch.bfloat16
+        else "fp4" if w1.dtype == torch.float4_e2m1fn_x2 else "fp8"
+    )
+    block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
@@ -517,12 +613,15 @@ def _run_decode(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=64,
+        BLOCK_TILE_SIZE_N=block_n,
         stage="gateup",
         alg="splitk",
         E=problem.experts,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
     )
     _launch(
         gateup_kernel,
@@ -545,7 +644,7 @@ def _run_decode(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=64,
+        BLOCK_TILE_SIZE_N=block_n,
         stage="down",
         alg="splitk",
         E=problem.experts,
@@ -581,6 +680,9 @@ def run_flydsl_moe_gfx942(
     moe_sorting_dispatch_policy: int,
     config_string: str,
     swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+    gate_mode: GateMode | str = GateMode.SEPARATED,
 ) -> torch.Tensor:
     if num_local_tokens is not None:
         raise NotImplementedError(
@@ -600,30 +702,61 @@ def run_flydsl_moe_gfx942(
                 f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
             )
     config = Config.from_string(config_string)
+    gate_mode = GateMode(gate_mode)
+    architecture = get_gfx()
+    if architecture not in ("gfx942", "gfx950"):
+        raise NotImplementedError(
+            f"Unsupported FlyDSL MoE architecture: {architecture}"
+        )
+    if architecture == "gfx950" and config.use_prefill:
+        raise NotImplementedError(
+            "This FlyDSL backend supports decoding only on gfx950"
+        )
+    fp8_dtype = (
+        torch.float8_e4m3fn if architecture == "gfx950" else torch.float8_e4m3fnuz
+    )
     is_bf16 = (
         w1.dtype == torch.bfloat16
         and w2.dtype == torch.bfloat16
         and quant_type == QuantType.No
     )
     is_fp8 = (
-        w1.dtype == torch.float8_e4m3fnuz
-        and w2.dtype == torch.float8_e4m3fnuz
+        w1.dtype == fp8_dtype
+        and w2.dtype == fp8_dtype
         and quant_type in (QuantType.per_Token, QuantType.per_Tensor)
+    )
+    is_mxfp4 = (
+        architecture == "gfx950"
+        and w1.dtype == torch.float4_e2m1fn_x2
+        and w2.dtype == torch.float4_e2m1fn_x2
+        and quant_type == QuantType.per_1x32
     )
     if (
         hidden_states.dtype != torch.bfloat16
         or expert_mask is not None
-        or activation not in (ActivationType.Silu, ActivationType.Swiglu)
-        or not (is_bf16 or is_fp8)
+        or activation
+        not in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+        or not (is_bf16 or is_fp8 or is_mxfp4)
     ):
         raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
+    if gate_mode is not GateMode.SEPARATED and not (
+        is_mxfp4 and gate_mode is GateMode.INTERLEAVE
+    ):
+        raise NotImplementedError("Interleaved Gate/Up requires MXFP4 weights")
     if is_fp8 and (w1_scale is None or w2_scale is None):
         raise ValueError("FP8 weights require both w1_scale and w2_scale")
     if is_bf16 and (w1_scale is not None or w2_scale is not None):
         raise NotImplementedError("BF16 weights do not support weight scales")
 
-    activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    if activation == ActivationType.Situv2:
+        if config.use_prefill:
+            raise NotImplementedError("SiTUv2 is supported by decoding kernels only")
+        activation_str = "situv2"
+    else:
+        activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    if is_mxfp4:
+        _validate_mxfp4_inputs(w1, w2, w1_scale, w2_scale, problem)
     unsupported_reason = config.unsupported_reason(problem)
     if unsupported_reason is not None:
         raise RuntimeError(
@@ -648,7 +781,7 @@ def run_flydsl_moe_gfx942(
             activation_str,
             swiglu_limit,
         )
-    if problem.batch == 1:
+    if problem.batch == 1 or config.use_batch1_algorithm:
         return _run_batch1(
             hidden_states,
             w1,
@@ -660,6 +793,9 @@ def run_flydsl_moe_gfx942(
             problem,
             activation_str,
             swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
+            gate_mode is GateMode.INTERLEAVE,
         )
     if 2 <= problem.batch <= 256:
         return _run_decode(
@@ -677,6 +813,9 @@ def run_flydsl_moe_gfx942(
             problem,
             activation_str,
             swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
+            gate_mode is GateMode.INTERLEAVE,
         )
     raise RuntimeError(f"Unsupported batch-size {problem.batch}")
 
@@ -709,10 +848,18 @@ def run_flydsl_moe_gfx942_impl(
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support hidden/intermediate padding"
         )
-    if request.gate_mode not in (None, "separated"):
-        raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend only supports separated gate weights"
-        )
+    gate_mode = (
+        GateMode.SEPARATED if request.gate_mode is None else GateMode(request.gate_mode)
+    )
+    is_mxfp4 = (
+        request.w1.dtype == torch.float4_e2m1fn_x2
+        and request.w2.dtype == torch.float4_e2m1fn_x2
+        and request.quant_type == QuantType.per_1x32
+    )
+    if gate_mode is not GateMode.SEPARATED and not (
+        is_mxfp4 and gate_mode is GateMode.INTERLEAVE
+    ):
+        raise NotImplementedError("Interleaved Gate/Up requires MXFP4 weights")
     if request.dtype not in (None, request.hidden_states.dtype):
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support output dtype conversion"
@@ -725,14 +872,25 @@ def run_flydsl_moe_gfx942_impl(
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support split-K"
         )
-    quant_dtype = (
-        torch.bfloat16 if request.w1.dtype == torch.bfloat16 else torch.float8_e4m3fnuz
-    )
-    if request.q_dtype_a not in (None, quant_dtype):
+    if request.w1.dtype == torch.bfloat16 or is_mxfp4:
+        supported_q_dtypes_a = (None, torch.bfloat16)
+    else:
+        fp8_dtype = (
+            torch.float8_e4m3fn if get_gfx() == "gfx950" else torch.float8_e4m3fnuz
+        )
+        supported_q_dtypes_a = (
+            (None, fp8_dtype)
+            if config.use_prefill
+            else (None, fp8_dtype, torch.bfloat16)
+        )
+    if request.q_dtype_a not in supported_q_dtypes_a:
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph activation dtype must match the weight mode"
         )
-    if request.q_dtype_w not in (None, quant_dtype):
+    if (
+        request.q_dtype_w not in (None, request.w1.dtype)
+        or request.w2.dtype != request.w1.dtype
+    ):
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph weight dtype must match the weight mode"
         )
@@ -751,4 +909,7 @@ def run_flydsl_moe_gfx942_impl(
         request.moe_sorting_dispatch_policy,
         config.to_string(),
         request.swiglu_limit,
+        1.0 if request.beta is None else float(request.beta),
+        1.0 if request.linear_beta is None else float(request.linear_beta),
+        gate_mode,
     )

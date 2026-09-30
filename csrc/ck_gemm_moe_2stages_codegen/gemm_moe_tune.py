@@ -5969,7 +5969,6 @@ class FmoeTuner(TunerCommon):
             beta=None,
             linear_beta=None,
         ):
-            del beta, linear_beta
             if doweight_stage1:
                 raise NotImplementedError(
                     "gfx942 FlyDSL whole-graph tuning does not support "
@@ -5990,6 +5989,8 @@ class FmoeTuner(TunerCommon):
                 moe_sorting_dispatch_policy,
                 config_string=config_string,
                 swiglu_limit=swiglu_limit,
+                situ_beta=1.0 if beta is None else float(beta),
+                situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             )
 
         GREEN = "\033[0;32m"
@@ -6011,7 +6012,15 @@ class FmoeTuner(TunerCommon):
                         model_dim=int(row["model_dim"]),
                         inter_dim=int(row["inter_dim"]),
                         topk=int(row["topk"]),
-                        quant_type=("no" if row["q_type"] == str(QuantType.No) else ""),
+                        quant_type=(
+                            "no"
+                            if row["q_type"] == str(QuantType.No)
+                            else (
+                                "mxfp4"
+                                if row["q_type"] == str(QuantType.per_1x32)
+                                else ""
+                            )
+                        ),
                     )
                 )
                 is None
@@ -6039,7 +6048,7 @@ class FmoeTuner(TunerCommon):
             err1 = "0%"
             err2 = "0%"
             kernelName1 = make_fused_moe_impl_kernel_name(
-                "flydsl_gfx942", config_string
+                f"flydsl_{get_gfx()}", config_string
             )
             kernelName2 = ""
             xbf16 = 0

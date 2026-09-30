@@ -40,6 +40,10 @@ def compile_gemm(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    fused_down_clear=False,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    mxfp4_gate_up_interleaved=True,
 ):
     if stage == "gateup":
         if down_path != "default" or down_output_padding_bytes != 0:
@@ -58,6 +62,10 @@ def compile_gemm(
             tile_k=tile_k,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            fused_down_clear=fused_down_clear,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
         )
     return compile_moe_gemm2(
         N=N,

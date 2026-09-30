@@ -77,6 +77,11 @@ def compile_moe_gemm2(
         activation,
         swiglu_limit,
     )
+    if weight_dtype == "fp4":
+        assert K % 128 == 0, "MXFP4 Down requires K divisible by 128"
+        assert BLOCK_TILE_SIZE_M == 16
+    if alg == "batch1":
+        assert K % TILE_K == 0, "batch1 Down requires K divisible by 64"
     if alg == "prefill_1x4":
         assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
         assert N % 256 == 0, (
@@ -96,10 +101,12 @@ def compile_moe_gemm2(
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
     elif weight_dtype == "fp8":
-        weight_dtype = fx.Float8E4M3FNUZ
+        weight_dtype = fxh.get_fp8_dtype()
+    elif weight_dtype == "fp4":
+        weight_dtype = fx.Float4E2M1FN
 
     TensorWithIndex, _read_sorted_index, gemm_splitk = make_gemm_helpers(
-        K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK
+        K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK, N, BLOCK_TILE_SIZE_N
     )
 
     def _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale):
@@ -144,6 +151,15 @@ def compile_moe_gemm2(
 
     def _make_down_weight_view(p_weight, expert_id):
         element_num = 16 // (p_weight.dtype.width // 8)
+        if const_expr(weight_dtype == fx.Float4E2M1FN):
+            storage_k = K // 2
+            return fx.make_view(
+                p_weight + fx.Int64(expert_id) * N * storage_k,
+                fx.make_layout(
+                    ((16, N // 16), (element_num, storage_k // element_num)),
+                    ((element_num, 16 * storage_k), (1, 16 * element_num)),
+                ),
+            )
         return fx.make_view(
             p_weight + fx.Int64(expert_id * N * K),
             fx.make_layout(
@@ -233,6 +249,8 @@ def compile_moe_gemm2(
                 arg_p_weight,
                 lds,
                 splitk_waves=1,
+                p_w_scale=p_w_scale,
+                expert_id=expert_id,
             )
 
             _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
@@ -301,17 +319,20 @@ def compile_moe_gemm2(
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
+        input_offset = fx.Int64(route_idx) * K
         arg_p_input = fx.make_view(
-            fxh._as_ptr(p_input) + fx.Int64(e_idx * K),
+            fxh._as_ptr(p_input) + input_offset,
             fx.make_layout((BLOCK_TILE_SIZE_M, K), (0, 1)),
         )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_topk_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
-        expert_id = arg_p_topk_ids[e_idx]
-        topk_weight = arg_p_topk_weights[e_idx]
+        expert_id = arg_p_topk_ids[route_idx]
+        topk_weight = arg_p_topk_weights[route_idx]
         arg_p_weight = _make_down_weight_view(p_weight, expert_id)
 
         c_frag = gemm_splitk(
@@ -324,6 +345,8 @@ def compile_moe_gemm2(
             None,
             splitk_waves=1,
             a_with_index=False,
+            p_w_scale=p_w_scale,
+            expert_id=expert_id,
         )
 
         _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
@@ -333,7 +356,8 @@ def compile_moe_gemm2(
         c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output), fx.make_layout((1, N), (N, 1))
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * N,
+            fx.make_layout((1, N), (N, 1)),
         )
         cp_atom_w = fx.make_copy_atom(
             fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
@@ -760,10 +784,11 @@ def compile_moe_gemm2(
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        batch_size = task_num // TOPK
         moe_2stage_down_batch1(
             p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
         ).launch(
-            grid=(num_n_blocks, task_num, 1),
+            grid=(num_n_blocks, TOPK, batch_size),
             block=(64, 1, 1),
             stream=stream,
         )
