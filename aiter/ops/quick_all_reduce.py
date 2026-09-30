@@ -12,12 +12,23 @@ MD_NAME = "module_quick_all_reduce"
 
 @compile_ops("module_quick_all_reduce", develop=True)
 def init_custom_qr(
-    rank: int, world_size: int, qr_max_size: int | None = None
+    rank: int,
+    world_size: int,
+    qr_max_size: int | None = None,
+    quant_level: int | None = None,
 ) -> int: ...
 
 
 @compile_ops("module_quick_all_reduce", develop=True)
 def qr_destroy(fa: int) -> None: ...
+
+
+@compile_ops("module_quick_all_reduce", develop=True)
+def qr_uses_pull_q4(fa: int) -> bool: ...
+
+
+@compile_ops("module_quick_all_reduce", develop=True)
+def qr_uses_pull_q4_bulk(fa: int) -> bool: ...
 
 
 @compile_ops("module_quick_all_reduce", develop=True)

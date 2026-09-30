@@ -38,15 +38,17 @@ except Exception:  # noqa: BLE001
     quick_ar = False
 
 
-def qr_rocm_arch_available():
+def _qr_rocm_arch() -> str:
     try:
         props = torch.cuda.get_device_properties(0)
-        gcn_arch = getattr(props, "gcnArchName", "")
-        supported_archs = ["gfx94", "gfx95"]
-        return any(gfx in gcn_arch for gfx in supported_archs)
+        return getattr(props, "gcnArchName", "")
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
-        return False
+        return ""
+
+
+def qr_rocm_arch_available() -> bool:
+    return any(gfx in _qr_rocm_arch() for gfx in ("gfx94", "gfx95", "gfx1250"))
 
 
 def is_weak_contiguous(inp: torch.Tensor):
@@ -72,6 +74,7 @@ class QuickAllReduce:
 
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 8]
     _SUPPORTED_DTYPES: ClassVar[list[Any]] = [torch.float16, torch.bfloat16]
+    _GFX1250_MIN_SIZE: ClassVar[dict[int, int]] = {2: 16 * MB, 4: 8 * MB}
     # The following data is based on kernel tests.
     # In this order [FP, FP8, INT6, INT4, INT3].
     # INT3 is TP2-only; its entries for world_size 4/8 are unused but kept
@@ -94,8 +97,7 @@ class QuickAllReduce:
         larger world sizes.
         Quick allreduce is designed as a complement to custom allreduce.
         Its initialization requires even stricter conditions.
-        Only the ROCm MI300 series is supported for quick allreduce at
-        this time.
+        ROCm MI300 and gfx1250 are supported. gfx1250 is limited to TP2/TP4.
         Args:
             group: the process group to work on. If None, it will use the
                 default process group.
@@ -103,12 +105,21 @@ class QuickAllReduce:
                 it will be bind to f"cuda:{local_rank}".
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
-        are in the same node.
+        are in the same node. Calls on one communicator must use one stream
+        and execute in the same order on every rank; concurrent streams are
+        unsupported.
         """
         self.disabled = True
-        if not qr_rocm_arch_available():
+        self._ptr = 0
+        self.uses_pull_q4 = False
+        self.uses_pull_q4_bulk = False
+        self._route_selection_logged = False
+        arch = _qr_rocm_arch()
+        self._is_gfx1250 = "gfx1250" in arch
+        if not any(gfx in arch for gfx in ("gfx94", "gfx95", "gfx1250")):
             logger.debug(
-                "Custom quick allreduce is only supported on ROCm MI300 series."
+                "Custom quick allreduce is only supported on ROCm "
+                "gfx94/gfx95/gfx1250 architectures."
             )
             return
 
@@ -141,6 +152,13 @@ class QuickAllReduce:
                 "unsupported world size: %d. Supported world sizes: %s.",
                 world_size,
                 str(QuickAllReduce._SUPPORTED_WORLD_SIZES),
+            )
+            return
+        if self._is_gfx1250 and world_size > 4:
+            logger.warning(
+                "Custom quick allreduce is disabled on gfx1250 for world size %d; "
+                "only TP2 and TP4 are supported.",
+                world_size,
             )
             return
 
@@ -181,7 +199,7 @@ class QuickAllReduce:
         self.init_quick_all_reduce()
 
     def init_quick_all_reduce(self):
-        # On RocM, bfloat16 kernels are slower than fp16
+        # On ROCm, bfloat16 kernels are slower than fp16
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
         self.use_fp16_kernels = int(
@@ -222,10 +240,13 @@ class QuickAllReduce:
             )
             return
 
-        # TODO: If the dtype is not bfloat16 or then float16,
+        # TODO: If the dtype is neither bfloat16 nor float16,
         # quickallreduce should not be created.
 
-        # AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
+        # AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB.
+        # The legacy 2 GiB problem-size default requires a 4 GiB communication
+        # allocation per rank. Keep the gfx1250 default bounded while allowing
+        # callers to override it explicitly.
         qr_max_size = int(os.environ.get("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", "0"))
         if qr_max_size > 0:
             if qr_max_size < 1:
@@ -234,11 +255,23 @@ class QuickAllReduce:
                     "lead to error or degradation to custom allreduce or rccl."
                 )
             qr_max_size = qr_max_size * MB
-        # If qr_max_size is None, then 2GB is used by default.
-        self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
+        elif self._is_gfx1250:
+            qr_max_size = 256 * MB
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
-        self.create_shared_buffer()
-        self.disabled = False
+        try:
+            self._ptr = ops.init_custom_qr(
+                self.rank,
+                self.world_size,
+                qr_max_size,
+                self.qr_quant_level.value,
+            )
+            self.create_shared_buffer()
+            self.uses_pull_q4 = ops.qr_uses_pull_q4(self._ptr)
+            self.uses_pull_q4_bulk = ops.qr_uses_pull_q4_bulk(self._ptr)
+            self.disabled = False
+        except Exception:
+            self.close()
+            raise
 
     def create_shared_buffer(self):
         """
@@ -254,6 +287,33 @@ class QuickAllReduce:
         """
         if self.disabled:
             return False
+        if self._is_gfx1250:
+            # The production route is intentionally limited to the exact BF16
+            # PullQ4 bulk configurations that beat AITER CAR in both eager and
+            # graph microbenchmarks. Smaller rows fall back to CAR.
+            min_size = self._GFX1250_MIN_SIZE.get(self.world_size)
+            if (
+                min_size is None
+                or inp.dtype != torch.bfloat16
+                or self.qr_quant_level != QuickReduceRegime.INT4
+                or not self.use_fp16_kernels
+                or not self.uses_pull_q4
+                or not self.uses_pull_q4_bulk
+                or not is_weak_contiguous(inp)
+            ):
+                return False
+            inp_size = inp.numel() * inp.element_size()
+            eligible = min_size <= inp_size <= self.qr_max_size
+            if eligible and not self._route_selection_logged:
+                logger.info(
+                    "QuickReduce gfx1250 production route selected: "
+                    "TP%d BF16 INT4 PullQ4 bulk, message=%d bytes, minimum=%d bytes",
+                    self.world_size,
+                    inp_size,
+                    min_size,
+                )
+                self._route_selection_logged = True
+            return eligible
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -273,9 +333,13 @@ class QuickAllReduce:
         )
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
-        """Performs an out-of-place custom quick all reduce."""
+        """Performs an out-of-place custom quick all reduce.
+
+        Calls on one communicator must use one stream and execute in the same
+        order on every rank. Concurrent streams are unsupported.
+        """
         # quick allreduce doesn't require a separate graph mode,
-        # as QR uses static IPC buffer.
+        # as QR uses a static shared communication buffer.
         if out is None:
             out = torch.empty_like(inp)
         ops.qr_all_reduce(
@@ -290,6 +354,10 @@ class QuickAllReduce:
         weight: torch.Tensor,
         hidden_dim: int,
     ):
+        if getattr(self, "uses_pull_q4", False):
+            return False
+        if self.qr_quant_level == QuickReduceRegime.INT3:
+            return False
         if not self.should_quick_allreduce(inp):
             return False
         if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
@@ -311,7 +379,11 @@ class QuickAllReduce:
         eps: float,
         hidden_dim: int,
     ):
-        """Performs QR allreduce fused with residual add and RMSNorm."""
+        """Performs QR allreduce fused with residual add and RMSNorm.
+
+        Calls on one communicator must use one stream and execute in the same
+        order on every rank. Concurrent streams are unsupported.
+        """
         out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual_inp)
         ops.qr_all_reduce_rmsnorm(
@@ -329,11 +401,11 @@ class QuickAllReduce:
         return out, residual_out
 
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", None):
+        if getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
             self._ptr = 0
-            self.disabled = True
+        self.disabled = True
 
     def __del__(self):
         self.close()
