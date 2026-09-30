@@ -36,8 +36,9 @@ fptr_t init_custom_ar(int64_t meta_ptr,
                       bool fully_connected)
 {
     int world_size = all_meta_ptrs.size();
-    if(world_size > 4)
-        throw std::invalid_argument("gfx1250 custom allreduce: world size > 4 is not supported");
+    if(world_size > aiter::kMaxNgpus)
+        throw std::invalid_argument("gfx1250 custom allreduce: world size > " +
+                                    std::to_string(aiter::kMaxNgpus) + " is not supported");
     if(world_size % 2 != 0)
         throw std::invalid_argument("Odd num gpus is not supported for now");
     if(rank < 0 || rank >= world_size)
@@ -63,8 +64,9 @@ fptr_t init_custom_ar_ipc(int64_t meta_ptr,
                           bool fully_connected)
 {
     int world_size = offsets.size();
-    if(world_size > 4)
-        throw std::invalid_argument("gfx1250 custom allreduce: world size > 4 is not supported");
+    if(world_size > aiter::kMaxNgpus)
+        throw std::invalid_argument("gfx1250 custom allreduce: world size > " +
+                                    std::to_string(aiter::kMaxNgpus) + " is not supported");
     if(world_size % 2 != 0)
         throw std::invalid_argument("Odd num gpus is not supported for now");
     if(world_size != (int)ipc_handle_ptrs.size())
@@ -72,7 +74,7 @@ fptr_t init_custom_ar_ipc(int64_t meta_ptr,
     if(rank < 0 || rank >= world_size)
         throw std::invalid_argument("invalid rank passed in");
 
-    hipIpcMemHandle_t ipc_handles[4];
+    hipIpcMemHandle_t ipc_handles[aiter::kMaxNgpus];
     for(int i = 0; i < world_size; i++)
     {
         std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
@@ -471,12 +473,11 @@ void start_sync_latency(fptr_t _fa, int64_t blocks)
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     int ws = fa->world_size_;
     constexpr int threads = 256;
-    if(ws == 2)
-        aiter::start_sync_latency<2><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
-    else
-        aiter::start_sync_latency<4><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
+#define LAUNCH_START_SYNC(NG) \
+    aiter::start_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+        fa->sg_, fa->self_sg_, fa->rank_)
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_START_SYNC);
+#undef LAUNCH_START_SYNC
 }
 
 void end_sync_latency(fptr_t _fa, int64_t blocks)
@@ -485,12 +486,11 @@ void end_sync_latency(fptr_t _fa, int64_t blocks)
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     int ws = fa->world_size_;
     constexpr int threads = 256;
-    if(ws == 2)
-        aiter::end_sync_latency<2><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
-    else
-        aiter::end_sync_latency<4><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
+#define LAUNCH_END_SYNC(NG) \
+    aiter::end_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+        fa->sg_, fa->self_sg_, fa->rank_)
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_END_SYNC);
+#undef LAUNCH_END_SYNC
 }
 
 void two_sync_latency(fptr_t _fa, int64_t blocks)
@@ -499,12 +499,11 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     int ws = fa->world_size_;
     constexpr int threads = 256;
-    if(ws == 2)
-        aiter::two_sync_latency<2><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
-    else
-        aiter::two_sync_latency<4><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
+#define LAUNCH_TWO_SYNC(NG) \
+    aiter::two_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+        fa->sg_, fa->self_sg_, fa->rank_)
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
+#undef LAUNCH_TWO_SYNC
 }
 
 } // namespace aiter
