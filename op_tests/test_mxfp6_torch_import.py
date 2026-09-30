@@ -3,8 +3,8 @@
 
 import builtins
 import importlib.util
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -98,16 +98,20 @@ class TestFP6TorchImport(unittest.TestCase):
             "quantize_fp6_v_clean_triton",
             "quantize_fp6_v_data_scale_triton",
         ):
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(AssertionError, "triton/torch unavailable"):
-                    getattr(self.packer, name)(x)
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(AssertionError, "triton/torch unavailable"),
+            ):
+                getattr(self.packer, name)(x)
 
     def test_torch_entry_points_reject_missing_torch(self):
         packer = load_packer(without_torch=True)
         for name in ("quantize_fp6_lastdim_torch", "quantize_fp6_k_lds_order_torch"):
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(AssertionError, "torch unavailable"):
-                    getattr(packer, name)(None)
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(AssertionError, "torch unavailable"),
+            ):
+                getattr(packer, name)(None)
 
 
 if __name__ == "__main__":
