@@ -846,6 +846,9 @@ def gemm2_body_v2(
             N_OUT_rt,
             BN,
             kMChunks,
+            arg_bias=arg_bias,
+            expert_id=e,
+            enable_bias=enable_bias,
         )
     elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
@@ -1306,18 +1309,42 @@ def atomic_bf16_epilog(
 
 
 def nonatomic_bf16_epilog(
-    accm, arg_out, m_row, n_block_idx, wave, lane, N_OUT, BN, kMChunks
+    accm,
+    arg_out,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    N_OUT,
+    BN,
+    kMChunks,
+    arg_bias=None,
+    expert_id=None,
+    enable_bias=False,
 ):
     numAccN = (BN // 4) // 16
     row_base = m_row + (lane // 16) * 4
     gn_base = n_block_idx * BN + wave * (BN // 4) + (lane % 16)
-    out_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
+    out_ptr = global_typed_ptr(arg_out, T.bf16, align=2) + (
+        fx.Int64(row_base) * fx.Int64(N_OUT) + fx.Int64(gn_base)
+    )
+    bias = None
+    if const_expr(enable_bias):
+        bias_ptr = global_typed_ptr(arg_bias, T.f32) + (
+            fx.Int64(expert_id) * fx.Int64(N_OUT) + fx.Int64(gn_base)
+        )
+        bias = [
+            fx.Float32(bias_ptr[fx.Int32(J * 16)]) for J in range_constexpr(numAccN)
+        ]
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(numAccN):
             vec = Vec(accm[i][J])
             for v in range_constexpr(4):
-                bf = Vec.from_elements([vec[v]], Float32).to(BFloat16)
-                out_ptr[(row_base + i * 16 + v) * N_OUT + gn_base + J * 16] = bf[0]
+                val = vec[v]
+                if const_expr(enable_bias):
+                    val = fx.Float32(val) + bias[J]
+                bf = Vec.from_elements([val], Float32).to(BFloat16)
+                out_ptr[fx.Int32(i * 16 + v) * N_OUT + J * 16] = bf[0]
 
 
 def nonatomic_mxfp4_epilog(
