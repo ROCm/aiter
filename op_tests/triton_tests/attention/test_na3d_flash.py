@@ -283,7 +283,8 @@ _DEFAULT_SHAPES = [
 # ---------------------------------------------------------------------------
 # Fast subset for cross-validation against na3d_sdpa_ref (FP32 per-query loop).
 # Only shapes with SEQ <= 50K to keep na3d_sdpa_ref within a few seconds each.
-# Covers all 4 edge-case categories plus 2 LTX-2.5 default shapes.
+# Covers 6 edge-case categories plus 2 LTX-2.5 default shapes; the W=33
+# cross-row case is covered only by test_na3d_flash.
 # Large shapes (36,64,96), (40,96,96), (79,192,192) are excluded here; they
 # are already exercised in test_na3d_flash via the faster _na3d_sdpa_exact ref.
 # ---------------------------------------------------------------------------
