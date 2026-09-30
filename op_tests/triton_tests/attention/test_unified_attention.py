@@ -725,3 +725,106 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 200), (1, 37), (1, 131)],
+        [(1, 8000), (1, 37), (1, 2011), (1, 523)],
+        [(7, 100), (1, 37), (30, 530)],
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@torch.inference_mode()
+def test_triton_unified_attn_int64_metadata(
+    seq_lens: list[tuple[int, int]],
+    block_size: int,
+    dtype: torch.dtype,
+) -> None:
+    if not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=block_size,
+        head_size=128,
+        num_heads=(12, 2),
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens.to(torch.int64),
+        seqused_k=kv_lens.to(torch.int64),
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.float32),
+            ref_output.to(torch.float32),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="unified_attn int64 metadata",
+        )
+        <= tol_err_ratio
+    )
