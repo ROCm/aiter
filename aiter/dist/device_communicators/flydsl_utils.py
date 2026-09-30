@@ -16,12 +16,14 @@ def all_ranks_agree(ok: bool, group) -> bool:
     return bool(flag.item())
 
 
-def preload_fly_engines(engines) -> None:
+def preload_fly_engines(engines, *args) -> None:
     """Compile the binaries each engine serves, without launching them.
 
     *engines* holds ``(engine, (lo, hi))`` pairs, ``lo..hi`` being the payload
     bytes (inclusive) the dispatcher routes to that engine. Binaries its ladder
     assigns only to payloads outside that range are left alone: they never run.
+    *args* go to every ``preload`` ahead of the range: the hidden dim, for the
+    fused engines, whose binaries are per width.
 
     FlyDSL compiles a binary on its first launch, and if that happens inside an
     active CUDA graph capture, the capture pays seconds of JIT. The kernels take
@@ -31,4 +33,4 @@ def preload_fly_engines(engines) -> None:
     """
 
     for engine, payload_range in engines:
-        engine.preload(payload_range=payload_range)
+        engine.preload(*args, payload_range=payload_range)

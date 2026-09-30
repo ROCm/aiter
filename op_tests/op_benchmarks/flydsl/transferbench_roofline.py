@@ -127,10 +127,48 @@ WIRE_RATIO = {
     "qr_int3": 3.0 / 16.0,
     "fly_int4": 4.0 / 16.0,
     "fly_int4_ring": 4.0 / 16.0,
+    # Mixed-codec ring rungs. `base_key` cannot reach these: it strips a *final*
+    # tuning suffix, and here `_st8`/`_st32` sits in the middle with `_int6`
+    # after it. The mean of a 6-bit reduce-scatter lap and a 4-bit all-gather
+    # lap, since a ring moves the same bytes on each -- see the `rs_codec`
+    # comment on these rows in bench_comm_allreduce.py.
+    "fly_int4_ring_st8_int6": 5.0 / 16.0,
+    "fly_int4_ring_st32_int6": 5.0 / 16.0,
     # Exact, bf16 on the wire -- no codec, so the payload dtype is the wire
     # dtype. The (N-1)x fan-out of a one-shot is in the *pattern*, not here.
     "fly_1stage": 1.0,
     "rccl": 1.0,
+    # ---- --fusion ar_rmsnorm rows -----------------------------------------
+    # Fusing an RMSNorm epilogue changes what happens to the bytes after they
+    # land, never how many cross the fabric, so every ratio here is its plain
+    # counterpart's.
+    "fused_cdr_1stage": 1.0,
+    "fused_cdr_2stage": 1.0,
+    "fused_fly_1stage": 1.0,
+    "fused_qr_fp8": 0.5,
+    "fused_qr_int4": 4.0 / 16.0,
+    "fused_fly_ring": 4.0 / 16.0,
+    "fused_fly_mesh": 4.0 / 16.0,
+    # Two-launch baselines: the all-reduce is the plain kernel, and the norm
+    # that follows it is local -- no fabric traffic at all.
+    "separate_cdr": 1.0,
+    "separate_rccl": 1.0,
+    "separate_fly1s": 1.0,
+    "separate_qr_int4": 4.0 / 16.0,
+    "separate_flyring": 4.0 / 16.0,
+    "separate_flymesh": 4.0 / 16.0,
+}
+
+# Wire bytes per payload byte for a FlyDSL dispatch *family*, used for the rows
+# whose kernel is chosen per shape rather than pinned. The family names are
+# exactly what allreduce_policy.pick_family returns, and what
+# FlyDSLAllReduce.variant / FlyDSLAllReduceRMSNorm.variant prefix their symbol
+# with. The one-shot is exact bf16; the two-shot schedules are the same INT4
+# wire their pinned counterparts above use.
+_FAMILY_RATIO = {
+    "oneshot": 1.0,
+    "mesh": 4.0 / 16.0,
+    "ring": 4.0 / 16.0,
 }
 
 # Which traffic pattern each candidate actually runs, independent of the shape.
@@ -229,31 +267,57 @@ def round16(nbytes) -> int:
 
 # Tuning suffixes that never change the wire shape: ``_st<N>`` (two-shot/ring
 # super-tile), ``_g<N>`` (grid cap), ``_a<N>`` (atoms per thread), ``_fa``
-# (fanout order). All of them change how the bytes are scheduled, none of them
-# change how many there are or which pattern is driven.
-_ST_SUFFIX = re.compile(r"(?:_st\d+|_g\d+|_a\d+|_fa)$")
+# (fanout order), ``_b<N>`` (fused block, i.e. threads per token row) and
+# ``_ss`` (self-skip). All of them change how the bytes are scheduled or which
+# trip they take, none of them change how many there are.
+#
+# ``+$`` rather than a single alternative: the fused one-shot rows stack three
+# at once (``_b1024_g8_ss``), and stripping one per call would leave the rest
+# attached and the key unresolvable.
+_ST_SUFFIX = re.compile(r"(?:_st\d+|_g\d+|_a\d+|_b\d+|_fa|_ss)+$")
 
 
 def base_key(cand_key: str) -> str:
-    """Strip a ``_st<N>`` tuning suffix; variants share their base's wire shape.
+    """Strip trailing tuning suffixes; variants share their base's wire shape.
 
     ``fly_int4_ring_st16`` puts exactly the bytes on the wire that
     ``fly_int4_ring`` does and drives the same pattern -- the super-tile changes
     how many tiles a block batches behind one publish, never the wire format.
     The one-shot variants (``_g<N>``, ``_a<N>``, ``_fa``) are the same story:
-    block count and store order, not wire format.
+    block count and store order, not wire format. So are the fused ones:
+    ``_b<N>`` sizes the workgroup to the token row and ``_ss`` drops this rank's
+    trip through its own inbox, neither of which is a wire format.
 
-    Resolving by prefix matters because both lookups below fall back to a
-    *silent* default (ratio 1.0, pattern two-shot). A variant added in
-    ``bench_comm_allreduce.py`` and forgotten here would then be graded against
-    a 4x-too-large roof and quietly report a quarter of its real efficiency.
+    Resolving by prefix matters because the lookup below falls back to a
+    *silent* default of 1.0. A variant added in ``bench_comm_allreduce.py`` and
+    forgotten here is then graded against a 4x-too-large roof and quietly
+    reports several times its real efficiency`.
     """
     return _ST_SUFFIX.sub("", cand_key)
 
 
-def wire_bytes(payload_bytes: int, cand_key: str) -> int:
+def wire_ratio(cand_key: str, variant: str | None = None) -> float | None:
+    """Wire bytes per payload byte for *cand_key*, or None if unknown.
+
+    *variant* is the ``"<family>:<symbol>"`` string the FlyDSL dispatchers stamp
+    on their launch wrapper. When it names a family, it **wins over the key
+    lookup**: the three ``*fly_auto`` rows are policies rather than kernels, so
+    their wire is whichever family the policy picked at this shape and no static
+    entry can describe them.
+    """
+    if variant:
+        # `_agree_variant` emits "MIXED: ..." when ranks disagree, which names
+        # no single family; fall through to the key rather than parsing it.
+        family = variant.split(":", 1)[0]
+        if family in _FAMILY_RATIO:
+            return _FAMILY_RATIO[family]
+    return WIRE_RATIO.get(base_key(cand_key))
+
+
+def wire_bytes(payload_bytes: int, cand_key: str, variant: str | None = None) -> int:
     """Bytes *cand_key* puts on the wire for a *payload_bytes* all-reduce."""
-    return round16(payload_bytes * WIRE_RATIO.get(base_key(cand_key), 1.0))
+    ratio = wire_ratio(cand_key, variant)
+    return round16(payload_bytes * (1.0 if ratio is None else ratio))
 
 
 # ---------------------------------------------------------------------------

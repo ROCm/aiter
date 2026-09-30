@@ -10,14 +10,19 @@ on the 64 B fabric sector grid. FP16 is a passthrough wire format -- the
 thread's eight fp16 values verbatim, no quantization -- used to test the
 reduce-scatter/all-gather transport in isolation from the codec.
 
-``block`` is a build parameter: it sets the tile width, and through it how
-many blocks a payload gets.
+``block`` is a build parameter rather than a constant because the fused
+schedules size a workgroup to one token row -- ``block = hidden / 8`` -- so that
+one 16 B atom *is* one row and an RMSNorm epilogue can reduce it without a
+grid-wide barrier. Every region of a rank-tile scales with it, and the
+alignment that constrains it is the 64 B fabric sector: see
+:func:`validate_block`. The default is 256, which reproduces the shipped
+geometry exactly (INT4 1152 B, INT6 1664 B, FP16 4096 B).
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
 Depends on ``quick_allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 
 Note: Editing the shared modules doesn't invalidate the FlyDSL compiler cache.
-Hence, one may end up running stake kernels unless one sets
+Hence, one may end up running stale kernels unless one sets
 export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels at the repo root.
 """
 
@@ -36,7 +41,8 @@ SUPER_TILES = (1, 8)
 GROUP = 8
 PAIR = 2
 
-# Workgroup widths a codec can be built for.
+# The plain schedules' menu of workgroup widths: a caller that does not size a
+# workgroup to a token row picks one of these.
 #
 # Every region of a rank-tile has to be a whole number of 64 B fabric sectors:
 # the fanout moves one sector per quad, so a region ending mid-sector would
@@ -48,14 +54,29 @@ SUPPORTED_BLOCKS = (64, 128, 256, 512)
 # i32 per 64 B fabric sector.
 SECTOR_I32 = 16
 
+# The fused schedules do not pick from ``SUPPORTED_BLOCKS``: they derive
+# ``block = hidden / (8 * atoms_per_row)`` to fit one token row in a workgroup,
+# landing on any 128-thread-aligned width up to the hardware workgroup limit
+# (e.g. hidden 3072 -> 384, hidden 8192 -> 1024). :func:`validate_block` accepts
+# that whole range; these bounds are exported for ``quick_allreduce_fusions`` to
+# size a row with, and gate the codec geometry in :func:`validate_block`.
+MAX_BLOCK = 1024
+BLOCK_ALIGN = 128
+
 
 def validate_block(block: int) -> int:
     block = int(block)
-    if block not in SUPPORTED_BLOCKS:
-        raise ValueError(
-            f"codec block must be one of {SUPPORTED_BLOCKS}, got {block!r}"
-        )
-    return block
+    # 64 is the plain menu's floor: below a full fabric sector on the scale
+    # region, so codecs_for_block pads it. Every wider width is a whole number
+    # of 128-thread rank-tile alignments up to the hardware workgroup limit --
+    # the range the fused schedules derive a block in (block = hidden / 8). Both
+    # keep every rank-tile region on the 64 B fabric sector grid.
+    if block == 64 or (BLOCK_ALIGN <= block <= MAX_BLOCK and block % BLOCK_ALIGN == 0):
+        return block
+    raise ValueError(
+        f"codec block must be 64 or a multiple of {BLOCK_ALIGN} in "
+        f"[{BLOCK_ALIGN}, {MAX_BLOCK}], got {block!r}"
+    )
 
 
 def _round_up_to_sector(n_i32: int) -> int:
@@ -106,7 +127,8 @@ class Codec:
     rank_tile_i32: int
     #: Payload i32 a thread contributes per atom.
     n_words_per_thread: int
-    #: Workgroup width this instance was built for.
+    #: Workgroup width this instance was built for. Every region offset above
+    #: scales with it; see :func:`codecs_for_block`.
     block: int = BLOCK
 
     @property
@@ -159,8 +181,18 @@ class Codec:
 
 @functools.cache
 def codecs_for_block(block: int = BLOCK) -> dict[str, "Codec"]:
-    """The three wire formats at a given workgroup width."""
+    """The three wire formats at a given workgroup width.
 
+    Every region scales with *block*, because a rank-tile is one 16 B atom per
+    thread: the nibble plane is one i32 per thread, the dense 2-bit plane one
+    per lane pair, and the group-16 scale one byte per pair. At the default
+    ``block=256`` this returns exactly the shipped geometry -- INT4
+    ``256 / 288``, INT6 ``256 / 384 / 416``, FP16 ``1024`` -- so an unchanged
+    call site compiles an unchanged kernel.
+
+    Cached because these are compared and keyed on by identity in the kernel
+    factories, and because a codec table is immutable.
+    """
     block = validate_block(block)
     nibble = block  # one i32 of nibbles per thread
     hi2 = block // PAIR  # INT6's dense 2-bit plane, one i32 per lane pair
@@ -212,6 +244,8 @@ def codecs_for_block(block: int = BLOCK) -> dict[str, "Codec"]:
     }
 
 
+#: The default-width table. Every call site that does not size its workgroup to
+#: a token row imports this and is unaffected by the parameterization.
 CODECS = codecs_for_block(BLOCK)
 INT4, INT6, FP16 = CODECS["int4"], CODECS["int6"], CODECS["fp16"]
 
@@ -222,7 +256,8 @@ def thread_lane(tid, block: int = BLOCK):
     ``lane`` is the codec's own required argument to :func:`_codec_quant` /
     :func:`_codec_dequant` (the pairing and shuffle width both key off it);
     ``wave`` is only a byproduct callers use for their own fanout layouts.
-    Shared by the mesh, ring and codec-test kernels.
+    Shared by the mesh, ring and codec-test kernels, so extracted here rather
+    than repeated in each.
 
     Every supported *block* is a whole number of waves, so there is no partial
     wave for the shuffles to fall off.

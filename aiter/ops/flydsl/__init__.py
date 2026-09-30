@@ -36,7 +36,7 @@ _LAZY_IMPORTS = {
         "KERNEL_VARIANTS",
     ),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
-    "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
+    "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -111,7 +111,7 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
     "OneShotAllReduce",
-    "QuickAllReduceInt4",
+    "FlyQuickAllReduce",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
