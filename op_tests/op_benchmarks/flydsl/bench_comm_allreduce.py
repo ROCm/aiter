@@ -2828,8 +2828,8 @@ def _worker(
         # any timing and well before any graph capture. Building a width is a
         # collective, so every rank walks the same (hidden, config) order.
         # A split row's engine asks its candidates, not ``supports_hidden``:
-        # that answers for the unsplit geometry, and the row would only be
-        # skipped at this width anyway.
+        # that accepts the engine's fallback to the nearest split, and the row
+        # would only be skipped at this width anyway.
         rms_cands = {
             c.fly1s_rms_cfg: c
             for c in CANDIDATES

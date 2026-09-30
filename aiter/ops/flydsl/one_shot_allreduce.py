@@ -715,8 +715,18 @@ class OneShotAllReduceRMSNorm:
         return tuple(sorted({k[0] for k in self._by_cfg}))
 
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether any build exists for hidden dim, padded ones included."""
+        """Whether any build exists for hidden dim, padded and split ones included.
+
+        A split rung counts when ``_split_geom_for`` resolves it. With a pinned
+        ``block`` that is the slice's width, which the unsplit sets below need
+        not list: 4096 at ``block=64`` exists only as a split build.
+        """
         hidden = int(hidden)
+        if any(
+            r[5] > 1 and self._split_geom_for(hidden, r[1], r[5]) is not None
+            for r in self._ladder
+        ):
+            return True
         if self.block is not None:
             if any(b == self.block for b, _ in fused_block_options(hidden)):
                 return True
@@ -729,7 +739,8 @@ class OneShotAllReduceRMSNorm:
 
     def pads_hidden(self, hidden: int) -> int:
         """``h_pad`` this width would run at, or hidden dim when it needs no padding."""
-        return self._geom_for(int(hidden), self._ladder[0][1])[1]
+        _floor, atoms, _cap, _f, _s, split = self._ladder[0]
+        return self._geom_for(int(hidden), atoms, split)[1]
 
     # -- launch --------------------------------------------------------------
 

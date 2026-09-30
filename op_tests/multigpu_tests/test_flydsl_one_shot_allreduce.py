@@ -1133,13 +1133,21 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     # supports_hidden and _geom_for must give the same yes/no on the pin. When
     # supports_hidden says yes, _geom_for must return a geometry that honours
     # the pin rather than raising.
-    for block in (128, 256, 512, 1024):
+    # A split rung pins block as the slice's width: 4096 has no unsplit b64
+    # build, only k8/k4/k2 ones, and supports_hidden must still say yes -- the
+    # launch's _check gates on it. Rungs are (floor, atoms, cap, fanout,
+    # skip_self, split).
+    for block, split in ((128, 1), (256, 1), (512, 1), (1024, 1), (64, 8)):
         eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
         eng.block = block
         eng.pad = True
+        eng._ladder = ((0, 1, 64, None, False, split),)
         if eng.supports_hidden(4096):
-            atoms, h_pad, _split = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1)
-            assert block * atoms * 8 == h_pad, (block, atoms, h_pad)
+            atoms, h_pad, k = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1, split)
+            assert block * atoms * 8 * k == h_pad, (block, atoms, h_pad, k)
+            assert k == split, (block, split, k)
+        else:
+            assert split == 1, (block, split)
 
     # Padding off: a pinned non-native block has no geometry, so _geom_for hands
     # back the rung atoms and lets the build raise -- it must not resolve to a
