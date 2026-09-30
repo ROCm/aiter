@@ -54,6 +54,14 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
     ),
+    "flydsl_gdn_gated_rmsnorm_out_proj": (
+        ".gdn_gated_rmsnorm_out_proj",
+        "flydsl_gdn_gated_rmsnorm_out_proj",
+    ),
+    "flydsl_gdn_gated_rmsnorm_out_proj_supported": (
+        ".gdn_gated_rmsnorm_out_proj",
+        "flydsl_gdn_gated_rmsnorm_out_proj_supported",
+    ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -116,6 +124,8 @@ __all__ = [
     "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_gdn_gated_rmsnorm_out_proj",
+    "flydsl_gdn_gated_rmsnorm_out_proj_supported",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
