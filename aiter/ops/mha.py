@@ -685,12 +685,9 @@ def fmha_fwd_with_sink_varlen_asm(
       * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
 
     Contract details:
-      * D64 / D128 kernels carry no strides, so q/k/v/out are made dense here.
-        The D192x128 kernels take per-tensor token/head strides, so strided
-        views (e.g. slices of a packed qkv or kv buffer) are passed through
-        as-is when `_fmha_varlen_asm_strided_ok` accepts them; anything else
-        is made contiguous. A caller-supplied `out` the kernel cannot write in
-        place is filled through a temporary.
+      * D64 / D128 take no strides: q/k/v are made dense, `out` must be dense.
+      * D192x128 takes strides: q/k/v/out are used in place as views; the
+        dispatchers only send tensors `_fmha_varlen_asm_d192_operands_ok` accepts.
       * `max_seqlen_q` is the maximum per-batch Q sequence length (caller-
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
         count; the kernel early-exits tiles beyond each batch's actual length.
@@ -701,11 +698,7 @@ def fmha_fwd_with_sink_varlen_asm(
     """
     require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
     strided = q.size(-1) == 192 and v.size(-1) == 128
-    if strided:
-        q, k, v = (
-            x if _fmha_varlen_asm_strided_ok(x) else x.contiguous() for x in (q, k, v)
-        )
-    else:
+    if not strided:
         q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
@@ -717,12 +710,6 @@ def fmha_fwd_with_sink_varlen_asm(
         out = torch.empty(
             (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
         )
-    in_place = _fmha_varlen_asm_strided_ok(out) if strided else out.is_contiguous()
-    out_k = (
-        out
-        if in_place
-        else torch.empty_like(out, memory_format=torch.contiguous_format)
-    )
 
     lse = torch.empty((total_q, q_head_num, 1), dtype=torch.float32, device=q.device)
 
@@ -730,7 +717,7 @@ def fmha_fwd_with_sink_varlen_asm(
         q,
         k,
         v,
-        out_k,
+        out,
         lse,
         sink,
         cu_seqlens_q,
@@ -740,27 +727,26 @@ def fmha_fwd_with_sink_varlen_asm(
         bool(is_causal),
         bool(return_lse),
     )
-    if out_k is not out:
-        out.copy_(out_k)
     return out, lse
 
 
 def _fmha_varlen_asm_strided_ok(x: Tensor) -> bool:
-    """True if the D192x128 varlen ASM kernel can use `x` ([token, head, dim]) as is.
-
-    Mirrors the C++ check: byte strides go into 32-bit kernargs and the KV loop
-    steps by 128 token rows in 32 bits, so the token stride must stay below 2^24 B;
-    rows must be 4-byte aligned.
-    """
+    """True if the D192x128 kernel can address `x` in place (mirrors the C++ check)."""
     esz = x.element_size()
     ts, hs = x.stride(0) * esz, x.stride(1) * esz
-    return (
-        x.stride(-1) == 1
-        and 0 < ts < (1 << 24)
-        and 0 <= hs <= 0x7FFFFFFF
-        and ts % 4 == 0
-        and hs % 4 == 0
-        and x.data_ptr() % 4 == 0
+    return x.stride(-1) == 1 and 0 < ts < (1 << 24) and 0 <= hs <= 0x7FFFFFFF
+
+
+def _fmha_varlen_asm_d192_operands_ok(q, k, v, out=None, dense_last_dim_later=False):
+    """True if the D192x128 kernel can use q/k/v (and `out`) in place.
+
+    dense_last_dim_later: skip the last-dim check; `_flash_attn_varlen_forward`
+    fixes it with `maybe_contiguous` and checks again.
+    """
+    ops = (q, k, v) if out is None else (q, k, v, out)
+    return all(
+        (dense_last_dim_later and x.stride(-1) != 1) or _fmha_varlen_asm_strided_ok(x)
+        for x in ops
     )
 
 
@@ -3053,6 +3039,9 @@ def _flash_attn_varlen_forward(
             (hdim_q in (64, 128) and hdim_v == hdim_q)
             or (hdim_q == 192 and hdim_v == 128)
         )
+        # D192x128: strides the kernel cannot address go to another backend.
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and _fmha_varlen_asm_d192_operands_ok(q, k, v, out)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (sink_size == 0)
@@ -3129,10 +3118,9 @@ def _flash_attn_varlen_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_with_sink_varlen_asm():
-        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are THD; the wrapper makes
-        # them dense for D64/D128 and passes strided views through for D192x128,
-        # whose kernels take strides.  softmax_scale is forwarded as-is (the kernel
-        # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
+        # gfx1250 packed/varlen ASM bf16 path (THD; D192x128 takes strided views).
+        # softmax_scale is forwarded as-is (the kernel applies it internally to
+        # Q·K^T).  sink_ptr is passed through verbatim;
         # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
         # (D128 / D192x128 → no sink, D64 → sink) contract so we never feed a
         # null sink to a D64 binary that unconditionally reads it.
@@ -3799,6 +3787,11 @@ def flash_attn_varlen_func(
         nhead_k = k.shape[-2]
         is_hd192x128 = hdim_q == 192 and hdim_v == 128
         if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
+            return False
+        # D192x128: strides the kernel cannot address go to another backend.
+        if is_hd192x128 and not _fmha_varlen_asm_d192_operands_ok(
+            q, k, v, out, dense_last_dim_later=True
+        ):
             return False
         # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
         # yield so it reaches flydsl_flash_attn_varlen_func below.

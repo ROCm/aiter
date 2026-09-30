@@ -6,10 +6,8 @@
 // Layout: q/k/v/out are **packed [token, head, dim]** (batch folded into the
 // token axis).  Per-batch sequence boundaries are described by cumulative
 // length arrays cu_seqlens_q / cu_seqlens_k (int32, length batch+1, no
-// padding).  The D64 / D128 kernels compute all addresses internally from
-// (q_head_num, gqa, head_dim, cu_seqlens), so for them q/k/v/out MUST be densely
-// packed.  The D192x128 kernels take per-tensor token / head strides as
-// kernargs, so q/k/v/out may be strided views (last dim contiguous).
+// padding).  D64 / D128 need densely packed q/k/v/out; D192x128 takes token /
+// head strides, so its q/k/v/out may be views with a contiguous last dim.
 //
 //   q   : (total_q, nheads,   hdim_q)
 //   k   : (total_k, nheads_k, hdim_q)
@@ -59,9 +57,7 @@ struct FmhaFwdVarlenKernelArgs
 static_assert(sizeof(FmhaFwdVarlenKernelArgs) == 0x58,
               "fmha_fwd_with_sink_varlen_asm: FmhaFwdVarlenKernelArgs must be 88B packed");
 
-// D192x128 kernargs: the 88 B block above plus byte strides (0x78 = 120 B, the
-// whole s2..s31 preload window).  Matches FmhaFwdVarlenStrideKernelArgs in the
-// poc host code.
+// D192x128: the block above plus byte strides (120 B, the full s2..s31 preload).
 #pragma pack(push, 1)
 struct FmhaFwdVarlenStrideKernelArgs
 {
@@ -110,11 +106,8 @@ static std::string get_heuristic_kernel_fmha_fwd_bf16_varlen(const std::string& 
     return "";
 }
 
-// D192x128 strided operand check.  The kernel takes byte strides in 32-bit
-// kernargs and steps the KV loop by 128 * token_stride as a sign-extended 32-bit
-// value, so the token stride has to stay below 2^24 B.  Rows (and so the base)
-// are required to be 4-byte aligned, which every real view of a bf16 tensor
-// with an even head_dim satisfies.
+// The kernel steps the KV loop by 128 * token stride as a sign-extended 32-bit
+// value, hence token stride < 2^24 B.
 static void check_strided_thd(const aiter_tensor_t* t, const char* name)
 {
     const int64_t esz = (int64_t)t->element_size();
@@ -125,9 +118,6 @@ static void check_strided_thd(const aiter_tensor_t* t, const char* name)
     AITER_CHECK(ts > 0 && ts < (int64_t(1) << 24) && hs >= 0 && hs <= INT32_MAX,
                 "fmha_fwd_with_sink_varlen_asm: ", name, " strides out of range (token ", ts,
                 " B must be in (0, 2^24), head ", hs, " B must fit int32)");
-    AITER_CHECK(ts % 4 == 0 && hs % 4 == 0 && reinterpret_cast<uintptr_t>(t->data_ptr()) % 4 == 0,
-                "fmha_fwd_with_sink_varlen_asm: ", name,
-                " base and token/head strides must be 4-byte aligned (token ", ts, " B, head ", hs, " B)");
 }
 
 // ---- main entry ------------------------------------------------------------
@@ -137,8 +127,7 @@ AITER_CTYPES_ERROR_DEF
 // C ABI: every tensor is caller-allocated.  No GPU memory is allocated here;
 // no torch dependency.
 //
-// q/k/v/out are [token, head, dim]: densely packed for D64/D128, strided views
-// (last dim contiguous) allowed for D192x128.  lse is packed.  cu_seqlens_q/k
+// q/k/v/out are [token, head, dim] (strides: see the header).  cu_seqlens_q/k
 // are int32 [batch+1] cumulative arrays.  max_seqlen_q is the maximum per-batch
 // Q sequence length (host-supplied; used for the launch tile count).  sink is
 // optional and forwarded verbatim.
@@ -229,7 +218,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(lse->is_contiguous(),
                 "fmha_fwd_with_sink_varlen_asm: lse must be contiguous");
 
-    // Only the D192x128 kernels read strides; D64/D128 assume dense packing.
     const bool strided = (qk_head_dim == 192 && v_head_dim == 128);
     if (strided)
     {

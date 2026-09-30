@@ -29,10 +29,8 @@ KV-length constraint (mask=0 only): the non-causal D64/D128 kernels require
 per-sequence kv_seqlen that is a multiple of 256.  D192x128 has no such
 constraint (sub_K=128 with the border mask compiled in).
 
-Strided inputs: the D192x128 kernels take token/head strides, so q/k/v/out may be
-views (e.g. v = kv[..., 128:], or slices of one fused qkv row).  The strided test
-checks those against the torch reference and bit-for-bit against the same data
-passed contiguously.
+Strided inputs: D192x128 takes q/k/v/out views (e.g. v = kv[..., 128:]); they are
+checked against the reference and bit-for-bit against contiguous inputs.
 """
 
 import argparse
@@ -297,16 +295,12 @@ def test_fmha_fwd_with_sink_varlen_asm(
     return ret
 
 
-def _as_view(x, head_pad=0, token_pad=0):
-    """Copy of `x` ([token, head, dim]) living inside a NaN-filled buffer.
-
-    head_pad / token_pad elements separate heads / tokens, so the result is a
-    strided view; reading the padding would poison the output.
-    """
+def _as_view(x, head_pad=0, token_pad=0, base_off=0):
+    """Strided copy of `x` in a NaN buffer; odd pads/offset give 2-byte-aligned rows."""
     t, h, d = x.shape
     row = h * (d + head_pad) + token_pad
-    buf = torch.full((t * row,), float("nan"), dtype=x.dtype)
-    view = buf.as_strided((t, h, d), (row, d + head_pad, 1))
+    buf = torch.full((base_off + t * row,), float("nan"), dtype=x.dtype)
+    view = buf.as_strided((t, h, d), (row, d + head_pad, 1), base_off)
     view.copy_(x)
     return view
 
@@ -336,12 +330,23 @@ def _strided_inputs(layout, q, k, v):
             _as_view(k, head_pad=16, token_pad=24),
             _as_view(v, head_pad=128),
         )
+    if layout == "odd":
+        # Odd-element strides and offsets: rows start only 2-byte aligned.
+        return (
+            _as_view(q, head_pad=1, token_pad=3),
+            _as_view(k, head_pad=1, token_pad=1),
+            _as_view(v, head_pad=3, token_pad=1, base_off=1),
+        )
     raise ValueError(f"unknown layout {layout!r}")
+
+
+# Runs per case; every run must match the dense result bit for bit.
+_STRIDED_REPEATS = 5
 
 
 @benchmark()
 def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layout, via):
-    """D192x128 with strided q/k/v (and a strided `out` for layout="out_view")."""
+    """D192x128 with strided q/k/v, or a strided `out` for the out_view layouts."""
     q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
     max_seqlen_q = max(seqlens)
     scale = 1.0 / math.sqrt(192)
@@ -351,23 +356,36 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
     )
 
     ret = {"gfx": get_gfx()}
-    if layout == "out_view":
-        # The kernel writes straight into a view of a wider NaN buffer.
-        wide = torch.full((q.size(0), hq, 192), float("nan"), dtype=q.dtype)
-        out_view = wide[..., :128]
-        out, lse = aiter.fmha_fwd_with_sink_varlen_asm(
-            q, k, v, cu, cu, max_seqlen_q, scale, is_causal, True, out=out_view
-        )
-        lse = lse.squeeze(-1)
-        ret["out in place"] = out.data_ptr() == out_view.data_ptr()
-        ret["pad untouched"] = bool(wide[..., 128:].isnan().all().item())
-    else:
-        qs, ks, vs = _strided_inputs(layout, q, k, v)
-        out, lse = run_kernel(
-            qs, ks, vs, cu, cu, max_seqlen_q, scale=scale, is_causal=is_causal, via=via
-        )
-    ret["== dense (O)"] = torch.equal(out, dense_out)
-    ret["== dense (LSE)"] = torch.equal(lse, dense_lse)
+    same_o = same_lse = True
+    for _ in range(_STRIDED_REPEATS):
+        if layout.startswith("out_view"):
+            # out is a view of a wider NaN buffer (width 129: 2-byte-aligned rows).
+            width = 129 if layout == "out_view_odd" else 192
+            wide = torch.full((q.size(0), hq, width), float("nan"), dtype=q.dtype)
+            out_view = wide[..., :128]
+            out, lse = aiter.fmha_fwd_with_sink_varlen_asm(
+                q, k, v, cu, cu, max_seqlen_q, scale, is_causal, True, out=out_view
+            )
+            lse = lse.squeeze(-1)
+            ret["out in place"] = out.data_ptr() == out_view.data_ptr()
+            ret["pad untouched"] = bool(wide[..., 128:].isnan().all().item())
+        else:
+            qs, ks, vs = _strided_inputs(layout, q, k, v)
+            out, lse = run_kernel(
+                qs,
+                ks,
+                vs,
+                cu,
+                cu,
+                max_seqlen_q,
+                scale=scale,
+                is_causal=is_causal,
+                via=via,
+            )
+        same_o &= torch.equal(out, dense_out)
+        same_lse &= torch.equal(lse, dense_lse)
+    ret["== dense (O)"] = same_o
+    ret["== dense (LSE)"] = same_lse
     ret["err(O)"] = checkAllclose(
         ref_out.to(dtypes.fp32),
         out.to(dtypes.fp32),
@@ -385,7 +403,63 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
     return ret
 
 
-_STRIDED_LAYOUTS = ["kv_split", "fused_qkv", "padded", "out_view"]
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(is_causal):
+    """k's token stride (2^24 B) is out of range: the public path must use another
+    backend, and a direct op call must be refused by the C++ entry."""
+    seqlens, hq, hk = [2], 4, 1
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
+    tok = (1 << 24) // k.element_size()
+    buf = torch.empty((len(k) - 1) * tok + hk * 192, dtype=k.dtype)
+    k_far = buf.as_strided(k.shape, (tok, 192, 1))
+    k_far.copy_(k)
+    scale = 1.0 / math.sqrt(192)
+    ref_out, _ = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=None)
+
+    mha = aiter.ops.mha
+    calls = []
+    asm = mha._fmha_fwd_with_sink_varlen_asm
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return asm(*args, **kwargs)
+
+    mha._fmha_fwd_with_sink_varlen_asm = spy
+    try:
+        try:
+            aiter.fmha_fwd_with_sink_varlen_asm(
+                q, k_far, v, cu, cu, max(seqlens), scale, is_causal, True
+            )
+            ops_refused = False
+        except Exception as e:  # raised by the C++ stride check
+            ops_refused = "strides out of range" in str(e)
+        ops_calls = len(calls)
+        out, _ = run_kernel(
+            q, k_far, v, cu, cu, max(seqlens), scale=scale, is_causal=is_causal
+        )
+    finally:
+        mha._fmha_fwd_with_sink_varlen_asm = asm
+    return {
+        "ops refused": ops_refused,
+        "public asm calls": len(calls) - ops_calls,
+        "err(O)": checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"unsupported stride -> other backend, c={is_causal}",
+        ),
+    }
+
+
+_STRIDED_LAYOUTS = [
+    "kv_split",
+    "fused_qkv",
+    "padded",
+    "odd",
+    "out_view",
+    "out_view_odd",
+]
 # (hq, hk, seqlens): GQA, unaligned and mixed lengths
 _STRIDED_SHAPES = [
     (16, 4, [129, 1000, 333]),
@@ -497,7 +571,7 @@ def main():
         for (hq, hk, seqlens), is_causal, layout in itertools.product(
             _STRIDED_SHAPES, causal_modes, _STRIDED_LAYOUTS
         ):
-            for via in ["ops"] if layout == "out_view" else ["public", "ops"]:
+            for via in ["ops"] if layout.startswith("out_view") else ["public", "ops"]:
                 df.append(
                     test_fmha_fwd_with_sink_varlen_asm_strided(
                         hq, hk, seqlens, is_causal, layout, via
@@ -506,6 +580,17 @@ def main():
         df = pd.DataFrame(df)
         aiter.logger.info(
             "fmha_fwd_with_sink_varlen_asm D192x128 strided summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        df = pd.DataFrame(
+            [
+                test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(is_causal)
+                for is_causal in causal_modes
+            ]
+        )
+        aiter.logger.info(
+            "fmha_fwd_with_sink_varlen_asm D192x128 unsupported-stride summary "
+            "(markdown):\n%s",
             df.to_markdown(index=False),
         )
 
