@@ -52,6 +52,7 @@ from .kernels.qsa.k2 import qsa_k2, qsa_k2_serves
 _MEASURED_QUERIES = {
     (24, 256): (4, 8),  # Flash-Next / qwen4_exp, TP1
     (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
+    (6, 256): (4, 8),  # Flash-Next TP4: 6 query heads, 1 KV head
     (10, 128): (4, 8),
 }
 _BACKENDS = ("auto", "flydsl", "triton")
@@ -71,7 +72,10 @@ _BACKENDS = ("auto", "flydsl", "triton")
 # 16, the same M x L grid: q ``[M, 12, 256]`` over 1 KV head and the
 # replicated 4-head indexer. All 52 rows beat live AMD with err=0, by 1.73x
 # to 6.06x. The same grid with an 8-head indexer also won all 52 rows,
-# FlyDSL err=0, by 1.46x to 4.86x.
+# FlyDSL err=0, by 1.46x to 4.86x. GPU 6 / gfx950, the same cold grid:
+# q ``[M, 6, 256]`` over 1 KV head (Flash-Next TP4, group 6). The 4-head
+# indexer won all 52 rows with err=0, by 1.28x to 3.29x. The 8-head indexer
+# also won all 52, FlyDSL err=0, by 1.38x to 3.28x.
 
 __all__ = [
     "QsaGqaSpec",
