@@ -2,12 +2,15 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
+#include "mla_decode_shape.h"
 #include "mla_metadata.h"
 #include "metadata/v1_0_device.cuh"
 #include "metadata/v1_1_device.cuh"
 #include "metadata/v1_2_device.cuh"
 #include "metadata/v1_2_pa_device.cuh"
 #include "metadata/v1_2_host.cuh"
+#include <cstdlib>
+#include <stdexcept>
 
 // ===================================================================================================================
 // MLA Metadata V1
@@ -166,6 +169,98 @@ void get_mla_metadata_v1(
     }
 }
 
+
+std::tuple<std::string,
+           bool,
+           bool,
+           int64_t,
+           int64_t,
+           bool,
+           int64_t,
+           int64_t,
+           int64_t,
+           int64_t,
+           bool,
+           int64_t>
+get_mla_decode_head_plan_v1(const int64_t num_heads_k,
+                            const int64_t num_heads_per_head_k,
+                            const int64_t max_seqlen_qo,
+                            const int64_t uni_seqlen_qo,
+                            const int64_t dtype_q_nope,
+                            const int64_t dtype_kv_nope,
+                            const bool fast_mode,
+                            const bool intra_batch_mode,
+                            const std::string& arch,
+                            const int64_t enable_experimental,
+                            const int64_t flydsl_ps1,
+                            const int64_t v_head_dim,
+                            const int64_t page_size,
+                            const int64_t cp_world_size,
+                            const bool cp_round_robin,
+                            const bool has_scales,
+                            const bool use_opus,
+                            const bool use_ps1_asm)
+{
+    if(num_heads_k < 1 || num_heads_per_head_k < 1)
+    {
+        throw std::invalid_argument("get_mla_decode_head_plan_v1: #heads must be >= 1");
+    }
+    if(max_seqlen_qo < 1)
+    {
+        throw std::invalid_argument("get_mla_decode_head_plan_v1: max_seqlen_qo must be >= 1");
+    }
+
+    auto env_flag = [](const char* name) {
+        return std::getenv(name) != nullptr && std::atoi(std::getenv(name)) != 0;
+    };
+    const std::string arch_id = arch.empty() ? get_gpu_arch() : arch;
+    const MlaPlannerFlags flags{
+        enable_experimental < 0 ? env_flag("AITER_ENABLE_EXPERIMENTAL") : enable_experimental != 0,
+        flydsl_ps1 < 0 ? env_flag("AITER_MLA_DECODE_PS1_FLYDSL") : flydsl_ps1 != 0};
+    const AiterDtype q_dtype  = static_cast<AiterDtype>(dtype_q_nope);
+    const AiterDtype kv_dtype = static_cast<AiterDtype>(dtype_kv_nope);
+
+    const MlaDecodeHeadPlan p = mla_decode_head_plan(arch_id,
+                                                     static_cast<int32_t>(num_heads_k),
+                                                     static_cast<int32_t>(num_heads_per_head_k),
+                                                     static_cast<int32_t>(max_seqlen_qo),
+                                                     static_cast<int32_t>(uni_seqlen_qo),
+                                                     q_dtype,
+                                                     kv_dtype,
+                                                     fast_mode,
+                                                     intra_batch_mode,
+                                                     flags);
+    const bool reduce_supported =
+        mla_reduce_v1_supports(p.kernel_num_heads, static_cast<int32_t>(v_head_dim));
+    const MlaBackendId backend =
+        mla_decode_backend(arch_id,
+                           static_cast<int32_t>(num_heads_k * num_heads_per_head_k),
+                           p.kernel_num_heads,
+                           static_cast<int32_t>(max_seqlen_qo),
+                           q_dtype,
+                           kv_dtype,
+                           static_cast<int32_t>(page_size),
+                           static_cast<int32_t>(cp_world_size),
+                           cp_round_robin,
+                           intra_batch_mode,
+                           has_scales,
+                           use_opus,
+                           use_ps1_asm,
+                           flags);
+
+    return {arch_id,
+            flags.enable_experimental,
+            flags.flydsl_ps1,
+            static_cast<int64_t>(p.planner),
+            static_cast<int64_t>(p.plan),
+            p.natively_supported,
+            p.qk_batch_ratio,
+            p.kernel_num_heads,
+            p.seqlen_fold,
+            p.packed_qo_len_per_wg,
+            reduce_supported,
+            static_cast<int64_t>(backend)};
+}
 
 void get_pa_metadata_v1(
     const aiter_tensor_t& seqlens_qo_indptr,     // [batch size + 1]

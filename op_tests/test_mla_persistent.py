@@ -1470,6 +1470,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            fast_mode=bool(not non_persistent_mode),
             kv_scale=kv_scale,
             causal=causal,
         )
@@ -1548,6 +1549,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            fast_mode=bool(not non_persistent_mode),
             return_lse=return_lse,
             causal=causal,
         )
@@ -1651,6 +1653,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            fast_mode=bool(not non_persistent_mode),
             return_lse=return_lse,
             causal=causal,
         )
@@ -1772,6 +1775,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            fast_mode=bool(not non_persistent_mode),
             causal=causal,
         )
 

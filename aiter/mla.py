@@ -26,6 +26,9 @@ from aiter.ops.asm.mla_decode_v4 import (
     mla_v4_fused_slot_f32,
 )
 from aiter.ops.attention import (
+    _mla_decode_head_plan,
+    _MlaBackendId,
+    _MlaHeadPlanKind,
     get_mla_decode_fwd_max_splits,
     mla_ps64_qh128_fp8_asm_fwd,
 )
@@ -992,6 +995,7 @@ def mla_decode_fwd(
     seq_lens=None,
     page_table=None,
     kv_csr_layout="page",
+    fast_mode=True,
 ):
     """MLA decode with explicit KV byte-layout selection.
 
@@ -1408,105 +1412,31 @@ def mla_decode_fwd(
             num_kv_splits = get_mla_decode_fwd_max_splits(
                 ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
             )
-        # FP8 Q/KV with per-tensor scales, or BF16 Q/KV (no scales read).
-        ps1_is_fp8 = (
-            q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and q_scale is not None
-            and kv_scale is not None
+        head_plan = _mla_decode_head_plan(
+            ori_nhead,
+            max_seqlen_q,
+            q.dtype,
+            kv_buffer.dtype,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            page_size=page_size,
+            cp_world_size=cp_world_size,
+            cp_round_robin=g_kv_indptr is not None,
+            has_scales=q_scale is not None and kv_scale is not None,
         )
-        ps1_is_bf16 = q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
-        use_flydsl_ps1 = (
-            os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
-            and get_gfx() == "gfx1250"
-            and page_size == 1
-            and (ps1_is_fp8 or ps1_is_bf16)
-            and nhead in (16, 32, 64, 96, 128)
-            and (
-                nhead == 96
-                or max_seqlen_q == 1
-                or (nhead <= 64 and max_seqlen_q <= 4 and nhead * max_seqlen_q <= 128)
-            )
-            and (cp_world_size == 1 or g_kv_indptr is not None)
-            and not intra_batch_mode
-        )
+        use_ps1_asm = head_plan.backend == _MlaBackendId.PS1_FP8_ASM
+        use_flydsl_ps1 = use_ps1_asm or head_plan.backend == _MlaBackendId.FLYDSL_PS1
         if use_flydsl_ps1:
             pass
-        elif (
-            nhead == 16
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and is_experimental_enabled()
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead in (16, 32, 64)
-                and nhead * max_seqlen_q == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and is_experimental_enabled()
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and ((nhead == 32) or (nhead == 64) or (nhead == 128))
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 8
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 4
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 8
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and max_seqlen_q == 2
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 64
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 1
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 96
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q <= 6
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and nhead == 12
-                and nhead * max_seqlen_q <= 128
-            )
+        elif head_plan.plan in (
+            _MlaHeadPlanKind.NATIVE,
+            _MlaHeadPlanKind.ACCEPTED_NON_NATIVE,
         ):
             # Natively support cases
             pass
-        elif nhead in range(32, 128 + 1, 16) and persistent_mode:
-            fold_factor = ori_nhead // 16
-            nhead = 16
+        elif head_plan.plan == _MlaHeadPlanKind.FOLDED:
+            fold_factor = head_plan.qk_batch_ratio
+            nhead = head_plan.kernel_num_heads
             total_s = ori_total_s * fold_factor
             if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
@@ -1553,41 +1483,10 @@ def mla_decode_fwd(
             else None
         )
 
-        use_hk = (
-            get_gfx() in ("gfx942", "gfx950")
-            and nhead * max_seqlen_q == 128
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        ) or (
-            get_gfx() == "gfx950"
-            and nhead * max_seqlen_q == 64
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        )
+        use_hk = head_plan.backend == _MlaBackendId.HK
 
-        use_opus = (
-            os.environ.get("AITER_MLA_USE_OPUS", "0") == "1"
-            and get_gfx() == "gfx950"
-            and page_size == 1
-            and (
-                (q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16)
-                or (q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8)
-            )
-        )
+        use_opus = head_plan.backend == _MlaBackendId.OPUS
 
-        # FP8 head counts with code objects exported from the FlyDSL PS1 kernel
-        # (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
-        # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT. BF16 is JIT only.
-        use_ps1_asm = (
-            use_flydsl_ps1
-            and ps1_is_fp8
-            and nhead in (96, 128)
-            and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "1") == "1"
-        )
         if use_ps1_asm:
             aiter.mla_ps1_fp8_asm_fwd(
                 logits.view(-1, nhead, v_head_dim),
@@ -1610,7 +1509,7 @@ def mla_decode_fwd(
                 cp_world_size,
                 cp_rank,
             )
-        elif use_flydsl_ps1 and ps1_is_bf16:
+        elif use_flydsl_ps1 and q.dtype == dtypes.bf16:
             from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_bf16_bf16
 
             flydsl_mla_pagesize1_bf16_bf16(
