@@ -158,9 +158,11 @@ if [[ ! -f /.dockerenv ]]; then
   exit 2
 fi
 
-if ! git_repo diff --quiet || ! git_repo diff --cached --quiet; then
-  printf 'Tracked changes must be committed or stashed before revision switching.\n' >&2
-  exit 2
+if ((!CUSTOM_SHAPE)); then
+  if ! git_repo diff --quiet || ! git_repo diff --cached --quiet; then
+    printf 'Tracked changes must be committed or stashed before revision switching.\n' >&2
+    exit 2
+  fi
 fi
 
 OPTIMIZED_COMMIT="$(git_repo rev-parse HEAD)"
@@ -192,7 +194,7 @@ clear_legacy_optimization_env() {
   local var
   while IFS='=' read -r var _; do
     case "$var" in
-      AITER_FLYDSL_GEMM1_*|AITER_FLYDSL_GEMM2_*|AITER_FLYDSL_MXFP4_CLUSTER_*|AITER_TDM_NEXT_STAGE_*)
+      AITER_FLYDSL_GEMM1_*|AITER_FLYDSL_GEMM2_*|AITER_FLYDSL_MXFP4_CLUSTER_*|AITER_TDM_*)
         unset "$var"
         ;;
     esac
@@ -218,7 +220,7 @@ cleanup() {
   local rc=$?
   trap - EXIT
   clear_legacy_optimization_env
-  if ! restore_original_checkout; then
+  if ((!CUSTOM_SHAPE)) && ! restore_original_checkout; then
     printf 'Failed to restore the original checkout.\n' >&2
     rc=1
   fi
@@ -318,7 +320,9 @@ run_case() {
       return 2
       ;;
   esac
-  checkout_revision "$tested_commit"
+  if [[ "$mode" != current ]]; then
+    checkout_revision "$tested_commit"
+  fi
   tested_commit="$(git_repo rev-parse HEAD)"
 
   local log_file="$LOG_DIR/${data}_r${round}_o${order}_${case_name}.log"
