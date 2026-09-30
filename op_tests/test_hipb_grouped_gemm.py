@@ -4,9 +4,9 @@
 import pytest
 import torch
 
-import aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton as grouped_gemm_module
+import aiter.ops.triton.moe.sonicmoe as grouped_gemm_module
 from aiter.ops.gradlib import hipb_grouped_mm, hipb_multistream_mm
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
+from aiter.ops.triton.moe.sonicmoe import (
     _registered_host_cu_seqlens,
     clear_registered_host_cu_seqlens,
     grouped_gemm,
