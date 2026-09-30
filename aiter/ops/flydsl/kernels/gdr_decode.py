@@ -30,10 +30,23 @@ def _fast_exp(x):
     return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * _LOG2E))
 
 
+def _fast_exp_vec(x_vec, n, mult=1.0):
+    """exp(x * mult) per lane, mult folded into the log2(e) factor.
+
+    rocdl.exp2 is scalar-only; the per-lane map still emits v_exp_f32.
+    """
+    scaled = x_vec * fx.Vector.filled(n, mult * _LOG2E, fx.Float32)
+    return fx.Vector.from_elements(
+        [fx.Float32(rocdl.exp2(T.f32, _to_raw(scaled[i]))) for i in range_constexpr(n)],
+        fx.Float32,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def create_vk_gdr_decode_kernel(
     dtype: str,
     A_log_dtype: str,
+    dt_bias_dtype: str,
     state_dtype: str,
     seq_length: int,
     num_k_heads: int,
@@ -47,12 +60,21 @@ def create_vk_gdr_decode_kernel(
     a_strides: tuple,
     b_strides: tuple,
     use_qk_l2norm: bool,
+    gate_mode: str = "gdr",
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
+    g_min: float = -5.0,
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
 ):
+    # "gdr": per-head decay, -exp(A_log) * softplus(a + dt_bias).
+    # "kda": per-channel decay, g_min * sigmoid(exp(A_log) * (a + dt_bias)).
+    # Separate binaries, so adding "kda" leaves "gdr" bit-identical.
+    assert gate_mode in ("gdr", "kda"), gate_mode
+    PER_CHANNEL = gate_mode == "kda"
+    # The out store narrows anything that is not bf16 to f16.
+    assert dtype in ("f16", "bf16"), dtype
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
 
@@ -71,6 +93,13 @@ def create_vk_gdr_decode_kernel(
         "f16": fx.Float16,
         "bf16": fx.BFloat16,
     }[state_dtype]
+    dt_bias_num = {
+        "f32": fx.Float32,
+        "f16": fx.Float16,
+        "bf16": fx.BFloat16,
+    }[dt_bias_dtype]
+    DT_BIAS_VALUES_PER_COPY = min(VALUES_PER_THREAD_K, 128 // dt_bias_num.width)
+    DT_BIAS_COPIES_PER_THREAD = VALUES_PER_THREAD_K // DT_BIAS_VALUES_PER_COPY
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -104,6 +133,8 @@ def create_vk_gdr_decode_kernel(
     KERNEL_NAME = f"gdr_decode_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     KERNEL_NAME += f"_{NUM_WARPS}w{WARP_THREADS_V}x{WARP_THREADS_K}"
     KERNEL_NAME += f"_vs{NUM_BLOCKS_PER_V_DIM}"
+    if gate_mode != "gdr":
+        KERNEL_NAME += f"_{gate_mode}"
 
     @flyc.kernel
     def gdr_decode_kernel(
@@ -149,6 +180,13 @@ def create_vk_gdr_decode_kernel(
             fx.rocdl.BufferCopy(data_num.width * VALUES_PER_THREAD_K), data_num
         )
         cp_A_log = fx.make_copy_atom(fx.rocdl.BufferCopy(A_log_num.width), A_log_num)
+        cp_dt_bias = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(dt_bias_num.width), dt_bias_num
+        )
+        cp_dt_bias_vec = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(dt_bias_num.width * DT_BIAS_VALUES_PER_COPY),
+            dt_bias_num,
+        )
         cp_state_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), state_num)
 
         read_indices_view = _gview(read_indices, None, (batch_size, 1), (1, 1))
@@ -190,19 +228,43 @@ def create_vk_gdr_decode_kernel(
             (batch_size, seq_length, num_v_heads, head_v_dim, 1),
             (*v_strides, 1),
         )
-        a_view = _gview(
-            a,
-            None,
-            (batch_size, seq_length, num_v_heads, 1),
-            (*a_strides, 1),
-        )
+        if const_expr(PER_CHANNEL):
+            a_view = _gview(
+                a,
+                None,
+                (
+                    batch_size,
+                    seq_length,
+                    num_v_heads,
+                    head_k_dim // VALUES_PER_THREAD_K,
+                    VALUES_PER_THREAD_K,
+                ),
+                (*a_strides[:-1], VALUES_PER_THREAD_K, 1),
+            )
+            dt_bias_view = _gview(
+                dt_bias,
+                None,
+                (
+                    num_v_heads,
+                    head_k_dim // DT_BIAS_VALUES_PER_COPY,
+                    DT_BIAS_VALUES_PER_COPY,
+                ),
+                (head_k_dim, DT_BIAS_VALUES_PER_COPY, 1),
+            )
+        else:
+            a_view = _gview(
+                a,
+                None,
+                (batch_size, seq_length, num_v_heads, 1),
+                (*a_strides, 1),
+            )
+            dt_bias_view = _gview(dt_bias, None, (num_v_heads, 1), (1, 1))
         b_view = _gview(
             b,
             None,
             (batch_size, seq_length, num_v_heads, 1),
             (*b_strides, 1),
         )
-        dt_bias_view = _gview(dt_bias, None, (num_v_heads, 1), (1, 1))
         A_log_view = _gview(A_log, None, (num_v_heads, 1), (1, 1))
         out_view = _gview(
             out,
@@ -250,9 +312,15 @@ def create_vk_gdr_decode_kernel(
             )
             if const_expr("f32" not in A_log_dtype):
                 r_A_log = r_A_log.to(fx.Float32)
-            r_dt_bias = _load_vec(
-                cp_data, fx.slice(dt_bias_view, (hv_i, None)), 1, data_num
-            ).to(fx.Float32)
+            if const_expr(not PER_CHANNEL):
+                r_dt_bias = _load_vec(
+                    cp_dt_bias,
+                    fx.slice(dt_bias_view, (hv_i, None)),
+                    1,
+                    dt_bias_num,
+                )
+                if const_expr("f32" not in dt_bias_dtype):
+                    r_dt_bias = r_dt_bias.to(fx.Float32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
             for vi in range_constexpr(WARP_TILE_V_ITERS):
@@ -279,37 +347,94 @@ def create_vk_gdr_decode_kernel(
                         ].to(fx.Float32)
 
             for sq_i in range_constexpr(seq_length):
-                r_a = _load_vec(
-                    cp_data,
-                    fx.slice(a_view, (b_i, sq_i, hv_i, None)),
-                    1,
-                    data_num,
-                ).to(fx.Float32)
                 r_b = _load_vec(
                     cp_data,
                     fx.slice(b_view, (b_i, sq_i, hv_i, None)),
                     1,
                     data_num,
                 ).to(fx.Float32)
-                x = r_a + r_dt_bias
-                beta_x = softplus_beta_ * x
-
-                # For beta_x > threshold, softplus(x) == x; both arms run and
-                # the overflowing one is dropped.
-                softplus_big = (f32_1 / softplus_beta_) * fx.math.log1p(
-                    _fast_exp(beta_x)
-                )
-                softplus_x = (
-                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
-                ).select(softplus_big, x)
-
-                r_g_value = -_fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))
-                r_g = _fast_exp(r_g_value)
+                if const_expr(PER_CHANNEL):
+                    r_A_vec = fx.Vector.filled(
+                        VALUES_PER_THREAD_K,
+                        fx.Float32(_fast_exp(r_A_log)),
+                        fx.Float32,
+                    )
+                    g_min_vec = fx.Vector.filled(VALUES_PER_THREAD_K, g_min, fx.Float32)
+                    one_vec = fx.Vector.filled(VALUES_PER_THREAD_K, f32_1, fx.Float32)
+                    # Decay varies along K, not V, so hoist it above the v loop:
+                    # one vector per ki, reused for every vi.
+                    r_g_vecs = [0] * WARP_TILE_K_ITERS
+                    for ki in range_constexpr(WARP_TILE_K_ITERS):
+                        warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
+                        k_tile = warp_k_vec_i // VALUES_PER_THREAD_K
+                        a_vec = _load_vec(
+                            cp_data_vec,
+                            fx.slice(a_view, (b_i, sq_i, hv_i, k_tile, None)),
+                            VALUES_PER_THREAD_K,
+                            data_num,
+                        ).to(fx.Float32)
+                        dt_bias_parts = [
+                            _load_vec(
+                                cp_dt_bias_vec,
+                                fx.slice(
+                                    dt_bias_view,
+                                    (
+                                        hv_i,
+                                        warp_k_vec_i // DT_BIAS_VALUES_PER_COPY
+                                        + copy_i,
+                                        None,
+                                    ),
+                                ),
+                                DT_BIAS_VALUES_PER_COPY,
+                                dt_bias_num,
+                            )
+                            for copy_i in range_constexpr(DT_BIAS_COPIES_PER_THREAD)
+                        ]
+                        dt_bias_vec = fx.Vector.from_elements(
+                            [
+                                dt_bias_parts[lane // DT_BIAS_VALUES_PER_COPY][
+                                    lane % DT_BIAS_VALUES_PER_COPY
+                                ]
+                                for lane in range_constexpr(VALUES_PER_THREAD_K)
+                            ],
+                            dt_bias_num,
+                        )
+                        if const_expr("f32" not in dt_bias_dtype):
+                            dt_bias_vec = dt_bias_vec.to(fx.Float32)
+                        # g = g_min * sigmoid(exp(A_log) * (a + dt_bias)), stored
+                        # as exp(g) -- the decay factor, like r_g on the scalar path.
+                        y_vec = r_A_vec * (a_vec + dt_bias_vec)
+                        sigmoid_vec = one_vec / (
+                            one_vec + _fast_exp_vec(y_vec, VALUES_PER_THREAD_K, -1.0)
+                        )
+                        r_g_vecs[ki] = _fast_exp_vec(
+                            g_min_vec * sigmoid_vec, VALUES_PER_THREAD_K
+                        )
+                else:
+                    r_a = _load_vec(
+                        cp_data,
+                        fx.slice(a_view, (b_i, sq_i, hv_i, None)),
+                        1,
+                        data_num,
+                    ).to(fx.Float32)
+                    x = r_a + r_dt_bias
+                    beta_x = softplus_beta_ * x
 
-                r_g_vec = fx.Vector.filled(
-                    VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
-                )
+                    # For beta_x > threshold, softplus(x) == x; both arms run and
+                    # the overflowing one is dropped.
+                    softplus_big = (f32_1 / softplus_beta_) * fx.math.log1p(
+                        _fast_exp(beta_x)
+                    )
+                    softplus_x = (
+                        fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
+                    ).select(softplus_big, x)
+
+                    r_g_value = -_fast_exp(r_A_log) * softplus_x
+                    r_g = _fast_exp(r_g_value)
+                    r_g_vec = fx.Vector.filled(
+                        VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
+                    )
 
                 sq_vecs = [0] * WARP_TILE_K_ITERS
                 sk_vecs = [0] * WARP_TILE_K_ITERS
@@ -435,7 +560,10 @@ def create_vk_gdr_decode_kernel(
                     )
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
+                        if const_expr(PER_CHANNEL):
+                            state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vecs[ki]
+                        else:
+                            state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
                         h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                         sum_hk = fx.math.fma(h_cur, sk_vecs[ki], sum_hk)
                         sum_hq_old = fx.math.fma(h_cur, sq_vecs[ki], sum_hq_old)
