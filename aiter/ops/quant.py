@@ -506,7 +506,6 @@ def per_group_quant_hip(
             num_rows=num_rows,
             num_rows_factor=num_rows_factor,
         )
-    scale.is_transposed = transpose_scale
     return y, scale
 
 
