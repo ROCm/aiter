@@ -108,6 +108,7 @@ else:
     from .ops.aiter_operator import *
     from .ops.activation import *
     from .ops.attention import *
+    from .ops.sparse_mla import sparse_mla_bf16_fwd  # noqa: F401
     from .ops.custom import *
     from .ops.custom_all_reduce import *
     from .ops.quick_all_reduce import *
