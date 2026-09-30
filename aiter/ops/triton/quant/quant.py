@@ -281,11 +281,19 @@ def dynamic_mxfp4_quant(
         )
 
     # for large N values
-    if M <= 32:
+    if M <= 16:
         NUM_ITER = 1
         BLOCK_SIZE_M = triton.next_power_of_2(M)
         BLOCK_SIZE_N = 32
         NUM_WARPS = 1
+        NUM_STAGES = 1
+    elif M <= 64:
+        # decode batch sizes. the 32x512 tile below only gives
+        # cdiv(M, 32) * cdiv(N, 512) programs (16 at M=64, N=4096)
+        NUM_ITER = 1
+        BLOCK_SIZE_M = 16
+        BLOCK_SIZE_N = 128
+        NUM_WARPS = 4
         NUM_STAGES = 1
     else:
         NUM_ITER = 4
