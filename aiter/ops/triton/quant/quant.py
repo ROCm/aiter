@@ -304,15 +304,6 @@ def dynamic_mxfp4_quant(
         NUM_WARPS = cfg["NUM_WARPS"]
         NUM_STAGES = cfg["NUM_STAGES"]
 
-        # Shape-derived, not tunable via JSON.
-        if M <= 32:
-            BLOCK_SIZE_M = triton.next_power_of_2(M)
-            BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
-
-        if N <= 1024:
-            BLOCK_SIZE_N = max(32, min(128, triton.next_power_of_2(N)))
-            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
-
         grid = (
             triton.cdiv(M, BLOCK_SIZE_M),
             triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
@@ -514,17 +505,6 @@ def dynamic_mxfp8_quant(
         cfg_dir = resolve_config_dir("quant", "MXFP8", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
         cfg = lookup_tuned_config(tuned, M=M, K=K)
-
-        # Shape-derived; K<=1024's BLOCK_SIZE_M=8 must win when both apply.
-        if M <= 32 and K > 1024:
-            BLOCK_SIZE_M = triton.next_power_of_2(M)
-            cfg["BLOCK_SIZE_M"] = BLOCK_SIZE_M
-            cfg["BLOCK_SIZE_N"] = max(
-                32, min(4096 // BLOCK_SIZE_M, triton.next_power_of_2(K))
-            )
-
-        if K <= 1024:
-            cfg["BLOCK_SIZE_N"] = max(32, min(1024, triton.next_power_of_2(K)))
 
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
