@@ -245,6 +245,7 @@ def test_m3_opt_in_changed_input_graph(opus_dispatch, monkeypatch, aux, tokens):
         "model_dim",
         "buffer_dtype",
         "block_size",
+        "block_size_128",
         "expert_mask",
         "num_local_tokens",
         "dispatch_policy",
@@ -281,6 +282,7 @@ def test_m3_gate_falls_back(m3_routes, monkeypatch, case):
             "model_dim": ("model_dim", 4096),
             "buffer_dtype": ("moebuf_dtype", torch.float32),
             "block_size": ("block_size", 32),
+            "block_size_128": ("block_size", 128),
             "expert_mask": ("expert_mask", torch.ones(EXPERTS, device=ids.device)),
             "num_local_tokens": (
                 "num_local_tokens",
@@ -388,7 +390,7 @@ def test_default_and_supplied_output_keep_legacy_dispatch(
 
 @pytest.mark.parametrize("tokens", [8192, 32768, 65537])
 def test_fused_moe_m3_tiled_sort_is_exact(opus_dispatch, monkeypatch, tokens):
-    """The route-reduce consumer must receive identical sorted data and scales."""
+    """Tuned BM64 uses tiled sorting; other layouts retain the native sorter."""
     torch.manual_seed(921)
     hidden, intermediate = MODEL_DIM, 768
     x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -411,12 +413,19 @@ def test_fused_moe_m3_tiled_sort_is_exact(opus_dispatch, monkeypatch, tokens):
     ids, weights = _routes(tokens)
     original = tiled.tiled_sort
     calls = []
+    original_sort = fm.moe_sorting
+    sort_blocks = []
+
+    def tracked_sort(*args, **kwargs):
+        sort_blocks.append(args[5])
+        return original_sort(*args, **kwargs)
 
     def tracked(*args, **kwargs):
         calls.append(True)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(tiled, "tiled_sort", tracked)
+    monkeypatch.setattr(fm, "moe_sorting", tracked_sort)
 
     def run(enabled):
         return fm.fused_moe(
@@ -437,7 +446,13 @@ def test_fused_moe_m3_tiled_sort_is_exact(opus_dispatch, monkeypatch, tokens):
 
     native = run(False)
     candidate = run(True)
-    assert calls, "fused_moe did not propagate its M3 sorting opt-in"
+    # Tuned GEMM rows can select BM128 even for large M3 prefill. Do not
+    # override that layout merely to make the BM64-only sorter run.
+    assert len(sort_blocks) == 2 and sort_blocks[0] == sort_blocks[1]
+    assert len(calls) == int(sort_blocks[1] == 64), (
+        f"M3 tiled dispatch disagrees with tuned sorting block {sort_blocks[1]}: "
+        f"{len(calls)} tiled calls"
+    )
     assert torch.isfinite(native).all() and torch.isfinite(candidate).all()
     torch.testing.assert_close(
         candidate.view(torch.uint8), native.view(torch.uint8), rtol=0, atol=0
