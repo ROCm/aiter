@@ -13,6 +13,8 @@ import logging
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -22,12 +24,13 @@ CFG_PATH = os.path.join(REPO_DIR, "aiter", "jit", "optCompilerConfig.json")
 
 sys.path.insert(0, os.path.join(REPO_DIR, "aiter"))
 
-from utility.pretune import (
+from utility.pretune import (  # noqa: E402 - import without GPU/torch initialization
     _SCRIPT_FALLBACK,
     _all_tune_modules,
     _make_untune_csv,
     _parse_module_list,
     _resolve,
+    run_pretune,
 )
 
 with open(CFG_PATH) as f:
@@ -353,6 +356,98 @@ def test_parse_pretune_modules():
     )
 
 
+def _test_pretune_module_names(use_callback):
+    """Both build paths must supply usable Python extension module names."""
+    for module_name in (
+        "module_gemm_a8w8_blockscale_tune",
+        "module_gemm_a8w8_blockscale_cktile_tune",
+    ):
+        inference_name = "module_gemm_a8w8_blockscale"
+        for name_args, expected_name in (
+            ({"md_name": ""}, inference_name),
+            ({}, inference_name),
+            ({"md_name": "custom_inference_module"}, "custom_inference_module"),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                tune_file = os.path.join(tmp, "tuned.csv")
+                pd.DataFrame({"M": [1], "N": [128], "K": [128]}).to_csv(
+                    tune_file, index=False
+                )
+                build_args = {
+                    "srcs": ["inference.cu"],
+                    "flags_extra_cc": [],
+                    "flags_extra_hip": [],
+                    "blob_gen_cmd": "",
+                    "extra_include": [],
+                    "third_party": [],
+                    **name_args,
+                }
+                original_build_args = dict(build_args)
+                core = SimpleNamespace(
+                    AITER_CONFIGS=SimpleNamespace(
+                        AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE=tune_file
+                    ),
+                    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=tune_file,
+                    get_args_of_build=Mock(return_value=build_args),
+                    rm_module=Mock(),
+                    clear_build=Mock(),
+                    build_module=Mock(),
+                )
+                build_one_module = Mock() if use_callback else None
+                with patch(
+                    "utility.pretune.subprocess.run",
+                    return_value=SimpleNamespace(returncode=0),
+                ):
+                    run_pretune(
+                        module_name, CFG, core, CSRC_DIR, REPO_DIR, build_one_module
+                    )
+                assert build_args == original_build_args
+                if use_callback:
+                    assert core.get_args_of_build.call_count == 2
+                    assert [
+                        call.kwargs["ops_name"]
+                        for call in core.get_args_of_build.call_args_list
+                    ] == [module_name, inference_name]
+                    core.build_module.assert_not_called()
+                    assert build_one_module.call_count == 2
+                    expected_tune_name = name_args.get("md_name") or module_name
+                    for build_call, expected in zip(
+                        build_one_module.call_args_list,
+                        (expected_tune_name, expected_name),
+                    ):
+                        assert build_call.args[0] is not build_args
+                        actual = build_call.args[0]["md_name"]
+                        assert actual == expected
+                        check(
+                            f"{module_name} {name_args!r} callback name {expected}",
+                            actual == expected,
+                            f"got {actual!r}",
+                        )
+                else:
+                    core.get_args_of_build.assert_called_once_with(
+                        ops_name=inference_name
+                    )
+                    core.build_module.assert_called_once()
+                    assert (
+                        core.build_module.call_args.kwargs["md_name"] == expected_name
+                    )
+                    check(
+                        f"{module_name} {name_args!r} rebuild name",
+                        core.build_module.call_args.kwargs["md_name"] == expected_name,
+                        f"got {core.build_module.call_args.kwargs['md_name']!r}",
+                    )
+
+
+def test_direct_inference_module_name():
+    print("\n=== test_direct_inference_module_name ===")
+    _test_pretune_module_names(use_callback=False)
+
+
+def test_callback_module_names():
+    print("\n=== test_callback_module_names ===")
+    _test_pretune_module_names(use_callback=True)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -364,6 +459,8 @@ if __name__ == "__main__":
     test_make_untune_csv_missing_raises()
     test_write_tune_file_resolution()
     test_parse_pretune_modules()
+    test_direct_inference_module_name()
+    test_callback_module_names()
 
     print(f"\n{'='*50}")
     print(f"Results: {_passed} passed, {_failed} failed")
