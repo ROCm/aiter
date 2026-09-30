@@ -364,16 +364,17 @@ def _use_fused_quant_preshuffle(
 
 
 @functools.cache
-def _get_compiled_g2l_lut(clear_counter: bool = True):
+def _get_compiled_g2l_lut(clear_counter: bool = True, block_size: int = 512):
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
     from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 
-    return build_moe_g2l_lut_module(clear_counter=clear_counter)
+    return build_moe_g2l_lut_module(clear_counter=clear_counter, block_size=block_size)
 
 
-# Legacy FlyDSL single-workgroup scan ceiling. The Triton path below has
-# its own (larger) limit; otherwise keep the original torch fallback.
-_G2L_MAX_N = 512
+# Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
+# masks fall back to the torch chain. Include masks with an appended sentinel
+# (e.g. 512 global experts plus one dropped entry).
+_G2L_MAX_N = 1024
 
 
 _G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
@@ -436,14 +437,11 @@ def _build_g2l_lut(
     or the sentinel ``E`` for dropped (non-local) routes. Result is int32 on
     ``device``.
 
-    Fast path: one Triton kernel fuses ``ne + cumsum + sub + where``, counter
-    reset (unless the preceding dispatch owns it), and ``nvt * topk``. The caller
-    uses the returned nvr directly, so its fallback torch mul is not launched.
-    ``AITER_G2L_TRITON=0`` restores the original FlyDSL/torch selection;
-    ``AITER_G2L_TORCH=1`` forces torch regardless of the Triton switch.
-
-    The LUT depends only on ``expert_mask`` (static per rank) but cannot be
-    memoised here: ``fused_moe`` is dispatched
+    Fast path: a single FlyDSL kernel (``moe_g2l_lut``) does ``ne + cumsum + sub
+    + where`` in one pass -- one launch instead of ~6 elementwise/scan kernels,
+    and on the same compiler/runtime as the rest of the gfx1250 grouped path
+    (no Triton in the decode hot path). This depends only on ``expert_mask``
+    (static per rank) but cannot be memoised here: ``fused_moe`` is dispatched
     through ``torch.ops.aiter.*``, so the op layer hands this function a fresh
     copy of ``expert_mask`` (new object *and* storage) on essentially every call,
     so neither object- nor data_ptr-keyed caching hits. Collapsing the chain into
@@ -453,42 +451,11 @@ def _build_g2l_lut(
     n = expert_mask.numel()
     # nvr is only folded in when both the dynamic-token scalar and topk are known.
     _want_nvr = nvt is not None and topk is not None
-    _force_torch = os.environ.get("AITER_G2L_TORCH", "0") in _TRUTHY_ENV
-    if not _force_torch and os.environ.get("AITER_G2L_TRITON", "1") in _TRUTHY_ENV:
-        try:
-            from aiter.ops.triton.moe.g2l_lut import (
-                MAX_G2L_EXPERTS,
-                build_g2l_lut,
-            )
-
-            if max(n, int(E)) <= MAX_G2L_EXPERTS:
-                # Keep the mask dtype: != 0 is fused before the int32 cast.
-                # Already-device-resident 1-D inputs need no preparation kernel.
-                mask = expert_mask.to(device=device).reshape(-1)
-                clear_counter = not (
-                    _flydsl_dispatch_context() is not None
-                    and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
-                    in ("1", "true", "True")
-                )
-                # Only dispatch-owned reset needs the persistent address. The
-                # generic path allocates empty inside build_g2l_lut and lets the
-                # fused kernel zero it, including on the very first invocation.
-                counter = None if clear_counter else route_counter_buffer(E, device)
-                return build_g2l_lut(
-                    mask,
-                    int(E),
-                    nvt.to(device=device) if _want_nvr else None,
-                    int(topk) if _want_nvr else None,
-                    counter=counter,
-                    clear_counter=clear_counter,
-                )
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover
-            logger.debug(
-                "[grouped_a8w4] triton g2l build unavailable (%s); "
-                "falling back to FlyDSL/torch",
-                exc,
-            )
-    if not _force_torch and n <= _G2L_MAX_N:
+    if (
+        os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV
+        and 0 <= int(E)
+        and max(n, int(E)) <= _G2L_MAX_N
+    ):
         try:
             mask = (
                 expert_mask.to(device=device, dtype=torch.int32)
@@ -514,7 +481,9 @@ def _build_g2l_lut(
                     _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
-                )
+                ),
+                # One thread per mask entry / counter slot; all must fit.
+                block_size=max(32, _next_pow2(max(n, int(E), 1))),
             )(
                 ptr_arg(mask),
                 ptr_arg(lut),
@@ -782,9 +751,6 @@ def _grouped_a8w4_tdm_moe(
             _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
                 expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
             )
-            # The fused path returns the contiguous int32 scalar computed by
-            # the SAME kernel as the LUT. Python evaluates only the selected
-            # branch: this mul runs exclusively on the torch fallback.
             _ep_nvr = (
                 _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
             )
