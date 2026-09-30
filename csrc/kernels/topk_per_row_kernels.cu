@@ -3604,76 +3604,46 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             if(threadIdx.x < WARP_SIZE)
             {
                 // Wave0 holds the bin's keys two per lane and walks their low
-                // 18 bits two at a time for the (k - before)-th smallest: four
-                // ballots split the live keys into four sub-buckets per step.
+                // 18 bits six at a time for the (k - before)-th smallest: each
+                // step counts the live keys into a 64-bin LDS histogram, one bin
+                // per lane, and one scan finds the bin that holds the rank.
                 // Ties at that key go in lane order.
                 IdxT const needed = k - before;
                 IdxT const count  = static_cast<IdxT>(in_bin);
                 Bits key_a = 0, key_b = 0;
-                IdxT index_a = 0, index_b = 0;
-                if(lane < count)
-                {
-                    key_a   = __builtin_bit_cast(Bits, candidate_values[lane]);
-                    index_a = candidate_indices[lane];
-                }
+                if(lane < count) key_a = __builtin_bit_cast(Bits, candidate_values[lane]);
                 if(lane + WARP_SIZE < count)
-                {
-                    key_b   = __builtin_bit_cast(Bits, candidate_values[lane + WARP_SIZE]);
-                    index_b = candidate_indices[lane + WARP_SIZE];
-                }
+                    key_b = __builtin_bit_cast(Bits, candidate_values[lane + WARP_SIZE]);
                 uint64_t const valid_a = static_cast<uint64_t>(__ballot(lane < count));
                 uint64_t const valid_b =
                     static_cast<uint64_t>(__ballot(lane + WARP_SIZE < count));
                 uint64_t active_a = valid_a, active_b = valid_b;
                 IdxT rank = needed;
-                static_assert(wide_start_bit % 2 == 0);
+                IdxT live = count;
+                static_assert(wide_start_bit % 6 == 0);
 #pragma unroll 1
-                for(int bit = wide_start_bit - 2;
-                    bit >= 0 && __builtin_popcountll(active_a) + __builtin_popcountll(active_b) > 1;
-                    bit -= 2)
+                for(int shift = wide_start_bit - 6; shift >= 0 && live > 1; shift -= 6)
                 {
-                    Bits const hi_mask = Bits{2} << bit;
-                    Bits const lo_mask = Bits{1} << bit;
-                    uint64_t const hz_a =
-                        active_a & static_cast<uint64_t>(__ballot((key_a & hi_mask) == 0));
-                    uint64_t const hz_b =
-                        active_b & static_cast<uint64_t>(__ballot((key_b & hi_mask) == 0));
-                    uint64_t const lz_a = static_cast<uint64_t>(__ballot((key_a & lo_mask) == 0));
-                    uint64_t const lz_b = static_cast<uint64_t>(__ballot((key_b & lo_mask) == 0));
-                    IdxT const c00 = static_cast<IdxT>(__builtin_popcountll(hz_a & lz_a) +
-                                                       __builtin_popcountll(hz_b & lz_b));
-                    IdxT const c0x = static_cast<IdxT>(__builtin_popcountll(hz_a) +
-                                                       __builtin_popcountll(hz_b));
-                    if(rank <= c00)
-                    {
-                        active_a = hz_a & lz_a;
-                        active_b = hz_b & lz_b;
-                    }
-                    else if(rank <= c0x)
-                    {
-                        active_a = hz_a & ~lz_a;
-                        active_b = hz_b & ~lz_b;
-                        rank -= c00;
-                    }
-                    else
-                    {
-                        uint64_t const o_a = active_a & ~hz_a;
-                        uint64_t const o_b = active_b & ~hz_b;
-                        rank -= c0x;
-                        IdxT const c10 = static_cast<IdxT>(__builtin_popcountll(o_a & lz_a) +
-                                                           __builtin_popcountll(o_b & lz_b));
-                        if(rank <= c10)
-                        {
-                            active_a = o_a & lz_a;
-                            active_b = o_b & lz_b;
-                        }
-                        else
-                        {
-                            active_a = o_a & ~lz_a;
-                            active_b = o_b & ~lz_b;
-                            rank -= c10;
-                        }
-                    }
+                    // Nothing reads the wide histogram after the reservation
+                    // barrier, and Wave0's LDS operations complete in order.
+                    wide[lane] = 0u;
+                    __builtin_amdgcn_wave_barrier();
+                    if(__builtin_amdgcn_inverse_ballot_w64(active_a))
+                        atomicAdd(wide + ((key_a >> shift) & 63u), 1u);
+                    if(__builtin_amdgcn_inverse_ballot_w64(active_b))
+                        atomicAdd(wide + ((key_b >> shift) & 63u), 1u);
+                    __builtin_amdgcn_wave_barrier();
+                    int const bin   = static_cast<int>(wide[lane]);
+                    int const incl  = wave_inclusive_sum_dpp(bin);
+                    int const digit = __builtin_ctzll(
+                        static_cast<uint64_t>(__ballot(incl - bin < rank && rank <= incl)));
+                    rank -= static_cast<IdxT>(__builtin_amdgcn_readlane(incl - bin, digit));
+                    live = static_cast<IdxT>(__builtin_amdgcn_readlane(bin, digit));
+                    uint32_t const mask = 63u << shift;
+                    uint32_t const want = static_cast<uint32_t>(digit) << shift;
+                    active_a &= static_cast<uint64_t>(__ballot((key_a & mask) == want));
+                    active_b &= static_cast<uint64_t>(__ballot((key_b & mask) == want));
+                    __builtin_amdgcn_wave_barrier();
                 }
                 Bits const kth_bits =
                     active_a != 0
@@ -3681,6 +3651,10 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                               static_cast<int>(key_a), __builtin_ctzll(active_a)))
                         : static_cast<Bits>(__builtin_amdgcn_readlane(
                               static_cast<int>(key_b), __builtin_ctzll(active_b)));
+                // Read only now, so the walk keeps every wide copy within the
+                // 64-VGPR budget.
+                IdxT const index_a = lane < count ? candidate_indices[lane] : 0;
+                IdxT const index_b = lane + WARP_SIZE < count ? candidate_indices[lane + WARP_SIZE] : 0;
                 uint64_t const less_a =
                     valid_a & static_cast<uint64_t>(__ballot(key_a < kth_bits));
                 uint64_t const less_b =
