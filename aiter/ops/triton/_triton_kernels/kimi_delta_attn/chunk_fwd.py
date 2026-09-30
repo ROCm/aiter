@@ -15,32 +15,32 @@ Pipeline:
 
 import torch
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+)
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
     RCP_LN2,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     AITER_FDA_ENABLE,
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
     flash_kda_supported,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import beta_sigmoid_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.gla_output import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.gate import beta_sigmoid_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.gla_output import (
     chunk_gla_fwd_o,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.intra_attn import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.intra_attn import (
     chunk_delta_attn_fwd_intra,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.cumsum import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.cumsum import (
     chunk_gate_cumsum,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.l2norm import l2norm_fwd
-from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_h,
-)
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import l2norm_fwd
 
 # What an unset `chunk_size` falls back to when the FlashKDA path cannot serve
 # the call.
