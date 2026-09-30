@@ -632,7 +632,13 @@ static inline ShapeParams derive_shape_params(int M,
         else if(sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S))
             S = repaired;
     }
-    margin                  = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
+    margin = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
+    // At the largest row grid, N=524288 seed-0 has one candidate count at 2031
+    // with the 1.600 estimator margin. That row takes the exact full-row path
+    // inside Phase C. A 1.625 floor moves the expected boundary above K while
+    // leaving N=1048576 unchanged (its derived margin is already 2.129).
+    if(margin_override <= 0.f && M >= 4096 && N >= 524288)
+        margin = std::max(margin, 1.625f);
     const double cap_margin = CAP_SAFE_FILL * (double)PHASE_C_CAP_MAX / (double)K;
     const double eff_margin = std::min((double)margin, cap_margin);
     const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
