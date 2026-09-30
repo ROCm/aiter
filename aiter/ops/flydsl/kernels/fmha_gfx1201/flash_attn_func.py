@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Flash Attention kernel for gfx1201 (RDNA4).
+"""BF16/F16 Flash Attention kernel for gfx1201 (RDNA4).
 
-Uses 16x16x16 wave32 WMMA, online softmax, pipelined V loads, and flattened
-BSHD inputs. Requires ``head_dim >= 64`` and ``head_dim % 32 == 0``.
+Inputs and output are flattened BSHD tensors. The kernel uses wave32 16x16x16
+WMMA, online softmax, and pipelined V loads. It requires ``head_dim >= 64`` and
+``head_dim % 32 == 0``.
 """
 
 import math as host_math
@@ -109,7 +110,7 @@ def build_flash_attn_func_module(
     CROSS_ATTN = cross_attn
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
-    # Padding reduces LDS bank conflicts.
+    # K/V are row-major in LDS; padding reduces bank conflicts.
     K_STRIDE = HEAD_DIM + 4
     V_STRIDE = HEAD_DIM + 4
 
@@ -140,7 +141,7 @@ def build_flash_attn_func_module(
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
     LDS_KV_TOTAL_SIZE = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE
 
-    # A single aligned, typed arena preserves the explicit K/V element offsets while
+    # A single aligned, typed arena preserves explicit K/V element offsets while
     # allowing vector-width views. SharedAllocator owns the static LDS sizing.
     _NUMERIC_MAP = {
         "f32": fx.Float32,
@@ -180,7 +181,8 @@ def build_flash_attn_func_module(
         o_elem_ptr = _as_elem_ptr(O)
 
         def _bounds_checked_buf_ptr(ptr, num_records_bytes):
-            # OOB_SELECT=3 zero-fills accesses beyond num_records.
+            # OOB_SELECT=3 zero-fills accesses beyond num_records. This explicit
+            # descriptor is required for the branch-free V tail prefetch below.
             flags = (7 << 12) | (4 << 15) | (1 << 24) | (3 << 28)
             buf_ptr_ty = fx.PointerType.get(
                 elem_ty=ptr.element_type.ir_type,
@@ -202,6 +204,7 @@ def build_flash_attn_func_module(
         )
 
         def wmma_acc(a_v8, b_v8, c_v8):
+            """Execute one BF16/F16 gfx1201 WMMA through FlyDSL's typed atom."""
             a_frag = fx.make_rmem_tensor(8, elem_dtype)
             b_frag = fx.make_rmem_tensor(8, elem_dtype)
             c_frag = fx.make_rmem_tensor(8, fx.Float32)
@@ -264,7 +267,7 @@ def build_flash_attn_func_module(
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         # Hardware OOB handling keeps the tail prefetch branch-free. A batch
-        # slice must fit the descriptor's 32-bit num_records.
+        # slice must fit the descriptor's 32-bit ``num_records`` field.
         ELEM_BYTES = (elem_numeric_cls.width + 7) // 8
         v_batch_elems = seq_len_kv_v * fx.Uint64(STRIDE_TOKEN)
         v_buf_ptr = _bounds_checked_buf_ptr(
@@ -288,12 +291,6 @@ def build_flash_attn_func_module(
                 fx.make_layout(val.numel, 1),
             )
             view.store(Vec(val))
-
-        def load_global_f16xN(base_ptr, base_idx):
-            return _load_global_half_vec(base_ptr, base_idx, VEC_WIDTH)
-
-        def load_global_v8f16(base_ptr, base_idx):
-            return _load_global_half_vec(base_ptr, base_idx, 8)
 
         def _bitcast_i32(value):
             return fx.Float32(value).bitcast(fx.Int32)
@@ -336,12 +333,12 @@ def build_flash_attn_func_module(
                     if chunk_valid:
                         g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
-                        vec = load_global_f16xN(k_elem_ptr, g_idx)
+                        vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
                         lds_store(lds_idx, vec)
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
-                    vec = load_global_f16xN(k_elem_ptr, g_idx)
+                    vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
                     lds_store(lds_idx, vec)
 
         def _v_store_row_major(v_base, lds_row, load_col_base, col_extra, vec):
@@ -410,7 +407,7 @@ def build_flash_attn_func_module(
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
-            raw = load_global_v8f16(q_elem_ptr, g_idx)
+            raw = _load_global_half_vec(q_elem_ptr, g_idx, 8)
             q_b_packs.append(q_in_bounds.select(raw, c_zero_v8f16))
 
         c_neg_inf = fx.Float32(float("-inf"))
@@ -538,9 +535,7 @@ def build_flash_attn_func_module(
 
             diff_m_raw = m_running - m_new_raw
             diff_m_scaled = diff_m_raw * c_sm_scale_log2e
-            corr = fx.Float32(
-                fx.rocdl.exp2(fx.Float32.ir_type, fx.Float32(diff_m_scaled).ir_value())
-            )
+            corr = fx.exp2(diff_m_scaled, fastmath="fast")
 
             scaled_max = c_sm_scale_log2e * m_new_raw
             neg_scaled_max = c_zero_f - scaled_max
@@ -549,9 +544,7 @@ def build_flash_attn_func_module(
             local_sum = c_zero_f
             for r in range_constexpr(NUM_S_VALS):
                 diff = fx.math.fma(s_raw[r], c_sm_scale_log2e, neg_scaled_max)
-                p = fx.Float32(
-                    fx.rocdl.exp2(fx.Float32.ir_type, fx.Float32(diff).ir_value())
-                )
+                p = fx.exp2(diff, fastmath="fast")
                 p_vals.append(p)
                 local_sum = local_sum + p
 
