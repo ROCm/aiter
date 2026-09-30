@@ -356,7 +356,7 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
     )
 
     ret = {"gfx": get_gfx()}
-    same_o = same_lse = True
+    same_o = same_lse = in_place = pad_untouched = True
     for _ in range(_STRIDED_REPEATS):
         if layout.startswith("out_view"):
             # out is a view of a wider NaN buffer (width 129: 2-byte-aligned rows).
@@ -367,8 +367,8 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
                 q, k, v, cu, cu, max_seqlen_q, scale, is_causal, True, out=out_view
             )
             lse = lse.squeeze(-1)
-            ret["out in place"] = out.data_ptr() == out_view.data_ptr()
-            ret["pad untouched"] = bool(wide[..., 128:].isnan().all().item())
+            in_place &= out.data_ptr() == out_view.data_ptr()
+            pad_untouched &= bool(wide[..., 128:].isnan().all().item())
         else:
             qs, ks, vs = _strided_inputs(layout, q, k, v)
             out, lse = run_kernel(
@@ -384,8 +384,13 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
             )
         same_o &= torch.equal(out, dense_out)
         same_lse &= torch.equal(lse, dense_lse)
+    assert same_o and same_lse, f"strided {layout} via={via}: differs from dense"
+    assert in_place and pad_untouched, f"{layout}: out not written in place"
     ret["== dense (O)"] = same_o
     ret["== dense (LSE)"] = same_lse
+    if layout.startswith("out_view"):
+        ret["out in place"] = in_place
+        ret["pad untouched"] = pad_untouched
     ret["err(O)"] = checkAllclose(
         ref_out.to(dtypes.fp32),
         out.to(dtypes.fp32),
@@ -403,16 +408,27 @@ def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layou
     return ret
 
 
+def _unsupported_kv(case, k, v):
+    """k/v views the D192x128 kernel cannot address."""
+    if case == "k token stride 2^24 B":
+        tok = (1 << 24) // k.element_size()
+        buf = torch.empty((len(k) - 1) * tok + k.size(1) * 192, dtype=k.dtype)
+        k_far = buf.as_strided(k.shape, (tok, 192, 1))
+        k_far.copy_(k)
+        return k_far, v
+    if case == "k/v head stride 0":
+        # All kv heads share one head (expanded MQA): pass hk=1 instead.
+        return k[:, :1].expand_as(k), v[:, :1].expand_as(v)
+    raise ValueError(f"unknown case {case!r}")
+
+
 @benchmark()
-def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(is_causal):
-    """k's token stride (2^24 B) is out of range: the public path must use another
-    backend, and a direct op call must be refused by the C++ entry."""
-    seqlens, hq, hk = [2], 4, 1
+def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
+    """Unsupported k/v strides: the public path must use another backend, and a
+    direct op call must be refused by the C++ entry."""
+    seqlens, hq, hk = [2], 4, 2
     q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
-    tok = (1 << 24) // k.element_size()
-    buf = torch.empty((len(k) - 1) * tok + hk * 192, dtype=k.dtype)
-    k_far = buf.as_strided(k.shape, (tok, 192, 1))
-    k_far.copy_(k)
+    k, v = _unsupported_kv(case, k, v)
     scale = 1.0 / math.sqrt(192)
     ref_out, _ = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=None)
 
@@ -428,17 +444,19 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(is_causal):
     try:
         try:
             aiter.fmha_fwd_with_sink_varlen_asm(
-                q, k_far, v, cu, cu, max(seqlens), scale, is_causal, True
+                q, k, v, cu, cu, max(seqlens), scale, is_causal, True
             )
             ops_refused = False
-        except Exception as e:  # raised by the C++ stride check
+        except RuntimeError as e:  # raised by the C++ stride check
             ops_refused = "strides out of range" in str(e)
         ops_calls = len(calls)
         out, _ = run_kernel(
-            q, k_far, v, cu, cu, max(seqlens), scale=scale, is_causal=is_causal
+            q, k, v, cu, cu, max(seqlens), scale=scale, is_causal=is_causal
         )
     finally:
         mha._fmha_fwd_with_sink_varlen_asm = asm
+    assert ops_refused, f"{case}: C++ accepted an unsupported stride"
+    assert len(calls) == ops_calls, f"{case}: public path called ASM"
     return {
         "ops refused": ops_refused,
         "public asm calls": len(calls) - ops_calls,
@@ -447,9 +465,25 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(is_causal):
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
-            msg=f"unsupported stride -> other backend, c={is_causal}",
+            msg=f"{case} -> other backend, c={is_causal}",
         ),
     }
+
+
+def test_fmha_fwd_with_sink_varlen_asm_overlapping_out():
+    """An out whose heads overlap (head stride 64 < 128) must be refused."""
+    q, k, v, cu = make_varlen_packed([2], 4, 2, 192, 128)
+    t, hq = q.shape[:2]
+    buf = torch.empty(t * hq * 64 + 64, dtype=q.dtype)
+    out = buf.as_strided((t, hq, 128), (hq * 64, 64, 1))
+    try:
+        aiter.fmha_fwd_with_sink_varlen_asm(
+            q, k, v, cu, cu, 2, 1.0 / math.sqrt(192), False, True, out=out
+        )
+        refused = False
+    except RuntimeError as e:
+        refused = "must not overlap" in str(e)
+    assert refused, "C++ accepted an overlapping out"
 
 
 _STRIDED_LAYOUTS = [
@@ -584,8 +618,10 @@ def main():
         )
         df = pd.DataFrame(
             [
-                test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(is_causal)
-                for is_causal in causal_modes
+                test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal)
+                for case, is_causal in itertools.product(
+                    ["k token stride 2^24 B", "k/v head stride 0"], causal_modes
+                )
             ]
         )
         aiter.logger.info(
@@ -593,6 +629,7 @@ def main():
             "(markdown):\n%s",
             df.to_markdown(index=False),
         )
+        test_fmha_fwd_with_sink_varlen_asm_overlapping_out()
 
     # ---- perf-only table (large shapes; ref infeasible) ----
     df = []

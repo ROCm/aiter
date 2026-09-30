@@ -115,9 +115,32 @@ static void check_strided_thd(const aiter_tensor_t* t, const char* name)
     const int64_t hs  = t->stride(1) * esz;
     AITER_CHECK(t->stride(-1) == 1,
                 "fmha_fwd_with_sink_varlen_asm: ", name, " must have contiguous last dim");
-    AITER_CHECK(ts > 0 && ts < (int64_t(1) << 24) && hs >= 0 && hs <= INT32_MAX,
+    AITER_CHECK(ts > 0 && ts < (int64_t(1) << 24) && hs > 0 && hs <= INT32_MAX,
                 "fmha_fwd_with_sink_varlen_asm: ", name, " strides out of range (token ", ts,
-                " B must be in (0, 2^24), head ", hs, " B must fit int32)");
+                " B must be in (0, 2^24), head ", hs, " B must be in (0, INT32_MAX])");
+}
+
+// Every out element must have its own address: stores from different
+// heads/tokens would otherwise race (e.g. head stride < v_head_dim).
+static bool non_overlapping_thd(const aiter_tensor_t* t)
+{
+    int64_t st[3], sz[3];
+    int n = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        if (t->size(i) < 2) continue;
+        int j = n++;
+        for (; j > 0 && st[j - 1] > t->stride(i); j--)
+        {
+            st[j] = st[j - 1];
+            sz[j] = sz[j - 1];
+        }
+        st[j] = t->stride(i);
+        sz[j] = t->size(i);
+    }
+    for (int i = 0; i < n; i++)
+        if (st[i] <= 0 || (i > 0 && st[i] < st[i - 1] * sz[i - 1])) return false;
+    return true;
 }
 
 // ---- main entry ------------------------------------------------------------
@@ -225,6 +248,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         check_strided_thd(k, "k");
         check_strided_thd(v, "v");
         check_strided_thd(out, "out");
+        AITER_CHECK(non_overlapping_thd(out),
+                    "fmha_fwd_with_sink_varlen_asm: out must not overlap itself");
     }
     else
     {
