@@ -196,6 +196,8 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_sfmpack": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_wave8n4": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_fused": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_minterleave": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter": ("fp8_t", "fp8_t"),
@@ -272,6 +274,7 @@ def _kargs_template_vars(kernel_tag, kargs_name):
         "a8w8_mxscale_bmm_bpreshuffle",
         "a8w8_mxscale_bmm_bpreshuffle_bcast",
         "a8w8_mxscale_bmm_bpreshuffle_sfmpack",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     ):
         return (
             "",
@@ -285,6 +288,7 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     if kernel_tag in (
         "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
         "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
     ):
         return (
             "",

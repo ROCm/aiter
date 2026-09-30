@@ -32,6 +32,8 @@ PIPELINE_HEADER_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_allwave": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave1_gfx950.cuh",
     "a8w8_mxscale_bmm_minterleave": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_fused": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
@@ -67,6 +69,8 @@ TRAITS_HEADER_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_allwave": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_minterleave": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_fused": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -93,6 +97,8 @@ KERNEL_FUNC_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_allwave": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
     "a8w8_mxscale_bmm_minterleave": "gemm_a8w8_mxscale_flatmm_minterleave_kernel",
     "a8w8_mxscale_bmm_fused": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     # pipeline: default; the emit fn selects the real kernel per-kid from flags.
@@ -126,6 +132,8 @@ TRAITS_NAME_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_allwave": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_allwave_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "opus_gemm_a8w8_mxscale_bpreshuffle_wave8n4_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_blds_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "opus_gemm_a8w8_mxscale_bpreshuffle_wave1_traits_gfx950",
     "a8w8_mxscale_bmm_minterleave": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_fused": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_a8w8_scale_traits_gfx950",
@@ -152,6 +160,8 @@ KARGS_NAME_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_allwave": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_minterleave": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_fused": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_scale_kargs_gfx950",
@@ -1643,6 +1653,50 @@ def _assert_m_align(k, tile_mult):
 # fused-reduce kid stays monolithic in opus_bmm.cu.
 _BMM_MXSCALE_SPLITK_LAUNCHER_BODY = r"""
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#ifndef OPUS_BMM_XCD_COUNTERS_DEFINED
+#define OPUS_BMM_XCD_COUNTERS_DEFINED
+#include <cstdlib>
+#include <map>
+#include <mutex>
+// Arrival counters for the same-XCD fused split-K, one int32 per (batch, tile),
+// zeroed once when allocated and re-armed by the kernel after every use, so a
+// launch pays no memset. One buffer per device, allocated on the first eager
+// launch and reused under graph capture -- torch.cuda.graph captures on a side
+// stream, so a per-stream buffer would never exist where it is needed.
+//
+// The buffer holds XCD_COUNTER_SLOTS slices and each launch takes the next, so
+// launches in flight at once on different streams (a two-batch overlap, say)
+// count in different slices; only XCD_COUNTER_SLOTS concurrent split-K launches
+// could collide. An outgrown buffer is kept rather than freed, since a kernel
+// still in flight may be counting in it. Returns nullptr when it would have to
+// allocate under graph capture; the caller then takes the workspace + reduce
+// path.
+constexpr int XCD_COUNTER_SLOTS = 8;
+inline int* opus_bmm_xcd_counters(size_t n, hipStream_t stream)
+{
+  static const bool off = std::getenv("OPUS_BMM_NO_XCD_FUSE") != nullptr;
+  if (off) return nullptr;
+  struct Buf { int* p = nullptr; size_t slice = 0; unsigned next = 0; };
+  static std::mutex mu;
+  static std::map<int, Buf> bufs;
+  int dev = 0;
+  HIP_CALL(hipGetDevice(&dev));
+  std::lock_guard<std::mutex> lock(mu);
+  Buf& b = bufs[dev];
+  if (b.slice < n) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture));
+    if (capture != hipStreamCaptureStatusNone) return nullptr;
+    const size_t slice = n > (size_t(1) << 14) ? n : (size_t(1) << 14);
+    int* p = nullptr;
+    HIP_CALL(hipMalloc(&p, slice * XCD_COUNTER_SLOTS * sizeof(int)));
+    HIP_CALL(hipMemsetAsync(p, 0, slice * XCD_COUNTER_SLOTS * sizeof(int), stream));
+    b.p = p;
+    b.slice = slice;
+  }
+  return b.p + (size_t)(b.next++ % XCD_COUNTER_SLOTS) * b.slice;
+}
+#endif
 // mmajor: O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major
 // [batch, N, K]. Caller (opus_bmm.cu switch) does dtype/arch/common checks.
 template <typename D_C>
@@ -1724,6 +1778,10 @@ void
   auto stream = aiter::getCurrentHIPStream();
 
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
+  {  // TEMP ablation probe: wave1 reads OPUS_WAVE1_ABL through m_per_wg
+    static const char* abl = std::getenv("OPUS_WAVE1_ABL");
+    kargs.m_per_wg = abl ? std::atoi(abl) : 0;
+  }
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
   kargs.ptr_ws = nullptr;
@@ -1766,6 +1824,36 @@ void
     void* workspace_ptr = opus_validate_workspace(
         workspace.value(), O, AITER_DTYPE_fp32, required_numel, 16, "@@NAME@@");
     kargs.ptr_ws = workspace_ptr;
+
+    // Same-XCD fused split-K: the splits reduce among themselves in the main
+    // kernel (see xcd_fused in the pipeline), so there is no reduce launch and
+    // no second pass over the workspace. Launched on the direct-output
+    // specialization, whose D_OUT the last split writes.
+    const size_t n_counters = (size_t)num_tiles_m * num_tiles_n * batch;
+    int* xcd_counters = @@XCD_FUSE@@ ? opus_bmm_xcd_counters(n_counters, stream) : nullptr;
+    if (xcd_counters) {
+      kargs.ptr_xcd_counters = xcd_counters;
+      kargs.ptr_c = Y.data_ptr();
+      kargs.stride_c = (int)Y.stride(0);
+      kargs.stride_c_batch = (int)Y.stride(1);
+      const int tiles_per_batch = num_tiles_m * num_tiles_n;
+      // Either form keeps a tile's splits on one XCD. @@XCD_SPLIT_IN_X@@ puts
+      // them in x, next to each other in dispatch order, the kernel recovering
+      // (tile, split) with divides by its compile-time split count; otherwise
+      // split is y, a whole grid row apart.
+      dim3 grid_xcd = @@XCD_SPLIT_IN_X@@
+          ? dim3((unsigned)((tiles_per_batch + 7) / 8 * 8 * split_k), 1u, (unsigned)batch)
+          : dim3((unsigned)((tiles_per_batch + 7) / 8 * 8), (unsigned)split_k,
+                 (unsigned)batch);
+      if (Y.dtype() == AITER_DTYPE_bf16) {
+        @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
+            <<<grid_xcd, block_main, 0, stream>>>(kargs);
+      } else {
+        @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
+            <<<grid_xcd, block_main, 0, stream>>>(kargs);
+      }
+      return;
+    }
 
     // Pass all 4 template args explicitly (D_OUT=void: the split-K main kernel
     // writes an fp32 workspace, so its output dtype is irrelevant; the reduce
@@ -1841,13 +1929,14 @@ def gen_bmm_mxscale_flatmm_splitk_instance(
 
     # Non-templated traits alias: fp32 split-K workspace is fixed; the workspace
     # tuple slot 4 (scale) is `unsigned char` for the e8m0 mxscale path.
+    ring_arg = f", {k.wave1_ring}" if k.wave1_ring else ""
     traits_aliases = f"""
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
     opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
-    {k.WG_PER_CU}>;
+    {k.WG_PER_CU}{ring_arg}>;
 """
 
     preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
@@ -1904,6 +1993,17 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     launcher = (
         _BMM_MXSCALE_SPLITK_LAUNCHER_BODY.replace("@@NAME@@", k.name)
         .replace("@@KERNEL@@", kernel_func)
+        .replace(
+            "@@XCD_FUSE@@",
+            "Traits::XCD_FUSE"
+            if kernel_func in ("gemm_a8w8_mxscale_flatmm_splitk_kernel",
+                               "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel")
+            else "false",
+        )
+        .replace(
+            "@@XCD_SPLIT_IN_X@@",
+            "true" if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel" else "false",
+        )
         .replace("@@DIRECT@@", "true" if k.direct_only else "false")
         .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
         .replace("@@PRELOAD@@", "true" if k.preload_sf else "false")
@@ -1927,6 +2027,10 @@ __global__ void opus_bmm_splitk_reduce_kernel(
                 "Traits::SF_SHUF_K_TILES_MAX"
                 if k.sf_shuf_in_lds
                 else "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
+                if k.preload_sf
+                # No panel: the bound is compiled out, and the wave1 traits
+                # carry no panel geometry to name.
+                else "0"
             ),
         )
         .replace("@@SFMPACK@@", sfmpack)
@@ -3046,6 +3150,16 @@ _register_bmm_emit(
 # grids, and it holds the fastest kid here.
 _register_bmm_emit(
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# wavetm1_blds: the same kernel on traits that stage B through the LDS ring.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# wave1: one wave per workgroup, every operand global -> registers, no LDS and
+# no barrier -- the decode schedule. Shares the split-K launcher, fused tail
+# included.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_wave1", gen_bmm_mxscale_flatmm_splitk_instance, 0
 )
 _register_bmm_emit(
     "a8w8_mxscale_bmm_minterleave", gen_bmm_mxscale_minterleave_instance, 2

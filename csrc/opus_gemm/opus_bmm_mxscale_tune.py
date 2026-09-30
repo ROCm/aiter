@@ -886,6 +886,9 @@ def _workspace_numel(kernel_id, split_k, batch, m, n):
     if split_k <= 1 or instance.kernel_tag not in {
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     }:
         return 0
     tiles_m = (m + instance.B_M - 1) // instance.B_M

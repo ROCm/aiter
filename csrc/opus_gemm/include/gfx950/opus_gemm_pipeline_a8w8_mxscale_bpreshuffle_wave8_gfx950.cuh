@@ -386,8 +386,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     static_assert(std::is_same_v<D_C, fp32_t>, "split-K main writes an fp32 workspace");
     static_assert(!DIRECT_ONLY && !PREFETCH_SCALE && PRELOAD_SF_LDS,
                   "this pipeline is the direct-B + LDS-scale-panel schedule only");
-    static_assert(T::B_PRESHUFFLE && T::B_DIRECT_REG,
-                  "B is read from the 16x16 preshuffle straight into registers");
+    static_assert(T::B_PRESHUFFLE && (T::B_DIRECT_REG || T::B_LDS),
+                  "B is read from the 16x16 preshuffle, into registers or the LDS ring");
     static_assert(T::ALL_WAVE && (T::WAVES == 8 || T::WAVES == 4),
                   "four or eight all-compute waves");
     static_assert(T::GROUP_M == 1, "one A scale byte per row per K group");
@@ -426,7 +426,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // With the words in LDS the loop issues no scale load at all, so the plain
     // staged B wait applies again -- there is nothing left for the KP=1 staging to
     // account for.
-    constexpr bool B_STAGED_WAIT = !SFA_MPACK_GLOBAL && (!SHUFFLE_SCALE || SF_SHUF_IN_LDS);
+    // Staged B has no register load to wait on piecewise.
+    constexpr bool B_STAGED_WAIT =
+        !T::B_LDS && !SFA_MPACK_GLOBAL && (!SHUFFLE_SCALE || SF_SHUF_IN_LDS);
 
     const int split_id = opus::block_id_x() % kargs.split_k;
     const int wgid     = opus::block_id_x() / kargs.split_k;
@@ -521,9 +523,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                            + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start);
 
     constexpr int PF = T::prefetch_k_iter;
-    // Per-wave vmcnt entries per K tile: A async copies, and direct-B loads.
+    // Per-wave vmcnt entries per K tile: A async copies, and direct-B loads --
+    // or, with B staged, B's async copies, issued in the same batch as A's.
     constexpr int A_MB = T::a_buffer_load_insts;
-    constexpr int B_MB = T::b_direct_load_insts;
+    constexpr int B_MB = T::B_LDS ? T::b_lds_copy_insts : T::b_direct_load_insts;
 
     // Shuffled scale words are prefetched one K tile pair ahead, so they are in flight
     // across a whole tile's MFMAs and every wait between has to leave them alone.
@@ -557,9 +560,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // compiler sinks the fold past the rotate; read the ISA before assuming.
     constexpr int SF_PF = SF_PREFETCH ? T::SF_A_SLOTS + T::SFB_GROUPS : 0;
 
-    // B never lands in LDS here, so only A is staged.
+    // A is staged always; B only under B_LDS, one b_lds_slot_bytes slot per tile.
     __shared__ char smem_a[PF * T::NUM_LOAD_GROUPS_PER_BM
                            * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
+    __shared__ __align__(16) char smem_b[T::B_LDS ? PF * T::b_lds_slot_bytes : 1];
 
     // Scale panels: the A per-token scales (SFA) and B block scales (SFB) for
     // this split's whole K range, staged once so the per-K-tile fetch is a
@@ -1087,6 +1091,33 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         const int kk = loop_k < loops ? loop_k : loops - 1;
         v_b = load<T::VEC_B>(g_b, u_gb_direct, b_direct_iter_offset_mxsk<T>(kk));
     };
+
+    // Staged B. Chunk q of a tile (1 KiB, one wave instruction) is 16-column
+    // block q / B_CHUNKS_PER_BLOCK, bytes (q % B_CHUNKS_PER_BLOCK) KiB into its
+    // K tile, and lands at q KiB into the slot -- so the slot holds the blocks at
+    // a B_K*16 stride, the direct-B layout's with B_K for stride_b. Wave w issues
+    // chunks w, w + WAVES, ...; LDS DMA writes lane i at M0 + 16*i, so only the
+    // source offset is per lane.
+    constexpr int B_CHUNKS_PER_BLOCK = T::B_K * 16 / 1024;
+    auto b_lds_src = [&](int i) {
+        const int q = i * T::WAVES + wave_id;
+        return (q / B_CHUNKS_PER_BLOCK) * kargs.stride_b * 16
+             + (q % B_CHUNKS_PER_BLOCK) * 1024 + lane_id * T::VEC_B;
+    };
+    auto issue_b_lds = [&](int issue_k) {
+        if constexpr (T::B_LDS) {
+            const int kk = issue_k < loops ? issue_k : loops - 1;
+            char* slot = smem_b + (issue_k % PF) * T::b_lds_slot_bytes;
+            opus::static_for<T::b_lds_copy_insts>([&](auto i_c) {
+                constexpr int i = decltype(i_c)::value;
+                g_b.template async_load<T::VEC_B>(
+                    slot + (i * T::WAVES + wave_id) * 1024, b_lds_src(i),
+                    b_direct_iter_offset_mxsk<T>(kk));
+            });
+        }
+    };
+    // The consumer side: the direct-B fragment layout over the slot.
+    auto u_rb_lds = make_layout_gmem_b_direct_mxsk<T>(lane_id, T::B_K, wave_id_n * T::COM_REP_N);
     // B single-buffered is what made the next tile's B wait for this tile's
     // last MFMA: ATT on kid8194/8205 puts 6-7% of cycles on that load's issue
     // and another 8% on the first MFMA after it. The MMA loop is n-repeat
@@ -1347,6 +1378,80 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             issue_a_tile(p);
             issue_b_buf(p + B_BUFS - PF, number<(p + B_BUFS - PF) % B_BUFS>{});
         });
+    } else if constexpr (T::B_LDS) {
+        // Staged-B schedule, its own loop. k_tile's single fragment set leans
+        // on a second wave per SIMD for overlap, and the 1x4 grid has none: ATT
+        // on kid8454 serialises every tile into barrier, ~300 cycles of ds_read
+        // issue, ~300 of copy issue, then 512 of MFMA. Here the fragments are
+        // double buffered and tile k+1's reads, and tile k+PF's copies, issue
+        // between tile k's MFMAs:
+        //
+        //   lgkmcnt(0)        -- this wave's reads of tile k are in registers
+        //   vmcnt, barrier    -- tile k+1 has landed, every wave is done with tile
+        //                        k, so its slot takes tile k+PF
+        //   copies of k+PF, reads of k+1, MFMAs of k -- one interleaved region
+        //
+        // All PF slots are filled up front. At tile k the copies of k+2 .. k+PF-1
+        // are the ones allowed outstanding.
+        constexpr int CP = A_MB + B_MB;
+        opus::static_for<PF>([&](auto p_c) {
+            issue_a_tile(decltype(p_c)::value);
+            issue_b_lds(decltype(p_c)::value);
+        });
+        typename decltype(mma)::vtype_a v_a2[2];
+        typename decltype(mma)::vtype_b v_b2[2];
+        vtype_sfa v_sfa2[2];
+        vtype_sfb v_sfb2[2];
+        auto read_tile = [&](int kt, auto set_c) {
+            constexpr int s = decltype(set_c)::value;
+            const int kk = kt < loops ? kt : loops - 1;
+            auto sa = make_smem(smem_a_at(kk % PF, 0, 0));
+            if constexpr (A_SWZ) {
+                auto a0 = load<T::VEC_A>(sa, u_ra_h0);
+                auto a1 = load<T::VEC_A>(sa, u_ra_h1);
+                constexpr int A_PIECES = T::COM_REP_M * T::NUM_LOAD_GROUPS_PER_BK;
+                opus::static_for<A_PIECES>([&](auto p_c) {
+                    constexpr int p = decltype(p_c)::value;
+                    opus::set_slice(v_a2[s],
+                        opus::slice(a0, opus::number<p * T::VEC_A>{},
+                                    opus::number<(p + 1) * T::VEC_A>{}),
+                        opus::number<(2 * p) * T::VEC_A>{},
+                        opus::number<(2 * p + 1) * T::VEC_A>{});
+                    opus::set_slice(v_a2[s],
+                        opus::slice(a1, opus::number<p * T::VEC_A>{},
+                                    opus::number<(p + 1) * T::VEC_A>{}),
+                        opus::number<(2 * p + 1) * T::VEC_A>{},
+                        opus::number<(2 * p + 2) * T::VEC_A>{});
+                });
+            } else {
+                v_a2[s] = load<T::VEC_A>(sa, u_ra);
+            }
+            auto sb = make_smem(reinterpret_cast<D_B*>(smem_b + (kk % PF) * T::b_lds_slot_bytes));
+            v_b2[s] = load<T::VEC_B>(sb, u_rb_lds);
+            read_scales(kk, v_sfa2[s], v_sfb2[s]);
+        };
+        auto step = [&](int k, auto set_c) {
+            constexpr int s = decltype(set_c)::value;
+            s_waitcnt_lgkmcnt(0_I);
+            s_waitcnt_vmcnt(number<(PF - 2) * CP>{});
+            __builtin_amdgcn_s_barrier();
+            issue_a_tile(k + PF);
+            issue_b_lds(k + PF);
+            read_tile(k + 1, number<s ^ 1>{});
+            mma_mxscale_wave8_accum<T, decltype(mma), 0, false>(
+                v_a2[s], v_b2[s], v_sfa2[s], v_sfb2[s], v_c);
+            sched_mfma_interleave<T::mma_insts,
+                                  T::a_ds_read_insts + T::b_ds_read_insts, CP>();
+        };
+        s_waitcnt_vmcnt(number<(PF - 1) * CP>{});
+        __builtin_amdgcn_s_barrier();
+        read_tile(0, number<0>{});
+        int k = 0;
+        for (; k + 1 < loops; k += 2) {
+            step(k, number<0>{});
+            step(k + 1, number<1>{});
+        }
+        if (k < loops) step(k, number<0>{});
     } else {
         opus::static_for<PF - 1>([&](auto p_c) {
             issue_a_tile(decltype(p_c)::value);
@@ -1354,7 +1459,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         issue_b_direct(0);
     }
 
-    if constexpr (B_BUFS > 1) {
+    if constexpr (T::B_LDS) {
+        // The staged-B loop ran with its prefill above.
+    } else if constexpr (B_BUFS > 1) {
         // Unrolled by the ring depth so each tile's buffer is a compile-time index.
         int k = 0;
         for (; k + B_BUFS - 1 < loops; k += B_BUFS) {

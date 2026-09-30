@@ -998,14 +998,28 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     int wgid_full = opus::block_id_x();
     int split_id  = 0;
     int wgid      = wgid_full;
-    if constexpr (!DIRECT_ONLY) {
-        split_id = wgid_full % kargs.split_k;
-        wgid = wgid_full / kargs.split_k;
-    }
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
+    int batch_id = opus::block_id_z();
+    // Same-XCD fused split-K: grid (tiles padded to a multiple of 8, split_k,
+    // batch). The linear workgroup id is x + gx * (y + split_k * z) and the XCD is
+    // that mod 8, so with gx a multiple of 8 every split of tile x runs on XCD
+    // x % 8 and they hand their partials over through its L2. Split and batch
+    // come straight off the grid: the 1-D form this replaces spent four runtime
+    // divisions recovering them, ~600 cycles ahead of a decode tile's first load.
+    constexpr bool XCD_FUSE = !std::is_void_v<D_OUT> && !DIRECT_ONLY && T::XCD_FUSE;
+    const bool xcd_fused = XCD_FUSE && kargs.ptr_xcd_counters != nullptr;
+    const int tiles_per_batch = num_tiles_m * ceil_div(kargs.n, T::B_N);
+    if constexpr (!DIRECT_ONLY) {
+        if (xcd_fused) {
+            if (wgid_full >= tiles_per_batch) return;  // pad to a multiple of 8
+            split_id = opus::block_id_y();
+        } else {
+            split_id = wgid_full % kargs.split_k;
+            wgid = wgid_full / kargs.split_k;
+        }
+    }
     int row = (wgid % num_tiles_m) * T::B_M;
     int col = (wgid / num_tiles_m) * T::B_N;
-    int batch_id = opus::block_id_z();
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 
@@ -2163,21 +2177,40 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         // The slot tile k-1's scales sit in is still live here: the panel holds
         // the whole split, and the ring has the one spare slot for exactly this.
         constexpr bool SF_EARLY = SF_FROM_LDS && !SHUFFLE_SCALE;
+        // The whole-split panel is published before the K loop, so a tile's
+        // scales need no barrier at all: they are read a whole step ahead, right
+        // behind the previous tile's MFMAs, and land under those MFMAs and the
+        // next barrier. Read after the barrier instead, the compiler packs them
+        // ahead of the A/B ds_reads and waits them out there, which put a full
+        // LDS round trip in front of every tile's MFMAs (kid8179: ~250 of the
+        // ~680 cycles per tile). The ring publishes a tile's scales with the
+        // tile, so it keeps the after-the-barrier read. Tile 0's scales still
+        // wait for barrier 1, as they did: the overlap-prologue panel is an
+        // LDS DMA, whose writes can trail the vmcnt that stage 0 retires.
+        constexpr bool SF_AHEAD = SF_EARLY && SF_PANEL;
         vtype_sfa v_sfa_pre;
         vtype_sfb v_sfb_pre;
         auto stage_barrier_c = [&](int pub) {
             stage_barrier(pub);
-            if constexpr (SF_EARLY) load_scale_regs(pub - 1, v_sfa_pre, v_sfb_pre);
+            if constexpr (SF_EARLY) {
+                if (!SF_AHEAD || pub == 1) load_scale_regs(pub - 1, v_sfa_pre, v_sfb_pre);
+            }
         };
 
         // lgkm_cnt == 0 marks the one MMA no stage_barrier_c precedes (the last
-        // tile's), which reads its own scales.
+        // tile's), which reads its own scales -- or under SF_AHEAD has them.
         auto wait_lgkm_then_scaled_mma =
             [&](const auto& va, const auto& vb, auto& vb_next, int loop_k, auto lgkm_cnt) {
-                if constexpr (SF_EARLY && decltype(lgkm_cnt)::value != 0) {
+                if constexpr (SF_EARLY && (SF_AHEAD || decltype(lgkm_cnt)::value != 0)) {
                     issue_b_direct(vb_next, loop_k + 1);
                     s_waitcnt_lgkmcnt(lgkm_cnt);
                     do_scaled_mma(va, vb, v_sfa_pre, v_sfb_pre, opus::bool_constant<true>{});
+                    if constexpr (SF_AHEAD && decltype(lgkm_cnt)::value != 0) {
+                        load_scale_regs(loop_k + 1, v_sfa_pre, v_sfb_pre);
+                        // s_barrier does not order memory for the scheduler, which
+                        // otherwise sinks these reads back down next to their use.
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
                 } else if constexpr (PREFETCH_SCALE) {
                     vtype_sfa v_sfa;
                     vtype_sfb v_sfb;
@@ -2386,7 +2419,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                                            0, lane_id / mma.grpn_c);
         auto u_gc1 = partition_layout_c<T::VEC_C>(mma_c1,
             opus::make_tuple(stride_c_main, 1_I), p_coord_c1);
-        auto store_c = [&](auto& g) {
+        auto store_c_v = [&](auto& g, const auto& vc, const auto& ug, const auto& ug1) {
             if constexpr (SPLIT_N_STORE) {
                 // The accumulator nests m-repeat outside n-repeat (i_tile_c =
                 // im*COM_REP_N + in), so one n-repeat's tiles sit COM_REP_N*C_LEN
@@ -2409,15 +2442,44 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                         opus::static_for<C_LEN>([&](auto e_c) {
                             constexpr int e = decltype(e_c)::value;
                             vj[im * C_LEN + e] =
-                                v_c[(im * T::COM_REP_N + j) * C_LEN + e];
+                                vc[(im * T::COM_REP_N + j) * C_LEN + e];
                         });
                     });
-                    store<T::VEC_C>(g, vj, u_gc1,
+                    store<T::VEC_C>(g, vj, ug1,
                                     (wave_id_n_cons * T::COM_REP_N + j) * T::W_N);
                 });
             } else {
-                store<T::VEC_C>(g, v_c, u_gc, 0);
+                store<T::VEC_C>(g, vc, ug, 0);
             }
+        };
+        auto store_c = [&](auto& g) { store_c_v(g, v_c, u_gc, u_gc1); };
+        // store_c_v's mirror image, reading past L1 (sc0 sc1): the partials it is
+        // for were written by other CUs of this XCD, and only their L2 has them.
+        constexpr int C_ELEMS = T::COM_REP_M * T::COM_REP_N * C_LEN;
+        auto load_c = [&](auto& g) {
+            typename decltype(mma)::vtype_c vc;
+            if constexpr (SPLIT_N_STORE) {
+                opus::static_for<T::COM_REP_N>([&](auto j_c) {
+                    constexpr int j = decltype(j_c)::value;
+                    auto vj = load<T::VEC_C>(g, u_gc1,
+                                             (wave_id_n_cons * T::COM_REP_N + j) * T::W_N,
+                                             number<17>{});
+                    opus::static_for<T::COM_REP_M>([&](auto im_c) {
+                        constexpr int im = decltype(im_c)::value;
+                        opus::static_for<C_LEN>([&](auto e_c) {
+                            constexpr int e = decltype(e_c)::value;
+                            vc[(im * T::COM_REP_N + j) * C_LEN + e] = vj[im * C_LEN + e];
+                        });
+                    });
+                });
+            } else {
+                auto v = load<T::VEC_C>(g, u_gc, 0, number<17>{});
+                opus::static_for<C_ELEMS>([&](auto e_c) {
+                    constexpr int e = decltype(e_c)::value;
+                    vc[e] = v[e];
+                });
+            }
+            return vc;
         };
         if constexpr (!std::is_void_v<D_OUT>) {
             if (kargs.split_k == 1) {
@@ -2436,6 +2498,80 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                               + (size_t)col;
                 auto g_c = make_gmem(ws_c_ptr);
                 store_c(g_c);
+                if (xcd_fused) {
+                    // All of this tile's splits run on this XCD, so their partials
+                    // meet in its L2: draining this workgroup's stores and a
+                    // workgroup-scope arrival count publish them, with none of the
+                    // L2 writeback / invalidate an agent-scope fence emits. The
+                    // last to arrive sums every split's partial in split order --
+                    // the same order whichever split that is -- and re-arms the
+                    // counter for the next launch.
+                    // Only consumer waves get here, so the arrival is counted by
+                    // the first consumer wave's lane 0 -- not thread 0, whose wave
+                    // is a producer on the split kids (role above) and has already
+                    // left, which left xcd_last unset and the counter unbumped.
+                    __shared__ int xcd_last;
+                    const int lead_wave = T::ALL_WAVE ? 0 : (1 ^ ((wgid >> 8) & 1));
+                    const bool lead = wave_id == lead_wave && lane_id == 0;
+                    s_waitcnt_vmcnt(0_I);
+                    __builtin_amdgcn_s_barrier();
+                    int* counter = kargs.ptr_xcd_counters + batch_id * tiles_per_batch + wgid;
+                    if (lead) {
+                        xcd_last = __hip_atomic_fetch_add(counter, 1, __ATOMIC_RELAXED,
+                                                          __HIP_MEMORY_SCOPE_WORKGROUP)
+                                   == kargs.split_k - 1;
+                    }
+                    s_waitcnt_lgkmcnt(0_I);
+                    __builtin_amdgcn_s_barrier();
+                    if (xcd_last) {
+                        const size_t split_stride = (size_t)kargs.batch * kargs.stride_ws_batch;
+                        D_C* tile_ws = ws_c_ptr - (size_t)split_id * split_stride;
+                        typename decltype(mma)::vtype_c acc;
+                        clear(acc);
+                        // SPLITS_PER_PASS partials in flight at once rather than
+                        // one L2 round trip per split, which is what a runtime
+                        // split loop costs the reducing workgroup. A slot past
+                        // split_k re-reads the last split and adds nothing. The
+                        // pass holds SPLITS_PER_PASS partials at once, so it is
+                        // sized to 64 VGPRs of them: eight of a 64-float tile
+                        // crashed clang on the 64x128 blds kids.
+                        constexpr int SPLITS_PER_PASS =
+                            C_ELEMS >= 64 ? 1 : (64 / C_ELEMS > 8 ? 8 : 64 / C_ELEMS);
+                        for (int sp0 = 0; sp0 < kargs.split_k; sp0 += SPLITS_PER_PASS) {
+                            typename decltype(mma)::vtype_c part[SPLITS_PER_PASS];
+                            opus::static_for<SPLITS_PER_PASS>([&](auto j_c) {
+                                constexpr int j = decltype(j_c)::value;
+                                const int sp = sp0 + j < kargs.split_k ? sp0 + j
+                                                                       : kargs.split_k - 1;
+                                auto g_s = make_gmem(tile_ws + (size_t)sp * split_stride);
+                                part[j] = load_c(g_s);
+                            });
+                            opus::static_for<SPLITS_PER_PASS>([&](auto j_c) {
+                                constexpr int j = decltype(j_c)::value;
+                                const bool in = sp0 + j < kargs.split_k;
+                                opus::static_for<C_ELEMS>([&](auto e_c) {
+                                    constexpr int e = decltype(e_c)::value;
+                                    acc[e] += in ? part[j][e] : 0.0f;
+                                });
+                            });
+                        }
+                        auto u_gc_o = partition_layout_c<T::VEC_C>(mma,
+                            opus::make_tuple(kargs.stride_c, 1_I), p_coord_c);
+                        auto u_gc1_o = partition_layout_c<T::VEC_C>(mma_c1,
+                            opus::make_tuple(kargs.stride_c, 1_I), p_coord_c1);
+                        D_OUT* out_ptr = reinterpret_cast<D_OUT*>(kargs.ptr_c)
+                                       + (size_t)batch_id * kargs.stride_c_batch
+                                       + (size_t)row * kargs.stride_c
+                                       + (size_t)col;
+                        auto g_out = make_gmem(out_ptr,
+                            (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
+                        store_c_v(g_out, acc, u_gc_o, u_gc1_o);
+                        if (lead)
+                            __hip_atomic_store(counter, 0, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                    return;
+                }
             }
         } else {
             D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ptr_ws)
@@ -2449,7 +2585,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     }
 
     if constexpr (!std::is_void_v<D_OUT>) {
-        if (kargs.split_k == 1) return;
+        if (kargs.split_k == 1 || xcd_fused) return;
 
         __shared__ int fused_do_reduce;
         if (opus::thread_id_x() == 0) {

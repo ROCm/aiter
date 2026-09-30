@@ -637,17 +637,33 @@ def bmm_a8w8_mxscale_opus(
         else:
             kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
 
+    split_k = int(splitK if splitK is not None else 1)
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
         x,
         wo_a,
         Y,
         x_scale,
         w_scale,
-        workspace=None,
+        workspace=_mxscale_bmm_workspace(x, wo_a, Y, int(kernelId), split_k),
         kid=int(kernelId),
-        split_k=int(splitK if splitK is not None else 1),
+        split_k=split_k,
     )
     return Y
+
+
+def _mxscale_bmm_workspace(
+    x: Tensor, wo_a: Tensor, Y: Tensor, kid: int, split_k: int
+) -> Tensor | None:
+    """The FP32 split-K workspace kid needs on mmajor ``x`` [M, G, K], or None."""
+    if split_k <= 1:
+        return None
+    m, g, k = map(int, x.shape)
+    spec = _get_cached_a8w8_mxscale_bmm_plan(
+        _device_arch(x.device), kid, Y.dtype, m, g, int(wo_a.shape[1]), k, split_k
+    ).workspace_spec
+    if spec is None:
+        return None
+    return torch.empty(spec.shape, dtype=spec.dtype, device=x.device)
 
 
 __all__ = [

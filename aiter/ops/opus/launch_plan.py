@@ -470,10 +470,15 @@ _A8W8_MXSCALE_BMM_TAGS = frozenset(
     for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
     for tag in arch_families.get(_A8W8_MXSCALE_BMM_FAMILY, ())
 )
+# The preshuffled-B bdirect/blds kids run the same flatmm split-K kernel and
+# launcher as flatmm_splitk, so they take its FP32 partials workspace too.
 _A8W8_MXSCALE_BMM_WORKSPACE_TAGS = frozenset(
     {
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     }
 )
 _A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(

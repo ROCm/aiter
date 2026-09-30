@@ -38,7 +38,10 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.opus import policy
-from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
+from aiter.ops.opus.gemm_op_a8w8 import (
+    _opus_gemm_a8w8_mxscale_bmm_launch_raw,
+    _mxscale_bmm_workspace,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import run_perftest
 
@@ -87,7 +90,14 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
         Y = torch.zeros((m, g, n), dtype=ydt)
         xs_kid, ws_kid = scale_for(kid)
         _opus_gemm_a8w8_mxscale_bmm_launch_raw(
-            O_in, W, Y, xs_kid, ws_kid, workspace=None, kid=kid, split_k=split_k
+            O_in,
+            W,
+            Y,
+            xs_kid,
+            ws_kid,
+            workspace=_mxscale_bmm_workspace(O_in, W, Y, kid, split_k),
+            kid=kid,
+            split_k=split_k,
         )
         torch.cuda.synchronize()
         return Y
@@ -103,16 +113,19 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
             continue
         try:
             errs[kid] = _rel_err(_call(kid, W_sh), ref)
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             skipped.append(kid)
     # The row-major reference kid, or at a K too short for it the 128-deep one.
     for cand in (kid_plain, kid_plain - KID_PLAIN + 8653):
         try:
             err_plain = _rel_err(_call(cand, W_mx), ref)
-        except RuntimeError:
+        except RuntimeError as e:
+            plain_exc = e
             continue
         kid_plain = cand
         break
+    else:
+        raise plain_exc
 
     # The public entry end to end: guarded custom op -> the preshuffle table
     # (the entry picks that one, nothing to set) -> the row's backend, opus or
