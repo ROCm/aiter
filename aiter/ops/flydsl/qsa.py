@@ -48,11 +48,9 @@ from .kernels.qsa.k2 import qsa_k2, qsa_k2_serves
 
 # GQA query ``(n_q_heads, head_dim)`` -> the indexer head counts swept with
 # it. K2 serves any structurally valid shape, so this table is the only
-# thing keeping auto off an untuned one. The measured thing is the pair:
-# 24x256 was never swept with an 8-head indexer, so admitting one there
-# would be a claim nobody made.
+# thing keeping auto off an untuned one. The measured thing is the pair.
 _MEASURED_QUERIES = {
-    (24, 256): (4,),  # Flash-Next / qwen4_exp
+    (24, 256): (4, 8),  # Flash-Next / qwen4_exp
     (10, 128): (4, 8),
 }
 _BACKENDS = ("auto", "flydsl", "triton")
@@ -60,7 +58,9 @@ _BACKENDS = ("auto", "flydsl", "triton")
 # GPU 6 / gfx950, cold ``--rotate 0``, page_size 16, M in {1, 2, 3, 4, 6, 8,
 # 12, 16, 32, 64, 128, 256, 512} crossed with L in {512, 2048, 8192, 32768}.
 # All 104 rows beat live AMD with err=0: 24x256 by 1.03x to 1.67x, 10x128 by
-# 1.17x to 2.66x, and 10x128 also won at both indexer widths. That reaches
+# 1.17x to 2.66x, and 10x128 also won at both indexer widths. The same grid
+# with an 8-head indexer on 24x256 also won all 52 rows, err=0, by 1.08x to
+# 1.70x. Indexer width does not change the K2 ladder. That reaches
 # every launch config the K2 policy can pick, and M past 512 reuses M=512's
 # BN32 single-split config with a larger grid, so neither M nor the
 # selection width filters this gate. The ``_launch_config`` decode bands are
