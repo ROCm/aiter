@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import subprocess
 import sys
 from contextlib import nullcontext
 
@@ -785,6 +786,47 @@ def test_grouped_a4w4_silu_matches_torch_ref():
         model_dim=512,
         inter_dim=512,
     )
+
+
+@pytest.mark.parametrize(
+    ("waves_per_tensor", "as_prologue"),
+    [(1, 0), (2, 0), (4, 0), (1, 1)],
+)
+def test_selected_tdm_ownership_matches_torch_ref(waves_per_tensor, as_prologue):
+    """Exercise multiple descriptor slots and the one-shot scale path."""
+    _require_gfx1250()
+    import inspect
+    import flydsl.expr as fx
+
+    if "tile_shape" not in inspect.signature(fx.rocdl.make_tdm_atom).parameters:
+        pytest.skip("FlyDSL runtime TDM geometry support is not available")
+    # FlyDSL captures globals on first compile and rejects subsequent drift.
+    # Each ownership configuration needs a fresh interpreter.
+    env = dict(
+        os.environ,
+        AITER_GROUPED_GEMM_AS_PROLOGUE=str(as_prologue),
+        AITER_TDM_B_TH="0",
+        AITER_TDM_NEXT_STAGE_PREFETCH="1",
+    )
+    code = """
+import sys
+from aiter.ops.flydsl import grouped_gemm_mxfp4
+from op_tests.flydsl_tests.test_flydsl_grouped_gemm import ActivationType, run_moe
+
+grouped_gemm_mxfp4._select_num_waves_per_tensor_tdm = lambda _: int(sys.argv[2])
+run_moe(
+    sys.argv[1], activation=ActivationType.Silu, tokens=65,
+    model_dim=1024, inter_dim=1024, check_aot_cache=False,
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, "a4w4", str(waves_per_tensor)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_grouped_a4w4_swiglu_matches_torch_ref():

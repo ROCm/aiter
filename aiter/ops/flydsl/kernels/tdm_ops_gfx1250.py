@@ -28,11 +28,25 @@ compute_warp_distribution = _tdm_ops.compute_warp_distribution
 __all__ = [
     "TDMDescriptor2D",
     "make_tensor_descriptor_2d",
+    "encode_tdm_layout_config",
     "tensor_load_2d",
     "tensor_wait",
     "update_tensor_descriptor_2d_addr64",
     "update_tensor_descriptor_2d_lds_addr",
 ]
+
+
+def encode_tdm_layout_config(pad_interval=0, pad_amount=0, *, early_timeout=False):
+    """Encode byte-based LDS padding and timeout for a runtime TDM atom field."""
+    config = int(early_timeout) << 21
+    if pad_interval and pad_amount:
+        if pad_interval % 4 or pad_amount % 4:
+            raise ValueError("TDM byte padding must be dword aligned")
+        interval, amount = compute_padding_encoding(pad_interval, pad_amount, 8)
+        if not 0 <= interval <= 7 or not 0 <= amount <= 127:
+            raise ValueError("TDM padding exceeds the hardware descriptor fields")
+        config |= (1 << 20) | (interval << 22) | (amount << 25)
+    return config
 
 
 def _fly_lds_base_index(raw: ir.Value) -> ir.Value:
