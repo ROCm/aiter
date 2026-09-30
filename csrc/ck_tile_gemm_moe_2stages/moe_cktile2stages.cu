@@ -243,7 +243,7 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       false>::dispatch(M, N, K, block_m);
             }
         }
-        else if(activation == static_cast<int>(ActivationType::Relu2) && !has_bias)
+        else if(activation == static_cast<int>(ActivationType::Relu2) && !has_bias && split_k == 1)
         {
             if(stage == 1)
             {
