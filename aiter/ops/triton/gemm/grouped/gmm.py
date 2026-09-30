@@ -16,7 +16,7 @@ import triton
 from torch import Tensor
 
 # AITER: GMM Triton kernels
-from aiter.ops.triton._triton_kernels.gmm import (
+from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     get_config,
     gmm_kernel,
     tgmm_non_persistent_kernel,
