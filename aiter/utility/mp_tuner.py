@@ -159,8 +159,9 @@ def _failed_group_results(
     return_status, a candidate the worker already measured keeps its real
     result, so one GPU fault costs the shape a single candidate rather than
     every timing taken before it; the typed statuses tell the caller the group
-    is incomplete. Only the first unmeasured candidate is reported as failed;
-    the ones behind it never ran and stay eligible for a resume.
+    is incomplete. Only the first unmeasured candidate is reported as failed
+    and checkpointed; the ones behind it never ran, come back as not_run, and
+    stay eligible for a resume.
 
     Without return_status a caller cannot tell a partial group from a complete
     one and would publish the fastest survivor of a search that never finished,
@@ -176,12 +177,21 @@ def _failed_group_results(
         if measured is not None:
             results.append(measured)
             continue
-        result = _format_worker_result(
-            info, float("inf"), 1.0, status, return_status, detail
-        )
-        results.append(result)
-        if not to_publish:
+        if to_publish:
+            result = _format_worker_result(
+                info,
+                float("inf"),
+                1.0,
+                "not_run",
+                return_status,
+                f"not reached: the group stopped at {to_publish[0][0]} ({status})",
+            )
+        else:
+            result = _format_worker_result(
+                info, float("inf"), 1.0, status, return_status, detail
+            )
             to_publish.append(result)
+        results.append(result)
     return results, to_publish
 
 
@@ -586,9 +596,30 @@ def mp_tuner(
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
         timeout: Timeout in seconds for each task group (None = no timeout)
+        verbose: Print per-task progress and pool restarts
+        return_status: Return (info, latency, error_ratio, status, detail)
+            instead of (info, latency, error_ratio), and keep the candidates a
+            faulted group had already measured
+        result_callback: Called in the parent with each candidate's result, in
+            the form return_status selects, as the result arrives. Candidates
+            that were not reached before a fault are not passed to it
 
     Returns:
-        List of (info, latency, error_ratio) tuples
+        One result per candidate, in task order. Without return_status, a list
+        of (info, latency, error_ratio) tuples; a failed candidate has an
+        infinite or -1 latency, and every candidate of a faulted group fails.
+        With return_status, a list of (info, latency, error_ratio, status,
+        detail) tuples, where status is one of:
+            ok: measured and within err_ratio
+            mismatch: measured, but the error ratio exceeds err_ratio
+            unsupported: the candidate rejected the shape or its arguments
+            crash: the candidate raised, faulted the GPU or killed its worker
+            timeout: the candidate or its group exceeded timeout
+            oom_runtime: the candidate ran out of memory
+            oom_preflight: the group ran out of memory outside a candidate's
+                run, for example while generating inputs
+            not_run: the group stopped at an earlier candidate's fault
+        and detail is a one-line reason, empty for ok.
     """
     gpu_num = torch.cuda.device_count()
     if gpu_num < 1:
@@ -775,8 +806,15 @@ def mp_tuner(
                         flush=True,
                     )
                     failed_tasks.append((k, "worker exited"))
+                    drain_progress()
                     dummy_results = []
-                    add_dummy_result(k, dummy_results)
+                    add_dummy_result(
+                        k,
+                        dummy_results,
+                        "crash",
+                        f"worker process {task_pids[k]} exited; "
+                        "likely a GPU memory fault",
+                    )
                     result_dict[k] = (
                         dummy_results if shape_grouped else [dummy_results[0]]
                     )
