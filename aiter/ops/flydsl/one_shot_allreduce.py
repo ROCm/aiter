@@ -50,7 +50,7 @@ from .kernels.quick_allreduce_fusions import (
     PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
 )
 from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
 
@@ -312,19 +312,19 @@ class OneShotAllReduce:
             raise ValueError("OneShotAllReduce requires non-overlapping input/output")
         return live_bytes
 
-    def _launch_eng(self, eng, spec, inp, out, stream, *, live_bytes: int) -> None:
+    def _launch_args(self, eng, spec, inp_ptr, out_ptr, stream, *, live_bytes):
         num_tiles = self._num_tiles(live_bytes, spec["tile_bytes"])
         grid_x = self._grid_x(num_tiles, spec["grid"])
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
         elif not isinstance(stream, Stream):
             stream = Stream(stream)
-        args = (
+        return (
             Int32(self.rank),
             Int64(live_bytes),
             Int32(num_tiles),
-            Int64(int(inp.data_ptr())),
-            Int64(int(out.data_ptr())),
+            Int64(inp_ptr),
+            Int64(out_ptr),
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             Int32(grid_x),
@@ -336,6 +336,16 @@ class OneShotAllReduce:
             Int64(0),
             Float32(0.0),
             stream,
+        )
+
+    def _launch_eng(self, eng, spec, inp, out, stream, *, live_bytes: int) -> None:
+        args = self._launch_args(
+            eng,
+            spec,
+            int(inp.data_ptr()),
+            int(out.data_ptr()),
+            stream,
+            live_bytes=live_bytes,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -354,34 +364,23 @@ class OneShotAllReduce:
         picked = {self._pick_cfg(n) for n in payload_probes(floors, lo, hi)}
         return [key for key in self._by_cfg if key in picked]
 
-    def compile_and_launch(
-        self, inp, out=None, stream=None, *, payload_range=None
-    ) -> None:
-        """Eager-JIT rung binaries and launch each of them once, for real,
-        against *inp*/*out*.
+    def preload(self, *, payload_range=None) -> None:
+        """JIT-compile rung binaries without launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the rungs ``allreduce`` would run
         for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every one.
         The ladder builds engines for the whole size range, while a dispatcher
         routes only its own window here, so the rest never run.
 
-        ``out`` ends up holding whichever rung ran last, and this is a real
-        collective: every rank must call it with the same shape and range. Used
-        by ``bench_comm_allreduce.py`` and the flydsl op tests to force a real
-        warm launch (and, for the tests, to exercise the launch path directly)
-        before timing or correctness checks begin.
-
-        ``CustomAllreduce`` also calls it once at init, via ``warm_fly_engines``.
-        Not for timing: it keeps each rung's JIT compile and module load off the
-        first real all-reduce, which may be inside a CUDA graph capture.
+        Local to this rank, not a collective. ``CustomAllreduce`` calls it once
+        at init, via ``preload_fly_engines``, to keep each rung's JIT compile off
+        the first real all-reduce, which may be inside a CUDA graph capture.
         """
-        if out is None:
-            out = torch.empty_like(inp)
-        live_bytes = self._check_payload(inp, out)
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
         for key in keys:
             eng, spec = self._by_cfg[key]
-            self._launch_eng(eng, spec, inp, out, stream, live_bytes=live_bytes)
+            args = self._launch_args(eng, spec, 0, 0, None, live_bytes=0)
+            _preload_compiled(eng.launch, *args)
 
     def variant(self, nbytes: int) -> str:
         """Identity of the binary an *nbytes* payload would run."""
@@ -753,6 +752,32 @@ class OneShotAllReduceRMSNorm:
                     )
         return hidden, live_bytes
 
+    def _launch_args(self, eng, spec, ptrs, eps, stream, *, hidden, live_bytes):
+        """Kernel arguments. *ptrs* is ``(inp, out, residual_in, residual_out,
+        weight)`` as raw addresses."""
+        inp_ptr, out_ptr, res_in_ptr, res_out_ptr, w_ptr = ptrs
+        num_tiles = live_bytes // (hidden * 2)
+        grid_x = max(1, min(num_tiles, spec["grid"]))
+        if stream is None:
+            stream = Stream(torch.cuda.current_stream(self._device_index))
+        elif not isinstance(stream, Stream):
+            stream = Stream(stream)
+        return (
+            Int32(self.rank),
+            Int64(live_bytes),
+            Int32(num_tiles),
+            Int64(inp_ptr),
+            Int64(out_ptr),
+            Int64(int(eng._gpu_peer_ptrs)),
+            Int64(int(eng._colors)),
+            Int32(grid_x),
+            Int64(res_in_ptr),
+            Int64(res_out_ptr),
+            Int64(w_ptr),
+            Float32(float(eps)),
+            stream,
+        )
+
     def _launch(
         self,
         inp,
@@ -767,26 +792,11 @@ class OneShotAllReduceRMSNorm:
         live_bytes,
     ):
         eng, spec = self._by_cfg[self._pick_cfg(hidden, live_bytes)]
-        num_tiles = int(inp.numel()) // hidden
-        grid_x = max(1, min(num_tiles, spec["grid"]))
-        if stream is None:
-            stream = Stream(torch.cuda.current_stream(self._device_index))
-        elif not isinstance(stream, Stream):
-            stream = Stream(stream)
-        args = (
-            Int32(self.rank),
-            Int64(live_bytes),
-            Int32(num_tiles),
-            Int64(int(inp.data_ptr())),
-            Int64(int(out.data_ptr())),
-            Int64(int(eng._gpu_peer_ptrs)),
-            Int64(int(eng._colors)),
-            Int32(grid_x),
-            Int64(int(residual_in.data_ptr())),
-            Int64(int(residual_out.data_ptr())),
-            Int64(int(weight.data_ptr())),
-            Float32(float(eps)),
-            stream,
+        ptrs = tuple(
+            int(t.data_ptr()) for t in (inp, out, residual_in, residual_out, weight)
+        )
+        args = self._launch_args(
+            eng, spec, ptrs, eps, stream, hidden=hidden, live_bytes=live_bytes
         )
         self._has_launched = True
         _run_compiled(eng.launch, *args)
@@ -828,45 +838,42 @@ class OneShotAllReduceRMSNorm:
         )
         return out, residual_out
 
-    def compile_and_launch(self, inp, residual_in, weight, eps=1e-6, stream=None):
-        """Eager-JIT every rung for this shape and run each once.
+    def cfgs_for(self, hidden: int, lo: int, hi: int) -> list[tuple]:
+        """``_by_cfg`` keys at hidden dim a payload of ``lo..hi`` bytes
+        (inclusive) can select, in build order. Builds the width if needed."""
+        hidden = int(hidden)
+        floors = [rung[0] for rung in self._ladder]
+        picked = {self._pick_cfg(hidden, n) for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
 
-        A real collective -- every rank must call it with the same shape. Used
-        by the bench and the op tests to force a warm launch before timing or
-        before a graph capture, where a first-call JIT would be fatal.
+    def preload(self, hidden: int, *, payload_range=None) -> None:
+        """Build hidden dim and JIT-compile its rung binaries without launching
+        any of them.
+
+        ``payload_range=(lo, hi)`` takes only the rungs ``allreduce_rmsnorm``
+        would run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes
+        every one. The build still covers the whole ladder: a width's engines
+        are built together.
+
+        A collective only when hidden dim is not built yet, since building
+        exchanges IPC handles, so every rank must call it with the same widths
+        in the same order. The compile itself is local. ``FlyDSLAllReduceRMSNorm``
+        calls it via ``preload_fly_engines`` to keep the JIT off the first real
+        call, which may be inside a HIP graph capture. The HIP module load
+        still happens on each binary's first launch.
         """
-        out = torch.empty_like(inp)
-        residual_out = torch.empty_like(residual_in)
-        hidden, live_bytes = self._check(inp, residual_in, weight, out, residual_out)
-        self._pick_cfg(hidden, live_bytes)  # force the engines for this hidden
-        for key, (eng, spec) in self._by_cfg.items():
-            if key[0] != hidden:
-                continue
-            num_tiles = int(inp.numel()) // hidden
-            grid_x = max(1, min(num_tiles, spec["grid"]))
-            st = (
-                Stream(torch.cuda.current_stream(self._device_index))
-                if stream is None
-                else (stream if isinstance(stream, Stream) else Stream(stream))
+        hidden = int(hidden)
+        self._build_hidden(hidden)
+        if payload_range is None:
+            keys = [key for key in self._by_cfg if key[0] == hidden]
+        else:
+            keys = self.cfgs_for(hidden, *payload_range)
+        for key in keys:
+            eng, spec = self._by_cfg[key]
+            args = self._launch_args(
+                eng, spec, (0,) * 5, 0.0, None, hidden=hidden, live_bytes=0
             )
-            self._has_launched = True
-            _run_compiled(
-                eng.launch,
-                Int32(self.rank),
-                Int64(live_bytes),
-                Int32(num_tiles),
-                Int64(int(inp.data_ptr())),
-                Int64(int(out.data_ptr())),
-                Int64(int(eng._gpu_peer_ptrs)),
-                Int64(int(eng._colors)),
-                Int32(grid_x),
-                Int64(int(residual_in.data_ptr())),
-                Int64(int(residual_out.data_ptr())),
-                Int64(int(weight.data_ptr())),
-                Float32(float(eps)),
-                st,
-            )
-        return out, residual_out
+            _preload_compiled(eng.launch, *args)
 
     def variant(self, hidden: int, nbytes: int) -> str:
         """``<jit symbol>/g<grid_cap>/x<grid_x>`` for this (hidden, payload)."""

@@ -505,10 +505,9 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         bad = []
         parts, residual, weight = _fused_inputs(m, hidden, args.tp, device)
         inp = parts[rank].contiguous()
-        # A real warm launch, so the timed/checked call below is never the one
-        # that JITs. Writes into scratch, not into the buffers checked after.
-        eng.compile_and_launch(inp, residual, weight, RMS_EPS)
-        torch.cuda.synchronize()
+        # Build and JIT this width up front, so the checked call below is
+        # never the one that compiles.
+        eng.preload(hidden)
 
         out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
         torch.cuda.synchronize()
@@ -542,7 +541,7 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         inp = parts[rank].contiguous()
         out = torch.empty_like(inp)
         res_out = torch.empty_like(inp)
-        eng.compile_and_launch(inp, residual, weight, RMS_EPS)
+        eng.preload(hidden)
         out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
         drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
         bad = 0
@@ -663,8 +662,7 @@ def _run_rank(
         max_bytes=1 << 30,
         **engine_kw,
     )
-    warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
-    eng.compile_and_launch(warm, torch.empty_like(warm))
+    eng.preload()
     production_cfgs = None if window is None else eng.cfgs_for(*window)
 
     rows = []

@@ -493,6 +493,29 @@ def pick_fused_family(nbytes: int, policy: FusedPolicy) -> str:
     return "ring"
 
 
+def fused_family_range(family: str, policy: FusedPolicy) -> tuple[int, int]:
+    """Payload bytes (inclusive) the fused dispatcher sends to *family*.
+
+    ``pick_fused_family`` clipped to ``min_bytes`` below and ``max_bytes``
+    above; an unbounded policy is capped at the 4 GiB buffer window every
+    FlyDSL schedule enforces.
+    """
+    top = 0xFFFFFFFF if policy.max_bytes is None else policy.max_bytes
+    if family == "oneshot":
+        lo, hi = 0, policy.oneshot_max
+    elif family == "mesh":
+        lo = policy.oneshot_max + 1
+        hi = top if policy.mesh_max is None else policy.mesh_max
+    elif family == "ring":
+        if policy.mesh_max is None:
+            # An unbounded mesh takes everything above the one-shot.
+            return 1, 0
+        lo, hi = max(policy.oneshot_max, policy.mesh_max) + 1, top
+    else:
+        raise ValueError(f"family must be 'oneshot', 'mesh' or 'ring', got {family!r}")
+    return max(lo, policy.min_bytes), min(hi, top)
+
+
 def fused_families_reachable(policy: FusedPolicy) -> tuple[str, ...]:
     """Fused families a *policy* can ever select, in size order."""
     out = []

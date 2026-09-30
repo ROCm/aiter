@@ -609,18 +609,7 @@ def _run_rank(
         min_bytes=0,
         **engine_kw,
     )
-    # compile_and_launch() launches every ST binary on this shape and all ranks
-    # must pass the same one, so keep the JIT buffer small at the widest hidden.
-    compile_inp = torch.empty(
-        (min(512, max(c[0] for c in cases)), max(c[1] for c in cases)),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    compile_out = torch.empty_like(compile_inp)
-    dist.barrier()
-    fly.compile_and_launch(compile_inp, compile_out)
-    dist.barrier()
-    del compile_inp, compile_out
+    fly.preload()
     production_cfgs = None
     if window is not None:
         production_cfgs = [
@@ -998,13 +987,9 @@ def _run_rank_fused(
             if solo and rank != 0:
                 inp.zero_()
 
-            # A real warm launch, so the checked call below is never the one
-            # that JITs. Writes into scratch, not into the buffers checked
-            # after.
-            dist.barrier()
-            eng.compile_and_launch(inp, residual, weight, RMS_EPS)
-            torch.cuda.synchronize()
-            dist.barrier()
+            # Build and JIT this width up front, so the checked call below is
+            # never the one that compiles.
+            eng.preload(hidden)
 
             out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
             torch.cuda.synchronize()

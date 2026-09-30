@@ -422,6 +422,37 @@ def test_fused_family_windows_partition_by_size():
     assert P.pick_fused_family(p.mesh_max + 1, p) == "ring"
 
 
+@pytest.mark.parametrize("mode", P.ACCURACY_MODES)
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_family_range_matches_the_picker(cell, mode):
+    """``fused_family_range`` is what ``prime`` preloads, so every payload the
+    dispatcher accepts must fall in exactly one reachable family's range, and
+    that family must be the one ``pick_fused_family`` sends it to.
+
+    A range that is too narrow leaves a binary to JIT inside a graph capture.
+    """
+    link, ws = cell
+    p = P.resolve_fused(link, ws, mode=mode)
+    reachable = P.fused_families_reachable(p)
+    ranges = {fam: P.fused_family_range(fam, p) for fam in ("oneshot", "mesh", "ring")}
+    top = 0xFFFFFFFF if p.max_bytes is None else p.max_bytes
+    edges = {p.min_bytes, p.oneshot_max, p.oneshot_max + 1, top}
+    if p.mesh_max is not None:
+        edges.update((p.mesh_max, p.mesh_max + 1))
+    edges.update(1 << k for k in range(4, 32))
+    for n in sorted(edges):
+        if not p.min_bytes <= n <= top:
+            continue
+        owners = [f for f, (lo, hi) in ranges.items() if lo <= n <= hi]
+        assert owners == [P.pick_fused_family(n, p)], (n, owners, ranges)
+        assert owners[0] in reachable, (n, owners, reachable)
+
+
+def test_fused_family_range_rejects_unknown_family():
+    with pytest.raises(ValueError):
+        P.fused_family_range("tree", P.resolve_fused("pcie", 4, mode="fast"))
+
+
 def test_fused_max_bytes_is_none_when_a_family_is_unbounded():
     """An open-ended family means no integer ceiling; exact mode has one."""
     assert P.resolve_fused("pcie", 4, mode="fast").max_bytes is None

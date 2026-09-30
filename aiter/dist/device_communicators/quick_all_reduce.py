@@ -13,7 +13,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
-from .flydsl_utils import all_ranks_agree, warm_fly_engines
+from .flydsl_utils import all_ranks_agree, preload_fly_engines
 
 logger = logging.getLogger(__name__)
 
@@ -281,16 +281,15 @@ class FlyDSLAllReduceRMSNorm:
         h_pad = eng.pads_hidden(int(hidden))
         return got if h_pad == int(hidden) else f"{got}/pad{h_pad}"
 
-    #: Rows in the probe :meth:`prime` launches. Small, but >1 so a partial
-    #: last tile is exercised the way a real decode step would be.
-    _PRIME_TOKENS: ClassVar[int] = 8
-
     def prime(self, hidden: int) -> bool:
-        """Build and JIT every reachable family at *hidden*. Collective.
+        """Build every reachable family at *hidden* and JIT the binaries its
+        payload window can select. Collective.
 
         Makes a width safe to use inside a HIP graph capture. Every rank must
         call it with the same hidden dim, in the same order -- the build exchanges
-        IPC handles. Idempotent; a width already primed costs one launch.
+        IPC handles. Launches nothing. Idempotent; a width already primed costs
+        only JIT-cache lookups. As on the plain path, the HIP module load is
+        left to each binary's first launch.
 
         Returns False when this width fuses in no family, which is a geometry
         fact (``supports_hidden``) and the same answer on every rank.
@@ -305,14 +304,14 @@ class FlyDSLAllReduceRMSNorm:
         ]
         if not usable:
             return False
-        probe = torch.zeros(
-            (self._PRIME_TOKENS, hidden), dtype=torch.bfloat16, device=self.device
+        preload_fly_engines(
+            (
+                (eng, fly_policy.fused_family_range(fam, self.policy))
+                for fam, eng in usable
+            ),
+            hidden,
         )
-        weight = torch.zeros(hidden, dtype=torch.bfloat16, device=self.device)
-        for fam, eng in usable:
-            eng.compile_and_launch(probe, probe.clone(), weight, 1e-6)
-            self._ready.add((fam, hidden))
-        del probe, weight
+        self._ready.update((fam, hidden) for fam, _eng in usable)
         return True
 
     def _capture_blocked(self, family: str, hidden: int) -> bool:
@@ -596,12 +595,9 @@ class QuickAllReduce:
 
         ok = True
         try:
-            warm_fly_engines(
-                (
-                    (engine, fly_policy.quant_family_range(family, policy))
-                    for family, engine in self._fly_engines.items()
-                ),
-                self.device,
+            preload_fly_engines(
+                (engine, fly_policy.quant_family_range(family, policy))
+                for family, engine in self._fly_engines.items()
             )
         except Exception:
             logger.warning(
@@ -767,7 +763,7 @@ class QuickAllReduce:
         # quick allreduce doesn't require a separate graph mode,
         # as QR uses static IPC buffer. The same holds for the FlyDSL
         # schedules, whose IPC inbox is likewise allocated once at init
-        # and whose served binaries are compiled at init (warm_fly_engines).
+        # and whose served binaries are compiled at init (preload_fly_engines).
         if out is None:
             out = torch.empty_like(inp)
         if self._should_fly(inp):

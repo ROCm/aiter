@@ -2639,14 +2639,11 @@ def _worker(
                     ),
                 ),
             )
-        # compile() JIT-compiles every super-tile engine without launching any
-        # of them (quick_allreduce.compile_only), so one call at any shape keeps every
-        # timed region below free of a first-call JIT stall.
-        warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
+        # preload() JIT-compiles every super-tile engine without launching any
+        # of them, so every timed region below is free of a first-call JIT
+        # stall. The module load on first launch lands in the untimed warmup.
         for cfg in wanted_cfgs:
-            dist.barrier(group=group)
-            fly[cfg].compile_and_launch(warm, torch.empty_like(warm))
-        del warm
+            fly[cfg].preload()
 
     fly1s = {}  # fly1s_cfg tuple -> OneShotAllReduce engine
     # Same rules as the FlyQuickAllReduce engines above: one per distinct config, each with
@@ -2682,11 +2679,8 @@ def _worker(
                 max_bytes=_fly1s_ceiling(tp_size),
                 **kw,
             )
-        warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
         for cfg in wanted_1s:
-            dist.barrier(group=group)
-            fly1s[cfg].compile_and_launch(warm, torch.empty_like(warm))
-        del warm
+            fly1s[cfg].preload()
 
     fly1s_rms = {}  # (atoms, grid_cap, fanout) -> OneShotAllReduceRMSNorm engine
     # One object per distinct config, each building a per-hidden IPC inbox on
@@ -2721,18 +2715,14 @@ def _worker(
                 pad=_bench_fly_pad_enabled(),
                 **kw,
             )
-        # Warm every (config, hidden) this sweep will touch, before any timing
-        # and well before any graph capture: a FlyDSL JIT compile inside a
-        # capture is fatal, and a lazily-built engine is a collective.
+        # Build and preload every (config, hidden) this sweep will touch, before
+        # any timing and well before any graph capture. Building a width is a
+        # collective, so every rank walks the same (hidden, config) order.
         for hidden in sorted({h for _, h in shapes}):
-            warm = torch.zeros((8, hidden), dtype=dtypes.bf16, device=device)
-            w = torch.zeros(hidden, dtype=dtypes.bf16, device=device)
             for cfg, eng in fly1s_rms.items():
                 if not eng.supports_hidden(hidden):
                     continue
-                dist.barrier(group=group)
-                eng.compile_and_launch(warm, warm.clone(), w, FUSION_EPS)
-            del warm, w
+                eng.preload(hidden)
 
     flyqr_rms = {}  # (algorithm, st, grid_cap, rs, ag) -> FlyQuickAllReduceRMSNorm
     # One object per distinct config, each building a per-hidden IPC inbox on
@@ -2769,18 +2759,13 @@ def _worker(
             )
             # Measure every size the sweep asks for, as the plain fly rows do.
             flyqr_rms[cfg].min_bytes = 0
-        # Warm every (config, hidden) this sweep will touch, before any timing
-        # and well before any graph capture: a FlyDSL JIT compile inside a
-        # capture is fatal, and a lazily-built engine is a collective.
+        # Build and preload every (config, hidden) this sweep will touch, in
+        # the same total order as above.
         for hidden in sorted({h for _, h in shapes}):
-            warm = torch.zeros((8, hidden), dtype=dtypes.bf16, device=device)
-            w = torch.zeros(hidden, dtype=dtypes.bf16, device=device)
             for cfg, eng in flyqr_rms.items():
                 if not eng.supports_hidden(hidden):
                     continue
-                dist.barrier(group=group)
-                eng.compile_and_launch(warm, warm.clone(), w, FUSION_EPS)
-            del warm, w
+                eng.preload(hidden)
 
     # Production dispatch, built last so its three internal engines exchange
     # handles after every pinned one -- the exchange is a collective and the
