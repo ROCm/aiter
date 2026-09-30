@@ -93,9 +93,7 @@ def split_cos_sin_tables(cos_sin, rotary_cols):
     rotary_cols = layout_rotary_table.shape[1].unpack()
     table_iter = fx.get_iter(cos_sin)
     cos_t = fx.Tensor(fx.make_view(table_iter, layout_rotary_table))
-    sin_t = fx.Tensor(
-        fx.make_view(table_iter + rotary_cols, layout_rotary_table)
-    )
+    sin_t = fx.Tensor(fx.make_view(table_iter + rotary_cols, layout_rotary_table))
     return cos_t, sin_t
 
 
@@ -204,24 +202,18 @@ def _build_q_kernel(
     ):
         fm_fast = fx.FastMathFlags.fast
         cos_t, sin_t = split_cos_sin_tables(cos_sin, D // 2)
-        layout_rms_tv = fx.make_ordered_layout(
-            (RMS_GROUP, D // RMS_GROUP), (1, 0)
-        )
+        layout_rms_tv = fx.make_ordered_layout((RMS_GROUP, D // RMS_GROUP), (1, 0))
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
         rms_values_per_lane = fx.size(layout_rms_values.shape).unpack()
         # Q lanes own contiguous RMS vectors, but their NEOX outputs are
         # ordered by (lane-within-half, lane-half, pair, rotary-half).
-        layout_q_lane = fx.make_ordered_layout(
-            (RMS_GROUP // 2, 2), (0, 1)
-        )
+        layout_q_lane = fx.make_ordered_layout((RMS_GROUP // 2, 2), (0, 1))
         partner_xor = layout_q_lane.shape[0].unpack()
         layout_q_pair_tv = fx.make_ordered_layout(
             ((partner_xor, 2), (rms_values_per_lane // 2, 2)),
             ((2, 1), (0, 3)),
         )
-        layout_q_pair_cols = fx.slice(
-            layout_q_pair_tv, (None, (None, 0))
-        )
+        layout_q_pair_cols = fx.slice(layout_q_pair_tv, (None, (None, 0)))
         pairs_per_lane = layout_q_pair_cols.shape[1].unpack()
         # [wave, row-within-wave, RMS lane] maps a linear workgroup thread
         # directly to all three of its logical roles.
@@ -261,17 +253,13 @@ def _build_q_kernel(
         q_lane_coord = fx.idx2crd(rl, layout_q_lane)
         lane_value_coord = (q_lane_coord, None)
         w_lane_pairs = fx.slice(weight_pair_view, lane_value_coord)
-        q_out_lane_pairs = fx.slice(
-            q_out_pair_view, (None, None, lane_value_coord)
-        )
+        q_out_lane_pairs = fx.slice(q_out_pair_view, (None, None, lane_value_coord))
 
         # Head-independent work, hoisted out of the head loop: every head of
         # this token shares the same mrope cos/sin gather and norm weights.
         cos_vs, sin_vs, w0s, w1s = [], [], [], []
         for p in range_constexpr(pairs_per_lane):
-            col = fx.Int32(
-                fx.crd2idx((q_lane_coord, p), layout_q_pair_cols).unpack()
-            )
+            col = fx.Int32(fx.crd2idx((q_lane_coord, p), layout_q_pair_cols).unpack())
             cos_v, sin_v = mrope_cos_sin(
                 col,
                 tok,
@@ -327,9 +315,7 @@ def _build_q_kernel(
             head_in_block = fx.crd2idx(
                 (i, wid, row_in_wave), layout_head_iter_wave_row
             ).unpack()
-            head = bid_head * HEADS_PER_BLOCK + fx.Int32(
-                head_in_block
-            )
+            head = bid_head * HEADS_PER_BLOCK + fx.Int32(head_in_block)
             if const_expr(NEEDS_HEAD_GUARD):
                 if head < H_Q:
                     compute_head(head)
@@ -456,9 +442,7 @@ def _build_kv_kernel(
             (KV_THREADS // compute_group_size, compute_group_size),
             stride=(compute_group_size, 1),
         )
-        compute_groups_per_block = (
-            layout_thread_compute_pair_lane.shape[0].unpack()
-        )
+        compute_groups_per_block = layout_thread_compute_pair_lane.shape[0].unpack()
         # Explicit thread-value maps for each linear cooperative walk. Keeping
         # the thread mode unit-stride makes ownership visible as
         # item = thread + thread_count * iteration.
@@ -474,9 +458,7 @@ def _build_kv_kernel(
         )
         # RMSNorm uses a second ownership map: 32 lanes own contiguous
         # D/32-element vectors.
-        layout_rms_tv = fx.make_ordered_layout(
-            (RMS_GROUP, D // RMS_GROUP), (1, 0)
-        )
+        layout_rms_tv = fx.make_ordered_layout((RMS_GROUP, D // RMS_GROUP), (1, 0))
         layout_rms_values = fx.slice(layout_rms_tv, (0, None))
         rms_values_per_lane = fx.size(layout_rms_values.shape).unpack()
         layout_pair_cols = fx.slice(layout_pair_tv, (None, (None, 0)))
@@ -487,12 +469,8 @@ def _build_kv_kernel(
         # Per-head cache layouts are the source of truth for the nested shape
         # and physical strides: x is fastest, followed by token/D, then the
         # outer D/token tile.
-        layout_k_head = fx.make_ordered_layout(
-            ((D // x, x), block_size), ((2, 0), 1)
-        )
-        layout_v_head = fx.make_ordered_layout(
-            ((block_size // x, x), D), ((2, 0), 1)
-        )
+        layout_k_head = fx.make_ordered_layout(((D // x, x), block_size), ((2, 0), 1))
+        layout_v_head = fx.make_ordered_layout(((block_size // x, x), D), ((2, 0), 1))
         # Keep each physical x-run nested inside its logical D/token mode and
         # encode the possibly-strided physical block mode in the same view.
         # K is indexed as [block, head, d, token], and V as
@@ -562,9 +540,7 @@ def _build_kv_kernel(
             )
             mapping_valid = valid_base.select(fx.Int32(1), fx.Int32(0))
             if full_page:
-                for check_it in range_constexpr(
-                    layout_page_check_tv.shape[1].unpack()
-                ):
+                for check_it in range_constexpr(layout_page_check_tv.shape[1].unpack()):
                     token_local = fx.crd2idx(
                         (lane, check_it), layout_page_check_tv
                     ).unpack()
@@ -610,12 +586,8 @@ def _build_kv_kernel(
         v_lds = lds.v_lds
         k_lds_view = k_lds.view(layout_stage)
         v_lds_view = v_lds.view(layout_stage)
-        k_cache_view = fx.Tensor(
-            fx.make_view(fx.get_iter(k_cache), layout_k_cache)
-        )
-        v_cache_view = fx.Tensor(
-            fx.make_view(fx.get_iter(v_cache), layout_v_cache)
-        )
+        k_cache_view = fx.Tensor(fx.make_view(fx.get_iter(k_cache), layout_k_cache))
+        v_cache_view = fx.Tensor(fx.make_view(fx.get_iter(v_cache), layout_v_cache))
         mapping_ok = lds.mapping_ok
 
         tok0 = (blk + page_block_offset) * block_size
@@ -625,9 +597,7 @@ def _build_kv_kernel(
         coord_wl = fx.idx2crd(t, layout_thread_wave_lane)
         wid = fx.Int32(fx.get_(coord_wl, 0).unpack())
         lane = fx.Int32(fx.get_(coord_wl, 1).unpack())
-        coord_compute_pair_lane = fx.idx2crd(
-            t, layout_thread_compute_pair_lane
-        )
+        coord_compute_pair_lane = fx.idx2crd(t, layout_thread_compute_pair_lane)
         compute_group = fx.Int32(fx.get_(coord_compute_pair_lane, 0).unpack())
         pair_lane = fx.Int32(fx.get_(coord_compute_pair_lane, 1).unpack())
 
@@ -647,9 +617,7 @@ def _build_kv_kernel(
         v_lds_lane_pairs = fx.slice(v_lds_pair_view, (None, lane_coord))
         pair_cols, w0s, w1s = [], [], []
         for p in range_constexpr(pairs_per_lane):
-            col = fx.Int32(
-                fx.crd2idx((pair_lane, p), layout_pair_cols).unpack()
-            )
+            col = fx.Int32(fx.crd2idx((pair_lane, p), layout_pair_cols).unpack())
             w0 = fx.Float32(w_lane_pairs[p, 0])
             w1 = fx.Float32(w_lane_pairs[p, 1])
             if const_expr(gemma_norm):
@@ -763,15 +731,9 @@ def _build_kv_kernel(
             # shuffle cache is [D/x, token, x]. This lets the tiled copy own
             # the complete page without per-run slicing or coordinate walks.
             k_copy_shape = ((D // x, block_size), x)
-            k_src_layout = fx.make_layout(
-                k_copy_shape, stride=((x, D), 1)
-            )
-            k_dst_layout = fx.make_layout(
-                k_copy_shape, stride=((block_size * x, x), 1)
-            )
-            k_src = fx.Tensor(
-                fx.make_view(fx.get_iter(k_lds_view), k_src_layout)
-            )
+            k_src_layout = fx.make_layout(k_copy_shape, stride=((x, D), 1))
+            k_dst_layout = fx.make_layout(k_copy_shape, stride=((block_size * x, x), 1))
+            k_src = fx.Tensor(fx.make_view(fx.get_iter(k_lds_view), k_src_layout))
             k_dst_base = (
                 fx.get_iter(k_cache_view)
                 + block_id * k_cache_block_stride
@@ -787,14 +749,10 @@ def _build_kv_kernel(
             k_value_layout = fx.make_ordered_layout(
                 ((k_value_chunks, 1), x), ((1, 2), 0)
             )
-            k_tile, k_tv = fx.make_layout_tv(
-                k_thread_layout, k_value_layout
-            )
+            k_tile, k_tv = fx.make_layout_tv(k_thread_layout, k_value_layout)
             k_copy_threads = k_thread_chunks * block_size
             if t < k_copy_threads:
-                k_thr = fx.make_tiled_copy(
-                    copy_128b, k_tv, k_tile
-                ).get_slice(t)
+                k_thr = fx.make_tiled_copy(copy_128b, k_tv, k_tile).get_slice(t)
                 part_k_src = k_thr.partition_S(k_src)
                 part_k_dst = k_thr.partition_D(k_dst)
                 frag_k = fx.make_fragment_like(part_k_src)
@@ -805,15 +763,9 @@ def _build_kv_kernel(
             # is strided by D, so scalar copies gather into a fragment before
             # the destination tiled copy emits one contiguous 16-byte store.
             v_copy_shape = ((block_size // x, D), x)
-            v_src_layout = fx.make_layout(
-                v_copy_shape, stride=((x * D, 1), D)
-            )
-            v_dst_layout = fx.make_layout(
-                v_copy_shape, stride=((D * x, x), 1)
-            )
-            v_src = fx.Tensor(
-                fx.make_view(fx.get_iter(v_lds_view), v_src_layout)
-            )
+            v_src_layout = fx.make_layout(v_copy_shape, stride=((x * D, 1), D))
+            v_dst_layout = fx.make_layout(v_copy_shape, stride=((D * x, x), 1))
+            v_src = fx.Tensor(fx.make_view(fx.get_iter(v_lds_view), v_src_layout))
             v_dst_base = (
                 fx.get_iter(v_cache_view)
                 + block_id * v_cache_block_stride
@@ -829,17 +781,11 @@ def _build_kv_kernel(
             v_value_layout = fx.make_ordered_layout(
                 ((v_value_tiles, 1), x), ((1, 2), 0)
             )
-            v_tile, v_tv = fx.make_layout_tv(
-                v_thread_layout, v_value_layout
-            )
+            v_tile, v_tv = fx.make_layout_tv(v_thread_layout, v_value_layout)
             v_copy_threads = v_thread_tiles * D
             if t < v_copy_threads:
-                v_load_thr = fx.make_tiled_copy(
-                    copy_elem, v_tv, v_tile
-                ).get_slice(t)
-                v_store_thr = fx.make_tiled_copy(
-                    copy_128b, v_tv, v_tile
-                ).get_slice(t)
+                v_load_thr = fx.make_tiled_copy(copy_elem, v_tv, v_tile).get_slice(t)
+                v_store_thr = fx.make_tiled_copy(copy_128b, v_tv, v_tile).get_slice(t)
                 part_v_src = v_load_thr.partition_S(v_src)
                 part_v_dst = v_store_thr.partition_D(v_dst)
                 frag_v = fx.make_fragment_like(part_v_src)
@@ -863,12 +809,12 @@ def _build_kv_kernel(
                             block_off,
                             fx.make_ordered_layout(layout_v_head.shape[0], (1, 0)),
                         )
-                        k_cache_view[
-                            block_id, head, d_coord, block_off
-                        ] = k_lds_view[token_local, d]
-                        v_cache_view[
-                            block_id, head, token_coord, d
-                        ] = v_lds_view[token_local, d]
+                        k_cache_view[block_id, head, d_coord, block_off] = k_lds_view[
+                            token_local, d
+                        ]
+                        v_cache_view[block_id, head, token_coord, d] = v_lds_view[
+                            token_local, d
+                        ]
 
     @flyc.jit
     def launch(
@@ -1100,8 +1046,14 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"sum(mrope_section_)={sum(mrope_section_)} must equal "
             f"head_size//2={head_size // 2}"
         )
-    if (block_size % x != 0) or (block_size <= 0) or (block_size & (block_size - 1) != 0):
-        raise ValueError(f"block_size ({block_size}) must be a multiple of x ({x}), and a power of two.")
+    if (
+        (block_size % x != 0)
+        or (block_size <= 0)
+        or (block_size & (block_size - 1) != 0)
+    ):
+        raise ValueError(
+            f"block_size ({block_size}) must be a multiple of x ({x}), and a power of two."
+        )
     if (head_size * block_size) % 16 != 0:
         raise ValueError(
             f"head_size*block_size ({head_size * block_size}) must be a "
