@@ -113,6 +113,29 @@ def mhc_pre_big_fuse_rmsnorm(
 ) -> None: ...
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_pre_big_fuse_rmsnorm_quant(
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    out: Tensor,
+    quant_out: Tensor,
+    quant_scale: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    residual: Tensor,
+    norm_weight: Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    res_preshuffle: int = 0,
+) -> None: ...
+
+
 # Pre-shuffled residual layout selected independently with res_preshuffle=1
 # (kernel-side tile width: mhc_res_ks).
 #   resS[k // KS][head][row][k % KS]  <-  res[row][head][k]
@@ -702,6 +725,101 @@ def mhc_pre(
         )
 
     return post_mix, comb_mix, layer_input
+
+
+def mhc_pre_quant_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
+    return (
+        torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.fp8, device=device),
+        torch.empty(m, 1, dtype=dtypes.fp32, device=device),
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_quant_fake)
+def mhc_pre_quant(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m, hc_mult, hidden_size = residual.shape
+    hc_mult3 = fn.size(0)
+    assert m in (8192, 16384) and hc_mult == 4 and hc_mult3 == 24
+    selected_splitk, selected_tile_k = get_mhc_pre_splitk(
+        m, hc_mult * hidden_size
+    )
+    device = residual.device
+    out_pad = torch.empty(
+        selected_splitk,
+        m,
+        (hc_mult3 + 31) // 32 * 32,
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    out = out_pad[:, :, :hc_mult3]
+    sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
+    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k)
+
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    quant_out = torch.empty(m, hidden_size, dtype=dtypes.fp8, device=device)
+    quant_scale = torch.empty(m, 1, dtype=dtypes.fp32, device=device)
+    mhc_pre_big_fuse_rmsnorm_quant(
+        post_mix,
+        comb_mix,
+        layer_input,
+        quant_out,
+        quant_scale,
+        out,
+        sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        norm_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return post_mix, comb_mix, layer_input, quant_out, quant_scale
 
 
 @compile_ops("module_mhc", fc_name="mhc_post", develop=True)
