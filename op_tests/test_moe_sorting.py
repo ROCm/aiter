@@ -245,7 +245,7 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
     return errs
 
 
-def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
+def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
     """Cover auxiliary outputs on one-shot and newly multi-phase auto routes."""
     for token, E, topk in ((7, 32, 5), (8, 256, 8), (1, 385, 7)):
         topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
@@ -290,6 +290,23 @@ def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
             assert sorted_weights.numel() == expected_capacity
             assert aux_m_indices.numel() == expected_capacity
             assert aux_reverse_sorted.numel() == topk_ids.numel()
+            num_tokens_post_pad = out[3][0].item()
+            assert torch.equal(
+                aux_m_indices[:num_tokens_post_pad],
+                sorted_ids[:num_tokens_post_pad] & 0x00FFFFFF,
+            )
+            topk_slots = torch.arange(
+                topk, dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            expected_sorted_ids = (
+                topk_slots.unsqueeze(0) << 24
+                | torch.arange(
+                    token, dtype=topk_ids.dtype, device=topk_ids.device
+                ).unsqueeze(1)
+            ).flatten()
+            assert torch.equal(
+                sorted_ids[aux_reverse_sorted.long()], expected_sorted_ids
+            )
 
 
 def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
@@ -313,12 +330,9 @@ def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
             dispatch_policy=0,
             return_local_topk_ids=True,
         )
-        checkAllclose(
-            topk_ids,
-            local_topk_ids,
-            atol=0,
-            msg=f"local_topk_ids mismatch at M={token}, E={E}",
-        )
+        assert torch.equal(
+            topk_ids, local_topk_ids
+        ), f"local_topk_ids mismatch at M={token}, E={E}"
 
 
 def _build_moe_sorting_inputs(
@@ -897,7 +911,7 @@ def main():
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
     for dtype in args.dtype:
-        test_moe_sorting_opus_aux_capacity(dtype, args.model_dim)
+        test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
         df = []
         for (
