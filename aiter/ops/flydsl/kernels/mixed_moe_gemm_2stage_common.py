@@ -1535,8 +1535,7 @@ def compile_mixed_moe_gemm1_common(
                     if const_expr(heterogeneous_b and use_async_copy):
                         barrier(vmcnt=0)
                     else:
-                        # Partial VMEM waits can leave LDS-DMA loads crossing the barrier.
-                        rocdl.s_waitcnt(0)
+                        rocdl.s_waitcnt(body_vmcnt_before_barrier)
                         barrier()
                     rocdl.sched_barrier(0)
 
@@ -1545,8 +1544,6 @@ def compile_mixed_moe_gemm1_common(
                     )
                     if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
                         prefetch_x_to_lds(abs_k_dma, lds_write)
-                        # Keep scale loads after the LDS-DMA group.
-                        rocdl.sched_barrier(0)
                     if const_expr(not use_async_copy):
                         x_regs = load_x_tile(abs_k_dma)
 

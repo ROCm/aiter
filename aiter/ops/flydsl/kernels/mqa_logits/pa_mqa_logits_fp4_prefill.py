@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from functools import cache
+from functools import lru_cache
 from typing import NamedTuple
 
 import flydsl.compiler as flyc
@@ -826,7 +826,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 # ============================================================================
 
 
-@cache
+@lru_cache(maxsize=32)
 def compile_pa_mqa_logits_fp4_prefill(
     *,
     block_k: int = 256,
