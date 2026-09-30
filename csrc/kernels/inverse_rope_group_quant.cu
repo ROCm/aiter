@@ -58,16 +58,25 @@
 
 namespace aiter {
 
+// get_gpu_arch() re-queries the driver on every call (hipGetDeviceCount plus
+// hipGetDeviceProperties), which is real host time beside a 10 us kernel. The
+// device cannot change under a process, so resolve it once.
+static inline const std::string& cached_gpu_arch()
+{
+    static const std::string arch = get_gpu_arch();
+    return arch;
+}
+
 // Runtime mirror of the layout gates above: the device image only carries the
 // layout its family consumes, so the host has to refuse the other one here
 // rather than let the launch fail with a bare "invalid device function".
 static inline bool is_cdna_arch()
 {
-    return get_gpu_arch().rfind("gfx9", 0) == 0;
+    return cached_gpu_arch().rfind("gfx9", 0) == 0;
 }
 
 // The tensor engine the payload staging below rides on is gfx1250-only.
-static inline bool has_tdm_arch() { return get_gpu_arch() == "gfx1250"; }
+static inline bool has_tdm_arch() { return cached_gpu_arch() == "gfx1250"; }
 
 static constexpr float kAbsmaxFloor = 1e-8f;
 
@@ -443,11 +452,23 @@ __global__ void inverse_rope_group_quant_kernel(
     // bytes for four adjacent k are four adjacent bytes and splitting a quad
     // would hand one 4-byte run to two different waves.
     constexpr int kRopeFirstGroup = ROPE_START / GROUP_SIZE;
-    // At four groups per head the half-cut misfiles group 2 under rope;
-    // cutting at kRopeFirstGroup is exact (3 nope + 1 rope) and lifts the
-    // nope share from 1/2 to 3/4. At eight the odd run length scatters
-    // the wave's address footprint, costing more than it saves.
-    // Wide row/128 uses equal half-head runs for regular TDM tiles.
+    // At four groups per head the half-cut is not merely coarse, it is wrong:
+    // rope lives only in group 3, so cutting at 2 files the pure-nope group 2
+    // under rope, and since the native path is gated on the pass's segment that
+    // group pays the f32 widening for a rotation it never does. Cutting at
+    // kRopeFirstGroup is exact there -- 3 nope + 1 rope, nothing misfiled --
+    // and takes the nope share of passes from 1/2 to 3/4. Worth 5.3% on
+    // row/GS=128 at s=16384 (263.5 -> 250.2 us).
+    //
+    // Only at four. The same correction at eight (GS=64, cut 4 -> 7) costs
+    // 11.7% -- a run of seven does not divide the eight slots a wave holds, so
+    // every wave straddles a head and its per-pass address footprint scatters,
+    // which is the cost the half-cut was there to avoid. At four the run is
+    // three against four slots and scatters too, but the extra quarter of
+    // passes reaching the native path more than pays for it.
+    // Wide row/128 uses equal half-head runs: regular TDM tiles and a
+    // native-quantization pass for the first half. The host enables this
+    // order only for streaming launches; narrow row/128 retains its 3+1 cut.
     constexpr bool kWideRow128 = SCALE_LAYOUT == kScaleRowMajor &&
                                 GROUP_SIZE == 128 && THREAD_DATA_SIZE == 32;
     constexpr int kNopePerHead =
@@ -599,10 +620,19 @@ __global__ void inverse_rope_group_quant_kernel(
     vec_i in_vec[K_PER_THREAD];
 
 #if defined(__gfx1250__)
-    // Prefetch each pass as one TDM tile into LDS.
-    //   untiered   dim0 = slots*GS,        dim1 = 1
-    //   run 4      dim0 = 4*GS,            dim1 = slots/4
-    //   run 8      dim0 = nopePerHead*GS,  dim1 = slots/nopePerHead
+    // Prefetch each pass as one TDM tile into LDS. Every access order here is a
+    // regular 2D tile, tiering included -- for a wave's slot j the low part
+    // walks a contiguous run of groups and the high part steps whole heads:
+    //
+    //   untiered   group = slot_base + j             one run, dim1 = 1
+    //   run 4      group = (j/4)*GPH + hi*4 + (j%4)  dim0 = 4 groups
+    //   run 8      group = (j/8)*GPH + seg + (j%8)   dim0 = 8 groups
+    //
+    // So dim0 = run*GROUP_SIZE, dim1 = slots/run, dim0 stride = one head, and
+    // the tier only moves the origin.
+    //
+    // Clamped so the divisions stay constant-evaluable where a group is wider
+    // than a wave; kTdmOk rejects that case.
     constexpr int kSlotsRaw = static_cast<int>(WARP_SIZE) / THREADS_PER_GROUP;
     constexpr int kSlotsPerWave = kSlotsRaw > 0 ? kSlotsRaw : 1;
     // Groups in one contiguous run. Untiered a wave's whole slot span is one.
@@ -621,9 +651,15 @@ __global__ void inverse_rope_group_quant_kernel(
         kSlotsRaw >= 1 && kTdmRunRaw >= 1 &&
         kSlotsPerWave % kTdmRun == 0 && kTdmSegUniform &&
         kTileD0 >= 1 && kTileD0 <= 65535 && kTileD1 >= 1 && kTileD1 <= 65535;
+    // Declared at function scope: the per-pass read in the main loop below
+    // needs the same base.
     extern __shared__ char irgq_lds_raw[];
-    // tid is threadIdx-derived, so LLVM marks it divergent; asserting
-    // uniformity here avoids redundant readfirstlane on every descriptor field.
+    // Uniform by construction -- a wave is WARP_SIZE consecutive tid -- but tid
+    // is threadIdx-derived, so LLVM's divergence analysis calls it divergent and
+    // that spreads to org1, wave_slot and the LDS offset below. opus then has to
+    // insert a real readfirstlane per descriptor field (17 of them at s=16384),
+    // each preceded by a v_mov to get the already-scalar value into a VGPR.
+    // Asserting uniformity once here lets those fold to nothing.
 #if defined(__HIP_DEVICE_COMPILE__)
     const int tdm_wave =
         __builtin_amdgcn_readfirstlane(tid / static_cast<int>(WARP_SIZE));
@@ -637,7 +673,7 @@ __global__ void inverse_rope_group_quant_kernel(
         constexpr int kWaveTileElems = kSlotsPerWave * GROUP_SIZE;
 
         // Row in the pointer: the window addresses within one row, so the
-        // 2 GiB descriptor limit that ROW_BASED guards against cannot bite.
+        // 2 GiB descriptor limit ROW_BASED exists for cannot bite.
         const scalar_t* row_ptr = o + row_elem_base;
         const opus::u32_t lds_base =
             static_cast<opus::u32_t>(
@@ -820,9 +856,20 @@ __global__ void inverse_rope_group_quant_kernel(
                          static_cast<int64_t>(g) * scale_stride_g;
     }
 
-    // Every lane stores the scale byte (all lanes agree on address and value).
-    // Duplicate stores are cheaper than an exec mask: the mask's WAR hazard
-    // forces s_wait_xcnt drains that dominate the kernel's xcnt stall.
+    // One byte per group, from consecutive k_slots: row-major scale lands as
+    // one contiguous run per wave.
+    //
+    // Every lane of a group stores it, rather than lane 0 under an exec mask.
+    // k_group is built from k_slot and byte comes out of
+    // reduce_amax_across_group, so a group's lanes already agree on both the
+    // address and the value -- the mask only suppressed writes that were
+    // duplicates. It did not pay for itself: wrapping the store in
+    // s_and_saveexec / s_or exec_lo makes EXEC a WAR hazard against the store
+    // still in flight, so the compiler drains the address queue with
+    // s_wait_xcnt 0x0 before it can restore the mask. That drain is four of the
+    // ten xcnt sites in this kernel and ~40% of its xcnt stall in the s = 16384
+    // ATT trace. The duplicate stores land on the byte the group already owns,
+    // so they cost requests but no extra cache lines.
     auto store_scale = [&](int k_group, uint8_t byte)
     {
         if constexpr(SCALE_LAYOUT == kScaleMfmaTile)
@@ -902,7 +949,11 @@ __global__ void inverse_rope_group_quant_kernel(
                 (tdm_wave * K_PER_THREAD + k) * kWaveTileElems +
                 (local_slot / kTdmRun) * kTileD0 +
                 (local_slot % kTdmRun) * GROUP_SIZE + group_elem_base;
-            // Wait only for pass k; later tiles stay in flight.
+            // Staged, so passes k+1.. stay in flight across this pass's
+            // amax -> scale -> store chain; waiting on 0 serialises every tile
+            // behind the first consumer. Dispatched because the count is a
+            // template argument and k is an induction variable; the loop is
+            // unrolled, so each arm folds to one constant wait.
             switch(K_PER_THREAD - 1 - k)
             {
             case 3:  opus::s_wait_tensorcnt<3>(); break;
@@ -966,9 +1017,20 @@ __global__ void inverse_rope_group_quant_kernel(
         // 16-byte access that scalar_t's own alignment would leave undefined.
         __align__(alignof(vec_c)) scalar_t cbuf[NCOS];
         __align__(alignof(vec_c)) scalar_t sbuf[NCOS];
-        // Loaded unguarded off a clamped row: the exec mask the guard needed
-        // caused WAR-hazard xcnt drains. Lanes below the tail read row 0 and
-        // discard it (same cache line, L1 hit).
+        // Issued above the conversion below rather than beside the arithmetic
+        // that consumes it: the payload loads are all issued up in the prologue,
+        // so consuming in_vec first forces a wait, and a cos/sin load issued
+        // after that wait overlaps nothing. Worth -0.8% at S = 16384.
+        //
+        // Loaded unguarded off a clamped row rather than under `if(local0 >= 0)`.
+        // local0 carries the lane term, so that test was an exec mask around two
+        // global_loads, and both the `v_cmpx` that enters it and the `s_or
+        // exec_lo` that leaves it are WAR hazards against the loads still in
+        // flight -- the compiler drains the address queue with `s_wait_xcnt 0x0`
+        // at each. Three of the ten xcnt sites in this kernel were this one
+        // branch. A lane below the tail now reads row 0 and discards it; the row
+        // is the same cache line the rotating lanes are already pulling, so the
+        // read is an L1 hit and no wider than the mask it replaces.
         const int crow = (local0 >= 0 ? local0 : 0) >> 1;
 #pragma unroll
         for(int c = 0; c < NCOS / CCHUNK; ++c)
