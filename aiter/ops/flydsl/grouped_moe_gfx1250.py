@@ -579,6 +579,7 @@ def _grouped_a8w4_tdm_moe(
     cluster_m2=-1,
     cluster_n2=None,
     waves_per_tensor_tdm=-1,
+    waves_per_tensor_tdm2=None,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
@@ -618,6 +619,8 @@ def _grouped_a8w4_tdm_moe(
         tile_k2 = tile_k
     if num_buffers2 is None:
         num_buffers2 = num_buffers
+    if waves_per_tensor_tdm2 is None:
+        waves_per_tensor_tdm2 = waves_per_tensor_tdm
     if m_warp2 is None:
         m_warp2 = m_warp
     if n_warp2 is None:
@@ -1132,7 +1135,7 @@ def _grouped_a8w4_tdm_moe(
         num_buffers=num_buffers2,
         cluster_m=cluster_m2,
         cluster_n=cluster_n2,
-        waves_per_tensor_tdm=waves_per_tensor_tdm,
+        waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
@@ -1282,7 +1285,7 @@ def _grouped_a8w4_tdm_moe(
                     num_buffers=num_buffers2,
                     cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
-                    waves_per_tensor_tdm=waves_per_tensor_tdm,
+                    waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
@@ -1550,6 +1553,10 @@ def grouped_gemm_gfx1250_a8w4(
             )
             _tdm_kw["waves_per_tensor_tdm"] = _as_int(
                 cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["waves_per_tensor_tdm2"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm2"),
+                _tdm_kw["waves_per_tensor_tdm"],
             )
             _tdm_kw["next_stage_prefetch"] = _as_int(
                 cfg_row.get("next_stage_prefetch"), 0
