@@ -1414,12 +1414,22 @@ class FmoeTuner(TunerCommon):
         kernel_name="",
         topk=2,
         dtype=dtypes.bf16,
+        flat=False,
     ):
-        moe_buf = torch.zeros(
-            (a1.shape[0], a1.shape[1]),
-            dtype=dtype,
-            device="cuda",
-        )
+        if flat:
+            # Match _moe_prepare_unsorted_input's output storage contract:
+            # the visible rows are followed by eight coordination bytes.
+            # Keep the tuner's zero initialization and routing inputs intact.
+            shape = (a1.shape[0], a1.shape[1])
+            row_bytes = shape[0] * shape[1] * torch.empty(0, dtype=dtype).element_size()
+            backing = torch.zeros(row_bytes + 8, dtype=torch.uint8, device=a1.device)
+            moe_buf = backing[:row_bytes].view(dtype).view(shape)
+        else:
+            moe_buf = torch.zeros(
+                (a1.shape[0], a1.shape[1]),
+                dtype=dtype,
+                device="cuda",
+            )
         aiter.fmoe_fp8_blockscale_g1u1(
             moe_buf,
             a1,
@@ -2785,6 +2795,17 @@ class FmoeTuner(TunerCommon):
         if asm_1stage_csv_path and os.path.exists(asm_1stage_csv_path):
             _df = pd.read_csv(asm_1stage_csv_path)
             asm_1stage_flat = _manifest_flat_by_kernel(_df)
+        # gfx942 FLAT symbols may be listed in both activation manifests.
+        # The Bf16 manifest declares kernel-internal activation quantization;
+        # match its explicit flat flag rather than guessing from the name.
+        gfx942_bf16_flat = {}
+        if get_gfx() == "gfx942" and q_type == QuantType.per_1x128:
+            bf16_csv = kernels_list_csv_1stage.format(
+                quantDtype_1stage="blockscaleBf16",
+                extraInfo_1stage=extraInfo_1stage,
+            )
+            if os.path.exists(bf16_csv):
+                gfx942_bf16_flat = _manifest_flat_by_kernel(pd.read_csv(bf16_csv))
         fmoe_func = FmoeTuner.get_1stage_fmoe_func(
             q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
         )
@@ -2797,14 +2818,31 @@ class FmoeTuner(TunerCommon):
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
                 # Per-kernel ``flat`` in asm manifest (FLAT == raw topk, no host sort).
                 flat_flag = int(asm_1stage_flat.get(el, 0))
+                input_bf16 = (
+                    flat_flag in (1, 2) and gfx942_bf16_flat.get(el) == flat_flag
+                )
+                stage = "asm_1stage_xbf16" if input_bf16 else "asm_1stage"
                 if flat_flag:
-                    _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
+                    _data_idx = [
+                        0,
+                        0 if input_bf16 else 1,
+                        2,
+                        3,
+                        15,
+                        14,
+                        15,
+                        15,
+                        18,
+                        10,
+                        11,
+                        17,
+                    ]
                 else:
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
                 _data_names = [_GEN_DATA_1STAGE_KEYS[i] for i in _data_idx]
                 task_1stage.append(
                     (
-                        (info, "asm_1stage", el, tile_m, flat_flag),
+                        (info, stage, el, tile_m, flat_flag),
                         FmoeTuner.generate_data_1stage,
                         (
                             token,
@@ -2830,7 +2868,7 @@ class FmoeTuner(TunerCommon):
                             topk,
                             dtype,
                         ),
-                        {},
+                        {"flat": flat_flag} if q_type == QuantType.per_1x128 else {},
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
@@ -2934,7 +2972,7 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 dtype,
                             ),
-                            {},
+                            {"flat": flat_flag},
                             (FmoeTuner.torch_moe_blockscale),
                             (
                                 [
