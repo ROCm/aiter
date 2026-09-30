@@ -453,7 +453,8 @@ def make_quick_allreduce_ring_kernel(
                 hbm_layout=hbm_layout,
             )
             # A padded build addresses each row through a per-row buffer
-            # descriptor bounded to the true width; ``_rowbuf_atom_row(ptr, tile,
+            # descriptor bounded to the true width, and to nothing at all for a
+            # row past M in a partial last tile; ``_rowbuf_atom_row(ptr, tile,
             # atom)`` builds it from the operand's raw base pointer. Unpadded is
             # None (unused).
             _rowbuf_atom_row = (
@@ -465,6 +466,7 @@ def make_quick_allreduce_ring_kernel(
                     hidden=hidden,
                     hbm_i32_ptr=hbm_i32_ptr,
                     hbm_row_layout=hbm_row_layout,
+                    nbytes=nbytes,
                 )
                 if padded
                 else None

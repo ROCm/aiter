@@ -912,17 +912,34 @@ FUSED_SQNR_MIN_DB = 18.0
 # weight-indexing bug could survive, since those move whole rows.
 FUSED_SELF_SQNR_MIN_DB = 40.0
 
+# Sentinel rows after each fused output. A tile holds at most ATOMS (8) rows, so
+# a partial last tile has at most 7 dead rows; 8 covers every one of them. The
+# bits are a bf16 NaN, which no live store produces.
+_GUARD_ROWS = 8
+_GUARD_BITS = 0x7FC1
+
 
 def _fused_inputs(tokens, hidden, rank, device):
     """Per-rank input, and the residual and gain every rank shares.
 
     Values stay inside fp16's exponent range so the ``fp16`` passthrough wire
     is genuinely lossless -- the exactness case below depends on it.
+
+    ``inp`` and ``residual`` are followed by _GUARD_ROWS rows of ones. A load
+    past row M would otherwise read whatever the allocator left there -- which
+    can be a previous case's NaN sentinel, and a dead row computed from it
+    writes the sentinel's own bits back, hiding the store the guard is for.
     """
+
+    def _head(values):
+        buf = torch.ones(tokens + _GUARD_ROWS, hidden, dtype=dtypes.bf16, device=device)
+        buf[:tokens] = values.to(device, dtypes.bf16)
+        return buf[:tokens]
+
     g = torch.Generator().manual_seed(1234 + rank)
-    inp = (torch.randn(tokens, hidden, generator=g) * 0.25).to(device, dtypes.bf16)
+    inp = _head(torch.randn(tokens, hidden, generator=g) * 0.25)
     gs = torch.Generator().manual_seed(99)
-    residual = (torch.randn(tokens, hidden, generator=gs) * 0.5).to(device, dtypes.bf16)
+    residual = _head(torch.randn(tokens, hidden, generator=gs) * 0.5)
     weight = (torch.randn(hidden, generator=gs) * 0.1 + 1.0).to(device, dtypes.bf16)
     return inp, residual, weight
 
@@ -993,9 +1010,21 @@ def _run_rank_fused(
             # never the one that compiles.
             eng.preload(hidden)
 
-            out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+            # Both outputs are the head of a buffer with a sentinel tail of
+            # _GUARD_ROWS rows, so a store past row M -- a dead row of a partial
+            # last tile -- shows up here rather than in whatever allocation
+            # happens to follow the tensor.
+            guard = torch.full(
+                (2, tokens + _GUARD_ROWS, hidden), _GUARD_BITS, dtype=torch.int16
+            ).to(device)
+            out = guard[0, :tokens].view(dtypes.bf16)
+            res_out = guard[1, :tokens].view(dtypes.bf16)
+            eng.allreduce_rmsnorm(
+                inp, residual, weight, RMS_EPS, out=out, residual_out=res_out
+            )
             torch.cuda.synchronize()
             dist.barrier()
+            tail_intact = bool((guard[:, tokens:] == _GUARD_BITS).all())
 
             # fp32 oracle of the contract, through an untimed NCCL all-reduce.
             ar = inp.to(torch.float32)
@@ -1030,6 +1059,7 @@ def _run_rank_fused(
                         out.to(torch.float32), out_self.to(torch.float32)
                     ),
                     "res_exact": bool(torch.equal(res_out, res_ref)),
+                    "tail_intact": tail_intact,
                     "finite": bool(torch.isfinite(out.to(torch.float32)).all()),
                     # Cheap cross-rank fingerprints; see the mesh identity test.
                     "out_bits": int(
@@ -1041,7 +1071,7 @@ def _run_rank_fused(
                 }
             )
             del inp, residual, weight, out, res_out, ar, x, res_ref, out_ref, xr
-            del out_self
+            del out_self, guard
             torch.cuda.empty_cache()
     finally:
         eng.close()
@@ -1154,6 +1184,8 @@ def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
     for row in rows:
         if not row["finite"]:
             fails.append(f"rank {row['rank']}: non-finite output")
+        if not row["tail_intact"]:
+            fails.append(f"rank {row['rank']}: stored past the last row")
         if row["out_sqnr_db"] < FUSED_SQNR_MIN_DB:
             fails.append(
                 f"rank {row['rank']}: out SQNR {row['out_sqnr_db']:.2f} dB < "
@@ -1185,7 +1217,14 @@ def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
 #: tile: at ``rows_per_tile = 8`` a single-tile payload puts every pad lane past
 #: the end of the tensor, where the descriptor bound masks it for free, so it
 #: would pass with the per-lane mask removed entirely.
-_FUSED_PAD_CASES = ((2, 512, 1536, "tp2-1536pad2048"),)
+#:
+#: The second case is the opposite corner: 11 rows is one full 8-row tile and a
+#: partial one with 5 dead rows, whose descriptors must be empty. A row bound
+#: that only clamps the columns lets those rows store past the end of ``out``.
+_FUSED_PAD_CASES = (
+    (2, 512, 1536, "tp2-1536pad2048"),
+    (2, 11, 1536, "tp2-1536pad2048-partial-tile"),
+)
 
 
 @pytest.mark.parametrize("algorithm", ("ring", "mesh"))
@@ -1203,12 +1242,17 @@ def test_quick_allreduce_rmsnorm_padded_is_bit_exact(
     """
     batch = _fused_batch(
         (tp, "pad", algorithm),
-        [(tokens, hidden)],
+        [(t, h) for w, t, h, _ in _FUSED_PAD_CASES if w == tp],
         algorithm=algorithm,
         codecs=("fp16", "fp16"),
         solo=True,
     )
     rows = batch[(tokens, hidden)]
+    bad = [r["rank"] for r in rows if not r["tail_intact"]]
+    assert not bad, (
+        f"{label}/{algorithm}: stored past the last row on ranks {bad} -- a "
+        "dead row of the partial last tile is not masked"
+    )
     bad = [r["rank"] for r in rows if not r["res_exact"]]
     assert not bad, (
         f"{label}/{algorithm}: residual_out is not bit-exact on ranks {bad} "
