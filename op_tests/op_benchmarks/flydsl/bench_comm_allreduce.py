@@ -1208,6 +1208,14 @@ def _wants_flyauto(keys) -> bool:
     )
 
 
+def _wants_fused_flyauto(keys) -> bool:
+    """Whether *keys* needs the fused ``FlyDSLAllReduceRMSNorm`` dispatcher
+    built -- the ``fused_fly_auto`` row. It shares ``AITER_FLY_AR`` with the
+    plain dispatcher, so it needs that opt-in exported just the same."""
+    ks = set(keys)
+    return any(c.key in ks and c.family == "fused_flyauto" for c in CANDIDATES)
+
+
 # RMSNorm epsilon, matching the value in the Qwen3-235B trace's call signature.
 FUSION_EPS = 1e-6
 
@@ -2771,8 +2779,8 @@ def _worker(
     # handles after every pinned one -- the exchange is a collective and the
     # order has to match across ranks. It self-disables unless AITER_FLY_AR is
     # set, which main() does when either row that drives it is in the sweep --
-    # `fly_auto` or, under --fusion, `separate_fly_auto` -- alongside
-    # AITER_FLY_AR_ACCURACY from --fly-accuracy.
+    # `fly_auto` or, under --fusion, `separate_fly_auto`. Its accuracy regime
+    # comes from --fly-accuracy as ``quant_open``.
     flyauto = None
     if (
         _wants_flyauto(keys)
@@ -2839,7 +2847,7 @@ def _worker(
 
     fused_flyauto = None
     if (
-        any(c.family == "fused_flyauto" and c.key in keys for c in CANDIDATES)
+        _wants_fused_flyauto(keys)
         and HAS_FLY_INT4
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
@@ -4196,10 +4204,11 @@ def main():
             logger.info("TransferBench: using %s", roofline_bin)
     # Remember what the deployment would do before overriding the environment
     # for our own QR candidates; `prod path` is reported against this value.
-    if _wants_flyauto(keys):
-        # FlyDSLAllReduce is opt-in; set it before the ranks are spawned so the
-        # children inherit it. Unlike _QR_ENV this does not change `prod path`,
-        # which reports the custom-AR/quick-reduce dispatch only.
+    if _wants_flyauto(keys) or _wants_fused_flyauto(keys):
+        # FlyDSLAllReduce and FlyDSLAllReduceRMSNorm are opt-in; set it before
+        # the ranks are spawned so the children inherit it. Unlike _QR_ENV this
+        # does not change `prod path`, which reports the custom-AR/quick-reduce
+        # dispatch only.
         os.environ[_FLY_ENV] = "1"
     # --fly-accuracy, not whatever accuracy mode the launching shell happens to
     # have exported -- a report's accuracy regime should be exactly what its own
@@ -4208,6 +4217,12 @@ def main():
     # and a `-c cdr qr_int4 rccl --fly-accuracy exact` sweep would otherwise
     # keep them, having never exported the variable the gate reads.
     os.environ[_FLY_ACCURACY_ENV] = args.fly_accuracy
+    # fused_fly_auto is the production FlyDSLAllReduceRMSNorm, which reads its
+    # regime from AITER_FLY_AR_ACCURACY itself -- there is no composed oracle
+    # to hand ``quant_open`` to, as there is for fly_auto. Export it too, or
+    # that row runs in whatever mode the launching shell had (default exact).
+    if policy is not None:
+        os.environ[policy.ACCURACY_VAR] = args.fly_accuracy
     prod_regime = os.environ.get(_QR_ENV)
     if any(
         c.family in ("qr", "fused_qr") or (c.family == "separate" and c.sep_ar == "qr")
