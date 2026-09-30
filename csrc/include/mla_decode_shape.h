@@ -4,6 +4,7 @@
 #pragma once
 
 #include "aiter_enum.h"
+#include "mla_reduce_cases.h"
 #include <cstdint>
 #include <string_view>
 
@@ -263,3 +264,11 @@ inline int32_t mla_metadata_cluster_multiplier(const std::string_view arch_id,
 
     return is_hk_m16x4 ? 2 : 1;
 }
+
+#define AITER_MLA_REDUCE_SUPPORTS_X(NUM_HEAD_C, HEAD_DIM_C, NUM_HEAD, HEAD_DIM) \
+    || (((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))
+inline bool mla_reduce_v1_supports(const int32_t num_heads, const int32_t head_dim)
+{
+    return false AITER_MLA_REDUCE_CASES(AITER_MLA_REDUCE_SUPPORTS_X, num_heads, head_dim);
+}
+#undef AITER_MLA_REDUCE_SUPPORTS_X

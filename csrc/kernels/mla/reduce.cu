@@ -6,6 +6,7 @@
 #include "aiter_tensor.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
+#include "mla_reduce_cases.h"
 #include "opus/opus.hpp"
 #include <cstdio>
 #include <optional>
@@ -913,12 +914,6 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
             false, NAME " doesn't support the specified settings: ", ss.str().c_str(), "."); \
     }
 
-#define MLA_REDUCE_CASE_IF(NUM_HEAD, NUM_HEAD_C, HEAD_DIM, HEAD_DIM_C, NUM_WG_PER_BH, NAME, ...) \
-    if(((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))                             \
-    {                                                                                            \
-        MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH, NAME, __VA_ARGS__)                \
-    }
-
 #define MLA_REDUCE_CASE_EF(NUM_HEAD, NUM_HEAD_C, HEAD_DIM, HEAD_DIM_C, NUM_WG_PER_BH, NAME, ...) \
     else if(((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))                        \
     { MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH, NAME, __VA_ARGS__) }
@@ -931,31 +926,13 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
             false, NAME " doesn't support the specified settings: ", ss.str().c_str(), "."); \
     }
 
-#define MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, ...)                \
-    MLA_REDUCE_CASE_IF(NUM_HEAD, 1, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 2, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 4, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 8, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 10, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 16, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 16, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 24, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 32, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 32, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 40, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 48, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 64, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 96, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 128, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__) \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 128, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__) \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 8, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 12, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 48, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 80, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 96, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
-    MLA_REDUCE_CASE_EF(NUM_HEAD, 112, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__) \
+#define MLA_REDUCE_CASE_EF_X(NUM_HEAD_C, HEAD_DIM_C, NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, ...) \
+    MLA_REDUCE_CASE_EF(NUM_HEAD, NUM_HEAD_C, HEAD_DIM, HEAD_DIM_C, NUM_WG_PER_BH, NAME, __VA_ARGS__)
+
+#define MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, ...)             \
+    if(false) {}                                                                    \
+    AITER_MLA_REDUCE_CASES(                                                         \
+        MLA_REDUCE_CASE_EF_X, NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__) \
     else MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, NAME);
 
 #define DISPATCH_MLA_REDUCE_KERNEL(                                                               \
