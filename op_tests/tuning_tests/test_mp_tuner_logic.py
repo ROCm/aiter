@@ -18,10 +18,7 @@ import subprocess
 import sys
 import time
 import unittest
-import warnings
 from multiprocessing import TimeoutError as MPTimeoutError
-
-import triton  # noqa: F401  # ROCm environments may require Triton before torch.
 
 
 def _wait_for_release(release, value):
@@ -325,21 +322,11 @@ class TestTaskExecutionTiming(unittest.TestCase):
         self.assertIsNotNone(init_start_times)
         self.assertIsNotNone(run_with_tracking)
 
-        # Importing the ROCm torch/Triton stack in a spawned test worker can
-        # abort in the dynamic loader before this helper runs. The queue
-        # timing behavior under test is independent of the start method.
-        start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
-        ctx = mp.get_context(start_method)
+        ctx = mp.get_context("spawn")
         start_times = ctx.RawArray("d", 2)
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r"This process .* is multi-threaded, use of fork.*",
-                category=DeprecationWarning,
-            )
-            manager = ctx.Manager()
-            release = manager.Event()
-            pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
+        manager = ctx.Manager()
+        release = manager.Event()
+        pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
         try:
             first = pool.apply_async(
                 run_with_tracking, (0, _wait_for_release, (release, "first"))
