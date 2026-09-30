@@ -50,7 +50,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("softmax_scale"),
           py::arg("kv_block_indices"),
           py::arg("lut_start"),
-          py::arg("lut_count"));
+          py::arg("lut_count"),
+          py::arg("lse") = std::nullopt);
     m.def("mha_v4_sparse_work_table",
           &aiter::torch_itfs::mha_v4_sparse_work_table,
           py::arg("lut_count"),

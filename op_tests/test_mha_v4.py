@@ -1010,15 +1010,16 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    # Dense LSE is supported for every shipped format row; the sorted-sparse path is not.
+    # LSE ships for every measured format row, dense and sorted-sparse alike; a row outside that
+    # set is rejected rather than left to export a value nothing has compared against.
     block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
-    with pytest.raises(NotImplementedError, match="sorted-sparse path"):
+    with pytest.raises(NotImplementedError, match="not implemented for Q=FP4_E2M1"):
         mha_v4(
             q,
             q,
             q,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
             AttentionFormat.FP8,
             return_lse=True,
             block_mask=block_mask,

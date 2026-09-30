@@ -381,6 +381,114 @@ def _assert_sparse_matches_dense(sparse, dense, message=None):
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "tol"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16, 0.01),
+        (AttentionFormat.BF16, AttentionFormat.FP8, 0.10),
+        (AttentionFormat.FP8, AttentionFormat.FP8, 0.15),
+    ],
+)
+@pytest.mark.parametrize("kept", [[0, 1], [2, 5], [3], [0, 1, 2, 3, 4, 5, 6, 7]])
+def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
+    q_format, v_format, tol, kept
+):
+    """The sorted-sparse LSE sums only the KV blocks the LUT names.
+
+    A whole-length logsumexp would pass the all-blocks case and fail the others, so the reference
+    is rebuilt per selection rather than taken once over the full key length.
+    """
+    torch.manual_seed(7)
+    kv = mha_v4_kv_tile()
+    batch, heads, dim, tiles = 1, 5, 128, 8
+    sequence_q, sequence_k = 256, tiles * kv
+    q = torch.randn((batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    scale = dim**-0.5
+
+    mask = torch.zeros((batch, heads, 1, tiles), device="cuda", dtype=torch.bool)
+    for tile in kept:
+        mask[..., tile] = True
+
+    _, lse = mha_v4(
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=scale,
+        block_mask=mask,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+
+    index = torch.cat(
+        [torch.arange(t * kv, (t + 1) * kv, device=k.device) for t in sorted(kept)]
+    )
+    scores = torch.matmul(
+        q.float().permute(0, 2, 1, 3),
+        k.float()[:, index].permute(0, 2, 1, 3).transpose(-1, -2),
+    ) * scale
+    reference = torch.logsumexp(scores, dim=-1)
+
+    assert torch.isfinite(lse).all()
+    error = (lse.float() - reference).abs().max().item()
+    assert error < tol, f"sparse LSE off by {error:.4f} nats for tiles {kept}"
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
+    ],
+)
+def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(
+    q_format, v_format
+):
+    """A LUT row that names no KV tile has an empty softmax, so its LSE is -inf.
+
+    The head-0-empty case is the one that matters: a finite LSE there is not obviously wrong, and
+    O is zero either way, so nothing else in the suite would catch it.
+    """
+    torch.manual_seed(11)
+    kv = mha_v4_kv_tile()
+    batch, heads, dim, tiles = 1, 5, 128, 8
+    sequence_q, sequence_k = 256, tiles * kv
+    q = torch.randn((batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    mask = torch.zeros((batch, heads, 1, tiles), device="cuda", dtype=torch.bool)
+    mask[:, 1:, :, :] = True  # every head but 0 attends; head 0 selects nothing
+
+    _, lse = mha_v4(
+        q, k, v, q_format, q_format, v_format,
+        softmax_scale=dim**-0.5, block_mask=mask, return_lse=True,
+    )
+    torch.cuda.synchronize()
+
+    empty = lse[:, 0].float()
+    assert torch.isinf(empty).all() and (empty < 0).all(), (
+        f"empty LUT row exported a finite LSE (sample {empty.flatten()[0].item()})"
+    )
+    assert torch.isfinite(lse[:, 1:].float()).all()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
 def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
     """Retained FP8-P sparse F4F4 remains close to dense FP6-P on an all-true mask."""
     torch.manual_seed(41)

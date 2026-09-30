@@ -655,11 +655,12 @@ def _fmha_v4_fwd_sparse_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count
+    del kv_block_indices, lut_start, lut_count, lse
     del out
 
 
@@ -687,10 +688,13 @@ def _fmha_v4_fwd_sparse(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out",))
+@torch.library.custom_op(
+    "aiter::mha_v4_fwd_sparse_launch", mutates_args=("out", "lse")
+)
 def _mha_v4_fwd_sparse_launch(
     q: Tensor,
     k: Tensor,
@@ -710,6 +714,7 @@ def _mha_v4_fwd_sparse_launch(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],
 ) -> None:
     _fmha_v4_fwd_sparse(
         q,
@@ -730,6 +735,7 @@ def _mha_v4_fwd_sparse_launch(
         kv_block_indices,
         lut_start,
         lut_count,
+        lse,
     )
 
 
@@ -753,11 +759,12 @@ def _mha_v4_fwd_sparse_launch_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count
+    del kv_block_indices, lut_start, lut_count, lse
 
 
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
@@ -785,13 +792,9 @@ _LSE_CAPABLE_QV = frozenset(
 
 
 def _check_lse_capable(
-    q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
+    q_format: AttentionFormat, v_format: AttentionFormat
 ) -> None:
     """Reject LSE where the exported value has not been measured."""
-    if sparse:
-        raise NotImplementedError(
-            "MHA v4 does not produce LSE on the sorted-sparse path yet"
-        )
     arch = get_gfx()
     if arch != "gfx950":
         # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
@@ -887,7 +890,7 @@ def mha_v4_packed(
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     if return_lse:
-        _check_lse_capable(q_format, v_format, lut is not None)
+        _check_lse_capable(q_format, v_format)
     _validate_pack_contract(v_format, v_pack)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
@@ -978,7 +981,7 @@ def mha_v4_packed(
                 "sorted-sparse MHA v4 requires key length padded to a "
                 f"multiple of {kv_tile}"
             )
-        _mha_v4_fwd_sparse_launch(*launch_args, *lut)
+        _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse)
     if return_lse:
         return out, lse
     return out
@@ -1244,7 +1247,7 @@ def mha_v4(
     ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
     """
     if return_lse:
-        _check_lse_capable(q_format, v_format, block_mask is not None)
+        _check_lse_capable(q_format, v_format)
     # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
     # own launchers, which never forward seqlens_k.
     if seqlens_k is not None:
