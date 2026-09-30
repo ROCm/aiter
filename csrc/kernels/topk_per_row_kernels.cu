@@ -3372,7 +3372,9 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             counter.out_back_cnt = 0;
         }
     }
-    if constexpr(!UseHighBucketPredictor && !UsePass0Bucket206Predictor)
+    // The wide form clears the 12-bit histogram only if it falls back to it:
+    // clearing it here delays the row loads.
+    if constexpr(!UseHighBucketPredictor && !UsePass0Bucket206Predictor && !WideFirstDigit)
         clear_main_histogram();
     if constexpr(WideFirstDigit)
     {
@@ -3426,7 +3428,13 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         else
         {
             T const value = is_valid_element(j, i) ? in[i] : static_cast<T>(0);
-            if constexpr(CacheTwiddledBits)
+            if constexpr(WideFirstDigit)
+            {
+                // Twiddled in the histogram loop below, so the barrier waits
+                // only for the LDS clears and the histogram overlaps the loads.
+                vals[j] = __builtin_bit_cast(Bits, value);
+            }
+            else if constexpr(CacheTwiddledBits)
             {
                 vals[j] = twiddle_in(value, select_min);
             }
@@ -3465,6 +3473,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         for(int j = 0; j < ElemsPerThread; ++j)
         {
             IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+            vals[j] = twiddle_in(__builtin_bit_cast(T, vals[j]), select_min);
             if(is_valid_element(j, i))
             {
                 uint32_t const digit = vals[j] >> wide_start_bit;
@@ -3595,8 +3604,9 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             if(threadIdx.x < WARP_SIZE)
             {
                 // Wave0 holds the bin's keys two per lane and walks their low
-                // 18 bits for the (k - before)-th smallest, as the ballot form
-                // does; ties at that key go in lane order.
+                // 18 bits two at a time for the (k - before)-th smallest: four
+                // ballots split the live keys into four sub-buckets per step.
+                // Ties at that key go in lane order.
                 IdxT const needed = k - before;
                 IdxT const count  = static_cast<IdxT>(in_bin);
                 Bits key_a = 0, key_b = 0;
@@ -3616,28 +3626,53 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                     static_cast<uint64_t>(__ballot(lane + WARP_SIZE < count));
                 uint64_t active_a = valid_a, active_b = valid_b;
                 IdxT rank = needed;
+                static_assert(wide_start_bit % 2 == 0);
 #pragma unroll 1
-                for(int bit = wide_start_bit - 1;
+                for(int bit = wide_start_bit - 2;
                     bit >= 0 && __builtin_popcountll(active_a) + __builtin_popcountll(active_b) > 1;
-                    --bit)
+                    bit -= 2)
                 {
-                    Bits const bit_mask = Bits{1} << bit;
-                    uint64_t const zero_a =
-                        active_a & static_cast<uint64_t>(__ballot((key_a & bit_mask) == 0));
-                    uint64_t const zero_b =
-                        active_b & static_cast<uint64_t>(__ballot((key_b & bit_mask) == 0));
-                    IdxT const zeros = static_cast<IdxT>(__builtin_popcountll(zero_a) +
-                                                         __builtin_popcountll(zero_b));
-                    if(rank <= zeros)
+                    Bits const hi_mask = Bits{2} << bit;
+                    Bits const lo_mask = Bits{1} << bit;
+                    uint64_t const hz_a =
+                        active_a & static_cast<uint64_t>(__ballot((key_a & hi_mask) == 0));
+                    uint64_t const hz_b =
+                        active_b & static_cast<uint64_t>(__ballot((key_b & hi_mask) == 0));
+                    uint64_t const lz_a = static_cast<uint64_t>(__ballot((key_a & lo_mask) == 0));
+                    uint64_t const lz_b = static_cast<uint64_t>(__ballot((key_b & lo_mask) == 0));
+                    IdxT const c00 = static_cast<IdxT>(__builtin_popcountll(hz_a & lz_a) +
+                                                       __builtin_popcountll(hz_b & lz_b));
+                    IdxT const c0x = static_cast<IdxT>(__builtin_popcountll(hz_a) +
+                                                       __builtin_popcountll(hz_b));
+                    if(rank <= c00)
                     {
-                        active_a = zero_a;
-                        active_b = zero_b;
+                        active_a = hz_a & lz_a;
+                        active_b = hz_b & lz_b;
+                    }
+                    else if(rank <= c0x)
+                    {
+                        active_a = hz_a & ~lz_a;
+                        active_b = hz_b & ~lz_b;
+                        rank -= c00;
                     }
                     else
                     {
-                        active_a &= ~zero_a;
-                        active_b &= ~zero_b;
-                        rank -= zeros;
+                        uint64_t const o_a = active_a & ~hz_a;
+                        uint64_t const o_b = active_b & ~hz_b;
+                        rank -= c0x;
+                        IdxT const c10 = static_cast<IdxT>(__builtin_popcountll(o_a & lz_a) +
+                                                           __builtin_popcountll(o_b & lz_b));
+                        if(rank <= c10)
+                        {
+                            active_a = o_a & lz_a;
+                            active_b = o_b & lz_b;
+                        }
+                        else
+                        {
+                            active_a = o_a & ~lz_a;
+                            active_b = o_b & ~lz_b;
+                            rank -= c10;
+                        }
                     }
                 }
                 Bits const kth_bits =
@@ -3701,6 +3736,8 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             }
             return;
         }
+        clear_main_histogram();
+        __syncthreads();
     }
 
     // The seeded 8K workload's 2048th-largest value normally lands in high
