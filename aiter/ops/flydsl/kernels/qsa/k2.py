@@ -107,7 +107,11 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
 
 
 def _launch_config(
-    rows: int, n_sel: int, n_kv_heads: int, head_dim: int
+    rows: int,
+    n_sel: int,
+    n_kv_heads: int,
+    head_dim: int,
+    tiny_splits: int = _TINY_SPLITS,
 ) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
     base_programs = rows * n_kv_heads
@@ -120,7 +124,7 @@ def _launch_config(
         _DECODE_BANDS_NARROW if head_dim <= _NARROW_HEAD_DIM else _DECODE_BANDS_WIDE
     )
     if base_programs <= tiny_max:
-        block_n, target_splits, threads = 16, _TINY_SPLITS, _DECODE_THREADS
+        block_n, target_splits, threads = 16, tiny_splits, _DECODE_THREADS
     elif base_programs <= mid_max:
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
@@ -1518,7 +1522,13 @@ def qsa_k2(
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
     n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
+    # gfx950 keeps the fitted 128-split tiny band. On gfx942 the M=1
+    # workgroup at 128 splits loses to the 2-tile workgroup live AMD runs
+    # at 64, and the merge pays for the extra partials.
+    tiny_splits = _TINY_SPLITS if use_k32 else 64
+    block_n, block_threads, n_splits = _launch_config(
+        rows, n_sel, n_kv_heads, head_dim, tiny_splits
+    )
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
         # is not a second buffer on this path.
