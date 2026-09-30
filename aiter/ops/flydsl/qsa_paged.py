@@ -55,6 +55,7 @@ from .kernels.qsa.indexer_select import (
     build_qsa_pack_valid_blocks_module,
 )
 from .kernels.qsa.sparse_gqa import (
+    _TINY_SPLITS,
     _launch_config,
     _paged_gqa_coverage_reason,
     _paged_gqa_lds_bytes,
@@ -1217,8 +1218,12 @@ def flydsl_qsa_paged_gqa(
     n_sel = int(indices.shape[1])
     if num_cus is None:
         num_cus = int(get_cu_num())
+    # gfx950 keeps the fitted 128-split tiny band. On gfx942 the M=1
+    # workgroup at 128 splits loses to the 2-tile workgroup live AMD runs
+    # at 64, and the merge pays for the extra partials.
+    tiny_splits = _TINY_SPLITS if use_k32 else 64
     block_n, block_threads, n_splits = _launch_config(
-        rows, n_sel, n_kv_heads, head_dim, num_cus
+        rows, n_sel, n_kv_heads, head_dim, num_cus, tiny_splits
     )
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
