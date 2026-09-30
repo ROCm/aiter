@@ -794,6 +794,13 @@ def build_qsa_k2_module(
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(kv_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
+            if const_expr(gfx942_v_pf):
+                # Left alone, the scheduler sinks this gather onto the
+                # vmcnt(0) that drains the MFMA it just fed, so the load
+                # never overlaps QK. VMEM reads cannot cross, which holds
+                # the dwordx4 above the compute. gfx950's prefetch shares
+                # the copy loop and is not pinned.
+                fx.rocdl.sched_barrier("vmem_read")
 
             # Compute K @ Q^T. The transposed QK C map is token-major in each
             # lane and can feed PV A without a P-LDS or bpermute transpose.
