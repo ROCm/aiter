@@ -9,6 +9,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ..tensor_shim import buf_copy_load, ptr_buf_tensor
+from ..act import situ_mul, tanh_via_sigmoid_f32
 
 _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
 
@@ -651,7 +652,7 @@ class SiluQuantEpilogue:
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
         sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False,
-        out_tensor=None, out_dtype="fp8"):
+        out_tensor=None, out_dtype="fp8", act="silu", situ_beta=1.0, situ_linear_beta=1.0):
     # fmt: on
         self._out_rsrc = out_rsrc
         self._out_scale_rsrc = out_scale_rsrc
@@ -665,6 +666,13 @@ class SiluQuantEpilogue:
         self._num_waves = num_waves
         self._lds_out = lds_out
         self._swiglu_limit = float(swiglu_limit)
+        self._act = act
+        self._situ_beta = float(situ_beta)
+        self._situ_linear_beta = float(situ_linear_beta)
+        assert act in ("silu", "situv2"), f"unsupported mega_moe act {act!r}"
+        if act == "situv2":
+            assert self._situ_beta > 0.0 and self._situ_linear_beta > 0.0, \
+                "situv2 requires positive beta / linear_beta"
         self._always_valid = always_valid
         self._out_tensor = out_tensor
         self._is_fp4 = out_dtype == "fp4"
@@ -683,12 +691,28 @@ class SiluQuantEpilogue:
         for mi in range_constexpr(self._m_repeat):
             for ni in range_constexpr(gui_n):
                 g_idx = mi * self._num_acc_n + ni * _PACK
-                out.append(self._silu_mul(acc[g_idx], acc[g_idx + 1]))
+                out.append(self._act_mul(acc[g_idx], acc[g_idx + 1]))
         return out
 
-    def _silu_mul(self, gate_v4, up_v4):
+    def _act_mul(self, gate_v4, up_v4):
         gv = Vec(gate_v4)
         uv = Vec(up_v4)
+        if const_expr(self._act == "situv2"):
+            # SiTUv2 (Kimi-K3 hidden_act="situ"):
+            #   situ(g)    = beta * tanh(g / beta) * sigmoid(g)
+            #   situ_up(u) = linear_beta * tanh(u / linear_beta)
+            # No hard clamp -- tanh self-saturates, matching SGLang SituAndMul and
+            # the split-K silu_and_mul_fq situv2 path.  beta/linear_beta are baked
+            # per network (one K3 value), so they stay compile-time here.
+            b = fx.Float32(self._situ_beta)
+            br = fx.Float32(1.0 / self._situ_beta)
+            lb = fx.Float32(self._situ_linear_beta)
+            lbr = fx.Float32(1.0 / self._situ_linear_beta)
+            elems = [
+                situ_mul(gv[i], uv[i], b, br, lb, lbr, tanh=tanh_via_sigmoid_f32)
+                for i in range_constexpr(4)
+            ]
+            return Vec.from_elements(elems, fx.Float32)
         if self._swiglu_limit <= 0:
             elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
             return Vec.from_elements(elems, fx.Float32)

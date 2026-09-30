@@ -273,7 +273,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
-    source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0):
+    source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0,
+    act="silu", situ_beta=1.0, situ_linear_beta=1.0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -313,7 +314,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None, out_dtype=out_dtype)
+        out_tensor=out_tensor if use_tile_resource else None, out_dtype=out_dtype,
+        act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
     # fmt: on
 
     def _decode(flat):
@@ -348,6 +350,7 @@ def compile_gemm1(
     mfma_amajor: bool = False, swizzle_a: bool = True, async_a_copy: bool = False,
     use_tile_resource: bool = True, waves_per_eu_hint: int = 2, b_cache_modifier: int = 0,
     a_dtype: str = "fp8", out_dtype: str = "fp8", swiglu_limit: float = 0.0,
+    act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
 ):
     # fmt: on
     """Compile standalone group GEMM1 from the fused Stage1 compute body."""
@@ -428,6 +431,7 @@ def compile_gemm1(
             use_tile_resource=use_tile_resource, indirect_input=False,
             a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit,
+            act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
         total_work = (num_valid // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
         for flat in range(fx.block_idx.x, total_work, grid_x):
@@ -458,7 +462,7 @@ def gemm1_kernel(
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
     num_cu: int = 256, b_cache_modifier: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 0.0, act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
 ):
     # fmt: on
     """Run standalone MegaMoEV2 group GEMM1 and return ``(out, out_scale)``."""
@@ -477,7 +481,7 @@ def gemm1_kernel(
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, b_cache_modifier=b_cache_modifier,
         a_dtype=a_dtype, out_dtype=out_dtype,
-        swiglu_limit=swiglu_limit,
+        swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
     )
     _run_compiled(
         launch, out, x, w.view(torch.uint8), scale_x, scale_w.view(torch.uint8),

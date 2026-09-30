@@ -32,6 +32,13 @@ K3_EXPERTS_PER_RANKS = (112,)
 K3_TOPK = 16
 K3_MODEL_DIM = 3584
 K3_INTER_DIM = 3072
+# K3 uses SiTUv2 (hidden_act="situ"); tanh self-saturates so no hard clamp.
+# beta=4.0 / linear_beta=25.0 are the K3 checkpoint constants the MegaMoE SiTU
+# kernel bakes in (SGLang kimi_k3.py asserts exactly these); they MUST match
+# op_tests kimi_k3_route or the AOT bundle name will not match at serving.
+K3_ACT = "situv2"
+K3_SITU_BETA = 4.0
+K3_SITU_LINEAR_BETA = 25.0
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -72,6 +79,9 @@ def default_jobs(
     model_dim=MODEL_DIM,
     inter_dim=INTER_DIM,
     swiglu_limit=SWIGLU_LIMIT,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     shape_suffix = ""
     if (world_size, topk, model_dim, inter_dim) != (
@@ -81,11 +91,14 @@ def default_jobs(
         INTER_DIM,
     ):
         shape_suffix = f"_w{world_size}_k{topk}_d{model_dim}_i{inter_dim}"
+    # Activation is baked into the Stage1 epilogue, so a non-default act needs a
+    # distinct AOT artifact name (mirrors the runtime kernel-name act suffix).
+    act_suffix = "" if act == "silu" else f"_{act}"
     return [
         {
             "kernel_name": (
                 f"mega_moe_{quant}_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
-                f"_rank{rank}{shape_suffix}"
+                f"_rank{rank}{shape_suffix}{act_suffix}"
             ),
             "quant": quant,
             "stage": stage,
@@ -97,6 +110,9 @@ def default_jobs(
             "model_dim": model_dim,
             "inter_dim": inter_dim,
             "swiglu_limit": swiglu_limit,
+            "act": act,
+            "situ_beta": situ_beta,
+            "situ_linear_beta": situ_linear_beta,
         }
         for mtpr in mtprs
         for experts_per_rank in experts_per_ranks
@@ -129,7 +145,12 @@ def production_jobs(
         topk=K3_TOPK,
         model_dim=K3_MODEL_DIM,
         inter_dim=K3_INTER_DIM,
-        swiglu_limit=swiglu_limit,
+        # SiTUv2 self-saturates -> no hard clamp; keep swiglu_limit at 0 so the
+        # kernel name matches the runtime kimi_k3_route (swiglu_limit=0.0).
+        swiglu_limit=0.0,
+        act=K3_ACT,
+        situ_beta=K3_SITU_BETA,
+        situ_linear_beta=K3_SITU_LINEAR_BETA,
     )
     return jobs
 
@@ -150,6 +171,9 @@ def _compile_stage1(
     model_dim,
     inter_dim,
     swiglu_limit,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_prepare import (
         preload_mega_moe_prepare,
@@ -248,6 +272,9 @@ def _compile_stage1(
         tile_state_stride=tile_state_stride,
         variants=plan.stage1_variants,
         swiglu_limit=swiglu_limit,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         a_dtype=a_dtype,
         out_dtype=a_dtype,
     )
@@ -463,6 +490,9 @@ def compile_one_config(**job):
         model_dim = job.get("model_dim", MODEL_DIM)
         inter_dim = job.get("inter_dim", INTER_DIM)
         swiglu_limit = job.get("swiglu_limit", SWIGLU_LIMIT)
+        act = job.get("act", "silu")
+        situ_beta = job.get("situ_beta", 1.0)
+        situ_linear_beta = job.get("situ_linear_beta", 1.0)
         a_dtype = "fp4" if job["quant"] == "a4w4" else "fp8"
         plan = build_mega_moe_bundle_plan(
             job["mtpr"],
@@ -485,6 +515,9 @@ def compile_one_config(**job):
                     model_dim=model_dim,
                     inter_dim=inter_dim,
                     swiglu_limit=swiglu_limit,
+                    act=act,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
                 )
             else:
                 _compile_stage2(

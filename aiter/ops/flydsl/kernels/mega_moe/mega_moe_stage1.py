@@ -96,6 +96,7 @@ def compile_mega_moe_stage1(
     work_shards: int | None = None, payload_chunk_rows: int = 0,
     tile_state_stride: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0,
+    act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
     bounds_check: bool = False,
     _return_kernel_spec: bool = False,
 ):
@@ -213,6 +214,13 @@ def compile_mega_moe_stage1(
 
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
+    # Activation is baked into the epilogue, so it (and its baked beta/linear_beta)
+    # must key the kernel or a situv2 launch would collide with the silu cache.
+    act_suffix = "" if act == "silu" else (
+        f"_{act}"
+        f"b{str(float(situ_beta)).replace('.', 'p')}"
+        f"lb{str(float(situ_linear_beta)).replace('.', 'p')}"
+    )
     WORK_BATCH = 1
 
     # Optional hardware bounds checking.  A V# descriptor with a finite
@@ -248,6 +256,7 @@ def compile_mega_moe_stage1(
         f"_rc31_wb{WORK_BATCH}_adaptive"
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
+        f"{act_suffix}"
         # Kept in the name so a bounds-checked build never reuses a cached
         # unbounded kernel, or the reverse.
         f"{'_bc1' if bounds_check else ''}"
@@ -506,6 +515,7 @@ def compile_mega_moe_stage1(
             source_rows=source_rows,
             a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit,
+            act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
 
         if tid == fx.Int32(0):
@@ -704,6 +714,9 @@ def compile_mega_moe_stage1_bundle(
     tile_state_stride: int,
     variants: tuple[Stage1Config, ...],
     swiglu_limit: float = 0.0,
+    act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     bounds_check: bool = False,
     a_dtype: str = "fp8",
     out_dtype: str = "fp8",
@@ -741,6 +754,9 @@ def compile_mega_moe_stage1_bundle(
             payload_chunk_rows=config.payload_chunk_rows,
             tile_state_stride=tile_state_stride,
             swiglu_limit=swiglu_limit,
+            act=act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             a_dtype=a_dtype,
             out_dtype=out_dtype,
             bounds_check=bounds_check,
@@ -830,7 +846,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     b_nt=-1, work_shards=None,
     payload_chunk_rows=0, tile_state_stride=0,
     a_dtype="fp8", out_dtype="fp8",
-    swiglu_limit=0.0, bounds_check=False):
+    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0, bounds_check=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -841,7 +857,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=work_shards, payload_chunk_rows=payload_chunk_rows,
         tile_state_stride=tile_state_stride, a_dtype=a_dtype, out_dtype=out_dtype,
-        swiglu_limit=swiglu_limit, bounds_check=bounds_check,
+        swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
+        bounds_check=bounds_check,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,

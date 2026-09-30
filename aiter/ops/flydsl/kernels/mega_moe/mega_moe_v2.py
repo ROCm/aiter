@@ -35,7 +35,8 @@ class MegaMoEV2:
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", stage2_p2p_quant: str = "auto",
-        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = ()):
+        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
+        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
     # fmt: on
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
@@ -61,6 +62,13 @@ class MegaMoEV2:
         )
         self._a_view_dim = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
         self.swiglu_limit = float(swiglu_limit)
+        self.act = act
+        self.situ_beta = float(situ_beta)
+        self.situ_linear_beta = float(situ_linear_beta)
+        if self.act not in ("silu", "situv2"):
+            raise ValueError(f"MegaMoEV2 act must be 'silu' or 'situv2', got {self.act!r}")
+        if self.act == "situv2" and (self.situ_beta <= 0.0 or self.situ_linear_beta <= 0.0):
+            raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
             a_dtype=self._a_dtype,
@@ -486,6 +494,7 @@ class MegaMoEV2:
             tile_state_stride=self._s1_tile_state_stride,
             variants=self._bundle_plan.stage1_variants,
             swiglu_limit=self.swiglu_limit,
+            act=self.act, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta,
             a_dtype=self._a_dtype,
             out_dtype=self._a_dtype,
         )
@@ -632,6 +641,9 @@ class MegaMoEV2:
             "fixed_slot_dispatch": self._s1_fixed_slot,
             "num_cu": self._s1_num_cu,
             "swiglu_limit": self.swiglu_limit,
+            "act": self.act,
+            "situ_beta": self.situ_beta,
+            "situ_linear_beta": self.situ_linear_beta,
             "a_dtype": self._a_dtype,
             "out_dtype": self._a_dtype,
             "bounds_check": self._s1_bounds_check,

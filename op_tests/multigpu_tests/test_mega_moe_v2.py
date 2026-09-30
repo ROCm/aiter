@@ -60,15 +60,20 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
-    # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
-    # the numerical reference intentionally keeps MegaMoEV2's current bounded
-    # SwiGLU activation while the K3 activation integration remains separate.
+    # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112 and
+    # the real K3 activation: SiTUv2 (hidden_act="situ"), which self-saturates
+    # via tanh, so it carries no hard swiglu clamp.  beta=4.0 / linear_beta=25.0
+    # are the K3 checkpoint constants the MegaMoE SiTU kernel bakes in (SGLang
+    # kimi_k3.py asserts exactly these for the MegaMoE a2a backend).
     "kimi_k3_route": {
         "model_dim": 3584,
         "inter_dim": 3072,
         "experts": 896,
         "topk": 16,
-        "swiglu_limit": 10.0,
+        "swiglu_limit": 0.0,
+        "act": "situv2",
+        "situ_beta": 4.0,
+        "situ_linear_beta": 25.0,
     },
 }
 
@@ -276,6 +281,9 @@ def _reference(
     inter_dim,
     experts,
     swiglu_limit,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     x_all, token_counts = _all_gather_variable(x)
     weights_all, _ = _all_gather_variable(route_weights, token_counts)
@@ -300,13 +308,20 @@ def _reference(
         inp = x_all[rows].float()
         gate = inp @ w1[:inter_dim].T
         up = inp @ w1[inter_dim:].T
-        # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
-        # unconditionally turns up into zeros at the operator's own default of
-        # 0.0, so the reference is all-zero and relL2 divides by zero.
-        if swiglu_limit > 0:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(-swiglu_limit, swiglu_limit)
-        hidden = F.silu(gate) * up
+        if act == "situv2":
+            # SiTUv2 (Kimi-K3 hidden_act="situ"), matching SGLang SituAndMul and
+            # the operator's no-clamp situv2 epilogue: tanh self-saturates.
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            hidden = gate * up
+        else:
+            # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
+            # unconditionally turns up into zeros at the operator's own default of
+            # 0.0, so the reference is all-zero and relL2 divides by zero.
+            if swiglu_limit > 0:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(-swiglu_limit, swiglu_limit)
+            hidden = F.silu(gate) * up
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -375,6 +390,9 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.inter_dim,
             moe.experts,
             moe.swiglu_limit,
+            moe.act,
+            moe.situ_beta,
+            moe.situ_linear_beta,
         )
         error_sq = torch.sum((output.float() - reference) ** 2)
         reference_sq = torch.sum(reference**2)
