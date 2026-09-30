@@ -221,6 +221,120 @@ def _iq2r_route_reduce_add_rmsnorm_indexed_out(
 ) -> None: ...
 
 
+# GLM-5.3 packed-layout MoE stages (TP4/TP8, 257 experts incl. the fused
+# shared expert, top-9, hidden 6144).  Shapes are validated natively; see
+# ``aiter.iq2r_glm53`` for the orchestration and tuned dispatch.
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_sort_quant_out", develop=True)
+def iq2r_glm53_sort_quant_out(
+    input: Tensor,
+    topk_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    gather_indices: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
+    gate_tasks: Tensor,
+    gate_task_count: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_sort_out", develop=True)
+def iq2r_glm53_sort_out(
+    topk_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    gather_indices: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    scratch: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_route_reduce_out", develop=True)
+def iq2r_glm53_route_reduce_out(
+    route_output: Tensor,
+    route_weights: Tensor,
+    scatter_indices: Tensor,
+    output: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_gate_m1_out", develop=True)
+def iq2r_glm53_gate_m1_out(
+    activations: Tensor,
+    scales: Tensor,
+    data: Tensor,
+    auxiliary: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    output_scales: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_gate_out", develop=True)
+def iq2r_glm53_gate_out(
+    activations: Tensor,
+    scales: Tensor,
+    data: Tensor,
+    auxiliary: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    gather: Tensor,
+    output: Tensor,
+    output_scales: Tensor,
+    kernel: int,
+    grid_multiplier: int,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_down_out", develop=True)
+def iq2r_glm53_down_out(
+    activations: Tensor,
+    scales: Tensor,
+    data: Tensor,
+    auxiliary: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    kernel: int,
+    grid_multiplier: int,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_down_route9_out", develop=True)
+def iq2r_glm53_down_route9_out(
+    activations: Tensor,
+    scales: Tensor,
+    data: Tensor,
+    auxiliary: Tensor,
+    expert_ids: Tensor,
+    scatter: Tensor,
+    route_weights: Tensor,
+    output: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_down_reduce_out", develop=True)
+def iq2r_glm53_down_reduce_out(
+    activations: Tensor,
+    scales: Tensor,
+    data: Tensor,
+    auxiliary: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    route_output: Tensor,
+    scatter: Tensor,
+    route_weights: Tensor,
+    output: Tensor,
+    chunks: int,
+) -> None: ...
+
+
 def _validate_gpu_weights(
     data: Tensor, auxiliary: Tensor, metadata: IQ2RMetadata
 ) -> None:
@@ -1194,6 +1308,14 @@ __all__ = [
     "iq2r_encode_device",
     "iq2r_gemm",
     "iq2r_gemm_out",
+    "iq2r_glm53_down_out",
+    "iq2r_glm53_down_reduce_out",
+    "iq2r_glm53_down_route9_out",
+    "iq2r_glm53_gate_m1_out",
+    "iq2r_glm53_gate_out",
+    "iq2r_glm53_route_reduce_out",
+    "iq2r_glm53_sort_out",
+    "iq2r_glm53_sort_quant_out",
     "iq2r_materialize_device",
     "iq2r_materialize_out",
     "iq2r_route_direct_gather_quant_out",
