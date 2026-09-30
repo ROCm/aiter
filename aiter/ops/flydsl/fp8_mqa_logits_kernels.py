@@ -9,8 +9,8 @@ Wraps the gfx942/gfx950 kernel builders in
     (``_auto_variant`` / ``KERNEL_VARIANTS`` / ``DEFAULT_VARIANT``).
   - A build cache keyed by shape/variant/dtype-conversion flags
     (``compile_fp8_mqa_logits``).
-  - Host-side seq_len padding, output-column alignment, and the KV-column
-    split (``grid.y``) heuristic that fills the device for small-M shapes.
+  - Output-column alignment, and the KV-column split (``grid.y``) heuristic
+    that fills the device for small-M shapes. Query rows are not padded.
 """
 
 from __future__ import annotations
@@ -160,7 +160,7 @@ def _max_blocks_per_cu(launcher, args):
 
 
 def _auto_num_splits(
-    seq_len_padded: int,
+    seq_len: int,
     seq_len_kv: int,
     rows_per_block: int,
     block_kv: int,
@@ -180,7 +180,8 @@ def _auto_num_splits(
     the compiled kernel (its register and LDS use), not only on the device.
     """
     pol = _split_policy()
-    grid_x = seq_len_padded // rows_per_block
+    # Match the kernel grid. A short last tile is one block, not a host pad.
+    grid_x = (seq_len + rows_per_block - 1) // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
     max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
@@ -382,10 +383,10 @@ _TAG_RE = re.compile(
 
 
 def _parse_variant(tag):
-    """(block_kv, rows_per_block_effective) for host-side padding and splitting.
+    """(block_kv, rows_per_block_effective) for the row grid and KV splits.
 
     For ``_lds`` variants the WPB waves partition rows within one shared KV
-    tile, so a block owns RPB*WPB rows and seq_len must be padded to that.
+    tile, so a block owns RPB*WPB rows. A short tail is masked in the kernel.
     """
     m = _TAG_RE.match(tag)
     if m is None:
@@ -399,8 +400,7 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
     """Pick a variant from the problem shape.
 
     gfx942: RPB from ``seq_len * seq_len_kv`` thresholds; in the middle band an
-        odd ``seq_len`` drops RPB to 1, since padding costs a fixed host-side
-        overhead that only the largest shapes outgrow. WPB=2 packs more column
+        odd ``seq_len`` stays at RPB 1. WPB=2 packs more column
         tiles per wave when M and N are both large, else WPB=4 for more
         wavefronts on small-M / short-window shapes.
 
@@ -614,26 +614,14 @@ def flydsl_fp8_mqa_logits(
         clean_logits=bool(clean_logits),
     )
 
-    # The kernels require seq_len padded to a multiple of the rows a block owns,
-    # so every block owns exactly that many. Padded rows get empty windows
-    # (start == end == 0) so the kernel writes nothing for them; the output is
-    # sliced back to the original seq_len after the launch.
-    seq_len_padded = (
-        (seq_len + _ROWS_PER_BLOCK - 1) // _ROWS_PER_BLOCK
-    ) * _ROWS_PER_BLOCK
-    if seq_len_padded != seq_len:
-        pad = seq_len_padded - seq_len
-        Q = torch.cat([Q, Q.new_zeros((pad, num_heads, head_size))], dim=0)
-        weights = torch.cat([weights, weights.new_zeros((pad, num_heads))], dim=0)
-        cu_starts = torch.cat([cu_starts, cu_starts.new_zeros(pad)], dim=0)
-        cu_ends = torch.cat([cu_ends, cu_ends.new_zeros(pad)], dim=0)
-
-    # No torch.full even when clean_logits: the kernel now writes -inf itself,
-    # at exactly the out-of-window positions it would otherwise skip.
+    # The last query tile may be short. The kernel masks those rows, so Q,
+    # weights, and the window are not padded and the output is exactly seq_len
+    # rows. No torch.full: when clean_logits is set the kernel writes -inf
+    # itself, at the out-of-window positions it would otherwise skip.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     logits = torch.empty(
-        (seq_len_padded, seq_len_kv_aligned),
+        (seq_len, seq_len_kv_aligned),
         dtype=torch.float32,
         device=Q.device,
     )[:, :seq_len_kv]
@@ -642,7 +630,7 @@ def flydsl_fp8_mqa_logits(
         stream = torch.cuda.current_stream()
 
     tensors = (Q, KV, kv_scales, weights, cu_starts, cu_ends, logits)
-    scalars = (int(seq_len_padded), int(seq_len_kv), int(logits.stride(0)))
+    scalars = (int(seq_len), int(seq_len_kv), int(logits.stride(0)))
 
     with torch.cuda.device(Q.device.index):
         blocks_per_cu = None
@@ -651,7 +639,7 @@ def flydsl_fp8_mqa_logits(
                 launcher, (*tensors, *scalars, 1, stream)
             )
         num_splits = _auto_num_splits(
-            seq_len_padded,
+            seq_len,
             seq_len_kv,
             _ROWS_PER_BLOCK,
             _BKV,
