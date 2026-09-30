@@ -65,6 +65,8 @@ void sp_head_exchange(int64_t handle,
     {
         AITER_CHECK(registered_buffer != 0 && bytes <= registered_bytes,
                     "head exchange registered pool too small");
+        AITER_CHECK(static_cast<uintptr_t>(registered_buffer) % 16 == 0,
+                    "staged head exchange buffer requires 16-byte alignment");
         source = reinterpret_cast<void*>(registered_buffer);
         HIP_CALL(hipMemcpyAsync(source, input.data_ptr(), bytes, hipMemcpyDeviceToDevice, stream));
     }

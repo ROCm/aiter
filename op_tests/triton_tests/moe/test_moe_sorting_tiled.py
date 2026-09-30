@@ -40,13 +40,13 @@ def _routes(tokens, seed=0, skew=False):
     return ids.to(device="cuda", dtype=torch.int32), weights.to("cuda")
 
 
-def _reference(ids, weights, block_size):
+def _reference(ids, weights, block_size, num_experts=EXPERTS):
     """Stable CPU reference, including auxiliary mappings and padded rows."""
     ids, weights = ids.cpu(), weights.cpu()
     tokens, topk = ids.shape
     flat_ids = ids.flatten().long()
     order = torch.argsort(flat_ids, stable=True)
-    counts = torch.bincount(flat_ids, minlength=EXPERTS)
+    counts = torch.bincount(flat_ids, minlength=num_experts)
     padded = (counts + block_size - 1) // block_size * block_size
     total = int(padded.sum())
     packed = torch.full(
@@ -54,7 +54,7 @@ def _reference(ids, weights, block_size):
     )
     sorted_weights = torch.zeros(total, dtype=torch.float32, device="cpu")
     sorted_experts = torch.repeat_interleave(
-        torch.arange(EXPERTS, dtype=torch.int32, device="cpu"), padded // block_size
+        torch.arange(num_experts, dtype=torch.int32, device="cpu"), padded // block_size
     )
     m_indices = torch.full((total,), tokens, dtype=torch.int32, device="cpu")
     reverse = torch.empty(tokens * topk, dtype=torch.int32, device="cpu")
@@ -74,12 +74,12 @@ def _reference(ids, weights, block_size):
     return packed, sorted_weights, sorted_experts, m_indices, reverse
 
 
-def _assert_result(ids, weights, result, block_size, aux):
-    expected = _reference(ids, weights, block_size)
+def _assert_result(ids, weights, result, block_size, aux, num_experts=EXPERTS):
+    expected = _reference(ids, weights, block_size, num_experts)
     total = expected[0].numel()
     tokens, topk = ids.shape
     capacity = (
-        (tokens * topk + EXPERTS * block_size - topk + block_size - 1)
+        (tokens * topk + num_experts * block_size - topk + block_size - 1)
         // block_size
         * block_size
     )
@@ -130,6 +130,41 @@ def test_tiled_sort_stable_packed_routes(tokens, block_size, skew, aux):
 @pytest.fixture
 def m3_routes():
     return _routes(32768)
+
+
+@pytest.mark.parametrize("aux", [False, True])
+@pytest.mark.parametrize("tokens", [2039, 65537])
+@pytest.mark.parametrize(
+    "num_experts,topk,model_dim",
+    [
+        (8, 2, 4096),
+        (128, 4, 2880),
+        (128, 8, 2048),
+        (160, 8, 5120),
+        (256, 8, 7168),
+        (257, 9, 7168),
+        (384, 8, 7168),
+        (385, 9, 7168),
+    ],
+)
+def test_direct_tiled_sort_other_shapes(num_experts, topk, model_dim, tokens, aux):
+    """Direct kernel coverage does not widen the production M3 dispatch gate."""
+    generator = torch.Generator(device="cpu").manual_seed(19)
+    ids = (
+        torch.rand((tokens, num_experts), generator=generator).topk(topk, dim=1).indices
+    )
+    weights = torch.rand((tokens, topk), generator=generator)
+    ids, weights = ids.to(device="cuda", dtype=torch.int32), weights.cuda()
+    result = tiled.tiled_sort(
+        ids, weights, num_experts, model_dim, torch.bfloat16, 64, output_aux=aux
+    )
+    _assert_result(ids, weights, result, 64, aux, num_experts)
+    assert (
+        tiled.try_m3_tiled_sort(
+            ids, weights, num_experts, model_dim, torch.bfloat16, 64, accumulate=False
+        )
+        is None
+    )
 
 
 @pytest.fixture

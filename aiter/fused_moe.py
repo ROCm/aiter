@@ -1456,11 +1456,11 @@ def _fused_moe_impl(
 
     sort_m_indices = None
     sort_reverse_sorted = None
-    # Explicit call-site opt-in; metadata/kernel selection is unchanged.
+    # Explicit call-site opt-in; metadata/kernel selection is unchanged. Sort
+    # shape checks live in try_m3_tiled_sort; keep GEMM/EP eligibility here.
     use_tiled_sort = (
         use_tiled_sort
-        and E == global_E == 129
-        and model_dim == 6144
+        and E == global_E
         and inter_dim == 768
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a == dtypes.fp4x2

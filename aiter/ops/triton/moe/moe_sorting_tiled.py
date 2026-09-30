@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Stable MoE sorting for the M3 prefill contract selected by the caller.
+"""Stable MoE sorting for the FlyDSL MoE pipeline's M3 prefill contract.
+
+Replaces the Opus sorting stage in the FlyDSL MXFP4 two-stage GEMM pipeline
+used by ``aiter.fused_moe``. GEMM dispatch is unchanged; this is not the routing
+metadata interface consumed by AITER's Triton MoE GEMMs.
 
 Per-token-tile histogram, prefix offsets, and parallel stable scatter. Large
 inputs split prefix work by expert to avoid a single oversized program.
