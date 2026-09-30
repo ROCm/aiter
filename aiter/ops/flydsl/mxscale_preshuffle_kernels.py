@@ -261,6 +261,8 @@ def flydsl_mxscale_preshuffle_gemm(
 
     # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
     tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    if isinstance(st, torch.cuda.Stream):
+        tmp.record_stream(st)
     tmp_ptr = ptr_arg(tmp)
     _run_compiled(
         gemm_exe,
@@ -359,6 +361,16 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kerne
             f"[FlyDSL gfx950 mxpsh] {kernel_name!r} is not an a8w8 kernel; "
             f"gemm_a8w8_blockscale_bpreshuffle only serves fp8/fp8"
         )
+
+    # The launch pins a_row_stride / c_row_stride to -1, i.e. the kernel indexes
+    # A and Out as densely packed rows. A strided view would be read/written as
+    # if it were contiguous: wrong values, and for Out a write past its own rows.
+    for name, t in (("XQ", XQ), ("WQ", WQ), ("Out", Out)):
+        if not t.is_contiguous():
+            raise RuntimeError(
+                f"[FlyDSL gfx950 mxpsh] {name} must be contiguous, got shape "
+                f"{tuple(t.shape)} stride {tuple(t.stride())}"
+            )
 
     M, K = int(XQ.shape[0]), int(XQ.shape[-1])
     N = int(Out.shape[-1])
