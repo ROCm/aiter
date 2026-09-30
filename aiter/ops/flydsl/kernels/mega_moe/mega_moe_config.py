@@ -743,6 +743,16 @@ def select_mega_moe_config(
                 config,
                 stage2={"block_m": 64, "block_n": 256, "b2stage": True},
             )
+        elif 8 <= bucket <= 128:
+            # BN256 extends the wider Stage2 N-tile down to bs 8-128: measured
+            # +1-4.8% e2e on both routes, reproduced across three sittings.  Only
+            # block_n -- the decompose showed b2stage/deep_a add nothing here, and
+            # SBM32 pins block_m to 32.  bs 1-4 stay BN128 (too few tokens to fill
+            # the wider tile, so it does not pay there).
+            config = _replace_config(
+                config,
+                stage2={"block_n": 256},
+            )
 
     if a_dtype == ACTIVATION_FP4:
         config = _apply_a4_tuning(
