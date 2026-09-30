@@ -29,12 +29,6 @@ def _is_gluon_available() -> bool:
     return get_arch() in _GLUON_SUPPORTED_ARCHS
 
 
-def _pick_largest_floor(table: dict, prefix: str, value: int) -> dict | None:
-    bounds = [int(k[len(prefix) :]) for k in table if k.startswith(prefix)]
-    hit = max((b for b in bounds if value >= b), default=None)
-    return dict(table[f"{prefix}{hit}"]) if hit is not None else None
-
-
 def _pick_smallest_ceil(
     table: dict, prefix: str, value: int, fallback_key="any"
 ) -> dict:
@@ -60,15 +54,12 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     """Tuned config for ``(M, N)`` on ``backend``, or the untuned default.
 
     Both backends read ``configs/{arch}/{backend}/fusions/fused_clamp_act_mul/``.
-
-    gluon takes the N-specialized ``FUSED_CLAMP_ACT_MUL-N={N}.json`` and falls
-    back to ``DEFAULT.json``; within the specialized file the largest
-    ``M_LEQ_<x> <= M`` wins, so an M below the smallest tuned point falls
-    through to the default. A null ``BLOCK_SIZE_N`` means "keep the caller's
-    width" (the whole row unless overridden).
-
-    triton: the per-N file's smallest ``M_LEQ_<x> >= M`` wins, else ``any``;
-    ``DEFAULT.json`` is read only when no per-N file exists
+    A ``FUSED_CLAMP_ACT_MUL-N={N}.json`` file covers every M for that N: the
+    smallest ``M_LEQ_<x> >= M`` wins, else ``any``. Without one, ``DEFAULT.json``
+    applies: triton picks the smallest ``N_LEQ_<x> >= block_size_n`` (else
+    ``any``), falling back to the gfx950 copy; gluon takes ``any``. For gluon, a
+    null ``BLOCK_SIZE_N`` means "keep the caller's width" (the whole row unless
+    overridden).
 
     Returns:
         The config dict for this shape.
@@ -78,19 +69,16 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
         f"{cfg_dir}/{_CONFIG_NAME}-N={N}.json", required=False
     )
 
-    if backend == "triton":
-        if specialized is not None:
-            return _pick_smallest_ceil(specialized, "M_LEQ_", M)
-        return _pick_smallest_ceil(
+    if specialized is not None:
+        config = _pick_smallest_ceil(specialized, "M_LEQ_", M)
+    elif backend == "triton":
+        config = _pick_smallest_ceil(
             _load_default(backend, arch_fallback="gfx950"), "N_LEQ_", block_size_n
         )
-
-    config = None
-    if specialized is not None:
-        config = _pick_largest_floor(specialized, "M_LEQ_", M)
-    if config is None:
+    else:
         config = dict(_load_default(backend)["any"])
-    if config["BLOCK_SIZE_N"] is None:
+
+    if backend == "gluon" and config["BLOCK_SIZE_N"] is None:
         config["BLOCK_SIZE_N"] = block_size_n
     return config
 
