@@ -377,12 +377,10 @@ def _moe_gemm_a8w8(
                 # One scale per operand per K-step, so it is constant across the
                 # dot: scaling the result is equivalent to scaling the operands,
                 # and the MFMA stays FP8 instead of being promoted to FP32.
-                # tl.sum over the length-1 scale axis is how the value is read;
-                # a_sc[:, 0] is rejected as an unsupported tensor index.
                 acc += (
                     tl.dot(x, w, input_precision="ieee")
-                    * tl.sum(a_sc, axis=1)[:, None]
-                    * tl.sum(b_sc, axis=1)[None, :]
+                    * tl.reshape(a_sc, (BLOCK_M, 1))
+                    * tl.reshape(b_sc, (1, BLOCK_N))
                 )
             else:
                 # Broadcast each block-scale across its MX_PACK_DIVISOR elements.
@@ -458,8 +456,8 @@ def _moe_gemm_a8w8(
                 # Same accumulator-side scaling as the EVEN_K branch above.
                 acc += (
                     tl.dot(x, w, input_precision="ieee")
-                    * tl.sum(a_sc, axis=1)[:, None]
-                    * tl.sum(b_sc, axis=1)[None, :]
+                    * tl.reshape(a_sc, (BLOCK_M, 1))
+                    * tl.reshape(b_sc, (1, BLOCK_N))
                 )
             else:
                 a_f32 = x.to(tl.float32)
