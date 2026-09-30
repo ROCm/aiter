@@ -126,6 +126,8 @@ def build_decode(batch, kv_len, device="cuda"):
         max_seqlen_qo=MAX_SEQLEN_Q,
         uni_seqlen_qo=MAX_SEQLEN_Q,
         fast_mode=True,
+        dtype_q_nope=dtypes.fp8,
+        dtype_kv_nope=dtypes.fp8,
     )
     torch.cuda.synchronize()
 
