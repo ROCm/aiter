@@ -255,7 +255,7 @@ def gfx950_value_lookup(monkeypatch):
 
 @pytest.mark.parametrize(
     "m, n, k",
-    [(m, 256, 512) for m in range(33, 129)] + [(m, 512, 192) for m in range(33, 65)],
+    [(m, 256, 512) for m in range(33, 257)] + [(m, 512, 192) for m in range(33, 129)],
 )
 def test_native_value_config_bucket(m, n, k, gfx950_value_lookup):
     from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
@@ -263,11 +263,12 @@ def test_native_value_config_bucket(m, n, k, gfx950_value_lookup):
     )
 
     config, tuned = _get_config(m, n, k)
+    larger_tile = (n == 512 and m >= 65) or (n == 256 and m >= 129)
     expected = {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_M": 32 if larger_tile else 16,
+        "BLOCK_SIZE_N": 128 if larger_tile else 64,
         "GROUP_SIZE_M": 1,
-        "num_warps": 4,
+        "num_warps": 8 if larger_tile else 4,
         "num_stages": 2,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
@@ -280,23 +281,23 @@ def test_native_value_config_bucket(m, n, k, gfx950_value_lookup):
 
 
 @pytest.mark.parametrize(
-    "m, n, k, bm, bn, warps, waves",
+    "m, n, k, bm, bn, warps, waves, expected_tuned",
     [
-        (32, 256, 512, 32, 128, 8, 2),
-        (129, 256, 512, 64, 256, 8, 1),
-        (32, 512, 192, 32, 128, 8, 2),
-        (65, 512, 192, 64, 256, 8, 1),
+        (32, 256, 512, 32, 128, 8, 2, True),
+        (257, 256, 512, 32, 128, 8, 2, False),
+        (32, 512, 192, 32, 128, 8, 2, True),
+        (129, 512, 192, 64, 256, 8, 1, True),
     ],
 )
 def test_native_value_config_neighbors(
-    m, n, k, bm, bn, warps, waves, gfx950_value_lookup
+    m, n, k, bm, bn, warps, waves, expected_tuned, gfx950_value_lookup
 ):
     from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         _get_config,
     )
 
     config, tuned = _get_config(m, n, k)
-    assert tuned
+    assert tuned == expected_tuned
     assert (
         config["BLOCK_SIZE_M"],
         config["BLOCK_SIZE_N"],
@@ -307,8 +308,8 @@ def test_native_value_config_neighbors(
 
 @pytest.mark.parametrize(
     "m, n, k",
-    [(128, 255, 512), (128, 257, 512), (128, 256, 511), (128, 256, 513)]
-    + [(64, 511, 192), (64, 513, 192), (64, 512, 191), (64, 512, 193)],
+    [(256, 255, 512), (256, 257, 512), (256, 256, 511), (256, 256, 513)]
+    + [(128, 511, 192), (128, 513, 192), (128, 512, 191), (128, 512, 193)],
 )
 def test_native_value_config_exact_nk(m, n, k, gfx950_value_lookup):
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
@@ -320,7 +321,10 @@ def test_native_value_config_exact_nk(m, n, k, gfx950_value_lookup):
     assert actual == default
 
 
-@pytest.mark.parametrize("m, n, k", [(64, 256, 512), (128, 256, 512), (64, 512, 192)])
+@pytest.mark.parametrize(
+    "m, n, k",
+    [(64, 256, 512), (128, 256, 512), (256, 256, 512), (64, 512, 192), (128, 512, 192)],
+)
 def test_native_value_config_u02_isolation(m, n, k, gfx950_value_lookup):
     from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
         _get_fp8_config,
