@@ -126,6 +126,56 @@
         "dn_block_n": 128,
         "dn_m_waves": 2,
         "dn_n_waves": 2
+      },
+      "64": {
+        "method": "splitk",
+        "_us": 52.3,
+        "split_k": 16,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 96,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "128": {
+        "method": "splitk",
+        "_us": 57.2,
+        "split_k": 16,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 128,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "256": {
+        "method": "splitk",
+        "_us": 69.1,
+        "split_k": 16,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 384,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "512": {
+        "method": "splitk",
+        "_us": 74.7,
+        "split_k": 16,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 384,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
+      },
+      "1024": {
+        "method": "splitk",
+        "_us": 93.5,
+        "split_k": 16,
+        "sk_block_m": 64,
+        "block_k": 64,
+        "dn_block_n": 128,
+        "dn_m_waves": 2,
+        "dn_n_waves": 2
       }
     }
   },

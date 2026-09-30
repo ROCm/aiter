@@ -975,13 +975,14 @@ def _decode_reduce_params(total: int):
     return 1, 1
 
 
-# Decode skinny path holds m_rows accumulators per lane, so the GEMV bodies spill
-# for m_rows >= 8 (rocprofv3: down_gemv M=8 ~134us, M=32 ~514us). It only
-# wins at very small M (M<=4: ~17-26us, ~1.4-1.8x vs Triton); above that the padded
-# split-K/pipe path is far better, so gate the skinny decode at 4.
-DECODE_MAX_M = 4
-# Two launches (skinny.py) instead of the four below.
+# Two launches (skinny.py) instead of the four-kernel fallback below.
 _SKINNY_TWO_KERNEL = os.environ.get("AITER_GR_SKINNY_TWO_KERNEL", "1") == "1"
+# The skinny GEMV holds m_rows accumulators per lane and packs partial dots into
+# 16-byte stores; above its row budget it spills and the padded split-K/pipe tail
+# wins. The two-kernel path chunks the partial store, so it stays ahead of the
+# tail through M=8 (and beats Triton at M<=6). The four-kernel fallback's GEMV
+# has no chunking and spills past M=4, so it keeps the lower cap.
+DECODE_MAX_M = 8 if _SKINNY_TWO_KERNEL else 4
 
 
 def flydsl_k1k2_skinny_decode(
