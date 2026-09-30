@@ -154,12 +154,23 @@ def build_qsa_k2_module(
     block_threads: int,
     n_splits: int,
     wide_cache: bool,
+    kv_strides: tuple[int, int, int] | None = None,
 ):
     if n_kv_heads < 1 or n_q_heads % n_kv_heads:
         raise ValueError(
             f"{n_q_heads} query heads do not group over {n_kv_heads} KV heads"
         )
     group_size = n_q_heads // n_kv_heads
+    dense_kv_strides = (
+        page_size * n_kv_heads * head_dim,
+        n_kv_heads * head_dim,
+        head_dim,
+    )
+    if kv_strides is None:
+        kv_strides = dense_kv_strides
+    # The page/token/head strides only reach the kernel as constants on the
+    # wide path; the narrow descriptor reads them from the runtime layout.
+    strided_wide = wide_cache and tuple(kv_strides) != dense_kv_strides
     # The group occupies the M dim of one 16x16 MFMA, and D is walked in
     # K32 steps of eight-element vectors.
     if group_size > 16:
@@ -306,6 +317,7 @@ def build_qsa_k2_module(
             ns=n_splits,
             qkk=qk_k,
             wide=int(wide_cache),
+            **({"kvs": "x".join(str(s) for s in kv_strides)} if strided_wide else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -359,9 +371,9 @@ def build_qsa_k2_module(
                 address_space=fx.AddressSpace.Global,
                 alignment=16,
             )
-            page_elems64 = Int64(page_size * n_kv_heads * head_dim)
-            token_elems64 = Int64(n_kv_heads * head_dim)
-            head_elems64 = Int64(head_dim)
+            page_elems64 = Int64(kv_strides[0])
+            token_elems64 = Int64(kv_strides[1])
+            head_elems64 = Int64(kv_strides[2])
             row_bytes = head_dim * 2
 
             def kv_row(base, phys, page_off):
@@ -1257,6 +1269,7 @@ def _plan(
     block_threads: int,
     n_splits: int,
     wide_cache: bool,
+    kv_strides: tuple[int, int, int] | None = None,
 ):
     return build_qsa_k2_module(
         n_q_heads,
@@ -1268,7 +1281,16 @@ def _plan(
         block_threads,
         n_splits,
         wide_cache,
+        kv_strides,
     )
+
+
+def _span_bytes(t: torch.Tensor) -> int:
+    """Bytes from ``t``'s first element to one past its last, for any strides."""
+    if t.numel() == 0:
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
 
 
 def qsa_k2_serves(
@@ -1289,6 +1311,19 @@ def qsa_k2_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[3] != q.shape[2]:
         return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
+    # Paged caches are read in place. A K|V-interleaved view (vLLM's
+    # [pages, page_size, H, 2 * D] split in two) is fine; a copy is not.
+    if k_cache.stride(3) != 1 or v_cache.stride(3) != 1:
+        return f"k_cache and v_cache need a unit D stride, got {k_cache.stride()}"
+    if k_cache.stride() != v_cache.stride():
+        return (
+            f"k_cache and v_cache strides differ: {k_cache.stride()} vs "
+            f"{v_cache.stride()}"
+        )
+    if any(s % 8 for s in k_cache.stride()[:3]):
+        return (
+            f"k_cache strides must be multiples of 8 elements, got {k_cache.stride()}"
+        )
     if indices.dim() != 2 or indices.shape[0] != q.shape[0]:
         return "indices must be [M, W]"
     if indices.dtype != torch.int32:
@@ -1379,14 +1414,14 @@ def qsa_k2(
         return out.zero_()
 
     q = q.contiguous()
-    k_cache = k_cache.contiguous()
-    v_cache = v_cache.contiguous()
     indices = indices.contiguous()
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
     # Unsigned 32-bit V# span. Exactly 4 GiB still fits: the last byte
-    # offset is 2^32 - 1. Python ints do not wrap.
-    wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
+    # offset is 2^32 - 1. Python ints do not wrap. A strided view spans
+    # more than its numel.
+    wide_cache = _span_bytes(k_cache) > (1 << 32)
+    kv_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
     n_sel = int(indices.shape[1])
@@ -1419,6 +1454,7 @@ def qsa_k2(
             block_threads,
             n_splits,
             wide_cache,
+            kv_strides,
         ),
         q,
         k_cache,
