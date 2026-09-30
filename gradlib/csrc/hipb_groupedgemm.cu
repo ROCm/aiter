@@ -9,6 +9,7 @@
 #include <hipblaslt/hipblaslt-ext.hpp>
 #include <hipblaslt/hipblaslt.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -24,37 +25,31 @@ namespace {
 constexpr size_t kWorkspaceBytes = 256 * 1024 * 1024;
 constexpr size_t kMultiStreamWorkspaceBytes = 64 * 1024 * 1024;
 
-struct HipblasLtContext
+// One in-flight grouped GEMM owns a slot. A second call takes the other slot,
+// so submission does not wait on the host. A slot is reused only after its
+// event completes; pinned user arguments are never overwritten while a copy
+// that reads them is still queued.
+struct GroupedScratch
 {
-    int device;
-    hipblasLtHandle_t handle = nullptr;
-    void* workspace          = nullptr;
+    void* workspace                                = nullptr;
     hipblaslt_ext::UserArguments* host_user_args   = nullptr;
     hipblaslt_ext::UserArguments* device_user_args = nullptr;
     size_t user_args_capacity                       = 0;
-    hipEvent_t completion                            = nullptr;
-    bool has_pending_work                            = false;
+    hipEvent_t completion                           = nullptr;
+    bool has_pending_work                           = false;
 
-    explicit HipblasLtContext(int device_) : device(device_)
+    GroupedScratch()
     {
-        TORCH_CHECK(hipSetDevice(device) == hipSuccess,
-                    "selecting device for grouped GEMM context failed");
-        TORCH_CHECK(
-            hipblasLtCreate(&handle) == HIPBLAS_STATUS_SUCCESS,
-            "hipblasLtCreate failed for grouped GEMM");
-        TORCH_CHECK(
-            hipMalloc(&workspace, kWorkspaceBytes) == hipSuccess,
-            "hipMalloc failed for grouped GEMM workspace");
-        TORCH_CHECK(hipEventCreate(&completion) == hipSuccess,
+        TORCH_CHECK(hipMalloc(&workspace, kWorkspaceBytes) == hipSuccess,
+                    "hipMalloc failed for grouped GEMM workspace");
+        TORCH_CHECK(hipEventCreateWithFlags(&completion, hipEventDisableTiming) ==
+                        hipSuccess,
                     "hipEventCreate failed for grouped GEMM completion");
     }
 
-    ~HipblasLtContext()
+    ~GroupedScratch()
     {
-        int previous_device = device;
-        hipGetDevice(&previous_device);
-        hipSetDevice(device);
-        if(has_pending_work)
+        if(has_pending_work && completion != nullptr)
             hipEventSynchronize(completion);
         if(completion != nullptr)
             hipEventDestroy(completion);
@@ -64,25 +59,26 @@ struct HipblasLtContext
             hipHostFree(host_user_args);
         if(device_user_args != nullptr)
             hipFree(device_user_args);
-        if(handle != nullptr)
-            hipblasLtDestroy(handle);
-        hipSetDevice(previous_device);
     }
 
-    void wait_for_completion()
+    GroupedScratch(const GroupedScratch&)            = delete;
+    GroupedScratch& operator=(const GroupedScratch&) = delete;
+
+    bool is_idle()
     {
         if(!has_pending_work)
-            return;
-        TORCH_CHECK(hipEventSynchronize(completion) == hipSuccess,
-                    "waiting for grouped GEMM scratch reuse failed");
-        has_pending_work = false;
-    }
-
-    void mark_pending(hipStream_t stream)
-    {
-        TORCH_CHECK(hipEventRecord(completion, stream) == hipSuccess,
-                    "recording grouped GEMM completion failed");
-        has_pending_work = true;
+            return true;
+        const hipError_t query = hipEventQuery(completion);
+        if(query == hipSuccess)
+        {
+            has_pending_work = false;
+            return true;
+        }
+        if(query == hipErrorNotReady)
+            hipGetLastError();
+        else
+            TORCH_CHECK(false, "querying grouped GEMM scratch failed");
+        return false;
     }
 
     void reserve_user_args(size_t count)
@@ -101,6 +97,53 @@ struct HipblasLtContext
         TORCH_CHECK(hipMalloc(&device_user_args, bytes) == hipSuccess,
                     "hipMalloc failed for grouped GEMM arguments");
         user_args_capacity = count;
+    }
+};
+
+struct HipblasLtContext
+{
+    static constexpr size_t kScratchSlots = 2;
+    int device;
+    hipblasLtHandle_t handle = nullptr;
+    std::vector<std::unique_ptr<GroupedScratch>> scratches;
+
+    explicit HipblasLtContext(int device_) : device(device_)
+    {
+        TORCH_CHECK(hipSetDevice(device) == hipSuccess,
+                    "selecting device for grouped GEMM context failed");
+        TORCH_CHECK(hipblasLtCreate(&handle) == HIPBLAS_STATUS_SUCCESS,
+                    "hipblasLtCreate failed for grouped GEMM");
+    }
+
+    ~HipblasLtContext()
+    {
+        int previous_device = device;
+        hipGetDevice(&previous_device);
+        hipSetDevice(device);
+        scratches.clear();
+        if(handle != nullptr)
+            hipblasLtDestroy(handle);
+        hipSetDevice(previous_device);
+    }
+
+    GroupedScratch& acquire_scratch()
+    {
+        for(auto& scratch : scratches)
+        {
+            if(scratch->is_idle())
+                return *scratch;
+        }
+        if(scratches.size() < kScratchSlots)
+        {
+            scratches.push_back(std::make_unique<GroupedScratch>());
+            return *scratches.back();
+        }
+        auto& scratch = *scratches.front();
+        TORCH_CHECK(hipEventSynchronize(scratch.completion) == hipSuccess,
+                    "waiting for grouped GEMM scratch reuse failed");
+        scratch.has_pending_work = false;
+        std::rotate(scratches.begin(), scratches.begin() + 1, scratches.end());
+        return *scratches.back();
     }
 };
 
@@ -417,6 +460,7 @@ HipblasLtContext& get_context(int device)
 struct GroupedProblem
 {
     hipDataType dtype;
+    hipDataType output_dtype;
     std::vector<int64_t> m;
     std::vector<int64_t> n;
     std::vector<int64_t> setup_n;
@@ -449,10 +493,14 @@ GroupedProblem make_problem(const torch::Tensor& a,
                 "grouped GEMM tensors must be on the same GPU");
     TORCH_CHECK(!cu_seqlens.is_cuda() || cu_seqlens.get_device() == a.get_device(),
                 "grouped GEMM offsets must be on CPU or the same GPU as A");
-    TORCH_CHECK(a.scalar_type() == at::kBFloat16 || a.scalar_type() == at::kHalf,
-                "grouped GEMM supports BF16 and FP16");
-    TORCH_CHECK(b.scalar_type() == a.scalar_type() && out.scalar_type() == a.scalar_type(),
-                "grouped GEMM inputs and output must have the same dtype");
+    TORCH_CHECK(a.scalar_type() == at::kBFloat16 || a.scalar_type() == at::kHalf ||
+                    a.scalar_type() == at::kFloat,
+                "grouped GEMM supports BF16, FP16, and FP32");
+    TORCH_CHECK(b.scalar_type() == a.scalar_type(),
+                "grouped GEMM inputs must have the same dtype");
+    TORCH_CHECK(out.scalar_type() == at::kBFloat16 || out.scalar_type() == at::kHalf ||
+                    out.scalar_type() == at::kFloat,
+                "grouped GEMM output supports BF16, FP16, and FP32");
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && out.is_contiguous(),
                 "grouped GEMM requires contiguous tensors");
     TORCH_CHECK(a.dim() == 2, "grouped GEMM A must be 2-D");
@@ -482,8 +530,8 @@ GroupedProblem make_problem(const torch::Tensor& a,
         TORCH_CHECK(!a_is_transposed, "bias is not supported for wgrad grouped GEMM");
         TORCH_CHECK(bias->is_cuda() && bias->is_contiguous(), "grouped GEMM bias must be contiguous on GPU");
         TORCH_CHECK(bias->get_device() == a.get_device() &&
-                        bias->scalar_type() == a.scalar_type(),
-                    "grouped GEMM bias must match the input device and dtype");
+                        bias->scalar_type() == out.scalar_type(),
+                    "grouped GEMM bias must match the output device and dtype");
         TORCH_CHECK(bias->dim() == 2 && bias->size(0) == experts && bias->size(1) == out.size(1),
                     "grouped GEMM bias must be [E, N]");
     }
@@ -494,13 +542,19 @@ GroupedProblem make_problem(const torch::Tensor& a,
     TORCH_CHECK(offset_data[0] == 0 && offset_data[experts] == a.size(0),
                 "cu_seqlens must span all rows of A");
 
-    const size_t element_size = a.element_size();
-    auto* a_base              = static_cast<char*>(a.data_ptr());
-    auto* b_base              = static_cast<char*>(b.data_ptr());
+    const size_t input_element_size  = a.element_size();
+    const size_t output_element_size = out.element_size();
+    auto* a_base                     = static_cast<char*>(a.data_ptr());
+    auto* b_base                     = static_cast<char*>(b.data_ptr());
     auto* out_base                   = static_cast<char*>(out.data_ptr());
     auto* bias_base = bias.has_value() ? static_cast<char*>(bias->data_ptr()) : nullptr;
     GroupedProblem problem;
-    problem.dtype = a.scalar_type() == at::kBFloat16 ? HIP_R_16BF : HIP_R_16F;
+    problem.dtype = a.scalar_type() == at::kBFloat16
+                        ? HIP_R_16BF
+                        : (a.scalar_type() == at::kHalf ? HIP_R_16F : HIP_R_32F);
+    problem.output_dtype = out.scalar_type() == at::kBFloat16
+                               ? HIP_R_16BF
+                               : (out.scalar_type() == at::kHalf ? HIP_R_16F : HIP_R_32F);
     problem.m.reserve(experts);
     problem.n.reserve(experts);
     problem.k.reserve(experts);
@@ -534,7 +588,7 @@ GroupedProblem make_problem(const torch::Tensor& a,
         problem.epilogues.back().setMode(
             bias.has_value() ? HIPBLASLT_EPILOGUE_BIAS : HIPBLASLT_EPILOGUE_DEFAULT);
         if(bias.has_value())
-            problem.epilogues.back().setBiasDataType(problem.dtype);
+            problem.epilogues.back().setBiasDataType(problem.output_dtype);
         problem.inputs.emplace_back();
         problem.alphas.push_back(1.0f);
         problem.betas.push_back(0.0f);
@@ -553,10 +607,10 @@ GroupedProblem make_problem(const torch::Tensor& a,
             problem.ldb.push_back(output_k);
             problem.ldc.push_back(output_n);
             problem.ldd.push_back(output_n);
-            input.setA(b_base + begin * output_n * element_size);
-            input.setB(a_base + begin * output_k * element_size);
-            input.setC(out_base + expert * output_k * output_n * element_size);
-            input.setD(out_base + expert * output_k * output_n * element_size);
+            input.setA(b_base + begin * output_n * input_element_size);
+            input.setB(a_base + begin * output_k * input_element_size);
+            input.setC(out_base + expert * output_k * output_n * output_element_size);
+            input.setD(out_base + expert * output_k * output_n * output_element_size);
         }
         else
         {
@@ -569,10 +623,10 @@ GroupedProblem make_problem(const torch::Tensor& a,
             problem.ldb.push_back(input_k);
             problem.ldc.push_back(output_n);
             problem.ldd.push_back(output_n);
-            input.setA(b_base + expert * input_k * output_n * element_size);
-            input.setB(a_base + begin * input_k * element_size);
-            input.setC(out_base + begin * output_n * element_size);
-            input.setD(out_base + begin * output_n * element_size);
+            input.setA(b_base + expert * input_k * output_n * input_element_size);
+            input.setB(a_base + begin * input_k * input_element_size);
+            input.setC(out_base + begin * output_n * output_element_size);
+            input.setD(out_base + begin * output_n * output_element_size);
             if(bias.has_value())
                 input.setBias(
                     bias_base + expert * output_n * bias->element_size());
@@ -605,8 +659,8 @@ make_grouped_gemm(hipblasLtHandle_t handle,
         a_is_transposed ? HIPBLAS_OP_T : HIPBLAS_OP_N,
         problem.dtype,
         problem.dtype,
-        problem.dtype,
-        problem.dtype,
+        problem.output_dtype,
+        problem.output_dtype,
         HIPBLAS_COMPUTE_32F);
     grouped->setMaxWorkspaceBytes(kWorkspaceBytes);
     hipblaslt_ext::GemmProblemType problem_type(
@@ -614,8 +668,8 @@ make_grouped_gemm(hipblasLtHandle_t handle,
         a_is_transposed ? HIPBLAS_OP_T : HIPBLAS_OP_N,
         problem.dtype,
         problem.dtype,
-        problem.dtype,
-        problem.dtype,
+        problem.output_dtype,
+        problem.output_dtype,
         HIPBLAS_COMPUTE_32F);
     const auto status = grouped->setProblem(
         problem.m,
@@ -643,7 +697,8 @@ std::vector<hipblasLtMatmulHeuristicResult_t>
 supported_algorithms(hipblasLtHandle_t handle,
                      hipblaslt_ext::GroupedGemm& grouped,
                      bool a_is_transposed,
-                     hipDataType dtype,
+                     hipDataType input_dtype,
+                     hipDataType output_dtype,
                      int requested)
 {
     hipblaslt_ext::GemmPreference preference;
@@ -663,10 +718,10 @@ supported_algorithms(hipblasLtHandle_t handle,
         hipblaslt_ext::GemmType::HIPBLASLT_GROUPED_GEMM,
         a_is_transposed ? HIPBLAS_OP_N : HIPBLAS_OP_T,
         a_is_transposed ? HIPBLAS_OP_T : HIPBLAS_OP_N,
-        dtype,
-        dtype,
-        dtype,
-        dtype,
+        input_dtype,
+        input_dtype,
+        output_dtype,
+        output_dtype,
         HIPBLAS_COMPUTE_32F,
         candidates);
     TORCH_CHECK(status_all == HIPBLAS_STATUS_SUCCESS,
@@ -722,9 +777,25 @@ void hipb_grouped_mm(const torch::Tensor& a,
     if(problem.m.empty())
         return;
 
-    auto& ctx    = get_context(a.get_device());
-    ctx.wait_for_completion();
-    auto grouped = make_grouped_gemm(ctx.handle, problem, a_is_transposed);
+    auto& ctx     = get_context(a.get_device());
+    auto& scratch = ctx.acquire_scratch();
+    auto grouped  = make_grouped_gemm(ctx.handle, problem, a_is_transposed);
+    struct PendingScratch
+    {
+        GroupedScratch* scratch = nullptr;
+        hipStream_t stream      = nullptr;
+        bool armed              = false;
+
+        ~PendingScratch()
+        {
+            if(!armed)
+                return;
+            if(hipEventRecord(scratch->completion, stream) == hipSuccess)
+                scratch->has_pending_work = true;
+            else
+                hipStreamSynchronize(stream);
+        }
+    } pending{&scratch, stream, false};
     hipblasLtMatmulAlgo_t algorithm;
     if(solution_index >= 0)
     {
@@ -739,30 +810,29 @@ void hipb_grouped_mm(const torch::Tensor& a,
     else
     {
         auto algorithms =
-            supported_algorithms(ctx.handle, *grouped, a_is_transposed, problem.dtype, 1);
+            supported_algorithms(
+                ctx.handle, *grouped, a_is_transposed, problem.dtype, problem.output_dtype, 1);
         TORCH_CHECK(!algorithms.empty(), "no hipBLASLt grouped GEMM algorithm supports this problem");
         algorithm = algorithms.front().algo;
     }
 
-    ctx.reserve_user_args(problem.m.size());
-    grouped->getDefaultValueForDeviceUserArguments(ctx.host_user_args);
+    scratch.reserve_user_args(problem.m.size());
+    grouped->getDefaultValueForDeviceUserArguments(scratch.host_user_args);
     for(size_t index = 0; index < problem.n.size(); ++index)
-        ctx.host_user_args[index].n = problem.n[index];
+        scratch.host_user_args[index].n = problem.n[index];
     TORCH_CHECK(
-        hipMemcpyAsync(ctx.device_user_args,
-                       ctx.host_user_args,
+        hipMemcpyAsync(scratch.device_user_args,
+                       scratch.host_user_args,
                        problem.m.size() * sizeof(hipblaslt_ext::UserArguments),
                        hipMemcpyHostToDevice,
                        stream) == hipSuccess,
         "copying hipBLASLt grouped user arguments failed");
-    ctx.mark_pending(stream);
-    auto status = grouped->initialize(algorithm, ctx.workspace, true, stream);
-    ctx.mark_pending(stream);
+    pending.armed = true;
+    auto status   = grouped->initialize(algorithm, scratch.workspace, true, stream);
     TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
                 "hipBLASLt grouped initialize failed: ",
                 hipblasStatusToString(status));
-    status = grouped->run(ctx.device_user_args, stream);
-    ctx.mark_pending(stream);
+    status = grouped->run(scratch.device_user_args, stream);
     TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS,
                 "hipBLASLt grouped run failed: ",
                 hipblasStatusToString(status));
