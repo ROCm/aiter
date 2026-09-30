@@ -497,7 +497,9 @@ def _make_inputs(case: PrefillArgs, context_lens, *, stable_coupling=False):
     return k, w_orig, u_orig, w_c, u_c, g, h0, cu_seqlens
 
 
-def _build_prefill_metadata(context_lens, cu_seqlens, chunk_size: int = 64):
+def _build_prefill_metadata(
+    context_lens, cu_seqlens, chunk_size: int = 64, build_blocks: bool = False
+):
     """Prebuild the GDR chunk schedule a serving stack builds once per forward
     pass. Skipping it makes each wrapper rediscover the chunk counts with a
     blocking D2H copy. None for dense shapes, where the wrappers read the batch
@@ -509,6 +511,7 @@ def _build_prefill_metadata(context_lens, cu_seqlens, chunk_size: int = 64):
         list(context_lens),
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        build_blocks=build_blocks,
     )
 
 
@@ -638,7 +641,9 @@ def ref_chunk_gated_delta_rule_fwd_h(
 
 
 @benchmark()
-def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
+def test_chunk_gdn_prefill_h_blocked(
+    case_name, context_lens, state_dtype=torch.float32
+):
     """Check cross-block state coupling and empty requests."""
     case = PrefillArgs(
         K=128,
@@ -653,13 +658,14 @@ def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
         trace_tag=case_name,
         output_final_state=True,
         g_head_major=True,
+        ssm_state_dtype=state_dtype,
     )
     k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(
         case, context_lens, stable_coupling=True
     )
     # Production and oracle gates use log2 and natural-log scales, respectively.
     g_log2 = g * math.log2(math.e)
-    metadata = _build_prefill_metadata(context_lens, cu)
+    metadata = _build_prefill_metadata(context_lens, cu, build_blocks=True)
     ref_h, ref_vn, ref_fs = ref_chunk_gated_delta_rule_fwd_h(
         k,
         w_orig,
@@ -676,7 +682,7 @@ def test_chunk_gdn_prefill_h_blocked(case_name, context_lens):
         "output_final_state": True,
         "chunk_size": case.BT,
         "cu_seqlens": cu,
-        "state_dtype": torch.float32,
+        "state_dtype": state_dtype,
         "snapshot_dtype": None,
         "prefill_metadata": metadata,
         "use_exp2": True,
@@ -1008,6 +1014,8 @@ def main():
         cases = [
             ("ragged_coupling", [8257]),
             ("empty_sequence", [8192, 0]),
+            ("two_requests", [8257, 4097]),
+            ("two_requests_bf16", [8257, 4097], torch.bfloat16),
         ]
         df = pd.DataFrame([test_chunk_gdn_prefill_h_blocked(*case) for case in cases])
         aiter.logger.info(

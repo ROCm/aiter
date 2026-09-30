@@ -303,6 +303,8 @@ def _tuned_bv(
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
 _ADAPTIVE_K5_META_ATTR = "_aiter_gdn_k5_adaptive_meta"
+# Keeps dense offsets alive so the attribute cache above can hit.
+_DENSE_K5_OFFSETS = {}
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -410,7 +412,12 @@ def _resolve_adaptive_k5_metadata(
     if lengths is None:
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
     if cu_seqlens is None:
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+        key = (device, T)
+        if key not in _DENSE_K5_OFFSETS:
+            _DENSE_K5_OFFSETS[key] = torch.tensor(
+                [0, T], device=device, dtype=torch.int32
+            )
+        cu_seqlens = _DENSE_K5_OFFSETS[key]
     cache_key = (64, 0, 0, T, lengths, target_segments)
     version = _tensor_version(cu_seqlens)
     cached = getattr(cu_seqlens, _ADAPTIVE_K5_META_ATTR, None)
@@ -1212,12 +1219,15 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
             lengths,
             cu_seqlens=cu_seqlens,
             block_chunks=block_chunks,
+            build_blocks=True,
         )
     elif cu_seqlens is not None:
         prefill_metadata.layout.validate(cu_seqlens)
     schedule = prefill_metadata.get_chunk_schedule(64)
     if schedule.block_chunks not in (0, block_chunks) and target_segments is None:
         raise ValueError("Rebuild metadata for the requested block_chunks.")
+    if schedule.block_prefix.numel() == 0:
+        raise ValueError("Blocked emit needs metadata built with build_blocks=True.")
     if schedule.kernel_cu_seqlens.device != k.device:
         raise ValueError("Blocked metadata must be on the input device.")
     blocks = schedule.total_blocks

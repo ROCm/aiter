@@ -415,6 +415,7 @@ def build_gated_delta_rule_prefill_metadata(
     num_decode_tokens: int = 0,
     block_chunks: int = 64,
     block_chunks_per_seq: Sequence[int] | None = None,
+    build_blocks: bool = False,
 ) -> GatedDeltaRulePrefillMetadata:
     """Build reusable GDR prefill metadata on the ``cu_seqlens`` device."""
     if cu_seqlens.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -449,7 +450,12 @@ def build_gated_delta_rule_prefill_metadata(
         chunk_offsets_cpu.append(chunk_offsets_cpu[-1] + num_chunks)
         kernel_cu_seqlens_cpu.append(kernel_cu_seqlens_cpu[-1] + length)
 
-    if block_chunks_per_seq is None:
+    # Only the blocked K5 path reads the block arrays; skip their build/upload.
+    build_blocks = build_blocks or block_chunks_per_seq is not None
+    block_counts, total_blocks = (), 0
+    if not build_blocks:
+        pass
+    elif block_chunks_per_seq is None:
         block_counts, total_blocks, _ = _chunk_counts(counts, block_chunks)
     else:
         if len(block_chunks_per_seq) != len(prefill_lens):
@@ -466,9 +472,9 @@ def build_gated_delta_rule_prefill_metadata(
     block_seq_id_cpu: list[int] = []
     block_chunk_base_cpu: list[int] = []
     block_nchunks_cpu: list[int] = []
-    block_prefix_cpu = [0]
+    block_prefix_cpu = [0] if build_blocks else []
     for sequence_id, (num_chunks, num_blocks) in enumerate(
-        zip(counts, block_counts, strict=True)
+        zip(counts, block_counts, strict=False)
     ):
         block_seq_id_cpu.extend([sequence_id] * num_blocks)
         seq_block_chunks = (
