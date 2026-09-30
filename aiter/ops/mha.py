@@ -685,8 +685,12 @@ def fmha_fwd_with_sink_varlen_asm(
       * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
 
     Contract details:
-      * The varlen kernel carries NO strides; q/k/v/out MUST be densely packed,
-        so this wrapper calls `.contiguous()` defensively.
+      * D64 / D128 kernels carry no strides, so q/k/v/out are made dense here.
+        The D192x128 kernels take per-tensor token/head strides, so strided
+        views (e.g. slices of a packed qkv or kv buffer) are passed through
+        as-is when `_fmha_varlen_asm_strided_ok` accepts them; anything else
+        is made contiguous. A caller-supplied `out` the kernel cannot write in
+        place is filled through a temporary.
       * `max_seqlen_q` is the maximum per-batch Q sequence length (caller-
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
         count; the kernel early-exits tiles beyond each batch's actual length.
@@ -696,7 +700,13 @@ def fmha_fwd_with_sink_varlen_asm(
         allocated even when `return_lse=False`; in that case ignore the result.
     """
     require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
-    q, k, v = (x.contiguous() for x in (q, k, v))
+    strided = q.size(-1) == 192 and v.size(-1) == 128
+    if strided:
+        q, k, v = (
+            x if _fmha_varlen_asm_strided_ok(x) else x.contiguous() for x in (q, k, v)
+        )
+    else:
+        q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
 
@@ -707,6 +717,12 @@ def fmha_fwd_with_sink_varlen_asm(
         out = torch.empty(
             (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
         )
+    in_place = _fmha_varlen_asm_strided_ok(out) if strided else out.is_contiguous()
+    out_k = (
+        out
+        if in_place
+        else torch.empty_like(out, memory_format=torch.contiguous_format)
+    )
 
     lse = torch.empty((total_q, q_head_num, 1), dtype=torch.float32, device=q.device)
 
@@ -714,7 +730,7 @@ def fmha_fwd_with_sink_varlen_asm(
         q,
         k,
         v,
-        out,
+        out_k,
         lse,
         sink,
         cu_seqlens_q,
@@ -724,7 +740,28 @@ def fmha_fwd_with_sink_varlen_asm(
         bool(is_causal),
         bool(return_lse),
     )
+    if out_k is not out:
+        out.copy_(out_k)
     return out, lse
+
+
+def _fmha_varlen_asm_strided_ok(x: Tensor) -> bool:
+    """True if the D192x128 varlen ASM kernel can use `x` ([token, head, dim]) as is.
+
+    Mirrors the C++ check: byte strides go into 32-bit kernargs and the KV loop
+    steps by 128 token rows in 32 bits, so the token stride must stay below 2^24 B;
+    rows must be 4-byte aligned.
+    """
+    esz = x.element_size()
+    ts, hs = x.stride(0) * esz, x.stride(1) * esz
+    return (
+        x.stride(-1) == 1
+        and 0 < ts < (1 << 24)
+        and 0 <= hs <= 0x7FFFFFFF
+        and ts % 4 == 0
+        and hs % 4 == 0
+        and x.data_ptr() % 4 == 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3092,9 +3129,9 @@ def _flash_attn_varlen_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_with_sink_varlen_asm():
-        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
-        # requires dense packing (the wrapper calls `.contiguous()` defensively)
-        # and carries no strides.  softmax_scale is forwarded as-is (the kernel
+        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are THD; the wrapper makes
+        # them dense for D64/D128 and passes strided views through for D192x128,
+        # whose kernels take strides.  softmax_scale is forwarded as-is (the kernel
         # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
         # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
         # (D128 / D192x128 → no sink, D64 → sink) contract so we never feed a
