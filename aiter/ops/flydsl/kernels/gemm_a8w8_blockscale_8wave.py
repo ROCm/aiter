@@ -395,9 +395,9 @@ def compile_gemm_fp8_8wave(
             frag_C,
             frag_B,
             frag_A,
-            prev_scale_a,
-            prev_scale_b,
-            prev_m_slice,
+            dq_scale_a,
+            dq_scale_b,
+            dq_m_slice,
         ):
             # Half-M pipeline: M_SLICES=2, PHASE_M_REP=2, N_REP=2.
             # Per-lane fragment shapes for the 256x256x128 WG:
@@ -408,12 +408,12 @@ def compile_gemm_fp8_8wave(
             # These are logical register equivalents per fragment, not
             # additive physical VGPR allocations. A storage is reused across
             # M slices; both B fragments and all four C quadrants stay live.
-            # One P FIFO is reused across slices/quadrants. prev_scale_a has
-            # two f32 values; prev_scale_b is one wave-uniform scalar.
+            # One P FIFO is reused across slices/quadrants. dq_scale_a has
+            # two f32 values; dq_scale_b is one wave-uniform scalar.
 
             # for mm in (Mrep):
-            #   dq_scale = prev_scale_a[mm] *prev_scale_b
-            #   m_slice_offset = prev_m_slice * PHASE_M_REP
+            #   dq_scale = dq_scale_a[mm] *dq_scale_b
+            #   m_slice_offset = dq_m_slice * PHASE_M_REP
             #   for nn in (Nrep):
             #       frag_C[0, nn, m_slice_offset + mm] += dq_scale * frag_P[0, nn, mm]
             #       frag_C[1, nn, m_slice_offset + mm] += dq_scale * frag_P[1, nn, mm]
@@ -427,19 +427,19 @@ def compile_gemm_fp8_8wave(
             # This compute block uses fx.fma and the MFMA intrinsic, not
             # inline asm/early-clobber constraints. WG sync stays in the caller.
             for m0 in range_constexpr(PHASE_M_REP):
-                scale = Vec(prev_scale_a)[m0] * prev_scale_b
+                dq_scale = Vec(dq_scale_a)[m0] * dq_scale_b
                 rocdl.sched_barrier(0)
                 for n0 in range_constexpr(N_REP):
-                    cs = frag_C[None, n0, prev_m_slice * PHASE_M_REP + m0]
-                    ps = frag_P[None, n0, m0]
-                    partial = Vec(ps.load())
-                    accum = Vec(cs.load())
+                    sub_frag_C = frag_C[None, n0, dq_m_slice * PHASE_M_REP + m0]
+                    sub_frag_P = frag_P[None, n0, m0]
+                    partial = Vec(sub_frag_P.load())
+                    accum = Vec(sub_frag_C.load())
                     values = []
                     for elem in range_constexpr(4):
-                        values.append(fx.fma(partial[elem], scale, accum[elem]))
-                    cs.store(Vec.from_elements(values, fx.Float32))
+                        values.append(fx.fma(partial[elem], dq_scale, accum[elem]))
+                    sub_frag_C.store(Vec.from_elements(values, fx.Float32))
                     rocdl.sched_barrier(0)
-                    ps.store(
+                    sub_frag_P.store(
                         rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                             T.vec(4, T.f32),
                             [
@@ -674,30 +674,15 @@ def compile_gemm_fp8_8wave(
         lds_rd_Bl(0)
 
         frag_P.fill(0)
-        # Keep FP8 out of SCF loop-carried state for FlyDSL 0.3.4.1 legalization.
-        # Bitcast only: preserve the FP8 bytes and restore their type on entry.
-        acc_init = [
-            frag_C_tl.load(),
-            frag_C_tr.load(),
-            frag_C_bl.load(),
-            frag_C_br.load(),
-            frag_P.load(),
-            Vec.filled(PHASE_M_REP, 0.0, fx.Float32),
-            fx.Float32(0),
-            Vec(frag_B_l.load()).bitcast(fx.Int8),
-        ]
+        # Register fragments are promoted to loop-carried SSA automatically;
+        # FP8 register storage uses the compiler's integer representation.
+        # Initialize the pending P scales once, then let range carry updates.
+        fifo_scale_a_1 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
+        fifo_scale_b_1 = fx.Float32(0)
 
-        for kidx, states in range(0, num_tiles, 2, init=acc_init):
-            frag_C_tl.store(states[0])
-            frag_C_tr.store(states[1])
-            frag_C_bl.store(states[2])
-            frag_C_br.store(states[3])
-            frag_P.store(states[4])
+        for kidx in range(0, num_tiles, 2):
             fifo_scale_a_0 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
             fifo_scale_b_0 = fx.Float32(0)
-            fifo_scale_a_1 = Vec(states[5])
-            fifo_scale_b_1 = fx.Float32(states[6])
-            frag_B_l.store(Vec(states[7]).bitcast(element_type))
             kiter = fx.Int32(kidx)
 
             # Each K tile: TL[s0]/TR[s0]/BL[s0]/BR[s0], then TL[s1]/TR[s1]/BL[s1]/BR[s1].
@@ -717,8 +702,8 @@ def compile_gemm_fp8_8wave(
                         async_copy_Ab(lds_idx=tock, ki=ki + 1)
                     rocdl.sched_barrier(0)
 
-                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
                     begin_compute_phase()
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
                     do_gemm(
                         frag_C_br,
                         frag_B_l,
@@ -772,6 +757,7 @@ def compile_gemm_fp8_8wave(
                     else:
                         # BL[s1]'s end barrier closes all current ScaleA reads.
                         async_copy_scale_a(lds_idx=tick, ki=ki + 2)
+                        # this vmcnt ensure ki+1 prefetch all complted. The mainloop next iteration would read the ki+1 data.
                         rocdl.s_waitcnt(
                             encode_waitcnt_950(
                                 vmcnt=vm_load_cnt_a
@@ -795,22 +781,6 @@ def compile_gemm_fp8_8wave(
                         m_slice,
                     )
                     end_compute_phase()
-            yield_values = [
-                frag_C_tl.load(),
-                frag_C_tr.load(),
-                frag_C_bl.load(),
-                frag_C_br.load(),
-                frag_P.load(),
-                fifo_scale_a_1,
-                fifo_scale_b_1,
-                Vec(frag_B_l.load()).bitcast(fx.Int8),
-            ]
-            results = yield yield_values
-
-        frag_C_tl.store(results[0])
-        frag_C_tr.store(results[1])
-        frag_C_bl.store(results[2])
-        frag_C_br.store(results[3])
 
         c_store_rsrc = rocdl.get_buffer_rsrc(fx.get_iter(C))
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 0, 1]
@@ -821,9 +791,7 @@ def compile_gemm_fp8_8wave(
         bC_bl = fx.composition(bC_bl, transposed_c_layout)
         bC_br = fx.composition(bC_br, transposed_c_layout)
 
-        frag_P.store(results[4])
-        fifo_scale_a_1 = Vec(results[5])
-        fifo_scale_b_1 = fx.Float32(results[6])
+        # Drain the final BR[s1] partial using the state retained by the loop.
         for m0 in range_constexpr(PHASE_M_REP):
             for n0 in range_constexpr(N_REP):
                 cs = frag_C_br[None, n0, (M_SLICES - 1) * PHASE_M_REP + m0]
@@ -857,12 +825,16 @@ def compile_gemm_fp8_8wave(
                         d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
                         d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
                         d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+
+                        # | lane | d0_a      | d1_a      | d0_b      | d1_b      |
+                        # |------|-----------|-----------|-----------|-----------|
+                        # |    0 | [b0,b1]   | [b2,b3]   | [b32,b33] | [b34,b35] |
+                        # |   16 | [b4,b5]   | [b6,b7]   | [b36,b37] | [b38,b39] |
+                        # |   32 | [b8,b9]   | [b10,b11] | [b40,b41] | [b42,b43] |
+                        # |   48 | [b12,b13] | [b14,b15] | [b44,b45] | [b46,b47] |
                         # Swap a's odd 16-lane groups with b's even groups
                         # (partner lane = lane_id ^ 16); keep the other values.
-                        # At fixed lane_id % 16, groups 0, 1, 2, 3 become:
-                        #   a: a0 a1 a2 a3 -> a0 b0 a2 b2 (result[0])
-                        #   b: b0 b1 b2 b3 -> a1 b1 a3 b3 (result[1])
-                        # Apply this to both dword pairs; no LDS transpose.
+
                         swap0 = rocdl.permlane16_swap(
                             pair_type,
                             arith._to_raw(d0_a),
@@ -870,6 +842,12 @@ def compile_gemm_fp8_8wave(
                             False,
                             False,
                         )
+                        # | lane | swap0[0]  | d1_a      | swap0[1]  | d1_b      |
+                        # |------|-----------|-----------|-----------|-----------|
+                        # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b34,b35] |
+                        # |   16 | [b32,b33] | [b6,b7]   | [b36,b37] | [b38,b39] |
+                        # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b42,b43] |
+                        # |   48 | [b40,b41] | [b14,b15] | [b44,b45] | [b46,b47] |
                         swap1 = rocdl.permlane16_swap(
                             pair_type,
                             arith._to_raw(d1_a),
@@ -877,8 +855,13 @@ def compile_gemm_fp8_8wave(
                             False,
                             False,
                         )
-                        # Word order: BF16 columns [0:2], [2:4], [4:6], [6:8]
-                        # relative to col below: 4 dwords = 8 BF16 = 16 bytes.
+                        # | lane | swap0[0]  | swap1[0]  | swap0[1]  | swap1[1]  | columns |
+                        # |------|-----------|-----------|-----------|-----------|---------|
+                        # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b6,b7]   | N0-N7   |
+                        # |   16 | [b32,b33] | [b34,b35] | [b36,b37] | [b38,b39] | N32-N39 |
+                        # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b14,b15] | N8-N15  |
+                        # |   48 | [b40,b41] | [b42,b43] | [b44,b45] | [b46,b47] | N40-N47 |
+                        # repack swap0[0] , swap1[0] , swap0[1]  | swap1[1]
                         packed = Vec.from_elements(
                             [
                                 fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
