@@ -29,11 +29,7 @@ def _mxfp4_quant_op(
     BLOCK_SIZE_M: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
 ):
-    """
-    Converts x (fp32) [BLOCK_SIZE_M, BLOCK_SIZE_N] to packed mxfp4 bytes via
-    gl.amd.cdna5.scaled_downcast, computing the per-32-element e8m0 scale
-    ourselves.
-    """
+    """x (fp32) -> packed mxfp4 via scaled_downcast; e8m0 scale computed here."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
     amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True)
@@ -87,19 +83,19 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
 
-    # LDS layout: row-major, vec=8 elements = 128-bit stores, padded to avoid bank conflicts
+    # Padded row-major LDS, 128-bit vectors.
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
 
-    # Register layout for LDS reads: order=[1,0] = N fastest, matches row-major LDS
+    # N-fastest, matching the LDS layout.
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[4, 8],
         warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
-    # 1D slice of blocked_layout along the N axis, for masking tail columns
+    # N-axis slice, for tail masking.
     gLayoutN: gl.constexpr = gl.SliceLayout(0, blocked_layout)
 
     # LDS ring buffer
@@ -172,7 +168,7 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
                 x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
             )
         else:
-            # Tail N-tile: mask stale ring-buffer garbage past N before amax/quant.
+            # Tail tile: mask stale ring-buffer columns past N.
             col_valid = (
                 pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)
             ) < N
@@ -281,7 +277,7 @@ def _mxfp8_quant_op(
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    """Converts x (fp32) to fp8 e4m3 (elementwise, no packing), computing the e8m0 scale per block."""
+    """x (fp32) -> fp8 e4m3 with a per-block e8m0 scale."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP8_QUANT_BLOCK_SIZE)
     amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True)
@@ -331,7 +327,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 ):
     # NUM_BUFFERS=1: synchronous, no prefetch
     gl.static_assert(NUM_BUFFERS >= 1, "LDS kernel requires NUM_BUFFERS >= 1")
-    # Cap unverified beyond repro testing (see repo notes on async_store corruption).
+    # Unverified beyond 1024 (async_store corruption).
     gl.static_assert(
         BLOCK_SIZE_N <= 1024,
         "BLOCK_SIZE_N > 1024 not yet verified safe for fp8 TDM async_store",
@@ -342,7 +338,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
 
-    # row-major, vec=8 (128-bit), padded to avoid bank conflicts
+    # Padded row-major LDS, 128-bit vectors.
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -360,7 +356,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
-    # Unpadded: padding here triggers fp8 async_store corruption at BLOCK_SIZE_N >= 256 (see repo notes).
+    # Unpadded: padding corrupts fp8 async_store at BLOCK_SIZE_N >= 256.
     SHARED_LAYOUT_OUT: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     out_smem = gl.allocate_shared_memory(
         x_fp8_ptr.type.element_ty,
@@ -375,7 +371,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, NUM_QUANT_BLOCKS],
         layout=SHARED_LAYOUT_BS,
     )
-    # 2 stores/iter; same-kind TDM ops finish in issue order, so NUM_BUFFERS-1 pairs suffice
+    # 2 stores/iter; TDM ops complete in issue order.
     STORE_WAIT: gl.constexpr = 2 * (NUM_BUFFERS - 1)
 
     x_base = (

@@ -134,7 +134,7 @@ def run_benchmark(args):
                 return quant_fn(x, use_sr=True, philox_seed=1234)
             return quant_fn(x)
 
-        # Rotates deep-copied inputs past L2 cache size, unlike do_bench_cudagraph's buffer reuse.
+        # Rotates inputs past L2 size.
         _, us = run_perftest(fn)
         ms = us / 1000
 

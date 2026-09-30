@@ -163,8 +163,7 @@ def _bound_of(component: str) -> int:
 
 
 def _candidates(axis: str, value, parts: set) -> list:
-    """Components of ``axis`` matching ``value``, most specific first: LEQ
-    bounds ascending, then GEQ bounds descending, then ``"any"``."""
+    """Matching components of ``axis``: LEQ ascending, GEQ descending, ``any``."""
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound_of)
     geq = sorted(
         (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound_of, reverse=True
@@ -187,8 +186,7 @@ def _canonical(key: str, axes: tuple) -> tuple:
 
 @functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
 def _bucket_index(keys: tuple, axes: tuple) -> tuple:
-    """Build ``(slots -> key, LEQ/GEQ components declared per axis)``, cached
-    on the key names (all it depends on)."""
+    """Cached ``(slots -> key, components per axis)``."""
     parts = {a: set() for a in axes}
     for key in keys:
         if key != "any":
@@ -198,11 +196,7 @@ def _bucket_index(keys: tuple, axes: tuple) -> tuple:
 
 
 def lookup_config(table: dict, axes: tuple, **values) -> dict:
-    """Resolve one config from a flat table keyed by composite bucket keys,
-    e.g. ``{"M_LEQ_32": {...}, "M_GEQ_33.N_LEQ_1024": {...}, "any": {...}}``.
-    Per axis (in ``axes`` order, leftmost wins ties): LEQ bounds ascending,
-    then GEQ bounds descending, then ``"any"`` (required). Fresh dict copy.
-    """
+    """Bucket-table lookup: per axis (leftmost first) LEQ ascending, GEQ descending, ``any``."""
     index, parts = _bucket_index(tuple(table), axes)
     per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]
     for slots in itertools.product(*per_axis):

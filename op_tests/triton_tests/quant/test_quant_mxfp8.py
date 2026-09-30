@@ -73,8 +73,7 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
         (128, 1024),
         (137, 64),  # non-power-of-2 M
         (256, 32),
-        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
-        # non-power-of-2 shapes in between.
+        # Mid-range, non-power-of-2 shapes.
         (8, 1024),
         (2048, 3072),
         (16384, 7168),
