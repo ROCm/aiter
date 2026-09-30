@@ -331,7 +331,7 @@ def test_fused_qk_norm_mrope_cache_quant_shuffle(
     qkv = torch.randn(num_tokens, total_heads * head_size, dtype=dtypes.bf16)
     qw = torch.randn(head_size, dtype=dtypes.bf16)
     kw = torch.randn(head_size, dtype=dtypes.bf16)
-    cos_sin = torch.randn(MAX_POSITIONS, head_size, dtype=dtypes.bf16) * 0.25
+    cos_sin = torch.randn(MAX_POSITIONS, head_size, dtype=dtypes.bf16)
     positions_storage = torch.randint(
         0,
         MAX_POSITIONS,
