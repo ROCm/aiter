@@ -3110,6 +3110,16 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
     return false;
 }
 
+// Row placement of a register-copy launch (topk_oneblock_reg_placement): run
+// `rows` rows in groups of `period` workgroups whose first half take
+// consecutive rows.  An unplaced launch passes no placement argument, so it
+// keeps the kernel signature, and the code, it had before placement existed.
+struct TopkRowPlacement
+{
+    int rows;
+    int period;
+};
+
 /**
  * Register-resident one-block radix specialization for fp32/k=2048 rows short
  * enough to hold in VGPRs.
@@ -3142,13 +3152,15 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int 
            bool UseHighBucketPredictor = false, unsigned PredictorFirstBucket = 0x40du,
            bool UsePass0Bucket206Predictor = false,
            int BallotCandidateCapacity = 0,
-           bool FuseLoadPass0Histogram = false>
+           bool FuseLoadPass0Histogram = false,
+           typename... Placement>
 __global__ void radix_topk_one_block_reg_kernel(T const* in,
                                                 const int64_t len,
                                                 const IdxT k,
                                                 T* out,
                                                 IdxT* out_idx,
-                                                bool const select_min)
+                                                bool const select_min,
+                                                Placement const... placement)
 {
     static_assert(std::is_same_v<T, float>);
     static_assert(std::is_same_v<IdxT, int>);
@@ -3230,7 +3242,24 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     __shared__ IdxT winner_indices[WinnerCapacity];
     __shared__ IdxT candidate_count;
 
-    const int64_t batch_id = blockIdx.x;
+    // A placed launch (one TopkRowPlacement argument) takes the first half of
+    // each group of `period` workgroups for consecutive rows; the rest exit
+    // before touching LDS or memory.  Every row still maps to exactly one
+    // workgroup, whatever the hardware placement.  The division runs on VALU;
+    // readfirstlane keeps the row and the exit test scalar, so the row
+    // pointers stay in SGPRs.
+    int64_t batch_id = blockIdx.x;
+    if constexpr(sizeof...(Placement) != 0)
+    {
+        TopkRowPlacement const place = (placement, ...);
+        unsigned const period = static_cast<unsigned>(place.period);
+        unsigned const width  = period / 2u;
+        int const slot = __builtin_amdgcn_readfirstlane(static_cast<int>(blockIdx.x % period));
+        int const row  = __builtin_amdgcn_readfirstlane(
+            static_cast<int>((blockIdx.x / period) * width) + slot);
+        if(slot >= static_cast<int>(width) || row >= place.rows) return;
+        batch_id = row;
+    }
     const IdxT row_len = StaticRowLen > 0 ? static_cast<IdxT>(StaticRowLen)
                                           : static_cast<IdxT>(len);
     constexpr int static_full_iters = StaticRowLen > 0 ? StaticRowLen / BlockSize : 0;
@@ -6578,6 +6607,38 @@ inline int topk_oneblock_num_cu()
     return v;
 }
 
+// XCDs (XCCs) in the device's current compute partition; 1 when the runtime
+// cannot tell.
+inline int topk_oneblock_num_xcd()
+{
+    static const int v = []() {
+        int dev = 0, n = 0;
+        if(hipGetDevice(&dev) != hipSuccess ||
+           hipDeviceGetAttribute(&n, hipDeviceAttributeNumberOfXccs, dev) != hipSuccess)
+            return 1;
+        return n > 1 ? n : 1;
+    }();
+    return v;
+}
+
+// Workgroups are dealt to the XCDs round-robin in launch order, so a grid of at
+// least one row per XCD spreads over every XCD, and on MI355X such a launch
+// takes up to about 1 us longer than one that stays on half of them.  From one
+// row per XCD up to one row per CU of half the XCDs, place the rows on the
+// first half of every group of XCD-count workgroups; the other half exit at
+// once.  Correctness never depends on the placement; the speed-up does: it
+// relies on that round-robin dispatch and was validated only in SPX / NPS1
+// mode on MI355X.  With one XCD (CPX) or an unknown count, or outside that row
+// range, `rows` is 0 and the launch is unplaced.
+inline TopkRowPlacement topk_oneblock_reg_placement(int batch_size)
+{
+    int const xcds = topk_oneblock_num_xcd();
+    int const half = xcds / 2;
+    if(xcds >= 2 && batch_size >= xcds && batch_size <= topk_oneblock_num_cu() / xcds * half)
+        return {batch_size, xcds};
+    return {0, 0};
+}
+
 // Per-wave winner reservation, the twiddled register cache and the Wave0
 // ballot selector keep the row live across the selector.  Take them only for
 // copies that still compile to at most 64 VGPRs without scratch on gfx950 (two
@@ -6590,8 +6651,9 @@ constexpr bool topk_oneblock_reg_wave_select_fits(int elems_per_thread)
 
 // Launches the register copy whose compile-time lane capacity equals the
 // runtime `ept`; returns false when `ept` is outside [MinEPT, MaxEPT].
+// `Placeable` families also take topk_oneblock_reg_placement.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int MainBits,
-          int TailBits, int MinEPT, int MaxEPT, bool WaveSelect>
+          int TailBits, int MinEPT, int MaxEPT, bool WaveSelect, bool Placeable = false>
 inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream, T const* in,
                                      int64_t len, IdxT k, T* out, IdxT* out_idx, bool select_min)
 {
@@ -6603,9 +6665,24 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
     {
         if(ept != MinEPT)
             return topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MainBits,
-                                            TailBits, MinEPT + 1, MaxEPT, WaveSelect>(
+                                            TailBits, MinEPT + 1, MaxEPT, WaveSelect, Placeable>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         constexpr bool Wave = WaveSelect && topk_oneblock_reg_wave_select_fits(MinEPT);
+        if constexpr(Placeable)
+        {
+            TopkRowPlacement const place = topk_oneblock_reg_placement(batch_size);
+            if(place.rows > 0)
+            {
+                unsigned const half   = static_cast<unsigned>(place.period / 2);
+                unsigned const groups = (static_cast<unsigned>(batch_size) + half - 1) / half;
+                radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT,
+                                                MainBits, TailBits, 0, Wave, Wave, false, Wave,
+                                                false, 0x40du, false, 0, false>
+                    <<<groups * static_cast<unsigned>(place.period), BlockSize, 0, stream>>>(
+                        in, len, k, out, out_idx, select_min, place);
+                return true;
+            }
+        }
         radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
                                         TailBits, 0, Wave, Wave, false, Wave>
             <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
@@ -6650,7 +6727,7 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         if(2 * batch_size <= num_cu && len > 4 * 1024 && len <= 4 * 1024 + 768)
             return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
-        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true>(
+        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true, true>(
             ept, batch_size, stream, in, len, k, out, out_idx, select_min);
     }
     if(len <= 22 * 1024)
