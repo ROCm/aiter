@@ -804,30 +804,55 @@ def build_qsa_k2_module(
                         acc4 = qk_mfma(a_vec, fx.Vector(q_regs[ks]), acc4)
                 else:
                     k_row_bytes = Int32(head_dim if use_k32 else k_stride)
-                    sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
-                    a_src = qk_a_copy.partition_S(sA)
-                    a_frag = fx.make_fragment_like(a_src)
-                    fx.copy(qk_b_atom, a_src, a_frag)
-                    for ks in range_constexpr(qk_steps - 1):
-                        sA_n = make_k_lds_view(
+
+                    def load_qk_a(ks, n0=n0, k_row_bytes=k_row_bytes):
+                        sA_k = make_k_lds_view(
                             k_arr,
-                            n0 * k_row_bytes + Int32((ks + 1) * qk_k),
+                            n0 * k_row_bytes + Int32(ks * qk_k),
                             (16, qk_k),
                         )
-                        a_src_n = qk_a_copy.partition_S(sA_n)
-                        a_frag_n = fx.make_fragment_like(a_src_n)
-                        fx.copy(qk_b_atom, a_src_n, a_frag_n)
-                        acc4 = qk_mfma(
-                            fx.Vector(fx.memref_load_vec(a_frag)),
+                        src = qk_a_copy.partition_S(sA_k)
+                        frag = fx.make_fragment_like(src)
+                        fx.copy(qk_b_atom, src, frag)
+                        return frag
+
+                    def mfma_qk(frag, ks, acc):
+                        return qk_mfma(
+                            fx.Vector(fx.memref_load_vec(frag)),
                             fx.Vector(q_regs[ks]),
-                            acc4,
+                            acc,
                         )
-                        a_frag = a_frag_n
-                    acc4 = qk_mfma(
-                        fx.Vector(fx.memref_load_vec(a_frag)),
-                        fx.Vector(q_regs[qk_steps - 1]),
-                        acc4,
-                    )
+
+                    # gfx942 decode: two K steps per LDS read. Issue the next
+                    # pair before consuming the current one, and let nothing
+                    # cross, so that read stays in flight under the MFMA.
+                    # The scoreboard then waits only for the pair being used.
+                    pipe_qk = gfx942_v_pf and qk_steps >= 2
+                    if const_expr(pipe_qk):
+                        a0 = load_qk_a(0)
+                        a1 = load_qk_a(1)
+                        n_pairs = qk_steps // 2
+                        for p in range_constexpr(n_pairs - 1):
+                            b0 = load_qk_a(2 * p + 2)
+                            b1 = load_qk_a(2 * p + 3)
+                            fx.rocdl.sched_barrier("none")
+                            acc4 = mfma_qk(a0, 2 * p, acc4)
+                            acc4 = mfma_qk(a1, 2 * p + 1, acc4)
+                            a0 = b0
+                            a1 = b1
+                        last = 2 * (n_pairs - 1)
+                        acc4 = mfma_qk(a0, last, acc4)
+                        acc4 = mfma_qk(a1, last + 1, acc4)
+                        if const_expr(qk_steps % 2 == 1):
+                            tail = qk_steps - 1
+                            acc4 = mfma_qk(load_qk_a(tail), tail, acc4)
+                    else:
+                        a_frag = load_qk_a(0)
+                        for ks in range_constexpr(qk_steps - 1):
+                            a_frag_n = load_qk_a(ks + 1)
+                            acc4 = mfma_qk(a_frag, ks, acc4)
+                            a_frag = a_frag_n
+                        acc4 = mfma_qk(a_frag, qk_steps - 1, acc4)
                 qk_local.append(acc4)
             if const_expr(gfx942_v_pf):
                 # The mask that consumes the fragment is VALU and cannot
@@ -989,9 +1014,7 @@ def build_qsa_k2_module(
                 tile_i = state[out_chunks + 6 + n_k_pref]
                 # One tile past the split clamps to its first column, so
                 # the last iteration's extra gather stays in bounds.
-                safe_n, off_n, _live_n = resolve(
-                    tok_next, tile_i + Int32(1), phys_next
-                )
+                safe_n, off_n, _live_n = resolve(tok_next, tile_i + Int32(1), phys_next)
                 next_frags = load_k_frags(k_row_of(safe_n, off_n))
                 # Nothing crosses, so the new loads stay above softmax and
                 # PV instead of sinking to the next tile's drain. The
@@ -1196,9 +1219,7 @@ def build_qsa_k2_module(
             phys_n1 = load_page(tok_n1)
             safe_phys, page_off_i, live = resolve(tok_cur, t, phys_cur)
             if const_expr(gfx942_v_pf):
-                acc = tile_body(
-                    safe_phys, page_off_i, live, state + [phys_n1, t]
-                )
+                acc = tile_body(safe_phys, page_off_i, live, state + [phys_n1, t])
                 head_n = out_chunks + 2
                 carried = acc[:head_n] + [tok_n1, tok_n2, phys_n1] + acc[head_n:]
             else:
