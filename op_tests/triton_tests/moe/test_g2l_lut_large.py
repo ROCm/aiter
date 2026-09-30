@@ -3,14 +3,19 @@
 
 """Large-expert G2L integration: FlyDSL <=512, Triton <=16384, then torch.
 
+Standard correctness/perf sweep: op_tests/test_moe_g2l_lut.py
+This file retains focused pytest regression checks.
+
 Run: python -m pytest -q op_tests/triton_tests/moe/test_g2l_lut_large.py
 """
 
 import pytest
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
 from aiter.ops.triton.moe import g2l_lut as wrapper
+from op_tests.test_moe_g2l_lut import SUPPORTED_GFX
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
@@ -30,6 +35,12 @@ def reference(host, E):
 def exact(out, ref):
     assert out.dtype == torch.int32 and out.is_contiguous()
     assert torch.equal(out.cpu(), ref)
+
+
+@pytest.fixture(autouse=True)
+def supported_arch():
+    if get_gfx() not in SUPPORTED_GFX:
+        pytest.skip(f"G2L auxiliary kernels are unsupported on {get_gfx()}")
 
 
 @pytest.fixture(autouse=True)
@@ -359,3 +370,66 @@ def test_integrated_nonzero_semantics(n, dtype, pattern, stride, no_fallback):
     exact(lut, reference(host, E))
     exact(counter, torch.zeros(E, dtype=torch.int32, device="cpu"))
     exact(nvr, torch.tensor([32768], dtype=torch.int32, device="cpu"))
+
+
+def test_standard_harness_preserves_int32_precision():
+    from op_tests.test_moe_g2l_lut import check_outputs
+
+    ref = (
+        torch.tensor([0], dtype=torch.int32, device="cuda"),
+        torch.tensor([0], dtype=torch.int32, device="cuda"),
+        torch.tensor([2**31 - 8], dtype=torch.int32, device="cuda"),
+    )
+    bad = tuple(x.clone() for x in ref)
+    bad[2].sub_(1)
+    # A float-only comparison would falsely pass here.
+    assert torch.equal(ref[2].float(), bad[2].float())
+    with pytest.raises(AssertionError, match="nvr int32 mismatch"):
+        check_outputs(ref, bad, "injected one-bit error")
+
+
+@pytest.mark.parametrize(
+    "n,E,backend",
+    [
+        (512, 128, "flydsl"),
+        (513, 128, "triton"),
+        (8193, 8192, "triton"),
+        (16385, 1024, "torch"),
+    ],
+)
+def test_standard_harness_candidates(n, E, backend, monkeypatch):
+    import os
+
+    from op_tests import test_moe_g2l_lut as bench
+
+    # Exercise real candidates/output validation once. The CLI owns the actual
+    # timing sweep; pytest should not profile every API regression test.
+    calls = []
+
+    def single_run(fn, **kwargs):
+        calls.append((os.environ["AITER_G2L_TORCH"], kwargs))
+        return fn(), 1.0
+
+    monkeypatch.setattr(bench, "run_perftest", single_run)
+    monkeypatch.setenv("AITER_G2L_TORCH", "caller-setting")
+    monkeypatch.setenv("AITER_G2L_TRITON", "0")
+    row = bench.test_moe_g2l_lut(n, E, torch.int32, 2, 37, 8, "graph")
+    assert row["auto_backend"] == backend
+    assert [flag for flag, _ in calls] == ["0", "1"]
+    assert all(kwargs["testGraph"] for _, kwargs in calls)
+    for name in ("auto", "torch_fallback"):
+        assert row[f"{name} err"] == row[f"{name} TFLOPS"] == 0
+        assert row[f"{name} us"] > 0 and row[f"{name} TB/s"] > 0
+    assert os.environ["AITER_G2L_TORCH"] == "caller-setting"
+    assert os.environ["AITER_G2L_TRITON"] == "0"
+
+
+def test_standard_harness_rejects_silent_fallback(monkeypatch):
+    from op_tests import test_moe_g2l_lut as bench
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected Triton build failure")
+
+    monkeypatch.setattr(wrapper, "build_g2l_lut", fail)
+    with pytest.raises(AssertionError, match="unexpected G2L nvr fallback"):
+        bench.test_moe_g2l_lut(8193, 128, torch.int32, 1, 37, 8, "graph")

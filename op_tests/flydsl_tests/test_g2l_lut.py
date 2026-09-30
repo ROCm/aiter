@@ -3,6 +3,9 @@
 
 """Unmodified FlyDSL G2L scan for masks/counters fitting its 512-entry limit.
 
+Standard correctness/perf sweep: op_tests/test_moe_g2l_lut.py
+This file retains focused pytest regression checks.
+
 Run: python -m pytest -q op_tests/flydsl_tests/test_g2l_lut.py
 Inputs retain the original int32-mask contract; dtype preparation is checked
 only for integral values, not fractional masks or out-of-range int64 values.
@@ -10,6 +13,9 @@ only for integral values, not fractional masks or out-of-range int64 values.
 
 import pytest
 import torch
+
+from aiter.jit.utils.chip_info import get_gfx
+from op_tests.test_moe_g2l_lut import SUPPORTED_GFX
 
 pytest.importorskip("flydsl")
 
@@ -35,6 +41,12 @@ def assert_exact(actual, expected):
     assert actual.dtype == torch.int32
     assert actual.is_contiguous()
     assert torch.equal(actual.cpu(), expected)
+
+
+@pytest.fixture(autouse=True)
+def supported_arch():
+    if get_gfx() not in SUPPORTED_GFX:
+        pytest.skip(f"G2L auxiliary kernels are unsupported on {get_gfx()}")
 
 
 @pytest.fixture(autouse=True)
