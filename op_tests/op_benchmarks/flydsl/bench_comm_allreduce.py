@@ -49,7 +49,7 @@ question instead: all-reduce + residual add + RMSNorm.
 |-----------------|---------------------------------------------|-------|
 | ``fused_fly_1stage``  | FlyDSL one-shot with the epilogue fused | yes |
 | ``fused_fly_1stage_b<block>_g<cap>[_ss]`` | same, pinned block x grid cap x self-skip | yes |
-| ``fused_fly_1stage_k<split>_b<block>_g64[_ss]`` | same, each row split over ``split`` workgroups of ``block`` threads | yes |
+| ``fused_fly_1stage_k<split>_b<block>_g<cap>[_ss]`` | same, each row split over ``split`` workgroups of ``block`` threads | yes |
 | ``fused_cdr_1stage``  | ``allreduce_fusion_kernel_1stage`` -- the traced kernel | yes |
 | ``fused_cdr_2stage``  | ``allreduce_fusion_kernel_2stage``      | yes |
 | ``fused_qr_fp8``/``_int4`` | ``qr_all_reduce_rmsnorm`` per codec | yes |
@@ -920,14 +920,24 @@ def _fused_fly1s_grid_rows():
     return tuple(rows)
 
 
+# A split build spends ``split`` workgroups per row, so one cap holds 1/split as
+# many rows in flight as it does unsplit; 256 lets k2 match unsplit cap 128.
+_FUSED_FLY1S_SPLIT_CAPS = _FUSED_FLY1S_CAPS + (256,)
+
+
 def _fused_fly1s_split_rows():
-    """Split-row fused builds: ``split`` x slice block x self-skip, at cap 64.
+    """Split-row fused builds: ``split`` x slice block x grid cap x self-skip.
 
     Generated from ``fused_split_options`` over the widths this bench sees,
     like the block rows: a row whose (split, block) a width does not have is
     skipped there by ``_fused_hidden_ok`` -- exactly, not via the engine's
     fallback to the nearest split, which would report one build under
     another's key.
+
+    The engine rounds a split build's cap down to a multiple of ``split`` (k7
+    at g64 runs 63 workgroups; the variant column shows it) and up to
+    ``split`` itself, so a cap below ``split`` is not generated: it would run
+    as ``g<split>`` under a ``g<cap>`` key.
     """
     if _fused_split_options is None:
         return ()
@@ -943,22 +953,25 @@ def _fused_fly1s_split_rows():
     rows = []
     for skip_self in (False, True):
         for split, block in pairs:
-            key = f"fused_fly_1stage_k{split}_b{block}_g64"
-            if skip_self:
-                key += "_ss"
-            rows.append(
-                Candidate(
-                    key,
-                    "fused_fly1s",
-                    40.0,  # min acceptable SQNR value
-                    True,
-                    fusion=True,
-                    grid_cap=64,
-                    block=block,
-                    skip_self=skip_self,
-                    split=split,
+            for cap in _FUSED_FLY1S_SPLIT_CAPS:
+                if cap < split:
+                    continue
+                key = f"fused_fly_1stage_k{split}_b{block}_g{cap}"
+                if skip_self:
+                    key += "_ss"
+                rows.append(
+                    Candidate(
+                        key,
+                        "fused_fly1s",
+                        40.0,  # min acceptable SQNR value
+                        True,
+                        fusion=True,
+                        grid_cap=cap,
+                        block=block,
+                        skip_self=skip_self,
+                        split=split,
+                    )
                 )
-            )
     return tuple(rows)
 
 
