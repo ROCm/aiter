@@ -216,7 +216,10 @@ def test_native_fp8_cache_rejected(fmt):
 
 
 def test_lds_budget_gfx950_is_unchecked():
-    """gfx950 is left to the launcher; the 64 KB table is gfx942-only."""
+    """gfx950 is left to the launcher, though arch_info lists its LDS too.
+
+    The footprint model holds only for gfx942's bf16, non-async tiles.
+    """
     smd._check_lds_budget("gfx950", 64, 2048, 64)
 
 
