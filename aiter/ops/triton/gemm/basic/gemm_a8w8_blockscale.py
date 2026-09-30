@@ -99,12 +99,12 @@ def gemm_a8w8_blockscale(
     if config is None:
         config, _ = _get_config(M, N, K, backend=backend)
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -113,8 +113,6 @@ def gemm_a8w8_blockscale(
         )
     else:
         y_pp = None
-
-    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
@@ -314,12 +312,12 @@ def gemm_a8w8_blockscale_preshuffle(
     if kernel_type_from_config is not None:
         kernel_type = kernel_type_from_config
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -328,8 +326,6 @@ def gemm_a8w8_blockscale_preshuffle(
         )
     else:
         y_pp = None
-
-    compute_splitk_params(config, K)
 
     # If block size is greater than split k size, shrink the block size
     if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:

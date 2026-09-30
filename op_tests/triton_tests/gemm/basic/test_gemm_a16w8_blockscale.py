@@ -9,9 +9,6 @@ import torch.nn.functional as F
 import triton
 
 from aiter.ops.shuffle import shuffle_weight
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w8_blockscale import (
-    _get_config,
-)
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale,
     gemm_a16w8_blockscale_preshuffle,
@@ -56,6 +53,9 @@ def get_x_vals():
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
+    # gfx950's default config splits these K into 256-wide partitions, so the
+    # last one runs past K (K=640 -> 3 x 256)
+    x_vals += [(v, 6144, K) for v in (1, 16, 64) for K in (640, 896)]
     return x_vals
 
 
@@ -152,17 +152,18 @@ def test_gemm(dtype, M, N, K, output, shuffle):
 
 
 @pytest.mark.parametrize("shuffle", [False, True])
-@pytest.mark.parametrize("K", [640, 896])
-def test_gemm_splitk_tail(K, shuffle):
-    # an 8-way split leaves the last partition running past K
-    M, N = 16, 6144
-    x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
+def test_gemm_skip_reduce(shuffle):
+    # gfx950's default config asks for 8 splits here and normalizes to 3; the
+    # returned partials must be exactly the ones the kernel wrote
+    M, N, K = 16, 6144, 640
+    x, weight, weight_triton, w_scale, _ = generate_gemm_a16w8_blockscale_inputs(
         M, N, K, *block_shape, shuffle=shuffle
     )
-    config = dict(_get_config(M, N, K, shuffle)[0], NUM_KSPLIT=8)
     impl = gemm_a16w8_blockscale_preshuffle if shuffle else gemm_a16w8_blockscale
 
     a = run_torch(x, weight, w_scale)
-    b = impl(x, weight_triton, w_scale, torch.bfloat16, y, config=config)
+    b = impl(x, weight_triton, w_scale, torch.bfloat16, skip_reduce=True)
+    if b.dim() == 3:
+        b = b.sum(dim=0).to(torch.bfloat16)
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
