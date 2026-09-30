@@ -27,6 +27,9 @@ class TestCSVValidation(unittest.TestCase):
         "a8w8_bpreshuffle": "a8w8_bpreshuffle_tuned_gemm.csv",
         "a8w8_blockscale": "a8w8_blockscale_tuned_gemm.csv",
         "a8w8_blockscale_bpreshuffle": "a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+        "a8w8_blockscale_mxscale_bpreshuffle": (
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv"
+        ),
         "a4w4_blockscale": "a4w4_blockscale_tuned_gemm.csv",
         "a6w6_blockscale": "a6w6_blockscale_tuned_gemm.csv",
         "a6w4_asm": "a6w4_asm_tuned_gemm.csv",
@@ -85,8 +88,12 @@ class TestCSVValidation(unittest.TestCase):
         )
 
     def test_a8w8_blockscale_bpreshuffle_no_duplicates(self):
+        self._check_no_duplicates("a8w8_blockscale_bpreshuffle", extra_keys=["libtype"])
+
+    def test_a8w8_blockscale_mxscale_bpreshuffle_no_duplicates(self):
         self._check_no_duplicates(
-            "a8w8_blockscale_bpreshuffle", extra_keys=["scaletype", "libtype"]
+            "a8w8_blockscale_mxscale_bpreshuffle",
+            extra_keys=["w_scale_block", "kernelId", "libtype"],
         )
 
     def test_a4w4_blockscale_no_duplicates(self):

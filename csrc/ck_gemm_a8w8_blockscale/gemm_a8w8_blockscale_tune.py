@@ -15,14 +15,11 @@ from aiter import dtypes, logger
 from aiter.jit.core import (
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a8w8 import (
-    SCALE_TYPE_E8M0,
-    SCALE_TYPE_FP32,
-    blockscale_bpreshuffle_backends,
-)
+from aiter.ops.gemm_op_a8w8 import MXPSH_W_SCALE_BLOCK, MXSCALE_BMM_KERNEL_ID
 from aiter.ops.opus.gemm_op_a8w8 import (
     opus_gemm_a8w8_blockscale_bpreshuffle_tune,
 )
@@ -32,7 +29,7 @@ from aiter.ops.shuffle import (
     shuffle_weight,
 )
 from aiter.utility import fp4_utils
-from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.utility.base_tuner import GemmCommonTuner, _read_csv
 from aiter.utility.mp_tuner import mp_tuner
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -300,15 +297,43 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
 
         super().__init__(name, keys, resultList, description)
+        self._mxscale = False
+        self._hide_bmm = False
 
     def run(self, args, fast_mode=False):
-        # Stash before super().run() -> pre_process() -> get_untuned_gemm_list().
-        self._scaletype_arg = getattr(args, "scaletype", None)
-        if not getattr(args, "preshuffle", False):
-            self.keys = [k for k in self.keys if k != "scaletype"]
-            self.columns = [c for c in self.columns if c != "scaletype"]
-            self.sort_keys = [k for k in self.sort_keys if k != "scaletype"]
-        if getattr(args, "preshuffle", False):
+        self._mxscale = args.libtype == "flydsl"
+        if self._mxscale:
+            if not getattr(args, "preshuffle", False):
+                self.parser.error(
+                    "--libtype flydsl tunes the preshuffled-weight mxscale GEMM; "
+                    "pass --preshuffle"
+                )
+            if "w_scale_block" not in self.keys:
+                self.keys = [*self.keys, "w_scale_block"]
+                self.sort_keys = [*self.sort_keys, "w_scale_block"]
+                self.columns = self.keys + [
+                    c for c in self.columns if c not in self.keys
+                ]
+            self.ARG_DEFAULTS = {
+                **self.ARG_DEFAULTS,
+                "config_env_name": (
+                    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE"
+                ),
+                "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE}",
+            }
+            if args.tune_file in (
+                f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
+                f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}",
+            ):
+                args.tune_file = (
+                    f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE}"
+                )
+                logger.warning(
+                    "--libtype flydsl without -o: writing to %s (the mxscale "
+                    "family; the fp32 -o defaults point at other tables).",
+                    args.tune_file,
+                )
+        elif getattr(args, "preshuffle", False):
             self.ARG_DEFAULTS = {
                 **self.ARG_DEFAULTS,
                 "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
@@ -323,27 +348,66 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 )
         return super().run(args, fast_mode)
 
-    def _fill_scaletype(self, df, value):
-        if "scaletype" not in self.keys or "scaletype" in df.columns:
-            return df
-        pos = self.columns.index("scaletype")
-        df.insert(min(pos, len(df.columns)), "scaletype", value)
-        return df
+    @staticmethod
+    def _is_bmm(df):
+        if df.empty or "kernelId" not in df.columns:
+            return pd.Series(False, index=df.index, dtype=bool)
+        return (df["libtype"].astype(str) == "flydsl") & (
+            df["kernelId"].astype(str) == MXSCALE_BMM_KERNEL_ID
+        )
+
+    def pre_process(self, args):
+        self._hide_bmm = self._mxscale
+        try:
+            super().pre_process(args)
+        finally:
+            self._hide_bmm = False
+
+    def result_to_csv(self, resultdf, file, concat=False):
+        if not self._mxscale:
+            return super().result_to_csv(resultdf, file, concat)
+        full = super().get_tuned_gemm_list(file)
+        bmm_rows = full[self._is_bmm(full)]
+        self._hide_bmm = True
+        try:
+            super().result_to_csv(resultdf, file, concat)
+        finally:
+            self._hide_bmm = False
+        merged = pd.concat([_read_csv(file), bmm_rows], ignore_index=True)
+        merged.to_csv(file, index=False, na_rep="Null")
+
+    def sortResults(self, tune_file, issorted, values):
+        # super() de-duplicates on self.keys, which bmm and mxpsh share entirely,
+        # so it would drop one row of every pair. De-dup per contract instead.
+        if not self._mxscale or not os.path.exists(tune_file):
+            return super().sortResults(tune_file, issorted, values)
+        df = _read_csv(tune_file)
+        if df.empty:
+            return super().sortResults(tune_file, issorted, values)
+        if "gfx" in self.keys and "gfx" not in df.columns:
+            df.insert(0, "gfx", self.get_gfx())
+        is_bmm = self._is_bmm(df)
+        df = pd.concat(
+            [
+                g.drop_duplicates(subset=self.keys, keep="last")
+                for g in (df[~is_bmm], df[is_bmm])
+            ]
+        )
+        if issorted:
+            df = df.sort_values(by=values)
+        df.to_csv(tune_file, index=False)
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
+        # A plain M,N,K shape list has no w_scale_block, but pre_process slices
+        # untunedf down to self.keys. The mxpsh contract fixes the block.
         df = super().get_untuned_gemm_list(untuned_gemm_file)
-        override = getattr(self, "_scaletype_arg", None)
-        if override is not None and "scaletype" in self.keys:
-            df["scaletype"] = override
-            return df
-        return self._fill_scaletype(df, SCALE_TYPE_FP32)
+        if "w_scale_block" in self.keys and "w_scale_block" not in df.columns:
+            df["w_scale_block"] = MXPSH_W_SCALE_BLOCK
+        return df
 
-    def get_tuned_gemm_list(self, tuned_gemm_file):
-        """Mirror of get_untuned_gemm_list: a tuned CSV predating the column is
-        all fp32, and pre_process compares the two frames column-for-column."""
-        return self._fill_scaletype(
-            super().get_tuned_gemm_list(tuned_gemm_file), SCALE_TYPE_FP32
-        )
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
+        df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
+        return df[~self._is_bmm(df)].reset_index(drop=True) if self._hide_bmm else df
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -363,23 +427,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             default="all",
             choices=["ck", "cktile", "asm", "opus", "flydsl", "all", "both"],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, flydsl, both or all (covers all supported backends across standard/preshuffleB modes)",
-        )
-
-        self.parser.add_argument(
-            "--scaletype",
-            type=str,
-            default=None,
-            choices=[SCALE_TYPE_FP32, SCALE_TYPE_E8M0],
-            required=False,
-            help=(
-                "Tune the untuned shapes as this scale type, overriding any "
-                "scaletype column they carry -- so an ordinary M,N,K shape list "
-                "needs no new column to be tuned for e8m0. Defaults to whatever "
-                "the input declares, or fp32. The groups never share a pool: an "
-                "e8m0 backend takes e8m0 scales in a shuffled layout the fp32 "
-                "backends cannot read, and vice versa."
-            ),
+            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, flydsl, both or all. 'all'/'both' cover the fp32 backends only; 'flydsl' is the e8m0 mxpsh group (requires --preshuffle) and writes the mxscale table.",
         )
 
         self.parser.add_argument(
@@ -706,11 +754,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 self._get_run_config_err_ratio_limit(row, args)
             )
             try:
-                row_scaletype = (
-                    row["scaletype"] if "scaletype" in row.index else SCALE_TYPE_FP32
-                )
-                is_e8m0_row = is_preshuffle and row_scaletype == SCALE_TYPE_E8M0
-                if is_e8m0_row:
+                if is_preshuffle and self._mxscale:
                     gd = generate_data_e8m0(M, N, K, 0)
                     out, us = run_perftest(
                         gemm_a8w8_blockscale_bpreshuffle,
@@ -865,21 +909,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
-            row_scaletype = (
-                str(untunedf.loc[i, "scaletype"])
-                if "scaletype" in untunedf.columns
-                else SCALE_TYPE_FP32
-            )
             prev_task_count = len(task)
-            info_keys = (gfx, cu_num, M, N, K, row_scaletype)
+            info_keys = (gfx, cu_num, M, N, K)
+            if self._mxscale:
+                info_keys += (MXPSH_W_SCALE_BLOCK,)
             lib = args.libtype
-            row_backends = blockscale_bpreshuffle_backends(row_scaletype)
 
-            def _in_group(libtype, _b=row_backends):
-                """Backends only compete inside their own scale-type group."""
-                return libtype in _b
-
-            if lib in ("ck", "both", "all") and _in_group("ck"):
+            if lib in ("ck", "both", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_tune_task(
                         info_keys,
@@ -889,7 +925,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            if lib in ("cktile", "both", "all") and _in_group("cktile"):
+            if lib in ("cktile", "both", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_cktile_tune_task(
                         info_keys,
@@ -900,7 +936,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            if lib in ("asm", "all") and _in_group("asm"):
+            if lib in ("asm", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_asm_tune_task(
                         info_keys,
@@ -910,7 +946,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            if lib in ("opus", "all") and _in_group("opus"):
+            if lib in ("opus", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_opus_tune_task(
                         info_keys,
@@ -919,7 +955,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            if lib in ("flydsl", "all") and _in_group("flydsl"):
+            if lib == "flydsl":
                 task.extend(
                     self.get_gemm_a8w8_blockscale_flydsl_tune_task(
                         info_keys,
@@ -995,7 +1031,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    key = ["gfx", "cu_num", "M", "N", "K", "scaletype"]
+    key = ["gfx", "cu_num", "M", "N", "K"]
     resultList = [
         "libtype",
         "kernelId",

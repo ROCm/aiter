@@ -217,15 +217,6 @@ def gemm_a8w8_bpreshuffle_flydsl(
     return Out
 
 
-SCALE_TYPE_FP32 = "fp32"
-SCALE_TYPE_E8M0 = "e8m0"
-
-BLOCKSCALE_BPRESHUFFLE_BACKENDS = {
-    SCALE_TYPE_FP32: ("ck", "cktile", "asm", "opus", "triton"),
-    SCALE_TYPE_E8M0: ("flydsl",),
-}
-
-
 @functools.cache
 def _warn_untuned_flydsl_fallback(gfx: str, op: str, n: int, k: int) -> None:
     """Warn once per (arch, op, N, K) that a shape has no tuned row."""
@@ -234,26 +225,6 @@ def _warn_untuned_flydsl_fallback(gfx: str, op: str, n: int, k: int) -> None:
         f"heuristic flydsl kernel. Tune this shape to remove the guess. "
         f"(logged once per N/K; AITER_LOG_TUNED_CONFIG=1 for per-call detail)"
     )
-
-
-@functools.cache
-def _warn_unknown_scaletype(scaletype: str) -> None:
-    logger.warning(
-        f"a8w8 blockscale-bpreshuffle: unknown scaletype {scaletype!r}; no backend "
-        f"can serve it. Known groups: {sorted(BLOCKSCALE_BPRESHUFFLE_BACKENDS)}."
-    )
-
-
-def blockscale_bpreshuffle_backends(scaletype) -> tuple:
-    """Backends able to serve the given scale format."""
-    key = "" if scaletype is None else str(scaletype)
-    if not key or key == "nan":
-        key = SCALE_TYPE_FP32
-    backends = BLOCKSCALE_BPRESHUFFLE_BACKENDS.get(key)
-    if backends is None:
-        _warn_unknown_scaletype(key)
-        return ()
-    return backends
 
 
 def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
@@ -526,56 +497,37 @@ _CKGEMM_HAS_GFX: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None, scaletype=None):
+def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
-    cache_key = (tuned_file, scaletype)
-    if cache_key not in _CKGEMM_CONFIG_CACHE:
+    if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        if scaletype is not None:
-            if "scaletype" in ckgemm_dict.columns:
-                ckgemm_dict = ckgemm_dict[
-                    ckgemm_dict["scaletype"].fillna(SCALE_TYPE_FP32) == scaletype
-                ]
-            elif scaletype != SCALE_TYPE_FP32:
-                # No column at all -> every row is a legacy fp32 row.
-                ckgemm_dict = ckgemm_dict.iloc[0:0]
         # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
         # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
-        index_cols = (
-            ["gfx", "cu_num", "M", "N", "K"]
-            if "gfx" in ckgemm_dict.columns
-            else ["cu_num", "M", "N", "K"]
-        )
-        if ckgemm_dict.duplicated(subset=index_cols).any():
-            sort_col = "us" if "us" in ckgemm_dict.columns else None
-            if sort_col:
-                ckgemm_dict = ckgemm_dict.sort_values(sort_col, kind="stable")
-            ckgemm_dict = ckgemm_dict.drop_duplicates(subset=index_cols, keep="first")
         if "gfx" in ckgemm_dict.columns:
-            _CKGEMM_CONFIG_CACHE[cache_key] = ckgemm_dict.set_index(
+            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
                 ["gfx", "cu_num", "M", "N", "K"]
             ).to_dict("index")
-            _CKGEMM_HAS_GFX[cache_key] = True
+            _CKGEMM_HAS_GFX[tuned_file] = True
         else:
             logger.warning(
                 f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
-            _CKGEMM_CONFIG_CACHE[cache_key] = ckgemm_dict.set_index(
+            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
                 ["cu_num", "M", "N", "K"]
             ).to_dict("index")
-            _CKGEMM_HAS_GFX[cache_key] = False
+            _CKGEMM_HAS_GFX[tuned_file] = False
 
     gfx = get_gfx()
     cu_num = get_cu_num()
-    has_gfx = _CKGEMM_HAS_GFX[cache_key]
+    has_gfx = _CKGEMM_HAS_GFX[tuned_file]
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
-        config = _CKGEMM_CONFIG_CACHE[cache_key].get(key, None)
+        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
@@ -963,23 +915,40 @@ def _group32_w_scale_block(XQ, WQ, x_scale, w_scale) -> str | None:
 
 _MXSCALE_BPRESHUFFLE_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
+MXSCALE_BMM_KERNEL_ID = "bmm"
+
 
 @functools.cache
-def _load_mxscale_bpreshuffle_tuned() -> dict:
+def _load_mxscale_bpreshuffle_tuned(bmm: bool) -> dict:
     """{(gfx, cu_num, M, N, K, w_scale_block): row} of the e8m0 block-scale
-    table for preshuffled weights."""
+    table for preshuffled weights, restricted to the batched-GEMM rows
+    (``bmm``) or to the shuffled-scale 2D-GEMM rows."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
     df = pd.read_csv(path).drop_duplicates()
-    return df.set_index(_MXSCALE_BPRESHUFFLE_KEYS).to_dict("index")
+    is_bmm = (df["libtype"].astype(str) == "flydsl") & (
+        df["kernelId"].astype(str) == MXSCALE_BMM_KERNEL_ID
+    )
+    return (
+        df[is_bmm if bmm else ~is_bmm]
+        .set_index(_MXSCALE_BPRESHUFFLE_KEYS)
+        .to_dict("index")
+    )
 
 
 @functools.lru_cache(maxsize=1024)
-def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
+def get_mxscale_bpreshuffle_config(
+    m: int, n: int, k: int, w_scale_block: str, bmm: bool
+):
+    # bmm is passed positionally at every call site: lru_cache's _make_key takes
+    # a slower path for keyword arguments (+37ns on every hit).
     """Tuned row of an e8m0 block-scale GEMM on preshuffled weights, at M or a
-    padded M; None when untuned. Cached per shape, so a miss is reported once."""
+    padded M; None when untuned. ``bmm`` selects the operand contract: the
+    batched GEMM run with B = 1, or the shuffled-scale 2D GEMM. Cached per
+    shape, so a miss is reported once."""
     gfx, cu_num = get_gfx(), get_cu_num()
+    kind = "bmm" if bmm else "2d"
     row, padded_m = find_padded_m_row(
-        _load_mxscale_bpreshuffle_tuned(),
+        _load_mxscale_bpreshuffle_tuned(bmm),
         lambda pm: (gfx, cu_num, pm, n, k, w_scale_block),
         m,
         n,
@@ -987,13 +956,14 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
     )
     if row is None:
         logger.warning(
-            f"mxscale bpreshuffle M:{m}, N:{n}, K:{k}, w_scale {w_scale_block} is "
-            f"untuned on {gfx}; the flydsl batched GEMM heuristic picks its kernel."
+            f"mxscale bpreshuffle ({kind}) M:{m}, N:{n}, K:{k}, w_scale "
+            f"{w_scale_block} is untuned on {gfx}; a heuristic picks the kernel."
         )
     elif AITER_LOG_TUNED_CONFIG:
         logger.info(
-            f"mxscale bpreshuffle M:{m}, N:{n}, K:{k}, w_scale {w_scale_block} is "
-            f"tuned at padded_M {padded_m} on {gfx}: {row['kernelName']}"
+            f"mxscale bpreshuffle ({kind}) M:{m}, N:{n}, K:{k}, w_scale "
+            f"{w_scale_block} is tuned at padded_M {padded_m} on {gfx}: "
+            f"{row['kernelName']}"
         )
     return row
 
@@ -1001,20 +971,23 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
 # The blockscale x_scale block: a 1x128 x_scale has column-major bytes.
 _BLOCKSCALE_X_BLOCK = 128
 
+MXPSH_W_SCALE_BLOCK = "128x128"
+
 
 def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     """E8M0 block-scale GEMM on (16, 16)-preshuffled weights. A 128-wide
     x_scale has column-major bytes (blockscale), a 32-wide one is row-major
-    (group32/MX). A tuned row names its implementation by (libtype, kernelId);
-    "flydsl"/"bmm" is the flydsl batched GEMM (flydsl.batched_gemm_a8w8) run
-    with B = 1, which also serves untuned shapes."""
+    (group32/MX). Rows are selected by kernelId == "bmm": the flydsl batched
+    GEMM (flydsl.batched_gemm_a8w8) run with B = 1, which also serves untuned
+    shapes. The non-"bmm" rows at the same key belong to the shuffled-scale 2D
+    GEMMs, which cannot read these raw scales."""
     m, k = XQ.shape
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
-    config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+    config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block, True)  # bmm
     if config is not None and (config["libtype"], str(config["kernelId"])) != (
         "flydsl",
-        "bmm",
+        MXSCALE_BMM_KERNEL_ID,
     ):
         raise NotImplementedError(
             f"mxscale bpreshuffle row {config['libtype']}/{config['kernelId']} "
@@ -1215,11 +1188,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and w_scale.dtype == dtypes.fp8_e8m0
     )
     if use_gfx1250_flydsl_or_triton_mxfp8_128:
-        config = get_CKGEMM_config(
-            m,
-            n,
-            k,
-            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+        config = get_mxscale_bpreshuffle_config(
+            m, n, k, mxscale_w_scale_block(tuple(w_scale.shape), n, k), False  # not bmm
         )
         # A tuned triton/gluon row wins over flydsl on the SAME mxfp8_128
         # operands: gemm_afp8wfp8_preshuffle consumes the e8m0 scales natively
@@ -1292,12 +1262,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and w_scale.dtype == dtypes.fp8_e8m0
     ):
         if x_scale.dim() == 1 and w_scale.dim() == 1:
-            config = get_CKGEMM_config(
-                m,
-                n,
-                k,
-                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
-                scaletype=SCALE_TYPE_E8M0,
+            config = get_mxscale_bpreshuffle_config(
+                m, n, k, MXPSH_W_SCALE_BLOCK, False  # not bmm
             )
             if config is not None and config["libtype"] == "flydsl":
                 return gemm_a8w8_mxscale_preshuffle_flydsl(
@@ -1365,14 +1331,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
             config=_fallback_cfg,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
-    # fp32 scales -> the fp32 group only; an e8m0 row names a kernel that cannot
-    # read these operands.
+
     config = get_CKGEMM_config(
         m,
         n,
         k,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
-        scaletype=SCALE_TYPE_FP32,
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
@@ -1431,7 +1395,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 x_scale=x_scale,
                 w_scale=w_scale,
             )
-        elif libtype == "flydsl" and get_gfx() == "gfx1250":
+        elif libtype == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
@@ -1444,14 +1408,16 @@ def gemm_a8w8_blockscale_bpreshuffle(
         ) from e
 
 
-def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int) -> dict:
+def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> dict:
     """Fall back to the bpreshuffle winner for a shape with no A-preshuffle row.
 
     The two kernel families differ only by an ``_apre`` marker, which sits before
-    any ``_ps<n>`` persistent-tile suffix.
+    any ``_ps<n>`` persistent-tile suffix. Those bpreshuffle rows are the e8m0
+    2D-GEMM rows of the mxscale table -- the very ones the non-A-preshuffled
+    gfx1250 path reads -- not the fp32 blockscale-bpreshuffle table.
     """
-    config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    config = get_mxscale_bpreshuffle_config(
+        m, n, k, mxscale_w_scale_block(tuple(w_scale.shape), n, k), False  # not bmm
     )
     if config is None or config.get("libtype") != "flydsl":
         raise RuntimeError(
@@ -1554,7 +1520,7 @@ def gemm_a8w8_blockscale_abpreshuffle(
     except FileNotFoundError:
         config = None
     if config is None or config.get("libtype") != "flydsl":
-        config = _abpreshuffle_config_from_bpreshuffle(m, n, k)
+        config = _abpreshuffle_config_from_bpreshuffle(m, n, k, w_scale)
     return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
         XQ, WQ, x_scale, w_scale, Y, config, a_is_preshuffled=True
     )
