@@ -65,7 +65,7 @@ def create_causal_conv1d_prefill_kernel(
         )
 
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def kernel(
+    def causal_conv1d_prefill_kernel(
         x: fx.Tensor,
         w: fx.Tensor,
         bias: fx.Tensor,
@@ -204,7 +204,7 @@ def create_causal_conv1d_prefill_kernel(
         out_span: fx.Int64,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
-        kernel(
+        causal_conv1d_prefill_kernel(
             x,
             w,
             bias,

@@ -101,7 +101,7 @@ def create_gdn_decode_verify_kernel(
         return s
 
     @flyc.kernel
-    def kernel(
+    def gdn_decode_verify_kernel(
         q: fx.Tensor,
         k: fx.Tensor,
         v: fx.Tensor,
@@ -298,7 +298,7 @@ def create_gdn_decode_verify_kernel(
         n: fx.Int32,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
-        kernel(
+        gdn_decode_verify_kernel(
             q, k, v, a, b, A_log, dt_bias, state, indices, out, cu, icache, icache_idx
         ).launch(grid=(HV, V // VTILE, n), block=(BLOCK,), stream=stream)
 
