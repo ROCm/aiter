@@ -2061,12 +2061,9 @@ def test_qsa_auto_admits_only_measured_pairs():
     """
     page = 16
     n_columns = 128
-    for hq, d_gqa, heads in ((24, 256, 4), (10, 128, 4), (10, 128, 8)):
+    for hq, d_gqa, heads in ((24, 256, 4), (24, 256, 8), (10, 128, 4), (10, 128, 8)):
         swept = _policy_args(1, hq, d_gqa, n_columns, page, heads, 128)
         assert qsa_auto_uses_flydsl(*swept) is True
-    # Family A was only ever swept with a 4-head indexer.
-    wide_indexer = _policy_args(1, 24, 256, n_columns, page, 8, 128)
-    assert qsa_auto_uses_flydsl(*wide_indexer) is False
     # An untuned GQA query stays on Triton however it is indexed.
     untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
     assert qsa_auto_uses_flydsl(*untuned) is False
