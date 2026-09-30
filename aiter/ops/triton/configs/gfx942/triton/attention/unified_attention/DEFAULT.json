@@ -266,7 +266,7 @@
       "BLOCK_M": 16,
       "num_warps": 4,
       "num_stages": 1,
-      "waves_per_eu": 1
+      "waves_per_eu": 2
     },
     "any": {
       "BLOCK_M": 16,
