@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Large-expert G2L integration: FlyDSL <=1024, Triton <=16384, then torch.
+"""Large-expert G2L integration: FlyDSL <=512, Triton <=16384, then torch.
 
 Run: python -m pytest -q op_tests/triton_tests/moe/test_g2l_lut_large.py
 """
@@ -171,8 +171,11 @@ def test_optional(n, with_nvt, topk, no_fallback):
 @pytest.mark.parametrize(
     "n,E,expected",
     [
+        (511, 128, "flydsl"),
         (512, 128, "flydsl"),
-        (1024, 256, "flydsl"),
+        (513, 128, "triton"),
+        (1, 513, "triton"),
+        (1024, 256, "triton"),
         (1025, 256, "triton"),
         (8192, 1024, "triton"),
         (8193, 8192, "triton"),
@@ -211,7 +214,7 @@ def test_dispatch_boundaries(n, E, expected, monkeypatch):
         exact(nvr, torch.tensor([296], dtype=torch.int32, device="cpu"))
 
 
-@pytest.mark.parametrize("n", [1024, 8193])
+@pytest.mark.parametrize("n", [512, 513, 1024, 8193])
 @pytest.mark.parametrize("force_torch", [False, True])
 @pytest.mark.parametrize("enable_triton", [False, True])
 def test_env_selection(n, force_torch, enable_triton, monkeypatch):
@@ -235,7 +238,7 @@ def test_env_selection(n, force_torch, enable_triton, monkeypatch):
     lut, counter, nvr = grouped._build_g2l_lut(mask, n, mask.device)
     expected = []
     if not force_torch:
-        if n <= 1024:
+        if n <= 512:
             expected = ["flydsl"]
         elif enable_triton:
             expected = ["triton"]
@@ -299,7 +302,7 @@ def test_dispatch_reset_ownership(direct_mask, monkeypatch, no_fallback):
     exact(lut, torch.arange(8193, dtype=torch.int32, device="cpu"))
 
 
-@pytest.mark.parametrize("n,E", [(8192, 1024), (8193, 8192)])
+@pytest.mark.parametrize("n,E", [(513, 128), (8192, 1024), (8193, 8192)])
 def test_integrated_single_kernel(n, E, no_fallback):
     mask = torch.zeros(n, device="cuda", dtype=torch.int32)
     mask[:E] = 1
@@ -325,5 +328,34 @@ def test_integrated_single_kernel(n, E, no_fallback):
         pytest.skip("GPU profiler activity collection unavailable")
     assert len(gpu) == 1 and "_g2l_lut_kernel" in gpu[0], gpu
     exact(lut, reference(mask.cpu(), E))
+    exact(counter, torch.zeros(E, dtype=torch.int32, device="cpu"))
+    exact(nvr, torch.tensor([32768], dtype=torch.int32, device="cpu"))
+
+
+@pytest.mark.parametrize("n", range(513, 1025))
+def test_former_flydsl_extension_uses_triton(n, no_fallback):
+    host = (torch.arange(n, device="cpu") % 3 == 0).to(torch.int32)
+    host[-1] = 0  # 512 experts + sentinel at the first newly routed size.
+    E = int(host.sum())
+    mask = host.cuda()
+    nvt = torch.tensor([37], dtype=torch.int32, device="cuda")
+    lut, counter, nvr = grouped._build_g2l_lut(mask, E, mask.device, nvt, 8)
+    assert counter is not None and nvr is not None
+    exact(lut, reference(host, E))
+    exact(counter, torch.zeros(E, dtype=torch.int32, device="cpu"))
+    exact(nvr, torch.tensor([296], dtype=torch.int32, device="cpu"))
+
+
+@pytest.mark.parametrize("n", [513, 8192, 8193])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool, torch.float32])
+@pytest.mark.parametrize("pattern", ["zero", "one", "sentinel", "last", "random"])
+@pytest.mark.parametrize("stride", [1, 2])
+def test_integrated_nonzero_semantics(n, dtype, pattern, stride, no_fallback):
+    # Compare before cast, including fractional floats, NaN, and wide int64.
+    host, mask, E = mask_data(n, dtype, pattern, stride)
+    nvt = torch.tensor([4096], dtype=torch.int32, device="cuda")
+    lut, counter, nvr = grouped._build_g2l_lut(mask, E, mask.device, nvt, 8)
+    assert counter is not None and nvr is not None
+    exact(lut, reference(host, E))
     exact(counter, torch.zeros(E, dtype=torch.int32, device="cpu"))
     exact(nvr, torch.tensor([32768], dtype=torch.int32, device="cpu"))

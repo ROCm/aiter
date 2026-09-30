@@ -364,17 +364,17 @@ def _use_fused_quant_preshuffle(
 
 
 @functools.cache
-def _get_compiled_g2l_lut(clear_counter: bool = True, block_size: int = 512):
+def _get_compiled_g2l_lut(clear_counter: bool = True):
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
     from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 
-    return build_moe_g2l_lut_module(clear_counter=clear_counter, block_size=block_size)
+    return build_moe_g2l_lut_module(clear_counter=clear_counter)
 
 
 # FlyDSL single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS).
 # Larger masks use Triton, then torch if unavailable/disabled/out of range.
-# Include masks with an appended sentinel (512 global experts plus one entry).
-_G2L_MAX_N = 1024
+# A mask with 512 global experts plus a sentinel already needs Triton.
+_G2L_MAX_N = 512
 
 
 _G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
@@ -437,7 +437,7 @@ def _build_g2l_lut(
     or the sentinel ``E`` for dropped (non-local) routes. Result is int32 on
     ``device``.
 
-    Small masks/counters (max(N, E) <= 1024) keep the original FlyDSL kernel.
+    Small masks/counters (max(N, E) <= 512) keep the original FlyDSL kernel.
     Larger ones use a single Triton scan up to max(N, E) <= 16384, including
     8192 global experts plus a sentinel. Both kernels fuse the LUT, counter
     reset and optional nvr. AITER_G2L_TRITON=0 disables the large-input path;
@@ -481,9 +481,7 @@ def _build_g2l_lut(
                     _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
-                ),
-                # One thread per mask entry / counter slot; all must fit.
-                block_size=max(32, _next_pow2(max(n, int(E), 1))),
+                )
             )(
                 ptr_arg(mask),
                 ptr_arg(lut),

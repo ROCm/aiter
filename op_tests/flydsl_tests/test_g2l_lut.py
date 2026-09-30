@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Original FlyDSL G2L scan, including 512 experts plus a sentinel.
+"""Unmodified FlyDSL G2L scan for masks/counters fitting its 512-entry limit.
 
 Run: python -m pytest -q op_tests/flydsl_tests/test_g2l_lut.py
 Inputs retain the original int32-mask contract; dtype preparation is checked
@@ -14,10 +14,7 @@ import torch
 pytest.importorskip("flydsl")
 
 from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
-from aiter.ops.flydsl.kernels.moe_g2l_lut import (
-    MAX_G2L_EXPERTS,
-    build_moe_g2l_lut_module,
-)
+from aiter.ops.flydsl.kernels.moe_g2l_lut import MAX_G2L_EXPERTS
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
@@ -43,7 +40,7 @@ def assert_exact(actual, expected):
 @pytest.fixture(autouse=True)
 def isolated_context(monkeypatch):
     monkeypatch.delenv("AITER_G2L_TORCH", raising=False)
-    monkeypatch.delenv("AITER_G2L_TRITON", raising=False)
+    monkeypatch.setenv("AITER_G2L_TRITON", "0")
     monkeypatch.setenv("AITER_TDM_DIRECT_EP_MASK", "1")
     monkeypatch.setattr(grouped, "_flydsl_dispatch_context", lambda: None)
     monkeypatch.setattr(grouped, "_G2L_COUNTER_CACHE", {})
@@ -87,7 +84,7 @@ def check_fused(host, *, clear_counter=True, stride=1, monkeypatch):
 
 @pytest.mark.parametrize(
     "n",
-    [0, 1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 511, 512, 513, 767, 1023, 1024],
+    [0, 1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 511, 512],
 )
 @pytest.mark.parametrize("pattern", ["zero", "one", "last", "alternating", "random"])
 @pytest.mark.parametrize("clear_counter", [False, True])
@@ -111,14 +108,7 @@ def test_scan_patterns(n, pattern, clear_counter, monkeypatch, no_fallback):
     check_fused(host, clear_counter=clear_counter, monkeypatch=monkeypatch)
 
 
-@pytest.mark.parametrize("n", range(513, 1025))
-def test_all_extended_lengths(n, monkeypatch, no_fallback):
-    host = (torch.arange(n, device="cpu") % 3 == 0).to(torch.int32)
-    host[-1] = 0  # Explicit dropped sentinel after the global experts.
-    check_fused(host, monkeypatch=monkeypatch)
-
-
-@pytest.mark.parametrize("n", [513, 1024])
+@pytest.mark.parametrize("n", [257, 512])
 @pytest.mark.parametrize("dtype", [torch.bool, torch.int32, torch.int64, torch.float32])
 @pytest.mark.parametrize("stride", [1, 2])
 def test_existing_input_preparation(n, dtype, stride, monkeypatch, no_fallback):
@@ -130,20 +120,20 @@ def test_existing_input_preparation(n, dtype, stride, monkeypatch, no_fallback):
     "with_nvt,topk", [(False, None), (False, 8), (True, None), (True, 0), (True, 8)]
 )
 def test_optional_nvr(with_nvt, topk, no_fallback):
-    mask = torch.ones(513, device="cuda", dtype=torch.int32)
+    mask = torch.ones(512, device="cuda", dtype=torch.int32)
     nvt = torch.tensor([37, 99], device="cuda", dtype=torch.int64) if with_nvt else None
-    lut, counter, nvr = grouped._build_g2l_lut(mask, 513, mask.device, nvt, topk)
-    assert_exact(lut, torch.arange(513, dtype=torch.int32, device="cpu"))
-    assert_exact(counter, torch.zeros(513, dtype=torch.int32, device="cpu"))
+    lut, counter, nvr = grouped._build_g2l_lut(mask, 512, mask.device, nvt, topk)
+    assert_exact(lut, torch.arange(512, dtype=torch.int32, device="cpu"))
+    assert_exact(counter, torch.zeros(512, dtype=torch.int32, device="cpu"))
     if with_nvt and topk is not None:
         assert_exact(nvr, torch.tensor([37 * topk], dtype=torch.int32, device="cpu"))
     else:
         assert nvr is None
 
 
-@pytest.mark.parametrize("n,E", [(0, 1024), (1, 1024), (512, 1024)])
+@pytest.mark.parametrize("n,E", [(0, 512), (1, 512), (256, 512)])
 def test_counter_coverage(n, E, monkeypatch, no_fallback):
-    # Guard / block selection must cover E even if it exceeds N.
+    # The original block must cover all E counter entries, even when E > N.
     mask = torch.ones(n, device="cuda", dtype=torch.int32)
     storage = torch.full((E + 2,), 777, device="cuda", dtype=torch.int32)
     counter = storage[1:-1]
@@ -155,7 +145,7 @@ def test_counter_coverage(n, E, monkeypatch, no_fallback):
     assert storage[0].item() == storage[-1].item() == 777
 
 
-@pytest.mark.parametrize("n", [513, 1024])
+@pytest.mark.parametrize("n", [257, 512])
 def test_dynamic_graph(n, no_fallback):
     E, topk = 73, 8
     mask = torch.zeros(n, device="cuda", dtype=torch.int32)
@@ -194,8 +184,8 @@ def test_dynamic_graph(n, no_fallback):
     [
         ("size", 16385, 256),
         ("size", 1, 16385),
-        ("env", 513, 128),
-        ("compile", 513, 128),
+        ("env", 512, 128),
+        ("compile", 512, 128),
     ],
 )
 def test_torch_fallback(reason, n, E, monkeypatch):
@@ -220,11 +210,5 @@ def test_torch_fallback(reason, n, E, monkeypatch):
     assert_exact(ep_nvr, torch.tensor([136], dtype=torch.int32, device="cpu"))
 
 
-@pytest.mark.parametrize("block_size", [0, -1, 3, 513, 1025, 2048])
-def test_invalid_block_size(block_size):
-    with pytest.raises(ValueError, match="power of two"):
-        build_moe_g2l_lut_module(block_size=block_size)
-
-
 def test_matching_limits():
-    assert grouped._G2L_MAX_N == MAX_G2L_EXPERTS == 1024
+    assert grouped._G2L_MAX_N == MAX_G2L_EXPERTS == 512

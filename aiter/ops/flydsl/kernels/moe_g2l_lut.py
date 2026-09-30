@@ -28,21 +28,19 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_buf_tensor,
 )
 
-MAX_G2L_EXPERTS = 1024
+MAX_G2L_EXPERTS = 512
 
 
-def build_moe_g2l_lut_module(clear_counter: bool = True, block_size: int = 512):
-    """Build a single-block LUT launcher; callers must ensure n, E <= block_size."""
-    if block_size < 1 or block_size > MAX_G2L_EXPERTS or block_size & (block_size - 1):
-        raise ValueError("block_size must be a power of two <= MAX_G2L_EXPERTS")
+def build_moe_g2l_lut_module(clear_counter: bool = True):
+    """JIT launcher: single-block build of the EP global->local expert LUT."""
 
     # Double-buffered LDS for the Hillis-Steele scan (ping-pong between passes).
     @fx.struct
     class SharedStorage:
-        buf0: fx.Array[fx.Int32, block_size, 16]
-        buf1: fx.Array[fx.Int32, block_size, 16]
+        buf0: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+        buf1: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
 
-    @flyc.kernel(name="moe_g2l_lut", known_block_size=[block_size, 1, 1])
+    @flyc.kernel(name="moe_g2l_lut", known_block_size=[MAX_G2L_EXPERTS, 1, 1])
     def g2l_kernel(
         mask: fx.Pointer,  # (n,) int32 0/1 expert mask
         lut: fx.Pointer,  # (n,) int32 out: global->local, sentinel E
@@ -86,7 +84,7 @@ def build_moe_g2l_lut_module(clear_counter: bool = True, block_size: int = 512):
 
         # Inclusive Hillis-Steele scan (identical to moe_contiguous_psum).
         src, dst = mr0, mr1
-        for offset in range_constexpr(1, block_size):
+        for offset in range_constexpr(1, MAX_G2L_EXPERTS):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
             if in_range:
@@ -119,7 +117,7 @@ def build_moe_g2l_lut_module(clear_counter: bool = True, block_size: int = 512):
     ):
         g2l_kernel(mask, lut, counter, nvt, nvr_out, n, E, topk).launch(
             grid=(1, 1, 1),
-            block=(block_size, 1, 1),
+            block=(MAX_G2L_EXPERTS, 1, 1),
             stream=stream,
         )
 
