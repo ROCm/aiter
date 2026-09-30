@@ -1067,13 +1067,13 @@ def _run_full_runtime_case(
         reduced.add_(fixture.shared_partial)
         return reduced
 
-    def before_stage2(_shared_rows: int):
+    def before_stage2_for_rows(_shared_rows: int):
         return fixture.shared_partial
 
     def run_comm_fused(stage2_stream=None):
         return runtime.run(
             shared_partial=None,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
             stage2_stream=stage2_stream,
             **moe_args,
         )
