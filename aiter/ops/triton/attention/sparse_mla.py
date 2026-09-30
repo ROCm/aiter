@@ -516,10 +516,11 @@ def sparse_mla_fwd(
         dot_precision: what the QK and PV matrix-core ops run in.
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
-                into LDS and both dots are bf16. Works with every cache format.
+                into LDS and both dots are bf16. Works with every cache format
+                the arch takes: all of them on gfx950, bf16 alone on gfx942.
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
-                tensor scale fp8 kv cache only.
+                tensor scale fp8 kv cache only; gfx950 only.
 
             q is adapted to the choice. bf16 q is quantized in the kernel
             prologue, one scale per (query, head-block) tile; fp8 q is passed
