@@ -1,0 +1,7 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,kernelName1,kernelName2,run_1stage
+gfx950,256,8192,4096,256,513,11,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,256,0,fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate,,1
+gfx950,256,16384,4096,256,513,11,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,256,0,fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate,,1
+gfx950,256,32768,4096,256,513,11,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,256,0,fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate,,1
+gfx950,256,8192,8192,256,513,11,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,256,0,fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate,,1
+gfx950,256,16384,8192,256,513,11,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,256,0,fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate,,1
+gfx950,256,32768,8192,256,513,11,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,256,0,fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate,,1
