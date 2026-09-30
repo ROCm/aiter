@@ -3110,6 +3110,28 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
     return false;
 }
 
+// LDS of the wide-first-digit fast path: 2^14 bins as packed 16-bit halves,
+// then the chooser result (bin, keys before it, keys in it) and the packed
+// winner/bin-key reservation counter.  Only kernels that take the path
+// instantiate it, so every other kernel keeps its LDS layout.
+constexpr int kWideDigitBits    = 14;
+constexpr int kWideDigitDwords  = (1 << kWideDigitBits) / 2;
+constexpr int kWideDigitControl = 4;
+
+template <bool Enable>
+__device__ __forceinline__ uint32_t* wide_digit_lds()
+{
+    if constexpr(Enable)
+    {
+        __shared__ uint32_t storage[kWideDigitDwords + kWideDigitControl];
+        return storage;
+    }
+    else
+    {
+        return nullptr;
+    }
+}
+
 // Row placement of a register-copy launch (topk_oneblock_reg_placement): run
 // `rows` rows in groups of `period` workgroups whose first half take
 // consecutive rows.  An unplaced launch passes no placement argument, so it
@@ -3153,7 +3175,7 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int 
            bool UsePass0Bucket206Predictor = false,
            int BallotCandidateCapacity = 0,
            bool FuseLoadPass0Histogram = false,
-           typename... Placement>
+           bool WideFirstDigit = false, typename... Placement>
 __global__ void radix_topk_one_block_reg_kernel(T const* in,
                                                 const int64_t len,
                                                 const IdxT k,
@@ -3210,6 +3232,15 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                    !UseHighBucketPredictor));
     static_assert(!UsePass0Bucket206Predictor || WARP_SIZE == 64);
     static_assert(!UsePass0Bucket206Predictor || StaticRowLen < (1 << 16));
+    // The wide first digit counts each bin in 16 bits, so a row must stay
+    // below 2^16 elements, and its fast path reuses the reservation, cached
+    // twiddled keys and Wave0 selector of the ballot form.
+    static_assert(!WideFirstDigit ||
+                  (BlockSize == 1024 && WARP_SIZE == 64 && StaticRowLen == 0 &&
+                   BlockSize * ElemsPerThread < (1 << 16) && UseWaveWinnerReserve &&
+                   CacheTwiddledBits && UseWaveBallotSelect && !DirectWaveWinnerWrite &&
+                   !UseHighBucketPredictor && !UsePass0Bucket206Predictor &&
+                   BallotCandidateCapacity == 0 && !FuseLoadPass0Histogram));
     using Bits = typename aiter::radix_traits<T>::UnsignedBits;
     using CachedValue = std::conditional_t<CacheTwiddledBits, Bits, T>;
     static_assert(std::is_same_v<Bits, uint32_t>);
@@ -3341,6 +3372,21 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     }
     if constexpr(!UseHighBucketPredictor && !UsePass0Bucket206Predictor)
         clear_main_histogram();
+    if constexpr(WideFirstDigit)
+    {
+        using U4 = __attribute__((__ext_vector_type__(4))) uint32_t;
+        U4 const zero = {0u, 0u, 0u, 0u};
+        uint32_t* const wide = wide_digit_lds<true>();
+#pragma unroll
+        for(int q = 0; q < kWideDigitDwords / (4 * BlockSize); ++q)
+            reinterpret_cast<U4*>(wide)[threadIdx.x + q * BlockSize] = zero;
+        if(threadIdx.x == 0)
+        {
+            // Until a bin is chosen, its key count fails the capacity test.
+            wide[kWideDigitDwords + 2] = ~0u;
+            wide[kWideDigitDwords + 3] = 0u;
+        }
+    }
 
     int64_t const row_stride = StaticRowLen > 0 ? static_cast<int64_t>(StaticRowLen) : len;
     in += batch_id * row_stride;
@@ -3389,6 +3435,271 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         }
     }
     if constexpr(!FuseLoadPass0Histogram) __syncthreads();
+
+    // Wide first digit.  A 14-bit first digit leaves a crossing bin of about
+    // 40-60 keys on an 8K randn row, which Wave0 finishes with a ballot radix
+    // walk over the remaining 18 bits.  That replaces the middle histogram, its
+    // chooser and the radix tail, and one returning LDS atomic per wave
+    // reserves both the winner slots and the bin slots.  A bin of more than
+    // 2 * WARP_SIZE keys (ties, narrow data) continues on the unchanged
+    // 12+12+8 path below; nothing has been written to the output by then.
+    if constexpr(WideFirstDigit)
+    {
+        constexpr int wide_start_bit = 32 - kWideDigitBits;
+        constexpr int waves          = BlockSize / WARP_SIZE;
+        constexpr int wave_dwords    = kWideDigitDwords / waves;
+        constexpr int lane_dwords    = wave_dwords / WARP_SIZE;
+        constexpr int lane_bins      = 2 * lane_dwords;
+        constexpr int wide_capacity  = 2 * WARP_SIZE;
+        static_assert(wave_dwords % (4 * WARP_SIZE) == 0 && lane_dwords % 4 == 0);
+        static_assert(lane_bins <= 16 && waves <= 16 && wide_capacity <= CandidateCapacity);
+        using U4 = __attribute__((__ext_vector_type__(4))) uint32_t;
+        uint32_t* const wide    = wide_digit_lds<true>();
+        uint32_t* const control = wide + kWideDigitDwords;
+        int const lane          = static_cast<int>(threadIdx.x) % WARP_SIZE;
+        int const wave          = static_cast<int>(threadIdx.x) / WARP_SIZE;
+
+#pragma unroll
+        for(int j = 0; j < ElemsPerThread; ++j)
+        {
+            IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+            if(is_valid_element(j, i))
+            {
+                uint32_t const digit = vals[j] >> wide_start_bit;
+                atomicAdd(wide + (digit >> 1), (digit & 1u) ? 0x10000u : 1u);
+            }
+        }
+        __syncthreads();
+
+        // Each wave totals its 1024 bins with conflict-free 16-byte reads.
+        {
+            uint32_t sum = 0;
+#pragma unroll
+            for(int q = 0; q < wave_dwords / (4 * WARP_SIZE); ++q)
+            {
+                U4 const t = reinterpret_cast<U4 const*>(
+                    wide)[wave * (wave_dwords / 4) + q * WARP_SIZE + lane];
+                sum += t[0] + t[1] + t[2] + t[3];
+            }
+            sum = (sum & 0xffffu) + (sum >> 16);
+            uint32_t const total = static_cast<uint32_t>(__builtin_amdgcn_readlane(
+                static_cast<int>(wave_inclusive_sum_dpp_u32(sum)), WARP_SIZE - 1));
+            if(lane == 0) wave_sums[wave] = static_cast<IdxT>(total);
+        }
+        __syncthreads();
+
+        // Every wave scans the wave totals; the wave whose bins hold rank k
+        // finds the lane slice of 16 bins, then the bin, that crosses it.
+        {
+            int const t = lane < waves ? static_cast<int>(wave_sums[lane]) : 0;
+            int s = t;
+            s = dpp_add<0x111, 0xf, 0xf>(s); // row_shr:1
+            s = dpp_add<0x112, 0xf, 0xf>(s); // row_shr:2
+            s = dpp_add<0x114, 0xf, 0xe>(s); // row_shr:4
+            s = dpp_add<0x118, 0xf, 0xc>(s); // row_shr:8
+            IdxT const wave_before = static_cast<IdxT>(__builtin_amdgcn_readlane(s - t, wave));
+            IdxT const wave_count  = static_cast<IdxT>(__builtin_amdgcn_readlane(t, wave));
+            if(wave_before < k && k <= wave_before + wave_count)
+            {
+                uint32_t const* chunk = wide + wave * wave_dwords;
+                uint32_t slice        = 0;
+#pragma unroll
+                for(int q = 0; q < lane_dwords / 4; ++q)
+                {
+                    U4 const v = reinterpret_cast<U4 const*>(chunk)[lane * (lane_dwords / 4) + q];
+                    slice += v[0] + v[1] + v[2] + v[3];
+                }
+                slice = (slice & 0xffffu) + (slice >> 16);
+                int const slice_end = wave_inclusive_sum_dpp(static_cast<int>(slice));
+                uint64_t const slice_mask = static_cast<uint64_t>(
+                    __ballot(wave_before + slice_end - static_cast<int>(slice) < k &&
+                             k <= wave_before + slice_end));
+                int const cross_lane = __builtin_ctzll(slice_mask);
+                IdxT const slice_before =
+                    wave_before + static_cast<IdxT>(__builtin_amdgcn_readlane(
+                                      slice_end - static_cast<int>(slice), cross_lane));
+                uint32_t const dword =
+                    chunk[cross_lane * lane_dwords + ((lane >> 1) & (lane_dwords - 1))];
+                int const bin_count =
+                    lane < lane_bins
+                        ? static_cast<int>((lane & 1) ? (dword >> 16) : (dword & 0xffffu))
+                        : 0;
+                int b = bin_count;
+                b = dpp_add<0x111, 0xf, 0xf>(b); // row_shr:1
+                b = dpp_add<0x112, 0xf, 0xf>(b); // row_shr:2
+                b = dpp_add<0x114, 0xf, 0xe>(b); // row_shr:4
+                b = dpp_add<0x118, 0xf, 0xc>(b); // row_shr:8
+                bool const crossing = lane < lane_bins && slice_before + b - bin_count < k &&
+                                      k <= slice_before + b;
+                uint64_t const crossing_mask = static_cast<uint64_t>(__ballot(crossing));
+                if(crossing_mask != 0 && lane == __builtin_ctzll(crossing_mask))
+                {
+                    control[0] = static_cast<uint32_t>(wave * (2 * wave_dwords) +
+                                                       cross_lane * lane_bins + lane);
+                    control[1] = static_cast<uint32_t>(slice_before + b - bin_count);
+                    control[2] = static_cast<uint32_t>(bin_count);
+                }
+            }
+        }
+        __syncthreads();
+
+        uint32_t const bin =
+            static_cast<uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(control[0])));
+        IdxT const before =
+            static_cast<IdxT>(__builtin_amdgcn_readfirstlane(static_cast<int>(control[1])));
+        uint32_t const in_bin =
+            static_cast<uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(control[2])));
+        if(in_bin <= static_cast<uint32_t>(wide_capacity) && before < k &&
+           k <= before + static_cast<IdxT>(in_bin))
+        {
+            // Winners (below the bin) fill the low half of the reservation and
+            // the bin's keys the high half; neither can carry into the other.
+            unsigned winner_mask = 0, bin_mask = 0;
+#pragma unroll
+            for(int j = 0; j < ElemsPerThread; ++j)
+            {
+                IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                if(is_valid_element(j, i))
+                {
+                    uint32_t const digit = vals[j] >> wide_start_bit;
+                    winner_mask |= static_cast<unsigned>(digit < bin) << j;
+                    bin_mask |= static_cast<unsigned>(digit == bin) << j;
+                }
+            }
+            uint32_t const packed = static_cast<uint32_t>(__builtin_popcount(winner_mask)) |
+                                    (static_cast<uint32_t>(__builtin_popcount(bin_mask)) << 16);
+            uint32_t const end = wave_inclusive_sum_dpp_u32(packed);
+            uint32_t base      = 0;
+            if(lane == WARP_SIZE - 1) base = atomicAdd(control + 3, end);
+            base = static_cast<uint32_t>(
+                __builtin_amdgcn_readlane(static_cast<int>(base), WARP_SIZE - 1));
+            uint32_t const start = base + end - packed;
+            IdxT winner_pos      = static_cast<IdxT>(start & 0xffffu);
+            IdxT bin_pos         = static_cast<IdxT>(start >> 16);
+#pragma unroll
+            for(int j = 0; j < ElemsPerThread; ++j)
+            {
+                IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
+                if(winner_mask & (1u << j)) winner_indices[winner_pos++] = i;
+                if(bin_mask & (1u << j))
+                {
+                    candidate_values[bin_pos]  = __builtin_bit_cast(T, vals[j]);
+                    candidate_indices[bin_pos] = i;
+                    ++bin_pos;
+                }
+            }
+            __syncthreads();
+
+            if(threadIdx.x < WARP_SIZE)
+            {
+                // Wave0 holds the bin's keys two per lane and walks their low
+                // 18 bits for the (k - before)-th smallest, as the ballot form
+                // does; ties at that key go in lane order.
+                IdxT const needed = k - before;
+                IdxT const count  = static_cast<IdxT>(in_bin);
+                Bits key_a = 0, key_b = 0;
+                IdxT index_a = 0, index_b = 0;
+                if(lane < count)
+                {
+                    key_a   = __builtin_bit_cast(Bits, candidate_values[lane]);
+                    index_a = candidate_indices[lane];
+                }
+                if(lane + WARP_SIZE < count)
+                {
+                    key_b   = __builtin_bit_cast(Bits, candidate_values[lane + WARP_SIZE]);
+                    index_b = candidate_indices[lane + WARP_SIZE];
+                }
+                uint64_t const valid_a = static_cast<uint64_t>(__ballot(lane < count));
+                uint64_t const valid_b =
+                    static_cast<uint64_t>(__ballot(lane + WARP_SIZE < count));
+                uint64_t active_a = valid_a, active_b = valid_b;
+                IdxT rank = needed;
+#pragma unroll 1
+                for(int bit = wide_start_bit - 1;
+                    bit >= 0 && __builtin_popcountll(active_a) + __builtin_popcountll(active_b) > 1;
+                    --bit)
+                {
+                    Bits const bit_mask = Bits{1} << bit;
+                    uint64_t const zero_a =
+                        active_a & static_cast<uint64_t>(__ballot((key_a & bit_mask) == 0));
+                    uint64_t const zero_b =
+                        active_b & static_cast<uint64_t>(__ballot((key_b & bit_mask) == 0));
+                    IdxT const zeros = static_cast<IdxT>(__builtin_popcountll(zero_a) +
+                                                         __builtin_popcountll(zero_b));
+                    if(rank <= zeros)
+                    {
+                        active_a = zero_a;
+                        active_b = zero_b;
+                    }
+                    else
+                    {
+                        active_a &= ~zero_a;
+                        active_b &= ~zero_b;
+                        rank -= zeros;
+                    }
+                }
+                Bits const kth_bits =
+                    active_a != 0
+                        ? static_cast<Bits>(__builtin_amdgcn_readlane(
+                              static_cast<int>(key_a), __builtin_ctzll(active_a)))
+                        : static_cast<Bits>(__builtin_amdgcn_readlane(
+                              static_cast<int>(key_b), __builtin_ctzll(active_b)));
+                uint64_t const less_a =
+                    valid_a & static_cast<uint64_t>(__ballot(key_a < kth_bits));
+                uint64_t const less_b =
+                    valid_b & static_cast<uint64_t>(__ballot(key_b < kth_bits));
+                uint64_t const equal_a =
+                    valid_a & static_cast<uint64_t>(__ballot(key_a == kth_bits));
+                uint64_t const equal_b =
+                    valid_b & static_cast<uint64_t>(__ballot(key_b == kth_bits));
+                IdxT const equal_needed = needed - static_cast<IdxT>(__builtin_popcountll(less_a) +
+                                                                     __builtin_popcountll(less_b));
+                uint64_t const lower_lanes =
+                    lane == 0 ? uint64_t{0} : ((uint64_t{1} << lane) - uint64_t{1});
+                bool const take_a =
+                    ((valid_a >> lane) & 1u) &&
+                    (key_a < kth_bits ||
+                     (key_a == kth_bits &&
+                      static_cast<IdxT>(__builtin_popcountll(equal_a & lower_lanes)) <
+                          equal_needed));
+                bool const take_b =
+                    ((valid_b >> lane) & 1u) &&
+                    (key_b < kth_bits ||
+                     (key_b == kth_bits &&
+                      static_cast<IdxT>(__builtin_popcountll(equal_a) +
+                                        __builtin_popcountll(equal_b & lower_lanes)) <
+                          equal_needed));
+                uint64_t const taken_a = static_cast<uint64_t>(__ballot(take_a));
+                uint64_t const taken_b = static_cast<uint64_t>(__ballot(take_b));
+                if(take_a)
+                {
+                    __builtin_nontemporal_store(
+                        index_a,
+                        out_idx + before +
+                            static_cast<IdxT>(__builtin_popcountll(taken_a & lower_lanes)));
+                }
+                if(take_b)
+                {
+                    __builtin_nontemporal_store(
+                        index_b,
+                        out_idx + before +
+                            static_cast<IdxT>(__builtin_popcountll(taken_a) +
+                                              __builtin_popcountll(taken_b & lower_lanes)));
+                }
+            }
+            else
+            {
+                // The other waves flush the winners while Wave0 walks the bin.
+                constexpr int FlushThreads = BlockSize - WARP_SIZE;
+                for(IdxT i = static_cast<IdxT>(threadIdx.x - WARP_SIZE); i < before;
+                    i += FlushThreads)
+                {
+                    __builtin_nontemporal_store(winner_indices[i], out_idx + i);
+                }
+            }
+            return;
+        }
+    }
 
     // The seeded 8K workload's 2048th-largest value normally lands in high
     // radix bucket 0x40d, with the M=4 rows occasionally using its 0x40c
@@ -6649,11 +6960,24 @@ constexpr bool topk_oneblock_reg_wave_select_fits(int elems_per_thread)
     return elems_per_thread <= 21;
 }
 
+// The 1024-thread wide-first-digit form (MI355X, randn rows, 1..512 rows): from
+// 7 to 11 elements per lane it is 5-20% faster than the ballot form, because
+// its 14-bit crossing bin stays within the selector's 128 keys where the
+// 12-bit bucket exceeds 32.  Up to 6 elements per lane that bucket can still
+// fit the selector (at 5121 columns and one row the wide form was 8.5%
+// slower, at 4096 up to 13%); past 11 it needs more than 64 VGPRs.
+constexpr bool topk_oneblock_reg_wide_digit_fits(int elems_per_thread)
+{
+    return elems_per_thread >= 7 && elems_per_thread <= 11;
+}
+
 // Launches the register copy whose compile-time lane capacity equals the
 // runtime `ept`; returns false when `ept` is outside [MinEPT, MaxEPT].
 // `Placeable` families also take topk_oneblock_reg_placement.
+// `WideDigit` families take the wide-first-digit form inside its lane range.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int MainBits,
-          int TailBits, int MinEPT, int MaxEPT, bool WaveSelect, bool Placeable = false>
+          int TailBits, int MinEPT, int MaxEPT, bool WaveSelect, bool Placeable = false,
+          bool WideDigit = false>
 inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream, T const* in,
                                      int64_t len, IdxT k, T* out, IdxT* out_idx, bool select_min)
 {
@@ -6665,9 +6989,11 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
     {
         if(ept != MinEPT)
             return topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MainBits,
-                                            TailBits, MinEPT + 1, MaxEPT, WaveSelect, Placeable>(
+                                            TailBits, MinEPT + 1, MaxEPT, WaveSelect, Placeable,
+                                            WideDigit>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         constexpr bool Wave = WaveSelect && topk_oneblock_reg_wave_select_fits(MinEPT);
+        constexpr bool Wide = WideDigit && Wave && topk_oneblock_reg_wide_digit_fits(MinEPT);
         if constexpr(Placeable)
         {
             TopkRowPlacement const place = topk_oneblock_reg_placement(batch_size);
@@ -6677,14 +7003,15 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
                 unsigned const groups = (static_cast<unsigned>(batch_size) + half - 1) / half;
                 radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT,
                                                 MainBits, TailBits, 0, Wave, Wave, false, Wave,
-                                                false, 0x40du, false, 0, false>
+                                                false, 0x40du, false, 0, false, Wide>
                     <<<groups * static_cast<unsigned>(place.period), BlockSize, 0, stream>>>(
                         in, len, k, out, out_idx, select_min, place);
                 return true;
             }
         }
         radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
-                                        TailBits, 0, Wave, Wave, false, Wave>
+                                        TailBits, 0, Wave, Wave, false, Wave, false, 0x40du,
+                                        false, 0, false, Wide>
             <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
         return true;
     }
@@ -6727,7 +7054,8 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         if(2 * batch_size <= num_cu && len > 4 * 1024 && len <= 4 * 1024 + 768)
             return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
-        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true, true>(
+        return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true, true,
+                                        true>(
             ept, batch_size, stream, in, len, k, out, out_idx, select_min);
     }
     if(len <= 22 * 1024)
