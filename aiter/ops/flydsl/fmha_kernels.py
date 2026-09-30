@@ -115,6 +115,7 @@ def _has_unsupported_internal_overlap(tensor: torch.Tensor) -> bool:
 
 def _validate_gfx1201_launch_limits(
     *,
+    batch: int,
     seq_len: int,
     seq_len_kv_real: int,
     seq_len_kv: int,
@@ -122,7 +123,7 @@ def _validate_gfx1201_launch_limits(
     head_dim: int,
     fp8: bool,
 ) -> None:
-    """Validate integer kernel arguments and BF16/F16 V descriptor capacity."""
+    """Validate integer arguments and signed-Int32 V# buffer indices."""
     for name, value in (
         ("padded query sequence length", seq_len),
         ("real KV sequence length", seq_len_kv_real),
@@ -139,6 +140,18 @@ def _validate_gfx1201_launch_limits(
             raise ValueError(
                 f"one BF16/F16 V batch requires {v_batch_bytes} bytes, but the "
                 "gfx1201 buffer descriptor requires a byte count below 2^32"
+            )
+    # The FP8 kernel's typed V# helpers narrow flattened Q/K/V/O element
+    # offsets to Int32. Bound the padded tensors before materializing them so
+    # a large batch cannot wrap those buffer indices.
+    for name, elements in (
+        ("padded Q/O", batch * seq_len * num_heads * head_dim),
+        ("padded K/V", batch * seq_len_kv * num_heads * head_dim),
+    ):
+        if elements > _GFX1201_KERNEL_INT32_MAX:
+            raise ValueError(
+                f"{name} requires {elements} elements, exceeding the gfx1201 "
+                f"FP8 buffer-index Int32 limit ({_GFX1201_KERNEL_INT32_MAX})"
             )
 
 
@@ -376,6 +389,7 @@ def flydsl_flash_attn_func(
     )
     tail_mask = not causal and seq_len_kv_real % block_n != 0
     _validate_gfx1201_launch_limits(
+        batch=batch,
         seq_len=seq_len_pad,
         seq_len_kv_real=seq_len_kv_real,
         seq_len_kv=seq_len_kv_pad,
