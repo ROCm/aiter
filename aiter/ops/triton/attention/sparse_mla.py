@@ -130,7 +130,7 @@ def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
 
 # Row pitch padding, and the scratch the kernel takes beyond the tiles. Both
 # hold only for bf16 tiles with the async path off, which is every gfx942
-# launch: fp8 dots are rejected there and lds_limited forces ASYNC_LDS off.
+# launch: fp8 dots are rejected there and its launch config keeps ASYNC_LDS off.
 _LDS_PAD = 8
 _LDS_SCRATCH_PER_BLOCK_K = 32
 
@@ -187,7 +187,6 @@ def _async_launch_config(
     uni_tile: bool = True,
     has_extra: bool = False,
     block_k: int = 64,
-    lds_limited: bool = False,
 ) -> tuple[bool, int, int]:
     """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
 
@@ -207,8 +206,8 @@ def _async_launch_config(
     )
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
-    # The tiles below are sized for gfx950's LDS; block_k already fits this arch.
-    if lds_limited:
+    # The tiles below are sized for gfx950's LDS; block_k already fits gfx942's.
+    if arch_info.get_arch() == "gfx942":
         waves_per_eu = 1 if (use_buffer_load and workgroups <= num_sms) else 2
         return False, block_k, waves_per_eu
     if enabled and workgroups >= 4 * num_sms:
@@ -603,7 +602,6 @@ def sparse_mla_fwd(
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
     _check_fp8_arch(arch, fmt, q.dtype)
-    lds_limited = arch == "gfx942"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -719,7 +717,6 @@ def sparse_mla_fwd(
         uni_tile=True,
         has_extra=False,
         block_k=block_k,
-        lds_limited=lds_limited,
     )
     _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim)
 
