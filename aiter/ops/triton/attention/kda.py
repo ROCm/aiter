@@ -8,10 +8,7 @@ import torch
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
-    load_config_json,
-)
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -39,9 +36,8 @@ def get_kda_config(
     overrides: dict | None = None,
     fused: bool = False,
 ) -> dict:
-    tuned = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-KDA_DECODE-DEFAULT.json"
-    )
+    cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
+    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
     if fused:
@@ -143,8 +139,8 @@ def fused_recurrent_kda(
         pad_slot_guard: paged only: state slots <= 0 mark padded sequences
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
             use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
-            from ``configs/<arch>-KDA_DECODE-DEFAULT.json``, and omitted
-            keys inherit the resolved bucket's published values.
+            from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
+            and omitted keys inherit the resolved bucket's published values.
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
