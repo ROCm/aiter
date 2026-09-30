@@ -18,8 +18,8 @@ integer scan. TB/s is effective *logical* input/output traffic, not measured
 DRAM bandwidth (nor the sum of intermediates in the multi-kernel fallback).
 Timing uses run_perftest's profiler-based kernel durations, with optional graph
 replay; it is not directly comparable to whole-graph CUDA-event wall time.
-Specialized pytest tests cover reset ownership, exceptions, and dynamic graphs:
-    op_tests/flydsl_tests/test_g2l_lut.py
+Specialized pytest tests cover both backends, reset ownership, exceptions,
+and dynamic graphs:
     op_tests/triton_tests/moe/test_g2l_lut_large.py
 """
 
