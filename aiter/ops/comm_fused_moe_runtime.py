@@ -9,7 +9,8 @@ from typing import Any
 
 import torch
 
-_BeforeStage2 = Callable[[int], torch.Tensor]
+_BeforeStage2 = Callable[[], torch.Tensor]
+_BeforeStage2ForRows = Callable[[int], torch.Tensor]
 _BeforeSharedAdd = Callable[[], None]
 
 
@@ -68,6 +69,7 @@ class CommFusedMoeRuntime:
         *,
         shared_partial: torch.Tensor | None,
         before_stage2: _BeforeStage2 | None = None,
+        before_stage2_for_rows: _BeforeStage2ForRows | None = None,
         before_shared_add: _BeforeSharedAdd | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
         reduce_scatter_sizes: list[int] | tuple[int, ...] | None = None,
@@ -76,15 +78,22 @@ class CommFusedMoeRuntime:
     ) -> torch.Tensor:
         """Run ordinary MoE through Stage1 and fuse Stage2 with TP reduction.
 
-        ``before_stage2`` receives the runner's required shared-output row count.
-        For compact ragged reduce-scatter this is the calling rank's real row
-        count; fixed layouts retain their configured output capacity.
+        ``before_stage2`` is the legacy zero-argument shared-output producer.
+        ``before_stage2_for_rows`` receives the runner's required output row
+        count. For compact ragged reduce-scatter this is the calling rank's
+        real row count; fixed layouts retain their configured output capacity.
+        Supplying both callbacks is an error.
         ``before_shared_add`` joins that producer only when the selected runner
         first consumes the shared output; no standalone ready kernel is used.
         ``reuse_is_synchronized`` lets an enclosing collective prove that all
         ranks finished the preceding Direct read before its Stage2 destination
         is overwritten. Other callers retain Direct's explicit deferred wait.
         """
+
+        if before_stage2 is not None and before_stage2_for_rows is not None:
+            raise ValueError(
+                "before_stage2 and before_stage2_for_rows are mutually exclusive"
+            )
 
         from aiter.fused_moe import _fused_moe_impl
 
@@ -165,13 +174,15 @@ class CommFusedMoeRuntime:
             def launch():
                 nonlocal final_output
                 current_shared = shared_partial
-                if before_stage2 is not None:
+                if before_stage2_for_rows is not None:
                     shared_rows = (
                         output_rows
                         if reduce_scatter_sizes is not None
                         else runner.config.output_rows
                     )
-                    current_shared = before_stage2(shared_rows)
+                    current_shared = before_stage2_for_rows(shared_rows)
+                elif before_stage2 is not None:
+                    current_shared = before_stage2()
                 add_shared = runner.config.shape.add_shared
                 if add_shared and current_shared is None:
                     raise RuntimeError("comm-fused Stage2 requires shared_partial")
