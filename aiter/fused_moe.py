@@ -1147,23 +1147,6 @@ def _fused_moe_impl(
         inter_dim * 2,
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
-    if (
-        get_gfx() == "gfx950"
-        and quant_type in (QuantType.per_128x128, QuantType.per_1x128)
-        and w1.dtype == dtypes.fp8
-        and w2.dtype == dtypes.fp8
-        and gate_mode == GateMode.SEPARATED
-    ):
-        # FP8 blockscale ASM and CK codegen both consume the (16,16) shuffle.
-        # A tuning row cannot make raw weights compatible with that layout.
-        # Convert only raw inputs; callers should pre-shuffle static weights to
-        # avoid paying this cost on every invocation. FP32 scales stay unchanged.
-        from aiter.ops.shuffle import shuffle_weight
-
-        if not getattr(w1, "is_shuffled", False):
-            w1 = shuffle_weight(w1, layout=(16, 16))
-        if not getattr(w2, "is_shuffled", False):
-            w2 = shuffle_weight(w2, layout=(16, 16))
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     # gfx1250: GUGU row-interleave, not 16-row block shuffle.
     if get_gfx() == "gfx1250" and isG1U1 and gate_mode != GateMode.INTERLEAVE:
