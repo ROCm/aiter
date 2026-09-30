@@ -47,6 +47,25 @@ void mhc_pre_big_fuse_rmsnorm(aiter_tensor_t& post_mix,        // (m, hc_mult)
                               // 1: residual is in the pre-shuffled
                               // resS[k/KS][head][row][k%KS] layout.
                               int res_preshuffle       = 0);
+void mhc_pre_big_fuse_rmsnorm_quant(
+    aiter_tensor_t& post_mix,
+    aiter_tensor_t& comb_mix,
+    aiter_tensor_t& out,
+    aiter_tensor_t& quant_out,
+    aiter_tensor_t& quant_scale,
+    aiter_tensor_t& gemm_out_mul,
+    aiter_tensor_t& gemm_out_sqrsum,
+    aiter_tensor_t& hc_scale,
+    aiter_tensor_t& hc_base,
+    aiter_tensor_t& residual,
+    aiter_tensor_t& norm_weight,
+    float rms_eps            = 1e-6,
+    float hc_pre_eps         = 1e-6,
+    float hc_sinkhorn_eps    = 1e-6,
+    float norm_eps           = 1e-6,
+    float hc_post_mult_value = 1.0,
+    int sinkhorn_repeat      = 20,
+    int res_preshuffle       = 0);
 void mhc_post(aiter_tensor_t& out,            // (m, hc_mult, hidden_size)
               aiter_tensor_t& x,              // (m, hidden_size)
               aiter_tensor_t& residual,       // (m, hc_mult, hidden_size)
