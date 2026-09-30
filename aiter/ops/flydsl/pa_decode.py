@@ -290,7 +290,7 @@ def pa_decode(
     expected_ranks = (
         ("output", output, (3,)),
         ("query", query, (3,)),
-        ("key_cache", key_cache, (5,)),
+        ("key_cache", key_cache, (4, 5)),
         ("value_cache", value_cache, (4, 5)),
         ("context_lengths", context_lengths, (1,)),
         ("block_tables", block_tables, (2,)),
@@ -324,7 +324,20 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    nhd_layout = key_cache.dim() == 4
+    if nhd_layout:
+        num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
+        num_hgroups, hgroup_width = head_dim // 16, 16
+        if k_head != head_dim:
+            raise ValueError(
+                "NHD key_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            )
+    else:
+        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
+            key_cache.shape
+        )
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -354,7 +367,16 @@ def pa_decode(
         )
 
     trans_v = value_cache.dim() == 5
-    if trans_v:
+    if nhd_layout:
+        if value_cache.shape != key_cache.shape:
+            raise ValueError(
+                "NHD value_cache shape must match key_cache, "
+                f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
+            )
+        if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+            raise ValueError("NHD key and value head axes must be contiguous")
+        v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
+    elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // 16, head_dim, 16)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
@@ -475,6 +497,8 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
+        if nhd_layout and name in ("key_cache", "value_cache"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
@@ -564,8 +588,42 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
+    stride_k_block = stride_k_token = stride_k_head = 0
+    stride_v_block = stride_v_token = stride_v_head = 0
+    if nhd_layout:
+        if arch != "gfx950" or work_plan is not None or per_token_kv:
+            raise NotImplementedError(
+                "NHD pa_decode requires gfx950, per-tensor scales, and no work plan"
+            )
+        if not longctx_m1_shape(
+            head_dim,
+            block_size,
+            trans_v,
+            per_token_kv,
+            query_length,
+            query_group_size,
+        ) or block_size != 64:
+            raise NotImplementedError(
+                "NHD pa_decode requires head 256, page 64, and one query M-tile"
+            )
+        stride_k_block = int(key_cache.stride(0))
+        stride_k_token = int(key_cache.stride(1))
+        stride_k_head = int(key_cache.stride(2))
+        stride_v_block = int(value_cache.stride(0))
+        stride_v_token = int(value_cache.stride(1))
+        stride_v_head = int(value_cache.stride(2))
+
     # Widen before either cache's i32 element offsets can wrap.
-    wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
+    if nhd_layout:
+        wide_kv_addressing = (
+            max(
+                key_cache.shape[0] * key_cache.stride(0),
+                value_cache.shape[0] * value_cache.stride(0),
+            )
+            >= 2**31
+        )
+    else:
+        wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
     # Bound page-id LDS by the block table, not the live lengths, so capture
     # and replay keep the same specialization. Past 16 KiB, leave the table
@@ -615,6 +673,7 @@ def pa_decode(
             use_sinks=use_direct_sinks,
             sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",
             stage_page_capacity=stage_page_capacity,
+            nhd_layout=nhd_layout,
         )
 
     if num_partitions == 1 and work_plan is None:
@@ -711,6 +770,12 @@ def pa_decode(
             int(output.stride(1)),
             int(query.stride(0)),
             int(query.stride(1)),
+            stride_k_block,
+            stride_k_token,
+            stride_k_head,
+            stride_v_block,
+            stride_v_token,
+            stride_v_head,
             (
                 ptr_arg(work_plan.work_info, fx.Int32)
                 if work_plan is not None

@@ -96,6 +96,7 @@ class DecodeCase:
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
+    nhd: bool = False
 
 
 def _require_gpu():
@@ -247,18 +248,34 @@ def _make_inputs(case, planned=False):
     key_quant, value_quant = scatter(key_quant), scatter(value_quant)
     if case.per_token:
         key_scale, value_scale = scatter(key_scale), scatter(value_scale)
-    key_cache = (
-        key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-    )
-    value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
-        .permute(0, 1, 2, 4, 3)
-        .contiguous()
-        if case.trans_v
-        else value_quant.permute(0, 1, 3, 2).contiguous()
-    )
+    if case.nhd:
+        storage = torch.empty(
+            physical_pages, kv_heads, page, 2 * dim, dtype=quant_dtype
+        )
+        storage[..., :dim] = key_quant
+        storage[..., dim:] = value_quant
+        # fp8 NaN in the unwritten tail must not poison PV.
+        nan = torch.zeros((), dtype=torch.uint8).fill_(0x7F).view(quant_dtype)
+        page_base = 0
+        for length, count in zip(case.lengths, counts):
+            used = length % page
+            if length > 0 and used:
+                storage[selected[page_base + count - 1], :, used:, dim:] = nan
+            page_base += count
+        key_cache, value_cache = storage.transpose(1, 2).split(dim, dim=-1)
+    else:
+        key_cache = (
+            key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+        value_cache = (
+            value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+            if case.trans_v
+            else value_quant.permute(0, 1, 3, 2).contiguous()
+        )
     table = torch.zeros((batch, max(counts)), dtype=torch.int32)
     start = 0
     for seq, count in enumerate(counts):
@@ -829,6 +846,14 @@ CASES = [
         lengths=(0, 1, 255, 256, 257, 8192),
     ),
     _case(
+        "nhd-d256-page64",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(0, 1, 63, 64, 65, 255, 256, 257, 8192),
+        nhd=True,
+    ),
+    _case(
         "exact-parts-override",
         (1, 1, 16, 128),
         parts=5,
@@ -929,6 +954,11 @@ def test_pa_decode(case, planned, monkeypatch):
                     context, case.num_kv_heads, max_partitions=case.num_partitions
                 )
             return
+    if case.nhd and planned:
+        args, options, _reference = _make_inputs(case, planned=True)
+        with pytest.raises(NotImplementedError):
+            pa_decode(*args, **options)
+        return
     args, options, reference = _make_inputs(case, planned)
     if not planned and case.sliding_window > 0:
         with pytest.raises(ValueError, match="work_plan"):
