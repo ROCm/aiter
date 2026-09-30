@@ -495,17 +495,16 @@ class MegaMoeTPEngine:
             self._cfgs[m] = cfg
         return cfg
 
+    def _cfg_sched(self, cfg: LaunchCfg) -> _Sched:
+        return self._sched(0 if cfg.dyn else cfg.xb)
+
     def _xl(self, cfg: LaunchCfg) -> bool:
-        return (
-            self._sched(0 if cfg.dyn else cfg.xb).xl_e0 > 0
-            and not cfg.dyn
-            and not cfg.ll
-        )
+        return not cfg.dyn and not cfg.ll and self._cfg_sched(cfg).xl_e0 > 0
 
     def _launcher(self, cfg: LaunchCfg):
         fn = self._launchers.get(cfg)
         if fn is None:
-            sc = self._sched(0 if cfg.dyn else cfg.xb)
+            sc = self._cfg_sched(cfg)
             static = (
                 {}
                 if cfg.dyn
@@ -537,7 +536,7 @@ class MegaMoeTPEngine:
                 ll_rs=cfg.ll,
                 ll_route=cfg.ll and cfg.llr,
                 xl=self._xl(cfg),
-                xl_s0=self._sched(0 if cfg.dyn else cfg.xb).xl_s0,
+                xl_s0=sc.xl_s0 if self._xl(cfg) else 0,
                 **static,
             )
             self._launchers[cfg] = fn
@@ -561,7 +560,7 @@ class MegaMoeTPEngine:
         cfg = self.config(m)
         key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), cfg)
         if self._args[0] != key:
-            sc = self._sched(0 if cfg.dyn else cfg.xb)
+            sc = self._cfg_sched(cfg)
             peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
             args = (
                 self.w1.data_ptr(),

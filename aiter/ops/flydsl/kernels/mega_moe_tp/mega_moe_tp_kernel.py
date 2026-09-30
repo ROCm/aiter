@@ -52,8 +52,6 @@ FLAG_RDY = 0
 FLAG_AGM = FLAG_RDY + MAX_TP * NCK_MAX
 FLAG_PRE = FLAG_AGM + MAX_TP * 32
 PRE_CH = 4
-PRE_LAG = 1
-PRE_LAG_S = 2
 NPRE_MAX = 16
 FLAG_YAG = FLAG_PRE + NPRE_MAX * MAX_TP * NCTA_MAX
 FLAG_AGQ = FLAG_YAG + NCK_MAX * MAX_TP * NCTA_MAX
@@ -187,8 +185,7 @@ def mega_moe_tp_consts(
         start, off = off, off + n
         return start
 
-    c["NSK1"] = nsk
-    c["L_RING"] = take(NW * max(nsk, NSK) * SLOT)
+    c["L_RING"] = take(NW * nsk * SLOT)
     c["L_A"] = take(nab * RG * ACB)
     c["L_AS"] = take(nab * KCS * NSC_BLK * 64 * 4)
     c["L_INTER"] = take(
@@ -274,9 +271,6 @@ def compile_mega_moe_tp(
     """
     DYN = dyn_e > 0
     c = mega_moe_tp_consts(H, I, MT, TMAX, agr, dyn_e, nab, nsk)
-    NSK1 = c["NSK1"]
-    NPP = int(npp)
-    RING_W = max(NSK1, NSK) * SLOT
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
     NA_ROWOPS, NSC_BLK, NA_L = c["NA_ROWOPS"], c["NSC_BLK"], c["NA_L"]
@@ -285,7 +279,7 @@ def compile_mega_moe_tp(
     L_INTER, L_INTERS, L_RIX, L_WT = c["L_INTER"], c["L_INTERS"], c["L_RIX"], c["L_WT"]
     L_CTL, LDS_BYTES = c["L_CTL"], c["LDS_BYTES"]
     L_CLS = c["L_CLS"]
-    assert NPP >= 1 and NSK1 % (NPP * KCS) == 0 and (KS1 * NPP) % NSK1 == 0
+    assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
     NE = dyn_e
     VPL = (CW // 8 + 63) // 64
@@ -307,8 +301,6 @@ def compile_mega_moe_tp(
     assert xsplit <= XQ_P
     XCOL_PER_CHUNK = xrem if XSPLIT else 0
     XL = bool(xl)
-    XL_S0 = int(xl_s0) if XL else 0
-    N_EARLY_SH = min(XL_S0, N_XCD)
     assert not XL or (XSPLIT and not DYN and not LL and NPC == 1)
     NV = 2 * NCK if XL else NCK
     assert NV <= 31
@@ -324,11 +316,11 @@ def compile_mega_moe_tp(
         + (f"_x{xsplit}r{xrem}w{xw}" if xsplit else "")
         + (f"_dyn{NE}" if DYN else "")
         + (f"_nab{NAB}" if NAB != 4 else "")
-        + (f"_nsk{NSK1}" if NSK1 != NSK else "")
-        + (f"_npp{NPP}" if NPP > 1 else "")
+        + (f"_nsk{nsk}" if nsk != NSK else "")
+        + (f"_npp{npp}" if npp > 1 else "")
         + ("_ll" if LL else "")
         + ("_llr" if DLL else "")
-        + (f"_xl{XL_S0}" if XL else "")
+        + (f"_xl{xl_s0}" if XL else "")
     )
     const_expr = fx.const_expr
     # flydsl's cache key ignores module constants: the kernel references this tag
@@ -821,16 +813,16 @@ def compile_mega_moe_tp(
             lds_atomic_add(L, L_CTL + C_AFREE * 4 + buf * i32(4), 1, REL)
 
     def g1_group(nnb):
-        if const_expr(NPP > 1):
-            return ((nnb % i32(NPP)) == i32(0)).select(i32(NPP), i32(1))
+        if const_expr(npp > 1):
+            return ((nnb % i32(npp)) == i32(0)).select(i32(npp), i32(1))
         return i32(1)
 
     @traced
     def gemm1(L, tid, a, expert, i0, nnb):
         nnb = uni(nnb)
-        if const_expr(NPP > 1):
-            if (nnb % i32(NPP)) == i32(0):
-                _gemm1(L, tid, a, expert, i0, nnb, NPP)
+        if const_expr(npp > 1):
+            if (nnb % i32(npp)) == i32(0):
+                _gemm1(L, tid, a, expert, i0, nnb, npp)
             else:
                 _gemm1(L, tid, a, expert, i0, nnb, 1)
         else:
@@ -853,11 +845,11 @@ def compile_mega_moe_tp(
         vsl = lane * i32(4)
         sg0 = uni((e * i32(2 * I) + icol0) // i32(32)) * i32(CH1 * 256)
         su0 = uni((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256)
-        ring = uni(L + i32(L_RING) + w * i32(RING_W))
+        ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
         total = nnb * i32(KS1)
         qbase = lds_ld_i32(L, L_CTL + C_QBASE * 4 + w * i32(4))
         GS = KS1 * P
-        assert NSK1 % (P * KCS) == 0 and GS % NSK1 == 0
+        assert nsk % (P * KCS) == 0 and GS % nsk == 0
 
         def issue_b(g, slot_idx):
             gc = fx.min(g, total - i32(1))
@@ -875,7 +867,7 @@ def compile_mega_moe_tp(
             dma4(slot + i32(4096), rws, vsl, sg0 + sso)
             dma4(slot + i32(4096 + 256), rws, vsl, su0 + sso)
 
-        for kk in range_constexpr(NSK1):
+        for kk in range_constexpr(nsk):
             issue_b(i32(kk), kk)
 
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -884,12 +876,12 @@ def compile_mega_moe_tp(
             grp = i32(grp_)
             init = [zero] * (NA * P)
             for g0_, st in range(
-                grp * i32(GS), (grp + i32(1)) * i32(GS), i32(NSK1), init=init
+                grp * i32(GS), (grp + i32(1)) * i32(GS), i32(nsk), init=init
             ):
                 g0 = i32(g0_)
                 acc = list(st)
                 qb = qbase + grp * i32(NCH) + (g0 - grp * i32(GS)) // i32(P * KCS)
-                for ks in range_constexpr(NSK1 // P):
+                for ks in range_constexpr(nsk // P):
                     k = ks % KCS
                     q = qb + i32(ks // KCS)
                     buf = q % i32(NAB)
@@ -907,7 +899,7 @@ def compile_mega_moe_tp(
                     for pp in range_constexpr(P):
                         s_ = ks * P + pp
                         g = g0 + i32(s_)
-                        wait_vm((NSK1 - 1) * OPS)
+                        wait_vm((nsk - 1) * OPS)
                         slot = ring + i32(s_ * SLOT)
                         b = [
                             lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
@@ -941,7 +933,7 @@ def compile_mega_moe_tp(
                             )
                         wait_lgkm0()
                         rocdl.sched_barrier(0)
-                        issue_b(g + i32(NSK1), s_)
+                        issue_b(g + i32(nsk), s_)
                         rocdl.sched_barrier(0)
                     if k == KCS - 1:
                         release_a_chunk(L, lane, buf)
@@ -1163,7 +1155,7 @@ def compile_mega_moe_tp(
         )
         r_routes = rsrc(dst, routes_bytes)
         oob = routes_bytes
-        ring = uni(L + i32(L_RING) + w * i32(RING_W))
+        ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
         q4 = lane // i32(16)
         g_lo = i32(0) if gi_lo is None else uni(gi_lo)
         g_hi = i32(G2) if gi_hi is None else uni(gi_hi)
@@ -2236,17 +2228,17 @@ def compile_mega_moe_tp(
 
     @traced
     def _signal_col_xl(a, epoch, cidx, j):
-        if j < i32(XL_S0):
+        if j < i32(xl_s0):
             sh = j % i32(N_XCD)
             _signal_part(
                 a,
                 epoch,
                 cidx,
                 i32(SC_SHARD) + sh,
-                (i32(XL_S0) - sh + i32(N_XCD - 1)) // i32(N_XCD),
+                (i32(xl_s0) - sh + i32(N_XCD - 1)) // i32(N_XCD),
             )
         else:
-            _signal_part(a, epoch, cidx, i32(SC_LATE), i32(XCOL_PER_CHUNK - XL_S0))
+            _signal_part(a, epoch, cidx, i32(SC_LATE), i32(XCOL_PER_CHUNK - xl_s0))
 
     @traced
     def _signal_part(a, epoch, cidx, slot, target):
@@ -2263,7 +2255,7 @@ def compile_mega_moe_tp(
             ea = sc_addr(a, cidx, i32(SC_E))
             if g_add_agent(ea, 1) + i32(1) == fx.min(
                 i32(gpu.grid_dim.x), i32(N_XCD)
-            ) + i32(N_EARLY_SH):
+            ) + i32(min(xl_s0, N_XCD)):
                 g_st_sys(ea, i32(0))
                 g_st_sys(ctrl_at(a, i32(CTRL_LRDY) + cidx * i32(LRDY_STRIDE)), epoch)
 
@@ -2271,7 +2263,7 @@ def compile_mega_moe_tp(
     def _signal_count(a, epoch, cidx):
         cnt_addr = sc_addr(a, cidx, i32(SC_ALL))
         ncol_parts = (
-            N_EARLY_SH + (1 if XCOL_PER_CHUNK > XL_S0 else 0)
+            min(xl_s0, N_XCD) + (1 if XCOL_PER_CHUNK > xl_s0 else 0)
             if XL
             else min(XCOL_PER_CHUNK, N_XCD)
         )
@@ -2418,7 +2410,7 @@ def compile_mega_moe_tp(
 
     @traced
     def _pre_throttle(L, lane, a, g, pc):
-        lag = (ag_split(a) == i32(1)).select(i32(PRE_LAG), i32(PRE_LAG_S))
+        lag = (ag_split(a) == i32(1)).select(i32(1), i32(2))
         if (g >= lag) & (lane == i32(0)):
             spin_lds_ge(L, L_CTL + C_AGK * 4, (g - lag + i32(1)) * pc)
         rocdl.sched_barrier(0)

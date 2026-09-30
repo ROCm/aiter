@@ -127,8 +127,6 @@ def refinements(best: LaunchCfg) -> list[LaunchCfg]:
         LaunchCfg(**{**d, "route_fp8": not best.route_fp8}),
         LaunchCfg(**{**d, "ll": not best.ll, "llr": False}),
         LaunchCfg(**{**d, "npp": 2 if best.npp == 1 else 1}),
-        LaunchCfg(**{**d, "nsk": 8 if best.nsk == 4 else 4}),
-        LaunchCfg(**{**d, "npp": 3, "nsk": 6}),
         LaunchCfg(**{**d, "xb": 2}),
         LaunchCfg(**{**d, "xb": 4}),
     ]
