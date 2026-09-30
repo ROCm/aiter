@@ -41,6 +41,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "opus/opus.hpp"
 
@@ -1389,6 +1390,30 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
     return is_sub_token_onshot;
 }
 
+OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
+{
+    static const std::vector<unsigned char> gfx950_by_device = [] {
+        int device_count = 0;
+        OPUS_HIP_CHECK_ERROR(hipGetDeviceCount(&device_count));
+        std::vector<unsigned char> result(device_count, 0);
+        for(int device_id = 0; device_id < device_count; ++device_id)
+        {
+            hipDeviceProp_t dev_prop;
+            OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, device_id));
+            result[device_id] =
+                std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+        }
+        return result;
+    }();
+
+    hipDevice_t dev = device_id_;
+    if(dev < 0)
+        OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
+    if(dev >= static_cast<hipDevice_t>(gfx950_by_device.size()))
+        throw std::out_of_range("invalid HIP device id");
+    return gfx950_by_device[dev] != 0;
+}
+
 OPUS_H bool
 moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
 {
@@ -1396,16 +1421,9 @@ moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
     if(!is_oneshot)
         return false;
 
-    hipDevice_t dev = device_id_;
-    if(dev < 0)
-        OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
-    hipDeviceProp_t dev_prop;
-    OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, dev));
-    bool is_gfx950 = std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
-
     // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
     bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
-    return !(is_gfx950 && prefer_mp);
+    return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
 }
 
 // return size in byte
