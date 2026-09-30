@@ -4,6 +4,7 @@
 #pragma once
 
 #include "aiter_hip_common.h"
+#include "mla_decode_shape.h"
 #include "v1_comm.cuh"
 
 #define PRINT_DBG 0
@@ -659,7 +660,7 @@ void get_mla_metadata_v1_1_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and
     // qo size from 1 to 4 without support to split qo for each workgroup. This means that
     // kPackedQoLenPerWg should be 4*16=64 to prevent spliting in any case supported by it.
-    constexpr int32_t kPackedQoLenPerWg = 128;
+    constexpr int32_t kPackedQoLenPerWg = kMlaMetadataV10V11PackedQoLenPerWg;
     constexpr int32_t kMaxClusterSize   = 1;
 
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -677,16 +678,11 @@ void get_mla_metadata_v1_1_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
-    if((num_heads != 16) &&
-       (num_heads != 128) && // main kernel natively supports #head=16 or #head=128
-       (num_heads % 16 == 0) && (num_heads < 128))
-    {
-        qk_batch_ratio = num_heads / 16;
-        num_heads      = 16;
-        num_batches *= qk_batch_ratio;
-    }
+    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_1(num_heads);
+
+    qk_batch_ratio = head_plan.qk_batch_ratio;
+    num_heads      = head_plan.kernel_num_heads;
+    num_batches *= qk_batch_ratio;
 
     if(is_sparse)
     {
@@ -694,7 +690,7 @@ void get_mla_metadata_v1_1_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
         uni_seqlen_qo = 1;
     }
 
-    AITER_CHECK((num_heads == 16) || (num_heads == 128),
+    AITER_CHECK(head_plan.plan != MlaHeadPlan::Unsupported,
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).");
