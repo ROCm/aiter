@@ -37,12 +37,15 @@ from .kernels.one_shot_allreduce import (
     DEFAULT_GRID_CAP,
     DEFAULT_SKIP_SELF,
     DEFAULT_SPIN_SLEEP,
+    DEFAULT_SPLIT,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
+    SUPPORTED_SPLITS,
     fused_atoms_for_block,
     fused_block_options,
     fused_oneshot_ladder,
     fused_padded_block_options,
+    fused_split_options,
     make_one_shot_allreduce_kernel,
     oneshot_ladder,
 )
@@ -328,13 +331,14 @@ class OneShotAllReduce:
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             Int32(grid_x),
-            # The fused epilogue's operands. One kernel signature serves both
-            # modes (see the factory), and a plain build's ``const_expr(fused)``
-            # arms never read these.
+            # The fused epilogue's operands, then the split build's exchange
+            # state. One kernel signature serves both modes (see the factory),
+            # and a plain build's ``const_expr(fused)`` arms never read these.
             Int64(0),
             Int64(0),
             Int64(0),
             Float32(0.0),
+            Int64(0),
             stream,
         )
 
@@ -446,6 +450,13 @@ class OneShotAllReduceRMSNorm:
     Same tuning surface as ``OneShotAllReduce`` with one difference. ``block``
     is not free: the row has to fit one workgroup, so ``block * atoms * 8 ==
     hidden`` and picking either of ``atoms``/``block`` picks the other.
+
+    ``split`` spreads each row over that many workgroups instead (``block *
+    atoms * 8 * split == hidden``), which joins the row's sum of squares through
+    one HBM exchange word; at decode sizes one workgroup per row leaves most of
+    the GPU idle. Like ``skip_self`` it overrides every ladder rung rather than
+    pinning one. A width with no split geometry for the requested value takes
+    the nearest one it has, and a padded width runs unsplit.
     """
 
     def __init__(
@@ -466,6 +477,7 @@ class OneShotAllReduceRMSNorm:
         skip_self: bool | None = None,
         hiddens: tuple[int, ...] = (),
         pad: bool = True,
+        split: int | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -484,6 +496,8 @@ class OneShotAllReduceRMSNorm:
         )
         if atoms is not None and atoms not in SUPPORTED_ATOMS:
             raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
+        if split is not None and int(split) not in SUPPORTED_SPLITS:
+            raise ValueError(f"split must be one of {SUPPORTED_SPLITS}, got {split!r}")
         if block is not None and atoms is not None:
             raise ValueError(
                 f"pin atoms or block, not both: block={block} and atoms={atoms} "
@@ -528,6 +542,8 @@ class OneShotAllReduceRMSNorm:
         # ``FUSED_ONESHOT_LADDER``: ``atoms`` sets tile
         # width in the plain schedule and block width here.
         ss = None if skip_self is None else bool(skip_self)
+        # ``split`` overrides every rung, as ``skip_self`` does.
+        k = None if split is None else int(split)
         if pinned:
             self._ladder = (
                 (
@@ -536,6 +552,7 @@ class OneShotAllReduceRMSNorm:
                     DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
                     DEFAULT_FANOUT if fanout is None else fanout,
                     DEFAULT_SKIP_SELF if ss is None else ss,
+                    DEFAULT_SPLIT if k is None else k,
                 ),
             )
         else:
@@ -547,12 +564,16 @@ class OneShotAllReduceRMSNorm:
                     rung_cap if ceiling is None else min(rung_cap, ceiling),
                     f,
                     s if ss is None else ss,
+                    rung_split if k is None else k,
                 )
-                for floor, a, rung_cap, f, s in fused_oneshot_ladder(world_size, link)
+                for floor, a, rung_cap, f, s, rung_split in fused_oneshot_ladder(
+                    world_size, link
+                )
             )
         self.skip_self = self._ladder[0][4]
+        self.split = self._ladder[0][5]
 
-        # (hidden, atoms, grid_cap, fanout, skip_self) -> (engine, spec)
+        # (hidden, atoms, grid_cap, fanout, skip_self, h_pad, split) -> (engine, spec)
         self._by_cfg: dict[tuple, tuple] = {}
         try:
             for h in sorted({int(x) for x in hiddens}):
@@ -563,50 +584,83 @@ class OneShotAllReduceRMSNorm:
 
     # -- engine construction -------------------------------------------------
 
-    def _geom_for(self, hidden: int, rung_atoms: int) -> tuple[int, int]:
-        """``(atoms, h_pad)`` for a rung at hidden dim.
+    @staticmethod
+    def _nearest(legal, want: int) -> int:
+        """*want* if legal, else the nearest legal value, ties to the smaller."""
+        want = int(want)
+        return want if want in legal else min(legal, key=lambda v: (abs(v - want), v))
 
-        A width with a native geometry resolves exactly and ``h_pad ==
-        hidden``. A width that native geometry cannot cover falls to the
-        padded set, where the pad leads. ``fused_padded_block_options`` is
-        ordered by ascending ``h_pad``, so this takes the least wire volume
-        available and only then uses the rung's ``atoms`` to break the tie.
+    def _split_geom_for(self, hidden: int, rung_atoms: int, rung_split: int):
+        """``(atoms, hidden, split)`` for a split rung, or None to run unsplit.
+
+        Only native widths split. The requested split resolves to the nearest
+        one this width has (7168 has {2, 7, 14}); then ``atoms`` resolves as in
+        ``_geom_for``, or from a pinned ``block``, which is then the slice's.
+        """
+        opts = [o for o in fused_split_options(hidden) if o[0] > 1]
+        if self.block:
+            opts = [o for o in opts if o[1] == self.block]
+        if not opts:
+            return None
+        split = self._nearest(sorted({k for k, _b, _a in opts}), rung_split)
+        atoms = self._nearest([a for k, _b, a in opts if k == split], rung_atoms)
+        return atoms, hidden, split
+
+    def _geom_for(
+        self, hidden: int, rung_atoms: int, rung_split: int = DEFAULT_SPLIT
+    ) -> tuple[int, int, int]:
+        """``(atoms, h_pad, split)`` for a rung at hidden dim.
+
+        A split rung takes a split geometry if the width has one
+        (``_split_geom_for``) and otherwise runs unsplit. Unsplit, a width with
+        a native geometry resolves exactly and ``h_pad == hidden``. A width that
+        native geometry cannot cover falls to the padded set, where the pad
+        leads. ``fused_padded_block_options`` is ordered by ascending ``h_pad``,
+        so this takes the least wire volume available and only then uses the
+        rung's ``atoms`` to break the tie.
         """
         hidden = int(hidden)
+        if int(rung_split) > 1:
+            geom = self._split_geom_for(hidden, rung_atoms, rung_split)
+            if geom is not None:
+                return geom
         native = fused_block_options(hidden)
         if self.block:
             native_atoms = next((a for b, a in native if b == self.block), None)
             if native_atoms is not None:
-                return native_atoms, hidden
+                return native_atoms, hidden, 1
         elif native:
-            legal = [a for _b, a in native]
-            want = int(rung_atoms)
-            atoms = want if want in legal else min(legal, key=lambda a: (abs(a - want), a))
-            return atoms, hidden
+            return self._nearest([a for _b, a in native], rung_atoms), hidden, 1
 
         opts = fused_padded_block_options(hidden) if self.pad else ()
         if self.block:
             pinned = [o for o in opts if o[0] == self.block]
             if pinned:
-                return pinned[0][1], pinned[0][2]
+                return pinned[0][1], pinned[0][2], 1
         elif opts:
             least_pad = opts[0][2]
             tied = [o for o in opts if o[2] == least_pad]
             _b, atoms, h_pad = min(
                 tied, key=lambda o: (abs(o[1] - int(rung_atoms)), o[1])
             )
-            return atoms, h_pad
+            return atoms, h_pad, 1
 
         # No geometry at all -- or a pinned block padding cannot reach. Returning
         # the rung's own atoms lets the build raise with the message that names
         # the constraint that failed.
-        return int(rung_atoms), hidden
+        return int(rung_atoms), hidden, 1
 
     def _cfg_key(self, hidden: int, rung: tuple) -> tuple:
-        """A ladder rung's engine key at *hidden*."""
-        _floor, a, cap, f, s = rung
-        atoms, h_pad = self._geom_for(hidden, a)
-        return (int(hidden), atoms, int(cap), f, bool(s), h_pad)
+        """A ladder rung's engine key at *hidden*.
+
+        A split build's grid cap is rounded down to a multiple of its split --
+        a row group is ``split`` consecutive workgroups and all of them must be
+        launched -- so a cap of 64 runs 63 workgroups at split=7.
+        """
+        _floor, a, cap, f, s, k = rung
+        atoms, h_pad, split = self._geom_for(hidden, a, k)
+        cap = max(split, int(cap) // split * split)
+        return (int(hidden), atoms, cap, f, bool(s), h_pad, split)
 
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for hidden dim. Collective: all ranks must call it in
@@ -627,6 +681,7 @@ class OneShotAllReduceRMSNorm:
                 fusion="rmsnorm",
                 hidden=key[0],
                 h_pad=key[5],
+                split=key[6],
             )
             with torch.cuda.device(self._device_index):
                 self._by_cfg[key] = (
@@ -756,8 +811,7 @@ class OneShotAllReduceRMSNorm:
         """Kernel arguments. *ptrs* is ``(inp, out, residual_in, residual_out,
         weight)`` as raw addresses."""
         inp_ptr, out_ptr, res_in_ptr, res_out_ptr, w_ptr = ptrs
-        num_tiles = live_bytes // (hidden * 2)
-        grid_x = max(1, min(num_tiles, spec["grid"]))
+        num_tiles, grid_x = self._tiles_and_grid(spec, hidden, live_bytes)
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
         elif not isinstance(stream, Stream):
@@ -775,8 +829,24 @@ class OneShotAllReduceRMSNorm:
             Int64(res_out_ptr),
             Int64(w_ptr),
             Float32(float(eps)),
+            Int64(int(eng._xchg)),
             stream,
         )
+
+    @staticmethod
+    def _tiles_and_grid(spec, hidden: int, live_bytes: int) -> tuple[int, int]:
+        """``(num_tiles, grid_x)`` for a launch.
+
+        A split build views the ``(M, hidden)`` operands as ``(M*split,
+        hidden/split)``, so it has ``split`` tiles per token, and launches whole
+        row groups: a group whose workgroups were not all launched would wait
+        forever on the missing ones' contributions.
+        """
+        split = int(spec.get("split", 1))
+        tokens = live_bytes // (int(hidden) * 2)
+        grid_x = max(1, min(tokens, spec["grid"] // split)) * split
+        assert grid_x % split == 0 and grid_x <= spec["grid"], (grid_x, split)
+        return tokens * split, grid_x
 
     def _launch(
         self,
@@ -878,9 +948,10 @@ class OneShotAllReduceRMSNorm:
     def variant(self, hidden: int, nbytes: int) -> str:
         """``<jit symbol>/g<grid_cap>/x<grid_x>`` for this (hidden, payload)."""
         key = self._pick_cfg(int(hidden), int(nbytes))
-        eng, _spec = self._by_cfg[key]
-        num_tiles = max(1, int(nbytes) // (int(hidden) * 2))
-        grid_x = max(1, min(num_tiles, key[2]))
+        eng, spec = self._by_cfg[key]
+        # The symbol names a split build (``_k<split>``); grid_x counts its
+        # workgroups, ``split`` per token.
+        _tiles, grid_x = self._tiles_and_grid(spec, int(hidden), int(nbytes))
         return f"{kernel_symbol(eng.launch)}/g{key[2]}/x{grid_x}"
 
     def is_beneficial(self, nbytes: int) -> bool:

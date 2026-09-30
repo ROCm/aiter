@@ -19,14 +19,20 @@ will carry:
   :func:`scale_by_weight`, kept as three steps rather than one call so a caller
   can issue the ``residual_out`` store *before* the reduction's barrier instead
   of behind it.
+* **RMSNorm across workgroups** -- the ``xchg_*`` helpers: the arithmetic of
+  the one i64 word through which the one-shot's split build joins a row's sum
+  of squares over K workgroups. The spin that waits on it lives in the kernel
+  body, which is the only code the AST rewriter sees.
 
 Why a whole workgroup per row: RMSNorm reduces over the row, so a row split
-across two workgroups could only be joined with a grid-wide barrier -- which
-none of these schedules has, and which a persistent collective kernel cannot
+across two workgroups needs a cross-workgroup join -- which none of the
+schedules has by default, and which a persistent collective kernel cannot
 cheaply acquire. Sizing the block to the row instead makes the reduction local,
 and for the ring it does something stronger: with one 16 B atom per row, every
 chunk the ring receives is a whole number of rows, so the epilogue runs inside
-the op that receives it rather than waiting for the tile to be reassembled.
+the op that receives it rather than waiting for the tile to be reassembled. The
+one-shot's ``split`` build is the exception: at decode sizes one workgroup per
+row leaves the machine idle, so it splits the row and pays for one exchange.
 """
 
 import math
@@ -218,6 +224,7 @@ def make_rowbuf_atom_row(
     hbm_i32_ptr,
     hbm_row_layout,
     atom_i32: int = ATOM_I32,
+    nbytes=None,
 ):
     """Build a padded build's per-row buffer-tensor view, shared by all schedules.
 
@@ -241,6 +248,17 @@ def make_rowbuf_atom_row(
     ``ptr_i64`` is the raw ``Int64`` base of the ``(M, hidden)`` operand;
     ``atom`` is a trace-time constant, so its column offset and the live-byte
     count fold at trace time and the descriptor base is one scalar add.
+
+    *nbytes* is the runtime payload size, and bounds the **rows**. The column
+    bound above says nothing about whether the row exists: a multi-row tile
+    (mesh, ring) whose last tile is partial has rows past ``M``, and without
+    this their descriptors point past the end of the tensor with a full row of
+    live records -- loads read whatever follows it, and stores write it, which
+    corrupts neighbouring allocations or faults. A dead row gets
+    ``num_records = 0``, so its loads return 0 and its stores are dropped, the
+    same thing the unpadded whole-payload descriptor does. ``None`` skips the
+    check, for a schedule whose tiles never outrun ``M`` (the one-shot's tile is
+    a single row).
     """
 
     def _rowbuf_atom_row(ptr_i64, tile, atom):
@@ -254,12 +272,16 @@ def make_rowbuf_atom_row(
         # index is computed in i32 (small), then widened to i64 for the byte
         # multiply so ``row * row_bytes`` cannot overflow at large M.
         row = tile * fx.Int32(rows_per_tile) + fx.Int32(r)
-        row_byte_off = fx.Int64(row) * fx.Int64(row_stride_i32 * 4) + fx.Int64(
-            atom_col_bytes
-        )
+        row_start = fx.Int64(row) * fx.Int64(row_stride_i32 * 4)
+        row_byte_off = row_start + fx.Int64(atom_col_bytes)
+        records = fx.Int64(live_bytes)
+        if const_expr(nbytes is not None):
+            # ``select``, not ``if``: this module is outside the kernel body, so
+            # the AST rewriter never sees a Python branch here.
+            records = (row_start < nbytes).select(records, fx.Int64(0))
         buf_ptr = rocdl.make_buffer_ptr(
             fx.inttoptr(hbm_i32_ptr, ptr_i64 + row_byte_off),
-            num_records_bytes=fx.Int64(live_bytes),
+            num_records_bytes=records,
         )
         return fx.make_view(buf_ptr, hbm_row_layout)
 
@@ -422,6 +444,21 @@ def make_wave_partials(n_floats: int):
     return WavePartials
 
 
+def wave_reduce_add(values):
+    """Wave-wide sums of *values*, one per row, in every lane of the wave.
+
+    A full-wave ``shuffle_xor`` butterfly: a fixed reduction tree, so every
+    lane -- and every wave that reduces the same values -- gets identical bits.
+    """
+    sums = []
+    for v in values:
+        acc = v
+        for sh in range_constexpr(int(math.log2(WAVE))):
+            acc = acc + acc.shuffle_xor(WAVE // (2 << sh), WAVE)
+        sums.append(acc)
+    return sums
+
+
 def block_reduce_add(values, *, tid, block: int, lds=None):
     """Block-wide sums of *values*, one per row, broadcast to every thread.
 
@@ -447,12 +484,7 @@ def block_reduce_add(values, *, tid, block: int, lds=None):
     expressed as ``select`` or avoided, and here it is cheaper to avoid it.
     """
     n_waves = block // WAVE
-    locals_ = []
-    for v in values:
-        acc = v
-        for sh in range_constexpr(int(math.log2(WAVE))):
-            acc = acc + acc.shuffle_xor(WAVE // (2 << sh), WAVE)
-        locals_.append(acc)
+    locals_ = wave_reduce_add(values)
 
     if const_expr(n_waves == 1):
         return locals_
@@ -501,12 +533,10 @@ def pack_bf16(values):
     return [atom_f32_to_bf16(v) for v in values]
 
 
-def rms_rstd(rows, eps, hidden: int, *, tid, block: int, lds=None):
-    """``rsqrt(mean(x^2) + eps)`` per row, on the fp32 values.
+def rms_local_sumsq(rows):
+    """This thread's ``sum(x^2)`` per row, on the fp32 values.
 
-    *rows* is a list of lists: the fp32 atoms of each row this thread holds. The
-    reciprocal square root is taken on the fp32 accumulator rather than on the
-    bf16 already stored to ``residual_out``, which is what the reference does.
+    *rows* is a list of lists: the fp32 atoms of each row this thread holds.
     """
     sums = []
     for row in range_constexpr(len(rows)):
@@ -516,8 +546,93 @@ def rms_rstd(rows, eps, hidden: int, *, tid, block: int, lds=None):
             part = fx.Float32(sq.reduce(ReductionOp.ADD))
             local = part if local is None else local + part
         sums.append(local)
-    totals = block_reduce_add(sums, tid=tid, block=block, lds=lds)
-    return [fmath.rsqrt(t * (1.0 / hidden) + eps) for t in totals]
+    return sums
+
+
+def rstd_from_total(total, eps, hidden: int):
+    """``rsqrt(total / hidden + eps)``: *total* is the row's whole ``sum(x^2)``
+    and *hidden* the row's whole width, however many workgroups computed it."""
+    return fmath.rsqrt(total * (1.0 / hidden) + eps)
+
+
+def rms_rstd(rows, eps, hidden: int, *, tid, block: int, lds=None):
+    """``rsqrt(mean(x^2) + eps)`` per row, on the fp32 values.
+
+    *rows* is a list of lists: the fp32 atoms of each row this thread holds. The
+    reciprocal square root is taken on the fp32 accumulator rather than on the
+    bf16 already stored to ``residual_out``, which is what the reference does.
+    """
+    totals = block_reduce_add(rms_local_sumsq(rows), tid=tid, block=block, lds=lds)
+    return [rstd_from_total(t, eps, hidden) for t in totals]
+
+
+# -- RMSNorm across workgroups: the split-row exchange word ---------------------
+#
+# A row split over K workgroups joins its sum of squares through one i64 word
+# per (parity, row group) in HBM. Every contributing wave atomically adds
+#
+#     fixed(partial) * 2**XCHG_COUNT_BITS + 1
+#
+# so the word is ``2**8 * (sum of fixed partials) + (arrivals)`` as a single
+# integer. Integer addition is order-independent, so every rank and every wave
+# decodes bit-identical sums whatever order the waves arrive in -- the property
+# a float atomic_add cannot give. Count and sum move in one atomic op, so a
+# reader that sees the count complete sees the sum complete: no fence needed.
+#
+# The word is never reset. A reader keeps the value it last saw complete on
+# this parity (``prev``); ``d = cur - prev`` is this call's contribution, done
+# when ``d % 2**8 == n_writers``, and its sum is ``d >> 8``. Wrap-around of the
+# 64-bit word is harmless: the deltas are exact modulo 2**64.
+
+#: Fixed-point fraction bits of a partial sum of squares.
+XCHG_FIX_BITS = 16
+#: Low bits of the word counting arrivals; one call's writers must fit.
+XCHG_COUNT_BITS = 8
+#: One call's summed fixed-point partials stay below ``2**XCHG_SUM_BITS``, so
+#: ``d`` stays a positive i64 (``2**8 * 2**55 = 2**63``).
+XCHG_SUM_BITS = 55
+#: Words live one per cache line, so row groups never share one.
+XCHG_LINE_BYTES = 128
+
+
+def xchg_clamp_units(n_writers: int) -> int:
+    """Largest fixed-point partial one of *n_writers* may contribute.
+
+    A power of two, so it is exact in f32 and the clamp cannot round past it;
+    ``n_writers`` of them sum below ``2**XCHG_SUM_BITS``.
+    """
+    n = int(n_writers)
+    if not 0 < n < (1 << XCHG_COUNT_BITS):
+        raise ValueError(
+            f"a split-row exchange counts arrivals in {XCHG_COUNT_BITS} bits, so "
+            f"it takes 1..{(1 << XCHG_COUNT_BITS) - 1} writers, got {n}"
+        )
+    return 1 << (((1 << XCHG_SUM_BITS) - 1) // n).bit_length() - 1
+
+
+def xchg_contribution(partial, n_writers: int):
+    """The i64 a writer adds to the exchange word for its fp32 *partial*.
+
+    ``partial`` is a sum of squares, so ``>= 0``. It is clamped to
+    ``xchg_clamp_units`` first -- with a select on ``partial < clamp``, so a
+    NaN clamps too instead of reaching the float-to-int conversion -- then
+    rounded to the nearest fixed-point unit.
+    """
+    clamp = fx.Float32(xchg_clamp_units(n_writers) * 2.0**-XCHG_FIX_BITS)
+    u = (partial < clamp).select(partial, clamp)
+    q = fx.Int64(u * fx.Float32(2.0**XCHG_FIX_BITS) + fx.Float32(0.5))
+    return q * fx.Int64(1 << XCHG_COUNT_BITS) + fx.Int64(1)
+
+
+def xchg_arrivals(delta):
+    """Writers that have arrived, from ``cur - prev`` (mod ``2**8``)."""
+    return delta & fx.Int64((1 << XCHG_COUNT_BITS) - 1)
+
+
+def xchg_total(delta):
+    """The fp32 sum of squares a *complete* ``cur - prev`` carries."""
+    units = delta // fx.Int64(1 << XCHG_COUNT_BITS)
+    return fx.Float32(units) * fx.Float32(2.0**-XCHG_FIX_BITS)
 
 
 def scale_by_weight(values, rstd, w_atoms):

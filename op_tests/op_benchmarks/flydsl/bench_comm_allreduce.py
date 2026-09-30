@@ -49,6 +49,7 @@ question instead: all-reduce + residual add + RMSNorm.
 |-----------------|---------------------------------------------|-------|
 | ``fused_fly_1stage``  | FlyDSL one-shot with the epilogue fused | yes |
 | ``fused_fly_1stage_b<block>_g<cap>[_ss]`` | same, pinned block x grid cap x self-skip | yes |
+| ``fused_fly_1stage_k<split>_b<block>_g64[_ss]`` | same, each row split over ``split`` workgroups of ``block`` threads | yes |
 | ``fused_cdr_1stage``  | ``allreduce_fusion_kernel_1stage`` -- the traced kernel | yes |
 | ``fused_cdr_2stage``  | ``allreduce_fusion_kernel_2stage``      | yes |
 | ``fused_qr_fp8``/``_int4`` | ``qr_all_reduce_rmsnorm`` per codec | yes |
@@ -342,6 +343,9 @@ try:
     from aiter.ops.flydsl.kernels.one_shot_allreduce import (
         fused_padded_block_options as _fused_padded_block_options,
     )
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_split_options as _fused_split_options,
+    )
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
         quick_reduce_hidden_supported as _flyqr_hidden_supported,
     )
@@ -372,6 +376,7 @@ except Exception:  # noqa: BLE001
     _fused_hidden_supported = None
     _fused_block_options = None
     _fused_padded_block_options = None
+    _fused_split_options = None
     _flyqr_hidden_supported = None
     _flyqr_block_options = None
     _flyqr_padded_block_options = None
@@ -640,6 +645,9 @@ class Candidate:
     # is the knob that sets how many blocks a payload gets. None leaves it to
     # the rung.
     block: int | None = None
+    # Workgroups per token row, family "fused_fly1s" (with ``block`` then the
+    # width of one slice's workgroup). None leaves it to the rung.
+    split: int | None = None
     # Rows that only exist under --fusion ar_rmsnorm. A fused candidate is never
     # run in plain mode and vice versa: the two modes compute different things
     # and are graded against different references, so mixing them in one table
@@ -755,8 +763,16 @@ class Candidate:
         pin ``block``, leaving ``atoms`` None for the engine to resolve per
         width. Both are in the key anyway: they are engine-identifying, and a
         row that pinned ``atoms`` instead must not collide with one of these.
+        ``split`` is last, so the unsplit rows keep their order.
         """
-        return (self.atoms, self.grid_cap, self.fanout, self.skip_self, self.block)
+        return (
+            self.atoms,
+            self.grid_cap,
+            self.fanout,
+            self.skip_self,
+            self.block,
+            self.split,
+        )
 
 
 _FLY1S_GRID = (
@@ -901,6 +917,48 @@ def _fused_fly1s_grid_rows():
                         skip_self=skip_self,
                     )
                 )
+    return tuple(rows)
+
+
+def _fused_fly1s_split_rows():
+    """Split-row fused builds: ``split`` x slice block x self-skip, at cap 64.
+
+    Generated from ``fused_split_options`` over the widths this bench sees,
+    like the block rows: a row whose (split, block) a width does not have is
+    skipped there by ``_fused_hidden_ok`` -- exactly, not via the engine's
+    fallback to the nearest split, which would report one build under
+    another's key.
+    """
+    if _fused_split_options is None:
+        return ()
+    pairs = sorted(
+        {
+            (k, b)
+            for h in _FUSED_GRID_HIDDENS
+            for k, b, _a in _fused_split_options(h)
+            if k > 1
+        },
+        key=lambda kb: (kb[0], -kb[1]),
+    )
+    rows = []
+    for skip_self in (False, True):
+        for split, block in pairs:
+            key = f"fused_fly_1stage_k{split}_b{block}_g64"
+            if skip_self:
+                key += "_ss"
+            rows.append(
+                Candidate(
+                    key,
+                    "fused_fly1s",
+                    40.0,  # min acceptable SQNR value
+                    True,
+                    fusion=True,
+                    grid_cap=64,
+                    block=block,
+                    skip_self=skip_self,
+                    split=split,
+                )
+            )
     return tuple(rows)
 
 
@@ -1094,8 +1152,10 @@ CANDIDATES = (
     # The new FlyDSL kernel, ladder-driven. The row this whole mode exists for.
     Candidate("fused_fly_1stage", "fused_fly1s", 40.0, True, fusion=True),
     # ... plus the pinned block x grid-cap x self-skip grid, see
-    # `_fused_fly1s_grid_rows`.
+    # `_fused_fly1s_grid_rows`, and the split-row builds, see
+    # `_fused_fly1s_split_rows`.
     *_fused_fly1s_grid_rows(),
+    *_fused_fly1s_split_rows(),
     # The shipped fused dispatcher, routed through  FlyDSLAllReduceRMSNorm.
     Candidate("fused_fly_auto", "fused_flyauto", 10.0, False, fusion=True),
     # The incumbent: the kernel the Qwen3-235B MXFP4 decode trace spends 3.72 s
@@ -1285,10 +1345,21 @@ def _fused_hidden_ok(hidden: int, cand: Candidate) -> bool:
     hidden=7168 has only 896 and 448, so a b256 row is *skipped* here rather
     than failing later. That is the same shape of answer as the atoms form, and
     it is why these rows can be generated across widths and left to gate.
+
+    A split row needs its exact ``(split, block)`` at this width. The engine
+    would fall back to the nearest split the width has, but then the row would
+    report another build under its own key, so it is skipped instead.
     """
     if _fused_hidden_supported is None:
         return False
     pad = _bench_fly_pad_enabled()
+    if cand.split is not None and cand.split > 1:
+        if _fused_split_options is None:
+            return False
+        return any(
+            k == cand.split and (cand.block is None or b == cand.block)
+            for k, b, _a in _fused_split_options(int(hidden))
+        )
     if cand.block is not None:
         if _fused_block_options is None:
             return False
@@ -2738,7 +2809,9 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_rms:
-            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block"))
+            kw = _fly_kwargs(
+                cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block", "split")
+            )
             fly1s_rms[cfg] = OneShotAllReduceRMSNorm(
                 group=tp_group.cpu_group,
                 device=device,
@@ -2754,9 +2827,21 @@ def _worker(
         # Build and preload every (config, hidden) this sweep will touch, before
         # any timing and well before any graph capture. Building a width is a
         # collective, so every rank walks the same (hidden, config) order.
+        # A split row's engine asks its candidates, not ``supports_hidden``:
+        # that answers for the unsplit geometry, and the row would only be
+        # skipped at this width anyway.
+        rms_cands = {
+            c.fly1s_rms_cfg: c
+            for c in CANDIDATES
+            if c.family == "fused_fly1s" and c.key in keys
+        }
         for hidden in sorted({h for _, h in shapes}):
             for cfg, eng in fly1s_rms.items():
-                if not eng.supports_hidden(hidden):
+                cand = rms_cands[cfg]
+                if cand.split is not None and cand.split > 1:
+                    if not _fused_hidden_ok(hidden, cand):
+                        continue
+                elif not eng.supports_hidden(hidden):
                     continue
                 eng.preload(hidden)
 

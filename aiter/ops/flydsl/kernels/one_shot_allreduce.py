@@ -38,17 +38,25 @@ from flydsl.expr.typing import (
 from .quick_allreduce_fusions import (
     ATOM_ELEMS,
     FUSIONS,
+    XCHG_LINE_BYTES,
     make_rowbuf_atom_row,
     make_wave_partials,
     pack_bf16,
     padded_row_block,
     padded_row_block_options,
     residual_add,
+    rms_local_sumsq,
     rms_rstd,
     row_block,
     row_block_options,
     row_block_supported,
+    rstd_from_total,
     scale_by_weight,
+    wave_reduce_add,
+    xchg_arrivals,
+    xchg_clamp_units,
+    xchg_contribution,
+    xchg_total,
 )
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
@@ -65,6 +73,7 @@ from .quick_allreduce_shared import (
     _buffer_load,
     _buffer_ptr,
     _color_io,
+    _global_ptr,
     _i32_to_bytes,
     _load_flag,
     _load_peers,
@@ -94,6 +103,12 @@ DEFAULT_ATOMS = 1
 # the last partial tile.
 SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
+# Workgroups one fused token row is split over. 1 is one workgroup per row, the
+# unsplit build. The rest are the counts that divide the shipped widths into
+# whole waves: 7168 = 14 waves at atoms=1 gives {2, 7, 14}; 4096/8192 give the
+# powers of two.
+SUPPORTED_SPLITS = (1, 2, 4, 7, 8, 14, 16)
+DEFAULT_SPLIT = 1
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, atoms, grid_cap,
 # fanout, block, skip_self)`` rungs. The host builds one engine per rung and
@@ -167,19 +182,24 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
 # so a bigger atom count means fewer, fatter tiles and fewer flags. TP2 and TP8
 # pick atoms=4 for exactly that reason.
 #
-# In the fused schedule the tile is pinned to one token row, because RMSNorm
-# reduces over the row and every element has to be reachable from one workgroup.
-# ``atoms`` therefore sets the *block width* instead -- BLOCK = hidden/(8*atoms)
-# -- and the tile, the flag count and the block count are all independent of it.
+# In the fused schedule the tile is pinned to one token row -- or, with
+# ``split``, to one 1/split slice of it -- because RMSNorm reduces over the row.
+# ``atoms`` therefore sets the *block width* instead -- BLOCK =
+# hidden/(split*8*atoms) -- and the tile, the flag count and the block count are
+# all independent of it.
+#
+# Rungs are ``(min_bytes, atoms, grid_cap, fanout, skip_self, split)``. Rungs
+# select by payload, which at a fixed hidden is the token count, so "split the
+# row at M=1, not at M=4" is two rungs.
 FUSED_ONESHOT_LADDER = {
     # PCIe: from measurements on MI350P
-    ("pcie", 2): ((0, 2, 128, "peer", True),),
-    ("pcie", 4): ((0, 2, 64, "peer", False),),
-    ("pcie", 8): ((0, 4, 64, "peer", False), (8 << 10, 2, 64, "peer", True)),
+    ("pcie", 2): ((0, 2, 128, "peer", True, 1),),
+    ("pcie", 4): ((0, 2, 64, "peer", False, 1),),
+    ("pcie", 8): ((0, 4, 64, "peer", False, 1), (8 << 10, 2, 64, "peer", True, 1)),
     # xGMI: from measurements on MI300X
-    ("xgmi", 2): ((0, 2, 128, "peer", True),),
-    ("xgmi", 4): ((0, 2, 64, "peer", False),),   # window empty; placeholder kept for schema
-    ("xgmi", 8): ((0, 4, 64, "peer", False),),   # window empty; placeholder kept for schema
+    ("xgmi", 2): ((0, 2, 128, "peer", True, 1),),
+    ("xgmi", 4): ((0, 2, 64, "peer", False, 1),),   # window empty; placeholder kept for schema
+    ("xgmi", 8): ((0, 4, 64, "peer", False, 1),),   # window empty; placeholder kept for schema
 }
 
 
@@ -187,7 +207,7 @@ def fused_oneshot_ladder(world_size: int, link: str = "pcie"):
     """Rungs for *(link, world_size)* under ``fusion="rmsnorm"``."""
     return FUSED_ONESHOT_LADDER.get(
         (str(link), int(world_size)),
-        ((0, 1, DEFAULT_GRID_CAP, DEFAULT_FANOUT, DEFAULT_SKIP_SELF),),
+        ((0, 1, DEFAULT_GRID_CAP, DEFAULT_FANOUT, DEFAULT_SKIP_SELF, DEFAULT_SPLIT),),
     )
 
 
@@ -220,6 +240,29 @@ def fused_padded_block_options(hidden: int) -> tuple[tuple[int, int, int], ...]:
 def fused_padded_block(hidden: int) -> tuple[int, int, int]:
     """``(block, atoms, h_pad)`` for a padded fused build, least padding first."""
     return padded_row_block(hidden, atoms_choices=SUPPORTED_ATOMS, align=WAVE)
+
+
+def fused_split_options(hidden: int) -> tuple[tuple[int, int, int], ...]:
+    """Every ``(split, block, atoms)`` a native (unpadded) fused build can use
+    at hidden dim, by ascending split, widest block first within one.
+
+    ``split == 1`` is the unsplit build, i.e. ``fused_block_options``. A split
+    build needs each ``hidden/split`` slice to be a whole-wave row geometry, and
+    ``split * waves`` exchange writers to fit the word's arrival count.
+    """
+    hidden = int(hidden)
+    opts = []
+    for split in SUPPORTED_SPLITS:
+        if hidden % split:
+            continue
+        for block, atoms in fused_block_options(hidden // split):
+            if split > 1:
+                try:
+                    xchg_clamp_units(split * (block // WAVE))
+                except ValueError:
+                    continue
+            opts.append((split, block, atoms))
+    return tuple(opts)
 
 
 def fused_atoms_for_block(hidden: int, block: int) -> int:
@@ -281,9 +324,34 @@ def make_one_shot_allreduce_kernel(
     fusion: str = "none",
     hidden: int | None = None,
     h_pad: int | None = None,
+    split: int = DEFAULT_SPLIT,
+    debug_slice_delay: int = 0,
 ):
+    """Build the one-shot all-reduce, plain or fused with residual-add + RMSNorm.
+
+    ``split`` (fused only) spreads each token row over that many workgroups,
+    each owning a contiguous ``hidden/split`` slice; they join the row's sum of
+    squares through one HBM exchange word (see ``_xchg`` in the kernel body).
+    ``split=1`` is the one-workgroup-per-row build and compiles none of it.
+
+    ``debug_slice_delay`` is for tests only: when set, the waves of slice 0
+    sleep ``debug_slice_delay`` x ``s_sleep 127`` on every third row *after*
+    contributing to the exchange and *before* reading it, so their siblings
+    complete the row and run ahead into the other parity's word while slice 0
+    still reads this one -- the case the exchange's reuse argument is about.
+    Only a workgroup that handles several rows in one launch can be overtaken
+    (launches on a stream do not overlap), so a test pairs it with a small
+    grid cap.
+    """
     if fusion not in FUSIONS:
         raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
+    split = int(split)
+    if split not in SUPPORTED_SPLITS:
+        raise ValueError(f"split must be one of {SUPPORTED_SPLITS}, got {split!r}")
+    if split > 1 and fusion == "none":
+        raise ValueError("split is only meaningful for a fused build")
+    if debug_slice_delay and split == 1:
+        raise ValueError("debug_slice_delay needs a split build")
     if fusion != "none" and hidden is None:
         raise ValueError(f"fusion={fusion!r} requires hidden")
     if fusion == "none" and hidden is not None:
@@ -320,6 +388,7 @@ def make_one_shot_allreduce_kernel(
 
     fused = fusion == "rmsnorm"
     if fused:
+        assert hidden is not None  # rejected above
         # ``h_pad`` is the width the *workgroup* covers; ``hidden`` stays the
         # width the *tensor* has.
         h_pad = hidden if h_pad is None else int(h_pad)
@@ -331,12 +400,31 @@ def make_one_shot_allreduce_kernel(
                 f"{ATOM_ELEMS}-element atoms so the pad boundary lands on an "
                 f"atom granule, got hidden={hidden}"
             )
-        row_width = fused_block(h_pad, atoms)
+        if split > 1:
+            # The padded path bounds a per-row descriptor at the true row
+            # width; splitting it is not needed by any shipped width.
+            if h_pad != hidden:
+                raise ValueError(
+                    f"split={split} needs a native geometry, but hidden={hidden} "
+                    f"runs padded to {h_pad}"
+                )
+            if hidden % split:
+                raise ValueError(f"split={split} does not divide hidden={hidden}")
+            if grid % split:
+                # A row group is split consecutive workgroups, and every one of
+                # them has to be launched or its siblings wait forever.
+                raise ValueError(f"grid={grid} is not a multiple of split={split}")
+        row_width = fused_block(h_pad // split, atoms)
         if block is not None and int(block) != row_width:
+            legal = (
+                fused_block_options(h_pad)
+                if split == 1
+                else [(b, a) for k, b, a in fused_split_options(hidden) if k == split]
+            )
             raise ValueError(
-                f"fused hidden={hidden} (h_pad={h_pad}) at atoms={atoms} needs "
-                f"block={row_width}, got block={block}; the legal (block, atoms) "
-                f"pairs for this width are {fused_block_options(h_pad)}"
+                f"fused hidden={hidden} (h_pad={h_pad}, split={split}) at "
+                f"atoms={atoms} needs block={row_width}, got block={block}; the "
+                f"legal (block, atoms) pairs for this width are {legal}"
             )
         block = row_width
     else:
@@ -345,17 +433,30 @@ def make_one_shot_allreduce_kernel(
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
     # Whether any lane of the workgroup sits past the end of the real row.
     padded = fused and h_pad != hidden
-    # Per-wave partials for the block-wide sum of squares. The plain build has
-    # no LDS at all.
     n_waves = block // WAVE
-    lds_bytes = n_waves * 4 if fused else 0
+    # Split build: every wave of every slice of a row contributes one partial
+    # to the row group's exchange word. Raises if the arrival count overflows.
+    n_writers = split * n_waves
+    if split > 1:
+        xchg_clamp_units(n_writers)
+    # Row groups: ``split`` consecutive workgroups share one row.
+    n_groups = grid // split
+    # Exchange state, split builds only: one word per (parity, group), each on
+    # its own line, then this workgroup's last-complete word per parity.
+    xchg_prev_off = PARITIES * n_groups * XCHG_LINE_BYTES
+    xchg_bytes = xchg_prev_off + grid * PARITIES * 8 if split > 1 else 0
+    # Per-wave partials for the block-wide sum of squares. The plain build has
+    # no LDS at all, and nor does a split one: its waves reduce through HBM.
+    lds_bytes = n_waves * 4 if fused and split == 1 else 0
 
     tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
     # i32 between one token row and the next *in HBM*. The tile the wire and the
     # workgroup see is h_pad wide, but the tensor's rows are still packed at the
-    # true width, so these part company exactly when a build is padded.
-    row_stride_i32 = (hidden // 2) if fused else tile_i32
+    # true width, so these part company exactly when a build is padded. A split
+    # build views an (M, hidden) operand as (M*split, hidden/split) -- the same
+    # memory -- so its "row" here is one slice.
+    row_stride_i32 = (hidden // split // 2) if fused else tile_i32
     # Payload then the 64 B handshake sector.
     wire_tile_i32 = tile_i32 + FLAG_I32
     wire_tile_bytes = wire_tile_i32 * 4
@@ -381,12 +482,13 @@ def make_one_shot_allreduce_kernel(
     # LDS for the fused sum-of-squares. Carries the per-wave partial sums
     # only: the 1/hidden, the +eps and the rsqrt all happen afterwards in
     # registers, per thread, so no scale is ever broadcast through LDS.
-    _RmsShared = make_wave_partials(n_waves) if fused else None
+    _RmsShared = make_wave_partials(n_waves) if fused and split == 1 else None
 
     # One signature for both modes. The fused-only arguments are present (and
     # passed as zeros) in a plain build rather than being appended to a second
     # kernel. The fused-only code is still elided by ``const_expr(fused)``,
-    # only four unused kernargs remain in a plain build.
+    # only five unused kernargs remain in a plain build. ``xchg_ptr`` is the
+    # split build's exchange state, and 0 (never read) in every other build.
     @flyc.kernel(known_block_size=[block, 1, 1])
     def one_shot_allreduce(
         rank: Int32,
@@ -401,6 +503,7 @@ def make_one_shot_allreduce_kernel(
         res_out_ptr: Int64,
         w_ptr: Int64,
         eps: Float32,
+        xchg_ptr: Int64,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
@@ -480,7 +583,21 @@ def make_one_shot_allreduce_kernel(
             # build reads it through the same per-row descriptor at row 0; an
             # unpadded build bounds a one-row buffer tensor at the true width,
             # which is the whole mask for this one operand (nothing lies past it).
+            # A split build sees it as (split, hidden/split) and reads row
+            # ``part``: its own slice of the gain.
             w_buf = _operand(w_ptr, records=fx.Int64(hidden * 2))
+
+        if const_expr(split > 1):
+            # ``split`` consecutive workgroups share one token row: ``group``
+            # names the row group, ``part`` this workgroup's slice. The host
+            # launches a multiple of ``split`` workgroups, so tile
+            # ``bid + i*n_blocks`` is row ``group + i*(n_blocks/split)``, slice
+            # ``part`` -- the same row for the whole group at every i -- and
+            # ``n_block_tiles`` below is equal across the group:
+            # ceil((split*M - split*g - part) / (split*G)) = ceil((M - g) / G)
+            # for every 0 <= part < split.
+            group = bid // fx.Int32(split)
+            part = bid % fx.Int32(split)
 
         def _slot_i32(parity, src):
             """i32 offset of the wire slot ``[parity][bid][src]``.
@@ -670,27 +787,106 @@ def make_one_shot_allreduce_kernel(
             """The plain path's result: one rounding, at the end of the sum."""
             return [atom_f32_to_bf16(a) for a in _reduce_f32(parity, my_atoms)]
 
-        def _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms):
+        def _xchg(tile, parity, wave_sum, prev_same):
+            """Join this wave's sum of squares with every other wave of the row.
+
+            ``n_writers`` waves -- every wave of every slice of the row -- each
+            add ``fixed(wave_sum) << 8 | 1`` to the row group's word for this
+            parity (``quick_allreduce_fusions.xchg_contribution``), with a
+            relaxed agent-scope 64-bit atomic whose result is left *unused*:
+            that is the no-return form, and a returning one measured ~0.25 us
+            slower. Count and sum move in one atomic op, so a wave that sees the
+            count complete sees the sum complete, and no fence orders anything.
+            (On gfx950 the release/acquire fences would be ``buffer_wbl2 sc1`` /
+            ``buffer_inv sc1``: a whole-L2 writeback and invalidate.) Integer
+            addition is order-independent, so every wave on every rank decodes
+            the same bits whatever order the writers arrived in.
+
+            The word is never reset. *prev_same* is its value when this parity
+            last completed; this call is done when ``cur - prev_same`` counts
+            ``n_writers`` arrivals. That value cannot be overtaken: before any
+            wave can add to this parity again it must pass the *other* parity's
+            exchange, which needs every wave's contribution there, which each
+            wave makes only after it has finished reading this one.
+
+            Returns ``(row sum of squares, cur)``; *cur* becomes ``prev`` for
+            this parity's next use.
+            """
+            word = _global_ptr(
+                xchg_ptr
+                + fx.Int64(parity * fx.Int32(n_groups) + group)
+                * fx.Int64(XCHG_LINE_BYTES),
+                T.i64,
+                8,
+            )
+            if (tid & fx.Int32(WAVE - 1)) == fx.Int32(0):
+                fx.atomic_add(
+                    word,
+                    xchg_contribution(wave_sum, n_writers),
+                    syncscope=rocdl.SyncScope.AgentOneAs,
+                )
+            if const_expr(debug_slice_delay):
+                # Test-only: contributed, not yet read. The siblings complete
+                # this row without us and run on into the other parity's word.
+                if (part == fx.Int32(0)) & (
+                    (tile // fx.Int32(split)) % fx.Int32(3) == fx.Int32(0)
+                ):
+                    for _ in range_constexpr(debug_slice_delay):
+                        rocdl.s_sleep(127)
+            # Every lane polls the same address: one request per wave.
+            cur = fx.generic_load(
+                word,
+                dtype=fx.Int64,
+                memory_order=fx.AtomicOrdering.Monotonic,
+                syncscope=rocdl.SyncScope.AgentOneAs,
+            )
+            while xchg_arrivals(cur - prev_same) != fx.Int64(n_writers):
+                if const_expr(spin_sleep):
+                    rocdl.s_sleep(spin_sleep)
+                cur = fx.generic_load(
+                    word,
+                    dtype=fx.Int64,
+                    memory_order=fx.AtomicOrdering.Monotonic,
+                    syncscope=rocdl.SyncScope.AgentOneAs,
+                )
+            return xchg_total(cur - prev_same), cur
+
+        def _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms, prev_same):
             """bf16 round-trip, residual add, RMSNorm.
 
             The arithmetic lives in ``quick_allreduce_fusions``, which the mesh
             and ring epilogues share; what stays here is the store placement.
             ``residual_out`` is written *before* the reduction, so it is in
-            flight across the barrier rather than issued behind it -- it has no
-            dependence on the norm.
+            flight across the barrier (or, split, the exchange) rather than
+            issued behind it -- it has no dependence on the norm.
+
+            Returns the exchange word a split build saw complete (the next
+            ``prev`` for this parity), None otherwise.
             """
             accs = residual_add(_reduce_f32(parity, my_atoms), x_atoms)
             _store_rows(res_out_buf, tile, pack_bf16(accs))
-            # One block covers one row, so there is a single row to reduce.
-            rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[0]
+            done = None
+            if const_expr(split > 1):
+                # The row spans ``split`` workgroups: reduce this wave's share,
+                # then join the rest through HBM. 1/hidden is the whole row's.
+                wave_sum = wave_reduce_add(rms_local_sumsq([accs]))[0]
+                total, done = _xchg(tile, parity, wave_sum, prev_same)
+                rstd = rstd_from_total(total, eps, hidden)
+            else:
+                # One block covers one row, so there is a single row to reduce.
+                rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[0]
             _store_tile(tile, scale_by_weight(accs, rstd, w_atoms))
+            return done
 
         sq_lds = None
         if const_expr(fused):
             # The gain is one row shared by every token, so it is read once here
-            # rather than once per token.
-            w_atoms = _load_rows(w_buf, fx.Int32(0))
-            if const_expr(n_waves > 1):
+            # rather than once per token -- a split build reads its own slice.
+            if const_expr(split > 1):
+                w_atoms = _load_rows(w_buf, part)
+            else:
+                w_atoms = _load_rows(w_buf, fx.Int32(0))
+            if const_expr(n_waves > 1 and split == 1):
                 # Allocated once, at kernel scope: SharedAllocator is static, so
                 # an allocation reached from inside the tile loop would emit a
                 # fresh LDS symbol per trace-time visit.
@@ -701,6 +897,32 @@ def make_one_shot_allreduce_kernel(
         # every tile above n_blocks unprocessed.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
         color = _load_color()
+        # Split build: the exchange word's value when each parity last
+        # completed -- ``prev_same`` for the coming row's parity, ``prev_other``
+        # for the other -- rotated every row and persisted per workgroup across
+        # launches. Defined in every build because the loop below assigns them
+        # (the rewriter carries whatever the body assigns); unsplit, they pass
+        # through the loop untouched and fold away.
+        prev_same = fx.Int64(0)
+        prev_other = fx.Int64(0)
+        if const_expr(split > 1):
+            prev_base = (
+                xchg_ptr
+                + fx.Int64(xchg_prev_off)
+                + fx.Int64(bid) * fx.Int64(PARITIES * 8)
+            )
+            prev_same = fx.generic_load(
+                _global_ptr(prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8),
+                dtype=fx.Int64,
+            )
+            prev_other = fx.generic_load(
+                _global_ptr(
+                    prev_base + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
+                    T.i64,
+                    8,
+                ),
+                dtype=fx.Int64,
+            )
         for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
             tile = bid + i * n_blocks
             parity = color & fx.Int32(1)
@@ -714,7 +936,13 @@ def make_one_shot_allreduce_kernel(
             _publish(parity, color)
             _wait(parity, color)
             if const_expr(fused):
-                _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms)
+                done = _epilogue(
+                    tile, x_atoms, w_atoms, parity, sq_lds, my_atoms, prev_same
+                )
+                if const_expr(split > 1):
+                    # The next row uses the other parity.
+                    prev_same = prev_other
+                    prev_other = done
             else:
                 _store_tile(tile, _reduce(parity, my_atoms))
             color = color + fx.Int32(1)
@@ -727,6 +955,23 @@ def make_one_shot_allreduce_kernel(
                 color = fx.Int32(2)
         if tid == 0:
             _store_color(color)
+            if const_expr(split > 1):
+                # Every wave decoded the same completed words, so any one
+                # thread's copy is the workgroup's. The wrap above keeps the
+                # parities alternating, so ``color``'s parity is still
+                # ``prev_same``'s.
+                fx.generic_store(
+                    _global_ptr(prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8),
+                    prev_same,
+                )
+                fx.generic_store(
+                    _global_ptr(
+                        prev_base + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
+                        T.i64,
+                        8,
+                    ),
+                    prev_other,
+                )
         gpu.barrier()
 
     flat_wg = f"{block},{block}"
@@ -745,6 +990,7 @@ def make_one_shot_allreduce_kernel(
         res_out_ptr: Int64,
         w_ptr: Int64,
         eps: Float32,
+        xchg_ptr: Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         one_shot_allreduce(
@@ -760,6 +1006,7 @@ def make_one_shot_allreduce_kernel(
             res_out_ptr,
             w_ptr,
             eps,
+            xchg_ptr,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
@@ -773,6 +1020,12 @@ def make_one_shot_allreduce_kernel(
         tag += f"_rms_h{hidden}"
         if padded:
             tag += f"p{h_pad}"
+        if split > 1:
+            # split sets the tile and adds the exchange; block alone does not
+            # name it (7168 at split=7 and 896 at split=1 differ in both).
+            tag += f"_k{split}"
+            if debug_slice_delay:
+                tag += f"_dly{debug_slice_delay}"
     if spin_sleep:
         tag += f"_sl{spin_sleep}"
     if skip_self:
@@ -811,4 +1064,8 @@ def make_one_shot_allreduce_kernel(
         "hidden": hidden,
         "h_pad": h_pad,
         "padded": padded,
+        "split": split,
+        # Local (never IPC-shared) exchange state for a split build, zeroed at
+        # engine build: ``_StEngine`` appends it to its meta allocation.
+        "xchg_bytes": xchg_bytes,
     }
