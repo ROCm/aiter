@@ -21,7 +21,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
-    lookup_tuned_config,
+    lookup_config,
     resolve_config_dir,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -297,7 +297,7 @@ def dynamic_mxfp4_quant(
 
         cfg_dir = resolve_config_dir("quant", "MXFP4", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-        cfg = lookup_tuned_config(tuned, M=M, N=N)
+        cfg = lookup_config(tuned, ("M", "N"), M=M, N=N)
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
@@ -504,7 +504,7 @@ def dynamic_mxfp8_quant(
 
         cfg_dir = resolve_config_dir("quant", "MXFP8", backend="gluon")
         tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-        cfg = lookup_tuned_config(tuned, M=M, K=K)
+        cfg = lookup_config(tuned, ("M", "K"), M=M, K=K)
 
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]

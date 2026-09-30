@@ -153,83 +153,63 @@ def resolve_config_dir(
     return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
 
 
-_BUCKET_SEP = "."
-_BUCKET_COMPONENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)_(LEQ|GEQ)_(-?\d+)$")
+def _axis_of(component: str) -> str:
+    """``M_LEQ_32`` -> ``M``."""
+    return component.split("_", 1)[0]
 
 
-def _bucket_axis(component: str) -> str:
-    return _BUCKET_COMPONENT_RE.fullmatch(component).group(1)
+def _bound_of(component: str) -> int:
+    return int(component.rsplit("_", 1)[1])
 
 
-def _bucket_bound(component: str) -> int:
-    return int(_BUCKET_COMPONENT_RE.fullmatch(component).group(3))
+def _candidates(axis: str, value, parts: set) -> list:
+    """Components of ``axis`` matching ``value``, most specific first: LEQ
+    bounds ascending, then GEQ bounds descending, then ``"any"``."""
+    leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound_of)
+    geq = sorted(
+        (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound_of, reverse=True
+    )
+    return (
+        [c for c in leq if value <= _bound_of(c)]
+        + [c for c in geq if value >= _bound_of(c)]
+        + ["any"]
+    )
 
 
-def _bucket_canonical(key: str, axes: tuple) -> tuple:
-    """Expand a key to one slot per axis, ``any`` where it says nothing."""
+def _canonical(key: str, axes: tuple) -> tuple:
+    """Expand a bucket key to one slot per axis, ``"any"`` where it says nothing."""
     slot = dict.fromkeys(axes, "any")
     if key != "any":
-        for part in key.split(_BUCKET_SEP):
-            slot[_bucket_axis(part)] = part
+        for part in key.split("."):
+            slot[_axis_of(part)] = part
     return tuple(slot[a] for a in axes)
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
 def _bucket_index(keys: tuple, axes: tuple) -> tuple:
-    """Build ``(slots -> key, components used per axis)``, cached on the key
-    names (all this depends on)."""
+    """Build ``(slots -> key, LEQ/GEQ components declared per axis)``, cached
+    on the key names (all it depends on)."""
     parts = {a: set() for a in axes}
     for key in keys:
         if key != "any":
-            for part in key.split(_BUCKET_SEP):
-                parts[_bucket_axis(part)].add(part)
-    return {_bucket_canonical(k, axes): k for k in keys}, parts
+            for part in key.split("."):
+                parts[_axis_of(part)].add(part)
+    return {_canonical(k, axes): k for k in keys}, parts
 
 
-def _bucket_candidates(axis: str, value, parts: set) -> list:
-    """Components of `axis` matching `value`, most specific first: LEQ bounds
-    ascending, then GEQ bounds descending, then the "any" catch-all."""
-    leq = sorted(
-        (
-            c
-            for c in parts
-            if c.startswith(f"{axis}_LEQ_") and value <= _bucket_bound(c)
-        ),
-        key=_bucket_bound,
-    )
-    geq = sorted(
-        (
-            c
-            for c in parts
-            if c.startswith(f"{axis}_GEQ_") and value >= _bucket_bound(c)
-        ),
-        key=_bucket_bound,
-        reverse=True,
-    )
-    return leq + geq + ["any"]
-
-
-def lookup_tuned_config(tuned: dict, **variables) -> dict:
-    """Resolve one config from a flat bucket table.
-
-    ``tuned`` is ``{"schema": [<axis>, ...], "<bucket key>": {...}, "any": {...}}``;
-    a key names only the axes it constrains, joined by ``'.'`` (e.g.
-    ``"M_GEQ_33.N_LEQ_16384"``). Each config is complete; ``"any"`` is required.
-
-    Per axis, in ``"schema"`` order (leftmost wins ties): LEQ bounds ascending,
-    then GEQ bounds descending, then ``"any"``. Returns a fresh dict.
+def lookup_config(table: dict, axes: tuple, **values) -> dict:
+    """Resolve one config from a flat table keyed by composite bucket keys,
+    e.g. ``{"M_LEQ_32": {...}, "M_GEQ_33.N_LEQ_1024": {...}, "any": {...}}``.
+    Per axis (in ``axes`` order, leftmost wins ties): LEQ bounds ascending,
+    then GEQ bounds descending, then ``"any"`` (required). Fresh dict copy.
     """
-    axes = tuple(tuned["schema"])
-    table = {k: v for k, v in tuned.items() if k != "schema"}
-    if not axes:
-        return dict(table.get("any", next(iter(table.values()))))
     index, parts = _bucket_index(tuple(table), axes)
-    per_axis = [_bucket_candidates(a, variables[a], parts[a]) for a in axes]
+    per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]
     for slots in itertools.product(*per_axis):
         if slots in index:
             return dict(table[index[slots]])
     raise KeyError(
         "no entry for "
-        + " ".join(f"{a}={variables[a]!r}" for a in axes)
+        + " ".join(f"{a}={values[a]!r}" for a in axes)
         + f"; every table needs an 'any' entry (keys: {sorted(table)[:8]})"
     )
