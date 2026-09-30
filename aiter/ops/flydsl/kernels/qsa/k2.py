@@ -799,10 +799,10 @@ def build_qsa_k2_module(
                     fx.copy(kv_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
             if const_expr(gfx942_v_pf):
-                # Left alone, the scheduler sinks this gather onto the
-                # vmcnt(0) that drains the MFMA it just fed, so the load
-                # never overlaps QK. VMEM reads cannot cross, which holds
-                # the dwordx4 above the compute. gfx950's prefetch shares
+                # Only VMEM reads may cross, so this gather can sink into
+                # QK and stay in flight. Everything else stays put, which
+                # keeps the index math that built these addresses from
+                # sliding under the first MFMA. gfx950's prefetch shares
                 # the copy loop and is not pinned.
                 fx.rocdl.sched_barrier("vmem_read")
 
@@ -851,6 +851,14 @@ def build_qsa_k2_module(
                         acc4,
                     )
                 qk_local.append(acc4)
+            if const_expr(gfx942_v_pf):
+                # The prefetch loads may cross, so they ride through this
+                # whole QK block. The mask that consumes the fragment is
+                # VALU and cannot, which holds vmcnt(0) until the MFMA is
+                # done. Letting that mask rise reuses the fragment
+                # registers for the K LDS reads and drains the gather
+                # halfway through QK.
+                fx.rocdl.sched_barrier("vmem_read")
 
             if const_expr(qk_split):
                 # Publish this wave's subtiles. The two barriers already in
