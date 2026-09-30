@@ -684,9 +684,10 @@ def run_flydsl_moe_gfx942(
     situ_linear_beta: float = 1.0,
     gate_mode: GateMode | str = GateMode.SEPARATED,
 ) -> torch.Tensor:
+    architecture = get_gfx()
     if num_local_tokens is not None:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support num_local_tokens"
+            f"{architecture} FlyDSL whole-graph backend does not support num_local_tokens"
         )
     for name, tensor in (
         ("hidden_states", hidden_states),
@@ -699,11 +700,10 @@ def run_flydsl_moe_gfx942(
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise NotImplementedError(
-                f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
+                f"{architecture} FlyDSL whole-graph backend requires contiguous {name}"
             )
     config = Config.from_string(config_string)
     gate_mode = GateMode(gate_mode)
-    architecture = get_gfx()
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(
             f"Unsupported FlyDSL MoE architecture: {architecture}"
@@ -738,7 +738,9 @@ def run_flydsl_moe_gfx942(
         not in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
         or not (is_bf16 or is_fp8 or is_mxfp4)
     ):
-        raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
+        raise RuntimeError(
+            f"Unsupported input for the {architecture} FlyDSL MoE backend"
+        )
     if gate_mode is not GateMode.SEPARATED and not (
         is_mxfp4 and gate_mode is GateMode.INTERLEAVE
     ):
@@ -760,7 +762,7 @@ def run_flydsl_moe_gfx942(
     unsupported_reason = config.unsupported_reason(problem)
     if unsupported_reason is not None:
         raise RuntimeError(
-            f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
+            f"Unsupported {architecture} FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
         )
     if config.use_prefill:
@@ -825,28 +827,29 @@ def run_flydsl_moe_gfx942_impl(
     config_string: str,
 ) -> torch.Tensor:
     config = Config.from_string(config_string)
+    architecture = get_gfx()
     if not (
         getattr(request.w1, "is_shuffled", False)
         and getattr(request.w2, "is_shuffled", False)
     ):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend requires preshuffled weights"
+            f"{architecture} FlyDSL whole-graph backend requires preshuffled weights"
         )
     if request.bias1 is not None or request.bias2 is not None:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support per-expert bias"
+            f"{architecture} FlyDSL whole-graph backend does not support per-expert bias"
         )
     if request.doweight_stage1:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support doweight_stage1=True"
+            f"{architecture} FlyDSL whole-graph backend does not support doweight_stage1=True"
         )
     if request.a1_scale is not None or request.a2_scale is not None:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support prequantized activations"
+            f"{architecture} FlyDSL whole-graph backend does not support prequantized activations"
         )
     if request.hidden_pad or request.intermediate_pad:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support hidden/intermediate padding"
+            f"{architecture} FlyDSL whole-graph backend does not support hidden/intermediate padding"
         )
     gate_mode = (
         GateMode.SEPARATED if request.gate_mode is None else GateMode(request.gate_mode)
@@ -862,21 +865,21 @@ def run_flydsl_moe_gfx942_impl(
         raise NotImplementedError("Interleaved Gate/Up requires MXFP4 weights")
     if request.dtype not in (None, request.hidden_states.dtype):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support output dtype conversion"
+            f"{architecture} FlyDSL whole-graph backend does not support output dtype conversion"
         )
     if request.block_size_m not in (None, config.BLOCK_M):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support overriding block_size_m"
+            f"{architecture} FlyDSL whole-graph backend does not support overriding block_size_m"
         )
     if request.ksplit != 0:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support split-K"
+            f"{architecture} FlyDSL whole-graph backend does not support split-K"
         )
     if request.w1.dtype == torch.bfloat16 or is_mxfp4:
         supported_q_dtypes_a = (None, torch.bfloat16)
     else:
         fp8_dtype = (
-            torch.float8_e4m3fn if get_gfx() == "gfx950" else torch.float8_e4m3fnuz
+            torch.float8_e4m3fn if architecture == "gfx950" else torch.float8_e4m3fnuz
         )
         supported_q_dtypes_a = (
             (None, fp8_dtype)
@@ -885,14 +888,14 @@ def run_flydsl_moe_gfx942_impl(
         )
     if request.q_dtype_a not in supported_q_dtypes_a:
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph activation dtype must match the weight mode"
+            f"{architecture} FlyDSL whole-graph activation dtype must match the weight mode"
         )
     if (
         request.q_dtype_w not in (None, request.w1.dtype)
         or request.w2.dtype != request.w1.dtype
     ):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph weight dtype must match the weight mode"
+            f"{architecture} FlyDSL whole-graph weight dtype must match the weight mode"
         )
     return run_flydsl_moe_gfx942(
         request.hidden_states,
