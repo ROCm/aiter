@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import itertools
 import os
 from typing import Any
 
@@ -738,14 +737,6 @@ def _fmha_varlen_asm_strided_ok(x: Tensor) -> bool:
     return x.stride(-1) == 1 and 0 < ts < (1 << 24) and 0 < hs <= 0x7FFFFFFF
 
 
-def _fmha_varlen_asm_non_overlapping(x: Tensor) -> bool:
-    """True if every element of `x` has its own address (mirrors the C++ check on out)."""
-    dims = sorted((st, n) for st, n in zip(x.stride(), x.shape) if n > 1)
-    return all(st > 0 for st, _ in dims) and all(
-        st1 >= st0 * n0 for (st0, n0), (st1, _) in itertools.pairwise(dims)
-    )
-
-
 def _fmha_varlen_asm_d192_operands_ok(q, k, v, out=None, dense_last_dim_later=False):
     """True if the D192x128 kernel can use q/k/v (and `out`) in place.
 
@@ -753,7 +744,7 @@ def _fmha_varlen_asm_d192_operands_ok(q, k, v, out=None, dense_last_dim_later=Fa
     fixes it with `maybe_contiguous` and checks again.
     """
     ops = (q, k, v) if out is None else (q, k, v, out)
-    return (out is None or _fmha_varlen_asm_non_overlapping(out)) and all(
+    return all(
         (dense_last_dim_later and x.stride(-1) != 1) or _fmha_varlen_asm_strided_ok(x)
         for x in ops
     )

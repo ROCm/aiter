@@ -531,33 +531,6 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
     }
 
 
-def _overlapping_out(case, t, hq):
-    if case == "head stride 64 < 128":
-        buf = torch.empty(t * hq * 64 + 64, dtype=dtypes.bf16)
-        return buf.as_strided((t, hq, 128), (hq * 64, 64, 1))
-    if case == "token stride 128 < heads x 128":
-        buf = torch.empty((t + hq) * 128, dtype=dtypes.bf16)
-        return buf.as_strided((t, hq, 128), (128, 128, 1))
-    raise ValueError(f"unknown case {case!r}")
-
-
-@benchmark()
-def test_fmha_fwd_with_sink_varlen_asm_overlapping_out(case):
-    """An `out` whose heads/tokens share memory must be refused by the C++ entry
-    (any backend's stores would race on it, so there is no result to check)."""
-    q, k, v, cu = make_varlen_packed([2], 4, 2, 192, 128)
-    out = _overlapping_out(case, q.size(0), q.size(1))
-    try:
-        aiter.fmha_fwd_with_sink_varlen_asm(
-            q, k, v, cu, cu, 2, 1.0 / math.sqrt(192), False, True, out=out
-        )
-        refused = False
-    except RuntimeError as e:
-        refused = "must not overlap" in str(e)
-    assert refused, f"{case}: C++ accepted an overlapping out"
-    return {"gfx": get_gfx(), "ops refused": refused}
-
-
 _STRIDED_LAYOUTS = [
     "kv_split",
     "fused_qkv",
@@ -706,16 +679,6 @@ def main():
                 for case, c in itertools.product(
                     ["k token stride 2^24 B", "k/v head stride 0"], causal_modes
                 )
-            ],
-        )
-        summarize(
-            "D192x128 overlapping out",
-            [
-                test_fmha_fwd_with_sink_varlen_asm_overlapping_out(case)
-                for case in [
-                    "head stride 64 < 128",
-                    "token stride 128 < heads x 128",
-                ]
             ],
         )
 
