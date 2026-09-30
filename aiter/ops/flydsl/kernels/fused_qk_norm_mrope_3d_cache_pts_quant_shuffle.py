@@ -30,7 +30,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.utility import dtypes as aiter_dtypes
 
-from .kernels_common import get_warp_size, ceildiv
+from .kernels_common import ceildiv, get_warp_size
 from .tensor_shim import _run_compiled
 
 # RMSNorm uses 32-lane logical groups on both wave32 and wave64 targets.
