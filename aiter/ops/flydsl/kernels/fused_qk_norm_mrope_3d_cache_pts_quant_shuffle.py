@@ -30,7 +30,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.utility import dtypes as aiter_dtypes
 
-from .kernels_common import get_warp_size
+from .kernels_common import get_warp_size, ceildiv
 from .tensor_shim import _run_compiled
 
 # RMSNorm uses 32-lane logical groups on both wave32 and wave64 targets.
@@ -51,13 +51,6 @@ _RUN_BYTES = 16
 _MAX_GRID_Y = 65535
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return -(-a // b)
-
-
-# ============================================================================
-# Cache-layout helpers.
-# ============================================================================
 def _is_contiguous_from_dim1(t: torch.Tensor) -> bool:
     """Whether every cache block is internally contiguous.
 
@@ -186,7 +179,7 @@ def _build_q_kernel(
     ROWS_PER_WAVE = WAVE // RMS_GROUP
     Q_THREADS = waves_per_block * WAVE
     HEADS_PER_BLOCK = waves_per_block * ROWS_PER_WAVE * head_iters
-    N_HEAD_BLOCKS = _ceil_div(H_Q, HEADS_PER_BLOCK)
+    N_HEAD_BLOCKS = ceildiv(H_Q, HEADS_PER_BLOCK)
     NEEDS_HEAD_GUARD = N_HEAD_BLOCKS * HEADS_PER_BLOCK != H_Q
 
     kname = f"qk_norm_mrope_q_D{D}_H{H_Q}_w{waves_per_block}h{head_iters}_flydsl"
@@ -283,7 +276,7 @@ def _build_q_kernel(
             rms_tile = fx.slice(qkv_rms_view, (tok, head, (rl, None)))
             out_pairs = fx.slice(q_out_lane_pairs, (tok, head, None))
             rms_reg = fx.make_rmem_tensor(layout_rms_values, fx.BFloat16)
-            fx.copy_atom_call(copy_rms, rms_tile, rms_reg)
+            fx.copy(copy_rms, rms_tile, rms_reg)
             own = rms_reg.load().to(fx.Float32)
 
             sumsq_local = fx.Float32(0.0)
@@ -447,12 +440,12 @@ def _build_kv_kernel(
         # the thread mode unit-stride makes ownership visible as
         # item = thread + thread_count * iteration.
         layout_page_check_tv = fx.make_layout(
-            (WAVE, _ceil_div(block_size, WAVE)), stride=(1, WAVE)
+            (WAVE, ceildiv(block_size, WAVE)), stride=(1, WAVE)
         )
         layout_phase1_token_tv = fx.make_layout(
             (
                 compute_groups_per_block,
-                _ceil_div(block_size, compute_groups_per_block),
+                ceildiv(block_size, compute_groups_per_block),
             ),
             stride=(1, compute_groups_per_block),
         )
@@ -508,7 +501,7 @@ def _build_kv_kernel(
             """Map each thread/iteration pair over an item's layout."""
             total_items = fx.size(item_layout.shape).unpack()
             return fx.make_layout(
-                (KV_THREADS, _ceil_div(total_items, KV_THREADS)),
+                (KV_THREADS, ceildiv(total_items, KV_THREADS)),
                 stride=(1, KV_THREADS),
             )
 
@@ -524,7 +517,7 @@ def _build_kv_kernel(
 
         def load_rms_sumsq(tile):
             reg = fx.make_rmem_tensor(layout_rms_values, fx.BFloat16)
-            fx.copy_atom_call(copy_rms, tile, reg)
+            fx.copy(copy_rms, tile, reg)
             values = reg.load().to(fx.Float32)
             acc = fx.Float32(0.0)
             for i in range_constexpr(rms_values_per_lane):
@@ -1248,7 +1241,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     )
     # Include a final partial page; the kernel handles it with guarded staging
     # and scatter writes.
-    num_page_blocks = _ceil_div(num_tokens, block_size)
+    num_page_blocks = ceildiv(num_tokens, block_size)
     k_out_arg = (
         k_out.view(num_tokens, H_K, D) if return_kv else k_cache.new_empty((1, 1, 1))
     )
