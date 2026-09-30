@@ -853,6 +853,15 @@ CASES = [
         lengths=(0, 1, 63, 64, 65, 255, 256, 257, 8192),
         nhd=True,
     ),
+    # More CTAs than CUs selects single-buffered NHD V staging.
+    _case(
+        "nhd-d256-page64-wide-grid",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(0, 1, 63, 64, 65, 255, 256, 257, 8192) * 8,
+        nhd=True,
+    ),
     _case(
         "exact-parts-override",
         (1, 1, 16, 128),
