@@ -75,9 +75,7 @@ def batched_gemm_a16w8(
     wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
     shared_a, shared_b = create_shared_layouts(BM, BN, BK, "TN", 16)
     c_pad = config.get("C_PAD", 16)
-    shared_c = gl.PaddedSharedLayout.with_identity_for(
-        [[BN, c_pad]], [BM, BN], [1, 0]
-    )
+    shared_c = gl.PaddedSharedLayout.with_identity_for([[BN, c_pad]], [BM, BN], [1, 0])
     tpn = min(32, BN // 8)
     store_layout = gl.BlockedLayout([1, 8], [32 // tpn, tpn], [num_warps, 1], [1, 0])
 
