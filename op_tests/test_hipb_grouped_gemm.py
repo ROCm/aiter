@@ -7,9 +7,11 @@ import torch
 import aiter.ops.triton.moe.sonicmoe as grouped_gemm_module
 from aiter.ops.gradlib import hipb_grouped_mm, hipb_multistream_mm
 from aiter.ops.triton.moe.sonicmoe import (
+    ActivationType,
     _registered_host_cu_seqlens,
     clear_registered_host_cu_seqlens,
     grouped_gemm,
+    moe_pre_routed_inputs,
     register_host_cu_seqlens,
 )
 
@@ -356,3 +358,159 @@ def test_triton_dispatch_unwraps_local_tensors(monkeypatch):
     )
 
     assert result is wrapped_out
+
+
+def _backend_tensors():
+    torch.manual_seed(41)
+    counts = [8, 0, 16]
+    total, experts, k, n = sum(counts), len(counts), 64, 96
+    a = torch.randn(total, k, device="cuda", dtype=torch.float16)
+    b = torch.randn(experts, k, n, device="cuda", dtype=torch.float16)
+    return counts, a, b
+
+
+@pytest.mark.parametrize("backend", ("hipblaslt", "multistream", "auto"))
+def test_grouped_gemm_backend_matches_triton(monkeypatch, backend):
+    counts, a, b = _backend_tensors()
+    offsets = _offsets(counts)
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
+    expected = grouped_gemm(a, b, offsets)
+
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", backend)
+    caller_out = torch.empty_like(expected)
+    returned = grouped_gemm(a, b, offsets, out=caller_out)
+    assert returned is caller_out
+    actual = grouped_gemm(a, b, offsets)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(caller_out, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("backend", ("hipblaslt", "multistream"))
+def test_grouped_gemm_backend_gather_scatter_and_wgrad_match_triton(
+    monkeypatch, backend
+):
+    counts, a, b = _backend_tensors()
+    offsets = _offsets(counts)
+    pool = torch.randn(16, a.shape[1], device="cuda", dtype=a.dtype)
+    a_idx = torch.randint(0, pool.shape[0], (a.shape[0],), device="cuda")
+    scatter_idx = torch.randperm(a.shape[0], device="cuda", dtype=torch.int32)
+    tokens_n = torch.randn(a.shape[0], b.shape[2], device="cuda", dtype=a.dtype)
+
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
+    expected = grouped_gemm(pool, b, offsets, A_idx=a_idx, scatter_idx=scatter_idx)
+    expected_wgrad = grouped_gemm(a, tokens_n, offsets, A_is_transposed=True)
+
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", backend)
+    actual = grouped_gemm(pool, b, offsets, A_idx=a_idx, scatter_idx=scatter_idx)
+    actual_wgrad = grouped_gemm(a, tokens_n, offsets, A_is_transposed=True)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_wgrad, expected_wgrad, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("backend", ("hipblaslt", "multistream"))
+def test_grouped_gemm_backend_returns_wrapped_out(monkeypatch, backend):
+    class LocalTensorWrapper:
+        def __init__(self, local):
+            self.local = local
+
+        def to_local(self):
+            return self.local
+
+    counts, a, b = _backend_tensors()
+    out = torch.empty(a.shape[0], b.shape[2], device="cuda", dtype=a.dtype)
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", backend)
+    result = grouped_gemm(
+        LocalTensorWrapper(a),
+        LocalTensorWrapper(b),
+        LocalTensorWrapper(_offsets(counts)),
+        out=LocalTensorWrapper(out),
+    )
+    assert result.local is out
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
+    expected = grouped_gemm(a, b, _offsets(counts))
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_multistream_honors_float32_output(monkeypatch):
+    counts, a, b = _backend_tensors()
+    offsets = _offsets(counts)
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "multistream")
+    actual = grouped_gemm(a, b, offsets, out_dtype=torch.float32)
+    assert actual.dtype == torch.float32
+    caller_out = torch.empty(a.shape[0], b.shape[2], device="cuda", dtype=torch.float32)
+    returned = grouped_gemm(a, b, offsets, out=caller_out)
+    assert returned is caller_out
+    torch.testing.assert_close(caller_out, actual, rtol=2e-2, atol=2e-2)
+
+
+def test_auto_backend_falls_back_to_triton(monkeypatch):
+    counts, a, b = _backend_tensors()
+    offsets = _offsets(counts)
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
+    expected = grouped_gemm(a, b, offsets)
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("hipblaslt unavailable")
+
+    monkeypatch.setattr(grouped_gemm_module, "_grouped_gemm_hipblaslt", unavailable)
+    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "auto")
+    actual = grouped_gemm(a, b, offsets)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("backend", ("hipblaslt", "multistream", "auto"))
+def test_pre_routed_backend_matches_triton(monkeypatch, backend):
+    torch.manual_seed(43)
+    counts = [8, 0, 16]
+    tokens, experts, hidden, intermediate = sum(counts), len(counts), 64, 64
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16) * 0.1
+    scores = torch.rand(tokens, device="cuda", dtype=torch.float32)
+    w1 = (
+        torch.randn(
+            experts, hidden, intermediate * 2, device="cuda", dtype=torch.float16
+        )
+        * 0.02
+    )
+    w2 = (
+        torch.randn(experts, intermediate, hidden, device="cuda", dtype=torch.float16)
+        * 0.02
+    )
+    frequency = torch.tensor(counts, dtype=torch.int32)
+    leaves = (x, scores, w1, w2)
+    upstream = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16)
+
+    def run(selected):
+        cloned = tuple(leaf.detach().clone().requires_grad_() for leaf in leaves)
+        monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", selected)
+        seen_host = {}
+        if selected == "multistream":
+            real_lookup = grouped_gemm_module._registered_host_cu_seqlens
+
+            def spy(cu_seqlens):
+                host = real_lookup(cu_seqlens)
+                seen_host["value"] = host
+                return host
+
+            monkeypatch.setattr(grouped_gemm_module, "_registered_host_cu_seqlens", spy)
+        out, _ = moe_pre_routed_inputs(
+            cloned[0],
+            cloned[1],
+            frequency,
+            cloned[2],
+            None,
+            cloned[3],
+            None,
+            torch.cuda.current_stream().cuda_stream,
+            ActivationType.SWIGLU,
+        )
+        grads = torch.autograd.grad(out, cloned, upstream)
+        return out.detach(), grads, seen_host
+
+    expected, expected_grads, _ = run("triton")
+    actual, actual_grads, seen_host = run(backend)
+    if backend == "multistream":
+        assert seen_host["value"] is not None
+        assert seen_host["value"].device.type == "cpu"
+    torch.testing.assert_close(actual, expected, rtol=7e-2, atol=7e-2)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=7e-2, atol=7e-2)
