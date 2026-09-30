@@ -333,20 +333,20 @@ def compile_gemm_fp8_8wave(
         scale_lane_src_offset = fx.Int32(scale_row * 4)
         scale_src_tile_base = fx.Int32(bid_x * TILE_M * 4)
 
-        def async_copy_scale_a(buf, kb):
-            scale_dst = _scale_dst_ptr(scale_a_lds[buf], scale_wave_dst_offset)
+        def async_copy_scale_a(lds_idx, ki):
+            scale_dst = _scale_dst_ptr(scale_a_lds[lds_idx], scale_wave_dst_offset)
             rocdl.raw_ptr_buffer_load_lds(
                 scaleA_rsrc,
                 scale_dst,
                 fx.Int32(4),
                 scale_lane_src_offset,
-                fx.Int32(scale_src_tile_base + kb * M * 4),
+                fx.Int32(scale_src_tile_base + ki * M * 4),
                 fx.Int32(0),
                 fx.Int32(0),
             )
 
-        def load_scale_b(kb):
-            addr = fx.Int32((bid_y * scaleB_elems + kb) * 4)
+        def load_scale_b(ki):
+            addr = fx.Int32((bid_y * scaleB_elems + ki) * 4)
             result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
             result = _llvm.inline_asm(
                 result_type,
@@ -629,15 +629,15 @@ def compile_gemm_fp8_8wave(
                 )
 
         rocdl.sched_barrier(0)
-        async_copy_scale_a(0, fx.Int32(0))
+        async_copy_scale_a(lds_idx=0, ki=fx.Int32(0))
         rocdl.sched_barrier(0)
-        async_copy_Bl(0, 0)
+        async_copy_Bl(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        async_copy_At(0, 0)
+        async_copy_At(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        async_copy_Br(0, 0)
+        async_copy_Br(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        async_copy_Ab(0, 0)
+        async_copy_Ab(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
         # Offset the two groups of four waves by one stage. The lower group
         # closes this unmatched barrier after the final FIFO drain.
@@ -657,13 +657,13 @@ def compile_gemm_fp8_8wave(
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
-        async_copy_scale_a(1, fx.Int32(1))
+        async_copy_scale_a(lds_idx=1, ki=fx.Int32(1))
         rocdl.sched_barrier(0)
-        async_copy_At(1, 1)
+        async_copy_At(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
-        async_copy_Bl(1, 1)
+        async_copy_Bl(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
-        async_copy_Br(1, 1)
+        async_copy_Br(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
 
         vmcnt = vm_load_cnt_a + vm_load_cnt_b * 2 + vm_load_cnt_scale_a
@@ -674,6 +674,8 @@ def compile_gemm_fp8_8wave(
         lds_rd_Bl(0)
 
         frag_P.fill(0)
+        # Keep FP8 out of SCF loop-carried state for FlyDSL 0.3.4.1 legalization.
+        # Bitcast only: preserve the FP8 bytes and restore their type on entry.
         acc_init = [
             frag_C_tl.load(),
             frag_C_tr.load(),
@@ -682,7 +684,7 @@ def compile_gemm_fp8_8wave(
             frag_P.load(),
             Vec.filled(PHASE_M_REP, 0.0, fx.Float32),
             fx.Float32(0),
-            frag_B_l.load(),
+            Vec(frag_B_l.load()).bitcast(fx.Int8),
         ]
 
         for kidx, states in range(0, num_tiles, 2, init=acc_init):
@@ -695,7 +697,7 @@ def compile_gemm_fp8_8wave(
             fifo_scale_b_0 = fx.Float32(0)
             fifo_scale_a_1 = Vec(states[5])
             fifo_scale_b_1 = fx.Float32(states[6])
-            frag_B_l.store(states[7])
+            frag_B_l.store(Vec(states[7]).bitcast(element_type))
             kiter = fx.Int32(kidx)
 
             # Each K tile: TL[s0]/TR[s0]/BL[s0]/BR[s0], then TL[s1]/TR[s1]/BL[s1]/BR[s1].
@@ -711,8 +713,8 @@ def compile_gemm_fp8_8wave(
                     lds_rd_At(tick, m_slice)
                     mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)
                     if const_expr(m_slice == 0):
-                        mfma_scaleB = load_scale_b(ki)
-                        async_copy_Ab(tock, ki + 1)
+                        mfma_scaleB = load_scale_b(ki=ki)
+                        async_copy_Ab(lds_idx=tock, ki=ki + 1)
                     rocdl.sched_barrier(0)
 
                     fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
@@ -732,7 +734,7 @@ def compile_gemm_fp8_8wave(
                     else:
                         # A_t must survive slice0; only slice1's read closes
                         # its lifetime in both staggered wave groups.
-                        async_copy_At(tick, ki + 2)
+                        async_copy_At(lds_idx=tick, ki=ki + 2)
 
                     fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
                     begin_compute_phase()
@@ -746,12 +748,12 @@ def compile_gemm_fp8_8wave(
                     )
                     end_compute_phase()
 
-                    lds_rd_Ab(tick, m_slice)
+                    lds_rd_Ab(lds_idx=tick, m_slice=m_slice)
                     mfma_scaleA = lds_rd_scale_a(tick, 1, m_slice)
                     if const_expr(m_slice == 0):
                         # B survives in registers through slice1; its LDS
                         # slot is already free after slice0's reads.
-                        async_copy_Bl(tick, ki + 2)
+                        async_copy_Bl(lds_idx=tick, ki=ki + 2)
 
                     fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
                     begin_compute_phase()
@@ -766,10 +768,10 @@ def compile_gemm_fp8_8wave(
                     end_compute_phase()
 
                     if const_expr(m_slice == 0):
-                        async_copy_Br(tick, ki + 2)
+                        async_copy_Br(lds_idx=tick, ki=ki + 2)
                     else:
                         # BL[s1]'s end barrier closes all current ScaleA reads.
-                        async_copy_scale_a(tick, ki + 2)
+                        async_copy_scale_a(lds_idx=tick, ki=ki + 2)
                         rocdl.s_waitcnt(
                             encode_waitcnt_950(
                                 vmcnt=vm_load_cnt_a
@@ -780,7 +782,7 @@ def compile_gemm_fp8_8wave(
                         # BL[s1] has consumed the current B_l registers.
                         # The next LDS slot predates A_b(k+1), which
                         # the rolling vmcnt wait above completes.
-                        lds_rd_Bl(tock)
+                        lds_rd_Bl(lds_idx=tock)
 
                     fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
                     begin_compute_phase()
@@ -801,7 +803,7 @@ def compile_gemm_fp8_8wave(
                 frag_P.load(),
                 fifo_scale_a_1,
                 fifo_scale_b_1,
-                frag_B_l.load(),
+                Vec(frag_B_l.load()).bitcast(fx.Int8),
             ]
             results = yield yield_values
 
