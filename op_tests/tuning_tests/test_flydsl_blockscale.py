@@ -232,9 +232,11 @@ def test_invalid_scales_are_rejected(backend):
 
 def test_kernel_names_and_shape_gates(catalog):
     assert len(catalog.kernels_by_name) == len(catalog.kernels_list) == 2
-    assert set(catalog.kernels_list) == {2, 6}
-    assert catalog.kernels_list[2].name.endswith("_ps0_sm1_tdma0")
-    assert catalog.kernels_list[6].name.endswith("_ps1_sm1_tdma0")
+    assert set(catalog.kernels_list) == {0, 1}
+    assert catalog.kernels_list[0].preshuffle_b is False
+    assert catalog.kernels_list[1].preshuffle_b is True
+    assert catalog.kernels_list[0].name.endswith("_ps0_sm1_tdma0")
+    assert catalog.kernels_list[1].name.endswith("_ps1_sm1_tdma0")
     for ki in catalog.kernels_list.values():
         assert catalog.kernels_by_name[ki.name] is ki
         assert catalog.kernel_fits_shape(ki, 33, 384, 512, "gfx950")
@@ -302,10 +304,48 @@ def test_compiler_signature_has_no_removed_flags(backend):
 
 
 @pytest.mark.parametrize("preshuffle", [False, True])
+@pytest.mark.parametrize("k", [256, 512, 768])
+def test_fp8_loop_state_compiles(backend, monkeypatch, tmp_path, preshuffle, k):
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl.compiler.jit_executor import CompiledArtifact
+
+    from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_8wave import (
+        compile_gemm_fp8_8wave,
+    )
+
+    # K=256 may fold away the loop; K>=512 must legalize its carried state.
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    monkeypatch.setenv("FLYDSL_GPU_ARCH", "gfx950")
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    monkeypatch.setenv("FLYDSL_RUNTIME_RUN_ONLY", "0")
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    m, n = 1, 384
+    args = (
+        torch.empty((m, k), dtype=torch.int8),
+        torch.empty((n, k), dtype=torch.int8),
+        torch.empty((m, n), dtype=torch.bfloat16),
+        torch.empty(m * (k // 128)),
+        torch.empty(3 * (k // 128)),
+        m,
+        fx.Stream(None),
+    )
+    with (
+        patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("CPU test")),
+        patch.object(
+            CompiledArtifact, "_ensure_engine", side_effect=AssertionError("CPU test")
+        ),
+    ):
+        launch = compile_gemm_fp8_8wave(256, 256, 128, n, k, preshuffle_b=preshuffle)
+        assert flyc.compile[{"opt_level": 2}](launch, *args) is None
+        assert launch._last_compiled[1]._engine is None
+
+
+@pytest.mark.parametrize("preshuffle", [False, True])
 def test_compile_adapter_uses_fixed_raw_signature(backend, catalog, preshuffle):
     from aiter.ops.flydsl.kernels import gemm_a8w8_blockscale_8wave as kernel
 
-    ki = catalog.kernels_list[6 if preshuffle else 2]
+    ki = catalog.kernels_list[int(preshuffle)]
     launch = SimpleNamespace(compile_hints={})
     backend._compile_gemm.cache_clear()
     try:
@@ -330,7 +370,7 @@ def test_adapter_preserves_matrix_rank_for_large_address_abi(
     from aiter.ops.flydsl.kernels import tensor_shim
 
     x, w, sa, sb, out = _inputs()
-    ki = catalog.kernels_list[6 if preshuffle else 2]
+    ki = catalog.kernels_list[int(preshuffle)]
     stream = object()
     with (
         patch.object(backend, "is_supported", return_value=True),
@@ -373,7 +413,9 @@ def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
     shape = ("gfx950", 256, 33, 384, 512)
     tasks = tuner.get_gemm_a8w8_blockscale_flydsl_tune_task(shape, 0, preshuffle, {})
     assert len(tasks) == 1
-    assert tasks[0][0][1] == (6 if preshuffle else 2)
+    assert tasks[0][0][1] == int(preshuffle)
+    for old_id in (2, 6):
+        assert tuner.getKernelName(old_id, "flydsl", preshuffle) is None
     for task in tasks:
         info = task[0]
         _, kernel_id, split_k, name, libtype, ps = info
@@ -386,6 +428,7 @@ def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
         )
         assert task[-1] == ("out",)
     df = tuner.result_to_df([(tasks[0][0], 12.0, 0.0)])
+    assert df.iloc[0]["kernelId"] == int(preshuffle)
     assert df.iloc[0]["kernelName"] == tasks[0][0][3]
     assert df.iloc[0]["libtype"] == "flydsl"
     assert (
@@ -465,7 +508,7 @@ def test_missing_flydsl_asserts_without_fallback(preshuffle):
 
 def test_kernel_name_layout_mismatch_is_rejected(backend, catalog):
     x, w, sa, sb, out = _inputs()
-    plain = catalog.kernels_list[2].name
+    plain = catalog.kernels_list[0].name
     with pytest.raises(ValueError, match="B layout"):
         backend.run_gemm_a8w8_blockscale(x, w, sa, sb, out, plain, True)
     with pytest.raises(ValueError, match="Unknown"):
@@ -484,8 +527,8 @@ def test_codegen_ignores_flydsl_rows(catalog):
                 "N": 256,
                 "K": 512,
                 "libtype": "flydsl",
-                "kernelId": 2,
-                "kernelName": catalog.kernels_list[2].name,
+                "kernelId": 0,
+                "kernelName": catalog.kernels_list[0].name,
             }
         ]
     )

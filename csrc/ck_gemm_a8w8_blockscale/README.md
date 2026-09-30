@@ -38,8 +38,10 @@ for the B-preshuffled operator and select its output CSV with `-o`.
   `libtype=flydsl` and a `flydsl_blockscale_8w_...` name selects the new backend.
   No FlyDSL default or tuned rows are installed by this integration.
 - The candidate table fixes the 256x256x128 tile, half-M pipeline and raw DMA,
-  with one candidate per B layout. The surviving IDs/names stay stable:
-  ID 2 ends in `ps0_sm1_tdma0`; ID 6 ends in `ps1_sm1_tdma0`.
+  with one candidate per B layout. Kernel names stay unchanged; candidate IDs
+  are consecutive: ID 0 ends in `ps0_sm1_tdma0`; ID 1 ends in `ps1_sm1_tdma0`.
+  For ID-based tooling, update older records from IDs 2/6 to 0/1 or retune them.
+  Runtime FlyDSL dispatch continues to select the kernel by `kernelName`.
   `splitK` remains zero. Full-M and tiled-DMA names are no longer accepted;
   retune external CSVs selecting those removed modes rather than aliasing them
   to a different implementation.
@@ -83,6 +85,15 @@ The dedicated correctness/performance sweep is
 it covers both public APIs, signed/random data, M/N tails, and packed/strided
 scales. CPU routing/tuner regressions are in
 [op_tests/tuning_tests/test_flydsl_blockscale.py](../../op_tests/tuning_tests/test_flydsl_blockscale.py).
+
+#### Pipeline and synchronization
+
+The [8-wave pipeline comparison](pipeline_8wave.md) documents the current
+FlyDSL half-M mainloop against pyhip `moe_gemm_8wave_g1u1`: DMA counts,
+rolling `vmcnt`, LDS/register lifetimes, FIFO retirement, staggered barrier
+epochs, and source-bound ISA observations. It separates verified instruction
+accounting from cross-wave synchronization proof gaps; it is not a new GPU
+validation or a dense-GEMM-versus-MoE performance claim.
 
 #### Recorded performance
 

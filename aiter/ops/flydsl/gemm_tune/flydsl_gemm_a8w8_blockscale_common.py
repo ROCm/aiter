@@ -4,8 +4,9 @@
 """Tune space for the gfx950 8-wave FP8 blockscale GEMM.
 
 The tile, half-M pipeline, raw DMA, PID swizzle and permlane epilogue are fixed.
-The preshuffle bit distinguishes the two weight layouts. Surviving names/IDs
-stay stable; removed full-M/tiled-DMA names are not aliases for another kernel.
+The preshuffle bit distinguishes the two weight layouts: ID 0 is plain B and
+ID 1 is preshuffled B. Kernel names stay stable; removed full-M/tiled-DMA names
+are not aliases for another kernel.
 No FlyDSL compiler imports are needed to read this table.
 """
 
@@ -29,10 +30,10 @@ class kernelInstance:
         )
 
 
-# Preserve the original IDs of half-M/raw DMA; --preshuffle selects one layout.
+# Candidate IDs are consecutive; --preshuffle selects the B layout.
 kernels_list = {
-    2: kernelInstance(False),
-    6: kernelInstance(True),
+    0: kernelInstance(False),
+    1: kernelInstance(True),
 }
 kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
 
@@ -60,12 +61,11 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> b
     kb = K // 128
     return (
         max(
-            TILE_M * K + 2 * TILE_K,
-            TILE_N * K + b_prefetch_bytes,
+            TILE_M * K,
+            TILE_N * K,
             TILE_M * N * 2,
-            (kb + 2) * padded_m * 4,
+            kb * padded_m * 4,
             (padded_n // 128) * kb * 4,
-            (padded_m // TILE_M) * (padded_n // TILE_N) + 7,
         )
         < 2**31
     )
