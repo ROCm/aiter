@@ -80,7 +80,12 @@ def idle_gpus(n: int, wait_s: int = 1800) -> str:
 
 
 def _valid(eng, cfg: LaunchCfg) -> bool:
-    return 1 <= cfg.mt <= 6 and eng._lds(cfg.mt, cfg.dyn) <= LDS_LIMIT
+    return (
+        1 <= cfg.mt <= 6
+        and eng._lds(cfg.mt, cfg.dyn, cfg.nsk) <= LDS_LIMIT
+        and eng._fit_nsk(cfg.mt, cfg.dyn, cfg.nsk) == cfg.nsk
+        and eng._fit_npp(cfg.npp, cfg.nsk) == cfg.npp
+    )
 
 
 def schedules(eng, m: int) -> list[LaunchCfg]:
@@ -98,6 +103,19 @@ def schedules(eng, m: int) -> list[LaunchCfg]:
             out.append(
                 LaunchCfg(mt=mt, dyn=dyn, route_fp8=not dyn, ll=base.ll, llr=llr)
             )
+        if not dyn:
+            for npp, nsk in ((2, 4), (3, 6)):
+                if (eng.I // 128) % npp == 0:
+                    out.append(
+                        LaunchCfg(
+                            mt=mt,
+                            dyn=False,
+                            route_fp8=True,
+                            ll=base.ll,
+                            npp=npp,
+                            nsk=nsk,
+                        )
+                    )
     return [c for c in out if _valid(eng, c)]
 
 
@@ -108,6 +126,11 @@ def refinements(best: LaunchCfg) -> list[LaunchCfg]:
         LaunchCfg(**{**d, "mt": best.mt + 1}),
         LaunchCfg(**{**d, "route_fp8": not best.route_fp8}),
         LaunchCfg(**{**d, "ll": not best.ll, "llr": False}),
+        LaunchCfg(**{**d, "npp": 2 if best.npp == 1 else 1}),
+        LaunchCfg(**{**d, "nsk": 8 if best.nsk == 4 else 4}),
+        LaunchCfg(**{**d, "npp": 3, "nsk": 6}),
+        LaunchCfg(**{**d, "xb": 2}),
+        LaunchCfg(**{**d, "xb": 4}),
     ]
 
 
@@ -212,6 +235,9 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
         "topk": e.K,
         "act": e.activation,
         "block_m": cfg.block_m,
+        "nsk": cfg.nsk,
+        "npp": cfg.npp,
+        "xb": cfg.xb,
         "dyn": int(cfg.dyn),
         "route_fp8": int(cfg.route_fp8),
         "ll": int(cfg.ll),
@@ -253,8 +279,8 @@ def main() -> int:
             print(f"[tune] BEST {row}", flush=True)
             print("TUNE_ROW " + json.dumps(row), flush=True)
         return 0
-    os.environ.setdefault("HIP_VISIBLE_DEVICES", idle_gpus(a.tp))
-    print(f"[tune] GPUs {os.environ['HIP_VISIBLE_DEVICES']} -> {a.out}", flush=True)
+    pinned = "HIP_VISIBLE_DEVICES" in os.environ
+    print(f"[tune] -> {a.out}", flush=True)
     for name, mode, tok in itertools.product(
         a.models, a.comm_modes, sorted(set(a.tokens))
     ):
@@ -276,8 +302,15 @@ def main() -> int:
             "--out",
             a.out,
         ] + (["--no-split"] if a.no_split else [])
+        env = dict(os.environ)
+        if not pinned:
+            env["HIP_VISIBLE_DEVICES"] = idle_gpus(a.tp)
+        print(
+            f"[tune] {name} {mode} M={tok} on GPUs {env['HIP_VISIBLE_DEVICES']}",
+            flush=True,
+        )
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=3600, check=False
+            cmd, capture_output=True, text=True, timeout=3600, check=False, env=env
         )
         rows = []
         for line in r.stdout.splitlines():

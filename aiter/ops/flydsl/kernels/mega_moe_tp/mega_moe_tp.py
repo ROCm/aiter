@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import torch
 
 from ..symmetric_arena import SymmetricArena
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_tp_kernel import (
     CTRL_ERR,
     CTRL_INTS,
@@ -62,7 +62,7 @@ CSV_KEY = (
     "topk",
     "act",
 )
-CSV_CFG = ("block_m", "dyn", "route_fp8", "ll", "llr")
+CSV_CFG = ("block_m", "nsk", "npp", "xb", "dyn", "route_fp8", "ll", "llr")
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,9 @@ class LaunchCfg:
     route_fp8: bool
     ll: bool = False
     llr: bool = False
+    nsk: int = 4
+    npp: int = 1
+    xb: int = 0
 
     @property
     def block_m(self) -> int:
@@ -108,6 +111,9 @@ def _tuned_rows(path: str) -> dict:
                 route_fp8=r["route_fp8"] == "1",
                 ll=r["ll"] == "1",
                 llr=r["llr"] == "1",
+                nsk=int(r.get("nsk") or 4),
+                npp=int(r.get("npp") or 1),
+                xb=int(r.get("xb") or 0),
             )
             rows.setdefault(tuple(r[k] for k in CSV_KEY), []).append(
                 (int(r["token"]), cfg)
@@ -129,6 +135,8 @@ class _Sched:
     xw: int = 0
     col0: int = 0
     ncol: int = 0
+    xl_e0: int = 0
+    xl_s0: int = 0
 
 
 def _kind(k, j, groups=0):
@@ -206,7 +214,8 @@ class MegaMoeTPEngine:
             raise ValueError(f"at most {NCTA_MAX} CTAs (flag layout)")
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
         self.agr = max(1, -(-self.mmax // self.n_cta))
-        self.sched = self._schedule()
+        self._scheds: dict = {}
+        self.sched = self._sched(0)
         self.dyn_max = min(tot, DYN_MAX)
         extra = (
             max(
@@ -245,6 +254,7 @@ class MegaMoeTPEngine:
         )
         self._cfgs: dict = {}
         self._launchers: dict = {}
+        self._armed: set = set()
         self._args = (None, None)
 
     def _pieces(self, rem: int) -> int:
@@ -254,7 +264,13 @@ class MegaMoeTPEngine:
                 return p
         return nb
 
-    def _schedule(self) -> _Sched:
+    def _sched(self, xb: int) -> _Sched:
+        sc = self._scheds.get(xb)
+        if sc is None:
+            sc = self._scheds[xb] = self._schedule(xb)
+        return sc
+
+    def _schedule(self, xb: int = 0) -> _Sched:
         E, C, I = self.E, self.n_cta, self.I
         full, rem = divmod(E, C)
         per = [[(c * full + k, 0, I, 0) for k in range(full)] for c in range(C)]
@@ -265,7 +281,18 @@ class MegaMoeTPEngine:
             p = self._pieces(rem)
             nslice = I // 128
             xok = rem <= XQ_MAX and nslice <= XQ_P
-            if xok and rem * p >= C and (rem * p) % C:
+            extra = 2 * rem - C
+            pairs = (
+                xok
+                and full == 0
+                and nslice % 2 == 0
+                and 0 < extra < C
+                and extra % 2 == 0
+                and (extra // 2) * nslice % 2 == 0
+            )
+            if pairs:
+                cols = self._schedule_pairs(per, rem, nslice, sc, xb)
+            elif xok and rem * p >= C and (rem * p) % C:
                 cols = self._schedule_balanced(per, e, rem, nslice)
                 sc.update(xsplit=nslice, xrem=rem)
             elif xok and rem * p < C:
@@ -299,6 +326,38 @@ class MegaMoeTPEngine:
             **sc,
         )
 
+    def _schedule_pairs(self, per, E, nslice, sc, xb=0):
+        C, I, H = len(per), self.I, self.H
+        g2 = H // 256
+        step = math.lcm(gemm2_group_step(H, I), gemm2_chunk_groups(H, I))
+        nx = (2 * E - C) // 2
+        nh = nx * nslice
+        hosts = range(C - nh, C)
+        half = nslice // 2
+        for c in range(C):
+            j, h = divmod(c, 2)
+            per[c] = [(j, h * half * 128, half * 128, _kind(UNIT_G1X, j))]
+            if c not in hosts:
+                lo = 0 if h == 0 else g2 // 2 + xb
+                hi = g2 // 2 + xb if h == 0 else g2
+                per[c].append((j, lo, 0, _kind(UNIT_G2COL, j, hi - lo)))
+        for idx, c in enumerate(hosts):
+            j, k = divmod(idx, nslice)
+            per[c].append((E - nx + j, k * 128, 128, _kind(UNIT_G1X, E - nx + j)))
+        for c in range(C):
+            per[c][0] = per[c][0][:3] + (per[c][0][3] | UNIT_SIGNAL,)
+        cols = []
+        late0 = (C - nh) // 2
+        for g in range(0, g2, step):
+            for c in hosts:
+                j, h = divmod(c, 2)
+                if h * (g2 // 2) <= g < (h + 1) * (g2 // 2):
+                    cols.append((j, g, 0, _kind(UNIT_G2COL, j, step)))
+            for j in range(E - nx, E):
+                cols.append((j, g, 0, _kind(UNIT_G2COL, j, step)))
+        sc.update(xsplit=nslice, xrem=E, xl_e0=late0, xl_s0=late0, piece_e0=late0)
+        return cols
+
     def _schedule_few(self, per, e, rem, nslice, sc):
         C, I = len(per), self.I
         step = math.lcm(gemm2_group_step(self.H, I), gemm2_chunk_groups(self.H, I))
@@ -307,6 +366,8 @@ class MegaMoeTPEngine:
         for c in hosts:
             slot[per[c][0][0]] = len(slot)
         sc.update(xsplit=nslice, xrem=len(slot))
+        if sorted(slot) == list(range(min(slot), self.E)):
+            sc["xl_e0"] = min(slot)
         for c in hosts:
             e0 = per[c][0][0]
             per[c] = [(e0, 0, I, _kind(UNIT_G1X, slot[e0]))]
@@ -362,22 +423,39 @@ class MegaMoeTPEngine:
             for j in range(rem)
         ]
 
-    def _consts(self, mt: int, dyn: bool, nab: int = 4) -> dict:
+    def _consts(self, mt: int, dyn: bool, nab: int = 4, nsk: int = 4) -> dict:
         return mega_moe_tp_consts(
-            self.H, self.I, mt, self.mmax * self.tp, self.agr, self.E if dyn else 0, nab
+            self.H,
+            self.I,
+            mt,
+            self.mmax * self.tp,
+            self.agr,
+            self.E if dyn else 0,
+            nab,
+            nsk,
         )
 
-    def _nab(self, mt: int, dyn: bool) -> int:
-        return 4 if self._consts(mt, dyn)["LDS_BYTES"] <= LDS_LIMIT else 3
+    def _nab(self, mt: int, dyn: bool, nsk: int = 4) -> int:
+        return 4 if self._consts(mt, dyn, 4, nsk)["LDS_BYTES"] <= LDS_LIMIT else 3
 
-    def _lds(self, mt: int, dyn: bool) -> int:
-        return self._consts(mt, dyn, self._nab(mt, dyn))["LDS_BYTES"]
+    def _lds(self, mt: int, dyn: bool, nsk: int = 4) -> int:
+        return self._consts(mt, dyn, self._nab(mt, dyn, nsk), nsk)["LDS_BYTES"]
 
-    def _fit_mt(self, mt: int, dyn: bool) -> int:
+    def _fit_mt(self, mt: int, dyn: bool, nsk: int = 4) -> int:
         mt = max(1, min(6, int(mt)))
-        while mt > 1 and self._lds(mt, dyn) > LDS_LIMIT:
+        while mt > 1 and self._lds(mt, dyn, nsk) > LDS_LIMIT:
             mt -= 1
         return mt
+
+    def _fit_npp(self, npp: int, nsk: int) -> int:
+        ok = npp >= 1 and nsk % (2 * npp) == 0 and (self.H // 128 * npp) % nsk == 0
+        return npp if ok else 1
+
+    def _fit_nsk(self, mt: int, dyn: bool, nsk: int) -> int:
+        nsk = nsk if nsk in (4, 6, 8) and (self.H // 128) % nsk == 0 else 4
+        while nsk > 4 and self._lds(mt, dyn, nsk) > LDS_LIMIT:
+            nsk -= 2
+        return nsk
 
     def default_config(self, m: int) -> LaunchCfg:
         tot = m * self.tp
@@ -402,20 +480,32 @@ class MegaMoeTPEngine:
             else:
                 cfg = self.default_config(m)
             dyn = cfg.dyn and tot <= self.dyn_max and self.I // 128 >= 2
+            mt = self._fit_mt(cfg.mt, dyn)
+            nsk = self._fit_nsk(mt, dyn, cfg.nsk)
             cfg = LaunchCfg(
-                self._fit_mt(cfg.mt, dyn),
+                mt,
                 dyn,
                 cfg.route_fp8,
                 cfg.ll,
                 cfg.ll and cfg.llr,
+                nsk,
+                self._fit_npp(cfg.npp, nsk),
+                cfg.xb if cfg.xb % 2 == 0 and 0 <= cfg.xb < self.H // 512 else 0,
             )
             self._cfgs[m] = cfg
         return cfg
 
+    def _xl(self, cfg: LaunchCfg) -> bool:
+        return (
+            self._sched(0 if cfg.dyn else cfg.xb).xl_e0 > 0
+            and not cfg.dyn
+            and not cfg.ll
+        )
+
     def _launcher(self, cfg: LaunchCfg):
         fn = self._launchers.get(cfg)
         if fn is None:
-            sc = self.sched
+            sc = self._sched(0 if cfg.dyn else cfg.xb)
             static = (
                 {}
                 if cfg.dyn
@@ -441,9 +531,13 @@ class MegaMoeTPEngine:
                 tp=self.tp,
                 ar=self.ar,
                 dyn_e=self.E if cfg.dyn else 0,
-                nab=self._nab(cfg.mt, cfg.dyn),
+                nab=self._nab(cfg.mt, cfg.dyn, cfg.nsk),
+                nsk=cfg.nsk,
+                npp=cfg.npp,
                 ll_rs=cfg.ll,
                 ll_route=cfg.ll and cfg.llr,
+                xl=self._xl(cfg),
+                xl_s0=self._sched(0 if cfg.dyn else cfg.xb).xl_s0,
                 **static,
             )
             self._launchers[cfg] = fn
@@ -467,7 +561,7 @@ class MegaMoeTPEngine:
         cfg = self.config(m)
         key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), cfg)
         if self._args[0] != key:
-            sc = self.sched
+            sc = self._sched(0 if cfg.dyn else cfg.xb)
             peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
             args = (
                 self.w1.data_ptr(),
@@ -496,7 +590,7 @@ class MegaMoeTPEngine:
                 self.tp,
                 m,
                 self.mmax,
-                0 if cfg.dyn else sc.piece_e0,
+                sc.xl_e0 if self._xl(cfg) else (0 if cfg.dyn else sc.piece_e0),
                 0 if self.xg is None else self.xg.data_ptr(),
                 0 if cfg.dyn else sc.col0,
                 0 if cfg.dyn else sc.ncol,
@@ -504,14 +598,21 @@ class MegaMoeTPEngine:
             )
             # the inputs stay referenced while their pointers are cached
             self._args = (key, (args, x, ids, tw))
-        _run_compiled(
-            self._launcher(cfg), *self._args[1][0], torch.cuda.current_stream()
-        )
+        fn = self._launcher(cfg)
+        if cfg not in self._armed:
+            _preload_compiled(fn, *self._args[1][0], torch.cuda.current_stream())
+            torch.cuda.synchronize(self.device)
+            self.arena.barrier()
+            self._armed.add(cfg)
+        _run_compiled(fn, *self._args[1][0], torch.cuda.current_stream())
         if self.ar:
             return self._yall.local[: m * self.tp]
         return self.y[:m]
 
     __call__ = forward
+
+    def clear_errors(self) -> None:
+        self.ctrl[CTRL_ERR] = 0
 
     def poll_errors(self) -> int:
         """OR of the watchdog codes of every wait that gave up (0 when healthy);

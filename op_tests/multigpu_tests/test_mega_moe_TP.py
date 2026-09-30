@@ -1336,6 +1336,9 @@ def run_case_sp(
                         comm_mode=args.comm_mode,
                     )
                 )
+        _sp_run(devices, lambda r: fused[r](inputs[r]))
+        for f in fused:
+            f.engine.engine.clear_errors()
         yf = [t.clone() for t in _sp_run(devices, lambda r: fused[r](inputs[r]))]
         errs = [f.engine.poll_errors() for f in fused]
         if any(errs):

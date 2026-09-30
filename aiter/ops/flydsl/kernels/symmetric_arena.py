@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import logging
+import threading
 from dataclasses import dataclass, field
 
 import torch
@@ -91,6 +93,7 @@ class PeerArenaGroup:
         self.devices = [torch.device(d) for d in devices]
         self.world_size = len(self.devices)
         self._base: dict[int, int] = {}
+        self._barrier = threading.Barrier(self.world_size)
         hip = _hip()
         prev = torch.cuda.current_device()
         for d in self.devices:
@@ -108,6 +111,15 @@ class PeerArenaGroup:
 
     def rank_of(self, device: torch.device) -> int:
         return self.devices.index(torch.device(device))
+
+    def barrier(self, timeout: float = 60.0) -> None:
+        try:
+            self._barrier.wait(timeout)
+        except threading.BrokenBarrierError:
+            logging.getLogger(__name__).warning(
+                "PeerArenaGroup.barrier: ranks did not meet within %.0f s", timeout
+            )
+            self._barrier.reset()
 
     def register(self, rank: int, base_ptr: int) -> None:
         self._base[rank] = base_ptr
@@ -190,6 +202,12 @@ class SymmetricArena:
         self._base_ptrs = tuple(ptrs)
         dist.barrier(group=self.group)
         return self
+
+    def barrier(self) -> None:
+        if isinstance(self.group, PeerArenaGroup):
+            self.group.barrier()
+        else:
+            dist.barrier(group=self.group)
 
     @property
     def base_ptrs(self) -> tuple[int, ...]:
