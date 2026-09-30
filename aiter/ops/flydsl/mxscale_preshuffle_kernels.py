@@ -381,10 +381,11 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kerne
         ("x_scale", x_scale, want_a, "shuffle_scale_blockscale_a(x_scale, K)"),
         ("w_scale", w_scale, want_b, "shuffle_scale_blockscale_b(w_scale, N, K)"),
     ):
-        if s.dim() != 1 or s.numel() != want:
+        if s.dim() != 1 or s.numel() != want or not s.is_contiguous():
             raise RuntimeError(
                 f"[FlyDSL gfx950 mxpsh] {name} must be the shuffled flat buffer "
-                f"({want} elements, 1-D), got {tuple(s.shape)}. Prepare it with "
+                f"({want} contiguous elements, 1-D), got {tuple(s.shape)} "
+                f"stride {tuple(s.stride())}. Prepare it with "
                 f"aiter.ops.shuffle.{helper}."
             )
 
