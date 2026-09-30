@@ -885,10 +885,9 @@ def test_triton_unified_attn_gfx942_large_prefill(
         expected_block_m = 16
     else:
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
-        # d512 fp8 tuned to M128; the other composites to M64
-        expected_block_m = 128 if head_size == 512 else 64
-        if head_size == 512 and dt_tag == "bf16_bf16":
-            expected_block_m = 64
+        # all composites tuned to M64 (d512 fp8 retuned from M128 to M64
+        # with TILE 32 / waves 1 per review measurement)
+        expected_block_m = 64
     key, config = _lookup(
         table,
         axes,
