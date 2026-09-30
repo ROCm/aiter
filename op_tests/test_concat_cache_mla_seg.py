@@ -15,7 +15,10 @@ import pytest
 import torch
 
 from aiter import dtypes
-from aiter.ops.cache import concat_and_cache_mla_seg, fused_qk_rope_concat_and_cache_mla_seg
+from aiter.ops.cache import (
+    concat_and_cache_mla_seg,
+    fused_qk_rope_concat_and_cache_mla_seg,
+)
 
 KV_LORA, PE_DIM, PAGE = 512, 64, 64
 MAX_POS = 65536
@@ -58,7 +61,11 @@ def _expected_cache(kv_cache, slots, nope, pe):
     valid = slots >= 0
     blk, off = slots[valid] // PAGE, slots[valid] % PAGE
     nope_idx = off[:, None] * KV_LORA + torch.arange(KV_LORA, device="cuda")[None, :]
-    pe_idx = PAGE * KV_LORA + off[:, None] * PE_DIM + torch.arange(PE_DIM, device="cuda")[None, :]
+    pe_idx = (
+        PAGE * KV_LORA
+        + off[:, None] * PE_DIM
+        + torch.arange(PE_DIM, device="cuda")[None, :]
+    )
     ref[blk[:, None], nope_idx] = nope[valid]
     ref[blk[:, None], pe_idx] = pe[valid]
     return ref
@@ -79,7 +86,9 @@ def test_concat_and_cache_mla_seg(kv_dtype, scatter, t):
     k_pe = torch.randn((t, PE_DIM), generator=gen).to(dtypes.bf16).cuda()
     num_blocks = max(4096, (t + PAGE - 1) // PAGE)
     cdt = dtypes.fp8 if kv_dtype == "fp8" else dtypes.bf16
-    kv_cache = torch.zeros((num_blocks, PAGE * (KV_LORA + PE_DIM)), dtype=cdt, device="cuda")
+    kv_cache = torch.zeros(
+        (num_blocks, PAGE * (KV_LORA + PE_DIM)), dtype=cdt, device="cuda"
+    )
     slots = _slots(t, num_blocks, scatter, gen)
     scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
 
@@ -99,7 +108,17 @@ def test_concat_and_cache_mla_seg(kv_dtype, scatter, t):
 # (H, T): (1, *) and small T*H stay one head per block; (6, 1536) two heads,
 # (12, 1536) four, (32, 1536) / (128, 1536) / (128, 192) eight.
 @pytest.mark.parametrize(
-    "h,t", [(1, 7), (1, 1536), (32, 192), (6, 1536), (12, 1536), (32, 1536), (128, 192), (128, 1536)]
+    "h,t",
+    [
+        (1, 7),
+        (1, 1536),
+        (32, 192),
+        (6, 1536),
+        (12, 1536),
+        (32, 1536),
+        (128, 192),
+        (128, 1536),
+    ],
 )
 def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     gen = torch.Generator().manual_seed(h * 100003 + t)
@@ -108,7 +127,9 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     kv_c = torch.randn((t, KV_LORA), generator=gen).to(dtypes.bf16).cuda()
     k_pe = torch.randn((t, PE_DIM), generator=gen).to(dtypes.bf16).cuda()
     num_blocks = 4096
-    kv_cache = torch.zeros((num_blocks, PAGE * (KV_LORA + PE_DIM)), dtype=dtypes.fp8, device="cuda")
+    kv_cache = torch.zeros(
+        (num_blocks, PAGE * (KV_LORA + PE_DIM)), dtype=dtypes.fp8, device="cuda"
+    )
     q_out = torch.zeros((t, h, Q_OUT_DIM), dtype=dtypes.fp8, device="cuda")
     slots = _slots(t, num_blocks, scatter, gen)
     positions = torch.randint(0, MAX_POS, (t,), generator=gen).cuda()
@@ -119,9 +140,13 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
 
     valid = (slots >= 0)[:, None, None]
     ref_q = torch.zeros_like(q_out)
-    ref_q[..., :KV_LORA] = torch.where(valid, _quant(q_nope, q_scale.item()).float(), 0).to(dtypes.fp8)
+    ref_q[..., :KV_LORA] = torch.where(
+        valid, _quant(q_nope, q_scale.item()).float(), 0
+    ).to(dtypes.fp8)
     ref_q[..., KV_LORA : KV_LORA + PE_DIM] = torch.where(
-        valid, _quant(_rope(q_pe, positions, cos, sin, is_neox), q_scale.item()).float(), 0
+        valid,
+        _quant(_rope(q_pe, positions, cos, sin, is_neox), q_scale.item()).float(),
+        0,
     ).to(dtypes.fp8)
     ref_cache = _expected_cache(
         kv_cache,
@@ -131,8 +156,20 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     )
 
     fused_qk_rope_concat_and_cache_mla_seg(
-        q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slots,
-        k_scale, q_scale, positions, cos, sin, is_neox, True,
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        slots,
+        k_scale,
+        q_scale,
+        positions,
+        cos,
+        sin,
+        is_neox,
+        True,
     )
     torch.cuda.synchronize()
     assert _bytes_differ(q_out, ref_q) == 0
