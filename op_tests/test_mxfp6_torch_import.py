@@ -13,7 +13,7 @@ import torch
 def load_packer(*, without_torch=False):
     # Load the full module, bypassing AITER's GPU-dependent package initializer.
     source = (
-        Path(__file__).resolve().parents[3]
+        Path(__file__).resolve().parents[1]
         / "aiter/ops/triton/quant/mxfp6_fmha_pack.py"
     )
     spec = importlib.util.spec_from_file_location("fp6_packer_without_triton", source)
