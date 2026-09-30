@@ -47,6 +47,11 @@ _BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset(
     {"gfx940", "gfx941", "gfx942", "gfx950", "gfx1250"}
 )
 
+# A tuned FlyDSL row can be valid while the local FlyDSL/LLD toolchain cannot
+# serialize its code object.  Remember those compile-only failures so repeated
+# projections of the same shape use the native CK fallback directly.
+_flydsl_compile_failures: set[str] = set()
+
 
 def _hip_blockscale_supported() -> bool:
     """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
@@ -769,9 +774,36 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl":
-            if w_k > k:
-                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            kernel_name = str(config.get("kernelName", ""))
+            if kernel_name not in _flydsl_compile_failures:
+                flydsl_xq = XQ
+                if w_k > k:
+                    flydsl_xq = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+                try:
+                    return gemm_a8w8_bpreshuffle_flydsl(
+                        flydsl_xq,
+                        WQ,
+                        x_scale,
+                        w_scale,
+                        Y,
+                        config,
+                    )
+                except Exception as exc:
+                    # A launch/runtime failure can leave the stream unsafe and
+                    # must propagate.  A DSLCompileError occurs before launch,
+                    # so falling through to CK is safe.
+                    if not (
+                        exc.__class__.__name__ == "DSLCompileError"
+                        and exc.__class__.__module__.startswith("flydsl.")
+                    ):
+                        raise
+                    _flydsl_compile_failures.add(kernel_name)
+                    logger.warning(
+                        "FlyDSL failed to compile tuned A8W8 kernel '%s'; "
+                        "falling back to CK for this process: %s",
+                        kernel_name,
+                        exc,
+                    )
 
     if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
