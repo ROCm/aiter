@@ -1378,7 +1378,7 @@ def _rope_rotate_activation_fp4quant(
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
-    shuffle_scale: bool = True,
+    scale_layout: str = "none",
     do_rotate_act: bool = True,
     round_rope: bool = False,
 ) -> None:
@@ -1428,7 +1428,7 @@ def rope_rotate_activation(
     rope_dim: int,
     out_scale: torch.Tensor | None = None,
     group_size: int | None = None,
-    shuffle_scale: bool = True,
+    scale_layout: str = "none",
     do_rotate_act: bool = True,
     round_rope: bool = False,
 ) -> None:
@@ -1437,8 +1437,10 @@ def rope_rotate_activation(
 
     - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
-      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
-      selects the dsv4 preshuffled scale layout.
+      (``scale`` required; ``group_size`` defaults to 32). ``scale_layout``
+      selects ``"none"`` (the default, natural rows), ``"flydsl"`` (dsv4
+      preshuffle), or ``"opus"`` (gfx950 scales [T, 2, 32, 4], requiring
+      H=64, D=128, group_size=32).
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
@@ -1449,6 +1451,10 @@ def rope_rotate_activation(
     """
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
+        if scale_layout not in ("none", "flydsl", "opus"):
+            raise ValueError(
+                f"scale_layout must be none|flydsl|opus, got {scale_layout!r}"
+            )
         _rope_rotate_activation_fp4quant(
             out,
             out_scale,
@@ -1458,7 +1464,7 @@ def rope_rotate_activation(
             positions,
             rope_dim,
             group_size=32 if group_size is None else group_size,
-            shuffle_scale=shuffle_scale,
+            scale_layout=scale_layout,
             do_rotate_act=do_rotate_act,
             round_rope=round_rope,
         )
