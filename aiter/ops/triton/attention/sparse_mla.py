@@ -228,7 +228,7 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
     if arch not in FP8_ARCHS:
         raise ValueError(
             f"dot_precision='fp8' is not supported on {arch}: the kernel feeds the "
-            f"matrix core OCP e4m3, and {arch}'s decodes fnuz. Use "
+            f"matrix core OCP e4m3, but {arch}'s native fp8 is fnuz. Use "
             "dot_precision='bf16'."
         )
     if fmt == "fp8_dsv32_mla":
