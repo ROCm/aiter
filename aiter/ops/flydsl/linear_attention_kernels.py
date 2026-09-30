@@ -1233,5 +1233,6 @@ def flydsl_gdn_decode_varlen(
             intermediate_states if cache_states else state,
             intermediate_state_indices if cache_states else state_indices,
             fx.Int32(n),
+            fx.Stream(torch.cuda.current_stream(q.device)),
         )
     return out
