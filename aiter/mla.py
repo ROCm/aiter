@@ -923,7 +923,7 @@ def mla_decode_fwd(
         # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT.
         use_ps1_asm = (
             use_flydsl_ps1
-            and nhead == 96
+            and nhead in (96, 128)
             and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "1") == "1"
         )
         if use_ps1_asm:

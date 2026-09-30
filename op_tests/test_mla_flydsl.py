@@ -18,7 +18,8 @@ Modes:
 * ``ps1-asm`` checks the interface to the code objects exported from the FlyDSL
   PS1 kernel (``aiter.mla_ps1_fp8_asm_fwd``, hsa/gfx1250/mla_dsl): every case
   runs through :func:`aiter.mla.mla_decode_fwd` once on FlyDSL JIT and once on
-  the code object, the two must agree bit for bit in output and LSE, and the
+  the code object, the two must agree in output and LSE (bit for bit where the
+  code objects come from this kernel source, to rounding otherwise), and the
   code object output is checked against the torch reference. Causal masking and
   the returned LSE are swept, since each selects its own code object.
 * ``cp-asm`` does the same for round-robin CP, rank by rank.
@@ -59,7 +60,10 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ("gfx1250",)
 MODES = ("ps1", "ps64", "ps1-vs-asm", "cp", "ps1-asm", "cp-asm")
 # Head counts with PS1 code objects in hsa/gfx1250/mla_dsl/mla_dsl.csv.
-PS1_ASM_NUM_Q_HEADS = (96,)
+PS1_ASM_NUM_Q_HEADS = (96, 128)
+# The 128-head code objects come from a kernel revision with lazy softmax
+# rescaling, so they match FlyDSL JIT only to rounding, not bit for bit.
+PS1_ASM_BIT_EXACT_Q_HEADS = (96,)
 PS1_ASM_ENV = "AITER_MLA_DECODE_PS1_ASM"
 SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
 NHEAD96 = 96
@@ -615,15 +619,35 @@ def _ps1_stage1_backend(use_asm):
     ), f"PS1 stage 1 expected on {expected}, dispatched {calls}"
 
 
-def _assert_bit_identical(name, jit_tensors, asm_tensors):
+def _assert_matches_jit(name, nhead, jit_tensors, asm_tensors):
+    """Code object output and LSE against FlyDSL JIT: bit for bit for
+    PS1_ASM_BIT_EXACT_Q_HEADS, else to bf16 output / fp32 LSE rounding."""
+    bit_exact = nhead in PS1_ASM_BIT_EXACT_Q_HEADS
     for index, (jit, asm) in enumerate(zip(jit_tensors, asm_tensors, strict=True)):
         if jit is None or asm is None:
             assert jit is None and asm is None, f"{name}: tensor {index} is missing"
             continue
-        view = {4: torch.int32, 2: torch.int16}[jit.element_size()]
+        if bit_exact:
+            view = {4: torch.int32, 2: torch.int16}[jit.element_size()]
+            assert torch.equal(
+                jit.view(view), asm.view(view)
+            ), f"{name}: code object output {index} differs from FlyDSL JIT"
+            continue
+        jit, asm = jit.float(), asm.float()
         assert torch.equal(
-            jit.view(view), asm.view(view)
-        ), f"{name}: code object output {index} differs from FlyDSL JIT"
+            torch.isneginf(jit), torch.isneginf(asm)
+        ), f"{name}: code object output {index} has -inf where FlyDSL JIT does not"
+        finite = torch.isfinite(jit)
+        tol = 2e-2 if jit_tensors[index].dtype == torch.bfloat16 else 1e-4
+        torch.testing.assert_close(
+            asm[finite],
+            jit[finite],
+            atol=tol,
+            rtol=tol,
+            msg=lambda m, index=index: (
+                f"{name}: code object output {index} vs FlyDSL JIT: {m}"
+            ),
+        )
 
 
 def _test_ps1_asm(
@@ -661,7 +685,7 @@ def _test_ps1_asm(
         results[backend] = (output, final_lse)
 
     name = f"ps1-asm causal={int(causal)} lse={int(return_lse)}"
-    _assert_bit_identical(name, results["jit"], results["asm"])
+    _assert_matches_jit(name, nhead, results["jit"], results["asm"])
     output, final_lse = results["asm"]
     err = _check_output(name, reference, output)
     if return_lse:
@@ -911,8 +935,9 @@ def _test_cp_asm(
     jit_row, jit_outputs, jit_lses = _test_cp(*args, scales, use_asm=False, **kwargs)
     asm_row, asm_outputs, asm_lses = _test_cp(*args, scales, use_asm=True, **kwargs)
     for cp_rank in range(cp_world_size):
-        _assert_bit_identical(
+        _assert_matches_jit(
             f"cp-asm W={cp_world_size} rank={cp_rank} lse={int(return_lse)}",
+            nhead,
             (jit_outputs[cp_rank], jit_lses[cp_rank]),
             (asm_outputs[cp_rank], asm_lses[cp_rank]),
         )
