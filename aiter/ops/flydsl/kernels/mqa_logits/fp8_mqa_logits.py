@@ -124,6 +124,7 @@ def _emit_row_neg_inf_fill(
     starts,  # list[fx.Int32]: max(cu_starts, 0),        parallel to rows
     ends,  # list[fx.Int32]: min(cu_ends, seq_len_kv), parallel to rows
     seq_len_kv,  # fx.Int32
+    seq_len,  # fx.Int32: real query rows; slots at or past this are not filled
     by_i32,  # fx.Int32: block_idx.y
     num_splits,  # fx.Int32: grid.y (>= 1)
     fill_range,  # (out_row_t, lo, hi) -> None: thread-strided -inf fill
@@ -178,10 +179,19 @@ def _emit_row_neg_inf_fill(
         b_lo = fx.min(lo + by_i32 * chunk, hi)
         return b_lo, fx.min(b_lo + chunk, hi)
 
+    seq_len_m_1 = seq_len - fx.Int32(1)
     for j in range_constexpr(len(rows)):
-        out_row_t = _make_out_row_t(logits, stride_i64, rows[j])
+        # An empty window fills the whole row. A past-the-end slot has no
+        # output row, so force both ranges empty (s=0, e=seq_len_kv) and point
+        # the descriptor at the last real row. Nothing is stored.
+        in_rows = rows[j] < seq_len
+        out_row_t = _make_out_row_t(
+            logits, stride_i64, fx.min(rows[j], seq_len_m_1)
+        )
         s = fx.min(starts[j], slk)
         e = fx.max(ends[j], s)
+        s = in_rows.select(s, fx.Int32(0))
+        e = in_rows.select(e, slk)
         for lo_i32, hi_i32 in ((fx.Int32(0), s), (e, slk)):
             b_lo, b_hi = _split(lo_i32, hi_i32)
             fill_range(out_row_t, b_lo, b_hi)
@@ -362,10 +372,10 @@ def _build_kernel_mfma_r_w(
         within each BKV tile.
       * A-operand (Q) layout and head-reduce are per-lane within the wave (width 64).
 
-    Grid: ``(ceil(seq_len / RPB), num_splits, 1)``.  The host pads ``seq_len`` to
-    a multiple of ``RPB`` (every block owns exactly ``RPB`` rows) and may split
-    each row's KV window across ``grid.y`` blocks when the row grid alone is too
-    small to fill the device (see ``flydsl_fp8_mqa_logits``).
+    Grid: ``(ceil(seq_len / RPB), num_splits, 1)``.  The last block may own fewer
+    than ``RPB`` rows; those slots are not loaded or written. The host passes the
+    real ``seq_len`` and may split each row's KV window across ``grid.y`` when
+    the row grid alone is too small to fill the device.
     """
     H = num_heads
     D = head_size
@@ -425,7 +435,7 @@ def _build_kernel_mfma_r_w(
         cu_starts: fx.Tensor,  # [seq_len]             i32
         cu_ends: fx.Tensor,  # [seq_len]             i32
         logits: fx.Tensor,  # [seq_len, seq_len_kv] f32
-        seq_len: fx.Int32,  # padded to a multiple of RPB
+        seq_len: fx.Int32,  # real query rows; the last block may be short
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
@@ -512,22 +522,30 @@ def _build_kernel_mfma_r_w(
 
         # ---- Preload window bounds, Q frags, and weights for all RPB rows ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
+        # A short last tile still has RPB slots. Loads clamp onto the last real
+        # row; the window is forced empty so that slot is not written and does
+        # not widen the union scan beyond what a zero-length window would.
         starts = [None] * RPB
         ends = [None] * RPB
         a_packs = [None] * RPB
         w_frag = [None] * RPB
+        seq_len_m_1 = seq_len - fx.Int32(1)
 
         for j in range_constexpr(RPB):
             row = r0 + fx.Int32(j)
-            starts[j] = fx.max(fx.Int32(cs_t[row]), fx.Int32(0))
-            ends[j] = fx.min(fx.Int32(ce_t[row]), seq_len_kv)
+            row_ld = fx.min(row, seq_len_m_1)
+            in_rows = row < seq_len
+            ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
+            ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
+            starts[j] = in_rows.select(ss, fx.Int32(0))
+            ends[j] = in_rows.select(ee, fx.Int32(0))
 
             # lane -> Q[row, h = mi*MFMA_M + lane%MFMA_N,
             #            d = kk*MFMA_K + (lane//MFMA_N)*8 + 0..7]
             row_a = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
                 h_a = fx.Int32(mi * MFMA_M) + lane_mod_N
-                row_h = row * fx.Int32(H) + h_a
+                row_h = row_ld * fx.Int32(H) + h_a
                 base_a = row_h * fx.Int32(D)
                 for kk in range_constexpr(K_STEPS):
                     row_a[mi][kk] = _load_frag(
@@ -536,7 +554,7 @@ def _build_kernel_mfma_r_w(
             a_packs[j] = row_a
 
             w_frag[j] = _load_row_weights(
-                weights, H, cp_4xfp32, tc_c_w, M_TILES, MFMA_N, row
+                weights, H, cp_4xfp32, tc_c_w, M_TILES, MFMA_N, row_ld
             )
 
         # ---- Union window across all RPB rows ----
@@ -590,7 +608,9 @@ def _build_kernel_mfma_r_w(
             # ---- Per-row MFMA + epilogue (inner loop over RPB rows) ----
             for j in range_constexpr(RPB):
                 row = r0 + fx.Int32(j)
-                out_row_t = _make_out_row_t(logits, _stride_i64, row)
+                out_row_t = _make_out_row_t(
+                    logits, _stride_i64, fx.min(row, seq_len_m_1)
+                )
                 for ni in range_constexpr(N_TILES_PER_WAVE):
                     col = cols[ni]
                     col_sum = _emit_col_sum(
@@ -609,7 +629,7 @@ def _build_kernel_mfma_r_w(
                     # below `start`, so it guards the -inf that the fused fill
                     # below writes into [aligned_start, start).
                     in_window = (col >= starts[j]) & (col < ends[j])
-                    is_writer = (lane_div_N == fx.Int32(0)) & in_window
+                    is_writer = (lane_div_N == fx.Int32(0)) & in_window & (row < seq_len)
 
                     # Via a closure, not a bare `out_row_t[col] = ...` in the
                     # branch: the rewriter reads a subscript store as an
@@ -649,6 +669,7 @@ def _build_kernel_mfma_r_w(
                 starts=starts,
                 ends=ends,
                 seq_len_kv=seq_len_kv,
+                seq_len=seq_len,
                 by_i32=by,
                 num_splits=num_splits,
                 fill_range=_fill_range,
@@ -825,7 +846,7 @@ def _build_kernel_mfma_lds_pipe(
         cu_starts: fx.Tensor,
         cu_ends: fx.Tensor,
         logits: fx.Tensor,
-        seq_len: fx.Int32,  # padded to a multiple of ROWS_PER_BLOCK
+        seq_len: fx.Int32,  # real query rows; the last block may be short
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
@@ -925,16 +946,23 @@ def _build_kernel_mfma_lds_pipe(
                 )
 
         # ---- Preload this wave's RPW rows: window, Q A-frags, weights ----
+        # Same short-tile rule as the direct-load builder: clamp loads, and
+        # give a past-the-end slot an empty window.
         starts = [None] * RPW
         ends = [None] * RPW
         a_packs = [None] * RPW
         w_frag = [None] * RPW
+        seq_len_m_1 = seq_len - fx.Int32(1)
 
         # Loop over the rows owned by this wave.
         for j in range_constexpr(RPW):
             row = wave_row0 + fx.Int32(j)
-            starts[j] = fx.max(fx.Int32(cs_t[row]), fx.Int32(0))
-            ends[j] = fx.min(fx.Int32(ce_t[row]), seq_len_kv)
+            row_ld = fx.min(row, seq_len_m_1)
+            in_rows = row < seq_len
+            ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
+            ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
+            starts[j] = in_rows.select(ss, fx.Int32(0))
+            ends[j] = in_rows.select(ee, fx.Int32(0))
 
             # Load A-frags:
             # Q[
@@ -945,7 +973,7 @@ def _build_kernel_mfma_lds_pipe(
             row_a_frag = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
                 h_a = fx.Int32(mi * mfma.MFMA_M) + lane_mod_N
-                row_h = h_a + row * fx.Int32(H)
+                row_h = h_a + row_ld * fx.Int32(H)
                 base_a = row_h * fx.Int32(D)
                 for kk in range_constexpr(K_STEPS):
                     row_a_frag[mi][kk] = mfma.make_frag(
@@ -957,7 +985,7 @@ def _build_kernel_mfma_lds_pipe(
             a_packs[j] = row_a_frag
 
             w_frag[j] = _load_row_weights(
-                weights, H, cp_4xfp32, tc_c_w, M_TILES, mfma.MFMA_N, row
+                weights, H, cp_4xfp32, tc_c_w, M_TILES, mfma.MFMA_N, row_ld
             )
 
         # ---- Union KV window across all block rows (all waves cooperate) ----
@@ -970,8 +998,12 @@ def _build_kernel_mfma_lds_pipe(
         #   u_end = max(cu_ends[rows]).
         for jj in range_constexpr(ROWS_PER_BLOCK):
             rr = block_row0 + fx.Int32(jj)
-            ss = fx.max(fx.Int32(cs_t[rr]), fx.Int32(0))
-            ee = fx.min(fx.Int32(ce_t[rr]), seq_len_kv)
+            rr_ld = fx.min(rr, seq_len_m_1)
+            in_rows = rr < seq_len
+            ss = fx.max(fx.Int32(cs_t[rr_ld]), fx.Int32(0))
+            ee = fx.min(fx.Int32(ce_t[rr_ld]), seq_len_kv)
+            ss = in_rows.select(ss, fx.Int32(0))
+            ee = in_rows.select(ee, fx.Int32(0))
             if jj == 0:
                 u_start = ss
                 u_end = ee
@@ -1080,7 +1112,9 @@ def _build_kernel_mfma_lds_pipe(
             # ---- Per-row MFMA + epilogue (this wave's RPW rows, all columns) ----
             for j in range_constexpr(RPW):
                 row = wave_row0 + fx.Int32(j)
-                out_row_t = _make_out_row_t(logits, _stride_i64, row)
+                out_row_t = _make_out_row_t(
+                    logits, _stride_i64, fx.min(row, seq_len_m_1)
+                )
                 for ni in range_constexpr(N_TILES):
                     col = cols[ni]
                     col_sum = _emit_col_sum(
@@ -1095,7 +1129,7 @@ def _build_kernel_mfma_lds_pipe(
                     )
 
                     in_window = (col >= starts[j]) & (col < ends[j])
-                    is_writer = (lane_div_N == fx.Int32(0)) & in_window
+                    is_writer = (lane_div_N == fx.Int32(0)) & in_window & (row < seq_len)
 
                     # Closure, not a bare subscript store -- see the direct-load
                     # builder's epilogue for why.
@@ -1135,6 +1169,7 @@ def _build_kernel_mfma_lds_pipe(
                 starts=starts,
                 ends=ends,
                 seq_len_kv=seq_len_kv,
+                seq_len=seq_len,
                 by_i32=block_y,
                 num_splits=num_splits,
                 fill_range=_fill_range,

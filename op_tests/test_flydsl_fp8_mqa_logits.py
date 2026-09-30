@@ -781,7 +781,8 @@ def main():
             (64, 2048),
             (64, 8192),
             # gfx942 auto-selects r4 from 256*8192 == 2**21 up (pinned in
-            # _GFX942_AUTO_VARIANTS). 257 is odd, so the launcher pads it.
+            # _GFX942_AUTO_VARIANTS). 257 is not a multiple of 4, so the last
+            # tile is short and the kernel masks it.
             (256, 8192),
             (257, 8192),
             # s_kv < s_q. A causal mask then puts cu_ends below zero on the
