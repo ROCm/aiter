@@ -53,6 +53,7 @@ _MEASURED_QUERIES = {
     (24, 256): (4, 8),  # Flash-Next / qwen4_exp, TP1
     (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
     (6, 256): (4, 8),  # Flash-Next TP4: 6 query heads, 1 KV head
+    (3, 256): (4, 8),  # Flash-Next TP8: 3 query heads, 1 KV head
     (10, 128): (4, 8),
 }
 _BACKENDS = ("auto", "flydsl", "triton")
@@ -75,7 +76,10 @@ _BACKENDS = ("auto", "flydsl", "triton")
 # FlyDSL err=0, by 1.46x to 4.86x. GPU 6 / gfx950, the same cold grid:
 # q ``[M, 6, 256]`` over 1 KV head (Flash-Next TP4, group 6). The 4-head
 # indexer won all 52 rows with err=0, by 1.28x to 3.29x. The 8-head indexer
-# also won all 52, FlyDSL err=0, by 1.38x to 3.28x.
+# also won all 52, FlyDSL err=0, by 1.38x to 3.28x. The same gfx950 grid
+# with q ``[M, 3, 256]`` over 1 KV head (Flash-Next TP8, group 3) won all
+# 52 rows at both indexer widths, FlyDSL err=0: 4-head by 1.21x to 3.29x,
+# 8-head by 1.27x to 3.34x.
 
 __all__ = [
     "QsaGqaSpec",
