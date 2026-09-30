@@ -487,9 +487,12 @@ jobs:
   # CPython 3 (including versions the prebuilt wheels are not built for).
   build_aiter_noprebuild_wheel:
     name: Build Aiter wheel without prebuilt kernels
+    # Nightly runs are not published (see upload_s3_noprebuild), and this wheel
+    # always uses the pinned CK commit, so a nightly build would add nothing.
     if: >-
-      needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
-      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
+      github.event_name != 'schedule' &&
+      (needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true')
     runs-on: build-only-aiter
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
@@ -566,6 +569,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import glob
+          import re
           import zipfile
 
           wheels = glob.glob("dist/*.whl")
@@ -576,7 +580,9 @@ jobs:
           name = wheel.rsplit("/", 1)[-1]
           with zipfile.ZipFile(wheel) as zf:
               names = zf.namelist()
-          modules = [n for n in names if n.startswith("aiter/jit/") and n.endswith(".so")]
+          # aiter tracks no shared libraries, so any in the wheel was compiled
+          # during the build and ties the wheel to one interpreter.
+          libs = [n for n in names if re.search(r"\.so(\.\d+)*$", n)]
           cache = [n for n in names if n.startswith("aiter/jit/flydsl_cache/")]
 
           print(f"Wheel: {name}")
@@ -585,13 +591,13 @@ jobs:
               errors.append("wheel is not tagged py3-none")
           if ".noprebuild-" not in name and "+noprebuild-" not in name:
               errors.append("version lacks the noprebuild local suffix")
-          if modules:
-              errors.append(f"{len(modules)} prebuilt modules present, e.g. {modules[0]}")
+          if libs:
+              errors.append(f"{len(libs)} shared libraries present, e.g. {libs[0]}")
           if cache:
               errors.append(f"{len(cache)} FlyDSL cache entries present")
           if errors:
               raise SystemExit("::error::" + "; ".join(errors))
-          print("No prebuilt modules or FlyDSL cache; tagged py3-none")
+          print("No shared libraries or FlyDSL cache; tagged py3-none")
           PY
 
       - name: Upload wheel as artifact
