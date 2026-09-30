@@ -124,7 +124,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          int64_t reg_ptr,
                                          int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr = 0);
+                                         int64_t bf16_out_ptr = 0,
+                                         bool gemma_norm      = false);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,
