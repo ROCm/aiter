@@ -133,6 +133,9 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     q_out = torch.zeros((t, h, Q_OUT_DIM), dtype=dtypes.fp8, device="cuda")
     slots = _slots(t, num_blocks, scatter, gen)
     positions = torch.randint(0, MAX_POS, (t,), generator=gen).cuda()
+    ref_positions = positions.clone()
+    # A padded row may carry a stale position, far outside the cos/sin cache.
+    positions[slots < 0] = 1 << 40
     theta = torch.randn((MAX_POS, PE_DIM // 2), generator=gen).cuda()
     cos, sin = torch.cos(theta).to(dtypes.bf16), torch.sin(theta).to(dtypes.bf16)
     q_scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
@@ -145,14 +148,14 @@ def test_fused_qk_rope_concat_and_cache_mla_seg(is_neox, scatter, h, t):
     ).to(dtypes.fp8)
     ref_q[..., KV_LORA : KV_LORA + PE_DIM] = torch.where(
         valid,
-        _quant(_rope(q_pe, positions, cos, sin, is_neox), q_scale.item()).float(),
+        _quant(_rope(q_pe, ref_positions, cos, sin, is_neox), q_scale.item()).float(),
         0,
     ).to(dtypes.fp8)
     ref_cache = _expected_cache(
         kv_cache,
         slots,
         _quant(kv_c, k_scale.item()),
-        _quant(_rope(k_pe, positions, cos, sin, is_neox), k_scale.item()),
+        _quant(_rope(k_pe, ref_positions, cos, sin, is_neox), k_scale.item()),
     )
 
     fused_qk_rope_concat_and_cache_mla_seg(

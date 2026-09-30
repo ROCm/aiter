@@ -2537,7 +2537,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const int64_t k_pe_stride,
     const int64_t cos_stride0,
     const int64_t sin_stride0,
-    const int64_t block_stride)
+    const int64_t block_stride,
+    const int max_position)
 {
     constexpr int HALF    = PE_DIM / 2;
     constexpr int NUM_VEC = KV_LORA / VEC; // nope vectors per row
@@ -2568,9 +2569,33 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             return; // uniform across the block (same token)
     }
 
-    const int64_t pos       = positions[token_idx];
-    const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
-    const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
+    // cos/sin are read at <buf>[<row> + i]; <end> is an offset past the buffer.
+    // A padded token reaches this on the one-head path and may carry a stale
+    // position, so there the descriptors span the whole cache with the row in
+    // the offset: the hardware range check then covers the row too, and any
+    // position reads in bounds or not at all. Clamping it instead cost that
+    // path 3-5% (H=16/32 T=192), and gating it on the slot would put the slot
+    // round trip back in front of the cos/sin loads. With more heads per block
+    // a padded token has already returned, and a per-row descriptor keeps the
+    // row offset scalar (~2% at H=128 T=1536).
+    const int64_t pos = positions[token_idx];
+    const scalar_t* cos_base = cos_cache;
+    const scalar_t* sin_base = sin_cache;
+    int cos_row = 0, sin_row = 0, cos_end = HALF, sin_end = HALF;
+    if constexpr(HPT == 1)
+    {
+        cos_row = static_cast<int>(pos * cos_stride0);
+        sin_row = static_cast<int>(pos * sin_stride0);
+        cos_end = static_cast<int>(max_position * cos_stride0);
+        sin_end = static_cast<int>(max_position * sin_stride0);
+    }
+    else
+    {
+        cos_base += pos * cos_stride0;
+        sin_base += pos * sin_stride0;
+    }
+    auto cos_buf = opus::make_gmem<scalar_t>(cos_base, cos_end * sizeof(scalar_t));
+    auto sin_buf = opus::make_gmem<scalar_t>(sin_base, sin_end * sizeof(scalar_t));
 
     // ---- helper: the whole pe segment, VEC elements per thread ----
     //
@@ -2620,22 +2645,19 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         PeOperands o{};
         const int d0 = chunk * VEC;
         auto pe_buf  = opus::make_gmem<scalar_t>(pe_ptr, extent * sizeof(scalar_t));
-        auto cos_buf = opus::make_gmem<scalar_t>(cos_ptr, HALF * sizeof(scalar_t));
-        auto sin_buf = opus::make_gmem<scalar_t>(sin_ptr, HALF * sizeof(scalar_t));
         o.x = pe_buf.template load<VEC>(active ? row_off + d0 : extent);
         if constexpr(IS_NEOX)
         {
-            const bool low   = d0 < HALF;
-            const int  cbase = !active ? HALF : (low ? d0 : d0 - HALF);
+            const int cidx = d0 < HALF ? d0 : d0 - HALF;
             if constexpr(!PE_EXCHANGE)
                 o.y = pe_buf.template load<VEC>(active ? row_off + (d0 ^ HALF) : extent);
-            o.c = cos_buf.template load<VEC>(cbase);
-            o.s = sin_buf.template load<VEC>(cbase);
+            o.c = cos_buf.template load<VEC>(active ? cos_row + cidx : cos_end);
+            o.s = sin_buf.template load<VEC>(active ? sin_row + cidx : sin_end);
         }
         else
         {
-            o.c = cos_buf.template load<VEC / 2>(active ? d0 / 2 : HALF);
-            o.s = sin_buf.template load<VEC / 2>(active ? d0 / 2 : HALF);
+            o.c = cos_buf.template load<VEC / 2>(active ? cos_row + d0 / 2 : cos_end);
+            o.s = sin_buf.template load<VEC / 2>(active ? sin_row + d0 / 2 : sin_end);
         }
         return o;
     };
@@ -2767,20 +2789,16 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         const int pe_chunk = threadIdx.x % PE_CHUNKS;
         const int d0       = pe_chunk * VEC;
         PeOperands pe_op{};
+        if constexpr(IS_NEOX)
         {
-            auto cos_buf = opus::make_gmem<scalar_t>(cos_ptr, HALF * sizeof(scalar_t));
-            auto sin_buf = opus::make_gmem<scalar_t>(sin_ptr, HALF * sizeof(scalar_t));
-            if constexpr(IS_NEOX)
-            {
-                const int cbase = d0 < HALF ? d0 : d0 - HALF;
-                pe_op.c         = cos_buf.template load<VEC>(cbase);
-                pe_op.s         = sin_buf.template load<VEC>(cbase);
-            }
-            else
-            {
-                pe_op.c = cos_buf.template load<VEC / 2>(d0 / 2);
-                pe_op.s = sin_buf.template load<VEC / 2>(d0 / 2);
-            }
+            const int cidx = d0 < HALF ? d0 : d0 - HALF;
+            pe_op.c        = cos_buf.template load<VEC>(cos_row + cidx);
+            pe_op.s        = sin_buf.template load<VEC>(sin_row + cidx);
+        }
+        else
+        {
+            pe_op.c = cos_buf.template load<VEC / 2>(cos_row + d0 / 2);
+            pe_op.s = sin_buf.template load<VEC / 2>(sin_row + d0 / 2);
         }
         const float inv_qscale = 1.0f / (*q_scale);
         opus::s_wait_tensorcnt<0>();
@@ -5460,6 +5478,12 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     const int64_t cos_stride0     = cos_cache.stride(0);
     const int64_t sin_stride0     = sin_cache.stride(0);
     const int64_t block_stride    = kv_cache.stride(0);
+    const int max_position        = std::min(cos_cache.size(0), sin_cache.size(0));
+    AITER_CHECK(max_position > 0, "cos_cache and sin_cache must not be empty");
+    // The kernel reads cos/sin through one buffer descriptor per cache.
+    AITER_CHECK(max_position * std::max(cos_stride0, sin_stride0) * cos_cache.element_size() <=
+                    std::numeric_limits<int32_t>::max(),
+                "cos/sin cache too large for a buffer descriptor");
 
     HipDeviceGuard device_guard(kv_c.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -5523,7 +5547,7 @@ void fused_qk_rope_concat_and_cache_mla_seg(
             q_out_stride_0, q_out_stride_1,                                               \
             kv_c_stride, k_pe_stride,                                                     \
             cos_stride0, sin_stride0,                                                     \
-            block_stride);
+            block_stride, max_position);
 
 #define LAUNCH_MLA_NORM_ROPE_HPT(SCALAR_T, NEOX)                                          \
     switch(hpt)                                                                           \
