@@ -39,18 +39,14 @@ _ATOL = 0.05
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
-    input_dtype = x.dtype
     variance = x.float().pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x.to(input_dtype)
     return weight * x
 
 
 def gemma_rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
-    input_dtype = x.dtype
     variance = x.float().pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x.to(input_dtype)
     return (1.0 + weight) * x
 
 
@@ -72,8 +68,8 @@ def apply_rotary_emb_torch(
     sin: Tensor,
     is_neox_style: bool,
 ) -> Tensor:
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
     if is_neox_style:
         x1, x2 = torch.chunk(x, 2, dim=-1)
     else:
