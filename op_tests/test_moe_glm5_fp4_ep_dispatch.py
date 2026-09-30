@@ -61,3 +61,7 @@ def test_decode_tiers_use_fused_fp4_stage1(gfx950_dispatch, m, tier):
     assert meta.stage2.keywords["kernelName"] == STAGE2
     assert meta.fuse_quant == "fp4"
     assert meta.block_m == 32
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
