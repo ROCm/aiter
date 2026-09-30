@@ -19,10 +19,10 @@ import math
 import pytest
 import torch
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_fwd as _chunk_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import flash_kda as _flash_kda
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
     flash_kda_supported,
@@ -545,7 +545,7 @@ def test_cases_reach_the_gluon_k2():
     """
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
-    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
+    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
         flash_kda_k2 as _g2,
     )
 

@@ -56,7 +56,7 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
     CHUNK_DELTA_ATTN_TRITON_AUTOTUNE,
     autotune_cache_kwargs,
     chunk_delta_attn_tuned_config,
@@ -66,8 +66,8 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
     input_guard,
     tensor_cache,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -1116,7 +1116,7 @@ def flash_kda_fwd(
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     if use_gluon_k1:
-        from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
+        from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
             gluon_k1_prepare,
         )
 
@@ -1252,7 +1252,7 @@ def flash_kda_fwd(
         b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
         if use_gluon_k2:
-            from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
+            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
                 flash_kda_k2 as _g2,
             )
 
