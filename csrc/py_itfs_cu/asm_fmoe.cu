@@ -75,6 +75,7 @@ class FMoeKernel
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
+    uint32_t block_size         = 256;
     const char* name            = nullptr;
     // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
     int flat_mode = 0;
@@ -84,12 +85,14 @@ class FMoeKernel
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               int flat_mode               = 0) : kernel(name, hsaco)
+               int flat_mode               = 0,
+               uint32_t block_size         = 256) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
         this->flat_mode          = flat_mode;
+        this->block_size         = block_size == 0 ? 256 : block_size;
     };
 
     const char* get_name() const { return name; }
@@ -191,7 +194,7 @@ class FMoeKernel
         // flat_mode==2: emsort persistent grid; no host moe_sort, same grid as ps.
         if(this->flat_mode == 1)
         {
-            bdx = 256;
+            bdx = this->block_size;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
@@ -290,6 +293,34 @@ FMoeKernel* get_heuristic_kernel(
             }
         }
 
+        // Host-sorted tiles are 32x256/32x512. Irregular inter_dims such as 160
+        // and 320 only have FLAT 16xN kernels (gdx = inter_dim/subGU_n). Prefer
+        // the largest FLAT tile that divides; ignore vskip (FLAT rows are novs).
+        if(selectedKl.empty())
+        {
+            round    = 0xffffffff;
+            empty_cu = num_cu;
+            for(const auto& el : *cfgs)
+            {
+                if(el.first.find(arch_id) != 0)
+                    continue;
+                const auto& cfg = el.second;
+                if(cfg.smf != smf || cfg.flat != 1)
+                    continue;
+                if((inter_dim % cfg.subGU_n) != 0)
+                    continue;
+                tg_num               = inter_dim / cfg.subGU_n * sub_X_cnt;
+                uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+                if(local_round < round ||
+                   (local_round == round && empty_cu > (local_round * num_cu - tg_num)))
+                {
+                    round      = local_round;
+                    empty_cu   = local_round * num_cu - tg_num;
+                    selectedKl = el.first;
+                }
+            }
+        }
+
         AITER_CHECK(selectedKl != "",
                     __func__,
                     ": No suitable kernel found for inter_dim: ",
@@ -313,7 +344,8 @@ FMoeKernel* get_heuristic_kernel(
             num_persistent_tgs = 0;
 
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
-            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat);
+            return FMoeKernel(
+                name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat, cfg.bdx);
         });
     }
     else
@@ -669,19 +701,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         AITER_CHECK(false, __func__, ": unsupport current input type:", AiterDtype_to_str(input->dtype()));
     }
 
-    // The small-tile asm MXFP4 kernels drain O through a tile schedule derived
-    // from model_dim/1024, with no handling for a short trailing tile. Below
-    // 1024 no tiles are produced at all and the output buffer is left
-    // untouched; a non-multiple leaves the remainder columns unwritten. Both
-    // return a silently wrong result instead of failing, so require an exact
-    // multiple. A multiple of 256 is not enough: model_dim=2304 drops 256
-    // columns. Larger tiles use a different epilogue and are not constrained.
-    if(is_mxfp4 && impl_ptr->get_sub_GU() <= 128)
+    // These asm MXFP4 kernels drain O through the LDS flush epilogue, which walks
+    // full 1024-column blocks and then an optional 512-column tail (bit 9 of dim).
+    // No smaller remainder is expressible, so a non-multiple of 512 would leave the
+    // trailing columns unwritten and return a silently wrong result. The large-tile
+    // host-sorted kernels (sub_GU > 128, non-FLAT) use a different epilogue and stay
+    // unconstrained.
+    if(is_mxfp4 && (impl_ptr->get_sub_GU() <= 128 || impl_ptr->get_flat_mode() == 1))
     {
-        AITER_CHECK(model_dim >= 1024 && (model_dim % 1024) == 0,
+        AITER_CHECK(model_dim >= 512 && (model_dim % 512) == 0,
                     __func__,
-                    " asm MXFP4 kernels with sub_GU <= 128 require model_dim to be a positive "
-                    "multiple of 1024; got model_dim=" +
+                    " asm MXFP4 kernels require model_dim to be a positive multiple of 512;"
+                    " got model_dim=" +
                         std::to_string(model_dim));
     }
 
