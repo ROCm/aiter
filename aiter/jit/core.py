@@ -990,61 +990,51 @@ def clone_3rdparty(third_party: str) -> None:
                 return False
 
             logger.info(f"Cloning 3rdparty {third_party} to {dir_path}")
-            # Check git version for --revision flag support (>=2.49)
-            if not check_git_version(2, 49):
-                logger.warning(
-                    "Your git version does not support the --revision flag (requires >=2.49). Slow path is used for cloning 3rdparty."
-                )
-                subprocess.call(
-                    [
-                        "git",
-                        "clone",
-                        "-q",
-                        third_party_info["url"],
-                        dir_path,
-                    ]
-                )
-                subprocess.call(
-                    [
-                        "git",
-                        "-C",
-                        dir_path,
-                        "reset",
-                        "-q",
-                        "--hard",
-                        third_party_info["commit"],
-                    ]
-                )
-                subprocess.call(
-                    [
-                        "git",
-                        "-C",
-                        dir_path,
-                        "submodule",
-                        "update",
-                        "-q",
-                        "--init",
-                        "--recursive",
-                    ]
-                )
-            else:
-                # Save current git config value for advice.detachedHead, set to false
-                prev_detached_head = None
-                try:
-                    try:
-                        prev_detached_head = subprocess.check_output(
-                            ["git", "config", "--get", "advice.detachedHead"], text=True
-                        ).strip()
-                    except subprocess.CalledProcessError:
-                        prev_detached_head = None  # not set before
-                    # Set to false before clone
-                    subprocess.call(
-                        ["git", "config", "--global", "advice.detachedHead", "false"]
+            parent = os.path.dirname(dir_path)
+            os.makedirs(parent, exist_ok=True)
+            # Clone at its final path: moving a checkout after submodule update
+            # can invalidate submodule gitdir links. Remove only a checkout
+            # created by this invocation if any Git step fails.
+            try:
+                if not check_git_version(2, 49):
+                    logger.warning(
+                        "Your git version does not support the --revision flag (requires >=2.49). Slow path is used for cloning 3rdparty."
                     )
-
-                    subprocess.call(
+                    subprocess.run(
+                        ["git", "clone", "-q", third_party_info["url"], dir_path],
+                        check=True,
+                    )
+                    subprocess.run(
                         [
                             "git",
+                            "-C",
+                            dir_path,
+                            "reset",
+                            "-q",
+                            "--hard",
+                            third_party_info["commit"],
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            dir_path,
+                            "submodule",
+                            "update",
+                            "-q",
+                            "--init",
+                            "--recursive",
+                        ],
+                        check=True,
+                    )
+                else:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-c",
+                            "advice.detachedHead=false",
                             "clone",
                             "-q",
                             f"--revision={third_party_info['commit']}",
@@ -1052,30 +1042,13 @@ def clone_3rdparty(third_party: str) -> None:
                             "--recurse-submodules",
                             third_party_info["url"],
                             dir_path,
-                        ]
+                        ],
+                        check=True,
                     )
-                finally:
-                    # Restore config after clone
-                    if prev_detached_head is not None:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "advice.detachedHead",
-                                prev_detached_head,
-                            ]
-                        )
-                    else:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "--unset",
-                                "advice.detachedHead",
-                            ]
-                        )
+            except BaseException:
+                if os.path.isdir(dir_path) and not os.path.islink(dir_path):
+                    shutil.rmtree(dir_path)
+                raise
 
     if third_party == "HipKittens":
         dir_path = HIP_KITTENS_DIR
@@ -1089,7 +1062,7 @@ def clone_3rdparty(third_party: str) -> None:
 
     if "third_party_info" in locals():
         lock_path = f"{bd_dir}/lock_3rdparty_clone_{third_party}"
-        mp_lock(lockPath=lock_path, MainFunc=MainFunc)
+        mp_lock(lockPath=lock_path, MainFunc=MainFunc, build_after_wait=True)
 
 
 def rm_module(md_name):
