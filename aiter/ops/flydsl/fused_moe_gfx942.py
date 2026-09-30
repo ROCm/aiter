@@ -83,15 +83,21 @@ class Config:
             else:
                 if not 1 <= problem.batch <= 256:
                     return "decoding requires 1 to 256 tokens"
-                if self.BLOCK_M != 16 or self.BLOCK_N not in (16, 64, 128):
-                    return "decoding requires BM16 and BN16, BN64 or BN128"
-                if self.BLOCK_K not in (16, 64):
-                    return "decoding requires BK16 or BK64"
-                if problem.batch == 1 and (self.BLOCK_N, self.BLOCK_K) != (16, 16):
-                    return "batch1 uses the fixed 16_16_16 config"
+                if problem.batch == 1:
+                    if (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K) != (16, 16, 16):
+                        return "batch1 uses the fixed 16_16_16 config"
+                else:
+                    if self.BLOCK_M != 16 or self.BLOCK_N not in (64, 128):
+                        return "sorted decoding requires BM16 and BN64 or BN128"
+                    if self.BLOCK_K != 64:
+                        return "sorted decoding requires BK64"
             if problem.quant_type == "mxfp4":
-                if not self.use_batch1_algorithm and self.BLOCK_N not in (16, 64):
-                    return "MXFP4 sorted decoding requires BLOCK_N=16 or 64"
+                if (
+                    problem.batch > 1
+                    and not self.use_batch1_algorithm
+                    and self.BLOCK_N != 64
+                ):
+                    return "MXFP4 sorted decoding requires BLOCK_N=64"
                 if problem.hidden_dim % 512 or problem.inter_dim % 128:
                     return "MXFP4 requires hidden_dim divisible by 512 and inter_dim by 128"
             elif problem.hidden_dim % 256 or problem.inter_dim % 64:
@@ -198,6 +204,7 @@ def get_tune_space():
     configs = [
         Config(16, 16, 16, False),
         Config(16, 16, 16, False, use_batch1_algorithm=True),
+        Config(16, 64, 64, False),
         Config(16, 128, 64, False),
     ]
     if get_gfx() == "gfx950":
@@ -293,11 +300,12 @@ def _empty_scale(device):
 def _validate_mxfp4_inputs(w1, w2, w1_scale, w2_scale, problem):
     if w1.shape[0] != w2.shape[0]:
         raise ValueError("MXFP4 weights must have the same expert count")
+    scale_dtypes = (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
     for name, scale, channels, reduction in (
         ("w1_scale", w1_scale, problem.gateup_dim, problem.hidden_dim),
         ("w2_scale", w2_scale, problem.model_dim, problem.inter_dim),
     ):
-        if scale is None or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        if scale is None or scale.dtype not in scale_dtypes:
             raise ValueError(f"{name} must use an E8M0/uint8 dtype")
         groups = ((reduction // 32 + 7) // 8) * 8
         required = problem.experts * channels * groups
@@ -605,7 +613,6 @@ def _run_decode(
         if w1.dtype == torch.bfloat16
         else "fp4" if w1.dtype == torch.float4_e2m1fn_x2 else "fp8"
     )
-    block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
@@ -613,7 +620,8 @@ def _run_decode(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=block_n,
+        BLOCK_TILE_SIZE_N=config.BLOCK_N,
+        BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="gateup",
         alg="splitk",
         E=problem.experts,
@@ -644,7 +652,8 @@ def _run_decode(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=block_n,
+        BLOCK_TILE_SIZE_N=config.BLOCK_N,
+        BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="down",
         alg="splitk",
         E=problem.experts,

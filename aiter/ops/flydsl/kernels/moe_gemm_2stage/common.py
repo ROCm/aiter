@@ -80,9 +80,10 @@ _TORCH_TO_FX = {
     torch.float8_e4m3fnuz: fx.Uint8,
     torch.float8_e4m3fn: fx.Uint8,
     torch.float4_e2m1fn_x2: fx.Uint8,
-    torch.float8_e8m0fnu: fx.Uint8,
     torch.uint8: fx.Uint8,
 }
+if hasattr(torch, "float8_e8m0fnu"):
+    _TORCH_TO_FX[torch.float8_e8m0fnu] = fx.Uint8
 
 
 def _ptr(t):
