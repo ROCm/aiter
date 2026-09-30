@@ -42,7 +42,7 @@ def _mxfp4_quant_op(
     amax = amax.to(gl.float32, bitcast=True)
     scale_e8m0_unbiased = gl.log2(amax).floor() - 2
     scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
-    bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
+    bs_e8m0 = (scale_e8m0_unbiased.to(gl.int32) + 127).to(gl.uint8)
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
     x_fp4 = gl.amd.cdna5.scaled_downcast(x, bs_e8m0, "e2m1", axis=1)
@@ -291,7 +291,7 @@ def _mxfp8_quant_op(
     # e4m3 max=448=2**8*1.75 -> exponent offset -8 (mxfp4: -2, max 6)
     scale_e8m0_unbiased = gl.log2(amax).floor() - 8
     scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
-    bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
+    bs_e8m0 = (scale_e8m0_unbiased.to(gl.int32) + 127).to(gl.uint8)
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
     # scaled_downcast requires the scale in this compact per-thread layout
