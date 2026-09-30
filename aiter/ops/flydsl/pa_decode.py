@@ -595,14 +595,17 @@ def pa_decode(
             raise NotImplementedError(
                 "NHD pa_decode requires gfx950, per-tensor scales, and no work plan"
             )
-        if not longctx_m1_shape(
-            head_dim,
-            block_size,
-            trans_v,
-            per_token_kv,
-            query_length,
-            query_group_size,
-        ) or block_size != 64:
+        if (
+            not longctx_m1_shape(
+                head_dim,
+                block_size,
+                trans_v,
+                per_token_kv,
+                query_length,
+                query_group_size,
+            )
+            or block_size != 64
+        ):
             raise NotImplementedError(
                 "NHD pa_decode requires head 256, page 64, and one query M-tile"
             )

@@ -209,9 +209,7 @@ def compile_pa_decode_tile(
             query_group_size,
         )
     )
-    if nhd_layout and not (
-        LONGCTX_PIPE and block_size == 64 and is_gfx950
-    ):
+    if nhd_layout and not (LONGCTX_PIPE and block_size == 64 and is_gfx950):
         raise NotImplementedError(
             "NHD pa_decode is the gfx950 head-256 page-64 per-tensor decode path"
         )
@@ -1207,9 +1205,9 @@ def compile_pa_decode_tile(
         NHD_DMAS = block_size // NHD_TOKS_PER_DMA
         NHD_K_LOADS = NCHUNK * QKHE_LOOP
         if nhd_layout:
-            assert head_dim == WAVE * 16 // NHD_TOKS_PER_DMA, (
-                "NHD staging needs a whole number of token rows per LDS-DMA"
-            )
+            assert (
+                head_dim == WAVE * 16 // NHD_TOKS_PER_DMA
+            ), "NHD staging needs a whole number of token rows per LDS-DMA"
             assert NHD_DMAS * WAVE * 16 == nhd_page_bytes
 
         def _nhd_band_slot(region, tok, band):
