@@ -184,9 +184,7 @@ def _emit_row_neg_inf_fill(
         # An empty window fills the whole row, so a past-the-end slot must
         # collapse both ranges instead. The descriptor stays on a real row.
         in_rows = rows[j] < seq_len
-        out_row_t = _make_out_row_t(
-            logits, stride_i64, fx.min(rows[j], seq_len_m_1)
-        )
+        out_row_t = _make_out_row_t(logits, stride_i64, fx.min(rows[j], seq_len_m_1))
         s = fx.min(starts[j], slk)
         e = fx.max(ends[j], s)
         s = in_rows.select(s, fx.Int32(0))
