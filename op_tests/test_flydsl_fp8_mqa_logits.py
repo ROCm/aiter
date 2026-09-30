@@ -416,7 +416,7 @@ _GFX942_AUTO_VARIANTS = {
     (65, 8192): "mfma_r1_w4",  # odd, below 2**21: steps down
     (254, 8192): "mfma_r2_w4",
     (256, 8192): "mfma_r4_w4",  # 2**21
-    (257, 8192): "mfma_r4_w4",  # odd, from 2**21 up: pads
+    (257, 8192): "mfma_r4_w4",  # odd, from 2**21 up: short tail tile
     (1024, 131072): "mfma_r4_w4",  # long-context indexer prefill
     (2048, 8192): "mfma_r4_w2",
 }
