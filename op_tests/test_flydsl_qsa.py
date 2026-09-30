@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA oracle, family A plumbing, live vLLM AMD, FlyDSL K1/K2.
+"""QSA oracle, family A plumbing, live vLLM AMD, #4882 Triton/Gluon, FlyDSL K1/K2.
 
 Two layers:
   * Correctness (pytest gate): ``test_*`` unit cases.
   * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
-    ``bench_qsa_family_a_vllm_amd``,
+    ``bench_qsa_family_a_vllm_amd``, ``bench_qsa_family_a_4882_triton``,
+    ``bench_qsa_family_b_4882_triton``, ``bench_qsa_family_b_4882_gluon``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table;
     HIP-graph select columns for FlyDSL and live AMD when the table is
     wider than 20000 columns and ``M<=64``),
@@ -64,6 +65,14 @@ from aiter.ops.flydsl.qsa import (
     qsa_sparse_gqa,
     qsa_topk_blocks,
     qsa_visible_blocks,
+)
+from aiter.ops.triton.attention.qsa_4882 import (
+    AITER_4882_QSA_PIN,
+    gluon_qsa_available,
+    qsa_sparse_paged_gqa,
+)
+from aiter.ops.triton.attention.qsa_4882 import (
+    qsa_select_paged_tokens as qsa_4882_select_paged_tokens,
 )
 from aiter.ops.triton.attention.qsa_vllm_amd import (
     VLLM_AMD_QSA_PIN,
@@ -2176,9 +2185,9 @@ def _flydsl_k1_select(
 ):
     """Block ids plus the vendored Triton expand live AMD select includes.
 
-    The live AMD column times ``qsa_select_paged_tokens``, which expands
-    inside the call. This is that same span for FlyDSL. Set equality uses
-    the block ids.
+    The vLLM and #4882 columns time ``qsa_select_paged_tokens``, which
+    expands inside the call. This is that same span for FlyDSL. Set
+    equality uses the block ids.
     """
     block_ids = qsa_k1_block_ids(
         q,
@@ -2231,17 +2240,19 @@ def _pad_index_table(index_table, pad_pages):
 def bench_qsa_family_a_k1(
     m, seq_len, page_size, dtype, rotate=0, pad_pages=0, cache_layout="packed"
 ):
-    """Family A FlyDSL K1 vs oracle set equality; us vs live AMD.
+    """Family A FlyDSL K1 vs oracle set equality; us vs live AMD and #4882 Triton.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
     and streaming radix at or above that width. Single-request prefill scores
     16 query rows per workgroup. The FlyDSL column times block ids and then
     the vendored Triton expand, the same expand live AMD select includes.
-    Set equality stays on block ids. Same ``rotate`` on every select column.
-    ``pad_pages`` widens the block table every column sees; ``0`` keeps it
-    packed to the context. ``cache_layout="wide"`` gives every column the
-    serving cache span. The layer bench takes the same layout.
+    The #4882 column times its own select, which also expands. Set equality
+    stays on block ids. Same ``rotate`` on every select column. ``pad_pages``
+    widens the block table every column sees; ``0`` keeps it packed to the
+    context. ``cache_layout="wide"`` gives every column the serving cache
+    span. Family A GQA is group 12 / D=256, so #4882 Gluon does not dispatch
+    and is not a column here. The layer bench takes the same layout.
 
     When ``M`` is at most 64 and the table is wider than 20000 columns, two
     more columns replay the select under HIP-graph capture. FlyDSL capture
@@ -2311,6 +2322,21 @@ def bench_qsa_family_a_k1(
         rotate=rotate,
     )
     vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids, ref_scores)
+
+    (_triton_indices, triton_ids), triton_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend="triton",
+    )
+    triton_err = _set_mismatch_ratio(ref_ids, triton_ids, ref_scores)
 
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
@@ -2386,6 +2412,10 @@ def bench_qsa_family_a_k1(
         "vllm_amd_select TFLOPS": flops / vllm_us / 1e6,
         "vllm_amd_select TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_select err": vllm_err,
+        "4882_triton_select us": triton_us,
+        "4882_triton_select TFLOPS": flops / triton_us / 1e6,
+        "4882_triton_select TB/s": nbytes / triton_us / 1e6,
+        "4882_triton_select err": triton_err,
     }
     if graph_us is not None:
         ret["flydsl_k1_graph us"] = graph_us
@@ -2403,7 +2433,7 @@ def bench_qsa_family_a_k1(
 def bench_qsa_family_a_k2(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
-    """Family A FlyDSL K2 vs oracle GQA; us vs live AMD.
+    """Family A FlyDSL K2 vs oracle GQA; us vs live AMD and #4882 Triton.
 
     3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a two-wave merge.
@@ -2490,6 +2520,25 @@ def bench_qsa_family_a_k2(
         msg="vllm_amd GQA vs oracle",
     )
 
+    t4882_out, t4882_us = _time(
+        qsa_sparse_paged_gqa,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+        backend="triton",
+    )
+    t4882_err = checkAllclose(
+        ref.output,
+        t4882_out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 Triton GQA vs oracle",
+    )
+
     w_alloc = indices.shape[1]
     w = _selected_width(indices)
     flops = 4 * m * gqa.n_heads * gqa.head_dim * w
@@ -2510,6 +2559,10 @@ def bench_qsa_family_a_k2(
         "vllm_amd_gqa TFLOPS": flops / vllm_us / 1e6,
         "vllm_amd_gqa TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_gqa err": vllm_err,
+        "4882_triton_gqa us": t4882_us,
+        "4882_triton_gqa TFLOPS": flops / t4882_us / 1e6,
+        "4882_triton_gqa TB/s": nbytes / t4882_us / 1e6,
+        "4882_triton_gqa err": t4882_err,
     }
 
 
@@ -2688,7 +2741,7 @@ def test_k1_family_b_set_equality_two_tiles_h8():
 
 
 def test_k1_family_b_set_equality_published_indexer_point():
-    """Published indexer point: M=32, H=4, D=128, page_size=8, n_blocks=512.
+    """#4882 published indexer point: M=32, H=4, D=128, page_size=8, n_blocks=512.
 
     ``pages=512`` is 512 compressed keys packed at ``page_size=8`` (64 pages).
     """
@@ -2748,7 +2801,7 @@ def bench_qsa_family_b_k1(
     pad_pages=0,
     cache_layout="packed",
 ):
-    """Family B FlyDSL K1 vs oracle set equality.
+    """Family B FlyDSL K1 vs oracle set equality; us vs #4882 select.
 
     2e/2f: emit on ``n_blocks <= 512``. Longer rows use family A's MFMA
     scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
@@ -2800,9 +2853,24 @@ def bench_qsa_family_b_k1(
     )
     k1_err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
 
+    (_indices, triton_ids), triton_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend="triton",
+    )
+    triton_err = _set_mismatch_ratio(ref_ids, triton_ids, ref_scores)
+
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
-    return {
+    ret = {
         "gfx": get_gfx(),
         "index_heads": idx.n_heads,
         "n_blocks": n_blocks,
@@ -2812,7 +2880,34 @@ def bench_qsa_family_b_k1(
         "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
         "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
         "flydsl_k1 err": k1_err,
+        "4882_triton_select us": triton_us,
+        "4882_triton_select TFLOPS": flops / triton_us / 1e6,
+        "4882_triton_select TB/s": nbytes / triton_us / 1e6,
+        "4882_triton_select err": triton_err,
     }
+    # Gluon indexer dispatches on family B H in {4, 8}, D=128; skip off gfx950.
+    if get_gfx() == "gfx950" and gluon_qsa_available():
+
+        (_g_indices, gluon_ids), gluon_us = _time(
+            qsa_4882_select_paged_tokens,
+            q_indexer,
+            index_cache,
+            index_table,
+            token_to_req,
+            qpos,
+            slen,
+            idx.token_budget,
+            idx.compress_ratio,
+            rotate=rotate,
+            backend="gluon",
+        )
+        ret["4882_gluon_select us"] = gluon_us
+        ret["4882_gluon_select TFLOPS"] = flops / gluon_us / 1e6
+        ret["4882_gluon_select TB/s"] = nbytes / gluon_us / 1e6
+        ret["4882_gluon_select err"] = _set_mismatch_ratio(
+            ref_ids, gluon_ids, ref_scores
+        )
+    return ret
 
 
 @benchmark()
@@ -2922,12 +3017,256 @@ def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=0):
     }
 
 
+@benchmark()
+def bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate=0):
+    """#4882 portable Triton QSA vs the oracle. Gluon is not launched.
+
+    Indexer chain and sparse GQA are timed separately. Oracle is not timed.
+    Same ``rotate`` on select and GQA.
+    """
+    idx = FAMILY_A_INDEXER
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device).contiguous()
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        k_bar, k, v, page_size, device
+    )
+    index_cache = index_cache.contiguous()
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    index_table = index_table.contiguous()
+    kv_table = kv_table.contiguous()
+
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=FAMILY_A_SCORE_SCALE,
+        out_dtype=dtypes.fp32,
+    )
+
+    (indices, block_ids), select_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend="triton",
+    )
+    block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
+    index_err = _set_mismatch_ratio(ref.indices, indices)
+
+    out, gqa_us = _time(
+        qsa_sparse_paged_gqa,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+        backend="triton",
+    )
+    gqa_err = checkAllclose(
+        ref.output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 Triton GQA vs oracle",
+    )
+
+    w = _selected_width(indices)
+    flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
+    bytes_select = (
+        m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim
+    ) * dtype.itemsize
+    bytes_gqa = (
+        m * gqa.n_heads * gqa.head_dim * 2 + 2 * seq_len * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    return {
+        "gfx": get_gfx(),
+        "aiter_4882_pin": AITER_4882_QSA_PIN,
+        "n_blocks": n_blocks,
+        "valid%": 100.0 * w / idx.index_width,
+        "4882_triton_select us": select_us,
+        "4882_triton_select TFLOPS": flops_select / select_us / 1e6,
+        "4882_triton_select TB/s": bytes_select / select_us / 1e6,
+        "4882_triton_select err": max(block_err, index_err),
+        "4882_triton_gqa us": gqa_us,
+        "4882_triton_gqa TFLOPS": flops_gqa / gqa_us / 1e6,
+        "4882_triton_gqa TB/s": bytes_gqa / gqa_us / 1e6,
+        "4882_triton_gqa err": gqa_err,
+    }
+
+
 def _family_b_indexer(index_heads):
     if index_heads == FAMILY_B_INDEXER.n_heads:
         return FAMILY_B_INDEXER
     if index_heads == FAMILY_B_INDEXER_H8.n_heads:
         return FAMILY_B_INDEXER_H8
     raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
+
+
+def _bench_qsa_family_b_4882(
+    m, seq_len, page_size, dtype, index_heads, backend, rotate=0
+):
+    """Family B #4882 vs oracle. ``backend`` is ``triton`` or ``gluon``."""
+    idx = _family_b_indexer(index_heads)
+    gqa = FAMILY_B_GQA
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device).contiguous()
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        k_bar, k, v, page_size, device
+    )
+    index_cache = index_cache.contiguous()
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    index_table = index_table.contiguous()
+    kv_table = kv_table.contiguous()
+
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=idx.head_dim**-0.5,
+        out_dtype=dtypes.fp32,
+    )
+
+    (indices, block_ids), select_us = _time(
+        qsa_4882_select_paged_tokens,
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+        rotate=rotate,
+        backend=backend,
+    )
+    block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
+    index_err = _set_mismatch_ratio(ref.indices, indices)
+    if indices.shape[1] != idx.index_width:
+        raise AssertionError(
+            f"family B selection width {indices.shape[1]} != {idx.index_width}"
+        )
+
+    gqa_tol = 2e-2 if backend == "gluon" else 1e-2
+    out, gqa_us = _time(
+        qsa_sparse_paged_gqa,
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        rotate=rotate,
+        backend=backend,
+    )
+    gqa_err = checkAllclose(
+        ref.output,
+        out.to(dtypes.fp32),
+        rtol=gqa_tol,
+        atol=gqa_tol,
+        msg=f"4882 {backend} GQA vs oracle",
+    )
+
+    tag = backend
+    w = _selected_width(indices)
+    flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
+    bytes_select = (
+        m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim
+    ) * dtype.itemsize
+    bytes_gqa = (
+        m * gqa.n_heads * gqa.head_dim * 2 + 2 * seq_len * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    return {
+        "gfx": get_gfx(),
+        "aiter_4882_pin": AITER_4882_QSA_PIN,
+        "n_blocks": n_blocks,
+        "valid%": 100.0 * w / idx.index_width,
+        f"4882_{tag}_select us": select_us,
+        f"4882_{tag}_select TFLOPS": flops_select / select_us / 1e6,
+        f"4882_{tag}_select TB/s": bytes_select / select_us / 1e6,
+        f"4882_{tag}_select err": max(block_err, index_err),
+        f"4882_{tag}_gqa us": gqa_us,
+        f"4882_{tag}_gqa TFLOPS": flops_gqa / gqa_us / 1e6,
+        f"4882_{tag}_gqa TB/s": bytes_gqa / gqa_us / 1e6,
+        f"4882_{tag}_gqa err": gqa_err,
+    }
+
+
+@benchmark()
+def bench_qsa_family_b_4882_triton(m, seq_len, page_size, dtype, index_heads, rotate=0):
+    """#4882 portable Triton QSA vs the oracle on family B shapes.
+
+    Separate table from family A Triton and from family B Gluon. Oracle is
+    not timed.
+    """
+    return _bench_qsa_family_b_4882(
+        m, seq_len, page_size, dtype, index_heads, backend="triton", rotate=rotate
+    )
+
+
+@benchmark()
+def bench_qsa_family_b_4882_gluon(m, seq_len, page_size, dtype, index_heads, rotate=0):
+    """#4882 gfx950 Gluon QSA vs the oracle on family B (Gluon-validated) shapes.
+
+    Family A GQA (group 12 / D=256) is not launched here. Oracle is not timed.
+    """
+    return _bench_qsa_family_b_4882(
+        m, seq_len, page_size, dtype, index_heads, backend="gluon", rotate=rotate
+    )
 
 
 def _policy_args(m, hq, d_gqa, n_columns, page_size, n_heads, d_idx, kv_heads=2):
@@ -3663,6 +4002,43 @@ def test_qsa_layer_decode_graph_replays():
         raise AssertionError(f"graph replay diverged from the oracle (err={err})")
 
 
+def _qsa_4882_layer(
+    q_indexer,
+    index_cache,
+    index_table,
+    q_gqa,
+    k_cache,
+    v_cache,
+    kv_table,
+    token_to_req,
+    qpos,
+    slen,
+    token_topk,
+    compress_ratio,
+    backend,
+):
+    indices, _blocks = qsa_4882_select_paged_tokens(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        token_topk,
+        compress_ratio,
+        backend=backend,
+    )
+    return qsa_sparse_paged_gqa(
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        backend=backend,
+    )
+
+
 def _e2e_counts(case, idx, gqa, dtype):
     indices = case["ref"].indices
     w_alloc = indices.shape[1]
@@ -3704,7 +4080,7 @@ def _time_layer(case, idx, backend, rotate):
 def bench_qsa_family_a_e2e(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
-    """One family A QSA layer: FlyDSL K1+expand+K2 vs live AMD.
+    """One family A QSA layer: FlyDSL K1+expand+K2 vs live AMD and #4882 Triton.
 
     Expand stays the vendored Triton kernel. Oracle is not timed. Same
     ``rotate`` on every column. HIP graph replay is a separate table.
@@ -3724,6 +4100,21 @@ def bench_qsa_family_a_e2e(
     amd_err = checkAllclose(
         ref, amd.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="vllm amd e2e vs oracle"
     )
+    t4882, t4882_us = _time(
+        _qsa_4882_layer,
+        *_layer_args(case),
+        idx.token_budget,
+        idx.compress_ratio,
+        "triton",
+        rotate=rotate,
+    )
+    t4882_err = checkAllclose(
+        ref,
+        t4882.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 triton e2e vs oracle",
+    )
     ret = {
         "gfx": get_gfx(),
         "n_blocks": case["n_blocks"],
@@ -3733,6 +4124,7 @@ def bench_qsa_family_a_e2e(
     }
     ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
     ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
+    ret.update(_e2e_cells("4882_triton_e2e", t4882_us, t4882_err, flops, nbytes))
     return ret
 
 
@@ -3740,10 +4132,10 @@ def bench_qsa_family_a_e2e(
 def bench_qsa_family_b_e2e(
     m, seq_len, page_size, dtype, index_heads, rotate=0, cache_layout="packed"
 ):
-    """One family B QSA layer vs live AMD.
+    """One family B QSA layer vs live AMD, #4882 Triton and, on gfx950, Gluon.
 
     Separate table from family A. Live AMD is the column ``auto`` decides
-    against, so it is the one that governs the gate.
+    against, so it is the one that governs the gate; the others are parity.
     """
     idx = _family_b_indexer(index_heads)
     gqa = FAMILY_B_GQA
@@ -3758,6 +4150,21 @@ def bench_qsa_family_b_e2e(
     amd_err = checkAllclose(
         ref, amd.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="vllm amd family B e2e"
     )
+    triton, triton_us = _time(
+        _qsa_4882_layer,
+        *_layer_args(case),
+        idx.token_budget,
+        idx.compress_ratio,
+        "triton",
+        rotate=rotate,
+    )
+    triton_err = checkAllclose(
+        ref,
+        triton.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="4882 triton family B e2e",
+    )
     ret = {
         "gfx": get_gfx(),
         "index_heads": idx.n_heads,
@@ -3768,6 +4175,24 @@ def bench_qsa_family_b_e2e(
     }
     ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
     ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
+    ret.update(_e2e_cells("4882_triton_e2e", triton_us, triton_err, flops, nbytes))
+    if get_gfx() == "gfx950" and gluon_qsa_available():
+        gluon, gluon_us = _time(
+            _qsa_4882_layer,
+            *_layer_args(case),
+            idx.token_budget,
+            idx.compress_ratio,
+            "gluon",
+            rotate=rotate,
+        )
+        gluon_err = checkAllclose(
+            ref,
+            gluon.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg="4882 gluon family B e2e",
+        )
+        ret.update(_e2e_cells("4882_gluon_e2e", gluon_us, gluon_err, flops, nbytes))
     return ret
 
 
@@ -4054,6 +4479,38 @@ def main():
             df.to_markdown(index=False),
         )
 
+        rows = []
+        for m, seq_len, page_size, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate
+        ):
+            if m > seq_len:
+                continue
+            rows.append(
+                bench_qsa_family_a_4882_triton(m, seq_len, page_size, dtype, rotate)
+            )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family A #4882 Triton summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+        rows = []
+        for m, seq_len, page_size, index_heads, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, (4, 8), args.rotate
+        ):
+            if m > seq_len:
+                continue
+            rows.append(
+                bench_qsa_family_b_4882_triton(
+                    m, seq_len, page_size, dtype, index_heads, rotate
+                )
+            )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family B #4882 Triton summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
         decode_m, prefill_m = _k1_k2_sweep_batches(args.batch)
 
         rows = []
@@ -4276,7 +4733,7 @@ def main():
                 df.to_markdown(index=False),
             )
 
-        # Published indexer point: M=32, H=4, page_size=8, n_blocks=512.
+        # #4882 published indexer point: M=32, H=4, page_size=8, n_blocks=512.
         rows = []
         for rotate, pad_pages, cache_layout in itertools.product(
             args.rotate, args.pad_pages, args.cache_layout
@@ -4420,6 +4877,29 @@ def main():
                 "QSA family B end-to-end summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
+
+        if get_gfx() != "gfx950" or not gluon_qsa_available():
+            aiter.logger.warning(
+                "skip family B #4882 Gluon on %s (need gfx950 + Gluon import)",
+                get_gfx(),
+            )
+            continue
+        rows = []
+        for m, seq_len, page_size, index_heads, rotate in itertools.product(
+            args.batch, args.seq, args.page_size, (4, 8), args.rotate
+        ):
+            if m > seq_len:
+                continue
+            rows.append(
+                bench_qsa_family_b_4882_gluon(
+                    m, seq_len, page_size, dtype, index_heads, rotate
+                )
+            )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "QSA family B #4882 Gluon summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":
