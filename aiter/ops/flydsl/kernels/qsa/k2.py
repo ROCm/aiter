@@ -843,12 +843,14 @@ def build_qsa_k2_module(
                     fx.copy(kv_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
             if const_expr(gfx942_v_pf):
-                # Only VMEM reads may cross, so this gather can sink into
-                # QK and stay in flight. Everything else stays put, which
-                # keeps the index math that built these addresses from
-                # sliding under the first MFMA. gfx950's prefetch shares
-                # the copy loop and is not pinned.
-                fx.rocdl.sched_barrier("vmem_read")
+                # Nothing may cross, so these loads stay issued here and
+                # remain in flight across the whole QK block. A barrier
+                # that lets VMEM reads through sinks them to the consume,
+                # and the trace drained three of the four after the alias
+                # barrier. The post-QK barrier below keeps the VALU mask
+                # that consumes them from rising into the MFMA. gfx950's
+                # prefetch shares the copy loop and is not pinned.
+                fx.rocdl.sched_barrier("none")
 
             # Compute K @ Q^T. The transposed QK C map is token-major in each
             # lane and can feed PV A without a P-LDS or bpermute transpose.
@@ -896,12 +898,11 @@ def build_qsa_k2_module(
                     )
                 qk_local.append(acc4)
             if const_expr(gfx942_v_pf):
-                # The prefetch loads may cross, so they ride through this
-                # whole QK block. The mask that consumes the fragment is
-                # VALU and cannot, which holds vmcnt(0) until the MFMA is
-                # done. Letting that mask rise reuses the fragment
-                # registers for the K LDS reads and drains the gather
-                # halfway through QK.
+                # The mask that consumes the fragment is VALU and cannot
+                # cross, which holds vmcnt(0) until the MFMA is done.
+                # Letting that mask rise reuses the fragment registers
+                # for the K LDS reads and drains the gather halfway
+                # through QK.
                 fx.rocdl.sched_barrier("vmem_read")
 
             if const_expr(qk_split):
