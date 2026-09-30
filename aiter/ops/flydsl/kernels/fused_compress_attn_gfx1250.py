@@ -176,7 +176,7 @@ def _build_kernel(
     rms_weight_is_bf16: bool,
     rms_eps: float,
     enable_prefetch_input: bool = False,
-    quant_mode: str = "per_row_fp8",  # "per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main, nm-asm) | (future) "fp4"
+    quant_mode: str = "fp8_per_row",  # "fp8_per_row" (indexer) | "fp8_group" (CSA/HCA Main, nm-asm) | "fp4"
     quant_group_size: int = 64,
 ):
     """Build the @flyc.kernel + @flyc.jit launcher for a given config.
@@ -214,19 +214,19 @@ def _build_kernel(
     # The RD%(2*VEC) == 0 invariant means rope threads cleanly own whole pairs.
 
     quant_fp4 = quant_mode == "fp4"
-    # FP8 1xG e8m0 group-quant geometry (quant_mode=="group_fp8" only): wave32 ->
+    # FP8 1xG e8m0 group-quant geometry (quant_mode=="fp8_group" only): wave32 ->
     # VEC=16, RTS = G/VEC = 4, N_GROUPS = NOPE/G = 7. Byte-identical to wave64.
-    nm_asm = quant_mode == "group_fp8"
+    nm_asm = quant_mode == "fp8_group"
     GROUP_SIZE_Q = quant_group_size
     RTS = (GROUP_SIZE_Q // VEC) if nm_asm else 1
     log2_rts = int(math.log2(RTS)) if nm_asm else 0
     if nm_asm:
         assert (
             quant and not preshuffle
-        ), "group_fp8: requires quant=True, preshuffle=False"
+        ), "fp8_group: requires quant=True, preshuffle=False"
         assert (
             NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
-        ), f"group_fp8: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
+        ), f"fp8_group: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
 
     assert D % BLOCK_THREADS == 0, f"D={D} must divide BLOCK_THREADS={BLOCK_THREADS}"
     assert VEC in (2, 4, 8, 16), f"VEC={VEC} (D/{BLOCK_THREADS}) outside supported set"
@@ -303,9 +303,9 @@ def _build_kernel(
         kv_cache: fx.Tensor,  # bf16 OR fp8 [NB, k_per_block, D]
         kv_cache_block_stride: Int32,  # elements (bf16 or fp8 -- caller's responsibility)
         kv_cache_token_stride: Int32,
-        cache_scale: fx.Tensor,  # [NB, k_per_block] f32 (dummy if not quant / group_fp8)
+        cache_scale: fx.Tensor,  # [NB, k_per_block] f32 (dummy if not quant / fp8_group)
         cache_scale_block_stride: Int32,
-        k_rope_buff: fx.Tensor,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope (dummy otherwise)
+        k_rope_buff: fx.Tensor,  # fp8_group only: paged [NB, k_per_block, RD] bf16 rope (dummy otherwise)
         krope_block_stride: Int32,
         krope_token_stride: Int32,
         block_table: fx.Tensor,  # [bs, max_blocks_per_seq] i32 (dummy if not has_bt)
@@ -421,7 +421,7 @@ def _build_kernel(
             # Buffer resources reused across K iters.
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            # Rebased onto this program's slot -- see `state_slot_byte_offset`.
             kv_state_rsrc = buffer_ops.create_buffer_resource(
                 kv_state,
                 max_size=True,
@@ -858,7 +858,7 @@ def _build_kernel(
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(hi, out_rsrc, cache_off_dw + 4)
                 elif const_expr(nm_asm):
-                    # -- group_fp8 (V4 nm-asm) via shared emitter (wave32; same layout
+                    # -- fp8_group (V4 nm-asm) via shared emitter (wave32; same layout
                     # as wave64 -- single source of truth). --
                     # The block term rides on each descriptor's base, not on
                     # the 32-bit offset -- see `block_base_bytes_i64`.
@@ -1300,7 +1300,7 @@ def _build_kernel_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    quant_mode: str = "per_row_fp8",
+    quant_mode: str = "fp8_per_row",
 ):
     """K-split single-kernel (wave32 / gfx1250): NW-wave LDS-reduced compress +
     norm + rope + scatter (BF16 or FP8).
@@ -1442,7 +1442,7 @@ def _build_kernel_ksplit(
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            # Rebased onto this program's slot -- see `state_slot_byte_offset`.
             kv_state_rsrc = buffer_ops.create_buffer_resource(
                 kv_state,
                 max_size=True,
@@ -2178,7 +2178,7 @@ def compile_flydsl_fused_compress_attn_gfx1250(
     rms_weight_is_bf16: bool,
     rms_eps: float,
     enable_prefetch_input: bool = False,
-    quant_mode: str = "per_row_fp8",  # "per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main, nm-asm) | (future) "fp4"
+    quant_mode: str = "fp8_per_row",  # "fp8_per_row" (indexer) | "fp8_group" (CSA/HCA Main, nm-asm) | "fp4"
     quant_group_size: int = 64,
 ):
     launcher = _build_kernel(
@@ -2229,7 +2229,7 @@ def compile_flydsl_fused_compress_attn_ksplit_gfx1250(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    quant_mode: str = "per_row_fp8",
+    quant_mode: str = "fp8_per_row",
 ):
     launcher = _build_kernel_ksplit(
         head_dim=head_dim,
@@ -2275,10 +2275,10 @@ def flydsl_fused_compress_attn_gfx1250(
     use_ue8m0: bool = True,
     preshuffle: bool = True,
     k_split_num_waves: int | None = None,
-    quant_mode: str = "per_row_fp8",  # per_row_fp8 | group_fp8 | fp4
+    quant_mode: str | None = None,  # none | fp8_per_row | fp8_group | fp4
     k_rope_cache: (
         torch.Tensor | None
-    ) = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
+    ) = None,  # fp8_group only: paged [NB, k_per_block, RD] bf16 rope
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """gfx1250 (wave32) drop-in for ``flydsl_fused_compress_attn``.
@@ -2287,10 +2287,16 @@ def flydsl_fused_compress_attn_gfx1250(
     linear FP8 layout) and ``enable_prefetch_input=False`` (VEC=16 register
     pressure on RDNA4's 512 VGPRs/wave).
     """
+    quant_mode = (
+        quant_mode if quant_mode is not None else ("fp8_per_row" if quant else "none")
+    )
+    if quant_mode not in ("none", "fp8_per_row", "fp8_group", "fp4"):
+        raise ValueError(f"unsupported gfx1250 quant_mode: {quant_mode!r}")
+    quant = quant_mode != "none"
     # gfx1250 overrides
     preshuffle = False  # MFMA preshuffle is gfx9-only; force linear layout
     enable_prefetch_input = False  # noqa: F841  # VEC=16 VGPR pressure
-    nm_asm = quant_mode == "group_fp8"  # V4 nm-asm group-quant (separate rope buf)
+    nm_asm = quant_mode == "fp8_group"  # V4 nm-asm group-quant (separate rope buf)
     quant_fp4 = quant_mode == "fp4"
     # ---- input validation ----
     plan_capacity = plan_gpu.shape[0]
@@ -2324,7 +2330,7 @@ def flydsl_fused_compress_attn_gfx1250(
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
     # Slot and ring strides are passed to the kernel and the descriptor is
-    # rebased per slot, so the states may be strided views — a per-request
+    # rebased per slot, so the states may be strided views -- a per-request
     # arena hands out a view whose slot stride is a whole entry. Only the
     # innermost dim must be unit stride: the kernel addresses it as
     # `col_off + lane`.
@@ -2438,14 +2444,14 @@ def flydsl_fused_compress_attn_gfx1250(
         cs_arg = cache_scale
         cs_block_stride = cache_scale.stride(0)
     else:
-        cs_arg = rms_weight  # fp32 dummy (group_fp8: e8m0 inline, no separate scale)
+        cs_arg = rms_weight  # fp32 dummy (fp8_group: e8m0 inline, no separate scale)
         cs_block_stride = 0
 
-    # group_fp8: rotated PE bf16 -> separate paged k_rope_cache (V4 nm layout); else dummy.
+    # fp8_group: rotated PE bf16 -> separate paged k_rope_cache (V4 nm layout); else dummy.
     if nm_asm:
         if not quant:
             raise ValueError(
-                "quant_mode='group_fp8' requires quant=True (fp8 kv_cache)"
+                "quant_mode='fp8_group' requires quant=True (fp8 kv_cache)"
             )
         if (
             k_rope_cache is None
@@ -2453,7 +2459,7 @@ def flydsl_fused_compress_attn_gfx1250(
             or k_rope_cache.dim() != 3
         ):
             raise ValueError(
-                "quant_mode='group_fp8' requires bf16 [NB, k_per_block, RD] k_rope_cache"
+                "quant_mode='fp8_group' requires bf16 [NB, k_per_block, RD] k_rope_cache"
             )
         krope_arg = k_rope_cache
         krope_block_stride = k_rope_cache.stride(0)
@@ -2476,7 +2482,7 @@ def flydsl_fused_compress_attn_gfx1250(
         and rope_head_dim == 64
         and ratio == 4
         and overlap
-        and quant_mode in ("per_row_fp8", "fp4")
+        and quant_mode in ("fp8_per_row", "fp4")
     )
     if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
         nw_eff = csa_ksplit_num_waves_gfx1250(plan_capacity)
@@ -2486,7 +2492,7 @@ def flydsl_fused_compress_attn_gfx1250(
         nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
     use_ksplit = (
         nw_eff > 1 and has_bt and not nm_asm
-    )  # group_fp8: legacy only (for now)
+    )  # fp8_group: legacy only (for now)
     if use_ksplit:
         k_split_num_waves = nw_eff
         if K_pool % k_split_num_waves != 0:

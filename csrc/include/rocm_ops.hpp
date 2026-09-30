@@ -1819,7 +1819,7 @@ namespace py = pybind11;
           py::arg("positions"),                                                              \
           py::arg("rope_dim"),                                                               \
           py::arg("group_size")    = 32,                                                     \
-          py::arg("shuffle_scale") = true,                                                   \
+          py::arg("scale_layout") = "none",                                                   \
           py::arg("do_rotate_act") = true,                                                   \
           py::arg("round_rope")    = false);                                                 \
     m.def("rope_rotate_activation",                                                          \
