@@ -233,7 +233,9 @@ def test_oneshot_min_override():
             P.resolve_oneshot("xgmi", 8).max_bytes
             == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max_exact
         )
-        assert P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+        assert (
+            P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+        )
     # 0 is a valid override: accept every size down to the custom-AR floor.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
         assert P.resolve_oneshot("xgmi", 8).min_bytes == 0

@@ -1266,11 +1266,11 @@ def _bench_graph(thunk, *, num_iters, num_warmup, inner, group, label="candidate
     each call on a single handshake, so a rank that finishes call *i* early
     can start pushing call *i+1* while its peers are still reducing call *i*.
     The ``cross_device_reduce_*`` kernels close every call with an end barrier
-    and cannot run ahead. A normal deployment puts model compute between two 
+    and cannot run ahead. A normal deployment puts model compute between two
     all-reduces and the concern was that this timing methodology flatters FlyDSL.
 
-    Measured on MI350P (PCIe) by capturing a rank-local 2048x2048x2048 bf16 GEMM 
-    before every collective and subtracting the GEMM's separately timed cost: 
+    Measured on MI350P (PCIe) by capturing a rank-local 2048x2048x2048 bf16 GEMM
+    before every collective and subtracting the GEMM's separately timed cost:
     No consistent bias for FlyDSL.
 
     The tensor returned is what a **replay** produced, not what a subsequent
