@@ -30,20 +30,9 @@ static inline bool dyn_gq_tuned_arch()
     return tuned;
 }
 
-// gfx1250 tuning. All three are swept values; the sweeps are at the use sites.
-// The 256-thread block and TDM staging are mutually exclusive, and TDM wins where it
-// applies: a wider block scales the staged tile with it (16 KiB per ring slot instead of
-// 4), so the two together cost 22% at T=8192. Below the staging threshold the wide block
-// is worth 1-6% from T=512 up, and 2.7% NEGATIVE at T=128. Denominator 4 = a quarter of a
-// SIMD's worth of blocks, which puts the switch between T=128 and T=512.
+// gfx1250: use 256-thread blocks once there are at least a quarter as many as SIMDs.
 constexpr int kDynGqWideBlkPerSimdDenom = 4;
-// Blocks/SIMD below which TDM staging is skipped. At blk=64 this counts
-// rows*scaleN/32, so T=4096 sits at 7168 and T=8192 at 14336: 8 puts the switch between
-// them, which is where staging starts paying. It measured 10.18 vs 10.02 us at T=4096
-// (slightly harmful) against ~15% faster at T=16384. Below this the block widens to 256
-// instead -- the two are mutually exclusive, see kDynGqWideBlkPerSimdDenom.
-constexpr int kDynGqTdmMinBlkPerSimd  = 8;
-constexpr int kDynGqTdmKPT            = 2;  // staged steps per block
+constexpr int kDynGqTdmKPT            = 2;  // staged steps per block (TDM kernels)
 
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
 // byte scale, fp8 / i8 output a continuous fp32 per-group scale.
@@ -57,7 +46,7 @@ constexpr int kDynGqTdmKPT            = 2;  // staged steps per block
 // Every TUNING choice below is gated on gfx1250: each was swept there and leans on
 // something arch-specific (wave32, b128 as the widest per-lane access). Nothing was
 // measured on gfx950, so that target keeps the shape it had before.
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool packed_bf16_amax = false, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false, bool direct_prefetch = false>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool packed_bf16_amax = false, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -70,13 +59,38 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t const* __restrict__ num_rows = nullptr,
                                       const int32_t num_cols_factor        = 1)
 {
-    // The 2D path is selected only for dense input without dynamic row counts.
-    // This invariant is independent of the numeric M/K values.
+    // The 2D path is selected only without dynamic row counts, and its output is dense.
+    int tile_col  = blockIdx.x;
+    int tile_band = blockIdx.y;
     if constexpr(grid_2d)
     {
         num_rows = nullptr;
-        ori_row_stride = ori_cols;
         oob_size = ori_rows * static_cast<int64_t>(ori_cols);
+        // Blocks dispatch round-robin over 8 XCDs; each XCD should own whole 256B spans
+        // of the scale output.
+        const int tiles = ori_cols / 512;
+        if constexpr(shuffle_scale)
+        {
+            // Transposed scale: a span is one tile column over 16 bands. With a band padded
+            // to a multiple of 8 tiles, slot % 8 picks the XCD; rotating between 256-row
+            // chunks spreads the empty padding slots over the XCDs.
+            const int padded = gridDim.x;
+            const int shift  = (tile_band / 16) * (padded - tiles) % padded;
+            tile_col = (static_cast<int>(blockIdx.x) + padded - shift) % padded;
+            if(tile_col >= tiles)
+                return;
+        }
+        else
+        {
+            // Row-major scale: a span covers whole rows, so a band stays on one XCD. The
+            // host pads the bands to a multiple of 8.
+            const int linear = blockIdx.y * gridDim.x + blockIdx.x;
+            const int k      = linear / 8;
+            tile_band        = (k / tiles) * 8 + linear % 8;
+            tile_col         = k % tiles;
+            if(tile_band * 16 >= ori_rows)
+                return;
+        }
     }
     static_assert(!emit_e8m0_scale
                       || std::is_same_v<DTYPE_O, opus::fp4_t>
@@ -141,7 +155,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // here would let the host size for staging while the kernel fell back, leaving half
     // the groups unvisited.
     static constexpr bool kUseTdmShape =
-        enable_tdm && kColumnMajorGroups && kTdmKPT > 1 && kTdmWaves >= 1 &&
+        enable_tdm && (kColumnMajorGroups || grid_2d) && kTdmKPT > 1 && kTdmWaves >= 1 &&
         (block_size % WARP_SIZE) == 0;
 
 #if defined(__gfx1250__)
@@ -161,19 +175,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #if defined(__gfx1250__)
         if constexpr(grid_2d)
         {
-            static_assert(kColumnMajorGroups && group_size == 128);
-            if constexpr(wide_group_stores)
-            {
-                constexpr int kTileCols=kTdmGroupsPerBlock/kTileRows;
-                const int local=static_cast<int>(gid%kTdmGroupsPerBlock);
-                gx=static_cast<int64_t>(blockIdx.y)*kTileRows+(local%kTdmGroupsPerStep)/2;
-                gy=static_cast<int>(blockIdx.x)*kTileCols+(local/kTdmGroupsPerStep)*2+local%2;
-            }
-            else
-            {
-                gx=gid;
-                gy=static_cast<int>(blockIdx.y);
-            }
+            static_assert(use_e8m0_scale && group_size == 128 && wide_group_stores);
+            constexpr int kTileCols=kTdmGroupsPerBlock/kTileRows;
+            const int local=static_cast<int>(gid%kTdmGroupsPerBlock);
+            gx=static_cast<int64_t>(tile_band)*kTileRows+(local%kTdmGroupsPerStep)/2;
+            gy=tile_col*kTileCols+(local/kTdmGroupsPerStep)*2+local%2;
         }
         else
 #endif
@@ -236,11 +242,14 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // would perfectly coalesce the loads but shrink the fp8 store to 8B per lane, and that
     // trade measured worse. A thread's elements are no longer contiguous, which nothing
     // downstream cares about: amax is order-independent and store_vector's interleave mode
-    // lays the output back down in this pattern.
+    // lays the output back down in this pattern. fp4 stores only 8B per lane, which pays
+    // off only under column-major order.
     static constexpr int kChunkElems = 32 / static_cast<int>(sizeof(DTYPE_I));
     static constexpr int kChunks     = kChunkElems ? thread_data_size / kChunkElems : 0;
     static constexpr bool kInterleavedChunks =
-        kTunedForThisArch && !std::is_same_v<DTYPE_O, opus::fp4_t> && sizeof(DTYPE_I) == 2 &&
+        kTunedForThisArch &&
+        (!std::is_same_v<DTYPE_O, opus::fp4_t> || kColumnMajorGroups) &&
+        sizeof(DTYPE_I) == 2 &&
         kChunkElems > 0 && thread_data_size % kChunkElems == 0 && kChunks > 1;
 
     using chunk_t = opus::vector_t<DTYPE_I, kChunkElems>;
@@ -265,26 +274,31 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         return td;
     };
 
-    using saved_scale_t = std::conditional_t<use_e8m0_scale, uint8_t, float>;
-    struct PendingGroupStore
-    {
-        opus::vector_t<uint8_t, 16> even_bytes;
-        opus::vector_t<uint8_t, 16> odd_bytes;
-        int32_t offset;
-        saved_scale_t* scale_dst;
-        saved_scale_t scale_val;
-    };
-    auto emit_group = [&](const PendingGroupStore& pending) {
-        auto buffer_o = opus::make_gmem<uint8_t>(reinterpret_cast<uint8_t*>(out), oob_size);
-        opus::store<16>(buffer_o, pending.even_bytes, pending.offset, 0, opus::number<0>{});
-        asm volatile("s_nop 0");
-        opus::store<16>(buffer_o, pending.odd_bytes, pending.offset + ori_cols, 0, opus::number<0>{});
-        asm volatile("s_nop 0");
-        if(pending.scale_dst != nullptr)
-            *pending.scale_dst = pending.scale_val;
-    };
+    // A column-major block's scale bytes are adjacent: gather them in LDS and store them
+    // as words, rather than having every wave write single bytes into one scale line.
+    // The barrier only pays off once the kernel is bandwidth bound.
+    static constexpr bool kScaleRunInLds =
+        kColumnMajorGroups && !kUseTdmShape && !grid_2d && use_e8m0_scale;
+    static constexpr int kScaleRun = block_size / num_thread_per_group;
+    static constexpr int64_t kScaleRunMinGroups = 32768;
+    const bool scale_run_in_lds =
+        kScaleRunInLds && static_cast<int64_t>(gridDim.x) * kScaleRun >= kScaleRunMinGroups;
+    __shared__ uint32_t s_scale_run[kScaleRunInLds ? (kScaleRun + 3) / 4 : 1];
+
+    // full_group_stores pairs groups gid and gid ^ 1: neighbouring rows at one column
+    // under column-major order, neighbouring columns of one row otherwise.
+    const int32_t pair_stride = kColumnMajorGroups ? ori_cols : group_size;
 
     auto process = [&](vec_i thread_data, int64_t x, int32_t y, int64_t groupId) {
+        // MXFP8: any NaN or Inf makes its group invalid (E8M0 0xff scale, FP8 NaN data).
+        static constexpr bool kMxFp8 = use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t>;
+        static constexpr bool kStoreTakesDivisor =
+            kMxFp8 && opus::is_any_of_v<DTYPE_I, opus::bf16_t, opus::fp16_t> &&
+            (thread_data_size % 8 == 0);
+        static constexpr bool kHwConvertDiv = kTunedForThisArch && kStoreTakesDivisor;
+        static constexpr bool kScaleMayClip =
+            aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
+            aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
         float absMax = 1e-10f;
         if constexpr(packed_bf16_amax && kTunedForThisArch)
         {
@@ -299,10 +313,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                 asm("v_pk_max_u16 %0, %1, %2" : "=v"(packed_max) : "v"(packed_max), "v"(pair));
             }
             const uint32_t magnitude = opus::max(packed_max & 0xffffU, packed_max >> 16);
-            if(magnitude > 0x7f80U)
+            if constexpr(kMxFp8)
+                // Unsigned magnitude order puts NaN above Inf: fold both onto Inf.
+                absMax = max(absMax, __builtin_bit_cast(float, opus::min(magnitude, 0x7f80U) << 16));
+            else if(magnitude > 0x7f80U)
             {
-                // Unsigned ordering puts NaNs above infinity. Preserve the original
-                // reduction semantics when a lane contains a NaN.
                 for(size_t j = 0; j < thread_data_size; ++j)
                     absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
             }
@@ -312,26 +327,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         else
         {
             for(size_t j = 0; j < thread_data_size; ++j)
-                absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
+            {
+                const float v = abs(static_cast<float>(thread_data[j]));
+                // NaN-propagating max; the cross-lane reduce below drops NaNs, so fold to Inf.
+                absMax = kMxFp8 ? __builtin_elementwise_maximum(absMax, v) : max(absMax, v);
+            }
+            if constexpr(kMxFp8)
+                absMax = __builtin_isnan(absMax) ? __builtin_inff() : absMax;
         }
         absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
-        // `v_cvt_scalef32_pk8_fp8_bf16` does not saturate -- past 464, the midpoint between fp8
-        // e4m3's top two steps, it rounds into the NaN encoding -- where the software med3 path
-        // clamps. Cap amax so an inf group still gets a finite scale, then saturate below.
-        // (kStoreTakesDivisor is declared here because the cap has to precede the scale.)
-        static constexpr bool kStoreTakesDivisor =
-            use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t> &&
-            std::is_same_v<DTYPE_I, opus::bf16_t> && (thread_data_size % 8 == 0);
-        static constexpr bool kHwConvertDiv = kTunedForThisArch && kStoreTakesDivisor;
-        static constexpr bool kScaleMayClip =
-            aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
-            aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
-        bool degenerate_group = false;
-        if constexpr(kHwConvertDiv)
-        {
-            degenerate_group = !(absMax < __builtin_inff());
-            absMax           = fminf(absMax, 448.0f * 0x1.0p119f);
-        }
 
         // MX e8m0 path: use the project-wide default round mode
         // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
@@ -352,6 +356,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #endif
             inverted_scale =
                 aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
+            if constexpr(kMxFp8 &&
+                         aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even)
+            {
+                if(!__builtin_isfinite(absMax))
+                    inverted_scale = __builtin_inff();
+            }
         }
         else
         {
@@ -359,7 +369,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         }
         // Interleaved layout: this thread's first chunk sits at lane * kChunkElems, and
         // store_vector's interleave mode strides the rest by num_thread_per_group chunks.
-        static constexpr int kLaneStride = kInterleavedChunks ? kChunkElems : vec_size_o;
+        static constexpr int kLaneStride =
+            kInterleavedChunks ? kChunkElems * vec_size_o / thread_data_size : vec_size_o;
         // The output is row-major regardless of the order in which groups are visited.
         // Keep row and in-row offsets separate so tensors beyond a global descriptor's
         // 32-bit byte reach can use one row as the descriptor range.
@@ -381,7 +392,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         scale_elem_t  scale_val{};
         if(lane_in_group == 0)
         {
-            int64_t scale_idx = groupId;
+            // The tile path's group ids follow the tile, not the scale layout.
+            int64_t scale_idx = grid_2d ? x * scaleN + y : groupId;
             if constexpr(shuffle_scale)
             {
                 if constexpr(use_e8m0_scale && group_size == 32)
@@ -415,22 +427,18 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             inverted_scale = 1.0f / inverted_scale;
         }
 
-        // Only RoundDown / Even can floor the scale enough for finite data to overflow, so under
-        // the shipped RoundUp this folds to `if(degenerate_group)` -- never taken, and free.
-        // Compares rather than min/max-es: both tests are false for NaN, so NaN stays NaN.
-        if constexpr(kHwConvertDiv)
+        // The native convert does not saturate. Only RoundDown / Even can floor the scale
+        // enough for finite data to overflow; an invalid group's 0xff scale already yields NaN.
+        if constexpr(kHwConvertDiv && kScaleMayClip)
         {
-            if(kScaleMayClip || degenerate_group)
+            const float hi = 448.0f * inverted_scale;
+            for(size_t j = 0; j < thread_data_size; j++)
             {
-                const float hi = 448.0f * inverted_scale;
-                for(size_t j = 0; j < thread_data_size; j++)
-                {
-                    const float v = static_cast<float>(thread_data[j]);
-                    if(v > hi)
-                        thread_data[j] = static_cast<DTYPE_I>(hi);
-                    if(v < -hi)
-                        thread_data[j] = static_cast<DTYPE_I>(-hi);
-                }
+                const float v = static_cast<float>(thread_data[j]);
+                if(v > hi)
+                    thread_data[j] = static_cast<DTYPE_I>(hi);
+                if(v < -hi)
+                    thread_data[j] = static_cast<DTYPE_I>(-hi);
             }
         }
 
@@ -466,37 +474,31 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         {
             static_assert(thread_data_size == 32 && group_size == 128 &&
                           std::is_same_v<DTYPE_O, opus::fp8_t>);
-            // Only selected for full waves with neighboring groups at consecutive x.
-            // Each store now covers a complete 128B group across eight lanes.
+            // Each store covers a complete 128B group across the lanes of groups gid and
+            // gid ^ 1, so both must be live together.
             const auto converted = scaled_cast_div<opus::fp8_t>(thread_data, inverted_scale);
             const auto words = __builtin_bit_cast(opus::vector_t<uint32_t,8>, converted);
             opus::vector_t<uint32_t,4> even_words, odd_words;
             const bool odd = (threadIdx.x & 4) != 0;
+            // Partner lanes (lane ^ 4) swap halves over DPP rather than LDS.
             opus::static_for<4>([&](auto i) {
                 const uint32_t lo = words[i.value];
                 const uint32_t hi = words[i.value+4];
-                const uint32_t partner_lo = __shfl_xor(lo,4,32);
-                const uint32_t partner_hi = __shfl_xor(hi,4,32);
-                even_words[i.value] = odd ? partner_hi : lo;
-                odd_words[i.value] = odd ? hi : partner_lo;
+                const uint32_t partner = aiter_dpp::move_dpp<uint32_t, 0x164>(odd ? lo : hi);
+                even_words[i.value] = odd ? partner : lo;
+                odd_words[i.value] = odd ? hi : partner;
             });
             auto buffer_o = opus::make_gmem<uint8_t>(reinterpret_cast<uint8_t*>(out),oob_size);
-            const int32_t offset0 = static_cast<int32_t>((x-static_cast<int>(odd))*ori_cols +
-                                        y*128 + lane_in_group*16 + (odd ? 64 : 0));
+            const int64_t even_x = kColumnMajorGroups ? x - static_cast<int>(odd) : x;
+            const int32_t even_y = kColumnMajorGroups ? y : y - static_cast<int>(odd);
+            const int32_t offset0 = static_cast<int32_t>(even_x*ori_cols +
+                                        even_y*128 + lane_in_group*16 + (odd ? 64 : 0));
             const auto even_bytes = __builtin_bit_cast(opus::vector_t<uint8_t,16>,even_words);
             const auto odd_bytes = __builtin_bit_cast(opus::vector_t<uint8_t,16>,odd_words);
-            if constexpr(direct_prefetch)
-            {
-                // Keep both batches' converted and exchanged payloads ready before writes.
-                return PendingGroupStore{even_bytes, odd_bytes, offset0, scale_dst, scale_val};
-            }
-            else
-            {
-                opus::store<16>(buffer_o, even_bytes, offset0, 0, opus::number<0>{});
-                asm volatile("s_nop 0");
-                opus::store<16>(buffer_o, odd_bytes, offset0 + ori_cols, 0, opus::number<0>{});
-                asm volatile("s_nop 0");
-            }
+            opus::store<16>(buffer_o, even_bytes, offset0, 0, opus::number<0>{});
+            asm volatile("s_nop 0");
+            opus::store<16>(buffer_o, odd_bytes, offset0 + pair_stride, 0, opus::number<0>{});
+            asm volatile("s_nop 0");
         }
         else
         {
@@ -514,6 +516,29 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                     store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1,
                                  DTYPE_O, kStoreTakesDivisor>(
                         buffer_o, thread_data, offset, inverted_scale);
+                }
+                // Software converts saturate NaN to a finite value: rewrite an invalid group.
+                if constexpr(kMxFp8 && !kHwConvertDiv)
+                {
+                    if(!__builtin_isfinite(row_scale))
+                    {
+#if defined(__gfx942__)
+                        constexpr uint32_t kNaN = 0x80808080U;
+#else
+                        constexpr uint32_t kNaN = 0xffffffffU;
+#endif
+                        opus::vector_t<uint32_t, thread_data_size / 4> nan_words;
+                        opus::static_for<thread_data_size / 4>(
+                            [&](auto i) { nan_words[i.value] = kNaN; });
+                        store_vector<DTYPE_STORE, DTYPE_O, thread_data_size, RT,
+                                     kInterleavedChunks,
+                                     kInterleavedChunks ? num_thread_per_group : WARP_SIZE,
+                                     kInterleavedChunks ? kChunks : 1, DTYPE_O>(
+                            buffer_o,
+                            __builtin_bit_cast(opus::vector_t<DTYPE_O, thread_data_size>,
+                                               nan_words),
+                            offset);
+                    }
                 }
             };
 
@@ -541,7 +566,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         // registers. See the note at `scale_dst`.
         if(scale_dst != nullptr)
         {
-            *scale_dst = scale_val;
+            if(scale_run_in_lds)
+                reinterpret_cast<uint8_t*>(s_scale_run)[threadIdx.x / num_thread_per_group] =
+                    scale_val;
+            else
+                *scale_dst = scale_val;
         }
     };   // process
 
@@ -633,24 +662,42 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
 #endif
 
-    if constexpr(direct_prefetch && kTunedForThisArch)
+    if(scale_run_in_lds)
     {
-        static_assert(grid_2d && !enable_tdm && full_group_stores && !wide_group_stores);
-        static_assert(thread_data_size == 32 && group_size == 128 && shuffle_scale && emit_e8m0_scale);
-        // Host dispatch guarantees complete row tiles and dense input. M/K remain runtime.
-        // Load both row spans before processing, overlapping independent memory requests.
-        constexpr int rows_per_span = block_size / num_thread_per_group;
-        const int64_t x0 = static_cast<int64_t>(blockIdx.x) * (2 * rows_per_span)
-                           + threadIdx.x / num_thread_per_group;
-        const int64_t x1 = x0 + rows_per_span;
-        const int y0 = static_cast<int>(blockIdx.y);
-        const vec_i data0 = gather(input + x0 * ori_row_stride + y0 * group_size);
-        const vec_i data1 = gather(input + x1 * ori_row_stride + y0 * group_size);
-        asm volatile("" ::: "memory"); // Compiler ordering only; no GPU barrier.
-        const auto pending0 = process(data0, x0, y0, 0);
-        const auto pending1 = process(data1, x1, y0, 0);
-        emit_group(pending0);
-        emit_group(pending1);
+        if(resolve(groupId, x, y))
+            process(gather(input + x * ori_row_stride + y * group_size), x, y, groupId);
+        // Wait on LDS only; __syncthreads would also drain the data stores.
+#if defined(__gfx1250__)
+        opus::s_wait_dscnt<0>();
+#endif
+        __builtin_amdgcn_s_barrier();
+        // The run starts at thread 0's group and may wrap into the next column. Words
+        // need rows and the scale base 4-aligned; otherwise store bytes.
+        const bool words = ori_rows % 4 == 0 && reinterpret_cast<uintptr_t>(scale) % 4 == 0;
+        const int step   = words ? 4 : 1;
+        if(threadIdx.x < WARP_SIZE)
+        {
+            const int64_t x0 = __builtin_amdgcn_readfirstlane(static_cast<int32_t>(x));
+            const int32_t y0 = __builtin_amdgcn_readfirstlane(y);
+            for(int i = threadIdx.x * step; i < kScaleRun; i += WARP_SIZE * step)
+            {
+                int64_t gx = x0 + i;
+                int32_t gy = y0;
+                while(gx >= ori_rows)
+                {
+                    gx -= ori_rows;
+                    ++gy;
+                }
+                auto* dst = reinterpret_cast<uint8_t*>(scale) + gy * ori_rows + gx;
+                if(gy < scaleN)
+                {
+                    if(words)
+                        *reinterpret_cast<uint32_t*>(dst) = s_scale_run[i / 4];
+                    else
+                        *dst = reinterpret_cast<const uint8_t*>(s_scale_run)[i];
+                }
+            }
+        }
     }
     else
     {
@@ -1395,26 +1442,16 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
             // Column-major group order: consecutive groups walk x at a fixed y, which is
-            // what makes the transposed scale store contiguous. It also gates TDM staging,
-            // whose tile only forms under this order.
+            // what makes the transposed scale store contiguous.
             constexpr bool kColMajor =
                 (std::is_same_v<out_t, opus::fp4_t> || ee) && ss && _GS == 128;
             // Block size is a template argument, so both widths are instantiated and the
-            // arch picks at launch; an untuned arch keeps the 64 it always had. TDM decides
-            // first, because a staged block scales its tile with the block width (16 KiB
-            // per ring slot at 256 against 4 at 64) and the two together measured 22%
-            // slower at T=8192. Where staging does not apply, the wide block is worth
-            // 4-6% from T=512 to T=4096.
+            // arch picks at launch; an untuned arch keeps the 64 it always had.
+            // No TDM staging here: the unstaged path is faster wherever it applied.
             static constexpr int32_t kBlkTuned = 256;
             const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
-            const int tdm_groups_at_64 = (64 / num_thread_per_group) * kDynGqTdmKPT;
-            const bool tdm_wanted =
-                dyn_gq_tuned_arch() && kColMajor && kDynGqTdmKPT > 1 &&
-                (rows % tdm_groups_at_64) == 0 &&
-                (static_cast<int64_t>(rows) * scaleN / tdm_groups_at_64) >=
-                    static_cast<int64_t>(simds_bs) * kDynGqTdmMinBlkPerSimd;
             const bool wide_ok =
-                dyn_gq_tuned_arch() && !tdm_wanted &&
+                dyn_gq_tuned_arch() &&
                 (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) *
                         kDynGqWideBlkPerSimdDenom >=
                     static_cast<int64_t>(simds_bs);
@@ -1438,55 +1475,46 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
             const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
 
-            // Staging was decided at the block size above, because the two interact; it is
-            // named again here only because it also changes the grid.
-            const bool use_tdm = tdm_wanted;
-
-            // The grid is deliberately sized by the UNSTAGED block span, so the back half
-            // dispatches blocks that reject on the first resolve and retire. Sizing it
-            // exactly is the obvious fix and measured 15-24% SLOWER (M=4096/8192/16384),
-            // with device code identical and only the launch dimension differing. The
-            // mechanism is not understood; this keeps what measures faster.
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    // Opt in only on the measured d01 configuration. Other gfx1250
-                    // machines already run this workload faster with the default path.
-                    if constexpr(std::is_same_v<input_dtype, opus::bf16_t> &&
-                                 std::is_same_v<out_t, opus::fp8_t> && _GS == 128 && ss && ee)
+                    // 16x512 tiles staged by TDM, with 256B row stores; the kernel maps
+                    // tiles so each XCD owns whole 256B spans of the scale output. It wins
+                    // once there are two tiles per SIMD at cols >= 12288, or three at
+                    // cols >= 7168. The stores address the output in 32 bits.
+                    if constexpr(std::is_same_v<out_t, opus::fp8_t> && _GS == 128 && ee)
                     {
-                        static const bool d01_tuning = [] {
-                            const char* value = std::getenv("AITER_DPGSQ_D01_TUNING");
-                            return value && value[0] == '1' && value[1] == '\0';
-                        }();
-                        if(d01_tuning && dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
-                           (rows == 16384 || (rows == 512 && cols == 16384)) && row_stride == cols &&
-                           (cols == 7168 || cols == 16384))
+                        constexpr bool kBf16 = std::is_same_v<input_dtype, opus::bf16_t>;
+                        const int64_t tiles_total =
+                            static_cast<int64_t>(rows / 16) * (cols / 512);
+                        const bool tiled =
+                            dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
+                            row_stride % 8 == 0 &&
+                            reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
+                            rows % 16 == 0 && cols % 512 == 0 && cols >= 7168 &&
+                            tiles_total >= (cols >= 12288 ? 2 : 3) * simds_bs &&
+                            oob_size <= std::numeric_limits<int32_t>::max();
+                        if(tiled)
                         {
-                            if(cols == 7168)
-                                aiter::dynamic_per_group_scaled_quant_kernel<
-                                    input_dtype, out_t, 32, 128, true, 512, true, false, 0, true, true, false, true, true>
-                                    <<<dim3(rows / 256, cols / 128), dim3(512), 0, stream>>>(
-                                    reinterpret_cast<out_t*>(out.data_ptr()),
-                                    reinterpret_cast<float*>(scales.data_ptr()),
-                                    reinterpret_cast<input_dtype*>(input.data_ptr()), nullptr,
-                                    rows, cols, row_stride, oob_size, nullptr, num_rows_factor);
-                            else
-                                aiter::dynamic_per_group_scaled_quant_kernel<
-                                    input_dtype, out_t, 32, 128, true, 128, true, true, 16, true, true, true, true>
-                                    <<<dim3(cols / 512, (rows + 15) / 16), dim3(128), 0, stream>>>(
-                                    reinterpret_cast<out_t*>(out.data_ptr()),
-                                    reinterpret_cast<float*>(scales.data_ptr()),
-                                    reinterpret_cast<input_dtype*>(input.data_ptr()), nullptr,
-                                    rows, cols, row_stride, oob_size, nullptr, num_rows_factor);
+                            const int tiles = cols / 512, bands = rows / 16;
+                            const dim3 tile_grid = ss ? dim3((tiles + 7) / 8 * 8, bands)
+                                                      : dim3(tiles, (bands + 7) / 8 * 8);
+                            aiter::dynamic_per_group_scaled_quant_kernel<
+                                input_dtype, out_t, 32, 128, ss, 128, true, true, 16, kBf16, true, true, true>
+                                <<<tile_grid, dim3(128), 0, stream>>>(
+                                reinterpret_cast<out_t*>(out.data_ptr()),
+                                reinterpret_cast<float*>(scales.data_ptr()),
+                                reinterpret_cast<input_dtype*>(input.data_ptr()), nullptr,
+                                rows, cols, row_stride, oob_size, nullptr, num_rows_factor);
                             return;
                         }
                     }
-                    auto launch_one = [&](auto tdm_tag, auto blk_tag) {
-                    constexpr bool tt = decltype(tdm_tag)::value;
+                    auto launch_one = [&](auto blk_tag, auto fgs_tag) {
                     constexpr int32_t BS = decltype(blk_tag)::value;
-                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS, ee, tt>
+                    constexpr bool fgs = decltype(fgs_tag)::value;
+                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS, ee, false,
+                                                                 0, false, fgs>
                         <<<grid, block, 0, stream>>>(
                         reinterpret_cast<out_t*>(out.data_ptr()),
                         reinterpret_cast<float*>(scales.data_ptr()),
@@ -1501,16 +1529,29 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     };
                     using BlkTuned = std::integral_constant<int32_t, kBlkTuned>;
                     using Blk64    = std::integral_constant<int32_t, 64>;
-                    if(blk_rt == kBlkTuned)
-                    {
-                        if(use_tdm) launch_one(std::true_type{},  BlkTuned{});
-                        else        launch_one(std::false_type{}, BlkTuned{});
-                    }
-                    else
-                    {
-                        if(use_tdm) launch_one(std::true_type{},  Blk64{});
-                        else        launch_one(std::false_type{}, Blk64{});
-                    }
+                    // full_group_stores: both groups of a pair must be live together, so
+                    // rows (column-major) or groups per row (row-major) must be even. The
+                    // store addresses the output in 32 bits and needs kStoreTakesDivisor.
+                    constexpr bool kFgsType = std::is_same_v<out_t, opus::fp8_t> &&
+                                              std::is_same_v<input_dtype, opus::bf16_t> &&
+                                              ee && _GS == 128;
+                    const bool fgs_pairs = kColMajor ? (num_rows_ptr == nullptr && rows % 2 == 0)
+                                                     : scaleN % 2 == 0;
+                    const bool fgs = kFgsType && dyn_gq_tuned_arch() && fgs_pairs &&
+                                     oob_size <= std::numeric_limits<int32_t>::max();
+                    auto dispatch = [&](auto blk_tag) {
+                        if constexpr(kFgsType)
+                        {
+                            if(fgs)
+                            {
+                                launch_one(blk_tag, std::true_type{});
+                                return;
+                            }
+                        }
+                        launch_one(blk_tag, std::false_type{});
+                    };
+                    if(blk_rt == kBlkTuned) dispatch(BlkTuned{});
+                    else                    dispatch(Blk64{});
                 });
         };
 

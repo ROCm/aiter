@@ -788,6 +788,9 @@ def dynamic_per_group_scaled_quant(
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
 
+    For MXFP8 (fp8 output, e8m0 scales), a NaN or Inf makes its whole group
+    invalid: the scale is 0xFF and every output of the group is an FP8 NaN.
+
     Only ``group_size`` in {32, 64, 128} is supported.
     """
 
