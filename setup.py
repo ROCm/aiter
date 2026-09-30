@@ -10,6 +10,11 @@ import sys
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+except ImportError:  # setuptools < 70.1
+    from wheel.bdist_wheel import bdist_wheel
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
@@ -449,6 +454,19 @@ class NinjaBuildExtension(build_ext):
         super().run()
 
 
+class PythonAgnosticBdistWheel(bdist_wheel):
+    """Tag the wheel ``py3-none-<platform>`` when it holds no prebuilt modules.
+
+    Without PREBUILD_KERNELS the wheel carries only Python, C++/CK sources and
+    ASM code objects. Every host module is JIT-built on first use against the
+    running interpreter, so the wheel is valid for any CPython 3 on the platform.
+    """
+
+    def get_tag(self):
+        _, _, plat = super().get_tag()
+        return "py3", "none", plat
+
+
 setup_requires = [
     "packaging",
     "psutil",
@@ -491,7 +509,10 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={
+        "build_ext": NinjaBuildExtension,
+        **({"bdist_wheel": PythonAgnosticBdistWheel} if not PREBUILD_KERNELS else {}),
+    },
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use
     # PEP 604 annotations (`X | None`) without `from __future__ import
     # annotations`, so they raise TypeError at import time on <3.10. Keep in sync

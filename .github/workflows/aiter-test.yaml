@@ -481,6 +481,231 @@ jobs:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
           CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.AITER_WHEEL_CLOUDFRONT_DISTRIBUTION_ID }}
 
+  # A wheel without prebuilt kernels: Python, C++/CK sources and ASM code
+  # objects only, with every host module JIT-built on first use. It carries no
+  # compiled Python extensions, so it is tagged py3 and installs on any
+  # CPython 3 (including versions the prebuilt wheels are not built for).
+  build_aiter_noprebuild_wheel:
+    name: Build Aiter wheel without prebuilt kernels
+    if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
+    runs-on: build-only-aiter
+    needs: [detect_aiter_test_scope, check-signal, ci_config]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # setuptools_scm derives the version from the distance to the last
+          # release tag; without history it falls back to 0.1.1.dev1, which
+          # sorts below every release.
+          fetch-depth: 0
+
+      - name: Sync submodules for wheel build
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+          echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
+
+      - name: Docker login
+        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      # setup.py needs a ROCm installation even when nothing is compiled, so the
+      # wheel is built in the same base image as the prebuilt wheels.
+      - name: Build Aiter wheel in base container
+        env:
+          DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --network=host \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              rm -rf dist build aiter_meta ./*.egg-info
+              pip install --upgrade build "setuptools_scm>=8"
+              version=$(python -m setuptools_scm)
+              # The prebuilt wheel of the same commit is published next to this
+              # one; a local-version suffix keeps an exact pin from resolving
+              # to the other.
+              case "${version}" in
+                *+*) version="${version}.noprebuild" ;;
+                *) version="${version}+noprebuild" ;;
+              esac
+              echo "Building amd-aiter ${version} with PREBUILD_KERNELS=0"
+              PREBUILD_KERNELS=0 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMD_AITER="${version}" \
+                python -m build --wheel
+              ls -lh dist/*.whl
+            '
+
+      - name: Verify wheel carries no prebuilt kernels
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one wheel in dist/, found {len(wheels)}")
+
+          wheel = wheels[0]
+          name = wheel.rsplit("/", 1)[-1]
+          with zipfile.ZipFile(wheel) as zf:
+              names = zf.namelist()
+          modules = [n for n in names if n.startswith("aiter/jit/") and n.endswith(".so")]
+          cache = [n for n in names if n.startswith("aiter/jit/flydsl_cache/")]
+
+          print(f"Wheel: {name}")
+          errors = []
+          if "-py3-none-" not in name:
+              errors.append("wheel is not tagged py3-none")
+          if ".noprebuild-" not in name and "+noprebuild-" not in name:
+              errors.append("version lacks the noprebuild local suffix")
+          if modules:
+              errors.append(f"{len(modules)} prebuilt modules present, e.g. {modules[0]}")
+          if cache:
+              errors.append(f"{len(cache)} FlyDSL cache entries present")
+          if errors:
+              raise SystemExit("::error::" + "; ".join(errors))
+          print("No prebuilt modules or FlyDSL cache; tagged py3-none")
+          PY
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-noprebuild
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Drop registry credentials
+        if: always()
+        run: |
+          # Self-hosted runners are persistent: drop the registry credentials
+          # written by the "Docker login" step so they do not outlive this job
+          # (SEC-00837 / ROCM-26712).
+          docker logout || true
+
+  # Published next to the prebuilt wheels, with its own manifests
+  # (latest-noprebuild.json) so the prebuilt wheels' latest.json is untouched.
+  upload_s3_noprebuild:
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
+    needs: [build_aiter_noprebuild_wheel]
+    name: Upload wheel without prebuilt kernels and manifest to S3
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-noprebuild
+          path: noprebuild-wheel
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheel and versioned manifest to S3
+        run: |
+          set -euo pipefail
+          S3_STAGING="s3://framework-whls-nightlies/whl-staging/gfx942-gfx950"
+
+          shopt -s nullglob
+          wheels=(noprebuild-wheel/amd_aiter*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one amd_aiter wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          WHL="${wheels[0]}"
+          WHL_NAME=$(basename "${WHL}")
+
+          echo "Uploading ${WHL_NAME}..."
+          aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}" \
+            --cache-control "public, max-age=31536000, immutable"
+
+          MANIFEST_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          export WHL_NAME MANIFEST_TIMESTAMP
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.parse import quote
+
+          whl_name = os.environ["WHL_NAME"]
+          whl_url = f"{os.environ['S3_PUBLIC']}/{quote(whl_name, safe='')}"
+          # Same layout as latest.json, keyed by the py3 tag.
+          manifest = {
+              "branch": os.environ["GITHUB_REF_NAME"],
+              "timestamp": os.environ["MANIFEST_TIMESTAMP"],
+              "commit": os.environ["GITHUB_SHA"],
+              "wheels": {"py3": {"wheel_name": whl_name, "wheel_url": whl_url}},
+              "wheel_name": whl_name,
+              "wheel_url": whl_url,
+          }
+          with open("latest-noprebuild.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          print(f"Manifest: {json.dumps(manifest, indent=2)}")
+          PY
+
+          aws s3 cp latest-noprebuild.json \
+            "${S3_STAGING}/commits/${GITHUB_SHA}/latest-noprebuild.json" \
+            --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+
+          aws s3 cp latest-noprebuild.json \
+            "${S3_STAGING}/main/latest-noprebuild.json" \
+            --content-type application/json \
+            --cache-control "no-store, max-age=0, must-revalidate"
+
+          if [ -n "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+              --paths "/whl-staging/gfx942-gfx950/main/latest-noprebuild.json"
+          else
+            echo "::warning::CLOUDFRONT_DISTRIBUTION_ID is not set; skipping latest-noprebuild.json invalidation"
+          fi
+        env:
+          S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.AITER_WHEEL_CLOUDFRONT_DISTRIBUTION_ID }}
+
   split_aiter_tests:
     if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     runs-on: ubuntu-latest
