@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import enum as _enum
+import functools as _functools
 import math
-import os
+import operator as _operator
+from collections import namedtuple as _namedtuple
+from dataclasses import dataclass as _dataclass
+from typing import Any
 
 import torch
 import triton
@@ -11,6 +16,7 @@ import triton.language as tl
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.utility.aiter_types import aiter_dtypes as _aiter_dtype_ids
 from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
@@ -19,7 +25,7 @@ from csrc.cpp_itfs.pa.pa_ragged import (
 from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
-from ..jit.core import compile_ops, is_experimental_enabled
+from ..jit.core import compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 
@@ -1137,6 +1143,607 @@ def mla_prefill_ps_asm_fwd(
 ) -> None: ...
 
 
+class MlaBackend(str, _enum.Enum):
+    ASM = "asm"
+    FLYDSL_PS1 = "flydsl_ps1"
+    OPUS = "opus"
+    HK = "hk"
+    PS1_FP8_ASM = "ps1_fp8_asm"
+
+
+class MlaAsmStatus(str, _enum.Enum):
+    OK = "ok"
+    REMAP_REJECT = "remap_reject"
+    NO_KERNEL = "no_kernel"
+    NOT_ASM = "not_asm"
+    ARCH_NOT_BUILT = "arch_not_built"
+    UNKNOWN = "unknown"
+
+
+@_dataclass(frozen=True)
+class MlaDecodeShapeSupport:
+    """Result of get_mla_decode_shape_support for one MLA decode shape.
+
+    natively_supported is the planner's native-head rule; native also requires
+    fold_factor == 1 and seqlen_fold == 1, i.e. the KV cache is read once.
+    fold_factor is the number of 16-head pseudo-batches each request is split
+    into, and kernel_num_heads the head count the kernel and reducer see.
+    planner_accepts is False where get_mla_metadata_v1 would reject the shape.
+    supported is True when the selected backend has a kernel for the shape,
+    False when it does not, and None when it cannot be determined (opus and
+    FlyDSL routes, or a failed asm query); reasons explains every False/None.
+    arch, enable_experimental and flydsl_ps1 echo the values that were used.
+    """
+
+    arch: str
+    enable_experimental: bool
+    flydsl_ps1: bool
+    planner: str
+    planner_accepts: bool
+    natively_supported: bool
+    fold_factor: int
+    seqlen_fold: int
+    native: bool
+    kernel_num_heads: int
+    reduce_supported: bool
+    backend: MlaBackend
+    asm_status: MlaAsmStatus
+    asm_kernel: str | None
+    supported: bool | None
+    reasons: tuple[str, ...]
+
+
+@compile_ops("module_mla_metadata")
+def get_mla_decode_head_plan_v1(
+    num_heads_k: int,
+    num_heads_per_head_k: int,
+    max_seqlen_qo: int,
+    uni_seqlen_qo: int,
+    dtype_q_nope: int,
+    dtype_kv_nope: int,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    arch: str,
+    enable_experimental: int,
+    flydsl_ps1: int,
+    v_head_dim: int,
+    page_size: int,
+    cp_world_size: int,
+    cp_round_robin: bool,
+    has_scales: bool,
+    use_opus: bool,
+    use_ps1_asm: bool,
+) -> tuple[str, bool, bool, int, int, bool, int, int, int, int, bool, int]: ...
+
+
+@compile_ops("module_mla_metadata")
+def mla_reduce_v1_supports(num_heads: int, head_dim: int) -> bool: ...
+
+
+_MLA_PLANNER_NAMES = ("v1_0", "v1_1", "v1_2")
+
+
+class _MlaHeadPlanKind(_enum.IntEnum):
+    NATIVE = 0
+    FOLDED = 1
+    ACCEPTED_NON_NATIVE = 2
+    UNSUPPORTED = 3
+
+
+class _MlaBackendId(_enum.IntEnum):
+    ASM = 0
+    FLYDSL_PS1 = 1
+    OPUS = 2
+    HK = 3
+    PS1_FP8_ASM = 4
+
+
+class _MlaAsmStatusCode(_enum.IntEnum):
+    OK = 0
+    REMAP_REJECT = 1
+    NO_KERNEL = 2
+    ARCH_NOT_BUILT = 3
+
+
+_MLA_BACKENDS = {
+    _MlaBackendId.ASM: MlaBackend.ASM,
+    _MlaBackendId.FLYDSL_PS1: MlaBackend.FLYDSL_PS1,
+    _MlaBackendId.OPUS: MlaBackend.OPUS,
+    _MlaBackendId.HK: MlaBackend.HK,
+    _MlaBackendId.PS1_FP8_ASM: MlaBackend.PS1_FP8_ASM,
+}
+_MLA_ASM_STATUSES = {
+    _MlaAsmStatusCode.OK: MlaAsmStatus.OK,
+    _MlaAsmStatusCode.REMAP_REJECT: MlaAsmStatus.REMAP_REJECT,
+    _MlaAsmStatusCode.NO_KERNEL: MlaAsmStatus.NO_KERNEL,
+    _MlaAsmStatusCode.ARCH_NOT_BUILT: MlaAsmStatus.ARCH_NOT_BUILT,
+}
+
+_MlaHeadPlan = _namedtuple(
+    "_MlaHeadPlan",
+    "arch enable_experimental flydsl_ps1 planner plan natively_supported "
+    "qk_batch_ratio kernel_num_heads seqlen_fold packed_qo_len_per_wg "
+    "reduce_supported backend",
+)
+
+
+def _mla_opus_enabled() -> bool:
+    return env_flag_atoi("AITER_MLA_USE_OPUS")
+
+
+def _mla_ps1_asm_enabled() -> bool:
+    return env_flag_atoi("AITER_MLA_DECODE_PS1_ASM", "1")
+
+
+_MLA_SHAPE_DTYPES = {
+    torch.float8_e4m3fn: (_aiter_dtype_ids["fp8"], "fp8"),
+    torch.float8_e4m3fnuz: (_aiter_dtype_ids["fp8"], "fp8"),
+    torch.bfloat16: (_aiter_dtype_ids["bf16"], "bf16"),
+    torch.float16: (_aiter_dtype_ids["fp16"], "fp16"),
+    torch.int8: (_aiter_dtype_ids["fp8"], "byte"),
+    torch.uint8: (_aiter_dtype_ids["fp8"], "byte"),
+}
+
+
+def _mla_asm_only(arch: str, q_dtype: torch.dtype, kv_dtype: torch.dtype) -> bool:
+    arch_fp8 = dtypes.defaultDtypes.get(arch, {"fp8": dtypes.fp8})["fp8"]
+    return any(
+        d in (torch.int8, torch.uint8)
+        or (d in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and d != arch_fp8)
+        for d in (q_dtype, kv_dtype)
+    )
+
+
+def _mla_shape_dtype(dtype: torch.dtype) -> tuple[int, str]:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"MLA decode dtype must be a torch.dtype, got {dtype!r}")
+    try:
+        return _MLA_SHAPE_DTYPES[dtype]
+    except KeyError:
+        raise ValueError(f"unsupported MLA decode dtype: {dtype}") from None
+
+
+@_functools.cache
+def _mla_cpp_gpu_arch(device_index: int) -> str:
+    bf16 = _aiter_dtype_ids["bf16"]
+    plan = get_mla_decode_head_plan_v1(
+        1, 16, 1, 1, bf16, bf16, True, False, "", 0, 0, 512, 1, 1, *(False,) * 4
+    )
+    return plan[0]
+
+
+def _mla_resolve_arch(arch: str | None) -> str:
+    if arch is not None:
+        return arch
+    return _mla_cpp_gpu_arch(torch.cuda.current_device())
+
+
+@_functools.lru_cache(maxsize=4096)
+def _mla_decode_head_plan_cached(
+    num_heads: int,
+    max_seqlen_qo: int,
+    q_id: int,
+    kv_id: int,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    arch: str,
+    enable_experimental: bool,
+    flydsl_ps1: bool,
+    v_head_dim: int,
+    page_size: int,
+    cp_world_size: int,
+    cp_round_robin: bool,
+    has_scales: bool,
+    use_opus: bool,
+    use_ps1_asm: bool,
+    asm_only: bool,
+) -> _MlaHeadPlan:
+    plan = _MlaHeadPlan(
+        *get_mla_decode_head_plan_v1(
+            1,
+            num_heads,
+            max_seqlen_qo,
+            max_seqlen_qo,
+            q_id,
+            kv_id,
+            fast_mode,
+            intra_batch_mode,
+            arch,
+            int(enable_experimental),
+            int(flydsl_ps1),
+            v_head_dim,
+            page_size,
+            cp_world_size,
+            cp_round_robin,
+            has_scales,
+            use_opus,
+            use_ps1_asm,
+        )
+    )
+    return plan._replace(backend=_MlaBackendId.ASM) if asm_only else plan
+
+
+def _mla_decode_head_plan(
+    num_heads: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    *,
+    fast_mode: bool = True,
+    intra_batch_mode: bool = False,
+    page_size: int = 1,
+    cp_world_size: int = 1,
+    cp_round_robin: bool = False,
+    has_scales: bool = True,
+    use_opus: bool | None = None,
+    use_ps1_asm: bool | None = None,
+    v_head_dim: int = 512,
+    arch: str | None = None,
+    enable_experimental: bool | None = None,
+    flydsl_ps1: bool | None = None,
+) -> _MlaHeadPlan:
+    q_id = _MLA_SHAPE_DTYPES.get(q_dtype, _MLA_SHAPE_DTYPES[torch.uint8])[0]
+    kv_id = _MLA_SHAPE_DTYPES.get(kv_dtype, _MLA_SHAPE_DTYPES[torch.uint8])[0]
+    arch = _mla_resolve_arch(arch)
+    asm_only = any(
+        d not in _MLA_SHAPE_DTYPES for d in (q_dtype, kv_dtype)
+    ) or _mla_asm_only(arch, q_dtype, kv_dtype)
+    return _mla_decode_head_plan_cached(
+        int(num_heads),
+        int(max_seqlen_qo),
+        q_id,
+        kv_id,
+        bool(fast_mode),
+        bool(intra_batch_mode),
+        arch,
+        (
+            env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")
+            if enable_experimental is None
+            else bool(enable_experimental)
+        ),
+        (
+            env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
+            if flydsl_ps1 is None
+            else bool(flydsl_ps1)
+        ),
+        int(v_head_dim),
+        int(page_size),
+        int(cp_world_size),
+        bool(cp_round_robin),
+        bool(has_scales),
+        _mla_opus_enabled() if use_opus is None else bool(use_opus),
+        _mla_ps1_asm_enabled() if use_ps1_asm is None else bool(use_ps1_asm),
+        asm_only,
+    )
+
+
+@_functools.lru_cache(maxsize=1)
+def _mla_asm_query_lib() -> Any:
+    import ctypes
+
+    from ..jit.core import build_ctypes_module
+
+    lib = ctypes.CDLL(build_ctypes_module("module_mla_asm"))
+    out_args = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+    lib.mla_decode_asm_query.argtypes = (
+        [ctypes.c_char_p] * 3 + [ctypes.c_int] * 7 + out_args
+    )
+    lib.mla_ps1_fp8_asm_query.argtypes = (
+        [ctypes.c_char_p] + [ctypes.c_int] * 5 + out_args
+    )
+    for fn in (lib.mla_decode_asm_query, lib.mla_ps1_fp8_asm_query):
+        fn.restype = ctypes.c_int
+    err = getattr(lib, "aiter_get_last_error", None)
+    if err is not None:
+        err.argtypes = []
+        err.restype = ctypes.c_char_p
+    return lib
+
+
+def _mla_asm_query_call(name: str, *args: bytes | int) -> tuple[int, str]:
+    import ctypes
+
+    lib = _mla_asm_query_lib()
+    buf = ctypes.create_string_buffer(256)
+    packed = getattr(lib, name)(*args, buf, len(buf), None)
+    if packed < 0:
+        err = getattr(lib, "aiter_get_last_error", None)
+        msg = err() if err is not None else None
+        raise RuntimeError((msg.decode() if msg else None) or f"{name} failed")
+    return packed, buf.value.decode()
+
+
+def mla_decode_asm_query(
+    arch: str,
+    q_type: str,
+    kv_type: str,
+    num_heads: int,
+    nhead_kv: int,
+    max_seqlen_q: int,
+    persistent: bool,
+    causal: bool,
+    has_lse: bool,
+    has_cprr: bool,
+) -> tuple[int, int, int, str]:
+    packed, kernel = _mla_asm_query_call(
+        "mla_decode_asm_query",
+        arch.encode(),
+        q_type.encode(),
+        kv_type.encode(),
+        num_heads,
+        nhead_kv,
+        max_seqlen_q,
+        int(persistent),
+        int(causal),
+        int(has_lse),
+        int(has_cprr),
+    )
+    return packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF, kernel
+
+
+def mla_ps1_fp8_asm_query(
+    arch: str,
+    num_heads: int,
+    max_seqlen_q: int,
+    causal: bool,
+    has_lse: bool,
+    has_cprr: bool,
+) -> tuple[int, str]:
+    return _mla_asm_query_call(
+        "mla_ps1_fp8_asm_query",
+        arch.encode(),
+        num_heads,
+        max_seqlen_q,
+        int(causal),
+        int(has_lse),
+        int(has_cprr),
+    )
+
+
+@_functools.lru_cache(maxsize=4096)
+def _get_mla_decode_shape_support_cached(
+    num_heads: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    v_head_dim: int,
+    return_lse: bool,
+    causal: bool,
+    persistent: bool,
+    cp_round_robin: bool,
+    page_size: int,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    arch: str,
+    enable_experimental: bool,
+    flydsl_ps1: bool,
+    use_opus: bool,
+    use_ps1_asm: bool,
+) -> MlaDecodeShapeSupport:
+    q_id, q_type = _mla_shape_dtype(q_dtype)
+    kv_id, kv_type = _mla_shape_dtype(kv_dtype)
+    p = _mla_decode_head_plan_cached(
+        num_heads,
+        max_seqlen_qo,
+        q_id,
+        kv_id,
+        fast_mode,
+        intra_batch_mode,
+        arch,
+        enable_experimental,
+        flydsl_ps1,
+        v_head_dim,
+        page_size,
+        2 if cp_round_robin else 1,
+        cp_round_robin,
+        True,
+        use_opus,
+        use_ps1_asm,
+        _mla_asm_only(arch, q_dtype, kv_dtype),
+    )
+    planner = _MLA_PLANNER_NAMES[p.planner]
+    planner_accepts = p.plan != _MlaHeadPlanKind.UNSUPPORTED
+    reasons = []
+
+    backend = _MLA_BACKENDS[p.backend] if persistent else MlaBackend.ASM
+    asm_route = backend in (MlaBackend.ASM, MlaBackend.PS1_FP8_ASM)
+    ps1_folded = backend in (MlaBackend.FLYDSL_PS1, MlaBackend.PS1_FP8_ASM) and (
+        p.qk_batch_ratio != 1 or p.seqlen_fold != 1
+    )
+    asm_heads = (
+        p.kernel_num_heads if persistent and backend is MlaBackend.ASM else num_heads
+    )
+    asm_status, asm_kernel = MlaAsmStatus.NOT_ASM, None
+    if asm_route:
+        try:
+            if backend is MlaBackend.ASM:
+                code, gqa, qlen, kernel = mla_decode_asm_query(
+                    arch,
+                    q_type,
+                    kv_type,
+                    asm_heads,
+                    1,
+                    max_seqlen_qo,
+                    persistent,
+                    causal,
+                    return_lse,
+                    cp_round_robin,
+                )
+            else:
+                code, kernel = mla_ps1_fp8_asm_query(
+                    arch, asm_heads, max_seqlen_qo, causal, return_lse, cp_round_robin
+                )
+                gqa, qlen = asm_heads, max_seqlen_qo
+            asm_status = _MLA_ASM_STATUSES.get(code, MlaAsmStatus.UNKNOWN)
+            if asm_status is MlaAsmStatus.UNKNOWN:
+                reasons.append(f"asm status code {code} unrecognised")
+        except Exception as e:  # noqa: BLE001
+            asm_status, gqa, qlen, kernel = MlaAsmStatus.UNKNOWN, 0, 0, ""
+            reasons.append(f"asm query failed: {e}")
+        if asm_status is MlaAsmStatus.OK:
+            asm_kernel = kernel
+        elif asm_status is not MlaAsmStatus.UNKNOWN:
+            reasons.append(
+                f"{backend.value} {asm_status.value} on {arch}: q={q_type} kv={kv_type} "
+                f"heads={asm_heads} qlen={max_seqlen_qo} (table gqa={gqa} "
+                f"qseqlen={qlen}) persistent={int(persistent)} "
+                f"causal={int(causal)} lse={int(return_lse)} "
+                f"cprr={int(cp_round_robin)}"
+            )
+
+    if not planner_accepts:
+        reasons.insert(
+            0,
+            f"planner {planner} rejects {num_heads} heads on {arch} "
+            f"(max_seqlen_qo={max_seqlen_qo}, {q_type}/{kv_type})",
+        )
+    if persistent and not p.reduce_supported:
+        reasons.append(
+            f"mla_reduce_v1 has no ({p.kernel_num_heads} heads, "
+            f"head_dim {v_head_dim}) case"
+        )
+    if ps1_folded:
+        reasons.append(
+            f"{backend.value} kernels read unfolded heads; planner {planner} folds "
+            f"{num_heads} heads {p.qk_batch_ratio * p.seqlen_fold}x"
+        )
+    if backend is MlaBackend.HK:
+        reasons.append(
+            "hk backend: hk_mla_decode_fwd is not defined "
+            "(AITER_ENABLE_EXPERIMENTAL route)"
+        )
+
+    if (
+        not planner_accepts
+        or (persistent and not p.reduce_supported)
+        or ps1_folded
+        or backend is MlaBackend.HK
+        or (asm_route and asm_status not in (MlaAsmStatus.OK, MlaAsmStatus.UNKNOWN))
+    ):
+        supported = False
+    elif asm_route and asm_status is MlaAsmStatus.OK:
+        supported = True
+    else:
+        supported = None
+        if not asm_route:
+            reasons.append(f"{backend.value} backend has no availability table")
+
+    return MlaDecodeShapeSupport(
+        arch=arch,
+        enable_experimental=enable_experimental,
+        flydsl_ps1=flydsl_ps1,
+        planner=planner,
+        planner_accepts=planner_accepts,
+        natively_supported=p.natively_supported,
+        fold_factor=p.qk_batch_ratio,
+        seqlen_fold=p.seqlen_fold,
+        native=p.natively_supported and p.qk_batch_ratio == 1 and p.seqlen_fold == 1,
+        kernel_num_heads=p.kernel_num_heads,
+        reduce_supported=p.reduce_supported,
+        backend=backend,
+        asm_status=asm_status,
+        asm_kernel=asm_kernel,
+        supported=supported,
+        reasons=tuple(reasons),
+    )
+
+
+def get_mla_decode_shape_support(
+    num_heads: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    *,
+    num_heads_k: int = 1,
+    v_head_dim: int = 512,
+    return_lse: bool = False,
+    causal: bool = True,
+    persistent: bool = True,
+    cp_round_robin: bool = False,
+    page_size: int = 1,
+    fast_mode: bool = True,
+    intra_batch_mode: bool = False,
+    arch: str | None = None,
+    enable_experimental: bool | None = None,
+    flydsl_ps1: bool | None = None,
+) -> MlaDecodeShapeSupport:
+    """Report how mla_decode_fwd will run an MLA decode shape, without launching.
+
+    The answer comes from the same C++ rules the metadata planner, the reducer
+    and the asm dispatch use: whether num_heads is native or folded into 16-head
+    pseudo-batches, which backend is selected, and whether a kernel exists.
+
+    num_heads is the Q head count per rank as passed to mla_decode_fwd (after any
+    DCP gather) and max_seqlen_qo the per-request query length (>= 1). The
+    keyword arguments describe the call the caller will make. arch=None uses the
+    current device's arch; an explicit arch needs no device, but asm availability
+    is only known for arches compiled into the build. enable_experimental and
+    flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL and
+    AITER_MLA_DECODE_PS1_FLYDSL env vars. Results are cached; call
+    get_mla_decode_shape_support.cache_clear() after changing env vars.
+
+    Raises TypeError for a non-int count or a non-torch.dtype, and ValueError
+    for num_heads < 1, max_seqlen_qo < 1, num_heads_k != 1 or an unsupported
+    dtype.
+    """
+
+    def _as_int(name: str, value: object) -> int:
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be an int, got {value!r}")
+        try:
+            return _operator.index(value)
+        except TypeError:
+            raise TypeError(f"{name} must be an int, got {value!r}") from None
+
+    num_heads = _as_int("num_heads", num_heads)
+    max_seqlen_qo = _as_int("max_seqlen_qo", max_seqlen_qo)
+    num_heads_k = _as_int("num_heads_k", num_heads_k)
+    v_head_dim = _as_int("v_head_dim", v_head_dim)
+    page_size = _as_int("page_size", page_size)
+    if num_heads < 1:
+        raise ValueError(f"num_heads must be >= 1, got {num_heads}")
+    if max_seqlen_qo < 1:
+        raise ValueError(f"max_seqlen_qo must be >= 1, got {max_seqlen_qo}")
+    if num_heads_k != 1:
+        raise ValueError(
+            f"num_heads_k must be 1 (asm MLA decode requires it), got {num_heads_k}"
+        )
+    _mla_shape_dtype(q_dtype)
+    _mla_shape_dtype(kv_dtype)
+    return _get_mla_decode_shape_support_cached(
+        num_heads,
+        max_seqlen_qo,
+        q_dtype,
+        kv_dtype,
+        v_head_dim,
+        bool(return_lse),
+        bool(causal),
+        bool(persistent),
+        bool(cp_round_robin),
+        page_size,
+        bool(fast_mode),
+        bool(intra_batch_mode),
+        _mla_resolve_arch(arch),
+        (
+            env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")
+            if enable_experimental is None
+            else bool(enable_experimental)
+        ),
+        (
+            env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
+            if flydsl_ps1 is None
+            else bool(flydsl_ps1)
+        ),
+        _mla_opus_enabled(),
+        _mla_ps1_asm_enabled(),
+    )
+
+
+get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
+    _get_mla_decode_shape_support_cached.cache_clear
+)
+
+
 def get_mla_decode_fwd_occupancy(
     num_head_qo: int,
     max_seqlen_qo: int,
@@ -1271,7 +1878,7 @@ def get_mla_metadata_info_v1(
             # sparse-collapsed length; a mismatch here would size the reduce
             # buffers for a fold the planner does not perform.
             get_gfx() == "gfx1250"
-            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
             and num_head_qo in (32, 64, 128)
@@ -1304,7 +1911,7 @@ def get_mla_metadata_info_v1(
         )
         or (
             get_gfx() == "gfx1250"
-            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
             and num_head_qo == 96
@@ -1728,7 +2335,7 @@ def decode_update_mla_metadata_v1(
         )
         or (
             arch_id == "gfx1250"
-            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_is_fp8
             and kv_is_fp8
             and num_heads_per_head_k in (32, 64, 128)

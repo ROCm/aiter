@@ -42,15 +42,13 @@ AITER_DISABLE_KERNARG_PRELOAD = (
 )
 
 
+def env_flag_atoi(name: str, default: str = "") -> bool:
+    m = re.match(r"\s*([+-]?\d+)", os.environ.get(name, default))
+    return m is not None and int(m.group(1)) != 0
+
+
 def is_experimental_enabled() -> bool:
-    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
-    # any other integer value as enabled. Non-numeric strings are treated as
-    # disabled to avoid accidentally turning on experimental code paths.
-    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
-    try:
-        return int(val) != 0
-    except ValueError:
-        return False
+    return env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")
 
 
 aiter_lib = None
@@ -1639,6 +1637,29 @@ def _is_union(origin):
 ) = range(7)
 
 
+def build_ctypes_module(md_name: str) -> str:
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
+        d_args = get_args_of_build(md_name)
+        d_args["torch_exclude"] = True
+        build_module(
+            md_name,
+            d_args["srcs"],
+            d_args["flags_extra_cc"],
+            d_args["flags_extra_hip"],
+            d_args["blob_gen_cmd"],
+            d_args["extra_include"],
+            d_args["extra_ldflags"],
+            d_args["verbose"],
+            d_args["is_python_module"],
+            d_args["is_standalone"],
+            d_args["torch_exclude"],
+            d_args.get("third_party", []),
+            flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+        )
+    return so_path
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
 
@@ -1684,25 +1705,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
-        if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
-            d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
-            build_module(
-                md_name,
-                d_args["srcs"],
-                d_args["flags_extra_cc"],
-                d_args["flags_extra_hip"],
-                d_args["blob_gen_cmd"],
-                d_args["extra_include"],
-                d_args["extra_ldflags"],
-                d_args["verbose"],
-                d_args["is_python_module"],
-                d_args["is_standalone"],
-                d_args["torch_exclude"],
-                d_args.get("third_party", []),
-                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
-            )
+        so_path = build_ctypes_module(md_name)
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 

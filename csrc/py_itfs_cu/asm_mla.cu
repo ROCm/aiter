@@ -10,6 +10,7 @@ namespace mla_dsl {
 #include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
@@ -564,6 +565,99 @@ static const mla_dsl::CFG::value_type* mla_ps1_fp8_asm_config(const std::string&
         }
     }
     return nullptr;
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(mla_decode_asm_query,
+                               (const char* arch,
+                                const char* q_type,
+                                const char* kv_type,
+                                int num_heads,
+                                int nhead_kv,
+                                int max_seqlen_q,
+                                int persistent,
+                                int causal,
+                                int has_lse,
+                                int has_cprr,
+                                char* kernel_out,
+                                int kernel_out_len,
+                                hipStream_t stream),
+                               (arch,
+                                q_type,
+                                kv_type,
+                                num_heads,
+                                nhead_kv,
+                                max_seqlen_q,
+                                persistent,
+                                causal,
+                                has_lse,
+                                has_cprr,
+                                kernel_out,
+                                kernel_out_len,
+                                stream))
+{
+    (void)stream;
+    AITER_CHECK(
+        q_type != nullptr && kv_type != nullptr, __func__, ": q_type and kv_type are required");
+    const std::string arch_id = (arch == nullptr || arch[0] == '\0') ? get_gpu_arch() : arch;
+    const MlaAsmDecodeCfg c   = mla_asm_decode_config(arch_id,
+                                                    q_type,
+                                                    kv_type,
+                                                    num_heads,
+                                                    nhead_kv,
+                                                    max_seqlen_q,
+                                                    persistent != 0,
+                                                    causal != 0,
+                                                    has_lse != 0,
+                                                    has_cprr != 0);
+    if(kernel_out != nullptr && kernel_out_len > 0)
+    {
+        const size_t n = std::min(c.kernel.size(), static_cast<size_t>(kernel_out_len - 1));
+        c.kernel.copy(kernel_out, n);
+        kernel_out[n] = '\0';
+    }
+    return static_cast<int>(c.status) | ((c.gqa & 0xff) << 8) | ((c.qseqlen & 0xff) << 16);
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(mla_ps1_fp8_asm_query,
+                               (const char* arch,
+                                int num_heads,
+                                int max_seqlen_q,
+                                int causal,
+                                int has_lse,
+                                int has_cprr,
+                                char* kernel_out,
+                                int kernel_out_len,
+                                hipStream_t stream),
+                               (arch,
+                                num_heads,
+                                max_seqlen_q,
+                                causal,
+                                has_lse,
+                                has_cprr,
+                                kernel_out,
+                                kernel_out_len,
+                                stream))
+{
+    (void)stream;
+    const std::string arch_id = (arch == nullptr || arch[0] == '\0') ? get_gpu_arch() : arch;
+    const int causal_flag     = causal != 0 ? 1 : 0;
+    const int cprr            = (has_cprr != 0 && causal_flag) ? 1 : 0;
+    const auto* cfg_entry     = mla_ps1_fp8_asm_config(
+        arch_id, num_heads, max_seqlen_q, causal_flag, has_lse != 0 ? 1 : 0, cprr);
+    bool arch_built = cfg_entry != nullptr;
+    for(const auto& el : mla_dsl::cfg_mla_dsl)
+        arch_built = arch_built || el.first.find(arch_id) == 0;
+    const std::string kernel = cfg_entry != nullptr ? cfg_entry->first : std::string();
+    if(kernel_out != nullptr && kernel_out_len > 0)
+    {
+        const size_t n = std::min(kernel.size(), static_cast<size_t>(kernel_out_len - 1));
+        kernel.copy(kernel_out, n);
+        kernel_out[n] = '\0';
+    }
+    const MlaAsmStatus status = cfg_entry != nullptr ? MlaAsmStatus::Ok
+                                : arch_built         ? MlaAsmStatus::NoKernel
+                                                     : MlaAsmStatus::ArchNotBuilt;
+    return static_cast<int>(status);
 }
 
 #ifdef ASM_DEBUG

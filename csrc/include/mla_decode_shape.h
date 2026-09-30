@@ -233,6 +233,74 @@ inline MlaDecodeHeadPlan mla_decode_head_plan(const std::string_view arch_id,
     return mla_decode_head_plan_v1_1(num_heads);
 }
 
+enum class MlaBackendId : int32_t
+{
+    Asm       = 0,
+    FlydslPs1 = 1,
+    Opus      = 2,
+    Hk        = 3,
+    Ps1Fp8Asm = 4,
+};
+
+inline MlaBackendId mla_decode_backend(const std::string_view arch_id,
+                                       const int32_t num_heads,
+                                       const int32_t kernel_num_heads,
+                                       const int32_t max_seqlen_qo,
+                                       const AiterDtype q_dtype,
+                                       const AiterDtype kv_dtype,
+                                       const int32_t page_size,
+                                       const int32_t cp_world_size,
+                                       const bool cp_round_robin,
+                                       const bool intra_batch_mode,
+                                       const bool has_scales,
+                                       const bool use_opus,
+                                       const bool use_ps1_asm,
+                                       const MlaPlannerFlags flags)
+{
+    const bool q_is_fp8   = (q_dtype == AITER_DTYPE_fp8);
+    const bool kv_is_fp8  = (kv_dtype == AITER_DTYPE_fp8);
+    const bool q_is_bf16  = (q_dtype == AITER_DTYPE_bf16);
+    const bool kv_is_bf16 = (kv_dtype == AITER_DTYPE_bf16);
+
+    const bool use_flydsl_ps1 =
+        flags.flydsl_ps1 && (arch_id == "gfx1250") && (page_size == 1) && q_is_fp8 && kv_is_fp8 &&
+        ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 96) ||
+         (num_heads == 128)) &&
+        ((num_heads == 16) || (num_heads == 96) || (max_seqlen_qo == 1)) &&
+        ((cp_world_size == 1) || cp_round_robin) && !intra_batch_mode && has_scales;
+    if(use_flydsl_ps1)
+    {
+        // Head counts with code objects exported from the FlyDSL PS1 kernel
+        // (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
+        // AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT.
+        if(use_ps1_asm && ((num_heads == 96) || (num_heads == 128)))
+        {
+            return MlaBackendId::Ps1Fp8Asm;
+        }
+        return MlaBackendId::FlydslPs1;
+    }
+
+    const bool opus_is_fp8  = q_is_fp8 && kv_is_fp8 && has_scales;
+    const bool opus_is_bf16 = q_is_bf16 && kv_is_bf16;
+    if(use_opus && (arch_id == "gfx950") && (page_size == 1) && (opus_is_fp8 || opus_is_bf16))
+    {
+        return MlaBackendId::Opus;
+    }
+
+    const bool hk_page_size = (page_size == 1) || (page_size == 64);
+    const bool use_hk       = ((arch_id == "gfx942" || arch_id == "gfx950") &&
+                         (kernel_num_heads * max_seqlen_qo == 128) && q_is_fp8 && kv_is_fp8 &&
+                         hk_page_size && flags.enable_experimental) ||
+                        ((arch_id == "gfx950") && (kernel_num_heads * max_seqlen_qo == 64) &&
+                         q_is_fp8 && kv_is_fp8 && hk_page_size && flags.enable_experimental);
+    if(use_hk)
+    {
+        return MlaBackendId::Hk;
+    }
+
+    return MlaBackendId::Asm;
+}
+
 // HK MLA m16x4 kernel runs at occupancy=2 (gfx950 + 64 q-tokens per tile, gated on
 // AITER_ENABLE_EXPERIMENTAL same as the dispatch in aiter/mla.py:use_hk). When it
 // applies, the m16x4 launch site spawns 2*num_cu workgroups; the work distribution
