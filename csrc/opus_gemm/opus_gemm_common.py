@@ -692,13 +692,17 @@ a16w16_kernels_list_nooob = {
 }
 
 # CPOL variants for a16w16: 3 policies per kid, tuner picks best per shape.
+# Explicit OOB/nooob offsets preserve the previously visible ids. The old
+# offset+1000 mirrors collided with the next policy and the +5000 4g_safe
+# family. Only those shadowed variants move to the unused 7000 band.
 _CACHECTL_CONFIGS = [
-    (2000, 1, 17, "Mheavy"),   # kid_offset, cachectl_a, cachectl_b
-    (3000, 17, 1, "Nheavy"),
-    (4000, 0,  0, "balanced"),
+    # (oob_offset, nooob_offset, cachectl_a, cachectl_b, tag)
+    (2000, 3000,  1, 17, "Mheavy"),
+    (7000, 4000, 17,  1, "Nheavy"),
+    (7100, 7200,  0,  0, "balanced"),
 ]
 a16w16_kernels_list_cpol = {}
-for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
+for offset, _nooob_offset, ca, cb, _tag in _CACHECTL_CONFIGS:
     for kid, inst in a16w16_kernels_list.items():
         new_inst = _a16w16(
             inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
@@ -709,7 +713,7 @@ for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
         a16w16_kernels_list_cpol[kid + offset] = new_inst
 
 a16w16_kernels_list_cpol_nooob = {}
-for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
+for _oob_offset, offset, ca, cb, _tag in _CACHECTL_CONFIGS:
     for kid, inst in a16w16_kernels_list.items():
         new_inst = _a16w16(
             inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
@@ -717,7 +721,7 @@ for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
         )
         new_inst.cachectl_a = ca
         new_inst.cachectl_b = cb
-        a16w16_kernels_list_cpol_nooob[kid + offset + 1000] = new_inst
+        a16w16_kernels_list_cpol_nooob[kid + offset] = new_inst
 
 a16w16_flatmm_splitk_kernels_list_nooob = {
     kid + 1000: _a16w16_flatmm_splitk(
@@ -864,8 +868,9 @@ a16w16_mono_tile_kernels_list = {
 #   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh
 #   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh
 #
-# Offset choice: +5000 sits above the cpol band (which uses +2000/+3000/+4000)
-# and well clear of the nooob mirror band (+1000). 4g_safe kids carry HAS_OOB
+# Offset choice: +5000 is reserved for legacy 4g_safe variants; cpol variants
+# use explicit disjoint offsets rather than an unconditional +1000 mirror.
+# 4g_safe kids carry HAS_OOB
 # from their parent (M/N tail is absorbed by the per-WG BR num_records, so
 # the per-thread predicate is structurally a no-op for valid in-tile threads;
 # we still emit both has_oob variants for consistency with the legacy axis).
